@@ -1,5 +1,17 @@
 # AGENTS.md
 
+## Environment
+
+This repo uses a Guix-managed development environment.
+
+- Use `./scripts/guix-run <command> ...` for dependency-sensitive work.
+- Prefer `./scripts/guix-run python3 ...` over bare `python` or `python3`.
+- Prefer `./scripts/guix-run ruff ...`, `./scripts/guix-run pyright`, and
+  `./scripts/guix-run pytest ...` when verifying behavior that depends on the
+  repo's declared toolchain.
+- `manifest.scm` is the source of truth for CuTe/CUTLASS, PyTorch, lint, and
+  profiling dependencies.
+
 ## Commit Conventions
 
 Use lightweight Conventional Commits for all new commits:
@@ -29,3 +41,13 @@ Add a real `CHANGELOG.md` only when one of these happens:
 - the repo is prepared for a public release
 - the paper artifact is being frozen
 - the kernel/benchmark stack reaches a release candidate state
+
+## CuTe Workflow Notes
+
+- Do not add CuTe availability fallbacks or placeholder benchmark behavior until
+  the Guix environment and launch path are in place.
+- Once CuTe kernel work begins, keep the op contract fixed and make the package
+  structure match the staged forward decomposition:
+  `chunk_increment -> state_passing -> chunk_scan`.
+- For benchmark and profiling scripts, prefer repo-local `scripts/` helpers over
+  ad hoc commands once those helpers exist.
