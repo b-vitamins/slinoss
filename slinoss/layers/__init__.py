@@ -8,6 +8,7 @@ from .discretization import (
     foh_taps_from_polar,
     principal_angle,
 )
+from .mixer import SLinOSSMixer
 from .state import SLinOSSMixerState, ScanState
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "SLinOSSMixerState",
     "SLinOSSDiscretizationOutput",
     "SLinOSSDiscretizer",
+    "SLinOSSMixer",
     "principal_angle",
     "build_transition_from_polar",
     "foh_taps_from_polar",
