@@ -1,6 +1,6 @@
 """SLinOSS model-side modules."""
 
-from .backend import ReferenceScanBackend, ScanBackend, ScanInputs
+from .backend import CuteScanBackend, ReferenceScanBackend, ScanBackend, ScanInputs
 from .discretization import (
     SLinOSSDiscretizationOutput,
     SLinOSSDiscretizer,
@@ -15,6 +15,7 @@ __all__ = [
     "ScanInputs",
     "ScanBackend",
     "ReferenceScanBackend",
+    "CuteScanBackend",
     "ScanState",
     "SLinOSSMixerState",
     "SLinOSSDiscretizationOutput",

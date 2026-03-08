@@ -7,7 +7,7 @@ from typing import Protocol
 
 import torch
 
-from slinoss.ops.v2x2ssd import v2x2ssd
+from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 
 from .state import ScanState
 
@@ -48,6 +48,36 @@ def _default_compute_dtype(dtype: torch.dtype) -> torch.dtype | None:
     return None
 
 
+def _run_scan_op(
+    scan_op,
+    inputs: ScanInputs,
+    *,
+    chunk_size: int,
+    state: ScanState | None,
+    compute_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, ScanState]:
+    scan_state = ScanState() if state is None else state
+    output_dtype = inputs.U.dtype
+    if compute_dtype is None:
+        compute_dtype = _default_compute_dtype(output_dtype)
+
+    y, final_state, b_last, u_last = scan_op(
+        inputs.U,
+        inputs.M,
+        inputs.K,
+        inputs.B,
+        inputs.C,
+        chunk_size=chunk_size,
+        initial_states=scan_state.state,
+        B_prev=scan_state.b_prev,
+        U_prev=scan_state.u_prev,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+    )
+    next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
+    return y, next_state
+
+
 class ReferenceScanBackend:
     """Reference backend that wraps the staged ``v2x2ssd`` implementation."""
 
@@ -61,27 +91,35 @@ class ReferenceScanBackend:
         chunk_size: int,
         state: ScanState | None = None,
     ) -> tuple[torch.Tensor, ScanState]:
-        scan_state = ScanState() if state is None else state
-        output_dtype = inputs.U.dtype
-        compute_dtype = self.compute_dtype
-        if compute_dtype is None:
-            compute_dtype = _default_compute_dtype(output_dtype)
-
-        y, final_state, b_last, u_last = v2x2ssd(
-            inputs.U,
-            inputs.M,
-            inputs.K,
-            inputs.B,
-            inputs.C,
+        return _run_scan_op(
+            v2x2ssd,
+            inputs,
             chunk_size=chunk_size,
-            initial_states=scan_state.state,
-            B_prev=scan_state.b_prev,
-            U_prev=scan_state.u_prev,
-            compute_dtype=compute_dtype,
-            output_dtype=output_dtype,
+            state=state,
+            compute_dtype=self.compute_dtype,
         )
-        next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
-        return y, next_state
 
 
-__all__ = ["ScanInputs", "ScanBackend", "ReferenceScanBackend"]
+class CuteScanBackend:
+    """CuTe backend wrapper for the staged ``v2x2ssd`` operator."""
+
+    def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
+        self.compute_dtype = compute_dtype
+
+    def __call__(
+        self,
+        inputs: ScanInputs,
+        *,
+        chunk_size: int,
+        state: ScanState | None = None,
+    ) -> tuple[torch.Tensor, ScanState]:
+        return _run_scan_op(
+            v2x2ssd_cute,
+            inputs,
+            chunk_size=chunk_size,
+            state=state,
+            compute_dtype=self.compute_dtype,
+        )
+
+
+__all__ = ["ScanInputs", "ScanBackend", "ReferenceScanBackend", "CuteScanBackend"]
