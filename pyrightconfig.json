@@ -1,0 +1,4 @@
+{
+    "include": ["examples", "slinoss", "tests"],
+    "exclude": ["slinoss/ops/v2x2ssd/cute/kernels"],
+}
