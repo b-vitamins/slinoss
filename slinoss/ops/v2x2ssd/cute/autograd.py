@@ -15,13 +15,15 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param import (
     _chunk_scan_bwd_param_from_intermediates,
-    _dlogprefix_half_packed,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
     chunk_scan_bwd_dc_exact_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
     chunk_scan_bwd_db_exact_cute,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
+    chunk_scan_bwd_dlogprefix_exact_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
@@ -344,13 +346,14 @@ def _chunk_scan_bwd_exact_packed(
     )
     dK_prev_packed = torch.bmm(dScore_prev.transpose(1, 2), Qf)
     dK_curr_packed = torch.bmm(dScore_curr.transpose(1, 2), Qf)
-    d_logprefix_half = _dlogprefix_half_packed(
+    y_off = torch.bmm(Qf, Z0f.transpose(1, 2)) * row_scale
+    d_logprefix_half = chunk_scan_bwd_dlogprefix_exact_cute(
         score_prev,
         score_curr,
         dSprev,
         dScurr,
-        torch.bmm(Qf, Z0f.transpose(1, 2)) * row_scale,
-        scale,
+        logprefix_half.contiguous(),
+        y_off.contiguous(),
         d_out_flat,
     )
 
