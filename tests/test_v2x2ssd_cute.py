@@ -110,13 +110,17 @@ def test_chunk_scan_compiled_key_distinguishes_full_operand_contract() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_batched_sgemm_fp32_cute_matches_torch_bmm_mixed_layouts() -> None:
+@pytest.mark.parametrize("shape", [(64, 64, 96), (32, 32, 32)])
+def test_batched_sgemm_fp32_cute_matches_torch_bmm_mixed_layouts(
+    shape: tuple[int, int, int],
+) -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
+    M, N, K = shape
     batch = 64
-    A = torch.randn((batch, 64, 96), device="cuda", dtype=torch.float32)
-    B_base = torch.randn((batch, 64, 96), device="cuda", dtype=torch.float32)
+    A = torch.randn((batch, M, K), device="cuda", dtype=torch.float32)
+    B_base = torch.randn((batch, N, K), device="cuda", dtype=torch.float32)
     B = B_base.transpose(1, 2)
 
     got = batched_sgemm_fp32_cute(A, B)
