@@ -122,4 +122,29 @@ class CuteScanBackend:
         )
 
 
-__all__ = ["ScanInputs", "ScanBackend", "ReferenceScanBackend", "CuteScanBackend"]
+class AutoScanBackend:
+    """Default backend that routes CUDA inputs to CuTe and others to reference."""
+
+    def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
+        self.compute_dtype = compute_dtype
+        self.reference = ReferenceScanBackend(compute_dtype=compute_dtype)
+        self.cute = CuteScanBackend(compute_dtype=compute_dtype)
+
+    def __call__(
+        self,
+        inputs: ScanInputs,
+        *,
+        chunk_size: int,
+        state: ScanState | None = None,
+    ) -> tuple[torch.Tensor, ScanState]:
+        backend = self.cute if inputs.U.device.type == "cuda" else self.reference
+        return backend(inputs, chunk_size=chunk_size, state=state)
+
+
+__all__ = [
+    "ScanInputs",
+    "ScanBackend",
+    "ReferenceScanBackend",
+    "CuteScanBackend",
+    "AutoScanBackend",
+]

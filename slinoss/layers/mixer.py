@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .backend import ReferenceScanBackend, ScanBackend, ScanInputs
+from .backend import AutoScanBackend, ScanBackend, ScanInputs
 from .discretization import SLinOSSDiscretizer
 from .state import SLinOSSMixerState
 
@@ -90,7 +90,7 @@ class SLinOSSMixer(nn.Module):
             eps=eps,
             device=device,
         )
-        self.backend = ReferenceScanBackend() if backend is None else backend
+        self.backend = AutoScanBackend() if backend is None else backend
 
         param_dim = self.n_heads * self.discretizer.param_dim
         self.in_proj = nn.Linear(
