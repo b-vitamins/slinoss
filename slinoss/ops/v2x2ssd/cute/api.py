@@ -11,22 +11,6 @@ from slinoss.ops.v2x2ssd.reference import (
 )
 
 
-def _validate_no_autograd_tensors(
-    tensors: list[tuple[str, torch.Tensor | None]],
-) -> None:
-    tracked = [
-        name for name, tensor in tensors if tensor is not None and tensor.requires_grad
-    ]
-    if tracked:
-        joined = ", ".join(tracked)
-        raise ValueError(
-            "The current CuTe v2x2ssd path does not support autograd-tracked "
-            f"tensors. Got requires_grad=True for: {joined}. Use the reference "
-            "backend for training, or call the CuTe path only on detached "
-            "tensors during evaluation."
-        )
-
-
 def v2x2ssd_cute(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -66,22 +50,6 @@ def v2x2ssd_cute(
         raise ValueError("CuTe v2x2ssd requires CUDA tensors.")
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive. Got {chunk_size}.")
-    # CuTe consumes DLPack-exportable tensors. PyTorch explicitly disallows
-    # exporting autograd-tracked tensors through ``__dlpack__``, so we fail
-    # here with a backend-level message instead of surfacing a low-level
-    # runtime BufferError from inside the kernel wrappers.
-    _validate_no_autograd_tensors(
-        [
-            ("U", U),
-            ("M", M),
-            ("K", K),
-            ("B", B),
-            ("C", C),
-            ("initial_states", initial_states),
-            ("B_prev", B_prev),
-            ("U_prev", U_prev),
-        ]
-    )
 
     D = 2 * N
     rdtype, odtype = _resolve_dtypes(
@@ -107,6 +75,26 @@ def v2x2ssd_cute(
             initial_states=initial_states,
             B_prev=B_prev,
             U_prev=U_prev,
+        )
+
+    if any(
+        tensor is not None and tensor.requires_grad
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    ):
+        from .autograd import v2x2ssd_cute_autograd
+
+        return v2x2ssd_cute_autograd(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=chunk_size,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=rdtype,
+            output_dtype=odtype,
         )
 
     B_last = B[:, :, -1, :].to(dtype=odtype).contiguous()
