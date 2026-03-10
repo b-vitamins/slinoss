@@ -6,7 +6,10 @@ import pytest
 import torch
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
+    _compiled_key,
+    chunk_scan_cute,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
 from slinoss.ops.v2x2ssd.reference import chunk_increment, chunk_scan, state_passing
 
@@ -62,6 +65,45 @@ def _make_scan_inputs(
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
     return U, M, K, B, C, initial_states, B_prev, U_prev
+
+
+def test_chunk_scan_compiled_key_distinguishes_full_operand_contract() -> None:
+    Q = torch.empty((4, 32, 1, 16), dtype=torch.float16)
+    Kprev = torch.empty((4, 32, 1, 16), dtype=torch.float16)
+    Kcurr = torch.empty((4, 32, 1, 16), dtype=torch.float16)
+    logprefix = torch.empty((4, 32), dtype=torch.float32)
+    Z0 = torch.empty((4, 16, 1, 16), dtype=torch.float16)
+    out = torch.empty((4, 32, 1, 16), dtype=torch.float32)
+
+    Vprev_a = torch.empty((4, 32, 1, 16), dtype=torch.float16)
+    Vprev_b = torch.empty((4, 32, 1, 32), dtype=torch.float16)
+    Vcurr_a = torch.empty((4, 32, 1, 16), dtype=torch.float16)
+    Vcurr_b = torch.empty((4, 32, 1, 32), dtype=torch.float16)
+
+    key_a = _compiled_key(
+        Q,
+        Kprev,
+        Vprev_a,
+        Kcurr,
+        Vcurr_a,
+        logprefix,
+        Z0,
+        out,
+        device_index=0,
+    )
+    key_b = _compiled_key(
+        Q,
+        Kprev,
+        Vprev_b,
+        Kcurr,
+        Vcurr_b,
+        logprefix,
+        Z0,
+        out,
+        device_index=0,
+    )
+
+    assert key_a != key_b
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

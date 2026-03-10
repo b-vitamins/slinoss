@@ -46,7 +46,15 @@ _CompiledKey = tuple[
     torch.dtype,
     torch.dtype,
     tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
     tuple[int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int],
 ]
 _COMPILED_CHUNK_SCAN: dict[_CompiledKey, object] = {}
 _CompiledPackDKey = tuple[
@@ -1116,15 +1124,29 @@ def _prepare_chunk_scan_operands(
 
 def _compiled_key(
     Q: torch.Tensor,
+    Kprev: torch.Tensor,
+    Vprev: torch.Tensor,
+    Kcurr: torch.Tensor,
+    Vcurr: torch.Tensor,
+    logprefix: torch.Tensor,
+    Z0: torch.Tensor,
+    out: torch.Tensor,
     *,
-    output_dtype: torch.dtype,
     device_index: int,
 ) -> _CompiledKey:
     return (
         device_index,
         Q.dtype,
-        output_dtype,
+        out.dtype,
         tuple(int(x) for x in Q.shape),
+        tuple(int(x) for x in Q.stride()),
+        tuple(int(x) for x in Vprev.shape),
+        tuple(int(x) for x in Vprev.stride()),
+        tuple(int(x) for x in Kprev.shape),
+        tuple(int(x) for x in Kprev.stride()),
+        tuple(int(x) for x in logprefix.shape),
+        tuple(int(x) for x in Z0.shape),
+        tuple(int(x) for x in Z0.stride()),
         (128, int(Q.shape[1])),
     )
 
@@ -1142,7 +1164,17 @@ def _get_compiled_chunk_scan(
     if Q.device.type != "cuda":
         raise ValueError("CuTe chunk_scan requires CUDA tensors.")
     device_index = 0 if Q.device.index is None else int(Q.device.index)
-    key = _compiled_key(Q, output_dtype=out.dtype, device_index=device_index)
+    key = _compiled_key(
+        Q,
+        Kprev,
+        Vprev,
+        Kcurr,
+        Vcurr,
+        logprefix,
+        Z0,
+        out,
+        device_index=device_index,
+    )
     compiled = _COMPILED_CHUNK_SCAN.get(key)
     if compiled is not None:
         return compiled
