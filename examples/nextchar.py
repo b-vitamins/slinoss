@@ -82,13 +82,19 @@ def load_enwik8_chars(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     raw_path = data_path if data_path is not None else download_enwik8(root=root)
     raw = raw_path.read_bytes()
-    data_bytes = np.frombuffer(raw, dtype=np.uint8)
-    unique_bytes = np.unique(data_bytes)
+    raw_np = np.frombuffer(raw, dtype=np.uint8)
+    unique_bytes = np.unique(raw_np)
     vocab_size = int(unique_bytes.size)
 
-    lut = np.full(256, -1, dtype=np.int64)
-    lut[unique_bytes] = np.arange(vocab_size, dtype=np.int64)
-    data = torch.from_numpy(lut[data_bytes].astype(np.int64))
+    lut = torch.full((256,), -1, dtype=torch.long)
+    lut[torch.tensor(unique_bytes.tolist(), dtype=torch.long)] = torch.arange(
+        vocab_size, dtype=torch.long
+    )
+    # Avoid the NumPy -> DLPack bridge here. The current Guix torch/NumPy stack
+    # rejects readonly NumPy buffers in this path, while a writable bytearray
+    # gives the same byte-level view without the failure.
+    data_bytes = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(torch.long)
+    data = lut[data_bytes].contiguous()
 
     train = data[:90_000_000]
     val = data[90_000_000:95_000_000]

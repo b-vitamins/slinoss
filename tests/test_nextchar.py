@@ -61,3 +61,17 @@ def test_nextchar_model_forward_shape() -> None:
 
     assert logits.shape == (2, 16, 32)
     assert torch.isfinite(logits).all()
+
+
+def test_nextchar_load_enwik8_chars_reads_small_local_file(tmp_path: Path) -> None:
+    mod = _load_example_module()
+    data_path = tmp_path / "tiny-enwik8"
+    data_path.write_bytes(b"babc")
+
+    train, val, test, vocab_size = mod.load_enwik8_chars(data_path)
+
+    assert vocab_size == 3
+    assert train.dtype == torch.long
+    assert train.tolist() == [1, 0, 1, 2]
+    assert val.numel() == 0
+    assert test.numel() == 0
