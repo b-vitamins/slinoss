@@ -149,7 +149,9 @@ def chunk_scan_bwd_du_cute(
         and neg_logprefix_half_rev.is_contiguous()
         and d_out.is_contiguous()
     ):
-        raise ValueError("chunk_scan backward cached operands and d_out must be contiguous.")
+        raise ValueError(
+            "chunk_scan backward cached operands and d_out must be contiguous."
+        )
     if Q_rev.ndim != 4 or Kprev_rev.ndim != 4 or Kcurr_rev.ndim != 4:
         raise ValueError("Q_rev/Kprev_rev/Kcurr_rev must be rank-4 tensors.")
     if Q_rev.shape != Kprev_rev.shape or Q_rev.shape != Kcurr_rev.shape:

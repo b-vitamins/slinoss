@@ -69,7 +69,9 @@ def prepare_chunk_scan_bwd_dc_operands(
             "Z0 must be the packed forward tensor shaped as (BHC, P, 1, D). "
             f"Got {tuple(Z0.shape)}."
         )
-    if not (M_raw.is_contiguous() and logprefix_half.is_contiguous() and Z0.is_contiguous()):
+    if not (
+        M_raw.is_contiguous() and logprefix_half.is_contiguous() and Z0.is_contiguous()
+    ):
         raise ValueError("M_raw, logprefix_half, and Z0 must be contiguous.")
 
     phase = torch.empty(
@@ -153,7 +155,9 @@ def chunk_scan_bwd_dc_cute(
     if any(t.device.type != "cuda" for _name, t in tensors):
         raise ValueError("CuTe chunk_scan backward requires CUDA tensors.")
     if any(not t.is_contiguous() for _name, t in tensors):
-        raise ValueError("chunk_scan backward cached operands and d_out must be contiguous.")
+        raise ValueError(
+            "chunk_scan backward cached operands and d_out must be contiguous."
+        )
     if Vprev.shape != Vcurr.shape:
         raise ValueError(
             f"Vprev and Vcurr must have the same shape. Got {tuple(Vprev.shape)} "
@@ -166,7 +170,10 @@ def chunk_scan_bwd_dc_cute(
         )
     if Vprev.ndim != 4 or Kprev.ndim != 4 or Vprev.shape[2] != 1 or Kprev.shape[2] != 1:
         raise ValueError("Packed V/K tensors must be rank-4 with a singleton dim2.")
-    if logprefix_half.shape != Kprev.shape[:2] or half_logprefix_half.shape != Kprev.shape[:2]:
+    if (
+        logprefix_half.shape != Kprev.shape[:2]
+        or half_logprefix_half.shape != Kprev.shape[:2]
+    ):
         raise ValueError("logprefix_half tensors must be (BHC, L) matching Kprev.")
     if phase.shape != (*Kprev.shape[:2], 2):
         raise ValueError(
@@ -175,10 +182,13 @@ def chunk_scan_bwd_dc_cute(
         )
     if Z0_q.ndim != 4 or Z0_q.shape[0] != Kprev.shape[0] or Z0_q.shape[2] != 1:
         raise ValueError(
-            "Z0_q must be shaped as (BHC, D, 1, P). Got "
-            f"{tuple(Z0_q.shape)}."
+            f"Z0_q must be shaped as (BHC, D, 1, P). Got {tuple(Z0_q.shape)}."
         )
-    if d_out.ndim != 4 or d_out.shape[:2] != (batch_size, n_heads) or int(d_out.shape[2]) != T:
+    if (
+        d_out.ndim != 4
+        or d_out.shape[:2] != (batch_size, n_heads)
+        or int(d_out.shape[2]) != T
+    ):
         raise ValueError(
             "d_out must be (batch_size, n_heads, T, P). Got "
             f"{tuple(d_out.shape)} for {(batch_size, n_heads, T)}."
@@ -198,9 +208,7 @@ def chunk_scan_bwd_dc_cute(
             f"T={T} exceeds the cached padded length T_pad={T_pad} implied by Kprev."
         )
     if Z0_q.shape != (BHC, D, 1, P):
-        raise ValueError(
-            f"Z0_q must be {(BHC, D, 1, P)}. Got {tuple(Z0_q.shape)}."
-        )
+        raise ValueError(f"Z0_q must be {(BHC, D, 1, P)}. Got {tuple(Z0_q.shape)}.")
 
     scratch = _get_dc_scratch(Kprev=Kprev, P=P)
 
