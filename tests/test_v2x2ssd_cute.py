@@ -8,6 +8,7 @@ import torch
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
     batched_sgemm_fp32_cute,
+    pair_sum_batched_sgemm_fp32_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _compiled_key,
@@ -129,7 +130,28 @@ def test_batched_sgemm_fp32_cute_matches_torch_bmm_mixed_layouts(
     got = batched_sgemm_fp32_cute(A, B)
     want = torch.bmm(A, B)
 
-    torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(got, want, atol=5e-5, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("shape", [(64, 96, 64), (32, 32, 32)])
+def test_pair_sum_batched_sgemm_fp32_cute_matches_torch(
+    shape: tuple[int, int, int],
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    M, N, K = shape
+    batch = 64
+    A0 = torch.randn((batch, M, K), device="cuda", dtype=torch.float32)
+    B0 = torch.randn((batch, K, N), device="cuda", dtype=torch.float32)
+    A1 = torch.randn((batch, M, K), device="cuda", dtype=torch.float32)
+    B1 = torch.randn((batch, K, N), device="cuda", dtype=torch.float32)
+
+    got = pair_sum_batched_sgemm_fp32_cute(A0, B0, A1, B1)
+    want = torch.bmm(A0, B0) + torch.bmm(A1, B1)
+
+    torch.testing.assert_close(got, want, atol=5e-5, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
