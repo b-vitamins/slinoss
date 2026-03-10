@@ -13,7 +13,16 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.stage import (
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
     _scalar_grad_from_vec,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_param_cute
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param import (
+    _chunk_scan_bwd_param_from_intermediates,
+    _dlogprefix_half_packed,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
+    chunk_scan_bwd_dc_exact_cute,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
+    chunk_scan_bwd_db_exact_cute,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
@@ -335,41 +344,48 @@ def _chunk_scan_bwd_exact_packed(
     )
     dK_prev_packed = torch.bmm(dScore_prev.transpose(1, 2), Qf)
     dK_curr_packed = torch.bmm(dScore_curr.transpose(1, 2), Qf)
+    d_logprefix_half = _dlogprefix_half_packed(
+        score_prev,
+        score_curr,
+        dSprev,
+        dScurr,
+        torch.bmm(Qf, Z0f.transpose(1, 2)) * row_scale,
+        scale,
+        d_out_flat,
+    )
 
     phase = _packed_phase_prefix(M_raw)
-    dQ_c = torch.view_as_complex(dQ.reshape(BHC, L, N, 2).contiguous())
-    dC_c = phase.unsqueeze(-1) * torch.conj(dQ_c)
-    dC = (
-        torch.view_as_real(dC_c)
-        .reshape(batch_size, n_heads, T_pad, D)
-        .to(dtype=torch.float32)[:, :, :T, :]
-        .contiguous()
+    dC = chunk_scan_bwd_dc_exact_cute(
+        dQ.contiguous(),
+        torch.view_as_real(phase).to(dtype=torch.float32).contiguous(),
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
     )
-    dB, dB_prev, dK = _scatter_key_grads(
+    dB, dB_prev, dK = chunk_scan_bwd_db_exact_cute(
+        dK_prev_packed.contiguous(),
+        dK_curr_packed.contiguous(),
+        torch.view_as_real(phase).to(dtype=torch.float32).contiguous(),
+        K_raw.to(dtype=torch.float32).contiguous(),
+        B_raw.to(dtype=torch.float32).contiguous(),
+        B_head.to(dtype=torch.float32).contiguous(),
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
+    dM = _chunk_scan_bwd_param_from_intermediates(
+        Qf,
+        Kprevf,
+        Kcurrf,
+        phase,
+        M_raw,
+        dQ,
         dK_prev_packed,
         dK_curr_packed,
-        phase,
-        K_raw,
-        B_raw,
-        B_head,
+        d_logprefix_half,
         batch_size=batch_size,
         n_heads=n_heads,
-        T=T,
-    )
-    dM = chunk_scan_bwd_param_cute(
-        Q,
-        Kprev,
-        Vprev,
-        Kcurr,
-        Vcurr,
-        logprefix_half,
-        Z0,
-        M_raw,
-        d_out[:, :, :T, :].contiguous(),
-        batch_size=batch_size,
-        n_heads=n_heads,
-        T=T,
-    )
+    )[:, :, :T, :].contiguous()
     return dU, dM, dK, dB, dC, d_chunk_starts, dB_prev, dU_prev
 
 
