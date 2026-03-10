@@ -61,7 +61,7 @@ from slinoss.ops.v2x2ssd.reference import (
     _validate_chunk_increment_inputs,
 )
 
-from .common import _scalar_grad_from_vec
+from .tail import chunk_increment_bwd_tail_exact_cute
 
 
 def _prepared_dA_main_cute(
@@ -240,15 +240,9 @@ def chunk_increment_bwd_cute(
     dB_blk = torch.zeros(
         (batch_size, n_heads, n_chunks, L, N), device=device, dtype=cplx_dtype
     )
-    dK_prev_blk = torch.zeros_like(k_prev_blk)
-    dK_curr_blk = torch.zeros_like(k_curr_blk)
-    d_suffix_after = torch.zeros_like(suffix_after)
-
     dB_blk += (
         torch.conj(suffix_after.unsqueeze(-1) * k_curr_blk.unsqueeze(-1)) * d_alpha
     )
-    dK_curr_blk += _scalar_grad_from_vec(suffix_after.unsqueeze(-1) * b_blk, d_alpha)
-    d_suffix_after += _scalar_grad_from_vec(k_curr_blk.unsqueeze(-1) * b_blk, d_alpha)
 
     if L > 1:
         d_alpha_shift = d_alpha[..., :-1, :]
@@ -258,14 +252,6 @@ def chunk_increment_bwd_cute(
             )
             * d_alpha_shift
         )
-        dK_prev_blk[..., 1:] += _scalar_grad_from_vec(
-            suffix_after[..., 1:].unsqueeze(-1) * b_blk[..., :-1, :],
-            d_alpha_shift,
-        )
-        d_suffix_after[..., 1:] += _scalar_grad_from_vec(
-            k_prev_blk[..., 1:].unsqueeze(-1) * b_blk[..., :-1, :],
-            d_alpha_shift,
-        )
 
     d_b_prev_chunk0 = (
         torch.conj(
@@ -273,14 +259,35 @@ def chunk_increment_bwd_cute(
         )
         * d_boundary
     )
-    dK_prev_blk[..., 0] += _scalar_grad_from_vec(
-        suffix_after[..., 0].unsqueeze(-1) * b_prev_chunk0,
-        d_boundary,
+    dK_prev_blk_r, dK_curr_blk_r, _d_suffix_after_r, dM_blk_r = (
+        chunk_increment_bwd_tail_exact_cute(
+            torch.view_as_real(suffix_after.reshape(BHC, L)).to(dtype=rdtype).contiguous(),
+            torch.view_as_real(k_prev_blk.reshape(BHC, L)).to(dtype=rdtype).contiguous(),
+            torch.view_as_real(k_curr_blk.reshape(BHC, L)).to(dtype=rdtype).contiguous(),
+            _pack_complex_pairs(
+                b_blk.reshape(batch_size * n_heads * n_chunks, L, N),
+                real_dtype=rdtype,
+            ).reshape(batch_size * n_heads * n_chunks, L, D).contiguous(),
+            _pack_complex_pairs(
+                b_prev_chunk0.reshape(batch_size * n_heads * n_chunks, N),
+                real_dtype=rdtype,
+            ).reshape(batch_size * n_heads * n_chunks, D).contiguous(),
+            _pack_complex_pairs(
+                d_alpha.reshape(batch_size * n_heads * n_chunks, L, N),
+                real_dtype=rdtype,
+            ).reshape(batch_size * n_heads * n_chunks, L, D).contiguous(),
+            _pack_complex_pairs(
+                d_boundary.reshape(batch_size * n_heads * n_chunks, N),
+                real_dtype=rdtype,
+            ).reshape(batch_size * n_heads * n_chunks, D).contiguous(),
+            torch.view_as_real(m_blk.reshape(BHC, L)).to(dtype=rdtype).contiguous(),
+            d_m_chunk.reshape(batch_size * n_heads * n_chunks, 2)
+            .to(dtype=rdtype)
+            .contiguous(),
+        )
     )
-    d_suffix_after[..., 0] += _scalar_grad_from_vec(
-        k_prev_blk[..., 0].unsqueeze(-1) * b_prev_chunk0,
-        d_boundary,
-    )
+    dK_prev_blk = torch.view_as_complex(dK_prev_blk_r.contiguous()).reshape_as(k_prev_blk)
+    dK_curr_blk = torch.view_as_complex(dK_curr_blk_r.contiguous()).reshape_as(k_curr_blk)
 
     dU_prev = dU_prev_blk[:, :, 0, :].contiguous()
     if n_chunks > 1:
@@ -290,21 +297,7 @@ def chunk_increment_bwd_cute(
     if n_chunks > 1:
         dB_blk[:, :, :-1, -1, :] += d_b_prev_chunk0[:, :, 1:, :]
 
-    dM_blk = torch.zeros_like(m_blk)
-    g_q = torch.zeros(
-        (batch_size, n_heads, n_chunks, L + 1), device=device, dtype=cplx_dtype
-    )
-    g_q[..., 0] = _to_complex_scalar(d_m_chunk.to(dtype=rdtype), name="d_m_chunk").to(
-        dtype=cplx_dtype
-    )
-    if L > 1:
-        g_q[..., 1:L] += d_suffix_after[..., :-1]
-    # ``suffix_after[..., -1]`` is the constant empty product (=1), so its
-    # gradient is intentionally dropped instead of being routed into ``g_q[..., L]``.
-    for t in range(L):
-        dM_blk[..., t] += g_q[..., t] * torch.conj(suffix_after[..., t])
-        if t + 1 < L:
-            g_q[..., t + 1] += g_q[..., t] * torch.conj(m_blk[..., t])
+    dM_blk = torch.view_as_complex(dM_blk_r.contiguous()).reshape_as(m_blk)
 
     dU = dU_blk.reshape(batch_size, n_heads, T_pad, P)[:, :, :T, :].contiguous()
     dM = torch.view_as_real(dM_blk.reshape(batch_size, n_heads, T_pad))
