@@ -257,31 +257,67 @@ def test_v2x2ssd_cute_matches_reference_forward() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_v2x2ssd_cute_rejects_autograd_tracked_inputs() -> None:
+def test_v2x2ssd_cute_matches_reference_autograd() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
     U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
         batch=2,
         heads=2,
-        T=64,
+        T=65,
         N=8,
         P=16,
         device=torch.device("cuda"),
     )
-    U.requires_grad_(True)
+    chunk_size = 32
+    weights = (
+        torch.randn((2, 2, 65, 16), device="cuda", dtype=torch.float32),
+        torch.randn((2, 2, 16, 16), device="cuda", dtype=torch.float32),
+        torch.randn((2, 2, 16), device="cuda", dtype=torch.float32),
+        torch.randn((2, 2, 16), device="cuda", dtype=torch.float32),
+    )
 
-    with pytest.raises(ValueError, match="does not support autograd-tracked tensors"):
-        v2x2ssd_cute(
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_size=32,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
+    def run(op, tensors: tuple[torch.Tensor, ...]) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        U_i, M_i, K_i, B_i, C_i, init_i, Bp_i, Up_i = tensors
+        Y, final_state, b_last, u_last = op(
+            U_i,
+            M_i,
+            K_i,
+            B_i,
+            C_i,
+            chunk_size=chunk_size,
+            initial_states=init_i,
+            B_prev=Bp_i,
+            U_prev=Up_i,
             compute_dtype=torch.float32,
             output_dtype=torch.float32,
         )
+        loss = (
+            (Y * weights[0]).sum()
+            + (final_state * weights[1]).sum()
+            + (b_last * weights[2]).sum()
+            + (u_last * weights[3]).sum()
+        )
+        grads = torch.autograd.grad(
+            loss,
+            (U_i, M_i, K_i, B_i, C_i, init_i, Bp_i, Up_i),
+            retain_graph=False,
+        )
+        return (Y, final_state, b_last, u_last), grads
+
+    ref_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+    cute_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+
+    ref_out, ref_grads = run(v2x2ssd, ref_tensors)
+    cute_out, cute_grads = run(v2x2ssd_cute, cute_tensors)
+
+    for got, want in zip(cute_out, ref_out, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-3, rtol=0.0)
+    for got, want in zip(cute_grads, ref_grads, strict=True):
+        torch.testing.assert_close(got, want, atol=3e-3, rtol=0.0)
