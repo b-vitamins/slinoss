@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slinoss"
+version = "0.1.0"
+description = "Selective linear oscillatory state-space models."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+  "torch>=2.4",
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+cuda = [
+  "nvidia-cutlass-dsl>=4.0.0",
+  "cuda-python>=13.0",
+]
+dev = [
+  "pytest>=8",
+  "ruff>=0.9.5",
+  "pyright>=1.1.400",
+]
+
+[tool.setuptools.packages.find]
+include = ["slinoss*"]

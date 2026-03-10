@@ -11,6 +11,9 @@ This repo uses a Guix-managed development environment.
   repo's declared toolchain.
 - `manifest.scm` is the source of truth for CuTe/CUTLASS, PyTorch, lint, and
   profiling dependencies.
+- `pyproject.toml` and `requirements*.txt` are the pip-facing install surface.
+  Keep them aligned with the repo's actual runtime/dev needs, but do not treat
+  them as a replacement for the Guix environment.
 
 ## Commit Conventions
 

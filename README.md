@@ -12,10 +12,27 @@ In this repo, the core pieces are:
 - [`SLinOSSDiscretizer`](./slinoss/layers/discretization.py): bounded per-token oscillator parameterization and exact FOH taps
 - [`v2x2ssd`](./slinoss/ops/v2x2ssd/reference.py): the current reference scan backend
 
+## Install
+
+For a pip-based local install, run:
+
+```bash
+pip install -r requirements.txt
+```
+
+For local development tools as well, run:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+The repo also ships a Guix environment in [`manifest.scm`](./manifest.scm), which
+remains the reproducible path for CuTe/CUTLASS development.
+
 ## Example
 
 For a minimal end-to-end run, see [`examples/nextchar.py`](./examples/nextchar.py).
-It trains a small next-character model on `enwik8` using the current reference
+It trains a small next-character model on `enwik8` using the default scan
 backend and writes all artifacts to `/tmp/nextchar` by default.
 
 Run it with:
