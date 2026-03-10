@@ -110,7 +110,10 @@ def test_chunk_scan_compiled_key_distinguishes_full_operand_contract() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("shape", [(64, 64, 96), (32, 32, 32)])
+@pytest.mark.parametrize(
+    "shape",
+    [(64, 64, 96), (64, 96, 64), (64, 64, 64), (32, 32, 32)],
+)
 def test_batched_sgemm_fp32_cute_matches_torch_bmm_mixed_layouts(
     shape: tuple[int, int, int],
 ) -> None:

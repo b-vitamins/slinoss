@@ -715,9 +715,9 @@ def _batched_sgemm_config(M: int, N: int, K: int) -> tuple[tuple[int, int, int],
     tuned: dict[tuple[int, int, int], tuple[tuple[int, int, int], int, int]] = {
         (32, 32, 32): ((32, 32, 16), 3, 128),
         # Exact chunk_scan backward hot shapes.
-        (64, 64, 96): ((64, 64, 16), 3, 128),
-        (64, 64, 64): ((64, 64, 32), 3, 256),
-        (64, 96, 64): ((64, 64, 16), 3, 128),
+        (64, 64, 96): ((64, 64, 32), 3, 128),
+        (64, 64, 64): ((64, 64, 32), 3, 128),
+        (64, 96, 64): ((64, 128, 16), 4, 128),
     }
     return tuned.get((M, N, K), ((64, 64, 16), 3, 256))
 
