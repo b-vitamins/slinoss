@@ -5,10 +5,10 @@ import math
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
-    chunk_scan_bwd_dk_packed_cute,
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
     chunk_scan_bwd_db_cute,
     chunk_scan_bwd_db_exact_cute,
+    chunk_scan_bwd_dk_packed_cute,
     prepare_chunk_scan_bwd_db_operands,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (

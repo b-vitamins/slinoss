@@ -9,32 +9,20 @@ import torch
 from .common import prepare_chunk_scan_bwd_dout, prepare_chunk_scan_bwd_packed_context
 from .db import (
     _chunk_scan_bwd_dk_prepared_cute,
-    chunk_scan_bwd_db_cute,
-    chunk_scan_bwd_db_exact_cute,
     chunk_scan_bwd_db_exact_with_meta_cute,
-    chunk_scan_bwd_dk_packed_cute,
     prepare_chunk_scan_bwd_db_operands,
 )
 from .dc import (
-    chunk_scan_bwd_dc_cute,
-    chunk_scan_bwd_dc_exact_cute,
     chunk_scan_bwd_dc_exact_with_meta_cute,
     chunk_scan_bwd_dc_packed_cute,
-    prepare_chunk_scan_bwd_dc_operands,
 )
 from .du import (
     _chunk_scan_bwd_du_prepared_cute,
-    chunk_scan_bwd_du_cute,
     prepare_chunk_scan_bwd_du_operands,
 )
-from .dz0 import chunk_scan_bwd_dz0_cute, chunk_scan_bwd_dz0_packed_cute
+from .dz0 import chunk_scan_bwd_dz0_packed_cute
 from .param_scan import (
-    chunk_scan_bwd_dlogprefix_exact_cute,
     chunk_scan_bwd_phase_scan_from_meta_cute,
-    chunk_scan_bwd_param_cute,
-    chunk_scan_bwd_param_packed_cute,
-    chunk_scan_bwd_param_scan_cute,
-    chunk_scan_bwd_param_scan_packed_cute,
 )
 
 
@@ -477,21 +465,4 @@ def chunk_scan_bwd_cute(
 __all__ = [
     "chunk_scan_bwd_cute",
     "compile_chunk_scan_bwd_kernels",
-    "prepare_chunk_scan_bwd_db_operands",
-    "chunk_scan_bwd_dk_packed_cute",
-    "chunk_scan_bwd_db_cute",
-    "chunk_scan_bwd_db_exact_cute",
-    "prepare_chunk_scan_bwd_dc_operands",
-    "chunk_scan_bwd_dc_packed_cute",
-    "chunk_scan_bwd_dc_cute",
-    "chunk_scan_bwd_dc_exact_cute",
-    "chunk_scan_bwd_dlogprefix_exact_cute",
-    "prepare_chunk_scan_bwd_du_operands",
-    "chunk_scan_bwd_du_cute",
-    "chunk_scan_bwd_dz0_packed_cute",
-    "chunk_scan_bwd_dz0_cute",
-    "chunk_scan_bwd_param_scan_cute",
-    "chunk_scan_bwd_param_scan_packed_cute",
-    "chunk_scan_bwd_param_cute",
-    "chunk_scan_bwd_param_packed_cute",
 ]

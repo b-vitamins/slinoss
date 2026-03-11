@@ -5,12 +5,10 @@ import math
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import (
     chunk_scan_bwd_dlogprefix_exact_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import (
-    _dlogprefix_half_packed,
-)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import _dlogprefix_half_packed
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _pack_chunk_scan_inner_inputs,
     _prepare_chunk_scan_small_operands,

@@ -1,4 +1,4 @@
-"""Exact packed helpers for chunk-scan validation and benchmarking."""
+"""Validation-only packed helpers for chunk-scan backward."""
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ from typing import Any, cast
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
+    _scalar_grad_from_vec,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
     _chunk_scan_bwd_dk_prepared_cute,
     chunk_scan_bwd_db_exact_cute,
@@ -24,11 +27,8 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dz0 import (
     chunk_scan_bwd_dz0_packed_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import (
-    chunk_scan_bwd_dlogprefix_exact_cute,
     _chunk_scan_bwd_param_from_intermediates,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
-    _scalar_grad_from_vec,
+    chunk_scan_bwd_dlogprefix_exact_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
     batched_sgemm_fp32_cute,
@@ -277,7 +277,16 @@ def chunk_scan_bwd_exact_packed(
     batch_size: int,
     n_heads: int,
     T: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     BHC, L, _, D = map(int, Q.shape)
     P = int(Vprev.shape[-1])
     BH = batch_size * n_heads

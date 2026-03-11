@@ -5,7 +5,9 @@ import math
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_param_cute
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import (
+    chunk_scan_bwd_param_cute,
+)
 from slinoss.ops.v2x2ssd.reference import chunk_increment, chunk_scan, state_passing
 
 

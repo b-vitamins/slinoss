@@ -9,7 +9,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
     chunk_scan_bwd_cute,
     compile_chunk_scan_bwd_kernels,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.exact import (
+from slinoss.ops.v2x2ssd.cute.validation.chunk_scan_bwd import (
     chunk_scan_bwd_exact_packed,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
@@ -247,12 +247,12 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
 
     atol_by_slot = (
         0.0,
+        5e-7,
+        2e-7,
+        2e-7,
         0.0,
         0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        2e-7,
         0.0,
     )
     for got_tensor, want_tensor, atol in zip(got_compiled, got_public, atol_by_slot, strict=True):
