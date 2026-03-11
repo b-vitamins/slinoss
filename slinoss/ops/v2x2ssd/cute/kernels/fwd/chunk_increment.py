@@ -1515,11 +1515,38 @@ def chunk_increment_cute(
             compute_dtype=compute_dtype,
         )
     )
+    return _chunk_increment_from_prepared_operands(
+        A_main,
+        B_main,
+        u_head,
+        b_head,
+        m_chunk,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        n_chunks=n_chunks,
+        P=P,
+    )
+
+
+def _chunk_increment_from_prepared_operands(
+    A_main: torch.Tensor,
+    B_main: torch.Tensor,
+    u_head: torch.Tensor,
+    b_head: torch.Tensor,
+    m_chunk: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+    n_chunks: int,
+    P: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the CuTe chunk-increment GEMM from prepared forward operands."""
 
     BHC = int(A_main.shape[0])
     D = int(B_main.shape[-1])
+    device = A_main.device
 
-    inc_out = torch.empty((BHC, P, D), device=U.device, dtype=torch.float32)
+    inc_out = torch.empty((BHC, P, D), device=device, dtype=torch.float32)
 
     # Keep the prepared operands in the same compact layout that worked well for
     # the v3 forward kernels: feature-major, then time, then batch.
@@ -1545,6 +1572,8 @@ def chunk_increment_cute(
 
 
 __all__ = [
+    "_chunk_increment_from_prepared_operands",
+    "_prepare_chunk_increment_operands",
     "batched_sgemm_fp32_cute",
     "chunk_increment_cute",
     "pair_sum_batched_sgemm_fp32_cute",

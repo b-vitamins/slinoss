@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+    _chunk_increment_from_prepared_operands,
+    _prepare_chunk_increment_operands,
+    chunk_increment_cute,
+)
 from slinoss.ops.v2x2ssd.reference import chunk_increment as reference_chunk_increment
 
 
@@ -107,3 +111,56 @@ def test_chunk_increment_cute_matches_reference_stage() -> None:
 
     torch.testing.assert_close(inc_cute, inc_ref, atol=2e-5, rtol=0.0)
     torch.testing.assert_close(m_cute, m_ref, atol=2e-5, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_increment_prepared_entrypoint_matches_public_stage() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    inputs = _make_inputs(
+        b=2,
+        h=2,
+        T=33,
+        N=8,
+        P=16,
+        dtype=torch.float32,
+        device=torch.device("cuda"),
+        streaming=True,
+    )
+
+    inc_public, m_public = chunk_increment_cute(
+        inputs.U,
+        inputs.M,
+        inputs.K,
+        inputs.B,
+        B_prev=inputs.B_prev,
+        U_prev=inputs.U_prev,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+    )
+    A_main, B_main, u_head, b_head, m_chunk, batch_size, n_heads, n_chunks, P = (
+        _prepare_chunk_increment_operands(
+            inputs.U,
+            inputs.M,
+            inputs.K,
+            inputs.B,
+            chunk_size=32,
+            B_prev=inputs.B_prev,
+            U_prev=inputs.U_prev,
+            compute_dtype=torch.float32,
+        )
+    )
+    inc_prepared, m_prepared = _chunk_increment_from_prepared_operands(
+        A_main,
+        B_main,
+        u_head,
+        b_head,
+        m_chunk,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        n_chunks=n_chunks,
+        P=P,
+    )
+
+    torch.testing.assert_close(inc_prepared, inc_public, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(m_prepared, m_public, atol=0.0, rtol=0.0)
