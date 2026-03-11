@@ -19,6 +19,19 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+    batched_sgemm_fp32_cute,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
+    _pack_chunk_scan_inner_inputs,
+    _prepare_chunk_scan_small_operands,
+)
+
+from .db import _chunk_scan_bwd_dk_prepared_cute, prepare_chunk_scan_bwd_db_operands
+from .dc import chunk_scan_bwd_dc_packed_cute
+from .dlogprefix import chunk_scan_bwd_dlogprefix_exact_cute
+from .du import prepare_chunk_scan_bwd_du_operands
+
 _CompiledPhaseReduceKey = tuple[
     int,
     tuple[int, int, int],
@@ -515,7 +528,7 @@ def _chunk_scan_bwd_param_from_intermediates(
     return dM.reshape(batch_size, n_heads, T_pad, 2).to(dtype=torch.float32).contiguous()
 
 
-def chunk_scan_bwd_param_cute(
+def chunk_scan_bwd_param_packed_cute(
     Q: torch.Tensor,
     Kprev: torch.Tensor,
     Vprev: torch.Tensor,
@@ -529,8 +542,10 @@ def chunk_scan_bwd_param_cute(
     batch_size: int,
     n_heads: int,
     T: int,
-) -> torch.Tensor:
-    """Compute ``dM`` for ``chunk_scan`` from cached packed forward tensors."""
+    Q_rev: torch.Tensor | None = None,
+    neg_logprefix_half_rev: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute packed param-side chunk-scan intermediates and ``dM``."""
 
     tensors = (
         ("Q", Q),
@@ -587,6 +602,11 @@ def chunk_scan_bwd_param_cute(
         )
 
     P = int(Vprev.shape[-1])
+    if (Q_rev is None) ^ (neg_logprefix_half_rev is None):
+        raise ValueError(
+            "Q_rev and neg_logprefix_half_rev must be passed together or both omitted."
+        )
+
     if T_pad != T:
         d_out = torch.cat(
             [
@@ -609,32 +629,68 @@ def chunk_scan_bwd_param_cute(
     Z0f = Z0.squeeze(2).to(torch.float32)
 
     scale, row_scale = _packed_causal_scales(logprefix_half)
-    score_prev = torch.bmm(Qf, Kprevf.transpose(1, 2))
-    score_curr = torch.bmm(Qf, Kcurrf.transpose(1, 2))
-    dSprev = torch.bmm(d_out_flat, Vprevf.transpose(1, 2))
-    dScurr = torch.bmm(d_out_flat, Vcurrf.transpose(1, 2))
-    dScore_prev = dSprev * scale
-    dScore_curr = dScurr * scale
-    y_off = torch.bmm(Qf, Z0f.transpose(1, 2)) * row_scale
+    score_prev = batched_sgemm_fp32_cute(Qf, Kprevf.transpose(1, 2))
+    score_curr = batched_sgemm_fp32_cute(Qf, Kcurrf.transpose(1, 2))
+    dSprev = batched_sgemm_fp32_cute(d_out_flat, Vprevf.transpose(1, 2))
+    dScurr = batched_sgemm_fp32_cute(d_out_flat, Vcurrf.transpose(1, 2))
+    y_off = batched_sgemm_fp32_cute(Qf, Z0f.transpose(1, 2)) * row_scale
 
-    dQ = (
-        torch.bmm(d_out_flat * row_scale, Z0f)
-        + torch.bmm(dScore_prev, Kprevf)
-        + torch.bmm(dScore_curr, Kcurrf)
-    )
-    dKprev = torch.bmm(dScore_prev.transpose(1, 2), Qf)
-    dKcurr = torch.bmm(dScore_curr.transpose(1, 2), Qf)
-    d_logprefix_half = _dlogprefix_half_packed(
+    d_logprefix_half = chunk_scan_bwd_dlogprefix_exact_cute(
         score_prev,
         score_curr,
         dSprev,
         dScurr,
-        y_off,
-        scale,
+        logprefix_half.contiguous(),
+        y_off.contiguous(),
         d_out_flat,
     )
 
-    phase = _packed_phase_prefix(M_raw)
+    if Q_rev is None or neg_logprefix_half_rev is None:
+        Q_rev, _Kprev_rev, _Kcurr_rev, neg_logprefix_half_rev = (
+            prepare_chunk_scan_bwd_du_operands(
+                Q.contiguous(),
+                Kprev.contiguous(),
+                Kcurr.contiguous(),
+                logprefix_half.contiguous(),
+            )
+        )
+    d_out_rev = torch.flip(
+        d_out.reshape(BHC, L, 1, P).to(dtype=Q_rev.dtype), dims=[1]
+    ).contiguous()
+    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase_real = (
+        prepare_chunk_scan_bwd_db_operands(
+            Q.contiguous(),
+            Vprev.contiguous(),
+            Vcurr.contiguous(),
+            logprefix_half.contiguous(),
+            M_raw.contiguous(),
+            Q_rev=Q_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
+        )
+    )
+    z0_q = Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
+    dQ = chunk_scan_bwd_dc_packed_cute(
+        Vprev.contiguous(),
+        Kprev.contiguous(),
+        Vcurr.contiguous(),
+        Kcurr.contiguous(),
+        logprefix_half.contiguous(),
+        z0_q,
+        d_out,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
+    dKprev, dKcurr = _chunk_scan_bwd_dk_prepared_cute(
+        Q_rev_db,
+        Vprev_rev,
+        Vcurr_rev,
+        neg_logprefix_half_rev_db,
+        d_out_rev,
+        batch_size=batch_size,
+        n_heads=n_heads,
+    )
+    phase = torch.view_as_complex(phase_real.contiguous())
     dM = _chunk_scan_bwd_param_from_intermediates(
         Qf,
         Kprevf,
@@ -648,7 +704,90 @@ def chunk_scan_bwd_param_cute(
         batch_size=batch_size,
         n_heads=n_heads,
     )
-    return dM[:, :, :T, :].contiguous()
+    return (
+        dM[:, :, :T, :].contiguous(),
+        dQ,
+        dKprev,
+        dKcurr,
+        phase_real,
+    )
+
+ 
+def chunk_scan_bwd_param_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    chunk_size: int,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    compute_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Compute canonical public-contract ``dM`` for ``chunk_scan``."""
+    if d_out.device.type != "cuda":
+        raise ValueError("CuTe chunk_scan backward requires CUDA tensors.")
+    if not d_out.is_contiguous():
+        raise ValueError(f"d_out must be contiguous; got strides {d_out.stride()}.")
+
+    batch_size, n_heads, T, _P = map(int, U.shape)
+    (
+        U_raw,
+        B_raw,
+        C_raw,
+        M_raw,
+        K_raw,
+        logprefix_half,
+        Z0_raw,
+        U_head,
+        B_head,
+        _batch_size,
+        _n_heads,
+        _T,
+        _T_pad,
+        _odtype,
+    ) = _prepare_chunk_scan_small_operands(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=compute_dtype,
+        output_dtype=torch.float32,
+    )
+    Q, Kprev, Vprev, Kcurr, Vcurr, logprefix_half, Z0 = _pack_chunk_scan_inner_inputs(
+        U_raw,
+        B_raw,
+        C_raw,
+        M_raw,
+        K_raw,
+        logprefix_half,
+        Z0_raw,
+        U_head,
+        B_head,
+    )
+    dM, _dQ, _dKprev, _dKcurr, _phase_real = chunk_scan_bwd_param_packed_cute(
+        Q,
+        Kprev,
+        Vprev,
+        Kcurr,
+        Vcurr,
+        logprefix_half,
+        Z0,
+        M_raw,
+        d_out,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
+    return dM
 
 
-__all__ = ["chunk_scan_bwd_param_cute"]
+__all__ = ["chunk_scan_bwd_param_cute", "chunk_scan_bwd_param_packed_cute"]
