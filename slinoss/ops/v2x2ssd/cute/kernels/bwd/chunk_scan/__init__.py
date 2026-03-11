@@ -8,6 +8,7 @@ from .db import (
 from .dc import (
     chunk_scan_bwd_dc_cute,
     chunk_scan_bwd_dc_exact_cute,
+    chunk_scan_bwd_dc_packed_cute,
     prepare_chunk_scan_bwd_dc_operands,
 )
 from .dlogprefix import chunk_scan_bwd_dlogprefix_exact_cute
@@ -20,6 +21,7 @@ __all__ = [
     "chunk_scan_bwd_db_cute",
     "chunk_scan_bwd_db_exact_cute",
     "prepare_chunk_scan_bwd_dc_operands",
+    "chunk_scan_bwd_dc_packed_cute",
     "chunk_scan_bwd_dc_cute",
     "chunk_scan_bwd_dc_exact_cute",
     "chunk_scan_bwd_dlogprefix_exact_cute",

@@ -17,6 +17,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param import (
     _chunk_scan_bwd_param_from_intermediates,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
+    chunk_scan_bwd_dc_packed_cute,
     chunk_scan_bwd_dc_exact_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
@@ -368,9 +369,22 @@ def _chunk_scan_bwd_exact_packed(
     )
 
     phase = _packed_phase_prefix(M_raw)
+    phase_real = torch.view_as_real(phase).to(dtype=torch.float32).contiguous()
+    z0_q = Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
     dC = chunk_scan_bwd_dc_exact_cute(
-        dQ.contiguous(),
-        torch.view_as_real(phase).to(dtype=torch.float32).contiguous(),
+        chunk_scan_bwd_dc_packed_cute(
+            Vprev.contiguous(),
+            Kprev.contiguous(),
+            Vcurr.contiguous(),
+            Kcurr.contiguous(),
+            logprefix_half.contiguous(),
+            z0_q,
+            d_out,
+            batch_size=batch_size,
+            n_heads=n_heads,
+            T=T,
+        ),
+        phase_real,
         batch_size=batch_size,
         n_heads=n_heads,
         T=T,
@@ -378,7 +392,7 @@ def _chunk_scan_bwd_exact_packed(
     dB, dB_prev, dK = chunk_scan_bwd_db_exact_cute(
         dK_prev_packed.contiguous(),
         dK_curr_packed.contiguous(),
-        torch.view_as_real(phase).to(dtype=torch.float32).contiguous(),
+        phase_real,
         K_raw.to(dtype=torch.float32).contiguous(),
         B_raw.to(dtype=torch.float32).contiguous(),
         B_head.to(dtype=torch.float32).contiguous(),

@@ -8,6 +8,7 @@ import torch
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
     chunk_scan_bwd_dc_cute,
     chunk_scan_bwd_dc_exact_cute,
+    chunk_scan_bwd_dc_packed_cute,
     prepare_chunk_scan_bwd_dc_operands,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
@@ -54,7 +55,7 @@ def _make_inputs(
     return U, M, K, B, C, B_prev, U_prev
 
 
-def _quantized_packed_dc_reference(
+def _quantized_packed_dq_reference(
     Q: torch.Tensor,
     Kprev: torch.Tensor,
     Vprev: torch.Tensor,
@@ -90,7 +91,10 @@ def _quantized_packed_dc_reference(
     )
 
     (dq_ref,) = torch.autograd.grad((y * d_out_flat).sum(), (q,), retain_graph=False)
+    return dq_ref
 
+
+def _scatter_packed_dq_to_public(dq_ref: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
     pr = phase[..., 0].unsqueeze(-1)
     pi = phase[..., 1].unsqueeze(-1)
     dqr = dq_ref[..., 0::2]
@@ -196,7 +200,7 @@ def test_chunk_scan_bwd_dc_cute_matches_quantized_packed_reference() -> None:
         d_out_pad = d_out
     d_out_flat = d_out_pad.reshape(Q.shape[0], chunk_size, P)
 
-    dC_ref = _quantized_packed_dc_reference(
+    dQ_ref = _quantized_packed_dq_reference(
         Q,
         Kprev,
         Vprev,
@@ -207,6 +211,7 @@ def test_chunk_scan_bwd_dc_cute_matches_quantized_packed_reference() -> None:
         phase,
         d_out_flat,
     )
+    dC_ref = _scatter_packed_dq_to_public(dQ_ref, phase)
     dC_ref = dC_ref.reshape(batch, heads, T_pad, Q.shape[-1])[:, :, :T, :].contiguous()
 
     dC_cute = chunk_scan_bwd_dc_cute(
@@ -225,6 +230,129 @@ def test_chunk_scan_bwd_dc_cute_matches_quantized_packed_reference() -> None:
     )
 
     torch.testing.assert_close(dC_cute, dC_ref, atol=1e-3, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_dc_packed_cute_matches_quantized_packed_dq_reference() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 2, 2, 65, 8, 16
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+
+    (
+        U_raw,
+        B_raw,
+        C_raw,
+        M_raw,
+        K_raw,
+        logprefix_half,
+        Z0_raw,
+        U_head,
+        B_head,
+        _batch,
+        _heads,
+        _T,
+        T_pad,
+        _odtype,
+    ) = _prepare_chunk_scan_small_operands(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    Q, Kprev, Vprev, Kcurr, Vcurr, logprefix_half, Z0 = _pack_chunk_scan_inner_inputs(
+        U_raw,
+        B_raw,
+        C_raw,
+        M_raw,
+        K_raw,
+        logprefix_half,
+        Z0_raw,
+        U_head,
+        B_head,
+    )
+
+    phase, _half_logprefix_half, Z0_q = prepare_chunk_scan_bwd_dc_operands(
+        M_raw,
+        logprefix_half,
+        Z0,
+    )
+
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+    if T_pad != T:
+        pad = T_pad - T
+        d_out_pad = torch.cat(
+            [
+                d_out,
+                torch.zeros((batch, heads, pad, P), device=device, dtype=torch.float32),
+            ],
+            dim=2,
+        )
+    else:
+        d_out_pad = d_out
+    d_out_flat = d_out_pad.reshape(Q.shape[0], chunk_size, P)
+
+    dQ_ref = _quantized_packed_dq_reference(
+        Q,
+        Kprev,
+        Vprev,
+        Kcurr,
+        Vcurr,
+        logprefix_half,
+        Z0,
+        phase,
+        d_out_flat,
+    )
+    dQ_cute = chunk_scan_bwd_dc_packed_cute(
+        Vprev,
+        Kprev,
+        Vcurr,
+        Kcurr,
+        logprefix_half,
+        Z0_q,
+        d_out,
+        batch_size=batch,
+        n_heads=heads,
+        T=T,
+    )
+
+    torch.testing.assert_close(dQ_cute, dQ_ref, atol=1e-3, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
