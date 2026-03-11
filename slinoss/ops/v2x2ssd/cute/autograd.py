@@ -7,9 +7,7 @@ from typing import Any, cast
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.stage import (
-    chunk_increment_bwd_cute,
-)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import chunk_increment_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
     _scalar_grad_from_vec,
 )

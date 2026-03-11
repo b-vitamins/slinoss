@@ -106,7 +106,7 @@ def _prepared_dB_main_cute(
     return dB_main
 
 
-def chunk_increment_bwd_cute(
+def chunk_increment_bwd_stage_cute(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
@@ -121,7 +121,7 @@ def chunk_increment_bwd_cute(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Backward for ``chunk_increment`` on the canonical public contract."""
+    """Low-level stage implementation for ``chunk_increment`` backward."""
     batch_size, n_heads, T, N, P = _validate_chunk_increment_inputs(
         U, M, K, B, B_prev, U_prev, int(U.shape[2])
     )
@@ -315,4 +315,4 @@ def chunk_increment_bwd_cute(
     return dU, dM, dK, dB, dB_prev, dU_prev.to(dtype=rdtype).contiguous()
 
 
-__all__ = ["chunk_increment_bwd_cute"]
+__all__ = ["chunk_increment_bwd_stage_cute"]
