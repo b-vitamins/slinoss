@@ -16,9 +16,6 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
     chunk_scan_bwd_dc_exact_cute,
     chunk_scan_bwd_dc_packed_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
-    chunk_scan_bwd_dlogprefix_exact_cute,
-)
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.du import (
     _chunk_scan_bwd_du_prepared_cute,
     prepare_chunk_scan_bwd_du_operands,
@@ -26,7 +23,8 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.du import (
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dz0 import (
     chunk_scan_bwd_dz0_packed_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param import (
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import (
+    chunk_scan_bwd_dlogprefix_exact_cute,
     _chunk_scan_bwd_param_from_intermediates,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (

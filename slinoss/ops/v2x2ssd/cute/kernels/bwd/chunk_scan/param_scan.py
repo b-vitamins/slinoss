@@ -1,16 +1,4 @@
-"""Parameter-side backward slice for ``chunk_scan`` gradients into ``M``.
-
-This slice stays on the packed chunk contract and differentiates the dense
-``Q/K`` algebra explicitly in Torch:
-
-- exact packed ``dQ/dKprev/dKcurr`` from batched matrix products
-- exact cumulative ``dlogprefix_half`` from the same packed contract
-- short SO(2) reverse scan back to per-step ``M``
-
-The chunk axis is intentionally kept explicit and small here. That keeps the
-phase-sensitive path numerically transparent and avoids feeding approximate
-packed ``dQ/dK`` slices into the final ``M`` reduction.
-"""
+"""Parameter scan-backward for ``chunk_scan`` gradients into ``M``."""
 
 from __future__ import annotations
 
@@ -22,14 +10,10 @@ from cutlass.cute.runtime import from_dlpack
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
     batched_sgemm_fp32_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
-    _pack_chunk_scan_inner_inputs,
-    _prepare_chunk_scan_small_operands,
-)
 
+from .common import prepare_chunk_scan_bwd_dout, prepare_chunk_scan_bwd_packed_context
 from .db import _chunk_scan_bwd_dk_prepared_cute, prepare_chunk_scan_bwd_db_operands
 from .dc import chunk_scan_bwd_dc_packed_cute
-from .dlogprefix import chunk_scan_bwd_dlogprefix_exact_cute
 from .du import prepare_chunk_scan_bwd_du_operands
 
 _CompiledPhaseReduceKey = tuple[
@@ -44,8 +28,244 @@ _CompiledPhaseScanKey = tuple[
     tuple[int, int],
     tuple[int, int, int],
 ]
+_CompiledDLogprefixKey = tuple[
+    int,
+    tuple[int, int, int],
+    tuple[int, int],
+    tuple[int, int, int],
+]
 _COMPILED_PHASE_REDUCE: dict[_CompiledPhaseReduceKey, object] = {}
 _COMPILED_PHASE_SCAN: dict[_CompiledPhaseScanKey, object] = {}
+_COMPILED_DLOGPREFIX: dict[_CompiledDLogprefixKey, object] = {}
+
+
+class _ChunkScanBwdDLogprefixExact:
+    """Warp-cooperative exact reduction for packed ``dlogprefix_half``."""
+
+    def __init__(self, *, num_threads: int = 128) -> None:
+        self.num_threads = int(num_threads)
+        if self.num_threads <= 0 or self.num_threads % 32 != 0:
+            raise ValueError("num_threads must be a positive multiple of 32.")
+
+    @cute.jit
+    def __call__(
+        self,
+        mScorePrev: cute.Tensor,
+        mScoreCurr: cute.Tensor,
+        mDSPrev: cute.Tensor,
+        mDSCurr: cute.Tensor,
+        mLogprefix: cute.Tensor,
+        mYOff: cute.Tensor,
+        mDOut: cute.Tensor,
+        mDLogprefix: cute.Tensor,
+    ) -> None:
+        if cutlass.const_expr(
+            not (
+                mScorePrev.element_type
+                == mScoreCurr.element_type
+                == mDSPrev.element_type
+                == mDSCurr.element_type
+                == mLogprefix.element_type
+                == mYOff.element_type
+                == mDOut.element_type
+                == mDLogprefix.element_type
+                == cutlass.Float32
+            )
+        ):
+            raise TypeError("Exact dlogprefix kernel expects Float32 tensors.")
+        if cutlass.const_expr(
+            mScorePrev.shape != mScoreCurr.shape
+            or mScorePrev.shape != mDSPrev.shape
+            or mScorePrev.shape != mDSCurr.shape
+        ):
+            raise ValueError("score and dS tensors must share shape.")
+        if cutlass.const_expr(
+            mScorePrev.shape[0] != mLogprefix.shape[0]
+            or mScorePrev.shape[1] != mLogprefix.shape[1]
+        ):
+            raise ValueError("logprefix must be (BHC, L) matching score tensors.")
+        if cutlass.const_expr(mYOff.shape != mDOut.shape):
+            raise ValueError("y_off and d_out must share shape.")
+        if cutlass.const_expr(
+            mYOff.shape[0] != mLogprefix.shape[0]
+            or mYOff.shape[1] != mLogprefix.shape[1]
+        ):
+            raise ValueError("y_off/d_out must be (BHC, L, P) matching logprefix.")
+        if cutlass.const_expr(mDLogprefix.shape != mLogprefix.shape):
+            raise ValueError("dlogprefix output must match logprefix shape.")
+
+        BHC = cute.size(mLogprefix.shape[0])
+        L = cute.size(mLogprefix.shape[1])
+        total_items = BHC * L
+        warps_per_block = self.num_threads // 32
+        self.kernel(
+            mScorePrev,
+            mScoreCurr,
+            mDSPrev,
+            mDSCurr,
+            mLogprefix,
+            mYOff,
+            mDOut,
+            mDLogprefix,
+            total_items,
+        ).launch(
+            grid=[cute.ceil_div(total_items, warps_per_block), 1, 1],
+            block=[self.num_threads, 1, 1],
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mScorePrev: cute.Tensor,
+        mScoreCurr: cute.Tensor,
+        mDSPrev: cute.Tensor,
+        mDSCurr: cute.Tensor,
+        mLogprefix: cute.Tensor,
+        mYOff: cute.Tensor,
+        mDOut: cute.Tensor,
+        mDLogprefix: cute.Tensor,
+        total_items: cutlass.Int32,
+    ) -> None:
+        bidx, _, _ = cute.arch.block_idx()
+        warp = cute.arch.warp_idx()
+        lane = cute.arch.lane_idx()
+
+        warps_per_block = self.num_threads // 32
+        item = bidx * warps_per_block + warp
+        item_valid = cute.elem_less(item, total_items)
+        item_safe = cutlass.min(item, total_items - cutlass.Int32(1))
+        L = cute.size(mLogprefix.shape[1])
+        bhc = item_safe // L
+        row = item_safe - bhc * L
+        lp_row = cutlass.Float32(mLogprefix[bhc, row])
+
+        off = cutlass.Float32(0.0)
+        P = cute.size(mYOff.shape[2])
+        p = lane
+        while p < P:
+            off += cutlass.Float32(mDOut[bhc, row, p]) * cutlass.Float32(mYOff[bhc, row, p])
+            p += 32
+
+        row_prev = cutlass.Float32(0.0)
+        row_curr = cutlass.Float32(0.0)
+        col_prev = cutlass.Float32(0.0)
+        col_curr = cutlass.Float32(0.0)
+
+        j = lane
+        while j < L:
+            lp_j = cutlass.Float32(mLogprefix[bhc, j])
+            if j <= row:
+                s_row = cutlass.Float32(
+                    cute.math.exp(cutlass.Float32(2.0) * (lp_row - lp_j))
+                )
+                row_prev += (
+                    cutlass.Float32(mDSPrev[bhc, row, j])
+                    * cutlass.Float32(mScorePrev[bhc, row, j])
+                    * s_row
+                )
+                row_curr += (
+                    cutlass.Float32(mDSCurr[bhc, row, j])
+                    * cutlass.Float32(mScoreCurr[bhc, row, j])
+                    * s_row
+                )
+            if row <= j:
+                s_col = cutlass.Float32(
+                    cute.math.exp(cutlass.Float32(2.0) * (lp_j - lp_row))
+                )
+                col_prev += (
+                    cutlass.Float32(mDSPrev[bhc, j, row])
+                    * cutlass.Float32(mScorePrev[bhc, j, row])
+                    * s_col
+                )
+                col_curr += (
+                    cutlass.Float32(mDSCurr[bhc, j, row])
+                    * cutlass.Float32(mScoreCurr[bhc, j, row])
+                    * s_col
+                )
+            j += 32
+
+        for offset in (16, 8, 4, 2, 1):
+            off += cute.arch.shuffle_sync_bfly(off, offset=offset, mask=-1, mask_and_clamp=31)
+            row_prev += cute.arch.shuffle_sync_bfly(row_prev, offset=offset, mask=-1, mask_and_clamp=31)
+            row_curr += cute.arch.shuffle_sync_bfly(row_curr, offset=offset, mask=-1, mask_and_clamp=31)
+            col_prev += cute.arch.shuffle_sync_bfly(col_prev, offset=offset, mask=-1, mask_and_clamp=31)
+            col_curr += cute.arch.shuffle_sync_bfly(col_curr, offset=offset, mask=-1, mask_and_clamp=31)
+
+        if item_valid and lane == 0:
+            mDLogprefix[bhc, row] = cutlass.Float32(2.0) * (
+                off + row_prev - col_prev + row_curr - col_curr
+            )
+
+
+def chunk_scan_bwd_dlogprefix_exact_cute(
+    score_prev: torch.Tensor,
+    score_curr: torch.Tensor,
+    dSprev: torch.Tensor,
+    dScurr: torch.Tensor,
+    logprefix_half: torch.Tensor,
+    y_off: torch.Tensor,
+    d_out_flat: torch.Tensor,
+) -> torch.Tensor:
+    """Exact fp32 CuTe reduction for ``dlogprefix_half``."""
+    tensors = (
+        ("score_prev", score_prev),
+        ("score_curr", score_curr),
+        ("dSprev", dSprev),
+        ("dScurr", dScurr),
+        ("logprefix_half", logprefix_half),
+        ("y_off", y_off),
+        ("d_out_flat", d_out_flat),
+    )
+    if any(t.device.type != "cuda" for _name, t in tensors):
+        raise ValueError("Exact CuTe dlogprefix requires CUDA tensors.")
+    if any(not t.is_contiguous() for _name, t in tensors):
+        raise ValueError("Exact CuTe dlogprefix expects contiguous tensors.")
+    if any(t.dtype != torch.float32 for _name, t in tensors):
+        raise ValueError("Exact CuTe dlogprefix expects float32 tensors.")
+    if score_prev.shape != score_curr.shape or score_prev.shape != dSprev.shape or score_prev.shape != dScurr.shape:
+        raise ValueError("score and dS tensors must share shape.")
+    if score_prev.ndim != 3 or logprefix_half.shape != score_prev.shape[:2]:
+        raise ValueError("score tensors must be (BHC, L, L) and logprefix must be (BHC, L).")
+    if y_off.shape != d_out_flat.shape:
+        raise ValueError("y_off and d_out_flat must share shape.")
+    if y_off.shape[:2] != logprefix_half.shape:
+        raise ValueError("y_off/d_out_flat must be (BHC, L, P) matching logprefix.")
+
+    out = torch.empty_like(logprefix_half)
+    device_index = 0 if score_prev.device.index is None else int(score_prev.device.index)
+    key: _CompiledDLogprefixKey = (
+        device_index,
+        tuple(int(x) for x in score_prev.shape),
+        tuple(int(x) for x in logprefix_half.shape),
+        tuple(int(x) for x in y_off.shape),
+    )
+    compiled = _COMPILED_DLOGPREFIX.get(key)
+    if compiled is None:
+        kernel = _ChunkScanBwdDLogprefixExact()
+        compiled = cute.compile(
+            kernel,
+            from_dlpack(score_prev, assumed_align=score_prev.element_size()),
+            from_dlpack(score_curr, assumed_align=score_curr.element_size()),
+            from_dlpack(dSprev, assumed_align=dSprev.element_size()),
+            from_dlpack(dScurr, assumed_align=dScurr.element_size()),
+            from_dlpack(logprefix_half, assumed_align=logprefix_half.element_size()),
+            from_dlpack(y_off, assumed_align=y_off.element_size()),
+            from_dlpack(d_out_flat, assumed_align=d_out_flat.element_size()),
+            from_dlpack(out, assumed_align=out.element_size()),
+        )
+        _COMPILED_DLOGPREFIX[key] = compiled
+
+    compiled(
+        from_dlpack(score_prev, assumed_align=score_prev.element_size()),
+        from_dlpack(score_curr, assumed_align=score_curr.element_size()),
+        from_dlpack(dSprev, assumed_align=dSprev.element_size()),
+        from_dlpack(dScurr, assumed_align=dScurr.element_size()),
+        from_dlpack(logprefix_half, assumed_align=logprefix_half.element_size()),
+        from_dlpack(y_off, assumed_align=y_off.element_size()),
+        from_dlpack(d_out_flat, assumed_align=d_out_flat.element_size()),
+        from_dlpack(out, assumed_align=out.element_size()),
+    )
+    return out
 
 
 class _ChunkScanParamPhaseReduce:
@@ -528,7 +748,7 @@ def _chunk_scan_bwd_param_from_intermediates(
     return dM.reshape(batch_size, n_heads, T_pad, 2).to(dtype=torch.float32).contiguous()
 
 
-def chunk_scan_bwd_param_packed_cute(
+def chunk_scan_bwd_param_scan_packed_cute(
     Q: torch.Tensor,
     Kprev: torch.Tensor,
     Vprev: torch.Tensor,
@@ -537,15 +757,17 @@ def chunk_scan_bwd_param_packed_cute(
     logprefix_half: torch.Tensor,
     Z0: torch.Tensor,
     M_raw: torch.Tensor,
-    d_out: torch.Tensor,
+    d_out_flat: torch.Tensor,
+    dQ: torch.Tensor,
+    dKprev: torch.Tensor,
+    dKcurr: torch.Tensor,
+    phase_real: torch.Tensor,
     *,
     batch_size: int,
     n_heads: int,
-    T: int,
-    Q_rev: torch.Tensor | None = None,
-    neg_logprefix_half_rev: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute packed param-side chunk-scan intermediates and ``dM``."""
+    T_pad: int,
+) -> torch.Tensor:
+    """Consume packed ``dQ/dK`` intermediates and produce public ``dM``."""
 
     tensors = (
         ("Q", Q),
@@ -556,7 +778,11 @@ def chunk_scan_bwd_param_packed_cute(
         ("logprefix_half", logprefix_half),
         ("Z0", Z0),
         ("M_raw", M_raw),
-        ("d_out", d_out),
+        ("d_out_flat", d_out_flat),
+        ("dQ", dQ),
+        ("dKprev", dKprev),
+        ("dKcurr", dKcurr),
+        ("phase_real", phase_real),
     )
     if any(t.device.type != "cuda" for _name, t in tensors):
         raise ValueError("CuTe chunk_scan backward requires CUDA tensors.")
@@ -582,11 +808,14 @@ def chunk_scan_bwd_param_packed_cute(
             "M_raw must be (BHC, L, 2) matching Q. Got "
             f"{tuple(M_raw.shape)}."
         )
-    if d_out.ndim != 4 or d_out.shape[:2] != (batch_size, n_heads) or int(d_out.shape[2]) != T:
-        raise ValueError(
-            "d_out must be (batch_size, n_heads, T, P). Got "
-            f"{tuple(d_out.shape)}."
-        )
+    if d_out_flat.shape != (Q.shape[0], Q.shape[1], Vprev.shape[-1]):
+        raise ValueError("d_out_flat must be (BHC, L, P) matching packed tensors.")
+    if dQ.shape != Q.squeeze(2).shape:
+        raise ValueError("dQ must be packed as (BHC, L, D).")
+    if dKprev.shape != dQ.shape or dKcurr.shape != dQ.shape:
+        raise ValueError("dKprev and dKcurr must match dQ.")
+    if phase_real.shape != (*Q.shape[:2], 2):
+        raise ValueError("phase_real must be (BHC, L, 2).")
 
     BHC, L, _, _ = map(int, Q.shape)
     BH = int(batch_size) * int(n_heads)
@@ -595,32 +824,10 @@ def chunk_scan_bwd_param_packed_cute(
             f"Q leading dim BHC={BHC} is not divisible by batch*heads={BH}."
         )
     n_chunks = BHC // BH
-    T_pad = n_chunks * L
-    if T > T_pad:
+    if int(T_pad) != n_chunks * L:
         raise ValueError(
-            f"T={T} exceeds the cached padded length T_pad={T_pad} implied by Q."
+            f"T_pad={T_pad} is inconsistent with packed shape {(BHC, L)} and batch*heads={BH}."
         )
-
-    P = int(Vprev.shape[-1])
-    if (Q_rev is None) ^ (neg_logprefix_half_rev is None):
-        raise ValueError(
-            "Q_rev and neg_logprefix_half_rev must be passed together or both omitted."
-        )
-
-    if T_pad != T:
-        d_out = torch.cat(
-            [
-                d_out,
-                torch.zeros(
-                    (batch_size, n_heads, T_pad - T, P),
-                    device=d_out.device,
-                    dtype=d_out.dtype,
-                ),
-            ],
-            dim=2,
-        )
-
-    d_out_flat = d_out.reshape(BHC, L, P).to(torch.float32)
     Qf = Q.squeeze(2).to(torch.float32)
     Kprevf = Kprev.squeeze(2).to(torch.float32)
     Kcurrf = Kcurr.squeeze(2).to(torch.float32)
@@ -645,51 +852,6 @@ def chunk_scan_bwd_param_packed_cute(
         d_out_flat,
     )
 
-    if Q_rev is None or neg_logprefix_half_rev is None:
-        Q_rev, _Kprev_rev, _Kcurr_rev, neg_logprefix_half_rev = (
-            prepare_chunk_scan_bwd_du_operands(
-                Q.contiguous(),
-                Kprev.contiguous(),
-                Kcurr.contiguous(),
-                logprefix_half.contiguous(),
-            )
-        )
-    d_out_rev = torch.flip(
-        d_out.reshape(BHC, L, 1, P).to(dtype=Q_rev.dtype), dims=[1]
-    ).contiguous()
-    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase_real = (
-        prepare_chunk_scan_bwd_db_operands(
-            Q.contiguous(),
-            Vprev.contiguous(),
-            Vcurr.contiguous(),
-            logprefix_half.contiguous(),
-            M_raw.contiguous(),
-            Q_rev=Q_rev,
-            neg_logprefix_half_rev=neg_logprefix_half_rev,
-        )
-    )
-    z0_q = Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
-    dQ = chunk_scan_bwd_dc_packed_cute(
-        Vprev.contiguous(),
-        Kprev.contiguous(),
-        Vcurr.contiguous(),
-        Kcurr.contiguous(),
-        logprefix_half.contiguous(),
-        z0_q,
-        d_out,
-        batch_size=batch_size,
-        n_heads=n_heads,
-        T=T,
-    )
-    dKprev, dKcurr = _chunk_scan_bwd_dk_prepared_cute(
-        Q_rev_db,
-        Vprev_rev,
-        Vcurr_rev,
-        neg_logprefix_half_rev_db,
-        d_out_rev,
-        batch_size=batch_size,
-        n_heads=n_heads,
-    )
     phase = torch.view_as_complex(phase_real.contiguous())
     dM = _chunk_scan_bwd_param_from_intermediates(
         Qf,
@@ -704,16 +866,10 @@ def chunk_scan_bwd_param_packed_cute(
         batch_size=batch_size,
         n_heads=n_heads,
     )
-    return (
-        dM[:, :, :T, :].contiguous(),
-        dQ,
-        dKprev,
-        dKcurr,
-        phase_real,
-    )
+    return dM
 
  
-def chunk_scan_bwd_param_cute(
+def chunk_scan_bwd_param_scan_cute(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
@@ -728,28 +884,7 @@ def chunk_scan_bwd_param_cute(
     compute_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Compute canonical public-contract ``dM`` for ``chunk_scan``."""
-    if d_out.device.type != "cuda":
-        raise ValueError("CuTe chunk_scan backward requires CUDA tensors.")
-    if not d_out.is_contiguous():
-        raise ValueError(f"d_out must be contiguous; got strides {d_out.stride()}.")
-
-    batch_size, n_heads, T, _P = map(int, U.shape)
-    (
-        U_raw,
-        B_raw,
-        C_raw,
-        M_raw,
-        K_raw,
-        logprefix_half,
-        Z0_raw,
-        U_head,
-        B_head,
-        _batch_size,
-        _n_heads,
-        _T,
-        _T_pad,
-        _odtype,
-    ) = _prepare_chunk_scan_small_operands(
+    ctx = prepare_chunk_scan_bwd_packed_context(
         U,
         M,
         K,
@@ -760,34 +895,79 @@ def chunk_scan_bwd_param_cute(
         B_prev=B_prev,
         U_prev=U_prev,
         compute_dtype=compute_dtype,
-        output_dtype=torch.float32,
     )
-    Q, Kprev, Vprev, Kcurr, Vcurr, logprefix_half, Z0 = _pack_chunk_scan_inner_inputs(
-        U_raw,
-        B_raw,
-        C_raw,
-        M_raw,
-        K_raw,
-        logprefix_half,
-        Z0_raw,
-        U_head,
-        B_head,
-    )
-    dM, _dQ, _dKprev, _dKcurr, _phase_real = chunk_scan_bwd_param_packed_cute(
-        Q,
-        Kprev,
-        Vprev,
-        Kcurr,
-        Vcurr,
-        logprefix_half,
-        Z0,
-        M_raw,
+    _d_out_padded, d_out_flat, d_out_rev = prepare_chunk_scan_bwd_dout(
         d_out,
-        batch_size=batch_size,
-        n_heads=n_heads,
-        T=T,
+        ctx=ctx,
+        tc_dtype=ctx.Q.dtype,
     )
-    return dM
+    Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = prepare_chunk_scan_bwd_du_operands(
+        ctx.Q.contiguous(),
+        ctx.Kprev.contiguous(),
+        ctx.Kcurr.contiguous(),
+        ctx.logprefix_half.contiguous(),
+    )
+    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase_real = (
+        prepare_chunk_scan_bwd_db_operands(
+            ctx.Q.contiguous(),
+            ctx.Vprev.contiguous(),
+            ctx.Vcurr.contiguous(),
+            ctx.logprefix_half.contiguous(),
+            ctx.M_raw.contiguous(),
+            Q_rev=Q_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
+        )
+    )
+    dQ = chunk_scan_bwd_dc_packed_cute(
+        ctx.Vprev.contiguous(),
+        ctx.Kprev.contiguous(),
+        ctx.Vcurr.contiguous(),
+        ctx.Kcurr.contiguous(),
+        ctx.logprefix_half.contiguous(),
+        ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous(),
+        d_out,
+        batch_size=ctx.batch_size,
+        n_heads=ctx.n_heads,
+        T=ctx.T,
+    )
+    dKprev, dKcurr = _chunk_scan_bwd_dk_prepared_cute(
+        Q_rev_db,
+        Vprev_rev,
+        Vcurr_rev,
+        neg_logprefix_half_rev_db,
+        d_out_rev,
+        batch_size=ctx.batch_size,
+        n_heads=ctx.n_heads,
+    )
+    dM = chunk_scan_bwd_param_scan_packed_cute(
+        ctx.Q,
+        ctx.Kprev,
+        ctx.Vprev,
+        ctx.Kcurr,
+        ctx.Vcurr,
+        ctx.logprefix_half,
+        ctx.Z0,
+        ctx.M_raw,
+        d_out_flat,
+        dQ,
+        dKprev,
+        dKcurr,
+        phase_real,
+        batch_size=ctx.batch_size,
+        n_heads=ctx.n_heads,
+        T_pad=ctx.T_pad,
+    )
+    return dM[:, :, : ctx.T, :].contiguous()
 
 
-__all__ = ["chunk_scan_bwd_param_cute", "chunk_scan_bwd_param_packed_cute"]
+chunk_scan_bwd_param_packed_cute = chunk_scan_bwd_param_scan_packed_cute
+chunk_scan_bwd_param_cute = chunk_scan_bwd_param_scan_cute
+
+
+__all__ = [
+    "chunk_scan_bwd_dlogprefix_exact_cute",
+    "chunk_scan_bwd_param_scan_cute",
+    "chunk_scan_bwd_param_scan_packed_cute",
+    "chunk_scan_bwd_param_cute",
+    "chunk_scan_bwd_param_packed_cute",
+]
