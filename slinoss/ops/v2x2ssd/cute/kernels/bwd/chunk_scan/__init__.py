@@ -1,5 +1,6 @@
 """Backward slices for the CuTe ``v2x2ssd`` chunk-scan stage."""
 
+from .stage import chunk_scan_bwd_cute
 from .db import (
     chunk_scan_bwd_dk_packed_cute,
     chunk_scan_bwd_db_cute,
@@ -18,6 +19,7 @@ from .dz0 import chunk_scan_bwd_dz0_cute, chunk_scan_bwd_dz0_packed_cute
 from .param import chunk_scan_bwd_param_cute
 
 __all__ = [
+    "chunk_scan_bwd_cute",
     "prepare_chunk_scan_bwd_db_operands",
     "chunk_scan_bwd_dk_packed_cute",
     "chunk_scan_bwd_db_cute",
