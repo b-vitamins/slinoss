@@ -296,22 +296,6 @@ def compile_chunk_scan_bwd_kernels(
     Callable[[], None],
 ]:
     """Compile the split chunk-scan backward pipeline on the public contract."""
-    dU = torch.empty_like(U, dtype=torch.float32)
-    dM = torch.empty_like(M, dtype=torch.float32)
-    dK = torch.empty_like(K, dtype=torch.float32)
-    dB = torch.empty_like(B, dtype=torch.float32)
-    dC = torch.empty_like(C, dtype=torch.float32)
-    d_chunk_starts = torch.empty_like(chunk_starts, dtype=torch.float32)
-    dB_prev_out = (
-        torch.empty_like(B_prev, dtype=torch.float32)
-        if B_prev is not None
-        else torch.empty((U.shape[0], U.shape[1], B.shape[-1]), device=U.device, dtype=torch.float32)
-    )
-    dU_prev_out = (
-        torch.empty_like(U_prev, dtype=torch.float32)
-        if U_prev is not None
-        else torch.empty((U.shape[0], U.shape[1], U.shape[-1]), device=U.device, dtype=torch.float32)
-    )
     ctx = prepare_chunk_scan_bwd_packed_context(
         U,
         M,
@@ -355,6 +339,51 @@ def compile_chunk_scan_bwd_kernels(
         )
     )
 
+    if not return_launchers:
+        return _run_chunk_scan_bwd_pipeline_prepared(
+            ctx=ctx,
+            Q=Q,
+            Kprev=Kprev,
+            Vprev=Vprev,
+            Kcurr=Kcurr,
+            Vcurr=Vcurr,
+            logprefix_half=logprefix_half,
+            M_raw=M_raw,
+            K_raw=K_raw,
+            B_raw=B_raw,
+            B_head=B_head,
+            z0_q=z0_q,
+            Q_rev=Q_rev,
+            Kprev_rev=Kprev_rev,
+            Kcurr_rev=Kcurr_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
+            Q_rev_db=Q_rev_db,
+            Vprev_rev=Vprev_rev,
+            Vcurr_rev=Vcurr_rev,
+            neg_logprefix_half_rev_db=neg_logprefix_half_rev_db,
+            phase=phase,
+            d_out_padded=d_out_padded,
+            d_out_flat=d_out_flat,
+            d_out_rev=d_out_rev,
+        )
+
+    dU = torch.empty_like(U, dtype=torch.float32)
+    dM = torch.empty_like(M, dtype=torch.float32)
+    dK = torch.empty_like(K, dtype=torch.float32)
+    dB = torch.empty_like(B, dtype=torch.float32)
+    dC = torch.empty_like(C, dtype=torch.float32)
+    d_chunk_starts = torch.empty_like(chunk_starts, dtype=torch.float32)
+    dB_prev_out = (
+        torch.empty_like(B_prev, dtype=torch.float32)
+        if B_prev is not None
+        else torch.empty((U.shape[0], U.shape[1], B.shape[-1]), device=U.device, dtype=torch.float32)
+    )
+    dU_prev_out = (
+        torch.empty_like(U_prev, dtype=torch.float32)
+        if U_prev is not None
+        else torch.empty((U.shape[0], U.shape[1], U.shape[-1]), device=U.device, dtype=torch.float32)
+    )
+
     def launch_sequential() -> None:
         got = _run_chunk_scan_bwd_pipeline_prepared(
             ctx=ctx,
@@ -394,22 +423,18 @@ def compile_chunk_scan_bwd_kernels(
         # so the safe package-level launcher is the sequential pipeline.
         launch_sequential()
 
-    if return_launchers:
-        return (
-            dU,
-            dM,
-            dK,
-            dB,
-            dC,
-            d_chunk_starts,
-            dB_prev_out,
-            dU_prev_out,
-            launch_sequential,
-            launch_overlapped,
-        )
-
-    launch_sequential()
-    return dU, dM, dK, dB, dC, d_chunk_starts, dB_prev_out, dU_prev_out
+    return (
+        dU,
+        dM,
+        dK,
+        dB,
+        dC,
+        d_chunk_starts,
+        dB_prev_out,
+        dU_prev_out,
+        launch_sequential,
+        launch_overlapped,
+    )
 
 
 def chunk_scan_bwd_cute(
