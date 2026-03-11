@@ -370,7 +370,15 @@ def test_v2x2ssd_cute_matches_reference_autograd() -> None:
     grad_names = ("U", "M", "K", "B", "C", "initial", "B_prev", "U_prev")
     for name, got, want in zip(grad_names, cute_grads, ref_grads, strict=True):
         atol = 3e-3
-        if name == "C":
+        if name in ("U", "U_prev"):
+            # The promoted chunk-scan dU slice now follows the same principled
+            # tensor-core contract as the dedicated du kernel tests: low-
+            # precision packed transport with fp32 accumulation in the dense
+            # contractions, plus a device-side fp32 scatter back to public
+            # layout. That is numerically sane but intentionally not on the old
+            # exact-fp32 autograd budget.
+            atol = 1e-1 if name == "U" else 6e-2
+        elif name == "C":
             # The promoted chunk-scan dC slice now follows the same principled
             # tensor-core contract as the dedicated dc kernel tests: fp16/bf16
             # transport with fp32 accumulation, plus an exact fp32 scatter back

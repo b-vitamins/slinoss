@@ -23,6 +23,10 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
     chunk_scan_bwd_db_exact_cute,
 )
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.du import (
+    chunk_scan_bwd_du_cute,
+    prepare_chunk_scan_bwd_du_operands,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
     chunk_scan_bwd_dlogprefix_exact_cute,
 )
@@ -41,6 +45,8 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _prepare_chunk_scan_small_operands,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
+
+
 def _run_chunk_scan_forward_and_pack(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -292,6 +298,7 @@ def _chunk_scan_bwd_exact_packed(
     T_pad = n_chunks * L
     N = D // 2
 
+    d_out_public = d_out
     if T_pad != T:
         d_out = torch.cat(
             [
@@ -315,8 +322,6 @@ def _chunk_scan_bwd_exact_packed(
     scale, row_scale = _packed_causal_scales(logprefix_half)
     score_prev = batched_sgemm_fp32_cute(Qf, Kprevf.transpose(1, 2))
     score_curr = batched_sgemm_fp32_cute(Qf, Kcurrf.transpose(1, 2))
-    Sprev = score_prev * scale
-    Scurr = score_curr * scale
     dSprev = batched_sgemm_fp32_cute(d_out_flat, Vprevf.transpose(1, 2))
     dScurr = batched_sgemm_fp32_cute(d_out_flat, Vcurrf.transpose(1, 2))
     dScore_prev = dSprev * scale
@@ -338,11 +343,20 @@ def _chunk_scan_bwd_exact_packed(
         .contiguous()
     )
 
-    dVprev = batched_sgemm_fp32_cute(Sprev.transpose(1, 2), d_out_flat)
-    dVcurr = batched_sgemm_fp32_cute(Scurr.transpose(1, 2), d_out_flat)
-    dU, dU_prev = _scatter_value_grads(
-        dVprev,
-        dVcurr,
+    Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = (
+        prepare_chunk_scan_bwd_du_operands(
+            Q.contiguous(),
+            Kprev.contiguous(),
+            Kcurr.contiguous(),
+            logprefix_half.contiguous(),
+        )
+    )
+    dU, dU_prev = chunk_scan_bwd_du_cute(
+        Q_rev,
+        Kprev_rev,
+        Kcurr_rev,
+        neg_logprefix_half_rev,
+        d_out_public.contiguous(),
         batch_size=batch_size,
         n_heads=n_heads,
         T=T,
