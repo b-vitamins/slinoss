@@ -7,10 +7,6 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    batched_sgemm_fp32_cute,
-)
-
 from .common import prepare_chunk_scan_bwd_dout, prepare_chunk_scan_bwd_packed_context
 from .db import _chunk_scan_bwd_dk_prepared_cute, prepare_chunk_scan_bwd_db_operands
 from .dc import chunk_scan_bwd_dc_packed_cute
@@ -18,8 +14,11 @@ from .du import prepare_chunk_scan_bwd_du_operands
 
 _CompiledPhaseReduceKey = tuple[
     int,
+    torch.dtype,
+    torch.dtype,
     tuple[int, int, int],
     tuple[int, int, int],
+    tuple[int, int],
     tuple[int, int, int],
 ]
 _CompiledPhaseScanKey = tuple[
@@ -268,13 +267,13 @@ def chunk_scan_bwd_dlogprefix_exact_cute(
     return out
 
 
-class _ChunkScanParamPhaseReduce:
-    """Warp-cooperative packed phase reduction.
+class _ChunkScanParamReduce:
+    """Warp-cooperative packed reduction for ``d_phase`` and ``dlogprefix``.
 
     Logical shape:
     - inputs: ``Q/Kprev/Kcurr/dQ/dKprev/dKcurr`` are ``(BHC, L, D)``
     - ``phase``: ``(BHC, L, 2)``
-    - output ``d_phase``: ``(BHC, L, 2)``
+    - outputs: ``d_phase`` is ``(BHC, L, 2)`` and ``d_logprefix_half`` is ``(BHC, L)``
 
     Layout / launch:
     - one warp owns one ``(bhc, t)`` item
@@ -282,7 +281,8 @@ class _ChunkScanParamPhaseReduce:
     - grid: linear over ``BHC * L``
 
     This matches the saved packed layout: ``D`` is contiguous, so a warp sees
-    coalesced loads while reducing the complex scalar gradient for the phase.
+    coalesced loads while reducing both metadata gradients directly from the
+    packed backward intermediates.
     """
 
     def __init__(self, *, num_threads: int = 128) -> None:
@@ -301,21 +301,28 @@ class _ChunkScanParamPhaseReduce:
         mDKcurr: cute.Tensor,
         mPhase: cute.Tensor,
         mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
     ) -> None:
         if cutlass.const_expr(
             not (
                 mQ.element_type
                 == mKprev.element_type
                 == mKcurr.element_type
-                == mDQ.element_type
+            )
+        ):
+            raise TypeError("Q/K inputs must share dtype.")
+        if cutlass.const_expr(
+            not (
+                mDQ.element_type
                 == mDKprev.element_type
                 == mDKcurr.element_type
                 == mPhase.element_type
                 == mDPhase.element_type
+                == mDLogprefixHalf.element_type
                 == cutlass.Float32
             )
         ):
-            raise TypeError("phase-reduce expects Float32 tensors.")
+            raise TypeError("param-reduce metadata tensors must be Float32.")
         if cutlass.const_expr(mQ.shape != mKprev.shape or mQ.shape != mKcurr.shape):
             raise ValueError("Q/K tensors must share the same shape.")
         if cutlass.const_expr(mQ.shape != mDQ.shape or mQ.shape != mDKprev.shape or mQ.shape != mDKcurr.shape):
@@ -324,6 +331,8 @@ class _ChunkScanParamPhaseReduce:
             raise ValueError("phase must be (BHC, L, 2).")
         if cutlass.const_expr(mDPhase.shape != mPhase.shape):
             raise ValueError("d_phase must match phase shape.")
+        if cutlass.const_expr(mDLogprefixHalf.shape[0] != mQ.shape[0] or mDLogprefixHalf.shape[1] != mQ.shape[1]):
+            raise ValueError("d_logprefix_half must be (BHC, L).")
 
         BHC = cute.size(mQ.shape[0])
         L = cute.size(mQ.shape[1])
@@ -338,6 +347,7 @@ class _ChunkScanParamPhaseReduce:
             mDKcurr,
             mPhase,
             mDPhase,
+            mDLogprefixHalf,
             BHC,
             L,
             total_items,
@@ -357,6 +367,7 @@ class _ChunkScanParamPhaseReduce:
         mDKcurr: cute.Tensor,
         mPhase: cute.Tensor,
         mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
         BHC: cutlass.Int32,
         L: cutlass.Int32,
         total_items: cutlass.Int32,
@@ -378,6 +389,9 @@ class _ChunkScanParamPhaseReduce:
 
         acc_re = cutlass.Float32(0.0)
         acc_im = cutlass.Float32(0.0)
+        acc_q = cutlass.Float32(0.0)
+        acc_kp = cutlass.Float32(0.0)
+        acc_kc = cutlass.Float32(0.0)
         n = lane
         while n < N:
             col = n * 2
@@ -408,6 +422,9 @@ class _ChunkScanParamPhaseReduce:
             acc_im += -dkpr * kpbi + dkpi * kpbr
             acc_re += dkcr * kcbr + dkci * kcbi
             acc_im += -dkcr * kcbi + dkci * kcbr
+            acc_q += dqr * qr + dqi * qi
+            acc_kp += dkpr * kpr + dkpi * kpi
+            acc_kc += dkcr * kcr + dkci * kci
             n += 32
 
         acc_re = acc_re + cute.arch.shuffle_sync_bfly(
@@ -440,9 +457,22 @@ class _ChunkScanParamPhaseReduce:
         acc_im = acc_im + cute.arch.shuffle_sync_bfly(
             acc_im, offset=1, mask=-1, mask_and_clamp=31
         )
+        for offset in (16, 8, 4, 2, 1):
+            acc_q += cute.arch.shuffle_sync_bfly(
+                acc_q, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            acc_kp += cute.arch.shuffle_sync_bfly(
+                acc_kp, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            acc_kc += cute.arch.shuffle_sync_bfly(
+                acc_kc, offset=offset, mask=-1, mask_and_clamp=31
+            )
         if item_valid and lane == 0:
             mDPhase[bhc, t, 0] = acc_re
             mDPhase[bhc, t, 1] = acc_im
+            mDLogprefixHalf[bhc, t] = cutlass.Float32(2.0) * (
+                acc_q - acc_kp - acc_kc
+            )
 
 
 class _ChunkScanParamPhaseScan:
@@ -456,7 +486,7 @@ class _ChunkScanParamPhaseScan:
     - one warp owns one ``bhc`` sequence
     - lane 0 executes the scalar SO(2) reverse scan while other lanes stay idle
 
-    The hot dense reduction already happened in ``_ChunkScanParamPhaseReduce``.
+    The hot packed reduction already happened in ``_ChunkScanParamReduce``.
     This kernel removes the many tiny Torch launches in the remaining exact
     reverse scan without trying to invent a tensor-core shape for scalar work.
     """
@@ -575,31 +605,40 @@ class _ChunkScanParamPhaseScan:
 
 def _get_compiled_phase_reduce(
     Q: torch.Tensor,
+    dQ: torch.Tensor,
     phase: torch.Tensor,
     d_phase: torch.Tensor,
+    d_logprefix_half: torch.Tensor,
 ) -> object:
     device_index = 0 if Q.device.index is None else int(Q.device.index)
     key: _CompiledPhaseReduceKey = (
         device_index,
+        Q.dtype,
+        dQ.dtype,
         tuple(int(x) for x in Q.shape),
         tuple(int(x) for x in phase.shape),
+        tuple(int(x) for x in d_logprefix_half.shape),
         tuple(int(x) for x in d_phase.shape),
     )
     compiled = _COMPILED_PHASE_REDUCE.get(key)
     if compiled is not None:
         return compiled
 
-    kernel = _ChunkScanParamPhaseReduce()
+    kernel = _ChunkScanParamReduce()
     compiled = cute.compile(
         kernel,
         from_dlpack(Q, assumed_align=Q.element_size()),
         from_dlpack(Q, assumed_align=Q.element_size()),
         from_dlpack(Q, assumed_align=Q.element_size()),
-        from_dlpack(Q, assumed_align=Q.element_size()),
-        from_dlpack(Q, assumed_align=Q.element_size()),
-        from_dlpack(Q, assumed_align=Q.element_size()),
+        from_dlpack(dQ, assumed_align=dQ.element_size()),
+        from_dlpack(dQ, assumed_align=dQ.element_size()),
+        from_dlpack(dQ, assumed_align=dQ.element_size()),
         from_dlpack(phase, assumed_align=phase.element_size()),
         from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
     )
     _COMPILED_PHASE_REDUCE[key] = compiled
     return compiled
@@ -632,18 +671,6 @@ def _get_compiled_phase_scan(
     )
     _COMPILED_PHASE_SCAN[key] = compiled
     return compiled
-
-
-def _packed_row_scale(logprefix_half: torch.Tensor) -> torch.Tensor:
-    """Build the packed off-term row scale ``exp(2 * lp[t])``."""
-
-    if logprefix_half.ndim != 2:
-        raise ValueError(
-            f"logprefix_half must be rank-2 packed metadata. Got {tuple(logprefix_half.shape)}."
-        )
-    lp = logprefix_half.to(torch.float32)
-    return torch.exp(2.0 * lp).unsqueeze(-1)
-
 
 def _dlogprefix_half_packed(
     score_prev: torch.Tensor,
@@ -681,9 +708,9 @@ def _packed_phase_prefix(M_raw: torch.Tensor) -> torch.Tensor:
 
 
 def _chunk_scan_bwd_param_from_intermediates(
-    Qf: torch.Tensor,
-    Kprevf: torch.Tensor,
-    Kcurrf: torch.Tensor,
+    Q_packed: torch.Tensor,
+    Kprev_packed: torch.Tensor,
+    Kcurr_packed: torch.Tensor,
     phase_real: torch.Tensor,
     M_raw: torch.Tensor,
     dQ: torch.Tensor,
@@ -694,8 +721,8 @@ def _chunk_scan_bwd_param_from_intermediates(
     batch_size: int,
     n_heads: int,
 ) -> torch.Tensor:
-    """Map packed exact intermediates onto public ``dM``."""
-    BHC, L, _ = map(int, Qf.shape)
+    """Map packed metadata intermediates onto public ``dM``."""
+    BHC, L, _ = map(int, Q_packed.shape)
     BH = int(batch_size) * int(n_heads)
     if BH <= 0 or BHC % BH != 0:
         raise ValueError(
@@ -705,16 +732,26 @@ def _chunk_scan_bwd_param_from_intermediates(
     T_pad = n_chunks * L
 
     d_phase = torch.empty_like(phase_real)
-    compiled_reduce = _get_compiled_phase_reduce(Qf, phase_real, d_phase)
+    compiled_reduce = _get_compiled_phase_reduce(
+        Q_packed,
+        dQ,
+        phase_real,
+        d_phase,
+        d_logprefix_half,
+    )
     compiled_reduce(
-        from_dlpack(Qf, assumed_align=Qf.element_size()),
-        from_dlpack(Kprevf, assumed_align=Kprevf.element_size()),
-        from_dlpack(Kcurrf, assumed_align=Kcurrf.element_size()),
+        from_dlpack(Q_packed, assumed_align=Q_packed.element_size()),
+        from_dlpack(Kprev_packed, assumed_align=Kprev_packed.element_size()),
+        from_dlpack(Kcurr_packed, assumed_align=Kcurr_packed.element_size()),
         from_dlpack(dQ, assumed_align=dQ.element_size()),
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
         from_dlpack(dKcurr, assumed_align=dKcurr.element_size()),
         from_dlpack(phase_real, assumed_align=phase_real.element_size()),
         from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
     )
 
     dM = torch.empty_like(M_raw)
@@ -809,34 +846,21 @@ def chunk_scan_bwd_param_scan_packed_cute(
         raise ValueError(
             f"T_pad={T_pad} is inconsistent with packed shape {(BHC, L)} and batch*heads={BH}."
         )
-    Qf = Q.squeeze(2).to(torch.float32)
-    Kprevf = Kprev.squeeze(2).to(torch.float32)
-    Kcurrf = Kcurr.squeeze(2).to(torch.float32)
-    Vprevf = Vprev.squeeze(2).to(torch.float32)
-    Vcurrf = Vcurr.squeeze(2).to(torch.float32)
-    Z0f = Z0.squeeze(2).to(torch.float32)
+    del Vprev, Vcurr, logprefix_half, Z0, d_out_flat
 
-    row_scale = _packed_row_scale(logprefix_half)
-    score_prev = batched_sgemm_fp32_cute(Qf, Kprevf.transpose(1, 2))
-    score_curr = batched_sgemm_fp32_cute(Qf, Kcurrf.transpose(1, 2))
-    dSprev = batched_sgemm_fp32_cute(d_out_flat, Vprevf.transpose(1, 2))
-    dScurr = batched_sgemm_fp32_cute(d_out_flat, Vcurrf.transpose(1, 2))
-    y_off = batched_sgemm_fp32_cute(Qf, Z0f.transpose(1, 2)) * row_scale
-
-    d_logprefix_half = chunk_scan_bwd_dlogprefix_exact_cute(
-        score_prev,
-        score_curr,
-        dSprev,
-        dScurr,
-        logprefix_half.contiguous(),
-        y_off.contiguous(),
-        d_out_flat,
+    Q_packed = Q.squeeze(2).contiguous()
+    Kprev_packed = Kprev.squeeze(2).contiguous()
+    Kcurr_packed = Kcurr.squeeze(2).contiguous()
+    d_logprefix_half = torch.empty(
+        (BHC, L),
+        device=Q.device,
+        dtype=torch.float32,
     )
 
     dM = _chunk_scan_bwd_param_from_intermediates(
-        Qf,
-        Kprevf,
-        Kcurrf,
+        Q_packed,
+        Kprev_packed,
+        Kcurr_packed,
         phase_real,
         M_raw,
         dQ,

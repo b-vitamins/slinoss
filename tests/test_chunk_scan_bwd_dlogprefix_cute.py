@@ -5,12 +5,11 @@ import math
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
     chunk_scan_bwd_dlogprefix_exact_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param import (
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param_scan import (
     _dlogprefix_half_packed,
-    _packed_causal_scales,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _pack_chunk_scan_inner_inputs,
@@ -54,6 +53,21 @@ def _make_inputs(
     )
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
     return U, M, K, B, C, B_prev, U_prev
+
+
+def _packed_causal_scales(
+    logprefix_half: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lp = logprefix_half.to(torch.float32)
+    L = int(lp.shape[1])
+    t_idx = torch.arange(L, device=lp.device).unsqueeze(1)
+    s_idx = torch.arange(L, device=lp.device).unsqueeze(0)
+    causal = (s_idx <= t_idx).unsqueeze(0)
+    scale = torch.exp(2.0 * (lp.unsqueeze(-1) - lp.unsqueeze(1))).masked_fill(
+        ~causal, 0.0
+    )
+    row_scale = torch.exp(2.0 * lp).unsqueeze(-1)
+    return scale, row_scale
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

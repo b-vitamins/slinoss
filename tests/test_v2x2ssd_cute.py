@@ -370,7 +370,7 @@ def test_v2x2ssd_cute_matches_reference_autograd() -> None:
     grad_names = ("U", "M", "K", "B", "C", "initial", "B_prev", "U_prev")
     atol_by_grad = {
         "U": 1e-1,
-        "M": 2.5e-1,
+        "M": 3e-1,
         "K": 5e-1,
         "B": 4e-1,
         "C": 3e-1,

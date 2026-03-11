@@ -108,6 +108,20 @@ def _run_chunk_scan_bwd_pipeline(
     B_raw = ctx.B_raw.to(dtype=torch.float32).contiguous()
     B_head = ctx.B_head.to(dtype=torch.float32).contiguous()
     z0_q = ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
+    Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = (
+        prepare_chunk_scan_bwd_du_operands(Q, Kprev, Kcurr, logprefix_half)
+    )
+    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase = (
+        prepare_chunk_scan_bwd_db_operands(
+            Q,
+            Vprev,
+            Vcurr,
+            logprefix_half,
+            M_raw,
+            Q_rev=Q_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
+        )
+    )
 
     return _run_chunk_scan_bwd_pipeline_prepared(
         ctx=ctx,
@@ -122,6 +136,15 @@ def _run_chunk_scan_bwd_pipeline(
         B_raw=B_raw,
         B_head=B_head,
         z0_q=z0_q,
+        Q_rev=Q_rev,
+        Kprev_rev=Kprev_rev,
+        Kcurr_rev=Kcurr_rev,
+        neg_logprefix_half_rev=neg_logprefix_half_rev,
+        Q_rev_db=Q_rev_db,
+        Vprev_rev=Vprev_rev,
+        Vcurr_rev=Vcurr_rev,
+        neg_logprefix_half_rev_db=neg_logprefix_half_rev_db,
+        phase=phase,
         d_out_padded=d_out_padded,
         d_out_flat=d_out_flat,
         d_out_rev=d_out_rev,
@@ -142,6 +165,15 @@ def _run_chunk_scan_bwd_pipeline_prepared(
     B_raw: torch.Tensor,
     B_head: torch.Tensor,
     z0_q: torch.Tensor,
+    Q_rev: torch.Tensor,
+    Kprev_rev: torch.Tensor,
+    Kcurr_rev: torch.Tensor,
+    neg_logprefix_half_rev: torch.Tensor,
+    Q_rev_db: torch.Tensor,
+    Vprev_rev: torch.Tensor,
+    Vcurr_rev: torch.Tensor,
+    neg_logprefix_half_rev_db: torch.Tensor,
+    phase: torch.Tensor,
     d_out_padded: torch.Tensor,
     d_out_flat: torch.Tensor,
     d_out_rev: torch.Tensor,
@@ -163,24 +195,6 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         n_chunks=ctx.n_chunks,
         P=ctx.P,
         D=ctx.D,
-    )
-
-    Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = prepare_chunk_scan_bwd_du_operands(
-        Q,
-        Kprev,
-        Kcurr,
-        logprefix_half,
-    )
-    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase = (
-        prepare_chunk_scan_bwd_db_operands(
-            Q,
-            Vprev,
-            Vcurr,
-            logprefix_half,
-            M_raw,
-            Q_rev=Q_rev,
-            neg_logprefix_half_rev=neg_logprefix_half_rev,
-        )
     )
 
     dU, dU_prev = _chunk_scan_bwd_du_prepared_cute(
@@ -326,6 +340,20 @@ def compile_chunk_scan_bwd_kernels(
     B_raw = ctx.B_raw.to(dtype=torch.float32).contiguous()
     B_head = ctx.B_head.to(dtype=torch.float32).contiguous()
     z0_q = ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
+    Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = (
+        prepare_chunk_scan_bwd_du_operands(Q, Kprev, Kcurr, logprefix_half)
+    )
+    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase = (
+        prepare_chunk_scan_bwd_db_operands(
+            Q,
+            Vprev,
+            Vcurr,
+            logprefix_half,
+            M_raw,
+            Q_rev=Q_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
+        )
+    )
 
     def launch_sequential() -> None:
         got = _run_chunk_scan_bwd_pipeline_prepared(
@@ -341,6 +369,15 @@ def compile_chunk_scan_bwd_kernels(
             B_raw=B_raw,
             B_head=B_head,
             z0_q=z0_q,
+            Q_rev=Q_rev,
+            Kprev_rev=Kprev_rev,
+            Kcurr_rev=Kcurr_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
+            Q_rev_db=Q_rev_db,
+            Vprev_rev=Vprev_rev,
+            Vcurr_rev=Vcurr_rev,
+            neg_logprefix_half_rev_db=neg_logprefix_half_rev_db,
+            phase=phase,
             d_out_padded=d_out_padded,
             d_out_flat=d_out_flat,
             d_out_rev=d_out_rev,
