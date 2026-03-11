@@ -11,12 +11,14 @@ from .db import (
     _chunk_scan_bwd_dk_prepared_cute,
     chunk_scan_bwd_db_cute,
     chunk_scan_bwd_db_exact_cute,
+    chunk_scan_bwd_db_exact_with_meta_cute,
     chunk_scan_bwd_dk_packed_cute,
     prepare_chunk_scan_bwd_db_operands,
 )
 from .dc import (
     chunk_scan_bwd_dc_cute,
     chunk_scan_bwd_dc_exact_cute,
+    chunk_scan_bwd_dq_meta_cute,
     chunk_scan_bwd_dc_packed_cute,
     prepare_chunk_scan_bwd_dc_operands,
 )
@@ -28,6 +30,7 @@ from .du import (
 from .dz0 import chunk_scan_bwd_dz0_cute, chunk_scan_bwd_dz0_packed_cute
 from .param_scan import (
     chunk_scan_bwd_dlogprefix_exact_cute,
+    chunk_scan_bwd_phase_scan_from_meta_cute,
     chunk_scan_bwd_param_cute,
     chunk_scan_bwd_param_packed_cute,
     chunk_scan_bwd_param_scan_cute,
@@ -219,6 +222,7 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         n_heads=ctx.n_heads,
         T=ctx.T,
     )
+    d_phase_q, d_logprefix_q = chunk_scan_bwd_dq_meta_cute(Q, dQ, phase)
     dC = chunk_scan_bwd_dc_exact_cute(
         dQ,
         phase,
@@ -237,9 +241,11 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         n_heads=ctx.n_heads,
         reverse_time=True,
     )
-    dB, dB_prev, dK = chunk_scan_bwd_db_exact_cute(
+    dB, dB_prev, dK, d_phase_k, d_logprefix_k = chunk_scan_bwd_db_exact_with_meta_cute(
         dK_prev_packed_rev,
         dK_curr_packed_rev,
+        Kprev.squeeze(2).contiguous(),
+        Kcurr.squeeze(2).contiguous(),
         phase,
         K_raw,
         B_raw,
@@ -249,24 +255,14 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         T=ctx.T,
         reverse_time=True,
     )
-    dM = chunk_scan_bwd_param_scan_packed_cute(
-        Q,
-        Kprev,
-        Vprev,
-        Kcurr,
-        Vcurr,
-        logprefix_half,
-        ctx.Z0,
+    dM = chunk_scan_bwd_phase_scan_from_meta_cute(
         M_raw,
-        d_out_flat,
-        dQ,
-        dK_prev_packed_rev,
-        dK_curr_packed_rev,
         phase,
+        (d_phase_q + d_phase_k).contiguous(),
+        (d_logprefix_q + d_logprefix_k).contiguous(),
         batch_size=ctx.batch_size,
         n_heads=ctx.n_heads,
         T_pad=ctx.T_pad,
-        dK_reverse_time=True,
     )
     return dU, dM[:, :, : ctx.T, :].contiguous(), dK, dB, dC, d_chunk_starts, dB_prev, dU_prev
 

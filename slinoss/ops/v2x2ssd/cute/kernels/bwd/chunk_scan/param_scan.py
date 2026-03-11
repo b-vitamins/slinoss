@@ -682,6 +682,60 @@ def _get_compiled_phase_scan(
     _COMPILED_PHASE_SCAN[key] = compiled
     return compiled
 
+
+def chunk_scan_bwd_phase_scan_from_meta_cute(
+    M_raw: torch.Tensor,
+    phase_real: torch.Tensor,
+    d_phase: torch.Tensor,
+    d_logprefix_half: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+    T_pad: int,
+) -> torch.Tensor:
+    """Map precomputed metadata partials onto public ``dM`` with the reverse scan."""
+    tensors = (
+        ("M_raw", M_raw),
+        ("phase_real", phase_real),
+        ("d_phase", d_phase),
+        ("d_logprefix_half", d_logprefix_half),
+    )
+    if any(t.device.type != "cuda" for _name, t in tensors):
+        raise ValueError("phase scan requires CUDA tensors.")
+    if any(not t.is_contiguous() for _name, t in tensors):
+        raise ValueError("phase scan expects contiguous tensors.")
+    if any(t.dtype != torch.float32 for _name, t in tensors):
+        raise ValueError("phase scan expects float32 tensors.")
+    if M_raw.shape != phase_real.shape or M_raw.shape != d_phase.shape:
+        raise ValueError("M_raw, phase_real, and d_phase must share shape.")
+    if M_raw.shape[-1] != 2:
+        raise ValueError("M_raw/phase_real/d_phase must be (BHC, L, 2).")
+    if d_logprefix_half.shape != M_raw.shape[:2]:
+        raise ValueError("d_logprefix_half must be (BHC, L).")
+
+    BHC, L, _ = map(int, M_raw.shape)
+    BH = int(batch_size) * int(n_heads)
+    if BH <= 0 or BHC % BH != 0:
+        raise ValueError(
+            f"M_raw leading dim BHC={BHC} is not divisible by batch*heads={BH}."
+        )
+    n_chunks = BHC // BH
+    if int(T_pad) != n_chunks * L:
+        raise ValueError(
+            f"T_pad={T_pad} is inconsistent with packed shape {(BHC, L)} and batch*heads={BH}."
+        )
+
+    dM = torch.empty_like(M_raw)
+    compiled_scan = _get_compiled_phase_scan(M_raw, d_logprefix_half, dM)
+    compiled_scan(
+        from_dlpack(M_raw, assumed_align=M_raw.element_size()),
+        from_dlpack(phase_real, assumed_align=phase_real.element_size()),
+        from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(d_logprefix_half, assumed_align=d_logprefix_half.element_size()),
+        from_dlpack(dM, assumed_align=dM.element_size()),
+    )
+    return dM.reshape(batch_size, n_heads, T_pad, 2).to(dtype=torch.float32).contiguous()
+
 def _dlogprefix_half_packed(
     score_prev: torch.Tensor,
     score_curr: torch.Tensor,
@@ -984,6 +1038,7 @@ chunk_scan_bwd_param_cute = chunk_scan_bwd_param_scan_cute
 
 __all__ = [
     "chunk_scan_bwd_dlogprefix_exact_cute",
+    "chunk_scan_bwd_phase_scan_from_meta_cute",
     "chunk_scan_bwd_param_scan_cute",
     "chunk_scan_bwd_param_scan_packed_cute",
     "chunk_scan_bwd_param_cute",

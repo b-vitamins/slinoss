@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
 import torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -75,17 +76,41 @@ _CompiledRawKey = tuple[
     tuple[int, int, int, int],
     tuple[int, int, int],
 ]
-_CompiledScatterKey = tuple[int, bool, tuple[int, int, int], tuple[int, int, int]]
-_CompiledReduceKey = tuple[
+_CompiledPairRawKey = tuple[
     int,
-    bool,
-    tuple[int, int, int],
+    torch.dtype,
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
     tuple[int, int],
     tuple[int, int, int, int],
 ]
+_CompiledScatterKey = tuple[int, bool, tuple[int, int, int], tuple[int, int, int]]
+_CompiledFusedKey = tuple[
+    int,
+    bool,
+    torch.dtype,
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+]
+_CompiledReduceKey = tuple[
+    int,
+    bool,
+    torch.dtype,
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int],
+]
 _COMPILED_DB_RAW: dict[_CompiledRawKey, object] = {}
+_COMPILED_DB_RAW_PAIR: dict[_CompiledPairRawKey, object] = {}
 _COMPILED_DB_SCATTER: dict[_CompiledScatterKey, object] = {}
+_COMPILED_DB_EXACT_FUSED: dict[_CompiledFusedKey, object] = {}
 _COMPILED_DK_REDUCE: dict[_CompiledReduceKey, object] = {}
+
+
+LOG2_E = 1.4426950408889634
 
 
 class _ChunkScanBwdDBExactScatter:
@@ -297,6 +322,523 @@ def _db_raw_config(
     return 128, L, 128
 
 
+@dataclass(frozen=True)
+class _ChunkScanBwdDBRawPairConfig:
+    D: int
+    P: int
+    L: int
+    tile: int = 32
+    num_threads: int = 128
+
+    def __post_init__(self) -> None:
+        if self.tile != 32:
+            raise ValueError("The current DB raw pair kernel expects tile=32.")
+        if self.L % self.tile != 0:
+            raise ValueError("L must be divisible by 32.")
+        if self.num_threads != 128:
+            raise ValueError("The current DB raw pair kernel expects 128 threads.")
+
+    @property
+    def D_padded(self) -> int:
+        return ((self.D + 31) // 32) * 32
+
+    @property
+    def P_padded(self) -> int:
+        return ((self.P + 31) // 32) * 32
+
+
+class _ChunkScanBwdDBRawPairAmpereTc:
+    """Ampere tensor-core kernel for packed ``dKprev`` and ``dKcurr`` together."""
+
+    def __init__(self, dtype: type[cutlass.Numeric], cfg: _ChunkScanBwdDBRawPairConfig):
+        self.cfg = cfg
+        self.ab_dtype = dtype
+        self.acc_dtype = cutlass.Float32
+        self.mma_inst_shape = (16, 8, 16)
+        self.warp_layout_mnk = (2, 2, 1)
+
+    def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
+        acc_layout_col_major = cute.make_layout(acc.layout.shape)
+        acc_layout_mn = cute.make_layout(
+            (
+                (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),
+                (acc_layout_col_major.shape[0][0], acc_layout_col_major.shape[2]),
+            ),
+            stride=(
+                (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),
+                (acc_layout_col_major.stride[0][0], acc_layout_col_major.stride[2]),
+            ),
+        )
+        return cute.make_tensor(
+            acc.iterator,
+            cute.composition(acc.layout, acc_layout_mn),
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        mQueryPrev: cute.Tensor,
+        mQueryCurr: cute.Tensor,
+        mKey: cute.Tensor,
+        mValue: cute.Tensor,
+        mLogprefix: cute.Tensor,
+        mOutPrev: cute.Tensor,
+        mOutCurr: cute.Tensor,
+    ) -> None:
+        if cutlass.const_expr(
+            not (
+                mQueryPrev.element_type
+                == mQueryCurr.element_type
+                == mKey.element_type
+                == mValue.element_type
+                == self.ab_dtype
+            )
+        ):
+            raise TypeError("DB raw pair inputs must share the tensor-core transport dtype.")
+        if cutlass.const_expr(
+            not (
+                self.ab_dtype == cutlass.Float16 or self.ab_dtype == cutlass.BFloat16
+            )
+        ):
+            raise TypeError("DB raw pair kernel supports only Float16/BFloat16 inputs.")
+        if cutlass.const_expr(
+            mLogprefix.element_type != cutlass.Float32
+            or mOutPrev.element_type != cutlass.Float32
+            or mOutCurr.element_type != cutlass.Float32
+        ):
+            raise TypeError("logprefix and outputs must be Float32.")
+        if cutlass.const_expr(
+            mQueryPrev.shape != mQueryCurr.shape
+            or mQueryPrev.shape[:3] != mKey.shape[:3]
+            or mQueryPrev.shape[0] != mValue.shape[0]
+            or mQueryPrev.shape[1] != mValue.shape[1]
+            or mQueryPrev.shape[2] != mValue.shape[2]
+            or mOutPrev.shape != mOutCurr.shape
+        ):
+            raise ValueError("DB raw pair tensors must share packed leading shapes.")
+        if cutlass.const_expr(
+            mQueryPrev.shape[2] != 1
+            or mKey.shape[2] != 1
+            or mValue.shape[2] != 1
+            or mOutPrev.shape[2] != 1
+            or mOutCurr.shape[2] != 1
+        ):
+            raise ValueError("Packed DB raw pair tensors must have singleton dim2.")
+
+        Pp = self.cfg.P_padded
+        d_tile = self.cfg.tile
+        n = self.cfg.tile
+        m = self.cfg.tile
+
+        smem_k_block_size_P = 64 if Pp % 64 == 0 else 32
+        swizzle_bits_P = 3 if smem_k_block_size_P == 64 else 2
+        sP_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_P, 3, 3),
+            0,
+            cute.make_layout((8, smem_k_block_size_P), stride=(smem_k_block_size_P, 1)),
+        )
+        sQ_layout = cute.tile_to_shape(sP_layout_atom, (m, Pp), (0, 1))
+        sK_layout = cute.tile_to_shape(sP_layout_atom, (n, Pp), (0, 1))
+
+        smem_k_block_size_D = 64 if self.cfg.D_padded % 64 == 0 else 32
+        swizzle_bits_D = 3 if smem_k_block_size_D == 64 else 2
+        sD_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_D, 3, 3),
+            0,
+            cute.make_layout((8, smem_k_block_size_D), stride=(smem_k_block_size_D, 1)),
+        )
+        sV_layout = cute.tile_to_shape(sD_layout_atom, (n, d_tile), (0, 1))
+
+        sBlk_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(3, 3, 3),
+            0,
+            cute.make_layout((8, n), stride=(n, 1)),
+        )
+        sS_layout = cute.tile_to_shape(sBlk_layout_atom, (m, n), (0, 1))
+        sRowLP_layout = cute.make_layout((m,), stride=(1,))
+        sColLP_layout = cute.make_layout((n,), stride=(1,))
+
+        universal_copy_bits = 128
+        async_elems_in = universal_copy_bits // mQueryPrev.element_type.width
+        atom_async_copy_in = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            mQueryPrev.element_type,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        tP_shape_dim_1 = sP_layout_atom.outer.shape[1] // async_elems_in
+        tP_layout = cute.make_layout(
+            (self.cfg.num_threads // tP_shape_dim_1, tP_shape_dim_1),
+            stride=(tP_shape_dim_1, 1),
+        )
+        tD_shape_dim_1 = sD_layout_atom.outer.shape[1] // async_elems_in
+        tD_layout = cute.make_layout(
+            (self.cfg.num_threads // tD_shape_dim_1, tD_shape_dim_1),
+            stride=(tD_shape_dim_1, 1),
+        )
+        v_in_layout = cute.make_layout((1, async_elems_in))
+        gmem_tiled_copy_P = cute.make_tiled_copy_tv(
+            atom_async_copy_in, tP_layout, v_in_layout
+        )
+        gmem_tiled_copy_D = cute.make_tiled_copy_tv(
+            atom_async_copy_in, tD_layout, v_in_layout
+        )
+
+        op = cute.nvgpu.warp.MmaF16BF16Op(
+            self.ab_dtype, self.acc_dtype, self.mma_inst_shape
+        )
+        perm = (
+            self.warp_layout_mnk[0] * self.mma_inst_shape[0],
+            self.warp_layout_mnk[1] * self.mma_inst_shape[1] * 2,
+            self.warp_layout_mnk[2] * self.mma_inst_shape[2],
+        )
+        tiled_mma = cute.make_tiled_mma(
+            op,
+            cute.make_layout(self.warp_layout_mnk),
+            permutation_mnk=perm,
+        )
+
+        smem_size = 0
+        smem_size += cute.size_in_bytes(self.ab_dtype, sQ_layout)
+        smem_size += cute.size_in_bytes(self.ab_dtype, sQ_layout)
+        smem_size += cute.size_in_bytes(self.ab_dtype, sK_layout)
+        smem_size += cute.size_in_bytes(self.ab_dtype, sV_layout)
+        smem_size += cute.size_in_bytes(self.ab_dtype, sS_layout)
+        smem_size += cute.size_in_bytes(cutlass.Float32, sRowLP_layout)
+        smem_size += cute.size_in_bytes(cutlass.Float32, sColLP_layout)
+        smem_size += 512
+
+        grid_x = cute.ceil_div(mOutPrev.shape[3], d_tile)
+        grid_y = cute.ceil_div(mOutPrev.shape[1], m)
+        grid_z = cute.size(mOutPrev.shape[0])
+        self.kernel(
+            mQueryPrev,
+            mQueryCurr,
+            mKey,
+            mValue,
+            mLogprefix,
+            mOutPrev,
+            mOutCurr,
+            sQ_layout,
+            sK_layout,
+            sV_layout,
+            sS_layout,
+            sRowLP_layout,
+            sColLP_layout,
+            gmem_tiled_copy_P,
+            gmem_tiled_copy_D,
+            tiled_mma,
+        ).launch(
+            grid=(grid_x, grid_y, grid_z),
+            block=[self.cfg.num_threads, 1, 1],
+            smem=smem_size,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQueryPrev: cute.Tensor,
+        mQueryCurr: cute.Tensor,
+        mKey: cute.Tensor,
+        mValue: cute.Tensor,
+        mLogprefix: cute.Tensor,
+        mOutPrev: cute.Tensor,
+        mOutCurr: cute.Tensor,
+        sQ_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
+        sS_layout: cute.ComposedLayout,
+        sRowLP_layout: cute.Layout,
+        sColLP_layout: cute.Layout,
+        gmem_tiled_copy_P: cute.TiledCopy,
+        gmem_tiled_copy_D: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        d_block, m_block, bhc = cute.arch.block_idx()
+        d_tile = self.cfg.tile
+        n = self.cfg.tile
+        m = self.cfg.tile
+
+        smem = utils.SmemAllocator()
+        sQPrev = smem.allocate_tensor(self.ab_dtype, sQ_layout, 16)
+        sQCurr = smem.allocate_tensor(self.ab_dtype, sQ_layout, 16)
+        sK = smem.allocate_tensor(self.ab_dtype, sK_layout, 16)
+        sV = smem.allocate_tensor(self.ab_dtype, sV_layout, 16)
+        sS = smem.allocate_tensor(self.ab_dtype, sS_layout, 16)
+        s_row_lp = smem.allocate_tensor(cutlass.Float32, sRowLP_layout, 4)
+        s_col_lp = smem.allocate_tensor(cutlass.Float32, sColLP_layout, 4)
+
+        g_thr_P = gmem_tiled_copy_P.get_slice(tidx)
+        g_thr_D = gmem_tiled_copy_D.get_slice(tidx)
+
+        thr_mma = tiled_mma.get_slice(tidx)
+        tSrQPrev = thr_mma.make_fragment_A(thr_mma.partition_A(sQPrev))
+        tSrQCurr = thr_mma.make_fragment_A(thr_mma.partition_A(sQCurr))
+        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
+        sVt = cute.composition(sV, cute.make_layout((d_tile, n), stride=(n, 1)))
+        tSrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
+        acc_shape_S = thr_mma.partition_shape_C((m, n))
+        acc_shape_D = thr_mma.partition_shape_C((m, d_tile))
+        acc_prev = cute.make_rmem_tensor(acc_shape_D, cutlass.Float32)
+        acc_prev.fill(0.0)
+        acc_curr = cute.make_rmem_tensor(acc_shape_D, cutlass.Float32)
+        acc_curr.fill(0.0)
+
+        smem_copy_atom_A = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            self.ab_dtype,
+        )
+        smem_copy_atom_B = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            self.ab_dtype,
+        )
+        smem_copy_atom_BT = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            self.ab_dtype,
+        )
+        smem_tiled_copy_A = cute.make_tiled_copy_A(smem_copy_atom_A, tiled_mma)
+        smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_B, tiled_mma)
+        smem_tiled_copy_BT = cute.make_tiled_copy_B(smem_copy_atom_BT, tiled_mma)
+        thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
+        thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
+        thr_copy_BT = smem_tiled_copy_BT.get_slice(tidx)
+        tSsQPrev = thr_copy_A.partition_S(sQPrev)
+        tSrQPrev_view = thr_copy_A.retile(tSrQPrev)
+        tSsQCurr = thr_copy_A.partition_S(sQCurr)
+        tSrQCurr_view = thr_copy_A.retile(tSrQCurr)
+        tSrS = thr_mma.make_fragment_A(thr_mma.partition_A(sS))
+        tSsS = thr_copy_A.partition_S(sS)
+        tSrS_view = thr_copy_A.retile(tSrS)
+        tSsK = thr_copy_B.partition_S(sK)
+        tSrK_view = thr_copy_B.retile(tSrK)
+        tSsVt = thr_copy_BT.partition_S(sVt)
+        tSrVt_view = thr_copy_BT.retile(tSrVt)
+
+        def _copy_query(gsrc: cute.Tensor, sdst: cute.Tensor, tSsQ, tSrQ_view) -> None:
+            gQ = cute.local_tile(gsrc[bhc, None, 0, None], (m, self.cfg.P_padded), (m_block, 0))
+            tQg = g_thr_P.partition_S(gQ)
+            tQs = g_thr_P.partition_D(sdst)
+            mcQ = cute.make_identity_tensor(gsrc.layout.shape)
+            cQ = cute.local_tile(mcQ[bhc, None, 0, None], (m, self.cfg.P_padded), (m_block, 0))
+            tQc = g_thr_P.partition_S(cQ)
+            tQp = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (tQs.shape[0][1], cute.size(tQs, mode=[1]), cute.size(tQs, mode=[2])),
+                    stride=(cute.size(tQs, mode=[2]), 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tQp.shape[0]):
+                for vi in cutlass.range_constexpr(tQp.shape[1]):
+                    for rest_k in cutlass.range_constexpr(tQp.shape[2]):
+                        coord = tQc[(0, rest_v), vi, rest_k]
+                        tQp[rest_v, vi, rest_k] = cute.elem_less(
+                            coord[1], gsrc.shape[1]
+                        ) and cute.elem_less(coord[3], gsrc.shape[3])
+            for vi in cutlass.range_constexpr(cute.size(tQs.shape[1])):
+                cute.copy(
+                    gmem_tiled_copy_P,
+                    tQg[None, vi, None],
+                    tQs[None, vi, None],
+                    pred=tQp[None, vi, None],
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            cute.copy(smem_tiled_copy_A, tSsQ[None, None, 0], tSrQ_view[None, None, 0])
+            for kk in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
+                kk_next = (kk + 1) % cute.size(tSsQ.shape[2])
+                cute.copy(
+                    smem_tiled_copy_A,
+                    tSsQ[None, None, kk_next],
+                    tSrQ_view[None, None, kk_next],
+                )
+
+        _copy_query(mQueryPrev, sQPrev, tSsQPrev, tSrQPrev_view)
+        _copy_query(mQueryCurr, sQCurr, tSsQCurr, tSrQCurr_view)
+
+        if tidx < cutlass.Int32(m):
+            row = m_block * m + tidx
+            s_row_lp[tidx] = cutlass.select_(
+                cute.elem_less(row, mLogprefix.shape[1]),
+                cutlass.Float32(mLogprefix[bhc, row]),
+                cutlass.Float32(0.0),
+            )
+
+        acc_prev_mn = self._make_acc_tensor_mn_view(acc_prev)
+        acc_curr_mn = self._make_acc_tensor_mn_view(acc_curr)
+
+        for n_block in range(0, m_block + 1):
+            if tidx < cutlass.Int32(n):
+                col = n_block * n + tidx
+                s_col_lp[tidx] = cutlass.select_(
+                    cute.elem_less(col, mLogprefix.shape[1]),
+                    cutlass.Float32(mLogprefix[bhc, col]),
+                    cutlass.Float32(0.0),
+                )
+
+            gK = cute.local_tile(mKey[bhc, None, 0, None], (n, self.cfg.P_padded), (n_block, 0))
+            tKg = g_thr_P.partition_S(gK)
+            tKs = g_thr_P.partition_D(sK)
+            mcK = cute.make_identity_tensor(mKey.layout.shape)
+            cK = cute.local_tile(mcK[bhc, None, 0, None], (n, self.cfg.P_padded), (n_block, 0))
+            tKc = g_thr_P.partition_S(cK)
+            tKp = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (
+                        tKs.shape[0][1],
+                        cute.size(tKs, mode=[1]),
+                        cute.size(tKs, mode=[2]),
+                    ),
+                    stride=(cute.size(tKs, mode=[2]), 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tKp.shape[0]):
+                for vi in cutlass.range_constexpr(tKp.shape[1]):
+                    for rest_k in cutlass.range_constexpr(tKp.shape[2]):
+                        coord = tKc[(0, rest_v), vi, rest_k]
+                        tKp[rest_v, vi, rest_k] = cute.elem_less(
+                            coord[1], mKey.shape[1]
+                        ) and cute.elem_less(coord[3], mKey.shape[3])
+            for vi in cutlass.range_constexpr(cute.size(tKs.shape[1])):
+                cute.copy(
+                    gmem_tiled_copy_P,
+                    tKg[None, vi, None],
+                    tKs[None, vi, None],
+                    pred=tKp[None, vi, None],
+                )
+            cute.arch.cp_async_commit_group()
+
+            gV = cute.local_tile(mValue[bhc, None, 0, None], (n, d_tile), (n_block, d_block))
+            tVg = g_thr_D.partition_S(gV)
+            tVs = g_thr_D.partition_D(sV)
+            mcV = cute.make_identity_tensor(mValue.layout.shape)
+            cV = cute.local_tile(mcV[bhc, None, 0, None], (n, d_tile), (n_block, d_block))
+            tVc = g_thr_D.partition_S(cV)
+            tVp = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (
+                        tVs.shape[0][1],
+                        cute.size(tVs, mode=[1]),
+                        cute.size(tVs, mode=[2]),
+                    ),
+                    stride=(cute.size(tVs, mode=[2]), 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tVp.shape[0]):
+                for vi in cutlass.range_constexpr(tVp.shape[1]):
+                    for rest_k in cutlass.range_constexpr(tVp.shape[2]):
+                        coord = tVc[(0, rest_v), vi, rest_k]
+                        tVp[rest_v, vi, rest_k] = cute.elem_less(
+                            coord[1], mValue.shape[1]
+                        ) and cute.elem_less(coord[3], mValue.shape[3])
+            for vi in cutlass.range_constexpr(cute.size(tVs.shape[1])):
+                cute.copy(
+                    gmem_tiled_copy_D,
+                    tVg[None, vi, None],
+                    tVs[None, vi, None],
+                    pred=tVp[None, vi, None],
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            cute.copy(smem_tiled_copy_B, tSsK[None, None, 0], tSrK_view[None, None, 0])
+            for kk in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
+                kk_next = (kk + 1) % cute.size(tSsK.shape[2])
+                cute.copy(
+                    smem_tiled_copy_B,
+                    tSsK[None, None, kk_next],
+                    tSrK_view[None, None, kk_next],
+                )
+
+            for q_frag, acc_out in ((tSrQPrev, acc_prev), (tSrQCurr, acc_curr)):
+                acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
+                acc_S.fill(0.0)
+                for kk in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
+                    cute.gemm(
+                        tiled_mma,
+                        acc_S,
+                        q_frag[None, None, kk],
+                        tSrK[None, None, kk],
+                        acc_S,
+                    )
+
+                mcS = cute.make_identity_tensor(
+                    (mQueryPrev.shape[0], mQueryPrev.shape[1], mQueryPrev.shape[2], mKey.shape[1])
+                )
+                cS = cute.local_tile(mcS[bhc, None, 0, None], (m, n), (m_block, n_block))
+                tScS = thr_mma.partition_C(cS)
+                tScS_mn = self._make_acc_tensor_mn_view(tScS)
+                acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
+                for r in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
+                    row_idx = cutlass.Int32(tScS_mn[r, 0][1])
+                    for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
+                        col_idx = cutlass.Int32(tScS_mn[0, c][3])
+                        if cute.elem_less(row_idx + 1, col_idx + 1) or cute.elem_less(
+                            mKey.shape[1], col_idx + 1
+                        ):
+                            acc_S_mn[r, c] = cutlass.Float32(0.0)
+                        else:
+                            row_lp = cutlass.Float32(s_row_lp[row_idx - m_block * m])
+                            col_lp = cutlass.Float32(s_col_lp[col_idx - n_block * n])
+                            acc_S_mn[r, c] = acc_S_mn[r, c] * cute.math.exp2(
+                                (row_lp - col_lp) * cutlass.Float32(LOG2_E)
+                            )
+                        s_row = row_idx - m_block * m
+                        s_col = col_idx - n_block * n
+                        if cute.elem_less(s_row, m) and cute.elem_less(s_col, n):
+                            sS[s_row, s_col] = acc_S_mn[r, c].to(self.ab_dtype)
+
+                cute.arch.barrier()
+                cute.copy(smem_tiled_copy_A, tSsS[None, None, 0], tSrS_view[None, None, 0])
+                cute.copy(
+                    smem_tiled_copy_BT,
+                    tSsVt[None, None, 0],
+                    tSrVt_view[None, None, 0],
+                )
+                for kk in cutlass.range_constexpr(cute.size(tSrS.shape[2])):
+                    kk_next = (kk + 1) % cute.size(tSrS.shape[2])
+                    cute.copy(
+                        smem_tiled_copy_A,
+                        tSsS[None, None, kk_next],
+                        tSrS_view[None, None, kk_next],
+                    )
+                    cute.copy(
+                        smem_tiled_copy_BT,
+                        tSsVt[None, None, kk_next],
+                        tSrVt_view[None, None, kk_next],
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        acc_out,
+                        tSrS[None, None, kk],
+                        tSrVt[None, None, kk],
+                        acc_out,
+                    )
+                cute.arch.barrier()
+
+        mcOut = cute.make_identity_tensor(mOutPrev.layout.shape)
+        cOut = cute.local_tile(
+            mcOut[bhc, None, 0, None], (m, d_tile), (m_block, d_block)
+        )
+        tOcOut = thr_mma.partition_C(cOut)
+        tOcOut_mn = self._make_acc_tensor_mn_view(tOcOut)
+        for r in cutlass.range_constexpr(cute.size(acc_prev_mn.shape[0])):
+            for c in cutlass.range_constexpr(cute.size(acc_prev_mn.shape[1])):
+                row_idx = cutlass.Int32(tOcOut_mn[r, c][1])
+                col_idx = cutlass.Int32(tOcOut_mn[r, c][3])
+                if cute.elem_less(row_idx, mOutPrev.shape[1]) and cute.elem_less(
+                    col_idx, mOutPrev.shape[3]
+                ):
+                    mOutPrev[bhc, row_idx, 0, col_idx] = acc_prev_mn[r, c]
+                    mOutCurr[bhc, row_idx, 0, col_idx] = acc_curr_mn[r, c]
+
+
 def _get_compiled_db_raw(
     Q: torch.Tensor,
     Kprev: torch.Tensor,
@@ -350,6 +892,68 @@ def _get_compiled_db_raw(
     return compiled
 
 
+def _compiled_db_raw_pair_key(
+    query_prev: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    logprefix: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    device_index: int,
+) -> _CompiledPairRawKey:
+    return (
+        device_index,
+        query_prev.dtype,
+        tuple(int(x) for x in query_prev.shape),
+        tuple(int(x) for x in key.shape),
+        tuple(int(x) for x in logprefix.shape),
+        tuple(int(x) for x in out.shape),
+    )
+
+
+def _get_compiled_db_raw_pair(
+    query_prev: torch.Tensor,
+    query_curr: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    logprefix: torch.Tensor,
+    out_prev: torch.Tensor,
+    out_curr: torch.Tensor,
+) -> object:
+    device_index = 0 if query_prev.device.index is None else int(query_prev.device.index)
+    key_cache = _compiled_db_raw_pair_key(
+        query_prev,
+        key,
+        value,
+        logprefix,
+        out_prev,
+        device_index=device_index,
+    )
+    compiled = _COMPILED_DB_RAW_PAIR.get(key_cache)
+    if compiled is not None:
+        return compiled
+
+    _, L, _, D = map(int, value.shape)
+    P = int(query_prev.shape[-1])
+    cfg = _ChunkScanBwdDBRawPairConfig(D=D, P=P, L=L)
+    cutlass_dtype = (
+        cutlass.Float16 if query_prev.dtype == torch.float16 else cutlass.BFloat16
+    )
+    kernel = _ChunkScanBwdDBRawPairAmpereTc(cutlass_dtype, cfg)
+    compiled = cute.compile(
+        kernel,
+        from_dlpack(query_prev, assumed_align=16),
+        from_dlpack(query_curr, assumed_align=16),
+        from_dlpack(key, assumed_align=16),
+        from_dlpack(value, assumed_align=16),
+        from_dlpack(logprefix, assumed_align=logprefix.element_size()),
+        from_dlpack(out_prev, assumed_align=16),
+        from_dlpack(out_curr, assumed_align=16),
+    )
+    _COMPILED_DB_RAW_PAIR[key_cache] = compiled
+    return compiled
+
+
 class _ChunkScanBwdDKExactReduce:
     """Warp reduction from exact packed intermediates into public tap gradients."""
 
@@ -364,38 +968,67 @@ class _ChunkScanBwdDKExactReduce:
         self,
         mDKPrev: cute.Tensor,
         mDKCurr: cute.Tensor,
+        mKPrev: cute.Tensor,
+        mKCurr: cute.Tensor,
         mPhase: cute.Tensor,
         mBRaw: cute.Tensor,
         mBHead: cute.Tensor,
         mDKPad: cute.Tensor,
+        mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
         n_chunks: cutlass.Int32,
     ) -> None:
         if cutlass.const_expr(
             not (
                 mDKPrev.element_type
                 == mDKCurr.element_type
-                == mPhase.element_type
-                == mBRaw.element_type
-                == mBHead.element_type
                 == mDKPad.element_type
                 == cutlass.Float32
             )
         ):
-            raise TypeError("Exact dK reduction expects Float32 tensors.")
+            raise TypeError("Exact dK reduction expects fp32 dK, outputs, and raw tensors.")
+        if cutlass.const_expr(mPhase.element_type != cutlass.Float32):
+            raise TypeError("phase must be Float32.")
+        if cutlass.const_expr(
+            mBRaw.element_type != cutlass.Float32
+            or mBHead.element_type != cutlass.Float32
+        ):
+            raise TypeError("B_raw and B_head must be Float32.")
+        if cutlass.const_expr(mKPrev.element_type != mKCurr.element_type):
+            raise TypeError("Kprev and Kcurr must share dtype.")
         if cutlass.const_expr(mDKPrev.shape != mDKCurr.shape or mDKPrev.shape != mBRaw.shape):
             raise ValueError("dKprev, dKcurr, and B_raw must share shape.")
+        if cutlass.const_expr(mKPrev.shape != mDKPrev.shape or mKCurr.shape != mDKPrev.shape):
+            raise ValueError("Kprev/Kcurr must match the packed dK shape.")
         if cutlass.const_expr(mPhase.shape != (mDKPrev.shape[0], mDKPrev.shape[1], 2)):
             raise ValueError("phase must be (BHC, L, 2).")
         if cutlass.const_expr(mBHead.shape != (mDKPrev.shape[0], mDKPrev.shape[2])):
             raise ValueError("B_head must be (BHC, D).")
         if cutlass.const_expr(mDKPad.shape[2] != 4):
             raise ValueError("dK pad must store 4 packed tap scalars.")
+        if cutlass.const_expr(mDPhase.shape != mPhase.shape):
+            raise ValueError("d_phase must match phase.")
+        if cutlass.const_expr(mDLogprefixHalf.shape != mDKPrev.shape[:2]):
+            raise ValueError("d_logprefix_half must be (BHC, L).")
 
         BHC = cute.size(mDKPrev.shape[0])
         L = cute.size(mDKPrev.shape[1])
         total_items = BHC * L
         warps_per_block = self.num_threads // 32
-        self.kernel(mDKPrev, mDKCurr, mPhase, mBRaw, mBHead, mDKPad, n_chunks, total_items).launch(
+        self.kernel(
+            mDKPrev,
+            mDKCurr,
+            mKPrev,
+            mKCurr,
+            mPhase,
+            mBRaw,
+            mBHead,
+            mDKPad,
+            mDPhase,
+            mDLogprefixHalf,
+            n_chunks,
+            total_items,
+        ).launch(
             grid=[cute.ceil_div(total_items, warps_per_block), 1, 1],
             block=[self.num_threads, 1, 1],
         )
@@ -405,10 +1038,14 @@ class _ChunkScanBwdDKExactReduce:
         self,
         mDKPrev: cute.Tensor,
         mDKCurr: cute.Tensor,
+        mKPrev: cute.Tensor,
+        mKCurr: cute.Tensor,
         mPhase: cute.Tensor,
         mBRaw: cute.Tensor,
         mBHead: cute.Tensor,
         mDKPad: cute.Tensor,
+        mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
         n_chunks: cutlass.Int32,
         total_items: cutlass.Int32,
     ) -> None:
@@ -439,6 +1076,10 @@ class _ChunkScanBwdDKExactReduce:
         acc_prev_im = cutlass.Float32(0.0)
         acc_curr_re = cutlass.Float32(0.0)
         acc_curr_im = cutlass.Float32(0.0)
+        acc_phase_re = cutlass.Float32(0.0)
+        acc_phase_im = cutlass.Float32(0.0)
+        acc_kp = cutlass.Float32(0.0)
+        acc_kc = cutlass.Float32(0.0)
 
         n = lane
         while n < N:
@@ -447,6 +1088,14 @@ class _ChunkScanBwdDKExactReduce:
             dkp_im = cutlass.Float32(mDKPrev[bhc, src_row, col + 1])
             dkc_re = cutlass.Float32(mDKCurr[bhc, src_row, col + 0])
             dkc_im = cutlass.Float32(mDKCurr[bhc, src_row, col + 1])
+            kpr = cutlass.Float32(mKPrev[bhc, row, col + 0])
+            kpi = cutlass.Float32(mKPrev[bhc, row, col + 1])
+            kcr = cutlass.Float32(mKCurr[bhc, row, col + 0])
+            kci = cutlass.Float32(mKCurr[bhc, row, col + 1])
+            kpbr = kpr * pr + kpi * pi
+            kpbi = kpi * pr - kpr * pi
+            kcbr = kcr * pr + kci * pi
+            kcbi = kci * pr - kcr * pi
             dbp_re = pr * dkp_re + pi * dkp_im
             dbp_im = pi * dkp_re - pr * dkp_im
             dbc_re = pr * dkc_re + pi * dkc_im
@@ -467,6 +1116,12 @@ class _ChunkScanBwdDKExactReduce:
             acc_prev_im += bpr * dbp_im - bpi * dbp_re
             acc_curr_re += bcr * dbc_re + bci * dbc_im
             acc_curr_im += bcr * dbc_im - bci * dbc_re
+            acc_phase_re += dkp_re * kpbr + dkp_im * kpbi
+            acc_phase_im += -dkp_re * kpbi + dkp_im * kpbr
+            acc_phase_re += dkc_re * kcbr + dkc_im * kcbi
+            acc_phase_im += -dkc_re * kcbi + dkc_im * kcbr
+            acc_kp += dkp_re * kpr + dkp_im * kpi
+            acc_kc += dkc_re * kcr + dkc_im * kci
             n += 32
 
         for offset in (16, 8, 4, 2, 1):
@@ -474,12 +1129,273 @@ class _ChunkScanBwdDKExactReduce:
             acc_prev_im += cute.arch.shuffle_sync_bfly(acc_prev_im, offset=offset, mask=-1, mask_and_clamp=31)
             acc_curr_re += cute.arch.shuffle_sync_bfly(acc_curr_re, offset=offset, mask=-1, mask_and_clamp=31)
             acc_curr_im += cute.arch.shuffle_sync_bfly(acc_curr_im, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_phase_re += cute.arch.shuffle_sync_bfly(acc_phase_re, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_phase_im += cute.arch.shuffle_sync_bfly(acc_phase_im, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_kp += cute.arch.shuffle_sync_bfly(acc_kp, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_kc += cute.arch.shuffle_sync_bfly(acc_kc, offset=offset, mask=-1, mask_and_clamp=31)
 
         if item_valid and lane == 0:
             mDKPad[bh, global_t, 0] = acc_prev_re
             mDKPad[bh, global_t, 1] = acc_prev_im
             mDKPad[bh, global_t, 2] = acc_curr_re
             mDKPad[bh, global_t, 3] = acc_curr_im
+            mDPhase[bhc, row, 0] = acc_phase_re
+            mDPhase[bhc, row, 1] = acc_phase_im
+            mDLogprefixHalf[bhc, row] = -cutlass.Float32(2.0) * (acc_kp + acc_kc)
+
+
+class _ChunkScanBwdDBExactFused:
+    """Single exact fp32 pass for public ``dB/dB_prev/dK`` and metadata partials."""
+
+    def __init__(self, *, num_threads: int = 128, reverse_time: bool = False) -> None:
+        self.num_threads = int(num_threads)
+        self.reverse_time = bool(reverse_time)
+        if self.num_threads <= 0 or self.num_threads % 32 != 0:
+            raise ValueError("num_threads must be a positive multiple of 32.")
+
+    @cute.jit
+    def __call__(
+        self,
+        mDKPrev: cute.Tensor,
+        mDKCurr: cute.Tensor,
+        mKPrev: cute.Tensor,
+        mKCurr: cute.Tensor,
+        mPhase: cute.Tensor,
+        mKRaw: cute.Tensor,
+        mBRaw: cute.Tensor,
+        mBHead: cute.Tensor,
+        mDBPad: cute.Tensor,
+        mDBPrev: cute.Tensor,
+        mDKPad: cute.Tensor,
+        mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
+        n_chunks: cutlass.Int32,
+    ) -> None:
+        if cutlass.const_expr(
+            not (
+                mDKPrev.element_type
+                == mDKCurr.element_type
+                == mPhase.element_type
+                == mKRaw.element_type
+                == mBRaw.element_type
+                == mBHead.element_type
+                == mDBPad.element_type
+                == mDBPrev.element_type
+                == mDKPad.element_type
+                == mDPhase.element_type
+                == mDLogprefixHalf.element_type
+                == cutlass.Float32
+            )
+        ):
+            raise TypeError("Exact fused db kernel expects Float32 exact tensors.")
+        if cutlass.const_expr(mKPrev.element_type != mKCurr.element_type):
+            raise TypeError("Kprev and Kcurr must share dtype.")
+        if cutlass.const_expr(
+            mDKPrev.shape != mDKCurr.shape
+            or mDKPrev.shape != mKPrev.shape
+            or mDKPrev.shape != mKCurr.shape
+            or mDKPrev.shape != mBRaw.shape
+        ):
+            raise ValueError("dKprev/dKcurr/Kprev/Kcurr/B_raw must share shape.")
+        if cutlass.const_expr(mPhase.shape != (mDKPrev.shape[0], mDKPrev.shape[1], 2)):
+            raise ValueError("phase must be (BHC, L, 2).")
+        if cutlass.const_expr(mKRaw.shape != (mDKPrev.shape[0], mDKPrev.shape[1], 2, 2)):
+            raise ValueError("K_raw must be (BHC, L, 2, 2).")
+        if cutlass.const_expr(mBHead.shape != (mDKPrev.shape[0], mDKPrev.shape[2])):
+            raise ValueError("B_head must be (BHC, D).")
+        if cutlass.const_expr(mDKPad.shape[2] != 4):
+            raise ValueError("dK pad must store 4 packed tap scalars.")
+        if cutlass.const_expr(mDPhase.shape != mPhase.shape):
+            raise ValueError("d_phase must match phase.")
+        if cutlass.const_expr(mDLogprefixHalf.shape != mDKPrev.shape[:2]):
+            raise ValueError("d_logprefix_half must be (BHC, L).")
+
+        L = cute.size(mDKPrev.shape[1])
+        warps_per_block = self.num_threads // 32
+        self.kernel(
+            mDKPrev,
+            mDKCurr,
+            mKPrev,
+            mKCurr,
+            mPhase,
+            mKRaw,
+            mBRaw,
+            mBHead,
+            mDBPad,
+            mDBPrev,
+            mDKPad,
+            mDPhase,
+            mDLogprefixHalf,
+            n_chunks,
+            L,
+        ).launch(
+            grid=[cute.ceil_div(L, warps_per_block), 1, cute.size(mDKPrev.shape[0])],
+            block=[self.num_threads, 1, 1],
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mDKPrev: cute.Tensor,
+        mDKCurr: cute.Tensor,
+        mKPrev: cute.Tensor,
+        mKCurr: cute.Tensor,
+        mPhase: cute.Tensor,
+        mKRaw: cute.Tensor,
+        mBRaw: cute.Tensor,
+        mBHead: cute.Tensor,
+        mDBPad: cute.Tensor,
+        mDBPrev: cute.Tensor,
+        mDKPad: cute.Tensor,
+        mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
+        n_chunks: cutlass.Int32,
+        L: cutlass.Int32,
+    ) -> None:
+        row_tile_idx, _, bhc = cute.arch.block_idx()
+        warp = cute.arch.warp_idx()
+        lane = cute.arch.lane_idx()
+
+        warps_per_block = self.num_threads // 32
+        row = row_tile_idx * warps_per_block + warp
+        row_valid = cute.elem_less(row, L)
+        row_safe = cutlass.min(row, L - cutlass.Int32(1))
+
+        bh = bhc // n_chunks
+        chunk = bhc - bh * n_chunks
+        global_t = chunk * L + row_safe
+        src_row = (
+            (L - cutlass.Int32(1)) - row_safe
+            if cutlass.const_expr(self.reverse_time)
+            else row_safe
+        )
+        N = cute.size(mDKPrev.shape[2]) // 2
+
+        pr = cutlass.Float32(mPhase[bhc, row_safe, 0])
+        pi = cutlass.Float32(mPhase[bhc, row_safe, 1])
+        acc_prev_re = cutlass.Float32(0.0)
+        acc_prev_im = cutlass.Float32(0.0)
+        acc_curr_re = cutlass.Float32(0.0)
+        acc_curr_im = cutlass.Float32(0.0)
+        acc_phase_re = cutlass.Float32(0.0)
+        acc_phase_im = cutlass.Float32(0.0)
+        acc_kp = cutlass.Float32(0.0)
+        acc_kc = cutlass.Float32(0.0)
+
+        n = lane
+        while n < N:
+            col = n * 2
+            dkp_re = cutlass.Float32(mDKPrev[bhc, src_row, col + 0])
+            dkp_im = cutlass.Float32(mDKPrev[bhc, src_row, col + 1])
+            dkc_re = cutlass.Float32(mDKCurr[bhc, src_row, col + 0])
+            dkc_im = cutlass.Float32(mDKCurr[bhc, src_row, col + 1])
+
+            dbp_re = pr * dkp_re + pi * dkp_im
+            dbp_im = pi * dkp_re - pr * dkp_im
+            dbc_re = pr * dkc_re + pi * dkc_im
+            dbc_im = pi * dkc_re - pr * dkc_im
+
+            kpr = cutlass.Float32(mKPrev[bhc, row_safe, col + 0])
+            kpi = cutlass.Float32(mKPrev[bhc, row_safe, col + 1])
+            kcr = cutlass.Float32(mKCurr[bhc, row_safe, col + 0])
+            kci = cutlass.Float32(mKCurr[bhc, row_safe, col + 1])
+            kpbr = kpr * pr + kpi * pi
+            kpbi = kpi * pr - kpr * pi
+            kcbr = kcr * pr + kci * pi
+            kcbi = kci * pr - kcr * pi
+
+            kcr_tap = cutlass.Float32(mKRaw[bhc, row_safe, 1, 0])
+            kci_tap = cutlass.Float32(mKRaw[bhc, row_safe, 1, 1])
+            out_re = kcr_tap * dbc_re + kci_tap * dbc_im
+            out_im = kcr_tap * dbc_im - kci_tap * dbc_re
+
+            next_row = row_safe + 1
+            if cute.elem_less(next_row, L):
+                next_src_row = (
+                    (L - cutlass.Int32(1)) - next_row
+                    if cutlass.const_expr(self.reverse_time)
+                    else next_row
+                )
+                npr = cutlass.Float32(mPhase[bhc, next_row, 0])
+                npi = cutlass.Float32(mPhase[bhc, next_row, 1])
+                ndkp_re = cutlass.Float32(mDKPrev[bhc, next_src_row, col + 0])
+                ndkp_im = cutlass.Float32(mDKPrev[bhc, next_src_row, col + 1])
+                ndbp_re = npr * ndkp_re + npi * ndkp_im
+                ndbp_im = npi * ndkp_re - npr * ndkp_im
+                nkpr = cutlass.Float32(mKRaw[bhc, next_row, 0, 0])
+                nkpi = cutlass.Float32(mKRaw[bhc, next_row, 0, 1])
+                out_re += nkpr * ndbp_re + nkpi * ndbp_im
+                out_im += nkpr * ndbp_im - nkpi * ndbp_re
+            else:
+                next_chunk = chunk + 1
+                if cute.elem_less(next_chunk, n_chunks):
+                    next_bhc = bhc + 1
+                    next_src_row = (
+                        L - cutlass.Int32(1)
+                        if cutlass.const_expr(self.reverse_time)
+                        else cutlass.Int32(0)
+                    )
+                    npr = cutlass.Float32(mPhase[next_bhc, 0, 0])
+                    npi = cutlass.Float32(mPhase[next_bhc, 0, 1])
+                    ndkp_re = cutlass.Float32(mDKPrev[next_bhc, next_src_row, col + 0])
+                    ndkp_im = cutlass.Float32(mDKPrev[next_bhc, next_src_row, col + 1])
+                    ndbp_re = npr * ndkp_re + npi * ndkp_im
+                    ndbp_im = npi * ndkp_re - npr * ndkp_im
+                    nkpr = cutlass.Float32(mKRaw[next_bhc, 0, 0, 0])
+                    nkpi = cutlass.Float32(mKRaw[next_bhc, 0, 0, 1])
+                    out_re += nkpr * ndbp_re + nkpi * ndbp_im
+                    out_im += nkpr * ndbp_im - nkpi * ndbp_re
+
+            if row_valid:
+                mDBPad[bh, global_t, col + 0] = out_re
+                mDBPad[bh, global_t, col + 1] = out_im
+
+            if row_valid and chunk == cutlass.Int32(0) and row_safe == cutlass.Int32(0):
+                kpr0 = cutlass.Float32(mKRaw[bhc, 0, 0, 0])
+                kpi0 = cutlass.Float32(mKRaw[bhc, 0, 0, 1])
+                mDBPrev[bh, col + 0] = kpr0 * dbp_re + kpi0 * dbp_im
+                mDBPrev[bh, col + 1] = kpr0 * dbp_im - kpi0 * dbp_re
+
+            bpr = cutlass.Float32(0.0)
+            bpi = cutlass.Float32(0.0)
+            if row_safe == cutlass.Int32(0):
+                bpr = cutlass.Float32(mBHead[bhc, col + 0])
+                bpi = cutlass.Float32(mBHead[bhc, col + 1])
+            else:
+                bpr = cutlass.Float32(mBRaw[bhc, row_safe - 1, col + 0])
+                bpi = cutlass.Float32(mBRaw[bhc, row_safe - 1, col + 1])
+            bcr = cutlass.Float32(mBRaw[bhc, row_safe, col + 0])
+            bci = cutlass.Float32(mBRaw[bhc, row_safe, col + 1])
+            acc_prev_re += bpr * dbp_re + bpi * dbp_im
+            acc_prev_im += bpr * dbp_im - bpi * dbp_re
+            acc_curr_re += bcr * dbc_re + bci * dbc_im
+            acc_curr_im += bcr * dbc_im - bci * dbc_re
+            acc_phase_re += dkp_re * kpbr + dkp_im * kpbi
+            acc_phase_im += -dkp_re * kpbi + dkp_im * kpbr
+            acc_phase_re += dkc_re * kcbr + dkc_im * kcbi
+            acc_phase_im += -dkc_re * kcbi + dkc_im * kcbr
+            acc_kp += dkp_re * kpr + dkp_im * kpi
+            acc_kc += dkc_re * kcr + dkc_im * kci
+            n += 32
+
+        for offset in (16, 8, 4, 2, 1):
+            acc_prev_re += cute.arch.shuffle_sync_bfly(acc_prev_re, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_prev_im += cute.arch.shuffle_sync_bfly(acc_prev_im, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_curr_re += cute.arch.shuffle_sync_bfly(acc_curr_re, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_curr_im += cute.arch.shuffle_sync_bfly(acc_curr_im, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_phase_re += cute.arch.shuffle_sync_bfly(acc_phase_re, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_phase_im += cute.arch.shuffle_sync_bfly(acc_phase_im, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_kp += cute.arch.shuffle_sync_bfly(acc_kp, offset=offset, mask=-1, mask_and_clamp=31)
+            acc_kc += cute.arch.shuffle_sync_bfly(acc_kc, offset=offset, mask=-1, mask_and_clamp=31)
+
+        if row_valid and lane == 0:
+            mDKPad[bh, global_t, 0] = acc_prev_re
+            mDKPad[bh, global_t, 1] = acc_prev_im
+            mDKPad[bh, global_t, 2] = acc_curr_re
+            mDKPad[bh, global_t, 3] = acc_curr_im
+            mDPhase[bhc, row_safe, 0] = acc_phase_re
+            mDPhase[bhc, row_safe, 1] = acc_phase_im
+            mDLogprefixHalf[bhc, row_safe] = -cutlass.Float32(2.0) * (acc_kp + acc_kc)
 
 
 def _get_compiled_db_exact_scatter(
@@ -518,11 +1434,67 @@ def _get_compiled_db_exact_scatter(
     return compiled
 
 
+def _get_compiled_db_exact_fused(
+    dKprev: torch.Tensor,
+    Kprev: torch.Tensor,
+    phase: torch.Tensor,
+    K_raw: torch.Tensor,
+    B_raw: torch.Tensor,
+    B_head: torch.Tensor,
+    dB_pad: torch.Tensor,
+    dB_prev: torch.Tensor,
+    dK_pad: torch.Tensor,
+    d_phase: torch.Tensor,
+    d_logprefix_half: torch.Tensor,
+    *,
+    reverse_time: bool = False,
+) -> object:
+    device_index = 0 if dKprev.device.index is None else int(dKprev.device.index)
+    key: _CompiledFusedKey = (
+        device_index,
+        bool(reverse_time),
+        Kprev.dtype,
+        tuple(int(x) for x in dKprev.shape),
+        tuple(int(x) for x in Kprev.shape),
+        tuple(int(x) for x in dB_pad.shape),
+    )
+    compiled = _COMPILED_DB_EXACT_FUSED.get(key)
+    if compiled is not None:
+        return compiled
+
+    kernel = _ChunkScanBwdDBExactFused(reverse_time=reverse_time)
+    compiled = cute.compile(
+        kernel,
+        from_dlpack(dKprev, assumed_align=dKprev.element_size()),
+        from_dlpack(dKprev, assumed_align=dKprev.element_size()),
+        from_dlpack(Kprev, assumed_align=Kprev.element_size()),
+        from_dlpack(Kprev, assumed_align=Kprev.element_size()),
+        from_dlpack(phase, assumed_align=phase.element_size()),
+        from_dlpack(K_raw, assumed_align=K_raw.element_size()),
+        from_dlpack(B_raw, assumed_align=B_raw.element_size()),
+        from_dlpack(B_head, assumed_align=B_head.element_size()),
+        from_dlpack(dB_pad, assumed_align=dB_pad.element_size()),
+        from_dlpack(dB_prev, assumed_align=dB_prev.element_size()),
+        from_dlpack(dK_pad, assumed_align=dK_pad.element_size()),
+        from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
+        int(dB_pad.shape[1] // dKprev.shape[1]),
+    )
+    _COMPILED_DB_EXACT_FUSED[key] = compiled
+    return compiled
+
+
 def _get_compiled_dk_exact_reduce(
     dKprev: torch.Tensor,
+    Kprev: torch.Tensor,
     phase: torch.Tensor,
     B_head: torch.Tensor,
     dK_pad: torch.Tensor,
+    d_phase: torch.Tensor,
+    d_logprefix_half: torch.Tensor,
     *,
     reverse_time: bool = False,
 ) -> object:
@@ -530,9 +1502,12 @@ def _get_compiled_dk_exact_reduce(
     key: _CompiledReduceKey = (
         device_index,
         bool(reverse_time),
+        Kprev.dtype,
         tuple(int(x) for x in dKprev.shape),
+        tuple(int(x) for x in Kprev.shape),
         tuple(int(x) for x in B_head.shape),
         tuple(int(x) for x in dK_pad.shape),
+        tuple(int(x) for x in d_phase.shape),
     )
     compiled = _COMPILED_DK_REDUCE.get(key)
     if compiled is not None:
@@ -543,19 +1518,28 @@ def _get_compiled_dk_exact_reduce(
         kernel,
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
+        from_dlpack(Kprev, assumed_align=Kprev.element_size()),
+        from_dlpack(Kprev, assumed_align=Kprev.element_size()),
         from_dlpack(phase, assumed_align=phase.element_size()),
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
         from_dlpack(B_head, assumed_align=B_head.element_size()),
         from_dlpack(dK_pad, assumed_align=dK_pad.element_size()),
+        from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
         int(dK_pad.shape[1] // dKprev.shape[1]),
     )
     _COMPILED_DK_REDUCE[key] = compiled
     return compiled
 
 
-def chunk_scan_bwd_db_exact_cute(
+def chunk_scan_bwd_db_exact_with_meta_cute(
     dK_prev_packed: torch.Tensor,
     dK_curr_packed: torch.Tensor,
+    Kprev_packed: torch.Tensor,
+    Kcurr_packed: torch.Tensor,
     phase: torch.Tensor,
     K_raw: torch.Tensor,
     B_raw: torch.Tensor,
@@ -565,11 +1549,13 @@ def chunk_scan_bwd_db_exact_cute(
     n_heads: int,
     T: int,
     reverse_time: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact fp32 CuTe scatter from packed key grads into public ``dB/dB_prev/dK``."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact fp32 CuTe scatter from packed key grads into public ``dB/dB_prev/dK`` and metadata partials."""
     tensors = (
         ("dK_prev_packed", dK_prev_packed),
         ("dK_curr_packed", dK_curr_packed),
+        ("Kprev_packed", Kprev_packed),
+        ("Kcurr_packed", Kcurr_packed),
         ("phase", phase),
         ("K_raw", K_raw),
         ("B_raw", B_raw),
@@ -579,10 +1565,12 @@ def chunk_scan_bwd_db_exact_cute(
         raise ValueError("Exact CuTe dB scatter requires CUDA tensors.")
     if any(not t.is_contiguous() for _name, t in tensors):
         raise ValueError("Exact CuTe dB scatter expects contiguous tensors.")
-    if any(t.dtype != torch.float32 for _name, t in tensors):
-        raise ValueError("Exact CuTe dB scatter expects float32 tensors.")
+    if any(t.dtype != torch.float32 for _name, t in tensors if _name not in {"Kprev_packed", "Kcurr_packed"}):
+        raise ValueError("Exact CuTe dB scatter expects fp32 exact tensors.")
     if dK_prev_packed.shape != dK_curr_packed.shape or dK_prev_packed.shape != B_raw.shape:
         raise ValueError("dK_prev_packed, dK_curr_packed, and B_raw must share shape.")
+    if Kprev_packed.shape != dK_prev_packed.shape or Kcurr_packed.shape != dK_prev_packed.shape:
+        raise ValueError("Kprev_packed/Kcurr_packed must match dK tensors.")
     if phase.shape != (*dK_prev_packed.shape[:2], 2):
         raise ValueError("phase must be (BHC, L, 2).")
     if K_raw.shape != (*dK_prev_packed.shape[:2], 2, 2):
@@ -602,46 +1590,78 @@ def chunk_scan_bwd_db_exact_cute(
     dB_pad = torch.empty((BH, T_pad, D), device=dK_prev_packed.device, dtype=torch.float32)
     dB_prev = torch.empty((BH, D), device=dK_prev_packed.device, dtype=torch.float32)
     dK_pad = torch.empty((BH, T_pad, 4), device=dK_prev_packed.device, dtype=torch.float32)
+    d_phase = torch.empty_like(phase)
+    d_logprefix_half = torch.empty((BHC, L), device=dK_prev_packed.device, dtype=torch.float32)
 
-    compiled_scatter = _get_compiled_db_exact_scatter(
+    compiled_fused = _get_compiled_db_exact_fused(
         dK_prev_packed,
-        dK_curr_packed,
+        Kprev_packed,
         phase,
         K_raw,
+        B_raw,
+        B_head,
         dB_pad,
         dB_prev,
-        reverse_time=reverse_time,
-    )
-    compiled_reduce = _get_compiled_dk_exact_reduce(
-        dK_prev_packed,
-        phase,
-        B_head,
         dK_pad,
+        d_phase,
+        d_logprefix_half,
         reverse_time=reverse_time,
     )
 
-    compiled_scatter(
+    compiled_fused(
         from_dlpack(dK_prev_packed, assumed_align=dK_prev_packed.element_size()),
         from_dlpack(dK_curr_packed, assumed_align=dK_curr_packed.element_size()),
+        from_dlpack(Kprev_packed, assumed_align=Kprev_packed.element_size()),
+        from_dlpack(Kcurr_packed, assumed_align=Kcurr_packed.element_size()),
         from_dlpack(phase, assumed_align=phase.element_size()),
         from_dlpack(K_raw, assumed_align=K_raw.element_size()),
-        from_dlpack(dB_pad, assumed_align=dB_pad.element_size()),
-        from_dlpack(dB_prev, assumed_align=dB_prev.element_size()),
-        n_chunks,
-    )
-    compiled_reduce(
-        from_dlpack(dK_prev_packed, assumed_align=dK_prev_packed.element_size()),
-        from_dlpack(dK_curr_packed, assumed_align=dK_curr_packed.element_size()),
-        from_dlpack(phase, assumed_align=phase.element_size()),
         from_dlpack(B_raw, assumed_align=B_raw.element_size()),
         from_dlpack(B_head, assumed_align=B_head.element_size()),
+        from_dlpack(dB_pad, assumed_align=dB_pad.element_size()),
+        from_dlpack(dB_prev, assumed_align=dB_prev.element_size()),
         from_dlpack(dK_pad, assumed_align=dK_pad.element_size()),
+        from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
         n_chunks,
     )
     dB = dB_pad.reshape(batch_size, n_heads, T_pad, D)[:, :, :T, :].contiguous()
     dB_prev_out = dB_prev.reshape(batch_size, n_heads, D).contiguous()
     dK = dK_pad.reshape(batch_size, n_heads, T_pad, 2, 2)[:, :, :T, :, :].contiguous()
-    return dB, dB_prev_out, dK
+    return dB, dB_prev_out, dK, d_phase, d_logprefix_half
+
+
+def chunk_scan_bwd_db_exact_cute(
+    dK_prev_packed: torch.Tensor,
+    dK_curr_packed: torch.Tensor,
+    phase: torch.Tensor,
+    K_raw: torch.Tensor,
+    B_raw: torch.Tensor,
+    B_head: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+    T: int,
+    reverse_time: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact fp32 CuTe scatter from packed key grads into public ``dB/dB_prev/dK``."""
+    dB, dB_prev, dK, _d_phase, _d_logprefix_half = chunk_scan_bwd_db_exact_with_meta_cute(
+        dK_prev_packed,
+        dK_curr_packed,
+        torch.zeros_like(dK_prev_packed),
+        torch.zeros_like(dK_curr_packed),
+        phase,
+        K_raw,
+        B_raw,
+        B_head,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+        reverse_time=reverse_time,
+    )
+    return dB, dB_prev, dK
 
 
 def prepare_chunk_scan_bwd_db_operands(
@@ -839,49 +1859,22 @@ def _chunk_scan_bwd_dk_prepared_cute(
         )
 
     scratch = _get_db_scratch(vprev_rev=Vprev_rev, D=D)
-    # The packed key-gradient contraction needs the same inner-kernel prefix
-    # renormalization as the packed ``dQ`` path: after reversing time, the
-    # stable segment ratio is represented by half of the negated half-logprefix.
-    half_neg_logprefix_half_rev = (0.5 * neg_logprefix_half_rev).contiguous()
-
-    compiled_prev = _get_compiled_db_raw(
+    compiled_pair = _get_compiled_db_raw_pair(
         Vprev_rev,
-        d_out_rev,
-        Q_rev,
-        scratch.K_zero,
-        scratch.V_zero,
-        half_neg_logprefix_half_rev,
-        scratch.Z0_zero,
-        scratch.dKprev_rev,
-    )
-    compiled_curr = _get_compiled_db_raw(
         Vcurr_rev,
-        scratch.K_zero,
-        scratch.V_zero,
         d_out_rev,
         Q_rev,
-        half_neg_logprefix_half_rev,
-        scratch.Z0_zero,
+        neg_logprefix_half_rev,
+        scratch.dKprev_rev,
         scratch.dKcurr_rev,
     )
-    compiled_prev(
+    compiled_pair(
         from_dlpack(Vprev_rev, assumed_align=16),
-        from_dlpack(d_out_rev, assumed_align=16),
-        from_dlpack(Q_rev, assumed_align=16),
-        from_dlpack(scratch.K_zero, assumed_align=16),
-        from_dlpack(scratch.V_zero, assumed_align=16),
-        from_dlpack(half_neg_logprefix_half_rev, assumed_align=16),
-        from_dlpack(scratch.Z0_zero, assumed_align=16),
-        from_dlpack(scratch.dKprev_rev, assumed_align=16),
-    )
-    compiled_curr(
         from_dlpack(Vcurr_rev, assumed_align=16),
-        from_dlpack(scratch.K_zero, assumed_align=16),
-        from_dlpack(scratch.V_zero, assumed_align=16),
         from_dlpack(d_out_rev, assumed_align=16),
         from_dlpack(Q_rev, assumed_align=16),
-        from_dlpack(half_neg_logprefix_half_rev, assumed_align=16),
-        from_dlpack(scratch.Z0_zero, assumed_align=16),
+        from_dlpack(neg_logprefix_half_rev, assumed_align=16),
+        from_dlpack(scratch.dKprev_rev, assumed_align=16),
         from_dlpack(scratch.dKcurr_rev, assumed_align=16),
     )
     if reverse_time:
@@ -1066,4 +2059,5 @@ __all__ = [
     "chunk_scan_bwd_dk_packed_cute",
     "chunk_scan_bwd_db_cute",
     "chunk_scan_bwd_db_exact_cute",
+    "chunk_scan_bwd_db_exact_with_meta_cute",
 ]
