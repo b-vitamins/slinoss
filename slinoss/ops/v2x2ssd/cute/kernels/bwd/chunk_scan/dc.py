@@ -42,6 +42,15 @@ _ScratchKey = tuple[int, torch.dtype, int, int, int, int]
 _SCRATCH_DC: dict[_ScratchKey, _ChunkScanBwdDCScratch] = {}
 _CompiledScatterKey = tuple[int, tuple[int, int, int], tuple[int, int, int]]
 _COMPILED_DC_SCATTER: dict[_CompiledScatterKey, object] = {}
+_CompiledFusedKey = tuple[
+    int,
+    torch.dtype,
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int],
+    tuple[int, int, int],
+]
+_COMPILED_DC_FUSED: dict[_CompiledFusedKey, object] = {}
 _CompiledMetaKey = tuple[
     int,
     torch.dtype,
@@ -747,6 +756,134 @@ class _ChunkScanBwdDCScatter:
             mDCPad[bh, global_t, col + 1] = dqr * pi - dqi * pr
 
 
+class _ChunkScanBwdDCFused:
+    """Single exact fp32 pass for public ``dC`` and ``Q/dQ`` metadata partials."""
+
+    def __init__(self, *, num_threads: int = 128) -> None:
+        self.num_threads = int(num_threads)
+        if self.num_threads <= 0 or self.num_threads % 32 != 0:
+            raise ValueError("num_threads must be a positive multiple of 32.")
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mDQ: cute.Tensor,
+        mPhase: cute.Tensor,
+        mDCPad: cute.Tensor,
+        mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
+        n_chunks: cutlass.Int32,
+    ) -> None:
+        if cutlass.const_expr(
+            not (
+                mDQ.element_type
+                == mPhase.element_type
+                == mDCPad.element_type
+                == mDPhase.element_type
+                == mDLogprefixHalf.element_type
+                == cutlass.Float32
+            )
+        ):
+            raise TypeError("Exact fused dC kernel expects fp32 dQ/phase/outputs.")
+        if cutlass.const_expr(mQ.shape != mDQ.shape):
+            raise ValueError("Q and dQ must share shape.")
+        if cutlass.const_expr(mPhase.shape != (mQ.shape[0], mQ.shape[1], 2)):
+            raise ValueError("phase must be (BHC, L, 2).")
+        if cutlass.const_expr(mDPhase.shape != mPhase.shape):
+            raise ValueError("d_phase must match phase.")
+        if cutlass.const_expr(mDLogprefixHalf.shape != mQ.shape[:2]):
+            raise ValueError("d_logprefix_half must be (BHC, L).")
+
+        BHC = cute.size(mQ.shape[0])
+        L = cute.size(mQ.shape[1])
+        warps_per_block = self.num_threads // 32
+        total_items = BHC * L
+        self.kernel(
+            mQ,
+            mDQ,
+            mPhase,
+            mDCPad,
+            mDPhase,
+            mDLogprefixHalf,
+            n_chunks,
+            L,
+            total_items,
+        ).launch(
+            grid=[cute.ceil_div(total_items, warps_per_block), 1, 1],
+            block=[self.num_threads, 1, 1],
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mDQ: cute.Tensor,
+        mPhase: cute.Tensor,
+        mDCPad: cute.Tensor,
+        mDPhase: cute.Tensor,
+        mDLogprefixHalf: cute.Tensor,
+        n_chunks: cutlass.Int32,
+        L: cutlass.Int32,
+        total_items: cutlass.Int32,
+    ) -> None:
+        bidx, _, _ = cute.arch.block_idx()
+        warp = cute.arch.warp_idx()
+        lane = cute.arch.lane_idx()
+
+        warps_per_block = self.num_threads // 32
+        item = bidx * warps_per_block + warp
+        item_valid = cute.elem_less(item, total_items)
+        item_safe = cutlass.min(item, total_items - cutlass.Int32(1))
+        bhc = item_safe // L
+        row = item_safe - bhc * L
+        bh = bhc // n_chunks
+        chunk = bhc - bh * n_chunks
+        global_t = chunk * L + row
+        N = cute.size(mQ.shape[2]) // 2
+
+        pr = cutlass.Float32(mPhase[bhc, row, 0])
+        pi = cutlass.Float32(mPhase[bhc, row, 1])
+        acc_re = cutlass.Float32(0.0)
+        acc_im = cutlass.Float32(0.0)
+        acc_q = cutlass.Float32(0.0)
+
+        n = lane
+        while n < N:
+            col = n * 2
+            qr = cutlass.Float32(mQ[bhc, row, col + 0])
+            qi = cutlass.Float32(mQ[bhc, row, col + 1])
+            dqr = cutlass.Float32(mDQ[bhc, row, col + 0])
+            dqi = cutlass.Float32(mDQ[bhc, row, col + 1])
+
+            qbr = qr * pr + qi * pi
+            qbi = qi * pr - qr * pi
+            acc_re += dqr * qbr + dqi * qbi
+            acc_im += -dqr * qbi + dqi * qbr
+            acc_q += dqr * qr + dqi * qi
+
+            if item_valid:
+                mDCPad[bh, global_t, col + 0] = dqr * pr + dqi * pi
+                mDCPad[bh, global_t, col + 1] = dqr * pi - dqi * pr
+            n += 32
+
+        for offset in (16, 8, 4, 2, 1):
+            acc_re += cute.arch.shuffle_sync_bfly(
+                acc_re, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            acc_im += cute.arch.shuffle_sync_bfly(
+                acc_im, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            acc_q += cute.arch.shuffle_sync_bfly(
+                acc_q, offset=offset, mask=-1, mask_and_clamp=31
+            )
+
+        if item_valid and lane == 0:
+            mDPhase[bhc, row, 0] = acc_re
+            mDPhase[bhc, row, 1] = acc_im
+            mDLogprefixHalf[bhc, row] = cutlass.Float32(2.0) * acc_q
+
+
 class _ChunkScanBwdDQMetaReduce:
     """Warp reduction for the ``Q/dQ`` contribution to ``(d_phase, dlogprefix)``."""
 
@@ -886,6 +1023,45 @@ def _get_compiled_dc_scatter(
     return compiled
 
 
+def _get_compiled_dc_fused(
+    Q: torch.Tensor,
+    dQ: torch.Tensor,
+    phase: torch.Tensor,
+    dC_pad: torch.Tensor,
+    d_phase: torch.Tensor,
+    d_logprefix_half: torch.Tensor,
+) -> object:
+    device_index = 0 if Q.device.index is None else int(Q.device.index)
+    key: _CompiledFusedKey = (
+        device_index,
+        Q.dtype,
+        tuple(int(x) for x in Q.shape),
+        tuple(int(x) for x in dQ.shape),
+        tuple(int(x) for x in phase.shape[:2]),
+        tuple(int(x) for x in dC_pad.shape),
+    )
+    compiled = _COMPILED_DC_FUSED.get(key)
+    if compiled is not None:
+        return compiled
+
+    kernel = _ChunkScanBwdDCFused()
+    compiled = cute.compile(
+        kernel,
+        from_dlpack(Q, assumed_align=Q.element_size()),
+        from_dlpack(dQ, assumed_align=dQ.element_size()),
+        from_dlpack(phase, assumed_align=phase.element_size()),
+        from_dlpack(dC_pad, assumed_align=dC_pad.element_size()),
+        from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
+        int(dC_pad.shape[1] // dQ.shape[1]),
+    )
+    _COMPILED_DC_FUSED[key] = compiled
+    return compiled
+
+
 def _get_compiled_dc_meta(
     Q: torch.Tensor,
     dQ: torch.Tensor,
@@ -962,6 +1138,63 @@ def chunk_scan_bwd_dc_exact_cute(
     return (
         dC_pad.reshape(batch_size, n_heads, T_pad, D)[:, :, :T, :].contiguous()
     )
+
+
+def chunk_scan_bwd_dc_exact_with_meta_cute(
+    Q: torch.Tensor,
+    dQ: torch.Tensor,
+    phase: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+    T: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Single exact fp32 pass for public ``dC`` and ``Q/dQ`` metadata partials."""
+    if Q.device.type != "cuda" or dQ.device.type != "cuda" or phase.device.type != "cuda":
+        raise ValueError("Exact fused dC path requires CUDA tensors.")
+    if not Q.is_contiguous() or not dQ.is_contiguous() or not phase.is_contiguous():
+        raise ValueError("Q, dQ, and phase must be contiguous.")
+    if Q.ndim != 3 or dQ.shape != Q.shape:
+        raise ValueError("Q and dQ must be packed as (BHC, L, D) with matching shape.")
+    if phase.shape != (*dQ.shape[:2], 2):
+        raise ValueError("phase must be (BHC, L, 2) matching dQ.")
+    if dQ.dtype != torch.float32 or phase.dtype != torch.float32:
+        raise ValueError("Exact fused dC path expects fp32 dQ and phase.")
+
+    BHC, L, D = map(int, dQ.shape)
+    BH = int(batch_size) * int(n_heads)
+    if BH <= 0 or BHC % BH != 0:
+        raise ValueError(
+            f"dQ leading dim BHC={BHC} is not divisible by batch*heads={BH}."
+        )
+    n_chunks = BHC // BH
+    T_pad = n_chunks * L
+
+    dC_pad = torch.empty((BH, T_pad, D), device=dQ.device, dtype=torch.float32)
+    d_phase = torch.empty_like(phase)
+    d_logprefix_half = torch.empty((BHC, L), device=dQ.device, dtype=torch.float32)
+    compiled = _get_compiled_dc_fused(
+        Q,
+        dQ,
+        phase,
+        dC_pad,
+        d_phase,
+        d_logprefix_half,
+    )
+    compiled(
+        from_dlpack(Q, assumed_align=Q.element_size()),
+        from_dlpack(dQ, assumed_align=dQ.element_size()),
+        from_dlpack(phase, assumed_align=phase.element_size()),
+        from_dlpack(dC_pad, assumed_align=dC_pad.element_size()),
+        from_dlpack(d_phase, assumed_align=d_phase.element_size()),
+        from_dlpack(
+            d_logprefix_half,
+            assumed_align=d_logprefix_half.element_size(),
+        ),
+        n_chunks,
+    )
+    dC = dC_pad.reshape(batch_size, n_heads, T_pad, D)[:, :, :T, :].contiguous()
+    return dC, d_phase, d_logprefix_half
 
 
 def chunk_scan_bwd_dq_meta_cute(
@@ -1314,4 +1547,5 @@ __all__ = [
     "chunk_scan_bwd_dq_meta_cute",
     "chunk_scan_bwd_dc_cute",
     "chunk_scan_bwd_dc_exact_cute",
+    "chunk_scan_bwd_dc_exact_with_meta_cute",
 ]

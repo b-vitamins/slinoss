@@ -18,7 +18,7 @@ from .db import (
 from .dc import (
     chunk_scan_bwd_dc_cute,
     chunk_scan_bwd_dc_exact_cute,
-    chunk_scan_bwd_dq_meta_cute,
+    chunk_scan_bwd_dc_exact_with_meta_cute,
     chunk_scan_bwd_dc_packed_cute,
     prepare_chunk_scan_bwd_dc_operands,
 )
@@ -222,8 +222,8 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         n_heads=ctx.n_heads,
         T=ctx.T,
     )
-    d_phase_q, d_logprefix_q = chunk_scan_bwd_dq_meta_cute(Q, dQ, phase)
-    dC = chunk_scan_bwd_dc_exact_cute(
+    dC, d_phase_q, d_logprefix_q = chunk_scan_bwd_dc_exact_with_meta_cute(
+        Q.squeeze(2).contiguous(),
         dQ,
         phase,
         batch_size=ctx.batch_size,
