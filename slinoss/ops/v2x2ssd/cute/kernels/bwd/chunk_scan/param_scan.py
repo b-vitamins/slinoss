@@ -634,33 +634,15 @@ def _get_compiled_phase_scan(
     return compiled
 
 
-def _packed_causal_scales(logprefix_half: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the stable packed-contract scale tensors.
-
-    ``logprefix_half`` stores half of the cumulative log-magnitude prefix. The
-    packed dense path uses:
-
-    - ``row_scale[t] = exp(2 * lp[t])`` for the off-term
-    - ``scale[t, s] = exp(2 * (lp[t] - lp[s]))`` for the causal diagonal terms
-
-    The explicit causal mask keeps the would-be undefined upper triangle out of
-    the computation entirely instead of relying on later multiplication by zero.
-    """
+def _packed_row_scale(logprefix_half: torch.Tensor) -> torch.Tensor:
+    """Build the packed off-term row scale ``exp(2 * lp[t])``."""
 
     if logprefix_half.ndim != 2:
         raise ValueError(
             f"logprefix_half must be rank-2 packed metadata. Got {tuple(logprefix_half.shape)}."
         )
-    L = int(logprefix_half.shape[1])
-    t_idx = torch.arange(L, device=logprefix_half.device).unsqueeze(1)
-    s_idx = torch.arange(L, device=logprefix_half.device).unsqueeze(0)
-    causal = (s_idx <= t_idx).unsqueeze(0)
     lp = logprefix_half.to(torch.float32)
-    scale = torch.exp(2.0 * (lp.unsqueeze(-1) - lp.unsqueeze(1))).masked_fill(
-        ~causal, 0.0
-    )
-    row_scale = torch.exp(2.0 * lp).unsqueeze(-1)
-    return scale, row_scale
+    return torch.exp(2.0 * lp).unsqueeze(-1)
 
 
 def _dlogprefix_half_packed(
@@ -702,7 +684,7 @@ def _chunk_scan_bwd_param_from_intermediates(
     Qf: torch.Tensor,
     Kprevf: torch.Tensor,
     Kcurrf: torch.Tensor,
-    phase: torch.Tensor,
+    phase_real: torch.Tensor,
     M_raw: torch.Tensor,
     dQ: torch.Tensor,
     dKprev: torch.Tensor,
@@ -722,9 +704,8 @@ def _chunk_scan_bwd_param_from_intermediates(
     n_chunks = BHC // BH
     T_pad = n_chunks * L
 
-    phase_raw = torch.view_as_real(phase).to(dtype=torch.float32).contiguous()
-    d_phase = torch.empty_like(phase_raw)
-    compiled_reduce = _get_compiled_phase_reduce(Qf, phase_raw, d_phase)
+    d_phase = torch.empty_like(phase_real)
+    compiled_reduce = _get_compiled_phase_reduce(Qf, phase_real, d_phase)
     compiled_reduce(
         from_dlpack(Qf, assumed_align=Qf.element_size()),
         from_dlpack(Kprevf, assumed_align=Kprevf.element_size()),
@@ -732,7 +713,7 @@ def _chunk_scan_bwd_param_from_intermediates(
         from_dlpack(dQ, assumed_align=dQ.element_size()),
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
         from_dlpack(dKcurr, assumed_align=dKcurr.element_size()),
-        from_dlpack(phase_raw, assumed_align=phase_raw.element_size()),
+        from_dlpack(phase_real, assumed_align=phase_real.element_size()),
         from_dlpack(d_phase, assumed_align=d_phase.element_size()),
     )
 
@@ -740,7 +721,7 @@ def _chunk_scan_bwd_param_from_intermediates(
     compiled_scan = _get_compiled_phase_scan(M_raw, d_logprefix_half, dM)
     compiled_scan(
         from_dlpack(M_raw, assumed_align=M_raw.element_size()),
-        from_dlpack(phase_raw, assumed_align=phase_raw.element_size()),
+        from_dlpack(phase_real, assumed_align=phase_real.element_size()),
         from_dlpack(d_phase, assumed_align=d_phase.element_size()),
         from_dlpack(d_logprefix_half, assumed_align=d_logprefix_half.element_size()),
         from_dlpack(dM, assumed_align=dM.element_size()),
@@ -835,7 +816,7 @@ def chunk_scan_bwd_param_scan_packed_cute(
     Vcurrf = Vcurr.squeeze(2).to(torch.float32)
     Z0f = Z0.squeeze(2).to(torch.float32)
 
-    scale, row_scale = _packed_causal_scales(logprefix_half)
+    row_scale = _packed_row_scale(logprefix_half)
     score_prev = batched_sgemm_fp32_cute(Qf, Kprevf.transpose(1, 2))
     score_curr = batched_sgemm_fp32_cute(Qf, Kcurrf.transpose(1, 2))
     dSprev = batched_sgemm_fp32_cute(d_out_flat, Vprevf.transpose(1, 2))
@@ -852,12 +833,11 @@ def chunk_scan_bwd_param_scan_packed_cute(
         d_out_flat,
     )
 
-    phase = torch.view_as_complex(phase_real.contiguous())
     dM = _chunk_scan_bwd_param_from_intermediates(
         Qf,
         Kprevf,
         Kcurrf,
-        phase,
+        phase_real,
         M_raw,
         dQ,
         dKprev,

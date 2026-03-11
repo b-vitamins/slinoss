@@ -371,7 +371,6 @@ def chunk_scan_bwd_exact_packed(
             neg_logprefix_half_rev=neg_logprefix_half_rev,
         )
     )
-    phase = torch.view_as_complex(phase_real.contiguous())
     z0_q = Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
     dQ = chunk_scan_bwd_dc_packed_cute(
         Vprev.contiguous(),
@@ -416,7 +415,7 @@ def chunk_scan_bwd_exact_packed(
         Qf,
         Kprevf,
         Kcurrf,
-        phase,
+        phase_real,
         M_raw,
         dQ,
         dK_prev_packed,
