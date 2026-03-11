@@ -5,7 +5,17 @@ import math
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_dz0_cute
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
+    chunk_scan_bwd_dz0_cute,
+    chunk_scan_bwd_dz0_packed_cute,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+    batched_sgemm_fp32_cute,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
+    _pack_chunk_scan_inner_inputs,
+    _prepare_chunk_scan_small_operands,
+)
 from slinoss.ops.v2x2ssd.reference import (
     chunk_increment,
     chunk_scan,
@@ -116,9 +126,104 @@ def test_chunk_scan_bwd_dz0_cute_matches_autograd() -> None:
         compute_dtype=torch.float32,
     )
 
+    # This wrapper now delegates the dense contraction to the packed TC kernel.
+    # The public ``M/C`` prep remains exact, but the transport is fp16/bf16 with
+    # fp32 accumulation, so its parity budget should match the production CuTe
+    # path rather than the old fp32 GEMM wrapper.
     torch.testing.assert_close(
         d_chunk_starts_cute,
         d_chunk_starts_ref,
-        atol=5e-5,
+        atol=5e-4,
         rtol=0.0,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_dz0_packed_cute_matches_exact_packed() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=2,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    (
+        U_raw,
+        B_raw,
+        C_raw,
+        M_raw,
+        K_raw,
+        logprefix_half,
+        Z0_raw,
+        U_head,
+        B_head,
+        _batch_size,
+        _n_heads,
+        T,
+        T_pad,
+        _odtype,
+    ) = _prepare_chunk_scan_small_operands(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    Q, _Kprev, _Vprev, _Kcurr, _Vcurr, logprefix_half, _Z0 = _pack_chunk_scan_inner_inputs(
+        U_raw,
+        B_raw,
+        C_raw,
+        M_raw,
+        K_raw,
+        logprefix_half,
+        Z0_raw,
+        U_head,
+        B_head,
+    )
+
+    d_out = torch.randn((2, 2, T, 16), device="cuda", dtype=torch.float32)
+    if T_pad != T:
+        pad = T_pad - T
+        d_out = torch.cat(
+            [d_out, torch.zeros((2, 2, pad, 16), device="cuda", dtype=torch.float32)],
+            dim=2,
+        )
+    d_out_flat = d_out.reshape(Q.shape[0], Q.shape[1], 16).contiguous()
+    row_scale = torch.exp(2.0 * logprefix_half.to(torch.float32)).unsqueeze(-1)
+    want = batched_sgemm_fp32_cute((d_out_flat * row_scale).transpose(1, 2), Q.squeeze(2).to(torch.float32))
+    got = chunk_scan_bwd_dz0_packed_cute(
+        Q.contiguous(),
+        logprefix_half.contiguous(),
+        d_out_flat,
+    )
+
+    torch.testing.assert_close(got, want, atol=2e-2, rtol=0.0)

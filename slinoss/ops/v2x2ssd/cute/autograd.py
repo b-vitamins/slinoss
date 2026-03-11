@@ -25,6 +25,9 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
     chunk_scan_bwd_dlogprefix_exact_cute,
 )
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dz0 import (
+    chunk_scan_bwd_dz0_packed_cute,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
@@ -318,9 +321,10 @@ def _chunk_scan_bwd_exact_packed(
     dScore_prev = dSprev * scale
     dScore_curr = dScurr * scale
 
-    dZ0 = batched_sgemm_fp32_cute(
-        (d_out_flat * row_scale).transpose(1, 2),
-        Qf,
+    dZ0 = chunk_scan_bwd_dz0_packed_cute(
+        Q.contiguous(),
+        logprefix_half.contiguous(),
+        d_out_flat.contiguous(),
     )
     d_chunk_starts = (
         torch.view_as_real(
