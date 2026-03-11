@@ -31,6 +31,7 @@ so there is no ``0 * inf`` hazard to guard against here.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
@@ -87,6 +88,16 @@ _PairSumKey = tuple[
     int,
 ]
 _COMPILED_PAIR_SUM: dict[_PairSumKey, Callable[..., object]] = {}
+
+
+@dataclass(frozen=True)
+class ChunkIncrementPreparedState:
+    """Forward-prepared state reused by the chunk-increment backward stage."""
+
+    A_main: torch.Tensor
+    B_main: torch.Tensor
+    u_head: torch.Tensor
+    b_head: torch.Tensor
 
 
 class _BatchedSgemmFp32Ampere:
@@ -1500,6 +1511,31 @@ def chunk_increment_cute(
     - ``inc``: ``(batch, heads, chunks, P, 2N)``
     - ``m_chunk``: ``(batch, heads, chunks, 2)``
     """
+    inc, m_chunk, _ = chunk_increment_with_prepared_cute(
+        U,
+        M,
+        K,
+        B,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=compute_dtype,
+    )
+    return inc, m_chunk
+
+
+def chunk_increment_with_prepared_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    chunk_size: int,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    compute_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, ChunkIncrementPreparedState]:
+    """Run chunk-increment forward and return reusable backward state."""
     if not (U.is_cuda and M.is_cuda and K.is_cuda and B.is_cuda):
         raise ValueError("CuTe chunk_increment requires CUDA tensors.")
 
@@ -1515,7 +1551,7 @@ def chunk_increment_cute(
             compute_dtype=compute_dtype,
         )
     )
-    return _chunk_increment_from_prepared_operands(
+    inc, m_chunk_packed = _chunk_increment_from_prepared_operands(
         A_main,
         B_main,
         u_head,
@@ -1525,6 +1561,16 @@ def chunk_increment_cute(
         n_heads=n_heads,
         n_chunks=n_chunks,
         P=P,
+    )
+    return (
+        inc,
+        m_chunk_packed,
+        ChunkIncrementPreparedState(
+            A_main=A_main,
+            B_main=B_main,
+            u_head=u_head,
+            b_head=b_head,
+        ),
     )
 
 
@@ -1572,9 +1618,11 @@ def _chunk_increment_from_prepared_operands(
 
 
 __all__ = [
+    "ChunkIncrementPreparedState",
     "_chunk_increment_from_prepared_operands",
     "_prepare_chunk_increment_operands",
     "batched_sgemm_fp32_cute",
     "chunk_increment_cute",
+    "chunk_increment_with_prepared_cute",
     "pair_sum_batched_sgemm_fp32_cute",
 ]

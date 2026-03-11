@@ -12,8 +12,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    _chunk_increment_from_prepared_operands,
-    _prepare_chunk_increment_operands,
+    chunk_increment_with_prepared_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
@@ -59,28 +58,15 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         B_last = B_d[:, :, -1, :].to(dtype=output_dtype or U.dtype).contiguous()
         U_last = U_d[:, :, -1, :].to(dtype=output_dtype or U.dtype).contiguous()
 
-        A_main, B_main, u_head, b_head, m_chunk, _, _, _, _ = (
-            _prepare_chunk_increment_operands(
-                U_d,
-                M_d,
-                K_d,
-                B_d,
-                chunk_size=ctx.chunk_size,
-                B_prev=B_prev_d,
-                U_prev=U_prev_d,
-                compute_dtype=compute_dtype,
-            )
-        )
-        inc, m_chunk = _chunk_increment_from_prepared_operands(
-            A_main,
-            B_main,
-            u_head,
-            b_head,
-            m_chunk,
-            batch_size=int(U_d.shape[0]),
-            n_heads=int(U_d.shape[1]),
-            n_chunks=(int(U_d.shape[2]) + ctx.chunk_size - 1) // ctx.chunk_size,
-            P=int(U_d.shape[-1]),
+        inc, m_chunk, prepared = chunk_increment_with_prepared_cute(
+            U_d,
+            M_d,
+            K_d,
+            B_d,
+            chunk_size=ctx.chunk_size,
+            B_prev=B_prev_d,
+            U_prev=U_prev_d,
+            compute_dtype=compute_dtype,
         )
         chunk_starts, final_state = state_passing_cute(
             inc,
@@ -108,10 +94,10 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             K_d,
             B_d,
             C_d,
-            A_main,
-            B_main,
-            u_head,
-            b_head,
+            prepared.A_main,
+            prepared.B_main,
+            prepared.u_head,
+            prepared.b_head,
             m_chunk,
             chunk_starts,
         ]

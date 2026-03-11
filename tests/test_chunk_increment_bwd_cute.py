@@ -10,7 +10,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
     chunk_increment_bwd_prepared_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    _prepare_chunk_increment_operands,
+    chunk_increment_with_prepared_cute,
 )
 from slinoss.ops.v2x2ssd.reference import chunk_increment as reference_chunk_increment
 
@@ -161,27 +161,25 @@ def test_chunk_increment_bwd_prepared_entrypoint_matches_public_stage() -> None:
         compute_dtype=torch.float32,
     )
 
-    A_main, B_main, u_head, b_head, _m_chunk, _, _, _, _ = (
-        _prepare_chunk_increment_operands(
-            U.detach(),
-            M.detach(),
-            K.detach(),
-            B.detach(),
-            chunk_size=32,
-            B_prev=B_prev.detach(),
-            U_prev=U_prev.detach(),
-            compute_dtype=torch.float32,
-        )
+    _, _m_chunk, prepared = chunk_increment_with_prepared_cute(
+        U.detach(),
+        M.detach(),
+        K.detach(),
+        B.detach(),
+        chunk_size=32,
+        B_prev=B_prev.detach(),
+        U_prev=U_prev.detach(),
+        compute_dtype=torch.float32,
     )
     got_prepared = chunk_increment_bwd_prepared_cute(
         U.detach(),
         M.detach(),
         K.detach(),
         B.detach(),
-        A_main=A_main,
-        B_main=B_main,
-        u_head=u_head,
-        b_head=b_head,
+        A_main=prepared.A_main,
+        B_main=prepared.B_main,
+        u_head=prepared.u_head,
+        b_head=prepared.b_head,
         d_inc=d_inc.detach(),
         d_m_chunk=d_m_chunk.detach(),
         chunk_size=32,

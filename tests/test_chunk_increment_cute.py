@@ -7,9 +7,8 @@ import pytest
 import torch
 
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    _chunk_increment_from_prepared_operands,
-    _prepare_chunk_increment_operands,
     chunk_increment_cute,
+    chunk_increment_with_prepared_cute,
 )
 from slinoss.ops.v2x2ssd.reference import chunk_increment as reference_chunk_increment
 
@@ -138,29 +137,20 @@ def test_chunk_increment_prepared_entrypoint_matches_public_stage() -> None:
         chunk_size=32,
         compute_dtype=torch.float32,
     )
-    A_main, B_main, u_head, b_head, m_chunk, batch_size, n_heads, n_chunks, P = (
-        _prepare_chunk_increment_operands(
-            inputs.U,
-            inputs.M,
-            inputs.K,
-            inputs.B,
-            chunk_size=32,
-            B_prev=inputs.B_prev,
-            U_prev=inputs.U_prev,
-            compute_dtype=torch.float32,
-        )
-    )
-    inc_prepared, m_prepared = _chunk_increment_from_prepared_operands(
-        A_main,
-        B_main,
-        u_head,
-        b_head,
-        m_chunk,
-        batch_size=batch_size,
-        n_heads=n_heads,
-        n_chunks=n_chunks,
-        P=P,
+    inc_prepared, m_prepared, prepared = chunk_increment_with_prepared_cute(
+        inputs.U,
+        inputs.M,
+        inputs.K,
+        inputs.B,
+        chunk_size=32,
+        B_prev=inputs.B_prev,
+        U_prev=inputs.U_prev,
+        compute_dtype=torch.float32,
     )
 
     torch.testing.assert_close(inc_prepared, inc_public, atol=0.0, rtol=0.0)
     torch.testing.assert_close(m_prepared, m_public, atol=0.0, rtol=0.0)
+    assert prepared.A_main.is_contiguous()
+    assert prepared.B_main.is_contiguous()
+    assert prepared.u_head.is_contiguous()
+    assert prepared.b_head.is_contiguous()
