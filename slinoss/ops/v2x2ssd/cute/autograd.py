@@ -18,12 +18,10 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
 )
 
 
-def _zero_like_optional(
-    tensor: torch.Tensor | None, *, dtype: torch.dtype
-) -> torch.Tensor | None:
-    if tensor is None:
-        return None
-    return torch.zeros_like(tensor, dtype=dtype)
+def _as_dtype_contiguous(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.dtype == dtype and tensor.is_contiguous():
+        return tensor
+    return tensor.to(dtype=dtype).contiguous()
 
 
 class _V2x2SSDCuTeFn(torch.autograd.Function):
@@ -44,7 +42,6 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.chunk_size = int(chunk_size)
         ctx.compute_dtype = compute_dtype
-        ctx.output_dtype = output_dtype
         ctx.has_initial_states = initial_states is not None
         ctx.has_prev = B_prev is not None
 
@@ -54,7 +51,7 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         B_d = B.detach()
         C_d = C.detach()
         initial_states_d = (
-            initial_states.detach().to(dtype=torch.float32).contiguous()
+            _as_dtype_contiguous(initial_states.detach(), dtype=torch.float32)
             if initial_states is not None
             else None
         )
@@ -163,21 +160,12 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             B_prev = saved[idx]
             U_prev = saved[idx + 1]
 
-        batch_size, n_heads, T, P = map(int, U.shape)
+        batch_size, n_heads, _T, P = map(int, U.shape)
         D = int(B.shape[-1])
         rdtype = torch.float32
 
-        dU_scan = torch.zeros_like(U, dtype=rdtype)
-        dM_scan = torch.zeros_like(M, dtype=rdtype)
-        dK_scan = torch.zeros_like(K, dtype=rdtype)
-        dB_scan = torch.zeros_like(B, dtype=rdtype)
-        dC_scan = torch.zeros_like(C, dtype=rdtype)
-        dB_prev_scan = _zero_like_optional(B_prev, dtype=rdtype)
-        dU_prev_scan = _zero_like_optional(U_prev, dtype=rdtype)
-        d_chunk_starts = torch.zeros_like(chunk_starts, dtype=rdtype)
-
         if dY is not None:
-            dY = dY.contiguous()
+            dY = dY if dY.is_contiguous() else dY.contiguous()
             (
                 dU_scan,
                 dM_scan,
@@ -185,8 +173,8 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                 dB_scan,
                 dC_scan,
                 d_chunk_starts,
-                dB_prev_scan_raw,
-                dU_prev_scan_raw,
+                dB_prev_scan,
+                dU_prev_scan,
             ) = chunk_scan_bwd_cute(
                 U,
                 M,
@@ -200,18 +188,19 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                 U_prev=U_prev,
                 compute_dtype=ctx.compute_dtype,
             )
-            if dU_prev_scan is not None:
-                dU_prev_scan = dU_prev_scan_raw
-            if dB_prev_scan is not None:
-                dB_prev_scan = dB_prev_scan_raw
-
-        dU_inc = torch.zeros_like(U, dtype=rdtype)
-        dM_inc = torch.zeros_like(M, dtype=rdtype)
-        dK_inc = torch.zeros_like(K, dtype=rdtype)
-        dB_inc = torch.zeros_like(B, dtype=rdtype)
-        dB_prev_inc = _zero_like_optional(B_prev, dtype=rdtype)
-        dU_prev_inc = _zero_like_optional(U_prev, dtype=rdtype)
-        d_initial = _zero_like_optional(initial_states, dtype=rdtype)
+        else:
+            dU_scan = torch.zeros_like(U, dtype=rdtype)
+            dM_scan = torch.zeros_like(M, dtype=rdtype)
+            dK_scan = torch.zeros_like(K, dtype=rdtype)
+            dB_scan = torch.zeros_like(B, dtype=rdtype)
+            dC_scan = torch.zeros_like(C, dtype=rdtype)
+            d_chunk_starts = torch.zeros_like(chunk_starts, dtype=rdtype)
+            dB_prev_scan = (
+                None if B_prev is None else torch.zeros_like(B_prev, dtype=rdtype)
+            )
+            dU_prev_scan = (
+                None if U_prev is None else torch.zeros_like(U_prev, dtype=rdtype)
+            )
 
         if dY is not None or d_final_state is not None:
             if d_final_state is None:
@@ -221,12 +210,16 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                     dtype=torch.float32,
                 )
             d_inc, d_m_chunk, d_initial_raw = state_passing_bwd_cute(
-                chunk_starts.to(dtype=torch.float32).contiguous(),
-                m_chunk.to(dtype=torch.float32).contiguous(),
-                d_chunk_starts=d_chunk_starts.contiguous(),
-                d_final=d_final_state.to(dtype=torch.float32).contiguous(),
+                chunk_starts,
+                m_chunk,
+                d_chunk_starts=(
+                    d_chunk_starts
+                    if d_chunk_starts.is_contiguous()
+                    else d_chunk_starts.contiguous()
+                ),
+                d_final=_as_dtype_contiguous(d_final_state, dtype=torch.float32),
             )
-            dU_inc, dM_inc, dK_inc, dB_inc, dB_prev_inc_raw, dU_prev_inc_raw = (
+            dU_inc, dM_inc, dK_inc, dB_inc, dB_prev_inc, dU_prev_inc = (
                 chunk_increment_bwd_cute(
                     U,
                     M,
@@ -240,37 +233,50 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                     compute_dtype=ctx.compute_dtype,
                 )
             )
-            if d_initial is not None:
-                d_initial = d_initial_raw
-            if dB_prev_inc is not None:
-                dB_prev_inc = dB_prev_inc_raw
-            if dU_prev_inc is not None:
-                dU_prev_inc = dU_prev_inc_raw
+            d_initial = d_initial_raw if initial_states is not None else None
+        else:
+            dU_inc = torch.zeros_like(U, dtype=rdtype)
+            dM_inc = torch.zeros_like(M, dtype=rdtype)
+            dK_inc = torch.zeros_like(K, dtype=rdtype)
+            dB_inc = torch.zeros_like(B, dtype=rdtype)
+            dB_prev_inc = (
+                None if B_prev is None else torch.zeros_like(B_prev, dtype=rdtype)
+            )
+            dU_prev_inc = (
+                None if U_prev is None else torch.zeros_like(U_prev, dtype=rdtype)
+            )
+            d_initial = (
+                None
+                if initial_states is None
+                else torch.zeros_like(initial_states, dtype=rdtype)
+            )
 
-        dU_total = dU_inc + dU_scan
-        dM_total = dM_inc + dM_scan
-        dK_total = dK_inc + dK_scan
-        dB_total = dB_inc + dB_scan
+        dU_scan.add_(dU_inc)
+        dM_scan.add_(dM_inc)
+        dK_scan.add_(dK_inc)
+        dB_scan.add_(dB_inc)
         dC_total = dC_scan
 
         if dB_last is not None:
-            dB_total[:, :, -1, :] += dB_last.to(dtype=rdtype)
+            dB_scan[:, :, -1, :] += dB_last.to(dtype=rdtype)
         if dU_last is not None:
-            dU_total[:, :, -1, :] += dU_last.to(dtype=rdtype)
+            dU_scan[:, :, -1, :] += dU_last.to(dtype=rdtype)
 
         dB_prev_total = None
         if B_prev is not None and dB_prev_inc is not None and dB_prev_scan is not None:
-            dB_prev_total = dB_prev_inc + dB_prev_scan
+            dB_prev_scan.add_(dB_prev_inc)
+            dB_prev_total = dB_prev_scan
 
         dU_prev_total = None
         if U_prev is not None and dU_prev_inc is not None and dU_prev_scan is not None:
-            dU_prev_total = dU_prev_inc + dU_prev_scan
+            dU_prev_scan.add_(dU_prev_inc)
+            dU_prev_total = dU_prev_scan
 
         return (
-            dU_total.to(dtype=U.dtype),
-            dM_total.to(dtype=M.dtype),
-            dK_total.to(dtype=K.dtype),
-            dB_total.to(dtype=B.dtype),
+            dU_scan.to(dtype=U.dtype),
+            dM_scan.to(dtype=M.dtype),
+            dK_scan.to(dtype=K.dtype),
+            dB_scan.to(dtype=B.dtype),
             dC_total.to(dtype=C.dtype),
             None
             if initial_states is None or d_initial is None
