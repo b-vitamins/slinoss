@@ -7,6 +7,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from typing import Callable
 
+from slinoss.perf import note_cache_event, record_region
+
 from .chunk_increment import ChunkIncrementFwdAmpere
 from .chunk_scan import ChunkScanFwdAmpere
 from .common import (
@@ -222,25 +224,29 @@ def _compile_chunk_increment_kernel_impl(
 
     compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cache.v2x2ssd.forward.chunk_increment", hit=False)
         cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
         kernel = ChunkIncrementFwdAmpere(cutlass_dtype, chunk_size=L)
         compiled = cute.compile(
             kernel, mU, mB, mM, mKprev, mKcurr, mU_prev, mB_prev, mInc, mMchunk
         )
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cache.v2x2ssd.forward.chunk_increment", hit=True)
 
     def launch() -> None:
-        compiled(
-            mU,
-            mB,
-            mM,
-            mKprev,
-            mKcurr,
-            mU_prev,
-            mB_prev,
-            mInc,
-            mMchunk,
-        )
+        with record_region("forward.v2x2ssd.chunk_increment.total"):
+            compiled(
+                mU,
+                mB,
+                mM,
+                mKprev,
+                mKcurr,
+                mU_prev,
+                mB_prev,
+                mInc,
+                mMchunk,
+            )
 
     return compiled, inc_chunk, m_chunk_chunk, launch
 
@@ -378,6 +384,7 @@ def _compile_state_passing_kernel_impl(
 
     compiled = _STATE_PASSING_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cache.v2x2ssd.forward.state_passing", hit=False)
         kernel = StatePassingFwdAmpere(
             num_threads=num_threads,
             vecs_per_thread=vecs_per_thread,
@@ -387,9 +394,12 @@ def _compile_state_passing_kernel_impl(
         )
         compiled = cute.compile(kernel, mInc, mM, mOutStarts, mOutFinal, mInit)
         _STATE_PASSING_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cache.v2x2ssd.forward.state_passing", hit=True)
 
     def launch() -> None:
-        compiled(mInc, mM, mOutStarts, mOutFinal, mInit)
+        with record_region("forward.v2x2ssd.state_passing.total"):
+            compiled(mInc, mM, mOutStarts, mOutFinal, mInit)
 
     return compiled, out_starts, out_final, launch
 
@@ -551,6 +561,7 @@ def _compile_chunk_scan_kernel_impl(
 
     compiled = _CHUNK_SCAN_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cache.v2x2ssd.forward.chunk_scan", hit=False)
         in_cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
         out_cutlass_dtype = _torch_to_cutlass_dtype(output_dtype)
         kernel = ChunkScanFwdAmpere(
@@ -569,9 +580,12 @@ def _compile_chunk_scan_kernel_impl(
             kernel, mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut
         )
         _CHUNK_SCAN_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cache.v2x2ssd.forward.chunk_scan", hit=True)
 
     def launch() -> None:
-        compiled(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
+        with record_region("forward.v2x2ssd.chunk_scan.total"):
+            compiled(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
 
     return compiled, out_chunk, out_view, launch
 

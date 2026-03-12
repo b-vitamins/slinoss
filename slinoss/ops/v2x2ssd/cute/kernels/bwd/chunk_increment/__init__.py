@@ -6,6 +6,8 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from slinoss.perf import note_cache_event, record_region
+
 from .boundary import ChunkIncrementBwdBoundaryAmpere
 from .common import _torch_to_cutlass_dtype
 from .db import ChunkIncrementBwdDBAmpere
@@ -273,6 +275,7 @@ def compile_chunk_increment_bwd_kernels(
 
     cached = _COMPILED_CACHE.get(cache_key)
     if cached is None:
+        note_cache_event("cache.v2x2ssd.backward.chunk_increment", hit=False)
         compiled_db = cute.compile(
             k_db, mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part
         )
@@ -303,6 +306,7 @@ def compile_chunk_increment_bwd_kernels(
         cached = (compiled_db, compiled_du, compiled_boundary, compiled_param)
         _COMPILED_CACHE[cache_key] = cached
     else:
+        note_cache_event("cache.v2x2ssd.backward.chunk_increment", hit=True)
         compiled_db, compiled_du, compiled_boundary, compiled_param = cached
 
     dB_view = dB.reshape(Bsz, H, n_chunks, L, D)
@@ -318,35 +322,39 @@ def compile_chunk_increment_bwd_kernels(
     dKcurr_view = dKcurr_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
 
     def _launch_db() -> None:
-        compiled_db(mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part)
+        with record_region("backward.v2x2ssd.chunk_increment.db"):
+            compiled_db(mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part)
 
     def _launch_du() -> None:
-        compiled_du(mDInc, mB, mM, mKprev, mKcurr, mDU)
+        with record_region("backward.v2x2ssd.chunk_increment.du"):
+            compiled_du(mDInc, mB, mM, mKprev, mKcurr, mDU)
 
     def _launch_boundary() -> None:
-        compiled_boundary(
-            mDInc_boundary,
-            mBPrev,
-            mUPrev,
-            mM,
-            mKprev,
-            mDUPrev,
-            mDBPrev,
-            mDMp0,
-        )
+        with record_region("backward.v2x2ssd.chunk_increment.boundary"):
+            compiled_boundary(
+                mDInc_boundary,
+                mBPrev,
+                mUPrev,
+                mM,
+                mKprev,
+                mDUPrev,
+                mDBPrev,
+                mDMp0,
+            )
 
     def _launch_param() -> None:
-        compiled_param(
-            mM,
-            mKprev,
-            mKcurr,
-            mDMsum_part,
-            mDMp0,
-            mDMchunk,
-            mDM,
-            mDKprev,
-            mDKcurr,
-        )
+        with record_region("backward.v2x2ssd.chunk_increment.param_scan"):
+            compiled_param(
+                mM,
+                mKprev,
+                mKcurr,
+                mDMsum_part,
+                mDMp0,
+                mDMchunk,
+                mDM,
+                mDKprev,
+                mDKcurr,
+            )
 
     def launch_sequential() -> None:
         _launch_db()
@@ -470,7 +478,8 @@ def chunk_increment_bwd_cute(
         compute_dtype=compute_dtype,
         return_launchers=True,
     )
-    launch_overlapped()
+    with record_region("backward.v2x2ssd.chunk_increment.total"):
+        launch_overlapped()
 
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)

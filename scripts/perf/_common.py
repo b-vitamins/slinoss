@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 
@@ -35,6 +35,8 @@ from slinoss.ops.v2x2ssd.reference import (  # noqa: E402
 )
 from slinoss.ops.v2x2ssd.reference import chunk_scan as ref_chunk_scan  # noqa: E402
 from slinoss.ops.v2x2ssd.reference import state_passing as ref_state_passing  # noqa: E402
+from slinoss.perf import PerfRecorder  # noqa: E402
+from slinoss.perf.budget import summarize_cache_samples, summarize_named_samples  # noqa: E402
 
 DEFAULT_BATCH = 16
 DEFAULT_HEADS = 4
@@ -105,7 +107,7 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 
 def benchmark(
-    fn: Callable[[], None],
+    fn: Callable[[], object],
     *,
     warmup: int,
     iterations: int,
@@ -124,7 +126,44 @@ def benchmark(
     }
 
 
-def _time_once(fn: Callable[[], None], iterations: int) -> float:
+def benchmark_instrumented(
+    fn: Callable[[], object],
+    *,
+    device: torch.device,
+    warmup: int,
+    iterations: int,
+    repeat: int,
+) -> dict[str, Any]:
+    for _ in range(warmup):
+        recorder = PerfRecorder(device=device)
+        with recorder.capture_step():
+            fn()
+
+    samples: list[float] = []
+    region_samples: list[dict[str, float]] = []
+    cache_samples: list[dict[str, dict[str, int]]] = []
+    for _ in range(repeat):
+        sample_ms, sample_regions, sample_caches = _time_once_instrumented(
+            fn, iterations=iterations, device=device
+        )
+        samples.append(sample_ms)
+        region_samples.extend(sample_regions)
+        cache_samples.extend(sample_caches)
+
+    return {
+        "samples_ms": samples,
+        "mean_ms": statistics.fmean(samples),
+        "median_ms": statistics.median(samples),
+        "min_ms": min(samples),
+        "max_ms": max(samples),
+        "stdev_ms": statistics.stdev(samples) if len(samples) > 1 else 0.0,
+        "region_summaries": summarize_named_samples(region_samples),
+        "cache_events": summarize_cache_samples(cache_samples),
+        "region_samples": region_samples,
+    }
+
+
+def _time_once(fn: Callable[[], object], iterations: int) -> float:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
@@ -141,6 +180,50 @@ def _time_once(fn: Callable[[], None], iterations: int) -> float:
         fn()
     ended = time.perf_counter()
     return (ended - started) * 1000.0 / max(1, iterations)
+
+
+def _time_once_instrumented(
+    fn: Callable[[], object],
+    *,
+    iterations: int,
+    device: torch.device,
+) -> tuple[float, list[dict[str, float]], list[dict[str, dict[str, int]]]]:
+    region_samples: list[dict[str, float]] = []
+    cache_samples: list[dict[str, dict[str, int]]] = []
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(torch.cuda.current_stream(device=device))
+        for _ in range(iterations):
+            recorder = PerfRecorder(device=device)
+            with recorder.capture_step():
+                fn()
+            capture = recorder.steps[-1]
+            region_samples.append(capture["regions_ms"])
+            cache_samples.append(capture["cache_events"])
+        end.record(torch.cuda.current_stream(device=device))
+        torch.cuda.synchronize(device)
+        return (
+            float(start.elapsed_time(end) / max(1, iterations)),
+            region_samples,
+            cache_samples,
+        )
+
+    started = time.perf_counter()
+    for _ in range(iterations):
+        recorder = PerfRecorder(device=device)
+        with recorder.capture_step():
+            fn()
+        capture = recorder.steps[-1]
+        region_samples.append(capture["regions_ms"])
+        cache_samples.append(capture["cache_events"])
+    ended = time.perf_counter()
+    return (
+        (ended - started) * 1000.0 / max(1, iterations),
+        region_samples,
+        cache_samples,
+    )
 
 
 def make_inputs(cfg: PerfConfig) -> dict[str, torch.Tensor]:
@@ -188,7 +271,7 @@ def build_callable(
     stage: str,
     direction: str,
     backend: str,
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     if direction == "forward":
         return _build_forward_callable(cfg, stage=stage, backend=backend)
     if direction == "backward":
@@ -198,7 +281,7 @@ def build_callable(
 
 def _build_forward_callable(
     cfg: PerfConfig, *, stage: str, backend: str
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     tensors = make_inputs(cfg)
     U = tensors["U"]
     M = tensors["M"]
@@ -347,7 +430,7 @@ def _build_forward_callable(
 
 def _build_backward_callable(
     cfg: PerfConfig, *, stage: str, backend: str
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     tensors = make_inputs(cfg)
     if stage == "full":
         return _build_full_backward_callable(cfg, tensors=tensors, backend=backend)
@@ -371,7 +454,7 @@ def _build_chunk_increment_backward_callable(
     *,
     tensors: dict[str, torch.Tensor],
     backend: str,
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
@@ -448,7 +531,7 @@ def _build_state_passing_backward_callable(
     *,
     tensors: dict[str, torch.Tensor],
     backend: str,
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
@@ -519,7 +602,7 @@ def _build_chunk_scan_backward_callable(
     *,
     tensors: dict[str, torch.Tensor],
     backend: str,
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
@@ -636,7 +719,7 @@ def _build_full_backward_callable(
     *,
     tensors: dict[str, torch.Tensor],
     backend: str,
-) -> Callable[[], None]:
+) -> Callable[[], object]:
     dY = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, cfg.P),
         device=cfg.torch_device,

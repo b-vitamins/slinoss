@@ -8,6 +8,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from slinoss.perf import call_region
+
 from .backend import AutoScanBackend, ScanBackend, ScanInputs
 from .discretization import SLinOSSDiscretizer
 from .state import SLinOSSMixerState
@@ -188,12 +190,7 @@ class SLinOSSMixer(nn.Module):
 
         state_len = max(self.d_conv - 1, 0)
         if state_len == 0:
-            y = F.conv1d(
-                x.transpose(1, 2).contiguous(),
-                self.dw_conv.weight,
-                self.dw_conv.bias,
-                groups=self.d_inner,
-            )
+            y = self.dw_conv(x.transpose(1, 2).contiguous())
             empty = x.new_empty((batch, self.d_inner, 0))
             return y.transpose(1, 2).contiguous(), empty
 
@@ -211,7 +208,7 @@ class SLinOSSMixer(nn.Module):
 
         x_t = x.transpose(1, 2).contiguous()
         cat = torch.cat([prefix, x_t], dim=-1)
-        y = F.conv1d(cat, self.dw_conv.weight, self.dw_conv.bias, groups=self.d_inner)
+        y = self.dw_conv(cat)
         next_state = cat[..., -state_len:].contiguous()
         return y.transpose(1, 2).contiguous(), next_state
 
@@ -222,24 +219,50 @@ class SLinOSSMixer(nn.Module):
         params: torch.Tensor,
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
-        U = value.view(batch, T, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-        U = U.contiguous()
-
-        bc = self.bc_proj(value).view(batch, T, self.n_heads, 4, self.d_state)
+        bc = call_region(
+            "mixer.bc_proj",
+            lambda value_: self.bc_proj(value_).view(
+                batch, T, self.n_heads, 4, self.d_state
+            ),
+            value,
+            capture_backward=False,
+        )
         B_sem = bc[..., :2, :]
         C_sem = bc[..., 2:, :]
         if self.normalize_bc:
             assert self.b_scale is not None and self.c_scale is not None
-            B_sem = self._normalize_bc(B_sem, self.b_scale)
-            C_sem = self._normalize_bc(C_sem, self.c_scale)
+            b_scale = self.b_scale
+            c_scale = self.c_scale
+            B_sem, C_sem = call_region(
+                "mixer.bc_norm",
+                lambda B_sem_, C_sem_: (
+                    self._normalize_bc(B_sem_, b_scale),
+                    self._normalize_bc(C_sem_, c_scale),
+                ),
+                B_sem,
+                C_sem,
+            )
 
-        coeffs = self.discretizer(params.view(batch, T, self.n_heads, -1))
-        return ScanInputs(
-            U=U,
-            M=coeffs.M,
-            K=coeffs.K,
-            B=_pack_interleaved_pairs(B_sem),
-            C=_pack_interleaved_pairs(C_sem),
+        coeffs = call_region(
+            "mixer.discretizer",
+            lambda params_: self.discretizer(params_.view(batch, T, self.n_heads, -1)),
+            params,
+        )
+        return call_region(
+            "mixer.scan_input_pack",
+            lambda value_, coeffs_, B_sem_, C_sem_: ScanInputs(
+                U=value_.view(batch, T, self.n_heads, self.d_head)
+                .permute(0, 2, 1, 3)
+                .contiguous(),
+                M=coeffs_.M,
+                K=coeffs_.K,
+                B=_pack_interleaved_pairs(B_sem_),
+                C=_pack_interleaved_pairs(C_sem_),
+            ),
+            value,
+            coeffs,
+            B_sem,
+            C_sem,
         )
 
     def forward(
@@ -260,33 +283,66 @@ class SLinOSSMixer(nn.Module):
             next_state = SLinOSSMixerState() if state is None else state
             return (empty, next_state) if return_state else empty
 
-        proj = self.in_proj(x)
+        proj = call_region("mixer.in_proj", self.in_proj, x, capture_backward=False)
         gate, value_raw, params = torch.split(
             proj,
             [self.d_inner, self.d_inner, self.n_heads * self.discretizer.param_dim],
             dim=-1,
         )
         conv_state_in = None if state is None else state.conv
-        conv_out, conv_state = self._apply_causal_depthwise_conv(
-            value_raw, conv_state_in
+        conv_out, conv_state = call_region(
+            "mixer.dw_conv",
+            lambda value_raw_: self._apply_causal_depthwise_conv(
+                value_raw_, conv_state_in
+            ),
+            value_raw,
+            capture_backward=False,
         )
-        value = F.silu(conv_out)
+        value = call_region("mixer.dw_conv_activation", F.silu, conv_out)
 
         scan_inputs = self._build_scan_inputs(value=value, params=params)
         scan_state_in = None if state is None else state.scan
-        scan_y, scan_state = self.backend(
-            scan_inputs, chunk_size=self.chunk_size, state=scan_state_in
+        scan_y, scan_state = call_region(
+            "v2x2ssd.total",
+            lambda scan_inputs_: self.backend(
+                scan_inputs_, chunk_size=self.chunk_size, state=scan_state_in
+            ),
+            scan_inputs,
         )
 
+        gated = call_region(
+            "mixer.gate_skip",
+            self._apply_gate_skip,
+            scan_y,
+            value,
+            gate,
+            batch,
+            T,
+        )
+        out = call_region(
+            "mixer.out_proj",
+            self.out_proj,
+            gated,
+            capture_backward=False,
+        )
+
+        next_state = SLinOSSMixerState(conv=conv_state, scan=scan_state)
+        return (out, next_state) if return_state else out
+
+    def _apply_gate_skip(
+        self,
+        scan_y: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> torch.Tensor:
         scan_y = scan_y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner).contiguous()
         skip = self.skip.to(dtype=value.dtype).view(1, 1, self.d_inner)
         y = (scan_y + value * skip) * F.silu(gate).to(dtype=value.dtype)
         if self.output_norm is not None:
             y = self.output_norm(y)
-        out = self.out_proj(y)
-
-        next_state = SLinOSSMixerState(conv=conv_state, scan=scan_state)
-        return (out, next_state) if return_state else out
+        return y
 
     def step(
         self,

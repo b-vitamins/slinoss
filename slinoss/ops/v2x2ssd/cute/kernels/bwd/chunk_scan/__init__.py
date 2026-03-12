@@ -7,6 +7,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from slinoss.perf import note_cache_event, record_region
+
 from .db import ChunkScanBwdDBAmpere
 from .dcdr import ChunkScanBwdDCDRAmpere
 from .du import ChunkScanBwdDUAmpere
@@ -425,6 +427,7 @@ def compile_chunk_scan_bwd_kernels(
 
     cached = _COMPILED_CACHE.get(cache_key)
     if cached is None:
+        note_cache_event("cache.v2x2ssd.backward.chunk_scan", hit=False)
         compiled_dz0 = cute.compile(k_dz0, mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
         compiled_du = cute.compile(
             k_du,
@@ -515,6 +518,7 @@ def compile_chunk_scan_bwd_kernels(
         )
         _COMPILED_CACHE[cache_key] = cached
     else:
+        note_cache_event("cache.v2x2ssd.backward.chunk_scan", hit=True)
         (
             compiled_dz0,
             compiled_du,
@@ -549,91 +553,96 @@ def compile_chunk_scan_bwd_kernels(
             )
 
     def _launch_dz0() -> None:
-        compiled_dz0(mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
+        with record_region("backward.v2x2ssd.chunk_scan.dz0"):
+            compiled_dz0(mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
 
     def _launch_du() -> None:
-        compiled_du(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mDU,
-            mDB_du_scratch,
-            mDU_prev,
-            mDB_prev_du_scratch,
-            mDLp_du_scratch,
-            mDMp_du_scratch,
-            mDMc_du_scratch,
-        )
+        with record_region("backward.v2x2ssd.chunk_scan.du"):
+            compiled_du(
+                mU,
+                mB,
+                mC,
+                mM,
+                mK,
+                mDOut,
+                mU_prev0,
+                mB_prev0,
+                mDU,
+                mDB_du_scratch,
+                mDU_prev,
+                mDB_prev_du_scratch,
+                mDLp_du_scratch,
+                mDMp_du_scratch,
+                mDMc_du_scratch,
+            )
 
     def _launch_db() -> None:
-        compiled_db(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mDU_db_scratch,
-            mDB,
-            mDU_prev_db_scratch,
-            mDB_prev,
-            mDLp_db_scratch,
-            mDMp_db_scratch,
-            mDMc_db_scratch,
-        )
+        with record_region("backward.v2x2ssd.chunk_scan.db"):
+            compiled_db(
+                mU,
+                mB,
+                mC,
+                mM,
+                mK,
+                mDOut,
+                mU_prev0,
+                mB_prev0,
+                mDU_db_scratch,
+                mDB,
+                mDU_prev_db_scratch,
+                mDB_prev,
+                mDLp_db_scratch,
+                mDMp_db_scratch,
+                mDMc_db_scratch,
+            )
 
     def _launch_dc() -> None:
-        if compiled_dc_fast is not None:
-            _ = Z0_blk_fast_keepalive
-            compiled_dc_fast(
-                mU,
-                mB,
-                mC,
-                mM,
-                mK,
-                mDOut,
-                mU_prev0,
-                mB_prev0,
-                mZ0_fast,
-                mDLogp,
-                mDC,
-                mDR,
-            )
-        else:
-            compiled_dc(
-                mU,
-                mB,
-                mC,
-                mM,
-                mK,
-                mDOut,
-                mU_prev0,
-                mB_prev0,
-                mZ0,
-                mDLogp,
-                mDC,
-                mDR,
-            )
+        with record_region("backward.v2x2ssd.chunk_scan.dcdr"):
+            if compiled_dc_fast is not None:
+                _ = Z0_blk_fast_keepalive
+                compiled_dc_fast(
+                    mU,
+                    mB,
+                    mC,
+                    mM,
+                    mK,
+                    mDOut,
+                    mU_prev0,
+                    mB_prev0,
+                    mZ0_fast,
+                    mDLogp,
+                    mDC,
+                    mDR,
+                )
+            else:
+                compiled_dc(
+                    mU,
+                    mB,
+                    mC,
+                    mM,
+                    mK,
+                    mDOut,
+                    mU_prev0,
+                    mB_prev0,
+                    mZ0,
+                    mDLogp,
+                    mDC,
+                    mDR,
+                )
 
     def _launch_param() -> None:
-        compiled_param(
-            mM,
-            mK,
-            mDLp,
-            mDMprev,
-            mDMcurr,
-            mDR_param,
-            mDM,
-            mDKprev,
-            mDKcurr,
-        )
+        with record_region("backward.v2x2ssd.chunk_scan.param_scan"):
+            compiled_param(
+                mM,
+                mK,
+                mDLp,
+                mDMprev,
+                mDMcurr,
+                mDR_param,
+                mDM,
+                mDKprev,
+                mDKcurr,
+            )
 
     def launch_sequential() -> None:
         _launch_dz0()
@@ -784,7 +793,8 @@ def chunk_scan_bwd_cute(
         compute_dtype=compute_dtype,
         return_launchers=True,
     )
-    launch_overlapped()
+    with record_region("backward.v2x2ssd.chunk_scan.total"):
+        launch_overlapped()
 
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)

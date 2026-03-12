@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
+from typing import Any
 
 import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from _common import (  # noqa: E402
     DEFAULT_BATCH,
@@ -30,6 +35,8 @@ from _common import (  # noqa: E402
     format_header,
     seed_all,
 )
+from slinoss.perf import PerfRecorder  # noqa: E402
+from slinoss.perf.budget import summarize_named_samples  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -79,6 +86,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional chrome trace output path.",
     )
+    parser.add_argument(
+        "--json-out",
+        type=Path,
+        default=None,
+        help="Optional JSON summary of event-timed regions.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +123,7 @@ def main() -> int:
         wait=0, warmup=int(args.warmup), active=int(args.active), repeat=1
     )
     total_steps = int(args.warmup) + int(args.active)
+    captures: list[dict[str, Any]] = []
     with torch.profiler.profile(
         activities=activities,
         schedule=schedule,
@@ -119,7 +133,10 @@ def main() -> int:
         with_stack=False,
     ) as prof:
         for step in range(total_steps):
-            fn()
+            recorder = PerfRecorder(device=cfg.torch_device)
+            with recorder.capture_step():
+                fn()
+            captures.append(recorder.steps[-1])
             prof.step()
 
     if args.trace_out is not None:
@@ -136,8 +153,34 @@ def main() -> int:
             row_limit=args.top_k,
         )
     )
+    active_captures = captures[-int(args.active) :]
+    region_samples = [capture["regions_ms"] for capture in active_captures]
+    region_summaries = summarize_named_samples(region_samples)
+    if region_summaries:
+        print()
+        print("| region | mean_ms | median_ms | stdev_ms |")
+        print("| --- | ---: | ---: | ---: |")
+        for region, stats in sorted(region_summaries.items()):
+            print(
+                f"| {region} | {float(stats['mean_ms']):.6f} | "
+                f"{float(stats['median_ms']):.6f} | {float(stats['stdev_ms']):.6f} |"
+            )
     if args.trace_out is not None:
         print(f"trace: {args.trace_out}")
+    if args.json_out is not None:
+        payload = {
+            "header": format_header(cfg),
+            "profile": {
+                "stage": args.stage,
+                "direction": args.direction,
+                "backend": args.backend,
+            },
+            "regions": region_summaries,
+            "trace_out": None if args.trace_out is None else str(args.trace_out),
+        }
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"json: {args.json_out}")
     return 0
 
 

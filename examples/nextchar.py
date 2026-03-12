@@ -213,8 +213,10 @@ class NextCharBlock(nn.Module):
         self.ff = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.mixer(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
+        norm1 = self.norm1(x)
+        x = x + self.mixer(norm1)
+        norm2 = self.norm2(x)
+        x = x + self.ff(norm2)
         return x
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from typing import Any
 import json
 from pathlib import Path
 import sys
@@ -25,7 +26,7 @@ from _common import (  # noqa: E402
     DIRECTIONS,
     STAGES,
     PerfConfig,
-    benchmark,
+    benchmark_instrumented,
     build_callable,
     dtype_from_str,
     ensure_cuda,
@@ -94,16 +95,19 @@ def main() -> int:
     directions = DIRECTIONS if args.direction == "both" else (args.direction,)
     backends = ("reference", "cute") if args.backend == "both" else (args.backend,)
 
-    rows: list[dict[str, float | str | list[float] | None]] = []
+    rows: list[dict[str, Any]] = []
+    region_rows: list[dict[str, Any]] = []
+    cache_rows: list[dict[str, Any]] = []
     for direction in directions:
         for stage in stages:
-            by_backend: dict[str, dict[str, float | list[float]]] = {}
+            by_backend: dict[str, dict[str, Any]] = {}
             for backend in backends:
                 fn = build_callable(
                     cfg, stage=stage, direction=direction, backend=backend
                 )
-                stats = benchmark(
+                stats = benchmark_instrumented(
                     fn,
+                    device=cfg.torch_device,
                     warmup=args.warmup,
                     iterations=args.iterations,
                     repeat=args.repeat,
@@ -125,18 +129,50 @@ def main() -> int:
             )
 
             for backend in backends:
+                backend_stats = by_backend[backend]
                 rows.append(
                     {
                         "direction": direction,
                         "stage": stage,
                         "backend": backend,
-                        "mean_ms": float(by_backend[backend]["mean_ms"]),
-                        "median_ms": float(by_backend[backend]["median_ms"]),
-                        "stdev_ms": float(by_backend[backend]["stdev_ms"]),
+                        "mean_ms": float(backend_stats["mean_ms"]),
+                        "median_ms": float(backend_stats["median_ms"]),
+                        "stdev_ms": float(backend_stats["stdev_ms"]),
                         "speedup_vs_reference": speedup if backend == "cute" else 1.0,
-                        "samples_ms": by_backend[backend]["samples_ms"],
+                        "samples_ms": backend_stats["samples_ms"],
                     }
                 )
+                region_summaries = backend_stats.get("region_summaries", {})
+                if isinstance(region_summaries, dict):
+                    for region, region_stats in sorted(region_summaries.items()):
+                        if not isinstance(region_stats, dict):
+                            continue
+                        region_rows.append(
+                            {
+                                "direction": direction,
+                                "stage": stage,
+                                "backend": backend,
+                                "region": region,
+                                "mean_ms": float(region_stats["mean_ms"]),
+                                "median_ms": float(region_stats["median_ms"]),
+                                "stdev_ms": float(region_stats["stdev_ms"]),
+                            }
+                        )
+                cache_events = backend_stats.get("cache_events", {})
+                if isinstance(cache_events, dict):
+                    for cache_label, counts in sorted(cache_events.items()):
+                        if not isinstance(counts, dict):
+                            continue
+                        cache_rows.append(
+                            {
+                                "direction": direction,
+                                "stage": stage,
+                                "backend": backend,
+                                "cache": cache_label,
+                                "hits": int(counts.get("hits", 0)),
+                                "misses": int(counts.get("misses", 0)),
+                            }
+                        )
 
     print(format_header(cfg))
     print("| direction | stage | backend | mean_ms | median_ms | stdev_ms | vs_ref |")
@@ -149,6 +185,27 @@ def main() -> int:
             f"{float(row['mean_ms']):.6f} | {float(row['median_ms']):.6f} | "
             f"{float(row['stdev_ms']):.6f} | {vs_ref_str} |"
         )
+    if region_rows:
+        print()
+        print(
+            "| direction | stage | backend | region | mean_ms | median_ms | stdev_ms |"
+        )
+        print("| --- | --- | --- | --- | ---: | ---: | ---: |")
+        for row in region_rows:
+            print(
+                f"| {row['direction']} | {row['stage']} | {row['backend']} | "
+                f"{row['region']} | {float(row['mean_ms']):.6f} | "
+                f"{float(row['median_ms']):.6f} | {float(row['stdev_ms']):.6f} |"
+            )
+    if cache_rows:
+        print()
+        print("| direction | stage | backend | cache | hits | misses |")
+        print("| --- | --- | --- | --- | ---: | ---: |")
+        for row in cache_rows:
+            print(
+                f"| {row['direction']} | {row['stage']} | {row['backend']} | "
+                f"{row['cache']} | {int(row['hits'])} | {int(row['misses'])} |"
+            )
 
     if args.json_out is not None:
         payload = {
@@ -157,6 +214,8 @@ def main() -> int:
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
             ),
             "rows": rows,
+            "region_rows": region_rows,
+            "cache_rows": cache_rows,
         }
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
