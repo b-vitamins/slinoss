@@ -98,9 +98,8 @@ def _fold_chunk_boundary_carries(
     n_chunks = int(x.shape[2])
     if n_chunks <= 1:
         return x
-    out = x.clone()
-    out[:, :, :-1, -1, :] = out[:, :, :-1, -1, :] + x_prev[:, :, 1:, :]
-    return out
+    x[:, :, :-1, -1, :].add_(x_prev[:, :, 1:, :])
+    return x
 
 
 def _public_from_param_scan(x: torch.Tensor, *, T: int) -> torch.Tensor:
@@ -121,9 +120,13 @@ def _public_dk_from_parts(
     *,
     T: int,
 ) -> torch.Tensor:
-    dKprev_public = _public_from_param_scan(dKprev, T=T)
-    dKcurr_public = _public_from_param_scan(dKcurr, T=T)
-    return torch.stack((dKprev_public, dKcurr_public), dim=3).contiguous()
+    if dKprev.shape != dKcurr.shape:
+        raise ValueError("dKprev and dKcurr must have identical shapes.")
+    B, H, C, S, L, F = map(int, dKprev.shape)
+    if S != 1:
+        raise ValueError("Only n_splits=1 is supported by the public wrapper.")
+    dK = torch.stack((dKprev[:, :, :, 0, :, :], dKcurr[:, :, :, 0, :, :]), dim=4)
+    return dK.reshape(B, H, C * L, 2, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
 
 
 def compile_chunk_scan_bwd_kernels(
