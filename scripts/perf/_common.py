@@ -614,10 +614,10 @@ def _build_chunk_scan_backward_callable(
         compute_dtype=torch.float32,
         return_launchers=True,
     )
-    launch_sequential = compiled[-2]
+    launch_overlapped = compiled[-1]
 
     def fn() -> None:
-        launch_sequential()
+        launch_overlapped()
 
     fn()
     return fn

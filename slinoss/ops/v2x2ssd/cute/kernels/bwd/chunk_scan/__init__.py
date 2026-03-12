@@ -655,8 +655,8 @@ def chunk_scan_bwd_cute(
         dM,
         dKprev,
         dKcurr,
-        launch_sequential,
-        _launch_overlapped,
+        _launch_sequential,
+        launch_overlapped,
     ) = compile_chunk_scan_bwd_kernels(
         U,
         M,
@@ -670,9 +670,8 @@ def chunk_scan_bwd_cute(
         U_prev=U_prev,
         compute_dtype=compute_dtype,
         return_launchers=True,
-        enable_overlapped_launcher=False,
     )
-    launch_sequential()
+    launch_overlapped()
 
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)
