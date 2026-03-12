@@ -645,8 +645,6 @@ class ChunkScanBwdDCDRAmpere:
         iters_k_tile = (total_k_tile + self.num_threads - 1) // self.num_threads
         total_z0_tile = cutlass.Int32(p_tile * Dp)
         iters_z0_tile = (total_z0_tile + self.num_threads - 1) // self.num_threads
-        total_blk_tile = cutlass.Int32(kv_tile * kv_tile)
-        iters_blk_tile = (total_blk_tile + self.num_threads - 1) // self.num_threads
         z0_vec = 4
         z0_vec_cols = (Dp + z0_vec - 1) // z0_vec
         total_z0_vec = cutlass.Int32(p_tile * z0_vec_cols)
@@ -1084,19 +1082,6 @@ class ChunkScanBwdDCDRAmpere:
                     tCsDS_blk = thr_mma.partition_C(sDS_blk)
                     tCrDS_blk = cute.make_fragment_like(tCsDS_blk, mU.element_type)
                     tCrDS_blk_mn = self._make_acc_tensor_mn_view(tCrDS_blk)
-                    for it in range(iters_blk_tile):
-                        idx = tidx + cutlass.Int32(it * self.num_threads)
-                        if idx < total_blk_tile:
-                            row = idx // cutlass.Int32(kv_tile)
-                            col = idx - row * cutlass.Int32(kv_tile)
-                            sDS_blk[row, col] = cutlass.Float32(0.0).to(mU.element_type)
-                            sDS_scratch[row, col] = cutlass.Float32(0.0).to(
-                                mU.element_type
-                            )
-                            sSc_scratch[row, col] = cutlass.Float32(0.0).to(
-                                mU.element_type
-                            )
-                    cute.arch.barrier()
                     diag_tile = m_tile == n_tile
                     for r in cutlass.range_constexpr(cute.size(acc_S_blk_mn.shape[0])):
                         row_idx = cutlass.Int32(tScS_blk_mn[r, 0][1])
