@@ -370,6 +370,27 @@ def compile_chunk_scan_bwd_kernels(
         mDC,
         mDR,
     )
+    compiled_dc_fast = None
+    mZ0_fast = None
+    Z0_blk_fast_keepalive = None
+    if return_launchers:
+        Z0_blk_fast_keepalive = Z0_blk.to(dtype=tc_dtype)
+        mZ0_fast = from_dlpack(Z0_blk_fast_keepalive, assumed_align=16)
+        compiled_dc_fast = cute.compile(
+            k_dc,
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mU_prev0,
+            mB_prev0,
+            mZ0_fast,
+            mDLogp,
+            mDC,
+            mDR,
+        )
 
     dlogp_view = dlogp.reshape(Bsz, H, n_chunks, L)
     dC_view = dC.reshape(Bsz, H, n_chunks, L, D)
@@ -452,20 +473,37 @@ def compile_chunk_scan_bwd_kernels(
         )
 
     def _launch_dc() -> None:
-        compiled_dc(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mZ0,
-            mDLogp,
-            mDC,
-            mDR,
-        )
+        if compiled_dc_fast is not None:
+            _ = Z0_blk_fast_keepalive
+            compiled_dc_fast(
+                mU,
+                mB,
+                mC,
+                mM,
+                mK,
+                mDOut,
+                mU_prev0,
+                mB_prev0,
+                mZ0_fast,
+                mDLogp,
+                mDC,
+                mDR,
+            )
+        else:
+            compiled_dc(
+                mU,
+                mB,
+                mC,
+                mM,
+                mK,
+                mDOut,
+                mU_prev0,
+                mB_prev0,
+                mZ0,
+                mDLogp,
+                mDC,
+                mDR,
+            )
 
     def _launch_param() -> None:
         compiled_param(

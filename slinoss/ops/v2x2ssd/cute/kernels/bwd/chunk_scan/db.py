@@ -501,31 +501,6 @@ class ChunkScanBwdDBAmpere:
             s_dlp[tidx] = cutlass.Float32(0.0)
         cute.arch.barrier()
 
-        total_du = self.L * Pp
-        iters_du = (total_du + self.num_threads - 1) // self.num_threads
-        for it in range(iters_du):
-            idx = tidx + cutlass.Int32(it * self.num_threads)
-            if idx < cutlass.Int32(total_du):
-                rr = idx // cutlass.Int32(Pp)
-                cc = idx - rr * cutlass.Int32(Pp)
-                if rr < cutlass.Int32(self.L) and cc < cutlass.Int32(self.P):
-                    mDU[bidz, rr, 0, cc] = cutlass.Float32(0.0).to(mU.element_type)
-        iters_dup = (self.P + self.num_threads - 1) // self.num_threads
-        for it in range(iters_dup):
-            p = tidx + cutlass.Int32(it * self.num_threads)
-            if p < cutlass.Int32(self.P):
-                mDU_prev[bidz, p] = cutlass.Float32(0.0).to(mU.element_type)
-        iters_dlp = (self.L + self.num_threads - 1) // self.num_threads
-        for it in range(iters_dlp):
-            t = tidx + cutlass.Int32(it * self.num_threads)
-            if t < cutlass.Int32(self.L):
-                mDLogp[bidz, t] = cutlass.Float32(0.0)
-                mDMprev[bidz, t, 0] = cutlass.Float32(0.0)
-                mDMprev[bidz, t, 1] = cutlass.Float32(0.0)
-                mDMcurr[bidz, t, 0] = cutlass.Float32(0.0)
-                mDMcurr[bidz, t, 1] = cutlass.Float32(0.0)
-        cute.arch.barrier()
-
         smem_copy_atom_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             mU.element_type,
