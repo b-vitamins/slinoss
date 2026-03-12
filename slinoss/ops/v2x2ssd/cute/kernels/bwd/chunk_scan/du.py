@@ -605,11 +605,6 @@ class ChunkScanBwdDUAmpere:
         iters_pairs_tile = (total_pairs_tile + self.num_threads - 1) // self.num_threads
         iters_p_padded = (Pp + self.num_threads - 1) // self.num_threads
         iters_d = (self.D + self.num_threads - 1) // self.num_threads
-        total_dm = self.L * 2
-        iters_dm = (total_dm + self.num_threads - 1) // self.num_threads
-        total_db = self.L * self.D
-        iters_db = (total_db + self.num_threads - 1) // self.num_threads
-
         for it in range(iters_p_padded):
             p = tidx + cutlass.Int32(it * self.num_threads)
             if p < cutlass.Int32(Pp):
@@ -1308,28 +1303,6 @@ class ChunkScanBwdDUAmpere:
             if p < cutlass.Int32(self.P):
                 mDU_prev[bidz, p] = sDV_carry[p]
         cute.arch.barrier()
-
-        for it in range(iters_db):
-            idx = tidx + cutlass.Int32(it * self.num_threads)
-            if idx < cutlass.Int32(total_db):
-                t = idx // cutlass.Int32(self.D)
-                d = idx - t * cutlass.Int32(self.D)
-                mDB[bidz, t, 0, d] = cutlass.Float32(0.0).to(mU.element_type)
-        for it in range(iters_d):
-            d = tidx + cutlass.Int32(it * self.num_threads)
-            if d < cutlass.Int32(self.D):
-                mDB_prev[bidz, d] = cutlass.Float32(0.0).to(mU.element_type)
-        for it in range((self.L + self.num_threads - 1) // self.num_threads):
-            t = tidx + cutlass.Int32(it * self.num_threads)
-            if t < cutlass.Int32(self.L):
-                mDLogp[bidz, t] = cutlass.Float32(0.0)
-        for it in range(iters_dm):
-            idx = tidx + cutlass.Int32(it * self.num_threads)
-            if idx < cutlass.Int32(total_dm):
-                t = idx // cutlass.Int32(2)
-                j = idx - t * cutlass.Int32(2)
-                mDMprev[bidz, t, j] = cutlass.Float32(0.0)
-                mDMcurr[bidz, t, j] = cutlass.Float32(0.0)
 
 
 __all__ = ["ChunkScanBwdDUAmpere"]
