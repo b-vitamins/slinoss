@@ -30,6 +30,18 @@ Use lightweight Conventional Commits for all new commits:
 Keep commit subjects short and specific. If a layout decision, kernel contract, or
 benchmark change is important, make that visible in the subject line.
 
+### Pre-Commit Gate
+
+Before creating any commit, clear this full verification gate in the Guix
+environment:
+
+- `./scripts/guix-run ruff format --check .`
+- `./scripts/guix-run ruff check`
+- `./scripts/guix-run pyright`
+- `./scripts/guix-run pytest`
+
+Do not commit while any of these are failing.
+
 ## Changelog Policy
 
 Do not maintain a hand-written `CHANGELOG.md` during active development.
