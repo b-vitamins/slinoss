@@ -16,6 +16,18 @@ from .param_scan import ChunkIncrementBwdParamScanAmpere
 
 
 _COMPILED_CACHE: dict[tuple, tuple[object, object, object, object]] = {}
+_OVERLAP_RESOURCES: dict[
+    int,
+    tuple[
+        torch.cuda.Stream,
+        torch.cuda.Stream,
+        torch.cuda.Stream,
+        torch.cuda.Event,
+        torch.cuda.Event,
+        torch.cuda.Event,
+        torch.cuda.Event,
+    ],
+] = {}
 
 
 def _tc_input_dtype(
@@ -125,6 +137,33 @@ def _compiled_key(
         int(chunk_size),
         has_prev,
     )
+
+
+def _get_overlap_resources(
+    device: torch.device,
+) -> tuple[
+    torch.cuda.Stream,
+    torch.cuda.Stream,
+    torch.cuda.Stream,
+    torch.cuda.Event,
+    torch.cuda.Event,
+    torch.cuda.Event,
+    torch.cuda.Event,
+]:
+    device_index = device.index if device.index is not None else -1
+    cached = _OVERLAP_RESOURCES.get(device_index)
+    if cached is None:
+        cached = (
+            torch.cuda.Stream(device=device),
+            torch.cuda.Stream(device=device),
+            torch.cuda.Stream(device=device),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+        )
+        _OVERLAP_RESOURCES[device_index] = cached
+    return cached
 
 
 def compile_chunk_increment_bwd_kernels(
@@ -371,13 +410,15 @@ def compile_chunk_increment_bwd_kernels(
     ev_boundary_done = None
 
     if return_launchers and enable_overlapped_launcher:
-        stream_db = torch.cuda.Stream(device=U.device)
-        stream_du = torch.cuda.Stream(device=U.device)
-        stream_boundary = torch.cuda.Stream(device=U.device)
-        ev_start = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_db_done = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_du_done = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_boundary_done = torch.cuda.Event(blocking=False, enable_timing=False)
+        (
+            stream_db,
+            stream_du,
+            stream_boundary,
+            ev_start,
+            ev_db_done,
+            ev_du_done,
+            ev_boundary_done,
+        ) = _get_overlap_resources(U.device)
 
     def launch_overlapped() -> None:
         if stream_db is None or stream_du is None or stream_boundary is None:

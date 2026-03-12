@@ -19,6 +19,20 @@ from .param_scan import ChunkScanBwdParamScanAmpere
 _COMPILED_CACHE: dict[
     tuple, tuple[object, object, object, object, object, object | None]
 ] = {}
+_OVERLAP_RESOURCES: dict[
+    int,
+    tuple[
+        torch.cuda.Stream,
+        torch.cuda.Stream,
+        torch.cuda.Stream,
+        torch.cuda.Stream,
+        torch.cuda.Event,
+        torch.cuda.Event,
+        torch.cuda.Event,
+        torch.cuda.Event,
+        torch.cuda.Event,
+    ],
+] = {}
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -40,6 +54,37 @@ def _tc_input_dtype(
     if dt == torch.float32:
         return torch.float16
     raise TypeError(f"Unsupported compute dtype: {dt}")
+
+
+def _get_overlap_resources(
+    device: torch.device,
+) -> tuple[
+    torch.cuda.Stream,
+    torch.cuda.Stream,
+    torch.cuda.Stream,
+    torch.cuda.Stream,
+    torch.cuda.Event,
+    torch.cuda.Event,
+    torch.cuda.Event,
+    torch.cuda.Event,
+    torch.cuda.Event,
+]:
+    device_index = device.index if device.index is not None else -1
+    cached = _OVERLAP_RESOURCES.get(device_index)
+    if cached is None:
+        cached = (
+            torch.cuda.Stream(device=device),
+            torch.cuda.Stream(device=device),
+            torch.cuda.Stream(device=device),
+            torch.cuda.Stream(device=device),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+            torch.cuda.Event(blocking=False, enable_timing=False),
+        )
+        _OVERLAP_RESOURCES[device_index] = cached
+    return cached
 
 
 def _pad_zero_time(
@@ -662,15 +707,17 @@ def compile_chunk_scan_bwd_kernels(
     ev_dc_done = None
 
     if return_launchers and enable_overlapped_launcher:
-        stream_dz0 = torch.cuda.Stream(device=U.device)
-        stream_du = torch.cuda.Stream(device=U.device)
-        stream_db = torch.cuda.Stream(device=U.device)
-        stream_dc = torch.cuda.Stream(device=U.device)
-        ev_start = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_dz0_done = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_du_done = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_db_done = torch.cuda.Event(blocking=False, enable_timing=False)
-        ev_dc_done = torch.cuda.Event(blocking=False, enable_timing=False)
+        (
+            stream_dz0,
+            stream_du,
+            stream_db,
+            stream_dc,
+            ev_start,
+            ev_dz0_done,
+            ev_du_done,
+            ev_db_done,
+            ev_dc_done,
+        ) = _get_overlap_resources(U.device)
 
     def launch_overlapped() -> None:
         if (
