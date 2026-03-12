@@ -7,12 +7,12 @@ from typing import cast
 import torch
 
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
-    chunk_increment_bwd_prepared_cute,
+    chunk_increment_bwd_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    chunk_increment_with_prepared_cute,
+    chunk_increment_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
@@ -62,7 +62,7 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         B_last = B_d[:, :, -1, :].to(dtype=output_dtype or U.dtype).contiguous()
         U_last = U_d[:, :, -1, :].to(dtype=output_dtype or U.dtype).contiguous()
 
-        inc, m_chunk, prepared = chunk_increment_with_prepared_cute(
+        inc, m_chunk = chunk_increment_cute(
             U_d,
             M_d,
             K_d,
@@ -98,10 +98,6 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             K_d,
             B_d,
             C_d,
-            prepared.A_main,
-            prepared.B_main,
-            prepared.u_head,
-            prepared.b_head,
             m_chunk,
             chunk_starts,
         ]
@@ -149,14 +145,6 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         B = saved[idx]
         idx += 1
         C = saved[idx]
-        idx += 1
-        A_main = saved[idx]
-        idx += 1
-        B_main = saved[idx]
-        idx += 1
-        u_head = saved[idx]
-        idx += 1
-        b_head = saved[idx]
         idx += 1
         m_chunk = saved[idx]
         idx += 1
@@ -239,15 +227,11 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                 m_chunk,
             )
             dU_inc, dM_inc, dK_inc, dB_inc, dB_prev_inc_raw, dU_prev_inc_raw = (
-                chunk_increment_bwd_prepared_cute(
+                chunk_increment_bwd_cute(
                     U,
                     M,
                     K,
                     B,
-                    A_main=A_main,
-                    B_main=B_main,
-                    u_head=u_head,
-                    b_head=b_head,
                     d_inc=d_inc,
                     d_m_chunk=d_m_chunk,
                     chunk_size=ctx.chunk_size,

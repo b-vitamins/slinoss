@@ -1,52 +1,307 @@
-"""Boundary branch for the CuTe ``v2x2ssd`` chunk-increment backward."""
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import torch
-
-from slinoss.ops.v2x2ssd.reference import _as_complex_pairs, _pack_complex_pairs
-
-from .common import ChunkIncrementBwdContext
+import cutlass
+import cutlass.cute as cute
 
 
-@dataclass(frozen=True)
-class ChunkIncrementBwdBoundaryResult:
-    d_boundary: torch.Tensor
-    d_b_prev_chunk0: torch.Tensor
-    dB_prev: torch.Tensor
+class ChunkIncrementBwdBoundaryAmpere:
+    """Boundary kernel for the per-chunk ``u_prev0 ⊗ b_prev_decay0`` term.
 
+    For each chunk (BHC), ``chunk_increment`` contains the rank-1 contribution:
 
-def chunk_increment_bwd_boundary_cute(
-    *,
-    u_head: torch.Tensor,
-    d_inc_flat: torch.Tensor,
-    ctx: ChunkIncrementBwdContext,
-) -> ChunkIncrementBwdBoundaryResult:
-    """Run the rank-1 boundary branch for ``chunk_increment`` backward."""
-    d_b_head = torch.einsum("bpd,bp->bd", d_inc_flat, u_head)
-    d_boundary = _as_complex_pairs(
-        d_b_head.reshape(ctx.batch_size, ctx.n_heads, ctx.n_chunks, ctx.D),
-        name="d_b_head",
-    ).to(dtype=ctx.cplx_dtype)
+      inc += u_boundary ⊗ (Mp0 * b_prev_input)
 
-    d_b_prev_chunk0 = (
-        torch.conj(
-            ctx.suffix_after[..., 0].unsqueeze(-1)
-            * ctx.k_prev_blk[..., 0].unsqueeze(-1)
+    where:
+      - ``u_boundary`` is ``U_prev0`` for the first chunk, else the previous
+        chunk's last ``U``,
+      - ``b_prev_input`` is ``B_prev0`` for the first chunk, else the previous
+        chunk's last ``B``,
+      - ``Mp0`` is the step-0 prev-tap + suffix transform scalar for the chunk.
+
+    This kernel computes:
+      - ``dU_boundary``   (P)   (same dtype as U/B)
+      - ``dB_prev_input`` (D)   (same dtype as U/B)
+      - ``dMp0``          (2)   (fp32 packed complex), to be consumed by the
+        parameter scan-backward kernel.
+    """
+
+    def __init__(
+        self,
+        dtype: type[cutlass.Numeric],
+        *,
+        chunk_size: int,
+        D: int,
+        P: int,
+        num_threads: int = 192,
+    ):
+        self.ab_dtype = dtype
+        self.L = int(chunk_size)
+        self.D = int(D)
+        self.P = int(P)
+        self.num_threads = int(num_threads)
+        if self.D % 2 != 0:
+            raise ValueError("D must be divisible by 2 (flattened 2N).")
+        if self.num_threads <= 64:
+            raise ValueError("num_threads must be > 64.")
+        if self.num_threads % 32 != 0:
+            raise ValueError("num_threads must be a multiple of 32.")
+
+    @cute.jit
+    def __call__(
+        self,
+        mDInc: cute.Tensor,  # (BHC, P, D) fp16/bf16
+        mBPrev: cute.Tensor,  # (D, BHC) fp16/bf16
+        mUPrev: cute.Tensor,  # (P, BHC) fp16/bf16
+        mM: cute.Tensor,  # (2, L, BHC) fp32
+        mKprev: cute.Tensor,  # (2, L, BHC) fp32
+        mDUPrev: cute.Tensor,  # (P, BHC) fp16/bf16
+        mDBPrev: cute.Tensor,  # (D, BHC) fp16/bf16
+        mDMp0: cute.Tensor,  # (2, BHC) fp32
+    ):
+        grid_x = cute.size(mDInc.shape[0])
+        self.kernel(
+            mDInc,
+            mBPrev,
+            mUPrev,
+            mM,
+            mKprev,
+            mDUPrev,
+            mDBPrev,
+            mDMp0,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
         )
-        * d_boundary
-    )
-    dB_prev = _pack_complex_pairs(
-        d_b_prev_chunk0[:, :, 0, :].contiguous(),
-        real_dtype=ctx.rdtype,
-    )
-    return ChunkIncrementBwdBoundaryResult(
-        d_boundary=d_boundary,
-        d_b_prev_chunk0=d_b_prev_chunk0,
-        dB_prev=dB_prev,
-    )
 
+    @cute.kernel
+    def kernel(
+        self,
+        mDInc: cute.Tensor,  # (BHC, P, D)
+        mBPrev: cute.Tensor,  # (D, BHC)
+        mUPrev: cute.Tensor,  # (P, BHC)
+        mM: cute.Tensor,  # (2, L, BHC)
+        mKprev: cute.Tensor,  # (2, L, BHC)
+        mDUPrev: cute.Tensor,  # (P, BHC)
+        mDBPrev: cute.Tensor,  # (D, BHC)
+        mDMp0: cute.Tensor,  # (2, BHC)
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bhc, _, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
 
-__all__ = ["ChunkIncrementBwdBoundaryResult", "chunk_increment_bwd_boundary_cute"]
+        smem = cutlass.utils.SmemAllocator()
+        s_Mp0 = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((2,), stride=(1,)), 8
+        )
+        warp_re_total = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((4,), stride=(1,)), 4
+        )
+        warp_im_total = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((4,), stride=(1,)), 4
+        )
+        s_u_prev = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.P,), stride=(1,)), 4
+        )
+        s_g = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.D,), stride=(1,)), 4
+        )
+        s_b_decay = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.D,), stride=(1,)), 4
+        )
+        s_dinc = smem.allocate_tensor(
+            mDInc.element_type,
+            cute.make_layout((self.P, self.D), stride=(self.D, 1)),
+            16,
+        )
+
+        p = tidx
+        while cute.elem_less(p, self.P):
+            s_u_prev[p] = mUPrev[p, bhc].to(cutlass.Float32)
+            p = p + self.num_threads
+
+        async_copy_bits = 128
+        async_elems = async_copy_bits // mDInc.element_type.width
+        d_vec = self.D // async_elems
+        mDInc_vec = cute.make_tensor(
+            mDInc.iterator,
+            cute.make_layout(
+                (mDInc.shape[0], mDInc.shape[1], d_vec, async_elems),
+                stride=(self.P * self.D, self.D, async_elems, 1),
+            ),
+        )
+        s_dinc_vec = cute.make_tensor(
+            s_dinc.iterator,
+            cute.make_layout(
+                (self.P, d_vec, async_elems), stride=(self.D, async_elems, 1)
+            ),
+        )
+        atom_async_copy_dinc = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            mDInc.element_type,
+            num_bits_per_copy=async_copy_bits,
+        )
+        p = tidx
+        while cute.elem_less(p, self.P):
+            dv = 0
+            while cute.elem_less(dv, d_vec):
+                cute.copy(
+                    atom_async_copy_dinc,
+                    mDInc_vec[bhc, p, dv, None],
+                    s_dinc_vec[p, dv, None],
+                )
+                dv = dv + 1
+            d = d_vec * async_elems
+            while cute.elem_less(d, self.D):
+                s_dinc[p, d] = mDInc[bhc, p, d]
+                d = d + 1
+            p = p + self.num_threads
+        cute.arch.cp_async_commit_group()
+
+        if tidx == 0:
+            for w in cutlass.range(4, unroll=1):
+                warp_re_total[w] = cutlass.Float32(1.0)
+                warp_im_total[w] = cutlass.Float32(0.0)
+
+        cute.arch.sync_threads()
+
+        scan_threads = 0
+        if self.L <= 64:
+            scan_threads = 64
+        elif self.L <= 128:
+            scan_threads = 128
+
+        if scan_threads != 0 and cute.elem_less(tidx, cutlass.Int32(scan_threads)):
+            t = (self.L - 1) - tidx
+            qr = cutlass.Float32(1.0)
+            qi = cutlass.Float32(0.0)
+            if cute.elem_less(cutlass.Int32(0), t):
+                qr = cutlass.Float32(mM[0, t, bhc])
+                qi = cutlass.Float32(mM[1, t, bhc])
+
+            for offset in (1, 2, 4, 8, 16):
+                orr = cute.arch.shuffle_sync_up(
+                    qr, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                oii = cute.arch.shuffle_sync_up(
+                    qi, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                pred = lane >= cutlass.Int32(offset)
+                nr = orr * qr - oii * qi
+                ni = orr * qi + oii * qr
+                qr = cutlass.select_(pred, nr, qr)
+                qi = cutlass.select_(pred, ni, qi)
+
+            if lane == cutlass.Int32(31) and cute.elem_less(
+                warp, cutlass.Int32(scan_threads // 32)
+            ):
+                warp_re_total[warp] = qr
+                warp_im_total[warp] = qi
+
+        cute.arch.sync_threads()
+
+        if tidx == 0:
+            suf_r = cutlass.Float32(1.0)
+            suf_i = cutlass.Float32(0.0)
+
+            if scan_threads != 0:
+                num_warps = scan_threads // 32
+                for w in cutlass.range(num_warps, unroll=1):
+                    orr = warp_re_total[w]
+                    oii = warp_im_total[w]
+                    nr = suf_r * orr - suf_i * oii
+                    ni = suf_r * oii + suf_i * orr
+                    suf_r = nr
+                    suf_i = ni
+            else:
+                for t_it in cutlass.range(self.L - 1, unroll=1):
+                    t = (self.L - 1) - t_it
+                    mr = cutlass.Float32(mM[0, t, bhc])
+                    mi = cutlass.Float32(mM[1, t, bhc])
+                    nr = suf_r * mr - suf_i * mi
+                    ni = suf_r * mi + suf_i * mr
+                    suf_r = nr
+                    suf_i = ni
+
+            kpr0 = cutlass.Float32(mKprev[0, 0, bhc])
+            kpi0 = cutlass.Float32(mKprev[1, 0, bhc])
+            s_Mp0[0] = suf_r * kpr0 - suf_i * kpi0
+            s_Mp0[1] = suf_r * kpi0 + suf_i * kpr0
+
+        cute.arch.sync_threads()
+
+        mp0r = s_Mp0[0]
+        mp0i = s_Mp0[1]
+
+        nvec = self.D // 2
+        v = tidx
+        while cute.elem_less(v, nvec):
+            d0 = v * 2
+            bx = mBPrev[d0 + 0, bhc].to(cutlass.Float32)
+            by = mBPrev[d0 + 1, bhc].to(cutlass.Float32)
+            s_b_decay[d0 + 0] = mp0r * bx - mp0i * by
+            s_b_decay[d0 + 1] = mp0r * by + mp0i * bx
+            v = v + self.num_threads
+
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        if cute.elem_less(tidx, cutlass.Int32(64)):
+            p = tidx
+            while cute.elem_less(p, self.P):
+                acc = cutlass.Float32(0.0)
+                d = 0
+                while cute.elem_less(d, self.D):
+                    acc = acc + s_dinc[p, d].to(cutlass.Float32) * s_b_decay[d]
+                    d = d + 1
+                mDUPrev[p, bhc] = acc.to(mDUPrev.element_type)
+                p = p + 64
+
+        if not cute.elem_less(tidx, cutlass.Int32(64)):
+            d = tidx - 64
+            d_stride = cutlass.Int32(self.num_threads - 64)
+            while cute.elem_less(d, self.D):
+                acc = cutlass.Float32(0.0)
+                for p in cutlass.range(self.P, unroll=1):
+                    acc = acc + s_u_prev[p] * s_dinc[p, d].to(cutlass.Float32)
+                s_g[d] = acc
+                d = d + d_stride
+
+        cute.arch.sync_threads()
+
+        v = tidx
+        while cute.elem_less(v, nvec):
+            d0 = v * 2
+            g0 = s_g[d0 + 0]
+            g1 = s_g[d0 + 1]
+            mDBPrev[d0 + 0, bhc] = (mp0r * g0 + mp0i * g1).to(mDBPrev.element_type)
+            mDBPrev[d0 + 1, bhc] = (mp0r * g1 - mp0i * g0).to(mDBPrev.element_type)
+            v = v + self.num_threads
+
+        if warp == cutlass.Int32(0):
+            v = lane
+            m0 = cutlass.Float32(0.0)
+            m1 = cutlass.Float32(0.0)
+            while cute.elem_less(v, nvec):
+                d0 = v * 2
+                bx = mBPrev[d0 + 0, bhc].to(cutlass.Float32)
+                by = mBPrev[d0 + 1, bhc].to(cutlass.Float32)
+                g0 = s_g[d0 + 0]
+                g1 = s_g[d0 + 1]
+                m0 = m0 + (g0 * bx + g1 * by)
+                m1 = m1 + (bx * g1 - by * g0)
+                v = v + 32
+
+            for off in (16, 8, 4, 2, 1):
+                m0 = m0 + cute.arch.shuffle_sync_bfly(
+                    m0, offset=off, mask=-1, mask_and_clamp=31
+                )
+                m1 = m1 + cute.arch.shuffle_sync_bfly(
+                    m1, offset=off, mask=-1, mask_and_clamp=31
+                )
+
+            if lane == cutlass.Int32(0):
+                mDMp0[0, bhc] = m0
+                mDMp0[1, bhc] = m1

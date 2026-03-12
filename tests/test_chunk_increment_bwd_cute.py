@@ -10,11 +10,7 @@ import torch
 
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
     chunk_increment_bwd_cute,
-    chunk_increment_bwd_prepared_cute,
     compile_chunk_increment_bwd_kernels,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    chunk_increment_with_prepared_cute,
 )
 from slinoss.ops.v2x2ssd.reference import chunk_increment as reference_chunk_increment
 
@@ -59,6 +55,34 @@ def _make_inputs(
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
     return U, M, K, B, B_prev, U_prev
+
+
+def _public_from_chunked(x: torch.Tensor, *, T: int) -> torch.Tensor:
+    B, H, C, L, F = map(int, x.shape)
+    return x.reshape(B, H, C * L, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+
+
+def _public_from_param_scan(x: torch.Tensor, *, T: int) -> torch.Tensor:
+    B, H, C, L, F = map(int, x.shape)
+    return x.reshape(B, H, C * L, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+
+
+def _public_dk_from_parts(
+    dKprev: torch.Tensor,
+    dKcurr: torch.Tensor,
+    *,
+    T: int,
+) -> torch.Tensor:
+    dK = torch.stack((dKprev, dKcurr), dim=4)
+    B, H, C, L, _, F = map(int, dK.shape)
+    return dK.reshape(B, H, C * L, 2, F)[:, :, :T, :, :].to(dtype=torch.float32).contiguous()
+
+
+def _fold_chunk_boundary_carries(x: torch.Tensor, x_prev: torch.Tensor) -> torch.Tensor:
+    x = x.clone()
+    if int(x.shape[2]) > 1:
+        x[:, :, :-1, -1, :].add_(x_prev[:, :, 1:, :])
+    return x
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -116,84 +140,18 @@ def test_chunk_increment_bwd_cute_matches_autograd() -> None:
         )
     )
 
-    torch.testing.assert_close(dU_cute, dU_ref, atol=5e-5, rtol=0.0)
-    torch.testing.assert_close(dM_cute, dM_ref, atol=5e-5, rtol=0.0)
-    torch.testing.assert_close(dK_cute, dK_ref, atol=5e-5, rtol=0.0)
-    torch.testing.assert_close(dB_cute, dB_ref, atol=5e-5, rtol=0.0)
-    torch.testing.assert_close(dB_prev_cute, dB_prev_ref, atol=5e-5, rtol=0.0)
-    torch.testing.assert_close(dU_prev_cute, dU_prev_ref, atol=5e-5, rtol=0.0)
+    # The stage-native backward follows the same tensor-core contract as the
+    # corresponding v3 kernels: fp16 transport, fp32 accumulation, and exact
+    # public reassembly. The right correctness bar here is principled
+    # low-precision agreement, not bitwise parity with the fp32 reference.
+    rtol_h, atol_h = 2e-3, 5e-3
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_increment_bwd_prepared_entrypoint_matches_public_stage() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    U, M, K, B, B_prev, U_prev = _make_inputs(
-        batch=2,
-        heads=2,
-        T=33,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-    )
-
-    inc, m_chunk = reference_chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=32,
-        compute_dtype=torch.float32,
-    )
-    d_inc = torch.randn_like(inc)
-    d_m_chunk = torch.randn_like(m_chunk)
-
-    got_public = chunk_increment_bwd_cute(
-        U.detach(),
-        M.detach(),
-        K.detach(),
-        B.detach(),
-        d_inc=d_inc.detach(),
-        d_m_chunk=d_m_chunk.detach(),
-        chunk_size=32,
-        B_prev=B_prev.detach(),
-        U_prev=U_prev.detach(),
-        compute_dtype=torch.float32,
-    )
-
-    _, _m_chunk, prepared = chunk_increment_with_prepared_cute(
-        U.detach(),
-        M.detach(),
-        K.detach(),
-        B.detach(),
-        chunk_size=32,
-        B_prev=B_prev.detach(),
-        U_prev=U_prev.detach(),
-        compute_dtype=torch.float32,
-    )
-    got_prepared = chunk_increment_bwd_prepared_cute(
-        U.detach(),
-        M.detach(),
-        K.detach(),
-        B.detach(),
-        A_main=prepared.A_main,
-        B_main=prepared.B_main,
-        u_head=prepared.u_head,
-        b_head=prepared.b_head,
-        d_inc=d_inc.detach(),
-        d_m_chunk=d_m_chunk.detach(),
-        chunk_size=32,
-        B_prev=B_prev.detach(),
-        U_prev=U_prev.detach(),
-        compute_dtype=torch.float32,
-    )
-
-    for got_tensor, want_tensor in zip(got_prepared, got_public, strict=True):
-        torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(dU_cute, dU_ref, atol=atol_h, rtol=rtol_h)
+    torch.testing.assert_close(dM_cute, dM_ref, atol=atol_h, rtol=rtol_h)
+    torch.testing.assert_close(dK_cute, dK_ref, atol=atol_h, rtol=rtol_h)
+    torch.testing.assert_close(dB_cute, dB_ref, atol=atol_h, rtol=rtol_h)
+    torch.testing.assert_close(dB_prev_cute, dB_prev_ref, atol=atol_h, rtol=rtol_h)
+    torch.testing.assert_close(dU_prev_cute, dU_prev_ref, atol=atol_h, rtol=rtol_h)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -239,6 +197,13 @@ def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
 
     compiled = cast(
         tuple[
+            object,
+            object,
+            object,
+            object,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
@@ -262,9 +227,33 @@ def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
             return_launchers=True,
         ),
     )
-    got_compiled = compiled[:6]
-    launch_sequential = compiled[6]
+    (
+        _compiled_db,
+        _compiled_du,
+        _compiled_boundary,
+        _compiled_param,
+        dB,
+        dU,
+        dB_prev,
+        dU_prev,
+        _dMsum_part,
+        _dMp0,
+        dM,
+        dKprev,
+        dKcurr,
+        launch_sequential,
+        _launch_overlapped,
+    ) = compiled
     launch_sequential()
+
+    got_compiled = (
+        _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=U.shape[2]),
+        _public_from_param_scan(dM, T=U.shape[2]),
+        _public_dk_from_parts(dKprev, dKcurr, T=U.shape[2]),
+        _public_from_chunked(_fold_chunk_boundary_carries(dB, dB_prev), T=U.shape[2]),
+        dB_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
+        dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
+    )
 
     for got_tensor, want_tensor in zip(got_compiled, got_public, strict=True):
         torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
