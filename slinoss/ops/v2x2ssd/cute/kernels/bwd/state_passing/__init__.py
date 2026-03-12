@@ -177,7 +177,8 @@ def state_passing_bwd_cute(
     d_final: torch.Tensor,
     num_threads: int = 128,
     pairs_per_thread: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_d_initial: bool = True,
+) -> tuple[torch.Tensor, ...]:
     """Thin public wrapper over the compiled state-passing backward kernel bundle."""
     (
         _compiled_state,
@@ -198,6 +199,11 @@ def state_passing_bwd_cute(
     )
     with record_region("backward.v2x2ssd.state_passing.total"):
         launch_sequential()
+    if not return_d_initial:
+        return (
+            d_inc.to(dtype=torch.float32).contiguous(),
+            d_m_chunk.to(dtype=torch.float32).contiguous(),
+        )
     return (
         d_inc.to(dtype=torch.float32).contiguous(),
         d_m_chunk.to(dtype=torch.float32).contiguous(),

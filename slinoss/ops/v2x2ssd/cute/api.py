@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 
 from slinoss.ops.v2x2ssd.reference import (
@@ -24,15 +26,14 @@ def v2x2ssd_cute(
     U_prev: torch.Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
     output_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """CuTe-backed staged v2x2ssd forward path.
 
     Contract:
     - logical shapes and layouts match ``reference.v2x2ssd`` exactly
     - the CuTe path preserves the staged decomposition
       ``chunk_increment -> state_passing -> chunk_scan``
-    - no model-side layout conversion or alternate public tensor contract is
-      introduced here
+    - the current public entrypoint is training-only and returns only ``Y``
     """
     # CuTe is a real runtime dependency for this path. Import it here so the
     # rest of the repo remains usable without the kernel toolchain.
@@ -61,42 +62,38 @@ def v2x2ssd_cute(
             "The current CuTe v2x2ssd forward path supports only float32 "
             f"compute. Got compute_dtype={rdtype}."
         )
+    if initial_states is not None or B_prev is not None or U_prev is not None:
+        raise NotImplementedError(
+            "CuTe v2x2ssd currently supports only stateless training execution."
+        )
 
     if T == 0:
-        return _resolve_empty_outputs(
+        empty_y, _final, _b_last, _u_last = _resolve_empty_outputs(
             batch_size=batch_size,
             n_heads=n_heads,
             P=P,
             D=D,
             device=U.device,
             output_dtype=odtype,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
+            initial_states=None,
+            B_prev=None,
+            U_prev=None,
         )
+        return empty_y
 
-    if any(
-        tensor is not None and tensor.requires_grad
-        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
-    ):
-        from .autograd import v2x2ssd_cute_autograd
+    if any(tensor.requires_grad for tensor in (U, M, K, B, C)):
+        from .autograd import v2x2ssd_cute_training_autograd
 
-        return v2x2ssd_cute_autograd(
+        return v2x2ssd_cute_training_autograd(
             U,
             M,
             K,
             B,
             C,
             chunk_size=chunk_size,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
             compute_dtype=rdtype,
             output_dtype=odtype,
         )
-
-    B_last = B[:, :, -1, :].to(dtype=odtype).contiguous()
-    U_last = U[:, :, -1, :].to(dtype=odtype).contiguous()
 
     inc, m_chunk = chunk_increment_cute(
         U,
@@ -104,20 +101,18 @@ def v2x2ssd_cute(
         K,
         B,
         chunk_size=chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
         compute_dtype=rdtype,
     )
-    chunk_starts, final_state = state_passing_cute(
-        inc,
-        m_chunk,
-        initial_states=(
-            None
-            if initial_states is None
-            else initial_states.to(dtype=torch.float32).contiguous()
+    chunk_starts = cast(
+        torch.Tensor,
+        state_passing_cute(
+            inc,
+            m_chunk,
+            initial_states=None,
+            return_final_state=False,
         ),
     )
-    Y = chunk_scan_cute(
+    return chunk_scan_cute(
         U,
         M,
         K,
@@ -125,12 +120,9 @@ def v2x2ssd_cute(
         C,
         chunk_starts,
         chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
         output_dtype=odtype,
         compute_dtype=rdtype,
     )
-    return Y, final_state.to(dtype=odtype).contiguous(), B_last, U_last
 
 
 __all__ = ["v2x2ssd_cute"]

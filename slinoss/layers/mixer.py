@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 from torch import nn
@@ -12,7 +13,7 @@ from slinoss.perf import call_region
 
 from .backend import AutoScanBackend, ScanBackend, ScanInputs
 from .discretization import SLinOSSDiscretizer
-from .state import SLinOSSMixerState
+from .state import SLinOSSMixerState, ScanState
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -304,13 +305,21 @@ class SLinOSSMixer(nn.Module):
 
         scan_inputs = self._build_scan_inputs(value=value, params=params)
         scan_state_in = None if state is None else state.scan
-        scan_y, scan_state = call_region(
+        scan_result = call_region(
             "v2x2ssd.total",
             lambda scan_inputs_: self.backend(
-                scan_inputs_, chunk_size=self.chunk_size, state=scan_state_in
+                scan_inputs_,
+                chunk_size=self.chunk_size,
+                state=scan_state_in,
+                return_state=return_state,
             ),
             scan_inputs,
         )
+        if return_state:
+            scan_y, scan_state = cast(tuple[torch.Tensor, ScanState], scan_result)
+        else:
+            scan_y = cast(torch.Tensor, scan_result)
+            scan_state = None
 
         gated = call_region(
             "mixer.gate_skip",
@@ -328,8 +337,13 @@ class SLinOSSMixer(nn.Module):
             capture_backward=False,
         )
 
-        next_state = SLinOSSMixerState(conv=conv_state, scan=scan_state)
-        return (out, next_state) if return_state else out
+        if not return_state:
+            return out
+
+        next_state = SLinOSSMixerState(
+            conv=conv_state, scan=cast(ScanState, scan_state)
+        )
+        return out, next_state
 
     def _apply_gate_skip(
         self,

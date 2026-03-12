@@ -1,4 +1,4 @@
-"""Autograd wrapper for the CuTe ``v2x2ssd`` operator."""
+"""Training-only autograd wrapper for the CuTe ``v2x2ssd`` operator."""
 
 from __future__ import annotations
 
@@ -19,13 +19,35 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
 )
 
 
-def _as_dtype_contiguous(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
-    if tensor.dtype == dtype and tensor.is_contiguous():
-        return tensor
-    return tensor.to(dtype=dtype).contiguous()
+_ZERO_FINAL_GRAD_CACHE: dict[tuple, torch.Tensor] = {}
 
 
-class _V2x2SSDCuTeFn(torch.autograd.Function):
+def _get_zero_final_grad(
+    *,
+    device: torch.device,
+    batch_size: int,
+    heads: int,
+    P: int,
+    D: int,
+) -> torch.Tensor:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch_size),
+        int(heads),
+        int(P),
+        int(D),
+    )
+    cached = _ZERO_FINAL_GRAD_CACHE.get(key)
+    if cached is None:
+        cached = torch.zeros(
+            (batch_size, heads, P, D), device=device, dtype=torch.float32
+        )
+        _ZERO_FINAL_GRAD_CACHE[key] = cached
+    return cached
+
+
+class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
     @staticmethod
     def forward(  # type: ignore[override]
         ctx,
@@ -34,33 +56,19 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         K: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
-        initial_states: torch.Tensor | None,
-        B_prev: torch.Tensor | None,
-        U_prev: torch.Tensor | None,
         chunk_size: int,
         compute_dtype: torch.dtype | None,
         output_dtype: torch.dtype | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         ctx.chunk_size = int(chunk_size)
         ctx.compute_dtype = compute_dtype
-        ctx.has_initial_states = initial_states is not None
-        ctx.has_prev = B_prev is not None
+        ctx.output_dtype = output_dtype
 
         U_d = U.detach()
         M_d = M.detach()
         K_d = K.detach()
         B_d = B.detach()
         C_d = C.detach()
-        initial_states_d = (
-            _as_dtype_contiguous(initial_states.detach(), dtype=torch.float32)
-            if initial_states is not None
-            else None
-        )
-        B_prev_d = B_prev.detach() if B_prev is not None else None
-        U_prev_d = U_prev.detach() if U_prev is not None else None
-
-        B_last = B_d[:, :, -1, :].to(dtype=output_dtype or U.dtype).contiguous()
-        U_last = U_d[:, :, -1, :].to(dtype=output_dtype or U.dtype).contiguous()
 
         inc, m_chunk = chunk_increment_cute(
             U_d,
@@ -68,14 +76,16 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             K_d,
             B_d,
             chunk_size=ctx.chunk_size,
-            B_prev0=B_prev_d,
-            U_prev0=U_prev_d,
             compute_dtype=compute_dtype,
         )
-        chunk_starts, final_state = state_passing_cute(
-            inc,
-            m_chunk,
-            initial_states=initial_states_d,
+        chunk_starts = cast(
+            torch.Tensor,
+            state_passing_cute(
+                inc,
+                m_chunk,
+                initial_states=None,
+                return_final_state=False,
+            ),
         )
         Y = chunk_scan_cute(
             U_d,
@@ -84,106 +94,64 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             B_d,
             C_d,
             chunk_starts,
-            B_prev=B_prev_d,
-            U_prev=U_prev_d,
-            output_dtype=output_dtype or U.dtype,
             chunk_size=ctx.chunk_size,
+            output_dtype=output_dtype or U.dtype,
             compute_dtype=compute_dtype,
         )
 
-        saved: list[torch.Tensor] = [
-            U_d,
-            M_d,
-            K_d,
-            B_d,
-            C_d,
-            m_chunk,
-            chunk_starts,
-        ]
-        if initial_states_d is not None:
-            saved.append(initial_states_d)
-        if B_prev_d is not None:
-            saved.append(B_prev_d)
-            saved.append(U_prev_d)  # type: ignore[arg-type]
-        ctx.save_for_backward(*saved)
-        return (
-            Y,
-            final_state.to(dtype=output_dtype or U.dtype).contiguous(),
-            B_last,
-            U_last,
-        )
+        ctx.save_for_backward(U_d, M_d, K_d, B_d, C_d, m_chunk, chunk_starts)
+        return Y
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx,
         dY: torch.Tensor | None,
-        d_final_state: torch.Tensor | None,
-        dB_last: torch.Tensor | None,
-        dU_last: torch.Tensor | None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
         None,
         None,
         None,
     ]:
         with record_region("backward.v2x2ssd.custom_op_total"):
-            saved = ctx.saved_tensors
-            idx = 0
-            U = saved[idx]
-            idx += 1
-            M = saved[idx]
-            idx += 1
-            K = saved[idx]
-            idx += 1
-            B = saved[idx]
-            idx += 1
-            C = saved[idx]
-            idx += 1
-            m_chunk = saved[idx]
-            idx += 1
-            chunk_starts = saved[idx]
-            idx += 1
+            U, M, K, B, C, m_chunk, chunk_starts = ctx.saved_tensors
 
-            initial_states = None
-            if ctx.has_initial_states:
-                initial_states = saved[idx]
-                idx += 1
-
-            B_prev = None
-            U_prev = None
-            if ctx.has_prev:
-                B_prev = saved[idx]
-                U_prev = saved[idx + 1]
-
-            batch_size, n_heads, _T, P = map(int, U.shape)
-            D = int(B.shape[-1])
-            rdtype = torch.float32
+            if dY is None:
+                with record_region("backward.v2x2ssd.autograd_wrapper"):
+                    return (
+                        torch.zeros_like(U),
+                        torch.zeros_like(M),
+                        torch.zeros_like(K),
+                        torch.zeros_like(B),
+                        torch.zeros_like(C),
+                        None,
+                        None,
+                        None,
+                    )
 
             with record_region("backward.v2x2ssd.autograd_wrapper"):
-                dY_contig = (
-                    None
-                    if dY is None
-                    else (dY if dY.is_contiguous() else dY.contiguous())
-                )
+                dY_contig = dY if dY.is_contiguous() else dY.contiguous()
 
-            if dY_contig is not None:
-                (
-                    dU_scan,
-                    dM_scan,
-                    dK_scan,
-                    dB_scan,
-                    dC_scan,
-                    d_chunk_starts,
-                    dB_prev_scan,
-                    dU_prev_scan,
-                ) = chunk_scan_bwd_cute(
+            (
+                dU_scan,
+                dM_scan,
+                dK_scan,
+                dB_scan,
+                dC_scan,
+                d_chunk_starts,
+            ) = cast(
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                ],
+                chunk_scan_bwd_cute(
                     U,
                     M,
                     K,
@@ -192,140 +160,63 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                     chunk_starts,
                     dY_contig,
                     chunk_size=ctx.chunk_size,
-                    B_prev=B_prev,
-                    U_prev=U_prev,
                     compute_dtype=ctx.compute_dtype,
-                )
-            else:
-                with record_region("backward.v2x2ssd.autograd_wrapper"):
-                    dU_scan = torch.zeros_like(U, dtype=rdtype)
-                    dM_scan = torch.zeros_like(M, dtype=rdtype)
-                    dK_scan = torch.zeros_like(K, dtype=rdtype)
-                    dB_scan = torch.zeros_like(B, dtype=rdtype)
-                    dC_scan = torch.zeros_like(C, dtype=rdtype)
-                    d_chunk_starts = torch.zeros_like(chunk_starts, dtype=rdtype)
-                    dB_prev_scan = (
-                        None
-                        if B_prev is None
-                        else torch.zeros_like(B_prev, dtype=rdtype)
-                    )
-                    dU_prev_scan = (
-                        None
-                        if U_prev is None
-                        else torch.zeros_like(U_prev, dtype=rdtype)
-                    )
+                    return_prev_grads=False,
+                ),
+            )
 
-            if dY_contig is not None or d_final_state is not None:
-                with record_region("backward.v2x2ssd.autograd_wrapper"):
-                    if d_final_state is None:
-                        d_final_state = torch.zeros(
-                            (batch_size, n_heads, P, D),
-                            device=U.device,
-                            dtype=torch.float32,
-                        )
-                    d_chunk_starts_contig = (
-                        d_chunk_starts
-                        if d_chunk_starts.is_contiguous()
-                        else d_chunk_starts.contiguous()
-                    )
-                    d_final_state_f = _as_dtype_contiguous(
-                        d_final_state, dtype=torch.float32
-                    )
-                d_inc, d_m_chunk, d_initial_raw = state_passing_bwd_cute(
+            zero_final = _get_zero_final_grad(
+                device=U.device,
+                batch_size=U.shape[0],
+                heads=U.shape[1],
+                P=U.shape[-1],
+                D=B.shape[-1],
+            )
+            d_inc, d_m_chunk = cast(
+                tuple[torch.Tensor, torch.Tensor],
+                state_passing_bwd_cute(
                     chunk_starts,
                     m_chunk,
-                    d_chunk_starts=d_chunk_starts_contig,
-                    d_final=d_final_state_f,
-                )
-                dU_inc, dM_inc, dK_inc, dB_inc, dB_prev_inc, dU_prev_inc = (
-                    chunk_increment_bwd_cute(
-                        U,
-                        M,
-                        K,
-                        B,
-                        d_inc=d_inc,
-                        d_m_chunk=d_m_chunk,
-                        chunk_size=ctx.chunk_size,
-                        B_prev=B_prev,
-                        U_prev=U_prev,
-                        compute_dtype=ctx.compute_dtype,
-                    )
-                )
-                d_initial = d_initial_raw if initial_states is not None else None
-            else:
-                with record_region("backward.v2x2ssd.autograd_wrapper"):
-                    dU_inc = torch.zeros_like(U, dtype=rdtype)
-                    dM_inc = torch.zeros_like(M, dtype=rdtype)
-                    dK_inc = torch.zeros_like(K, dtype=rdtype)
-                    dB_inc = torch.zeros_like(B, dtype=rdtype)
-                    dB_prev_inc = (
-                        None
-                        if B_prev is None
-                        else torch.zeros_like(B_prev, dtype=rdtype)
-                    )
-                    dU_prev_inc = (
-                        None
-                        if U_prev is None
-                        else torch.zeros_like(U_prev, dtype=rdtype)
-                    )
-                    d_initial = (
-                        None
-                        if initial_states is None
-                        else torch.zeros_like(initial_states, dtype=rdtype)
-                    )
+                    d_chunk_starts=d_chunk_starts,
+                    d_final=zero_final,
+                    return_d_initial=False,
+                ),
+            )
+
+            dU_inc, dM_inc, dK_inc, dB_inc = cast(
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                chunk_increment_bwd_cute(
+                    U,
+                    M,
+                    K,
+                    B,
+                    d_inc=d_inc,
+                    d_m_chunk=d_m_chunk,
+                    chunk_size=ctx.chunk_size,
+                    compute_dtype=ctx.compute_dtype,
+                    return_prev_grads=False,
+                ),
+            )
 
             with record_region("backward.v2x2ssd.autograd_wrapper"):
                 dU_scan.add_(dU_inc)
                 dM_scan.add_(dM_inc)
                 dK_scan.add_(dK_inc)
                 dB_scan.add_(dB_inc)
-                dC_total = dC_scan
-
-                if dB_last is not None:
-                    dB_scan[:, :, -1, :] += dB_last.to(dtype=rdtype)
-                if dU_last is not None:
-                    dU_scan[:, :, -1, :] += dU_last.to(dtype=rdtype)
-
-                dB_prev_total = None
-                if (
-                    B_prev is not None
-                    and dB_prev_inc is not None
-                    and dB_prev_scan is not None
-                ):
-                    dB_prev_scan.add_(dB_prev_inc)
-                    dB_prev_total = dB_prev_scan
-
-                dU_prev_total = None
-                if (
-                    U_prev is not None
-                    and dU_prev_inc is not None
-                    and dU_prev_scan is not None
-                ):
-                    dU_prev_scan.add_(dU_prev_inc)
-                    dU_prev_total = dU_prev_scan
 
             return (
-                dU_scan.to(dtype=U.dtype),
-                dM_scan.to(dtype=M.dtype),
-                dK_scan.to(dtype=K.dtype),
-                dB_scan.to(dtype=B.dtype),
-                dC_total.to(dtype=C.dtype),
-                None
-                if initial_states is None or d_initial is None
-                else d_initial.to(dtype=initial_states.dtype),
-                None
-                if B_prev is None or dB_prev_total is None
-                else dB_prev_total.to(dtype=B_prev.dtype),
-                None
-                if U_prev is None or dU_prev_total is None
-                else dU_prev_total.to(dtype=U_prev.dtype),
+                dU_scan,
+                dM_scan,
+                dK_scan,
+                dB_scan,
+                dC_scan,
                 None,
                 None,
                 None,
             )
 
 
-def v2x2ssd_cute_autograd(
+def v2x2ssd_cute_training_autograd(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
@@ -333,23 +224,17 @@ def v2x2ssd_cute_autograd(
     C: torch.Tensor,
     *,
     chunk_size: int,
-    initial_states: torch.Tensor | None = None,
-    B_prev: torch.Tensor | None = None,
-    U_prev: torch.Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
     output_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     return cast(
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        _V2x2SSDCuTeFn.apply(
+        torch.Tensor,
+        _V2x2SSDCuTeTrainingFn.apply(
             U,
             M,
             K,
             B,
             C,
-            initial_states,
-            B_prev,
-            U_prev,
             int(chunk_size),
             compute_dtype,
             output_dtype,
@@ -357,4 +242,4 @@ def v2x2ssd_cute_autograd(
     )
 
 
-__all__ = ["v2x2ssd_cute_autograd"]
+__all__ = ["v2x2ssd_cute_training_autograd"]

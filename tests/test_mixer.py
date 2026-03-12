@@ -10,6 +10,7 @@ class SpyBackend:
         self.calls = 0
         self.last_inputs: ScanInputs | None = None
         self.last_state: ScanState | None = None
+        self.last_return_state = False
 
     def __call__(
         self,
@@ -17,11 +18,13 @@ class SpyBackend:
         *,
         chunk_size: int,
         state: ScanState | None = None,
-    ) -> tuple[torch.Tensor, ScanState]:
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ScanState]:
         del chunk_size
         self.calls += 1
         self.last_inputs = inputs
         self.last_state = state
+        self.last_return_state = return_state
 
         batch, heads, _, P = map(int, inputs.U.shape)
         D = int(inputs.B.shape[-1])
@@ -32,6 +35,8 @@ class SpyBackend:
             b_prev=inputs.B[:, :, -1, :].contiguous(),
             u_prev=inputs.U[:, :, -1, :].contiguous(),
         )
+        if not return_state:
+            return torch.zeros_like(inputs.U)
         return torch.zeros_like(inputs.U), next_state
 
 
@@ -59,6 +64,7 @@ def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
     assert spy.calls == 1
     assert spy.last_inputs is not None
     assert spy.last_state is None
+    assert spy.last_return_state is True
     assert y.shape == (2, 5, 12)
     assert state.conv is not None
     assert state.scan.state is not None

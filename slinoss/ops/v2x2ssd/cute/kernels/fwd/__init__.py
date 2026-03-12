@@ -25,6 +25,35 @@ from .state_passing import StatePassingFwdAmpere
 _CHUNK_INCREMENT_CACHE: dict[tuple, object] = {}
 _STATE_PASSING_CACHE: dict[tuple, object] = {}
 _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
+_ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_zero_prev_tensors(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    heads: int,
+    P: int,
+    D: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        dtype,
+        int(batch_size),
+        int(heads),
+        int(P),
+        int(D),
+    )
+    cached = _ZERO_PREV_CACHE.get(key)
+    if cached is None:
+        cached = (
+            torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
+            torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
+        )
+        _ZERO_PREV_CACHE[key] = cached
+    return cached
 
 
 def _resolve_chunk_scan_n_block_size(L: int, requested: int) -> int:
@@ -190,8 +219,14 @@ def _compile_chunk_increment_kernel_impl(
     K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
 
     if U_prev0 is None:
-        U_prev = torch.zeros((Bsz, H, P), device=U.device, dtype=tc_dtype)
-        B_prev = torch.zeros((Bsz, H, D), device=U.device, dtype=tc_dtype)
+        U_prev, B_prev = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
     else:
         if U_prev0.shape != (Bsz, H, P) or B_prev0.shape != (Bsz, H, D):
             raise ValueError("U_prev0/B_prev0 must be (B,H,P)/(B,H,D).")
@@ -430,7 +465,8 @@ def state_passing_cute(
     initial_states: torch.Tensor | None,
     num_threads: int = 128,
     vecs_per_thread: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_final_state: bool = True,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Thin public wrapper over the compiled forward state-passing kernel."""
     _compiled, out_starts, out_final, launch = _compile_state_passing_kernel_impl(
         inc,
@@ -440,6 +476,8 @@ def state_passing_cute(
         vecs_per_thread=vecs_per_thread,
     )
     launch()
+    if not return_final_state:
+        return out_starts
     return out_starts, out_final
 
 
@@ -528,8 +566,14 @@ def _compile_chunk_scan_kernel_impl(
     K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
 
     if B_prev is None:
-        B_prev0 = torch.zeros((Bsz, H, D), device=U.device, dtype=tc_dtype)
-        U_prev0 = torch.zeros((Bsz, H, P), device=U.device, dtype=tc_dtype)
+        U_prev0, B_prev0 = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
     else:
         if B_prev.shape != (Bsz, H, D) or U_prev.shape != (Bsz, H, P):
             raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")

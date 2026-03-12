@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 
@@ -120,7 +121,15 @@ def test_reference_scan_backend_matches_v2x2ssd() -> None:
 
     inputs = ScanInputs(U=U, M=M, K=K, B=B, C=C)
     backend = ReferenceScanBackend(compute_dtype=torch.float64)
-    y_backend, next_state = backend(inputs, chunk_size=chunk_size, state=prev_state)
+    y_backend, next_state = cast(
+        tuple[torch.Tensor, ScanState],
+        backend(
+            inputs,
+            chunk_size=chunk_size,
+            state=prev_state,
+            return_state=True,
+        ),
+    )
     y_ref, final_state, b_last, u_last = v2x2ssd(
         U,
         M,

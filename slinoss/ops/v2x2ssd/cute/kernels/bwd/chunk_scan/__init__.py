@@ -33,6 +33,7 @@ _OVERLAP_RESOURCES: dict[
         torch.cuda.Event,
     ],
 ] = {}
+_ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -115,6 +116,34 @@ def _pad_m_identity(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
     return torch.cat((M, pad), dim=2).contiguous()
 
 
+def _get_zero_prev_tensors(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    heads: int,
+    P: int,
+    D: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        dtype,
+        int(batch_size),
+        int(heads),
+        int(P),
+        int(D),
+    )
+    cached = _ZERO_PREV_CACHE.get(key)
+    if cached is None:
+        cached = (
+            torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
+            torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
+        )
+        _ZERO_PREV_CACHE[key] = cached
+    return cached
+
+
 def _as_cute_compact(
     t: torch.Tensor,
     *,
@@ -134,9 +163,18 @@ def _as_cute_compact(
     )
 
 
-def _public_from_chunked(x: torch.Tensor, *, T: int) -> torch.Tensor:
+def _public_from_chunked(
+    x: torch.Tensor,
+    *,
+    T: int,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     B, H, C, L, F = map(int, x.shape)
-    return x.reshape(B, H, C * L, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+    out = x.reshape(B, H, C * L, F)[:, :, :T, :]
+    target_dtype = out.dtype if dtype is None else dtype
+    if out.dtype != target_dtype:
+        out = out.to(dtype=target_dtype)
+    return out.contiguous()
 
 
 def _fold_chunk_boundary_carries(
@@ -154,16 +192,20 @@ def _fold_chunk_boundary_carries(
     return x
 
 
-def _public_from_param_scan(x: torch.Tensor, *, T: int) -> torch.Tensor:
+def _public_from_param_scan(
+    x: torch.Tensor,
+    *,
+    T: int,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     B, H, C, S, L, F = map(int, x.shape)
     if S != 1:
         raise ValueError("Only n_splits=1 is supported by the public wrapper.")
-    return (
-        x[:, :, :, 0, :, :]
-        .reshape(B, H, C * L, F)[:, :, :T, :]
-        .to(dtype=torch.float32)
-        .contiguous()
-    )
+    out = x[:, :, :, 0, :, :].reshape(B, H, C * L, F)[:, :, :T, :]
+    target_dtype = out.dtype if dtype is None else dtype
+    if out.dtype != target_dtype:
+        out = out.to(dtype=target_dtype)
+    return out.contiguous()
 
 
 def _public_dk_from_parts(
@@ -302,8 +344,14 @@ def compile_chunk_scan_bwd_kernels(
     chunk_starts_f = chunk_starts.to(dtype=torch.float32).contiguous()
 
     if B_prev is None:
-        B_prev0 = torch.zeros((Bsz, H, D), device=U.device, dtype=tc_dtype)
-        U_prev0 = torch.zeros((Bsz, H, P), device=U.device, dtype=tc_dtype)
+        U_prev0, B_prev0 = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
     else:
         if B_prev.shape != (Bsz, H, D) or U_prev.shape != (Bsz, H, P):
             raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
@@ -796,16 +844,8 @@ def chunk_scan_bwd_cute(
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+    return_prev_grads: bool = True,
+) -> tuple[torch.Tensor, ...]:
     """Thin public wrapper over the compiled chunk-scan backward kernel bundle."""
     (
         _compiled_dz0,
@@ -846,15 +886,25 @@ def chunk_scan_bwd_cute(
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)
 
+    if not return_prev_grads:
+        return (
+            _public_from_chunked(dU_public, T=U.shape[2], dtype=U.dtype),
+            _public_from_param_scan(dM, T=U.shape[2]),
+            _public_dk_from_parts(dKprev, dKcurr, T=U.shape[2]),
+            _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
+            _public_from_chunked(dC, T=U.shape[2], dtype=C.dtype),
+            dZ0.to(dtype=torch.float32).contiguous(),
+        )
+
     return (
-        _public_from_chunked(dU_public, T=U.shape[2]),
+        _public_from_chunked(dU_public, T=U.shape[2], dtype=U.dtype),
         _public_from_param_scan(dM, T=U.shape[2]),
         _public_dk_from_parts(dKprev, dKcurr, T=U.shape[2]),
-        _public_from_chunked(dB_public, T=U.shape[2]),
-        _public_from_chunked(dC, T=U.shape[2]),
+        _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
+        _public_from_chunked(dC, T=U.shape[2], dtype=C.dtype),
         dZ0.to(dtype=torch.float32).contiguous(),
-        dB_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
-        dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
+        dB_prev[:, :, 0, :].to(dtype=B.dtype).contiguous(),
+        dU_prev[:, :, 0, :].to(dtype=U.dtype).contiguous(),
     )
 
 

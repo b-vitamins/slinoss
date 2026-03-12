@@ -293,20 +293,33 @@ def _build_forward_callable(
     U_prev = tensors["U_prev"]
 
     if stage == "full":
-        fn = partial(
-            v2x2ssd if backend == "reference" else v2x2ssd_cute,
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_size=cfg.chunk_size,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            compute_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
+        if backend == "reference":
+            fn = partial(
+                v2x2ssd,
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_size=cfg.chunk_size,
+                initial_states=initial_states,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+        else:
+            fn = partial(
+                v2x2ssd_cute,
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_size=cfg.chunk_size,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
         fn()
         return fn
 
@@ -725,19 +738,6 @@ def _build_full_backward_callable(
         device=cfg.torch_device,
         dtype=torch.float32,
     )
-    d_final = torch.randn(
-        (cfg.batch, cfg.heads, cfg.P, cfg.D),
-        device=cfg.torch_device,
-        dtype=torch.float32,
-    )
-    dB_last = torch.randn(
-        (cfg.batch, cfg.heads, cfg.D), device=cfg.torch_device, dtype=torch.float32
-    )
-    dU_last = torch.randn(
-        (cfg.batch, cfg.heads, cfg.P), device=cfg.torch_device, dtype=torch.float32
-    )
-
-    op = v2x2ssd if backend == "reference" else v2x2ssd_cute
 
     def fn() -> None:
         U = _clone_requires_grad(tensors["U"])
@@ -745,29 +745,59 @@ def _build_full_backward_callable(
         K = _clone_requires_grad(tensors["K"])
         B = _clone_requires_grad(tensors["B"])
         C = _clone_requires_grad(tensors["C"])
-        initial_states = _clone_requires_grad(tensors["initial_states"])
-        B_prev = _clone_requires_grad(tensors["B_prev"])
-        U_prev = _clone_requires_grad(tensors["U_prev"])
-        Y, final_state, B_last, U_last = op(
+        if backend == "reference":
+            initial_states = _clone_requires_grad(tensors["initial_states"])
+            B_prev = _clone_requires_grad(tensors["B_prev"])
+            U_prev = _clone_requires_grad(tensors["U_prev"])
+            d_final = torch.randn(
+                (cfg.batch, cfg.heads, cfg.P, cfg.D),
+                device=cfg.torch_device,
+                dtype=torch.float32,
+            )
+            dB_last = torch.randn(
+                (cfg.batch, cfg.heads, cfg.D),
+                device=cfg.torch_device,
+                dtype=torch.float32,
+            )
+            dU_last = torch.randn(
+                (cfg.batch, cfg.heads, cfg.P),
+                device=cfg.torch_device,
+                dtype=torch.float32,
+            )
+            Y, final_state, B_last, U_last = v2x2ssd(
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_size=cfg.chunk_size,
+                initial_states=initial_states,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+            loss = (
+                (Y * dY).sum()
+                + (final_state * d_final).sum()
+                + (B_last * dB_last).sum()
+                + (U_last * dU_last).sum()
+            )
+            torch.autograd.grad(loss, (U, M, K, B, C, initial_states, B_prev, U_prev))
+            return
+
+        Y = v2x2ssd_cute(
             U,
             M,
             K,
             B,
             C,
             chunk_size=cfg.chunk_size,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
             compute_dtype=torch.float32,
             output_dtype=torch.float32,
         )
-        loss = (
-            (Y * dY).sum()
-            + (final_state * d_final).sum()
-            + (B_last * dB_last).sum()
-            + (U_last * dU_last).sum()
-        )
-        torch.autograd.grad(loss, (U, M, K, B, C, initial_states, B_prev, U_prev))
+        loss = (Y * dY).sum()
+        torch.autograd.grad(loss, (U, M, K, B, C))
 
     fn()
     return fn
