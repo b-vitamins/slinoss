@@ -164,7 +164,6 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
 
         batch_size, n_heads, T, P = map(int, U.shape)
         D = int(B.shape[-1])
-        odtype = ctx.output_dtype or U.dtype
         rdtype = torch.float32
 
         dU_scan = torch.zeros_like(U, dtype=rdtype)
@@ -218,13 +217,13 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                 d_final_state = torch.zeros(
                     (batch_size, n_heads, P, D),
                     device=U.device,
-                    dtype=odtype,
+                    dtype=torch.float32,
                 )
             d_inc, d_m_chunk, d_initial_raw = state_passing_bwd_cute(
-                d_chunk_starts.contiguous(),
-                d_final_state.contiguous(),
-                chunk_starts,
-                m_chunk,
+                chunk_starts.to(dtype=torch.float32).contiguous(),
+                m_chunk.to(dtype=torch.float32).contiguous(),
+                d_chunk_starts=d_chunk_starts.contiguous(),
+                d_final=d_final_state.to(dtype=torch.float32).contiguous(),
             )
             dU_inc, dM_inc, dK_inc, dB_inc, dB_prev_inc_raw, dU_prev_inc_raw = (
                 chunk_increment_bwd_cute(

@@ -1,25 +1,41 @@
-"""Common helpers for CuTe ``v2x2ssd`` state-passing backward kernels.
+"""CuTe backward kernels for the ``v2x2ssd`` state-passing stage.
 
-Logical contract
-----------------
-- ``chunk_starts``: ``(B, H, C, P, D)``
-- ``d_chunk_starts``: ``(B, H, C, P, D)``
-- ``d_final``: ``(B, H, P, D)``
-- ``m_chunk``: ``(B, H, C, 2)``
-- ``d_inc``: ``(B, H, C, P, D)``
-- ``d_initial``: ``(B, H, P, D)``
-- ``d_m_chunk``: ``(B, H, C, 2)``
+This stage is split into two bandwidth-oriented kernels:
 
-The hot contiguous axis is always ``S = P * D`` with ``D = 2N`` interleaved
-complex pairs. Each thread therefore owns whole ``(re, im)`` pairs, never
-strided scalar lanes.
+1) Backprop through the chunk recurrence to produce gradients w.r.t. the
+   per-chunk increments and the initial state:
+
+   z_{c+1} = m_chunk[c] * z_c + inc[c]
+   chunk_starts[c] = z_c
+
+   Given upstream grads (d_chunk_starts, d_final), compute:
+     d_inc[c] = d_z_{c+1}
+     d_z_c = d_chunk_starts[c] + conj(m_chunk[c]) * d_z_{c+1}
+
+2) Gradient w.r.t. the per-chunk complex transport parameters m_chunk[c].
+   This is a reduction over the flattened state axis S=P*D. It consumes
+   (chunk_starts, d_inc) and produces d_m_chunk.
+
+Both kernels compute in fp32 and write fp32 outputs, matching the reference
+math.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import cutlass
 import torch
+
+
+def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
+    if dt == torch.float16:
+        return cutlass.Float16
+    if dt == torch.bfloat16:
+        return cutlass.BFloat16
+    if dt == torch.float32:
+        return cutlass.Float32
+    raise TypeError(f"Unsupported dtype: {dt}")
 
 
 def _elem_bits(dt: torch.dtype) -> int:
@@ -37,14 +53,16 @@ def _choose_copy_bits_for_linear_tiles(
     elems_per_thread: int,
     candidates_bits: tuple[int, ...] = (128, 64, 32),
 ) -> int:
-    """Pick the widest CopyUniversalOp width safe for all linear tile starts."""
+    """Pick the widest CopyUniversalOp width safe for all tile starts."""
     eb = _elem_bits(t.dtype)
     elem_bytes = t.element_size()
     stride_bytes = tile_stride_elems * elem_bytes
 
     best = eb
     for bits in candidates_bits:
-        if bits < eb or bits % eb != 0:
+        if bits < eb:
+            continue
+        if bits % eb != 0:
             continue
         vec_elems = bits // eb
         if elems_per_thread % vec_elems != 0:

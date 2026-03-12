@@ -498,13 +498,14 @@ def _build_state_passing_backward_callable(
         initial_states=initial_states,
         compute_dtype=torch.float32,
     )
-    _, _, _, _, _, launch_pipeline = compile_state_passing_bwd_kernels(
-        chunk_starts_cute,
+    compiled = compile_state_passing_bwd_kernels(
+        chunk_starts_cute.to(dtype=torch.float32).contiguous(),
         m_chunk,
         d_chunk_starts=d_chunk_starts,
         d_final=d_final,
         return_launchers=True,
     )
+    launch_pipeline = compiled[-2]
     launch_pipeline()
     return launch_pipeline
 

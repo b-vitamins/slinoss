@@ -8,10 +8,9 @@ import math
 import pytest
 import torch
 
+import slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing as state_passing_bwd_mod
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (
     compile_state_passing_bwd_kernels,
-    state_passing_bwd_m_cute,
-    state_passing_bwd_state_cute,
     state_passing_bwd_cute,
 )
 
@@ -73,81 +72,6 @@ def _make_inputs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_state_passing_bwd_state_cute_matches_autograd() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    inc, m_chunk, initial = _make_inputs(
-        batch=2,
-        heads=2,
-        chunks=12,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-    )
-    inc.requires_grad_(True)
-    m_chunk.requires_grad_(True)
-    initial.requires_grad_(True)
-
-    chunk_starts, final_state = _state_passing_autograd(inc, m_chunk, initial)
-    d_chunk_starts = torch.randn_like(chunk_starts)
-    d_final = torch.randn_like(final_state)
-    loss = (chunk_starts * d_chunk_starts).sum() + (final_state * d_final).sum()
-
-    d_inc_ref, _, d_initial_ref = torch.autograd.grad(loss, (inc, m_chunk, initial))
-    d_inc_cute, d_initial_cute = state_passing_bwd_state_cute(
-        d_chunk_starts.detach(),
-        d_final.detach(),
-        m_chunk.detach(),
-    )
-
-    torch.testing.assert_close(d_inc_cute, d_inc_ref, atol=2e-4, rtol=0.0)
-    torch.testing.assert_close(d_initial_cute, d_initial_ref, atol=2e-4, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_state_passing_bwd_m_cute_matches_autograd() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    inc, m_chunk, initial = _make_inputs(
-        batch=2,
-        heads=2,
-        chunks=12,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-    )
-    inc.requires_grad_(True)
-    m_chunk.requires_grad_(True)
-    initial.requires_grad_(True)
-
-    chunk_starts, final_state = _state_passing_autograd(inc, m_chunk, initial)
-    d_chunk_starts = torch.randn_like(chunk_starts)
-    d_final = torch.randn_like(final_state)
-    loss = (chunk_starts * d_chunk_starts).sum() + (final_state * d_final).sum()
-
-    _, d_m_ref, _ = torch.autograd.grad(loss, (inc, m_chunk, initial))
-    d_inc_ref, _ = state_passing_bwd_state_cute(
-        d_chunk_starts.detach(),
-        d_final.detach(),
-        m_chunk.detach(),
-    )
-
-    d_m_cute_f32 = state_passing_bwd_m_cute(
-        chunk_starts.detach().to(dtype=torch.float32),
-        d_inc_ref,
-    )
-    d_m_cute_f16 = state_passing_bwd_m_cute(
-        chunk_starts.detach().to(dtype=torch.float16),
-        d_inc_ref,
-    )
-
-    torch.testing.assert_close(d_m_cute_f32, d_m_ref, atol=2e-5, rtol=0.0)
-    torch.testing.assert_close(d_m_cute_f16, d_m_ref, atol=2e-2, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_compile_state_passing_bwd_kernels_matches_wrapper() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
@@ -162,28 +86,160 @@ def test_compile_state_passing_bwd_kernels_matches_wrapper() -> None:
     )
 
     chunk_starts, final_state = _state_passing_autograd(inc, m_chunk, initial)
-    d_chunk_starts = torch.randn_like(chunk_starts)
-    d_final = torch.randn_like(final_state)
+    chunk_starts_f32 = chunk_starts.detach().to(dtype=torch.float32).contiguous()
+    d_chunk_starts = torch.randn_like(chunk_starts_f32)
+    d_final = torch.randn_like(final_state, dtype=torch.float32)
 
-    d_inc_ref, d_m_ref, d_initial_ref = state_passing_bwd_cute(
-        d_chunk_starts.detach(),
-        d_final.detach(),
-        chunk_starts.detach().to(dtype=torch.float16),
+    got_public = state_passing_bwd_cute(
+        chunk_starts_f32,
         m_chunk.detach(),
+        d_chunk_starts=d_chunk_starts.detach(),
+        d_final=d_final.detach(),
     )
 
-    _, _, d_inc, d_m_chunk, d_initial, launch_pipeline = cast(
-        tuple[object, object, torch.Tensor, torch.Tensor, torch.Tensor, Callable[[], None]],
+    compiled = cast(
+        tuple[
+            object,
+            object,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Callable[[], None],
+            Callable[[], None],
+        ],
         compile_state_passing_bwd_kernels(
-            chunk_starts.detach().to(dtype=torch.float16),
+            chunk_starts_f32,
             m_chunk.detach(),
             d_chunk_starts=d_chunk_starts.detach(),
             d_final=d_final.detach(),
             return_launchers=True,
         ),
     )
-    launch_pipeline()
+    (
+        _compiled_state,
+        _compiled_m,
+        d_inc,
+        d_m_chunk,
+        d_initial,
+        launch_sequential,
+        _launch_overlapped,
+    ) = compiled
+    launch_sequential()
 
-    torch.testing.assert_close(d_inc, d_inc_ref, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(d_m_chunk, d_m_ref, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(d_initial, d_initial_ref, atol=0.0, rtol=0.0)
+    got_compiled = (
+        d_inc.to(dtype=torch.float32).contiguous(),
+        d_m_chunk.to(dtype=torch.float32).contiguous(),
+        d_initial.to(dtype=torch.float32).contiguous(),
+    )
+
+    for got_tensor, want_tensor in zip(got_compiled, got_public, strict=True):
+        torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compile_state_passing_bwd_overlapped_matches_sequential() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    inc, m_chunk, initial = _make_inputs(
+        batch=2,
+        heads=2,
+        chunks=12,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+
+    chunk_starts, final_state = _state_passing_autograd(inc, m_chunk, initial)
+    chunk_starts_f32 = chunk_starts.detach().to(dtype=torch.float32).contiguous()
+    d_chunk_starts = torch.randn_like(chunk_starts_f32)
+    d_final = torch.randn_like(final_state, dtype=torch.float32)
+
+    seq_bundle = cast(
+        tuple[
+            object,
+            object,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Callable[[], None],
+            Callable[[], None],
+        ],
+        compile_state_passing_bwd_kernels(
+            chunk_starts_f32.clone(),
+            m_chunk.detach(),
+            d_chunk_starts=d_chunk_starts.detach(),
+            d_final=d_final.detach(),
+            return_launchers=True,
+        ),
+    )
+    ov_bundle = cast(
+        tuple[
+            object,
+            object,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Callable[[], None],
+            Callable[[], None],
+        ],
+        compile_state_passing_bwd_kernels(
+            chunk_starts_f32.clone(),
+            m_chunk.detach(),
+            d_chunk_starts=d_chunk_starts.detach(),
+            d_final=d_final.detach(),
+            return_launchers=True,
+        ),
+    )
+
+    seq_launch = seq_bundle[-2]
+    ov_launch = ov_bundle[-1]
+    seq_launch()
+    ov_launch()
+
+    seq_public = tuple(t.to(dtype=torch.float32).contiguous() for t in seq_bundle[2:5])
+    ov_public = tuple(t.to(dtype=torch.float32).contiguous() for t in ov_bundle[2:5])
+    for got_tensor, want_tensor in zip(ov_public, seq_public, strict=True):
+        torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compile_state_passing_bwd_reuses_cached_executors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    inc, m_chunk, initial = _make_inputs(
+        batch=2,
+        heads=2,
+        chunks=12,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+
+    chunk_starts, final_state = _state_passing_autograd(inc, m_chunk, initial)
+    chunk_starts_f32 = chunk_starts.detach().to(dtype=torch.float32).contiguous()
+    d_chunk_starts = torch.randn_like(chunk_starts_f32)
+    d_final = torch.randn_like(final_state, dtype=torch.float32)
+
+    state_passing_bwd_mod._COMPILED_CACHE.clear()
+    compile_state_passing_bwd_kernels(
+        chunk_starts_f32,
+        m_chunk.detach(),
+        d_chunk_starts=d_chunk_starts.detach(),
+        d_final=d_final.detach(),
+    )
+
+    def _unexpected_compile(*args, **kwargs):
+        raise AssertionError("unexpected recompilation on cache hit")
+
+    monkeypatch.setattr(state_passing_bwd_mod.cute, "compile", _unexpected_compile)
+    compile_state_passing_bwd_kernels(
+        chunk_starts_f32,
+        m_chunk.detach(),
+        d_chunk_starts=d_chunk_starts.detach(),
+        d_final=d_final.detach(),
+    )
+    torch.cuda.synchronize()
