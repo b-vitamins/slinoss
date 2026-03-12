@@ -127,9 +127,7 @@ class ChunkIncrementBwdDUAmpere:
                     best_tn = tn
 
             if best_tm is None:
-                raise ValueError(
-                    "Failed to find a legal row-major async-copy tiling."
-                )
+                raise ValueError("Failed to find a legal row-major async-copy tiling.")
 
             thread_layout = cute.make_layout((best_tm, best_tn), stride=(best_tn, 1))
             return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
@@ -539,12 +537,8 @@ class ChunkIncrementBwdDUAmpere:
         suf_r = cutlass.Float32(1.0)
         suf_i = cutlass.Float32(0.0)
         if tidx < cutlass.Int32(self.L):
-            r_prev = cute.arch.shuffle_sync_up(
-                qr, offset=1, mask=-1, mask_and_clamp=0
-            )
-            i_prev = cute.arch.shuffle_sync_up(
-                qi, offset=1, mask=-1, mask_and_clamp=0
-            )
+            r_prev = cute.arch.shuffle_sync_up(qr, offset=1, mask=-1, mask_and_clamp=0)
+            i_prev = cute.arch.shuffle_sync_up(qi, offset=1, mask=-1, mask_and_clamp=0)
             if tidx == cutlass.Int32(0):
                 suf_r = cutlass.Float32(1.0)
                 suf_i = cutlass.Float32(0.0)

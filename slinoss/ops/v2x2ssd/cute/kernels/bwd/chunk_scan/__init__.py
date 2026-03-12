@@ -14,7 +14,9 @@ from .dz0 import ChunkScanBwdDZ0Ampere
 from .param_scan import ChunkScanBwdParamScanAmpere
 
 
-_COMPILED_CACHE: dict[tuple, tuple[object, object, object, object, object, object | None]] = {}
+_COMPILED_CACHE: dict[
+    tuple, tuple[object, object, object, object, object, object | None]
+] = {}
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -129,7 +131,9 @@ def _public_dk_from_parts(
     if S != 1:
         raise ValueError("Only n_splits=1 is supported by the public wrapper.")
     dK = torch.stack((dKprev[:, :, :, 0, :, :], dKcurr[:, :, :, 0, :, :]), dim=4)
-    return dK.reshape(B, H, C * L, 2, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+    return (
+        dK.reshape(B, H, C * L, 2, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+    )
 
 
 def _compiled_key(

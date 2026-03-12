@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import cast
 import math
 
 import pytest
@@ -263,15 +264,15 @@ def test_chunk_scan_bwd_overlapped_matches_sequential() -> None:
     def public_from_bundle(
         bundle: tuple[object, ...],
     ) -> tuple[torch.Tensor, ...]:
-        dZ0 = bundle[5]
-        dU = bundle[6]
-        dB = bundle[7]
-        dU_prev = bundle[8]
-        dB_prev = bundle[9]
-        dC = bundle[11]
-        dM = bundle[13]
-        dKprev = bundle[14]
-        dKcurr = bundle[15]
+        dZ0 = cast(torch.Tensor, bundle[5])
+        dU = cast(torch.Tensor, bundle[6])
+        dB = cast(torch.Tensor, bundle[7])
+        dU_prev = cast(torch.Tensor, bundle[8])
+        dB_prev = cast(torch.Tensor, bundle[9])
+        dC = cast(torch.Tensor, bundle[11])
+        dM = cast(torch.Tensor, bundle[13])
+        dKprev = cast(torch.Tensor, bundle[14])
+        dKcurr = cast(torch.Tensor, bundle[15])
 
         dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
         dB_public = _fold_chunk_boundary_carries(dB, dB_prev)

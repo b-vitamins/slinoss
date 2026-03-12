@@ -79,6 +79,7 @@ class StatePassingBwdStateAmpere:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         tile_idx, bh, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
 
         S = dinc_flat.shape[2]
         C = dinc_flat.shape[1]
@@ -185,11 +186,22 @@ class StatePassingBwdStateAmpere:
                 cute.copy(copy_in_vec, thrIn, frgIn)
             dstart_f32 = frgIn.load().to(cutlass.Float32)
 
-            gM = m_flat[bh, c, None]
-            frgM = cute.make_rmem_tensor_like(gM)
-            cute.copy(copy_m, gM, frgM)
-            m = frgM.load().to(cutlass.Float32)
-            mr, mi = m[0], m[1]
+            mr = cutlass.Float32(0.0)
+            mi = cutlass.Float32(0.0)
+            if lane == cutlass.Int32(0):
+                gM = m_flat[bh, c, None]
+                frgM = cute.make_rmem_tensor_like(gM)
+                cute.copy(copy_m, gM, frgM)
+                m = frgM.load().to(cutlass.Float32)
+                mr = m[0]
+                mi = m[1]
+            for offset in (1, 2, 4, 8, 16):
+                mr += cute.arch.shuffle_sync_bfly(
+                    mr, offset=offset, mask=-1, mask_and_clamp=31
+                )
+                mi += cute.arch.shuffle_sync_bfly(
+                    mi, offset=offset, mask=-1, mask_and_clamp=31
+                )
 
             for v in cutlass.range_constexpr(pairs_per_thread):
                 base = v * 2

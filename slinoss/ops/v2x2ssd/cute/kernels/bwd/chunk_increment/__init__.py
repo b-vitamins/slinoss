@@ -75,7 +75,11 @@ def _public_dk_from_parts(
         raise ValueError("dKprev and dKcurr must have identical shapes.")
     dK = torch.stack((dKprev, dKcurr), dim=4)
     B, H, C, L, _, F = map(int, dK.shape)
-    return dK.reshape(B, H, C * L, 2, F)[:, :, :T, :, :].to(dtype=torch.float32).contiguous()
+    return (
+        dK.reshape(B, H, C * L, 2, F)[:, :, :T, :, :]
+        .to(dtype=torch.float32)
+        .contiguous()
+    )
 
 
 def _fold_chunk_boundary_carries(
@@ -260,7 +264,9 @@ def compile_chunk_increment_bwd_kernels(
     mDUPrev = from_dlpack(dU_prev.transpose(0, 1), assumed_align=16)
     mDMsum_part = from_dlpack(dMsum_part, assumed_align=16)
     mDMp0 = from_dlpack(dMp0, assumed_align=16)
-    mDMchunk = from_dlpack(d_m_chunk_f.reshape(BHC, 2).transpose(0, 1), assumed_align=16)
+    mDMchunk = from_dlpack(
+        d_m_chunk_f.reshape(BHC, 2).transpose(0, 1), assumed_align=16
+    )
     mDM = from_dlpack(dM_out, assumed_align=16)
     mDKprev = from_dlpack(dKprev_out, assumed_align=16)
     mDKcurr = from_dlpack(dKcurr_out, assumed_align=16)
@@ -270,9 +276,7 @@ def compile_chunk_increment_bwd_kernels(
         compiled_db = cute.compile(
             k_db, mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part
         )
-        compiled_du = cute.compile(
-            k_du, mDInc, mB, mM, mKprev, mKcurr, mDU
-        )
+        compiled_du = cute.compile(k_du, mDInc, mB, mM, mKprev, mKcurr, mDU)
         compiled_boundary = cute.compile(
             k_boundary,
             mDInc_boundary,
@@ -305,7 +309,9 @@ def compile_chunk_increment_bwd_kernels(
     dU_view = dU.reshape(Bsz, H, n_chunks, L, P)
     dB_prev_view = dB_prev.reshape(Bsz, H, n_chunks, D)
     dU_prev_view = dU_prev.reshape(Bsz, H, n_chunks, P)
-    dMsum_part_view = dMsum_part.permute(3, 1, 2, 0).reshape(Bsz, H, n_chunks, L, nDtiles, 2)
+    dMsum_part_view = dMsum_part.permute(3, 1, 2, 0).reshape(
+        Bsz, H, n_chunks, L, nDtiles, 2
+    )
     dMp0_view = dMp0.permute(1, 0).reshape(Bsz, H, n_chunks, 2)
     dM_view = dM_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
     dKprev_view = dKprev_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)

@@ -110,7 +110,9 @@ def compile_state_passing_bwd_kernels(
     )
 
     cache_key = _compiled_key(
-        device_index=(chunk_starts.device.index if chunk_starts.device.index is not None else -1),
+        device_index=(
+            chunk_starts.device.index if chunk_starts.device.index is not None else -1
+        ),
         chunk_starts_shape=tuple(chunk_starts.shape),
         m_chunk_shape=tuple(m_chunk.shape),
         d_chunk_starts_shape=tuple(d_chunk_starts.shape),

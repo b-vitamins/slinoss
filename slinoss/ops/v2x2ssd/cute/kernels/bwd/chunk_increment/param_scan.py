@@ -81,7 +81,10 @@ class ChunkIncrementBwdParamScanAmpere:
         smem = cutlass.utils.SmemAllocator()
         sSuffix = smem.allocate_tensor(
             cutlass.Float32,
-            cute.make_layout((self.L, 2, self.num_threads), stride=(2 * self.num_threads, self.num_threads, 1)),
+            cute.make_layout(
+                (self.L, 2, self.num_threads),
+                stride=(2 * self.num_threads, self.num_threads, 1),
+            ),
             4,
         )
 

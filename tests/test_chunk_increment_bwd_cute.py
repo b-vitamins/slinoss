@@ -76,7 +76,11 @@ def _public_dk_from_parts(
 ) -> torch.Tensor:
     dK = torch.stack((dKprev, dKcurr), dim=4)
     B, H, C, L, _, F = map(int, dK.shape)
-    return dK.reshape(B, H, C * L, 2, F)[:, :, :T, :, :].to(dtype=torch.float32).contiguous()
+    return (
+        dK.reshape(B, H, C * L, 2, F)[:, :, :T, :, :]
+        .to(dtype=torch.float32)
+        .contiguous()
+    )
 
 
 def _fold_chunk_boundary_carries(x: torch.Tensor, x_prev: torch.Tensor) -> torch.Tensor:

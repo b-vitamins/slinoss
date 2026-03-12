@@ -552,12 +552,8 @@ class ChunkIncrementBwdDBAmpere:
         suf_r = cutlass.Float32(1.0)
         suf_i = cutlass.Float32(0.0)
         if tidx < cutlass.Int32(self.L):
-            r_prev = cute.arch.shuffle_sync_up(
-                qr, offset=1, mask=-1, mask_and_clamp=0
-            )
-            i_prev = cute.arch.shuffle_sync_up(
-                qi, offset=1, mask=-1, mask_and_clamp=0
-            )
+            r_prev = cute.arch.shuffle_sync_up(qr, offset=1, mask=-1, mask_and_clamp=0)
+            i_prev = cute.arch.shuffle_sync_up(qi, offset=1, mask=-1, mask_and_clamp=0)
             if tidx == cutlass.Int32(0):
                 suf_r = cutlass.Float32(1.0)
                 suf_i = cutlass.Float32(0.0)

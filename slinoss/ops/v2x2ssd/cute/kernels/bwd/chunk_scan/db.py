@@ -622,9 +622,7 @@ class ChunkScanBwdDBAmpere:
             if cutlass.const_expr(self.D == Dp):
                 cute.copy(gmem_tiled_copy_D, tBg, tKsB)
             else:
-                cB = cute.local_tile(
-                    mcKD_full, (kv_tile, Dp), (n_tile, 0)
-                )
+                cB = cute.local_tile(mcKD_full, (kv_tile, Dp), (n_tile, 0))
                 tBc = gmem_thr_copy_D.partition_S(cB)
                 for vi in cutlass.range_constexpr(cute.size(tKsB.shape[1])):
                     if cute.elem_less(tBc[0, vi, 0][1], mB.layout.shape[1]):
@@ -1557,8 +1555,12 @@ class ChunkScanBwdDBAmpere:
                             bi_curr0 = cutlass.Float32(
                                 mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
                             )
-                            dmy_curr0 = dmy_curr0 + gx_curr0 * br_curr0 - gy_curr0 * bi_curr0
-                            dmy_curr1 = dmy_curr1 + gx_curr0 * bi_curr0 + gy_curr0 * br_curr0
+                            dmy_curr0 = (
+                                dmy_curr0 + gx_curr0 * br_curr0 - gy_curr0 * bi_curr0
+                            )
+                            dmy_curr1 = (
+                                dmy_curr1 + gx_curr0 * bi_curr0 + gy_curr0 * br_curr0
+                            )
 
                             bxr_curr1 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 2].to(cutlass.Float32)
@@ -1575,8 +1577,12 @@ class ChunkScanBwdDBAmpere:
                             bi_curr1 = cutlass.Float32(
                                 mB[bidz, row, 0, d0 + 3].to(cutlass.Float32)
                             )
-                            dmy_curr0 = dmy_curr0 + gx_curr1 * br_curr1 - gy_curr1 * bi_curr1
-                            dmy_curr1 = dmy_curr1 + gx_curr1 * bi_curr1 + gy_curr1 * br_curr1
+                            dmy_curr0 = (
+                                dmy_curr0 + gx_curr1 * br_curr1 - gy_curr1 * bi_curr1
+                            )
+                            dmy_curr1 = (
+                                dmy_curr1 + gx_curr1 * bi_curr1 + gy_curr1 * br_curr1
+                            )
 
                             bxr_prev0 = cutlass.Float32(
                                 sQ0[t_local, d0 + 0].to(cutlass.Float32)
@@ -1668,10 +1674,18 @@ class ChunkScanBwdDBAmpere:
                                             d0 + 3,
                                         ].to(cutlass.Float32)
                                     )
-                            dmy_prev0 = dmy_prev0 + gx_prev0 * br_prev0 - gy_prev0 * bi_prev0
-                            dmy_prev1 = dmy_prev1 + gx_prev0 * bi_prev0 + gy_prev0 * br_prev0
-                            dmy_prev0 = dmy_prev0 + gx_prev1 * br_prev1 - gy_prev1 * bi_prev1
-                            dmy_prev1 = dmy_prev1 + gx_prev1 * bi_prev1 + gy_prev1 * br_prev1
+                            dmy_prev0 = (
+                                dmy_prev0 + gx_prev0 * br_prev0 - gy_prev0 * bi_prev0
+                            )
+                            dmy_prev1 = (
+                                dmy_prev1 + gx_prev0 * bi_prev0 + gy_prev0 * br_prev0
+                            )
+                            dmy_prev0 = (
+                                dmy_prev0 + gx_prev1 * br_prev1 - gy_prev1 * bi_prev1
+                            )
+                            dmy_prev1 = (
+                                dmy_prev1 + gx_prev1 * bi_prev1 + gy_prev1 * br_prev1
+                            )
 
                             vv4 = vv4 + cutlass.Int32(32)
                     else:
@@ -1685,15 +1699,21 @@ class ChunkScanBwdDBAmpere:
                             bxi_curr = cutlass.Float32(
                                 sK_tile[t_local, d0 + 1].to(cutlass.Float32)
                             )
-                            gx_curr, gy_curr = conj_mul_phase(bxr_curr, bxi_curr, pr, pi)
+                            gx_curr, gy_curr = conj_mul_phase(
+                                bxr_curr, bxi_curr, pr, pi
+                            )
                             br_curr = cutlass.Float32(
                                 mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
                             )
                             bi_curr = cutlass.Float32(
                                 mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
                             )
-                            dmy_curr0 = dmy_curr0 + gx_curr * br_curr - gy_curr * bi_curr
-                            dmy_curr1 = dmy_curr1 + gx_curr * bi_curr + gy_curr * br_curr
+                            dmy_curr0 = (
+                                dmy_curr0 + gx_curr * br_curr - gy_curr * bi_curr
+                            )
+                            dmy_curr1 = (
+                                dmy_curr1 + gx_curr * bi_curr + gy_curr * br_curr
+                            )
 
                             bxr_prev = cutlass.Float32(
                                 sQ0[t_local, d0 + 0].to(cutlass.Float32)
@@ -1701,7 +1721,9 @@ class ChunkScanBwdDBAmpere:
                             bxi_prev = cutlass.Float32(
                                 sQ0[t_local, d0 + 1].to(cutlass.Float32)
                             )
-                            gx_prev, gy_prev = conj_mul_phase(bxr_prev, bxi_prev, pr, pi)
+                            gx_prev, gy_prev = conj_mul_phase(
+                                bxr_prev, bxi_prev, pr, pi
+                            )
                             br_prev = cutlass.Float32(0.0)
                             bi_prev = cutlass.Float32(0.0)
                             if row > cutlass.Int32(0):
@@ -1740,8 +1762,12 @@ class ChunkScanBwdDBAmpere:
                                             d0 + 1,
                                         ].to(cutlass.Float32)
                                     )
-                            dmy_prev0 = dmy_prev0 + gx_prev * br_prev - gy_prev * bi_prev
-                            dmy_prev1 = dmy_prev1 + gx_prev * bi_prev + gy_prev * br_prev
+                            dmy_prev0 = (
+                                dmy_prev0 + gx_prev * br_prev - gy_prev * bi_prev
+                            )
+                            dmy_prev1 = (
+                                dmy_prev1 + gx_prev * bi_prev + gy_prev * br_prev
+                            )
 
                             vv = vv + cutlass.Int32(32)
 
@@ -1922,10 +1948,18 @@ class ChunkScanBwdDBAmpere:
                                     prevy1 = cutlass.Float32(
                                         sDB_carry[d0 + 3].to(cutlass.Float32)
                                     )
-                            sK_tile[t_local, d0 + 0] = (currx0 + prevx0).to(mU.element_type)
-                            sK_tile[t_local, d0 + 1] = (curry0 + prevy0).to(mU.element_type)
-                            sK_tile[t_local, d0 + 2] = (currx1 + prevx1).to(mU.element_type)
-                            sK_tile[t_local, d0 + 3] = (curry1 + prevy1).to(mU.element_type)
+                            sK_tile[t_local, d0 + 0] = (currx0 + prevx0).to(
+                                mU.element_type
+                            )
+                            sK_tile[t_local, d0 + 1] = (curry0 + prevy0).to(
+                                mU.element_type
+                            )
+                            sK_tile[t_local, d0 + 2] = (currx1 + prevx1).to(
+                                mU.element_type
+                            )
+                            sK_tile[t_local, d0 + 3] = (curry1 + prevy1).to(
+                                mU.element_type
+                            )
             else:
                 for it in cutlass.range_constexpr(iters_pairs_tile):
                     idx = tidx + cutlass.Int32(it * self.num_threads)
@@ -1962,8 +1996,12 @@ class ChunkScanBwdDBAmpere:
                                     prevy = cutlass.Float32(
                                         sDB_carry[d0 + 1].to(cutlass.Float32)
                                     )
-                            sK_tile[t_local, d0 + 0] = (currx + prevx).to(mU.element_type)
-                            sK_tile[t_local, d0 + 1] = (curry + prevy).to(mU.element_type)
+                            sK_tile[t_local, d0 + 0] = (currx + prevx).to(
+                                mU.element_type
+                            )
+                            sK_tile[t_local, d0 + 1] = (curry + prevy).to(
+                                mU.element_type
+                            )
             cute.arch.barrier()
 
             gDB = cute.local_tile(mDB[bidz, None, 0, None], (kv_tile, Dp), (n_tile, 0))
