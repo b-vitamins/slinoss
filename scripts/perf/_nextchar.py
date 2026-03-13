@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from _nextchar_model import NextCharLM, configure_optim
 from slinoss.layers import SLinOSSMixer
 from slinoss.layers.backend import CuteScanBackend, ReferenceScanBackend
-from slinoss.perf import PerfRecorder, attach_module_timer, call_region, record_region
+from slinoss.perf import PerfRecorder, call_region, record_region
 
 warnings.filterwarnings(
     "ignore",
@@ -99,89 +99,8 @@ def _configure_backend(model: NextCharLM, *, backend: str) -> None:
 def attach_workload_timers(
     model: NextCharLM,
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    handles: list[torch.utils.hooks.RemovableHandle] = []
-    handles.extend(
-        attach_module_timer(
-            model.token_embed,
-            "embed.token",
-            capture_forward=False,
-            capture_backward=True,
-        )
-    )
-    handles.extend(
-        attach_module_timer(
-            model.norm_f,
-            "norms.final",
-            capture_forward=False,
-            capture_backward=True,
-        )
-    )
-    handles.extend(
-        attach_module_timer(
-            model.lm_head,
-            "head.logits",
-            capture_forward=False,
-            capture_backward=True,
-        )
-    )
-    for block in model.blocks:
-        handles.extend(
-            attach_module_timer(
-                block.norm1,
-                "norms.pre_mixer",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-        handles.extend(
-            attach_module_timer(
-                block.norm2,
-                "norms.pre_ffn",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-        handles.extend(
-            attach_module_timer(
-                block.ff,
-                "ffn",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-        handles.extend(
-            attach_module_timer(
-                block.mixer.in_proj,
-                "mixer.in_proj",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-        handles.extend(
-            attach_module_timer(
-                block.mixer.dw_conv,
-                "mixer.dw_conv",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-        handles.extend(
-            attach_module_timer(
-                block.mixer.bc_proj,
-                "mixer.bc_proj",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-        handles.extend(
-            attach_module_timer(
-                block.mixer.out_proj,
-                "mixer.out_proj",
-                capture_forward=False,
-                capture_backward=True,
-            )
-        )
-    return handles
+    _ = model
+    return []
 
 
 def random_batch(cfg: NextCharPerfConfig) -> tuple[torch.Tensor, torch.Tensor]:

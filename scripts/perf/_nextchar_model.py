@@ -75,14 +75,14 @@ class NextCharBlock(nn.Module):
         self.ff = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm1 = call_region("norms.pre_mixer", self.norm1, x, capture_backward=False)
+        norm1 = call_region("norms.pre_mixer", self.norm1, x)
         x = call_region("residual.mixer", torch.add, x, self.mixer(norm1))
-        norm2 = call_region("norms.pre_ffn", self.norm2, x, capture_backward=False)
+        norm2 = call_region("norms.pre_ffn", self.norm2, x)
         x = call_region(
             "residual.ffn",
             torch.add,
             x,
-            call_region("ffn", self.ff, norm2, capture_backward=False),
+            call_region("ffn", self.ff, norm2),
         )
         return x
 
@@ -147,7 +147,6 @@ class NextCharLM(nn.Module):
             "embed.token",
             self.token_embed,
             idx,
-            capture_backward=False,
         )
         x = call_region(
             "embed.pos",
@@ -157,5 +156,5 @@ class NextCharLM(nn.Module):
         )
         for block in self.blocks:
             x = block(x)
-        x = call_region("norms.final", self.norm_f, x, capture_backward=False)
-        return call_region("head.logits", self.lm_head, x, capture_backward=False)
+        x = call_region("norms.final", self.norm_f, x)
+        return call_region("head.logits", self.lm_head, x)

@@ -226,7 +226,6 @@ class SLinOSSMixer(nn.Module):
             value,
             batch,
             T,
-            capture_backward=False,
         )
         B_sem = bc[..., :2, :]
         C_sem = bc[..., 2:, :]
@@ -274,7 +273,7 @@ class SLinOSSMixer(nn.Module):
             next_state = SLinOSSMixerState() if state is None else state
             return (empty, next_state) if return_state else empty
 
-        proj = call_region("mixer.in_proj", self.in_proj, x, capture_backward=False)
+        proj = call_region("mixer.in_proj", self.in_proj, x)
         gate, value_raw, params = torch.split(
             proj,
             [self.d_inner, self.d_inner, self.n_heads * self.discretizer.param_dim],
@@ -286,7 +285,6 @@ class SLinOSSMixer(nn.Module):
             self._apply_causal_depthwise_conv_with_state,
             value_raw,
             conv_state_in,
-            capture_backward=False,
         )
         value = call_region("mixer.dw_conv_activation", F.silu, conv_out)
 
@@ -318,7 +316,6 @@ class SLinOSSMixer(nn.Module):
             "mixer.out_proj",
             self.out_proj,
             gated,
-            capture_backward=False,
         )
 
         if not return_state:
