@@ -107,8 +107,8 @@ def scanprep_bwd(
         )
     )
 
-    value_grad = torch.empty_like(value, dtype=torch.float32)
-    bc_grad = torch.empty_like(bc, dtype=torch.float32)
+    value_grad = torch.empty_like(value)
+    bc_grad = torch.empty_like(bc)
     scale_partials = torch.empty(
         (batch, n_heads, t_size, 4, d_state),
         device=bc.device,
@@ -117,7 +117,7 @@ def scanprep_bwd(
     dparams_view = torch.empty(
         (batch, t_size, n_heads, 13),
         device=params.device,
-        dtype=torch.float32,
+        dtype=params.dtype,
     )
     bias_partials = torch.empty(
         (batch, n_heads, t_size, 7),
@@ -294,18 +294,49 @@ def scanprep_bwd(
         bias_grad_ptr,
     )
 
-    dvalue = value_grad.to(dtype=value.dtype)
-    dbc = bc_grad.to(dtype=bc.dtype)
-    dparams = dparams_view.reshape_as(params).to(dtype=params.dtype)
-    d_dt_bias = bias_grad[:, 0].to(dtype=dt_bias.dtype)
-    d_gamma_bias = bias_grad[:, 1].to(dtype=gamma_bias.dtype)
-    d_omega_bias = bias_grad[:, 2].to(dtype=omega_bias.dtype)
-    d_mix_r_bias = bias_grad[:, 3].to(dtype=mix_r_bias.dtype)
-    d_mix_theta_bias = bias_grad[:, 4].to(dtype=mix_theta_bias.dtype)
-    d_mix_k_prev_bias = bias_grad[:, 5].to(dtype=mix_k_prev_bias.dtype)
-    d_mix_k_curr_bias = bias_grad[:, 6].to(dtype=mix_k_curr_bias.dtype)
-    db_scale = scale_grad[:, :2, :].to(dtype=b_scale.dtype) if normalize_bc else None
-    dc_scale = scale_grad[:, 2:, :].to(dtype=c_scale.dtype) if normalize_bc else None
+    dvalue = (
+        value_grad
+        if value_grad.dtype == value.dtype
+        else value_grad.to(dtype=value.dtype)
+    )
+    dbc = bc_grad if bc_grad.dtype == bc.dtype else bc_grad.to(dtype=bc.dtype)
+    dparams = dparams_view.reshape_as(params)
+
+    bias_dtype = dt_bias.dtype
+    if (
+        gamma_bias.dtype == bias_dtype
+        and omega_bias.dtype == bias_dtype
+        and mix_r_bias.dtype == bias_dtype
+        and mix_theta_bias.dtype == bias_dtype
+        and mix_k_prev_bias.dtype == bias_dtype
+        and mix_k_curr_bias.dtype == bias_dtype
+    ):
+        d_dt_bias = bias_grad[:, 0]
+        d_gamma_bias = bias_grad[:, 1]
+        d_omega_bias = bias_grad[:, 2]
+        d_mix_r_bias = bias_grad[:, 3]
+        d_mix_theta_bias = bias_grad[:, 4]
+        d_mix_k_prev_bias = bias_grad[:, 5]
+        d_mix_k_curr_bias = bias_grad[:, 6]
+    else:
+        d_dt_bias = bias_grad[:, 0].to(dtype=dt_bias.dtype)
+        d_gamma_bias = bias_grad[:, 1].to(dtype=gamma_bias.dtype)
+        d_omega_bias = bias_grad[:, 2].to(dtype=omega_bias.dtype)
+        d_mix_r_bias = bias_grad[:, 3].to(dtype=mix_r_bias.dtype)
+        d_mix_theta_bias = bias_grad[:, 4].to(dtype=mix_theta_bias.dtype)
+        d_mix_k_prev_bias = bias_grad[:, 5].to(dtype=mix_k_prev_bias.dtype)
+        d_mix_k_curr_bias = bias_grad[:, 6].to(dtype=mix_k_curr_bias.dtype)
+
+    if normalize_bc:
+        if b_scale.dtype == c_scale.dtype:
+            db_scale = scale_grad[:, :2, :]
+            dc_scale = scale_grad[:, 2:, :]
+        else:
+            db_scale = scale_grad[:, :2, :].to(dtype=b_scale.dtype)
+            dc_scale = scale_grad[:, 2:, :].to(dtype=c_scale.dtype)
+    else:
+        db_scale = None
+        dc_scale = None
     return (
         dvalue,
         dparams,

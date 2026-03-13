@@ -226,10 +226,18 @@ class ScanPrepBwdFused:
                         dy1 = db1 * scale1
                         dy2 = dc0 * scale2
                         dy3 = dc1 * scale3
-                        mBCGrad[b, t, h, 0, n] = inv0 * dy0 - x0 * inv0_cubed * dot0
-                        mBCGrad[b, t, h, 1, n] = inv1 * dy1 - x1 * inv1_cubed * dot1
-                        mBCGrad[b, t, h, 2, n] = inv2 * dy2 - x2 * inv2_cubed * dot2
-                        mBCGrad[b, t, h, 3, n] = inv3 * dy3 - x3 * inv3_cubed * dot3
+                        mBCGrad[b, t, h, 0, n] = (
+                            inv0 * dy0 - x0 * inv0_cubed * dot0
+                        ).to(mBCGrad.element_type)
+                        mBCGrad[b, t, h, 1, n] = (
+                            inv1 * dy1 - x1 * inv1_cubed * dot1
+                        ).to(mBCGrad.element_type)
+                        mBCGrad[b, t, h, 2, n] = (
+                            inv2 * dy2 - x2 * inv2_cubed * dot2
+                        ).to(mBCGrad.element_type)
+                        mBCGrad[b, t, h, 3, n] = (
+                            inv3 * dy3 - x3 * inv3_cubed * dot3
+                        ).to(mBCGrad.element_type)
                         mScalePartials[b, h, t, 0, n] = db0 * y0
                         mScalePartials[b, h, t, 1, n] = db1 * y1
                         mScalePartials[b, h, t, 2, n] = dc0 * y2
@@ -239,14 +247,10 @@ class ScanPrepBwdFused:
                 for n_iter in cutlass.range_constexpr(num_n_iters):
                     n = lane + n_iter * 32
                     if n < self.n_size:
-                        mBCGrad[b, t, h, 0, n] = cutlass.Float32(mDB[b, h, t, 2 * n])
-                        mBCGrad[b, t, h, 1, n] = cutlass.Float32(
-                            mDB[b, h, t, 2 * n + 1]
-                        )
-                        mBCGrad[b, t, h, 2, n] = cutlass.Float32(mDC[b, h, t, 2 * n])
-                        mBCGrad[b, t, h, 3, n] = cutlass.Float32(
-                            mDC[b, h, t, 2 * n + 1]
-                        )
+                        mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
+                        mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
+                        mBCGrad[b, t, h, 2, n] = mDC[b, h, t, 2 * n]
+                        mBCGrad[b, t, h, 3, n] = mDC[b, h, t, 2 * n + 1]
 
     @cute.kernel
     def coeff_kernel(
@@ -612,19 +616,19 @@ class ScanPrepBwdFused:
                 * (cutlass.Float32(1.0) - k_curr_tanh_im * k_curr_tanh_im)
             )
 
-            mDParams[b, t, h, 0] = d0
-            mDParams[b, t, h, 1] = d1
-            mDParams[b, t, h, 2] = d2
-            mDParams[b, t, h, 3] = d3
-            mDParams[b, t, h, 4] = d4
-            mDParams[b, t, h, 5] = d5
-            mDParams[b, t, h, 6] = d6
-            mDParams[b, t, h, 7] = d7
-            mDParams[b, t, h, 8] = d8
-            mDParams[b, t, h, 9] = d9
-            mDParams[b, t, h, 10] = d10
-            mDParams[b, t, h, 11] = d11
-            mDParams[b, t, h, 12] = d12
+            mDParams[b, t, h, 0] = d0.to(mDParams.element_type)
+            mDParams[b, t, h, 1] = d1.to(mDParams.element_type)
+            mDParams[b, t, h, 2] = d2.to(mDParams.element_type)
+            mDParams[b, t, h, 3] = d3.to(mDParams.element_type)
+            mDParams[b, t, h, 4] = d4.to(mDParams.element_type)
+            mDParams[b, t, h, 5] = d5.to(mDParams.element_type)
+            mDParams[b, t, h, 6] = d6.to(mDParams.element_type)
+            mDParams[b, t, h, 7] = d7.to(mDParams.element_type)
+            mDParams[b, t, h, 8] = d8.to(mDParams.element_type)
+            mDParams[b, t, h, 9] = d9.to(mDParams.element_type)
+            mDParams[b, t, h, 10] = d10.to(mDParams.element_type)
+            mDParams[b, t, h, 11] = d11.to(mDParams.element_type)
+            mDParams[b, t, h, 12] = d12.to(mDParams.element_type)
             mBiasPartials[b, h, t, 0] = d0
             mBiasPartials[b, h, t, 1] = d1
             mBiasPartials[b, h, t, 2] = d2
