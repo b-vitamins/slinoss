@@ -222,50 +222,38 @@ class SLinOSSMixer(nn.Module):
         batch, T, _ = map(int, value.shape)
         bc = call_region(
             "mixer.bc_proj",
-            lambda value_: self.bc_proj(value_).view(
-                batch, T, self.n_heads, 4, self.d_state
-            ),
+            self._project_bc,
             value,
+            batch,
+            T,
             capture_backward=False,
         )
         B_sem = bc[..., :2, :]
         C_sem = bc[..., 2:, :]
         if self.normalize_bc:
-            assert self.b_scale is not None and self.c_scale is not None
-            b_scale = self.b_scale
-            c_scale = self.c_scale
             B_sem, C_sem = call_region(
                 "mixer.bc_norm",
-                lambda B_sem_, C_sem_: (
-                    self._normalize_bc(B_sem_, b_scale),
-                    self._normalize_bc(C_sem_, c_scale),
-                ),
+                self._normalize_scan_bc,
                 B_sem,
                 C_sem,
             )
 
         coeffs = call_region(
             "mixer.discretizer",
-            lambda params_: self.discretizer.scan_coeffs(
-                params_.view(batch, T, self.n_heads, -1)
-            ),
+            self._scan_coeffs_from_flat_params,
             params,
+            batch,
+            T,
         )
         return call_region(
             "mixer.scan_input_pack",
-            lambda value_, coeffs_, B_sem_, C_sem_: ScanInputs(
-                U=value_.view(batch, T, self.n_heads, self.d_head)
-                .permute(0, 2, 1, 3)
-                .contiguous(),
-                M=coeffs_[0],
-                K=coeffs_[1],
-                B=_pack_interleaved_pairs(B_sem_),
-                C=_pack_interleaved_pairs(C_sem_),
-            ),
+            self._pack_scan_inputs,
             value,
             coeffs,
             B_sem,
             C_sem,
+            batch,
+            T,
         )
 
     def forward(
@@ -295,10 +283,9 @@ class SLinOSSMixer(nn.Module):
         conv_state_in = None if state is None else state.conv
         conv_out, conv_state = call_region(
             "mixer.dw_conv",
-            lambda value_raw_: self._apply_causal_depthwise_conv(
-                value_raw_, conv_state_in
-            ),
+            self._apply_causal_depthwise_conv_with_state,
             value_raw,
+            conv_state_in,
             capture_backward=False,
         )
         value = call_region("mixer.dw_conv_activation", F.silu, conv_out)
@@ -307,13 +294,10 @@ class SLinOSSMixer(nn.Module):
         scan_state_in = None if state is None else state.scan
         scan_result = call_region(
             "v2x2ssd.total",
-            lambda scan_inputs_: self.backend(
-                scan_inputs_,
-                chunk_size=self.chunk_size,
-                state=scan_state_in,
-                return_state=return_state,
-            ),
+            self._run_scan_backend,
             scan_inputs,
+            scan_state_in,
+            return_state,
         )
         if return_state:
             scan_y, scan_state = cast(tuple[torch.Tensor, ScanState], scan_result)
@@ -359,6 +343,67 @@ class SLinOSSMixer(nn.Module):
         if self.output_norm is not None:
             y = self.output_norm(y)
         return y
+
+    def _project_bc(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
+        return self.bc_proj(value).view(batch, T, self.n_heads, 4, self.d_state)
+
+    def _normalize_scan_bc(
+        self,
+        B_sem: torch.Tensor,
+        C_sem: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.b_scale is not None and self.c_scale is not None
+        return (
+            self._normalize_bc(B_sem, self.b_scale),
+            self._normalize_bc(C_sem, self.c_scale),
+        )
+
+    def _scan_coeffs_from_flat_params(
+        self,
+        params: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.discretizer.scan_coeffs(params.view(batch, T, self.n_heads, -1))
+
+    def _pack_scan_inputs(
+        self,
+        value: torch.Tensor,
+        coeffs: tuple[torch.Tensor, torch.Tensor],
+        B_sem: torch.Tensor,
+        C_sem: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> ScanInputs:
+        return ScanInputs(
+            U=value.view(batch, T, self.n_heads, self.d_head)
+            .permute(0, 2, 1, 3)
+            .contiguous(),
+            M=coeffs[0],
+            K=coeffs[1],
+            B=_pack_interleaved_pairs(B_sem),
+            C=_pack_interleaved_pairs(C_sem),
+        )
+
+    def _apply_causal_depthwise_conv_with_state(
+        self,
+        value_raw: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._apply_causal_depthwise_conv(value_raw, conv_state)
+
+    def _run_scan_backend(
+        self,
+        scan_inputs: ScanInputs,
+        scan_state: ScanState | None,
+        return_state: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, ScanState]:
+        return self.backend(
+            scan_inputs,
+            chunk_size=self.chunk_size,
+            state=scan_state,
+            return_state=return_state,
+        )
 
     def step(
         self,
