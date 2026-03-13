@@ -21,6 +21,10 @@ warnings.filterwarnings(
 )
 
 
+def _cross_entropy_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+
+
 @dataclass(frozen=True)
 class NextCharPerfConfig:
     batch_size: int = 12
@@ -71,6 +75,9 @@ def build_model(
         d_conv=cfg.d_conv,
         chunk_size=cfg.chunk_size,
     ).to(device=cfg.torch_device, dtype=cfg.dtype)
+    model.perf_trainable_params = tuple(
+        p for p in model.parameters() if p.requires_grad
+    )
     optimizer = configure_optim(model, lr=cfg.lr, weight_decay=cfg.weight_decay)
     _configure_backend(model, backend=backend)
     return model, optimizer
@@ -203,6 +210,10 @@ def run_train_step(
     *,
     grad_clip: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    clip_params = model.perf_trainable_params
+    if not clip_params:
+        clip_params = tuple(p for p in model.parameters() if p.requires_grad)
+        model.perf_trainable_params = clip_params
     with record_region("step.total"):
         with record_region("step.zero_grad"):
             optimizer.zero_grad(set_to_none=True)
@@ -210,9 +221,7 @@ def run_train_step(
             logits = model(xb)
             loss = call_region(
                 "head.loss",
-                lambda logits_, targets_: F.cross_entropy(
-                    logits_.reshape(-1, logits_.shape[-1]), targets_.reshape(-1)
-                ),
+                _cross_entropy_logits,
                 logits,
                 yb,
             )
@@ -220,7 +229,7 @@ def run_train_step(
             loss.backward()
         with record_region("step.clip"):
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
+                clip_params,
                 max_norm=grad_clip,
                 foreach=xb.device.type == "cuda",
             )

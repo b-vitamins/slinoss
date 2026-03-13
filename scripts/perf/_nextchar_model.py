@@ -121,6 +121,7 @@ class NextCharLM(nn.Module):
         self.norm_f = nn.RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_embed.weight
+        self.perf_trainable_params: tuple[torch.nn.Parameter, ...] = ()
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -131,6 +132,9 @@ class NextCharLM(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    def _add_pos_embed(self, x: torch.Tensor, T: int) -> torch.Tensor:
+        return x + self.pos_embed[:, :T, :]
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         if idx.ndim != 2:
@@ -147,8 +151,9 @@ class NextCharLM(nn.Module):
         )
         x = call_region(
             "embed.pos",
-            lambda x_: x_ + self.pos_embed[:, : idx.shape[1], :],
+            self._add_pos_embed,
             x,
+            int(idx.shape[1]),
         )
         for block in self.blocks:
             x = block(x)
