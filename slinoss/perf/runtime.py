@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, is_dataclass
 from time import perf_counter
 import threading
@@ -15,6 +15,8 @@ T = TypeVar("T")
 Stamp: TypeAlias = torch.cuda.Event | float
 StampedBoundary: TypeAlias = tuple[int, Stamp]
 
+_IS_PROFILER_ENABLED = getattr(torch.autograd.profiler, "_is_profiler_enabled", None)
+
 _ACTIVE_STEPS: list["_PerfStep"] = []
 _ACTIVE_STEPS_LOCK = threading.RLock()
 
@@ -22,6 +24,14 @@ _ACTIVE_STEPS_LOCK = threading.RLock()
 def current_step() -> "_PerfStep | None":
     with _ACTIVE_STEPS_LOCK:
         return _ACTIVE_STEPS[-1] if _ACTIVE_STEPS else None
+
+
+def _profiler_enabled() -> bool:
+    if callable(_IS_PROFILER_ENABLED):
+        return bool(_IS_PROFILER_ENABLED())
+    if _IS_PROFILER_ENABLED is None:
+        return True
+    return bool(_IS_PROFILER_ENABLED)
 
 
 class _PerfStep:
@@ -150,10 +160,13 @@ def record_region(label: str) -> Iterator[None]:
         yield
         return
 
+    use_record_function = _profiler_enabled()
+
     if step.uses_cuda_events:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        with record_function(label):
+        maybe_record = record_function(label) if use_record_function else nullcontext()
+        with maybe_record:
             start.record(torch.cuda.current_stream(device=step.device))
             try:
                 yield
@@ -163,7 +176,8 @@ def record_region(label: str) -> Iterator[None]:
         return
 
     start_t = perf_counter()
-    with record_function(label):
+    maybe_record = record_function(label) if use_record_function else nullcontext()
+    with maybe_record:
         try:
             yield
         finally:
