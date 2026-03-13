@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     class _ScanPrepOwner(Protocol):
         def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs: ...
+        def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs: ...
 
 
 class ScanPrepBackend(Protocol):
@@ -72,18 +73,43 @@ class ReferenceScanPrepBackend:
         return owner._prepare_inputs_reference(inputs)
 
 
-class AutoScanPrepBackend:
-    """Default scanprep backend. CUDA fusion will route here later."""
+class CuteScanPrepBackend:
+    """Explicit CuTe scanprep backend.
 
-    def __init__(self) -> None:
-        self.reference = ReferenceScanPrepBackend()
+    This is not the default yet. The eager/reference path remains the source of
+    truth until the fused CuTe implementation is complete.
+    """
 
     def __call__(
         self,
         owner: "_ScanPrepOwner",
         inputs: ScanPrepInputs,
     ) -> ScanInputs:
-        return self.reference(owner, inputs)
+        return owner._prepare_inputs_cute(inputs)
+
+
+class AutoScanPrepBackend:
+    """Default scanprep backend. CUDA fusion will route here later."""
+
+    def __init__(self) -> None:
+        self.reference = ReferenceScanPrepBackend()
+        self.cute = CuteScanPrepBackend()
+
+    def __call__(
+        self,
+        owner: "_ScanPrepOwner",
+        inputs: ScanPrepInputs,
+    ) -> ScanInputs:
+        use_cute = (
+            inputs.value.device.type == "cuda"
+            and inputs.params.device.type == "cuda"
+            and inputs.bc.device.type == "cuda"
+            and inputs.value.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and inputs.params.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and inputs.bc.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+        backend = self.cute if use_cute else self.reference
+        return backend(owner, inputs)
 
 
 class ScanBackend(Protocol):
@@ -215,6 +241,7 @@ __all__ = [
     "ScanPrepInputs",
     "ScanPrepBackend",
     "ReferenceScanPrepBackend",
+    "CuteScanPrepBackend",
     "AutoScanPrepBackend",
     "ScanInputs",
     "ScanBackend",

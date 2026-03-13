@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import cast
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from slinoss.ops.scanprep import (
+    SLinOSSScanPrepCoefficients,
+    build_transition_from_polar,
+    foh_taps_from_polar,
+    principal_angle,
+)
+from slinoss.ops.scanprep.cute import scanprep_cute
+from slinoss.ops.scanprep.reference import _foh_taps_from_normalized, _pack_complex
 
 from .backend import (
     AutoScanPrepBackend,
@@ -30,90 +38,6 @@ def _logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
     return y + torch.log(-torch.expm1(-y))
-
-
-def principal_angle(theta: torch.Tensor) -> torch.Tensor:
-    """Wraps angles to the principal interval ``[-pi, pi)``."""
-    theta_f = theta.to(torch.float32)
-    two_pi = float(2.0 * math.pi)
-    return torch.remainder(theta_f + math.pi, two_pi) - math.pi
-
-
-def _pack_complex(x: torch.Tensor) -> torch.Tensor:
-    packed = torch.view_as_real(x)
-    if packed.dtype != torch.float32:
-        packed = packed.to(torch.float32)
-    return packed if packed.is_contiguous() else packed.contiguous()
-
-
-def _foh_taps_from_normalized(
-    dt_f: torch.Tensor,
-    log_r_f: torch.Tensor,
-    theta_f: torch.Tensor,
-    rho: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """FOH taps for already-normalized ``dt/log(r)/theta`` inputs."""
-
-    z = torch.complex(log_r_f, theta_f)
-    z_thresh = float(max(1.0e-4, math.sqrt(max(float(eps), 1.0e-12))))
-    small = log_r_f.square() + theta_f.square() < (z_thresh * z_thresh)
-    if bool(small.any()):
-        safe_z = torch.where(small, torch.ones_like(z), z)
-
-        kappa1 = (rho - 1.0) / safe_z
-        kappa2 = (rho * (safe_z - 1.0) + 1.0) / (safe_z * safe_z)
-
-        z2 = z * z
-        z3 = z2 * z
-        kappa1_taylor = 1.0 + 0.5 * z + z2 / 6.0 + z3 / 24.0
-        kappa2_taylor = 0.5 + z / 3.0 + z2 / 8.0 + z3 / 30.0
-        kappa1 = torch.where(small, kappa1_taylor, kappa1)
-        kappa2 = torch.where(small, kappa2_taylor, kappa2)
-    else:
-        kappa1 = (rho - 1.0) / z
-        kappa2 = (rho * (z - 1.0) + 1.0) / (z * z)
-
-    k_prev = dt_f * kappa2
-    k_curr = dt_f * kappa1 - k_prev
-    return _pack_complex(k_prev), _pack_complex(k_curr)
-
-
-def build_transition_from_polar(r: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-    """Builds packed complex transitions from polar parameters."""
-    r_f = r.to(torch.float32).clamp_min(0.0)
-    theta_f = principal_angle(theta)
-    return _pack_complex(torch.polar(r_f, theta_f))
-
-
-def foh_taps_from_polar(
-    dt: torch.Tensor,
-    r: torch.Tensor,
-    theta: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluates exact FOH taps with a small-``lambda`` continuation."""
-
-    dt_f = dt.to(torch.float32).clamp_min(max(1e-6, float(eps)))
-    r_f = r.to(torch.float32).clamp(min=max(1e-12, float(eps)), max=1.0)
-    theta_f = principal_angle(theta)
-
-    rho = torch.polar(r_f, theta_f)
-    log_r_f = torch.log(r_f)
-    return _foh_taps_from_normalized(dt_f, log_r_f, theta_f, rho, eps=eps)
-
-
-@dataclass(frozen=True)
-class SLinOSSScanPrepCoefficients:
-    """Structured oscillator coefficients for the scan backend."""
-
-    M: torch.Tensor
-    K: torch.Tensor
-    dt: torch.Tensor
-    r: torch.Tensor
-    theta: torch.Tensor
 
 
 class SLinOSSScanPrep(nn.Module):
@@ -431,6 +355,33 @@ class SLinOSSScanPrep(nn.Module):
         B, C = self._pack_scan_bc(bc, batch, T)
         M, K = self._scan_coeffs_from_flat_params(inputs.params, batch, T)
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
+
+    def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs:
+        return scanprep_cute(
+            inputs.value,
+            inputs.params,
+            inputs.bc,
+            n_heads=self.n_heads,
+            d_state=self.d_state,
+            d_head=self.d_head,
+            normalize_bc=self.normalize_bc,
+            dt_min=self.dt_min,
+            dt_max=self.dt_max,
+            r_min=self.r_min,
+            r_max=self.r_max,
+            theta_bound=self.theta_bound,
+            k_max=self.k_max,
+            eps=self.eps,
+            dt_bias=self.dt_bias,
+            gamma_bias=self.gamma_bias,
+            omega_bias=self.omega_bias,
+            mix_r_bias=self.mix_r_bias,
+            mix_theta_bias=self.mix_theta_bias,
+            mix_k_prev_bias=self.mix_k_prev_bias,
+            mix_k_curr_bias=self.mix_k_curr_bias,
+            b_scale=self.b_scale,
+            c_scale=self.c_scale,
+        )
 
     def forward(
         self,

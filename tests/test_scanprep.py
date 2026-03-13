@@ -4,8 +4,12 @@ import math
 from typing import cast
 
 import torch
+import pytest
 
 from slinoss.layers import (
+    AutoScanPrepBackend,
+    CuteScanPrepBackend,
+    ReferenceScanPrepBackend,
     ReferenceScanBackend,
     SLinOSSScanPrep,
     ScanInputs,
@@ -86,6 +90,262 @@ def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     assert bool((out.r >= prep.r_min).all())
     assert bool((out.r <= prep.r_max).all())
     assert torch.allclose(r, out.r, atol=1e-6, rtol=1e-6)
+
+
+def test_cute_scanprep_backend_requires_cuda() -> None:
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+    )
+    value = torch.randn((2, 5, 8), dtype=torch.float32)
+    params = torch.randn((2, 5, 2 * prep.param_dim), dtype=torch.float32)
+    bc = torch.randn((2, 5, 2, 4, 3), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="CuTe scanprep requires CUDA tensors"):
+        prep(value, params, bc)
+
+
+def test_auto_scanprep_backend_uses_reference_on_cpu() -> None:
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=AutoScanPrepBackend(),
+    )
+    assert isinstance(prep.backend, AutoScanPrepBackend)
+
+    value = torch.randn((2, 5, 8), dtype=torch.float32)
+    params = torch.randn((2, 5, 2 * prep.param_dim), dtype=torch.float32)
+    bc = torch.randn((2, 5, 2, 4, 3), dtype=torch.float32)
+
+    got = prep(value, params, bc)
+
+    prep_ref = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=ReferenceScanPrepBackend(),
+    )
+    prep_ref.load_state_dict(prep.state_dict())
+    expect = prep_ref(value, params, bc)
+
+    assert torch.equal(got.U, expect.U)
+    assert torch.equal(got.M, expect.M)
+    assert torch.equal(got.K, expect.K)
+    assert torch.equal(got.B, expect.B)
+    assert torch.equal(got.C, expect.C)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_auto_scanprep_backend_uses_cute_on_cuda_fp32() -> None:
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=AutoScanPrepBackend(),
+        device="cuda",
+    )
+    prep_cute = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+        device="cuda",
+    )
+    prep_cute.load_state_dict(prep.state_dict())
+
+    value = torch.randn((2, 5, 8), device="cuda", dtype=torch.float32)
+    params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=torch.float32)
+    bc = torch.randn((2, 5, 2, 4, 3), device="cuda", dtype=torch.float32)
+
+    with torch.no_grad():
+        got = prep(value, params, bc)
+        expect = prep_cute(value, params, bc)
+
+    assert torch.equal(got.U, expect.U)
+    assert torch.allclose(got.B, expect.B, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.C, expect.C, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.M, expect.M, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.K, expect.K, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_auto_scanprep_backend_uses_cute_on_cuda_training_dtypes(
+    dtype: torch.dtype,
+) -> None:
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=AutoScanPrepBackend(),
+        device="cuda",
+    ).to(dtype=dtype)
+    prep_cute = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+        device="cuda",
+    ).to(dtype=dtype)
+    prep_cute.load_state_dict(prep.state_dict())
+
+    value = torch.randn((2, 5, 8), device="cuda", dtype=dtype)
+    params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=dtype)
+    bc = torch.randn((2, 5, 2, 4, 3), device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        got = prep(value, params, bc)
+        expect = prep_cute(value, params, bc)
+
+    assert torch.equal(got.U, expect.U)
+    assert torch.allclose(got.B, expect.B, atol=5e-3, rtol=5e-3)
+    assert torch.allclose(got.C, expect.C, atol=5e-3, rtol=5e-3)
+    assert torch.allclose(got.M, expect.M, atol=5e-3, rtol=5e-3)
+    assert torch.allclose(got.K, expect.K, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cute_scanprep_backend_matches_reference_forward() -> None:
+    torch.manual_seed(0)
+    ref = SLinOSSScanPrep(
+        n_heads=3,
+        d_state=5,
+        d_head=4,
+        dt_min=1e-3,
+        dt_max=1e-1,
+        r_min=0.8,
+        r_max=0.98,
+        theta_bound=math.pi / 2.0,
+        k_max=0.25,
+        device="cuda",
+    )
+    cute = SLinOSSScanPrep(
+        n_heads=3,
+        d_state=5,
+        d_head=4,
+        dt_min=1e-3,
+        dt_max=1e-1,
+        r_min=0.8,
+        r_max=0.98,
+        theta_bound=math.pi / 2.0,
+        k_max=0.25,
+        device="cuda",
+        backend=CuteScanPrepBackend(),
+    )
+    cute.load_state_dict(ref.state_dict())
+
+    value = torch.randn((2, 7, 12), device="cuda", dtype=torch.float32)
+    params = torch.randn((2, 7, 3 * ref.param_dim), device="cuda", dtype=torch.float32)
+    bc = torch.randn((2, 7, 3, 4, 5), device="cuda", dtype=torch.float32)
+
+    with torch.no_grad():
+        got = cute(value, params, bc)
+        expect = ref(value, params, bc)
+
+    assert torch.equal(got.U, expect.U)
+    assert torch.allclose(got.B, expect.B, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.C, expect.C, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.M, expect.M, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.K, expect.K, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cute_scanprep_backend_matches_reference_gradients() -> None:
+    torch.manual_seed(1)
+    ref = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        device="cuda",
+    )
+    cute = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+        device="cuda",
+    )
+    cute.load_state_dict(ref.state_dict())
+
+    value_ref = torch.randn(
+        (2, 5, 8), device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    params_ref = torch.randn(
+        (2, 5, 2 * ref.param_dim),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    bc_ref = torch.randn(
+        (2, 5, 2, 4, 3), device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    value_cute = value_ref.detach().clone().requires_grad_(True)
+    params_cute = params_ref.detach().clone().requires_grad_(True)
+    bc_cute = bc_ref.detach().clone().requires_grad_(True)
+
+    out_ref = ref(value_ref, params_ref, bc_ref)
+    out_cute = cute(value_cute, params_cute, bc_cute)
+
+    g_u = torch.randn_like(out_ref.U)
+    g_m = torch.randn_like(out_ref.M)
+    g_k = torch.randn_like(out_ref.K)
+    g_b = torch.randn_like(out_ref.B)
+    g_c = torch.randn_like(out_ref.C)
+    loss_ref = (
+        (out_ref.U * g_u).sum()
+        + (out_ref.M * g_m).sum()
+        + (out_ref.K * g_k).sum()
+        + (out_ref.B * g_b).sum()
+        + (out_ref.C * g_c).sum()
+    )
+    loss_cute = (
+        (out_cute.U * g_u).sum()
+        + (out_cute.M * g_m).sum()
+        + (out_cute.K * g_k).sum()
+        + (out_cute.B * g_b).sum()
+        + (out_cute.C * g_c).sum()
+    )
+    loss_ref.backward()
+    loss_cute.backward()
+    grad_atol = 5e-5
+    grad_rtol = 5e-5
+
+    assert value_ref.grad is not None and value_cute.grad is not None
+    assert params_ref.grad is not None and params_cute.grad is not None
+    assert bc_ref.grad is not None and bc_cute.grad is not None
+    assert torch.allclose(
+        value_cute.grad, value_ref.grad, atol=grad_atol, rtol=grad_rtol
+    )
+    assert torch.allclose(
+        params_cute.grad, params_ref.grad, atol=grad_atol, rtol=grad_rtol
+    )
+    assert torch.allclose(bc_cute.grad, bc_ref.grad, atol=grad_atol, rtol=grad_rtol)
+
+    names = (
+        "dt_bias",
+        "gamma_bias",
+        "omega_bias",
+        "mix_r_bias",
+        "mix_theta_bias",
+        "mix_k_prev_bias",
+        "mix_k_curr_bias",
+        "b_scale",
+        "c_scale",
+    )
+    for name in names:
+        ref_grad = getattr(ref, name).grad
+        cute_grad = getattr(cute, name).grad
+        assert ref_grad is not None
+        assert cute_grad is not None
+        assert torch.allclose(
+            cast(torch.Tensor, cute_grad),
+            cast(torch.Tensor, ref_grad),
+            atol=grad_atol,
+            rtol=grad_rtol,
+        )
 
 
 def test_reference_scan_backend_matches_v2x2ssd() -> None:

@@ -11,7 +11,12 @@ from torch.nn import functional as F
 from _nextchar_model import NextCharLM, configure_optim
 from _profiled_nextchar_model import ProfiledNextCharLM
 from slinoss.layers import SLinOSSMixer
-from slinoss.layers.backend import CuteScanBackend, ReferenceScanBackend
+from slinoss.layers.backend import (
+    AutoScanPrepBackend,
+    CuteScanBackend,
+    ReferenceScanBackend,
+    ReferenceScanPrepBackend,
+)
 from slinoss.perf import PerfRecorder, call_region, record_region
 
 T = TypeVar("T")
@@ -85,14 +90,18 @@ def build_model(
 def _configure_backend(model: NextCharModel, *, backend: str) -> None:
     if backend not in ("reference", "cute"):
         raise ValueError(f"Unsupported backend: {backend}")
-    backend_obj = (
+    scan_backend = (
         ReferenceScanBackend(compute_dtype=torch.float32)
         if backend == "reference"
         else CuteScanBackend(compute_dtype=torch.float32)
     )
+    scanprep_backend = (
+        ReferenceScanPrepBackend() if backend == "reference" else AutoScanPrepBackend()
+    )
     for module in model.modules():
         if isinstance(module, SLinOSSMixer):
-            module.backend = backend_obj
+            module.backend = scan_backend
+            module.scanprep.backend = scanprep_backend
 
 
 def random_batch(cfg: NextCharPerfConfig) -> tuple[torch.Tensor, torch.Tensor]:
