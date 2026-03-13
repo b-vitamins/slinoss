@@ -49,18 +49,22 @@ def _foh_taps_from_normalized(
     z_abs = torch.abs(z)
     z_thresh = float(max(1.0e-4, math.sqrt(max(float(eps), 1.0e-12))))
     small = z_abs < z_thresh
-    safe_z = torch.where(small, torch.ones_like(z), z)
+    if bool(small.any()):
+        safe_z = torch.where(small, torch.ones_like(z), z)
 
-    # kappa1(z) = (exp(z) - 1) / z, kappa2(z) = (exp(z) * (z - 1) + 1) / z^2
-    kappa1 = (rho - 1.0) / safe_z
-    kappa2 = (rho * (safe_z - 1.0) + 1.0) / (safe_z * safe_z)
+        # kappa1(z) = (exp(z) - 1) / z, kappa2(z) = (exp(z) * (z - 1) + 1) / z^2
+        kappa1 = (rho - 1.0) / safe_z
+        kappa2 = (rho * (safe_z - 1.0) + 1.0) / (safe_z * safe_z)
 
-    z2 = z * z
-    z3 = z2 * z
-    kappa1_taylor = 1.0 + 0.5 * z + z2 / 6.0 + z3 / 24.0
-    kappa2_taylor = 0.5 + z / 3.0 + z2 / 8.0 + z3 / 30.0
-    kappa1 = torch.where(small, kappa1_taylor, kappa1)
-    kappa2 = torch.where(small, kappa2_taylor, kappa2)
+        z2 = z * z
+        z3 = z2 * z
+        kappa1_taylor = 1.0 + 0.5 * z + z2 / 6.0 + z3 / 24.0
+        kappa2_taylor = 0.5 + z / 3.0 + z2 / 8.0 + z3 / 30.0
+        kappa1 = torch.where(small, kappa1_taylor, kappa1)
+        kappa2 = torch.where(small, kappa2_taylor, kappa2)
+    else:
+        kappa1 = (rho - 1.0) / z
+        kappa2 = (rho * (z - 1.0) + 1.0) / (z * z)
 
     k_prev = dt_f * kappa2
     k_curr = dt_f * kappa1 - k_prev
