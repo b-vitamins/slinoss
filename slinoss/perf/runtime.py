@@ -253,6 +253,71 @@ def _tree_map_tensors(obj: T, fn: Callable[[torch.Tensor], torch.Tensor]) -> T:
     return obj
 
 
+def _wrap_backward_exit_tensor(
+    tensor: torch.Tensor,
+    *,
+    backward_label: str,
+    token_id: int,
+) -> torch.Tensor:
+    if tensor.requires_grad:
+        return cast(
+            torch.Tensor,
+            _BackwardRegionExit.apply(tensor, backward_label, token_id),
+        )
+    return tensor
+
+
+def _wrap_backward_enter_tensor(
+    tensor: torch.Tensor,
+    *,
+    backward_label: str,
+    token_id: int,
+) -> torch.Tensor:
+    if tensor.requires_grad:
+        return cast(
+            torch.Tensor,
+            _BackwardRegionEnter.apply(tensor, backward_label, token_id),
+        )
+    return tensor
+
+
+def _wrap_backward_enter_simple_out(
+    out: T,
+    *,
+    backward_label: str,
+    token_id: int,
+) -> T:
+    if isinstance(out, torch.Tensor):
+        return cast(
+            T,
+            _wrap_backward_enter_tensor(
+                out,
+                backward_label=backward_label,
+                token_id=token_id,
+            ),
+        )
+    if isinstance(out, tuple) and all(isinstance(item, torch.Tensor) for item in out):
+        return cast(
+            T,
+            tuple(
+                _wrap_backward_enter_tensor(
+                    item,
+                    backward_label=backward_label,
+                    token_id=token_id,
+                )
+                for item in out
+            ),
+        )
+    return _tree_map_tensors(
+        out,
+        lambda t: _wrap_backward_enter_tensor(
+            t,
+            backward_label=backward_label,
+            token_id=token_id,
+        ),
+    )
+
+
 def call_region(
     label: str,
     fn: Callable[..., T],
@@ -268,16 +333,49 @@ def call_region(
     backward_label = f"backward.{label}"
 
     if capture_backward:
+        if not kwargs:
+            if len(args) == 1 and isinstance(args[0], torch.Tensor):
+                arg0 = _wrap_backward_exit_tensor(
+                    args[0],
+                    backward_label=backward_label,
+                    token_id=token_id,
+                )
+                with record_region(f"forward.{label}"):
+                    out = fn(arg0)
+                return _wrap_backward_enter_simple_out(
+                    out,
+                    backward_label=backward_label,
+                    token_id=token_id,
+                )
+            if (
+                len(args) == 2
+                and isinstance(args[0], torch.Tensor)
+                and isinstance(args[1], torch.Tensor)
+            ):
+                arg0 = _wrap_backward_exit_tensor(
+                    args[0],
+                    backward_label=backward_label,
+                    token_id=token_id,
+                )
+                arg1 = _wrap_backward_exit_tensor(
+                    args[1],
+                    backward_label=backward_label,
+                    token_id=token_id,
+                )
+                with record_region(f"forward.{label}"):
+                    out = fn(arg0, arg1)
+                return _wrap_backward_enter_simple_out(
+                    out,
+                    backward_label=backward_label,
+                    token_id=token_id,
+                )
         args = tuple(
             _tree_map_tensors(
                 arg,
-                lambda t: (
-                    cast(
-                        torch.Tensor,
-                        _BackwardRegionExit.apply(t, backward_label, token_id),
-                    )
-                    if t.requires_grad
-                    else t
+                lambda t: _wrap_backward_exit_tensor(
+                    t,
+                    backward_label=backward_label,
+                    token_id=token_id,
                 ),
             )
             for arg in args
@@ -285,13 +383,10 @@ def call_region(
         kwargs = {
             key: _tree_map_tensors(
                 value,
-                lambda t: (
-                    cast(
-                        torch.Tensor,
-                        _BackwardRegionExit.apply(t, backward_label, token_id),
-                    )
-                    if t.requires_grad
-                    else t
+                lambda t: _wrap_backward_exit_tensor(
+                    t,
+                    backward_label=backward_label,
+                    token_id=token_id,
                 ),
             )
             for key, value in kwargs.items()
@@ -303,16 +398,10 @@ def call_region(
     if not capture_backward:
         return out
 
-    return _tree_map_tensors(
+    return _wrap_backward_enter_simple_out(
         out,
-        lambda t: (
-            cast(
-                torch.Tensor,
-                _BackwardRegionEnter.apply(t, backward_label, token_id),
-            )
-            if t.requires_grad
-            else t
-        ),
+        backward_label=backward_label,
+        token_id=token_id,
     )
 
 
