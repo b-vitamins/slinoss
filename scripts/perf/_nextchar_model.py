@@ -29,7 +29,13 @@ def configure_optim(
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))
+    use_fused = any(p.is_cuda for p in decay) or any(p.is_cuda for p in no_decay)
+    return torch.optim.AdamW(
+        groups,
+        lr=lr,
+        betas=(0.9, 0.95),
+        fused=use_fused,
+    )
 
 
 class FeedForward(nn.Module):

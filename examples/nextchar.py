@@ -173,7 +173,13 @@ def configure_optim(
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))
+    use_fused = any(p.is_cuda for p in decay) or any(p.is_cuda for p in no_decay)
+    return torch.optim.AdamW(
+        groups,
+        lr=lr,
+        betas=(0.9, 0.95),
+        fused=use_fused,
+    )
 
 
 class FeedForward(nn.Module):
@@ -397,7 +403,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not math.isfinite(last_loss):
             raise RuntimeError(f"Non-finite loss at step {step}: {last_loss}.")
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            args.grad_clip,
+            foreach=device.type == "cuda",
+        )
         optimizer.step()
 
         if step % args.log_interval == 0:

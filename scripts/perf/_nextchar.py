@@ -219,7 +219,11 @@ def run_train_step(
         with record_region("step.backward"):
             loss.backward()
         with record_region("step.clip"):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=grad_clip,
+                foreach=xb.device.type == "cuda",
+            )
         with record_region("step.optim"):
             optimizer.step()
     return logits, loss
