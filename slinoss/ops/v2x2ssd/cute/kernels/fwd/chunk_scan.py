@@ -202,6 +202,8 @@ class ChunkScanFwdInnerAmpere:
         )
         sV_layout = cute.tile_to_shape(sP_layout_atom, (n, Pp), (0, 1))
         sO_layout = cute.tile_to_shape(sP_layout_atom, (m, Pp), (0, 1))
+        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
+            sO_layout = cute.make_layout((m, Pp), stride=(Pp, 1))
 
         universal_copy_bits = 128
         in_dtype = mQ.element_type
@@ -719,53 +721,64 @@ class ChunkScanFwdInnerAmpere:
                         acc_O,
                     )
 
-        rO = cute.make_rmem_tensor_like(acc_O, mOut.element_type)
-        rO.store(acc_O.load().to(mOut.element_type))
+        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
+            for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
+                row_idx = tOcO_mn[r, 0][1]
+                if cute.elem_less(row_idx, mOut.layout.shape[1]):
+                    for c in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
+                        col_idx = tOcO_mn[0, c][3]
+                        if cute.elem_less(col_idx, mOut.layout.shape[3]):
+                            mOut[bhc, row_idx, 0, col_idx] = cutlass.Float32(
+                                acc_O_mn[r, c]
+                            )
+        else:
+            rO = cute.make_rmem_tensor_like(acc_O, mOut.element_type)
+            rO.store(acc_O.load().to(mOut.element_type))
 
-        sO = cute.make_tensor(
-            cute.recast_ptr(sQ.iterator, dtype=mOut.element_type), sO_layout
-        )
+            sO = cute.make_tensor(
+                cute.recast_ptr(sQ.iterator, dtype=mOut.element_type), sO_layout
+            )
 
-        smem_copy_atom_O = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mOut.element_type
-        )
-        smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
-        smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
-        taccOrO = smem_thr_copy_O.retile(rO)
-        taccOsO = smem_thr_copy_O.partition_D(sO)
-        cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
-        cute.arch.barrier()
+            smem_copy_atom_O = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mOut.element_type
+            )
+            smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
+            smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
+            taccOrO = smem_thr_copy_O.retile(rO)
+            taccOsO = smem_thr_copy_O.partition_D(sO)
+            cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
+            cute.arch.barrier()
 
-        gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-        tOsO = gmem_thr_copy_O.partition_S(sO)
-        tOgO = gmem_thr_copy_O.partition_D(gO)
-        tOrO = cute.make_rmem_tensor_like(tOgO, mOut.element_type)
-        cute.copy(gmem_tiled_copy_O, tOsO, tOrO)
+            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+            tOsO = gmem_thr_copy_O.partition_S(sO)
+            tOgO = gmem_thr_copy_O.partition_D(gO)
+            tOrO = cute.make_rmem_tensor_like(tOgO, mOut.element_type)
+            cute.copy(gmem_tiled_copy_O, tOsO, tOrO)
 
-        mcOut = cute.make_identity_tensor(mOut.layout.shape)
-        cOut = cute.local_tile(mcOut[bhc, None, 0, None], (m, Pp), (m_block, 0))
-        tOcOut = gmem_thr_copy_O.partition_D(cOut)
-        tOpOut = cute.make_rmem_tensor(
-            cute.make_layout(
-                (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
-                stride=(tOgO.shape[2], 0, 1),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in cutlass.range_constexpr(tOpOut.shape[0]):
-            for rest_n in cutlass.range_constexpr(cute.size(tOpOut.shape[2])):
-                tOpOut[rest_v, 0, rest_n] = cute.elem_less(
-                    tOcOut[(0, rest_v), 0, rest_n][3], mOut.layout.shape[3]
-                )
+            mcOut = cute.make_identity_tensor(mOut.layout.shape)
+            cOut = cute.local_tile(mcOut[bhc, None, 0, None], (m, Pp), (m_block, 0))
+            tOcOut = gmem_thr_copy_O.partition_D(cOut)
+            tOpOut = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
+                    stride=(tOgO.shape[2], 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tOpOut.shape[0]):
+                for rest_n in cutlass.range_constexpr(cute.size(tOpOut.shape[2])):
+                    tOpOut[rest_v, 0, rest_n] = cute.elem_less(
+                        tOcOut[(0, rest_v), 0, rest_n][3], mOut.layout.shape[3]
+                    )
 
-        for rest_m in cutlass.range_constexpr(cute.size(tOpOut.shape[1])):
-            if cute.elem_less(tOcOut[0, rest_m, 0][1], mOut.layout.shape[1]):
-                cute.copy(
-                    gmem_tiled_copy_O,
-                    tOrO[None, rest_m, None],
-                    tOgO[None, rest_m, None],
-                    pred=tOpOut[None, rest_m, None],
-                )
+            for rest_m in cutlass.range_constexpr(cute.size(tOpOut.shape[1])):
+                if cute.elem_less(tOcOut[0, rest_m, 0][1], mOut.layout.shape[1]):
+                    cute.copy(
+                        gmem_tiled_copy_O,
+                        tOrO[None, rest_m, None],
+                        tOgO[None, rest_m, None],
+                        pred=tOpOut[None, rest_m, None],
+                    )
 
     def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
@@ -915,6 +928,8 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         )
         sV_layout = cute.tile_to_shape(sP_layout_atom, (n, Pp), (0, 1))
         sO_layout = cute.tile_to_shape(sP_layout_atom, (m, Pp), (0, 1))
+        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
+            sO_layout = cute.make_layout((m, Pp), stride=(Pp, 1))
 
         universal_copy_bits = 128
         in_dtype = mU.element_type
@@ -1585,8 +1600,8 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                 if cutlass.const_expr(n_block == 0):
                     ii = tidx
                     while cute.elem_less(ii, Pp):
-                        old = sV_tile[0, ii]
                         bnd = mU_in.element_type(0)
+                        old = sV_tile[0, ii]
                         if cute.elem_less(ii, self.P):
                             bnd = mU_prev0[bh, ii]
                         sV_tile[0, ii] = cutlass.select_(is_chunk0, bnd, old)
@@ -1813,48 +1828,59 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         _diag_loop_prev(mU, mB, sLpK, sV, sK, gmem_thr_copy_D, gmem_thr_copy_P)
         _diag_loop_curr(mU, mB, sLpK, sV, gmem_thr_copy_D, gmem_thr_copy_P)
 
-        rO = cute.make_rmem_tensor_like(acc_O, mOut.element_type)
-        rO.store(acc_O.load().to(mOut.element_type))
-        sO = cute.make_tensor(
-            cute.recast_ptr(sQ.iterator, dtype=mOut.element_type), sO_layout
-        )
-        smem_copy_atom_O = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mOut.element_type
-        )
-        smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
-        smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
-        taccOrO = smem_thr_copy_O.retile(rO)
-        taccOsO = smem_thr_copy_O.partition_D(sO)
-        cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
-        cute.arch.barrier()
+        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
+            for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
+                row_idx = tOcO_mn[r, 0][1]
+                if cute.elem_less(row_idx, mOut.layout.shape[1]):
+                    for c in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
+                        col_idx = tOcO_mn[0, c][3]
+                        if cute.elem_less(col_idx, mOut.layout.shape[3]):
+                            mOut[bhc, row_idx, 0, col_idx] = cutlass.Float32(
+                                acc_O_mn[r, c]
+                            )
+        else:
+            rO = cute.make_rmem_tensor_like(acc_O, mOut.element_type)
+            rO.store(acc_O.load().to(mOut.element_type))
+            sO = cute.make_tensor(
+                cute.recast_ptr(sQ.iterator, dtype=mOut.element_type), sO_layout
+            )
+            smem_copy_atom_O = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mOut.element_type
+            )
+            smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
+            smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
+            taccOrO = smem_thr_copy_O.retile(rO)
+            taccOsO = smem_thr_copy_O.partition_D(sO)
+            cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
+            cute.arch.barrier()
 
-        gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-        tOsO = gmem_thr_copy_O.partition_S(sO)
-        tOgO = gmem_thr_copy_O.partition_D(gO)
-        tOrO = cute.make_rmem_tensor_like(tOgO, mOut.element_type)
-        cute.copy(gmem_tiled_copy_O, tOsO, tOrO)
+            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+            tOsO = gmem_thr_copy_O.partition_S(sO)
+            tOgO = gmem_thr_copy_O.partition_D(gO)
+            tOrO = cute.make_rmem_tensor_like(tOgO, mOut.element_type)
+            cute.copy(gmem_tiled_copy_O, tOsO, tOrO)
 
-        mcOut = cute.make_identity_tensor(mOut.layout.shape)
-        cOut = cute.local_tile(mcOut[bhc, None, 0, None], (m, Pp), (m_block, 0))
-        tOcOut = gmem_thr_copy_O.partition_D(cOut)
-        tOpOut = cute.make_rmem_tensor(
-            cute.make_layout(
-                (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
-                stride=(tOgO.shape[2], 0, 1),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in cutlass.range_constexpr(tOpOut.shape[0]):
-            for rest_n in cutlass.range_constexpr(cute.size(tOpOut.shape[2])):
-                tOpOut[rest_v, 0, rest_n] = cute.elem_less(
-                    tOcOut[(0, rest_v), 0, rest_n][3], mOut.layout.shape[3]
-                )
+            mcOut = cute.make_identity_tensor(mOut.layout.shape)
+            cOut = cute.local_tile(mcOut[bhc, None, 0, None], (m, Pp), (m_block, 0))
+            tOcOut = gmem_thr_copy_O.partition_D(cOut)
+            tOpOut = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
+                    stride=(tOgO.shape[2], 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tOpOut.shape[0]):
+                for rest_n in cutlass.range_constexpr(cute.size(tOpOut.shape[2])):
+                    tOpOut[rest_v, 0, rest_n] = cute.elem_less(
+                        tOcOut[(0, rest_v), 0, rest_n][3], mOut.layout.shape[3]
+                    )
 
-        for rest_m in cutlass.range_constexpr(cute.size(tOpOut.shape[1])):
-            if cute.elem_less(tOcOut[0, rest_m, 0][1], mOut.layout.shape[1]):
-                cute.copy(
-                    gmem_tiled_copy_O,
-                    tOrO[None, rest_m, None],
-                    tOgO[None, rest_m, None],
-                    pred=tOpOut[None, rest_m, None],
-                )
+            for rest_m in cutlass.range_constexpr(cute.size(tOpOut.shape[1])):
+                if cute.elem_less(tOcOut[0, rest_m, 0][1], mOut.layout.shape[1]):
+                    cute.copy(
+                        gmem_tiled_copy_O,
+                        tOrO[None, rest_m, None],
+                        tOgO[None, rest_m, None],
+                        pred=tOpOut[None, rest_m, None],
+                    )
