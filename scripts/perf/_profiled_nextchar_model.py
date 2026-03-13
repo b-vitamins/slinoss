@@ -10,36 +10,66 @@ from torch.nn import functional as F
 
 from _nextchar_model import FeedForward
 from slinoss.layers import SLinOSSMixer
-from slinoss.layers.backend import ScanInputs
+from slinoss.layers.backend import ReferenceScanPrepBackend, ScanInputs
 from slinoss.layers.state import SLinOSSMixerState, ScanState
 from slinoss.perf import call_region
 
 
 class ProfiledSLinOSSMixer(SLinOSSMixer):
-    def _build_scan_inputs(
-        self, *, value: torch.Tensor, params: torch.Tensor
+    def _build_reference_scanprep_profiled(
+        self,
+        *,
+        value: torch.Tensor,
+        params: torch.Tensor,
+        bc: torch.Tensor,
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
-        bc = call_region("mixer.bc_proj", self._project_bc, value, batch, T)
         U = call_region(
-            "mixer.scan_input_pack", self.scanprep._pack_scan_u, value, batch, T
+            "mixer.scanprep.pack_u",
+            self.scanprep._pack_scan_u,
+            value,
+            batch,
+            T,
         )
-        bc = call_region("mixer.bc_norm", self.scanprep._normalize_scan_bc_rows, bc)
+        bc = call_region(
+            "mixer.scanprep.bc_norm", self.scanprep._normalize_scan_bc_rows, bc
+        )
         coeffs = call_region(
-            "mixer.discretizer",
+            "mixer.scanprep.coefficients",
             self.scanprep._scan_coeffs_from_flat_params,
             params,
             batch,
             T,
         )
         B, C = call_region(
-            "mixer.scan_input_pack",
+            "mixer.scanprep.pack_bc",
             self.scanprep._pack_scan_bc,
             bc,
             batch,
             T,
         )
         return ScanInputs(U=U, M=coeffs[0], K=coeffs[1], B=B, C=C)
+
+    def _build_scan_inputs(
+        self, *, value: torch.Tensor, params: torch.Tensor
+    ) -> ScanInputs:
+        batch, T, _ = map(int, value.shape)
+        bc = call_region("mixer.bc_proj", self._project_bc, value, batch, T)
+        if isinstance(self.scanprep.backend, ReferenceScanPrepBackend):
+            return cast(
+                ScanInputs,
+                call_region(
+                    "mixer.scanprep.total",
+                    self._build_reference_scanprep_profiled,
+                    value=value,
+                    params=params,
+                    bc=bc,
+                ),
+            )
+        return cast(
+            ScanInputs,
+            call_region("mixer.scanprep.total", self.scanprep, value, params, bc),
+        )
 
     def forward(
         self,

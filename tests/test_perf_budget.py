@@ -27,18 +27,22 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
         "forward.mixer.in_proj": 0.7,
         "forward.mixer.dw_conv": 0.8,
         "forward.mixer.bc_proj": 0.9,
-        "forward.mixer.discretizer": 1.0,
-        "forward.mixer.bc_norm": 0.15,
         "forward.mixer.dw_conv_activation": 0.25,
-        "forward.mixer.scan_input_pack": 1.1,
+        "forward.mixer.scanprep.total": 2.25,
+        "forward.mixer.scanprep.pack_u": 0.4,
+        "forward.mixer.scanprep.bc_norm": 0.15,
+        "forward.mixer.scanprep.coefficients": 1.0,
+        "forward.mixer.scanprep.pack_bc": 0.7,
         "forward.mixer.gate_skip": 1.2,
         "backward.mixer.in_proj": 1.3,
         "backward.mixer.dw_conv": 1.4,
         "backward.mixer.bc_proj": 1.5,
-        "backward.mixer.discretizer": 1.6,
-        "backward.mixer.bc_norm": 0.35,
         "backward.mixer.dw_conv_activation": 0.45,
-        "backward.mixer.scan_input_pack": 1.7,
+        "backward.mixer.scanprep.total": 3.65,
+        "backward.mixer.scanprep.pack_u": 0.5,
+        "backward.mixer.scanprep.bc_norm": 0.35,
+        "backward.mixer.scanprep.coefficients": 1.6,
+        "backward.mixer.scanprep.pack_bc": 1.2,
         "backward.mixer.gate_skip": 1.8,
         "forward.ffn": 0.9,
         "backward.ffn": 1.9,
@@ -87,6 +91,8 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
     assert derived["backward.embed.total"] == 1.0
     assert derived["forward.norms.total"] == pytest.approx(0.6)
     assert derived["backward.norms.total"] == pytest.approx(1.5)
+    assert derived["forward.mixer.scanprep.total"] == pytest.approx(2.25)
+    assert derived["backward.mixer.scanprep.total"] == pytest.approx(3.65)
     assert derived["forward.mixer.total"] == pytest.approx(6.1)
     assert derived["backward.mixer.total"] == pytest.approx(10.1)
     assert derived["forward.residual.total"] == pytest.approx(0.23)

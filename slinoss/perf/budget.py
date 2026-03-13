@@ -62,6 +62,17 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     def _sum(*labels: str) -> float:
         return sum(sample.get(label, 0.0) for label in labels)
 
+    def _scanprep_total(direction: str) -> float:
+        return sample.get(
+            f"{direction}.mixer.scanprep.total",
+            _sum(
+                f"{direction}.mixer.scanprep.pack_u",
+                f"{direction}.mixer.scanprep.bc_norm",
+                f"{direction}.mixer.scanprep.coefficients",
+                f"{direction}.mixer.scanprep.pack_bc",
+            ),
+        )
+
     out = dict(sample)
     out["step.total"] = sample.get(
         "step.total",
@@ -117,10 +128,18 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         "forward.mixer.dw_conv_activation", 0.0
     )
     out["forward.mixer.bc_proj"] = sample.get("forward.mixer.bc_proj", 0.0)
-    out["forward.mixer.bc_norm"] = sample.get("forward.mixer.bc_norm", 0.0)
-    out["forward.mixer.discretizer"] = sample.get("forward.mixer.discretizer", 0.0)
-    out["forward.mixer.scan_input_pack"] = sample.get(
-        "forward.mixer.scan_input_pack", 0.0
+    out["forward.mixer.scanprep.total"] = _scanprep_total("forward")
+    out["forward.mixer.scanprep.pack_u"] = sample.get(
+        "forward.mixer.scanprep.pack_u", 0.0
+    )
+    out["forward.mixer.scanprep.bc_norm"] = sample.get(
+        "forward.mixer.scanprep.bc_norm", 0.0
+    )
+    out["forward.mixer.scanprep.coefficients"] = sample.get(
+        "forward.mixer.scanprep.coefficients", 0.0
+    )
+    out["forward.mixer.scanprep.pack_bc"] = sample.get(
+        "forward.mixer.scanprep.pack_bc", 0.0
     )
     out["forward.mixer.gate_skip"] = sample.get("forward.mixer.gate_skip", 0.0)
     out["forward.mixer.out_proj"] = sample.get("forward.mixer.out_proj", 0.0)
@@ -129,9 +148,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         + out["forward.mixer.dw_conv"]
         + out["forward.mixer.dw_conv_activation"]
         + out["forward.mixer.bc_proj"]
-        + out["forward.mixer.bc_norm"]
-        + out["forward.mixer.discretizer"]
-        + out["forward.mixer.scan_input_pack"]
+        + out["forward.mixer.scanprep.total"]
         + out["forward.mixer.gate_skip"]
         + out["forward.mixer.out_proj"]
     )
@@ -141,10 +158,18 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         "backward.mixer.dw_conv_activation", 0.0
     )
     out["backward.mixer.bc_proj"] = sample.get("backward.mixer.bc_proj", 0.0)
-    out["backward.mixer.bc_norm"] = sample.get("backward.mixer.bc_norm", 0.0)
-    out["backward.mixer.discretizer"] = sample.get("backward.mixer.discretizer", 0.0)
-    out["backward.mixer.scan_input_pack"] = sample.get(
-        "backward.mixer.scan_input_pack", 0.0
+    out["backward.mixer.scanprep.total"] = _scanprep_total("backward")
+    out["backward.mixer.scanprep.pack_u"] = sample.get(
+        "backward.mixer.scanprep.pack_u", 0.0
+    )
+    out["backward.mixer.scanprep.bc_norm"] = sample.get(
+        "backward.mixer.scanprep.bc_norm", 0.0
+    )
+    out["backward.mixer.scanprep.coefficients"] = sample.get(
+        "backward.mixer.scanprep.coefficients", 0.0
+    )
+    out["backward.mixer.scanprep.pack_bc"] = sample.get(
+        "backward.mixer.scanprep.pack_bc", 0.0
     )
     out["backward.mixer.gate_skip"] = sample.get("backward.mixer.gate_skip", 0.0)
     out["backward.mixer.out_proj"] = sample.get("backward.mixer.out_proj", 0.0)
@@ -153,9 +178,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         + out["backward.mixer.dw_conv"]
         + out["backward.mixer.dw_conv_activation"]
         + out["backward.mixer.bc_proj"]
-        + out["backward.mixer.bc_norm"]
-        + out["backward.mixer.discretizer"]
-        + out["backward.mixer.scan_input_pack"]
+        + out["backward.mixer.scanprep.total"]
         + out["backward.mixer.gate_skip"]
         + out["backward.mixer.out_proj"]
     )
