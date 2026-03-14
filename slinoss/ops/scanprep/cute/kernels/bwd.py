@@ -26,6 +26,8 @@ class ScanPrepBwdFused:
         self,
         *,
         spec: tuple[int, int, int, int, int, int],
+        du_stride: tuple[int, int, int, int] | None = None,
+        params_in_stride: tuple[int, int, int] | None = None,
         normalize_bc: bool,
         dt_min: float,
         dt_max: float,
@@ -47,7 +49,11 @@ class ScanPrepBwdFused:
         self.normalize_bc = bool(normalize_bc)
 
         self.du_shape = (self.batch, self.h_size, self.t_size, self.p_size)
-        self.du_stride = make_row_major_stride(self.du_shape)
+        self.du_stride = (
+            tuple(int(s) for s in du_stride)
+            if du_stride is not None
+            else make_row_major_stride(self.du_shape)
+        )
         self.value_shape = (self.batch, self.t_size, self.h_size * self.p_size)
         self.value_stride = make_row_major_stride(self.value_shape)
         self.bc_shape = (self.batch, self.t_size, self.h_size, 4, self.n_size)
@@ -64,8 +70,15 @@ class ScanPrepBwdFused:
             self.n_size,
         )
         self.scale_part_stride = make_row_major_stride(self.scale_part_shape)
-        self.params_shape = (self.batch, self.t_size, self.h_size, self.param_dim)
-        self.params_stride = make_row_major_stride(self.params_shape)
+        self.param_flat_size = self.h_size * self.param_dim
+        self.params_in_shape = (self.batch, self.t_size, self.param_flat_size)
+        self.params_in_stride = (
+            tuple(int(s) for s in params_in_stride)
+            if params_in_stride is not None
+            else make_row_major_stride(self.params_in_shape)
+        )
+        self.dparams_shape = (self.batch, self.t_size, self.param_flat_size)
+        self.dparams_stride = make_row_major_stride(self.dparams_shape)
         self.m_shape = (self.batch, self.h_size, self.t_size, 2)
         self.m_stride = make_row_major_stride(self.m_shape)
         self.k_shape = (self.batch, self.h_size, self.t_size, 2, 2)
@@ -81,10 +94,13 @@ class ScanPrepBwdFused:
         self.block_size = int(block_size)
         if self.block_size % 32 != 0:
             raise ValueError("block_size must be a multiple of 32.")
-        self.warps_per_block = self.block_size // 32
+        self.pack_group_size = 16 if self.n_size <= 16 else 32
+        if self.block_size % self.pack_group_size != 0:
+            raise ValueError("block_size must be divisible by pack_group_size.")
+        self.pack_groups_per_block = self.block_size // self.pack_group_size
         self.pack_grid_size = (
-            self.total_rows + self.warps_per_block - 1
-        ) // self.warps_per_block
+            self.total_rows + self.pack_groups_per_block - 1
+        ) // self.pack_groups_per_block
         self.coeff_grid_size = (
             self.total_rows + self.block_size - 1
         ) // self.block_size
@@ -127,9 +143,10 @@ class ScanPrepBwdFused:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.warp_idx()
-        row = bidx * self.warps_per_block + warp
+        subwarp_size = self.pack_group_size
+        group = tidx // subwarp_size
+        lane = tidx - group * subwarp_size
+        row = bidx * self.pack_groups_per_block + group
         if row < total_rows_:
             rows_per_batch = self.h_size * self.t_size
             b = row // rows_per_batch
@@ -138,9 +155,9 @@ class ScanPrepBwdFused:
             t = rem - h * self.t_size
 
             base = h * self.p_size
-            num_p_iters = (self.p_size + 31) // 32
+            num_p_iters = (self.p_size + subwarp_size - 1) // subwarp_size
             for p_iter in cutlass.range_constexpr(num_p_iters):
-                p = lane + p_iter * 32
+                p = lane + p_iter * subwarp_size
                 if p < self.p_size:
                     mValueGrad[b, t, base + p] = mDU[b, h, t, p]
 
@@ -149,9 +166,9 @@ class ScanPrepBwdFused:
                 s1 = cutlass.Float32(0.0)
                 s2 = cutlass.Float32(0.0)
                 s3 = cutlass.Float32(0.0)
-                num_n_iters = (self.n_size + 31) // 32
+                num_n_iters = (self.n_size + subwarp_size - 1) // subwarp_size
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         x0 = cutlass.Float32(mBC[b, t, h, 0, n])
                         x1 = cutlass.Float32(mBC[b, t, h, 1, n])
@@ -161,10 +178,10 @@ class ScanPrepBwdFused:
                         s1 = s1 + x1 * x1
                         s2 = s2 + x2 * x2
                         s3 = s3 + x3 * x3
-                s0 = cute.arch.warp_reduction_sum(s0)
-                s1 = cute.arch.warp_reduction_sum(s1)
-                s2 = cute.arch.warp_reduction_sum(s2)
-                s3 = cute.arch.warp_reduction_sum(s3)
+                s0 = cute.arch.warp_reduction_sum(s0, threads_in_group=subwarp_size)
+                s1 = cute.arch.warp_reduction_sum(s1, threads_in_group=subwarp_size)
+                s2 = cute.arch.warp_reduction_sum(s2, threads_in_group=subwarp_size)
+                s3 = cute.arch.warp_reduction_sum(s3, threads_in_group=subwarp_size)
                 denom = cutlass.Float32(self.n_size)
                 eps_bc = cutlass.Float32(1.0e-5)
                 inv0 = cute.rsqrt(s0 / denom + eps_bc)
@@ -181,7 +198,7 @@ class ScanPrepBwdFused:
                 dot2 = cutlass.Float32(0.0)
                 dot3 = cutlass.Float32(0.0)
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         db0 = cutlass.Float32(mDB[b, h, t, 2 * n])
                         db1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
@@ -199,12 +216,12 @@ class ScanPrepBwdFused:
                         dot1 = dot1 + (db1 * scale1) * x1
                         dot2 = dot2 + (dc0 * scale2) * x2
                         dot3 = dot3 + (dc1 * scale3) * x3
-                dot0 = cute.arch.warp_reduction_sum(dot0)
-                dot1 = cute.arch.warp_reduction_sum(dot1)
-                dot2 = cute.arch.warp_reduction_sum(dot2)
-                dot3 = cute.arch.warp_reduction_sum(dot3)
+                dot0 = cute.arch.warp_reduction_sum(dot0, threads_in_group=subwarp_size)
+                dot1 = cute.arch.warp_reduction_sum(dot1, threads_in_group=subwarp_size)
+                dot2 = cute.arch.warp_reduction_sum(dot2, threads_in_group=subwarp_size)
+                dot3 = cute.arch.warp_reduction_sum(dot3, threads_in_group=subwarp_size)
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         db0 = cutlass.Float32(mDB[b, h, t, 2 * n])
                         db1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
@@ -243,9 +260,9 @@ class ScanPrepBwdFused:
                         mScalePartials[b, h, t, 2, n] = dc0 * y2
                         mScalePartials[b, h, t, 3, n] = dc1 * y3
             else:
-                num_n_iters = (self.n_size + 31) // 32
+                num_n_iters = (self.n_size + subwarp_size - 1) // subwarp_size
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
                         mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
@@ -279,31 +296,34 @@ class ScanPrepBwdFused:
             h = rem // self.t_size
             t = rem - h * self.t_size
 
-            dt_raw = cutlass.Float32(mParams[b, t, h, 0]) + cutlass.Float32(mDtBias[h])
-            gamma_raw = cutlass.Float32(mParams[b, t, h, 1]) + cutlass.Float32(
+            p_base = h * self.param_dim
+            dt_raw = cutlass.Float32(mParams[b, t, p_base + 0]) + cutlass.Float32(
+                mDtBias[h]
+            )
+            gamma_raw = cutlass.Float32(mParams[b, t, p_base + 1]) + cutlass.Float32(
                 mGammaBias[h]
             )
-            omega_raw = cutlass.Float32(mParams[b, t, h, 2]) + cutlass.Float32(
+            omega_raw = cutlass.Float32(mParams[b, t, p_base + 2]) + cutlass.Float32(
                 mOmegaBias[h]
             )
-            r_raw = cutlass.Float32(mParams[b, t, h, 3])
-            theta_raw = cutlass.Float32(mParams[b, t, h, 4])
-            mix_r_raw = cutlass.Float32(mParams[b, t, h, 5]) + cutlass.Float32(
+            r_raw = cutlass.Float32(mParams[b, t, p_base + 3])
+            theta_raw = cutlass.Float32(mParams[b, t, p_base + 4])
+            mix_r_raw = cutlass.Float32(mParams[b, t, p_base + 5]) + cutlass.Float32(
                 mMixRBias[h]
             )
-            mix_theta_raw = cutlass.Float32(mParams[b, t, h, 6]) + cutlass.Float32(
-                mMixThetaBias[h]
-            )
-            mix_k_prev_raw = cutlass.Float32(mParams[b, t, h, 7]) + cutlass.Float32(
-                mMixKPrevBias[h]
-            )
-            mix_k_curr_raw = cutlass.Float32(mParams[b, t, h, 8]) + cutlass.Float32(
-                mMixKCurrBias[h]
-            )
-            k_prev_re_raw = cutlass.Float32(mParams[b, t, h, 9])
-            k_prev_im_raw = cutlass.Float32(mParams[b, t, h, 10])
-            k_curr_re_raw = cutlass.Float32(mParams[b, t, h, 11])
-            k_curr_im_raw = cutlass.Float32(mParams[b, t, h, 12])
+            mix_theta_raw = cutlass.Float32(
+                mParams[b, t, p_base + 6]
+            ) + cutlass.Float32(mMixThetaBias[h])
+            mix_k_prev_raw = cutlass.Float32(
+                mParams[b, t, p_base + 7]
+            ) + cutlass.Float32(mMixKPrevBias[h])
+            mix_k_curr_raw = cutlass.Float32(
+                mParams[b, t, p_base + 8]
+            ) + cutlass.Float32(mMixKCurrBias[h])
+            k_prev_re_raw = cutlass.Float32(mParams[b, t, p_base + 9])
+            k_prev_im_raw = cutlass.Float32(mParams[b, t, p_base + 10])
+            k_curr_re_raw = cutlass.Float32(mParams[b, t, p_base + 11])
+            k_curr_im_raw = cutlass.Float32(mParams[b, t, p_base + 12])
 
             dt_u = sigmoid(dt_raw)
             gamma = softplus(gamma_raw)
@@ -616,19 +636,19 @@ class ScanPrepBwdFused:
                 * (cutlass.Float32(1.0) - k_curr_tanh_im * k_curr_tanh_im)
             )
 
-            mDParams[b, t, h, 0] = d0.to(mDParams.element_type)
-            mDParams[b, t, h, 1] = d1.to(mDParams.element_type)
-            mDParams[b, t, h, 2] = d2.to(mDParams.element_type)
-            mDParams[b, t, h, 3] = d3.to(mDParams.element_type)
-            mDParams[b, t, h, 4] = d4.to(mDParams.element_type)
-            mDParams[b, t, h, 5] = d5.to(mDParams.element_type)
-            mDParams[b, t, h, 6] = d6.to(mDParams.element_type)
-            mDParams[b, t, h, 7] = d7.to(mDParams.element_type)
-            mDParams[b, t, h, 8] = d8.to(mDParams.element_type)
-            mDParams[b, t, h, 9] = d9.to(mDParams.element_type)
-            mDParams[b, t, h, 10] = d10.to(mDParams.element_type)
-            mDParams[b, t, h, 11] = d11.to(mDParams.element_type)
-            mDParams[b, t, h, 12] = d12.to(mDParams.element_type)
+            mDParams[b, t, p_base + 0] = d0.to(mDParams.element_type)
+            mDParams[b, t, p_base + 1] = d1.to(mDParams.element_type)
+            mDParams[b, t, p_base + 2] = d2.to(mDParams.element_type)
+            mDParams[b, t, p_base + 3] = d3.to(mDParams.element_type)
+            mDParams[b, t, p_base + 4] = d4.to(mDParams.element_type)
+            mDParams[b, t, p_base + 5] = d5.to(mDParams.element_type)
+            mDParams[b, t, p_base + 6] = d6.to(mDParams.element_type)
+            mDParams[b, t, p_base + 7] = d7.to(mDParams.element_type)
+            mDParams[b, t, p_base + 8] = d8.to(mDParams.element_type)
+            mDParams[b, t, p_base + 9] = d9.to(mDParams.element_type)
+            mDParams[b, t, p_base + 10] = d10.to(mDParams.element_type)
+            mDParams[b, t, p_base + 11] = d11.to(mDParams.element_type)
+            mDParams[b, t, p_base + 12] = d12.to(mDParams.element_type)
             mBiasPartials[b, h, t, 0] = d0
             mBiasPartials[b, h, t, 1] = d1
             mBiasPartials[b, h, t, 2] = d2
@@ -744,7 +764,8 @@ class ScanPrepBwdFused:
             cute.make_layout(self.bc_scale_shape, stride=self.bc_scale_stride),
         )
         mParams = cute.make_tensor(
-            params_ptr, cute.make_layout(self.params_shape, stride=self.params_stride)
+            params_ptr,
+            cute.make_layout(self.params_in_shape, stride=self.params_in_stride),
         )
         mDM = cute.make_tensor(
             dm_ptr, cute.make_layout(self.m_shape, stride=self.m_stride)
@@ -787,7 +808,8 @@ class ScanPrepBwdFused:
             cute.make_layout(self.scale_part_shape, stride=self.scale_part_stride),
         )
         mDParams = cute.make_tensor(
-            dparams_ptr, cute.make_layout(self.params_shape, stride=self.params_stride)
+            dparams_ptr,
+            cute.make_layout(self.dparams_shape, stride=self.dparams_stride),
         )
         mBiasPartials = cute.make_tensor(
             bias_part_ptr,

@@ -24,6 +24,7 @@ class ScanPrepFwdFused:
         self,
         *,
         spec: tuple[int, int, int, int, int],
+        params_in_stride: tuple[int, int, int] | None = None,
         normalize_bc: bool,
         dt_min: float,
         dt_max: float,
@@ -52,8 +53,12 @@ class ScanPrepFwdFused:
         self.scale_stride = make_row_major_stride(self.scale_shape)
         self.bc_out_shape = (self.batch, self.h_size, self.t_size, 2 * self.n_size)
         self.bc_out_stride = make_row_major_stride(self.bc_out_shape)
-        self.params_shape = (self.batch, self.t_size, self.h_size, 13)
-        self.params_stride = make_row_major_stride(self.params_shape)
+        self.params_shape = (self.batch, self.t_size, self.h_size * 13)
+        self.params_stride = (
+            tuple(int(s) for s in params_in_stride)
+            if params_in_stride is not None
+            else make_row_major_stride(self.params_shape)
+        )
         self.bias_shape = (self.h_size,)
         self.bias_stride = make_row_major_stride(self.bias_shape)
         self.m_shape = (self.batch, self.h_size, self.t_size, 2)
@@ -161,31 +166,34 @@ class ScanPrepFwdFused:
                         mCOut.element_type
                     )
 
-            dt_raw = cutlass.Float32(mParams[b, t, h, 0]) + cutlass.Float32(mDtBias[h])
-            gamma_raw = cutlass.Float32(mParams[b, t, h, 1]) + cutlass.Float32(
+            p_base = h * 13
+            dt_raw = cutlass.Float32(mParams[b, t, p_base + 0]) + cutlass.Float32(
+                mDtBias[h]
+            )
+            gamma_raw = cutlass.Float32(mParams[b, t, p_base + 1]) + cutlass.Float32(
                 mGammaBias[h]
             )
-            omega_raw = cutlass.Float32(mParams[b, t, h, 2]) + cutlass.Float32(
+            omega_raw = cutlass.Float32(mParams[b, t, p_base + 2]) + cutlass.Float32(
                 mOmegaBias[h]
             )
-            r_raw = cutlass.Float32(mParams[b, t, h, 3])
-            theta_raw = cutlass.Float32(mParams[b, t, h, 4])
-            mix_r_raw = cutlass.Float32(mParams[b, t, h, 5]) + cutlass.Float32(
+            r_raw = cutlass.Float32(mParams[b, t, p_base + 3])
+            theta_raw = cutlass.Float32(mParams[b, t, p_base + 4])
+            mix_r_raw = cutlass.Float32(mParams[b, t, p_base + 5]) + cutlass.Float32(
                 mMixRBias[h]
             )
-            mix_theta_raw = cutlass.Float32(mParams[b, t, h, 6]) + cutlass.Float32(
-                mMixThetaBias[h]
-            )
-            mix_k_prev_raw = cutlass.Float32(mParams[b, t, h, 7]) + cutlass.Float32(
-                mMixKPrevBias[h]
-            )
-            mix_k_curr_raw = cutlass.Float32(mParams[b, t, h, 8]) + cutlass.Float32(
-                mMixKCurrBias[h]
-            )
-            k_prev_re_raw = cutlass.Float32(mParams[b, t, h, 9])
-            k_prev_im_raw = cutlass.Float32(mParams[b, t, h, 10])
-            k_curr_re_raw = cutlass.Float32(mParams[b, t, h, 11])
-            k_curr_im_raw = cutlass.Float32(mParams[b, t, h, 12])
+            mix_theta_raw = cutlass.Float32(
+                mParams[b, t, p_base + 6]
+            ) + cutlass.Float32(mMixThetaBias[h])
+            mix_k_prev_raw = cutlass.Float32(
+                mParams[b, t, p_base + 7]
+            ) + cutlass.Float32(mMixKPrevBias[h])
+            mix_k_curr_raw = cutlass.Float32(
+                mParams[b, t, p_base + 8]
+            ) + cutlass.Float32(mMixKCurrBias[h])
+            k_prev_re_raw = cutlass.Float32(mParams[b, t, p_base + 9])
+            k_prev_im_raw = cutlass.Float32(mParams[b, t, p_base + 10])
+            k_curr_re_raw = cutlass.Float32(mParams[b, t, p_base + 11])
+            k_curr_im_raw = cutlass.Float32(mParams[b, t, p_base + 12])
 
             dt_u = sigmoid(dt_raw)
             gamma = softplus(gamma_raw)

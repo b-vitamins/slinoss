@@ -40,14 +40,13 @@ def scanprep_fwd_cute(
     c_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     value_c = value if value.is_contiguous() else value.contiguous()
-    params_c = params if params.is_contiguous() else params.contiguous()
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
     batch, t_size, width = map(int, value_c.shape)
     if width != int(n_heads * d_head):
         raise ValueError(f"value width must be {n_heads * d_head}. Got {width}.")
-    if tuple(map(int, params_c.shape)) != (batch, t_size, int(n_heads * 13)):
+    if tuple(map(int, params.shape)) != (batch, t_size, int(n_heads * 13)):
         raise ValueError(
-            f"params must be {(batch, t_size, int(n_heads * 13))}. Got {tuple(params_c.shape)}."
+            f"params must be {(batch, t_size, int(n_heads * 13))}. Got {tuple(params.shape)}."
         )
     if tuple(map(int, bc_c.shape)) != (batch, t_size, int(n_heads), 4, int(d_state)):
         raise ValueError(
@@ -77,13 +76,13 @@ def scanprep_fwd_cute(
         if c_scale is not None
         else torch.empty((n_heads, 2, d_state), device=value.device, dtype=bc.dtype)
     )
-    params_view = params_c.view(batch, t_size, n_heads, 13)
+    params_stride = tuple(int(s) for s in params.stride())
 
     value_ptr, value_align = make_ptr_arg(value_c)
     bc_ptr, bc_align = make_ptr_arg(bc_c)
     b_scale_ptr, b_scale_align = make_ptr_arg(b_scale_c)
     c_scale_ptr, c_scale_align = make_ptr_arg(c_scale_c)
-    params_ptr, params_align = make_ptr_arg(params_view)
+    params_ptr, params_align = make_ptr_arg(params)
     dt_bias_ptr, dt_bias_align = make_ptr_arg(dt_bias)
     gamma_bias_ptr, gamma_bias_align = make_ptr_arg(gamma_bias)
     omega_bias_ptr, omega_bias_align = make_ptr_arg(omega_bias)
@@ -103,7 +102,7 @@ def scanprep_fwd_cute(
         int(value.device.index or 0),
         bool(normalize_bc),
         value_c.dtype,
-        params_c.dtype,
+        params.dtype,
         bc_c.dtype,
         b_scale_c.dtype,
         c_scale_c.dtype,
@@ -123,6 +122,7 @@ def scanprep_fwd_cute(
         bc_align,
         b_scale_align,
         c_scale_align,
+        params_stride,
         params_align,
         dt_bias_align,
         gamma_bias_align,
@@ -149,6 +149,7 @@ def scanprep_fwd_cute(
         compiled = cute.compile(
             ScanPrepFwdFused(
                 spec=spec,
+                params_in_stride=params_stride,
                 normalize_bc=normalize_bc,
                 dt_min=dt_min,
                 dt_max=dt_max,

@@ -62,7 +62,7 @@ def scanprep_bwd(
     p_size = width // int(n_heads)
 
     du_in = (
-        (dU if dU.is_contiguous() else dU.contiguous())
+        dU
         if dU is not None
         else torch.zeros(
             (batch, n_heads, t_size, p_size),
@@ -114,8 +114,8 @@ def scanprep_bwd(
         device=bc.device,
         dtype=torch.float32,
     )
-    dparams_view = torch.empty(
-        (batch, t_size, n_heads, 13),
+    dparams = torch.empty(
+        (batch, t_size, n_heads * 13),
         device=params.device,
         dtype=params.dtype,
     )
@@ -141,8 +141,8 @@ def scanprep_bwd(
         else torch.empty((n_heads, 2, d_state), device=bc.device, dtype=bc.dtype)
     )
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
-    params_c = params if params.is_contiguous() else params.contiguous()
-    params_view = params_c.view(batch, t_size, n_heads, 13)
+    du_stride = tuple(int(s) for s in du_in.stride())
+    params_stride = tuple(int(s) for s in params.stride())
 
     du_ptr, du_align = make_ptr_arg(du_in)
     bc_ptr, bc_align = make_ptr_arg(bc_c)
@@ -150,7 +150,7 @@ def scanprep_bwd(
     dc_ptr, dc_align = make_ptr_arg(dc_in)
     b_scale_ptr, b_scale_align = make_ptr_arg(b_scale_in)
     c_scale_ptr, c_scale_align = make_ptr_arg(c_scale_in)
-    params_ptr, params_align = make_ptr_arg(params_view)
+    params_ptr, params_align = make_ptr_arg(params)
     dm_ptr, dm_align = make_ptr_arg(dm_in)
     dk_ptr, dk_align = make_ptr_arg(dk_in)
     dt_bias_ptr, dt_bias_align = make_ptr_arg(dt_bias)
@@ -163,7 +163,7 @@ def scanprep_bwd(
     value_grad_ptr, value_grad_align = make_ptr_arg(value_grad)
     bc_grad_ptr, bc_grad_align = make_ptr_arg(bc_grad)
     scale_part_ptr, scale_part_align = make_ptr_arg(scale_partials)
-    dparams_ptr, dparams_align = make_ptr_arg(dparams_view)
+    dparams_ptr, dparams_align = make_ptr_arg(dparams)
     bias_part_ptr, bias_part_align = make_ptr_arg(bias_partials)
     scale_grad_ptr, scale_grad_align = make_ptr_arg(scale_grad)
     bias_grad_ptr, bias_grad_align = make_ptr_arg(bias_grad)
@@ -193,10 +193,12 @@ def scanprep_bwd(
         value_grad.dtype,
         bc_grad.dtype,
         scale_partials.dtype,
-        dparams_view.dtype,
+        dparams.dtype,
         bias_partials.dtype,
         scale_grad.dtype,
         bias_grad.dtype,
+        du_stride,
+        params_stride,
         du_align,
         bc_align,
         db_align,
@@ -233,6 +235,8 @@ def scanprep_bwd(
         compiled = cute.compile(
             ScanPrepBwdFused(
                 spec=spec,
+                du_stride=du_stride,
+                params_in_stride=params_stride,
                 normalize_bc=normalize_bc,
                 dt_min=dt_min,
                 dt_max=dt_max,
@@ -300,7 +304,6 @@ def scanprep_bwd(
         else value_grad.to(dtype=value.dtype)
     )
     dbc = bc_grad if bc_grad.dtype == bc.dtype else bc_grad.to(dtype=bc.dtype)
-    dparams = dparams_view.reshape_as(params)
 
     bias_dtype = dt_bias.dtype
     if (
