@@ -1,0 +1,7 @@
+Repository: https://github.com/Dao-AILab/causal-conv1d
+Commit: 0d2252d161f25f7907bbd05985c08ab98d255874
+License: BSD-3-Clause (see LICENSE in this directory)
+
+Vendored files live under:
+- csrc/causal_conv1d/*
+

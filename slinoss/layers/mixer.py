@@ -9,7 +9,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .backend import AutoScanBackend, ScanBackend, ScanInputs, ScanPrepBackend
+from slinoss.ops.cconv1d import cconv1d_cuda, cconv1d_cuda_supported
+
+from .backend import (
+    AutoCConv1dBackend,
+    AutoScanBackend,
+    CConv1dBackend,
+    ScanBackend,
+    ScanInputs,
+    ScanPrepBackend,
+)
 from .scanprep import SLinOSSScanPrep
 from .state import SLinOSSMixerState, ScanState
 
@@ -32,6 +41,7 @@ class SLinOSSMixer(nn.Module):
         d_conv: int = 4,
         chunk_size: int = 64,
         scanprep_backend: ScanPrepBackend | None = None,
+        cconv_backend: CConv1dBackend | None = None,
         dt_min: float = 1e-4,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-4,
@@ -86,6 +96,9 @@ class SLinOSSMixer(nn.Module):
             device=device,
         )
         self.backend = AutoScanBackend() if backend is None else backend
+        self.cconv_backend = (
+            AutoCConv1dBackend() if cconv_backend is None else cconv_backend
+        )
 
         param_dim = self.n_heads * self.scanprep.param_dim
         self.in_proj = nn.Linear(
@@ -94,15 +107,10 @@ class SLinOSSMixer(nn.Module):
             bias=False,
             **factory_kwargs,
         )
-        self.dw_conv = nn.Conv1d(
-            self.d_inner,
-            self.d_inner,
-            kernel_size=self.d_conv,
-            groups=self.d_inner,
-            padding=0,
-            bias=True,
-            **factory_kwargs,
+        self.dw_weight = nn.Parameter(
+            torch.empty((self.d_inner, self.d_conv), **factory_kwargs)
         )
+        self.dw_bias = nn.Parameter(torch.empty((self.d_inner,), **factory_kwargs))
         self.bc_proj = nn.Linear(
             self.d_inner,
             self.n_heads * 4 * self.d_state,
@@ -127,6 +135,11 @@ class SLinOSSMixer(nn.Module):
     def reset_parameters(self) -> None:
         with torch.no_grad():
             self.skip.fill_(1.0)
+        nn.init.kaiming_uniform_(
+            self.dw_weight.view(self.d_inner, 1, self.d_conv), a=math.sqrt(5.0)
+        )
+        bound = 1.0 / math.sqrt(float(self.d_conv))
+        nn.init.uniform_(self.dw_bias, -bound, bound)
         self.scanprep.reset_parameters()
 
     def init_state(
@@ -154,6 +167,49 @@ class SLinOSSMixer(nn.Module):
         x: torch.Tensor,
         conv_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cconv_backend(self, x, conv_state)
+
+    def _dw_weight_3d(self) -> torch.Tensor:
+        return self.dw_weight.unsqueeze(1)
+
+    def _validate_conv_state(
+        self,
+        conv_state: torch.Tensor | None,
+        *,
+        batch: int,
+        state_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if conv_state is None:
+            return torch.zeros(
+                (batch, self.d_inner, state_len), device=device, dtype=dtype
+            )
+        if conv_state.shape != (batch, self.d_inner, state_len):
+            raise ValueError(
+                f"conv_state must be {(batch, self.d_inner, state_len)}. "
+                f"Got {tuple(conv_state.shape)}."
+            )
+        return conv_state.to(device=device, dtype=dtype)
+
+    def _next_conv_state_from_input(
+        self,
+        x_t: torch.Tensor,
+        *,
+        state_len: int,
+    ) -> torch.Tensor:
+        if state_len == 0:
+            return x_t.new_empty((x_t.shape[0], x_t.shape[1], 0))
+        if x_t.shape[-1] >= state_len:
+            return x_t[..., -state_len:].contiguous()
+        prefix = x_t.new_zeros((x_t.shape[0], x_t.shape[1], state_len - x_t.shape[-1]))
+        return torch.cat((prefix, x_t), dim=-1).contiguous()
+
+    def _apply_cconv_reference(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, T, channels = map(int, x.shape)
         if channels != self.d_inner:
             raise ValueError(
@@ -161,28 +217,98 @@ class SLinOSSMixer(nn.Module):
             )
 
         state_len = max(self.d_conv - 1, 0)
+        weight = self._dw_weight_3d()
         if state_len == 0:
-            y = self.dw_conv(x.transpose(1, 2).contiguous())
+            y = F.conv1d(
+                x.transpose(1, 2).contiguous(),
+                weight,
+                self.dw_bias,
+                groups=self.d_inner,
+            )
             empty = x.new_empty((batch, self.d_inner, 0))
             return y.transpose(1, 2).contiguous(), empty
 
-        if conv_state is None:
-            prefix = torch.zeros(
-                (batch, self.d_inner, state_len), device=x.device, dtype=x.dtype
-            )
-        else:
-            if conv_state.shape != (batch, self.d_inner, state_len):
-                raise ValueError(
-                    f"conv_state must be {(batch, self.d_inner, state_len)}. "
-                    f"Got {tuple(conv_state.shape)}."
-                )
-            prefix = conv_state.to(device=x.device, dtype=x.dtype)
-
+        prefix = self._validate_conv_state(
+            conv_state,
+            batch=batch,
+            state_len=state_len,
+            device=x.device,
+            dtype=x.dtype,
+        )
         x_t = x.transpose(1, 2).contiguous()
         cat = torch.cat([prefix, x_t], dim=-1)
-        y = self.dw_conv(cat)
+        y = F.conv1d(cat, weight, self.dw_bias, groups=self.d_inner)
         next_state = cat[..., -state_len:].contiguous()
         return y.transpose(1, 2).contiguous(), next_state
+
+    def _apply_cconv_cuda(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, _, channels = map(int, x.shape)
+        if channels != self.d_inner:
+            raise ValueError(
+                f"Expected conv input width {self.d_inner}, got {channels}."
+            )
+
+        state_len = max(self.d_conv - 1, 0)
+        x_t = x.transpose(1, 2)
+        weight = self.dw_weight
+        if x_t.stride(1) == 1 and (
+            self.d_inner % 8 != 0 or x_t.stride(2) % 8 != 0 or x_t.stride(0) % 8 != 0
+        ):
+            x_t = x_t.contiguous()
+
+        if state_len == 0:
+            if not cconv1d_cuda_supported(x_t, weight, activation=None):
+                return self._apply_cconv_reference(x, conv_state)
+            y = cconv1d_cuda(x_t, weight, self.dw_bias, activation=None)
+            assert isinstance(y, torch.Tensor)
+            return y.transpose(1, 2).contiguous(), x.new_empty((batch, self.d_inner, 0))
+
+        if conv_state is None:
+            if not cconv1d_cuda_supported(x_t, weight, activation=None):
+                return self._apply_cconv_reference(x, conv_state)
+            y = cconv1d_cuda(x_t, weight, self.dw_bias, activation=None)
+            assert isinstance(y, torch.Tensor)
+            next_state = self._next_conv_state_from_input(x_t, state_len=state_len)
+            return y.transpose(1, 2).contiguous(), next_state
+
+        if (
+            x_t.stride(1) != 1
+            or x_t.stride(2) % 8 != 0
+            or x_t.stride(0) % 8 != 0
+            or self.d_inner % 8 != 0
+        ):
+            return self._apply_cconv_reference(x, conv_state)
+
+        init = self._validate_conv_state(
+            conv_state,
+            batch=batch,
+            state_len=state_len,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        init = init.transpose(1, 2).contiguous().transpose(1, 2)
+        if not cconv1d_cuda_supported(
+            x_t,
+            weight,
+            initial_states=init,
+            activation=None,
+        ):
+            return self._apply_cconv_reference(x, conv_state)
+        y_with_state = cconv1d_cuda(
+            x_t,
+            weight,
+            self.dw_bias,
+            initial_states=init,
+            return_final_states=True,
+            activation=None,
+        )
+        assert isinstance(y_with_state, tuple)
+        y_t, next_state = y_with_state
+        return y_t.transpose(1, 2).contiguous(), next_state.contiguous()
 
     def _build_scan_inputs(
         self,

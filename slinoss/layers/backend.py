@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
+from slinoss.ops.cconv1d import cconv1d_cuda_supported, cconv1d_is_available
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 
 from .state import ScanState
@@ -50,6 +51,24 @@ if TYPE_CHECKING:
     class _ScanPrepOwner(Protocol):
         def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs: ...
         def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs: ...
+
+    class _CConvOwner(Protocol):
+        d_conv: int
+
+        @property
+        def dw_weight(self) -> torch.Tensor: ...
+
+        def _apply_cconv_reference(
+            self,
+            x: torch.Tensor,
+            conv_state: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+        def _apply_cconv_cuda(
+            self,
+            x: torch.Tensor,
+            conv_state: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 class ScanPrepBackend(Protocol):
@@ -110,6 +129,70 @@ class AutoScanPrepBackend:
         )
         backend = self.cute if use_cute else self.reference
         return backend(owner, inputs)
+
+
+class CConv1dBackend(Protocol):
+    """Hot-swappable depthwise causal conv1d backend."""
+
+    def __call__(
+        self,
+        owner: "_CConvOwner",
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class ReferenceCConv1dBackend:
+    """Reference depthwise causal conv1d backend."""
+
+    def __call__(
+        self,
+        owner: "_CConvOwner",
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return owner._apply_cconv_reference(x, conv_state)
+
+
+class CudaCConv1dBackend:
+    """CUDA depthwise causal conv1d backend."""
+
+    def __call__(
+        self,
+        owner: "_CConvOwner",
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not cconv1d_is_available():
+            return owner._apply_cconv_reference(x, conv_state)
+        return owner._apply_cconv_cuda(x, conv_state)
+
+
+class AutoCConv1dBackend:
+    """Default depthwise causal conv1d backend."""
+
+    def __init__(self) -> None:
+        self.reference = ReferenceCConv1dBackend()
+        self.cuda = CudaCConv1dBackend()
+
+    def __call__(
+        self,
+        owner: "_CConvOwner",
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        use_cuda = (
+            x.device.type == "cuda"
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and owner.d_conv in (2, 3, 4)
+            and cconv1d_cuda_supported(
+                x.transpose(1, 2),
+                owner.dw_weight,
+                activation=None,
+            )
+        )
+        backend = self.cuda if use_cuda else self.reference
+        return backend(owner, x, conv_state)
 
 
 class ScanBackend(Protocol):
@@ -238,6 +321,10 @@ class AutoScanBackend:
 
 
 __all__ = [
+    "CConv1dBackend",
+    "ReferenceCConv1dBackend",
+    "CudaCConv1dBackend",
+    "AutoCConv1dBackend",
     "ScanPrepInputs",
     "ScanPrepBackend",
     "ReferenceScanPrepBackend",

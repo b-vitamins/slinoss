@@ -1,10 +1,14 @@
 """SLinOSS model-side modules."""
 
 from .backend import (
+    AutoCConv1dBackend,
     AutoScanBackend,
     AutoScanPrepBackend,
+    CConv1dBackend,
+    CudaCConv1dBackend,
     CuteScanBackend,
     CuteScanPrepBackend,
+    ReferenceCConv1dBackend,
     ReferenceScanBackend,
     ReferenceScanPrepBackend,
     ScanBackend,
@@ -24,6 +28,10 @@ from .state import SLinOSSMixerState, ScanState
 
 __all__ = [
     "ScanInputs",
+    "CConv1dBackend",
+    "ReferenceCConv1dBackend",
+    "CudaCConv1dBackend",
+    "AutoCConv1dBackend",
     "ScanPrepInputs",
     "ScanBackend",
     "ScanPrepBackend",
