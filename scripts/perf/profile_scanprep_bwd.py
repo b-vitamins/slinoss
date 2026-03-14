@@ -43,8 +43,8 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Warm launches to run before starting the CUDA profiler.",
     )
-    parser.add_argument("--block-size", type=int, default=64)
-    parser.add_argument("--reduce-block-size", type=int, default=64)
+    parser.add_argument("--pack-block-size", type=int, default=32)
+    parser.add_argument("--coeff-block-size", type=int, default=128)
     parser.add_argument(
         "--no-normalize-bc",
         action="store_false",
@@ -103,16 +103,10 @@ def main() -> int:
     bc_grad = torch.empty(
         (batch, t_size, heads, 4, d_state), device=device, dtype=torch.float32
     )
-    scale_partials = torch.empty(
-        (batch, heads, t_size, 4, d_state), device=device, dtype=torch.float32
-    )
     dparams = torch.empty(
         (batch, t_size, heads, 13), device=device, dtype=torch.float32
     )
-    bias_partials = torch.empty(
-        (batch, heads, t_size, 7), device=device, dtype=torch.float32
-    )
-    scale_grad = torch.empty((heads, 4, d_state), device=device, dtype=torch.float32)
+    scale_grad = torch.zeros((heads, 4, d_state), device=device, dtype=torch.float32)
     bias_grad = torch.zeros((heads, 7), device=device, dtype=torch.float32)
 
     if args.normalize_bc:
@@ -142,9 +136,7 @@ def main() -> int:
     mix_k_curr_bias_ptr, _ = make_ptr_arg(prep.mix_k_curr_bias.detach())
     value_grad_ptr, _ = make_ptr_arg(value_grad)
     bc_grad_ptr, _ = make_ptr_arg(bc_grad)
-    scale_part_ptr, _ = make_ptr_arg(scale_partials)
     dparams_ptr, _ = make_ptr_arg(dparams)
-    bias_part_ptr, _ = make_ptr_arg(bias_partials)
     scale_grad_ptr, _ = make_ptr_arg(scale_grad)
     bias_grad_ptr, _ = make_ptr_arg(bias_grad)
 
@@ -159,8 +151,8 @@ def main() -> int:
             theta_bound=prep.theta_bound,
             k_max=prep.k_max,
             eps=prep.eps,
-            block_size=args.block_size,
-            reduce_block_size=args.reduce_block_size,
+            pack_block_size=args.pack_block_size,
+            coeff_block_size=args.coeff_block_size,
         ),
         du_ptr,
         bc_ptr,
@@ -180,14 +172,13 @@ def main() -> int:
         mix_k_curr_bias_ptr,
         value_grad_ptr,
         bc_grad_ptr,
-        scale_part_ptr,
         dparams_ptr,
-        bias_part_ptr,
         scale_grad_ptr,
         bias_grad_ptr,
     )
 
     def prepare() -> None:
+        scale_grad.zero_()
         bias_grad.zero_()
 
     def run() -> None:
@@ -210,9 +201,7 @@ def main() -> int:
             mix_k_curr_bias_ptr,
             value_grad_ptr,
             bc_grad_ptr,
-            scale_part_ptr,
             dparams_ptr,
-            bias_part_ptr,
             scale_grad_ptr,
             bias_grad_ptr,
         )

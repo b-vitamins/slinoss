@@ -36,8 +36,8 @@ class ScanPrepBwdFused:
         theta_bound: float,
         k_max: float,
         eps: float,
-        block_size: int = 64,
-        reduce_block_size: int = 64,
+        pack_block_size: int = 32,
+        coeff_block_size: int = 128,
     ) -> None:
         batch, t_size, h_size, p_size, n_size, param_dim = spec
         self.batch = int(batch)
@@ -62,14 +62,8 @@ class ScanPrepBwdFused:
         self.grad_stride = make_row_major_stride(self.grad_shape)
         self.bc_scale_shape = (self.h_size, 2, self.n_size)
         self.bc_scale_stride = make_row_major_stride(self.bc_scale_shape)
-        self.scale_part_shape = (
-            self.batch,
-            self.h_size,
-            self.t_size,
-            4,
-            self.n_size,
-        )
-        self.scale_part_stride = make_row_major_stride(self.scale_part_shape)
+        self.scale_grad_shape = (self.h_size, 4, self.n_size)
+        self.scale_grad_stride = make_row_major_stride(self.scale_grad_shape)
         self.param_flat_size = self.h_size * self.param_dim
         self.params_in_shape = (self.batch, self.t_size, self.param_flat_size)
         self.params_in_stride = (
@@ -85,38 +79,26 @@ class ScanPrepBwdFused:
         self.k_stride = make_row_major_stride(self.k_shape)
         self.bias_shape = (self.h_size,)
         self.bias_stride = make_row_major_stride(self.bias_shape)
-        self.bias_part_shape = (self.batch, self.h_size, self.t_size, 7)
-        self.bias_part_stride = make_row_major_stride(self.bias_part_shape)
         self.bias_grad_shape = (self.h_size, 7)
         self.bias_grad_stride = make_row_major_stride(self.bias_grad_shape)
 
         self.total_rows = self.batch * self.h_size * self.t_size
-        self.block_size = int(block_size)
-        if self.block_size % 32 != 0:
-            raise ValueError("block_size must be a multiple of 32.")
+        self.pack_block_size = int(pack_block_size)
+        if self.pack_block_size % 32 != 0:
+            raise ValueError("pack_block_size must be a multiple of 32.")
         self.pack_group_size = 16 if self.n_size <= 16 else 32
-        if self.block_size % self.pack_group_size != 0:
-            raise ValueError("block_size must be divisible by pack_group_size.")
-        self.pack_groups_per_block = self.block_size // self.pack_group_size
+        if self.pack_block_size % self.pack_group_size != 0:
+            raise ValueError("pack_block_size must be divisible by pack_group_size.")
+        self.pack_groups_per_block = self.pack_block_size // self.pack_group_size
         self.pack_grid_size = (
             self.total_rows + self.pack_groups_per_block - 1
         ) // self.pack_groups_per_block
+        self.coeff_block_size = int(coeff_block_size)
+        if self.coeff_block_size % 32 != 0:
+            raise ValueError("coeff_block_size must be a multiple of 32.")
         self.coeff_grid_size = (
-            self.total_rows + self.block_size - 1
-        ) // self.block_size
-        self.reduce_block_size = int(reduce_block_size)
-        if self.reduce_block_size % 32 != 0:
-            raise ValueError("reduce_block_size must be a multiple of 32.")
-        self.reduce_warps_per_block = self.reduce_block_size // 32
-        self.reduce_bt_rows = self.batch * self.t_size
-        self.scale_reduce_rows = self.h_size * 4 * self.n_size
-        self.scale_reduce_grid = (
-            self.scale_reduce_rows + self.reduce_warps_per_block - 1
-        ) // self.reduce_warps_per_block
-        self.bias_reduce_rows = self.h_size * 7
-        self.bias_reduce_grid = (
-            self.bias_reduce_rows + self.reduce_warps_per_block - 1
-        ) // self.reduce_warps_per_block
+            self.total_rows + self.coeff_block_size - 1
+        ) // self.coeff_block_size
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
@@ -138,7 +120,7 @@ class ScanPrepBwdFused:
         mCScale: cute.Tensor,
         mValueGrad: cute.Tensor,
         mBCGrad: cute.Tensor,
-        mScalePartials: cute.Tensor,
+        mScaleGrad: cute.Tensor,
         total_rows_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -255,10 +237,26 @@ class ScanPrepBwdFused:
                         mBCGrad[b, t, h, 3, n] = (
                             inv3 * dy3 - x3 * inv3_cubed * dot3
                         ).to(mBCGrad.element_type)
-                        mScalePartials[b, h, t, 0, n] = db0 * y0
-                        mScalePartials[b, h, t, 1, n] = db1 * y1
-                        mScalePartials[b, h, t, 2, n] = dc0 * y2
-                        mScalePartials[b, h, t, 3, n] = dc1 * y3
+                        h_base = h * 4 * self.n_size
+                        cute.arch.atomic_add(
+                            (mScaleGrad.iterator + h_base + n).llvm_ptr, db0 * y0
+                        )
+                        cute.arch.atomic_add(
+                            (mScaleGrad.iterator + h_base + self.n_size + n).llvm_ptr,
+                            db1 * y1,
+                        )
+                        cute.arch.atomic_add(
+                            (
+                                mScaleGrad.iterator + h_base + 2 * self.n_size + n
+                            ).llvm_ptr,
+                            dc0 * y2,
+                        )
+                        cute.arch.atomic_add(
+                            (
+                                mScaleGrad.iterator + h_base + 3 * self.n_size + n
+                            ).llvm_ptr,
+                            dc1 * y3,
+                        )
             else:
                 num_n_iters = (self.n_size + subwarp_size - 1) // subwarp_size
                 for n_iter in cutlass.range_constexpr(num_n_iters):
@@ -283,12 +281,12 @@ class ScanPrepBwdFused:
         mMixKPrevBias: cute.Tensor,
         mMixKCurrBias: cute.Tensor,
         mDParams: cute.Tensor,
-        mBiasPartials: cute.Tensor,
+        mBiasGrad: cute.Tensor,
         total_rows_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        row = bidx * self.block_size + tidx
+        row = bidx * self.coeff_block_size + tidx
         if row < total_rows_:
             rows_per_batch = self.h_size * self.t_size
             b = row // rows_per_batch
@@ -649,72 +647,14 @@ class ScanPrepBwdFused:
             mDParams[b, t, p_base + 10] = d10.to(mDParams.element_type)
             mDParams[b, t, p_base + 11] = d11.to(mDParams.element_type)
             mDParams[b, t, p_base + 12] = d12.to(mDParams.element_type)
-            mBiasPartials[b, h, t, 0] = d0
-            mBiasPartials[b, h, t, 1] = d1
-            mBiasPartials[b, h, t, 2] = d2
-            mBiasPartials[b, h, t, 3] = d5
-            mBiasPartials[b, h, t, 4] = d6
-            mBiasPartials[b, h, t, 5] = d7
-            mBiasPartials[b, h, t, 6] = d8
-
-    @cute.kernel
-    def reduce_scale_kernel(
-        self,
-        mPartials: cute.Tensor,
-        mScaleGrad: cute.Tensor,
-        total_rows,
-    ):
-        _tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.warp_idx()
-        row = bidx * self.reduce_warps_per_block + warp
-        if row < total_rows:
-            channels = mPartials.shape[3]
-            n_size = mPartials.shape[4]
-            h = row // (channels * n_size)
-            rem = row - h * channels * n_size
-            c = rem // n_size
-            n = rem - c * n_size
-            acc = cutlass.Float32(0.0)
-            num_bt_iters = (self.reduce_bt_rows + 31) // 32
-            for bt_iter in cutlass.range_constexpr(num_bt_iters):
-                bt = lane + bt_iter * 32
-                if bt < self.reduce_bt_rows:
-                    b = bt // self.t_size
-                    t = bt - b * self.t_size
-                    acc = acc + cutlass.Float32(mPartials[b, h, t, c, n])
-            acc = cute.arch.warp_reduction_sum(acc)
-            if lane == 0:
-                mScaleGrad[h, c, n] = acc
-
-    @cute.kernel
-    def reduce_bias_kernel(
-        self,
-        mPartials: cute.Tensor,
-        mBiasGrad: cute.Tensor,
-        total_rows,
-    ):
-        _tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.warp_idx()
-        row = bidx * self.reduce_warps_per_block + warp
-        if row < total_rows:
-            channels = mPartials.shape[3]
-            h = row // channels
-            c = row - h * channels
-            acc = cutlass.Float32(0.0)
-            num_bt_iters = (self.reduce_bt_rows + 31) // 32
-            for bt_iter in cutlass.range_constexpr(num_bt_iters):
-                bt = lane + bt_iter * 32
-                if bt < self.reduce_bt_rows:
-                    b = bt // self.t_size
-                    t = bt - b * self.t_size
-                    acc = acc + cutlass.Float32(mPartials[b, h, t, c])
-            acc = cute.arch.warp_reduction_sum(acc)
-            if lane == 0:
-                mBiasGrad[h, c] = acc
+            h_bias = h * 7
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 0).llvm_ptr, d0)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 1).llvm_ptr, d1)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 2).llvm_ptr, d2)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 3).llvm_ptr, d5)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 4).llvm_ptr, d6)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 5).llvm_ptr, d7)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 6).llvm_ptr, d8)
 
     @cute.jit
     def __call__(
@@ -737,9 +677,7 @@ class ScanPrepBwdFused:
         mix_k_curr_bias_ptr: cute.Pointer,
         value_grad_ptr: cute.Pointer,
         bc_grad_ptr: cute.Pointer,
-        scale_part_ptr: cute.Pointer,
         dparams_ptr: cute.Pointer,
-        bias_part_ptr: cute.Pointer,
         scale_grad_ptr: cute.Pointer,
         bias_grad_ptr: cute.Pointer,
     ):
@@ -803,23 +741,13 @@ class ScanPrepBwdFused:
         mBCGrad = cute.make_tensor(
             bc_grad_ptr, cute.make_layout(self.bc_shape, stride=self.bc_stride)
         )
-        mScalePartials = cute.make_tensor(
-            scale_part_ptr,
-            cute.make_layout(self.scale_part_shape, stride=self.scale_part_stride),
-        )
         mDParams = cute.make_tensor(
             dparams_ptr,
             cute.make_layout(self.dparams_shape, stride=self.dparams_stride),
         )
-        mBiasPartials = cute.make_tensor(
-            bias_part_ptr,
-            cute.make_layout(self.bias_part_shape, stride=self.bias_part_stride),
-        )
         mScaleGrad = cute.make_tensor(
             scale_grad_ptr,
-            cute.make_layout(
-                (self.h_size, 4, self.n_size), stride=(4 * self.n_size, self.n_size, 1)
-            ),
+            cute.make_layout(self.scale_grad_shape, stride=self.scale_grad_stride),
         )
         mBiasGrad = cute.make_tensor(
             bias_grad_ptr,
@@ -835,9 +763,9 @@ class ScanPrepBwdFused:
             mCScale,
             mValueGrad,
             mBCGrad,
-            mScalePartials,
+            mScaleGrad,
             self.total_rows,
-        ).launch(grid=(self.pack_grid_size, 1, 1), block=(self.block_size, 1, 1))
+        ).launch(grid=(self.pack_grid_size, 1, 1), block=(self.pack_block_size, 1, 1))
         self.coeff_kernel(
             mParams,
             mDM,
@@ -850,20 +778,9 @@ class ScanPrepBwdFused:
             mMixKPrevBias,
             mMixKCurrBias,
             mDParams,
-            mBiasPartials,
+            mBiasGrad,
             self.total_rows,
-        ).launch(grid=(self.coeff_grid_size, 1, 1), block=(self.block_size, 1, 1))
-        if self.normalize_bc:
-            self.reduce_scale_kernel(
-                mScalePartials, mScaleGrad, self.scale_reduce_rows
-            ).launch(
-                grid=(self.scale_reduce_grid, 1, 1),
-                block=(self.reduce_block_size, 1, 1),
-            )
-        self.reduce_bias_kernel(mBiasPartials, mBiasGrad, self.bias_reduce_rows).launch(
-            grid=(self.bias_reduce_grid, 1, 1),
-            block=(self.reduce_block_size, 1, 1),
-        )
+        ).launch(grid=(self.coeff_grid_size, 1, 1), block=(self.coeff_block_size, 1, 1))
 
 
 __all__ = ["ScanPrepBwdFused"]

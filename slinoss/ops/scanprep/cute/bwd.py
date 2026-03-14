@@ -109,27 +109,25 @@ def scanprep_bwd(
 
     value_grad = torch.empty_like(value)
     bc_grad = torch.empty_like(bc)
-    scale_partials = torch.empty(
-        (batch, n_heads, t_size, 4, d_state),
-        device=bc.device,
-        dtype=torch.float32,
-    )
     dparams = torch.empty(
         (batch, t_size, n_heads * 13),
         device=params.device,
         dtype=params.dtype,
     )
-    bias_partials = torch.empty(
-        (batch, n_heads, t_size, 7),
-        device=params.device,
-        dtype=torch.float32,
+    scale_grad = (
+        torch.zeros(
+            (n_heads, 4, d_state),
+            device=bc.device,
+            dtype=torch.float32,
+        )
+        if normalize_bc
+        else torch.empty(
+            (n_heads, 4, d_state),
+            device=bc.device,
+            dtype=torch.float32,
+        )
     )
-    scale_grad = torch.empty(
-        (n_heads, 4, d_state),
-        device=bc.device,
-        dtype=torch.float32,
-    )
-    bias_grad = torch.empty((n_heads, 7), device=params.device, dtype=torch.float32)
+    bias_grad = torch.zeros((n_heads, 7), device=params.device, dtype=torch.float32)
     b_scale_in = (
         b_scale
         if normalize_bc
@@ -162,9 +160,7 @@ def scanprep_bwd(
     mix_k_curr_bias_ptr, mix_k_curr_bias_align = make_ptr_arg(mix_k_curr_bias)
     value_grad_ptr, value_grad_align = make_ptr_arg(value_grad)
     bc_grad_ptr, bc_grad_align = make_ptr_arg(bc_grad)
-    scale_part_ptr, scale_part_align = make_ptr_arg(scale_partials)
     dparams_ptr, dparams_align = make_ptr_arg(dparams)
-    bias_part_ptr, bias_part_align = make_ptr_arg(bias_partials)
     scale_grad_ptr, scale_grad_align = make_ptr_arg(scale_grad)
     bias_grad_ptr, bias_grad_align = make_ptr_arg(bias_grad)
 
@@ -192,9 +188,7 @@ def scanprep_bwd(
         mix_k_curr_bias.dtype,
         value_grad.dtype,
         bc_grad.dtype,
-        scale_partials.dtype,
         dparams.dtype,
-        bias_partials.dtype,
         scale_grad.dtype,
         bias_grad.dtype,
         du_stride,
@@ -217,9 +211,7 @@ def scanprep_bwd(
         mix_k_curr_bias_align,
         value_grad_align,
         bc_grad_align,
-        scale_part_align,
         dparams_align,
-        bias_part_align,
         scale_grad_align,
         bias_grad_align,
         float(dt_min),
@@ -264,9 +256,7 @@ def scanprep_bwd(
             mix_k_curr_bias_ptr,
             value_grad_ptr,
             bc_grad_ptr,
-            scale_part_ptr,
             dparams_ptr,
-            bias_part_ptr,
             scale_grad_ptr,
             bias_grad_ptr,
         )
@@ -291,9 +281,7 @@ def scanprep_bwd(
         mix_k_curr_bias_ptr,
         value_grad_ptr,
         bc_grad_ptr,
-        scale_part_ptr,
         dparams_ptr,
-        bias_part_ptr,
         scale_grad_ptr,
         bias_grad_ptr,
     )
