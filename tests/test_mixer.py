@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from slinoss.layers import AutoScanBackend, SLinOSSMixer, ScanInputs, ScanState
@@ -85,6 +86,31 @@ def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
 def test_mixer_defaults_to_auto_scan_backend() -> None:
     mixer = _make_mixer()
     assert isinstance(mixer.backend, AutoScanBackend)
+
+
+def test_mixer_rejects_incompatible_d_state_for_cute_scan_backend() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        12,
+        d_state=3,
+        expand=2,
+        d_head=6,
+        d_conv=3,
+        chunk_size=4,
+        normalize_bc=True,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    x = torch.randn((2, 5, 12), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(
+        ValueError,
+        match="CuTe scan backend requires d_state to be a multiple of 8",
+    ):
+        mixer(x)
 
 
 def test_mixer_step_matches_full_forward() -> None:

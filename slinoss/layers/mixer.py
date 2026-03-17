@@ -15,6 +15,7 @@ from .backend import (
     AutoCConv1dBackend,
     AutoScanBackend,
     CConv1dBackend,
+    CuteScanBackend,
     ScanBackend,
     ScanInputs,
     ScanPrepBackend,
@@ -26,6 +27,14 @@ from .state import SLinOSSMixerState, ScanState
 def _require(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
+
+
+def _cute_scan_requires_d_state_multiple_of_8(d_state: int) -> None:
+    if int(d_state) % 8 != 0:
+        raise ValueError(
+            "The current CuTe scan backend requires d_state to be a multiple of 8 "
+            f"(got d_state={int(d_state)})."
+        )
 
 
 class SLinOSSMixer(nn.Module):
@@ -402,6 +411,11 @@ class SLinOSSMixer(nn.Module):
         scan_state: ScanState | None,
         return_state: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, ScanState]:
+        use_cute_scan = scan_inputs.U.device.type == "cuda" and isinstance(
+            self.backend, (AutoScanBackend, CuteScanBackend)
+        )
+        if use_cute_scan:
+            _cute_scan_requires_d_state_multiple_of_8(self.d_state)
         return self.backend(
             scan_inputs,
             chunk_size=self.chunk_size,
