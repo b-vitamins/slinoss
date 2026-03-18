@@ -18,6 +18,7 @@ except Exception:
 
 ROOT = Path(__file__).resolve().parent
 CSRC_DIR = ROOT / "csrc" / "causal_conv1d"
+CSRC_DIR_REL = CSRC_DIR.relative_to(ROOT)
 
 
 def _want_cuda_extension() -> bool:
@@ -43,12 +44,12 @@ if _want_cuda_extension():
         CUDAExtension(
             name="slinoss._C.cconv1d_cuda",
             sources=[
-                str(CSRC_DIR / "causal_conv1d.cpp"),
-                str(CSRC_DIR / "causal_conv1d_fwd.cu"),
-                str(CSRC_DIR / "causal_conv1d_bwd.cu"),
-                str(CSRC_DIR / "causal_conv1d_update.cu"),
+                str(CSRC_DIR_REL / "causal_conv1d.cpp"),
+                str(CSRC_DIR_REL / "causal_conv1d_fwd.cu"),
+                str(CSRC_DIR_REL / "causal_conv1d_bwd.cu"),
+                str(CSRC_DIR_REL / "causal_conv1d_update.cu"),
             ],
-            include_dirs=[str(CSRC_DIR)],
+            include_dirs=[str(CSRC_DIR_REL)],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": [

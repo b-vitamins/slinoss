@@ -11,16 +11,17 @@ on:
 
 jobs:
   build_pure:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     outputs:
       version: ${{ steps.meta.outputs.version }}
       wheel_name: ${{ steps.meta.outputs.wheel_name }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -43,7 +44,15 @@ jobs:
         run: test "${GITHUB_REF_NAME}" = "v${{ steps.meta.outputs.version }}"
 
       - name: Install build tooling
-        run: python -m pip install --upgrade pip setuptools>=69 wheel build
+        run: |
+          python -m pip install --upgrade pip "setuptools>=69" wheel build
+          python -m pip install --upgrade \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            "torch>=2.4"
+
+      - name: Clean build artifacts
+        run: rm -rf build dist *.egg-info
 
       - name: Build universal wheel
         env:
@@ -59,6 +68,10 @@ jobs:
         run: |
           python -m venv /tmp/slinoss-pure-wheel-smoke
           /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            "torch>=2.4"
           /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install "dist/${{ steps.meta.outputs.wheel_name }}"
           /tmp/slinoss-pure-wheel-smoke/bin/python - <<'PY'
           import torch
@@ -85,16 +98,17 @@ jobs:
 
   build_cuda:
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     outputs:
       version: ${{ steps.meta.outputs.version }}
       wheel_name: ${{ steps.wheel.outputs.wheel_name }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -116,18 +130,27 @@ jobs:
 
       - name: Install CUDA toolkit
         id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@v0.2.29
+        uses: Jimver/cuda-toolkit@v0.2.30
         with:
           cuda: "12.8.0"
-          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc"]'
 
       - name: Show nvcc version
         run: nvcc -V
 
       - name: Install build tooling
         run: >
-          python -m pip install --upgrade pip setuptools>=69 wheel build
+          python -m pip install --upgrade pip "setuptools>=69" wheel build
+
+      - name: Install PyTorch CUDA wheel
+        run: >
+          python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu128
+          --extra-index-url https://pypi.org/simple
           "torch>=2.4"
+
+      - name: Clean build artifacts
+        run: rm -rf build dist *.egg-info
 
       - name: Build CUDA wheel
         env:
@@ -154,16 +177,19 @@ jobs:
       - name: Smoke install CUDA wheel
         env:
           PIP_PREFER_BINARY: "1"
-          LD_LIBRARY_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64
         run: |
           python -m venv /tmp/slinoss-cuda-wheel-smoke
           WHEEL_URL="file://${GITHUB_WORKSPACE}/dist/${{ steps.wheel.outputs.wheel_name }}"
           /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install \
+            --index-url https://download.pytorch.org/whl/cu128 \
+            --extra-index-url https://pypi.org/simple \
+            "torch>=2.4"
           /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install "slinoss[cuda] @ ${WHEEL_URL}"
           /tmp/slinoss-cuda-wheel-smoke/bin/python - <<'PY'
+          import torch
           import cutlass  # noqa: F401
           import cuda  # noqa: F401
-          import slinoss._C.cconv1d_cuda  # noqa: F401
           from slinoss.layers import SLinOSSMixer
           from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
 
