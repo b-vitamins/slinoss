@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel", "torch>=2.4"]
+requires = ["setuptools>=69", "wheel", "torch==2.10.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,14 +10,14 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-  "torch>=2.4",
+  "torch==2.10.0",
   "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
 cuda = [
-  "nvidia-cutlass-dsl>=4.0.0",
-  "cuda-python>=13.0",
+  "nvidia-cutlass-dsl==4.4.2",
+  "cuda-python==12.9.4",
 ]
 dev = [
   "build>=1.2",

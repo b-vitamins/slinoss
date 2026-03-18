@@ -9,6 +9,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  TORCH_VERSION: "2.10.0"
+
 jobs:
   build_pure:
     runs-on: ubuntu-24.04
@@ -49,7 +52,7 @@ jobs:
           python -m pip install --upgrade \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple \
-            "torch>=2.4"
+            "torch==${TORCH_VERSION}"
 
       - name: Clean build artifacts
         run: rm -rf build dist *.egg-info
@@ -71,8 +74,9 @@ jobs:
           /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple \
-            "torch>=2.4"
+            "torch==${TORCH_VERSION}"
           /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install "dist/${{ steps.meta.outputs.wheel_name }}"
+          cd /tmp
           /tmp/slinoss-pure-wheel-smoke/bin/python - <<'PY'
           import torch
           from slinoss.layers import SLinOSSMixer
@@ -145,9 +149,8 @@ jobs:
 
       - name: Install PyTorch CUDA wheel
         run: >
-          python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu128
-          --extra-index-url https://pypi.org/simple
-          "torch>=2.4"
+          python -m pip install --upgrade
+          "torch==${TORCH_VERSION}"
 
       - name: Clean build artifacts
         run: rm -rf build dist *.egg-info
@@ -174,6 +177,33 @@ jobs:
           print(f"wheel_name={wheels[0]}")
           PY
 
+      - name: Verify CUDA wheel contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          wheel = Path("dist/${{ steps.wheel.outputs.wheel_name }}")
+          with zipfile.ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+
+          required = "slinoss/_C/__init__.py"
+          if required not in names:
+              raise SystemExit(f"Missing {required} in {wheel.name}")
+
+          extension_members = [
+              name
+              for name in names
+              if name.startswith("slinoss/_C/cconv1d_cuda")
+          ]
+          if len(extension_members) != 1:
+              raise SystemExit(
+                  f"Expected one packaged cconv1d extension in {wheel.name}, "
+                  f"found {extension_members}"
+              )
+          print("cuda-wheel-extension", extension_members[0])
+          PY
+
       - name: Smoke install CUDA wheel
         env:
           PIP_PREFER_BINARY: "1"
@@ -181,18 +211,17 @@ jobs:
           python -m venv /tmp/slinoss-cuda-wheel-smoke
           WHEEL_URL="file://${GITHUB_WORKSPACE}/dist/${{ steps.wheel.outputs.wheel_name }}"
           /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install --upgrade pip
-          /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install \
-            --index-url https://download.pytorch.org/whl/cu128 \
-            --extra-index-url https://pypi.org/simple \
-            "torch>=2.4"
           /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install "slinoss[cuda] @ ${WHEEL_URL}"
+          cd /tmp
           /tmp/slinoss-cuda-wheel-smoke/bin/python - <<'PY'
           import torch
           import cutlass  # noqa: F401
           import cuda  # noqa: F401
+          import slinoss
           from slinoss.layers import SLinOSSMixer
           from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
 
+          print("slinoss_import", slinoss.__file__)
           assert cconv1d_is_available(), cconv1d_load_error()
           mixer = SLinOSSMixer(
               d_model=32,
