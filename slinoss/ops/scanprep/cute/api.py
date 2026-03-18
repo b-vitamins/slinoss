@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 
 from slinoss.layers.backend import ScanInputs
-from slinoss.ops.scanprep.cute.autograd import scanprep_cute_training_autograd
-from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute
 
 
 def scanprep_cute(
@@ -94,6 +92,8 @@ def scanprep_cute(
         )
     )
     if grads_enabled:
+        from slinoss.ops.scanprep.cute.autograd import scanprep_cute_training_autograd
+
         U, M, K, B, C = scanprep_cute_training_autograd(
             value,
             params,
@@ -120,6 +120,8 @@ def scanprep_cute(
             c_scale=c_scale,
         )
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
+
+    from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute
 
     U, M, K, B, C = scanprep_fwd_cute(
         value,

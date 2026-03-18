@@ -14,20 +14,49 @@ In this repo, the core pieces are:
 
 ## Install
 
-For a pip-based local install, run:
+For a local source install, run:
 
 ```bash
-pip install -r requirements.txt
+pip install .
 ```
 
-For local development tools as well, run:
+For local development with CUDA/CuTe extras and repo tooling, run:
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -e .[cuda,dev]
 ```
 
 The repo also ships a Guix environment in [`manifest.scm`](./manifest.scm), which
 remains the reproducible path for CuTe/CUTLASS development.
+
+For downstream repos that should install SLinOSS without building from source,
+depend on a GitHub Releases wheel.
+
+Reference / CPU installs can use the universal wheel:
+
+```txt
+slinoss @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.0/slinoss-0.1.0-py3-none-any.whl
+```
+
+CUDA installs that need both the CuTe backend and the compiled
+`setup.py` causal-conv extension should use the matching platform wheel plus the
+`cuda` extra. For Linux x86_64 on Python 3.11, that looks like:
+
+```txt
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.0/slinoss-0.1.0-cp311-cp311-linux_x86_64.whl
+```
+
+In `pyproject.toml`, the equivalent is:
+
+```toml
+dependencies = [
+  "slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.0/slinoss-0.1.0-cp311-cp311-linux_x86_64.whl",
+]
+```
+
+Replace `v0.1.0` and `0.1.0` with the release tag and package version you want
+to consume, and pick the wheel asset whose Python and platform tags match your
+environment.
 
 ## Example
 

@@ -14,8 +14,8 @@ from slinoss.ops.scanprep import (
     build_transition_from_polar,
     foh_taps_from_polar,
     principal_angle,
+    scanprep_cute,
 )
-from slinoss.ops.scanprep.cute import scanprep_cute
 from slinoss.ops.scanprep.reference import _foh_taps_from_normalized, _pack_complex
 
 from .backend import (

@@ -1,0 +1,211 @@
+name: release-wheel
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build_pure:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      wheel_name: ${{ steps.meta.outputs.wheel_name }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Read package metadata
+        id: meta
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          version = data["project"]["version"]
+          print(f"version={version}")
+          print(f"wheel_name=slinoss-{version}-py3-none-any.whl")
+          PY
+
+      - name: Ensure tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "${GITHUB_REF_NAME}" = "v${{ steps.meta.outputs.version }}"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip setuptools>=69 wheel build
+
+      - name: Build universal wheel
+        env:
+          SLINOSS_SKIP_CUDA_BUILD: "1"
+        run: python -m build --wheel --no-isolation
+
+      - name: Verify universal wheel output
+        run: test -f "dist/${{ steps.meta.outputs.wheel_name }}"
+
+      - name: Smoke install universal wheel
+        env:
+          PIP_PREFER_BINARY: "1"
+        run: |
+          python -m venv /tmp/slinoss-pure-wheel-smoke
+          /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/slinoss-pure-wheel-smoke/bin/python -m pip install "dist/${{ steps.meta.outputs.wheel_name }}"
+          /tmp/slinoss-pure-wheel-smoke/bin/python - <<'PY'
+          import torch
+          from slinoss.layers import SLinOSSMixer
+
+          mixer = SLinOSSMixer(
+              d_model=32,
+              d_state=32,
+              expand=2,
+              d_head=16,
+              d_conv=4,
+          )
+          x = torch.randn(2, 8, 32)
+          y = mixer(x)
+          assert y.shape == (2, 8, 32)
+          print("pure-wheel-smoke-ok", tuple(y.shape))
+          PY
+
+      - name: Upload universal wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slinoss-pure-wheel-${{ steps.meta.outputs.version }}
+          path: dist/${{ steps.meta.outputs.wheel_name }}
+
+  build_cuda:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      wheel_name: ${{ steps.wheel.outputs.wheel_name }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Read package metadata
+        id: meta
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          print(f"version={data['project']['version']}")
+          PY
+
+      - name: Ensure tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "${GITHUB_REF_NAME}" = "v${{ steps.meta.outputs.version }}"
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.29
+        with:
+          cuda: "12.8.0"
+          linux-local-args: '["--toolkit"]'
+
+      - name: Show nvcc version
+        run: nvcc -V
+
+      - name: Install build tooling
+        run: >
+          python -m pip install --upgrade pip setuptools>=69 wheel build
+          "torch>=2.4"
+
+      - name: Build CUDA wheel
+        env:
+          CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+          TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
+        run: python -m build --wheel --no-isolation
+
+      - name: Capture CUDA wheel name
+        id: wheel
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+
+          wheels = [
+              wheel.name
+              for wheel in Path("dist").glob("slinoss-*.whl")
+              if "py3-none-any" not in wheel.name
+          ]
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one CUDA wheel, found: {wheels}")
+          print(f"wheel_name={wheels[0]}")
+          PY
+
+      - name: Smoke install CUDA wheel
+        env:
+          PIP_PREFER_BINARY: "1"
+          LD_LIBRARY_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64
+        run: |
+          python -m venv /tmp/slinoss-cuda-wheel-smoke
+          WHEEL_URL="file://${GITHUB_WORKSPACE}/dist/${{ steps.wheel.outputs.wheel_name }}"
+          /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/slinoss-cuda-wheel-smoke/bin/python -m pip install "slinoss[cuda] @ ${WHEEL_URL}"
+          /tmp/slinoss-cuda-wheel-smoke/bin/python - <<'PY'
+          import cutlass  # noqa: F401
+          import cuda  # noqa: F401
+          import slinoss._C.cconv1d_cuda  # noqa: F401
+          from slinoss.layers import SLinOSSMixer
+          from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
+
+          assert cconv1d_is_available(), cconv1d_load_error()
+          mixer = SLinOSSMixer(
+              d_model=32,
+              d_state=32,
+              expand=2,
+              d_head=16,
+              d_conv=4,
+          )
+          print("cuda-wheel-smoke-ok", type(mixer).__name__)
+          PY
+
+      - name: Upload CUDA wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slinoss-cuda-wheel-${{ steps.meta.outputs.version }}
+          path: dist/${{ steps.wheel.outputs.wheel_name }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build_pure
+      - build_cuda
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download universal wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: slinoss-pure-wheel-${{ needs.build_pure.outputs.version }}
+          path: dist
+
+      - name: Download CUDA wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: slinoss-cuda-wheel-${{ needs.build_cuda.outputs.version }}
+          path: dist
+
+      - name: Publish GitHub release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
