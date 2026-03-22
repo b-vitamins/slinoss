@@ -38,11 +38,11 @@ def scanprep_cute(
     Public contract:
     - ``value``: ``(B, T, H * P)`` post-conv/post-activation mixer values
     - ``params``: ``(B, T, H * 13)`` flat scanprep parameter stream
-    - ``bc``: ``(B, T, H, 4, N)`` projected ``bc_proj(value)`` output
+    - ``bc``: ``(B, T, H, 4, N)`` mixer-emitted BC tensor
     - output: packed scan-native ``(U, M, K, B, C)``
 
     Design constraints:
-    - ``bc_proj`` stays outside this backend
+    - BC generation stays outside this backend
     - this boundary is training-only for now
     - the default eager/reference backend remains the source of truth until the
       fused CuTe implementation is complete

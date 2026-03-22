@@ -129,7 +129,10 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     out["forward.mixer.dw_conv_activation"] = sample.get(
         "forward.mixer.dw_conv_activation", 0.0
     )
-    out["forward.mixer.bc_proj"] = sample.get("forward.mixer.bc_proj", 0.0)
+    out["forward.mixer.bc_emit"] = sample.get(
+        "forward.mixer.bc_emit",
+        sample.get("forward.mixer.bc_proj", 0.0),
+    )
     out["forward.mixer.scanprep.total"] = _scanprep_total("forward")
     out["forward.mixer.scanprep.pack_u"] = sample.get(
         "forward.mixer.scanprep.pack_u", 0.0
@@ -149,7 +152,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         out["forward.mixer.in_proj"]
         + out["forward.mixer.dw_conv"]
         + out["forward.mixer.dw_conv_activation"]
-        + out["forward.mixer.bc_proj"]
+        + out["forward.mixer.bc_emit"]
         + out["forward.mixer.scanprep.total"]
         + out["forward.mixer.gate_skip"]
         + out["forward.mixer.out_proj"]
@@ -159,7 +162,10 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     out["backward.mixer.dw_conv_activation"] = sample.get(
         "backward.mixer.dw_conv_activation", 0.0
     )
-    out["backward.mixer.bc_proj"] = sample.get("backward.mixer.bc_proj", 0.0)
+    out["backward.mixer.bc_emit"] = sample.get(
+        "backward.mixer.bc_emit",
+        sample.get("backward.mixer.bc_proj", 0.0),
+    )
     out["backward.mixer.scanprep.total"] = _scanprep_total("backward")
     out["backward.mixer.scanprep.pack_u"] = sample.get(
         "backward.mixer.scanprep.pack_u", 0.0
@@ -179,7 +185,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         out["backward.mixer.in_proj"]
         + out["backward.mixer.dw_conv"]
         + out["backward.mixer.dw_conv_activation"]
-        + out["backward.mixer.bc_proj"]
+        + out["backward.mixer.bc_emit"]
         + out["backward.mixer.scanprep.total"]
         + out["backward.mixer.gate_skip"]
         + out["backward.mixer.out_proj"]

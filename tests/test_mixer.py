@@ -88,6 +88,14 @@ def test_mixer_defaults_to_auto_scan_backend() -> None:
     assert isinstance(mixer.backend, AutoScanBackend)
 
 
+def test_mixer_emits_bc_from_in_proj() -> None:
+    mixer = _make_mixer()
+    assert not hasattr(mixer, "bc_proj")
+    assert mixer.in_proj.out_features == (
+        2 * mixer.d_inner + mixer.param_proj_dim + mixer.bc_proj_dim
+    )
+
+
 def test_mixer_rejects_incompatible_d_state_for_cute_scan_backend() -> None:
     if not torch.cuda.is_available():
         return

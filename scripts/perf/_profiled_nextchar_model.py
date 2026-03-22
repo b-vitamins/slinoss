@@ -51,10 +51,8 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
         return ScanInputs(U=U, M=coeffs[0], K=coeffs[1], B=B, C=C)
 
     def _build_scan_inputs(
-        self, *, value: torch.Tensor, params: torch.Tensor
+        self, *, value: torch.Tensor, params: torch.Tensor, bc: torch.Tensor
     ) -> ScanInputs:
-        batch, T, _ = map(int, value.shape)
-        bc = call_region("mixer.bc_proj", self._project_bc, value, batch, T)
         if isinstance(self.scanprep.backend, ReferenceScanPrepBackend):
             return cast(
                 ScanInputs,
@@ -92,9 +90,9 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             return (empty, next_state) if return_state else empty
 
         proj = call_region("mixer.in_proj", self.in_proj, x)
-        gate, value_raw, params = torch.split(
+        gate, value_raw, params, bc_flat = torch.split(
             proj,
-            [self.d_inner, self.d_inner, self.n_heads * self.scanprep.param_dim],
+            [self.d_inner, self.d_inner, self.param_proj_dim, self.bc_proj_dim],
             dim=-1,
         )
         conv_state_in = None if state is None else state.conv
@@ -105,8 +103,9 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             conv_state_in,
         )
         value = call_region("mixer.dw_conv_activation", F.silu, conv_out)
+        bc = call_region("mixer.bc_emit", self._reshape_bc, bc_flat, batch, T)
 
-        scan_inputs = self._build_scan_inputs(value=value, params=params)
+        scan_inputs = self._build_scan_inputs(value=value, params=params, bc=bc)
         scan_state_in = None if state is None else state.scan
         scan_result = call_region(
             "v2x2ssd.total",

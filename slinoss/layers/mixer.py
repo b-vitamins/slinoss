@@ -109,10 +109,11 @@ class SLinOSSMixer(nn.Module):
             AutoCConv1dBackend() if cconv_backend is None else cconv_backend
         )
 
-        param_dim = self.n_heads * self.scanprep.param_dim
+        self.param_proj_dim = self.n_heads * self.scanprep.param_dim
+        self.bc_proj_dim = self.n_heads * 4 * self.d_state
         self.in_proj = nn.Linear(
             self.d_model,
-            2 * self.d_inner + param_dim,
+            2 * self.d_inner + self.param_proj_dim + self.bc_proj_dim,
             bias=False,
             **factory_kwargs,
         )
@@ -120,12 +121,6 @@ class SLinOSSMixer(nn.Module):
             torch.empty((self.d_inner, self.d_conv), **factory_kwargs)
         )
         self.dw_bias = nn.Parameter(torch.empty((self.d_inner,), **factory_kwargs))
-        self.bc_proj = nn.Linear(
-            self.d_inner,
-            self.n_heads * 4 * self.d_state,
-            bias=False,
-            **factory_kwargs,
-        )
         self.out_proj = nn.Linear(
             self.d_inner, self.d_model, bias=False, **factory_kwargs
         )
@@ -324,9 +319,8 @@ class SLinOSSMixer(nn.Module):
         *,
         value: torch.Tensor,
         params: torch.Tensor,
+        bc: torch.Tensor,
     ) -> ScanInputs:
-        batch, T, _ = map(int, value.shape)
-        bc = self._project_bc(value, batch, T)
         return self.scanprep(value, params, bc)
 
     def forward(
@@ -348,9 +342,9 @@ class SLinOSSMixer(nn.Module):
             return (empty, next_state) if return_state else empty
 
         proj = self.in_proj(x)
-        gate, value_raw, params = torch.split(
+        gate, value_raw, params, bc_flat = torch.split(
             proj,
-            [self.d_inner, self.d_inner, self.n_heads * self.scanprep.param_dim],
+            [self.d_inner, self.d_inner, self.param_proj_dim, self.bc_proj_dim],
             dim=-1,
         )
         conv_state_in = None if state is None else state.conv
@@ -358,8 +352,9 @@ class SLinOSSMixer(nn.Module):
             value_raw, conv_state_in
         )
         value = F.silu(conv_out)
+        bc = self._reshape_bc(bc_flat, batch, T)
 
-        scan_inputs = self._build_scan_inputs(value=value, params=params)
+        scan_inputs = self._build_scan_inputs(value=value, params=params, bc=bc)
         scan_state_in = None if state is None else state.scan
         scan_result = self._run_scan_backend(scan_inputs, scan_state_in, return_state)
         if return_state:
@@ -395,8 +390,11 @@ class SLinOSSMixer(nn.Module):
             y = self.output_norm(y)
         return y
 
-    def _project_bc(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
-        return self.bc_proj(value).view(batch, T, self.n_heads, 4, self.d_state)
+    def _reshape_bc(self, bc: torch.Tensor, batch: int, T: int) -> torch.Tensor:
+        expected = (batch, T, self.bc_proj_dim)
+        if tuple(map(int, bc.shape)) != expected:
+            raise ValueError(f"bc must be {expected}. Got {tuple(bc.shape)}.")
+        return bc.view(batch, T, self.n_heads, 4, self.d_state)
 
     def _apply_causal_depthwise_conv_with_state(
         self,
