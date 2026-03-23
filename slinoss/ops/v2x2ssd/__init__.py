@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, cast
+
+import torch
 
 from .reference import (
     chunk_increment,
@@ -15,10 +17,13 @@ from .reference import (
 
 
 def v2x2ssd_cute(*args: Any, **kwargs: Any):
-    """Lazily import the CuTe scan path so base installs stay importable."""
+    """Compiler boundary for the CuTe scan JIT/runtime path."""
     from .cute import v2x2ssd_cute as _v2x2ssd_cute
 
     return _v2x2ssd_cute(*args, **kwargs)
+
+
+v2x2ssd_cute = cast(Callable[..., Any], torch.compiler.disable(v2x2ssd_cute))
 
 
 __all__ = [

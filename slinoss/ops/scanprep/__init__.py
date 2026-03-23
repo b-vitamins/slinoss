@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, cast
+
+import torch
 
 from .reference import (
     SLinOSSScanPrepCoefficients,
@@ -13,10 +15,13 @@ from .reference import (
 
 
 def scanprep_cute(*args: Any, **kwargs: Any):
-    """Lazily import the CuTe scanprep path so base installs stay importable."""
+    """Compiler boundary for the CuTe scanprep JIT/runtime path."""
     from .cute import scanprep_cute as _scanprep_cute
 
     return _scanprep_cute(*args, **kwargs)
+
+
+scanprep_cute = cast(Callable[..., Any], torch.compiler.disable(scanprep_cute))
 
 
 __all__ = [

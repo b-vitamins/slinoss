@@ -179,6 +179,83 @@ def test_mixer_forward_supports_issue_3_shape() -> None:
     assert torch.isfinite(y).all()
 
 
+def test_mixer_torch_compile_contains_only_intentional_cute_boundary_break() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        device="cuda",
+        dtype=torch.float16,
+    ).eval()
+    x = torch.randn((2, 64, 128), device="cuda", dtype=torch.float16)
+
+    explain = torch._dynamo.explain(mixer)
+    result = explain(x)
+
+    assert result.graph_count == 2
+    assert result.graph_break_count == 1
+    assert len(result.break_reasons) == 1
+    assert "torch.compiler.disable" in result.break_reasons[0].reason
+
+
+def test_mixer_torch_compile_runs_training_with_cute_boundaries() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        device="cuda",
+        dtype=torch.float16,
+    ).train()
+    compiled = torch.compile(mixer, backend="eager")
+
+    x0 = torch.randn(
+        (2, 64, 128), device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    y0 = compiled(x0)
+    loss0 = y0.to(dtype=torch.float32).square().mean()
+    loss0.backward()
+
+    assert torch.isfinite(y0).all()
+    assert x0.grad is not None
+    assert torch.isfinite(x0.grad).all()
+    for param in mixer.parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all()
+
+    mixer.zero_grad(set_to_none=True)
+    x1 = torch.randn(
+        (2, 64, 128), device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    y1 = compiled(x1)
+    loss1 = y1.to(dtype=torch.float32).square().mean()
+    loss1.backward()
+
+    assert torch.isfinite(y1).all()
+    assert x1.grad is not None
+    assert torch.isfinite(x1.grad).all()
+    for param in mixer.parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all()
+
+
 def test_mixer_step_matches_full_forward() -> None:
     torch.manual_seed(1)
     mixer = _make_mixer()
