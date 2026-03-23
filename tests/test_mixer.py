@@ -121,6 +121,39 @@ def test_mixer_rejects_incompatible_d_state_for_cute_scan_backend() -> None:
         mixer(x)
 
 
+def test_mixer_backward_supports_issue_2_shape() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        128,
+        d_state=16,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    x = torch.randn(
+        (2, 65, 128), device="cuda", dtype=torch.float16, requires_grad=True
+    )
+
+    y = mixer(x)
+    loss = y.to(dtype=torch.float32).square().mean()
+    loss.backward()
+
+    assert torch.isfinite(y).all()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    for param in mixer.parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all()
+
+
 def test_mixer_step_matches_full_forward() -> None:
     torch.manual_seed(1)
     mixer = _make_mixer()

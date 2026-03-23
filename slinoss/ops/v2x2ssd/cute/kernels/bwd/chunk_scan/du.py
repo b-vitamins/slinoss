@@ -194,10 +194,7 @@ class ChunkScanBwdDUAmpere:
         sDY_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
         sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
         sDV_prev_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, Pp), (0, 1))
-        if cutlass.const_expr(cute.cosize(sQ_layout) < cute.cosize(sDV_prev_layout)):
-            raise ValueError(
-                "DU kernel expects D_padded >= P_padded so it can alias sDV_prev into sQ."
-            )
+        use_dv_prev_storage = cute.cosize(sQ_layout) < cute.cosize(sDV_prev_layout)
 
         smem_k_block_size_blk = kv_tile
         swizzle_bits_blk = 3
@@ -275,6 +272,13 @@ class ChunkScanBwdDUAmpere:
             ]
             sV_tile: cute.struct.Align[
                 cute.struct.MemRange[mU.element_type, cute.cosize(sV_layout)], 16
+            ]
+            sDV_prev: cute.struct.Align[
+                cute.struct.MemRange[
+                    mU.element_type,
+                    cute.cosize(sDV_prev_layout) if use_dv_prev_storage else 1,
+                ],
+                16,
             ]
             sS_blk: cute.struct.Align[
                 cute.struct.MemRange[mU.element_type, cute.cosize(sBlk_layout)], 16
@@ -395,7 +399,10 @@ class ChunkScanBwdDUAmpere:
         sDY1 = sDY0
         sK_tile = storage.sK_tile.get_tensor(sK_layout)
         sV_tile = storage.sV_tile.get_tensor(sV_layout)
-        sDV_prev = cute.make_tensor(sQ0.iterator, sDV_prev_layout)
+        if cutlass.const_expr(cute.cosize(sQ_layout) < cute.cosize(sDV_prev_layout)):
+            sDV_prev = storage.sDV_prev.get_tensor(sDV_prev_layout)
+        else:
+            sDV_prev = cute.make_tensor(sQ0.iterator, sDV_prev_layout)
         sDV_carry = storage.sDV_carry.get_tensor(cute.make_layout((Pp,), stride=(1,)))
         sS_blk = storage.sS_blk.get_tensor(sBlk_layout)
         s_phase = storage.s_phase.get_tensor(
