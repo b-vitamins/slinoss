@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_ptr
 
 from .db import ChunkScanBwdDBAmpere
 from .dlp import ChunkScanBwdDLPAmpere
@@ -142,23 +142,83 @@ def _get_zero_prev_tensors(
     return cached
 
 
-def _as_cute_compact(
+def _assumed_align(
     t: torch.Tensor,
+    candidates_bytes: tuple[int, ...] = (16, 8, 4),
+) -> int:
+    elem_align = max(1, t.element_size())
+    ptr = int(t.data_ptr())
+    for align in candidates_bytes:
+        if align < elem_align:
+            continue
+        if (ptr % align) == 0:
+            return align
+    return elem_align
+
+
+def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= int(shape[i])
+    return tuple(stride)
+
+
+def _make_tensor_spec(
+    shape: tuple[int, ...],
     *,
-    leading_dim: int,
-    mode: int,
-    stride_order: tuple[int, ...],
-    divisibility: int,
-):
-    return (
-        from_dlpack(t, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=leading_dim)
-        .mark_compact_shape_dynamic(
-            mode=mode,
-            stride_order=stride_order,
-            divisibility=divisibility,
-        )
+    stride: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    shape = tuple(int(dim) for dim in shape)
+    if stride is None:
+        stride = _make_row_major_stride(shape)
+    else:
+        stride = tuple(int(step) for step in stride)
+    return shape, stride
+
+
+def _make_tensor_spec_from_tensor(
+    t: torch.Tensor,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    return _make_tensor_spec(
+        tuple(map(int, t.shape)), stride=tuple(map(int, t.stride()))
     )
+
+
+def _make_tensor_from_spec(
+    ptr: cute.Pointer,
+    spec: tuple[tuple[int, ...], tuple[int, ...]],
+):
+    shape, stride = spec
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+
+
+def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+    align = _assumed_align(t)
+    return (
+        make_ptr(
+            _torch_to_cutlass_dtype(t.dtype),
+            t.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=align,
+        ),
+        align,
+    )
+
+
+def _make_ptr_args(
+    *tensors: torch.Tensor,
+) -> tuple[tuple[object, ...], tuple[int, ...]]:
+    ptrs: list[object] = []
+    alignments: list[int] = []
+    for tensor in tensors:
+        ptr, align = _make_ptr_arg(tensor)
+        ptrs.append(ptr)
+        alignments.append(align)
+    return tuple(ptrs), tuple(alignments)
 
 
 def _public_from_chunked(
@@ -236,7 +296,7 @@ def _compiled_key(
     d_out_shape: tuple[int, ...],
     chunk_size: int,
     has_prev: bool,
-    input_ptr_signature: tuple[int, ...],
+    alignments: tuple[int, ...],
     num_threads_du: int,
     num_threads_db: int,
     num_threads_dc: int,
@@ -255,12 +315,337 @@ def _compiled_key(
         d_out_shape,
         int(chunk_size),
         has_prev,
-        input_ptr_signature,
+        alignments,
         int(num_threads_du),
         int(num_threads_db),
         int(num_threads_dc),
         int(num_threads_param),
     )
+
+
+def _make_dz0_host_wrapper(
+    *,
+    spec: tuple[tuple[int, ...], ...],
+    cfg: tuple[int, ...],
+):
+    (chunk_size,) = cfg
+    d_out_spec, c_spec, m_spec, dz0_spec = spec
+
+    @cute.jit
+    def _dz0_host_wrapper(
+        DOut_ptr: cute.Pointer,
+        C_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        DZ0_ptr: cute.Pointer,
+    ):
+        mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
+        mC = _make_tensor_from_spec(C_ptr, c_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mDZ0 = _make_tensor_from_spec(DZ0_ptr, dz0_spec)
+
+        kernel = ChunkScanBwdDZ0Ampere(DOut_ptr.value_type, chunk_size=chunk_size)
+        kernel(mDOut, mC, mM, mDZ0)
+
+    return _dz0_host_wrapper
+
+
+def _make_du_host_wrapper(
+    *,
+    spec: tuple[tuple[int, ...], ...],
+    cfg: tuple[int, ...],
+):
+    chunk_size, D, P, num_threads = cfg
+    (
+        u_spec,
+        b_spec,
+        c_spec,
+        m_spec,
+        k_spec,
+        d_out_spec,
+        u_prev0_spec,
+        b_prev0_spec,
+        d_u_spec,
+        d_b_scratch_spec,
+        d_u_prev_spec,
+        d_b_prev_scratch_spec,
+        dlp_spec,
+        dmp_spec,
+        dmc_spec,
+    ) = spec
+
+    @cute.jit
+    def _du_host_wrapper(
+        U_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        C_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        K_ptr: cute.Pointer,
+        DOut_ptr: cute.Pointer,
+        UPrev0_ptr: cute.Pointer,
+        BPrev0_ptr: cute.Pointer,
+        DU_ptr: cute.Pointer,
+        DBScratch_ptr: cute.Pointer,
+        DUPrev_ptr: cute.Pointer,
+        DBPrevScratch_ptr: cute.Pointer,
+        DLp_ptr: cute.Pointer,
+        DMp_ptr: cute.Pointer,
+        DMc_ptr: cute.Pointer,
+    ):
+        mU = _make_tensor_from_spec(U_ptr, u_spec)
+        mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mC = _make_tensor_from_spec(C_ptr, c_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mK = _make_tensor_from_spec(K_ptr, k_spec)
+        mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
+        mUPrev0 = _make_tensor_from_spec(UPrev0_ptr, u_prev0_spec)
+        mBPrev0 = _make_tensor_from_spec(BPrev0_ptr, b_prev0_spec)
+        mDU = _make_tensor_from_spec(DU_ptr, d_u_spec)
+        mDBScratch = _make_tensor_from_spec(DBScratch_ptr, d_b_scratch_spec)
+        mDUPrev = _make_tensor_from_spec(DUPrev_ptr, d_u_prev_spec)
+        mDBPrevScratch = _make_tensor_from_spec(
+            DBPrevScratch_ptr, d_b_prev_scratch_spec
+        )
+        mDLp = _make_tensor_from_spec(DLp_ptr, dlp_spec)
+        mDMp = _make_tensor_from_spec(DMp_ptr, dmp_spec)
+        mDMc = _make_tensor_from_spec(DMc_ptr, dmc_spec)
+
+        kernel = ChunkScanBwdDUAmpere(
+            U_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=num_threads,
+        )
+        kernel(
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mUPrev0,
+            mBPrev0,
+            mDU,
+            mDBScratch,
+            mDUPrev,
+            mDBPrevScratch,
+            mDLp,
+            mDMp,
+            mDMc,
+        )
+
+    return _du_host_wrapper
+
+
+def _make_db_host_wrapper(
+    *,
+    spec: tuple[tuple[int, ...], ...],
+    cfg: tuple[int, ...],
+):
+    chunk_size, D, P, num_threads = cfg
+    (
+        u_spec,
+        b_spec,
+        c_spec,
+        m_spec,
+        k_spec,
+        d_out_spec,
+        u_prev0_spec,
+        b_prev0_spec,
+        d_u_scratch_spec,
+        d_b_spec,
+        d_u_prev_scratch_spec,
+        d_b_prev_spec,
+        dlp_spec,
+        dmp_spec,
+        dmc_spec,
+    ) = spec
+
+    @cute.jit
+    def _db_host_wrapper(
+        U_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        C_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        K_ptr: cute.Pointer,
+        DOut_ptr: cute.Pointer,
+        UPrev0_ptr: cute.Pointer,
+        BPrev0_ptr: cute.Pointer,
+        DUScratch_ptr: cute.Pointer,
+        DB_ptr: cute.Pointer,
+        DUPrevScratch_ptr: cute.Pointer,
+        DBPrev_ptr: cute.Pointer,
+        DLp_ptr: cute.Pointer,
+        DMp_ptr: cute.Pointer,
+        DMc_ptr: cute.Pointer,
+    ):
+        mU = _make_tensor_from_spec(U_ptr, u_spec)
+        mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mC = _make_tensor_from_spec(C_ptr, c_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mK = _make_tensor_from_spec(K_ptr, k_spec)
+        mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
+        mUPrev0 = _make_tensor_from_spec(UPrev0_ptr, u_prev0_spec)
+        mBPrev0 = _make_tensor_from_spec(BPrev0_ptr, b_prev0_spec)
+        mDUScratch = _make_tensor_from_spec(DUScratch_ptr, d_u_scratch_spec)
+        mDB = _make_tensor_from_spec(DB_ptr, d_b_spec)
+        mDUPrevScratch = _make_tensor_from_spec(
+            DUPrevScratch_ptr, d_u_prev_scratch_spec
+        )
+        mDBPrev = _make_tensor_from_spec(DBPrev_ptr, d_b_prev_spec)
+        mDLp = _make_tensor_from_spec(DLp_ptr, dlp_spec)
+        mDMp = _make_tensor_from_spec(DMp_ptr, dmp_spec)
+        mDMc = _make_tensor_from_spec(DMc_ptr, dmc_spec)
+
+        kernel = ChunkScanBwdDBAmpere(
+            U_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=num_threads,
+        )
+        kernel(
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mUPrev0,
+            mBPrev0,
+            mDUScratch,
+            mDB,
+            mDUPrevScratch,
+            mDBPrev,
+            mDLp,
+            mDMp,
+            mDMc,
+        )
+
+    return _db_host_wrapper
+
+
+def _make_dc_host_wrapper(
+    *,
+    spec: tuple[tuple[int, ...], ...],
+    cfg: tuple[int, ...],
+):
+    chunk_size, D, P, num_threads = cfg
+    (
+        u_spec,
+        b_spec,
+        c_spec,
+        m_spec,
+        k_spec,
+        d_out_spec,
+        u_prev0_spec,
+        b_prev0_spec,
+        z0_spec,
+        dlp_spec,
+        d_c_spec,
+        d_r_spec,
+    ) = spec
+
+    @cute.jit
+    def _dc_host_wrapper(
+        U_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        C_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        K_ptr: cute.Pointer,
+        DOut_ptr: cute.Pointer,
+        UPrev0_ptr: cute.Pointer,
+        BPrev0_ptr: cute.Pointer,
+        Z0_ptr: cute.Pointer,
+        DLp_ptr: cute.Pointer,
+        DC_ptr: cute.Pointer,
+        DR_ptr: cute.Pointer,
+    ):
+        mU = _make_tensor_from_spec(U_ptr, u_spec)
+        mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mC = _make_tensor_from_spec(C_ptr, c_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mK = _make_tensor_from_spec(K_ptr, k_spec)
+        mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
+        mUPrev0 = _make_tensor_from_spec(UPrev0_ptr, u_prev0_spec)
+        mBPrev0 = _make_tensor_from_spec(BPrev0_ptr, b_prev0_spec)
+        mZ0 = _make_tensor_from_spec(Z0_ptr, z0_spec)
+        mDLp = _make_tensor_from_spec(DLp_ptr, dlp_spec)
+        mDC = _make_tensor_from_spec(DC_ptr, d_c_spec)
+        mDR = _make_tensor_from_spec(DR_ptr, d_r_spec)
+
+        kernel = ChunkScanBwdDLPAmpere(
+            U_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=num_threads,
+        )
+        kernel(
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mUPrev0,
+            mBPrev0,
+            mZ0,
+            mDLp,
+            mDC,
+            mDR,
+        )
+
+    return _dc_host_wrapper
+
+
+def _make_param_host_wrapper(
+    *,
+    spec: tuple[tuple[int, ...], ...],
+    cfg: tuple[int, ...],
+):
+    chunk_size, num_threads = cfg
+    (
+        m_spec,
+        k_spec,
+        dlp_spec,
+        dmp_spec,
+        dmc_spec,
+        d_r_spec,
+        d_m_spec,
+        d_kprev_spec,
+        d_kcurr_spec,
+    ) = spec
+
+    @cute.jit
+    def _param_host_wrapper(
+        M_ptr: cute.Pointer,
+        K_ptr: cute.Pointer,
+        DLp_ptr: cute.Pointer,
+        DMp_ptr: cute.Pointer,
+        DMc_ptr: cute.Pointer,
+        DR_ptr: cute.Pointer,
+        DM_ptr: cute.Pointer,
+        DKprev_ptr: cute.Pointer,
+        DKcurr_ptr: cute.Pointer,
+    ):
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mK = _make_tensor_from_spec(K_ptr, k_spec)
+        mDLp = _make_tensor_from_spec(DLp_ptr, dlp_spec)
+        mDMp = _make_tensor_from_spec(DMp_ptr, dmp_spec)
+        mDMc = _make_tensor_from_spec(DMc_ptr, dmc_spec)
+        mDR = _make_tensor_from_spec(DR_ptr, d_r_spec)
+        mDM = _make_tensor_from_spec(DM_ptr, d_m_spec)
+        mDKprev = _make_tensor_from_spec(DKprev_ptr, d_kprev_spec)
+        mDKcurr = _make_tensor_from_spec(DKcurr_ptr, d_kcurr_spec)
+
+        kernel = ChunkScanBwdParamScanAmpere(
+            chunk_size=chunk_size,
+            num_threads=num_threads,
+        )
+        kernel(mM, mK, mDLp, mDMp, mDMc, mDR, mDM, mDKprev, mDKcurr)
+
+    return _param_host_wrapper
 
 
 def compile_chunk_scan_bwd_kernels(
@@ -316,35 +701,6 @@ def compile_chunk_scan_bwd_kernels(
         raise ValueError("num_threads_dc must be 128 for the dC/dR kernel.")
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
-    cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
-    cache_key = _compiled_key(
-        device_index=(U.device.index if U.device.index is not None else -1),
-        tc_dtype=tc_dtype,
-        U_shape=tuple(U.shape),
-        B_shape=tuple(B.shape),
-        C_shape=tuple(C.shape),
-        M_shape=tuple(M.shape),
-        K_shape=tuple(K.shape),
-        chunk_starts_shape=tuple(chunk_starts.shape),
-        d_out_shape=tuple(d_out.shape),
-        chunk_size=L,
-        has_prev=B_prev is not None,
-        input_ptr_signature=(
-            int(U.data_ptr()),
-            int(M.data_ptr()),
-            int(K.data_ptr()),
-            int(B.data_ptr()),
-            int(C.data_ptr()),
-            int(chunk_starts.data_ptr()),
-            int(d_out.data_ptr()),
-            int(B_prev.data_ptr()) if B_prev is not None else 0,
-            int(U_prev.data_ptr()) if U_prev is not None else 0,
-        ),
-        num_threads_du=num_threads_du,
-        num_threads_db=num_threads_db,
-        num_threads_dc=num_threads_dc,
-        num_threads_param=num_threads_param,
-    )
 
     U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
     B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
@@ -377,28 +733,7 @@ def compile_chunk_scan_bwd_kernels(
     M2 = M_f.reshape(BH, T_pad, 2).permute(2, 1, 0)
 
     dZ0 = torch.empty((BHC, P, D), device=U.device, dtype=torch.float32)
-    mDOut_dz0 = _as_cute_compact(
-        dOut2,
-        leading_dim=0,
-        mode=0,
-        stride_order=(2, 1, 0),
-        divisibility=(128 // cutlass_dtype.width),
-    )
-    mC_dz0 = _as_cute_compact(
-        C2,
-        leading_dim=0,
-        mode=0,
-        stride_order=(2, 1, 0),
-        divisibility=(128 // cutlass_dtype.width),
-    )
-    mM_dz0 = from_dlpack(M2, assumed_align=16)
-    mDZ0 = (
-        from_dlpack(dZ0.permute(1, 2, 0), assumed_align=16)
-        .mark_layout_dynamic(leading_dim=1)
-        .mark_compact_shape_dynamic(mode=1, stride_order=(2, 0, 1), divisibility=4)
-    )
-
-    k_dz0 = ChunkScanBwdDZ0Ampere(cutlass_dtype, chunk_size=L)
+    dZ0_perm = dZ0.permute(1, 2, 0)
     compiled_dz0 = None
     dZ0_view = dZ0.reshape(Bsz, H, n_chunks, P, D)
 
@@ -413,15 +748,6 @@ def compile_chunk_scan_bwd_kernels(
     U_prev0_flat = U_prev0.reshape(BH, P).contiguous()
     B_prev0_flat = B_prev0.reshape(BH, D).contiguous()
 
-    mU = from_dlpack(U_blk, assumed_align=16)
-    mB = from_dlpack(B_blk, assumed_align=16)
-    mC = from_dlpack(C_blk, assumed_align=16)
-    mM = from_dlpack(M_blk, assumed_align=16)
-    mK = from_dlpack(K_blk, assumed_align=16)
-    mDOut = from_dlpack(dOut_blk, assumed_align=16)
-    mU_prev0 = from_dlpack(U_prev0_flat, assumed_align=16)
-    mB_prev0 = from_dlpack(B_prev0_flat, assumed_align=16)
-
     dU = torch.empty_like(U_blk)
     dU_prev = torch.empty((BHC, P), device=U.device, dtype=tc_dtype)
     dB_du_scratch = torch.empty_like(B_blk)
@@ -429,22 +755,6 @@ def compile_chunk_scan_bwd_kernels(
     dlp_du_scratch = torch.empty((BHC, L), device=U.device, dtype=torch.float32)
     dMp_du_scratch = torch.empty((BHC, L, 2), device=U.device, dtype=torch.float32)
     dMc_du_scratch = torch.empty((BHC, L, 2), device=U.device, dtype=torch.float32)
-
-    mDU = from_dlpack(dU, assumed_align=16)
-    mDU_prev = from_dlpack(dU_prev, assumed_align=16)
-    mDB_du_scratch = from_dlpack(dB_du_scratch, assumed_align=16)
-    mDB_prev_du_scratch = from_dlpack(dB_prev_du_scratch, assumed_align=16)
-    mDLp_du_scratch = from_dlpack(dlp_du_scratch, assumed_align=16)
-    mDMp_du_scratch = from_dlpack(dMp_du_scratch, assumed_align=16)
-    mDMc_du_scratch = from_dlpack(dMc_du_scratch, assumed_align=16)
-
-    k_du = ChunkScanBwdDUAmpere(
-        cutlass_dtype,
-        chunk_size=L,
-        D=D,
-        P=P,
-        num_threads=num_threads_du,
-    )
     compiled_du = None
 
     dB = torch.empty_like(B_blk)
@@ -454,22 +764,6 @@ def compile_chunk_scan_bwd_kernels(
     dlp_db_scratch = torch.empty((BHC, L), device=U.device, dtype=torch.float32)
     dMp_db_scratch = torch.empty((BHC, L, 2), device=U.device, dtype=torch.float32)
     dMc_db_scratch = torch.empty((BHC, L, 2), device=U.device, dtype=torch.float32)
-
-    mDB = from_dlpack(dB, assumed_align=16)
-    mDB_prev = from_dlpack(dB_prev, assumed_align=16)
-    mDU_db_scratch = from_dlpack(dU_db_scratch, assumed_align=16)
-    mDU_prev_db_scratch = from_dlpack(dU_prev_db_scratch, assumed_align=16)
-    mDLp_db_scratch = from_dlpack(dlp_db_scratch, assumed_align=16)
-    mDMp_db_scratch = from_dlpack(dMp_db_scratch, assumed_align=16)
-    mDMc_db_scratch = from_dlpack(dMc_db_scratch, assumed_align=16)
-
-    k_db = ChunkScanBwdDBAmpere(
-        cutlass_dtype,
-        chunk_size=L,
-        D=D,
-        P=P,
-        num_threads=num_threads_db,
-    )
     compiled_db = None
 
     dU_view = dU.reshape(Bsz, H, n_chunks, L, P)
@@ -480,19 +774,6 @@ def compile_chunk_scan_bwd_kernels(
     dlogp = torch.empty((BHC, L), device=U.device, dtype=torch.float32)
     dC = torch.empty_like(C_blk)
     dR = torch.empty((BHC, L, 4), device=U.device, dtype=torch.float32)
-
-    mZ0 = from_dlpack(Z0_blk, assumed_align=16)
-    mDLogp = from_dlpack(dlogp, assumed_align=16)
-    mDC = from_dlpack(dC, assumed_align=16)
-    mDR = from_dlpack(dR, assumed_align=16)
-
-    k_dc = ChunkScanBwdDLPAmpere(
-        cutlass_dtype,
-        chunk_size=L,
-        D=D,
-        P=P,
-        num_threads=num_threads_dc,
-    )
     compiled_dc = None
     compiled_dc_fast = None
 
@@ -508,89 +789,236 @@ def compile_chunk_scan_bwd_kernels(
     dM_out = torch.empty_like(dMp_blk)
     dkprev_out = torch.empty_like(dMp_blk)
     dkcurr_out = torch.empty_like(dMp_blk)
-
-    mDLp = from_dlpack(dlp_blk, assumed_align=16)
-    mDMprev = from_dlpack(dMp_blk, assumed_align=16)
-    mDMcurr = from_dlpack(dMc_blk, assumed_align=16)
-    mDR_param = from_dlpack(dR_blk, assumed_align=16)
-    mDM = from_dlpack(dM_out, assumed_align=16)
-    mDKprev = from_dlpack(dkprev_out, assumed_align=16)
-    mDKcurr = from_dlpack(dkcurr_out, assumed_align=16)
-
-    k_param = ChunkScanBwdParamScanAmpere(chunk_size=L, num_threads=num_threads_param)
     compiled_param = None
 
     dM_view = dM_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
     dkprev_view = dkprev_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
     dkcurr_view = dkcurr_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
 
+    dz0_args, dz0_alignments = _make_ptr_args(dOut2, C2, M2, dZ0_perm)
+    du_args, du_alignments = _make_ptr_args(
+        U_blk,
+        B_blk,
+        C_blk,
+        M_blk,
+        K_blk,
+        dOut_blk,
+        U_prev0_flat,
+        B_prev0_flat,
+        dU,
+        dB_du_scratch,
+        dU_prev,
+        dB_prev_du_scratch,
+        dlp_du_scratch,
+        dMp_du_scratch,
+        dMc_du_scratch,
+    )
+    db_args, db_alignments = _make_ptr_args(
+        U_blk,
+        B_blk,
+        C_blk,
+        M_blk,
+        K_blk,
+        dOut_blk,
+        U_prev0_flat,
+        B_prev0_flat,
+        dU_db_scratch,
+        dB,
+        dU_prev_db_scratch,
+        dB_prev,
+        dlp_db_scratch,
+        dMp_db_scratch,
+        dMc_db_scratch,
+    )
+    dc_args, dc_alignments = _make_ptr_args(
+        U_blk,
+        B_blk,
+        C_blk,
+        M_blk,
+        K_blk,
+        dOut_blk,
+        U_prev0_flat,
+        B_prev0_flat,
+        Z0_blk,
+        dlogp,
+        dC,
+        dR,
+    )
+    param_args, param_alignments = _make_ptr_args(
+        M_blk,
+        K_blk,
+        dlp_blk,
+        dMp_blk,
+        dMc_blk,
+        dR_blk,
+        dM_out,
+        dkprev_out,
+        dkcurr_out,
+    )
+    alignments = (
+        dz0_alignments
+        + du_alignments
+        + db_alignments
+        + dc_alignments
+        + param_alignments
+    )
+    keepalive = (
+        U_tc,
+        B_tc,
+        C_tc,
+        d_out_tc,
+        M_f,
+        K_f,
+        chunk_starts_f,
+        U_prev0,
+        B_prev0,
+        dOut2,
+        C2,
+        M2,
+        dZ0_perm,
+        U_blk,
+        B_blk,
+        C_blk,
+        M_blk,
+        K_blk,
+        dOut_blk,
+        Z0_blk,
+        U_prev0_flat,
+        B_prev0_flat,
+        dlp_blk,
+        dMp_blk,
+        dMc_blk,
+        dR_blk,
+        dB_du_scratch,
+        dB_prev_du_scratch,
+        dlp_du_scratch,
+        dMp_du_scratch,
+        dMc_du_scratch,
+        dU_db_scratch,
+        dU_prev_db_scratch,
+        dlp_db_scratch,
+        dMp_db_scratch,
+        dMc_db_scratch,
+    )
+    cache_key = _compiled_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=tc_dtype,
+        U_shape=tuple(U.shape),
+        B_shape=tuple(B.shape),
+        C_shape=tuple(C.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        chunk_starts_shape=tuple(chunk_starts.shape),
+        d_out_shape=tuple(d_out.shape),
+        chunk_size=L,
+        has_prev=B_prev is not None,
+        alignments=alignments,
+        num_threads_du=num_threads_du,
+        num_threads_db=num_threads_db,
+        num_threads_dc=num_threads_dc,
+        num_threads_param=num_threads_param,
+    )
+
     use_compiled_cache = not return_launchers
     cached = _COMPILED_CACHE.get(cache_key) if use_compiled_cache else None
     if cached is None:
-        compiled_dz0 = cute.compile(k_dz0, mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
-        compiled_du = cute.compile(
-            k_du,
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mDU,
-            mDB_du_scratch,
-            mDU_prev,
-            mDB_prev_du_scratch,
-            mDLp_du_scratch,
-            mDMp_du_scratch,
-            mDMc_du_scratch,
+        dz0_wrapper = _make_dz0_host_wrapper(
+            spec=(
+                _make_tensor_spec_from_tensor(dOut2),
+                _make_tensor_spec_from_tensor(C2),
+                _make_tensor_spec_from_tensor(M2),
+                _make_tensor_spec_from_tensor(dZ0_perm),
+            ),
+            cfg=(L,),
         )
-        compiled_db = cute.compile(
-            k_db,
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mDU_db_scratch,
-            mDB,
-            mDU_prev_db_scratch,
-            mDB_prev,
-            mDLp_db_scratch,
-            mDMp_db_scratch,
-            mDMc_db_scratch,
+        du_wrapper = _make_du_host_wrapper(
+            spec=tuple(
+                _make_tensor_spec_from_tensor(t)
+                for t in (
+                    U_blk,
+                    B_blk,
+                    C_blk,
+                    M_blk,
+                    K_blk,
+                    dOut_blk,
+                    U_prev0_flat,
+                    B_prev0_flat,
+                    dU,
+                    dB_du_scratch,
+                    dU_prev,
+                    dB_prev_du_scratch,
+                    dlp_du_scratch,
+                    dMp_du_scratch,
+                    dMc_du_scratch,
+                )
+            ),
+            cfg=(L, D, P, num_threads_du),
         )
-        compiled_dc = cute.compile(
-            k_dc,
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mZ0,
-            mDLogp,
-            mDC,
-            mDR,
+        db_wrapper = _make_db_host_wrapper(
+            spec=tuple(
+                _make_tensor_spec_from_tensor(t)
+                for t in (
+                    U_blk,
+                    B_blk,
+                    C_blk,
+                    M_blk,
+                    K_blk,
+                    dOut_blk,
+                    U_prev0_flat,
+                    B_prev0_flat,
+                    dU_db_scratch,
+                    dB,
+                    dU_prev_db_scratch,
+                    dB_prev,
+                    dlp_db_scratch,
+                    dMp_db_scratch,
+                    dMc_db_scratch,
+                )
+            ),
+            cfg=(L, D, P, num_threads_db),
         )
-        compiled_param = cute.compile(
-            k_param,
-            mM,
-            mK,
-            mDLp,
-            mDMprev,
-            mDMcurr,
-            mDR_param,
-            mDM,
-            mDKprev,
-            mDKcurr,
+        dc_wrapper = _make_dc_host_wrapper(
+            spec=tuple(
+                _make_tensor_spec_from_tensor(t)
+                for t in (
+                    U_blk,
+                    B_blk,
+                    C_blk,
+                    M_blk,
+                    K_blk,
+                    dOut_blk,
+                    U_prev0_flat,
+                    B_prev0_flat,
+                    Z0_blk,
+                    dlogp,
+                    dC,
+                    dR,
+                )
+            ),
+            cfg=(L, D, P, num_threads_dc),
         )
+        param_wrapper = _make_param_host_wrapper(
+            spec=tuple(
+                _make_tensor_spec_from_tensor(t)
+                for t in (
+                    M_blk,
+                    K_blk,
+                    dlp_blk,
+                    dMp_blk,
+                    dMc_blk,
+                    dR_blk,
+                    dM_out,
+                    dkprev_out,
+                    dkcurr_out,
+                )
+            ),
+            cfg=(L, num_threads_param),
+        )
+        compiled_dz0 = cute.compile(dz0_wrapper, *dz0_args)
+        compiled_du = cute.compile(du_wrapper, *du_args)
+        compiled_db = cute.compile(db_wrapper, *db_args)
+        compiled_dc = cute.compile(dc_wrapper, *dc_args)
+        compiled_param = cute.compile(param_wrapper, *param_args)
         cached = (
             compiled_dz0,
             compiled_du,
@@ -610,85 +1038,26 @@ def compile_chunk_scan_bwd_kernels(
             compiled_param,
             compiled_dc_fast,
         ) = cached
-        if use_compiled_cache:
-            _COMPILED_CACHE[cache_key] = (
-                compiled_dz0,
-                compiled_du,
-                compiled_db,
-                compiled_dc,
-                compiled_param,
-                compiled_dc_fast,
-            )
 
     def _launch_dz0() -> None:
-        compiled_dz0(mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
+        _ = keepalive
+        compiled_dz0(*dz0_args)
 
     def _launch_du() -> None:
-        compiled_du(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mDU,
-            mDB_du_scratch,
-            mDU_prev,
-            mDB_prev_du_scratch,
-            mDLp_du_scratch,
-            mDMp_du_scratch,
-            mDMc_du_scratch,
-        )
+        _ = keepalive
+        compiled_du(*du_args)
 
     def _launch_db() -> None:
-        compiled_db(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mDU_db_scratch,
-            mDB,
-            mDU_prev_db_scratch,
-            mDB_prev,
-            mDLp_db_scratch,
-            mDMp_db_scratch,
-            mDMc_db_scratch,
-        )
+        _ = keepalive
+        compiled_db(*db_args)
 
     def _launch_dc() -> None:
-        compiled_dc(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mZ0,
-            mDLogp,
-            mDC,
-            mDR,
-        )
+        _ = keepalive
+        compiled_dc(*dc_args)
 
     def _launch_param() -> None:
-        compiled_param(
-            mM,
-            mK,
-            mDLp,
-            mDMprev,
-            mDMcurr,
-            mDR_param,
-            mDM,
-            mDKprev,
-            mDKcurr,
-        )
+        _ = keepalive
+        compiled_param(*param_args)
 
     def launch_sequential() -> None:
         _launch_dz0()
