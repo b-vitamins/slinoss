@@ -326,6 +326,7 @@ def _state_passing_key(
     vecs_per_thread: int,
     copy_bits_in: int,
     copy_bits_out: int,
+    copy_bits_state: int,
 ) -> tuple:
     return (
         "state_passing_fwd",
@@ -337,6 +338,7 @@ def _state_passing_key(
         int(vecs_per_thread),
         int(copy_bits_in),
         int(copy_bits_out),
+        int(copy_bits_state),
     )
 
 
@@ -599,6 +601,15 @@ def _compile_state_passing_kernel_impl(
         tile_stride_elems=S,
         elems_per_thread=elems_per_thread,
     )
+    copy_bits_state = (
+        _choose_copy_bits_for_linear_tiles(
+            initial_states.contiguous(),
+            tile_stride_elems=S,
+            elems_per_thread=elems_per_thread,
+        )
+        if initial_states is not None
+        else 32
+    )
 
     cache_key = _state_passing_key(
         device_index=(inc.device.index if inc.device.index is not None else -1),
@@ -609,6 +620,7 @@ def _compile_state_passing_kernel_impl(
         vecs_per_thread=vecs_per_thread,
         copy_bits_in=copy_bits_in,
         copy_bits_out=copy_bits_out,
+        copy_bits_state=copy_bits_state,
     )
 
     align_in = max(inc.element_size(), copy_bits_in // 8)
@@ -627,7 +639,8 @@ def _compile_state_passing_kernel_impl(
         mInit = from_dlpack(inc_c, assumed_align=align_in)
         has_init = False
     else:
-        mInit = from_dlpack(init_c, assumed_align=max(init_c.element_size(), 4))
+        align_state = max(init_c.element_size(), copy_bits_state // 8)
+        mInit = from_dlpack(init_c, assumed_align=align_state)
         has_init = True
 
     compiled = _STATE_PASSING_CACHE.get(cache_key)
@@ -637,6 +650,7 @@ def _compile_state_passing_kernel_impl(
             vecs_per_thread=vecs_per_thread,
             copy_bits_in=copy_bits_in,
             copy_bits_out=copy_bits_out,
+            copy_bits_state=copy_bits_state,
             has_init=has_init,
         )
         compiled = cute.compile(kernel, mInc, mM, mOutStarts, mOutFinal, mInit)
@@ -949,6 +963,7 @@ def _fwd_host_cache_key(
     state_vecs_per_thread: int,
     state_copy_bits_in: int,
     state_copy_bits_out: int,
+    state_copy_bits_state: int,
     alignments: tuple[int, ...],
 ) -> tuple:
     return (
@@ -969,6 +984,7 @@ def _fwd_host_cache_key(
         int(state_vecs_per_thread),
         int(state_copy_bits_in),
         int(state_copy_bits_out),
+        int(state_copy_bits_state),
         alignments,
     )
 
@@ -1127,6 +1143,11 @@ def _build_forward_args(
         tile_stride_elems=P * D,
         elems_per_thread=2 * int(state_vecs_per_thread),
     )
+    state_copy_bits_state = _choose_copy_bits_for_linear_tiles(
+        final_state,
+        tile_stride_elems=P * D,
+        elems_per_thread=2 * int(state_vecs_per_thread),
+    )
 
     U_ptr, U_align = _make_ptr_arg(U_tc)
     B_ptr, B_align = _make_ptr_arg(B_tc)
@@ -1192,6 +1213,7 @@ def _build_forward_args(
         int(state_vecs_per_thread),
         int(state_copy_bits_in),
         int(state_copy_bits_out),
+        int(state_copy_bits_state),
     )
     return (
         dynamic_args,
@@ -1220,6 +1242,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
         state_vecs_per_thread,
         state_copy_bits_in,
         state_copy_bits_out,
+        state_copy_bits_state,
     ) = cfg
     BH = Bsz * H
     BHC = BH * n_chunks
@@ -1378,6 +1401,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             vecs_per_thread=state_vecs_per_thread,
             copy_bits_in=state_copy_bits_in,
             copy_bits_out=state_copy_bits_out,
+            copy_bits_state=state_copy_bits_state,
             has_init=False,
         )
         state_passing(
@@ -1461,6 +1485,7 @@ def compile_v2x2ssd_fwd_cute(
         state_vecs_per_thread=int(state_vecs_per_thread),
         state_copy_bits_in=int(cfg[5]),
         state_copy_bits_out=int(cfg[6]),
+        state_copy_bits_state=int(cfg[7]),
         alignments=alignments,
     )
     cached = _FWD_HOST_CACHE.get(cache_key)
@@ -1530,6 +1555,7 @@ def v2x2ssd_fwd_cute(
         state_vecs_per_thread=int(state_vecs_per_thread),
         state_copy_bits_in=int(cfg[5]),
         state_copy_bits_out=int(cfg[6]),
+        state_copy_bits_state=int(cfg[7]),
         alignments=alignments,
     )
     compiled = _FWD_HOST_CACHE.get(cache_key)
