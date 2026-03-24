@@ -179,6 +179,27 @@ def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(stride)
 
 
+def _make_tensor_spec(
+    shape: tuple[int, ...],
+    *,
+    stride: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    shape = tuple(int(dim) for dim in shape)
+    if stride is None:
+        stride = _make_row_major_stride(shape)
+    else:
+        stride = tuple(int(step) for step in stride)
+    return shape, stride
+
+
+def _make_tensor_from_spec(
+    ptr: cute.Pointer,
+    spec: tuple[tuple[int, ...], tuple[int, ...]],
+):
+    shape, stride = spec
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+
+
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
     device_index = (
         int(t.device.index)
@@ -204,6 +225,18 @@ def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
         _PTR_ARG_CACHE.clear()
     _PTR_ARG_CACHE[key] = cached
     return cached
+
+
+def _make_ptr_args(
+    *tensors: torch.Tensor,
+) -> tuple[tuple[object, ...], tuple[int, ...]]:
+    ptrs: list[object] = []
+    alignments: list[int] = []
+    for tensor in tensors:
+        ptr, align = _make_ptr_arg(tensor)
+        ptrs.append(ptr)
+        alignments.append(align)
+    return tuple(ptrs), tuple(alignments)
 
 
 def _make_cast_f32_to_tc(*, total_elems: int, num_threads: int = 256):
@@ -299,7 +332,7 @@ def _build_backward_args(
     ]
     | None = None,
 ) -> tuple[
-    list[object],
+    tuple[object, ...],
     tuple[int, ...],
     tuple[int, ...],
     tuple[int, ...],
@@ -548,12 +581,7 @@ def _build_backward_args(
         dKprev_inc,
         dKcurr_inc,
     ]
-    dynamic_args: list[object] = []
-    alignments_list: list[int] = []
-    for tensor in ptr_tensors:
-        ptr, align = _make_ptr_arg(tensor)
-        dynamic_args.append(ptr)
-        alignments_list.append(align)
+    dynamic_args, alignments = _make_ptr_args(*ptr_tensors)
 
     spec = (
         Bsz,
@@ -612,7 +640,7 @@ def _build_backward_args(
     )
     return (
         dynamic_args,
-        tuple(alignments_list),
+        alignments,
         spec,
         cfg,
         (
@@ -656,92 +684,48 @@ def _make_v2x2ssd_bwd_host_wrapper(
     BH = Bsz * H
     BHC = BH * n_chunks
 
-    def _make_tensor(
-        ptr: cute.Pointer, shape: tuple[int, ...], stride: tuple[int, ...]
-    ):
-        return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+    u_scan_spec = _make_tensor_spec((BHC, L, 1, P), stride=(L * P, P, P, 1))
+    b_scan_spec = _make_tensor_spec((BHC, L, 1, D), stride=(L * D, D, D, 1))
+    m_scan_spec = _make_tensor_spec((BHC, L, 2), stride=(L * 2, 2, 1))
+    k_scan_spec = _make_tensor_spec((BHC, L, 2, 2), stride=(L * 4, 4, 2, 1))
+    z0_scan_spec = _make_tensor_spec((BHC, P, D), stride=(P * D, D, 1))
+    u_prev0_scan_spec = _make_tensor_spec((BH, P), stride=(P, 1))
+    b_prev0_scan_spec = _make_tensor_spec((BH, D), stride=(D, 1))
+    dlogp_scan_spec = _make_tensor_spec((BHC, L), stride=(L, 1))
+    dm_scratch_scan_spec = _make_tensor_spec((BHC, L, 2), stride=(L * 2, 2, 1))
+    dr_scan_spec = _make_tensor_spec((BHC, L, 4), stride=(L * 4, 4, 1))
+    dparam_scan_spec = _make_tensor_spec((BHC, 1, L, 2), stride=(L * 2, L * 2, 2, 1))
+    dlp_param_spec = _make_tensor_spec((BHC, 1, L), stride=(L, L, 1))
+    dr_param_spec = _make_tensor_spec((BHC, 1, L, 4), stride=(L * 4, L * 4, 4, 1))
+    flat_state_spec = _make_tensor_spec((BHC * P * D,))
 
-    u_scan_shape = (BHC, L, 1, P)
-    u_scan_stride = (L * P, P, P, 1)
-    b_scan_shape = (BHC, L, 1, D)
-    b_scan_stride = (L * D, D, D, 1)
-    m_scan_shape = (BHC, L, 2)
-    m_scan_stride = (L * 2, 2, 1)
-    k_scan_shape = (BHC, L, 2, 2)
-    k_scan_stride = (L * 4, 4, 2, 1)
-    z0_shape = (BHC, P, D)
-    z0_stride = (P * D, D, 1)
-    u_prev0_shape = (BH, P)
-    u_prev0_stride = (P, 1)
-    b_prev0_shape = (BH, D)
-    b_prev0_stride = (D, 1)
-    dlogp_shape = (BHC, L)
-    dlogp_stride = (L, 1)
-    dm_scratch_shape = (BHC, L, 2)
-    dm_scratch_stride = (L * 2, 2, 1)
-    dr_shape = (BHC, L, 4)
-    dr_stride = (L * 4, 4, 1)
-    dparam_scan_shape = (BHC, 1, L, 2)
-    dparam_scan_stride = (L * 2, L * 2, 2, 1)
-    dlp_param_shape = (BHC, 1, L)
-    dlp_param_stride = (L, L, 1)
-    dr_param_shape = (BHC, 1, L, 4)
-    dr_param_stride = (L * 4, L * 4, 4, 1)
-    flat_state_shape = (BHC * P * D,)
-    flat_state_stride = (1,)
+    dz0_dout_spec = _make_tensor_spec((P, T_pad, BH), stride=(1, P, T_pad * P))
+    dz0_c_spec = _make_tensor_spec((D, T_pad, BH), stride=(1, D, T_pad * D))
+    dz0_m_spec = _make_tensor_spec((2, T_pad, BH), stride=(1, 2, T_pad * 2))
+    dz0_out_spec = _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D))
 
-    dz0_dout_shape = (P, T_pad, BH)
-    dz0_dout_stride = (1, P, T_pad * P)
-    dz0_c_shape = (D, T_pad, BH)
-    dz0_c_stride = (1, D, T_pad * D)
-    dz0_m_shape = (2, T_pad, BH)
-    dz0_m_stride = (1, 2, T_pad * 2)
-    dz0_out_shape = (P, D, BHC)
-    dz0_out_stride = (D, 1, P * D)
+    state_spec = _make_tensor_spec((Bsz, H, n_chunks, P, D))
+    m_chunk_state_spec = _make_tensor_spec((Bsz, H, n_chunks, 2))
+    final_state_spec = _make_tensor_spec((Bsz, H, P, D))
 
-    state_shape = (Bsz, H, n_chunks, P, D)
-    state_stride = _make_row_major_stride(state_shape)
-    m_chunk_shape = (Bsz, H, n_chunks, 2)
-    m_chunk_stride = _make_row_major_stride(m_chunk_shape)
-    final_shape = (Bsz, H, P, D)
-    final_stride = _make_row_major_stride(final_shape)
-
-    u_inc_shape = (L, P, BHC)
-    u_inc_stride = (P, 1, L * P)
-    du_out_shape = (P, L, BHC)
-    du_out_stride = (1, P, L * P)
-    b_inc_shape = (L, D, BHC)
-    b_inc_stride = (D, 1, L * D)
-    m_inc_shape = (2, L, BHC)
-    m_inc_stride = (1, 2, L * 2)
-    k_inc_shape = (2, L, BHC)
-    k_inc_stride = (1, 4, L * 4)
-    d_inc_shape = (P, D, BHC)
-    d_inc_stride = (D, 1, P * D)
-    d_inc_dp_shape = (D, P, BHC)
-    d_inc_dp_stride = (1, D, P * D)
-    d_inc_boundary_shape = (BHC, P, D)
-    d_inc_boundary_stride = (P * D, D, 1)
-    prev_u_chunks_shape = (P, BHC)
-    prev_u_chunks_stride = (1, P)
-    prev_b_chunks_shape = (D, BHC)
-    prev_b_chunks_stride = (1, D)
-    dmsum_part_shape = (2, L, n_d_tiles, BHC)
-    dmsum_part_stride = _make_row_major_stride(dmsum_part_shape)
-    dmp0_shape = (2, BHC)
-    dmp0_stride = _make_row_major_stride(dmp0_shape)
-    dmchunk_shape = (2, BHC)
-    dmchunk_stride = (1, 2)
-    dparam_inc_shape = (2, L, BHC)
-    dparam_inc_stride = _make_row_major_stride(dparam_inc_shape)
-    d_dummy_u_shape = (BHC, L, 1, P)
-    d_dummy_u_stride = (L * P, P, P, 1)
-    d_dummy_b_shape = (BHC, L, 1, D)
-    d_dummy_b_stride = (L * D, D, D, 1)
-    d_dummy_u_prev_shape = (BHC, P)
-    d_dummy_u_prev_stride = (P, 1)
-    d_dummy_b_prev_shape = (BHC, D)
-    d_dummy_b_prev_stride = (D, 1)
+    u_inc_spec = _make_tensor_spec((L, P, BHC), stride=(P, 1, L * P))
+    du_inc_spec = _make_tensor_spec((P, L, BHC), stride=(1, P, L * P))
+    b_inc_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    m_inc_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
+    k_inc_spec = _make_tensor_spec((2, L, BHC), stride=(1, 4, L * 4))
+    d_inc_spec = _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D))
+    d_inc_dp_spec = _make_tensor_spec((D, P, BHC), stride=(1, D, P * D))
+    d_inc_boundary_spec = _make_tensor_spec((BHC, P, D), stride=(P * D, D, 1))
+    prev_u_chunks_spec = _make_tensor_spec((P, BHC), stride=(1, P))
+    prev_b_chunks_spec = _make_tensor_spec((D, BHC), stride=(1, D))
+    dmsum_part_spec = _make_tensor_spec((2, L, n_d_tiles, BHC))
+    dmp0_spec = _make_tensor_spec((2, BHC))
+    dmchunk_inc_spec = _make_tensor_spec((2, BHC), stride=(1, 2))
+    dparam_inc_spec = _make_tensor_spec((2, L, BHC))
+    d_dummy_u_spec = _make_tensor_spec((BHC, L, 1, P), stride=(L * P, P, P, 1))
+    d_dummy_b_spec = _make_tensor_spec((BHC, L, 1, D), stride=(L * D, D, D, 1))
+    d_dummy_u_prev_spec = _make_tensor_spec((BHC, P), stride=(P, 1))
+    d_dummy_b_prev_spec = _make_tensor_spec((BHC, D), stride=(D, 1))
 
     @cute.jit
     def _v2x2ssd_bwd_host_wrapper(
@@ -791,101 +775,75 @@ def _make_v2x2ssd_bwd_host_wrapper(
         dKprev_inc_ptr: cute.Pointer,
         dKcurr_inc_ptr: cute.Pointer,
     ):
-        mU_scan = _make_tensor(U_ptr, u_scan_shape, u_scan_stride)
-        mB_scan = _make_tensor(B_ptr, b_scan_shape, b_scan_stride)
-        mC_scan = _make_tensor(C_ptr, b_scan_shape, b_scan_stride)
-        mM_scan = _make_tensor(M_ptr, m_scan_shape, m_scan_stride)
-        mK_scan = _make_tensor(K_ptr, k_scan_shape, k_scan_stride)
-        mDOut_scan = _make_tensor(dOut_ptr, u_scan_shape, u_scan_stride)
-        mZ0_scan = _make_tensor(chunk_starts_ptr, z0_shape, z0_stride)
-        mU_prev0_scan = _make_tensor(U_prev0_ptr, u_prev0_shape, u_prev0_stride)
-        mB_prev0_scan = _make_tensor(B_prev0_ptr, b_prev0_shape, b_prev0_stride)
-        mDU_scan = _make_tensor(dU_scan_ptr, u_scan_shape, u_scan_stride)
-        mDB_scan = _make_tensor(dB_scan_ptr, b_scan_shape, b_scan_stride)
-        mDU_prev_scan = _make_tensor(
-            dU_prev_scan_ptr, d_dummy_u_prev_shape, d_dummy_u_prev_stride
-        )
-        mDB_prev_scan = _make_tensor(
-            dB_prev_scan_ptr, d_dummy_b_prev_shape, d_dummy_b_prev_stride
-        )
-        mDLogp = _make_tensor(dlogp_ptr, dlogp_shape, dlogp_stride)
-        mDLogp_param = _make_tensor(dlogp_ptr, dlp_param_shape, dlp_param_stride)
-        mDMprev_scan = _make_tensor(
-            dMp_scratch_ptr, dm_scratch_shape, dm_scratch_stride
-        )
-        mDMcurr_scan = _make_tensor(
-            dMc_scratch_ptr, dm_scratch_shape, dm_scratch_stride
-        )
-        mDMprev_param = _make_tensor(
-            dMp_scratch_ptr, dparam_scan_shape, dparam_scan_stride
-        )
-        mDMcurr_param = _make_tensor(
-            dMc_scratch_ptr, dparam_scan_shape, dparam_scan_stride
-        )
-        mDC_scan = _make_tensor(dC_scan_ptr, b_scan_shape, b_scan_stride)
-        mDR_scan = _make_tensor(dR_ptr, dr_shape, dr_stride)
-        mDR_param = _make_tensor(dR_ptr, dr_param_shape, dr_param_stride)
-        mDM_scan = _make_tensor(dM_scan_ptr, dparam_scan_shape, dparam_scan_stride)
-        mDKprev_scan = _make_tensor(
-            dKprev_scan_ptr, dparam_scan_shape, dparam_scan_stride
-        )
-        mDKcurr_scan = _make_tensor(
-            dKcurr_scan_ptr, dparam_scan_shape, dparam_scan_stride
-        )
+        mU_scan = _make_tensor_from_spec(U_ptr, u_scan_spec)
+        mB_scan = _make_tensor_from_spec(B_ptr, b_scan_spec)
+        mC_scan = _make_tensor_from_spec(C_ptr, b_scan_spec)
+        mM_scan = _make_tensor_from_spec(M_ptr, m_scan_spec)
+        mK_scan = _make_tensor_from_spec(K_ptr, k_scan_spec)
+        mDOut_scan = _make_tensor_from_spec(dOut_ptr, u_scan_spec)
+        mZ0_scan = _make_tensor_from_spec(chunk_starts_ptr, z0_scan_spec)
+        mU_prev0_scan = _make_tensor_from_spec(U_prev0_ptr, u_prev0_scan_spec)
+        mB_prev0_scan = _make_tensor_from_spec(B_prev0_ptr, b_prev0_scan_spec)
+        mDU_scan = _make_tensor_from_spec(dU_scan_ptr, u_scan_spec)
+        mDB_scan = _make_tensor_from_spec(dB_scan_ptr, b_scan_spec)
+        mDU_prev_scan = _make_tensor_from_spec(dU_prev_scan_ptr, d_dummy_u_prev_spec)
+        mDB_prev_scan = _make_tensor_from_spec(dB_prev_scan_ptr, d_dummy_b_prev_spec)
+        mDLogp = _make_tensor_from_spec(dlogp_ptr, dlogp_scan_spec)
+        mDLogp_param = _make_tensor_from_spec(dlogp_ptr, dlp_param_spec)
+        mDMprev_scan = _make_tensor_from_spec(dMp_scratch_ptr, dm_scratch_scan_spec)
+        mDMcurr_scan = _make_tensor_from_spec(dMc_scratch_ptr, dm_scratch_scan_spec)
+        mDMprev_param = _make_tensor_from_spec(dMp_scratch_ptr, dparam_scan_spec)
+        mDMcurr_param = _make_tensor_from_spec(dMc_scratch_ptr, dparam_scan_spec)
+        mDC_scan = _make_tensor_from_spec(dC_scan_ptr, b_scan_spec)
+        mDR_scan = _make_tensor_from_spec(dR_ptr, dr_scan_spec)
+        mDR_param = _make_tensor_from_spec(dR_ptr, dr_param_spec)
+        mDM_scan = _make_tensor_from_spec(dM_scan_ptr, dparam_scan_spec)
+        mDKprev_scan = _make_tensor_from_spec(dKprev_scan_ptr, dparam_scan_spec)
+        mDKcurr_scan = _make_tensor_from_spec(dKcurr_scan_ptr, dparam_scan_spec)
 
-        mDOut_dz0 = _make_tensor(dOut_ptr, dz0_dout_shape, dz0_dout_stride)
-        mC_dz0 = _make_tensor(C_ptr, dz0_c_shape, dz0_c_stride)
-        mM_dz0 = _make_tensor(M_ptr, dz0_m_shape, dz0_m_stride)
-        mDZ0 = _make_tensor(dZ0_ptr, dz0_out_shape, dz0_out_stride)
+        mDOut_dz0 = _make_tensor_from_spec(dOut_ptr, dz0_dout_spec)
+        mC_dz0 = _make_tensor_from_spec(C_ptr, dz0_c_spec)
+        mM_dz0 = _make_tensor_from_spec(M_ptr, dz0_m_spec)
+        mDZ0 = _make_tensor_from_spec(dZ0_ptr, dz0_out_spec)
 
-        mChunkStarts_state = _make_tensor(chunk_starts_ptr, state_shape, state_stride)
-        mMchunk_state = _make_tensor(m_chunk_ptr, m_chunk_shape, m_chunk_stride)
-        mDChunkStarts_state = _make_tensor(dZ0_ptr, state_shape, state_stride)
-        mDFinal = _make_tensor(d_final_ptr, final_shape, final_stride)
-        mDInc_state = _make_tensor(d_inc_ptr, state_shape, state_stride)
-        mDInc_flat = _make_tensor(d_inc_ptr, flat_state_shape, flat_state_stride)
-        mDInc_tc_flat = _make_tensor(d_inc_tc_ptr, flat_state_shape, flat_state_stride)
-        mDInitial = _make_tensor(d_initial_ptr, final_shape, final_stride)
-        mDMchunk_state = _make_tensor(d_m_chunk_ptr, m_chunk_shape, m_chunk_stride)
+        mChunkStarts_state = _make_tensor_from_spec(chunk_starts_ptr, state_spec)
+        mMchunk_state = _make_tensor_from_spec(m_chunk_ptr, m_chunk_state_spec)
+        mDChunkStarts_state = _make_tensor_from_spec(dZ0_ptr, state_spec)
+        mDFinal = _make_tensor_from_spec(d_final_ptr, final_state_spec)
+        mDInc_state = _make_tensor_from_spec(d_inc_ptr, state_spec)
+        mDInc_flat = _make_tensor_from_spec(d_inc_ptr, flat_state_spec)
+        mDInc_tc_flat = _make_tensor_from_spec(d_inc_tc_ptr, flat_state_spec)
+        mDInitial = _make_tensor_from_spec(d_initial_ptr, final_state_spec)
+        mDMchunk_state = _make_tensor_from_spec(d_m_chunk_ptr, m_chunk_state_spec)
 
-        mU_inc = _make_tensor(U_ptr, u_inc_shape, u_inc_stride)
-        mB_inc = _make_tensor(B_ptr, b_inc_shape, b_inc_stride)
-        mM_inc = _make_tensor(M_ptr, m_inc_shape, m_inc_stride)
-        mKprev_inc = _make_tensor(Kprev_ptr, k_inc_shape, k_inc_stride)
-        mKcurr_inc = _make_tensor(Kcurr_ptr, k_inc_shape, k_inc_stride)
-        mDInc_DP = _make_tensor(d_inc_tc_ptr, d_inc_dp_shape, d_inc_dp_stride)
-        mDInc = _make_tensor(d_inc_tc_ptr, d_inc_shape, d_inc_stride)
-        mDInc_boundary = _make_tensor(
-            d_inc_tc_ptr, d_inc_boundary_shape, d_inc_boundary_stride
-        )
-        mBPrev_chunks = _make_tensor(
-            B_prev_chunks_ptr, prev_b_chunks_shape, prev_b_chunks_stride
-        )
-        mUPrev_chunks = _make_tensor(
-            U_prev_chunks_ptr, prev_u_chunks_shape, prev_u_chunks_stride
-        )
-        mDB_inc = _make_tensor(dB_inc_ptr, b_inc_shape, b_inc_stride)
-        mDU_inc = _make_tensor(dU_inc_ptr, du_out_shape, du_out_stride)
-        mDBPrev_inc = _make_tensor(
-            dB_prev_inc_ptr, prev_b_chunks_shape, prev_b_chunks_stride
-        )
-        mDUPrev_inc = _make_tensor(
-            dU_prev_inc_ptr, prev_u_chunks_shape, prev_u_chunks_stride
-        )
-        mDMsum_part = _make_tensor(dMsum_part_ptr, dmsum_part_shape, dmsum_part_stride)
-        mDMp0 = _make_tensor(dMp0_ptr, dmp0_shape, dmp0_stride)
-        mDMchunk_inc = _make_tensor(d_m_chunk_ptr, dmchunk_shape, dmchunk_stride)
-        mDM_inc = _make_tensor(dM_inc_ptr, dparam_inc_shape, dparam_inc_stride)
-        mDKprev_inc = _make_tensor(dKprev_inc_ptr, dparam_inc_shape, dparam_inc_stride)
-        mDKcurr_inc = _make_tensor(dKcurr_inc_ptr, dparam_inc_shape, dparam_inc_stride)
+        mU_inc = _make_tensor_from_spec(U_ptr, u_inc_spec)
+        mB_inc = _make_tensor_from_spec(B_ptr, b_inc_spec)
+        mM_inc = _make_tensor_from_spec(M_ptr, m_inc_spec)
+        mKprev_inc = _make_tensor_from_spec(Kprev_ptr, k_inc_spec)
+        mKcurr_inc = _make_tensor_from_spec(Kcurr_ptr, k_inc_spec)
+        mDInc_DP = _make_tensor_from_spec(d_inc_tc_ptr, d_inc_dp_spec)
+        mDInc = _make_tensor_from_spec(d_inc_tc_ptr, d_inc_spec)
+        mDInc_boundary = _make_tensor_from_spec(d_inc_tc_ptr, d_inc_boundary_spec)
+        mBPrev_chunks = _make_tensor_from_spec(B_prev_chunks_ptr, prev_b_chunks_spec)
+        mUPrev_chunks = _make_tensor_from_spec(U_prev_chunks_ptr, prev_u_chunks_spec)
+        mDB_inc = _make_tensor_from_spec(dB_inc_ptr, b_inc_spec)
+        mDU_inc = _make_tensor_from_spec(dU_inc_ptr, du_inc_spec)
+        mDBPrev_inc = _make_tensor_from_spec(dB_prev_inc_ptr, prev_b_chunks_spec)
+        mDUPrev_inc = _make_tensor_from_spec(dU_prev_inc_ptr, prev_u_chunks_spec)
+        mDMsum_part = _make_tensor_from_spec(dMsum_part_ptr, dmsum_part_spec)
+        mDMp0 = _make_tensor_from_spec(dMp0_ptr, dmp0_spec)
+        mDMchunk_inc = _make_tensor_from_spec(d_m_chunk_ptr, dmchunk_inc_spec)
+        mDM_inc = _make_tensor_from_spec(dM_inc_ptr, dparam_inc_spec)
+        mDKprev_inc = _make_tensor_from_spec(dKprev_inc_ptr, dparam_inc_spec)
+        mDKcurr_inc = _make_tensor_from_spec(dKcurr_inc_ptr, dparam_inc_spec)
 
-        mDU_db_dummy = _make_tensor(dU_db_dummy_ptr, d_dummy_u_shape, d_dummy_u_stride)
-        mDU_prev_db_dummy = _make_tensor(
-            dU_prev_db_dummy_ptr, d_dummy_u_prev_shape, d_dummy_u_prev_stride
+        mDU_db_dummy = _make_tensor_from_spec(dU_db_dummy_ptr, d_dummy_u_spec)
+        mDU_prev_db_dummy = _make_tensor_from_spec(
+            dU_prev_db_dummy_ptr, d_dummy_u_prev_spec
         )
-        mDB_du_dummy = _make_tensor(dB_du_dummy_ptr, d_dummy_b_shape, d_dummy_b_stride)
-        mDB_prev_du_dummy = _make_tensor(
-            dB_prev_du_dummy_ptr, d_dummy_b_prev_shape, d_dummy_b_prev_stride
+        mDB_du_dummy = _make_tensor_from_spec(dB_du_dummy_ptr, d_dummy_b_spec)
+        mDB_prev_du_dummy = _make_tensor_from_spec(
+            dB_prev_du_dummy_ptr, d_dummy_b_prev_spec
         )
 
         tc_dtype = U_ptr.value_type
