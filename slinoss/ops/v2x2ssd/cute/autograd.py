@@ -37,16 +37,6 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         K_d = K.detach()
         B_d = B.detach()
         C_d = C.detach()
-        n_chunks = (int(U_d.shape[2]) + ctx.chunk_size - 1) // ctx.chunk_size
-        T_pad = n_chunks * ctx.chunk_size
-        tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
-        prepared_inputs = (
-            _prepare_time_operand(U_d, T_pad=T_pad, dtype=tc_dtype),
-            _prepare_m_operand(M_d, T_pad=T_pad),
-            _prepare_time_operand(K_d, T_pad=T_pad, dtype=torch.float32),
-            _prepare_time_operand(B_d, T_pad=T_pad, dtype=tc_dtype),
-            _prepare_time_operand(C_d, T_pad=T_pad, dtype=tc_dtype),
-        )
 
         Y, m_chunk, chunk_starts = v2x2ssd_fwd_cute(
             U_d,
@@ -57,7 +47,6 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
             chunk_size=ctx.chunk_size,
             compute_dtype=compute_dtype,
             output_dtype=output_dtype or U.dtype,
-            prepared_inputs=prepared_inputs,
         )
 
         ctx.save_for_backward(
@@ -66,7 +55,6 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
             K_d,
             B_d,
             C_d,
-            *prepared_inputs,
             m_chunk,
             chunk_starts,
         )
@@ -86,9 +74,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         None,
         None,
     ]:
-        U, M, K, B, C, U_tc, M_f, K_f, B_tc, C_tc, m_chunk, chunk_starts = (
-            ctx.saved_tensors
-        )
+        U, M, K, B, C, m_chunk, chunk_starts = ctx.saved_tensors
 
         if dY is None:
             return (
@@ -103,6 +89,16 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
             )
 
         dY_contig = dY if dY.is_contiguous() else dY.contiguous()
+        n_chunks = (int(U.shape[2]) + ctx.chunk_size - 1) // ctx.chunk_size
+        T_pad = n_chunks * ctx.chunk_size
+        tc_dtype = _tc_input_dtype(U.dtype, ctx.compute_dtype)
+        prepared_inputs = (
+            _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype),
+            _prepare_m_operand(M, T_pad=T_pad),
+            _prepare_time_operand(K, T_pad=T_pad, dtype=torch.float32),
+            _prepare_time_operand(B, T_pad=T_pad, dtype=tc_dtype),
+            _prepare_time_operand(C, T_pad=T_pad, dtype=tc_dtype),
+        )
 
         dU_scan, dM_scan, dK_scan, dB_scan, dC_scan = cast(
             tuple[
@@ -123,7 +119,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                 dY_contig,
                 chunk_size=ctx.chunk_size,
                 compute_dtype=ctx.compute_dtype,
-                prepared_inputs=(U_tc, M_f, K_f, B_tc, C_tc),
+                prepared_inputs=prepared_inputs,
             ),
         )
 

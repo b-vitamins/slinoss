@@ -1166,7 +1166,11 @@ class ChunkScanBwdDCDRAmpere:
                                     )
                                     row_sum = row_sum + prod
                             if m < cutlass.Int32(self.L):
-                                s_dlp[m] = s_dlp[m] + cutlass.Float32(2.0) * row_sum
+                                cute.arch.atomic_add(
+                                    (s_dlp.iterator + m).llvm_ptr,
+                                    cutlass.Float32(2.0) * row_sum,
+                                    scope="cta",
+                                )
 
                     if warp == cutlass.Int32(2):
                         i = lane
@@ -1187,7 +1191,11 @@ class ChunkScanBwdDCDRAmpere:
                                 )
                                 col_sum = col_sum + prod
                         if n < cutlass.Int32(self.L):
-                            s_dlp[n] = s_dlp[n] - cutlass.Float32(2.0) * col_sum
+                            cute.arch.atomic_add(
+                                (s_dlp.iterator + n).llvm_ptr,
+                                -cutlass.Float32(2.0) * col_sum,
+                                scope="cta",
+                            )
                     cute.arch.barrier()
 
                     cute.copy(
@@ -1329,7 +1337,11 @@ class ChunkScanBwdDCDRAmpere:
                         )
                         row_sum = row_sum + dq0 * q0 + dq1 * q1
                     if t < cutlass.Int32(self.L):
-                        s_dlp[t] = s_dlp[t] + cutlass.Float32(2.0) * row_sum
+                        cute.arch.atomic_add(
+                            (s_dlp.iterator + t).llvm_ptr,
+                            cutlass.Float32(2.0) * row_sum,
+                            scope="cta",
+                        )
             cute.arch.barrier()
 
             tCsDQ = thr_mma.partition_C(sK_tile)

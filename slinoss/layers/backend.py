@@ -256,7 +256,7 @@ class ReferenceScanBackend:
 
 
 class CuteScanBackend:
-    """Training-only CuTe backend wrapper for the staged ``v2x2ssd`` operator."""
+    """Stateless CuTe backend wrapper for the staged ``v2x2ssd`` operator."""
 
     def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
         self.compute_dtype = compute_dtype
@@ -273,7 +273,7 @@ class CuteScanBackend:
             return_state = state is not None
         if state is not None or return_state:
             raise NotImplementedError(
-                "CuTe scan backend currently supports only stateless training execution."
+                "CuTe scan backend currently supports only stateless execution."
             )
 
         output_dtype = inputs.U.dtype

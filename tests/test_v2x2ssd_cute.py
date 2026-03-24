@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import pytest
 import torch
-
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _resolve_chunk_scan_launch_cfg,
@@ -262,6 +261,141 @@ def test_chunk_scan_cute_matches_reference_stage() -> None:
     )
 
     torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_stateless_forward_is_mode_invariant() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=2,
+        heads=4,
+        T=65,
+        N=32,
+        P=64,
+        device=torch.device("cuda"),
+        value_dtype=torch.float32,
+    )
+    U.requires_grad_()
+    M.requires_grad_()
+    K.requires_grad_()
+    B.requires_grad_()
+    C.requires_grad_()
+
+    with torch.enable_grad():
+        y_grad = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+    with torch.no_grad():
+        y_no_grad = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+    with torch.inference_mode():
+        y_infer = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+
+    for y in (y_grad, y_no_grad, y_infer):
+        assert torch.isfinite(y).all()
+
+    torch.testing.assert_close(y_no_grad, y_grad, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(y_infer, y_grad, atol=0.0, rtol=0.0)
+
+    with torch.no_grad():
+        y_repeat = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+    torch.testing.assert_close(y_repeat, y_no_grad, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
+    pytest.importorskip("cutlass")
+
+    def run_once() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        torch.manual_seed(0)
+        U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+            batch=2,
+            heads=4,
+            T=65,
+            N=32,
+            P=64,
+            device=torch.device("cuda"),
+            value_dtype=torch.float32,
+        )
+        U.requires_grad_()
+        M.requires_grad_()
+        K.requires_grad_()
+        B.requires_grad_()
+        C.requires_grad_()
+
+        y = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+        loss = y.square().mean()
+        loss.backward()
+
+        assert U.grad is not None
+        assert M.grad is not None
+        assert K.grad is not None
+        assert B.grad is not None
+        assert C.grad is not None
+        grads = (
+            U.grad.detach().clone(),
+            M.grad.detach().clone(),
+            K.grad.detach().clone(),
+            B.grad.detach().clone(),
+            C.grad.detach().clone(),
+        )
+        return y.detach().clone(), grads
+
+    y1, grads1 = run_once()
+    y2, grads2 = run_once()
+
+    assert torch.isfinite(y1).all()
+    assert torch.isfinite(y2).all()
+    torch.testing.assert_close(y1, y2, atol=0.0, rtol=0.0)
+
+    for grad1, grad2 in zip(grads1, grads2, strict=True):
+        assert torch.isfinite(grad1).all()
+        assert torch.isfinite(grad2).all()
+        torch.testing.assert_close(grad1, grad2, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -25,13 +25,17 @@ def v2x2ssd_cute(
     compute_dtype: torch.dtype | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """CuTe-backed staged v2x2ssd forward path.
+    """CuTe-backed stateless v2x2ssd forward path.
 
     Contract:
     - logical shapes and layouts match ``reference.v2x2ssd`` exactly
+    - stateless forward numerics are mode-invariant across grad-enabled,
+      ``torch.no_grad()``, and ``torch.inference_mode()``
+    - gradients, when recorded, are layered on top of the same stateless
+      forward contract
     - the CuTe path preserves the staged decomposition
       ``chunk_increment -> state_passing -> chunk_scan``
-    - the current public entrypoint is training-only and returns only ``Y``
+    - the current public entrypoint is stateless-only and returns only ``Y``
     """
     # CuTe is a real runtime dependency for this path. Import it here so the
     # rest of the repo remains usable without the kernel toolchain.
@@ -62,7 +66,7 @@ def v2x2ssd_cute(
         )
     if initial_states is not None or B_prev is not None or U_prev is not None:
         raise NotImplementedError(
-            "CuTe v2x2ssd currently supports only stateless training execution."
+            "CuTe v2x2ssd currently supports only stateless execution."
         )
 
     if T == 0:
@@ -79,7 +83,10 @@ def v2x2ssd_cute(
         )
         return empty_y
 
-    if any(tensor.requires_grad for tensor in (U, M, K, B, C)):
+    needs_autograd = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (U, M, K, B, C)
+    )
+    if needs_autograd:
         from .autograd import v2x2ssd_cute_training_autograd
 
         return v2x2ssd_cute_training_autograd(

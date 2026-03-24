@@ -33,7 +33,7 @@ def scanprep_cute(
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> ScanInputs:
-    """Training-only CuTe scanprep contract.
+    """CuTe scanprep contract for stateless mixer execution.
 
     Public contract:
     - ``value``: ``(B, T, H * P)`` post-conv/post-activation mixer values
@@ -43,7 +43,8 @@ def scanprep_cute(
 
     Design constraints:
     - BC generation stays outside this backend
-    - this boundary is training-only for now
+    - stateless forward numerics are shared across grad-enabled and no-grad
+      execution; autograd is layered on top only when gradients are recorded
     - the default eager/reference backend remains the source of truth until the
       fused CuTe implementation is complete
     """
@@ -74,7 +75,7 @@ def scanprep_cute(
             "CuTe scanprep supports only float16, bfloat16, and float32 inputs."
         )
 
-    grads_enabled = torch.is_grad_enabled() and any(
+    needs_autograd = torch.is_grad_enabled() and any(
         tensor is not None and tensor.requires_grad
         for tensor in (
             value,
@@ -91,7 +92,7 @@ def scanprep_cute(
             c_scale,
         )
     )
-    if grads_enabled:
+    if needs_autograd:
         from slinoss.ops.scanprep.cute.autograd import scanprep_cute_training_autograd
 
         U, M, K, B, C = scanprep_cute_training_autograd(

@@ -26,9 +26,7 @@ _STATE_PASSING_CACHE: dict[tuple, object] = {}
 _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
 _FWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_FWD_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
-_PTR_ARG_CACHE_LIMIT = 32768
+_ZERO_INITIAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _get_zero_prev_tensors(
@@ -59,6 +57,33 @@ def _get_zero_prev_tensors(
     return cached
 
 
+def _get_zero_initial_state(
+    *,
+    device: torch.device,
+    batch_size: int,
+    heads: int,
+    P: int,
+    D: int,
+) -> torch.Tensor:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch_size),
+        int(heads),
+        int(P),
+        int(D),
+    )
+    cached = _ZERO_INITIAL_STATE_CACHE.get(key)
+    if cached is None:
+        cached = torch.zeros(
+            (batch_size, heads, P, D),
+            device=device,
+            dtype=torch.float32,
+        )
+        _ZERO_INITIAL_STATE_CACHE[key] = cached
+    return cached
+
+
 def _get_fwd_workspace(
     *,
     device: torch.device,
@@ -68,27 +93,14 @@ def _get_fwd_workspace(
     P: int,
     D: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (
-        device.type,
-        device.index if device.index is not None else -1,
-        int(batch_size),
-        int(heads),
-        int(n_chunks),
-        int(P),
-        int(D),
+    return (
+        torch.empty(
+            (batch_size, heads, n_chunks, P, D),
+            device=device,
+            dtype=torch.float32,
+        ),
+        torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
     )
-    cached = _FWD_WORKSPACE_CACHE.get(key)
-    if cached is None:
-        cached = (
-            torch.empty(
-                (batch_size, heads, n_chunks, P, D),
-                device=device,
-                dtype=torch.float32,
-            ),
-            torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
-        )
-        _FWD_WORKSPACE_CACHE[key] = cached
-    return cached
 
 
 def _resolve_chunk_scan_n_block_size(L: int, requested: int) -> int:
@@ -266,18 +278,8 @@ def _make_tensor_from_spec(
 
 
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    device_index = (
-        int(t.device.index)
-        if t.device.type == "cuda" and t.device.index is not None
-        else -1
-    )
-    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
-    cached = _PTR_ARG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     align = _assumed_align(t)
-    cached = (
+    return (
         make_ptr(
             _torch_to_cutlass_dtype(t.dtype),
             t.data_ptr(),
@@ -286,10 +288,6 @@ def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
         ),
         align,
     )
-    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
-        _PTR_ARG_CACHE.clear()
-    _PTR_ARG_CACHE[key] = cached
-    return cached
 
 
 def _make_ptr_args(
@@ -622,8 +620,8 @@ def _compile_chunk_increment_kernel_impl(
     BH = Bsz * H
     BHC = BH * n_chunks
 
-    inc_chunk = torch.empty((BHC, P, D), device=U.device, dtype=torch.float32)
-    m_chunk_chunk = torch.empty((BHC, 2), device=U.device, dtype=torch.float32)
+    inc_chunk = torch.zeros((BHC, P, D), device=U.device, dtype=torch.float32)
+    m_chunk_chunk = torch.zeros((BHC, 2), device=U.device, dtype=torch.float32)
 
     Kprev_view = K_f[:, :, :, 0, :]
     Kcurr_view = K_f[:, :, :, 1, :]
@@ -1295,6 +1293,13 @@ def _build_forward_args(
         P=P,
         D=D,
     )
+    initial_state0 = _get_zero_initial_state(
+        device=U.device,
+        batch_size=Bsz,
+        heads=H,
+        P=P,
+        D=D,
+    )
     m_chunk = torch.empty((Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32)
     chunk_starts = torch.empty(
         (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
@@ -1331,6 +1336,7 @@ def _build_forward_args(
         m_chunk,
         chunk_starts,
         final_state,
+        initial_state0,
         out_pad,
     )
     spec = (
@@ -1423,6 +1429,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
         m_chunk_ptr: cute.Pointer,
         chunk_starts_ptr: cute.Pointer,
         final_state_ptr: cute.Pointer,
+        initial_state_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
     ):
         mU_inc = _make_tensor_from_spec(U_ptr, u_inc_spec)
@@ -1441,6 +1448,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             chunk_starts_ptr, chunk_starts_spec
         )
         final_state_t = _make_tensor_from_spec(final_state_ptr, final_state_spec)
+        initial_state_t = _make_tensor_from_spec(initial_state_ptr, final_state_spec)
 
         mU_scan = _make_tensor_from_spec(U_ptr, u_scan_spec)
         mB_scan = _make_tensor_from_spec(B_ptr, b_scan_spec)
@@ -1475,12 +1483,14 @@ def _make_v2x2ssd_fwd_host_wrapper(
             copy_bits_state=state_copy_bits_state,
             has_init=False,
         )
+        # Keep the stateless dummy init separate from the final-state output.
+        # Aliasing these makes the fused path effectively stateful across calls.
         state_passing(
             inc_state_t,
             m_chunk_state_t,
             chunk_starts_state_t,
             final_state_t,
-            final_state_t,
+            initial_state_t,
         )
 
         chunk_scan = ChunkScanFwdAmpere(

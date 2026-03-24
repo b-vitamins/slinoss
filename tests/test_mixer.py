@@ -260,6 +260,39 @@ def test_mixer_forward_supports_issue_3_shape() -> None:
     assert torch.isfinite(y).all()
 
 
+def test_mixer_cute_stateless_forward_is_mode_invariant_for_issue_6() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=128,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        device="cuda",
+        dtype=torch.float32,
+    ).eval()
+    x = torch.randn((2, 65, 128), device="cuda", dtype=torch.float32)
+
+    with torch.enable_grad():
+        y_grad = mixer(x)
+    with torch.no_grad():
+        y_no_grad = mixer(x)
+    with torch.inference_mode():
+        y_infer = mixer(x)
+
+    for y in (y_grad, y_no_grad, y_infer):
+        assert torch.isfinite(y).all()
+
+    torch.testing.assert_close(y_no_grad, y_grad, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(y_infer, y_grad, atol=0.0, rtol=0.0)
+
+
 def test_mixer_torch_compile_contains_only_intentional_compiler_boundaries() -> None:
     if not torch.cuda.is_available():
         return
