@@ -21,13 +21,43 @@ than any external wrapper surface. Compile/wrapper glue belongs in
 ``fwd/__init__.py``.
 """
 
-from __future__ import annotations
-
 import math
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+
+
+@dataclass(frozen=True)
+class ChunkIncrementLayoutBundle:
+    a_major_mode: object
+    b_major_mode: object
+    c_major_mode: object
+    sA_layout: object
+    sB_layout: object
+    sC_layout: object
+
+
+@dataclass(frozen=True)
+class ChunkIncrementCopyBundle:
+    tiled_copy_A: object
+    tiled_copy_B: object
+    tiled_copy_C: object
+
+
+@dataclass(frozen=True)
+class ChunkIncrementKernelBundle:
+    layouts: ChunkIncrementLayoutBundle
+    copies: ChunkIncrementCopyBundle
+    tiled_mma: object
+    SharedStorage: object
+    compute_smem_bytes: int
+    output_smem_bytes: int
+
+    @property
+    def smem_size(self) -> int:
+        return max(self.compute_smem_bytes, self.output_smem_bytes)
 
 
 class ChunkIncrementFwdAmpere:
@@ -78,6 +108,38 @@ class ChunkIncrementFwdAmpere:
         if self.bK % mmaK != 0:
             raise ValueError("bK must be divisible by MMA instruction shape")
 
+    @staticmethod
+    def _align_up(offset: int, align: int) -> int:
+        return ((offset + align - 1) // align) * align
+
+    @classmethod
+    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
+        offset = 0
+        max_align = 1
+        for size, align in fields:
+            offset = cls._align_up(offset, align)
+            offset += size
+            max_align = max(max_align, align)
+        return cls._align_up(offset, max_align)
+
+    def _alpha_layout(self):
+        return cute.make_layout((self.L, 2), stride=(2, 1))
+
+    def _u0_layout(self):
+        return cute.make_layout((self.bM,))
+
+    def _b0_layout(self):
+        return cute.make_layout((self.bN,))
+
+    def _warp_scan_layout(self):
+        return cute.make_layout((32, 2), stride=(2, 1))
+
+    def _output_alias_guard_layout(self):
+        return cute.make_layout((512,))
+
+    def _tail_pad_layout(self):
+        return cute.make_layout((64,))
+
     def _make_smem_layout_AB(self, dtype, major_mode, copy_bits, smem_tiler):
         major_mode_size = (
             smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
@@ -104,30 +166,6 @@ class ChunkIncrementFwdAmpere:
             layout_atom_outer,
         )
         return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))
-
-    def _make_smem_layout_C(self, dtype, major_mode, copy_bits, smem_tiler):
-        major_mode_size = (
-            smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
-        )
-        major_mode_size = 64 if major_mode_size >= 64 else major_mode_size
-        swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits))
-        swizzle_bits = min(swizzle_bits, 3)
-
-        layout_atom_outer = (
-            cute.make_layout((8, major_mode_size), stride=(major_mode_size, 1))
-            if major_mode == utils.LayoutEnum.ROW_MAJOR
-            else cute.make_layout((major_mode_size, 8), stride=(1, major_mode_size))
-        )
-        layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits, 3, 4),
-            0,
-            layout_atom_outer,
-        )
-        if major_mode == utils.LayoutEnum.COL_MAJOR:
-            layout_atom = cute.make_composed_layout(
-                cute.make_swizzle(0, 3, 4), 0, layout_atom_outer
-            )
-        return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1))
 
     def _make_gmem_tiled_copy_AB(
         self, atom_copy, dtype, major_mode, copy_bits, *, tile_m: int
@@ -210,6 +248,188 @@ class ChunkIncrementFwdAmpere:
         thread_layout = cute.make_layout((best_tm, best_tn), stride=(best_tn, 1))
         return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
 
+    def _make_layout_bundle(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mInc: cute.Tensor,
+    ) -> ChunkIncrementLayoutBundle:
+        a_major_mode = utils.LayoutEnum.from_tensor(mU)
+        b_major_mode = utils.LayoutEnum.from_tensor(mB)
+        c_major_mode = utils.LayoutEnum.from_tensor(mInc)
+
+        ab_copy_bits = 128
+        sA_layout = self._make_smem_layout_AB(
+            mU.element_type,
+            a_major_mode,
+            ab_copy_bits,
+            (self.bM, self.bK, self.num_stages),
+        )
+        sB_layout = self._make_smem_layout_AB(
+            mB.element_type,
+            b_major_mode,
+            ab_copy_bits,
+            (self.bN, self.bK, self.num_stages),
+        )
+        sC_layout = cute.make_layout((self.bM, self.bN), stride=(self.bN, 1))
+        return ChunkIncrementLayoutBundle(
+            a_major_mode=a_major_mode,
+            b_major_mode=b_major_mode,
+            c_major_mode=c_major_mode,
+            sA_layout=sA_layout,
+            sB_layout=sB_layout,
+            sC_layout=sC_layout,
+        )
+
+    def _make_copy_bundle(
+        self,
+        layouts: ChunkIncrementLayoutBundle,
+        in_dtype: type[cutlass.Numeric],
+    ) -> ChunkIncrementCopyBundle:
+        copy_bits = 128
+        atom_async_copy = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            in_dtype,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy_A = self._make_gmem_tiled_copy_AB(
+            atom_async_copy,
+            in_dtype,
+            layouts.a_major_mode,
+            copy_bits,
+            tile_m=self.bM,
+        )
+        tiled_copy_B = self._make_gmem_tiled_copy_AB(
+            atom_async_copy,
+            in_dtype,
+            layouts.b_major_mode,
+            copy_bits,
+            tile_m=self.bN,
+        )
+
+        atom_sync_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.c_dtype,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy_C = self._make_gmem_tiled_copy_C(
+            atom_sync_copy,
+            self.c_dtype,
+            layouts.c_major_mode,
+            copy_bits,
+        )
+        return ChunkIncrementCopyBundle(
+            tiled_copy_A=tiled_copy_A,
+            tiled_copy_B=tiled_copy_B,
+            tiled_copy_C=tiled_copy_C,
+        )
+
+    def _make_tiled_mma(self):
+        op = cute.nvgpu.warp.MmaF16BF16Op(
+            self.ab_dtype, self.acc_dtype, self.mma_inst_shape
+        )
+        permutation_mnk = (
+            self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
+            self.atom_layout_mnk[2] * self.mma_inst_shape[2],
+        )
+        atoms_layout = cute.make_layout(self.atom_layout_mnk)
+        return cute.make_tiled_mma(op, atoms_layout, permutation_mnk=permutation_mnk)
+
+    def _shared_storage_fields(
+        self,
+        in_dtype: type[cutlass.Numeric],
+        layouts: ChunkIncrementLayoutBundle,
+    ) -> list[tuple[int, int]]:
+        in_bytes = in_dtype.width // 8
+        return [
+            (cute.cosize(layouts.sA_layout) * in_bytes, 16),
+            (cute.cosize(layouts.sB_layout) * in_bytes, 16),
+            (cute.cosize(self._output_alias_guard_layout()) * 4, 16),
+            (cute.cosize(self._alpha_layout()) * 4, 4),
+            (cute.cosize(self._alpha_layout()) * 4, 4),
+            (cute.cosize(self._u0_layout()) * 4, 4),
+            (cute.cosize(self._b0_layout()) * 4, 4),
+            (cute.cosize(self._warp_scan_layout()) * 4, 8),
+            (cute.cosize(self._warp_scan_layout()) * 4, 8),
+            (cute.cosize(self._tail_pad_layout()) * 4, 4),
+        ]
+
+    def _make_shared_storage(
+        self,
+        in_dtype: type[cutlass.Numeric],
+        layouts: ChunkIncrementLayoutBundle,
+    ):
+        alpha_layout = self._alpha_layout()
+        u0_layout = self._u0_layout()
+        b0_layout = self._b0_layout()
+        warp_scan_layout = self._warp_scan_layout()
+        output_alias_guard_layout = self._output_alias_guard_layout()
+        tail_pad_layout = self._tail_pad_layout()
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "sA": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sA_layout)], 16
+            ],
+            "sB": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
+            ],
+            # Preserve the historical aliasing envelope for the sA -> sC epilogue reuse.
+            "output_alias_guard": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(output_alias_guard_layout)
+                ],
+                16,
+            ],
+            "alpha_prev": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(alpha_layout)], 4
+            ],
+            "alpha_curr": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(alpha_layout)], 4
+            ],
+            "u0": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(u0_layout)], 4
+            ],
+            "b0": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(b0_layout)], 4
+            ],
+            "warp_m_total": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(warp_scan_layout)], 8
+            ],
+            "warp_m_offset": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(warp_scan_layout)], 8
+            ],
+            "tail_pad": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(tail_pad_layout)], 4
+            ],
+        }
+        return cute.struct(SharedStorage)
+
+    def _make_kernel_bundle(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mInc: cute.Tensor,
+    ) -> ChunkIncrementKernelBundle:
+        layouts = self._make_layout_bundle(mU, mB, mInc)
+        copies = self._make_copy_bundle(layouts, mU.element_type)
+        SharedStorage = self._make_shared_storage(mU.element_type, layouts)
+        return ChunkIncrementKernelBundle(
+            layouts=layouts,
+            copies=copies,
+            tiled_mma=self._make_tiled_mma(),
+            SharedStorage=SharedStorage,
+            compute_smem_bytes=self._struct_size_bytes(
+                self._shared_storage_fields(mU.element_type, layouts)
+            ),
+            output_smem_bytes=cute.size_in_bytes(self.c_dtype, layouts.sC_layout),
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -223,87 +443,7 @@ class ChunkIncrementFwdAmpere:
         mInc: cute.Tensor,  # (P, D, BHC) fp32
         mMchunk: cute.Tensor,  # (2, BHC) fp32
     ):
-        self.a_major_mode = utils.LayoutEnum.from_tensor(mU)
-        self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
-        self.c_major_mode = utils.LayoutEnum.from_tensor(mInc)
-
-        ab_copy_bits = 128
-        sA_layout = self._make_smem_layout_AB(
-            mU.element_type,
-            self.a_major_mode,
-            ab_copy_bits,
-            (self.bM, self.bK, self.num_stages),
-        )
-        sB_layout = self._make_smem_layout_AB(
-            mB.element_type,
-            self.b_major_mode,
-            ab_copy_bits,
-            (self.bN, self.bK, self.num_stages),
-        )
-
-        smem_size_AB = cute.size_in_bytes(
-            mU.element_type, sA_layout
-        ) + cute.size_in_bytes(mB.element_type, sB_layout)
-
-        c_copy_bits = 128
-        sC_layout = cute.make_layout(
-            (self.cta_tiler[0], self.cta_tiler[1]), stride=(self.cta_tiler[1], 1)
-        )
-
-        extra_bytes = 0
-        extra_bytes += 2048
-        extra_bytes += 2 * self.L * 4  # alpha_prev
-        extra_bytes += 2 * self.L * 4  # alpha_curr
-        extra_bytes += (self.bM + self.bN) * 4  # boundary u0 / b0
-        extra_bytes += (32 * 2 + 32 * 2) * 4  # warp scan scratch
-        extra_bytes += 256
-
-        smem_needed = max(
-            smem_size_AB + extra_bytes, cute.size_in_bytes(self.c_dtype, sC_layout)
-        )
-
-        atom_async_copy = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(
-                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
-            ),
-            mU.element_type,
-            num_bits_per_copy=ab_copy_bits,
-        )
-        tiled_copy_A = self._make_gmem_tiled_copy_AB(
-            atom_async_copy,
-            mU.element_type,
-            self.a_major_mode,
-            ab_copy_bits,
-            tile_m=self.bM,
-        )
-        tiled_copy_B = self._make_gmem_tiled_copy_AB(
-            atom_async_copy,
-            mB.element_type,
-            self.b_major_mode,
-            ab_copy_bits,
-            tile_m=self.bN,
-        )
-
-        atom_sync_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.c_dtype,
-            num_bits_per_copy=c_copy_bits,
-        )
-        tiled_copy_C = self._make_gmem_tiled_copy_C(
-            atom_sync_copy, self.c_dtype, self.c_major_mode, c_copy_bits
-        )
-
-        op = cute.nvgpu.warp.MmaF16BF16Op(
-            self.ab_dtype, self.acc_dtype, self.mma_inst_shape
-        )
-        permutation_mnk = (
-            self.atom_layout_mnk[0] * self.mma_inst_shape[0],
-            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
-            self.atom_layout_mnk[2] * self.mma_inst_shape[2],
-        )
-        tC = cute.make_layout(self.atom_layout_mnk)
-        tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
-
+        bundle = self._make_kernel_bundle(mU, mB, mInc)
         grid_dim = cute.ceil_div(mInc.shape, (self.bM, self.bN, 1))
         grid_z = cute.size(mInc.shape[2])
 
@@ -317,18 +457,46 @@ class ChunkIncrementFwdAmpere:
             mB_prev0,
             mInc,
             mMchunk,
-            sA_layout,
-            sB_layout,
-            sC_layout,
-            tiled_copy_A,
-            tiled_copy_B,
-            tiled_copy_C,
-            tiled_mma,
+            bundle.layouts.a_major_mode,
+            bundle.layouts.b_major_mode,
+            bundle.layouts.sA_layout,
+            bundle.layouts.sB_layout,
+            bundle.layouts.sC_layout,
+            bundle.copies.tiled_copy_A,
+            bundle.copies.tiled_copy_B,
+            bundle.copies.tiled_copy_C,
+            bundle.tiled_mma,
+            bundle.SharedStorage,
         ).launch(
             grid=(cute.size(grid_dim[0]), cute.size(grid_dim[1]), grid_z),
             block=[self.num_threads, 1, 1],
-            smem=smem_needed,
+            smem=bundle.smem_size,
         )
+
+    @cute.jit
+    def _make_copy_row_predicate(
+        self,
+        partitioned_dst: cute.Tensor,
+        partitioned_coord: cute.Tensor,
+        row_limit: int,
+    ):
+        pred = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    partitioned_dst.shape[0][1],
+                    cute.size(partitioned_dst, mode=[1]),
+                    cute.size(partitioned_dst, mode=[2]),
+                ),
+                stride=(cute.size(partitioned_dst, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in cutlass.range_constexpr(pred.shape[0]):
+            for row in cutlass.range_constexpr(pred.shape[1]):
+                pred[rest_v, row, 0] = cute.elem_less(
+                    partitioned_coord[(0, rest_v), row, 0, 0][0], row_limit
+                )
+        return pred
 
     @cute.kernel
     def kernel(
@@ -342,6 +510,8 @@ class ChunkIncrementFwdAmpere:
         mB_prev0: cute.Tensor,
         mInc: cute.Tensor,
         mMchunk: cute.Tensor,
+        a_major_mode: cutlass.Constexpr,
+        b_major_mode: cutlass.Constexpr,
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
         sC_layout: cute.Layout,
@@ -349,6 +519,7 @@ class ChunkIncrementFwdAmpere:
         tiled_copy_B: cute.TiledCopy,
         tiled_copy_C: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
+        SharedStorage: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -371,28 +542,20 @@ class ChunkIncrementFwdAmpere:
         )
 
         smem = cutlass.utils.SmemAllocator()
-        sA = smem.allocate_tensor(mU.element_type, sA_layout, 16)
-        sB = smem.allocate_tensor(mB.element_type, sB_layout, 16)
+        storage = smem.allocate(SharedStorage)
+        sA = storage.sA.get_tensor(sA_layout)
+        sB = storage.sB.get_tensor(sB_layout)
         sC = cute.make_tensor(
             cute.recast_ptr(sA.iterator, dtype=self.c_dtype), sC_layout
         )
-
-        _guard = smem.allocate_tensor(cutlass.Float32, cute.make_layout((512,)), 16)
-
-        s_alpha_prev = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((self.L, 2), stride=(2, 1)), 4
-        )
-        s_alpha_curr = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((self.L, 2), stride=(2, 1)), 4
-        )
-        s_u0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((self.bM,)), 4)
-        s_b0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((self.bN,)), 4)
-        warp_m_total = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32, 2), stride=(2, 1)), 8
-        )
-        warp_m_offset = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32, 2), stride=(2, 1)), 8
-        )
+        alpha_layout = self._alpha_layout()
+        warp_scan_layout = self._warp_scan_layout()
+        s_alpha_prev = storage.alpha_prev.get_tensor(alpha_layout)
+        s_alpha_curr = storage.alpha_curr.get_tensor(alpha_layout)
+        s_u0 = storage.u0.get_tensor(self._u0_layout())
+        s_b0 = storage.b0.get_tensor(self._b0_layout())
+        warp_m_total = storage.warp_m_total.get_tensor(warp_scan_layout)
+        warp_m_offset = storage.warp_m_offset.get_tensor(warp_scan_layout)
 
         thr_copy_A = tiled_copy_A.get_slice(tidx)
         thr_copy_B = tiled_copy_B.get_slice(tidx)
@@ -416,13 +579,13 @@ class ChunkIncrementFwdAmpere:
 
         atom_copy_s2r_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                self.a_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+                a_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
             ),
             mU.element_type,
         )
         atom_copy_s2r_B = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                self.b_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+                b_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
             ),
             mB.element_type,
         )
@@ -454,38 +617,8 @@ class ChunkIncrementFwdAmpere:
         tUcU = thr_copy_A.partition_S(cU)
         tBcB = thr_copy_B.partition_S(cB)
 
-        tUpU = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    tAsA.shape[0][1],
-                    cute.size(tAsA, mode=[1]),
-                    cute.size(tAsA, mode=[2]),
-                ),
-                stride=(cute.size(tAsA, mode=[1]), 1, 0),
-            ),
-            cutlass.Boolean,
-        )
-        tBpB = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    tBsB.shape[0][1],
-                    cute.size(tBsB, mode=[1]),
-                    cute.size(tBsB, mode=[2]),
-                ),
-                stride=(cute.size(tBsB, mode=[1]), 1, 0),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in range(tUpU.shape[0]):
-            for m in range(tUpU.shape[1]):
-                tUpU[rest_v, m, 0] = cute.elem_less(
-                    tUcU[(0, rest_v), m, 0, 0][0], mU.shape[0]
-                )
-        for rest_v in range(tBpB.shape[0]):
-            for n in range(tBpB.shape[1]):
-                tBpB[rest_v, n, 0] = cute.elem_less(
-                    tBcB[(0, rest_v), n, 0, 0][0], mB.shape[0]
-                )
+        tUpU = self._make_copy_row_predicate(tAsA, tUcU, mU.shape[0])
+        tBpB = self._make_copy_row_predicate(tBsB, tBcB, mB.shape[0])
 
         lane = cute.arch.lane_idx()
         warp = cute.arch.warp_idx()
@@ -647,14 +780,14 @@ class ChunkIncrementFwdAmpere:
         cute.arch.sync_threads()
         k_tile_index = cutlass.Int32(0)
 
-        for kk in range(tUpU.shape[2]):
+        for kk in cutlass.range_constexpr(tUpU.shape[2]):
             cute.copy(
                 tiled_copy_A,
                 tAgA[None, None, kk, k_tile_index],
                 tAsA[None, None, kk, 0],
                 pred=tUpU[None, None, kk],
             )
-        for kk in range(tBpB.shape[2]):
+        for kk in cutlass.range_constexpr(tBpB.shape[2]):
             cute.copy(
                 tiled_copy_B,
                 tBgB[None, None, kk, k_tile_index],
@@ -864,14 +997,14 @@ class ChunkIncrementFwdAmpere:
                 ),
                 cutlass.Boolean,
             )
-            for rest_v in range(tCpC.shape[0]):
-                for m in range(tCpC.shape[1]):
+            for rest_v in cutlass.range_constexpr(tCpC.shape[0]):
+                for m in cutlass.range_constexpr(tCpC.shape[1]):
                     tCpC[rest_v, m, 0] = cute.elem_less(
                         tCcC[(0, rest_v), m, 0][0], mInc.shape[0]
                     )
 
-            for rest_v in range(tCpC.shape[0]):
-                for n in range(tCpC.shape[2]):
+            for rest_v in cutlass.range_constexpr(tCpC.shape[0]):
+                for n in cutlass.range_constexpr(tCpC.shape[2]):
                     if cute.elem_less(tCcC[(0, rest_v), 0, n][1], mInc.shape[1]):
                         cute.copy(
                             tiled_copy_C,
