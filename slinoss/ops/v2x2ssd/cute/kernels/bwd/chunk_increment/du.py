@@ -170,33 +170,32 @@ class ChunkIncrementBwdDUAmpere:
         mKcurr: cute.Tensor,  # (2, L, BHC) fp32 packed complex
         mDU: cute.Tensor,  # (P, L, BHC) fp16/bf16
     ):
-        self.a_major_mode = utils.LayoutEnum.from_tensor(mDInc)
-        self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
-        self.c_major_mode = utils.LayoutEnum.from_tensor(mDU)
+        a_major_mode = utils.LayoutEnum.from_tensor(mDInc)
+        b_major_mode = utils.LayoutEnum.from_tensor(mB)
 
         a_copy_bits = _default_async_copy_bits(
             dtype_width=mDInc.element_type.width,
-            major_mode=self.a_major_mode,
+            major_mode=a_major_mode,
             tile_m=self.bM,
             tile_k=self.bK,
             num_threads=self.num_threads,
         )
         b_copy_bits = _default_async_copy_bits(
             dtype_width=mB.element_type.width,
-            major_mode=self.b_major_mode,
+            major_mode=b_major_mode,
             tile_m=self.bN,
             tile_k=self.bK,
             num_threads=self.num_threads,
         )
         sA_layout = self._make_smem_layout_AB(
             mDInc.element_type,
-            self.a_major_mode,
+            a_major_mode,
             a_copy_bits,
             (self.bM, self.bK, self.num_stages),
         )
         sB_layout = self._make_smem_layout_AB(
             mB.element_type,
-            self.b_major_mode,
+            b_major_mode,
             b_copy_bits,
             (self.bN, self.bK, self.num_stages),
         )
@@ -227,7 +226,7 @@ class ChunkIncrementBwdDUAmpere:
         tiled_copy_A = self._make_gmem_tiled_copy_AB(
             atom_async_copy,
             mDInc.element_type,
-            self.a_major_mode,
+            a_major_mode,
             a_copy_bits,
             tile_m=self.bM,
         )
@@ -241,7 +240,7 @@ class ChunkIncrementBwdDUAmpere:
         tiled_copy_B = self._make_gmem_tiled_copy_AB(
             atom_async_copy_B,
             mB.element_type,
-            self.b_major_mode,
+            b_major_mode,
             b_copy_bits,
             tile_m=self.bN,
         )
@@ -256,6 +255,20 @@ class ChunkIncrementBwdDUAmpere:
         )
         tC = cute.make_layout(self.atom_layout_mnk)
         tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
+        atom_copy_s2r_A = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                a_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+            ),
+            mDInc.element_type,
+        )
+        atom_copy_s2r_B = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                b_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+            ),
+            mB.element_type,
+        )
+        tiled_copy_s2r_A = cute.make_tiled_copy_A(atom_copy_s2r_A, tiled_mma)
+        tiled_copy_s2r_B = cute.make_tiled_copy_B(atom_copy_s2r_B, tiled_mma)
 
         grid_x = cute.ceil_div(self.P, self.bM)
         grid_y = cute.ceil_div(self.L, self.bN)
@@ -274,6 +287,8 @@ class ChunkIncrementBwdDUAmpere:
             sGuard_layout,
             tiled_copy_A,
             tiled_copy_B,
+            tiled_copy_s2r_A,
+            tiled_copy_s2r_B,
             tiled_mma,
         ).launch(
             grid=(cute.size(grid_x), cute.size(grid_y), grid_z),
@@ -296,6 +311,8 @@ class ChunkIncrementBwdDUAmpere:
         sGuard_layout: cute.Layout,
         tiled_copy_A: cute.TiledCopy,
         tiled_copy_B: cute.TiledCopy,
+        tiled_copy_s2r_A: cute.TiledCopy,
+        tiled_copy_s2r_B: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -370,20 +387,6 @@ class ChunkIncrementBwdDUAmpere:
         tCrC = tiled_mma.make_fragment_C(tCgC)
         tCrC.fill(0.0)
 
-        atom_copy_s2r_A = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                self.a_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
-            ),
-            mDInc.element_type,
-        )
-        atom_copy_s2r_B = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                self.b_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
-            ),
-            mB.element_type,
-        )
-        tiled_copy_s2r_A = cute.make_tiled_copy_A(atom_copy_s2r_A, tiled_mma)
-        tiled_copy_s2r_B = cute.make_tiled_copy_B(atom_copy_s2r_B, tiled_mma)
         thr_copy_ld_A = tiled_copy_s2r_A.get_slice(tidx)
         thr_copy_ld_B = tiled_copy_s2r_B.get_slice(tidx)
         tCsA_copy = thr_copy_ld_A.partition_S(sA)

@@ -39,12 +39,25 @@ class ChunkIncrementBwdBoundaryAmpere:
         self.D = int(D)
         self.P = int(P)
         self.num_threads = int(num_threads)
+        self.du_prev_threads = 64
+        self.db_prev_threads = self.num_threads - self.du_prev_threads
+        self.async_copy_bits = 128
+        if self.L <= 64:
+            self.scan_threads = 64
+        elif self.L <= 128:
+            self.scan_threads = 128
+        else:
+            self.scan_threads = 0
         if self.D % 2 != 0:
             raise ValueError("D must be divisible by 2 (flattened 2N).")
         if self.num_threads <= 64:
             raise ValueError("num_threads must be > 64.")
         if self.num_threads % 32 != 0:
             raise ValueError("num_threads must be a multiple of 32.")
+        if self.db_prev_threads <= 0:
+            raise ValueError("num_threads must leave room for the dB_prev workers.")
+        if self.scan_threads > self.num_threads:
+            raise ValueError("num_threads must cover the configured suffix scan.")
 
     @cute.jit
     def __call__(
@@ -59,6 +72,7 @@ class ChunkIncrementBwdBoundaryAmpere:
         mDMp0: cute.Tensor,  # (2, BHC) fp32
     ):
         grid_x = cute.size(mDInc.shape[0])
+
         self.kernel(
             mDInc,
             mBPrev,
@@ -120,7 +134,7 @@ class ChunkIncrementBwdBoundaryAmpere:
             s_u_prev[p] = mUPrev[p, bhc].to(cutlass.Float32)
             p = p + self.num_threads
 
-        async_copy_bits = 128
+        async_copy_bits = self.async_copy_bits
         async_elems = async_copy_bits // mDInc.element_type.width
         d_vec = self.D // async_elems
         mDInc_vec = cute.make_tensor(
@@ -167,13 +181,9 @@ class ChunkIncrementBwdBoundaryAmpere:
 
         cute.arch.sync_threads()
 
-        scan_threads = 0
-        if self.L <= 64:
-            scan_threads = 64
-        elif self.L <= 128:
-            scan_threads = 128
-
-        if scan_threads != 0 and cute.elem_less(tidx, cutlass.Int32(scan_threads)):
+        if self.scan_threads != 0 and cute.elem_less(
+            tidx, cutlass.Int32(self.scan_threads)
+        ):
             t = (self.L - 1) - tidx
             qr = cutlass.Float32(1.0)
             qi = cutlass.Float32(0.0)
@@ -195,7 +205,7 @@ class ChunkIncrementBwdBoundaryAmpere:
                 qi = cutlass.select_(pred, ni, qi)
 
             if lane == cutlass.Int32(31) and cute.elem_less(
-                warp, cutlass.Int32(scan_threads // 32)
+                warp, cutlass.Int32(self.scan_threads // 32)
             ):
                 warp_re_total[warp] = qr
                 warp_im_total[warp] = qi
@@ -206,8 +216,8 @@ class ChunkIncrementBwdBoundaryAmpere:
             suf_r = cutlass.Float32(1.0)
             suf_i = cutlass.Float32(0.0)
 
-            if scan_threads != 0:
-                num_warps = scan_threads // 32
+            if self.scan_threads != 0:
+                num_warps = self.scan_threads // 32
                 for w in cutlass.range(num_warps, unroll=1):
                     orr = warp_re_total[w]
                     oii = warp_im_total[w]
@@ -248,7 +258,7 @@ class ChunkIncrementBwdBoundaryAmpere:
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        if cute.elem_less(tidx, cutlass.Int32(64)):
+        if cute.elem_less(tidx, cutlass.Int32(self.du_prev_threads)):
             p = tidx
             while cute.elem_less(p, self.P):
                 acc = cutlass.Float32(0.0)
@@ -257,11 +267,11 @@ class ChunkIncrementBwdBoundaryAmpere:
                     acc = acc + s_dinc[p, d].to(cutlass.Float32) * s_b_decay[d]
                     d = d + 1
                 mDUPrev[p, bhc] = acc.to(mDUPrev.element_type)
-                p = p + 64
+                p = p + self.du_prev_threads
 
-        if not cute.elem_less(tidx, cutlass.Int32(64)):
-            d = tidx - 64
-            d_stride = cutlass.Int32(self.num_threads - 64)
+        if not cute.elem_less(tidx, cutlass.Int32(self.du_prev_threads)):
+            d = tidx - self.du_prev_threads
+            d_stride = cutlass.Int32(self.db_prev_threads)
             while cute.elem_less(d, self.D):
                 acc = cutlass.Float32(0.0)
                 for p in cutlass.range(self.P, unroll=1):

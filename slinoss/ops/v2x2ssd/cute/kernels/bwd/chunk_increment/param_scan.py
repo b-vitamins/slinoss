@@ -38,8 +38,8 @@ class ChunkIncrementBwdParamScanAmpere:
         mDKprev: cute.Tensor,  # (2, L, BHC) fp32
         mDKcurr: cute.Tensor,  # (2, L, BHC) fp32
     ):
-        BHC = cute.size(mM.shape[2])
-        grid_x = cute.ceil_div(BHC, self.num_threads)
+        grid_x = cute.ceil_div(cute.size(mM.shape[2]), self.num_threads)
+
         self.kernel(
             mM,
             mKprev,
@@ -50,7 +50,6 @@ class ChunkIncrementBwdParamScanAmpere:
             mDM,
             mDKprev,
             mDKcurr,
-            BHC,
         ).launch(
             grid=[cute.size(grid_x), 1, 1],
             block=[self.num_threads, 1, 1],
@@ -68,10 +67,10 @@ class ChunkIncrementBwdParamScanAmpere:
         mDM: cute.Tensor,
         mDKprev: cute.Tensor,
         mDKcurr: cute.Tensor,
-        BHC: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         b0, _, _ = cute.arch.block_idx()
+        BHC = cute.size(mM.shape[2])
         bhc = b0 * self.num_threads + tidx
         bhc_valid = cute.elem_less(bhc, BHC)
         bhc = cutlass.min(bhc, BHC - cutlass.Int32(1))
