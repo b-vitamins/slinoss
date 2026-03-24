@@ -4,14 +4,92 @@ from __future__ import annotations
 
 import torch
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_ptr
 
-from .common import _TileConfig, _choose_copy_bits_for_linear_tiles
+from .common import (
+    _TileConfig,
+    _assumed_align,
+    _choose_copy_bits_for_linear_tiles,
+    _torch_to_cutlass_dtype,
+)
 from .m import StatePassingBwdMAmpere
 from .state import StatePassingBwdStateAmpere
 
 
 _COMPILED_CACHE: dict[tuple, tuple[object, object]] = {}
+_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
+_PTR_ARG_CACHE_LIMIT = 32768
+
+
+def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= int(shape[i])
+    return tuple(stride)
+
+
+def _make_tensor_spec(
+    shape: tuple[int, ...],
+    *,
+    stride: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    shape = tuple(int(dim) for dim in shape)
+    if stride is None:
+        stride = _make_row_major_stride(shape)
+    else:
+        stride = tuple(int(step) for step in stride)
+    return shape, stride
+
+
+def _make_tensor_from_spec(
+    ptr: cute.Pointer,
+    spec: tuple[tuple[int, ...], tuple[int, ...]],
+):
+    shape, stride = spec
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+
+
+def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+    device_index = (
+        int(t.device.index)
+        if t.device.type == "cuda" and t.device.index is not None
+        else -1
+    )
+    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
+    cached = _PTR_ARG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    align = _assumed_align(t)
+    cached = (
+        make_ptr(
+            _torch_to_cutlass_dtype(t.dtype),
+            t.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=align,
+        ),
+        align,
+    )
+    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
+        _PTR_ARG_CACHE.clear()
+    _PTR_ARG_CACHE[key] = cached
+    return cached
+
+
+def _make_ptr_args(
+    *tensors: torch.Tensor,
+) -> tuple[tuple[object, ...], tuple[int, ...]]:
+    ptrs: list[object] = []
+    alignments: list[int] = []
+    for tensor in tensors:
+        ptr, align = _make_ptr_arg(tensor)
+        ptrs.append(ptr)
+        alignments.append(align)
+    return tuple(ptrs), tuple(alignments)
 
 
 def _compiled_key(
@@ -25,6 +103,7 @@ def _compiled_key(
     pairs_per_thread: int,
     copy_bits_state: int,
     copy_bits_out: int,
+    alignments: tuple[int, ...],
 ) -> tuple:
     return (
         "state_passing_bwd",
@@ -37,7 +116,83 @@ def _compiled_key(
         int(pairs_per_thread),
         int(copy_bits_state),
         int(copy_bits_out),
+        alignments,
     )
+
+
+def _make_state_passing_state_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    B, H, C, P, D = spec
+    num_threads, pairs_per_thread, copy_bits_state, copy_bits_out = cfg
+
+    d_starts_spec = _make_tensor_spec((B, H, C, P, D))
+    d_final_spec = _make_tensor_spec((B, H, P, D))
+    m_spec = _make_tensor_spec((B, H, C, 2))
+    d_inc_spec = _make_tensor_spec((B, H, C, P, D))
+    d_initial_spec = _make_tensor_spec((B, H, P, D))
+
+    @cute.jit
+    def _state_host_wrapper(
+        DStarts_ptr: cute.Pointer,
+        DFinal_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        DInc_ptr: cute.Pointer,
+        DInit_ptr: cute.Pointer,
+    ):
+        mDStarts = _make_tensor_from_spec(DStarts_ptr, d_starts_spec)
+        mDFinal = _make_tensor_from_spec(DFinal_ptr, d_final_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
+        mDInit = _make_tensor_from_spec(DInit_ptr, d_initial_spec)
+
+        kernel = StatePassingBwdStateAmpere(
+            _TileConfig(
+                num_threads=num_threads,
+                pairs_per_thread=pairs_per_thread,
+            ),
+            copy_bits_in=copy_bits_state,
+            copy_bits_out=copy_bits_out,
+        )
+        kernel(mDStarts, mDFinal, mM, mDInc, mDInit)
+
+    return _state_host_wrapper
+
+
+def _make_state_passing_m_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    B, H, C, P, D = spec
+    num_threads, pairs_per_thread, copy_bits_state = cfg
+
+    starts_spec = _make_tensor_spec((B, H, C, P, D))
+    d_inc_spec = _make_tensor_spec((B, H, C, P, D))
+    d_m_spec = _make_tensor_spec((B, H, C, 2))
+
+    @cute.jit
+    def _m_host_wrapper(
+        Starts_ptr: cute.Pointer,
+        DInc_ptr: cute.Pointer,
+        DM_ptr: cute.Pointer,
+    ):
+        mStarts = _make_tensor_from_spec(Starts_ptr, starts_spec)
+        mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
+        mDM = _make_tensor_from_spec(DM_ptr, d_m_spec)
+
+        kernel = StatePassingBwdMAmpere(
+            _TileConfig(
+                num_threads=num_threads,
+                pairs_per_thread=pairs_per_thread,
+            ),
+            copy_bits_in=copy_bits_state,
+        )
+        kernel(mStarts, mDInc, mDM)
+
+    return _m_host_wrapper
 
 
 def compile_state_passing_bwd_kernels(
@@ -52,7 +207,6 @@ def compile_state_passing_bwd_kernels(
     enable_overlapped_launcher: bool = True,
 ) -> tuple:
     """Compile the standalone state-passing backward kernels and allocate outputs."""
-    del enable_overlapped_launcher
 
     if chunk_starts.ndim != 5:
         raise ValueError("chunk_starts must be (B,H,C,P,D).")
@@ -109,6 +263,21 @@ def compile_state_passing_bwd_kernels(
         elems_per_thread=cfg.elems_per_thread,
     )
 
+    starts_c = chunk_starts.contiguous()
+    d_starts_c = d_chunk_starts.contiguous()
+    d_final_c = d_final.contiguous()
+    m_c = m_chunk.contiguous()
+
+    state_args, state_alignments = _make_ptr_args(
+        d_starts_c,
+        d_final_c,
+        m_c,
+        d_inc,
+        d_initial,
+    )
+    m_args, m_alignments = _make_ptr_args(starts_c, d_inc, d_m_chunk)
+    alignments = state_alignments + m_alignments
+
     cache_key = _compiled_key(
         device_index=(
             chunk_starts.device.index if chunk_starts.device.index is not None else -1
@@ -121,38 +290,38 @@ def compile_state_passing_bwd_kernels(
         pairs_per_thread=cfg.pairs_per_thread,
         copy_bits_state=copy_bits_state,
         copy_bits_out=copy_bits_out,
+        alignments=alignments,
     )
-
-    align_state = max(d_chunk_starts.element_size(), copy_bits_state // 8)
-    align_out = max(d_inc.element_size(), copy_bits_out // 8)
-
-    mDStarts = from_dlpack(d_chunk_starts.contiguous(), assumed_align=align_state)
-    mDFinal = from_dlpack(d_final.contiguous(), assumed_align=align_state)
-    mM = from_dlpack(m_chunk.contiguous(), assumed_align=16)
-    mDInc = from_dlpack(d_inc, assumed_align=align_out)
-    mDInit = from_dlpack(d_initial, assumed_align=align_out)
-
-    mStarts = from_dlpack(chunk_starts.contiguous(), assumed_align=align_state)
-    mDM = from_dlpack(d_m_chunk, assumed_align=16)
 
     cached = _COMPILED_CACHE.get(cache_key)
     if cached is None:
-        k_state = StatePassingBwdStateAmpere(
-            cfg,
-            copy_bits_in=copy_bits_state,
-            copy_bits_out=copy_bits_out,
+        state_wrapper = _make_state_passing_state_host_wrapper(
+            spec=(B, H, C, P, D),
+            cfg=(
+                cfg.num_threads,
+                cfg.pairs_per_thread,
+                copy_bits_state,
+                copy_bits_out,
+            ),
         )
-        k_m = StatePassingBwdMAmpere(cfg, copy_bits_in=copy_bits_state)
-        compiled_state = cute.compile(k_state, mDStarts, mDFinal, mM, mDInc, mDInit)
-        compiled_m = cute.compile(k_m, mStarts, mDInc, mDM)
+        m_wrapper = _make_state_passing_m_host_wrapper(
+            spec=(B, H, C, P, D),
+            cfg=(
+                cfg.num_threads,
+                cfg.pairs_per_thread,
+                copy_bits_state,
+            ),
+        )
+        compiled_state = cute.compile(state_wrapper, *state_args)
+        compiled_m = cute.compile(m_wrapper, *m_args)
         cached = (compiled_state, compiled_m)
         _COMPILED_CACHE[cache_key] = cached
     else:
         compiled_state, compiled_m = cached
 
     def launch_sequential() -> None:
-        compiled_state(mDStarts, mDFinal, mM, mDInc, mDInit)
-        compiled_m(mStarts, mDInc, mDM)
+        compiled_state(*state_args)
+        compiled_m(*m_args)
 
     def launch_overlapped() -> None:
         launch_sequential()

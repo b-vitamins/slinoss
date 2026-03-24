@@ -74,6 +74,21 @@ def _choose_copy_bits_for_linear_tiles(
     return best
 
 
+def _assumed_align(
+    t: torch.Tensor,
+    candidates_bytes: tuple[int, ...] = (16, 8, 4),
+) -> int:
+    """Return the widest safe assumed alignment for a tensor view."""
+    elem_align = max(1, t.element_size())
+    ptr = int(t.data_ptr())
+    for align in candidates_bytes:
+        if align < elem_align:
+            continue
+        if (ptr % align) == 0:
+            return align
+    return elem_align
+
+
 @dataclass(frozen=True)
 class _TileConfig:
     num_threads: int = 128
