@@ -8,6 +8,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 
 from .db import ChunkScanBwdDBAmpere
+from .dcdr import ChunkScanBwdDCDRAmpere
 from .dlp import ChunkScanBwdDLPAmpere
 from .du import ChunkScanBwdDUAmpere
 from .dz0 import ChunkScanBwdDZ0Ampere
@@ -140,6 +141,43 @@ def _get_zero_prev_tensors(
         )
         _ZERO_PREV_CACHE[key] = cached
     return cached
+
+
+def _chunk_scan_device_label(device_index: int) -> str:
+    props = torch.cuda.get_device_properties(device_index)
+    return f"{props.name} (sm_{props.major}{props.minor})"
+
+
+def _validate_dcdr_support(
+    *,
+    tc_dtype: torch.dtype,
+    chunk_size: int,
+    D: int,
+    P: int,
+    num_threads: int,
+    device_index: int,
+) -> None:
+    kernel = ChunkScanBwdDCDRAmpere(
+        _torch_to_cutlass_dtype(tc_dtype),
+        chunk_size=chunk_size,
+        D=D,
+        P=P,
+        num_threads=num_threads,
+    )
+    info = kernel.support_info(
+        _torch_to_cutlass_dtype(tc_dtype),
+        device_index=device_index,
+    )
+    if info.supported:
+        return
+
+    device_label = _chunk_scan_device_label(device_index)
+    raise ValueError(
+        f"No supported chunk_scan backward dcdr kernel fits {device_label} for "
+        f"(chunk_size={chunk_size}, D={D}, P={P}, num_threads={num_threads}). "
+        f"The current low-SMEM variant needs {info.required_smem_bytes}B > "
+        f"{info.smem_capacity_bytes}B shared memory."
+    )
 
 
 def _assumed_align(
@@ -701,6 +739,17 @@ def compile_chunk_scan_bwd_kernels(
         raise ValueError("num_threads_dc must be 128 for the dC/dR kernel.")
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    device_index = (
+        U.device.index if U.device.index is not None else torch.cuda.current_device()
+    )
+    _validate_dcdr_support(
+        tc_dtype=tc_dtype,
+        chunk_size=L,
+        D=D,
+        P=P,
+        num_threads=num_threads_dc,
+        device_index=int(device_index),
+    )
 
     U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
     B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)

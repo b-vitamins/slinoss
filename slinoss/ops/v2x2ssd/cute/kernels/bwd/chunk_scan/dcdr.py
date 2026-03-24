@@ -21,8 +21,13 @@ The adaptation is only in the scan algebra:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import ClassVar
+
+import torch
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
 
 from .common import (
     LOG2_E,
@@ -31,6 +36,55 @@ from .common import (
     complex_mul,
     conj_mul_phase,
 )
+
+
+@dataclass(frozen=True)
+class ChunkScanBwdDCDRLayoutBundle:
+    s_u_prev_layout: object
+    s_b_prev_layout: object
+    s_dlp_layout: object
+    sDY_layout: object
+    sV_layout: object
+    sK_layout: object
+    sDS_layout: object
+    sZ0_layout: object
+    s_scale_full_layout: object
+    s_inv_scale_full_layout: object
+    s_phase_full_layout: object
+    tile_prefix_log_layout: object
+    tile_prefix_phase_layout: object
+    s_row_layout: object
+    s_inv_row_layout: object
+    s_phase_row_layout: object
+    s_phase_col_layout: object
+    s_tap_layout: object
+
+
+@dataclass(frozen=True)
+class ChunkScanBwdDCDRCopyBundle:
+    gmem_tiled_copy_D: object
+    gmem_tiled_copy_D_async: object
+    gmem_tiled_copy_P: object
+    gmem_tiled_copy_D_f32: object
+    gmem_tiled_store_D: object
+
+
+@dataclass(frozen=True)
+class ChunkScanBwdDCDRKernelBundle:
+    layouts: ChunkScanBwdDCDRLayoutBundle
+    copies: ChunkScanBwdDCDRCopyBundle
+    tiled_mma: object
+    smem_bytes: int
+
+
+@dataclass(frozen=True)
+class ChunkScanBwdDCDRSupportInfo:
+    smem_capacity_bytes: int
+    required_smem_bytes: int
+
+    @property
+    def supported(self) -> bool:
+        return self.required_smem_bytes <= self.smem_capacity_bytes
 
 
 class ChunkScanBwdDCDRAmpere:
@@ -50,6 +104,10 @@ class ChunkScanBwdDCDRAmpere:
         then an off-term against ``Z0``.
     """
 
+    _SUPPORT_INFO_CACHE: ClassVar[
+        dict[tuple[object, ...], ChunkScanBwdDCDRSupportInfo]
+    ] = {}
+
     def __init__(self, dtype, *, chunk_size, D, P, num_threads=128):
         self.ab_dtype = dtype
         self.acc_dtype = cutlass.Float32
@@ -58,6 +116,7 @@ class ChunkScanBwdDCDRAmpere:
         self.P = int(P)
         self.num_threads = int(num_threads)
         self.kv_tile = 32
+        self.p_tile = 32
 
         if self.L <= 0:
             raise ValueError("chunk_size must be positive.")
@@ -112,75 +171,243 @@ class ChunkScanBwdDCDRAmpere:
     def _tail_pad_layout(self):
         return cute.make_layout((128,), stride=(1,))
 
-    def _shared_storage_fields(
+    def _smem_block_size_D(self) -> int:
+        return 64 if self.D_padded % 64 == 0 else 32
+
+    @staticmethod
+    def _swizzle_bits(smem_block_size: int) -> int:
+        return 3 if smem_block_size == 64 else 2
+
+    def _smem_capacity_bytes(self, device_index: int | None = None) -> int:
+        if torch.cuda.is_available():
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(int(device_index))
+            capacity = int(getattr(props, "shared_memory_per_block_optin", 0))
+            if capacity > 0:
+                return capacity
+            cc = f"sm_{props.major}{props.minor}"
+            return int(utils.get_smem_capacity_in_bytes(cc))
+        return int(utils.get_smem_capacity_in_bytes("sm_80"))
+
+    def _make_layout_bundle(self) -> ChunkScanBwdDCDRLayoutBundle:
+        Dp = self.D_padded
+        kv_tile = self.kv_tile
+        p_tile = self.p_tile
+        n_tiles = self.L // kv_tile
+
+        smem_k_block_size_D = self._smem_block_size_D()
+        swizzle_bits_D = self._swizzle_bits(smem_k_block_size_D)
+        sD_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_D, 3, 3),
+            0,
+            cute.make_layout((8, smem_k_block_size_D), stride=(smem_k_block_size_D, 1)),
+        )
+        sK_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Dp), (0, 1))
+        sZ0_layout = cute.tile_to_shape(sD_layout_atom, (p_tile, Dp), (0, 1))
+
+        smem_k_block_size_P = p_tile
+        swizzle_bits_P = self._swizzle_bits(smem_k_block_size_P)
+        sP_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_P, 3, 3),
+            0,
+            cute.make_layout((8, smem_k_block_size_P), stride=(smem_k_block_size_P, 1)),
+        )
+        sDY_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
+        sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
+
+        smem_k_block_size_blk = kv_tile
+        swizzle_bits_blk = self._swizzle_bits(smem_k_block_size_blk)
+        sBlk_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_blk, 3, 3),
+            0,
+            cute.make_layout(
+                (8, smem_k_block_size_blk), stride=(smem_k_block_size_blk, 1)
+            ),
+        )
+        sDS_layout = cute.tile_to_shape(sBlk_layout_atom, (kv_tile, kv_tile), (0, 1))
+
+        return ChunkScanBwdDCDRLayoutBundle(
+            s_u_prev_layout=cute.make_layout((self.P,), stride=(1,)),
+            s_b_prev_layout=cute.make_layout((self.D,), stride=(1,)),
+            s_dlp_layout=cute.make_layout((self.L,), stride=(1,)),
+            sDY_layout=sDY_layout,
+            sV_layout=sV_layout,
+            sK_layout=sK_layout,
+            sDS_layout=sDS_layout,
+            sZ0_layout=sZ0_layout,
+            s_scale_full_layout=cute.make_layout((self.L,), stride=(1,)),
+            s_inv_scale_full_layout=cute.make_layout((self.L,), stride=(1,)),
+            s_phase_full_layout=cute.make_layout((self.L, 2), stride=(2, 1)),
+            tile_prefix_log_layout=cute.make_layout((n_tiles,), stride=(1,)),
+            tile_prefix_phase_layout=cute.make_layout((n_tiles, 2), stride=(2, 1)),
+            s_row_layout=cute.make_layout((kv_tile,), stride=(1,)),
+            s_inv_row_layout=cute.make_layout((kv_tile,), stride=(1,)),
+            s_phase_row_layout=cute.make_layout((kv_tile, 2), stride=(2, 1)),
+            s_phase_col_layout=cute.make_layout((kv_tile, 2), stride=(2, 1)),
+            s_tap_layout=cute.make_layout((kv_tile, 2), stride=(2, 1)),
+        )
+
+    def _required_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
+        in_bytes = in_dtype.width // 8
+        kv_tile = self.kv_tile
+        p_tile = self.p_tile
+        Dp = self.D_padded
+        n_tiles = self.L // kv_tile
+        return self._struct_size_bytes(
+            [
+                (kv_tile * p_tile * in_bytes, 16),
+                (kv_tile * p_tile * in_bytes, 16),
+                (kv_tile * Dp * in_bytes, 16),
+                (kv_tile * kv_tile * in_bytes, 16),
+                (kv_tile * Dp * in_bytes, 16),
+                (self.P * in_bytes, 16),
+                (self.D * in_bytes, 16),
+                (self.L * 4, 4),
+                (self.L * 4, 4),
+                (self.L * 4, 4),
+                (self.L * 2 * 4, 16),
+                (n_tiles * 4, 4),
+                (n_tiles * 2 * 4, 16),
+                (n_tiles * 4, 4),
+                (n_tiles * 2 * 4, 16),
+                (kv_tile * 4, 4),
+                (kv_tile * 4, 4),
+                (kv_tile * 2 * 4, 16),
+                (kv_tile * 2 * 4, 16),
+                (kv_tile * 2 * 4, 16),
+                (kv_tile * 2 * 4, 16),
+                (128 * 4, 16),
+            ]
+        )
+
+    def support_info(
         self,
         in_dtype: type[cutlass.Numeric],
-        s_u_prev_layout: cute.Layout,
-        s_b_prev_layout: cute.Layout,
-        s_dlp_layout: cute.Layout,
-        sDY_layout: cute.ComposedLayout,
-        sV_layout: cute.ComposedLayout,
-        sK_layout: cute.ComposedLayout,
-        sDS_layout: cute.Layout,
-        sZ0_layout: cute.Layout,
-        s_scale_full_layout: cute.Layout,
-        s_inv_scale_full_layout: cute.Layout,
-        s_phase_full_layout: cute.Layout,
-        tile_prefix_log_layout: cute.Layout,
-        tile_prefix_phase_layout: cute.Layout,
-        s_row_layout: cute.Layout,
-        s_inv_row_layout: cute.Layout,
-        s_phase_row_layout: cute.Layout,
-        s_phase_col_layout: cute.Layout,
-        s_tap_layout: cute.Layout,
-    ) -> list[tuple[int, int]]:
-        return [
-            (cute.size_in_bytes(in_dtype, sDY_layout), 16),
-            (cute.size_in_bytes(in_dtype, sV_layout), 16),
-            (cute.size_in_bytes(in_dtype, sK_layout), 16),
-            (cute.size_in_bytes(in_dtype, sDS_layout), 16),
-            (cute.size_in_bytes(in_dtype, sK_layout), 16),
-            (cute.size_in_bytes(in_dtype, sZ0_layout), 16),
-            (cute.size_in_bytes(in_dtype, s_u_prev_layout), 16),
-            (cute.size_in_bytes(in_dtype, s_b_prev_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, s_dlp_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, s_scale_full_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, s_inv_scale_full_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, s_phase_full_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, tile_prefix_log_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, tile_prefix_phase_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, tile_prefix_log_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, tile_prefix_phase_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, s_row_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, s_inv_row_layout), 4),
-            (cute.size_in_bytes(cutlass.Float32, s_phase_row_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, s_phase_col_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, s_tap_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, s_tap_layout), 16),
-            (cute.size_in_bytes(cutlass.Float32, self._tail_pad_layout()), 16),
-        ]
+        *,
+        device_index: int | None = None,
+    ) -> ChunkScanBwdDCDRSupportInfo:
+        if in_dtype not in (cutlass.Float16, cutlass.BFloat16):
+            return ChunkScanBwdDCDRSupportInfo(0, 1)
+
+        if device_index is None:
+            device_key = (
+                int(torch.cuda.current_device()) if torch.cuda.is_available() else -1
+            )
+        else:
+            device_key = int(device_index)
+        cache_key = (
+            type(self),
+            self.L,
+            self.D,
+            self.P,
+            self.num_threads,
+            in_dtype,
+            device_key,
+        )
+        cached = self._SUPPORT_INFO_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        info = ChunkScanBwdDCDRSupportInfo(
+            smem_capacity_bytes=self._smem_capacity_bytes(device_key),
+            required_smem_bytes=self._required_smem_bytes(in_dtype),
+        )
+        self._SUPPORT_INFO_CACHE[cache_key] = info
+        return info
+
+    def _make_copy_bundle(
+        self, in_dtype: type[cutlass.Numeric]
+    ) -> ChunkScanBwdDCDRCopyBundle:
+        universal_copy_bits = 128
+        async_elems_in = universal_copy_bits // in_dtype.width
+        smem_k_block_size_D = self._smem_block_size_D()
+        tD_shape_dim_1 = smem_k_block_size_D // async_elems_in
+        tD_layout = cute.make_layout(
+            (self.num_threads // tD_shape_dim_1, tD_shape_dim_1),
+            stride=(tD_shape_dim_1, 1),
+        )
+        tD_shape_dim_1_f32 = smem_k_block_size_D // (
+            universal_copy_bits // cutlass.Float32.width
+        )
+        tD_layout_f32 = cute.make_layout(
+            (self.num_threads // tD_shape_dim_1_f32, tD_shape_dim_1_f32),
+            stride=(tD_shape_dim_1_f32, 1),
+        )
+        tP_shape_dim_1 = self.p_tile // async_elems_in
+        tP_layout = cute.make_layout(
+            (self.num_threads // tP_shape_dim_1, tP_shape_dim_1),
+            stride=(tP_shape_dim_1, 1),
+        )
+        v_in_layout = cute.make_layout((1, async_elems_in))
+        v_f32_layout = cute.make_layout(
+            (1, universal_copy_bits // cutlass.Float32.width)
+        )
+
+        atom_universal_copy_in = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            in_dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        atom_async_copy_in = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            in_dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        atom_universal_copy_f32 = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float32,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        atom_universal_copy_out = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            in_dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        return ChunkScanBwdDCDRCopyBundle(
+            gmem_tiled_copy_D=cute.make_tiled_copy_tv(
+                atom_universal_copy_in, tD_layout, v_in_layout
+            ),
+            gmem_tiled_copy_D_async=cute.make_tiled_copy_tv(
+                atom_async_copy_in, tD_layout, v_in_layout
+            ),
+            gmem_tiled_copy_P=cute.make_tiled_copy_tv(
+                atom_async_copy_in, tP_layout, v_in_layout
+            ),
+            gmem_tiled_copy_D_f32=cute.make_tiled_copy_tv(
+                atom_universal_copy_f32, tD_layout_f32, v_f32_layout
+            ),
+            gmem_tiled_store_D=cute.make_tiled_copy_tv(
+                atom_universal_copy_out, tD_layout, v_in_layout
+            ),
+        )
+
+    def _make_tiled_mma(self, in_dtype: type[cutlass.Numeric]):
+        op = cute.nvgpu.warp.MmaF16BF16Op(in_dtype, self.acc_dtype, (16, 8, 16))
+        permutation_mnk = (
+            self.atom_layout_mnk[0] * 16,
+            self.atom_layout_mnk[1] * 8 * 2,
+            self.atom_layout_mnk[2] * 16,
+        )
+        tC = cute.make_layout(self.atom_layout_mnk)
+        return cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
+
+    def _make_kernel_bundle(
+        self, in_dtype: type[cutlass.Numeric]
+    ) -> ChunkScanBwdDCDRKernelBundle:
+        return ChunkScanBwdDCDRKernelBundle(
+            layouts=self._make_layout_bundle(),
+            copies=self._make_copy_bundle(in_dtype),
+            tiled_mma=self._make_tiled_mma(in_dtype),
+            smem_bytes=self._required_smem_bytes(in_dtype),
+        )
 
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
-        s_u_prev_layout: cute.Layout,
-        s_b_prev_layout: cute.Layout,
-        s_dlp_layout: cute.Layout,
-        sDY_layout: cute.ComposedLayout,
-        sV_layout: cute.ComposedLayout,
-        sK_layout: cute.ComposedLayout,
-        sDS_layout: cute.Layout,
-        sZ0_layout: cute.Layout,
-        s_scale_full_layout: cute.Layout,
-        s_inv_scale_full_layout: cute.Layout,
-        s_phase_full_layout: cute.Layout,
-        tile_prefix_log_layout: cute.Layout,
-        tile_prefix_phase_layout: cute.Layout,
-        s_row_layout: cute.Layout,
-        s_inv_row_layout: cute.Layout,
-        s_phase_row_layout: cute.Layout,
-        s_phase_col_layout: cute.Layout,
-        s_tap_layout: cute.Layout,
+        layouts: ChunkScanBwdDCDRLayoutBundle,
     ):
         tail_pad_layout = self._tail_pad_layout()
 
@@ -189,91 +416,108 @@ class ChunkScanBwdDCDRAmpere:
 
         SharedStorage.__annotations__ = {
             "sDY": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(sDY_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sDY_layout)], 16
             ],
             "sV_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(sV_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
             ],
             "sK_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(sK_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sK_layout)], 16
             ],
             "sDS_blk": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(sDS_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sDS_layout)], 16
             ],
             "sQZ_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(sK_layout)], 16
-            ],
-            "sZ0": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(sZ0_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sK_layout)], 16
             ],
             "s_u_prev": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(s_u_prev_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.s_u_prev_layout)], 16
             ],
             "s_b_prev": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(s_b_prev_layout)], 16
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.s_b_prev_layout)], 16
             ],
             "s_dlp": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_dlp_layout)], 4
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_dlp_layout)
+                ],
+                4,
             ],
             "s_scale_full": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_scale_full_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_scale_full_layout)
+                ],
                 4,
             ],
             "s_inv_scale_full": cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(s_inv_scale_full_layout)
+                    cutlass.Float32, cute.cosize(layouts.s_inv_scale_full_layout)
                 ],
                 4,
             ],
             "s_phase_full": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_phase_full_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_phase_full_layout)
+                ],
                 16,
             ],
             "s_tile_end_log": cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(tile_prefix_log_layout)
+                    cutlass.Float32, cute.cosize(layouts.tile_prefix_log_layout)
                 ],
                 4,
             ],
             "s_tile_end_phase": cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(tile_prefix_phase_layout)
+                    cutlass.Float32, cute.cosize(layouts.tile_prefix_phase_layout)
                 ],
                 16,
             ],
             "s_tile_off_log": cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(tile_prefix_log_layout)
+                    cutlass.Float32, cute.cosize(layouts.tile_prefix_log_layout)
                 ],
                 4,
             ],
             "s_tile_off_phase": cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(tile_prefix_phase_layout)
+                    cutlass.Float32, cute.cosize(layouts.tile_prefix_phase_layout)
                 ],
                 16,
             ],
             "s_row_scale": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_row_layout)], 4
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_row_layout)
+                ],
+                4,
             ],
             "s_inv_row_scale": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_inv_row_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_inv_row_layout)
+                ],
                 4,
             ],
             "s_phase_row": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_phase_row_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_phase_row_layout)
+                ],
                 16,
             ],
             "s_phase_col": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_phase_col_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_phase_col_layout)
+                ],
                 16,
             ],
             "s_tap_prev": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_tap_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_tap_layout)
+                ],
                 16,
             ],
             "s_tap_curr": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_tap_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_tap_layout)
+                ],
                 16,
             ],
             "tail_pad": cute.struct.Align[
@@ -347,157 +591,12 @@ class ChunkScanBwdDCDRAmpere:
         if cutlass.const_expr(mDR.shape[1] != self.L or mDR.shape[2] != 4):
             raise ValueError("dR must be (BHC, L, 4).")
 
-        Dp = self.D_padded
         Pp = self.P_padded
         in_dtype = mU.element_type
-        kv_tile = self.kv_tile
-        p_tile = 32
+        p_tile = self.p_tile
         if cutlass.const_expr(Pp % p_tile != 0):
             raise ValueError("P_padded must be a multiple of 32.")
-        n_tiles = self.L // kv_tile
-
-        smem_k_block_size_D = 64 if Dp % 64 == 0 else 32
-        swizzle_bits_D = 3 if smem_k_block_size_D == 64 else 2
-        sD_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_D, 3, 3),
-            0,
-            cute.make_layout((8, smem_k_block_size_D), stride=(smem_k_block_size_D, 1)),
-        )
-        sK_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Dp), (0, 1))
-        sZ0_layout = cute.tile_to_shape(sD_layout_atom, (p_tile, Dp), (0, 1))
-
-        smem_k_block_size_P = p_tile
-        swizzle_bits_P = 2
-        sP_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_P, 3, 3),
-            0,
-            cute.make_layout((8, smem_k_block_size_P), stride=(smem_k_block_size_P, 1)),
-        )
-        sDY_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
-        sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
-
-        smem_k_block_size_blk = kv_tile
-        swizzle_bits_blk = 3 if smem_k_block_size_blk == 64 else 2
-        sBlk_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_blk, 3, 3),
-            0,
-            cute.make_layout(
-                (8, smem_k_block_size_blk), stride=(smem_k_block_size_blk, 1)
-            ),
-        )
-        sDS_layout = cute.tile_to_shape(sBlk_layout_atom, (kv_tile, kv_tile), (0, 1))
-
-        s_u_prev_layout = cute.make_layout((self.P,), stride=(1,))
-        s_b_prev_layout = cute.make_layout((self.D,), stride=(1,))
-        s_dlp_layout = cute.make_layout((self.L,), stride=(1,))
-
-        s_scale_full_layout = cute.make_layout((self.L,), stride=(1,))
-        s_inv_scale_full_layout = cute.make_layout((self.L,), stride=(1,))
-        s_phase_full_layout = cute.make_layout((self.L, 2), stride=(2, 1))
-        tile_prefix_log_layout = cute.make_layout((n_tiles,), stride=(1,))
-        tile_prefix_phase_layout = cute.make_layout((n_tiles, 2), stride=(2, 1))
-
-        s_row_layout = cute.make_layout((kv_tile,), stride=(1,))
-        s_inv_row_layout = cute.make_layout((kv_tile,), stride=(1,))
-        s_phase_row_layout = cute.make_layout((kv_tile, 2), stride=(2, 1))
-        s_phase_col_layout = cute.make_layout((kv_tile, 2), stride=(2, 1))
-        s_tap_layout = cute.make_layout((kv_tile, 2), stride=(2, 1))
-
-        universal_copy_bits = 128
-        async_elems_in = universal_copy_bits // in_dtype.width
-        atom_universal_copy_in = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            in_dtype,
-            num_bits_per_copy=universal_copy_bits,
-        )
-        atom_async_copy_in = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(
-                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
-            ),
-            in_dtype,
-            num_bits_per_copy=universal_copy_bits,
-        )
-        atom_universal_copy_f32 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            cutlass.Float32,
-            num_bits_per_copy=universal_copy_bits,
-        )
-        tD_shape_dim_1 = sD_layout_atom.outer.shape[1] // async_elems_in
-        tD_layout = cute.make_layout(
-            (self.num_threads // tD_shape_dim_1, tD_shape_dim_1),
-            stride=(tD_shape_dim_1, 1),
-        )
-        tD_shape_dim_1_f32 = sD_layout_atom.outer.shape[1] // (
-            universal_copy_bits // cutlass.Float32.width
-        )
-        tD_layout_f32 = cute.make_layout(
-            (self.num_threads // tD_shape_dim_1_f32, tD_shape_dim_1_f32),
-            stride=(tD_shape_dim_1_f32, 1),
-        )
-        tP_shape_dim_1 = sP_layout_atom.outer.shape[1] // async_elems_in
-        tP_layout = cute.make_layout(
-            (self.num_threads // tP_shape_dim_1, tP_shape_dim_1),
-            stride=(tP_shape_dim_1, 1),
-        )
-        v_in_layout = cute.make_layout((1, async_elems_in))
-        v_f32_layout = cute.make_layout(
-            (1, universal_copy_bits // cutlass.Float32.width)
-        )
-        gmem_tiled_copy_D = cute.make_tiled_copy_tv(
-            atom_universal_copy_in, tD_layout, v_in_layout
-        )
-        gmem_tiled_copy_D_async = cute.make_tiled_copy_tv(
-            atom_async_copy_in, tD_layout, v_in_layout
-        )
-        gmem_tiled_copy_P = cute.make_tiled_copy_tv(
-            atom_async_copy_in, tP_layout, v_in_layout
-        )
-        gmem_tiled_copy_D_f32 = cute.make_tiled_copy_tv(
-            atom_universal_copy_f32, tD_layout_f32, v_f32_layout
-        )
-        store_elems = universal_copy_bits // in_dtype.width
-        atom_universal_copy_out = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            in_dtype,
-            num_bits_per_copy=universal_copy_bits,
-        )
-        v_out_layout = cute.make_layout((1, store_elems))
-        gmem_tiled_store_D = cute.make_tiled_copy_tv(
-            atom_universal_copy_out, tD_layout, v_out_layout
-        )
-
-        op = cute.nvgpu.warp.MmaF16BF16Op(self.ab_dtype, self.acc_dtype, (16, 8, 16))
-        permutation_mnk = (
-            self.atom_layout_mnk[0] * 16,
-            self.atom_layout_mnk[1] * 8 * 2,
-            self.atom_layout_mnk[2] * 16,
-        )
-        tC = cute.make_layout(self.atom_layout_mnk)
-        tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
-
-        smem_needed = self._struct_size_bytes(
-            self._shared_storage_fields(
-                in_dtype,
-                s_u_prev_layout,
-                s_b_prev_layout,
-                s_dlp_layout,
-                sDY_layout,
-                sV_layout,
-                sK_layout,
-                sDS_layout,
-                sZ0_layout,
-                s_scale_full_layout,
-                s_inv_scale_full_layout,
-                s_phase_full_layout,
-                tile_prefix_log_layout,
-                tile_prefix_phase_layout,
-                s_row_layout,
-                s_inv_row_layout,
-                s_phase_row_layout,
-                s_phase_col_layout,
-                s_tap_layout,
-            )
-        )
+        kernel_bundle = self._make_kernel_bundle(in_dtype)
 
         grid_z = cute.size(mU.shape[0])
         self.kernel(
@@ -513,34 +612,34 @@ class ChunkScanBwdDCDRAmpere:
             mDLogp,
             mDC,
             mDR,
-            s_u_prev_layout,
-            s_b_prev_layout,
-            s_dlp_layout,
-            sDY_layout,
-            sV_layout,
-            sK_layout,
-            sDS_layout,
-            sZ0_layout,
-            s_scale_full_layout,
-            s_inv_scale_full_layout,
-            s_phase_full_layout,
-            tile_prefix_log_layout,
-            tile_prefix_phase_layout,
-            s_row_layout,
-            s_inv_row_layout,
-            s_phase_row_layout,
-            s_phase_col_layout,
-            s_tap_layout,
-            gmem_tiled_copy_D,
-            gmem_tiled_copy_D_async,
-            gmem_tiled_copy_P,
-            gmem_tiled_copy_D_f32,
-            gmem_tiled_store_D,
-            tiled_mma,
+            kernel_bundle.layouts.s_u_prev_layout,
+            kernel_bundle.layouts.s_b_prev_layout,
+            kernel_bundle.layouts.s_dlp_layout,
+            kernel_bundle.layouts.sDY_layout,
+            kernel_bundle.layouts.sV_layout,
+            kernel_bundle.layouts.sK_layout,
+            kernel_bundle.layouts.sDS_layout,
+            kernel_bundle.layouts.sZ0_layout,
+            kernel_bundle.layouts.s_scale_full_layout,
+            kernel_bundle.layouts.s_inv_scale_full_layout,
+            kernel_bundle.layouts.s_phase_full_layout,
+            kernel_bundle.layouts.tile_prefix_log_layout,
+            kernel_bundle.layouts.tile_prefix_phase_layout,
+            kernel_bundle.layouts.s_row_layout,
+            kernel_bundle.layouts.s_inv_row_layout,
+            kernel_bundle.layouts.s_phase_row_layout,
+            kernel_bundle.layouts.s_phase_col_layout,
+            kernel_bundle.layouts.s_tap_layout,
+            kernel_bundle.copies.gmem_tiled_copy_D,
+            kernel_bundle.copies.gmem_tiled_copy_D_async,
+            kernel_bundle.copies.gmem_tiled_copy_P,
+            kernel_bundle.copies.gmem_tiled_copy_D_f32,
+            kernel_bundle.copies.gmem_tiled_store_D,
+            kernel_bundle.tiled_mma,
         ).launch(
             grid=(1, 1, grid_z),
             block=[self.num_threads, 1, 1],
-            smem=smem_needed,
+            smem=kernel_bundle.smem_bytes,
         )
 
     @cute.kernel
@@ -596,32 +695,32 @@ class ChunkScanBwdDCDRAmpere:
         Dp = self.D_padded
         Pp = self.P_padded
         kv_tile = self.kv_tile
-        p_tile = 32
+        p_tile = self.p_tile
         n_p_tiles = Pp // p_tile
         n_tiles = self.L // kv_tile
 
-        smem = cutlass.utils.SmemAllocator()
-        SharedStorage = self._make_shared_storage(
-            mU.element_type,
-            s_u_prev_layout,
-            s_b_prev_layout,
-            s_dlp_layout,
-            sDY_layout,
-            sV_layout,
-            sK_layout,
-            sDS_layout,
-            sZ0_layout,
-            s_scale_full_layout,
-            s_inv_scale_full_layout,
-            s_phase_full_layout,
-            tile_prefix_log_layout,
-            tile_prefix_phase_layout,
-            s_row_layout,
-            s_inv_row_layout,
-            s_phase_row_layout,
-            s_phase_col_layout,
-            s_tap_layout,
+        layouts = ChunkScanBwdDCDRLayoutBundle(
+            s_u_prev_layout=s_u_prev_layout,
+            s_b_prev_layout=s_b_prev_layout,
+            s_dlp_layout=s_dlp_layout,
+            sDY_layout=sDY_layout,
+            sV_layout=sV_layout,
+            sK_layout=sK_layout,
+            sDS_layout=sDS_layout,
+            sZ0_layout=sZ0_layout,
+            s_scale_full_layout=s_scale_full_layout,
+            s_inv_scale_full_layout=s_inv_scale_full_layout,
+            s_phase_full_layout=s_phase_full_layout,
+            tile_prefix_log_layout=tile_prefix_log_layout,
+            tile_prefix_phase_layout=tile_prefix_phase_layout,
+            s_row_layout=s_row_layout,
+            s_inv_row_layout=s_inv_row_layout,
+            s_phase_row_layout=s_phase_row_layout,
+            s_phase_col_layout=s_phase_col_layout,
+            s_tap_layout=s_tap_layout,
         )
+        smem = cutlass.utils.SmemAllocator()
+        SharedStorage = self._make_shared_storage(mU.element_type, layouts)
         storage = smem.allocate(SharedStorage)
         sDY = storage.sDY.get_tensor(sDY_layout)
         sV_tile = storage.sV_tile.get_tensor(sV_layout)
@@ -631,7 +730,9 @@ class ChunkScanBwdDCDRAmpere:
         sSc_scratch = cute.make_tensor(sV_tile.iterator, sStage_layout)
         sDS_scratch = cute.make_tensor(sDY.iterator, sStage_layout)
         sQZ_tile = storage.sQZ_tile.get_tensor(sK_layout)
-        sZ0 = storage.sZ0.get_tensor(sZ0_layout)
+        # `Z0` is only consumed after the causal `n_tile` sweep, so it can reuse
+        # the same 32xDp slab as `sK_tile` instead of reserving a third full-D tile.
+        sZ0 = cute.make_tensor(sK_tile.iterator, sZ0_layout)
         s_u_prev = storage.s_u_prev.get_tensor(s_u_prev_layout)
         s_b_prev = storage.s_b_prev.get_tensor(s_b_prev_layout)
         s_dlp = storage.s_dlp.get_tensor(s_dlp_layout)

@@ -399,6 +399,45 @@ def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_training_backward_supports_issue_5_shape() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=1,
+        heads=4,
+        T=65,
+        N=256,
+        P=64,
+        device=torch.device("cuda"),
+        value_dtype=torch.float16,
+    )
+    U.requires_grad_()
+    M.requires_grad_()
+    K.requires_grad_()
+    B.requires_grad_()
+    C.requires_grad_()
+
+    y = v2x2ssd_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=64,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    loss = y.square().mean()
+    loss.backward()
+
+    assert torch.isfinite(y).all()
+    for tensor in (U, M, K, B, C):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_scan_cute_matches_reference_stage_issue_3_shape() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)

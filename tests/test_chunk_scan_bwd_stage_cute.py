@@ -497,3 +497,47 @@ def test_chunk_scan_bwd_compile_entrypoint_reuses_cached_executors(
         compute_dtype=torch.float32,
     )
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_rejects_oversized_dcdr_shapes_before_launch() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 1, 1, 65, 1024, 128
+    chunk_size = 64
+    n_chunks = (T + chunk_size - 1) // chunk_size
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    chunk_starts = torch.zeros(
+        (batch, heads, n_chunks, P, 2 * N),
+        device=device,
+        dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    with pytest.raises(
+        ValueError,
+        match="No supported chunk_scan backward dcdr kernel fits",
+    ):
+        compile_chunk_scan_bwd_kernels(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+        )
