@@ -10,15 +10,21 @@ from torch import nn
 from torch.nn import functional as F
 
 from slinoss.ops.cconv1d import cconv1d_cuda, cconv1d_cuda_supported
+from slinoss.ops.v2x2ssd.reference import v2x2ssm
 
 from .backend import (
     AutoCConv1dBackend,
+    AutoMixerDecodeBackend,
     AutoScanBackend,
     CConv1dBackend,
     CuteScanBackend,
+    CuteMixerDecodeBackend,
+    MixerDecodeBackend,
+    MixerDecodeInputs,
     ScanBackend,
     ScanInputs,
     ScanPrepBackend,
+    ScanPrepInputs,
 )
 from .scanprep import SLinOSSScanPrep
 from .state import SLinOSSMixerState, ScanState
@@ -61,6 +67,7 @@ class SLinOSSMixer(nn.Module):
         eps: float = 1e-8,
         normalize_bc: bool = True,
         backend: ScanBackend | None = None,
+        decode_backend: MixerDecodeBackend | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -105,6 +112,9 @@ class SLinOSSMixer(nn.Module):
             device=device,
         )
         self.backend = AutoScanBackend() if backend is None else backend
+        self.decode_backend = (
+            AutoMixerDecodeBackend() if decode_backend is None else decode_backend
+        )
         self.cconv_backend = (
             AutoCConv1dBackend() if cconv_backend is None else cconv_backend
         )
@@ -163,7 +173,24 @@ class SLinOSSMixer(nn.Module):
                 (batch_size, self.d_inner, max(self.d_conv - 1, 0)),
                 device=device,
                 dtype=dtype,
-            )
+            ),
+            scan=ScanState(
+                state=torch.zeros(
+                    (batch_size, self.n_heads, self.d_head, 2 * self.d_state),
+                    device=device,
+                    dtype=dtype,
+                ),
+                b_prev=torch.zeros(
+                    (batch_size, self.n_heads, 2 * self.d_state),
+                    device=device,
+                    dtype=dtype,
+                ),
+                u_prev=torch.zeros(
+                    (batch_size, self.n_heads, self.d_head),
+                    device=device,
+                    dtype=dtype,
+                ),
+            ),
         )
 
     def _apply_causal_depthwise_conv(
@@ -403,6 +430,69 @@ class SLinOSSMixer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self._apply_causal_depthwise_conv(value_raw, conv_state)
 
+    def _apply_causal_depthwise_conv_step(
+        self,
+        value_raw: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if value_raw.ndim != 2 or value_raw.shape[-1] != self.d_inner:
+            raise ValueError(
+                f"Expected value_raw shape (batch, {self.d_inner}), "
+                f"got {tuple(value_raw.shape)}."
+            )
+
+        state_len = max(self.d_conv - 1, 0)
+        if state_len == 0:
+            x_t = value_raw.unsqueeze(-1).contiguous()
+            if cconv1d_cuda_supported(x_t, self.dw_weight, activation="silu"):
+                y = cconv1d_cuda(
+                    x_t,
+                    self.dw_weight,
+                    self.dw_bias,
+                    activation="silu",
+                )
+                assert isinstance(y, torch.Tensor)
+                return y[..., 0].contiguous(), value_raw.new_empty(
+                    (value_raw.shape[0], self.d_inner, 0)
+                )
+
+            y_seq, next_state = self._apply_cconv_reference(
+                value_raw.unsqueeze(1), None
+            )
+            return F.silu(y_seq[:, 0, :]), next_state
+
+        init = self._validate_conv_state(
+            conv_state,
+            batch=int(value_raw.shape[0]),
+            state_len=state_len,
+            device=value_raw.device,
+            dtype=value_raw.dtype,
+        )
+        x_t = value_raw.unsqueeze(-1).contiguous()
+        weight = self.dw_weight
+        if cconv1d_cuda_supported(
+            x_t,
+            weight,
+            initial_states=init,
+            activation="silu",
+        ):
+            y_with_state = cconv1d_cuda(
+                x_t,
+                weight,
+                self.dw_bias,
+                initial_states=init,
+                return_final_states=True,
+                activation="silu",
+            )
+            assert isinstance(y_with_state, tuple)
+            y_t, next_state = y_with_state
+            return y_t[..., 0].contiguous(), next_state.contiguous()
+
+        y_seq, next_state = self._apply_cconv_reference(
+            value_raw.unsqueeze(1), init.contiguous()
+        )
+        return F.silu(y_seq[:, 0, :]), next_state
+
     def _run_scan_backend(
         self,
         scan_inputs: ScanInputs,
@@ -421,6 +511,181 @@ class SLinOSSMixer(nn.Module):
             return_state=return_state,
         )
 
+    def _supports_cute_decode(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool:
+        if device.type != "cuda":
+            return False
+        if dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if batch_size not in (1, 2, 4, 8, 16):
+            return False
+        if self.d_head != 64 or self.d_state != 64:
+            return False
+        if not self.normalize_bc or self.output_norm is not None:
+            return False
+        return True
+
+    def _decode_step_reference(
+        self,
+        inputs: MixerDecodeInputs,
+        state: ScanState,
+    ) -> tuple[torch.Tensor, ScanState]:
+        batch = int(inputs.value.shape[0])
+        value = inputs.value.reshape(batch, 1, self.d_inner).contiguous()
+        params = inputs.params.reshape(batch, 1, self.param_proj_dim).contiguous()
+        bc = inputs.bc.reshape(batch, 1, self.n_heads, 4, self.d_state).contiguous()
+        gate = inputs.gate.reshape(batch, 1, self.d_inner).contiguous()
+
+        scan_inputs = self.scanprep._prepare_inputs_reference(
+            ScanPrepInputs(value=value, params=params, bc=bc)
+        )
+        compute_dtype = (
+            torch.float32
+            if value.dtype in (torch.float16, torch.bfloat16)
+            else value.dtype
+        )
+        scan_y, final_state, b_last, u_last = v2x2ssm(
+            scan_inputs.U,
+            scan_inputs.M,
+            scan_inputs.K,
+            scan_inputs.B,
+            scan_inputs.C,
+            initial_states=state.state,
+            B_prev=state.b_prev,
+            U_prev=state.u_prev,
+            compute_dtype=compute_dtype,
+            output_dtype=value.dtype,
+        )
+        gated = self._apply_gate_skip(scan_y, scan_inputs.U, gate, batch, 1)[:, 0, :]
+        next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
+        return gated.contiguous(), next_state
+
+    def _decode_step_cute(
+        self,
+        inputs: MixerDecodeInputs,
+        state: ScanState,
+    ) -> tuple[torch.Tensor, ScanState]:
+        from slinoss.ops.v2x2ssd.cute.decode import mixer_decode_step_cute
+
+        gated, final_state, b_last, u_last = mixer_decode_step_cute(
+            inputs.value,
+            inputs.params,
+            inputs.bc,
+            inputs.gate,
+            inputs.skip,
+            initial_states=state.state,
+            B_prev=state.b_prev,
+            U_prev=state.u_prev,
+            dt_min=self.scanprep.dt_min,
+            dt_max=self.scanprep.dt_max,
+            r_min=self.scanprep.r_min,
+            r_max=self.scanprep.r_max,
+            theta_bound=self.scanprep.theta_bound,
+            k_max=self.scanprep.k_max,
+            eps=self.scanprep.eps,
+            dt_bias=self.scanprep.dt_bias,
+            gamma_bias=self.scanprep.gamma_bias,
+            omega_bias=self.scanprep.omega_bias,
+            mix_r_bias=self.scanprep.mix_r_bias,
+            mix_theta_bias=self.scanprep.mix_theta_bias,
+            mix_k_prev_bias=self.scanprep.mix_k_prev_bias,
+            mix_k_curr_bias=self.scanprep.mix_k_curr_bias,
+            b_scale=self.scanprep.b_scale,
+            c_scale=self.scanprep.c_scale,
+            output_dtype=inputs.value.dtype,
+        )
+        next_state = ScanState(
+            state=final_state,
+            b_prev=b_last,
+            u_prev=u_last,
+        )
+        return gated, next_state
+
+    def _step_inplace(
+        self,
+        x: torch.Tensor,
+        state: SLinOSSMixerState,
+    ) -> torch.Tensor:
+        batch = int(x.shape[0])
+        proj = self.in_proj(x)
+        gate, value_raw, params_flat, bc_flat = torch.split(
+            proj,
+            [self.d_inner, self.d_inner, self.param_proj_dim, self.bc_proj_dim],
+            dim=-1,
+        )
+        value, conv_next = self._apply_causal_depthwise_conv_step(value_raw, state.conv)
+        if state.conv is None or tuple(state.conv.shape) != tuple(conv_next.shape):
+            state.conv = conv_next
+        else:
+            state.conv.copy_(conv_next)
+        decode_inputs = MixerDecodeInputs(
+            value=value.view(batch, self.n_heads, self.d_head).contiguous(),
+            params=params_flat.view(
+                batch, self.n_heads, self.scanprep.param_dim
+            ).contiguous(),
+            bc=bc_flat.view(batch, self.n_heads, 4, self.d_state).contiguous(),
+            gate=gate.view(batch, self.n_heads, self.d_head).contiguous(),
+            skip=self.skip.view(self.n_heads, self.d_head),
+        )
+        gated, scan_next = self.decode_backend(self, decode_inputs, state.scan)
+        if (
+            state.scan.state is None
+            or scan_next.state is None
+            or tuple(state.scan.state.shape) != tuple(scan_next.state.shape)
+        ):
+            state.scan.state = scan_next.state
+        else:
+            state.scan.state.copy_(scan_next.state)
+        if (
+            state.scan.b_prev is None
+            or scan_next.b_prev is None
+            or tuple(state.scan.b_prev.shape) != tuple(scan_next.b_prev.shape)
+        ):
+            state.scan.b_prev = scan_next.b_prev
+        else:
+            state.scan.b_prev.copy_(scan_next.b_prev)
+        if (
+            state.scan.u_prev is None
+            or scan_next.u_prev is None
+            or tuple(state.scan.u_prev.shape) != tuple(scan_next.u_prev.shape)
+        ):
+            state.scan.u_prev = scan_next.u_prev
+        else:
+            state.scan.u_prev.copy_(scan_next.u_prev)
+        return self.out_proj(gated)
+
+    def step_cuda_fast(
+        self,
+        x: torch.Tensor,
+        state: SLinOSSMixerState | None = None,
+    ) -> tuple[torch.Tensor, SLinOSSMixerState]:
+        if x.ndim != 2 or x.shape[-1] != self.d_model:
+            raise ValueError(
+                f"Expected x shape (batch, {self.d_model}), got {tuple(x.shape)}."
+            )
+        if torch.is_grad_enabled():
+            raise ValueError("step_cuda_fast is inference-only.")
+        batch = int(x.shape[0])
+        if not isinstance(
+            self.decode_backend, (AutoMixerDecodeBackend, CuteMixerDecodeBackend)
+        ) or not self._supports_cute_decode(
+            batch_size=batch,
+            device=x.device,
+            dtype=x.dtype,
+        ):
+            raise ValueError("Current inputs are unsupported for step_cuda_fast.")
+        next_state = (
+            self.init_state(batch, device=x.device, dtype=x.dtype)
+            if state is None
+            else state.clone()
+        )
+        return self._step_inplace(x, next_state), next_state
+
     def step(
         self,
         x: torch.Tensor,
@@ -436,8 +701,19 @@ class SLinOSSMixer(nn.Module):
                 f"got {tuple(x.shape)}."
             )
 
-        y, next_state = self.forward(x, state=state, return_state=True)
-        assert isinstance(next_state, SLinOSSMixerState)
+        x_t = x[:, 0, :] if x.ndim == 3 else x
+        if torch.is_grad_enabled():
+            y, next_state = self.forward(x, state=state, return_state=True)
+            assert isinstance(next_state, SLinOSSMixerState)
+        else:
+            batch = int(x_t.shape[0])
+            next_state = (
+                self.init_state(batch, device=x_t.device, dtype=x_t.dtype)
+                if state is None
+                else state.clone()
+            )
+            y_step = self._step_inplace(x_t, next_state)
+            y = y_step.unsqueeze(1)
         if squeeze:
             return y[:, 0, :], next_state
         return y, next_state

@@ -11,6 +11,10 @@ def _maybe_detach(x: torch.Tensor | None) -> torch.Tensor | None:
     return None if x is None else x.detach()
 
 
+def _maybe_clone(x: torch.Tensor | None) -> torch.Tensor | None:
+    return None if x is None else x.clone()
+
+
 def _maybe_to(
     x: torch.Tensor | None,
     *,
@@ -50,6 +54,13 @@ class ScanState:
             u_prev=_maybe_detach(self.u_prev),
         )
 
+    def clone(self) -> "ScanState":
+        return ScanState(
+            state=_maybe_clone(self.state),
+            b_prev=_maybe_clone(self.b_prev),
+            u_prev=_maybe_clone(self.u_prev),
+        )
+
     def to(
         self,
         *,
@@ -74,6 +85,12 @@ class SLinOSSMixerState:
         return SLinOSSMixerState(
             conv=_maybe_detach(self.conv),
             scan=self.scan.detach(),
+        )
+
+    def clone(self) -> "SLinOSSMixerState":
+        return SLinOSSMixerState(
+            conv=_maybe_clone(self.conv),
+            scan=self.scan.clone(),
         )
 
     def to(

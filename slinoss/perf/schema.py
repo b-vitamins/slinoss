@@ -124,3 +124,35 @@ def validate_nextchar_profile_payload(payload: dict[str, Any]) -> None:
     _expect_path(tree, "backward.__stats__")
     _expect_path(tree, "forward.mixer.scanprep.__stats__")
     _expect_path(tree, "backward.mixer.scanprep.__stats__")
+
+
+def validate_nextchar_decode_bench_payload(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("Payload must be a dict.")
+    if _expect(payload, "kind") != "bench_nextchar_decode":
+        raise ValueError("Expected kind=bench_nextchar_decode.")
+    if int(_expect(payload, "schema_version")) != 1:
+        raise ValueError("Unsupported schema_version.")
+    _expect(payload, "backend")
+    _expect(payload, "device_name")
+    rows = _expect(payload, "rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("Expected non-empty rows list.")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Each decode bench row must be a dict.")
+        _expect(row, "batch_size")
+        _expect_dict(_expect_dict(row, "persistent"), "summary")
+        _expect_dict(_expect_dict(row, "eager"), "summary")
+
+
+def validate_nextchar_decode_profile_payload(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("Payload must be a dict.")
+    if _expect(payload, "kind") != "profile_nextchar_decode":
+        raise ValueError("Expected kind=profile_nextchar_decode.")
+    if int(_expect(payload, "schema_version")) != 1:
+        raise ValueError("Unsupported schema_version.")
+    _expect(payload, "backend")
+    _expect(payload, "mode")
+    _expect(payload, "config")

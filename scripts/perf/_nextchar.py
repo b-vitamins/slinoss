@@ -14,9 +14,11 @@ from _profiled_nextchar_model import ProfiledNextCharLM
 from slinoss.layers import SLinOSSMixer
 from slinoss.layers.backend import (
     AutoCConv1dBackend,
+    AutoMixerDecodeBackend,
     AutoScanPrepBackend,
     CuteScanBackend,
     ReferenceCConv1dBackend,
+    ReferenceMixerDecodeBackend,
     ReferenceScanBackend,
     ReferenceScanPrepBackend,
 )
@@ -112,11 +114,17 @@ def _configure_backend(model: NextCharModel, *, backend: str) -> None:
     cconv_backend = (
         ReferenceCConv1dBackend() if backend == "reference" else AutoCConv1dBackend()
     )
+    decode_backend = (
+        ReferenceMixerDecodeBackend()
+        if backend == "reference"
+        else AutoMixerDecodeBackend()
+    )
     for module in model.modules():
         if isinstance(module, SLinOSSMixer):
             module.backend = scan_backend
             module.scanprep.backend = scanprep_backend
             module.cconv_backend = cconv_backend
+            module.decode_backend = decode_backend
 
 
 def random_batch(cfg: NextCharPerfConfig) -> tuple[torch.Tensor, torch.Tensor]:

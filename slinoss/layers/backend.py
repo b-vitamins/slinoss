@@ -46,6 +46,25 @@ class ScanInputs:
     C: torch.Tensor
 
 
+@dataclass(frozen=True)
+class MixerDecodeInputs:
+    """Canonical per-token mixer decode inputs.
+
+    Shapes:
+    - ``value``: ``(batch, heads, P)`` post-conv/post-activation value token
+    - ``params``: ``(batch, heads, 13)`` flat scanprep parameter token
+    - ``bc``: ``(batch, heads, 4, N)`` raw mixer-emitted BC token
+    - ``gate``: ``(batch, heads, P)`` token-local gating vector
+    - ``skip``: ``(heads, P)`` per-head skip vector
+    """
+
+    value: torch.Tensor
+    params: torch.Tensor
+    bc: torch.Tensor
+    gate: torch.Tensor
+    skip: torch.Tensor
+
+
 if TYPE_CHECKING:
 
     class _ScanPrepOwner(Protocol):
@@ -69,6 +88,27 @@ if TYPE_CHECKING:
             x: torch.Tensor,
             conv_state: torch.Tensor | None,
         ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    class _MixerDecodeOwner(Protocol):
+        def _supports_cute_decode(
+            self,
+            *,
+            batch_size: int,
+            device: torch.device,
+            dtype: torch.dtype,
+        ) -> bool: ...
+
+        def _decode_step_reference(
+            self,
+            inputs: "MixerDecodeInputs",
+            state: ScanState,
+        ) -> tuple[torch.Tensor, ScanState]: ...
+
+        def _decode_step_cute(
+            self,
+            inputs: "MixerDecodeInputs",
+            state: ScanState,
+        ) -> tuple[torch.Tensor, ScanState]: ...
 
 
 class ScanPrepBackend(Protocol):
@@ -208,6 +248,26 @@ class ScanBackend(Protocol):
     ) -> torch.Tensor | tuple[torch.Tensor, ScanState]: ...
 
 
+class MixerDecodeBackend(Protocol):
+    """Hot-swappable per-token mixer decode backend."""
+
+    def supports(
+        self,
+        owner: "_MixerDecodeOwner",
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool: ...
+
+    def __call__(
+        self,
+        owner: "_MixerDecodeOwner",
+        inputs: MixerDecodeInputs,
+        state: ScanState,
+    ) -> tuple[torch.Tensor, ScanState]: ...
+
+
 def _default_compute_dtype(dtype: torch.dtype) -> torch.dtype | None:
     if dtype in (torch.float16, torch.bfloat16):
         return torch.float32
@@ -344,6 +404,96 @@ class AutoScanBackend:
         )
 
 
+class ReferenceMixerDecodeBackend:
+    """Reference backend for per-token mixer decode."""
+
+    def supports(
+        self,
+        owner: "_MixerDecodeOwner",
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool:
+        del owner, batch_size, device, dtype
+        return True
+
+    def __call__(
+        self,
+        owner: "_MixerDecodeOwner",
+        inputs: MixerDecodeInputs,
+        state: ScanState,
+    ) -> tuple[torch.Tensor, ScanState]:
+        return owner._decode_step_reference(inputs, state)
+
+
+class CuteMixerDecodeBackend:
+    """CuTe backend for per-token mixer decode."""
+
+    def supports(
+        self,
+        owner: "_MixerDecodeOwner",
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool:
+        return owner._supports_cute_decode(
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def __call__(
+        self,
+        owner: "_MixerDecodeOwner",
+        inputs: MixerDecodeInputs,
+        state: ScanState,
+    ) -> tuple[torch.Tensor, ScanState]:
+        return owner._decode_step_cute(inputs, state)
+
+
+class AutoMixerDecodeBackend:
+    """Default per-token mixer decode backend."""
+
+    def __init__(self) -> None:
+        self.reference = ReferenceMixerDecodeBackend()
+        self.cute = CuteMixerDecodeBackend()
+
+    def supports(
+        self,
+        owner: "_MixerDecodeOwner",
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool:
+        return self.cute.supports(
+            owner,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def __call__(
+        self,
+        owner: "_MixerDecodeOwner",
+        inputs: MixerDecodeInputs,
+        state: ScanState,
+    ) -> tuple[torch.Tensor, ScanState]:
+        backend = (
+            self.cute
+            if self.cute.supports(
+                owner,
+                batch_size=int(inputs.value.shape[0]),
+                device=inputs.value.device,
+                dtype=inputs.value.dtype,
+            )
+            else self.reference
+        )
+        return backend(owner, inputs, state)
+
+
 __all__ = [
     "CConv1dBackend",
     "ReferenceCConv1dBackend",
@@ -359,4 +509,9 @@ __all__ = [
     "ReferenceScanBackend",
     "CuteScanBackend",
     "AutoScanBackend",
+    "MixerDecodeInputs",
+    "MixerDecodeBackend",
+    "ReferenceMixerDecodeBackend",
+    "CuteMixerDecodeBackend",
+    "AutoMixerDecodeBackend",
 ]

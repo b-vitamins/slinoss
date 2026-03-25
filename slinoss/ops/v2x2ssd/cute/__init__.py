@@ -16,5 +16,6 @@ The staged forward decomposition remains:
 """
 
 from .api import v2x2ssd_cute
+from .decode import mixer_decode_step_cute
 
-__all__ = ["v2x2ssd_cute"]
+__all__ = ["v2x2ssd_cute", "mixer_decode_step_cute"]
