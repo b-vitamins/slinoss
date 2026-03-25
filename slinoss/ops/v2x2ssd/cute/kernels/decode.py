@@ -44,6 +44,7 @@ class MixerDecodeStepFwd:
         spec: tuple[int, int, int, int],
         state_stride: tuple[int, int, int, int] | None = None,
         final_state_stride: tuple[int, int, int, int] | None = None,
+        workers_per_p: int = 1,
         normalize_bc: bool,
         dt_min: float,
         dt_max: float,
@@ -59,6 +60,12 @@ class MixerDecodeStepFwd:
         self.p_size = int(p_size)
         self.n_size = int(n_size)
         self.d_size = int(2 * n_size)
+        self.workers_per_p = int(workers_per_p)
+        if self.workers_per_p < 1 or self.n_size % self.workers_per_p != 0:
+            raise ValueError(
+                "workers_per_p must be positive and divide the decode N dimension."
+            )
+        self.block_threads = int(self.p_size * self.workers_per_p)
         self.normalize_bc = bool(normalize_bc)
 
         self.value_shape = (self.batch, self.heads, self.p_size)
@@ -221,7 +228,7 @@ class MixerDecodeStepFwd:
             mULast,
         ).launch(
             grid=(self.batch, self.heads, 1),
-            block=(self.p_size, 1, 1),
+            block=(self.block_threads, 1, 1),
             stream=stream,
         )
 
@@ -256,6 +263,7 @@ class MixerDecodeStepFwd:
         smem = cutlass.utils.SmemAllocator()
         vec_layout = cute.make_layout((self.n_size,))
         scalar_layout = cute.make_layout((1,))
+        acc_layout = cute.make_layout((self.workers_per_p, self.p_size))
         b_re = smem.allocate_tensor(
             element_type=cutlass.Float32,
             layout=vec_layout,
@@ -362,6 +370,12 @@ class MixerDecodeStepFwd:
             element_type=cutlass.Float32,
             layout=scalar_layout,
             byte_alignment=4,
+            swizzle=None,
+        )
+        acc_partial = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=acc_layout,
+            byte_alignment=16,
             swizzle=None,
         )
 
@@ -562,15 +576,17 @@ class MixerDecodeStepFwd:
 
         cute.arch.barrier()
 
-        if tidx < self.p_size:
-            p = tidx
+        if tidx < self.block_threads:
+            worker = tidx // self.p_size
+            p = tidx - worker * self.p_size
             u_prev = cutlass.Float32(mUPrev[bidx, hidx, p])
             u_curr = cutlass.Float32(mValue[bidx, hidx, p])
             acc = cutlass.Float32(0.0)
             rho_re = rho_re_s[0]
             rho_im = rho_im_s[0]
 
-            for n in cutlass.range(self.n_size, unroll_full=True):
+            for n_iter in cutlass.range_constexpr(self.n_size // self.workers_per_p):
+                n = worker + n_iter * self.workers_per_p
                 z_re = cutlass.Float32(mState[bidx, hidx, p, 2 * n])
                 z_im = cutlass.Float32(mState[bidx, hidx, p, 2 * n + 1])
                 mz_re, mz_im = complex_mul(rho_re, rho_im, z_re, z_im)
@@ -589,6 +605,17 @@ class MixerDecodeStepFwd:
                     c_im[n],
                 )
 
+            acc_partial[worker, p] = acc
+
+        if self.workers_per_p > 1:
+            cute.arch.barrier()
+
+        if tidx < self.p_size:
+            p = tidx
+            acc = cutlass.Float32(0.0)
+            for worker in cutlass.range_constexpr(self.workers_per_p):
+                acc = acc + acc_partial[worker, p]
+            u_curr = cutlass.Float32(mValue[bidx, hidx, p])
             gate = cutlass.Float32(mGate[bidx, hidx, p])
             silu_gate = gate * sigmoid(gate)
             y = (acc + u_curr * cutlass.Float32(mSkip[hidx, p])) * silu_gate

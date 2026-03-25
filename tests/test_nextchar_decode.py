@@ -34,7 +34,7 @@ def _force_reference_sequence_backends(model: NextCharLM) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_mixer_step_supported_cuda_matches_forward_without_calling_forward(
     dtype: torch.dtype,
     batch_size: int,
@@ -122,7 +122,7 @@ def test_mixer_init_decode_state_uses_decode_layout_only_for_cute_path(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_nextchar_decode_one_matches_full_forward_on_supported_cuda(
     dtype: torch.dtype,
     batch_size: int,

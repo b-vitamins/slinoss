@@ -193,8 +193,10 @@ def mixer_decode_step_cute(
     u_last_ptr, u_last_align = make_ptr_arg(u_last)
 
     spec = (batch, heads, P, N)
+    workers_per_p = 2 if batch * heads <= 32 else 1
     cache_key = (
         spec,
+        workers_per_p,
         int(value.device.index or 0),
         value.dtype,
         params_c.dtype,
@@ -249,6 +251,7 @@ def mixer_decode_step_cute(
                 spec=spec,
                 state_stride=state_stride,
                 final_state_stride=final_state_stride,
+                workers_per_p=workers_per_p,
                 normalize_bc=True,
                 dt_min=dt_min,
                 dt_max=dt_max,
