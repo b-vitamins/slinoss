@@ -110,6 +110,24 @@ class MixerDecodeStepFwd:
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
+    def _warp_reduce_sum(self, val: cutlass.Float32) -> cutlass.Float32:
+        val = val + cute.arch.shuffle_sync_bfly(
+            val, offset=16, mask=-1, mask_and_clamp=31
+        )
+        val = val + cute.arch.shuffle_sync_bfly(
+            val, offset=8, mask=-1, mask_and_clamp=31
+        )
+        val = val + cute.arch.shuffle_sync_bfly(
+            val, offset=4, mask=-1, mask_and_clamp=31
+        )
+        val = val + cute.arch.shuffle_sync_bfly(
+            val, offset=2, mask=-1, mask_and_clamp=31
+        )
+        val = val + cute.arch.shuffle_sync_bfly(
+            val, offset=1, mask=-1, mask_and_clamp=31
+        )
+        return val
+
     @cute.jit
     def __call__(
         self,
@@ -258,12 +276,15 @@ class MixerDecodeStepFwd:
         mULast: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.warp_idx()
         bidx, hidx, _ = cute.arch.block_idx()
 
         smem = cutlass.utils.SmemAllocator()
         vec_layout = cute.make_layout((self.n_size,))
         scalar_layout = cute.make_layout((1,))
         acc_layout = cute.make_layout((self.workers_per_p, self.p_size))
+        bc_reduce_layout = cute.make_layout((4, 2))
         b_re = smem.allocate_tensor(
             element_type=cutlass.Float32,
             layout=vec_layout,
@@ -378,32 +399,45 @@ class MixerDecodeStepFwd:
             byte_alignment=16,
             swizzle=None,
         )
+        bc_reduce = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=bc_reduce_layout,
+            byte_alignment=16,
+            swizzle=None,
+        )
 
-        if tidx == 0:
-            s0 = cutlass.Float32(0.0)
-            s1 = cutlass.Float32(0.0)
-            s2 = cutlass.Float32(0.0)
-            s3 = cutlass.Float32(0.0)
-            for n in cutlass.range(self.n_size, unroll_full=True):
-                x0 = cutlass.Float32(mBC[bidx, hidx, 0, n])
-                x1 = cutlass.Float32(mBC[bidx, hidx, 1, n])
-                x2 = cutlass.Float32(mBC[bidx, hidx, 2, n])
-                x3 = cutlass.Float32(mBC[bidx, hidx, 3, n])
-                s0 = s0 + x0 * x0
-                s1 = s1 + x1 * x1
-                s2 = s2 + x2 * x2
-                s3 = s3 + x3 * x3
+        if tidx < self.n_size:
+            s0 = cutlass.Float32(mBC[bidx, hidx, 0, tidx])
+            s1 = cutlass.Float32(mBC[bidx, hidx, 1, tidx])
+            s2 = cutlass.Float32(mBC[bidx, hidx, 2, tidx])
+            s3 = cutlass.Float32(mBC[bidx, hidx, 3, tidx])
+            s0 = self._warp_reduce_sum(s0 * s0)
+            s1 = self._warp_reduce_sum(s1 * s1)
+            s2 = self._warp_reduce_sum(s2 * s2)
+            s3 = self._warp_reduce_sum(s3 * s3)
+            if lane_idx == 0:
+                bc_reduce[0, warp_idx] = s0
+                bc_reduce[1, warp_idx] = s1
+                bc_reduce[2, warp_idx] = s2
+                bc_reduce[3, warp_idx] = s3
+
+        cute.arch.barrier()
+
+        if tidx < 4:
             denom = cutlass.Float32(self.n_size)
             eps_bc = cutlass.Float32(1.0e-5)
-            inv0 = cute.rsqrt(s0 / denom + eps_bc)
-            inv1 = cute.rsqrt(s1 / denom + eps_bc)
-            inv2 = cute.rsqrt(s2 / denom + eps_bc)
-            inv3 = cute.rsqrt(s3 / denom + eps_bc)
-            inv0_s[0] = inv0
-            inv1_s[0] = inv1
-            inv2_s[0] = inv2
-            inv3_s[0] = inv3
+            total = bc_reduce[tidx, 0] + bc_reduce[tidx, 1]
+            inv = cute.rsqrt(total / denom + eps_bc)
+            if tidx == 0:
+                inv0_s[0] = inv
+            elif tidx == 1:
+                inv1_s[0] = inv
+            elif tidx == 2:
+                inv2_s[0] = inv
+            else:
+                inv3_s[0] = inv
 
+        if tidx == 0:
             dt_raw = cutlass.Float32(mParams[bidx, hidx, 0]) + cutlass.Float32(
                 mDtBias[hidx]
             )

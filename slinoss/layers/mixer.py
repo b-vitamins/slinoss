@@ -723,17 +723,45 @@ class SLinOSSMixer(nn.Module):
             dtype=x.dtype,
         ):
             raise ValueError("Current inputs are unsupported for step_cuda_fast.")
+        return self.step_inplace(x, state)
+
+    def step_inplace(
+        self,
+        x: torch.Tensor,
+        state: SLinOSSMixerState | None = None,
+    ) -> tuple[torch.Tensor, SLinOSSMixerState]:
+        if torch.is_grad_enabled():
+            raise ValueError("step_inplace is inference-only.")
+
+        squeeze = False
+        if x.ndim == 2:
+            x_t = x
+            squeeze = True
+        elif x.ndim == 3 and x.shape[1] == 1:
+            x_t = x[:, 0, :]
+        else:
+            raise ValueError(
+                f"Expected x shape (batch, d_model) or (batch, 1, {self.d_model}), "
+                f"got {tuple(x.shape)}."
+            )
+
+        batch = int(x_t.shape[0])
         next_state = (
-            self.init_decode_state(batch, device=x.device, dtype=x.dtype)
+            self.init_decode_state(batch, device=x_t.device, dtype=x_t.dtype)
             if state is None
-            else state.clone()
+            else state
         )
-        return self._step_inplace(x, next_state), next_state
+        y_step = self._step_inplace(x_t, next_state)
+        if squeeze:
+            return y_step, next_state
+        return y_step.unsqueeze(1), next_state
 
     def step(
         self,
         x: torch.Tensor,
         state: SLinOSSMixerState | None = None,
+        *,
+        inplace: bool | None = None,
     ) -> tuple[torch.Tensor, SLinOSSMixerState]:
         squeeze = False
         if x.ndim == 2:
@@ -745,8 +773,14 @@ class SLinOSSMixer(nn.Module):
                 f"got {tuple(x.shape)}."
             )
 
+        if inplace is None:
+            inplace = not torch.is_grad_enabled()
         x_t = x[:, 0, :] if x.ndim == 3 else x
         if torch.is_grad_enabled():
+            if inplace:
+                raise ValueError(
+                    "In-place decode is unsupported when gradients are enabled."
+                )
             y, next_state = self.forward(x, state=state, return_state=True)
             assert isinstance(next_state, SLinOSSMixerState)
         else:
@@ -754,7 +788,7 @@ class SLinOSSMixer(nn.Module):
             next_state = (
                 self.init_decode_state(batch, device=x_t.device, dtype=x_t.dtype)
                 if state is None
-                else state.clone()
+                else (state if inplace else state.clone())
             )
             y_step = self._step_inplace(x_t, next_state)
             y = y_step.unsqueeze(1)

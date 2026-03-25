@@ -14,8 +14,12 @@ The landing has three explicit requirements:
 
 ## Public Surface
 
-`SLinOSSMixer.step()` is now a real decode entry point on inference workloads.
-On supported CUDA shapes it does not route through `forward(T=1)`.
+`SLinOSSMixer.step_inplace()` is the real public in-place decode entry point on
+inference workloads. On supported CUDA shapes it does not route through
+`forward(T=1)`.
+
+`SLinOSSMixer.step(..., inplace=False)` remains as a convenience wrapper that
+preserves the caller state by cloning it first.
 
 `NextCharLM` exposes:
 
@@ -52,6 +56,8 @@ The decode stack is split into two layers:
      causal depthwise convolution with persistent conv state.
    - `slinoss.ops.v2x2ssd.cute.decode.mixer_decode_step_cute(...)` runs the
      recurrent middle on a standalone one-token CuTe kernel.
+   - `SLinOSSMixer.step_inplace(...)` exposes the real fast layer decode surface
+     and mutates the passed decode state directly.
    - The kernel consumes token-local post-conv activations, flat params, raw
      `B/C`, gate and skip data, plus recurrent state, and returns gated output
      together with the next `state / b_prev / u_prev`.
@@ -75,6 +81,9 @@ CuTe decode backend. Explicit reference decode backends stay on the eager path.
 - The recurrent decode kernel writes `state / b_prev / u_prev` directly back
   into the stable decode buffers, which keeps the persistent graph state valid
   across replays without extra host-side state copies.
+- Public `step_inplace()` follows the same in-place decode contract as the
+  persistent model path. The convenience `step(..., inplace=False)` wrapper is
+  intentionally separate so callers can opt into cloning semantics when needed.
 
 ## Perf Tooling
 

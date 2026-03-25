@@ -30,25 +30,26 @@ Results:
 
 | B | persistent us/token | eager us/token | speedup | t_lower us/token | efficiency |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 384.043 | 3190.416 | 8.307x | 4.599 | 0.012 |
-| 2 | 258.950 | 1843.955 | 7.121x | 9.198 | 0.036 |
-| 4 | 127.536 | 879.899 | 6.899x | 18.394 | 0.144 |
-| 8 | 64.503 | 427.166 | 6.622x | 36.786 | 0.570 |
-| 16 | 37.810 | 219.635 | 5.809x | 73.570 | 1.946 |
+| 1 | 299.170 | 3312.410 | 11.072x | 4.599 | 0.015 |
+| 2 | 212.030 | 1915.486 | 9.034x | 9.198 | 0.043 |
+| 4 | 112.643 | 900.226 | 7.992x | 18.394 | 0.163 |
+| 8 | 66.540 | 455.699 | 6.848x | 36.786 | 0.553 |
+| 16 | 37.237 | 223.092 | 5.991x | 73.570 | 1.976 |
 
 Interpretation:
 
 - The persistent path is materially faster than the eager token loop across the
   entire supported batch grid.
-- Relative to the first issue-8 landing, persistent decode improved by about
-  `1.12x` at `B=1`, `1.11x` at `B=2`, `1.29x` at `B=4`, `1.52x` at `B=8`, and
-  `2.25x` at `B=16`.
-- Nsight Compute on the direct `B=16` recurrent kernel dropped from about
-  `151.6 us` to `37.4 us` after switching decode to the transposed physical
-  state layout and compiling the kernel against the real state strides.
-- Nsight Systems on the current `B=1` whole-model persistent path still shows
-  the CuTe recurrent decode kernel as the largest GPU bucket at about `34.3%`,
-  followed by small projection GEMMs and decode-step conv.
+- Relative to the `split-N=2` decode checkpoint, persistent decode improved by
+  about `1.12x` at `B=1`, `1.11x` at `B=2`, `1.02x` at `B=4`, and stayed
+  effectively flat at `B=8` and `B=16`.
+- The largest wins came from making the tiny `B*H` decode path use four workers
+  per `P` row and parallelizing the `B/C` norm reduction inside the recurrent
+  kernel.
+- Nsight Systems on the current `B=1` whole-model persistent path shows the
+  CuTe recurrent decode kernel down to about `16.3%` of GPU time, with the next
+  biggest remaining buckets now being small projection kernels and decode-step
+  conv.
 - Small batches are still far from the proxy bound on this GPU.
 - The `B=16` efficiency proxy exceeds `1.0`, which means the simple HBM traffic
   model is now overcounting off-chip traffic on this steady-state path. Treat

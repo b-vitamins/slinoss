@@ -314,15 +314,54 @@ def test_mixer_step_supported_cuda_reuses_scan_state_buffers(
         b_prev_ptr = state.scan.b_prev.data_ptr()
         u_prev_ptr = state.scan.u_prev.data_ptr()
 
-        y = mixer._step_inplace(x, state)
+        y, returned_state = mixer.step(x, state)
 
     assert y.shape == (2, 128)
+    assert returned_state is state
     assert state.scan.state is not None
     assert state.scan.b_prev is not None
     assert state.scan.u_prev is not None
     assert state.scan.state.data_ptr() == state_ptr
     assert state.scan.b_prev.data_ptr() == b_prev_ptr
     assert state.scan.u_prev.data_ptr() == u_prev_ptr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_step_supported_cuda_inplace_false_preserves_input_state(
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    x = torch.randn((2, 128), device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        state = mixer.init_state(x.shape[0], device="cuda", dtype=dtype)
+        assert state.scan.state is not None
+        assert state.scan.b_prev is not None
+        assert state.scan.u_prev is not None
+        state_before = state.clone()
+
+        _, next_state = mixer.step(x, state, inplace=False)
+
+    assert next_state is not state
+    assert state.scan.state is not None and state_before.scan.state is not None
+    assert state.scan.b_prev is not None and state_before.scan.b_prev is not None
+    assert state.scan.u_prev is not None and state_before.scan.u_prev is not None
+    torch.testing.assert_close(state.scan.state, state_before.scan.state)
+    torch.testing.assert_close(state.scan.b_prev, state_before.scan.b_prev)
+    torch.testing.assert_close(state.scan.u_prev, state_before.scan.u_prev)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
