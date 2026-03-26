@@ -34,14 +34,14 @@ def _cross_entropy_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.
 
 @dataclass(frozen=True)
 class NextCharPerfConfig:
-    batch_size: int = 12
-    block_size: int = 128
+    batch_size: int = 8
+    block_size: int = 2048
     vocab_size: int = 256
-    d_model: int = 96
-    n_layers: int = 2
-    d_state: int = 16
+    d_model: int = 736
+    n_layers: int = 3
+    d_state: int = 128
     expand: int = 2
-    d_head: int = 32
+    d_head: int = 64
     d_conv: int = 4
     chunk_size: int = 32
     lr: float = 3e-4
@@ -72,6 +72,10 @@ class NextCharBenchFixture:
     batches: list[tuple[torch.Tensor, torch.Tensor]]
     model_seed: int
     batch_seed: int
+
+
+# Largest training-suite shape verified to complete on the local RTX 3060 12GB.
+DEFAULT_NEXTCHAR_PERF_CONFIG = NextCharPerfConfig()
 
 
 def build_model(

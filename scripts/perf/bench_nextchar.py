@@ -35,6 +35,7 @@ from _common import (  # noqa: E402
     PerfConfig,
 )
 from _nextchar import (  # noqa: E402
+    DEFAULT_NEXTCHAR_PERF_CONFIG,
     NextCharBenchFixture,
     NextCharPerfConfig,
     build_bench_fixture,
@@ -44,37 +45,38 @@ from slinoss.perf.schema import validate_nextchar_bench_payload  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
+    default_cfg = DEFAULT_NEXTCHAR_PERF_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--backend", choices=("reference", "cute", "both"), default="both"
     )
-    parser.add_argument("--batch-size", type=int, default=12)
-    parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--vocab-size", type=int, default=256)
-    parser.add_argument("--d-model", type=int, default=96)
-    parser.add_argument("--n-layers", type=int, default=2)
-    parser.add_argument("--d-state", type=int, default=16)
-    parser.add_argument("--expand", type=int, default=2)
-    parser.add_argument("--d-head", type=int, default=32)
-    parser.add_argument("--d-conv", type=int, default=4)
-    parser.add_argument("--chunk-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=default_cfg.batch_size)
+    parser.add_argument("--block-size", type=int, default=default_cfg.block_size)
+    parser.add_argument("--vocab-size", type=int, default=default_cfg.vocab_size)
+    parser.add_argument("--d-model", type=int, default=default_cfg.d_model)
+    parser.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
+    parser.add_argument("--d-state", type=int, default=default_cfg.d_state)
+    parser.add_argument("--expand", type=int, default=default_cfg.expand)
+    parser.add_argument("--d-head", type=int, default=default_cfg.d_head)
+    parser.add_argument("--d-conv", type=int, default=default_cfg.d_conv)
+    parser.add_argument("--chunk-size", type=int, default=default_cfg.chunk_size)
+    parser.add_argument("--lr", type=float, default=default_cfg.lr)
+    parser.add_argument("--weight-decay", type=float, default=default_cfg.weight_decay)
+    parser.add_argument("--grad-clip", type=float, default=default_cfg.grad_clip)
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup-steps", type=int, default=10)
-    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--device", default=default_cfg.device)
+    parser.add_argument("--seed", type=int, default=default_cfg.seed)
+    parser.add_argument("--warmup-steps", type=int, default=4)
+    parser.add_argument("--steps", type=int, default=8)
     parser.add_argument(
         "--workload-repeat",
         type=int,
-        default=5,
+        default=3,
         help="Independent clean end-to-end repeats per backend/case.",
     )
-    parser.add_argument("--stage-warmup", type=int, default=5)
-    parser.add_argument("--stage-iterations", type=int, default=20)
-    parser.add_argument("--stage-repeat", type=int, default=5)
+    parser.add_argument("--stage-warmup", type=int, default=2)
+    parser.add_argument("--stage-iterations", type=int, default=8)
+    parser.add_argument("--stage-repeat", type=int, default=3)
     parser.add_argument(
         "--suite",
         choices=("single", "training"),
