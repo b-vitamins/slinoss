@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Warm launches to run before starting the CUDA profiler.",
     )
-    parser.add_argument("--pack-warps-per-block", type=int, default=18)
+    parser.add_argument("--pack-warps-per-block", type=int, default=12)
     parser.add_argument("--coeff-block-size", type=int, default=512)
     parser.add_argument("--scale-block-size", type=int, default=256)
     parser.add_argument("--bias-block-size", type=int, default=224)
@@ -149,9 +149,7 @@ def main() -> int:
         (batch, t_size, heads, 4, d_state), device=device, dtype=dtype
     )
     dparams = torch.empty((batch, t_size, heads * 13), device=device, dtype=dtype)
-    scale_tile_count = (
-        batch * t_size + (args.scale_block_size - 1)
-    ) // args.scale_block_size
+    scale_tile_count = (batch * t_size + (256 - 1)) // 256
     scale_partial = torch.empty(
         (scale_tile_count, heads, 4, d_state),
         device=device,

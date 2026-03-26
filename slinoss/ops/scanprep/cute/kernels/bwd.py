@@ -1,4 +1,4 @@
-# pyright: reportIndexIssue=false, reportOperatorIssue=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false, reportPrivateImportUsage=false, reportOptionalMemberAccess=false, reportGeneralTypeIssues=false
+# pyright: reportIndexIssue=false, reportOperatorIssue=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false, reportPrivateImportUsage=false, reportOptionalMemberAccess=false, reportOptionalSubscript=false, reportPossiblyUnboundVariable=false, reportGeneralTypeIssues=false
 """Split backward kernels for the CuTe scanprep backend."""
 
 from __future__ import annotations
@@ -58,7 +58,8 @@ class ScanPrepBwdFused:
         theta_bound: float,
         k_max: float,
         eps: float,
-        pack_warps_per_block: int = 18,
+        value_warps_per_block: int = 8,
+        pack_warps_per_block: int = 12,
         coeff_block_size: int = 512,
         scale_block_size: int = 256,
         bias_block_size: int = 224,
@@ -105,20 +106,40 @@ class ScanPrepBwdFused:
         self.rows_per_batch = self.t_size * self.h_size
         self.total_bt = self.batch * self.t_size
 
-        self.pack_row_warps = 2
+        self.value_warps_per_block = int(value_warps_per_block)
+        if self.value_warps_per_block <= 0:
+            raise ValueError("value_warps_per_block must be positive.")
+        self.value_rows_per_round = self.value_warps_per_block
+        self.value_block_size = self.value_warps_per_block * 32
+        self.value_bt_tile = 256
+        self.value_rounds = (
+            self.value_bt_tile + self.value_rows_per_round - 1
+        ) // self.value_rows_per_round
+        self.value_grid_x = (
+            self.total_bt + self.value_bt_tile - 1
+        ) // self.value_bt_tile
+
+        self.pack_role_warps = 2
         self.pack_warps_per_block = int(pack_warps_per_block)
         if (
             self.pack_warps_per_block <= 0
-            or self.pack_warps_per_block % self.pack_row_warps != 0
+            or self.pack_warps_per_block % self.pack_role_warps != 0
         ):
             raise ValueError(
-                "pack_warps_per_block must be a positive multiple of pack_row_warps."
+                "pack_warps_per_block must be a positive multiple of pack_role_warps."
             )
-        self.pack_rows_per_block = self.pack_warps_per_block // self.pack_row_warps
+        self.pack_rows_per_round = self.pack_warps_per_block // self.pack_role_warps
         self.pack_block_size = self.pack_warps_per_block * 32
-        self.pack_grid_size = (
-            self.total_rows + self.pack_rows_per_block - 1
-        ) // self.pack_rows_per_block
+        self.pack_bt_tile = 256
+        self.pack_rounds = (
+            self.pack_bt_tile + self.pack_rows_per_round - 1
+        ) // self.pack_rows_per_round
+        self.pack_grid_x = (self.total_bt + self.pack_bt_tile - 1) // self.pack_bt_tile
+        self.pack_scale_smem_stride = self.n_size + 1
+        self.pack_scale_smem_bytes = (
+            4 * self.pack_rows_per_round * self.pack_scale_smem_stride * 4
+        )
+        self.pack_scale_smem_bytes = self.pack_scale_smem_bytes + 64
 
         self.coeff_block_size = int(coeff_block_size)
         if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
@@ -145,10 +166,7 @@ class ScanPrepBwdFused:
         self.scale_channel_pairs = 2
         self.scale_grid_x = (self.n_size + self.scale_n_tile - 1) // self.scale_n_tile
         self.scale_bt_tile = self.scale_warps_per_block * 32
-        self.scale_grid_z = (
-            self.total_bt + self.scale_bt_tile - 1
-        ) // self.scale_bt_tile
-        self.scale_partial_grid_y = self.h_size * self.scale_channel_pairs
+        self.scale_grid_z = self.pack_grid_x
         self.scale_partial_shape = (
             self.scale_grid_z,
             self.h_size,
@@ -157,9 +175,6 @@ class ScanPrepBwdFused:
         )
         self.scale_partial_stride = make_row_major_stride(self.scale_partial_shape)
         self.scale_smem_stride = 33
-        self.scale_partial_smem_bytes = (
-            2 * self.scale_warps_per_block * self.scale_smem_stride * 4
-        )
         self.scale_reduce_smem_bytes = (
             self.scale_warps_per_block * self.scale_smem_stride * 4
         )
@@ -183,139 +198,308 @@ class ScanPrepBwdFused:
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
     @cute.kernel
-    def pack_grads_kernel(
+    def value_grad_kernel(
         self,
         mDU: cute.Tensor,
+        mValueGrad: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_bt, h, _ = cute.arch.block_idx()
+        warp = tidx // 32
+        lane = tidx - warp * 32
+
+        if h < self.h_size:
+            p_base = h * self.p_size
+            num_p_iters = (self.p_size + 31) // 32
+            for round_iter in cutlass.range_constexpr(self.value_rounds):
+                bt = (
+                    block_bt * self.value_bt_tile
+                    + round_iter * self.value_rows_per_round
+                    + warp
+                )
+                if bt < self.total_bt:
+                    b = bt // self.t_size
+                    t = bt - b * self.t_size
+                    for p_iter in cutlass.range_constexpr(num_p_iters):
+                        p = lane + p_iter * 32
+                        if p < self.p_size:
+                            mValueGrad[b, t, p_base + p] = mDU[b, h, t, p]
+
+    @cute.kernel
+    def pack_grads_kernel(
+        self,
         mBC: cute.Tensor,
         mDB: cute.Tensor,
         mDC: cute.Tensor,
         mBScale: cute.Tensor,
         mCScale: cute.Tensor,
         mRmsInv: cute.Tensor,
-        mValueGrad: cute.Tensor,
         mBCGrad: cute.Tensor,
-        total_rows_,
+        mScalePartial: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        block_bt, h, _ = cute.arch.block_idx()
         warp = tidx // 32
         lane = tidx - warp * 32
-        row_warp = warp % self.pack_row_warps
-        row_in_block = warp // self.pack_row_warps
-        row = bidx * self.pack_rows_per_block + row_in_block
+        role = warp // self.pack_rows_per_round
+        row_local = warp - role * self.pack_rows_per_round
 
-        if row < total_rows_:
-            b = row // self.rows_per_batch
-            rem = row - b * self.rows_per_batch
-            t = rem // self.h_size
-            h = rem - t * self.h_size
+        if cutlass.const_expr(self.normalize_bc):
+            smem = cutlass.utils.SmemAllocator()
+            sPartB0 = smem.allocate_tensor(
+                cutlass.Float32,
+                cute.make_layout(
+                    (self.pack_rows_per_round, self.pack_scale_smem_stride),
+                    stride=(self.pack_scale_smem_stride, 1),
+                ),
+                16,
+            )
+            sPartB1 = smem.allocate_tensor(
+                cutlass.Float32,
+                cute.make_layout(
+                    (self.pack_rows_per_round, self.pack_scale_smem_stride),
+                    stride=(self.pack_scale_smem_stride, 1),
+                ),
+                16,
+            )
+            sPartC0 = smem.allocate_tensor(
+                cutlass.Float32,
+                cute.make_layout(
+                    (self.pack_rows_per_round, self.pack_scale_smem_stride),
+                    stride=(self.pack_scale_smem_stride, 1),
+                ),
+                16,
+            )
+            sPartC1 = smem.allocate_tensor(
+                cutlass.Float32,
+                cute.make_layout(
+                    (self.pack_rows_per_round, self.pack_scale_smem_stride),
+                    stride=(self.pack_scale_smem_stride, 1),
+                ),
+                16,
+            )
 
-            if row_warp == 0:
-                p_base = h * self.p_size
-                num_p_iters = (self.p_size + 31) // 32
-                for p_iter in cutlass.range_constexpr(num_p_iters):
-                    p = lane + p_iter * 32
-                    if p < self.p_size:
-                        mValueGrad[b, t, p_base + p] = mDU[b, h, t, p]
-
+        if h < self.h_size and role < self.pack_role_warps:
             num_n_iters = (self.n_size + 31) // 32
             if cutlass.const_expr(self.normalize_bc):
                 denom = cutlass.Float32(self.n_size)
-                if row_warp == 0:
-                    inv0 = cutlass.Float32(mRmsInv[b, h, t, 0])
-                    inv1 = cutlass.Float32(mRmsInv[b, h, t, 1])
-                    inv0_cubed = inv0 * inv0 * inv0 / denom
-                    inv1_cubed = inv1 * inv1 * inv1 / denom
+                if role == 0:
+                    scale_acc0 = cute.make_fragment((num_n_iters,), cutlass.Float32)
+                    scale_acc1 = cute.make_fragment((num_n_iters,), cutlass.Float32)
+                    for n_iter in cutlass.range_constexpr(num_n_iters):
+                        scale_acc0[n_iter] = cutlass.Float32(0.0)
+                        scale_acc1[n_iter] = cutlass.Float32(0.0)
 
-                    dot0 = cutlass.Float32(0.0)
-                    dot1 = cutlass.Float32(0.0)
+                    for round_iter in cutlass.range_constexpr(self.pack_rounds):
+                        bt = (
+                            block_bt * self.pack_bt_tile
+                            + round_iter * self.pack_rows_per_round
+                            + row_local
+                        )
+                        if bt < self.total_bt:
+                            b = bt // self.t_size
+                            t = bt - b * self.t_size
+                            inv0 = cutlass.Float32(mRmsInv[b, h, t, 0])
+                            inv1 = cutlass.Float32(mRmsInv[b, h, t, 1])
+                            inv0_cubed = inv0 * inv0 * inv0 / denom
+                            inv1_cubed = inv1 * inv1 * inv1 / denom
+                            dot0 = cutlass.Float32(0.0)
+                            dot1 = cutlass.Float32(0.0)
+                            x0_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+                            x1_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+                            dy0_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+                            dy1_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+
+                            for n_iter in cutlass.range_constexpr(num_n_iters):
+                                n = lane + n_iter * 32
+                                if n < self.n_size:
+                                    grad0 = cutlass.Float32(mDB[b, h, t, 2 * n])
+                                    grad1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
+                                    x0 = cutlass.Float32(mBC[b, t, h, 0, n])
+                                    x1 = cutlass.Float32(mBC[b, t, h, 1, n])
+                                    scale0 = cutlass.Float32(mBScale[h, 0, n])
+                                    scale1 = cutlass.Float32(mBScale[h, 1, n])
+                                    dy0 = grad0 * scale0
+                                    dy1 = grad1 * scale1
+                                    x0_cache[n_iter] = x0
+                                    x1_cache[n_iter] = x1
+                                    dy0_cache[n_iter] = dy0
+                                    dy1_cache[n_iter] = dy1
+                                    dot0 = dot0 + dy0 * x0
+                                    dot1 = dot1 + dy1 * x1
+                                    scale_acc0[n_iter] = (
+                                        scale_acc0[n_iter] + grad0 * x0 * inv0
+                                    )
+                                    scale_acc1[n_iter] = (
+                                        scale_acc1[n_iter] + grad1 * x1 * inv1
+                                    )
+
+                            dot0 = cute.arch.warp_reduction_sum(
+                                dot0, threads_in_group=32
+                            )
+                            dot1 = cute.arch.warp_reduction_sum(
+                                dot1, threads_in_group=32
+                            )
+
+                            for n_iter in cutlass.range_constexpr(num_n_iters):
+                                n = lane + n_iter * 32
+                                if n < self.n_size:
+                                    x0 = x0_cache[n_iter]
+                                    x1 = x1_cache[n_iter]
+                                    dy0 = dy0_cache[n_iter]
+                                    dy1 = dy1_cache[n_iter]
+                                    mBCGrad[b, t, h, 0, n] = (
+                                        inv0 * dy0 - x0 * inv0_cubed * dot0
+                                    ).to(mBCGrad.element_type)
+                                    mBCGrad[b, t, h, 1, n] = (
+                                        inv1 * dy1 - x1 * inv1_cubed * dot1
+                                    ).to(mBCGrad.element_type)
+
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         n = lane + n_iter * 32
                         if n < self.n_size:
-                            db0 = cutlass.Float32(mDB[b, h, t, 2 * n])
-                            db1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
-                            x0 = cutlass.Float32(mBC[b, t, h, 0, n])
-                            x1 = cutlass.Float32(mBC[b, t, h, 1, n])
-                            scale0 = cutlass.Float32(mBScale[h, 0, n])
-                            scale1 = cutlass.Float32(mBScale[h, 1, n])
-                            dy0 = db0 * scale0
-                            dy1 = db1 * scale1
-                            dot0 = dot0 + dy0 * x0
-                            dot1 = dot1 + dy1 * x1
-                    dot0 = cute.arch.warp_reduction_sum(dot0, threads_in_group=32)
-                    dot1 = cute.arch.warp_reduction_sum(dot1, threads_in_group=32)
-
-                    for n_iter in cutlass.range_constexpr(num_n_iters):
-                        n = lane + n_iter * 32
-                        if n < self.n_size:
-                            db0 = cutlass.Float32(mDB[b, h, t, 2 * n])
-                            db1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
-                            x0 = cutlass.Float32(mBC[b, t, h, 0, n])
-                            x1 = cutlass.Float32(mBC[b, t, h, 1, n])
-                            scale0 = cutlass.Float32(mBScale[h, 0, n])
-                            scale1 = cutlass.Float32(mBScale[h, 1, n])
-                            dy0 = db0 * scale0
-                            dy1 = db1 * scale1
-                            mBCGrad[b, t, h, 0, n] = (
-                                inv0 * dy0 - x0 * inv0_cubed * dot0
-                            ).to(mBCGrad.element_type)
-                            mBCGrad[b, t, h, 1, n] = (
-                                inv1 * dy1 - x1 * inv1_cubed * dot1
-                            ).to(mBCGrad.element_type)
+                            sPartB0[row_local, n] = scale_acc0[n_iter]
+                            sPartB1[row_local, n] = scale_acc1[n_iter]
                 else:
-                    inv2 = cutlass.Float32(mRmsInv[b, h, t, 2])
-                    inv3 = cutlass.Float32(mRmsInv[b, h, t, 3])
-                    inv2_cubed = inv2 * inv2 * inv2 / denom
-                    inv3_cubed = inv3 * inv3 * inv3 / denom
+                    scale_acc2 = cute.make_fragment((num_n_iters,), cutlass.Float32)
+                    scale_acc3 = cute.make_fragment((num_n_iters,), cutlass.Float32)
+                    for n_iter in cutlass.range_constexpr(num_n_iters):
+                        scale_acc2[n_iter] = cutlass.Float32(0.0)
+                        scale_acc3[n_iter] = cutlass.Float32(0.0)
 
-                    dot2 = cutlass.Float32(0.0)
-                    dot3 = cutlass.Float32(0.0)
+                    for round_iter in cutlass.range_constexpr(self.pack_rounds):
+                        bt = (
+                            block_bt * self.pack_bt_tile
+                            + round_iter * self.pack_rows_per_round
+                            + row_local
+                        )
+                        if bt < self.total_bt:
+                            b = bt // self.t_size
+                            t = bt - b * self.t_size
+                            inv2 = cutlass.Float32(mRmsInv[b, h, t, 2])
+                            inv3 = cutlass.Float32(mRmsInv[b, h, t, 3])
+                            inv2_cubed = inv2 * inv2 * inv2 / denom
+                            inv3_cubed = inv3 * inv3 * inv3 / denom
+                            dot2 = cutlass.Float32(0.0)
+                            dot3 = cutlass.Float32(0.0)
+                            x2_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+                            x3_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+                            dy2_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+                            dy3_cache = cute.make_fragment(
+                                (num_n_iters,), cutlass.Float32
+                            )
+
+                            for n_iter in cutlass.range_constexpr(num_n_iters):
+                                n = lane + n_iter * 32
+                                if n < self.n_size:
+                                    grad2 = cutlass.Float32(mDC[b, h, t, 2 * n])
+                                    grad3 = cutlass.Float32(mDC[b, h, t, 2 * n + 1])
+                                    x2 = cutlass.Float32(mBC[b, t, h, 2, n])
+                                    x3 = cutlass.Float32(mBC[b, t, h, 3, n])
+                                    scale2 = cutlass.Float32(mCScale[h, 0, n])
+                                    scale3 = cutlass.Float32(mCScale[h, 1, n])
+                                    dy2 = grad2 * scale2
+                                    dy3 = grad3 * scale3
+                                    x2_cache[n_iter] = x2
+                                    x3_cache[n_iter] = x3
+                                    dy2_cache[n_iter] = dy2
+                                    dy3_cache[n_iter] = dy3
+                                    dot2 = dot2 + dy2 * x2
+                                    dot3 = dot3 + dy3 * x3
+                                    scale_acc2[n_iter] = (
+                                        scale_acc2[n_iter] + grad2 * x2 * inv2
+                                    )
+                                    scale_acc3[n_iter] = (
+                                        scale_acc3[n_iter] + grad3 * x3 * inv3
+                                    )
+
+                            dot2 = cute.arch.warp_reduction_sum(
+                                dot2, threads_in_group=32
+                            )
+                            dot3 = cute.arch.warp_reduction_sum(
+                                dot3, threads_in_group=32
+                            )
+
+                            for n_iter in cutlass.range_constexpr(num_n_iters):
+                                n = lane + n_iter * 32
+                                if n < self.n_size:
+                                    x2 = x2_cache[n_iter]
+                                    x3 = x3_cache[n_iter]
+                                    dy2 = dy2_cache[n_iter]
+                                    dy3 = dy3_cache[n_iter]
+                                    mBCGrad[b, t, h, 2, n] = (
+                                        inv2 * dy2 - x2 * inv2_cubed * dot2
+                                    ).to(mBCGrad.element_type)
+                                    mBCGrad[b, t, h, 3, n] = (
+                                        inv3 * dy3 - x3 * inv3_cubed * dot3
+                                    ).to(mBCGrad.element_type)
+
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         n = lane + n_iter * 32
                         if n < self.n_size:
-                            dc0 = cutlass.Float32(mDC[b, h, t, 2 * n])
-                            dc1 = cutlass.Float32(mDC[b, h, t, 2 * n + 1])
-                            x2 = cutlass.Float32(mBC[b, t, h, 2, n])
-                            x3 = cutlass.Float32(mBC[b, t, h, 3, n])
-                            scale2 = cutlass.Float32(mCScale[h, 0, n])
-                            scale3 = cutlass.Float32(mCScale[h, 1, n])
-                            dy2 = dc0 * scale2
-                            dy3 = dc1 * scale3
-                            dot2 = dot2 + dy2 * x2
-                            dot3 = dot3 + dy3 * x3
-                    dot2 = cute.arch.warp_reduction_sum(dot2, threads_in_group=32)
-                    dot3 = cute.arch.warp_reduction_sum(dot3, threads_in_group=32)
+                            sPartC0[row_local, n] = scale_acc2[n_iter]
+                            sPartC1[row_local, n] = scale_acc3[n_iter]
 
+                cute.arch.sync_threads()
+
+                if role == 0 and row_local == 0:
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         n = lane + n_iter * 32
                         if n < self.n_size:
-                            dc0 = cutlass.Float32(mDC[b, h, t, 2 * n])
-                            dc1 = cutlass.Float32(mDC[b, h, t, 2 * n + 1])
-                            x2 = cutlass.Float32(mBC[b, t, h, 2, n])
-                            x3 = cutlass.Float32(mBC[b, t, h, 3, n])
-                            scale2 = cutlass.Float32(mCScale[h, 0, n])
-                            scale3 = cutlass.Float32(mCScale[h, 1, n])
-                            dy2 = dc0 * scale2
-                            dy3 = dc1 * scale3
-                            mBCGrad[b, t, h, 2, n] = (
-                                inv2 * dy2 - x2 * inv2_cubed * dot2
-                            ).to(mBCGrad.element_type)
-                            mBCGrad[b, t, h, 3, n] = (
-                                inv3 * dy3 - x3 * inv3_cubed * dot3
-                            ).to(mBCGrad.element_type)
+                            acc0 = cutlass.Float32(0.0)
+                            acc1 = cutlass.Float32(0.0)
+                            for r in cutlass.range_constexpr(self.pack_rows_per_round):
+                                acc0 = acc0 + sPartB0[r, n]
+                                acc1 = acc1 + sPartB1[r, n]
+                            mScalePartial[block_bt, h, 0, n] = acc0
+                            mScalePartial[block_bt, h, 1, n] = acc1
+                elif role == 1 and row_local == 0:
+                    for n_iter in cutlass.range_constexpr(num_n_iters):
+                        n = lane + n_iter * 32
+                        if n < self.n_size:
+                            acc2 = cutlass.Float32(0.0)
+                            acc3 = cutlass.Float32(0.0)
+                            for r in cutlass.range_constexpr(self.pack_rows_per_round):
+                                acc2 = acc2 + sPartC0[r, n]
+                                acc3 = acc3 + sPartC1[r, n]
+                            mScalePartial[block_bt, h, 2, n] = acc2
+                            mScalePartial[block_bt, h, 3, n] = acc3
             else:
-                if row_warp == 0:
-                    for n_iter in cutlass.range_constexpr(num_n_iters):
-                        n = lane + n_iter * 32
-                        if n < self.n_size:
-                            mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
-                            mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
-                else:
-                    for n_iter in cutlass.range_constexpr(num_n_iters):
-                        n = lane + n_iter * 32
-                        if n < self.n_size:
-                            mBCGrad[b, t, h, 2, n] = mDC[b, h, t, 2 * n]
-                            mBCGrad[b, t, h, 3, n] = mDC[b, h, t, 2 * n + 1]
+                for round_iter in cutlass.range_constexpr(self.pack_rounds):
+                    bt = (
+                        block_bt * self.pack_bt_tile
+                        + round_iter * self.pack_rows_per_round
+                        + row_local
+                    )
+                    if bt < self.total_bt:
+                        b = bt // self.t_size
+                        t = bt - b * self.t_size
+                        if role == 0:
+                            for n_iter in cutlass.range_constexpr(num_n_iters):
+                                n = lane + n_iter * 32
+                                if n < self.n_size:
+                                    mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
+                                    mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
+                        else:
+                            for n_iter in cutlass.range_constexpr(num_n_iters):
+                                n = lane + n_iter * 32
+                                if n < self.n_size:
+                                    mBCGrad[b, t, h, 2, n] = mDC[b, h, t, 2 * n]
+                                    mBCGrad[b, t, h, 3, n] = mDC[b, h, t, 2 * n + 1]
 
     @cute.kernel
     def scale_partial_kernel(
@@ -924,34 +1108,28 @@ class ScanPrepBwdFused:
             cute.make_layout(self.bias_grad_shape, stride=self.bias_grad_stride),
         )
 
-        self.pack_grads_kernel(
+        self.value_grad_kernel(
             mDU,
+            mValueGrad,
+        ).launch(
+            grid=(self.value_grid_x, self.h_size, 1),
+            block=(self.value_block_size, 1, 1),
+        )
+        self.pack_grads_kernel(
             mBC,
             mDB,
             mDC,
             mBScale,
             mCScale,
             mRmsInv,
-            mValueGrad,
             mBCGrad,
-            self.total_rows,
+            mScalePartial,
         ).launch(
-            grid=(self.pack_grid_size, 1, 1),
+            grid=(self.pack_grid_x, self.h_size, 1),
             block=(self.pack_block_size, 1, 1),
+            smem=self.pack_scale_smem_bytes if self.normalize_bc else 0,
         )
         if cutlass.const_expr(self.normalize_bc):
-            self.scale_partial_kernel(
-                mBC,
-                mDB,
-                mDC,
-                mRmsInv,
-                mScalePartial,
-                self.total_bt,
-            ).launch(
-                grid=(self.scale_grid_x, self.scale_partial_grid_y, self.scale_grid_z),
-                block=(self.scale_block_size, 1, 1),
-                smem=self.scale_partial_smem_bytes,
-            )
             self.scale_reduce_kernel(
                 mScalePartial,
                 mScaleGrad,

@@ -109,14 +109,16 @@ def scanprep_bwd(
     dparams = torch.empty(
         (batch, t_size, n_heads * 13), device=bc.device, dtype=params_dtype
     )
-    pack_warps_per_block = 18
+    value_warps_per_block = 8
+    pack_warps_per_block = 12
     coeff_block_size = 512
     scale_block_size = 256
     bias_block_size = 224
+    pack_bt_tile = 256
     scale_grad = torch.zeros(
         (n_heads, 4, d_state), device=bc.device, dtype=torch.float32
     )
-    scale_tile_count = (batch * t_size + (scale_block_size - 1)) // scale_block_size
+    scale_tile_count = (batch * t_size + (pack_bt_tile - 1)) // pack_bt_tile
     scale_partial = torch.empty(
         (scale_tile_count, n_heads, 4, d_state),
         device=bc.device,
@@ -203,6 +205,7 @@ def scanprep_bwd(
         scale_grad_align,
         bias_partial_align,
         bias_grad_align,
+        int(value_warps_per_block),
         int(pack_warps_per_block),
         int(coeff_block_size),
         int(scale_block_size),
@@ -229,6 +232,7 @@ def scanprep_bwd(
                 theta_bound=theta_bound,
                 k_max=k_max,
                 eps=eps,
+                value_warps_per_block=value_warps_per_block,
                 pack_warps_per_block=pack_warps_per_block,
                 coeff_block_size=coeff_block_size,
                 scale_block_size=scale_block_size,
