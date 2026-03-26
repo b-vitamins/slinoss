@@ -1,9 +1,7 @@
 # pyright: reportIndexIssue=false, reportOperatorIssue=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false, reportPrivateImportUsage=false, reportOptionalMemberAccess=false, reportGeneralTypeIssues=false
-"""Thin backward wrapper for the fused CuTe scanprep backend."""
+"""Backward launcher for the split CuTe scanprep backend."""
 
 from __future__ import annotations
-
-from typing import cast
 
 import torch
 import cutlass.cute as cute
@@ -17,17 +15,20 @@ _SCANPREP_BWD_CACHE: dict[tuple[object, ...], object] = {}
 
 def scanprep_bwd(
     *,
-    value: torch.Tensor,
-    params: torch.Tensor,
     bc: torch.Tensor,
+    coeff_aux: torch.Tensor,
+    rms_inv: torch.Tensor,
     dU: torch.Tensor | None,
     dM: torch.Tensor | None,
     dK: torch.Tensor | None,
     dB: torch.Tensor | None,
     dC: torch.Tensor | None,
     n_heads: int,
+    d_head: int,
     d_state: int,
     normalize_bc: bool,
+    value_dtype: torch.dtype,
+    params_dtype: torch.dtype,
     dt_min: float,
     dt_max: float,
     r_min: float,
@@ -35,13 +36,6 @@ def scanprep_bwd(
     theta_bound: float,
     k_max: float,
     eps: float,
-    dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
-    mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> tuple[
@@ -58,89 +52,98 @@ def scanprep_bwd(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    batch, t_size, width = map(int, value.shape)
-    p_size = width // int(n_heads)
+    batch, t_size, _, _, _ = map(int, bc.shape)
 
     du_in = (
         dU
         if dU is not None
         else torch.zeros(
-            (batch, n_heads, t_size, p_size),
-            device=value.device,
-            dtype=value.dtype,
+            (batch, n_heads, t_size, d_head),
+            device=bc.device,
+            dtype=value_dtype,
         )
     )
+    if not du_in.is_contiguous():
+        du_in = du_in.contiguous()
     db_in = (
-        (dB if dB.is_contiguous() else dB.contiguous())
+        dB
         if dB is not None
         else torch.zeros(
-            (batch, n_heads, t_size, 2 * d_state),
-            device=bc.device,
-            dtype=bc.dtype,
+            (batch, n_heads, t_size, 2 * d_state), device=bc.device, dtype=bc.dtype
         )
     )
+    if not db_in.is_contiguous():
+        db_in = db_in.contiguous()
     dc_in = (
-        (dC if dC.is_contiguous() else dC.contiguous())
+        dC
         if dC is not None
         else torch.zeros(
-            (batch, n_heads, t_size, 2 * d_state),
-            device=bc.device,
-            dtype=bc.dtype,
+            (batch, n_heads, t_size, 2 * d_state), device=bc.device, dtype=bc.dtype
         )
     )
+    if not dc_in.is_contiguous():
+        dc_in = dc_in.contiguous()
     dm_in = (
-        (dM if dM.is_contiguous() else dM.contiguous())
+        dM
         if dM is not None
         else torch.zeros(
-            (batch, n_heads, t_size, 2),
-            device=params.device,
-            dtype=torch.float32,
+            (batch, n_heads, t_size, 2), device=bc.device, dtype=torch.float32
         )
     )
+    if not dm_in.is_contiguous():
+        dm_in = dm_in.contiguous()
     dk_in = (
-        (dK if dK.is_contiguous() else dK.contiguous())
+        dK
         if dK is not None
         else torch.zeros(
-            (batch, n_heads, t_size, 2, 2),
-            device=params.device,
-            dtype=torch.float32,
+            (batch, n_heads, t_size, 2, 2), device=bc.device, dtype=torch.float32
         )
     )
+    if not dk_in.is_contiguous():
+        dk_in = dk_in.contiguous()
 
-    value_grad = torch.empty_like(value)
+    value_grad = torch.empty(
+        (batch, t_size, n_heads * d_head), device=bc.device, dtype=value_dtype
+    )
     bc_grad = torch.empty_like(bc)
     dparams = torch.empty(
-        (batch, t_size, n_heads * 13),
-        device=params.device,
-        dtype=params.dtype,
+        (batch, t_size, n_heads * 13), device=bc.device, dtype=params_dtype
     )
-    scale_grad = (
-        torch.zeros(
-            (n_heads, 4, d_state),
-            device=bc.device,
-            dtype=torch.float32,
-        )
-        if normalize_bc
-        else torch.empty(
-            (n_heads, 4, d_state),
-            device=bc.device,
-            dtype=torch.float32,
-        )
+    pack_warps_per_block = 18
+    coeff_block_size = 512
+    scale_block_size = 256
+    bias_block_size = 224
+    scale_grad = torch.zeros(
+        (n_heads, 4, d_state), device=bc.device, dtype=torch.float32
     )
-    bias_grad = torch.zeros((n_heads, 7), device=params.device, dtype=torch.float32)
+    scale_tile_count = (batch * t_size + (scale_block_size - 1)) // scale_block_size
+    scale_partial = torch.empty(
+        (scale_tile_count, n_heads, 4, d_state),
+        device=bc.device,
+        dtype=torch.float32,
+    )
+    bias_tile_count = (batch * t_size + (256 - 1)) // 256
+    bias_partial = torch.empty(
+        (bias_tile_count, n_heads, 7),
+        device=bc.device,
+        dtype=torch.float32,
+    )
+    bias_grad = torch.empty((n_heads, 7), device=bc.device, dtype=torch.float32)
+
     b_scale_in = (
         b_scale
-        if normalize_bc
+        if normalize_bc and b_scale is not None
         else torch.empty((n_heads, 2, d_state), device=bc.device, dtype=bc.dtype)
     )
     c_scale_in = (
         c_scale
-        if normalize_bc
+        if normalize_bc and c_scale is not None
         else torch.empty((n_heads, 2, d_state), device=bc.device, dtype=bc.dtype)
     )
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
+    coeff_aux_c = coeff_aux if coeff_aux.is_contiguous() else coeff_aux.contiguous()
+    rms_inv_c = rms_inv if rms_inv.is_contiguous() else rms_inv.contiguous()
     du_stride = tuple(int(s) for s in du_in.stride())
-    params_stride = tuple(int(s) for s in params.stride())
 
     du_ptr, du_align = make_ptr_arg(du_in)
     bc_ptr, bc_align = make_ptr_arg(bc_c)
@@ -148,29 +151,23 @@ def scanprep_bwd(
     dc_ptr, dc_align = make_ptr_arg(dc_in)
     b_scale_ptr, b_scale_align = make_ptr_arg(b_scale_in)
     c_scale_ptr, c_scale_align = make_ptr_arg(c_scale_in)
-    params_ptr, params_align = make_ptr_arg(params)
+    rms_inv_ptr, rms_inv_align = make_ptr_arg(rms_inv_c)
+    coeff_aux_ptr, coeff_aux_align = make_ptr_arg(coeff_aux_c)
     dm_ptr, dm_align = make_ptr_arg(dm_in)
     dk_ptr, dk_align = make_ptr_arg(dk_in)
-    dt_bias_ptr, dt_bias_align = make_ptr_arg(dt_bias)
-    gamma_bias_ptr, gamma_bias_align = make_ptr_arg(gamma_bias)
-    omega_bias_ptr, omega_bias_align = make_ptr_arg(omega_bias)
-    mix_r_bias_ptr, mix_r_bias_align = make_ptr_arg(mix_r_bias)
-    mix_theta_bias_ptr, mix_theta_bias_align = make_ptr_arg(mix_theta_bias)
-    mix_k_prev_bias_ptr, mix_k_prev_bias_align = make_ptr_arg(mix_k_prev_bias)
-    mix_k_curr_bias_ptr, mix_k_curr_bias_align = make_ptr_arg(mix_k_curr_bias)
     value_grad_ptr, value_grad_align = make_ptr_arg(value_grad)
     bc_grad_ptr, bc_grad_align = make_ptr_arg(bc_grad)
     dparams_ptr, dparams_align = make_ptr_arg(dparams)
+    scale_partial_ptr, scale_partial_align = make_ptr_arg(scale_partial)
     scale_grad_ptr, scale_grad_align = make_ptr_arg(scale_grad)
+    bias_partial_ptr, bias_partial_align = make_ptr_arg(bias_partial)
     bias_grad_ptr, bias_grad_align = make_ptr_arg(bias_grad)
 
-    spec = (batch, t_size, int(n_heads), int(p_size), int(d_state), 13)
+    spec = (batch, t_size, int(n_heads), int(d_head), int(d_state), 13)
     cache_key = (
         spec,
-        int(value.device.index or 0),
+        int(bc.device.index or 0),
         bool(normalize_bc),
-        value.dtype,
-        params.dtype,
         bc.dtype,
         du_in.dtype,
         db_in.dtype,
@@ -179,41 +176,37 @@ def scanprep_bwd(
         dk_in.dtype,
         b_scale_in.dtype,
         c_scale_in.dtype,
-        dt_bias.dtype,
-        gamma_bias.dtype,
-        omega_bias.dtype,
-        mix_r_bias.dtype,
-        mix_theta_bias.dtype,
-        mix_k_prev_bias.dtype,
-        mix_k_curr_bias.dtype,
+        rms_inv_c.dtype,
+        coeff_aux_c.dtype,
         value_grad.dtype,
         bc_grad.dtype,
         dparams.dtype,
+        scale_partial.dtype,
         scale_grad.dtype,
+        bias_partial.dtype,
         bias_grad.dtype,
         du_stride,
-        params_stride,
         du_align,
         bc_align,
         db_align,
         dc_align,
         b_scale_align,
         c_scale_align,
-        params_align,
+        rms_inv_align,
+        coeff_aux_align,
         dm_align,
         dk_align,
-        dt_bias_align,
-        gamma_bias_align,
-        omega_bias_align,
-        mix_r_bias_align,
-        mix_theta_bias_align,
-        mix_k_prev_bias_align,
-        mix_k_curr_bias_align,
         value_grad_align,
         bc_grad_align,
         dparams_align,
+        scale_partial_align,
         scale_grad_align,
+        bias_partial_align,
         bias_grad_align,
+        int(pack_warps_per_block),
+        int(coeff_block_size),
+        int(scale_block_size),
+        int(bias_block_size),
         float(dt_min),
         float(dt_max),
         float(r_min),
@@ -228,7 +221,6 @@ def scanprep_bwd(
             ScanPrepBwdFused(
                 spec=spec,
                 du_stride=du_stride,
-                params_in_stride=params_stride,
                 normalize_bc=normalize_bc,
                 dt_min=dt_min,
                 dt_max=dt_max,
@@ -237,6 +229,10 @@ def scanprep_bwd(
                 theta_bound=theta_bound,
                 k_max=k_max,
                 eps=eps,
+                pack_warps_per_block=pack_warps_per_block,
+                coeff_block_size=coeff_block_size,
+                scale_block_size=scale_block_size,
+                bias_block_size=bias_block_size,
             ),
             du_ptr,
             bc_ptr,
@@ -244,24 +240,19 @@ def scanprep_bwd(
             dc_ptr,
             b_scale_ptr,
             c_scale_ptr,
-            params_ptr,
+            rms_inv_ptr,
+            coeff_aux_ptr,
             dm_ptr,
             dk_ptr,
-            dt_bias_ptr,
-            gamma_bias_ptr,
-            omega_bias_ptr,
-            mix_r_bias_ptr,
-            mix_theta_bias_ptr,
-            mix_k_prev_bias_ptr,
-            mix_k_curr_bias_ptr,
             value_grad_ptr,
             bc_grad_ptr,
             dparams_ptr,
+            scale_partial_ptr,
             scale_grad_ptr,
+            bias_partial_ptr,
             bias_grad_ptr,
         )
         _SCANPREP_BWD_CACHE[cache_key] = compiled
-
     compiled(
         du_ptr,
         bc_ptr,
@@ -269,78 +260,34 @@ def scanprep_bwd(
         dc_ptr,
         b_scale_ptr,
         c_scale_ptr,
-        params_ptr,
+        rms_inv_ptr,
+        coeff_aux_ptr,
         dm_ptr,
         dk_ptr,
-        dt_bias_ptr,
-        gamma_bias_ptr,
-        omega_bias_ptr,
-        mix_r_bias_ptr,
-        mix_theta_bias_ptr,
-        mix_k_prev_bias_ptr,
-        mix_k_curr_bias_ptr,
         value_grad_ptr,
         bc_grad_ptr,
         dparams_ptr,
+        scale_partial_ptr,
         scale_grad_ptr,
+        bias_partial_ptr,
         bias_grad_ptr,
     )
 
-    dvalue = (
-        value_grad
-        if value_grad.dtype == value.dtype
-        else value_grad.to(dtype=value.dtype)
-    )
-    dbc = bc_grad if bc_grad.dtype == bc.dtype else bc_grad.to(dtype=bc.dtype)
-
-    bias_dtype = dt_bias.dtype
-    if (
-        gamma_bias.dtype == bias_dtype
-        and omega_bias.dtype == bias_dtype
-        and mix_r_bias.dtype == bias_dtype
-        and mix_theta_bias.dtype == bias_dtype
-        and mix_k_prev_bias.dtype == bias_dtype
-        and mix_k_curr_bias.dtype == bias_dtype
-    ):
-        d_dt_bias = bias_grad[:, 0]
-        d_gamma_bias = bias_grad[:, 1]
-        d_omega_bias = bias_grad[:, 2]
-        d_mix_r_bias = bias_grad[:, 3]
-        d_mix_theta_bias = bias_grad[:, 4]
-        d_mix_k_prev_bias = bias_grad[:, 5]
-        d_mix_k_curr_bias = bias_grad[:, 6]
-    else:
-        d_dt_bias = bias_grad[:, 0].to(dtype=dt_bias.dtype)
-        d_gamma_bias = bias_grad[:, 1].to(dtype=gamma_bias.dtype)
-        d_omega_bias = bias_grad[:, 2].to(dtype=omega_bias.dtype)
-        d_mix_r_bias = bias_grad[:, 3].to(dtype=mix_r_bias.dtype)
-        d_mix_theta_bias = bias_grad[:, 4].to(dtype=mix_theta_bias.dtype)
-        d_mix_k_prev_bias = bias_grad[:, 5].to(dtype=mix_k_prev_bias.dtype)
-        d_mix_k_curr_bias = bias_grad[:, 6].to(dtype=mix_k_curr_bias.dtype)
-
-    if normalize_bc:
-        if b_scale.dtype == c_scale.dtype:
-            db_scale = scale_grad[:, :2, :]
-            dc_scale = scale_grad[:, 2:, :]
-        else:
-            db_scale = scale_grad[:, :2, :].to(dtype=b_scale.dtype)
-            dc_scale = scale_grad[:, 2:, :].to(dtype=c_scale.dtype)
-    else:
-        db_scale = None
-        dc_scale = None
+    d_b_scale = scale_grad[:, :2, :] if normalize_bc and b_scale is not None else None
+    d_c_scale = scale_grad[:, 2:, :] if normalize_bc and c_scale is not None else None
     return (
-        dvalue,
+        value_grad,
         dparams,
-        dbc,
-        d_dt_bias,
-        d_gamma_bias,
-        d_omega_bias,
-        d_mix_r_bias,
-        d_mix_theta_bias,
-        d_mix_k_prev_bias,
-        d_mix_k_curr_bias,
-        cast(torch.Tensor | None, db_scale),
-        cast(torch.Tensor | None, dc_scale),
+        bc_grad,
+        bias_grad[:, 0],
+        bias_grad[:, 1],
+        bias_grad[:, 2],
+        bias_grad[:, 3],
+        bias_grad[:, 4],
+        bias_grad[:, 5],
+        bias_grad[:, 6],
+        d_b_scale,
+        d_c_scale,
     )
 
 

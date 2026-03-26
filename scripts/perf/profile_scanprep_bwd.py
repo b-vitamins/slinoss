@@ -20,16 +20,17 @@ if str(PROJECT_ROOT) not in sys.path:
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import make_ptr_arg  # noqa: E402
+from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--B", type=int, default=12, help="Batch size.")
-    parser.add_argument("--H", type=int, default=6, help="Number of heads.")
-    parser.add_argument("--T", type=int, default=128, help="Sequence length.")
-    parser.add_argument("--P", type=int, default=32, help="Head width.")
-    parser.add_argument("--N", type=int, default=16, help="State width.")
+    parser.add_argument("--B", type=int, default=8, help="Batch size.")
+    parser.add_argument("--H", type=int, default=12, help="Number of heads.")
+    parser.add_argument("--T", type=int, default=2048, help="Sequence length.")
+    parser.add_argument("--P", type=int, default=64, help="Head width.")
+    parser.add_argument("--N", type=int, default=128, help="State width.")
     parser.add_argument(
         "--dtype",
         choices=("fp16", "bf16", "fp32"),
@@ -43,8 +44,10 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Warm launches to run before starting the CUDA profiler.",
     )
-    parser.add_argument("--pack-block-size", type=int, default=32)
-    parser.add_argument("--coeff-block-size", type=int, default=128)
+    parser.add_argument("--pack-warps-per-block", type=int, default=18)
+    parser.add_argument("--coeff-block-size", type=int, default=512)
+    parser.add_argument("--scale-block-size", type=int, default=256)
+    parser.add_argument("--bias-block-size", type=int, default=224)
     parser.add_argument(
         "--no-normalize-bc",
         action="store_false",
@@ -86,28 +89,22 @@ def main() -> int:
         d_head=p_size,
         normalize_bc=args.normalize_bc,
         device=device,
-    )
+    ).to(dtype=dtype)
 
+    value = torch.randn((batch, t_size, heads * p_size), device=device, dtype=dtype)
     params_flat = torch.randn((batch, t_size, heads * 13), device=device, dtype=dtype)
-    params_view = params_flat.view(batch, t_size, heads, 13)
     bc = torch.randn((batch, t_size, heads, 4, d_state), device=device, dtype=dtype)
     dU = torch.randn((batch, heads, t_size, p_size), device=device, dtype=dtype)
     dM = torch.randn((batch, heads, t_size, 2), device=device, dtype=torch.float32)
     dK = torch.randn((batch, heads, t_size, 2, 2), device=device, dtype=torch.float32)
     dB = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
     dC = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
-
-    value_grad = torch.empty(
-        (batch, t_size, heads * p_size), device=device, dtype=torch.float32
+    du_stride = (
+        int(dU.stride()[0]),
+        int(dU.stride()[1]),
+        int(dU.stride()[2]),
+        int(dU.stride()[3]),
     )
-    bc_grad = torch.empty(
-        (batch, t_size, heads, 4, d_state), device=device, dtype=torch.float32
-    )
-    dparams = torch.empty(
-        (batch, t_size, heads, 13), device=device, dtype=torch.float32
-    )
-    scale_grad = torch.zeros((heads, 4, d_state), device=device, dtype=torch.float32)
-    bias_grad = torch.zeros((heads, 7), device=device, dtype=torch.float32)
 
     if args.normalize_bc:
         assert prep.b_scale is not None
@@ -118,31 +115,14 @@ def main() -> int:
         b_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
         c_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
 
-    du_ptr, _ = make_ptr_arg(dU)
-    bc_ptr, _ = make_ptr_arg(bc)
-    db_ptr, _ = make_ptr_arg(dB)
-    dc_ptr, _ = make_ptr_arg(dC)
-    b_scale_ptr, _ = make_ptr_arg(b_scale)
-    c_scale_ptr, _ = make_ptr_arg(c_scale)
-    params_ptr, _ = make_ptr_arg(params_view)
-    dm_ptr, _ = make_ptr_arg(dM)
-    dk_ptr, _ = make_ptr_arg(dK)
-    dt_bias_ptr, _ = make_ptr_arg(prep.dt_bias.detach())
-    gamma_bias_ptr, _ = make_ptr_arg(prep.gamma_bias.detach())
-    omega_bias_ptr, _ = make_ptr_arg(prep.omega_bias.detach())
-    mix_r_bias_ptr, _ = make_ptr_arg(prep.mix_r_bias.detach())
-    mix_theta_bias_ptr, _ = make_ptr_arg(prep.mix_theta_bias.detach())
-    mix_k_prev_bias_ptr, _ = make_ptr_arg(prep.mix_k_prev_bias.detach())
-    mix_k_curr_bias_ptr, _ = make_ptr_arg(prep.mix_k_curr_bias.detach())
-    value_grad_ptr, _ = make_ptr_arg(value_grad)
-    bc_grad_ptr, _ = make_ptr_arg(bc_grad)
-    dparams_ptr, _ = make_ptr_arg(dparams)
-    scale_grad_ptr, _ = make_ptr_arg(scale_grad)
-    bias_grad_ptr, _ = make_ptr_arg(bias_grad)
-
-    compiled = cute.compile(
-        ScanPrepBwdFused(
-            spec=(batch, t_size, heads, p_size, d_state, 13),
+    with torch.no_grad():
+        _, _, _, _, _, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+            value,
+            params_flat,
+            bc,
+            n_heads=heads,
+            d_state=d_state,
+            d_head=p_size,
             normalize_bc=args.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
@@ -151,8 +131,75 @@ def main() -> int:
             theta_bound=prep.theta_bound,
             k_max=prep.k_max,
             eps=prep.eps,
-            pack_block_size=args.pack_block_size,
+            dt_bias=prep.dt_bias.detach(),
+            gamma_bias=prep.gamma_bias.detach(),
+            omega_bias=prep.omega_bias.detach(),
+            mix_r_bias=prep.mix_r_bias.detach(),
+            mix_theta_bias=prep.mix_theta_bias.detach(),
+            mix_k_prev_bias=prep.mix_k_prev_bias.detach(),
+            mix_k_curr_bias=prep.mix_k_curr_bias.detach(),
+            b_scale=b_scale if args.normalize_bc else None,
+            c_scale=c_scale if args.normalize_bc else None,
+        )
+
+    value_grad = torch.empty(
+        (batch, t_size, heads * p_size), device=device, dtype=dtype
+    )
+    bc_grad = torch.empty(
+        (batch, t_size, heads, 4, d_state), device=device, dtype=dtype
+    )
+    dparams = torch.empty((batch, t_size, heads * 13), device=device, dtype=dtype)
+    scale_tile_count = (
+        batch * t_size + (args.scale_block_size - 1)
+    ) // args.scale_block_size
+    scale_partial = torch.empty(
+        (scale_tile_count, heads, 4, d_state),
+        device=device,
+        dtype=torch.float32,
+    )
+    scale_grad = torch.zeros((heads, 4, d_state), device=device, dtype=torch.float32)
+    bias_tile_count = (batch * t_size + (256 - 1)) // 256
+    bias_partial = torch.empty(
+        (bias_tile_count, heads, 7),
+        device=device,
+        dtype=torch.float32,
+    )
+    bias_grad = torch.empty((heads, 7), device=device, dtype=torch.float32)
+
+    du_ptr, _ = make_ptr_arg(dU)
+    bc_ptr, _ = make_ptr_arg(bc)
+    db_ptr, _ = make_ptr_arg(dB)
+    dc_ptr, _ = make_ptr_arg(dC)
+    b_scale_ptr, _ = make_ptr_arg(b_scale)
+    c_scale_ptr, _ = make_ptr_arg(c_scale)
+    rms_inv_ptr, _ = make_ptr_arg(rms_inv)
+    coeff_aux_ptr, _ = make_ptr_arg(coeff_aux)
+    dm_ptr, _ = make_ptr_arg(dM)
+    dk_ptr, _ = make_ptr_arg(dK)
+    value_grad_ptr, _ = make_ptr_arg(value_grad)
+    bc_grad_ptr, _ = make_ptr_arg(bc_grad)
+    dparams_ptr, _ = make_ptr_arg(dparams)
+    scale_partial_ptr, _ = make_ptr_arg(scale_partial)
+    scale_grad_ptr, _ = make_ptr_arg(scale_grad)
+    bias_partial_ptr, _ = make_ptr_arg(bias_partial)
+    bias_grad_ptr, _ = make_ptr_arg(bias_grad)
+
+    compiled = cute.compile(
+        ScanPrepBwdFused(
+            spec=(batch, t_size, heads, p_size, d_state, 13),
+            du_stride=du_stride,
+            normalize_bc=args.normalize_bc,
+            dt_min=prep.dt_min,
+            dt_max=prep.dt_max,
+            r_min=prep.r_min,
+            r_max=prep.r_max,
+            theta_bound=prep.theta_bound,
+            k_max=prep.k_max,
+            eps=prep.eps,
+            pack_warps_per_block=args.pack_warps_per_block,
             coeff_block_size=args.coeff_block_size,
+            scale_block_size=args.scale_block_size,
+            bias_block_size=args.bias_block_size,
         ),
         du_ptr,
         bc_ptr,
@@ -160,20 +207,16 @@ def main() -> int:
         dc_ptr,
         b_scale_ptr,
         c_scale_ptr,
-        params_ptr,
+        rms_inv_ptr,
+        coeff_aux_ptr,
         dm_ptr,
         dk_ptr,
-        dt_bias_ptr,
-        gamma_bias_ptr,
-        omega_bias_ptr,
-        mix_r_bias_ptr,
-        mix_theta_bias_ptr,
-        mix_k_prev_bias_ptr,
-        mix_k_curr_bias_ptr,
         value_grad_ptr,
         bc_grad_ptr,
         dparams_ptr,
+        scale_partial_ptr,
         scale_grad_ptr,
+        bias_partial_ptr,
         bias_grad_ptr,
     )
 
@@ -189,20 +232,16 @@ def main() -> int:
             dc_ptr,
             b_scale_ptr,
             c_scale_ptr,
-            params_ptr,
+            rms_inv_ptr,
+            coeff_aux_ptr,
             dm_ptr,
             dk_ptr,
-            dt_bias_ptr,
-            gamma_bias_ptr,
-            omega_bias_ptr,
-            mix_r_bias_ptr,
-            mix_theta_bias_ptr,
-            mix_k_prev_bias_ptr,
-            mix_k_curr_bias_ptr,
             value_grad_ptr,
             bc_grad_ptr,
             dparams_ptr,
+            scale_partial_ptr,
             scale_grad_ptr,
+            bias_partial_ptr,
             bias_grad_ptr,
         )
 

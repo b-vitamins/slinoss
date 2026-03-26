@@ -1,19 +1,21 @@
 # pyright: reportIndexIssue=false, reportOperatorIssue=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false, reportPrivateImportUsage=false, reportGeneralTypeIssues=false
-"""Thin forward wrapper for the fused CuTe scanprep backend."""
+"""Forward launcher for the split CuTe scanprep backend."""
 
 from __future__ import annotations
+
+from typing import cast
 
 import torch
 import cutlass.cute as cute
 
-from .common import make_ptr_arg
+from .common import COEFF_AUX_FIELDS, make_ptr_arg
 from .kernels.fwd import ScanPrepFwdFused
 
 
 _SCANPREP_FWD_CACHE: dict[tuple[object, ...], object] = {}
 
 
-def scanprep_fwd_cute(
+def _scanprep_fwd_impl(
     value: torch.Tensor,
     params: torch.Tensor,
     bc: torch.Tensor,
@@ -38,7 +40,15 @@ def scanprep_fwd_cute(
     mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     value_c = value if value.is_contiguous() else value.contiguous()
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
     batch, t_size, width = map(int, value_c.shape)
@@ -66,6 +76,15 @@ def scanprep_fwd_cute(
         (batch, n_heads, t_size, 2 * d_state), device=value.device, dtype=bc.dtype
     )
     C = torch.empty_like(B)
+    rms_inv = torch.empty(
+        (batch, n_heads, t_size, 4), device=value.device, dtype=torch.float32
+    )
+    coeff_aux = torch.empty(
+        (batch, n_heads, COEFF_AUX_FIELDS, t_size),
+        device=value.device,
+        dtype=torch.float32,
+    )
+
     b_scale_c = (
         b_scale
         if b_scale is not None
@@ -91,10 +110,12 @@ def scanprep_fwd_cute(
     mix_k_prev_bias_ptr, mix_k_prev_bias_align = make_ptr_arg(mix_k_prev_bias)
     mix_k_curr_bias_ptr, mix_k_curr_bias_align = make_ptr_arg(mix_k_curr_bias)
     u_ptr, u_align = make_ptr_arg(U)
-    m_ptr, m_align = make_ptr_arg(M)
-    k_ptr, k_align = make_ptr_arg(K)
     b_ptr, b_align = make_ptr_arg(B)
     c_ptr, c_align = make_ptr_arg(C)
+    m_ptr, m_align = make_ptr_arg(M)
+    k_ptr, k_align = make_ptr_arg(K)
+    rms_inv_ptr, rms_inv_align = make_ptr_arg(rms_inv)
+    coeff_aux_ptr, coeff_aux_align = make_ptr_arg(coeff_aux)
 
     spec = (batch, t_size, int(n_heads), int(d_head), int(d_state))
     cache_key = (
@@ -118,6 +139,8 @@ def scanprep_fwd_cute(
         K.dtype,
         B.dtype,
         C.dtype,
+        rms_inv.dtype,
+        coeff_aux.dtype,
         value_align,
         bc_align,
         b_scale_align,
@@ -132,10 +155,12 @@ def scanprep_fwd_cute(
         mix_k_prev_bias_align,
         mix_k_curr_bias_align,
         u_align,
-        m_align,
-        k_align,
         b_align,
         c_align,
+        m_align,
+        k_align,
+        rms_inv_align,
+        coeff_aux_align,
         float(dt_min),
         float(dt_max),
         float(r_min),
@@ -172,10 +197,12 @@ def scanprep_fwd_cute(
             mix_k_prev_bias_ptr,
             mix_k_curr_bias_ptr,
             u_ptr,
-            m_ptr,
-            k_ptr,
             b_ptr,
             c_ptr,
+            m_ptr,
+            k_ptr,
+            rms_inv_ptr,
+            coeff_aux_ptr,
         )
         _SCANPREP_FWD_CACHE[cache_key] = compiled
     compiled(
@@ -192,12 +219,140 @@ def scanprep_fwd_cute(
         mix_k_prev_bias_ptr,
         mix_k_curr_bias_ptr,
         u_ptr,
-        m_ptr,
-        k_ptr,
         b_ptr,
         c_ptr,
+        m_ptr,
+        k_ptr,
+        rms_inv_ptr,
+        coeff_aux_ptr,
+    )
+    return U, M, K, B, C, rms_inv, coeff_aux
+
+
+def scanprep_fwd_cute(
+    value: torch.Tensor,
+    params: torch.Tensor,
+    bc: torch.Tensor,
+    *,
+    n_heads: int,
+    d_state: int,
+    d_head: int,
+    normalize_bc: bool,
+    dt_min: float,
+    dt_max: float,
+    r_min: float,
+    r_max: float,
+    theta_bound: float,
+    k_max: float,
+    eps: float,
+    dt_bias: torch.Tensor,
+    gamma_bias: torch.Tensor,
+    omega_bias: torch.Tensor,
+    mix_r_bias: torch.Tensor,
+    mix_theta_bias: torch.Tensor,
+    mix_k_prev_bias: torch.Tensor,
+    mix_k_curr_bias: torch.Tensor,
+    b_scale: torch.Tensor | None,
+    c_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    U, M, K, B, C, _, _ = _scanprep_fwd_impl(
+        value,
+        params,
+        bc,
+        n_heads=n_heads,
+        d_state=d_state,
+        d_head=d_head,
+        normalize_bc=normalize_bc,
+        dt_min=dt_min,
+        dt_max=dt_max,
+        r_min=r_min,
+        r_max=r_max,
+        theta_bound=theta_bound,
+        k_max=k_max,
+        eps=eps,
+        dt_bias=dt_bias,
+        gamma_bias=gamma_bias,
+        omega_bias=omega_bias,
+        mix_r_bias=mix_r_bias,
+        mix_theta_bias=mix_theta_bias,
+        mix_k_prev_bias=mix_k_prev_bias,
+        mix_k_curr_bias=mix_k_curr_bias,
+        b_scale=b_scale,
+        c_scale=c_scale,
     )
     return U, M, K, B, C
 
 
-__all__ = ["scanprep_fwd_cute"]
+def scanprep_fwd_cute_with_aux(
+    value: torch.Tensor,
+    params: torch.Tensor,
+    bc: torch.Tensor,
+    *,
+    n_heads: int,
+    d_state: int,
+    d_head: int,
+    normalize_bc: bool,
+    dt_min: float,
+    dt_max: float,
+    r_min: float,
+    r_max: float,
+    theta_bound: float,
+    k_max: float,
+    eps: float,
+    dt_bias: torch.Tensor,
+    gamma_bias: torch.Tensor,
+    omega_bias: torch.Tensor,
+    mix_r_bias: torch.Tensor,
+    mix_theta_bias: torch.Tensor,
+    mix_k_prev_bias: torch.Tensor,
+    mix_k_curr_bias: torch.Tensor,
+    b_scale: torch.Tensor | None,
+    c_scale: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return cast(
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+        _scanprep_fwd_impl(
+            value,
+            params,
+            bc,
+            n_heads=n_heads,
+            d_state=d_state,
+            d_head=d_head,
+            normalize_bc=normalize_bc,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            r_min=r_min,
+            r_max=r_max,
+            theta_bound=theta_bound,
+            k_max=k_max,
+            eps=eps,
+            dt_bias=dt_bias,
+            gamma_bias=gamma_bias,
+            omega_bias=omega_bias,
+            mix_r_bias=mix_r_bias,
+            mix_theta_bias=mix_theta_bias,
+            mix_k_prev_bias=mix_k_prev_bias,
+            mix_k_curr_bias=mix_k_curr_bias,
+            b_scale=b_scale,
+            c_scale=c_scale,
+        ),
+    )
+
+
+__all__ = ["scanprep_fwd_cute", "scanprep_fwd_cute_with_aux"]

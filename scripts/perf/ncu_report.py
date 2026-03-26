@@ -13,6 +13,7 @@ PROFILE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PROFILE_DIR.parent.parent
 
 KERNEL_SCRIPTS = {
+    "scanprep_fwd": "profile_scanprep_fwd.py",
     "scanprep_bwd": "profile_scanprep_bwd.py",
 }
 

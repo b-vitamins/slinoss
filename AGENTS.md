@@ -42,6 +42,18 @@ environment:
 
 Do not commit while any of these are failing.
 
+Use this sequencing while getting to the gate:
+
+1. Run `./scripts/guix-run ruff check` and fix lint issues first.
+2. Run `./scripts/guix-run ruff format` to apply formatting, then
+   `./scripts/guix-run ruff format --check .`.
+3. Run `./scripts/guix-run pyright` and fix any type issues.
+4. Only after the style and type gates are green, run the full
+   `./scripts/guix-run pytest` battery once.
+
+Do not run `pytest`, then make later style-only or typing-only changes, and then
+rerun `pytest` again just to recover from that avoidable sequencing mistake.
+
 ## Changelog Policy
 
 Do not maintain a hand-written `CHANGELOG.md` during active development.
