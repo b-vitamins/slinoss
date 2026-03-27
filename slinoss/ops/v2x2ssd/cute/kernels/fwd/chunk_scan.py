@@ -1165,9 +1165,9 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
     def _d_stage_size(self) -> int:
         """Shared-memory D slice width used by the end-to-end kernel."""
         Dp = self.D_padded
-        if Dp <= 96:
+        if Dp <= 64:
             return Dp
-        return 96
+        return 64
 
     def _d_stage_count(self) -> int:
         Ds = self._d_stage_size()
@@ -1292,6 +1292,8 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                 (self.L * 4, 16),
                 (self.L * 4, 16),
                 (self.L * 4, 16),
+                (self.n_block_size * 4, 16),
+                (self.n_block_size * 4, 16),
                 (self.num_warps * 4, 16),
                 (self.num_warps * 4, 16),
                 (self.num_warps * 2 * 4, 16),
@@ -1334,6 +1336,12 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         ]
         annotations["phase_im"] = cute.struct.Align[
             cute.struct.MemRange[cutlass.Float32, self.L], 16
+        ]
+        annotations["tap_phase_re"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+        ]
+        annotations["tap_phase_im"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
         ]
         annotations["warp_log_total"] = cute.struct.Align[
             cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
@@ -1482,6 +1490,12 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         sLogpref = storage.logpref.get_tensor(cute.make_layout((L,), stride=(1,)))
         sPhaseRe = storage.phase_re.get_tensor(cute.make_layout((L,), stride=(1,)))
         sPhaseIm = storage.phase_im.get_tensor(cute.make_layout((L,), stride=(1,)))
+        sTapPhaseRe = storage.tap_phase_re.get_tensor(
+            cute.make_layout((n,), stride=(1,))
+        )
+        sTapPhaseIm = storage.tap_phase_im.get_tensor(
+            cute.make_layout((n,), stride=(1,))
+        )
         warpLogTotal = storage.warp_log_total.get_tensor(
             cute.make_layout((self.num_warps,), stride=(1,))
         )
@@ -1794,6 +1808,22 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                     )
                     acc_S.fill(0.0)
 
+                    if tidx < n:
+                        key_idx = n_block * n + tidx
+                        tr = cutlass.Float32(0.0)
+                        ti = cutlass.Float32(0.0)
+                        if cute.elem_less(key_idx, L):
+                            tap_idx = 0 if cutlass.const_expr(use_prev) else 1
+                            tap_re = cutlass.Float32(mK[bhc, key_idx, tap_idx, 0])
+                            tap_im = cutlass.Float32(mK[bhc, key_idx, tap_idx, 1])
+                            phase_re = cutlass.Float32(sPhaseRe[key_idx])
+                            phase_im = cutlass.Float32(sPhaseIm[key_idx])
+                            tr = tap_re * phase_re + tap_im * phase_im
+                            ti = tap_im * phase_re - tap_re * phase_im
+                        sTapPhaseRe[tidx] = tr
+                        sTapPhaseIm[tidx] = ti
+                    cute.arch.barrier()
+
                     for d_stage_idx in cutlass.range_constexpr(d_stage_count):
                         d_col_base = d_stage_idx * Ds
 
@@ -1906,17 +1936,11 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                             im_col = vv * 2 + 1
                             bre = cutlass.Float32(sK[rr, re_col])
                             bim = cutlass.Float32(sK[rr, im_col])
-
                             tr = cutlass.Float32(0.0)
                             ti = cutlass.Float32(0.0)
                             if cute.elem_less(key_idx, L):
-                                tap_idx = 0 if cutlass.const_expr(use_prev) else 1
-                                tap_re = cutlass.Float32(mK[bhc, key_idx, tap_idx, 0])
-                                tap_im = cutlass.Float32(mK[bhc, key_idx, tap_idx, 1])
-                                phase_re = cutlass.Float32(sPhaseRe[key_idx])
-                                phase_im = cutlass.Float32(sPhaseIm[key_idx])
-                                tr = tap_re * phase_re + tap_im * phase_im
-                                ti = tap_im * phase_re - tap_re * phase_im
+                                tr = cutlass.Float32(sTapPhaseRe[rr])
+                                ti = cutlass.Float32(sTapPhaseIm[rr])
 
                             kre = bre * tr - bim * ti
                             kim = bre * ti + bim * tr
