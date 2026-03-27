@@ -9,7 +9,6 @@ from cutlass.cute.runtime import make_ptr
 
 from .db import ChunkScanBwdDBAmpere
 from .dcdr import ChunkScanBwdDCDRAmpere
-from .dlp import ChunkScanBwdDLPAmpere
 from .du import ChunkScanBwdDUAmpere
 from .dz0 import ChunkScanBwdDZ0Ampere
 from .param_scan import ChunkScanBwdParamScanAmpere
@@ -628,7 +627,7 @@ def _make_dc_host_wrapper(
         mDC = _make_tensor_from_spec(DC_ptr, d_c_spec)
         mDR = _make_tensor_from_spec(DR_ptr, d_r_spec)
 
-        kernel = ChunkScanBwdDLPAmpere(
+        kernel = ChunkScanBwdDCDRAmpere(
             U_ptr.value_type,
             chunk_size=chunk_size,
             D=D,

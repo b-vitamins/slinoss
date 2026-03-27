@@ -1486,8 +1486,8 @@ class ChunkScanBwdDBAmpere:
                 row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
                 if cute.elem_less(row_idx, cutlass.Int32(self.L)):
                     inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
-                    for c in cutlass.range_constexpr(
-                        cute.size(acc_dK_curr_mn.shape[1])
+                    for c in cutlass.range(
+                        cute.size(acc_dK_curr_mn.shape[1]), unroll_full=True
                     ):
                         d = cutlass.Int32(tOcKD_tile_mn[0, c][3])
                         if (
@@ -1506,8 +1506,8 @@ class ChunkScanBwdDBAmpere:
                 row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
                 if cute.elem_less(row_idx, cutlass.Int32(self.L)):
                     inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
-                    for c in cutlass.range_constexpr(
-                        cute.size(acc_dK_prev_mn.shape[1])
+                    for c in cutlass.range(
+                        cute.size(acc_dK_prev_mn.shape[1]), unroll_full=True
                     ):
                         d = cutlass.Int32(tOcKD_tile_mn[0, c][3])
                         if (

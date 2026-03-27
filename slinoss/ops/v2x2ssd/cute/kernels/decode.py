@@ -882,8 +882,8 @@ class MixerDecodeStepFwd:
 
             for vec_iter in cutlass.range_constexpr(self.n_vec_iters):
                 n0 = worker * self.vec_n + vec_iter * self.n_groups * self.vec_n
-                re_frag = cute.make_fragment((self.vec_n,), cutlass.Float32)
-                im_frag = cute.make_fragment((self.vec_n,), cutlass.Float32)
+                re_frag = cute.make_rmem_tensor((self.vec_n,), cutlass.Float32)
+                im_frag = cute.make_rmem_tensor((self.vec_n,), cutlass.Float32)
 
                 for vi in cutlass.range_constexpr(self.vec_n):
                     n = n0 + vi

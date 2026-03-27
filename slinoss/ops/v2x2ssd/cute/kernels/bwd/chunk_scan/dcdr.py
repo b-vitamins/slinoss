@@ -1406,7 +1406,9 @@ class ChunkScanBwdDCDRAmpere:
                 rs = cutlass.Float32(0.0)
                 if cute.elem_less(row_idx, cutlass.Int32(self.L)):
                     rs = cutlass.Float32(s_row_scale[row_local])
-                for c in cutlass.range_constexpr(cute.size(acc_dQ_total_mn.shape[1])):
+                for c in cutlass.range(
+                    cute.size(acc_dQ_total_mn.shape[1]), unroll_full=True
+                ):
                     off_scaled = acc_dQ_off_mn[r, c] * rs
                     acc_dQ_total_mn[r, c] = acc_dQ_total_mn[r, c] + off_scaled
                     acc_dQ_off_mn[r, c] = off_scaled
@@ -1422,7 +1424,7 @@ class ChunkScanBwdDCDRAmpere:
                 if row_task < cutlass.Int32(kv_tile):
                     t = m0 + row_task
                     row_sum = cutlass.Float32(0.0)
-                    for vv in cutlass.range_constexpr(N):
+                    for vv in cutlass.range(N, unroll_full=True):
                         d0 = cutlass.Int32(vv * 2)
                         dq0 = cutlass.Float32(
                             sK_tile[row_task, d0 + 0].to(cutlass.Float32)

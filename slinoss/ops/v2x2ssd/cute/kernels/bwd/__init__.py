@@ -25,7 +25,7 @@ from .chunk_scan import (
     _resolve_dz0_cta_tiler,
 )
 from .chunk_scan.db import ChunkScanBwdDBAmpere
-from .chunk_scan.dlp import ChunkScanBwdDLPAmpere
+from .chunk_scan.dcdr import ChunkScanBwdDCDRAmpere
 from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
 from .chunk_scan.param_scan import ChunkScanBwdParamScanAmpere
@@ -884,7 +884,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             P=P,
             num_threads=scan_num_threads_db,
         )
-        scan_dcdr = ChunkScanBwdDLPAmpere(
+        scan_dcdr = ChunkScanBwdDCDRAmpere(
             tc_dtype,
             chunk_size=L,
             D=D,

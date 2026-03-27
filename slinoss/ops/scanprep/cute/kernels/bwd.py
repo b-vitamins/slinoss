@@ -284,8 +284,8 @@ class ScanPrepBwdFused:
             if cutlass.const_expr(self.normalize_bc):
                 denom = cutlass.Float32(self.n_size)
                 if role == 0:
-                    scale_acc0 = cute.make_fragment((num_n_iters,), cutlass.Float32)
-                    scale_acc1 = cute.make_fragment((num_n_iters,), cutlass.Float32)
+                    scale_acc0 = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
+                    scale_acc1 = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         scale_acc0[n_iter] = cutlass.Float32(0.0)
                         scale_acc1[n_iter] = cutlass.Float32(0.0)
@@ -305,16 +305,16 @@ class ScanPrepBwdFused:
                             inv1_cubed = inv1 * inv1 * inv1 / denom
                             dot0 = cutlass.Float32(0.0)
                             dot1 = cutlass.Float32(0.0)
-                            x0_cache = cute.make_fragment(
+                            x0_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
-                            x1_cache = cute.make_fragment(
+                            x1_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
-                            dy0_cache = cute.make_fragment(
+                            dy0_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
-                            dy1_cache = cute.make_fragment(
+                            dy1_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
 
@@ -369,8 +369,8 @@ class ScanPrepBwdFused:
                             sPartB0[row_local, n] = scale_acc0[n_iter]
                             sPartB1[row_local, n] = scale_acc1[n_iter]
                 else:
-                    scale_acc2 = cute.make_fragment((num_n_iters,), cutlass.Float32)
-                    scale_acc3 = cute.make_fragment((num_n_iters,), cutlass.Float32)
+                    scale_acc2 = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
+                    scale_acc3 = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         scale_acc2[n_iter] = cutlass.Float32(0.0)
                         scale_acc3[n_iter] = cutlass.Float32(0.0)
@@ -390,16 +390,16 @@ class ScanPrepBwdFused:
                             inv3_cubed = inv3 * inv3 * inv3 / denom
                             dot2 = cutlass.Float32(0.0)
                             dot3 = cutlass.Float32(0.0)
-                            x2_cache = cute.make_fragment(
+                            x2_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
-                            x3_cache = cute.make_fragment(
+                            x3_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
-                            dy2_cache = cute.make_fragment(
+                            dy2_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
-                            dy3_cache = cute.make_fragment(
+                            dy3_cache = cute.make_rmem_tensor(
                                 (num_n_iters,), cutlass.Float32
                             )
 
