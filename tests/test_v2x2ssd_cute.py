@@ -83,11 +83,9 @@ def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
         requested_n_block_size=64,
         requested_num_threads=128,
     )
-    # After shared-memory reductions, larger n-block choices can fit; keep the
-    # contract focused on the tile family fallback (64-thread family).
-    assert cfg_issue3[0] == 32
-    assert cfg_issue3[2] == 64
-    assert cfg_issue3[1] in (16, 32, 64)
+    # With D-staged shared-memory residency, the issue-3 shape now fits the
+    # primary 64x64x128 family directly (no 64-thread fallback required).
+    assert cfg_issue3 == (64, 64, 128)
 
     assert _resolve_chunk_scan_launch_cfg(
         D=256,
