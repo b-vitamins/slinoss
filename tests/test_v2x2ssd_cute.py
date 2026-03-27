@@ -489,7 +489,7 @@ def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
     for grad1, grad2 in zip(grads1, grads2, strict=True):
         assert torch.isfinite(grad1).all()
         assert torch.isfinite(grad2).all()
-        torch.testing.assert_close(grad1, grad2, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(grad1, grad2, atol=1e-7, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

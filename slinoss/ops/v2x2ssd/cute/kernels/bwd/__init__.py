@@ -25,7 +25,9 @@ from .chunk_scan import (
     _resolve_dz0_cta_tiler,
 )
 from .chunk_scan.db import ChunkScanBwdDBAmpere
-from .chunk_scan.dcdr import ChunkScanBwdDCDRAmpere
+from .chunk_scan.dc import ChunkScanBwdDCAmpere
+from .chunk_scan.dlp import ChunkScanBwdDLPAmpere
+from .chunk_scan.dr import ChunkScanBwdDRAmpere
 from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
 from .chunk_scan.param_scan import ChunkScanBwdParamScanAmpere
@@ -884,11 +886,24 @@ def _make_v2x2ssd_bwd_host_wrapper(
             P=P,
             num_threads=scan_num_threads_db,
         )
-        scan_dcdr = ChunkScanBwdDCDRAmpere(
+        scan_dc = ChunkScanBwdDCAmpere(
             tc_dtype,
             chunk_size=L,
             D=D,
             P=P,
+            num_threads=scan_num_threads_dc,
+        )
+        scan_dlp = ChunkScanBwdDLPAmpere(
+            tc_dtype,
+            chunk_size=L,
+            D=D,
+            P=P,
+            num_threads=scan_num_threads_dc,
+        )
+        scan_dr = ChunkScanBwdDRAmpere(
+            tc_dtype,
+            chunk_size=L,
+            D=D,
             num_threads=scan_num_threads_dc,
         )
         scan_param = ChunkScanBwdParamScanAmpere(
@@ -944,7 +959,18 @@ def _make_v2x2ssd_bwd_host_wrapper(
             mDMprev_scan,
             mDMcurr_scan,
         )
-        scan_dcdr(
+        scan_dc(
+            mU_scan,
+            mB_scan,
+            mM_scan,
+            mK_scan,
+            mDOut_scan,
+            mU_prev0_scan,
+            mB_prev0_scan,
+            mZ0_scan,
+            mDC_scan,
+        )
+        scan_dlp(
             mU_scan,
             mB_scan,
             mC_scan,
@@ -955,9 +981,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             mB_prev0_scan,
             mZ0_scan,
             mDLogp,
-            mDC_scan,
-            mDR_scan,
         )
+        scan_dr(mC_scan, mM_scan, mDC_scan, mDR_scan)
         scan_param(
             mM_scan,
             mK_scan,
