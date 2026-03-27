@@ -72,7 +72,7 @@ def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
     pytest.importorskip("cutlass")
 
     device_index = torch.cuda.current_device()
-    assert _resolve_chunk_scan_launch_cfg(
+    cfg_issue3 = _resolve_chunk_scan_launch_cfg(
         D=512,
         P=64,
         L=64,
@@ -82,7 +82,12 @@ def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
         requested_m_block_size=None,
         requested_n_block_size=64,
         requested_num_threads=128,
-    ) == (32, 16, 64)
+    )
+    # After shared-memory reductions, larger n-block choices can fit; keep the
+    # contract focused on the tile family fallback (64-thread family).
+    assert cfg_issue3[0] == 32
+    assert cfg_issue3[2] == 64
+    assert cfg_issue3[1] in (16, 32, 64)
 
     assert _resolve_chunk_scan_launch_cfg(
         D=256,

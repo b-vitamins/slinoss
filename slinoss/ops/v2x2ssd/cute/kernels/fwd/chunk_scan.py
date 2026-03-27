@@ -192,6 +192,10 @@ class ChunkScanFwdInnerAmpere:
     def _v_smem_elems(self) -> int:
         return int(self.n_block_size) * int(self.P_padded)
 
+    def _v_alias_in_bz(self) -> bool:
+        """Whether ``sV`` can alias ``bz_alias`` storage instead of separate smem."""
+        return self._v_smem_elems() <= self._b_smem_elems()
+
     def _o_smem_elems(self) -> int:
         return int(self.m_block_size) * int(self.P_padded)
 
@@ -213,13 +217,15 @@ class ChunkScanFwdInnerAmpere:
         self, in_dtype: type[cutlass.Numeric]
     ) -> list[tuple[int, int]]:
         in_bytes = in_dtype.width // 8
-        return [
+        fields = [
             (self._q_smem_elems() * in_bytes, 16),
             (self._b_smem_elems() * in_bytes, 16),
-            (self._v_smem_elems() * in_bytes, 16),
             (self.m_block_size * 4, 16),
             (self.n_block_size * 4, 16),
         ]
+        if not self._v_alias_in_bz():
+            fields.insert(2, (self._v_smem_elems() * in_bytes, 16))
+        return fields
 
     def _compute_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
         return self._struct_size_bytes(self._shared_storage_fields(in_dtype))
@@ -353,23 +359,25 @@ class ChunkScanFwdInnerAmpere:
         class SharedStorage:
             pass
 
-        SharedStorage.__annotations__ = {
+        annotations = {
             "q_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sQ_layout)], 16
             ],
             "bz_alias": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
             ],
-            "v_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
-            ],
-            "lp_q": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
-            ],
-            "lp_k": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-            ],
         }
+        if not self._v_alias_in_bz():
+            annotations["v_tile"] = cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
+            ]
+        annotations["lp_q"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
+        ]
+        annotations["lp_k"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+        ]
+        SharedStorage.__annotations__ = annotations
         return cute.struct(SharedStorage)
 
     @cute.jit
@@ -765,7 +773,10 @@ class ChunkScanFwdInnerAmpere:
         storage = smem.allocate(SharedStorage)
         sQ = storage.q_tile.get_tensor(sQ_layout)
         sB = storage.bz_alias.get_tensor(sB_layout)
-        sV = storage.v_tile.get_tensor(sV_layout)
+        if cutlass.const_expr(self._v_alias_in_bz()):
+            sV = cute.make_tensor(sB.iterator, sV_layout)
+        else:
+            sV = storage.v_tile.get_tensor(sV_layout)
         sK = cute.make_tensor(sB.iterator, sK_layout)
         sZ = cute.make_tensor(sB.iterator, sZ_layout)
         sLpQ = storage.lp_q.get_tensor(cute.make_layout((m,), stride=(1,)))
@@ -968,17 +979,20 @@ class ChunkScanFwdInnerAmpere:
                         else:
                             sLpK[tidx] = 0.0
 
-                    cV = cute.local_tile(mcV[bhc, None, 0, None], (n, Pp), (n_block, 0))
-                    tVcV = gmem_thr_copy_P.partition_S(cV)
-                    self._copy_gmem_rows_or_zero(
-                        gmem_tiled_copy_P,
-                        tVgV[None, None, None, n_block],
-                        tVsV,
-                        tVcV,
-                        tVpV,
-                        mVcurr.layout.shape[1],
-                    )
-                    cute.arch.cp_async_commit_group()
+                    if cutlass.const_expr(not self._v_alias_in_bz()):
+                        cV = cute.local_tile(
+                            mcV[bhc, None, 0, None], (n, Pp), (n_block, 0)
+                        )
+                        tVcV = gmem_thr_copy_P.partition_S(cV)
+                        self._copy_gmem_rows_or_zero(
+                            gmem_tiled_copy_P,
+                            tVgV[None, None, None, n_block],
+                            tVsV,
+                            tVcV,
+                            tVpV,
+                            mVcurr.layout.shape[1],
+                        )
+                        cute.arch.cp_async_commit_group()
 
                     acc_S = cute.make_rmem_tensor_like(acc_template_S, cutlass.Float32)
                     acc_S.fill(0.0)
@@ -1036,8 +1050,34 @@ class ChunkScanFwdInnerAmpere:
                             apply_mask=True,
                         )
 
+                    if cutlass.const_expr(self._v_alias_in_bz()):
+                        cV = cute.local_tile(
+                            mcV[bhc, None, 0, None], (n, Pp), (n_block, 0)
+                        )
+                        tVcV = gmem_thr_copy_P.partition_S(cV)
+                        self._copy_gmem_rows_or_zero(
+                            gmem_tiled_copy_P,
+                            tVgV[None, None, None, n_block],
+                            tVsV,
+                            tVcV,
+                            tVpV,
+                            mVcurr.layout.shape[1],
+                        )
+                        cute.arch.cp_async_commit_group()
+
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.barrier()
+
+                    self._accumulate_scores_times_v(
+                        tiled_mma,
+                        acc_S,
+                        acc_O,
+                        mQ.element_type,
+                        smem_tiled_copy_V,
+                        tOsVt,
+                        tOrVt_view,
+                        tOrVt,
+                    )
 
                     if cute.elem_less(n_block + 1, visible_n_block_max):
                         cK_next = cute.local_tile(
@@ -1053,17 +1093,6 @@ class ChunkScanFwdInnerAmpere:
                             mKprev.layout.shape[1],
                         )
                         cute.arch.cp_async_commit_group()
-
-                    self._accumulate_scores_times_v(
-                        tiled_mma,
-                        acc_S,
-                        acc_O,
-                        mQ.element_type,
-                        smem_tiled_copy_V,
-                        tOsVt,
-                        tOrVt_view,
-                        tOrVt,
-                    )
 
         self._store_output(
             mOut,
@@ -1167,44 +1196,46 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         class SharedStorage:
             pass
 
-        SharedStorage.__annotations__ = {
+        annotations = {
             "q_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sQ_layout)], 16
             ],
             "bz_alias": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
             ],
-            "v_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
-            ],
-            "lp_q": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
-            ],
-            "lp_k": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-            ],
-            "logpref": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.L], 16
-            ],
-            "phase_re": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.L], 16
-            ],
-            "phase_im": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.L], 16
-            ],
-            "warp_log_total": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
-            ],
-            "warp_log_offset": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
-            ],
-            "warp_phase_total": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
-            ],
-            "warp_phase_offset": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
-            ],
         }
+        if not self._v_alias_in_bz():
+            annotations["v_tile"] = cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
+            ]
+        annotations["lp_q"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
+        ]
+        annotations["lp_k"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+        ]
+        annotations["logpref"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.L], 16
+        ]
+        annotations["phase_re"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.L], 16
+        ]
+        annotations["phase_im"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.L], 16
+        ]
+        annotations["warp_log_total"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
+        ]
+        annotations["warp_log_offset"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
+        ]
+        annotations["warp_phase_total"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
+        ]
+        annotations["warp_phase_offset"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
+        ]
+        SharedStorage.__annotations__ = annotations
         return cute.struct(SharedStorage)
 
     @cute.jit
@@ -1329,7 +1360,10 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         storage = smem.allocate(SharedStorage)
         sQ = storage.q_tile.get_tensor(sQ_layout)
         sB = storage.bz_alias.get_tensor(sB_layout)
-        sV = storage.v_tile.get_tensor(sV_layout)
+        if cutlass.const_expr(self._v_alias_in_bz()):
+            sV = cute.make_tensor(sB.iterator, sV_layout)
+        else:
+            sV = storage.v_tile.get_tensor(sV_layout)
         sK = cute.make_tensor(sB.iterator, sK_layout)
         sZ = cute.make_tensor(sB.iterator, sZ_layout)
 
@@ -1670,38 +1704,39 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.barrier()
 
-                    gVtile = cute.local_tile(
-                        mU_source[bhc, None, 0, None],
-                        (n, Pp),
-                        (n_block, 0),
-                    )
-                    tVgV = gmem_thr_copy_P.partition_S(gVtile)
-                    cV_tile = cute.local_tile(
-                        mcV[bhc, None, 0, None],
-                        (n, Pp),
-                        (n_block, 0),
-                    )
-                    tVcV = gmem_thr_copy_P.partition_S(cV_tile)
-                    for vi in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                        row = tVcV[0, vi, 0][1]
-                        if cute.elem_less(row, mU.layout.shape[1]):
-                            if (
-                                cutlass.const_expr(use_prev)
-                                and n_block == 0
-                                and is_chunk0
-                                and cute.elem_less(row, 1)
-                            ):
-                                tVsV[None, vi, None].fill(0)
+                    if cutlass.const_expr(not self._v_alias_in_bz()):
+                        gVtile = cute.local_tile(
+                            mU_source[bhc, None, 0, None],
+                            (n, Pp),
+                            (n_block, 0),
+                        )
+                        tVgV = gmem_thr_copy_P.partition_S(gVtile)
+                        cV_tile = cute.local_tile(
+                            mcV[bhc, None, 0, None],
+                            (n, Pp),
+                            (n_block, 0),
+                        )
+                        tVcV = gmem_thr_copy_P.partition_S(cV_tile)
+                        for vi in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
+                            row = tVcV[0, vi, 0][1]
+                            if cute.elem_less(row, mU.layout.shape[1]):
+                                if (
+                                    cutlass.const_expr(use_prev)
+                                    and n_block == 0
+                                    and is_chunk0
+                                    and cute.elem_less(row, 1)
+                                ):
+                                    tVsV[None, vi, None].fill(0)
+                                else:
+                                    cute.copy(
+                                        gmem_tiled_copy_P,
+                                        tVgV[None, vi, None],
+                                        tVsV[None, vi, None],
+                                        pred=tVpV[None, vi, None],
+                                    )
                             else:
-                                cute.copy(
-                                    gmem_tiled_copy_P,
-                                    tVgV[None, vi, None],
-                                    tVsV[None, vi, None],
-                                    pred=tVpV[None, vi, None],
-                                )
-                        else:
-                            tVsV[None, vi, None].fill(0)
-                    cute.arch.cp_async_commit_group()
+                                tVsV[None, vi, None].fill(0)
+                        cute.arch.cp_async_commit_group()
 
                     if cutlass.const_expr(use_prev) and n_block == 0:
                         ii = tidx
@@ -1804,6 +1839,40 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                             apply_mask=True,
                         )
 
+                    if cutlass.const_expr(self._v_alias_in_bz()):
+                        gVtile = cute.local_tile(
+                            mU_source[bhc, None, 0, None],
+                            (n, Pp),
+                            (n_block, 0),
+                        )
+                        tVgV = gmem_thr_copy_P.partition_S(gVtile)
+                        cV_tile = cute.local_tile(
+                            mcV[bhc, None, 0, None],
+                            (n, Pp),
+                            (n_block, 0),
+                        )
+                        tVcV = gmem_thr_copy_P.partition_S(cV_tile)
+                        for vi in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
+                            row = tVcV[0, vi, 0][1]
+                            if cute.elem_less(row, mU.layout.shape[1]):
+                                if (
+                                    cutlass.const_expr(use_prev)
+                                    and n_block == 0
+                                    and is_chunk0
+                                    and cute.elem_less(row, 1)
+                                ):
+                                    tVsV[None, vi, None].fill(0)
+                                else:
+                                    cute.copy(
+                                        gmem_tiled_copy_P,
+                                        tVgV[None, vi, None],
+                                        tVsV[None, vi, None],
+                                        pred=tVpV[None, vi, None],
+                                    )
+                            else:
+                                tVsV[None, vi, None].fill(0)
+                        cute.arch.cp_async_commit_group()
+
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.barrier()
 
@@ -1817,33 +1886,6 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                             sV[0, ii] = cutlass.select_(is_chunk0, boundary, old)
                             ii = ii + self.num_threads
                         cute.arch.barrier()
-
-                    if cute.elem_less(n_block + 1, visible_n_block_max):
-                        gK_next = cute.local_tile(
-                            mB_source[bhc, None, 0, None],
-                            (n, Dp),
-                            (n_block + 1, 0),
-                        )
-                        cK_next = cute.local_tile(
-                            mcK[bhc, None, 0, None],
-                            (n, Dp),
-                            (n_block + 1, 0),
-                        )
-                        tKgK_next = gmem_thr_copy_D.partition_S(gK_next)
-                        tKcK_next = gmem_thr_copy_D.partition_S(cK_next)
-                        for ni in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                            if cute.elem_less(
-                                tKcK_next[0, ni, 0][1], mB.layout.shape[1]
-                            ):
-                                cute.copy(
-                                    gmem_tiled_copy_D,
-                                    tKgK_next[None, ni, None],
-                                    tKsK[None, ni, None],
-                                    pred=tKpK[None, ni, None],
-                                )
-                            else:
-                                tKsK[None, ni, None].fill(0)
-                        cute.arch.cp_async_commit_group()
 
                     rP = cute.make_rmem_tensor_like(acc_S, mU.element_type)
                     rP.store(acc_S.load().to(mU.element_type))
@@ -1884,6 +1926,33 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                             tOrVt[None, None, k],
                             acc_O,
                         )
+
+                    if cute.elem_less(n_block + 1, visible_n_block_max):
+                        gK_next = cute.local_tile(
+                            mB_source[bhc, None, 0, None],
+                            (n, Dp),
+                            (n_block + 1, 0),
+                        )
+                        cK_next = cute.local_tile(
+                            mcK[bhc, None, 0, None],
+                            (n, Dp),
+                            (n_block + 1, 0),
+                        )
+                        tKgK_next = gmem_thr_copy_D.partition_S(gK_next)
+                        tKcK_next = gmem_thr_copy_D.partition_S(cK_next)
+                        for ni in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                            if cute.elem_less(
+                                tKcK_next[0, ni, 0][1], mB.layout.shape[1]
+                            ):
+                                cute.copy(
+                                    gmem_tiled_copy_D,
+                                    tKgK_next[None, ni, None],
+                                    tKsK[None, ni, None],
+                                    pred=tKpK[None, ni, None],
+                                )
+                            else:
+                                tKsK[None, ni, None].fill(0)
+                        cute.arch.cp_async_commit_group()
 
         if cutlass.const_expr(mOut.element_type == cutlass.Float32):
             for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
