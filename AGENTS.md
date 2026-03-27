@@ -145,3 +145,19 @@ Do not reintroduce verbose taxonomies like `everything_else.mixer_non_scan.*`.
   surface; regressions there count as perf bugs.
 - Include last-batch or reduced-batch cases when using the `training` suite so
   cache/dispatch behavior is exercised under realistic shape variation.
+
+### NCU Table Harness
+
+Use `scripts/perf/ncu_kernel_table.py` for compact, machine-readable kernel NCU
+snapshots instead of raw multi-thousand-line NCU dumps.
+
+- Full scanprep + v2x2ssd table (all kernels):
+  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --json-out /tmp/ncu_kernel_table.json`
+- Single-kernel probe:
+  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --kernel chunk_scan_bwd_dcdr --json-out /tmp/ncu_dcdr.json`
+- List supported kernel keys:
+  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --list`
+
+The table output is the default reporting surface and includes bench wall-time,
+effective GB/s, NCU DRAM throughput, occupancy, scheduler no-eligible, bank
+conflicts, registers/thread, and shared-memory-per-block breakdown.

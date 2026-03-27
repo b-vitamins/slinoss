@@ -193,6 +193,43 @@ def _run_ncu(
     return output
 
 
+def run_ncu_sections(
+    sections: Iterable[str],
+    script: Path,
+    script_args: list[str],
+    *,
+    ncu: str,
+    python: str,
+) -> str:
+    cmd = [ncu]
+    for section in sections:
+        cmd.extend(("--section", section))
+    cmd.extend(
+        [
+            "--print-details",
+            "all",
+            "--profile-from-start",
+            "off",
+            python,
+            str(script),
+            *script_args,
+        ]
+    )
+    proc = subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "NCU failed for sections "
+            f"{', '.join(str(section) for section in sections)}:\n{output}"
+        )
+    return output
+
+
 def _resolve_script(kernel: str | None) -> Path:
     if kernel is None:
         return PROFILE_DIR / KERNEL_SCRIPTS["scanprep_bwd"]
@@ -222,6 +259,133 @@ def _print_commands(
         if script_args:
             cmd = f"{cmd} {' '.join(script_args)}"
         print(cmd)
+
+
+def parse_ncu_summary(output: str) -> dict[str, float | None]:
+    dram_pct = _parse_percent(
+        output,
+        [
+            rf"dram__throughput(?:\.avg)?\.pct_of_peak_sustained_elapsed\s+{NUM_RE}",
+            rf"DRAM Throughput[^\n]*?{NUM_RE}\s*%",
+        ],
+    )
+    if dram_pct is None:
+        dram_pct = _parse_metric_value(output, "DRAM Throughput")
+    dram_read = _parse_unit_value(
+        output,
+        [
+            rf"dram__bytes_read\.sum\.per_second\s+{NUM_RE}\s*([A-Za-z/]+)?",
+            rf"Requested Global Load Throughput[^\n]*?{NUM_RE}\s*([A-Za-z/]+)?",
+        ],
+        unit_to_gbs=True,
+    )
+    if dram_read is None:
+        dram_read = _parse_unit_value_table(
+            output,
+            "dram__bytes_read.sum.per_second",
+            unit_to_gbs=True,
+        )
+    dram_write = _parse_unit_value(
+        output,
+        [
+            rf"dram__bytes_write\.sum\.per_second\s+{NUM_RE}\s*([A-Za-z/]+)?",
+            rf"Requested Global Store Throughput[^\n]*?{NUM_RE}\s*([A-Za-z/]+)?",
+        ],
+        unit_to_gbs=True,
+    )
+    if dram_write is None:
+        dram_write = _parse_unit_value_table(
+            output,
+            "dram__bytes_write.sum.per_second",
+            unit_to_gbs=True,
+        )
+    bank_ld = _parse_metric_value(
+        output,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+    )
+    bank_st = _parse_metric_value(
+        output,
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+    )
+    achieved_occ = _parse_metric_value(output, "Achieved Occupancy")
+    if achieved_occ is None:
+        achieved_occ = _parse_percent(
+            output,
+            [
+                rf"Achieved Occupancy[^\n]*?{NUM_RE}\s*%",
+                rf"sm__warps_active\.avg\.pct_of_peak_sustained_active\s+{NUM_RE}",
+            ],
+        )
+    no_eligible = _parse_metric_value(output, "No Eligible")
+    regs = _parse_metric_value(output, "Registers Per Thread")
+    if regs is None:
+        regs = _parse_unit_value(
+            output,
+            [rf"launch__registers_per_thread\s+{NUM_RE}"],
+        )
+    smem_dynamic_kib = _parse_size_kib_table(
+        output,
+        "Dynamic Shared Memory Per Block",
+    )
+    if smem_dynamic_kib is None:
+        smem_dynamic_kib = _parse_size_kib(
+            output,
+            [
+                rf"launch__dynamic_shared_mem_per_block\s+{NUM_RE}\s*([A-Za-z]+)?",
+                rf"launch__shared_mem_per_block\s+{NUM_RE}\s*([A-Za-z]+)?",
+            ],
+        )
+    smem_static_kib = _parse_size_kib_table(
+        output,
+        "Static Shared Memory Per Block",
+    )
+    if smem_static_kib is None:
+        smem_static_kib = _parse_size_kib(
+            output,
+            [rf"launch__static_shared_mem_per_block\s+{NUM_RE}\s*([A-Za-z]+)?"],
+        )
+    smem_driver_kib = _parse_size_kib_table(
+        output,
+        "Driver Shared Memory Per Block",
+    )
+    if smem_driver_kib is None:
+        smem_driver_kib = _parse_size_kib(
+            output,
+            [rf"launch__driver_shared_mem_per_block\s+{NUM_RE}\s*([A-Za-z]+)?"],
+        )
+    smem_total_kib = (
+        (smem_dynamic_kib or 0.0) + (smem_static_kib or 0.0) + (smem_driver_kib or 0.0)
+        if (
+            smem_dynamic_kib is not None
+            or smem_static_kib is not None
+            or smem_driver_kib is not None
+        )
+        else None
+    )
+    total_dram = (
+        dram_read + dram_write
+        if dram_read is not None and dram_write is not None
+        else None
+    )
+    bank_total = (
+        (bank_ld or 0.0) + (bank_st or 0.0)
+        if bank_ld is not None or bank_st is not None
+        else None
+    )
+    return {
+        "dram_pct": dram_pct,
+        "dram_read_gbs": dram_read,
+        "dram_write_gbs": dram_write,
+        "dram_total_gbs": total_dram,
+        "achieved_occupancy": achieved_occ,
+        "no_eligible": no_eligible,
+        "bank_conflicts": bank_total,
+        "registers_per_thread": regs,
+        "smem_dynamic_kib": smem_dynamic_kib,
+        "smem_static_kib": smem_static_kib,
+        "smem_driver_kib": smem_driver_kib,
+        "smem_total_kib": smem_total_kib,
+    }
 
 
 def main() -> int:
