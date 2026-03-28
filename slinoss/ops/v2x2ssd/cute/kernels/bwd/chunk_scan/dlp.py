@@ -45,7 +45,6 @@ class ChunkScanBwdDLPLayoutBundle:
     sDY_layout: object
     sV_layout: object
     sK_layout: object
-    sDS_layout: object
     sZ0_layout: object
     s_scale_full_layout: object
     s_inv_scale_full_layout: object
@@ -212,17 +211,6 @@ class ChunkScanBwdDLPAmpere:
         sDY_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
         sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
 
-        smem_k_block_size_blk = kv_tile
-        swizzle_bits_blk = self._swizzle_bits(smem_k_block_size_blk)
-        sBlk_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_blk, 3, 3),
-            0,
-            cute.make_layout(
-                (8, smem_k_block_size_blk), stride=(smem_k_block_size_blk, 1)
-            ),
-        )
-        sDS_layout = cute.tile_to_shape(sBlk_layout_atom, (kv_tile, kv_tile), (0, 1))
-
         return ChunkScanBwdDLPLayoutBundle(
             s_u_prev_layout=cute.make_layout((self.P,), stride=(1,)),
             s_b_prev_layout=cute.make_layout((self.D,), stride=(1,)),
@@ -230,7 +218,6 @@ class ChunkScanBwdDLPAmpere:
             sDY_layout=sDY_layout,
             sV_layout=sV_layout,
             sK_layout=sK_layout,
-            sDS_layout=sDS_layout,
             sZ0_layout=sZ0_layout,
             s_scale_full_layout=cute.make_layout((self.L,), stride=(1,)),
             s_inv_scale_full_layout=cute.make_layout((self.L,), stride=(1,)),
@@ -255,7 +242,6 @@ class ChunkScanBwdDLPAmpere:
                 (kv_tile * p_tile * in_bytes, 16),
                 (kv_tile * p_tile * in_bytes, 16),
                 (kv_tile * Dp * in_bytes, 16),
-                (kv_tile * kv_tile * in_bytes, 16),
                 (kv_tile * Dp * in_bytes, 16),
                 (self.P * in_bytes, 16),
                 (self.D * in_bytes, 16),
@@ -419,9 +405,6 @@ class ChunkScanBwdDLPAmpere:
             ],
             "sK_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sK_layout)], 16
-            ],
-            "sDS_blk": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sDS_layout)], 16
             ],
             "sQZ_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sK_layout)], 16
@@ -602,7 +585,6 @@ class ChunkScanBwdDLPAmpere:
             kernel_bundle.layouts.sDY_layout,
             kernel_bundle.layouts.sV_layout,
             kernel_bundle.layouts.sK_layout,
-            kernel_bundle.layouts.sDS_layout,
             kernel_bundle.layouts.sZ0_layout,
             kernel_bundle.layouts.s_scale_full_layout,
             kernel_bundle.layouts.s_inv_scale_full_layout,
@@ -645,7 +627,6 @@ class ChunkScanBwdDLPAmpere:
         sDY_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
-        sDS_layout: cute.Layout,
         sZ0_layout: cute.Layout,
         s_scale_full_layout: cute.Layout,
         s_inv_scale_full_layout: cute.Layout,
@@ -688,7 +669,6 @@ class ChunkScanBwdDLPAmpere:
             sDY_layout=sDY_layout,
             sV_layout=sV_layout,
             sK_layout=sK_layout,
-            sDS_layout=sDS_layout,
             sZ0_layout=sZ0_layout,
             s_scale_full_layout=s_scale_full_layout,
             s_inv_scale_full_layout=s_inv_scale_full_layout,
@@ -707,7 +687,6 @@ class ChunkScanBwdDLPAmpere:
         sDY = storage.sDY.get_tensor(sDY_layout)
         sV_tile = storage.sV_tile.get_tensor(sV_layout)
         sK_tile = storage.sK_tile.get_tensor(sK_layout)
-        sDS_blk = storage.sDS_blk.get_tensor(sDS_layout)
         sStage_layout = cute.make_layout((kv_tile, kv_tile), stride=(kv_tile, 1))
         sSc_scratch = cute.make_tensor(sV_tile.iterator, sStage_layout)
         sDS_scratch = cute.make_tensor(sDY.iterator, sStage_layout)
@@ -870,8 +849,6 @@ class ChunkScanBwdDLPAmpere:
         mcS_full = mcS[bidz, None, 0, None]
         mcKD_full = mcKD[bidz, None, 0, None]
 
-        sKt_layout = cute.make_layout((Dp, kv_tile), stride=(kv_tile, 1))
-        sKt = cute.composition(sK_tile, sKt_layout)
         sZ0t_layout = cute.make_layout((Dp, p_tile), stride=(p_tile, 1))
         sZ0t = cute.composition(sZ0, sZ0t_layout)
 
@@ -882,9 +859,6 @@ class ChunkScanBwdDLPAmpere:
         thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
         thr_copy_BT = smem_tiled_copy_BT.get_slice(tidx)
 
-        tSrDS_blk = thr_mma.make_fragment_A(thr_mma.partition_A(sDS_blk))
-        tSsDS_blk = thr_copy_A.partition_S(sDS_blk)
-        tSrDS_blk_view = thr_copy_A.retile(tSrDS_blk)
         tSrDY_tile = thr_mma.make_fragment_A(thr_mma.partition_A(sDY))
         tSsDY_tile = thr_copy_A.partition_S(sDY)
         tSrDY_tile_view = thr_copy_A.retile(tSrDY_tile)
@@ -894,9 +868,6 @@ class ChunkScanBwdDLPAmpere:
         tSrK_score = thr_mma.make_fragment_B(thr_mma.partition_B(sK_tile))
         tSsK_score = thr_copy_B.partition_S(sK_tile)
         tSrK_score_view = thr_copy_B.retile(tSrK_score)
-        tSrK_tile = thr_mma.make_fragment_B(thr_mma.partition_B(sKt))
-        tSsK_tile = thr_copy_BT.partition_S(sKt)
-        tSrK_tile_view = thr_copy_BT.retile(tSrK_tile)
         tSrQ_tile = thr_mma.make_fragment_A(thr_mma.partition_A(sQZ_tile))
         tSsQ_tile = thr_copy_A.partition_S(sQZ_tile)
         tSrQ_tile_view = thr_copy_A.retile(tSrQ_tile)
@@ -989,9 +960,6 @@ class ChunkScanBwdDLPAmpere:
                     sQZ_tile[t_local, d0 + 0] = qx0
                     sQZ_tile[t_local, d0 + 1] = qy0
             cute.arch.barrier()
-
-            acc_dQ_total = cute.make_rmem_tensor(acc_shape_tileD, cutlass.Float32)
-            acc_dQ_total.fill(0.0)
 
             for n_tile in range(m_tile + 1):
                 n0 = cutlass.Int32(n_tile * kv_tile)
@@ -1160,21 +1128,18 @@ class ChunkScanBwdDLPAmpere:
                     tScS_blk_mn = self._make_acc_tensor_mn_view(tScS_blk)
                     acc_dS_blk_mn = self._make_acc_tensor_mn_view(acc_dS_blk)
                     acc_S_blk_mn = self._make_acc_tensor_mn_view(acc_S_blk)
-                    tCsDS_blk = thr_mma.partition_C(sDS_blk)
-                    tCrDS_blk = cute.make_fragment_like(tCsDS_blk, mU.element_type)
-                    tCrDS_blk_mn = self._make_acc_tensor_mn_view(tCrDS_blk)
                     for it in range(iters_blk_tile):
                         idx = tidx + cutlass.Int32(it * self.num_threads)
                         if idx < total_blk_tile:
                             row = idx // cutlass.Int32(kv_tile)
                             col = idx - row * cutlass.Int32(kv_tile)
-                            sDS_blk[row, col] = cutlass.Float32(0.0).to(mU.element_type)
                             sDS_scratch[row, col] = cutlass.Float32(0.0).to(
                                 mU.element_type
                             )
-                            sSc_scratch[row, col] = cutlass.Float32(0.0).to(
-                                mU.element_type
-                            )
+                            if cutlass.const_expr(mU.element_type == cutlass.BFloat16):
+                                sSc_scratch[row, col] = cutlass.Float32(0.0).to(
+                                    mU.element_type
+                                )
                     cute.arch.barrier()
                     diag_tile = m_tile == n_tile
                     for r in cutlass.range_constexpr(cute.size(acc_S_blk_mn.shape[0])):
@@ -1191,7 +1156,6 @@ class ChunkScanBwdDLPAmpere:
                             ds_unscaled_q0 = cutlass.Float32(0.0).to(mU.element_type)
                             sc_scaled_q0 = cutlass.Float32(0.0).to(mU.element_type)
                             dlp_prod_q0 = cutlass.Float32(0.0).to(mU.element_type)
-                            ds_scaled_q0 = cutlass.Float32(0.0).to(mU.element_type)
                             if cute.elem_less(
                                 row_idx, cutlass.Int32(self.L)
                             ) and cute.elem_less(col_idx, cutlass.Int32(self.L)):
@@ -1213,17 +1177,11 @@ class ChunkScanBwdDLPAmpere:
                                         dlp_prod_q0 = (ds_unscaled_f32 * sc_f32).to(
                                             mU.element_type
                                         )
-                                    ds_scaled_q0 = (ds_unscaled_f32 * scale).to(
-                                        mU.element_type
-                                    )
                             if cutlass.const_expr(mU.element_type == cutlass.BFloat16):
                                 sDS_scratch[row_local, col_local] = ds_unscaled_q0
                                 sSc_scratch[row_local, col_local] = sc_scaled_q0
                             else:
                                 sDS_scratch[row_local, col_local] = dlp_prod_q0
-                            tCrDS_blk_mn[r, c] = ds_scaled_q0
-
-                    cute.autovec_copy(tCrDS_blk, tCsDS_blk)
                     cute.arch.barrier()
 
                     if lane < cutlass.Int32(16):
@@ -1279,37 +1237,6 @@ class ChunkScanBwdDLPAmpere:
                                 -cutlass.Float32(2.0) * col_sum,
                                 scope="cta",
                             )
-                    cute.arch.barrier()
-
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tSsDS_blk[None, None, 0],
-                        tSrDS_blk_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_BT,
-                        tSsK_tile[None, None, 0],
-                        tSrK_tile_view[None, None, 0],
-                    )
-                    for k in cutlass.range_constexpr(cute.size(tSsDS_blk.shape[2])):
-                        k_next = (k + 1) % cute.size(tSsDS_blk.shape[2])
-                        cute.copy(
-                            smem_tiled_copy_A,
-                            tSsDS_blk[None, None, k_next],
-                            tSrDS_blk_view[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_BT,
-                            tSsK_tile[None, None, k_next],
-                            tSrK_tile_view[None, None, k_next],
-                        )
-                        cute.gemm(
-                            tiled_mma,
-                            acc_dQ_total,
-                            tSrDS_blk[None, None, k],
-                            tSrK_tile[None, None, k],
-                            acc_dQ_total,
-                        )
                     cute.arch.barrier()
 
             acc_dQ_off = cute.make_rmem_tensor(acc_shape_tileD, cutlass.Float32)
@@ -1377,23 +1304,20 @@ class ChunkScanBwdDLPAmpere:
                     )
                 cute.arch.barrier()
 
-            acc_dQ_total_mn = self._make_acc_tensor_mn_view(acc_dQ_total)
             acc_dQ_off_mn = self._make_acc_tensor_mn_view(acc_dQ_off)
             cKD_tile = cute.local_tile(mcKD_full, (kv_tile, Dp), (m_tile, 0))
             tOcKD_tile = thr_mma.partition_C(cKD_tile)
             tOcKD_tile_mn = self._make_acc_tensor_mn_view(tOcKD_tile)
-            for r in cutlass.range_constexpr(cute.size(acc_dQ_total_mn.shape[0])):
+            for r in cutlass.range_constexpr(cute.size(acc_dQ_off_mn.shape[0])):
                 row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
                 row_local = row_idx - m0
                 rs = cutlass.Float32(0.0)
                 if cute.elem_less(row_idx, cutlass.Int32(self.L)):
                     rs = cutlass.Float32(s_row_scale[row_local])
                 for c in cutlass.range(
-                    cute.size(acc_dQ_total_mn.shape[1]), unroll_full=True
+                    cute.size(acc_dQ_off_mn.shape[1]), unroll_full=True
                 ):
-                    off_scaled = acc_dQ_off_mn[r, c] * rs
-                    acc_dQ_total_mn[r, c] = acc_dQ_total_mn[r, c] + off_scaled
-                    acc_dQ_off_mn[r, c] = off_scaled
+                    acc_dQ_off_mn[r, c] = acc_dQ_off_mn[r, c] * rs
 
             tCsDQ_off = thr_mma.partition_C(sK_tile)
             tCrDQ_off = cute.make_fragment_like(tCsDQ_off, mU.element_type)
