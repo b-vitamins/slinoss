@@ -101,6 +101,8 @@ KERNEL_ORDER = (
     "chunk_scan_bwd_du",
     "chunk_scan_bwd_db",
     "chunk_scan_bwd_dcdr",
+    "chunk_scan_bwd_dlp",
+    "chunk_scan_bwd_dr",
     "chunk_scan_bwd_param",
     "state_passing_bwd_state",
     "state_passing_bwd_m",
@@ -934,7 +936,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         dB_prev,
         dlogp,
         dC,
-        _dR,
+        dR,
         dM,
         dKprev,
         dKcurr,
@@ -959,6 +961,8 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         "chunk_scan_bwd_du": _closure_var(_launch_sequential, "_launch_du"),
         "chunk_scan_bwd_db": _closure_var(_launch_sequential, "_launch_db"),
         "chunk_scan_bwd_dcdr": _closure_var(_launch_sequential, "_launch_dc"),
+        "chunk_scan_bwd_dlp": _closure_var(_launch_sequential, "_launch_dlp"),
+        "chunk_scan_bwd_dr": _closure_var(_launch_sequential, "_launch_dr"),
         "chunk_scan_bwd_param": _closure_var(_launch_sequential, "_launch_param"),
     }
     launchers: dict[str, Callable[[], None]] = {}
@@ -985,6 +989,8 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
     def prepare_param() -> None:
         launchers["chunk_scan_bwd_db"]()
         launchers["chunk_scan_bwd_dcdr"]()
+        launchers["chunk_scan_bwd_dlp"]()
+        launchers["chunk_scan_bwd_dr"]()
 
     return {
         "chunk_scan_bwd_dz0": KernelRunner(
@@ -1021,13 +1027,30 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             name="chunk_scan_bwd_dcdr",
             effective_bytes=bytes_u
             + bytes_b
+            + bytes_m
+            + bytes_k
+            + bytes_d_out
+            + _tensor_bytes(U_prev, B_prev, chunk_starts, dC)
+            + bytes_dphase,
+            launch=launchers["chunk_scan_bwd_dcdr"],
+            prepare=_noop,
+        ),
+        "chunk_scan_bwd_dlp": KernelRunner(
+            name="chunk_scan_bwd_dlp",
+            effective_bytes=bytes_u
+            + bytes_b
             + bytes_b
             + bytes_m
             + bytes_k
             + bytes_d_out
-            + _tensor_bytes(U_prev, B_prev, chunk_starts, dlogp, dC)
-            + bytes_dphase,
-            launch=launchers["chunk_scan_bwd_dcdr"],
+            + _tensor_bytes(U_prev, B_prev, chunk_starts, dlogp),
+            launch=launchers["chunk_scan_bwd_dlp"],
+            prepare=_noop,
+        ),
+        "chunk_scan_bwd_dr": KernelRunner(
+            name="chunk_scan_bwd_dr",
+            effective_bytes=bytes_b + bytes_m + _tensor_bytes(dC, dR),
+            launch=launchers["chunk_scan_bwd_dr"],
             prepare=_noop,
         ),
         "chunk_scan_bwd_param": KernelRunner(
@@ -1035,7 +1058,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             effective_bytes=bytes_m
             + bytes_k
             + bytes_dphase
-            + _tensor_bytes(dlogp, dM, dM, dM, dKprev, dKcurr),
+            + _tensor_bytes(dlogp, dR, dM, dM, dM, dKprev, dKcurr),
             launch=launchers["chunk_scan_bwd_param"],
             prepare=prepare_param,
             note="integrated stage in chunk_scan_bwd",
@@ -1120,6 +1143,8 @@ def build_kernel_runner(
         "chunk_scan_bwd_du",
         "chunk_scan_bwd_db",
         "chunk_scan_bwd_dcdr",
+        "chunk_scan_bwd_dlp",
+        "chunk_scan_bwd_dr",
         "chunk_scan_bwd_param",
     }:
         return _build_v2x2ssd_chunk_scan_bwd_runners(v2_cfg)[name]

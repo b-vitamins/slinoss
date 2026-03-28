@@ -172,7 +172,7 @@ def _validate_dc_support(
 
     device_label = _chunk_scan_device_label(device_index)
     raise ValueError(
-        f"No supported chunk_scan backward dcdr kernel fits {device_label} for "
+        f"No supported chunk_scan backward dc kernel fits {device_label} for "
         f"(chunk_size={chunk_size}, D={D}, P={P}, num_threads={num_threads}). "
         f"The current low-SMEM variant needs {info.required_smem_bytes}B > "
         f"{info.smem_capacity_bytes}B shared memory."

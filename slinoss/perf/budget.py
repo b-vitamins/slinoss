@@ -290,6 +290,17 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         out["backward.v2x2ssd.state_passing.total"]
         - out["backward.v2x2ssd.state_passing.kernel_sum"]
     )
+    # Backward compatibility: historical payloads reported a single dcdr bucket;
+    # newer payloads can report dc/dlp/dr separately.
+    dcdr_total = sample.get("backward.v2x2ssd.chunk_scan.dcdr")
+    if dcdr_total is None:
+        dcdr_total = (
+            sample.get("backward.v2x2ssd.chunk_scan.dc", 0.0)
+            + sample.get("backward.v2x2ssd.chunk_scan.dlp", 0.0)
+            + sample.get("backward.v2x2ssd.chunk_scan.dr", 0.0)
+        )
+    sample["backward.v2x2ssd.chunk_scan.dcdr"] = float(dcdr_total)
+    out["backward.v2x2ssd.chunk_scan.dcdr"] = float(dcdr_total)
     out["backward.v2x2ssd.chunk_scan.kernel_sum"] = _sum(
         "backward.v2x2ssd.chunk_scan.dz0",
         "backward.v2x2ssd.chunk_scan.du",

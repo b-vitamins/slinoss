@@ -623,7 +623,7 @@ def test_chunk_scan_bwd_compile_entrypoint_reuses_cached_executors(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_bwd_rejects_oversized_dcdr_shapes_before_launch() -> None:
+def test_chunk_scan_bwd_rejects_oversized_dc_or_dlp_shapes_before_launch() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
@@ -649,7 +649,7 @@ def test_chunk_scan_bwd_rejects_oversized_dcdr_shapes_before_launch() -> None:
 
     with pytest.raises(
         ValueError,
-        match=r"No supported chunk_scan backward (dcdr|dlp) kernel fits",
+        match=r"No supported chunk_scan backward (dc|dlp) kernel fits",
     ):
         compile_chunk_scan_bwd_kernels(
             U,

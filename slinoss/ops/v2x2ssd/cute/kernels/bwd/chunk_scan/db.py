@@ -185,7 +185,7 @@ class ChunkScanBwdDBAmpere:
             raise ValueError("P must be padded to a multiple of 32.")
 
         smem_k_block_size_D = 64 if Dp % 64 == 0 else 32
-        swizzle_bits_D = 2 if smem_k_block_size_D >= 32 else 2
+        swizzle_bits_D = 3 if smem_k_block_size_D >= 32 else 2
         sD_layout_atom = cute.make_composed_layout(
             cute.make_swizzle(swizzle_bits_D, 3, 3),
             0,
@@ -205,7 +205,7 @@ class ChunkScanBwdDBAmpere:
         sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
 
         smem_k_block_size_blk = kv_tile
-        swizzle_bits_blk = 3 if smem_k_block_size_blk == 64 else 2
+        swizzle_bits_blk = 3
         sBlk_layout_atom = cute.make_composed_layout(
             cute.make_swizzle(swizzle_bits_blk, 3, 3),
             0,
