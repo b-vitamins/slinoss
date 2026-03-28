@@ -55,12 +55,11 @@ class ChunkScanBwdDZ0KernelBundle:
     layouts: ChunkScanBwdDZ0LayoutBundle
     copies: ChunkScanBwdDZ0CopyBundle
     tiled_mma: object
-    compute_smem_bytes: int
-    output_smem_bytes: int
+    smem_bytes: int
 
     @property
     def smem_size(self) -> int:
-        return max(self.compute_smem_bytes, self.output_smem_bytes)
+        return self.smem_bytes
 
 
 class ChunkScanBwdDZ0Ampere:
@@ -113,20 +112,6 @@ class ChunkScanBwdDZ0Ampere:
             raise ValueError("atom_layout_mnk K must be 1.")
         if self.bK % mmaK != 0:
             raise ValueError("bK must be divisible by MMA instruction shape.")
-
-    @staticmethod
-    def _align_up(offset: int, align: int) -> int:
-        return ((offset + align - 1) // align) * align
-
-    @classmethod
-    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
-        offset = 0
-        max_align = 1
-        for size, align in fields:
-            offset = cls._align_up(offset, align)
-            offset += size
-            max_align = max(max_align, align)
-        return cls._align_up(offset, max_align)
 
     def _row_layout(self):
         return cute.make_layout((self.num_threads,), stride=(1,))
@@ -382,29 +367,6 @@ class ChunkScanBwdDZ0Ampere:
             tiled_copy_s2r_B=cute.make_tiled_copy_B(atom_copy_s2r_B, tiled_mma),
         )
 
-    def _shared_storage_fields(
-        self,
-        in_a_dtype: type[cutlass.Numeric],
-        in_b_dtype: type[cutlass.Numeric],
-        sA_layout: cute.ComposedLayout,
-        sB_layout: cute.ComposedLayout,
-        sC_layout: cute.Layout,
-    ) -> list[tuple[int, int]]:
-        row_layout = self._row_layout()
-        phase_layout = self._phase_layout()
-        output_alias_guard_layout = self._output_alias_guard_layout(
-            in_a_dtype, in_b_dtype, sA_layout, sB_layout, sC_layout
-        )
-        return [
-            (cute.cosize(row_layout) * 4, 4),
-            (cute.cosize(phase_layout) * 4, 8),
-            (cute.cosize(row_layout) * 4, 4),
-            (cute.cosize(phase_layout) * 4, 8),
-            (cute.cosize(sA_layout) * (in_a_dtype.width // 8), 16),
-            (cute.cosize(sB_layout) * (in_b_dtype.width // 8), 16),
-            (cute.cosize(output_alias_guard_layout) * 4, 16),
-        ]
-
     def _make_shared_storage(
         self,
         in_a_dtype: type[cutlass.Numeric],
@@ -461,27 +423,18 @@ class ChunkScanBwdDZ0Ampere:
         copies = self._make_copy_bundle(
             layouts, mDOut.element_type, mC.element_type, tiled_mma
         )
-        scratch_bytes = (
-            cute.size_in_bytes(cutlass.Float32, self._row_layout())
-            + cute.size_in_bytes(cutlass.Float32, self._phase_layout())
-            + cute.size_in_bytes(cutlass.Float32, self._row_layout())
-            + cute.size_in_bytes(cutlass.Float32, self._phase_layout())
+        shared_storage = self._make_shared_storage(
+            mDOut.element_type,
+            mC.element_type,
+            layouts.sA_layout,
+            layouts.sB_layout,
+            layouts.sC_layout,
         )
         return ChunkScanBwdDZ0KernelBundle(
             layouts=layouts,
             copies=copies,
             tiled_mma=tiled_mma,
-            compute_smem_bytes=self._struct_size_bytes(
-                self._shared_storage_fields(
-                    mDOut.element_type,
-                    mC.element_type,
-                    layouts.sA_layout,
-                    layouts.sB_layout,
-                    layouts.sC_layout,
-                )
-            ),
-            output_smem_bytes=scratch_bytes
-            + cute.size_in_bytes(self.c_dtype, layouts.sC_layout),
+            smem_bytes=int(shared_storage.size_in_bytes()),
         )
 
     @cute.jit(preprocess=True)

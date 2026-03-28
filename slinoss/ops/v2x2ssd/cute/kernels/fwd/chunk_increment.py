@@ -52,12 +52,11 @@ class ChunkIncrementKernelBundle:
     copies: ChunkIncrementCopyBundle
     tiled_mma: object
     SharedStorage: object
-    compute_smem_bytes: int
-    output_smem_bytes: int
+    smem_bytes: int
 
     @property
     def smem_size(self) -> int:
-        return max(self.compute_smem_bytes, self.output_smem_bytes)
+        return self.smem_bytes
 
 
 class ChunkIncrementFwdAmpere:
@@ -107,20 +106,6 @@ class ChunkIncrementFwdAmpere:
             raise ValueError("atom_layout_mnk K must be 1")
         if self.bK % mmaK != 0:
             raise ValueError("bK must be divisible by MMA instruction shape")
-
-    @staticmethod
-    def _align_up(offset: int, align: int) -> int:
-        return ((offset + align - 1) // align) * align
-
-    @classmethod
-    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
-        offset = 0
-        max_align = 1
-        for size, align in fields:
-            offset = cls._align_up(offset, align)
-            offset += size
-            max_align = max(max_align, align)
-        return cls._align_up(offset, max_align)
 
     def _alpha_layout(self):
         return cute.make_layout((self.L, 2), stride=(2, 1))
@@ -338,25 +323,6 @@ class ChunkIncrementFwdAmpere:
         atoms_layout = cute.make_layout(self.atom_layout_mnk)
         return cute.make_tiled_mma(op, atoms_layout, permutation_mnk=permutation_mnk)
 
-    def _shared_storage_fields(
-        self,
-        in_dtype: type[cutlass.Numeric],
-        layouts: ChunkIncrementLayoutBundle,
-    ) -> list[tuple[int, int]]:
-        in_bytes = in_dtype.width // 8
-        return [
-            (cute.cosize(layouts.sA_layout) * in_bytes, 16),
-            (cute.cosize(layouts.sB_layout) * in_bytes, 16),
-            (cute.cosize(self._output_alias_guard_layout()) * 4, 16),
-            (cute.cosize(self._alpha_layout()) * 4, 4),
-            (cute.cosize(self._alpha_layout()) * 4, 4),
-            (cute.cosize(self._u0_layout()) * 4, 4),
-            (cute.cosize(self._b0_layout()) * 4, 4),
-            (cute.cosize(self._warp_scan_layout()) * 4, 8),
-            (cute.cosize(self._warp_scan_layout()) * 4, 8),
-            (cute.cosize(self._tail_pad_layout()) * 4, 4),
-        ]
-
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
@@ -424,10 +390,7 @@ class ChunkIncrementFwdAmpere:
             copies=copies,
             tiled_mma=self._make_tiled_mma(),
             SharedStorage=SharedStorage,
-            compute_smem_bytes=self._struct_size_bytes(
-                self._shared_storage_fields(mU.element_type, layouts)
-            ),
-            output_smem_bytes=cute.size_in_bytes(self.c_dtype, layouts.sC_layout),
+            smem_bytes=int(SharedStorage.size_in_bytes()),
         )
 
     @cute.jit

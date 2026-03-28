@@ -18,6 +18,16 @@ import cutlass.cute as cute
 from .common import complex_mul, conj_mul_phase
 
 
+def _make_shared_storage(phase_layout: cute.Layout):
+    class SharedStorage:
+        phase: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, cute.cosize(phase_layout)],
+            16,
+        ]
+
+    return cute.struct(SharedStorage)
+
+
 class ChunkScanBwdDRAmpere:
     """Post-pass kernel for ``dR`` after the chunk-scan backward ``dc`` contraction."""
 
@@ -69,7 +79,7 @@ class ChunkScanBwdDRAmpere:
 
         grid_z = cute.size(mC.shape[0])
         phase_layout = cute.make_layout((self.L, 2), stride=(2, 1))
-        smem_bytes = cute.cosize(phase_layout) * 4
+        smem_bytes = int(_make_shared_storage(phase_layout).size_in_bytes())
 
         self.kernel(
             mC,
@@ -101,14 +111,7 @@ class ChunkScanBwdDRAmpere:
         nvec = cutlass.Int32(self.D // 2)
 
         smem = cutlass.utils.SmemAllocator()
-
-        class SharedStorage:
-            phase: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(phase_layout)],
-                16,
-            ]
-
-        storage = smem.allocate(cute.struct(SharedStorage))
+        storage = smem.allocate(_make_shared_storage(phase_layout))
         s_phase = storage.phase.get_tensor(phase_layout)
 
         eps = cutlass.Float32(1.0e-20)

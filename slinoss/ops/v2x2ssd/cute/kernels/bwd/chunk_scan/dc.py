@@ -56,6 +56,8 @@ class ChunkScanBwdDCLayoutBundle:
     s_phase_row_layout: object
     s_phase_col_layout: object
     s_tap_layout: object
+    s_row_dlp_layout: object
+    s_row_dR_layout: object
 
 
 @dataclass(frozen=True)
@@ -243,6 +245,8 @@ class ChunkScanBwdDCAmpere:
             s_phase_row_layout=cute.make_layout((kv_tile, 2), stride=(2, 1)),
             s_phase_col_layout=cute.make_layout((kv_tile, 2), stride=(2, 1)),
             s_tap_layout=cute.make_layout((kv_tile, 2), stride=(2, 1)),
+            s_row_dlp_layout=cute.make_layout((kv_tile,), stride=(1,)),
+            s_row_dR_layout=cute.make_layout((kv_tile, 4), stride=(4, 1)),
         )
 
     def _required_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
@@ -273,6 +277,8 @@ class ChunkScanBwdDCAmpere:
                 (kv_tile * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
+                (kv_tile * 4, 4),
+                (kv_tile * 4 * 4, 16),
                 (128 * 4, 16),
             ]
         )
@@ -393,11 +399,13 @@ class ChunkScanBwdDCAmpere:
     def _make_kernel_bundle(
         self, in_dtype: type[cutlass.Numeric]
     ) -> ChunkScanBwdDCKernelBundle:
+        layouts = self._make_layout_bundle()
+        shared_storage = self._make_shared_storage(in_dtype, layouts)
         return ChunkScanBwdDCKernelBundle(
-            layouts=self._make_layout_bundle(),
+            layouts=layouts,
             copies=self._make_copy_bundle(in_dtype),
             tiled_mma=self._make_tiled_mma(in_dtype),
-            smem_bytes=self._required_smem_bytes(in_dtype),
+            smem_bytes=int(shared_storage.size_in_bytes()),
         )
 
     def _make_shared_storage(
@@ -510,6 +518,18 @@ class ChunkScanBwdDCAmpere:
                 ],
                 16,
             ],
+            "s_row_dlp": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_row_dlp_layout)
+                ],
+                4,
+            ],
+            "s_row_dR": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(layouts.s_row_dR_layout)
+                ],
+                16,
+            ],
             "tail_pad": cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(tail_pad_layout)],
                 16,
@@ -522,6 +542,7 @@ class ChunkScanBwdDCAmpere:
         self,
         mU: cute.Tensor,
         mB: cute.Tensor,
+        mC: cute.Tensor,
         mM: cute.Tensor,
         mK: cute.Tensor,
         mDOut: cute.Tensor,
@@ -529,15 +550,19 @@ class ChunkScanBwdDCAmpere:
         mB_prev0: cute.Tensor,
         mZ0: cute.Tensor,
         mDC: cute.Tensor,
+        mDLogp: cute.Tensor,
+        mDR: cute.Tensor,
     ):
         if cutlass.const_expr(
-            mU.element_type != mB.element_type or mU.element_type != mDOut.element_type
+            mU.element_type != mB.element_type
+            or mU.element_type != mC.element_type
+            or mU.element_type != mDOut.element_type
         ):
-            raise TypeError("U/B/dOut must share dtype.")
+            raise TypeError("U/B/C/dOut must share dtype.")
         if cutlass.const_expr(
             mU.element_type not in (cutlass.Float16, cutlass.BFloat16)
         ):
-            raise TypeError("U/B/dOut must be Float16/BFloat16.")
+            raise TypeError("U/B/C/dOut must be Float16/BFloat16.")
         if cutlass.const_expr(mM.element_type != cutlass.Float32):
             raise TypeError("M must be Float32.")
         if cutlass.const_expr(mK.element_type != cutlass.Float32):
@@ -548,11 +573,17 @@ class ChunkScanBwdDCAmpere:
             raise TypeError("Z0 must be Float32 or match U/B dtype.")
         if cutlass.const_expr(mDC.element_type != mU.element_type):
             raise TypeError("dC must share dtype with U/B.")
+        if cutlass.const_expr(mDLogp.element_type != cutlass.Float32):
+            raise TypeError("dlogprefix must be Float32.")
+        if cutlass.const_expr(mDR.element_type != cutlass.Float32):
+            raise TypeError("dR must be Float32.")
 
-        if cutlass.const_expr(mU.shape[1] != self.L or mB.shape[1] != self.L):
-            raise ValueError("U/B must have shape (BHC, L, 1, ...).")
-        if cutlass.const_expr(mU.shape[2] != 1 or mB.shape[2] != 1):
-            raise ValueError("U/B must have a singleton dim2 (BHC, L, 1, ...).")
+        if cutlass.const_expr(
+            mU.shape[1] != self.L or mB.shape[1] != self.L or mC.shape[1] != self.L
+        ):
+            raise ValueError("U/B/C must have shape (BHC, L, 1, ...).")
+        if cutlass.const_expr(mU.shape[2] != 1 or mB.shape[2] != 1 or mC.shape[2] != 1):
+            raise ValueError("U/B/C must have a singleton dim2 (BHC, L, 1, ...).")
         if cutlass.const_expr(mM.shape[1] != self.L or mM.shape[2] != 2):
             raise ValueError("M must be (BHC, L, 2).")
         if cutlass.const_expr(
@@ -565,6 +596,10 @@ class ChunkScanBwdDCAmpere:
             raise ValueError("Z0 must be (BHC, P, D).")
         if cutlass.const_expr(mDC.shape[1] != self.L or mDC.shape[2] != 1):
             raise ValueError("dC must be (BHC, L, 1, D).")
+        if cutlass.const_expr(mDLogp.shape[1] != self.L):
+            raise ValueError("dlogprefix must be (BHC, L).")
+        if cutlass.const_expr(mDR.shape[1] != self.L or mDR.shape[2] != 4):
+            raise ValueError("dR must be (BHC, L, 4).")
 
         Pp = self.P_padded
         in_dtype = mU.element_type
@@ -577,6 +612,7 @@ class ChunkScanBwdDCAmpere:
         self.kernel_dc(
             mU,
             mB,
+            mC,
             mM,
             mK,
             mDOut,
@@ -584,6 +620,8 @@ class ChunkScanBwdDCAmpere:
             mB_prev0,
             mZ0,
             mDC,
+            mDLogp,
+            mDR,
             kernel_bundle.layouts.s_u_prev_layout,
             kernel_bundle.layouts.s_b_prev_layout,
             kernel_bundle.layouts.sDY_layout,
@@ -601,6 +639,8 @@ class ChunkScanBwdDCAmpere:
             kernel_bundle.layouts.s_phase_row_layout,
             kernel_bundle.layouts.s_phase_col_layout,
             kernel_bundle.layouts.s_tap_layout,
+            kernel_bundle.layouts.s_row_dlp_layout,
+            kernel_bundle.layouts.s_row_dR_layout,
             kernel_bundle.copies.gmem_tiled_copy_D,
             kernel_bundle.copies.gmem_tiled_copy_D_async,
             kernel_bundle.copies.gmem_tiled_copy_P,
@@ -618,6 +658,7 @@ class ChunkScanBwdDCAmpere:
         self,
         mU: cute.Tensor,
         mB: cute.Tensor,
+        mC: cute.Tensor,
         mM: cute.Tensor,
         mK: cute.Tensor,
         mDOut: cute.Tensor,
@@ -625,6 +666,8 @@ class ChunkScanBwdDCAmpere:
         mB_prev0: cute.Tensor,
         mZ0: cute.Tensor,
         mDC: cute.Tensor,
+        mDLogp: cute.Tensor,
+        mDR: cute.Tensor,
         s_u_prev_layout: cute.Layout,
         s_b_prev_layout: cute.Layout,
         sDY_layout: cute.ComposedLayout,
@@ -642,6 +685,8 @@ class ChunkScanBwdDCAmpere:
         s_phase_row_layout: cute.Layout,
         s_phase_col_layout: cute.Layout,
         s_tap_layout: cute.Layout,
+        s_row_dlp_layout: cute.Layout,
+        s_row_dR_layout: cute.Layout,
         gmem_tiled_copy_D: cute.TiledCopy,
         gmem_tiled_copy_D_async: cute.TiledCopy,
         gmem_tiled_copy_P: cute.TiledCopy,
@@ -683,6 +728,8 @@ class ChunkScanBwdDCAmpere:
             s_phase_row_layout=s_phase_row_layout,
             s_phase_col_layout=s_phase_col_layout,
             s_tap_layout=s_tap_layout,
+            s_row_dlp_layout=s_row_dlp_layout,
+            s_row_dR_layout=s_row_dR_layout,
         )
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = self._make_shared_storage(mU.element_type, layouts)
@@ -712,6 +759,8 @@ class ChunkScanBwdDCAmpere:
         s_phase_col = storage.s_phase_col.get_tensor(s_phase_col_layout)
         s_tap_prev = storage.s_tap_prev.get_tensor(s_tap_layout)
         s_tap_curr = storage.s_tap_curr.get_tensor(s_tap_layout)
+        s_row_dlp = storage.s_row_dlp.get_tensor(s_row_dlp_layout)
+        s_row_dR = storage.s_row_dR.get_tensor(s_row_dR_layout)
 
         lane = cute.arch.lane_idx()
         warp = cute.arch.warp_idx()
@@ -883,6 +932,12 @@ class ChunkScanBwdDCAmpere:
                 s_row_scale[lane] = cutlass.Float32(s_scale_full[t])
                 s_phase_row[lane, 0] = cutlass.Float32(s_phase_full[t, 0])
                 s_phase_row[lane, 1] = cutlass.Float32(s_phase_full[t, 1])
+            if tidx < cutlass.Int32(kv_tile):
+                s_row_dlp[tidx] = cutlass.Float32(0.0)
+            if tidx < cutlass.Int32(kv_tile * 4):
+                row = tidx // cutlass.Int32(4)
+                col = tidx - row * cutlass.Int32(4)
+                s_row_dR[row, col] = cutlass.Float32(0.0)
             cute.arch.barrier()
 
             for d_tile in range(n_d_tiles):
@@ -1222,12 +1277,6 @@ class ChunkScanBwdDCAmpere:
                         acc_dQ_total_mn[r, c] = acc_dQ_total_mn[r, c] + off_scaled
                         acc_dQ_off_mn[r, c] = off_scaled
 
-                tCsDQ_off = thr_mma.partition_C(sK_blk)
-                tCrDQ_off = cute.make_fragment_like(tCsDQ_off, mU.element_type)
-                tCrDQ_off[None] = acc_dQ_off.load().to(mU.element_type)
-                cute.autovec_copy(tCrDQ_off, tCsDQ_off)
-                cute.arch.barrier()
-
                 tCsDQ = thr_mma.partition_C(sK_blk)
                 tCrDQ = cute.make_fragment_like(tCsDQ, mU.element_type)
                 tCrDQ[None] = acc_dQ_total.load().to(mU.element_type)
@@ -1260,6 +1309,67 @@ class ChunkScanBwdDCAmpere:
                             out1 = dc1.to(mU.element_type)
                         sQZ_blk[t_local, d0_local + 0] = out0
                         sQZ_blk[t_local, d0_local + 1] = out1
+                cute.arch.barrier()
+
+                nvec = cutlass.Int32(d_block // 2)
+                row_local = warp
+                while cute.elem_less(row_local, cutlass.Int32(kv_tile)):
+                    t = m0 + row_local
+                    row_dlp_sum = cutlass.Float32(0.0)
+                    dR00_sum = cutlass.Float32(0.0)
+                    dR01_sum = cutlass.Float32(0.0)
+                    dR10_sum = cutlass.Float32(0.0)
+                    dR11_sum = cutlass.Float32(0.0)
+                    vv = lane
+                    while cute.elem_less(vv, nvec):
+                        d0_local = vv * cutlass.Int32(2)
+                        d0 = d_base + d0_local
+                        if cute.elem_less(t, cutlass.Int32(self.L)) and cute.elem_less(
+                            d0 + cutlass.Int32(1), cutlass.Int32(self.D)
+                        ):
+                            dq0 = cutlass.Float32(
+                                sK_blk[row_local, d0_local + 0].to(cutlass.Float32)
+                            )
+                            dq1 = cutlass.Float32(
+                                sK_blk[row_local, d0_local + 1].to(cutlass.Float32)
+                            )
+                            dc0 = cutlass.Float32(
+                                sQZ_blk[row_local, d0_local + 0].to(cutlass.Float32)
+                            )
+                            dc1 = cutlass.Float32(
+                                sQZ_blk[row_local, d0_local + 1].to(cutlass.Float32)
+                            )
+                            c0 = cutlass.Float32(mC[bidz, t, 0, d0 + 0])
+                            c1 = cutlass.Float32(mC[bidz, t, 0, d0 + 1])
+                            row_dlp_sum = row_dlp_sum + dc0 * c0 + dc1 * c1
+                            dR00_sum = dR00_sum + dq0 * c0
+                            dR01_sum = dR01_sum + dq0 * c1
+                            dR10_sum = dR10_sum + dq1 * c0
+                            dR11_sum = dR11_sum + dq1 * c1
+                        vv = vv + cutlass.Int32(32)
+                    for off in (16, 8, 4, 2, 1):
+                        row_dlp_sum = row_dlp_sum + cute.arch.shuffle_sync_bfly(
+                            row_dlp_sum, offset=off, mask=-1, mask_and_clamp=31
+                        )
+                        dR00_sum = dR00_sum + cute.arch.shuffle_sync_bfly(
+                            dR00_sum, offset=off, mask=-1, mask_and_clamp=31
+                        )
+                        dR01_sum = dR01_sum + cute.arch.shuffle_sync_bfly(
+                            dR01_sum, offset=off, mask=-1, mask_and_clamp=31
+                        )
+                        dR10_sum = dR10_sum + cute.arch.shuffle_sync_bfly(
+                            dR10_sum, offset=off, mask=-1, mask_and_clamp=31
+                        )
+                        dR11_sum = dR11_sum + cute.arch.shuffle_sync_bfly(
+                            dR11_sum, offset=off, mask=-1, mask_and_clamp=31
+                        )
+                    if lane == cutlass.Int32(0):
+                        s_row_dlp[row_local] = s_row_dlp[row_local] + row_dlp_sum
+                        s_row_dR[row_local, 0] = s_row_dR[row_local, 0] + dR00_sum
+                        s_row_dR[row_local, 1] = s_row_dR[row_local, 1] + dR01_sum
+                        s_row_dR[row_local, 2] = s_row_dR[row_local, 2] + dR10_sum
+                        s_row_dR[row_local, 3] = s_row_dR[row_local, 3] + dR11_sum
+                    row_local = row_local + cutlass.Int32(num_warps)
                 cute.arch.barrier()
 
                 gDC = cute.local_tile(
@@ -1300,6 +1410,16 @@ class ChunkScanBwdDCAmpere:
                                 tDgC[None, rest_m, None],
                                 pred=tDpDC[None, rest_m, None],
                             )
+
+            cute.arch.barrier()
+            if tidx < cutlass.Int32(kv_tile):
+                t = m0 + tidx
+                if cute.elem_less(t, cutlass.Int32(self.L)):
+                    mDLogp[bidz, t] = cutlass.Float32(2.0) * s_row_dlp[tidx]
+                    mDR[bidz, t, 0] = s_row_dR[tidx, 0]
+                    mDR[bidz, t, 1] = s_row_dR[tidx, 1]
+                    mDR[bidz, t, 2] = s_row_dR[tidx, 2]
+                    mDR[bidz, t, 3] = s_row_dR[tidx, 3]
 
 
 __all__ = ["ChunkScanBwdDCAmpere"]

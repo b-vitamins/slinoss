@@ -397,11 +397,13 @@ class ChunkScanBwdDCDRAmpere:
     def _make_kernel_bundle(
         self, in_dtype: type[cutlass.Numeric]
     ) -> ChunkScanBwdDCDRKernelBundle:
+        layouts = self._make_layout_bundle()
+        shared_storage = self._make_shared_storage(in_dtype, layouts)
         return ChunkScanBwdDCDRKernelBundle(
-            layouts=self._make_layout_bundle(),
+            layouts=layouts,
             copies=self._make_copy_bundle(in_dtype),
             tiled_mma=self._make_tiled_mma(in_dtype),
-            smem_bytes=self._required_smem_bytes(in_dtype),
+            smem_bytes=int(shared_storage.size_in_bytes()),
         )
 
     def _make_shared_storage(

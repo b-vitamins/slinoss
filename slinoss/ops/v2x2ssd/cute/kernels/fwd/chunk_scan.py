@@ -40,7 +40,7 @@ The end-to-end kernel consumes raw stage inputs:
 """
 
 from dataclasses import dataclass
-from typing import ClassVar, Sequence
+from typing import ClassVar
 
 import torch
 import cutlass
@@ -196,15 +196,12 @@ class ChunkScanFwdInnerAmpere:
         """Whether ``sV`` can alias ``bz_alias`` storage instead of separate smem."""
         return self._v_smem_elems() <= self._b_smem_elems()
 
-    def _o_smem_elems(self) -> int:
-        return int(self.m_block_size) * int(self.P_padded)
-
     @staticmethod
     def _align_up(offset: int, align: int) -> int:
         return ((offset + align - 1) // align) * align
 
     @classmethod
-    def _struct_size_bytes(cls, fields: Sequence[tuple[int, int]]) -> int:
+    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
         offset = 0
         max_align = 1
         for size, align in fields:
@@ -213,26 +210,39 @@ class ChunkScanFwdInnerAmpere:
             max_align = max(max_align, align)
         return cls._align_up(offset, max_align)
 
-    def _shared_storage_fields(
-        self, in_dtype: type[cutlass.Numeric]
-    ) -> list[tuple[int, int]]:
+    def _compute_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
         in_bytes = in_dtype.width // 8
         fields = [
             (self._q_smem_elems() * in_bytes, 16),
             (self._b_smem_elems() * in_bytes, 16),
-            (self.m_block_size * 4, 16),
-            (self.n_block_size * 4, 16),
         ]
         if not self._v_alias_in_bz():
-            fields.insert(2, (self._v_smem_elems() * in_bytes, 16))
-        return fields
-
-    def _compute_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
-        return self._struct_size_bytes(self._shared_storage_fields(in_dtype))
+            fields.append((self._v_smem_elems() * in_bytes, 16))
+        fields.append((self.m_block_size * 4, 16))
+        fields.append((self.n_block_size * 4, 16))
+        return self._struct_size_bytes(fields)
 
     def _output_smem_bytes(self, out_dtype: type[cutlass.Numeric]) -> int:
         out_bytes = out_dtype.width // 8
-        return self._o_smem_elems() * out_bytes
+        return self._struct_size_bytes(
+            [(self.m_block_size * self.P_padded * out_bytes, 16)]
+        )
+
+    def _make_output_shared_storage(
+        self,
+        out_dtype: type[cutlass.Numeric],
+        layouts: ChunkScanLayoutBundle,
+    ):
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "out_tile": cute.struct.Align[
+                cute.struct.MemRange[out_dtype, cute.cosize(layouts.sO_layout)],
+                16,
+            ]
+        }
+        return cute.struct(SharedStorage)
 
     def _make_layout_bundle(
         self, out_dtype: type[cutlass.Numeric]
@@ -343,12 +353,14 @@ class ChunkScanFwdInnerAmpere:
     ) -> ChunkScanKernelBundle:
         layouts = self._make_layout_bundle(out_dtype)
         copies = self._make_copy_bundle(in_dtype, out_dtype)
+        shared_storage = self._make_shared_storage(in_dtype, layouts)
+        output_storage = self._make_output_shared_storage(out_dtype, layouts)
         return ChunkScanKernelBundle(
             layouts=layouts,
             copies=copies,
             tiled_mma=self._make_tiled_mma(in_dtype),
-            compute_smem_bytes=self._compute_smem_bytes(in_dtype),
-            output_smem_bytes=self._output_smem_bytes(out_dtype),
+            compute_smem_bytes=int(shared_storage.size_in_bytes()),
+            output_smem_bytes=int(output_storage.size_in_bytes()),
         )
 
     def _make_shared_storage(
@@ -1282,25 +1294,6 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         device_index: int | None = None,
     ) -> bool:
         return self.support_info(dtype, out_dtype, device_index=device_index).supported
-
-    def _shared_storage_fields(
-        self, in_dtype: type[cutlass.Numeric]
-    ) -> list[tuple[int, int]]:
-        fields = super()._shared_storage_fields(in_dtype)
-        fields.extend(
-            [
-                (self.L * 4, 16),
-                (self.L * 4, 16),
-                (self.L * 4, 16),
-                (self.n_block_size * 4, 16),
-                (self.n_block_size * 4, 16),
-                (self.num_warps * 4, 16),
-                (self.num_warps * 4, 16),
-                (self.num_warps * 2 * 4, 16),
-                (self.num_warps * 2 * 4, 16),
-            ]
-        )
-        return fields
 
     def _make_shared_storage(
         self,

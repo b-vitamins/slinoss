@@ -142,6 +142,24 @@ class ScanPrepFwdFused:
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
+    def _coeff_shared_storage(self):
+        coeff_layout = cute.make_layout(
+            (self.coeff_head_tile, 13, self.coeff_t_tile + 1),
+            stride=(13 * (self.coeff_t_tile + 1), self.coeff_t_tile + 1, 1),
+        )
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "sParams": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(coeff_layout)],
+                16,
+            ]
+        }
+
+        return cute.struct(SharedStorage)
+
     @cute.kernel
     def pack_kernel(
         self,
@@ -536,6 +554,7 @@ class ScanPrepFwdFused:
             coeff_aux_ptr,
             cute.make_layout(self.coeff_aux_shape, stride=self.coeff_aux_stride),
         )
+        coeff_smem_bytes = int(self._coeff_shared_storage().size_in_bytes())
 
         self.pack_kernel(
             mValue,
@@ -563,7 +582,7 @@ class ScanPrepFwdFused:
         ).launch(
             grid=(self.coeff_grid_x, self.coeff_grid_y, 1),
             block=(self.coeff_block_size, 1, 1),
-            smem=self.coeff_smem_bytes,
+            smem=coeff_smem_bytes,
         )
 
 

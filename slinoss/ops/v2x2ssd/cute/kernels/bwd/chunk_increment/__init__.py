@@ -15,8 +15,15 @@ from .param_scan import ChunkIncrementBwdParamScanAmpere
 
 _COMPILED_CACHE: dict[tuple, tuple[object, object, object, object, object]] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
-_PTR_ARG_CACHE_LIMIT = 32768
+_ZERO_PREV_CACHE_LIMIT = 8
+
+
+def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= int(limit):
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 def _get_zero_prev_tensors(
@@ -43,7 +50,7 @@ def _get_zero_prev_tensors(
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
         )
-        _ZERO_PREV_CACHE[key] = cached
+        _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
 
 
@@ -177,18 +184,8 @@ def _compiled_key(
 
 
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    device_index = (
-        int(t.device.index)
-        if t.device.type == "cuda" and t.device.index is not None
-        else -1
-    )
-    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
-    cached = _PTR_ARG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     align = _assumed_align(t)
-    cached = (
+    return (
         make_ptr(
             _torch_to_cutlass_dtype(t.dtype),
             t.data_ptr(),
@@ -197,10 +194,6 @@ def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
         ),
         align,
     )
-    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
-        _PTR_ARG_CACHE.clear()
-    _PTR_ARG_CACHE[key] = cached
-    return cached
 
 
 def _make_ptr_args(

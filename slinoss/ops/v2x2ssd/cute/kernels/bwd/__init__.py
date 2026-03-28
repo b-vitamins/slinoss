@@ -27,7 +27,6 @@ from .chunk_scan import (
 from .chunk_scan.db import ChunkScanBwdDBAmpere
 from .chunk_scan.dc import ChunkScanBwdDCAmpere
 from .chunk_scan.dlp import ChunkScanBwdDLPAmpere
-from .chunk_scan.dr import ChunkScanBwdDRAmpere
 from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
 from .chunk_scan.param_scan import ChunkScanBwdParamScanAmpere
@@ -40,8 +39,27 @@ _BWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_FINAL_GRAD_CACHE: dict[tuple, torch.Tensor] = {}
 _BWD_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
-_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
-_PTR_ARG_CACHE_LIMIT = 32768
+_ZERO_PREV_CACHE_LIMIT = 8
+_ZERO_FINAL_GRAD_CACHE_LIMIT = 8
+_BWD_WORKSPACE_CACHE_LIMIT = 4
+_CAST_D_INC_NUM_THREADS = 256
+
+
+@cute.kernel
+def _cast_f32_to_tc_kernel(gSrc: cute.Tensor, gDst: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    idx = bidx * int(_CAST_D_INC_NUM_THREADS) + tidx
+    if idx < gSrc.shape[0]:
+        gDst[idx] = gSrc[idx].to(gDst.element_type)
+
+
+def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= int(limit):
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 def _get_zero_prev_tensors(
@@ -68,7 +86,7 @@ def _get_zero_prev_tensors(
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
         )
-        _ZERO_PREV_CACHE[key] = cached
+        _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
 
 
@@ -93,7 +111,12 @@ def _get_zero_final_grad(
         cached = torch.zeros(
             (batch_size, heads, P, D), device=device, dtype=torch.float32
         )
-        _ZERO_FINAL_GRAD_CACHE[key] = cached
+        _cache_set(
+            _ZERO_FINAL_GRAD_CACHE,
+            key,
+            cached,
+            limit=_ZERO_FINAL_GRAD_CACHE_LIMIT,
+        )
     return cached
 
 
@@ -167,7 +190,7 @@ def _get_bwd_workspace(
         torch.empty((2, L, BHC), device=device, dtype=torch.float32),
         torch.empty((2, L, BHC), device=device, dtype=torch.float32),
     )
-    _BWD_WORKSPACE_CACHE[key] = cached
+    _cache_set(_BWD_WORKSPACE_CACHE, key, cached, limit=_BWD_WORKSPACE_CACHE_LIMIT)
     return cached
 
 
@@ -204,18 +227,8 @@ def _make_tensor_from_spec(
 
 
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    device_index = (
-        int(t.device.index)
-        if t.device.type == "cuda" and t.device.index is not None
-        else -1
-    )
-    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
-    cached = _PTR_ARG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     align = _assumed_align(t)
-    cached = (
+    return (
         make_ptr(
             _torch_to_cutlass_dtype(t.dtype),
             t.data_ptr(),
@@ -224,10 +237,6 @@ def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
         ),
         align,
     )
-    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
-        _PTR_ARG_CACHE.clear()
-    _PTR_ARG_CACHE[key] = cached
-    return cached
 
 
 def _make_ptr_args(
@@ -243,17 +252,12 @@ def _make_ptr_args(
 
 
 def _make_cast_f32_to_tc(*, total_elems: int, num_threads: int = 256):
-    grid_x = (int(total_elems) + int(num_threads) - 1) // int(num_threads)
-
-    @cute.kernel
-    def _cast_kernel(gSrc: cute.Tensor, gDst: cute.Tensor):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * int(num_threads) + tidx
-        if idx < int(total_elems):
-            gDst[idx] = gSrc[idx].to(gDst.element_type)
-
-    return _cast_kernel, int(grid_x), int(num_threads)
+    if int(num_threads) != _CAST_D_INC_NUM_THREADS:
+        raise ValueError(
+            f"cast kernel expects {_CAST_D_INC_NUM_THREADS} threads, got {num_threads}."
+        )
+    grid_x = (int(total_elems) + _CAST_D_INC_NUM_THREADS - 1) // _CAST_D_INC_NUM_THREADS
+    return _cast_f32_to_tc_kernel, int(grid_x), _CAST_D_INC_NUM_THREADS
 
 
 def _bwd_host_cache_key(
@@ -900,12 +904,6 @@ def _make_v2x2ssd_bwd_host_wrapper(
             P=P,
             num_threads=scan_num_threads_dc,
         )
-        scan_dr = ChunkScanBwdDRAmpere(
-            tc_dtype,
-            chunk_size=L,
-            D=D,
-            num_threads=scan_num_threads_dc,
-        )
         scan_param = ChunkScanBwdParamScanAmpere(
             chunk_size=L, num_threads=scan_num_threads_param
         )
@@ -962,6 +960,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         scan_dc(
             mU_scan,
             mB_scan,
+            mC_scan,
             mM_scan,
             mK_scan,
             mDOut_scan,
@@ -969,6 +968,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             mB_prev0_scan,
             mZ0_scan,
             mDC_scan,
+            mDLogp,
+            mDR_scan,
         )
         scan_dlp(
             mU_scan,
@@ -979,10 +980,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             mDOut_scan,
             mU_prev0_scan,
             mB_prev0_scan,
-            mZ0_scan,
             mDLogp,
         )
-        scan_dr(mC_scan, mM_scan, mDC_scan, mDR_scan)
         scan_param(
             mM_scan,
             mK_scan,

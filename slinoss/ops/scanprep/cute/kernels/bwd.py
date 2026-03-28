@@ -197,6 +197,72 @@ class ScanPrepBwdFused:
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
+    def _pack_scale_shared_storage(self):
+        part_layout = cute.make_layout(
+            (self.pack_rows_per_round, self.pack_scale_smem_stride),
+            stride=(self.pack_scale_smem_stride, 1),
+        )
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "sPartB0": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(part_layout)],
+                16,
+            ],
+            "sPartB1": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(part_layout)],
+                16,
+            ],
+            "sPartC0": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(part_layout)],
+                16,
+            ],
+            "sPartC1": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(part_layout)],
+                16,
+            ],
+        }
+
+        return cute.struct(SharedStorage)
+
+    def _scale_reduce_shared_storage(self):
+        acc_layout = cute.make_layout(
+            (self.scale_warps_per_block, self.scale_smem_stride),
+            stride=(self.scale_smem_stride, 1),
+        )
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "sAcc": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(acc_layout)],
+                16,
+            ]
+        }
+
+        return cute.struct(SharedStorage)
+
+    def _coeff_shared_storage(self):
+        coeff_layout = cute.make_layout(
+            (self.coeff_t_tile, self.coeff_flat_pad),
+            stride=(self.coeff_flat_pad, 1),
+        )
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "sDParams": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(coeff_layout)],
+                16,
+            ]
+        }
+
+        return cute.struct(SharedStorage)
+
     @cute.kernel
     def value_grad_kernel(
         self,
@@ -1107,6 +1173,15 @@ class ScanPrepBwdFused:
             bias_grad_ptr,
             cute.make_layout(self.bias_grad_shape, stride=self.bias_grad_stride),
         )
+        pack_scale_smem_bytes = (
+            int(self._pack_scale_shared_storage().size_in_bytes())
+            if self.normalize_bc
+            else 0
+        )
+        scale_reduce_smem_bytes = int(
+            self._scale_reduce_shared_storage().size_in_bytes()
+        )
+        coeff_smem_bytes = int(self._coeff_shared_storage().size_in_bytes())
 
         self.value_grad_kernel(
             mDU,
@@ -1127,7 +1202,7 @@ class ScanPrepBwdFused:
         ).launch(
             grid=(self.pack_grid_x, self.h_size, 1),
             block=(self.pack_block_size, 1, 1),
-            smem=self.pack_scale_smem_bytes if self.normalize_bc else 0,
+            smem=pack_scale_smem_bytes,
         )
         if cutlass.const_expr(self.normalize_bc):
             self.scale_reduce_kernel(
@@ -1136,7 +1211,7 @@ class ScanPrepBwdFused:
             ).launch(
                 grid=(self.scale_grid_x, self.h_size * 4, 1),
                 block=(self.scale_block_size, 1, 1),
-                smem=self.scale_reduce_smem_bytes,
+                smem=scale_reduce_smem_bytes,
             )
         self.coeff_grad_kernel(
             mCoeffAux,
@@ -1146,7 +1221,7 @@ class ScanPrepBwdFused:
         ).launch(
             grid=(self.coeff_grid_x, self.coeff_grid_y, 1),
             block=(self.coeff_block_size, 1, 1),
-            smem=self.coeff_smem_bytes,
+            smem=coeff_smem_bytes,
         )
         self.bias_partial_kernel(
             mDParams,

@@ -17,8 +17,14 @@ from .state import StatePassingBwdStateAmpere
 
 
 _COMPILED_CACHE: dict[tuple, tuple[object, object]] = {}
-_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
-_PTR_ARG_CACHE_LIMIT = 32768
+
+
+def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= int(limit):
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -54,18 +60,8 @@ def _make_tensor_from_spec(
 
 
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    device_index = (
-        int(t.device.index)
-        if t.device.type == "cuda" and t.device.index is not None
-        else -1
-    )
-    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
-    cached = _PTR_ARG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     align = _assumed_align(t)
-    cached = (
+    return (
         make_ptr(
             _torch_to_cutlass_dtype(t.dtype),
             t.data_ptr(),
@@ -74,10 +70,6 @@ def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
         ),
         align,
     )
-    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
-        _PTR_ARG_CACHE.clear()
-    _PTR_ARG_CACHE[key] = cached
-    return cached
 
 
 def _make_ptr_args(

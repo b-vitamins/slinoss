@@ -28,6 +28,17 @@ _FWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_INITIAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
 _DUMMY_FINAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
+_ZERO_PREV_CACHE_LIMIT = 8
+_ZERO_INITIAL_STATE_CACHE_LIMIT = 8
+_DUMMY_FINAL_STATE_CACHE_LIMIT = 8
+
+
+def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= int(limit):
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 def _get_zero_prev_tensors(
@@ -54,7 +65,7 @@ def _get_zero_prev_tensors(
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
         )
-        _ZERO_PREV_CACHE[key] = cached
+        _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
 
 
@@ -81,7 +92,12 @@ def _get_zero_initial_state(
             device=device,
             dtype=torch.float32,
         )
-        _ZERO_INITIAL_STATE_CACHE[key] = cached
+        _cache_set(
+            _ZERO_INITIAL_STATE_CACHE,
+            key,
+            cached,
+            limit=_ZERO_INITIAL_STATE_CACHE_LIMIT,
+        )
     return cached
 
 
@@ -108,7 +124,12 @@ def _get_dummy_final_state(
             device=device,
             dtype=torch.float32,
         )
-        _DUMMY_FINAL_STATE_CACHE[key] = cached
+        _cache_set(
+            _DUMMY_FINAL_STATE_CACHE,
+            key,
+            cached,
+            limit=_DUMMY_FINAL_STATE_CACHE_LIMIT,
+        )
     return cached
 
 

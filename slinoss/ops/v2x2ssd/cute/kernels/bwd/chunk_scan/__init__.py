@@ -10,7 +10,6 @@ from cutlass.cute.runtime import make_ptr
 from .db import ChunkScanBwdDBAmpere
 from .dc import ChunkScanBwdDCAmpere
 from .dlp import ChunkScanBwdDLPAmpere
-from .dr import ChunkScanBwdDRAmpere
 from .du import ChunkScanBwdDUAmpere
 from .dz0 import ChunkScanBwdDZ0Ampere
 from .param_scan import ChunkScanBwdParamScanAmpere
@@ -32,6 +31,16 @@ _OVERLAP_RESOURCES: dict[
     ],
 ] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_OVERLAP_RESOURCES_LIMIT = 8
+_ZERO_PREV_CACHE_LIMIT = 8
+
+
+def _cache_set(cache: dict, key: object, value, *, limit: int) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= int(limit):
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -82,7 +91,12 @@ def _get_overlap_resources(
             torch.cuda.Event(blocking=False, enable_timing=False),
             torch.cuda.Event(blocking=False, enable_timing=False),
         )
-        _OVERLAP_RESOURCES[device_index] = cached
+        _cache_set(
+            _OVERLAP_RESOURCES,
+            device_index,
+            cached,
+            limit=_OVERLAP_RESOURCES_LIMIT,
+        )
     return cached
 
 
@@ -138,7 +152,7 @@ def _get_zero_prev_tensors(
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
         )
-        _ZERO_PREV_CACHE[key] = cached
+        _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
 
 
@@ -619,6 +633,7 @@ def _make_dc_host_wrapper(
     (
         u_spec,
         b_spec,
+        c_spec,
         m_spec,
         k_spec,
         d_out_spec,
@@ -626,12 +641,15 @@ def _make_dc_host_wrapper(
         b_prev0_spec,
         z0_spec,
         d_c_spec,
+        dlp_spec,
+        d_r_spec,
     ) = spec
 
     @cute.jit
     def _dc_host_wrapper(
         U_ptr: cute.Pointer,
         B_ptr: cute.Pointer,
+        C_ptr: cute.Pointer,
         M_ptr: cute.Pointer,
         K_ptr: cute.Pointer,
         DOut_ptr: cute.Pointer,
@@ -639,9 +657,12 @@ def _make_dc_host_wrapper(
         BPrev0_ptr: cute.Pointer,
         Z0_ptr: cute.Pointer,
         DC_ptr: cute.Pointer,
+        DLp_ptr: cute.Pointer,
+        DR_ptr: cute.Pointer,
     ):
         mU = _make_tensor_from_spec(U_ptr, u_spec)
         mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mC = _make_tensor_from_spec(C_ptr, c_spec)
         mM = _make_tensor_from_spec(M_ptr, m_spec)
         mK = _make_tensor_from_spec(K_ptr, k_spec)
         mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
@@ -649,6 +670,8 @@ def _make_dc_host_wrapper(
         mBPrev0 = _make_tensor_from_spec(BPrev0_ptr, b_prev0_spec)
         mZ0 = _make_tensor_from_spec(Z0_ptr, z0_spec)
         mDC = _make_tensor_from_spec(DC_ptr, d_c_spec)
+        mDLp = _make_tensor_from_spec(DLp_ptr, dlp_spec)
+        mDR = _make_tensor_from_spec(DR_ptr, d_r_spec)
 
         kernel = ChunkScanBwdDCAmpere(
             U_ptr.value_type,
@@ -660,6 +683,7 @@ def _make_dc_host_wrapper(
         kernel(
             mU,
             mB,
+            mC,
             mM,
             mK,
             mDOut,
@@ -667,6 +691,8 @@ def _make_dc_host_wrapper(
             mBPrev0,
             mZ0,
             mDC,
+            mDLp,
+            mDR,
         )
 
     return _dc_host_wrapper
@@ -687,7 +713,6 @@ def _make_dlp_host_wrapper(
         d_out_spec,
         u_prev0_spec,
         b_prev0_spec,
-        z0_spec,
         dlp_spec,
     ) = spec
 
@@ -701,7 +726,6 @@ def _make_dlp_host_wrapper(
         DOut_ptr: cute.Pointer,
         UPrev0_ptr: cute.Pointer,
         BPrev0_ptr: cute.Pointer,
-        Z0_ptr: cute.Pointer,
         DLp_ptr: cute.Pointer,
     ):
         mU = _make_tensor_from_spec(U_ptr, u_spec)
@@ -712,7 +736,6 @@ def _make_dlp_host_wrapper(
         mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
         mUPrev0 = _make_tensor_from_spec(UPrev0_ptr, u_prev0_spec)
         mBPrev0 = _make_tensor_from_spec(BPrev0_ptr, b_prev0_spec)
-        mZ0 = _make_tensor_from_spec(Z0_ptr, z0_spec)
         mDLp = _make_tensor_from_spec(DLp_ptr, dlp_spec)
 
         kernel = ChunkScanBwdDLPAmpere(
@@ -731,47 +754,10 @@ def _make_dlp_host_wrapper(
             mDOut,
             mUPrev0,
             mBPrev0,
-            mZ0,
             mDLp,
         )
 
     return _dlp_host_wrapper
-
-
-def _make_dr_host_wrapper(
-    *,
-    spec: tuple[tuple[int, ...], ...],
-    cfg: tuple[int, ...],
-):
-    chunk_size, D, _P, num_threads = cfg
-    (
-        c_spec,
-        m_spec,
-        d_c_spec,
-        d_r_spec,
-    ) = spec
-
-    @cute.jit
-    def _dr_host_wrapper(
-        C_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        DC_ptr: cute.Pointer,
-        DR_ptr: cute.Pointer,
-    ):
-        mC = _make_tensor_from_spec(C_ptr, c_spec)
-        mM = _make_tensor_from_spec(M_ptr, m_spec)
-        mDC = _make_tensor_from_spec(DC_ptr, d_c_spec)
-        mDR = _make_tensor_from_spec(DR_ptr, d_r_spec)
-
-        kernel = ChunkScanBwdDRAmpere(
-            C_ptr.value_type,
-            chunk_size=chunk_size,
-            D=D,
-            num_threads=num_threads,
-        )
-        kernel(mC, mM, mDC, mDR)
-
-    return _dr_host_wrapper
 
 
 def _make_param_host_wrapper(
@@ -971,7 +957,6 @@ def compile_chunk_scan_bwd_kernels(
     dR = torch.empty((BHC, L, 4), device=U.device, dtype=torch.float32)
     compiled_dc = None
     compiled_dlp = None
-    compiled_dr = None
 
     dlogp_view = dlogp.reshape(Bsz, H, n_chunks, L)
     dC_view = dC.reshape(Bsz, H, n_chunks, L, D)
@@ -1029,6 +1014,7 @@ def compile_chunk_scan_bwd_kernels(
     dc_args, dc_alignments = _make_ptr_args(
         U_blk,
         B_blk,
+        C_blk,
         M_blk,
         K_blk,
         dOut_blk,
@@ -1036,6 +1022,8 @@ def compile_chunk_scan_bwd_kernels(
         B_prev0_flat,
         Z0_blk,
         dC,
+        dlogp,
+        dR,
     )
     dlp_args, dlp_alignments = _make_ptr_args(
         U_blk,
@@ -1046,14 +1034,7 @@ def compile_chunk_scan_bwd_kernels(
         dOut_blk,
         U_prev0_flat,
         B_prev0_flat,
-        Z0_blk,
         dlogp,
-    )
-    dr_args, dr_alignments = _make_ptr_args(
-        C_blk,
-        M_blk,
-        dC,
-        dR,
     )
     param_args, param_alignments = _make_ptr_args(
         M_blk,
@@ -1072,7 +1053,6 @@ def compile_chunk_scan_bwd_kernels(
         + db_alignments
         + dc_alignments
         + dlp_alignments
-        + dr_alignments
         + param_alignments
     )
     keepalive = (
@@ -1197,6 +1177,7 @@ def compile_chunk_scan_bwd_kernels(
                 for t in (
                     U_blk,
                     B_blk,
+                    C_blk,
                     M_blk,
                     K_blk,
                     dOut_blk,
@@ -1204,6 +1185,8 @@ def compile_chunk_scan_bwd_kernels(
                     B_prev0_flat,
                     Z0_blk,
                     dC,
+                    dlogp,
+                    dR,
                 )
             ),
             cfg=(L, D, P, num_threads_dc),
@@ -1220,20 +1203,7 @@ def compile_chunk_scan_bwd_kernels(
                     dOut_blk,
                     U_prev0_flat,
                     B_prev0_flat,
-                    Z0_blk,
                     dlogp,
-                )
-            ),
-            cfg=(L, D, P, num_threads_dc),
-        )
-        dr_wrapper = _make_dr_host_wrapper(
-            spec=tuple(
-                _make_tensor_spec_from_tensor(t)
-                for t in (
-                    C_blk,
-                    M_blk,
-                    dC,
-                    dR,
                 )
             ),
             cfg=(L, D, P, num_threads_dc),
@@ -1260,7 +1230,6 @@ def compile_chunk_scan_bwd_kernels(
         compiled_db = cute.compile(db_wrapper, *db_args)
         compiled_dc = cute.compile(dc_wrapper, *dc_args)
         compiled_dlp = cute.compile(dlp_wrapper, *dlp_args)
-        compiled_dr = cute.compile(dr_wrapper, *dr_args)
         compiled_param = cute.compile(param_wrapper, *param_args)
         cached = (
             compiled_dz0,
@@ -1268,7 +1237,6 @@ def compile_chunk_scan_bwd_kernels(
             compiled_db,
             compiled_dc,
             compiled_dlp,
-            compiled_dr,
             compiled_param,
         )
         if use_compiled_cache:
@@ -1280,7 +1248,6 @@ def compile_chunk_scan_bwd_kernels(
             compiled_db,
             compiled_dc,
             compiled_dlp,
-            compiled_dr,
             compiled_param,
         ) = cached
 
@@ -1304,10 +1271,6 @@ def compile_chunk_scan_bwd_kernels(
         _ = keepalive
         compiled_dlp(*dlp_args)
 
-    def _launch_dr() -> None:
-        _ = keepalive
-        compiled_dr(*dr_args)
-
     def _launch_param() -> None:
         _ = keepalive
         compiled_param(*param_args)
@@ -1318,7 +1281,6 @@ def compile_chunk_scan_bwd_kernels(
         _launch_db()
         _launch_dc()
         _launch_dlp()
-        _launch_dr()
         _launch_param()
 
     stream_dz0 = None
@@ -1345,7 +1307,7 @@ def compile_chunk_scan_bwd_kernels(
         ) = _get_overlap_resources(U.device)
 
     def launch_overlapped() -> None:
-        # Structural dc/dlp/dr changes are correctness-gated first; stream overlap
+        # Structural dc/dlp changes are correctness-gated first; stream overlap
         # remains disabled because it has historically shown near-zero gain here.
         launch_sequential()
         return
@@ -1381,7 +1343,6 @@ def compile_chunk_scan_bwd_kernels(
         with torch.cuda.stream(stream_dc):
             _launch_dc()
             _launch_dlp()
-            _launch_dr()
             stream_dc.record_event(ev_dc_done)
 
         current.wait_event(ev_db_done)
