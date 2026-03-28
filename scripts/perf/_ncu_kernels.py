@@ -100,7 +100,7 @@ KERNEL_ORDER = (
     "chunk_scan_bwd_dz0",
     "chunk_scan_bwd_du",
     "chunk_scan_bwd_db",
-    "chunk_scan_bwd_dcdr",
+    "chunk_scan_bwd_dc",
     "chunk_scan_bwd_dlp",
     "chunk_scan_bwd_dr",
     "chunk_scan_bwd_param",
@@ -960,7 +960,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         "chunk_scan_bwd_dz0": _closure_var(_launch_sequential, "_launch_dz0"),
         "chunk_scan_bwd_du": _closure_var(_launch_sequential, "_launch_du"),
         "chunk_scan_bwd_db": _closure_var(_launch_sequential, "_launch_db"),
-        "chunk_scan_bwd_dcdr": _closure_var(_launch_sequential, "_launch_dc"),
+        "chunk_scan_bwd_dc": _closure_var(_launch_sequential, "_launch_dc"),
         "chunk_scan_bwd_dlp": _closure_var(_launch_sequential, "_launch_dlp"),
         "chunk_scan_bwd_dr": _closure_var(_launch_sequential, "_launch_dr"),
         "chunk_scan_bwd_param": _closure_var(_launch_sequential, "_launch_param"),
@@ -988,7 +988,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
 
     def prepare_param() -> None:
         launchers["chunk_scan_bwd_db"]()
-        launchers["chunk_scan_bwd_dcdr"]()
+        launchers["chunk_scan_bwd_dc"]()
         launchers["chunk_scan_bwd_dlp"]()
         launchers["chunk_scan_bwd_dr"]()
 
@@ -1023,8 +1023,8 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             launch=launchers["chunk_scan_bwd_db"],
             prepare=_noop,
         ),
-        "chunk_scan_bwd_dcdr": KernelRunner(
-            name="chunk_scan_bwd_dcdr",
+        "chunk_scan_bwd_dc": KernelRunner(
+            name="chunk_scan_bwd_dc",
             effective_bytes=bytes_u
             + bytes_b
             + bytes_m
@@ -1032,7 +1032,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_d_out
             + _tensor_bytes(U_prev, B_prev, chunk_starts, dC)
             + bytes_dphase,
-            launch=launchers["chunk_scan_bwd_dcdr"],
+            launch=launchers["chunk_scan_bwd_dc"],
             prepare=_noop,
         ),
         "chunk_scan_bwd_dlp": KernelRunner(
@@ -1142,7 +1142,7 @@ def build_kernel_runner(
         "chunk_scan_bwd_dz0",
         "chunk_scan_bwd_du",
         "chunk_scan_bwd_db",
-        "chunk_scan_bwd_dcdr",
+        "chunk_scan_bwd_dc",
         "chunk_scan_bwd_dlp",
         "chunk_scan_bwd_dr",
         "chunk_scan_bwd_param",

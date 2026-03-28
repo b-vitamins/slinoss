@@ -154,7 +154,7 @@ snapshots instead of raw multi-thousand-line NCU dumps.
 - Full scanprep + v2x2ssd table (all kernels):
   - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --json-out /tmp/ncu_kernel_table.json`
 - Single-kernel probe:
-  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --kernel chunk_scan_bwd_dcdr --json-out /tmp/ncu_dcdr.json`
+  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --kernel chunk_scan_bwd_dc --json-out /tmp/ncu_dc.json`
 - List supported kernel keys:
   - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --list`
 
