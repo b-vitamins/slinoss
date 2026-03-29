@@ -25,7 +25,6 @@ import cutlass.cute as cute
 from .common import (
     LOG2_E,
     TWO_LOG2_E,
-    apply_complex_tap,
     apply_complex_tap_adjoint,
     complex_mul,
     conj_mul_phase,
@@ -85,6 +84,17 @@ class ChunkScanBwdDBAmpere:
     @property
     def D_padded(self) -> int:
         return (self.D + 31) // 32 * 32
+
+    def _d_stage_size(self) -> int:
+        """Shared-memory D slice width used by the backward DB kernel."""
+        Dp = self.D_padded
+        if Dp <= 64:
+            return Dp
+        return 64
+
+    def _d_stage_count(self) -> int:
+        Ds = self._d_stage_size()
+        return (self.D_padded + Ds - 1) // Ds
 
     @property
     def P_padded(self) -> int:
@@ -178,21 +188,22 @@ class ChunkScanBwdDBAmpere:
             raise ValueError("dM buffers must be (BHC, L, 2).")
 
         Dp = self.D_padded
+        Ds = self._d_stage_size()
         Pp = self.P_padded
         kv_tile = self.kv_tile
         p_tile = 32
         if cutlass.const_expr(Pp % p_tile != 0):
             raise ValueError("P must be padded to a multiple of 32.")
 
-        smem_k_block_size_D = 64 if Dp % 64 == 0 else 32
+        smem_k_block_size_D = 64 if Ds % 64 == 0 else 32
         swizzle_bits_D = 3 if smem_k_block_size_D >= 32 else 2
         sD_layout_atom = cute.make_composed_layout(
             cute.make_swizzle(swizzle_bits_D, 3, 3),
             0,
             cute.make_layout((8, smem_k_block_size_D), stride=(smem_k_block_size_D, 1)),
         )
-        sQ_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Dp), (0, 1))
-        sK_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Dp), (0, 1))
+        sQ_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Ds), (0, 1))
+        sK_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Ds), (0, 1))
 
         smem_k_block_size_P = p_tile
         swizzle_bits_P = 3
@@ -279,6 +290,9 @@ class ChunkScanBwdDBAmpere:
             sS_blk: cute.struct.Align[
                 cute.struct.MemRange[mU.element_type, cute.cosize(sBlk_layout)], 16
             ]
+            sS_cache: cute.struct.Align[
+                cute.struct.MemRange[mU.element_type, cute.cosize(sBlk_layout)], 16
+            ]
             s_phase: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32,
@@ -307,6 +321,20 @@ class ChunkScanBwdDBAmpere:
             ]
             s_inv_row_scale: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.L], 4
+            ]
+            s_dM_curr: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32,
+                    cute.cosize(cute.make_layout((kv_tile, 2), stride=(2, 1))),
+                ],
+                16,
+            ]
+            s_dM_prev: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32,
+                    cute.cosize(cute.make_layout((kv_tile, 2), stride=(2, 1))),
+                ],
+                16,
             ]
 
         grid_z = cute.size(mB.shape[0])
@@ -370,11 +398,12 @@ class ChunkScanBwdDBAmpere:
         tidx, _, _ = cute.arch.thread_idx()
         _, _, bidz = cute.arch.block_idx()
         Dp = self.D_padded
+        Ds = self._d_stage_size()
+        d_stage_count = self._d_stage_count()
         Pp = self.P_padded
         p_tile = 32
         n_p_tiles = Pp // p_tile
-        nvec = self.D // 2
-        nvec2 = self.D // 4
+        nvec_stage = Ds // 2
         BH = mU_prev0.shape[0]
         BHC = mB.shape[0]
         n_chunks = BHC // BH
@@ -382,14 +411,17 @@ class ChunkScanBwdDBAmpere:
         chunk = bidz - bh * n_chunks
         kv_tile = int(self.kv_tile)
         n_tiles = int(self.L // kv_tile)
+        single_tile_cache = n_tiles == 1
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ0 = storage.sQ.get_tensor(sQ_layout)
         sDY0 = storage.sDY.get_tensor(sDY_layout)
+        sS_prev = cute.make_tensor(sDY0.iterator.align(16), sBlk_layout)
         sK_tile = storage.sK_tile.get_tensor(sK_layout)
         sV_tile = storage.sV_tile.get_tensor(sV_layout)
         sS_blk = storage.sS_blk.get_tensor(sBlk_layout)
+        sS_cache = storage.sS_cache.get_tensor(sBlk_layout)
         sDY1 = cute.make_tensor(sK_tile.iterator.align(16), sDY_layout)
         sV1 = cute.make_tensor(sS_blk.iterator.align(16), sV_layout)
         s_phase = storage.s_phase.get_tensor(
@@ -408,6 +440,12 @@ class ChunkScanBwdDBAmpere:
         )
         s_inv_row_scale = storage.s_inv_row_scale.get_tensor(
             cute.make_layout((self.L,), stride=(1,))
+        )
+        s_dM_curr = storage.s_dM_curr.get_tensor(
+            cute.make_layout((kv_tile, 2), stride=(2, 1))
+        )
+        s_dM_prev = storage.s_dM_prev.get_tensor(
+            cute.make_layout((kv_tile, 2), stride=(2, 1))
         )
 
         lane = cute.arch.lane_idx()
@@ -545,7 +583,13 @@ class ChunkScanBwdDBAmpere:
         tSrS_blk = thr_mma.make_fragment_A(thr_mma.partition_A(sS_blk))
         tSsS_blk = thr_copy_A.partition_S(sS_blk)
         tSrS_blk_view = thr_copy_A.retile(tSrS_blk)
-        sQt_layout = cute.make_layout((Dp, kv_tile), stride=(kv_tile, 1))
+        tSrS_cache = thr_mma.make_fragment_A(thr_mma.partition_A(sS_cache))
+        tSsS_cache = thr_copy_A.partition_S(sS_cache)
+        tSrS_cache_view = thr_copy_A.retile(tSrS_cache)
+        tSrS_prev = thr_mma.make_fragment_A(thr_mma.partition_A(sS_prev))
+        tSsS_prev = thr_copy_A.partition_S(sS_prev)
+        tSrS_prev_view = thr_copy_A.retile(tSrS_prev)
+        sQt_layout = cute.make_layout((Ds, kv_tile), stride=(kv_tile, 1))
 
         sQt = cute.composition(sQ0, sQt_layout)
         tSrQt = thr_mma.make_fragment_B(thr_mma.partition_B(sQt))
@@ -553,35 +597,29 @@ class ChunkScanBwdDBAmpere:
         tSrQt_view = thr_copy_BT.retile(tSrQt)
 
         acc_shape_blk = thr_mma.partition_shape_C((kv_tile, kv_tile))
-        acc_shape_tileD = thr_mma.partition_shape_C((kv_tile, Dp))
+        acc_shape_tileD = thr_mma.partition_shape_C((kv_tile, Ds))
 
-        total_pairs_tile = int(kv_tile * nvec)
-        iters_pairs_tile = int(
-            (total_pairs_tile + self.num_threads - 1) // self.num_threads
-        )
-        total_quads_tile = int(kv_tile * nvec2)
-        iters_quads_tile = int(
-            (total_quads_tile + self.num_threads - 1) // self.num_threads
+        total_pairs_stage = int(kv_tile * nvec_stage)
+        iters_pairs_stage = int(
+            (total_pairs_stage + self.num_threads - 1) // self.num_threads
         )
         iters_d = int((self.D + self.num_threads - 1) // self.num_threads)
-        tQp = None
-        if cutlass.const_expr(self.D != Dp):
-            tQp = cute.make_rmem_tensor(
-                cute.make_layout(
-                    (
-                        tQsQ0.shape[0][1],
-                        cute.size(tQsQ0, mode=[1]),
-                        cute.size(tQsQ0, mode=[2]),
-                    ),
-                    stride=(cute.size(tQsQ0, mode=[2]), 0, 1),
+        tQp = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    tQsQ0.shape[0][1],
+                    cute.size(tQsQ0, mode=[1]),
+                    cute.size(tQsQ0, mode=[2]),
                 ),
-                cutlass.Boolean,
-            )
-            for rest_v in cutlass.range_constexpr(tQp.shape[0]):
-                for rest_k in cutlass.range_constexpr(tQp.shape[2]):
-                    tQp[rest_v, 0, rest_k] = cute.elem_less(
-                        tCc0[(0, rest_v), 0, rest_k][3], mC.layout.shape[3]
-                    )
+                stride=(cute.size(tQsQ0, mode=[2]), 0, 1),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in cutlass.range_constexpr(tQp.shape[0]):
+            for rest_k in cutlass.range_constexpr(tQp.shape[2]):
+                tQp[rest_v, 0, rest_k] = cute.elem_less(
+                    tCc0[(0, rest_v), 0, rest_k][3], mC.layout.shape[3]
+                )
         tDYp = None
         if cutlass.const_expr(self.P != Pp):
             tDYp = cute.make_rmem_tensor(
@@ -595,7 +633,8 @@ class ChunkScanBwdDBAmpere:
                 ),
                 cutlass.Boolean,
             )
-
+        mcDB = cute.make_identity_tensor(mDB.layout.shape)
+        iters_ds = int((Ds + self.num_threads - 1) // self.num_threads)
         for it in range((Dp + self.num_threads - 1) // self.num_threads):
             d = tidx + cutlass.Int32(it * self.num_threads)
             if d < cutlass.Int32(Dp):
@@ -605,111 +644,46 @@ class ChunkScanBwdDBAmpere:
         for n_tile_rev in cutlass.range_constexpr(n_tiles):
             n_tile = (n_tiles - 1) - n_tile_rev
             n0 = n_tile * kv_tile
-            acc_dK_curr = cute.make_rmem_tensor(acc_shape_tileD, cutlass.Float32)
-            acc_dK_curr.fill(0.0)
-            acc_dK_prev = cute.make_rmem_tensor(acc_shape_tileD, cutlass.Float32)
-            acc_dK_prev.fill(0.0)
+            m_tiles = n_tiles - n_tile
 
             if tidx < cutlass.Int32(kv_tile):
                 t = cutlass.Int32(n0) + tidx
                 s_tap_curr[tidx, 0] = cutlass.Float32(mK[bidz, t, 1, 0])
                 s_tap_curr[tidx, 1] = cutlass.Float32(mK[bidz, t, 1, 1])
+                s_dM_curr[tidx, 0] = cutlass.Float32(0.0)
+                s_dM_curr[tidx, 1] = cutlass.Float32(0.0)
+                s_dM_prev[tidx, 0] = cutlass.Float32(0.0)
+                s_dM_prev[tidx, 1] = cutlass.Float32(0.0)
             cute.arch.barrier()
 
-            gB = cute.local_tile(mB[bidz, None, 0, None], (kv_tile, Dp), (n_tile, 0))
-            tBg = gmem_thr_copy_D.partition_S(gB)
-            tKsB = gmem_thr_copy_D.partition_D(sK_tile)
-            if cutlass.const_expr(self.D == Dp):
-                cute.copy(gmem_tiled_copy_D, tBg, tKsB)
-            else:
-                cB = cute.local_tile(mcKD_full, (kv_tile, Dp), (n_tile, 0))
-                tBc = gmem_thr_copy_D.partition_S(cB)
-                for vi in cutlass.range_constexpr(cute.size(tKsB.shape[1])):
-                    if cute.elem_less(tBc[0, vi, 0][1], mB.layout.shape[1]):
-                        cute.copy(
-                            gmem_tiled_copy_D,
-                            tBg[None, vi, None],
-                            tKsB[None, vi, None],
-                            pred=tQp[None, vi, None],
+            for d_stage_idx in cutlass.range_constexpr(d_stage_count):
+                d_col_base = cutlass.Int32(d_stage_idx * Ds)
+                acc_dK_curr = cute.make_rmem_tensor(acc_shape_tileD, cutlass.Float32)
+                acc_dK_curr.fill(0.0)
+                acc_dK_prev = cute.make_rmem_tensor(acc_shape_tileD, cutlass.Float32)
+                acc_dK_prev.fill(0.0)
+
+                for rest_v in cutlass.range_constexpr(tQp.shape[0]):
+                    for rest_k in cutlass.range_constexpr(tQp.shape[2]):
+                        g_col = (
+                            cutlass.Int32(tCc0[(0, rest_v), 0, rest_k][3]) + d_col_base
                         )
-                    else:
-                        tKsB[None, vi, None].fill(0)
-            cute.arch.barrier()
+                        tQp[rest_v, 0, rest_k] = cute.elem_less(
+                            g_col, mC.layout.shape[3]
+                        )
 
-            if cutlass.const_expr((self.D % 4) == 0):
-                for it in cutlass.range_constexpr(iters_quads_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_quads_tile):
-                        t_local = idx // cutlass.Int32(nvec2)
-                        vv4 = idx - t_local * cutlass.Int32(nvec2)
-                        t = cutlass.Int32(n0) + t_local
-                        if t < cutlass.Int32(self.L):
-                            d0 = vv4 * 4
-                            kr = cutlass.Float32(s_tap_curr[t_local, 0])
-                            ki = cutlass.Float32(s_tap_curr[t_local, 1])
-                            pr = cutlass.Float32(s_phase[t, 0])
-                            pi = cutlass.Float32(s_phase[t, 1])
-                            bx0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            by0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            tr0, ti0 = apply_complex_tap(bx0, by0, kr, ki)
-                            kx0, ky0 = conj_mul_phase(tr0, ti0, pr, pi)
-                            bx1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            by1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            tr1, ti1 = apply_complex_tap(bx1, by1, kr, ki)
-                            kx1, ky1 = conj_mul_phase(tr1, ti1, pr, pi)
-                            sK_tile[t_local, d0 + 0] = kx0.to(mU.element_type)
-                            sK_tile[t_local, d0 + 1] = ky0.to(mU.element_type)
-                            sK_tile[t_local, d0 + 2] = kx1.to(mU.element_type)
-                            sK_tile[t_local, d0 + 3] = ky1.to(mU.element_type)
-            else:
-                for it in cutlass.range_constexpr(iters_pairs_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_pairs_tile):
-                        t_local = idx // nvec
-                        vv = idx - t_local * nvec
-                        t = cutlass.Int32(n0) + t_local
-                        if t < cutlass.Int32(self.L):
-                            d0 = vv * 2
-                            bx = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            by = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            kr = cutlass.Float32(s_tap_curr[t_local, 0])
-                            ki = cutlass.Float32(s_tap_curr[t_local, 1])
-                            tr, ti = apply_complex_tap(bx, by, kr, ki)
-                            pr = cutlass.Float32(s_phase[t, 0])
-                            pi = cutlass.Float32(s_phase[t, 1])
-                            kx, ky = conj_mul_phase(tr, ti, pr, pi)
-                            sK_tile[t_local, d0 + 0] = kx.to(mU.element_type)
-                            sK_tile[t_local, d0 + 1] = ky.to(mU.element_type)
-            cute.arch.barrier()
+                for mi in cutlass.range_constexpr(m_tiles):
+                    m_tile = n_tile + mi
+                    m0 = m_tile * kv_tile
 
-            m_tiles = n_tiles - n_tile
-            for mi in cutlass.range_constexpr(m_tiles):
-                m_tile = n_tile + mi
-                m0 = m_tile * kv_tile
-
-                gC = cute.local_tile(
-                    mC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
-                )
-                tCg = gmem_thr_copy_D.partition_S(gC)
-                cC = cute.local_tile(
-                    mcC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
-                )
-                tCc = gmem_thr_copy_D.partition_S(cC)
-                if cutlass.const_expr(self.D == Dp):
-                    cute.copy(gmem_tiled_copy_D, tCg, tQsQ0)
-                else:
+                    gC = cute.local_tile(
+                        mC[bidz, None, 0, None], (kv_tile, Ds), (m_tile, d_stage_idx)
+                    )
+                    tCg = gmem_thr_copy_D.partition_S(gC)
+                    cC = cute.local_tile(
+                        mcC[bidz, None, 0, None], (kv_tile, Ds), (m_tile, d_stage_idx)
+                    )
+                    tCc = gmem_thr_copy_D.partition_S(cC)
                     for di in cutlass.range_constexpr(cute.size(tQsQ0.shape[1])):
                         if cute.elem_less(tCc[0, di, 0][1], mC.layout.shape[1]):
                             cute.copy(
@@ -720,1331 +694,1154 @@ class ChunkScanBwdDBAmpere:
                             )
                         else:
                             tQsQ0[None, di, None].fill(0)
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.barrier()
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.barrier()
 
-                if cutlass.const_expr((self.D % 4) == 0):
-                    for it in cutlass.range_constexpr(iters_quads_tile):
+                    for it in cutlass.range_constexpr(iters_pairs_stage):
                         idx = tidx + cutlass.Int32(it * self.num_threads)
-                        if idx < cutlass.Int32(total_quads_tile):
-                            t_local = idx // cutlass.Int32(nvec2)
-                            vv4 = idx - t_local * cutlass.Int32(nvec2)
+                        if idx < cutlass.Int32(total_pairs_stage):
+                            t_local = idx // nvec_stage
+                            vv = idx - t_local * nvec_stage
                             t = cutlass.Int32(m0) + t_local
                             if t < cutlass.Int32(self.L):
-                                d0 = vv4 * 4
-                                pr = cutlass.Float32(s_phase[t, 0])
-                                pi = cutlass.Float32(s_phase[t, 1])
-                                x0 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                                )
-                                y0 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                                )
-                                rx0, ry0 = conj_mul_phase(x0, y0, pr, pi)
-                                x1 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 2].to(cutlass.Float32)
-                                )
-                                y1 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 3].to(cutlass.Float32)
-                                )
-                                rx1, ry1 = conj_mul_phase(x1, y1, pr, pi)
-                                sQ0[t_local, d0 + 0] = rx0.to(mU.element_type)
-                                sQ0[t_local, d0 + 1] = ry0.to(mU.element_type)
-                                sQ0[t_local, d0 + 2] = rx1.to(mU.element_type)
-                                sQ0[t_local, d0 + 3] = ry1.to(mU.element_type)
-                else:
-                    for it in cutlass.range_constexpr(iters_pairs_tile):
-                        idx = tidx + cutlass.Int32(it * self.num_threads)
-                        if idx < cutlass.Int32(total_pairs_tile):
-                            t_local = idx // nvec
-                            vv = idx - t_local * nvec
-                            t = cutlass.Int32(m0) + t_local
-                            if t < cutlass.Int32(self.L):
-                                d0 = vv * 2
+                                d_local = vv * 2
                                 x = cutlass.Float32(
-                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                                    sQ0[t_local, d_local + 0].to(cutlass.Float32)
                                 )
                                 y = cutlass.Float32(
-                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                                    sQ0[t_local, d_local + 1].to(cutlass.Float32)
                                 )
                                 pr = cutlass.Float32(s_phase[t, 0])
                                 pi = cutlass.Float32(s_phase[t, 1])
                                 rx, ry = conj_mul_phase(x, y, pr, pi)
-                                sQ0[t_local, d0 + 0] = rx.to(mU.element_type)
-                                sQ0[t_local, d0 + 1] = ry.to(mU.element_type)
-                cute.arch.barrier()
-
-                acc_blk_curr = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
-                acc_blk_curr.fill(0.0)
-                p_tile_idx = cutlass.Int32(0)
-                gDY = cute.local_tile(
-                    mDOut[bidz, None, 0, None], (kv_tile, p_tile), (m_tile, p_tile_idx)
-                )
-                tDYg = gmem_thr_copy_P.partition_S(gDY)
-                cDY = cute.local_tile(
-                    mcDY[bidz, None, 0, None], (kv_tile, p_tile), (m_tile, p_tile_idx)
-                )
-                tDYc = gmem_thr_copy_P.partition_S(cDY)
-                if cutlass.const_expr(self.P == Pp):
-                    cute.copy(gmem_tiled_copy_P, tDYg, tDYs0)
-                else:
-                    tDYp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
-                    for rest_v in cutlass.range_constexpr(tDYp_s.shape[0]):
-                        for rest_k in cutlass.range_constexpr(tDYp_s.shape[2]):
-                            tDYp_s[rest_v, 0, rest_k] = cute.elem_less(
-                                tDYc[(0, rest_v), 0, rest_k][3], mDOut.layout.shape[3]
-                            )
-                    for vi in cutlass.range_constexpr(cute.size(tDYs0.shape[1])):
-                        if cute.elem_less(tDYc[0, vi, 0][1], mDOut.layout.shape[1]):
-                            cute.copy(
-                                gmem_tiled_copy_P,
-                                tDYg[None, vi, None],
-                                tDYs0[None, vi, None],
-                                pred=tDYp_s[None, vi, None],
-                            )
-                        else:
-                            tDYs0[None, vi, None].fill(0)
-                gV = cute.local_tile(
-                    mU[bidz, None, 0, None], (kv_tile, p_tile), (n_tile, p_tile_idx)
-                )
-                tVg = gmem_thr_copy_P.partition_S(gV)
-                cV = cute.local_tile(
-                    mcU[bidz, None, 0, None], (kv_tile, p_tile), (n_tile, p_tile_idx)
-                )
-                tVc = gmem_thr_copy_P.partition_S(cV)
-                if cutlass.const_expr(self.P == Pp):
-                    cute.copy(gmem_tiled_copy_P, tVg, tVsV0)
-                else:
-                    tVp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
-                    for rest_v in cutlass.range_constexpr(tVp_s.shape[0]):
-                        for rest_k in cutlass.range_constexpr(tVp_s.shape[2]):
-                            tVp_s[rest_v, 0, rest_k] = cute.elem_less(
-                                tVc[(0, rest_v), 0, rest_k][3], mU.layout.shape[3]
-                            )
-                    for vi in cutlass.range_constexpr(cute.size(tVsV0.shape[1])):
-                        if cute.elem_less(tVc[0, vi, 0][1], mU.layout.shape[1]):
-                            cute.copy(
-                                gmem_tiled_copy_P,
-                                tVg[None, vi, None],
-                                tVsV0[None, vi, None],
-                                pred=tVp_s[None, vi, None],
-                            )
-                        else:
-                            tVsV0[None, vi, None].fill(0)
-                cute.arch.cp_async_commit_group()
-                for p_iter in cutlass.range_constexpr(n_p_tiles):
-                    cute.arch.cp_async_wait_group(0)
+                                sQ0[t_local, d_local + 0] = rx.to(mU.element_type)
+                                sQ0[t_local, d_local + 1] = ry.to(mU.element_type)
                     cute.arch.barrier()
-                    if cutlass.const_expr(p_iter + 1 < n_p_tiles):
-                        p_next = cutlass.Int32(p_iter + 1)
-                        gDY_next = cute.local_tile(
+
+                    cS_blk = cute.local_tile(
+                        mcS_full, (kv_tile, kv_tile), (m_tile, n_tile)
+                    )
+                    tScS_blk = thr_mma.partition_C(cS_blk)
+                    tScS_blk_mn = self._make_acc_tensor_mn_view(tScS_blk)
+                    if (not single_tile_cache) or d_stage_idx == 0:
+                        acc_blk_curr = cute.make_rmem_tensor(
+                            acc_shape_blk, cutlass.Float32
+                        )
+                        acc_blk_curr.fill(0.0)
+                        p_tile_idx = cutlass.Int32(0)
+                        gDY = cute.local_tile(
                             mDOut[bidz, None, 0, None],
                             (kv_tile, p_tile),
-                            (m_tile, p_next),
+                            (m_tile, p_tile_idx),
                         )
-                        tDYg_next = gmem_thr_copy_P.partition_S(gDY_next)
-                        cDY_next = cute.local_tile(
+                        tDYg = gmem_thr_copy_P.partition_S(gDY)
+                        cDY = cute.local_tile(
                             mcDY[bidz, None, 0, None],
                             (kv_tile, p_tile),
-                            (m_tile, p_next),
+                            (m_tile, p_tile_idx),
                         )
-                        tDYc_next = gmem_thr_copy_P.partition_S(cDY_next)
-                        gV_next = cute.local_tile(
-                            mU[bidz, None, 0, None], (kv_tile, p_tile), (n_tile, p_next)
+                        tDYc = gmem_thr_copy_P.partition_S(cDY)
+                        if cutlass.const_expr(self.P == Pp):
+                            cute.copy(gmem_tiled_copy_P, tDYg, tDYs0)
+                        else:
+                            tDYp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
+                            for rest_v in cutlass.range_constexpr(tDYp_s.shape[0]):
+                                for rest_k in cutlass.range_constexpr(tDYp_s.shape[2]):
+                                    tDYp_s[rest_v, 0, rest_k] = cute.elem_less(
+                                        tDYc[(0, rest_v), 0, rest_k][3],
+                                        mDOut.layout.shape[3],
+                                    )
+                            for vi in cutlass.range_constexpr(
+                                cute.size(tDYs0.shape[1])
+                            ):
+                                if cute.elem_less(
+                                    tDYc[0, vi, 0][1], mDOut.layout.shape[1]
+                                ):
+                                    cute.copy(
+                                        gmem_tiled_copy_P,
+                                        tDYg[None, vi, None],
+                                        tDYs0[None, vi, None],
+                                        pred=tDYp_s[None, vi, None],
+                                    )
+                                else:
+                                    tDYs0[None, vi, None].fill(0)
+                        gV = cute.local_tile(
+                            mU[bidz, None, 0, None],
+                            (kv_tile, p_tile),
+                            (n_tile, p_tile_idx),
                         )
-                        tVg_next = gmem_thr_copy_P.partition_S(gV_next)
-                        cV_next = cute.local_tile(
+                        tVg = gmem_thr_copy_P.partition_S(gV)
+                        cV = cute.local_tile(
                             mcU[bidz, None, 0, None],
                             (kv_tile, p_tile),
-                            (n_tile, p_next),
+                            (n_tile, p_tile_idx),
                         )
-                        tVc_next = gmem_thr_copy_P.partition_S(cV_next)
-                        if cutlass.const_expr((p_iter & 1) == 0):
-                            if cutlass.const_expr(self.P == Pp):
-                                cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs1)
-                                cute.copy(gmem_tiled_copy_P, tVg_next, tVsV1)
-                            else:
-                                tDYp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                tVp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                for rest_v in cutlass.range_constexpr(
-                                    tDYp_next.shape[0]
-                                ):
-                                    for rest_k in cutlass.range_constexpr(
-                                        tDYp_next.shape[2]
-                                    ):
-                                        tDYp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tDYc_next[(0, rest_v), 0, rest_k][3],
-                                            mDOut.layout.shape[3],
-                                        )
-                                        tVp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tVc_next[(0, rest_v), 0, rest_k][3],
-                                            mU.layout.shape[3],
-                                        )
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tDYs1.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        tDYc_next[0, vi, 0][1], mDOut.layout.shape[1]
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tDYg_next[None, vi, None],
-                                            tDYs1[None, vi, None],
-                                            pred=tDYp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tDYs1[None, vi, None].fill(0)
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tVsV1.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        tVc_next[0, vi, 0][1], mU.layout.shape[1]
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tVg_next[None, vi, None],
-                                            tVsV1[None, vi, None],
-                                            pred=tVp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tVsV1[None, vi, None].fill(0)
+                        tVc = gmem_thr_copy_P.partition_S(cV)
+                        if cutlass.const_expr(self.P == Pp):
+                            cute.copy(gmem_tiled_copy_P, tVg, tVsV0)
                         else:
-                            if cutlass.const_expr(self.P == Pp):
-                                cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs0)
-                                cute.copy(gmem_tiled_copy_P, tVg_next, tVsV0)
-                            else:
-                                tDYp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                tVp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                for rest_v in cutlass.range_constexpr(
-                                    tDYp_next.shape[0]
-                                ):
-                                    for rest_k in cutlass.range_constexpr(
-                                        tDYp_next.shape[2]
-                                    ):
-                                        tDYp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tDYc_next[(0, rest_v), 0, rest_k][3],
-                                            mDOut.layout.shape[3],
-                                        )
-                                        tVp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tVc_next[(0, rest_v), 0, rest_k][3],
-                                            mU.layout.shape[3],
-                                        )
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tDYs0.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        tDYc_next[0, vi, 0][1], mDOut.layout.shape[1]
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tDYg_next[None, vi, None],
-                                            tDYs0[None, vi, None],
-                                            pred=tDYp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tDYs0[None, vi, None].fill(0)
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tVsV0.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        tVc_next[0, vi, 0][1], mU.layout.shape[1]
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tVg_next[None, vi, None],
-                                            tVsV0[None, vi, None],
-                                            pred=tVp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tVsV0[None, vi, None].fill(0)
+                            tVp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
+                            for rest_v in cutlass.range_constexpr(tVp_s.shape[0]):
+                                for rest_k in cutlass.range_constexpr(tVp_s.shape[2]):
+                                    tVp_s[rest_v, 0, rest_k] = cute.elem_less(
+                                        tVc[(0, rest_v), 0, rest_k][3],
+                                        mU.layout.shape[3],
+                                    )
+                            for vi in cutlass.range_constexpr(
+                                cute.size(tVsV0.shape[1])
+                            ):
+                                if cute.elem_less(tVc[0, vi, 0][1], mU.layout.shape[1]):
+                                    cute.copy(
+                                        gmem_tiled_copy_P,
+                                        tVg[None, vi, None],
+                                        tVsV0[None, vi, None],
+                                        pred=tVp_s[None, vi, None],
+                                    )
+                                else:
+                                    tVsV0[None, vi, None].fill(0)
                         cute.arch.cp_async_commit_group()
-                    if cutlass.const_expr((p_iter & 1) == 0):
-                        sDY_p = sDY0
-                        sV_p = sV_tile
-                    else:
-                        sDY_p = sDY1
-                        sV_p = sV1
-                    tSrDY_m = thr_mma.make_fragment_A(thr_mma.partition_A(sDY_p))
-                    tSsDY_m = thr_copy_A.partition_S(sDY_p)
-                    tSrDY_m_view = thr_copy_A.retile(tSrDY_m)
-                    tSrV_p = thr_mma.make_fragment_B(thr_mma.partition_B(sV_p))
-                    tSsV_p = thr_copy_B.partition_S(sV_p)
-                    tSrV_p_view = thr_copy_B.retile(tSrV_p)
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tSsDY_m[None, None, 0],
-                        tSrDY_m_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_B,
-                        tSsV_p[None, None, 0],
-                        tSrV_p_view[None, None, 0],
-                    )
-                    for k in cutlass.range_constexpr(cute.size(tSsDY_m.shape[2])):
-                        k_next = (k + 1) % cute.size(tSsDY_m.shape[2])
-                        cute.copy(
-                            smem_tiled_copy_A,
-                            tSsDY_m[None, None, k_next],
-                            tSrDY_m_view[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_B,
-                            tSsV_p[None, None, k_next],
-                            tSrV_p_view[None, None, k_next],
-                        )
-                        cute.gemm(
-                            tiled_mma,
-                            acc_blk_curr,
-                            tSrDY_m[None, None, k],
-                            tSrV_p[None, None, k],
-                            acc_blk_curr,
-                        )
-                acc_blk_curr_mn = self._make_acc_tensor_mn_view(acc_blk_curr)
-                cS_blk = cute.local_tile(mcS_full, (kv_tile, kv_tile), (m_tile, n_tile))
-                tScS_blk = thr_mma.partition_C(cS_blk)
-                tScS_blk_mn = self._make_acc_tensor_mn_view(tScS_blk)
-                for r in cutlass.range_constexpr(cute.size(acc_blk_curr_mn.shape[0])):
-                    row_idx = cutlass.Int32(tScS_blk_mn[r, 0][1])
-                    row_local = row_idx - cutlass.Int32(m0)
-                    for c in cutlass.range_constexpr(
-                        cute.size(acc_blk_curr_mn.shape[1])
-                    ):
-                        col_idx = cutlass.Int32(tScS_blk_mn[0, c][3])
-                        col_local = col_idx - cutlass.Int32(n0)
-                        val = cutlass.Float32(0.0)
-                        if cute.elem_less(col_idx, row_idx + 1):
-                            val = acc_blk_curr_mn[r, c]
-                        sS_blk[col_local, row_local] = val.to(mU.element_type)
-                cute.arch.barrier()
+                        for p_iter in cutlass.range_constexpr(n_p_tiles):
+                            cute.arch.cp_async_wait_group(0)
+                            cute.arch.barrier()
+                            if cutlass.const_expr(p_iter + 1 < n_p_tiles):
+                                p_next = cutlass.Int32(p_iter + 1)
+                                gDY_next = cute.local_tile(
+                                    mDOut[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (m_tile, p_next),
+                                )
+                                tDYg_next = gmem_thr_copy_P.partition_S(gDY_next)
+                                cDY_next = cute.local_tile(
+                                    mcDY[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (m_tile, p_next),
+                                )
+                                tDYc_next = gmem_thr_copy_P.partition_S(cDY_next)
+                                gV_next = cute.local_tile(
+                                    mU[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (n_tile, p_next),
+                                )
+                                tVg_next = gmem_thr_copy_P.partition_S(gV_next)
+                                cV_next = cute.local_tile(
+                                    mcU[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (n_tile, p_next),
+                                )
+                                tVc_next = gmem_thr_copy_P.partition_S(cV_next)
+                                if cutlass.const_expr((p_iter & 1) == 0):
+                                    if cutlass.const_expr(self.P == Pp):
+                                        cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs1)
+                                        cute.copy(gmem_tiled_copy_P, tVg_next, tVsV1)
+                                    else:
+                                        tDYp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        tVp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        for rest_v in cutlass.range_constexpr(
+                                            tDYp_next.shape[0]
+                                        ):
+                                            for rest_k in cutlass.range_constexpr(
+                                                tDYp_next.shape[2]
+                                            ):
+                                                tDYp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tDYc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mDOut.layout.shape[3],
+                                                    )
+                                                )
+                                                tVp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tVc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mU.layout.shape[3],
+                                                    )
+                                                )
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tDYs1.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                tDYc_next[0, vi, 0][1],
+                                                mDOut.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tDYg_next[None, vi, None],
+                                                    tDYs1[None, vi, None],
+                                                    pred=tDYp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tDYs1[None, vi, None].fill(0)
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tVsV1.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                tVc_next[0, vi, 0][1],
+                                                mU.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tVg_next[None, vi, None],
+                                                    tVsV1[None, vi, None],
+                                                    pred=tVp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tVsV1[None, vi, None].fill(0)
+                                else:
+                                    if cutlass.const_expr(self.P == Pp):
+                                        cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs0)
+                                        cute.copy(gmem_tiled_copy_P, tVg_next, tVsV0)
+                                    else:
+                                        tDYp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        tVp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        for rest_v in cutlass.range_constexpr(
+                                            tDYp_next.shape[0]
+                                        ):
+                                            for rest_k in cutlass.range_constexpr(
+                                                tDYp_next.shape[2]
+                                            ):
+                                                tDYp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tDYc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mDOut.layout.shape[3],
+                                                    )
+                                                )
+                                                tVp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tVc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mU.layout.shape[3],
+                                                    )
+                                                )
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tDYs0.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                tDYc_next[0, vi, 0][1],
+                                                mDOut.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tDYg_next[None, vi, None],
+                                                    tDYs0[None, vi, None],
+                                                    pred=tDYp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tDYs0[None, vi, None].fill(0)
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tVsV0.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                tVc_next[0, vi, 0][1],
+                                                mU.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tVg_next[None, vi, None],
+                                                    tVsV0[None, vi, None],
+                                                    pred=tVp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tVsV0[None, vi, None].fill(0)
+                                cute.arch.cp_async_commit_group()
+                            if cutlass.const_expr((p_iter & 1) == 0):
+                                sDY_p = sDY0
+                                sV_p = sV_tile
+                            else:
+                                sDY_p = sDY1
+                                sV_p = sV1
+                            tSrDY_m = thr_mma.make_fragment_A(
+                                thr_mma.partition_A(sDY_p)
+                            )
+                            tSsDY_m = thr_copy_A.partition_S(sDY_p)
+                            tSrDY_m_view = thr_copy_A.retile(tSrDY_m)
+                            tSrV_p = thr_mma.make_fragment_B(thr_mma.partition_B(sV_p))
+                            tSsV_p = thr_copy_B.partition_S(sV_p)
+                            tSrV_p_view = thr_copy_B.retile(tSrV_p)
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tSsDY_m[None, None, 0],
+                                tSrDY_m_view[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tSsV_p[None, None, 0],
+                                tSrV_p_view[None, None, 0],
+                            )
+                            for k in cutlass.range_constexpr(
+                                cute.size(tSsDY_m.shape[2])
+                            ):
+                                k_next = (k + 1) % cute.size(tSsDY_m.shape[2])
+                                cute.copy(
+                                    smem_tiled_copy_A,
+                                    tSsDY_m[None, None, k_next],
+                                    tSrDY_m_view[None, None, k_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_B,
+                                    tSsV_p[None, None, k_next],
+                                    tSrV_p_view[None, None, k_next],
+                                )
+                                cute.gemm(
+                                    tiled_mma,
+                                    acc_blk_curr,
+                                    tSrDY_m[None, None, k],
+                                    tSrV_p[None, None, k],
+                                    acc_blk_curr,
+                                )
+                        acc_blk_curr_mn = self._make_acc_tensor_mn_view(acc_blk_curr)
+                        sS_curr = sS_cache if single_tile_cache else sS_blk
+                        for r in cutlass.range_constexpr(
+                            cute.size(acc_blk_curr_mn.shape[0])
+                        ):
+                            row_idx = cutlass.Int32(tScS_blk_mn[r, 0][1])
+                            row_local = row_idx - cutlass.Int32(m0)
+                            for c in cutlass.range_constexpr(
+                                cute.size(acc_blk_curr_mn.shape[1])
+                            ):
+                                col_idx = cutlass.Int32(tScS_blk_mn[0, c][3])
+                                col_local = col_idx - cutlass.Int32(n0)
+                                val = cutlass.Float32(0.0)
+                                if cute.elem_less(col_idx, row_idx + 1):
+                                    val = acc_blk_curr_mn[r, c]
+                                sS_curr[col_local, row_local] = val.to(mU.element_type)
+                        cute.arch.barrier()
 
-                if cutlass.const_expr((self.D % 4) == 0):
-                    for it in cutlass.range_constexpr(iters_quads_tile):
+                    for it in cutlass.range_constexpr(iters_pairs_stage):
                         idx = tidx + cutlass.Int32(it * self.num_threads)
-                        if idx < cutlass.Int32(total_quads_tile):
-                            t_local = idx // cutlass.Int32(nvec2)
-                            vv4 = idx - t_local * cutlass.Int32(nvec2)
+                        if idx < cutlass.Int32(total_pairs_stage):
+                            t_local = idx // nvec_stage
+                            vv = idx - t_local * nvec_stage
                             t = cutlass.Int32(m0) + t_local
                             if t < cutlass.Int32(self.L):
-                                d0 = vv4 * 4
-                                rs = cutlass.Float32(s_row_scale[t])
-                                qx0 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                                )
-                                qy0 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                                )
-                                qx1 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 2].to(cutlass.Float32)
-                                )
-                                qy1 = cutlass.Float32(
-                                    sQ0[t_local, d0 + 3].to(cutlass.Float32)
-                                )
-                                sQ0[t_local, d0 + 0] = (qx0 * rs).to(mU.element_type)
-                                sQ0[t_local, d0 + 1] = (qy0 * rs).to(mU.element_type)
-                                sQ0[t_local, d0 + 2] = (qx1 * rs).to(mU.element_type)
-                                sQ0[t_local, d0 + 3] = (qy1 * rs).to(mU.element_type)
-                else:
-                    for it in cutlass.range_constexpr(iters_pairs_tile):
-                        idx = tidx + cutlass.Int32(it * self.num_threads)
-                        if idx < cutlass.Int32(total_pairs_tile):
-                            t_local = idx // nvec
-                            vv = idx - t_local * nvec
-                            t = cutlass.Int32(m0) + t_local
-                            if t < cutlass.Int32(self.L):
-                                d0 = vv * 2
+                                d_local = vv * 2
                                 qx = cutlass.Float32(
-                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                                    sQ0[t_local, d_local + 0].to(cutlass.Float32)
                                 )
                                 qy = cutlass.Float32(
-                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                                    sQ0[t_local, d_local + 1].to(cutlass.Float32)
                                 )
                                 rs = cutlass.Float32(s_row_scale[t])
-                                sQ0[t_local, d0 + 0] = (qx * rs).to(mU.element_type)
-                                sQ0[t_local, d0 + 1] = (qy * rs).to(mU.element_type)
-                cute.arch.barrier()
+                                sQ0[t_local, d_local + 0] = (qx * rs).to(
+                                    mU.element_type
+                                )
+                                sQ0[t_local, d_local + 1] = (qy * rs).to(
+                                    mU.element_type
+                                )
+                    cute.arch.barrier()
 
-                cute.copy(
-                    smem_tiled_copy_A,
-                    tSsS_blk[None, None, 0],
-                    tSrS_blk_view[None, None, 0],
-                )
-                cute.copy(
-                    smem_tiled_copy_BT,
-                    tSsQt[None, None, 0],
-                    tSrQt_view[None, None, 0],
-                )
-                for k in cutlass.range_constexpr(cute.size(tSsS_blk.shape[2])):
-                    k_next = (k + 1) % cute.size(tSsS_blk.shape[2])
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tSsS_blk[None, None, k_next],
-                        tSrS_blk_view[None, None, k_next],
-                    )
+                    if single_tile_cache:
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tSsS_cache[None, None, 0],
+                            tSrS_cache_view[None, None, 0],
+                        )
+                    else:
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tSsS_blk[None, None, 0],
+                            tSrS_blk_view[None, None, 0],
+                        )
                     cute.copy(
                         smem_tiled_copy_BT,
-                        tSsQt[None, None, k_next],
-                        tSrQt_view[None, None, k_next],
+                        tSsQt[None, None, 0],
+                        tSrQt_view[None, None, 0],
                     )
-                    cute.gemm(
-                        tiled_mma,
-                        acc_dK_curr,
-                        tSrS_blk[None, None, k],
-                        tSrQt[None, None, k],
-                        acc_dK_curr,
-                    )
-                cute.arch.barrier()
-
-                acc_blk_prev = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
-                acc_blk_prev.fill(0.0)
-                p_tile_idx = cutlass.Int32(0)
-                gDY = cute.local_tile(
-                    mDOut[bidz, None, 0, None], (kv_tile, p_tile), (m_tile, p_tile_idx)
-                )
-                tDYg = gmem_thr_copy_P.partition_S(gDY)
-                cDY = cute.local_tile(
-                    mcDY[bidz, None, 0, None], (kv_tile, p_tile), (m_tile, p_tile_idx)
-                )
-                tDYc = gmem_thr_copy_P.partition_S(cDY)
-                if cutlass.const_expr(self.P == Pp):
-                    cute.copy(gmem_tiled_copy_P, tDYg, tDYs0)
-                else:
-                    tDYp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
-                    for rest_v in cutlass.range_constexpr(tDYp_s.shape[0]):
-                        for rest_k in cutlass.range_constexpr(tDYp_s.shape[2]):
-                            tDYp_s[rest_v, 0, rest_k] = cute.elem_less(
-                                tDYc[(0, rest_v), 0, rest_k][3], mDOut.layout.shape[3]
-                            )
-                    for vi in cutlass.range_constexpr(cute.size(tDYs0.shape[1])):
-                        if cute.elem_less(tDYc[0, vi, 0][1], mDOut.layout.shape[1]):
+                    for k in cutlass.range_constexpr(cute.size(tSsS_blk.shape[2])):
+                        k_next = (k + 1) % cute.size(tSsS_blk.shape[2])
+                        if single_tile_cache:
                             cute.copy(
-                                gmem_tiled_copy_P,
-                                tDYg[None, vi, None],
-                                tDYs0[None, vi, None],
-                                pred=tDYp_s[None, vi, None],
+                                smem_tiled_copy_A,
+                                tSsS_cache[None, None, k_next],
+                                tSrS_cache_view[None, None, k_next],
                             )
                         else:
-                            tDYs0[None, vi, None].fill(0)
-                gV = cute.local_tile(
-                    mU[bidz, None, 0, None], (kv_tile, p_tile), (n_tile, p_tile_idx)
-                )
-                gV = cute.domain_offset((-1, 0), gV)
-                gV = cute.make_tensor(gV.iterator.align(16), gV.layout)
-                tVg = gmem_thr_copy_P.partition_S(gV)
-                cV = cute.local_tile(
-                    mcU[bidz, None, 0, None], (kv_tile, p_tile), (n_tile, p_tile_idx)
-                )
-                cV = cute.domain_offset((-1, 0), cV)
-                tVc = gmem_thr_copy_P.partition_S(cV)
-                if cutlass.const_expr(self.P == Pp):
-                    if n_tile == cutlass.Int32(0):
-                        for vi in cutlass.range_constexpr(cute.size(tVsV0.shape[1])):
-                            if cute.elem_less(
-                                cutlass.Int32(-1), cutlass.Int32(tVc[0, vi, 0][1])
-                            ):
-                                cute.copy(
-                                    gmem_tiled_copy_P,
-                                    tVg[None, vi, None],
-                                    tVsV0[None, vi, None],
-                                )
-                            else:
-                                tVsV0[None, vi, None].fill(0)
-                    else:
-                        cute.copy(gmem_tiled_copy_P, tVg, tVsV0)
-                else:
-                    tVp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
-                    for rest_v in cutlass.range_constexpr(tVp_s.shape[0]):
-                        for rest_k in cutlass.range_constexpr(tVp_s.shape[2]):
-                            tVp_s[rest_v, 0, rest_k] = cute.elem_less(
-                                tVc[(0, rest_v), 0, rest_k][3], mU.layout.shape[3]
-                            )
-                    for vi in cutlass.range_constexpr(cute.size(tVsV0.shape[1])):
-                        if cute.elem_less(
-                            cutlass.Int32(-1), cutlass.Int32(tVc[0, vi, 0][1])
-                        ) and cute.elem_less(
-                            cutlass.Int32(tVc[0, vi, 0][1]), mU.layout.shape[1]
-                        ):
                             cute.copy(
-                                gmem_tiled_copy_P,
-                                tVg[None, vi, None],
-                                tVsV0[None, vi, None],
-                                pred=tVp_s[None, vi, None],
+                                smem_tiled_copy_A,
+                                tSsS_blk[None, None, k_next],
+                                tSrS_blk_view[None, None, k_next],
                             )
-                        else:
-                            tVsV0[None, vi, None].fill(0)
-                cute.arch.cp_async_commit_group()
-                for p_iter in cutlass.range_constexpr(n_p_tiles):
-                    if cutlass.const_expr((p_iter & 1) == 0):
-                        sDY_p = sDY0
-                        sV_p = sV_tile
-                    else:
-                        sDY_p = sDY1
-                        sV_p = sV1
-                    if n0 == 0:
-                        p_base = cutlass.Int32(p_iter * p_tile)
-                        iters_row0 = (p_tile + self.num_threads - 1) // self.num_threads
-                        for it in range(iters_row0):
-                            p_local = tidx + cutlass.Int32(it * self.num_threads)
-                            if p_local < cutlass.Int32(p_tile):
-                                p = p_base + p_local
-                                if p < cutlass.Int32(self.P):
-                                    if chunk == cutlass.Int32(0):
-                                        sV_p[0, p_local] = mU_prev0[bh, p]
-                                    else:
-                                        sV_p[0, p_local] = mU[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            p,
-                                        ]
-                                else:
-                                    sV_p[0, p_local] = cutlass.Float32(0.0).to(
-                                        mU.element_type
-                                    )
-                    cute.arch.cp_async_wait_group(0)
+                        cute.copy(
+                            smem_tiled_copy_BT,
+                            tSsQt[None, None, k_next],
+                            tSrQt_view[None, None, k_next],
+                        )
+                        cute.gemm(
+                            tiled_mma,
+                            acc_dK_curr,
+                            tSrS_cache[None, None, k]
+                            if single_tile_cache
+                            else tSrS_blk[None, None, k],
+                            tSrQt[None, None, k],
+                            acc_dK_curr,
+                        )
                     cute.arch.barrier()
-                    if cutlass.const_expr(p_iter + 1 < n_p_tiles):
-                        p_next = cutlass.Int32(p_iter + 1)
-                        gDY_next = cute.local_tile(
+
+                    if (not single_tile_cache) or d_stage_idx == 0:
+                        acc_blk_prev = cute.make_rmem_tensor(
+                            acc_shape_blk, cutlass.Float32
+                        )
+                        acc_blk_prev.fill(0.0)
+                        p_tile_idx = cutlass.Int32(0)
+                        gDY = cute.local_tile(
                             mDOut[bidz, None, 0, None],
                             (kv_tile, p_tile),
-                            (m_tile, p_next),
+                            (m_tile, p_tile_idx),
                         )
-                        tDYg_next = gmem_thr_copy_P.partition_S(gDY_next)
-                        cDY_next = cute.local_tile(
+                        tDYg = gmem_thr_copy_P.partition_S(gDY)
+                        cDY = cute.local_tile(
                             mcDY[bidz, None, 0, None],
                             (kv_tile, p_tile),
-                            (m_tile, p_next),
+                            (m_tile, p_tile_idx),
                         )
-                        tDYc_next = gmem_thr_copy_P.partition_S(cDY_next)
-                        gV_next = cute.local_tile(
-                            mU[bidz, None, 0, None], (kv_tile, p_tile), (n_tile, p_next)
+                        tDYc = gmem_thr_copy_P.partition_S(cDY)
+                        if cutlass.const_expr(self.P == Pp):
+                            cute.copy(gmem_tiled_copy_P, tDYg, tDYs0)
+                        else:
+                            tDYp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
+                            for rest_v in cutlass.range_constexpr(tDYp_s.shape[0]):
+                                for rest_k in cutlass.range_constexpr(tDYp_s.shape[2]):
+                                    tDYp_s[rest_v, 0, rest_k] = cute.elem_less(
+                                        tDYc[(0, rest_v), 0, rest_k][3],
+                                        mDOut.layout.shape[3],
+                                    )
+                            for vi in cutlass.range_constexpr(
+                                cute.size(tDYs0.shape[1])
+                            ):
+                                if cute.elem_less(
+                                    tDYc[0, vi, 0][1], mDOut.layout.shape[1]
+                                ):
+                                    cute.copy(
+                                        gmem_tiled_copy_P,
+                                        tDYg[None, vi, None],
+                                        tDYs0[None, vi, None],
+                                        pred=tDYp_s[None, vi, None],
+                                    )
+                                else:
+                                    tDYs0[None, vi, None].fill(0)
+                        gV = cute.local_tile(
+                            mU[bidz, None, 0, None],
+                            (kv_tile, p_tile),
+                            (n_tile, p_tile_idx),
                         )
-                        gV_next = cute.domain_offset((-1, 0), gV_next)
-                        gV_next = cute.make_tensor(
-                            gV_next.iterator.align(16), gV_next.layout
-                        )
-                        tVg_next = gmem_thr_copy_P.partition_S(gV_next)
-                        cV_next = cute.local_tile(
+                        gV = cute.domain_offset((-1, 0), gV)
+                        gV = cute.make_tensor(gV.iterator.align(16), gV.layout)
+                        tVg = gmem_thr_copy_P.partition_S(gV)
+                        cV = cute.local_tile(
                             mcU[bidz, None, 0, None],
                             (kv_tile, p_tile),
-                            (n_tile, p_next),
+                            (n_tile, p_tile_idx),
                         )
-                        cV_next = cute.domain_offset((-1, 0), cV_next)
-                        tVc_next = gmem_thr_copy_P.partition_S(cV_next)
-                        if cutlass.const_expr((p_iter & 1) == 0):
-                            if cutlass.const_expr(self.P == Pp):
-                                cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs1)
-                                if n_tile == cutlass.Int32(0):
-                                    for vi in cutlass.range_constexpr(
-                                        cute.size(tVsV1.shape[1])
-                                    ):
-                                        if cute.elem_less(
-                                            cutlass.Int32(-1),
-                                            cutlass.Int32(tVc_next[0, vi, 0][1]),
-                                        ):
-                                            cute.copy(
-                                                gmem_tiled_copy_P,
-                                                tVg_next[None, vi, None],
-                                                tVsV1[None, vi, None],
-                                            )
-                                        else:
-                                            tVsV1[None, vi, None].fill(0)
-                                else:
-                                    cute.copy(gmem_tiled_copy_P, tVg_next, tVsV1)
-                            else:
-                                tDYp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                tVp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                for rest_v in cutlass.range_constexpr(
-                                    tDYp_next.shape[0]
-                                ):
-                                    for rest_k in cutlass.range_constexpr(
-                                        tDYp_next.shape[2]
-                                    ):
-                                        tDYp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tDYc_next[(0, rest_v), 0, rest_k][3],
-                                            mDOut.layout.shape[3],
-                                        )
-                                        tVp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tVc_next[(0, rest_v), 0, rest_k][3],
-                                            mU.layout.shape[3],
-                                        )
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tDYs1.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        tDYc_next[0, vi, 0][1], mDOut.layout.shape[1]
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tDYg_next[None, vi, None],
-                                            tDYs1[None, vi, None],
-                                            pred=tDYp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tDYs1[None, vi, None].fill(0)
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tVsV1.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        cutlass.Int32(-1),
-                                        cutlass.Int32(tVc_next[0, vi, 0][1]),
-                                    ) and cute.elem_less(
-                                        cutlass.Int32(tVc_next[0, vi, 0][1]),
-                                        mU.layout.shape[1],
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tVg_next[None, vi, None],
-                                            tVsV1[None, vi, None],
-                                            pred=tVp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tVsV1[None, vi, None].fill(0)
-                        else:
-                            if cutlass.const_expr(self.P == Pp):
-                                cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs0)
-                                if n_tile == cutlass.Int32(0):
-                                    for vi in cutlass.range_constexpr(
-                                        cute.size(tVsV0.shape[1])
-                                    ):
-                                        if cute.elem_less(
-                                            cutlass.Int32(-1),
-                                            cutlass.Int32(tVc_next[0, vi, 0][1]),
-                                        ):
-                                            cute.copy(
-                                                gmem_tiled_copy_P,
-                                                tVg_next[None, vi, None],
-                                                tVsV0[None, vi, None],
-                                            )
-                                        else:
-                                            tVsV0[None, vi, None].fill(0)
-                                else:
-                                    cute.copy(gmem_tiled_copy_P, tVg_next, tVsV0)
-                            else:
-                                tDYp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                tVp_next = cute.make_rmem_tensor(
-                                    tDYp.layout, cutlass.Boolean
-                                )
-                                for rest_v in cutlass.range_constexpr(
-                                    tDYp_next.shape[0]
-                                ):
-                                    for rest_k in cutlass.range_constexpr(
-                                        tDYp_next.shape[2]
-                                    ):
-                                        tDYp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tDYc_next[(0, rest_v), 0, rest_k][3],
-                                            mDOut.layout.shape[3],
-                                        )
-                                        tVp_next[rest_v, 0, rest_k] = cute.elem_less(
-                                            tVc_next[(0, rest_v), 0, rest_k][3],
-                                            mU.layout.shape[3],
-                                        )
-                                for vi in cutlass.range_constexpr(
-                                    cute.size(tDYs0.shape[1])
-                                ):
-                                    if cute.elem_less(
-                                        tDYc_next[0, vi, 0][1], mDOut.layout.shape[1]
-                                    ):
-                                        cute.copy(
-                                            gmem_tiled_copy_P,
-                                            tDYg_next[None, vi, None],
-                                            tDYs0[None, vi, None],
-                                            pred=tDYp_next[None, vi, None],
-                                        )
-                                    else:
-                                        tDYs0[None, vi, None].fill(0)
+                        cV = cute.domain_offset((-1, 0), cV)
+                        tVc = gmem_thr_copy_P.partition_S(cV)
+                        if cutlass.const_expr(self.P == Pp):
+                            if n_tile == cutlass.Int32(0):
                                 for vi in cutlass.range_constexpr(
                                     cute.size(tVsV0.shape[1])
                                 ):
                                     if cute.elem_less(
                                         cutlass.Int32(-1),
-                                        cutlass.Int32(tVc_next[0, vi, 0][1]),
-                                    ) and cute.elem_less(
-                                        cutlass.Int32(tVc_next[0, vi, 0][1]),
-                                        mU.layout.shape[1],
+                                        cutlass.Int32(tVc[0, vi, 0][1]),
                                     ):
                                         cute.copy(
                                             gmem_tiled_copy_P,
-                                            tVg_next[None, vi, None],
+                                            tVg[None, vi, None],
                                             tVsV0[None, vi, None],
-                                            pred=tVp_next[None, vi, None],
                                         )
                                     else:
                                         tVsV0[None, vi, None].fill(0)
+                            else:
+                                cute.copy(gmem_tiled_copy_P, tVg, tVsV0)
+                        else:
+                            tVp_s = cute.make_rmem_tensor(tDYp.layout, cutlass.Boolean)
+                            for rest_v in cutlass.range_constexpr(tVp_s.shape[0]):
+                                for rest_k in cutlass.range_constexpr(tVp_s.shape[2]):
+                                    tVp_s[rest_v, 0, rest_k] = cute.elem_less(
+                                        tVc[(0, rest_v), 0, rest_k][3],
+                                        mU.layout.shape[3],
+                                    )
+                            for vi in cutlass.range_constexpr(
+                                cute.size(tVsV0.shape[1])
+                            ):
+                                if cute.elem_less(
+                                    cutlass.Int32(-1), cutlass.Int32(tVc[0, vi, 0][1])
+                                ) and cute.elem_less(
+                                    cutlass.Int32(tVc[0, vi, 0][1]), mU.layout.shape[1]
+                                ):
+                                    cute.copy(
+                                        gmem_tiled_copy_P,
+                                        tVg[None, vi, None],
+                                        tVsV0[None, vi, None],
+                                        pred=tVp_s[None, vi, None],
+                                    )
+                                else:
+                                    tVsV0[None, vi, None].fill(0)
                         cute.arch.cp_async_commit_group()
-                    tSrDY_m = thr_mma.make_fragment_A(thr_mma.partition_A(sDY_p))
-                    tSsDY_m = thr_copy_A.partition_S(sDY_p)
-                    tSrDY_m_view = thr_copy_A.retile(tSrDY_m)
-                    tSrV_p = thr_mma.make_fragment_B(thr_mma.partition_B(sV_p))
-                    tSsV_p = thr_copy_B.partition_S(sV_p)
-                    tSrV_p_view = thr_copy_B.retile(tSrV_p)
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tSsDY_m[None, None, 0],
-                        tSrDY_m_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_B,
-                        tSsV_p[None, None, 0],
-                        tSrV_p_view[None, None, 0],
-                    )
-                    for k in cutlass.range_constexpr(cute.size(tSsDY_m.shape[2])):
-                        k_next = (k + 1) % cute.size(tSsDY_m.shape[2])
+                        for p_iter in cutlass.range_constexpr(n_p_tiles):
+                            if cutlass.const_expr((p_iter & 1) == 0):
+                                sDY_p = sDY0
+                                sV_p = sV_tile
+                            else:
+                                sDY_p = sDY1
+                                sV_p = sV1
+                            if n0 == 0:
+                                p_base = cutlass.Int32(p_iter * p_tile)
+                                iters_row0 = (
+                                    p_tile + self.num_threads - 1
+                                ) // self.num_threads
+                                for it in range(iters_row0):
+                                    p_local = tidx + cutlass.Int32(
+                                        it * self.num_threads
+                                    )
+                                    if p_local < cutlass.Int32(p_tile):
+                                        p = p_base + p_local
+                                        if p < cutlass.Int32(self.P):
+                                            if chunk == cutlass.Int32(0):
+                                                sV_p[0, p_local] = mU_prev0[bh, p]
+                                            else:
+                                                sV_p[0, p_local] = mU[
+                                                    bidz - cutlass.Int32(1),
+                                                    cutlass.Int32(self.L - 1),
+                                                    0,
+                                                    p,
+                                                ]
+                                        else:
+                                            sV_p[0, p_local] = cutlass.Float32(0.0).to(
+                                                mU.element_type
+                                            )
+                            cute.arch.cp_async_wait_group(0)
+                            cute.arch.barrier()
+                            if cutlass.const_expr(p_iter + 1 < n_p_tiles):
+                                p_next = cutlass.Int32(p_iter + 1)
+                                gDY_next = cute.local_tile(
+                                    mDOut[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (m_tile, p_next),
+                                )
+                                tDYg_next = gmem_thr_copy_P.partition_S(gDY_next)
+                                cDY_next = cute.local_tile(
+                                    mcDY[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (m_tile, p_next),
+                                )
+                                tDYc_next = gmem_thr_copy_P.partition_S(cDY_next)
+                                gV_next = cute.local_tile(
+                                    mU[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (n_tile, p_next),
+                                )
+                                gV_next = cute.domain_offset((-1, 0), gV_next)
+                                gV_next = cute.make_tensor(
+                                    gV_next.iterator.align(16), gV_next.layout
+                                )
+                                tVg_next = gmem_thr_copy_P.partition_S(gV_next)
+                                cV_next = cute.local_tile(
+                                    mcU[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (n_tile, p_next),
+                                )
+                                cV_next = cute.domain_offset((-1, 0), cV_next)
+                                tVc_next = gmem_thr_copy_P.partition_S(cV_next)
+                                if cutlass.const_expr((p_iter & 1) == 0):
+                                    if cutlass.const_expr(self.P == Pp):
+                                        cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs1)
+                                        if n_tile == cutlass.Int32(0):
+                                            for vi in cutlass.range_constexpr(
+                                                cute.size(tVsV1.shape[1])
+                                            ):
+                                                if cute.elem_less(
+                                                    cutlass.Int32(-1),
+                                                    cutlass.Int32(
+                                                        tVc_next[0, vi, 0][1]
+                                                    ),
+                                                ):
+                                                    cute.copy(
+                                                        gmem_tiled_copy_P,
+                                                        tVg_next[None, vi, None],
+                                                        tVsV1[None, vi, None],
+                                                    )
+                                                else:
+                                                    tVsV1[None, vi, None].fill(0)
+                                        else:
+                                            cute.copy(
+                                                gmem_tiled_copy_P, tVg_next, tVsV1
+                                            )
+                                    else:
+                                        tDYp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        tVp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        for rest_v in cutlass.range_constexpr(
+                                            tDYp_next.shape[0]
+                                        ):
+                                            for rest_k in cutlass.range_constexpr(
+                                                tDYp_next.shape[2]
+                                            ):
+                                                tDYp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tDYc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mDOut.layout.shape[3],
+                                                    )
+                                                )
+                                                tVp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tVc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mU.layout.shape[3],
+                                                    )
+                                                )
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tDYs1.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                tDYc_next[0, vi, 0][1],
+                                                mDOut.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tDYg_next[None, vi, None],
+                                                    tDYs1[None, vi, None],
+                                                    pred=tDYp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tDYs1[None, vi, None].fill(0)
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tVsV1.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                cutlass.Int32(-1),
+                                                cutlass.Int32(tVc_next[0, vi, 0][1]),
+                                            ) and cute.elem_less(
+                                                cutlass.Int32(tVc_next[0, vi, 0][1]),
+                                                mU.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tVg_next[None, vi, None],
+                                                    tVsV1[None, vi, None],
+                                                    pred=tVp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tVsV1[None, vi, None].fill(0)
+                                else:
+                                    if cutlass.const_expr(self.P == Pp):
+                                        cute.copy(gmem_tiled_copy_P, tDYg_next, tDYs0)
+                                        if n_tile == cutlass.Int32(0):
+                                            for vi in cutlass.range_constexpr(
+                                                cute.size(tVsV0.shape[1])
+                                            ):
+                                                if cute.elem_less(
+                                                    cutlass.Int32(-1),
+                                                    cutlass.Int32(
+                                                        tVc_next[0, vi, 0][1]
+                                                    ),
+                                                ):
+                                                    cute.copy(
+                                                        gmem_tiled_copy_P,
+                                                        tVg_next[None, vi, None],
+                                                        tVsV0[None, vi, None],
+                                                    )
+                                                else:
+                                                    tVsV0[None, vi, None].fill(0)
+                                        else:
+                                            cute.copy(
+                                                gmem_tiled_copy_P, tVg_next, tVsV0
+                                            )
+                                    else:
+                                        tDYp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        tVp_next = cute.make_rmem_tensor(
+                                            tDYp.layout, cutlass.Boolean
+                                        )
+                                        for rest_v in cutlass.range_constexpr(
+                                            tDYp_next.shape[0]
+                                        ):
+                                            for rest_k in cutlass.range_constexpr(
+                                                tDYp_next.shape[2]
+                                            ):
+                                                tDYp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tDYc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mDOut.layout.shape[3],
+                                                    )
+                                                )
+                                                tVp_next[rest_v, 0, rest_k] = (
+                                                    cute.elem_less(
+                                                        tVc_next[
+                                                            (0, rest_v), 0, rest_k
+                                                        ][3],
+                                                        mU.layout.shape[3],
+                                                    )
+                                                )
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tDYs0.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                tDYc_next[0, vi, 0][1],
+                                                mDOut.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tDYg_next[None, vi, None],
+                                                    tDYs0[None, vi, None],
+                                                    pred=tDYp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tDYs0[None, vi, None].fill(0)
+                                        for vi in cutlass.range_constexpr(
+                                            cute.size(tVsV0.shape[1])
+                                        ):
+                                            if cute.elem_less(
+                                                cutlass.Int32(-1),
+                                                cutlass.Int32(tVc_next[0, vi, 0][1]),
+                                            ) and cute.elem_less(
+                                                cutlass.Int32(tVc_next[0, vi, 0][1]),
+                                                mU.layout.shape[1],
+                                            ):
+                                                cute.copy(
+                                                    gmem_tiled_copy_P,
+                                                    tVg_next[None, vi, None],
+                                                    tVsV0[None, vi, None],
+                                                    pred=tVp_next[None, vi, None],
+                                                )
+                                            else:
+                                                tVsV0[None, vi, None].fill(0)
+                                cute.arch.cp_async_commit_group()
+                            tSrDY_m = thr_mma.make_fragment_A(
+                                thr_mma.partition_A(sDY_p)
+                            )
+                            tSsDY_m = thr_copy_A.partition_S(sDY_p)
+                            tSrDY_m_view = thr_copy_A.retile(tSrDY_m)
+                            tSrV_p = thr_mma.make_fragment_B(thr_mma.partition_B(sV_p))
+                            tSsV_p = thr_copy_B.partition_S(sV_p)
+                            tSrV_p_view = thr_copy_B.retile(tSrV_p)
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tSsDY_m[None, None, 0],
+                                tSrDY_m_view[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tSsV_p[None, None, 0],
+                                tSrV_p_view[None, None, 0],
+                            )
+                            for k in cutlass.range_constexpr(
+                                cute.size(tSsDY_m.shape[2])
+                            ):
+                                k_next = (k + 1) % cute.size(tSsDY_m.shape[2])
+                                cute.copy(
+                                    smem_tiled_copy_A,
+                                    tSsDY_m[None, None, k_next],
+                                    tSrDY_m_view[None, None, k_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_B,
+                                    tSsV_p[None, None, k_next],
+                                    tSrV_p_view[None, None, k_next],
+                                )
+                                cute.gemm(
+                                    tiled_mma,
+                                    acc_blk_prev,
+                                    tSrDY_m[None, None, k],
+                                    tSrV_p[None, None, k],
+                                    acc_blk_prev,
+                                )
+                        acc_blk_prev_mn = self._make_acc_tensor_mn_view(acc_blk_prev)
+                        sS_prev_target = sS_prev if single_tile_cache else sS_blk
+                        for r in cutlass.range_constexpr(
+                            cute.size(acc_blk_prev_mn.shape[0])
+                        ):
+                            row_idx = cutlass.Int32(tScS_blk_mn[r, 0][1])
+                            row_local = row_idx - cutlass.Int32(m0)
+                            for c in cutlass.range_constexpr(
+                                cute.size(acc_blk_prev_mn.shape[1])
+                            ):
+                                col_idx = cutlass.Int32(tScS_blk_mn[0, c][3])
+                                col_local = col_idx - cutlass.Int32(n0)
+                                val = cutlass.Float32(0.0)
+                                if cute.elem_less(col_idx, row_idx + 1):
+                                    val = acc_blk_prev_mn[r, c]
+                                sS_prev_target[col_local, row_local] = val.to(
+                                    mU.element_type
+                                )
+                        cute.arch.barrier()
+
+                    if single_tile_cache:
                         cute.copy(
                             smem_tiled_copy_A,
-                            tSsDY_m[None, None, k_next],
-                            tSrDY_m_view[None, None, k_next],
+                            tSsS_prev[None, None, 0],
+                            tSrS_prev_view[None, None, 0],
                         )
+                    else:
                         cute.copy(
-                            smem_tiled_copy_B,
-                            tSsV_p[None, None, k_next],
-                            tSrV_p_view[None, None, k_next],
+                            smem_tiled_copy_A,
+                            tSsS_blk[None, None, 0],
+                            tSrS_blk_view[None, None, 0],
+                        )
+                    cute.copy(
+                        smem_tiled_copy_BT,
+                        tSsQt[None, None, 0],
+                        tSrQt_view[None, None, 0],
+                    )
+                    for k in cutlass.range_constexpr(cute.size(tSsS_blk.shape[2])):
+                        k_next = (k + 1) % cute.size(tSsS_blk.shape[2])
+                        if single_tile_cache:
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tSsS_prev[None, None, k_next],
+                                tSrS_prev_view[None, None, k_next],
+                            )
+                        else:
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tSsS_blk[None, None, k_next],
+                                tSrS_blk_view[None, None, k_next],
+                            )
+                        cute.copy(
+                            smem_tiled_copy_BT,
+                            tSsQt[None, None, k_next],
+                            tSrQt_view[None, None, k_next],
                         )
                         cute.gemm(
                             tiled_mma,
-                            acc_blk_prev,
-                            tSrDY_m[None, None, k],
-                            tSrV_p[None, None, k],
-                            acc_blk_prev,
+                            acc_dK_prev,
+                            (
+                                tSrS_prev[None, None, k]
+                                if single_tile_cache
+                                else tSrS_blk[None, None, k]
+                            ),
+                            tSrQt[None, None, k],
+                            acc_dK_prev,
                         )
-                acc_blk_prev_mn = self._make_acc_tensor_mn_view(acc_blk_prev)
-                for r in cutlass.range_constexpr(cute.size(acc_blk_prev_mn.shape[0])):
-                    row_idx = cutlass.Int32(tScS_blk_mn[r, 0][1])
-                    row_local = row_idx - cutlass.Int32(m0)
-                    for c in cutlass.range_constexpr(
-                        cute.size(acc_blk_prev_mn.shape[1])
-                    ):
-                        col_idx = cutlass.Int32(tScS_blk_mn[0, c][3])
-                        col_local = col_idx - cutlass.Int32(n0)
-                        val = cutlass.Float32(0.0)
-                        if cute.elem_less(col_idx, row_idx + 1):
-                            val = acc_blk_prev_mn[r, c]
-                        sS_blk[col_local, row_local] = val.to(mU.element_type)
+                    cute.arch.barrier()
+
+                cKD_stage = cute.local_tile(
+                    mcKD_full, (kv_tile, Ds), (n_tile, d_stage_idx)
+                )
+                tOcKD_stage = thr_mma.partition_C(cKD_stage)
+                tOcKD_stage_mn = self._make_acc_tensor_mn_view(tOcKD_stage)
+                tCsPrev = thr_mma.partition_C(sQ0)
+                tCrPrev = cute.make_fragment_like(tCsPrev, mU.element_type)
+                tCrPrev.fill(0.0)
+                tCrPrev_mn = self._make_acc_tensor_mn_view(tCrPrev)
+                tCsK = thr_mma.partition_C(sK_tile)
+                tCrK_curr = cute.make_fragment_like(tCsK, mU.element_type)
+                tCrK_curr.fill(0.0)
+                tCrK_curr_mn = self._make_acc_tensor_mn_view(tCrK_curr)
+                acc_dK_curr_mn = self._make_acc_tensor_mn_view(acc_dK_curr)
+                acc_dK_prev_mn = self._make_acc_tensor_mn_view(acc_dK_prev)
+
+                for r in cutlass.range_constexpr(cute.size(acc_dK_curr_mn.shape[0])):
+                    row_idx = cutlass.Int32(tOcKD_stage_mn[r, 0][1])
+                    if cute.elem_less(row_idx, cutlass.Int32(self.L)):
+                        inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
+                        for c in cutlass.range(cute.size(acc_dK_curr_mn.shape[1])):
+                            d = cutlass.Int32(tOcKD_stage_mn[0, c][3])
+                            if (
+                                d + cutlass.Int32(1) < cutlass.Int32(self.D)
+                                and (d & 1) == 0
+                            ):
+                                gx = acc_dK_curr_mn[r, c] * inv_rs
+                                gy = acc_dK_curr_mn[r, c + 1] * inv_rs
+                                pr = cutlass.Float32(s_phase[row_idx, 0])
+                                pi = cutlass.Float32(s_phase[row_idx, 1])
+                                bxr, bxi = conj_mul_phase(gx, gy, pr, pi)
+                                tCrK_curr_mn[r, c] = bxr.to(mU.element_type)
+                                tCrK_curr_mn[r, c + 1] = bxi.to(mU.element_type)
+
+                for r in cutlass.range_constexpr(cute.size(acc_dK_prev_mn.shape[0])):
+                    row_idx = cutlass.Int32(tOcKD_stage_mn[r, 0][1])
+                    if cute.elem_less(row_idx, cutlass.Int32(self.L)):
+                        inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
+                        for c in cutlass.range(cute.size(acc_dK_prev_mn.shape[1])):
+                            d = cutlass.Int32(tOcKD_stage_mn[0, c][3])
+                            if (
+                                d + cutlass.Int32(1) < cutlass.Int32(self.D)
+                                and (d & 1) == 0
+                            ):
+                                gx = acc_dK_prev_mn[r, c] * inv_rs
+                                gy = acc_dK_prev_mn[r, c + 1] * inv_rs
+                                pr = cutlass.Float32(s_phase[row_idx, 0])
+                                pi = cutlass.Float32(s_phase[row_idx, 1])
+                                bxr, bxi = conj_mul_phase(gx, gy, pr, pi)
+                                tCrPrev_mn[r, c] = bxr.to(mU.element_type)
+                                tCrPrev_mn[r, c + 1] = bxi.to(mU.element_type)
+                cute.autovec_copy(tCrPrev, tCsPrev)
+                cute.autovec_copy(tCrK_curr, tCsK)
                 cute.arch.barrier()
 
-                cute.copy(
-                    smem_tiled_copy_A,
-                    tSsS_blk[None, None, 0],
-                    tSrS_blk_view[None, None, 0],
-                )
-                cute.copy(
-                    smem_tiled_copy_BT,
-                    tSsQt[None, None, 0],
-                    tSrQt_view[None, None, 0],
-                )
-                for k in cutlass.range_constexpr(cute.size(tSsS_blk.shape[2])):
-                    k_next = (k + 1) % cute.size(tSsS_blk.shape[2])
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tSsS_blk[None, None, k_next],
-                        tSrS_blk_view[None, None, k_next],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_BT,
-                        tSsQt[None, None, k_next],
-                        tSrQt_view[None, None, k_next],
-                    )
-                    cute.gemm(
-                        tiled_mma,
-                        acc_dK_prev,
-                        tSrS_blk[None, None, k],
-                        tSrQt[None, None, k],
-                        acc_dK_prev,
-                    )
-                cute.arch.barrier()
-
-            cKD_tile = cute.local_tile(mcKD_full, (kv_tile, Dp), (n_tile, 0))
-            tOcKD_tile = thr_mma.partition_C(cKD_tile)
-            tOcKD_tile_mn = self._make_acc_tensor_mn_view(tOcKD_tile)
-            tCsPrev = thr_mma.partition_C(sQ0)
-            tCrPrev = cute.make_fragment_like(tCsPrev, mU.element_type)
-            tCrPrev.fill(0.0)
-            tCrPrev_mn = self._make_acc_tensor_mn_view(tCrPrev)
-            tCsK = thr_mma.partition_C(sK_tile)
-            tCrK_curr = cute.make_fragment_like(tCsK, mU.element_type)
-            tCrK_curr.fill(0.0)
-            tCrK_curr_mn = self._make_acc_tensor_mn_view(tCrK_curr)
-            acc_dK_curr_mn = self._make_acc_tensor_mn_view(acc_dK_curr)
-            acc_dK_prev_mn = self._make_acc_tensor_mn_view(acc_dK_prev)
-
-            for r in cutlass.range_constexpr(cute.size(acc_dK_curr_mn.shape[0])):
-                row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
-                if cute.elem_less(row_idx, cutlass.Int32(self.L)):
-                    inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
-                    for c in cutlass.range(
-                        cute.size(acc_dK_curr_mn.shape[1]), unroll_full=True
-                    ):
-                        d = cutlass.Int32(tOcKD_tile_mn[0, c][3])
-                        if (
-                            d + cutlass.Int32(1) < cutlass.Int32(self.D)
-                            and (d & 1) == 0
-                        ):
-                            gx = acc_dK_curr_mn[r, c] * inv_rs
-                            gy = acc_dK_curr_mn[r, c + 1] * inv_rs
-                            pr = cutlass.Float32(s_phase[row_idx, 0])
-                            pi = cutlass.Float32(s_phase[row_idx, 1])
-                            bxr, bxi = conj_mul_phase(gx, gy, pr, pi)
-                            tCrK_curr_mn[r, c] = bxr.to(mU.element_type)
-                            tCrK_curr_mn[r, c + 1] = bxi.to(mU.element_type)
-
-            for r in cutlass.range_constexpr(cute.size(acc_dK_prev_mn.shape[0])):
-                row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
-                if cute.elem_less(row_idx, cutlass.Int32(self.L)):
-                    inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
-                    for c in cutlass.range(
-                        cute.size(acc_dK_prev_mn.shape[1]), unroll_full=True
-                    ):
-                        d = cutlass.Int32(tOcKD_tile_mn[0, c][3])
-                        if (
-                            d + cutlass.Int32(1) < cutlass.Int32(self.D)
-                            and (d & 1) == 0
-                        ):
-                            gx = acc_dK_prev_mn[r, c] * inv_rs
-                            gy = acc_dK_prev_mn[r, c + 1] * inv_rs
-                            pr = cutlass.Float32(s_phase[row_idx, 0])
-                            pi = cutlass.Float32(s_phase[row_idx, 1])
-                            bxr, bxi = conj_mul_phase(gx, gy, pr, pi)
-                            tCrPrev_mn[r, c] = bxr.to(mU.element_type)
-                            tCrPrev_mn[r, c + 1] = bxi.to(mU.element_type)
-            cute.autovec_copy(tCrPrev, tCsPrev)
-            cute.autovec_copy(tCrK_curr, tCsK)
-            cute.arch.barrier()
-
-            t_local = warp
-            while t_local < cutlass.Int32(kv_tile):
-                row = cutlass.Int32(n0) + t_local
-                if row < cutlass.Int32(self.L):
-                    dmy_curr0 = cutlass.Float32(0.0)
-                    dmy_curr1 = cutlass.Float32(0.0)
-                    dmy_prev0 = cutlass.Float32(0.0)
-                    dmy_prev1 = cutlass.Float32(0.0)
-                    pr = cutlass.Float32(s_phase[row, 0])
-                    pi = cutlass.Float32(s_phase[row, 1])
-                    if cutlass.const_expr((self.D % 4) == 0):
-                        vv4 = lane
-                        while vv4 < cutlass.Int32(nvec2):
-                            d0 = vv4 * 4
-
-                            bxr_curr0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_curr0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            gx_curr0, gy_curr0 = conj_mul_phase(
-                                bxr_curr0, bxi_curr0, pr, pi
-                            )
-                            br_curr0 = cutlass.Float32(
-                                mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
-                            )
-                            bi_curr0 = cutlass.Float32(
-                                mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
-                            )
-                            dmy_curr0 = (
-                                dmy_curr0 + gx_curr0 * br_curr0 - gy_curr0 * bi_curr0
-                            )
-                            dmy_curr1 = (
-                                dmy_curr1 + gx_curr0 * bi_curr0 + gy_curr0 * br_curr0
-                            )
-
-                            bxr_curr1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            bxi_curr1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            gx_curr1, gy_curr1 = conj_mul_phase(
-                                bxr_curr1, bxi_curr1, pr, pi
-                            )
-                            br_curr1 = cutlass.Float32(
-                                mB[bidz, row, 0, d0 + 2].to(cutlass.Float32)
-                            )
-                            bi_curr1 = cutlass.Float32(
-                                mB[bidz, row, 0, d0 + 3].to(cutlass.Float32)
-                            )
-                            dmy_curr0 = (
-                                dmy_curr0 + gx_curr1 * br_curr1 - gy_curr1 * bi_curr1
-                            )
-                            dmy_curr1 = (
-                                dmy_curr1 + gx_curr1 * bi_curr1 + gy_curr1 * br_curr1
-                            )
-
-                            bxr_prev0 = cutlass.Float32(
-                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_prev0 = cutlass.Float32(
-                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            gx_prev0, gy_prev0 = conj_mul_phase(
-                                bxr_prev0, bxi_prev0, pr, pi
-                            )
-                            bxr_prev1 = cutlass.Float32(
-                                sQ0[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            bxi_prev1 = cutlass.Float32(
-                                sQ0[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            gx_prev1, gy_prev1 = conj_mul_phase(
-                                bxr_prev1, bxi_prev1, pr, pi
-                            )
-                            br_prev0 = cutlass.Float32(0.0)
-                            bi_prev0 = cutlass.Float32(0.0)
-                            br_prev1 = cutlass.Float32(0.0)
-                            bi_prev1 = cutlass.Float32(0.0)
-                            if row > cutlass.Int32(0):
-                                br_prev0 = cutlass.Float32(
-                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 0].to(
-                                        cutlass.Float32
-                                    )
-                                )
-                                bi_prev0 = cutlass.Float32(
-                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 1].to(
-                                        cutlass.Float32
-                                    )
-                                )
-                                br_prev1 = cutlass.Float32(
-                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 2].to(
-                                        cutlass.Float32
-                                    )
-                                )
-                                bi_prev1 = cutlass.Float32(
-                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 3].to(
-                                        cutlass.Float32
-                                    )
-                                )
-                            else:
-                                if chunk == cutlass.Int32(0):
-                                    br_prev0 = cutlass.Float32(
-                                        mB_prev0[bh, d0 + 0].to(cutlass.Float32)
-                                    )
-                                    bi_prev0 = cutlass.Float32(
-                                        mB_prev0[bh, d0 + 1].to(cutlass.Float32)
-                                    )
-                                    br_prev1 = cutlass.Float32(
-                                        mB_prev0[bh, d0 + 2].to(cutlass.Float32)
-                                    )
-                                    bi_prev1 = cutlass.Float32(
-                                        mB_prev0[bh, d0 + 3].to(cutlass.Float32)
-                                    )
-                                else:
-                                    br_prev0 = cutlass.Float32(
-                                        mB[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            d0 + 0,
-                                        ].to(cutlass.Float32)
-                                    )
-                                    bi_prev0 = cutlass.Float32(
-                                        mB[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            d0 + 1,
-                                        ].to(cutlass.Float32)
-                                    )
-                                    br_prev1 = cutlass.Float32(
-                                        mB[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            d0 + 2,
-                                        ].to(cutlass.Float32)
-                                    )
-                                    bi_prev1 = cutlass.Float32(
-                                        mB[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            d0 + 3,
-                                        ].to(cutlass.Float32)
-                                    )
-                            dmy_prev0 = (
-                                dmy_prev0 + gx_prev0 * br_prev0 - gy_prev0 * bi_prev0
-                            )
-                            dmy_prev1 = (
-                                dmy_prev1 + gx_prev0 * bi_prev0 + gy_prev0 * br_prev0
-                            )
-                            dmy_prev0 = (
-                                dmy_prev0 + gx_prev1 * br_prev1 - gy_prev1 * bi_prev1
-                            )
-                            dmy_prev1 = (
-                                dmy_prev1 + gx_prev1 * bi_prev1 + gy_prev1 * br_prev1
-                            )
-
-                            vv4 = vv4 + cutlass.Int32(32)
-                    else:
+                t_local = warp
+                while t_local < cutlass.Int32(kv_tile):
+                    row = cutlass.Int32(n0) + t_local
+                    if row < cutlass.Int32(self.L):
+                        dmy_curr0 = cutlass.Float32(0.0)
+                        dmy_curr1 = cutlass.Float32(0.0)
+                        dmy_prev0 = cutlass.Float32(0.0)
+                        dmy_prev1 = cutlass.Float32(0.0)
+                        pr = cutlass.Float32(s_phase[row, 0])
+                        pi = cutlass.Float32(s_phase[row, 1])
                         vv = lane
-                        while vv < nvec:
-                            d0 = vv * 2
-
-                            bxr_curr = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_curr = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            gx_curr, gy_curr = conj_mul_phase(
-                                bxr_curr, bxi_curr, pr, pi
-                            )
-                            br_curr = cutlass.Float32(
-                                mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
-                            )
-                            bi_curr = cutlass.Float32(
-                                mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
-                            )
-                            dmy_curr0 = (
-                                dmy_curr0 + gx_curr * br_curr - gy_curr * bi_curr
-                            )
-                            dmy_curr1 = (
-                                dmy_curr1 + gx_curr * bi_curr + gy_curr * br_curr
-                            )
-
-                            bxr_prev = cutlass.Float32(
-                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_prev = cutlass.Float32(
-                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            gx_prev, gy_prev = conj_mul_phase(
-                                bxr_prev, bxi_prev, pr, pi
-                            )
-                            br_prev = cutlass.Float32(0.0)
-                            bi_prev = cutlass.Float32(0.0)
-                            if row > cutlass.Int32(0):
-                                br_prev = cutlass.Float32(
-                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 0].to(
-                                        cutlass.Float32
-                                    )
+                        while vv < cutlass.Int32(nvec_stage):
+                            d_local = vv * 2
+                            d0 = d_col_base + d_local
+                            if d0 + cutlass.Int32(1) < cutlass.Int32(self.D):
+                                bxr_curr = cutlass.Float32(
+                                    sK_tile[t_local, d_local + 0].to(cutlass.Float32)
                                 )
-                                bi_prev = cutlass.Float32(
-                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 1].to(
-                                        cutlass.Float32
-                                    )
+                                bxi_curr = cutlass.Float32(
+                                    sK_tile[t_local, d_local + 1].to(cutlass.Float32)
                                 )
-                            else:
-                                if chunk == cutlass.Int32(0):
+                                gx_curr, gy_curr = conj_mul_phase(
+                                    bxr_curr, bxi_curr, pr, pi
+                                )
+                                br_curr = cutlass.Float32(
+                                    mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
+                                )
+                                bi_curr = cutlass.Float32(
+                                    mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
+                                )
+                                dmy_curr0 = (
+                                    dmy_curr0 + gx_curr * br_curr - gy_curr * bi_curr
+                                )
+                                dmy_curr1 = (
+                                    dmy_curr1 + gx_curr * bi_curr + gy_curr * br_curr
+                                )
+
+                                bxr_prev = cutlass.Float32(
+                                    sQ0[t_local, d_local + 0].to(cutlass.Float32)
+                                )
+                                bxi_prev = cutlass.Float32(
+                                    sQ0[t_local, d_local + 1].to(cutlass.Float32)
+                                )
+                                gx_prev, gy_prev = conj_mul_phase(
+                                    bxr_prev, bxi_prev, pr, pi
+                                )
+                                br_prev = cutlass.Float32(0.0)
+                                bi_prev = cutlass.Float32(0.0)
+                                if row > cutlass.Int32(0):
                                     br_prev = cutlass.Float32(
-                                        mB_prev0[bh, d0 + 0].to(cutlass.Float32)
+                                        mB[bidz, row - cutlass.Int32(1), 0, d0 + 0].to(
+                                            cutlass.Float32
+                                        )
                                     )
                                     bi_prev = cutlass.Float32(
-                                        mB_prev0[bh, d0 + 1].to(cutlass.Float32)
+                                        mB[bidz, row - cutlass.Int32(1), 0, d0 + 1].to(
+                                            cutlass.Float32
+                                        )
                                     )
                                 else:
-                                    br_prev = cutlass.Float32(
-                                        mB[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            d0 + 0,
-                                        ].to(cutlass.Float32)
-                                    )
-                                    bi_prev = cutlass.Float32(
-                                        mB[
-                                            bidz - cutlass.Int32(1),
-                                            cutlass.Int32(self.L - 1),
-                                            0,
-                                            d0 + 1,
-                                        ].to(cutlass.Float32)
-                                    )
-                            dmy_prev0 = (
-                                dmy_prev0 + gx_prev * br_prev - gy_prev * bi_prev
-                            )
-                            dmy_prev1 = (
-                                dmy_prev1 + gx_prev * bi_prev + gy_prev * br_prev
-                            )
-
+                                    if chunk == cutlass.Int32(0):
+                                        br_prev = cutlass.Float32(
+                                            mB_prev0[bh, d0 + 0].to(cutlass.Float32)
+                                        )
+                                        bi_prev = cutlass.Float32(
+                                            mB_prev0[bh, d0 + 1].to(cutlass.Float32)
+                                        )
+                                    else:
+                                        br_prev = cutlass.Float32(
+                                            mB[
+                                                bidz - cutlass.Int32(1),
+                                                cutlass.Int32(self.L - 1),
+                                                0,
+                                                d0 + 0,
+                                            ].to(cutlass.Float32)
+                                        )
+                                        bi_prev = cutlass.Float32(
+                                            mB[
+                                                bidz - cutlass.Int32(1),
+                                                cutlass.Int32(self.L - 1),
+                                                0,
+                                                d0 + 1,
+                                            ].to(cutlass.Float32)
+                                        )
+                                dmy_prev0 = (
+                                    dmy_prev0 + gx_prev * br_prev - gy_prev * bi_prev
+                                )
+                                dmy_prev1 = (
+                                    dmy_prev1 + gx_prev * bi_prev + gy_prev * br_prev
+                                )
                             vv = vv + cutlass.Int32(32)
 
-                    for off in (16, 8, 4, 2, 1):
-                        dmy_curr0 = dmy_curr0 + cute.arch.shuffle_sync_bfly(
-                            dmy_curr0, offset=off, mask=-1, mask_and_clamp=31
-                        )
-                        dmy_curr1 = dmy_curr1 + cute.arch.shuffle_sync_bfly(
-                            dmy_curr1, offset=off, mask=-1, mask_and_clamp=31
-                        )
-                        dmy_prev0 = dmy_prev0 + cute.arch.shuffle_sync_bfly(
-                            dmy_prev0, offset=off, mask=-1, mask_and_clamp=31
-                        )
-                        dmy_prev1 = dmy_prev1 + cute.arch.shuffle_sync_bfly(
-                            dmy_prev1, offset=off, mask=-1, mask_and_clamp=31
-                        )
-                    if lane == cutlass.Int32(0):
-                        mDMcurr[bidz, row, 0] = dmy_curr0
-                        mDMcurr[bidz, row, 1] = dmy_curr1
-                        mDMprev[bidz, row, 0] = dmy_prev0
-                        mDMprev[bidz, row, 1] = dmy_prev1
-                t_local = t_local + cutlass.Int32(self.num_warps)
-            cute.arch.barrier()
+                        for off in (16, 8, 4, 2, 1):
+                            dmy_curr0 = dmy_curr0 + cute.arch.shuffle_sync_bfly(
+                                dmy_curr0, offset=off, mask=-1, mask_and_clamp=31
+                            )
+                            dmy_curr1 = dmy_curr1 + cute.arch.shuffle_sync_bfly(
+                                dmy_curr1, offset=off, mask=-1, mask_and_clamp=31
+                            )
+                            dmy_prev0 = dmy_prev0 + cute.arch.shuffle_sync_bfly(
+                                dmy_prev0, offset=off, mask=-1, mask_and_clamp=31
+                            )
+                            dmy_prev1 = dmy_prev1 + cute.arch.shuffle_sync_bfly(
+                                dmy_prev1, offset=off, mask=-1, mask_and_clamp=31
+                            )
+                        if lane == cutlass.Int32(0):
+                            s_dM_curr[t_local, 0] = cutlass.Float32(
+                                s_dM_curr[t_local, 0] + dmy_curr0
+                            )
+                            s_dM_curr[t_local, 1] = cutlass.Float32(
+                                s_dM_curr[t_local, 1] + dmy_curr1
+                            )
+                            s_dM_prev[t_local, 0] = cutlass.Float32(
+                                s_dM_prev[t_local, 0] + dmy_prev0
+                            )
+                            s_dM_prev[t_local, 1] = cutlass.Float32(
+                                s_dM_prev[t_local, 1] + dmy_prev1
+                            )
+                    t_local = t_local + cutlass.Int32(self.num_warps)
+                cute.arch.barrier()
 
-            if cutlass.const_expr((self.D % 4) == 0):
-                for it in cutlass.range_constexpr(iters_quads_tile):
+                for it in cutlass.range_constexpr(iters_pairs_stage):
                     idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_quads_tile):
-                        t_local = idx // cutlass.Int32(nvec2)
-                        vv4 = idx - t_local * cutlass.Int32(nvec2)
+                    if idx < cutlass.Int32(total_pairs_stage):
+                        t_local = idx // nvec_stage
+                        vv = idx - t_local * nvec_stage
                         row = cutlass.Int32(n0) + t_local
                         if row < cutlass.Int32(self.L):
-                            d0 = vv4 * 4
-                            kr_curr = cutlass.Float32(s_tap_curr[t_local, 0])
-                            ki_curr = cutlass.Float32(s_tap_curr[t_local, 1])
-                            bxr_curr0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_curr0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            dbr_curr0, dbi_curr0 = apply_complex_tap_adjoint(
-                                bxr_curr0, bxi_curr0, kr_curr, ki_curr
-                            )
-                            bxr_curr1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            bxi_curr1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            dbr_curr1, dbi_curr1 = apply_complex_tap_adjoint(
-                                bxr_curr1, bxi_curr1, kr_curr, ki_curr
-                            )
-                            sK_tile[t_local, d0 + 0] = dbr_curr0.to(mU.element_type)
-                            sK_tile[t_local, d0 + 1] = dbi_curr0.to(mU.element_type)
-                            sK_tile[t_local, d0 + 2] = dbr_curr1.to(mU.element_type)
-                            sK_tile[t_local, d0 + 3] = dbi_curr1.to(mU.element_type)
-
-                            kr_prev = cutlass.Float32(s_tap_prev[row, 0])
-                            ki_prev = cutlass.Float32(s_tap_prev[row, 1])
-                            bxr_prev0 = cutlass.Float32(
-                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_prev0 = cutlass.Float32(
-                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            dbr_prev0, dbi_prev0 = apply_complex_tap_adjoint(
-                                bxr_prev0, bxi_prev0, kr_prev, ki_prev
-                            )
-                            bxr_prev1 = cutlass.Float32(
-                                sQ0[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            bxi_prev1 = cutlass.Float32(
-                                sQ0[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            dbr_prev1, dbi_prev1 = apply_complex_tap_adjoint(
-                                bxr_prev1, bxi_prev1, kr_prev, ki_prev
-                            )
-                            sQ0[t_local, d0 + 0] = dbr_prev0.to(mU.element_type)
-                            sQ0[t_local, d0 + 1] = dbi_prev0.to(mU.element_type)
-                            sQ0[t_local, d0 + 2] = dbr_prev1.to(mU.element_type)
-                            sQ0[t_local, d0 + 3] = dbi_prev1.to(mU.element_type)
-            else:
-                for it in cutlass.range_constexpr(iters_pairs_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_pairs_tile):
-                        t_local = idx // nvec
-                        vv = idx - t_local * nvec
-                        row = cutlass.Int32(n0) + t_local
-                        if row < cutlass.Int32(self.L):
-                            d0 = vv * 2
+                            d_local = vv * 2
                             bxr_curr = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                                sK_tile[t_local, d_local + 0].to(cutlass.Float32)
                             )
                             bxi_curr = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                                sK_tile[t_local, d_local + 1].to(cutlass.Float32)
                             )
                             kr_curr = cutlass.Float32(s_tap_curr[t_local, 0])
                             ki_curr = cutlass.Float32(s_tap_curr[t_local, 1])
-                            dbr_curr, dbi_curr = apply_complex_tap_adjoint(
+                            currx, curry = apply_complex_tap_adjoint(
                                 bxr_curr, bxi_curr, kr_curr, ki_curr
-                            )
-                            sK_tile[t_local, d0 + 0] = dbr_curr.to(mU.element_type)
-                            sK_tile[t_local, d0 + 1] = dbi_curr.to(mU.element_type)
-
-                            bxr_prev = cutlass.Float32(
-                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            bxi_prev = cutlass.Float32(
-                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            kr_prev = cutlass.Float32(s_tap_prev[row, 0])
-                            ki_prev = cutlass.Float32(s_tap_prev[row, 1])
-                            dbr_prev, dbi_prev = apply_complex_tap_adjoint(
-                                bxr_prev, bxi_prev, kr_prev, ki_prev
-                            )
-                            sQ0[t_local, d0 + 0] = dbr_prev.to(mU.element_type)
-                            sQ0[t_local, d0 + 1] = dbi_prev.to(mU.element_type)
-            cute.arch.barrier()
-
-            if cutlass.const_expr((self.D % 4) == 0):
-                for it in cutlass.range_constexpr(iters_quads_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_quads_tile):
-                        t_local = idx // cutlass.Int32(nvec2)
-                        vv4 = idx - t_local * cutlass.Int32(nvec2)
-                        row = cutlass.Int32(n0) + t_local
-                        if row < cutlass.Int32(self.L):
-                            d0 = vv4 * 4
-                            currx0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            curry0 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            currx1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            curry1 = cutlass.Float32(
-                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            prevx0 = cutlass.Float32(0.0)
-                            prevy0 = cutlass.Float32(0.0)
-                            prevx1 = cutlass.Float32(0.0)
-                            prevy1 = cutlass.Float32(0.0)
-                            if row + cutlass.Int32(1) < cutlass.Int32(self.L):
-                                if t_local + cutlass.Int32(1) < cutlass.Int32(kv_tile):
-                                    prevx0 = cutlass.Float32(
-                                        sQ0[t_local + cutlass.Int32(1), d0 + 0].to(
-                                            cutlass.Float32
-                                        )
-                                    )
-                                    prevy0 = cutlass.Float32(
-                                        sQ0[t_local + cutlass.Int32(1), d0 + 1].to(
-                                            cutlass.Float32
-                                        )
-                                    )
-                                    prevx1 = cutlass.Float32(
-                                        sQ0[t_local + cutlass.Int32(1), d0 + 2].to(
-                                            cutlass.Float32
-                                        )
-                                    )
-                                    prevy1 = cutlass.Float32(
-                                        sQ0[t_local + cutlass.Int32(1), d0 + 3].to(
-                                            cutlass.Float32
-                                        )
-                                    )
-                                else:
-                                    prevx0 = cutlass.Float32(
-                                        sDB_carry[d0 + 0].to(cutlass.Float32)
-                                    )
-                                    prevy0 = cutlass.Float32(
-                                        sDB_carry[d0 + 1].to(cutlass.Float32)
-                                    )
-                                    prevx1 = cutlass.Float32(
-                                        sDB_carry[d0 + 2].to(cutlass.Float32)
-                                    )
-                                    prevy1 = cutlass.Float32(
-                                        sDB_carry[d0 + 3].to(cutlass.Float32)
-                                    )
-                            sK_tile[t_local, d0 + 0] = (currx0 + prevx0).to(
-                                mU.element_type
-                            )
-                            sK_tile[t_local, d0 + 1] = (curry0 + prevy0).to(
-                                mU.element_type
-                            )
-                            sK_tile[t_local, d0 + 2] = (currx1 + prevx1).to(
-                                mU.element_type
-                            )
-                            sK_tile[t_local, d0 + 3] = (curry1 + prevy1).to(
-                                mU.element_type
-                            )
-            else:
-                for it in cutlass.range_constexpr(iters_pairs_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_pairs_tile):
-                        t_local = idx // nvec
-                        vv = idx - t_local * nvec
-                        row = cutlass.Int32(n0) + t_local
-                        if row < cutlass.Int32(self.L):
-                            d0 = vv * 2
-                            currx = cutlass.Float32(
-                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            curry = cutlass.Float32(
-                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
                             )
                             prevx = cutlass.Float32(0.0)
                             prevy = cutlass.Float32(0.0)
                             if row + cutlass.Int32(1) < cutlass.Int32(self.L):
                                 if t_local + cutlass.Int32(1) < cutlass.Int32(kv_tile):
-                                    prevx = cutlass.Float32(
-                                        sQ0[t_local + cutlass.Int32(1), d0 + 0].to(
+                                    row_next = row + cutlass.Int32(1)
+                                    bxr_prev = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d_local + 0].to(
                                             cutlass.Float32
                                         )
                                     )
-                                    prevy = cutlass.Float32(
-                                        sQ0[t_local + cutlass.Int32(1), d0 + 1].to(
+                                    bxi_prev = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d_local + 1].to(
                                             cutlass.Float32
                                         )
+                                    )
+                                    kr_prev = cutlass.Float32(s_tap_prev[row_next, 0])
+                                    ki_prev = cutlass.Float32(s_tap_prev[row_next, 1])
+                                    prevx, prevy = apply_complex_tap_adjoint(
+                                        bxr_prev, bxi_prev, kr_prev, ki_prev
                                     )
                                 else:
                                     prevx = cutlass.Float32(
-                                        sDB_carry[d0 + 0].to(cutlass.Float32)
+                                        sDB_carry[d_col_base + d_local + 0].to(
+                                            cutlass.Float32
+                                        )
                                     )
                                     prevy = cutlass.Float32(
-                                        sDB_carry[d0 + 1].to(cutlass.Float32)
+                                        sDB_carry[d_col_base + d_local + 1].to(
+                                            cutlass.Float32
+                                        )
                                     )
-                            sK_tile[t_local, d0 + 0] = (currx + prevx).to(
+                            sK_tile[t_local, d_local + 0] = (currx + prevx).to(
                                 mU.element_type
                             )
-                            sK_tile[t_local, d0 + 1] = (curry + prevy).to(
+                            sK_tile[t_local, d_local + 1] = (curry + prevy).to(
                                 mU.element_type
                             )
-            cute.arch.barrier()
+                cute.arch.barrier()
 
-            gDB = cute.local_tile(mDB[bidz, None, 0, None], (kv_tile, Dp), (n_tile, 0))
-            gmem_thr_store_B = gmem_tiled_store_D.get_slice(tidx)
-            tBsK = gmem_thr_store_B.partition_S(sK_tile)
-            tBgDB = gmem_thr_store_B.partition_D(gDB)
-            if cutlass.const_expr(self.D == Dp):
-                cute.copy(gmem_tiled_store_D, tBsK, tBgDB)
-            else:
-                tBrB = cute.make_rmem_tensor_like(tBgDB, mU.element_type)
-                cute.copy(gmem_tiled_store_D, tBsK, tBrB)
-                mcDB = cute.make_identity_tensor(mDB.layout.shape)
-                cDB = cute.local_tile(
-                    mcDB[bidz, None, 0, None], (kv_tile, Dp), (n_tile, 0)
+                gDB_stage = cute.local_tile(
+                    mDB[bidz, None, 0, None], (kv_tile, Ds), (n_tile, d_stage_idx)
                 )
-                tBcDB = gmem_thr_store_B.partition_D(cDB)
-                tBpDB = cute.make_rmem_tensor(
-                    cute.make_layout(
-                        (tBgDB.shape[0][1], tBgDB.shape[1], tBgDB.shape[2]),
-                        stride=(tBgDB.shape[2], 0, 1),
-                    ),
-                    cutlass.Boolean,
-                )
-                for rest_v in cutlass.range_constexpr(tBpDB.shape[0]):
-                    for rest_n in cutlass.range_constexpr(cute.size(tBpDB.shape[2])):
-                        tBpDB[rest_v, 0, rest_n] = cute.elem_less(
-                            tBcDB[(0, rest_v), 0, rest_n][3], mDB.layout.shape[3]
-                        )
-                for rest_m in cutlass.range_constexpr(cute.size(tBpDB.shape[1])):
-                    if cute.elem_less(tBcDB[0, rest_m, 0][1], mDB.layout.shape[1]):
-                        cute.copy(
-                            gmem_tiled_store_D,
-                            tBrB[None, rest_m, None],
-                            tBgDB[None, rest_m, None],
-                            pred=tBpDB[None, rest_m, None],
-                        )
+                gmem_thr_store_B = gmem_tiled_store_D.get_slice(tidx)
+                tBsK = gmem_thr_store_B.partition_S(sK_tile)
+                tBgDB = gmem_thr_store_B.partition_D(gDB_stage)
+                if cutlass.const_expr(self.D == Dp):
+                    cute.copy(gmem_tiled_store_D, tBsK, tBgDB)
+                else:
+                    tBrB = cute.make_rmem_tensor_like(tBgDB, mU.element_type)
+                    cute.copy(gmem_tiled_store_D, tBsK, tBrB)
+                    cDB_stage = cute.local_tile(
+                        mcDB[bidz, None, 0, None], (kv_tile, Ds), (n_tile, d_stage_idx)
+                    )
+                    tBcDB = gmem_thr_store_B.partition_D(cDB_stage)
+                    tBpDB = cute.make_rmem_tensor(
+                        cute.make_layout(
+                            (tBgDB.shape[0][1], tBgDB.shape[1], tBgDB.shape[2]),
+                            stride=(tBgDB.shape[2], 0, 1),
+                        ),
+                        cutlass.Boolean,
+                    )
+                    for rest_v in cutlass.range_constexpr(tBpDB.shape[0]):
+                        for rest_n in cutlass.range_constexpr(
+                            cute.size(tBpDB.shape[2])
+                        ):
+                            tBpDB[rest_v, 0, rest_n] = cute.elem_less(
+                                tBcDB[(0, rest_v), 0, rest_n][3], mDB.layout.shape[3]
+                            )
+                    for rest_m in cutlass.range_constexpr(cute.size(tBpDB.shape[1])):
+                        if cute.elem_less(tBcDB[0, rest_m, 0][1], mDB.layout.shape[1]):
+                            cute.copy(
+                                gmem_tiled_store_D,
+                                tBrB[None, rest_m, None],
+                                tBgDB[None, rest_m, None],
+                                pred=tBpDB[None, rest_m, None],
+                            )
 
-            for it in range((Dp + self.num_threads - 1) // self.num_threads):
-                d = tidx + cutlass.Int32(it * self.num_threads)
-                if d < cutlass.Int32(Dp):
-                    sDB_carry[d] = sQ0[0, d]
+                for it in range(iters_ds):
+                    d_local = tidx + cutlass.Int32(it * self.num_threads)
+                    if d_local + cutlass.Int32(1) < cutlass.Int32(Ds) and (
+                        d_local & cutlass.Int32(1)
+                    ) == cutlass.Int32(0):
+                        d = d_col_base + d_local
+                        if d < cutlass.Int32(Dp):
+                            bxr_head = cutlass.Float32(
+                                sQ0[0, d_local + 0].to(cutlass.Float32)
+                            )
+                            bxi_head = cutlass.Float32(
+                                sQ0[0, d_local + 1].to(cutlass.Float32)
+                            )
+                            kr_head = cutlass.Float32(s_tap_prev[n0, 0])
+                            ki_head = cutlass.Float32(s_tap_prev[n0, 1])
+                            headx, heady = apply_complex_tap_adjoint(
+                                bxr_head, bxi_head, kr_head, ki_head
+                            )
+                            sDB_carry[d_col_base + d_local + 0] = headx.to(
+                                mU.element_type
+                            )
+                            sDB_carry[d_col_base + d_local + 1] = heady.to(
+                                mU.element_type
+                            )
+                cute.arch.barrier()
+
+            if tidx < cutlass.Int32(kv_tile):
+                row = cutlass.Int32(n0) + tidx
+                if row < cutlass.Int32(self.L):
+                    mDMcurr[bidz, row, 0] = s_dM_curr[tidx, 0]
+                    mDMcurr[bidz, row, 1] = s_dM_curr[tidx, 1]
+                    mDMprev[bidz, row, 0] = s_dM_prev[tidx, 0]
+                    mDMprev[bidz, row, 1] = s_dM_prev[tidx, 1]
             cute.arch.barrier()
-
         for it in cutlass.range_constexpr(iters_d):
             d = tidx + cutlass.Int32(it * self.num_threads)
             if d < cutlass.Int32(self.D):
