@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import torch
 import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_ptr
+
+
+_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
+_PTR_ARG_CACHE_LIMIT = 32768
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -78,6 +84,45 @@ def _assumed_align(
     return elem_align
 
 
+def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+    device_index = (
+        int(t.device.index)
+        if t.device.type == "cuda" and t.device.index is not None
+        else -1
+    )
+    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
+    cached = _PTR_ARG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    align = _assumed_align(t)
+    cached = (
+        make_ptr(
+            _torch_to_cutlass_dtype(t.dtype),
+            t.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=align,
+        ),
+        align,
+    )
+    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
+        _PTR_ARG_CACHE.clear()
+    _PTR_ARG_CACHE[key] = cached
+    return cached
+
+
+def _make_ptr_args(
+    *tensors: torch.Tensor,
+) -> tuple[tuple[object, ...], tuple[int, ...]]:
+    ptrs: list[object] = []
+    alignments: list[int] = []
+    for tensor in tensors:
+        ptr, align = _make_ptr_arg(tensor)
+        ptrs.append(ptr)
+        alignments.append(align)
+    return tuple(ptrs), tuple(alignments)
+
+
 def _pad_zero_time(
     tensor: torch.Tensor,
     *,
@@ -110,6 +155,8 @@ __all__ = [
     "_assumed_align",
     "_choose_copy_bits_for_linear_tiles",
     "_elem_bits",
+    "_make_ptr_arg",
+    "_make_ptr_args",
     "_pad_m_identity",
     "_pad_zero_time",
     "_tc_input_dtype",

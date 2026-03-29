@@ -8,11 +8,78 @@ from typing import cast
 import torch
 import cutlass.cute as cute
 
+from slinoss.perf import note_cache_event
+
 from .common import COEFF_AUX_FIELDS, make_ptr_arg
 from .kernels.fwd import ScanPrepFwdFused
 
 
 _SCANPREP_FWD_CACHE: dict[tuple[object, ...], object] = {}
+_SCANPREP_DUMMY_RMS_INV_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+_SCANPREP_DUMMY_COEFF_AUX_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+_SCANPREP_DUMMY_CACHE_LIMIT = 8
+
+
+def _cache_set(
+    cache: dict[tuple[object, ...], object], key: tuple[object, ...], value
+) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= _SCANPREP_DUMMY_CACHE_LIMIT:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
+
+
+def _get_dummy_rms_inv(
+    *,
+    device: torch.device,
+    batch: int,
+    n_heads: int,
+    t_size: int,
+) -> torch.Tensor:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch),
+        int(n_heads),
+        int(t_size),
+    )
+    cached = _SCANPREP_DUMMY_RMS_INV_CACHE.get(key)
+    if cached is not None:
+        note_cache_event("cute.scanprep.fwd.dummy_rms_inv", hit=True)
+        return cached
+    note_cache_event("cute.scanprep.fwd.dummy_rms_inv", hit=False)
+    cached = torch.empty(
+        (batch, n_heads, t_size, 4), device=device, dtype=torch.float32
+    )
+    _cache_set(_SCANPREP_DUMMY_RMS_INV_CACHE, key, cached)
+    return cached
+
+
+def _get_dummy_coeff_aux(
+    *,
+    device: torch.device,
+    batch: int,
+    n_heads: int,
+    t_size: int,
+) -> torch.Tensor:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch),
+        int(n_heads),
+        int(t_size),
+    )
+    cached = _SCANPREP_DUMMY_COEFF_AUX_CACHE.get(key)
+    if cached is not None:
+        note_cache_event("cute.scanprep.fwd.dummy_coeff_aux", hit=True)
+        return cached
+    note_cache_event("cute.scanprep.fwd.dummy_coeff_aux", hit=False)
+    cached = torch.empty(
+        (batch, n_heads, COEFF_AUX_FIELDS, t_size), device=device, dtype=torch.float32
+    )
+    _cache_set(_SCANPREP_DUMMY_COEFF_AUX_CACHE, key, cached)
+    return cached
 
 
 def _scanprep_fwd_impl(
@@ -40,6 +107,7 @@ def _scanprep_fwd_impl(
     mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
+    return_aux: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -76,14 +144,22 @@ def _scanprep_fwd_impl(
         (batch, n_heads, t_size, 2 * d_state), device=value.device, dtype=bc.dtype
     )
     C = torch.empty_like(B)
-    rms_inv = torch.empty(
-        (batch, n_heads, t_size, 4), device=value.device, dtype=torch.float32
-    )
-    coeff_aux = torch.empty(
-        (batch, n_heads, COEFF_AUX_FIELDS, t_size),
-        device=value.device,
-        dtype=torch.float32,
-    )
+    if return_aux:
+        rms_inv = torch.empty(
+            (batch, n_heads, t_size, 4), device=value.device, dtype=torch.float32
+        )
+        coeff_aux = torch.empty(
+            (batch, n_heads, COEFF_AUX_FIELDS, t_size),
+            device=value.device,
+            dtype=torch.float32,
+        )
+    else:
+        rms_inv = _get_dummy_rms_inv(
+            device=value.device, batch=batch, n_heads=n_heads, t_size=t_size
+        )
+        coeff_aux = _get_dummy_coeff_aux(
+            device=value.device, batch=batch, n_heads=n_heads, t_size=t_size
+        )
 
     b_scale_c = (
         b_scale
@@ -161,6 +237,7 @@ def _scanprep_fwd_impl(
         k_align,
         rms_inv_align,
         coeff_aux_align,
+        bool(return_aux),
         float(dt_min),
         float(dt_max),
         float(r_min),
@@ -171,11 +248,14 @@ def _scanprep_fwd_impl(
     )
     compiled = _SCANPREP_FWD_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cute.scanprep.fwd.compile", hit=False)
         compiled = cute.compile(
             ScanPrepFwdFused(
                 spec=spec,
                 params_in_stride=params_stride,
                 normalize_bc=normalize_bc,
+                store_rms_inv=bool(return_aux and normalize_bc),
+                store_coeff_aux=bool(return_aux),
                 dt_min=dt_min,
                 dt_max=dt_max,
                 r_min=r_min,
@@ -205,6 +285,8 @@ def _scanprep_fwd_impl(
             coeff_aux_ptr,
         )
         _SCANPREP_FWD_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cute.scanprep.fwd.compile", hit=True)
     compiled(
         value_ptr,
         bc_ptr,
@@ -279,6 +361,7 @@ def scanprep_fwd_cute(
         mix_k_curr_bias=mix_k_curr_bias,
         b_scale=b_scale,
         c_scale=c_scale,
+        return_aux=False,
     )
     return U, M, K, B, C
 
@@ -351,6 +434,7 @@ def scanprep_fwd_cute_with_aux(
             mix_k_curr_bias=mix_k_curr_bias,
             b_scale=b_scale,
             c_scale=c_scale,
+            return_aux=True,
         ),
     )
 

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import torch
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
+
+from slinoss.perf import note_cache_event
 
 from ..fwd.common import (
-    _assumed_align,
+    _make_ptr_args,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -19,7 +20,6 @@ from .chunk_increment.du import ChunkIncrementBwdDUAmpere
 from .chunk_increment.param_scan import ChunkIncrementBwdParamScanAmpere
 from .chunk_scan import (
     _fold_chunk_boundary_carries,
-    _public_dk_from_parts,
     _public_from_chunked,
     _public_from_param_scan,
     _resolve_dz0_cta_tiler,
@@ -81,11 +81,14 @@ def _get_zero_prev_tensors(
     )
     cached = _ZERO_PREV_CACHE.get(key)
     if cached is None:
+        note_cache_event("cute.v2x2ssd.bwd.zero_prev", hit=False)
         cached = (
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
+    else:
+        note_cache_event("cute.v2x2ssd.bwd.zero_prev", hit=True)
     return cached
 
 
@@ -107,6 +110,7 @@ def _get_zero_final_grad(
     )
     cached = _ZERO_FINAL_GRAD_CACHE.get(key)
     if cached is None:
+        note_cache_event("cute.v2x2ssd.bwd.zero_final_grad", hit=False)
         cached = torch.zeros(
             (batch_size, heads, P, D), device=device, dtype=torch.float32
         )
@@ -116,6 +120,8 @@ def _get_zero_final_grad(
             cached,
             limit=_ZERO_FINAL_GRAD_CACHE_LIMIT,
         )
+    else:
+        note_cache_event("cute.v2x2ssd.bwd.zero_final_grad", hit=True)
     return cached
 
 
@@ -145,8 +151,10 @@ def _get_bwd_workspace(
     )
     cached = _BWD_WORKSPACE_CACHE.get(key)
     if cached is not None:
+        note_cache_event("cute.v2x2ssd.bwd.workspace", hit=True)
         return cached
 
+    note_cache_event("cute.v2x2ssd.bwd.workspace", hit=False)
     BH = int(batch_size) * int(heads)
     BHC = BH * int(n_chunks)
     L = int(chunk_size)
@@ -177,8 +185,7 @@ def _get_bwd_workspace(
         torch.empty((BHC, L, 2), device=device, dtype=torch.float32),
         torch.empty((BHC, L, 2), device=device, dtype=torch.float32),
         torch.empty((BHC, 1, L, 2), device=device, dtype=torch.float32),
-        torch.empty((BHC, 1, L, 2), device=device, dtype=torch.float32),
-        torch.empty((BHC, 1, L, 2), device=device, dtype=torch.float32),
+        torch.empty((2, BHC, 1, L, 2), device=device, dtype=torch.float32),
         torch.empty((BHC, L, D), device=device, dtype=tc_dtype),
         torch.empty((BHC, D), device=device, dtype=tc_dtype),
         torch.empty((BHC, L, P), device=device, dtype=tc_dtype),
@@ -186,8 +193,7 @@ def _get_bwd_workspace(
         torch.empty((2, L, n_d_tiles, BHC), device=device, dtype=torch.float32),
         torch.empty((2, BHC), device=device, dtype=torch.float32),
         torch.empty((2, L, BHC), device=device, dtype=torch.float32),
-        torch.empty((2, L, BHC), device=device, dtype=torch.float32),
-        torch.empty((2, L, BHC), device=device, dtype=torch.float32),
+        torch.empty((2, 2, L, BHC), device=device, dtype=torch.float32),
     )
     _cache_set(_BWD_WORKSPACE_CACHE, key, cached, limit=_BWD_WORKSPACE_CACHE_LIMIT)
     return cached
@@ -217,37 +223,21 @@ def _make_tensor_spec(
     return shape, stride
 
 
+def _public_from_packed_dk(
+    x: torch.Tensor,
+    *,
+    T: int,
+) -> torch.Tensor:
+    B, H, C, L, _, F = map(int, x.shape)
+    return x.reshape(B, H, C * L, 2, F)[:, :, :T, :, :]
+
+
 def _make_tensor_from_spec(
     ptr: cute.Pointer,
     spec: tuple[tuple[int, ...], tuple[int, ...]],
 ):
     shape, stride = spec
     return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
-
-
-def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    align = _assumed_align(t)
-    return (
-        make_ptr(
-            _torch_to_cutlass_dtype(t.dtype),
-            t.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=align,
-        ),
-        align,
-    )
-
-
-def _make_ptr_args(
-    *tensors: torch.Tensor,
-) -> tuple[tuple[object, ...], tuple[int, ...]]:
-    ptrs: list[object] = []
-    alignments: list[int] = []
-    for tensor in tensors:
-        ptr, align = _make_ptr_arg(tensor)
-        ptrs.append(ptr)
-        alignments.append(align)
-    return tuple(ptrs), tuple(alignments)
 
 
 def _make_cast_f32_to_tc(*, total_elems: int, num_threads: int = 256):
@@ -515,8 +505,7 @@ def _build_backward_args(
         dMp_scratch,
         dMc_scratch,
         dM_scan,
-        dKprev_scan,
-        dKcurr_scan,
+        dK_scan,
         dB_inc,
         dB_prev_inc,
         dU_inc,
@@ -524,8 +513,7 @@ def _build_backward_args(
         dMsum_part,
         dMp0,
         dM_inc,
-        dKprev_inc,
-        dKcurr_inc,
+        dK_inc,
     ) = _get_bwd_workspace(
         device=U.device,
         tc_dtype=tc_dtype,
@@ -537,6 +525,11 @@ def _build_backward_args(
         D=D,
         n_d_tiles=n_d_tiles,
     )
+
+    dKprev_scan = dK_scan[0]
+    dKcurr_scan = dK_scan[1]
+    dKprev_inc = dK_inc[0]
+    dKcurr_inc = dK_inc[1]
 
     # The fused state-passing backward kernel atomically accumulates d_m_chunk.
     # This workspace is cached across calls, so it must be reset before launch.
@@ -655,16 +648,18 @@ def _build_backward_args(
     dB_prev_scan_view = dB_prev_scan.reshape(Bsz, H, n_chunks, D)
     dC_scan_view = dC_scan.reshape(Bsz, H, n_chunks, L, D)
     dM_scan_view = dM_scan.reshape(Bsz, H, n_chunks, 1, L, 2)
-    dKprev_scan_view = dKprev_scan.reshape(Bsz, H, n_chunks, 1, L, 2)
-    dKcurr_scan_view = dKcurr_scan.reshape(Bsz, H, n_chunks, 1, L, 2)
+    dK_scan_view = (
+        dK_scan.permute(1, 2, 3, 0, 4)
+        .reshape(Bsz, H, n_chunks, 1, L, 2, 2)
+        .reshape(Bsz, H, n_chunks, L, 2, 2)
+    )
 
     dU_inc_view = dU_inc.reshape(Bsz, H, n_chunks, L, P)
     dU_prev_inc_view = dU_prev_inc.reshape(Bsz, H, n_chunks, P)
     dB_inc_view = dB_inc.reshape(Bsz, H, n_chunks, L, D)
     dB_prev_inc_view = dB_prev_inc.reshape(Bsz, H, n_chunks, D)
     dM_inc_view = dM_inc.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
-    dKprev_inc_view = dKprev_inc.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
-    dKcurr_inc_view = dKcurr_inc.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
+    dK_inc_view = dK_inc.permute(3, 2, 0, 1).reshape(Bsz, H, n_chunks, L, 2, 2)
 
     keepalive = (
         U_tc,
@@ -695,15 +690,13 @@ def _build_backward_args(
             dB_prev_scan_view,
             dC_scan_view,
             dM_scan_view,
-            dKprev_scan_view,
-            dKcurr_scan_view,
+            dK_scan_view,
             dU_inc_view,
             dU_prev_inc_view,
             dB_inc_view,
             dB_prev_inc_view,
             dM_inc_view,
-            dKprev_inc_view,
-            dKcurr_inc_view,
+            dK_inc_view,
             *keepalive,
         ),
     )
@@ -1144,8 +1137,10 @@ def compile_v2x2ssd_bwd_cute(
     )
     cached = _BWD_HOST_CACHE.get(cache_key)
     if cached is not None:
+        note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=True)
         return cached
 
+    note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=False)
     host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
     compiled = cute.compile(host_wrapper, *dynamic_args)
     _BWD_HOST_CACHE[cache_key] = compiled
@@ -1242,9 +1237,12 @@ def _v2x2ssd_bwd_cute_impl(
     )
     compiled = _BWD_HOST_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=False)
         host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
         compiled = cute.compile(host_wrapper, *dynamic_args)
         _BWD_HOST_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=True)
 
     compiled(*dynamic_args)
 
@@ -1256,15 +1254,13 @@ def _v2x2ssd_bwd_cute_impl(
         dB_prev_scan,
         dC_scan,
         dM_scan,
-        dKprev_scan,
-        dKcurr_scan,
+        dK_scan,
         dU_inc,
         dU_prev_inc,
         dB_inc,
         dB_prev_inc,
         dM_inc,
-        dKprev_inc,
-        dKcurr_inc,
+        dK_inc,
         *_keepalive,
     ) = outputs
 
@@ -1273,8 +1269,7 @@ def _v2x2ssd_bwd_cute_impl(
     dB_scan.add_(dB_inc)
     dB_prev_scan.add_(dB_prev_inc)
     dM_scan[:, :, :, 0, :, :].add_(dM_inc)
-    dKprev_scan[:, :, :, 0, :, :].add_(dKprev_inc)
-    dKcurr_scan[:, :, :, 0, :, :].add_(dKcurr_inc)
+    dK_scan.add_(dK_inc)
 
     dU_public = _fold_chunk_boundary_carries(dU_scan, dU_prev_scan)
     dB_public = _fold_chunk_boundary_carries(dB_scan, dB_prev_scan)
@@ -1282,7 +1277,7 @@ def _v2x2ssd_bwd_cute_impl(
     return (
         _public_from_chunked(dU_public, T=U.shape[2], dtype=U.dtype),
         _public_from_param_scan(dM_scan, T=U.shape[2]),
-        _public_dk_from_parts(dKprev_scan, dKcurr_scan, T=U.shape[2]),
+        _public_from_packed_dk(dK_scan, T=U.shape[2]),
         _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
         _public_from_chunked(dC_scan, T=U.shape[2], dtype=C.dtype),
         d_initial.to(dtype=initial_state_dtype or torch.float32).contiguous(),

@@ -5,14 +5,15 @@ from __future__ import annotations
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
 from typing import Callable
+
+from slinoss.perf import note_cache_event
 
 from .chunk_increment import ChunkIncrementFwdAmpere
 from .chunk_scan import ChunkScanFwdAmpere
 from .common import (
-    _assumed_align,
     _choose_copy_bits_for_linear_tiles,
+    _make_ptr_args,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -25,9 +26,13 @@ _CHUNK_INCREMENT_CACHE: dict[tuple, object] = {}
 _STATE_PASSING_CACHE: dict[tuple, object] = {}
 _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
 _FWD_HOST_CACHE: dict[tuple, object] = {}
+_FWD_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
+_FWD_NO_GRAD_INTERMEDIATE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_INITIAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
 _DUMMY_FINAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
+_FWD_WORKSPACE_CACHE_LIMIT = 4
+_FWD_NO_GRAD_INTERMEDIATE_CACHE_LIMIT = 4
 _ZERO_PREV_CACHE_LIMIT = 8
 _ZERO_INITIAL_STATE_CACHE_LIMIT = 8
 _DUMMY_FINAL_STATE_CACHE_LIMIT = 8
@@ -61,11 +66,14 @@ def _get_zero_prev_tensors(
     )
     cached = _ZERO_PREV_CACHE.get(key)
     if cached is None:
+        note_cache_event("cute.v2x2ssd.fwd.zero_prev", hit=False)
         cached = (
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
+    else:
+        note_cache_event("cute.v2x2ssd.fwd.zero_prev", hit=True)
     return cached
 
 
@@ -87,6 +95,7 @@ def _get_zero_initial_state(
     )
     cached = _ZERO_INITIAL_STATE_CACHE.get(key)
     if cached is None:
+        note_cache_event("cute.v2x2ssd.fwd.zero_initial_state", hit=False)
         cached = torch.zeros(
             (batch_size, heads, P, D),
             device=device,
@@ -98,6 +107,8 @@ def _get_zero_initial_state(
             cached,
             limit=_ZERO_INITIAL_STATE_CACHE_LIMIT,
         )
+    else:
+        note_cache_event("cute.v2x2ssd.fwd.zero_initial_state", hit=True)
     return cached
 
 
@@ -119,6 +130,7 @@ def _get_dummy_final_state(
     )
     cached = _DUMMY_FINAL_STATE_CACHE.get(key)
     if cached is None:
+        note_cache_event("cute.v2x2ssd.fwd.dummy_final_state", hit=False)
         cached = torch.empty(
             (batch_size, heads, P, D),
             device=device,
@@ -130,6 +142,8 @@ def _get_dummy_final_state(
             cached,
             limit=_DUMMY_FINAL_STATE_CACHE_LIMIT,
         )
+    else:
+        note_cache_event("cute.v2x2ssd.fwd.dummy_final_state", hit=True)
     return cached
 
 
@@ -142,11 +156,65 @@ def _get_fwd_workspace(
     P: int,
     D: int,
 ) -> torch.Tensor:
-    return torch.empty(
-        (batch_size, heads, n_chunks, P, D),
-        device=device,
-        dtype=torch.float32,
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch_size),
+        int(heads),
+        int(n_chunks),
+        int(P),
+        int(D),
     )
+    cached = _FWD_WORKSPACE_CACHE.get(key)
+    if cached is not None:
+        note_cache_event("cute.v2x2ssd.fwd.workspace", hit=True)
+        return cached
+    note_cache_event("cute.v2x2ssd.fwd.workspace", hit=False)
+    cached = torch.empty(
+        (batch_size, heads, n_chunks, P, D), device=device, dtype=torch.float32
+    )
+    _cache_set(_FWD_WORKSPACE_CACHE, key, cached, limit=_FWD_WORKSPACE_CACHE_LIMIT)
+    return cached
+
+
+def _get_no_grad_intermediates(
+    *,
+    device: torch.device,
+    batch_size: int,
+    heads: int,
+    n_chunks: int,
+    P: int,
+    D: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch_size),
+        int(heads),
+        int(n_chunks),
+        int(P),
+        int(D),
+    )
+    cached = _FWD_NO_GRAD_INTERMEDIATE_CACHE.get(key)
+    if cached is not None:
+        note_cache_event("cute.v2x2ssd.fwd.no_grad_intermediates", hit=True)
+        return cached
+    note_cache_event("cute.v2x2ssd.fwd.no_grad_intermediates", hit=False)
+    cached = (
+        torch.empty(
+            (batch_size, heads, n_chunks, 2), device=device, dtype=torch.float32
+        ),
+        torch.empty(
+            (batch_size, heads, n_chunks, P, D), device=device, dtype=torch.float32
+        ),
+    )
+    _cache_set(
+        _FWD_NO_GRAD_INTERMEDIATE_CACHE,
+        key,
+        cached,
+        limit=_FWD_NO_GRAD_INTERMEDIATE_CACHE_LIMIT,
+    )
+    return cached
 
 
 def _resolve_chunk_scan_n_block_size(L: int, requested: int) -> int:
@@ -321,31 +389,6 @@ def _make_tensor_from_spec(
 ):
     shape, stride = spec
     return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
-
-
-def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    align = _assumed_align(t)
-    return (
-        make_ptr(
-            _torch_to_cutlass_dtype(t.dtype),
-            t.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=align,
-        ),
-        align,
-    )
-
-
-def _make_ptr_args(
-    *tensors: torch.Tensor,
-) -> tuple[tuple[object, ...], tuple[int, ...]]:
-    ptrs: list[object] = []
-    alignments: list[int] = []
-    for tensor in tensors:
-        ptr, align = _make_ptr_arg(tensor)
-        ptrs.append(ptr)
-        alignments.append(align)
-    return tuple(ptrs), tuple(alignments)
 
 
 def _prepare_time_operand(
@@ -1244,6 +1287,7 @@ def _build_forward_args(
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
     return_final_state: bool = False,
+    return_intermediates: bool = True,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1413,10 +1457,22 @@ def _build_forward_args(
             P=P,
             D=D,
         )
-    m_chunk = torch.empty((Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32)
-    chunk_starts = torch.empty(
-        (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
-    )
+    if return_intermediates:
+        m_chunk = torch.empty(
+            (Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32
+        )
+        chunk_starts = torch.empty(
+            (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
+        )
+    else:
+        m_chunk, chunk_starts = _get_no_grad_intermediates(
+            device=U.device,
+            batch_size=Bsz,
+            heads=H,
+            n_chunks=n_chunks,
+            P=P,
+            D=D,
+        )
     out_pad = torch.empty((Bsz, H, T_pad, P), device=U.device, dtype=output_dtype)
 
     state_copy_bits_in = _choose_copy_bits_for_linear_tiles(
@@ -1699,8 +1755,10 @@ def compile_v2x2ssd_fwd_cute(
     )
     cached = _FWD_HOST_CACHE.get(cache_key)
     if cached is not None:
+        note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=True)
         return cached
 
+    note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=False)
     host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
     compiled = cute.compile(host_wrapper, *dynamic_args)
     _FWD_HOST_CACHE[cache_key] = compiled
@@ -1726,6 +1784,7 @@ def v2x2ssd_fwd_cute(
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
     return_final_state: bool = False,
+    return_intermediates: bool = True,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1756,6 +1815,7 @@ def v2x2ssd_fwd_cute(
         B_prev=B_prev,
         U_prev=U_prev,
         return_final_state=return_final_state,
+        return_intermediates=return_intermediates,
         prepared_inputs=prepared_inputs,
     )
     cache_key = _fwd_host_cache_key(
@@ -1781,9 +1841,12 @@ def v2x2ssd_fwd_cute(
     )
     compiled = _FWD_HOST_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=False)
         host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
         compiled = cute.compile(host_wrapper, *dynamic_args)
         _FWD_HOST_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=True)
     compiled(*dynamic_args)
     Y, final_state, m_chunk, chunk_starts = outputs
     if not return_final_state:

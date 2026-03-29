@@ -54,6 +54,8 @@ class ScanPrepFwdFused:
         spec: tuple[int, int, int, int, int],
         params_in_stride: tuple[int, int, int] | None = None,
         normalize_bc: bool,
+        store_rms_inv: bool,
+        store_coeff_aux: bool,
         dt_min: float,
         dt_max: float,
         r_min: float,
@@ -71,6 +73,8 @@ class ScanPrepFwdFused:
         self.p_size = int(p_size)
         self.n_size = int(n_size)
         self.normalize_bc = bool(normalize_bc)
+        self.store_rms_inv = bool(store_rms_inv)
+        self.store_coeff_aux = bool(store_coeff_aux)
 
         self.value_shape = (self.batch, self.t_size, self.h_size * self.p_size)
         self.value_stride = make_row_major_stride(self.value_shape)
@@ -228,7 +232,7 @@ class ScanPrepFwdFused:
                 inv2 = cute.rsqrt(s2 / denom + eps_bc)
                 inv3 = cute.rsqrt(s3 / denom + eps_bc)
 
-                if lane == 0:
+                if cutlass.const_expr(self.store_rms_inv) and lane == 0:
                     mRmsInv[b, h, t, 0] = inv0
                     mRmsInv[b, h, t, 1] = inv1
                     mRmsInv[b, h, t, 2] = inv2
@@ -449,33 +453,34 @@ class ScanPrepFwdFused:
             mKOut[b, h, t, 1, 0] = out_curr_re
             mKOut[b, h, t, 1, 1] = out_curr_im
 
-            mCoeffAux[b, h, COEFF_AUX_DT_U, t] = dt_u
-            mCoeffAux[b, h, COEFF_AUX_GAMMA_SIGMOID, t] = gamma_sigmoid
-            mCoeffAux[b, h, COEFF_AUX_OMEGA, t] = omega
-            mCoeffAux[b, h, COEFF_AUX_R_DIRECT_U, t] = r_direct_u
-            mCoeffAux[b, h, COEFF_AUX_THETA_DIRECT_TANH, t] = theta_direct_tanh
-            mCoeffAux[b, h, COEFF_AUX_MIX_R, t] = mix_r
-            mCoeffAux[b, h, COEFF_AUX_MIX_THETA, t] = mix_theta
-            mCoeffAux[b, h, COEFF_AUX_MIX_K_PREV, t] = mix_k_prev
-            mCoeffAux[b, h, COEFF_AUX_MIX_K_CURR, t] = mix_k_curr
-            mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_RE, t] = k_prev_tanh_re
-            mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_IM, t] = k_prev_tanh_im
-            mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_RE, t] = k_curr_tanh_re
-            mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_IM, t] = k_curr_tanh_im
-            mCoeffAux[b, h, COEFF_AUX_DT, t] = dt
-            mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
-            mCoeffAux[b, h, COEFF_AUX_EXP_TERM, t] = exp_term
-            mCoeffAux[b, h, COEFF_AUX_DELTA_R, t] = r_struct - r_direct
-            mCoeffAux[b, h, COEFF_AUX_DELTA_THETA, t] = theta_struct - theta_direct
-            mCoeffAux[b, h, COEFF_AUX_R, t] = r
-            mCoeffAux[b, h, COEFF_AUX_THETA, t] = theta
-            mCoeffAux[b, h, COEFF_AUX_RHO_RE, t] = rho_re
-            mCoeffAux[b, h, COEFF_AUX_RHO_IM, t] = rho_im
-            mCoeffAux[b, h, COEFF_AUX_LOG_R, t] = log_r
-            mCoeffAux[b, h, COEFF_AUX_KAPPA1_RE, t] = kappa1_re
-            mCoeffAux[b, h, COEFF_AUX_KAPPA1_IM, t] = kappa1_im
-            mCoeffAux[b, h, COEFF_AUX_KAPPA2_RE, t] = kappa2_re
-            mCoeffAux[b, h, COEFF_AUX_KAPPA2_IM, t] = kappa2_im
+            if cutlass.const_expr(self.store_coeff_aux):
+                mCoeffAux[b, h, COEFF_AUX_DT_U, t] = dt_u
+                mCoeffAux[b, h, COEFF_AUX_GAMMA_SIGMOID, t] = gamma_sigmoid
+                mCoeffAux[b, h, COEFF_AUX_OMEGA, t] = omega
+                mCoeffAux[b, h, COEFF_AUX_R_DIRECT_U, t] = r_direct_u
+                mCoeffAux[b, h, COEFF_AUX_THETA_DIRECT_TANH, t] = theta_direct_tanh
+                mCoeffAux[b, h, COEFF_AUX_MIX_R, t] = mix_r
+                mCoeffAux[b, h, COEFF_AUX_MIX_THETA, t] = mix_theta
+                mCoeffAux[b, h, COEFF_AUX_MIX_K_PREV, t] = mix_k_prev
+                mCoeffAux[b, h, COEFF_AUX_MIX_K_CURR, t] = mix_k_curr
+                mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_RE, t] = k_prev_tanh_re
+                mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_IM, t] = k_prev_tanh_im
+                mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_RE, t] = k_curr_tanh_re
+                mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_IM, t] = k_curr_tanh_im
+                mCoeffAux[b, h, COEFF_AUX_DT, t] = dt
+                mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
+                mCoeffAux[b, h, COEFF_AUX_EXP_TERM, t] = exp_term
+                mCoeffAux[b, h, COEFF_AUX_DELTA_R, t] = r_struct - r_direct
+                mCoeffAux[b, h, COEFF_AUX_DELTA_THETA, t] = theta_struct - theta_direct
+                mCoeffAux[b, h, COEFF_AUX_R, t] = r
+                mCoeffAux[b, h, COEFF_AUX_THETA, t] = theta
+                mCoeffAux[b, h, COEFF_AUX_RHO_RE, t] = rho_re
+                mCoeffAux[b, h, COEFF_AUX_RHO_IM, t] = rho_im
+                mCoeffAux[b, h, COEFF_AUX_LOG_R, t] = log_r
+                mCoeffAux[b, h, COEFF_AUX_KAPPA1_RE, t] = kappa1_re
+                mCoeffAux[b, h, COEFF_AUX_KAPPA1_IM, t] = kappa1_im
+                mCoeffAux[b, h, COEFF_AUX_KAPPA2_RE, t] = kappa2_re
+                mCoeffAux[b, h, COEFF_AUX_KAPPA2_IM, t] = kappa2_im
 
     @cute.jit
     def __call__(

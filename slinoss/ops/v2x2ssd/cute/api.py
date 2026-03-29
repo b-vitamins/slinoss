@@ -146,6 +146,7 @@ def v2x2ssd_cute(
                 U_prev=U_prev,
                 output_dtype=odtype,
                 compute_dtype=rdtype,
+                return_intermediates=False,
             ),
         )
         return Y
@@ -165,6 +166,7 @@ def v2x2ssd_cute(
             output_dtype=odtype,
             compute_dtype=rdtype,
             return_final_state=True,
+            return_intermediates=False,
         ),
     )
     B_last = B[:, :, -1, :].to(dtype=odtype).contiguous()

@@ -6,11 +6,72 @@ from __future__ import annotations
 import torch
 import cutlass.cute as cute
 
+from slinoss.perf import note_cache_event
+
 from .common import make_ptr_arg
 from .kernels.bwd import ScanPrepBwdFused
 
 
 _SCANPREP_BWD_CACHE: dict[tuple[object, ...], object] = {}
+_SCANPREP_BWD_PARTIAL_CACHE: dict[
+    tuple[object, ...], tuple[torch.Tensor, torch.Tensor]
+] = {}
+_SCANPREP_BWD_PARTIAL_CACHE_LIMIT = 8
+
+
+def _cache_set(
+    cache: dict[tuple[object, ...], object],
+    key: tuple[object, ...],
+    value,
+    *,
+    limit: int,
+) -> None:
+    if key in cache:
+        cache.pop(key, None)
+    elif len(cache) >= int(limit):
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
+
+
+def _get_partial_workspace(
+    *,
+    device: torch.device,
+    batch: int,
+    t_size: int,
+    n_heads: int,
+    d_state: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pack_bt_tile = 256
+    scale_tile_count = (batch * t_size + (pack_bt_tile - 1)) // pack_bt_tile
+    bias_tile_count = (batch * t_size + (256 - 1)) // 256
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch),
+        int(t_size),
+        int(n_heads),
+        int(d_state),
+        int(scale_tile_count),
+        int(bias_tile_count),
+    )
+    cached = _SCANPREP_BWD_PARTIAL_CACHE.get(key)
+    if cached is not None:
+        note_cache_event("cute.scanprep.bwd.partial_workspace", hit=True)
+        return cached
+    note_cache_event("cute.scanprep.bwd.partial_workspace", hit=False)
+    cached = (
+        torch.empty(
+            (scale_tile_count, n_heads, 4, d_state), device=device, dtype=torch.float32
+        ),
+        torch.empty((bias_tile_count, n_heads, 7), device=device, dtype=torch.float32),
+    )
+    _cache_set(
+        _SCANPREP_BWD_PARTIAL_CACHE,
+        key,
+        cached,
+        limit=_SCANPREP_BWD_PARTIAL_CACHE_LIMIT,
+    )
+    return cached
 
 
 def scanprep_bwd(
@@ -114,21 +175,15 @@ def scanprep_bwd(
     coeff_block_size = 512
     scale_block_size = 256
     bias_block_size = 224
-    pack_bt_tile = 256
     scale_grad = torch.zeros(
         (n_heads, 4, d_state), device=bc.device, dtype=torch.float32
     )
-    scale_tile_count = (batch * t_size + (pack_bt_tile - 1)) // pack_bt_tile
-    scale_partial = torch.empty(
-        (scale_tile_count, n_heads, 4, d_state),
+    scale_partial, bias_partial = _get_partial_workspace(
         device=bc.device,
-        dtype=torch.float32,
-    )
-    bias_tile_count = (batch * t_size + (256 - 1)) // 256
-    bias_partial = torch.empty(
-        (bias_tile_count, n_heads, 7),
-        device=bc.device,
-        dtype=torch.float32,
+        batch=batch,
+        t_size=t_size,
+        n_heads=n_heads,
+        d_state=d_state,
     )
     bias_grad = torch.zeros((n_heads, 7), device=bc.device, dtype=torch.float32)
 
@@ -220,6 +275,7 @@ def scanprep_bwd(
     )
     compiled = _SCANPREP_BWD_CACHE.get(cache_key)
     if compiled is None:
+        note_cache_event("cute.scanprep.bwd.compile", hit=False)
         compiled = cute.compile(
             ScanPrepBwdFused(
                 spec=spec,
@@ -257,6 +313,8 @@ def scanprep_bwd(
             bias_grad_ptr,
         )
         _SCANPREP_BWD_CACHE[cache_key] = compiled
+    else:
+        note_cache_event("cute.scanprep.bwd.compile", hit=True)
     compiled(
         du_ptr,
         bc_ptr,
