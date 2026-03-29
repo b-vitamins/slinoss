@@ -263,8 +263,6 @@ class ChunkScanBwdDCAmpere:
                 (kv_tile * self.P_padded * in_bytes, 16),
                 (kv_tile * (2 * self.P_padded) * in_bytes, 16),
                 (kv_tile * d_block * in_bytes, 16),
-                (kv_tile * kv_tile * in_bytes, 16),
-                (kv_tile * kv_tile * in_bytes, 16),
                 (self.P * in_bytes, 16),
                 (self.D * in_bytes, 16),
                 (self.L * 4, 4),
@@ -279,10 +277,8 @@ class ChunkScanBwdDCAmpere:
                 (kv_tile * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
-                (kv_tile * 2 * 4, 16),
                 (kv_tile * 4, 4),
                 (kv_tile * 4 * 4, 16),
-                (128 * 4, 16),
             ]
         )
 
@@ -416,8 +412,6 @@ class ChunkScanBwdDCAmpere:
         in_dtype: type[cutlass.Numeric],
         layouts: ChunkScanBwdDCLayoutBundle,
     ):
-        tail_pad_layout = self._tail_pad_layout()
-
         class SharedStorage:
             pass
 
@@ -430,12 +424,6 @@ class ChunkScanBwdDCAmpere:
             ],
             "sK_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sK_layout)], 16
-            ],
-            "sDS_blk": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sDS_layout)], 16
-            ],
-            "sDS_blk_alt": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sDS_layout)], 16
             ],
             "s_u_prev": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.s_u_prev_layout)], 16
@@ -497,12 +485,6 @@ class ChunkScanBwdDCAmpere:
                 ],
                 4,
             ],
-            "s_phase_row": cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(layouts.s_phase_row_layout)
-                ],
-                16,
-            ],
             "s_phase_col": cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(layouts.s_phase_col_layout)
@@ -531,10 +513,6 @@ class ChunkScanBwdDCAmpere:
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(layouts.s_row_dR_layout)
                 ],
-                16,
-            ],
-            "tail_pad": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(tail_pad_layout)],
                 16,
             ],
         }
@@ -740,8 +718,8 @@ class ChunkScanBwdDCAmpere:
         sDY = storage.sDY.get_tensor(sDY_layout)
         sV_tile = storage.sV_tile.get_tensor(sV_layout)
         sK_tile = storage.sK_tile.get_tensor(sK_layout)
-        sDS_blk = storage.sDS_blk.get_tensor(sDS_layout)
-        sDS_blk_alt = storage.sDS_blk_alt.get_tensor(sDS_layout)
+        sDS_blk = cute.local_tile(sV_tile, (kv_tile, kv_tile), (0, 0))
+        sDS_blk_alt = cute.local_tile(sV_tile, (kv_tile, kv_tile), (0, 1))
         # `Z0` is only consumed after the causal `n_tile` sweep, so it can reuse
         # the same 32xDp slab as `sK_tile` instead of reserving a third full-D tile.
         sZ0 = cute.make_tensor(sK_tile.iterator, sZ0_layout)
@@ -758,7 +736,6 @@ class ChunkScanBwdDCAmpere:
 
         s_row_scale = storage.s_row_scale.get_tensor(s_row_layout)
         s_inv_row_scale = storage.s_inv_row_scale.get_tensor(s_inv_row_layout)
-        s_phase_row = storage.s_phase_row.get_tensor(s_phase_row_layout)
         s_phase_col = storage.s_phase_col.get_tensor(s_phase_col_layout)
         s_tap_prev = storage.s_tap_prev.get_tensor(s_tap_layout)
         s_tap_curr = storage.s_tap_curr.get_tensor(s_tap_layout)
@@ -945,8 +922,6 @@ class ChunkScanBwdDCAmpere:
             if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
                 t = m0 + lane
                 s_row_scale[lane] = cutlass.Float32(s_scale_full[t])
-                s_phase_row[lane, 0] = cutlass.Float32(s_phase_full[t, 0])
-                s_phase_row[lane, 1] = cutlass.Float32(s_phase_full[t, 1])
             if tidx < cutlass.Int32(kv_tile):
                 s_row_dlp[tidx] = cutlass.Float32(0.0)
             if tidx < cutlass.Int32(kv_tile * 4):
@@ -1537,8 +1512,8 @@ class ChunkScanBwdDCAmpere:
                             dq1 = cutlass.Float32(
                                 sK_blk[row_local, d0_local + 1].to(cutlass.Float32)
                             )
-                            pr = cutlass.Float32(s_phase_row[row_local, 0])
-                            pi = cutlass.Float32(s_phase_row[row_local, 1])
+                            pr = cutlass.Float32(s_phase_full[t, 0])
+                            pi = cutlass.Float32(s_phase_full[t, 1])
                             dc0, dc1 = conj_mul_phase(dq0, dq1, pr, pi)
                             c0 = cutlass.Float32(mC[bidz, t, 0, d0 + 0])
                             c1 = cutlass.Float32(mC[bidz, t, 0, d0 + 1])
