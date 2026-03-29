@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import pytest
 import torch
+
+import slinoss.ops.v2x2ssd.cute.kernels.bwd as v2x2ssd_bwd_mod
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _resolve_chunk_scan_launch_cfg,
@@ -739,6 +741,115 @@ def test_v2x2ssd_cute_matches_reference_autograd_with_state() -> None:
     state_weight = torch.randn((2, 2, 16, 16), device="cuda", dtype=torch.float32)
     b_last_weight = torch.randn((2, 2, 16), device="cuda", dtype=torch.float32)
     u_last_weight = torch.randn((2, 2, 16), device="cuda", dtype=torch.float32)
+
+    def run(
+        op, tensors: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        U_i, M_i, K_i, B_i, C_i, initial_i, B_prev_i, U_prev_i = tensors
+        if op is v2x2ssd:
+            outputs = op(
+                U_i,
+                M_i,
+                K_i,
+                B_i,
+                C_i,
+                chunk_size=chunk_size,
+                initial_states=initial_i,
+                B_prev=B_prev_i,
+                U_prev=U_prev_i,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+        else:
+            outputs = op(
+                U_i,
+                M_i,
+                K_i,
+                B_i,
+                C_i,
+                chunk_size=chunk_size,
+                initial_states=initial_i,
+                B_prev=B_prev_i,
+                U_prev=U_prev_i,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+                return_state=True,
+            )
+        Y, final_state, B_last, U_last = outputs
+        loss = (
+            (Y * y_weight).sum()
+            + (final_state * state_weight).sum()
+            + (B_last * b_last_weight).sum()
+            + (U_last * u_last_weight).sum()
+        )
+        grads = torch.autograd.grad(
+            loss,
+            (U_i, M_i, K_i, B_i, C_i, initial_i, B_prev_i, U_prev_i),
+            retain_graph=False,
+        )
+        return outputs, grads
+
+    ref_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+    cute_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+
+    ref_out, ref_grads = run(v2x2ssd, ref_tensors)
+    cute_out, cute_grads = run(v2x2ssd_cute, cute_tensors)
+
+    for got, want in zip(cute_out, ref_out, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-3, rtol=0.0)
+
+    grad_names = ("U", "M", "K", "B", "C", "initial_states", "B_prev", "U_prev")
+    atol_by_grad = {
+        "U": 1e-1,
+        "M": 3e-1,
+        "K": 5e-1,
+        "B": 4e-1,
+        "C": 3e-1,
+        "initial_states": 5e-3,
+        "B_prev": 5e-3,
+        "U_prev": 5e-3,
+    }
+    for name, got, want in zip(grad_names, cute_grads, ref_grads, strict=True):
+        torch.testing.assert_close(got, want, atol=atol_by_grad[name], rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_stateful_backward_clears_fused_dm_chunk_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    orig_get_bwd_workspace = v2x2ssd_bwd_mod._get_bwd_workspace
+
+    def _poisoned_get_bwd_workspace(*args, **kwargs):
+        workspace = orig_get_bwd_workspace(*args, **kwargs)
+        workspace[6].fill_(123.0)
+        return workspace
+
+    monkeypatch.setattr(
+        v2x2ssd_bwd_mod, "_get_bwd_workspace", _poisoned_get_bwd_workspace
+    )
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=1,
+        T=33,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    y_weight = torch.randn((1, 1, 33, 16), device="cuda", dtype=torch.float32)
+    state_weight = torch.randn((1, 1, 16, 16), device="cuda", dtype=torch.float32)
+    b_last_weight = torch.randn((1, 1, 16), device="cuda", dtype=torch.float32)
+    u_last_weight = torch.randn((1, 1, 16), device="cuda", dtype=torch.float32)
 
     def run(
         op, tensors: tuple[torch.Tensor, ...]

@@ -10,8 +10,10 @@ from .common import _TileConfig, _make_layout_bundle, _thread_tile_view
 
 @dataclass(frozen=True)
 class StatePassingCopyBundle:
-    copy_in_vec: object
-    copy_in_scalar: object
+    copy_starts_vec: object
+    copy_starts_scalar: object
+    copy_dstarts_vec: object
+    copy_dstarts_scalar: object
     copy_out_vec: object
     copy_out_scalar: object
     copy_final_vec: object
@@ -19,19 +21,21 @@ class StatePassingCopyBundle:
     copy_m: object
 
 
-class StatePassingBwdStateAmpere:
-    """Backward kernel for (d_inc, d_initial) (no reductions)."""
+class StatePassingBwdAmpere:
+    """Fused backward kernel for d_inc, d_m_chunk, and d_initial."""
 
     def __init__(
         self,
         cfg: _TileConfig,
         *,
-        copy_bits_in: int,
+        copy_bits_starts: int,
+        copy_bits_dstarts: int,
         copy_bits_out: int,
         copy_bits_final: int,
     ):
         self.cfg = cfg
-        self.copy_bits_in = int(copy_bits_in)
+        self.copy_bits_starts = int(copy_bits_starts)
+        self.copy_bits_dstarts = int(copy_bits_dstarts)
         self.copy_bits_out = int(copy_bits_out)
         self.copy_bits_final = int(copy_bits_final)
 
@@ -46,14 +50,21 @@ class StatePassingBwdStateAmpere:
     def _make_copy_bundle(
         self,
         *,
-        in_dtype: type[cutlass.Numeric],
+        starts_dtype: type[cutlass.Numeric],
+        dstarts_dtype: type[cutlass.Numeric],
         out_dtype: type[cutlass.Numeric],
         final_dtype: type[cutlass.Numeric],
         m_dtype: type[cutlass.Numeric],
     ) -> StatePassingCopyBundle:
         return StatePassingCopyBundle(
-            copy_in_vec=self._make_copy_atom(in_dtype, self.copy_bits_in),
-            copy_in_scalar=self._make_copy_atom(in_dtype, in_dtype.width),
+            copy_starts_vec=self._make_copy_atom(starts_dtype, self.copy_bits_starts),
+            copy_starts_scalar=self._make_copy_atom(starts_dtype, starts_dtype.width),
+            copy_dstarts_vec=self._make_copy_atom(
+                dstarts_dtype, self.copy_bits_dstarts
+            ),
+            copy_dstarts_scalar=self._make_copy_atom(
+                dstarts_dtype, dstarts_dtype.width
+            ),
             copy_out_vec=self._make_copy_atom(out_dtype, self.copy_bits_out),
             copy_out_scalar=self._make_copy_atom(out_dtype, out_dtype.width),
             copy_final_vec=self._make_copy_atom(final_dtype, self.copy_bits_final),
@@ -64,10 +75,12 @@ class StatePassingBwdStateAmpere:
     @cute.jit
     def __call__(
         self,
+        chunk_starts: cute.Tensor,  # (B,H,C,P,D) fp32
         d_chunk_starts: cute.Tensor,  # (B,H,C,P,D) fp32
         d_final: cute.Tensor,  # (B,H,P,D) fp32
         m_chunk: cute.Tensor,  # (B,H,C,2) fp32
         d_inc: cute.Tensor,  # (B,H,C,P,D) fp32
+        d_m_chunk: cute.Tensor,  # (B,H,C,2) fp32
         d_initial: cute.Tensor,  # (B,H,P,D) fp32
     ):
         B, H, C, P, D = d_inc.shape
@@ -76,16 +89,19 @@ class StatePassingBwdStateAmpere:
 
         layouts = _make_layout_bundle(BH=BH, C=C, S=S, cfg=self.cfg)
         copies = self._make_copy_bundle(
-            in_dtype=d_chunk_starts.element_type,
+            starts_dtype=chunk_starts.element_type,
+            dstarts_dtype=d_chunk_starts.element_type,
             out_dtype=d_inc.element_type,
             final_dtype=d_final.element_type,
             m_dtype=m_chunk.element_type,
         )
 
+        starts_flat = cute.make_tensor(chunk_starts.iterator, layouts.layout_bcs)
         dstarts_flat = cute.make_tensor(d_chunk_starts.iterator, layouts.layout_bcs)
         dfinal_flat = cute.make_tensor(d_final.iterator, layouts.layout_bs)
         m_flat = cute.make_tensor(m_chunk.iterator, layouts.layout_bcm)
         dinc_flat = cute.make_tensor(d_inc.iterator, layouts.layout_bcs)
+        dm_flat = cute.make_tensor(d_m_chunk.iterator, layouts.layout_bcm)
         dinitial_flat = cute.make_tensor(d_initial.iterator, layouts.layout_bs)
 
         idS = cute.make_identity_tensor(S)
@@ -95,16 +111,20 @@ class StatePassingBwdStateAmpere:
         grid_y = BH
 
         self.kernel(
+            starts_flat,
             dstarts_flat,
             dfinal_flat,
             m_flat,
             dinc_flat,
+            dm_flat,
             dinitial_flat,
             cS,
             layouts.tile_layout,
             layouts.tv_layout,
-            copies.copy_in_vec,
-            copies.copy_in_scalar,
+            copies.copy_starts_vec,
+            copies.copy_starts_scalar,
+            copies.copy_dstarts_vec,
+            copies.copy_dstarts_scalar,
             copies.copy_out_vec,
             copies.copy_out_scalar,
             copies.copy_final_vec,
@@ -118,16 +138,20 @@ class StatePassingBwdStateAmpere:
     @cute.kernel
     def kernel(
         self,
+        starts_flat: cute.Tensor,  # (BH, C, S)
         dstarts_flat: cute.Tensor,  # (BH, C, S)
         dfinal_flat: cute.Tensor,  # (BH, S)
         m_flat: cute.Tensor,  # (BH, C, 2)
         dinc_flat: cute.Tensor,  # (BH, C, S)
+        dm_flat: cute.Tensor,  # (BH, C, 2)
         dinitial_flat: cute.Tensor,  # (BH, S)
         cS: cute.Tensor,
         tile_layout: cute.Layout,
         tv_layout: cute.Layout,
-        copy_in_vec,
-        copy_in_scalar,
+        copy_starts_vec,
+        copy_starts_scalar,
+        copy_dstarts_vec,
+        copy_dstarts_scalar,
         copy_out_vec,
         copy_out_scalar,
         copy_final_vec,
@@ -169,7 +193,8 @@ class StatePassingBwdStateAmpere:
             cute.copy(copy_final_vec, thrF, frgF)
         accG.store(frgF.load().to(cutlass.Float32))
 
-        frgIn = cute.make_rmem_tensor_like(thrF)
+        frgStarts = cute.make_rmem_tensor_like(thrF)
+        frgDStarts = cute.make_rmem_tensor_like(thrF)
         pairs_per_thread = cute.size(accG) // 2
 
         for c_it in cutlass.range(C, unroll=1):
@@ -185,15 +210,48 @@ class StatePassingBwdStateAmpere:
             else:
                 cute.copy(copy_out_vec, frgTmp, thrOut)
 
+            gStarts = starts_flat[bh, c, None]
+            thrStarts = _thread_tile_view(
+                gStarts, tile_layout, cta_coord, tv_layout, tidx
+            )
+            frgStarts.fill(0)
+            if is_partial_tile:
+                cute.copy(copy_starts_scalar, thrStarts, frgStarts, pred=frgPred)
+            else:
+                cute.copy(copy_starts_vec, thrStarts, frgStarts)
+            starts_f32 = frgStarts.load().to(cutlass.Float32)
+
+            dmr = cutlass.Float32(0.0)
+            dmi = cutlass.Float32(0.0)
+            for v in cutlass.range_constexpr(pairs_per_thread):
+                base = v * 2
+                zr = starts_f32[base + 0]
+                zi = starts_f32[base + 1]
+                gr = accG[base + 0]
+                gi = accG[base + 1]
+                dmr += gr * zr + gi * zi
+                dmi += gi * zr - gr * zi
+            for offset in (16, 8, 4, 2, 1):
+                dmr += cute.arch.shuffle_sync_bfly(
+                    dmr, offset=offset, mask=-1, mask_and_clamp=31
+                )
+                dmi += cute.arch.shuffle_sync_bfly(
+                    dmi, offset=offset, mask=-1, mask_and_clamp=31
+                )
+            if lane == cutlass.Int32(0):
+                gDM = dm_flat[bh, c, None]
+                cute.arch.atomic_add((gDM.iterator + 0).llvm_ptr, dmr)
+                cute.arch.atomic_add((gDM.iterator + 1).llvm_ptr, dmi)
+
             gIn = dstarts_flat[bh, c, None]
             thrIn = _thread_tile_view(gIn, tile_layout, cta_coord, tv_layout, tidx)
 
-            frgIn.fill(0)
+            frgDStarts.fill(0)
             if is_partial_tile:
-                cute.copy(copy_in_scalar, thrIn, frgIn, pred=frgPred)
+                cute.copy(copy_dstarts_scalar, thrIn, frgDStarts, pred=frgPred)
             else:
-                cute.copy(copy_in_vec, thrIn, frgIn)
-            dstart_f32 = frgIn.load().to(cutlass.Float32)
+                cute.copy(copy_dstarts_vec, thrIn, frgDStarts)
+            dstart_f32 = frgDStarts.load().to(cutlass.Float32)
 
             mr = cutlass.Float32(0.0)
             mi = cutlass.Float32(0.0)

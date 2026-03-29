@@ -283,8 +283,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         - out["backward.v2x2ssd.chunk_increment.kernel_sum"]
     )
     out["backward.v2x2ssd.state_passing.kernel_sum"] = _sum(
-        "backward.v2x2ssd.state_passing.state",
-        "backward.v2x2ssd.state_passing.m",
+        "backward.v2x2ssd.state_passing.kernel",
     )
     out["backward.v2x2ssd.state_passing.overhead"] = (
         out["backward.v2x2ssd.state_passing.total"]

@@ -37,7 +37,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (  # noqa: E402
     compile_chunk_scan_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (  # noqa: E402
-    compile_state_passing_bwd_kernels,
+    compile_state_passing_bwd_kernel,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (  # noqa: E402
     _compile_chunk_increment_kernel_impl,
@@ -103,8 +103,7 @@ KERNEL_ORDER = (
     "chunk_scan_bwd_dc",
     "chunk_scan_bwd_dlp",
     "chunk_scan_bwd_param",
-    "state_passing_bwd_state",
-    "state_passing_bwd_m",
+    "state_passing_bwd",
 )
 
 
@@ -836,51 +835,42 @@ def _build_v2x2ssd_state_passing_bwd_runners(
     d_chunk_starts = torch.randn_like(chunk_starts)
     d_final = torch.randn_like(initial_states)
     (
-        _compiled_state,
-        _compiled_m,
+        _compiled,
         d_inc,
         d_m_chunk,
         d_initial,
-        _launch_sequential,
-        _launch_overlapped,
-    ) = compile_state_passing_bwd_kernels(
+        launch,
+    ) = compile_state_passing_bwd_kernel(
         chunk_starts,
         m_chunk,
         d_chunk_starts=d_chunk_starts,
         d_final=d_final,
-        return_launchers=True,
+        return_launcher=True,
     )
-    state_args = _closure_var(_launch_sequential, "state_args")
-    m_args = _closure_var(_launch_sequential, "m_args")
-    if not isinstance(state_args, tuple) or not isinstance(m_args, tuple):
+    compiled = _closure_var(launch, "compiled")
+    dynamic_args = _closure_var(launch, "dynamic_args")
+    if not isinstance(dynamic_args, tuple):
         raise RuntimeError(
-            "state_passing_bwd launcher closure did not expose state/m args tuples."
+            "state_passing_bwd launcher closure did not expose dynamic_args tuple."
         )
-    launchers: dict[str, Callable[[], None]] = {
-        "state_passing_bwd_state": lambda compiled=_compiled_state,
-        args=state_args: compiled(*args),
-        "state_passing_bwd_m": lambda compiled=_compiled_m, args=m_args: compiled(
-            *args
-        ),
-    }
 
-    def prepare_m() -> None:
-        launchers["state_passing_bwd_state"]()
+    def prepare() -> None:
+        d_m_chunk.zero_()
 
     return {
-        "state_passing_bwd_state": KernelRunner(
-            name="state_passing_bwd_state",
+        "state_passing_bwd": KernelRunner(
+            name="state_passing_bwd",
             effective_bytes=_tensor_bytes(
-                d_chunk_starts, d_final, m_chunk, d_inc, d_initial
+                chunk_starts,
+                d_chunk_starts,
+                d_final,
+                m_chunk,
+                d_inc,
+                d_m_chunk,
+                d_initial,
             ),
-            launch=launchers["state_passing_bwd_state"],
-            prepare=_noop,
-        ),
-        "state_passing_bwd_m": KernelRunner(
-            name="state_passing_bwd_m",
-            effective_bytes=_tensor_bytes(chunk_starts, d_inc, d_m_chunk),
-            launch=launchers["state_passing_bwd_m"],
-            prepare=prepare_m,
+            launch=lambda compiled=compiled, args=dynamic_args: compiled(*args),
+            prepare=prepare,
         ),
     }
 
@@ -1139,9 +1129,6 @@ def build_kernel_runner(
         "chunk_scan_bwd_param",
     }:
         return _build_v2x2ssd_chunk_scan_bwd_runners(v2_cfg)[name]
-    if name in {
-        "state_passing_bwd_state",
-        "state_passing_bwd_m",
-    }:
+    if name in {"state_passing_bwd"}:
         return _build_v2x2ssd_state_passing_bwd_runners(v2_cfg)[name]
     raise KeyError(f"Unknown kernel runner: {name}")

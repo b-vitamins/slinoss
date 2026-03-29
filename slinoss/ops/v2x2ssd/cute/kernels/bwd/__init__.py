@@ -31,8 +31,7 @@ from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
 from .chunk_scan.param_scan import ChunkScanBwdParamScanAmpere
 from .state_passing.common import _TileConfig, _choose_copy_bits_for_linear_tiles
-from .state_passing.m import StatePassingBwdMAmpere
-from .state_passing.state import StatePassingBwdStateAmpere
+from .state_passing.state import StatePassingBwdAmpere
 
 
 _BWD_HOST_CACHE: dict[tuple, object] = {}
@@ -279,7 +278,8 @@ def _bwd_host_cache_key(
     scan_num_threads_param: int,
     state_num_threads: int,
     state_pairs_per_thread: int,
-    state_copy_bits_state: int,
+    state_copy_bits_starts: int,
+    state_copy_bits_dstarts: int,
     state_copy_bits_out: int,
     state_copy_bits_final: int,
     n_d_tiles: int,
@@ -305,7 +305,8 @@ def _bwd_host_cache_key(
         int(scan_num_threads_param),
         int(state_num_threads),
         int(state_pairs_per_thread),
-        int(state_copy_bits_state),
+        int(state_copy_bits_starts),
+        int(state_copy_bits_dstarts),
         int(state_copy_bits_out),
         int(state_copy_bits_final),
         int(n_d_tiles),
@@ -537,6 +538,10 @@ def _build_backward_args(
         n_d_tiles=n_d_tiles,
     )
 
+    # The fused state-passing backward kernel atomically accumulates d_m_chunk.
+    # This workspace is cached across calls, so it must be reset before launch.
+    d_m_chunk.zero_()
+
     U_prev_chunks[:, 0, :] = U_prev0.reshape(BH, P)
     B_prev_chunks[:, 0, :] = B_prev0.reshape(BH, D)
     if n_chunks > 1:
@@ -547,7 +552,12 @@ def _build_backward_args(
         num_threads=int(state_num_threads),
         pairs_per_thread=int(state_pairs_per_thread),
     )
-    state_copy_bits_state = _choose_copy_bits_for_linear_tiles(
+    state_copy_bits_starts = _choose_copy_bits_for_linear_tiles(
+        chunk_starts_f.reshape(Bsz, H, n_chunks, P, D),
+        tile_stride_elems=P * D,
+        elems_per_thread=state_cfg.elems_per_thread,
+    )
+    state_copy_bits_dstarts = _choose_copy_bits_for_linear_tiles(
         dZ0.reshape(Bsz, H, n_chunks, P, D),
         tile_stride_elems=P * D,
         elems_per_thread=state_cfg.elems_per_thread,
@@ -632,7 +642,8 @@ def _build_backward_args(
         int(scan_num_threads_param),
         int(state_num_threads),
         int(state_pairs_per_thread),
-        int(state_copy_bits_state),
+        int(state_copy_bits_starts),
+        int(state_copy_bits_dstarts),
         int(state_copy_bits_out),
         int(state_copy_bits_final),
         dz0_cta_tiler,
@@ -711,7 +722,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
         scan_num_threads_param,
         state_num_threads,
         state_pairs_per_thread,
-        state_copy_bits_state,
+        state_copy_bits_starts,
+        state_copy_bits_dstarts,
         state_copy_bits_out,
         state_copy_bits_final,
         dz0_cta_tiler,
@@ -925,14 +937,12 @@ def _make_v2x2ssd_bwd_host_wrapper(
             num_threads=state_num_threads,
             pairs_per_thread=state_pairs_per_thread,
         )
-        state_bwd = StatePassingBwdStateAmpere(
+        state_bwd = StatePassingBwdAmpere(
             state_cfg,
-            copy_bits_in=state_copy_bits_state,
+            copy_bits_starts=state_copy_bits_starts,
+            copy_bits_dstarts=state_copy_bits_dstarts,
             copy_bits_out=state_copy_bits_out,
             copy_bits_final=state_copy_bits_final,
-        )
-        state_m_bwd = StatePassingBwdMAmpere(
-            state_cfg, copy_bits_in=state_copy_bits_state
         )
 
         inc_db = ChunkIncrementBwdDBAmpere(tc_dtype, chunk_size=L, D=D, P=P)
@@ -1013,13 +1023,14 @@ def _make_v2x2ssd_bwd_host_wrapper(
         scan_dz0(mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
 
         state_bwd(
+            mChunkStarts_state,
             mDChunkStarts_state,
             mDFinal,
             mMchunk_state,
             mDInc_state,
+            mDMchunk_state,
             mDInitial,
         )
-        state_m_bwd(mChunkStarts_state, mDInc_state, mDMchunk_state)
         cast_d_inc(mDInc_flat, mDInc_tc_flat).launch(
             grid=[cast_grid_x, 1, 1],
             block=[cast_num_threads, 1, 1],
@@ -1123,10 +1134,11 @@ def compile_v2x2ssd_bwd_cute(
         scan_num_threads_param=int(scan_num_threads_param),
         state_num_threads=int(state_num_threads),
         state_pairs_per_thread=int(state_pairs_per_thread),
-        state_copy_bits_state=int(cfg[6]),
-        state_copy_bits_out=int(cfg[7]),
-        state_copy_bits_final=int(cfg[8]),
-        dz0_cta_tiler=cfg[9],
+        state_copy_bits_starts=int(cfg[6]),
+        state_copy_bits_dstarts=int(cfg[7]),
+        state_copy_bits_out=int(cfg[8]),
+        state_copy_bits_final=int(cfg[9]),
+        dz0_cta_tiler=cfg[10],
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )
@@ -1220,10 +1232,11 @@ def _v2x2ssd_bwd_cute_impl(
         scan_num_threads_param=int(scan_num_threads_param),
         state_num_threads=int(state_num_threads),
         state_pairs_per_thread=int(state_pairs_per_thread),
-        state_copy_bits_state=int(cfg[6]),
-        state_copy_bits_out=int(cfg[7]),
-        state_copy_bits_final=int(cfg[8]),
-        dz0_cta_tiler=cfg[9],
+        state_copy_bits_starts=int(cfg[6]),
+        state_copy_bits_dstarts=int(cfg[7]),
+        state_copy_bits_out=int(cfg[8]),
+        state_copy_bits_final=int(cfg[9]),
+        dz0_cta_tiler=cfg[10],
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )

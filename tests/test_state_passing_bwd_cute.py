@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import cast
-
-import math
 
 import pytest
 import torch
 
 import slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing as state_passing_bwd_mod
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (
-    compile_state_passing_bwd_kernels,
+    compile_state_passing_bwd_kernel,
     state_passing_bwd_cute,
 )
 
@@ -46,6 +45,30 @@ def _state_passing_autograd(
     return chunk_starts, final_state
 
 
+def _state_passing_backward_reference(
+    inc: torch.Tensor,
+    m_chunk: torch.Tensor,
+    initial_states: torch.Tensor,
+    d_chunk_starts: torch.Tensor,
+    d_final: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    inc_ref = inc.detach().clone().requires_grad_(True)
+    m_ref = m_chunk.detach().clone().requires_grad_(True)
+    initial_ref = initial_states.detach().clone().requires_grad_(True)
+    chunk_starts, final_state = _state_passing_autograd(inc_ref, m_ref, initial_ref)
+    loss = (chunk_starts * d_chunk_starts).sum() + (final_state * d_final).sum()
+    d_inc, d_m_chunk, d_initial = torch.autograd.grad(
+        loss,
+        (inc_ref, m_ref, initial_ref),
+        retain_graph=False,
+    )
+    return (
+        d_inc.detach().to(dtype=torch.float32).contiguous(),
+        d_m_chunk.detach().to(dtype=torch.float32).contiguous(),
+        d_initial.detach().to(dtype=torch.float32).contiguous(),
+    )
+
+
 def _make_inputs(
     *,
     batch: int,
@@ -71,8 +94,17 @@ def _make_inputs(
     return inc, m_chunk, initial_states
 
 
+def _assert_state_passing_bwd_close(
+    got: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    want: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    atol_by_idx = (1e-6, 3e-4, 1e-6)
+    for got_tensor, want_tensor, atol in zip(got, want, atol_by_idx, strict=True):
+        torch.testing.assert_close(got_tensor, want_tensor, atol=atol, rtol=0.0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_state_passing_bwd_kernels_matches_wrapper() -> None:
+def test_compile_state_passing_bwd_kernel_matches_wrapper_and_reference() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
@@ -89,42 +121,36 @@ def test_compile_state_passing_bwd_kernels_matches_wrapper() -> None:
     chunk_starts_f32 = chunk_starts.detach().to(dtype=torch.float32).contiguous()
     d_chunk_starts = torch.randn_like(chunk_starts_f32)
     d_final = torch.randn_like(final_state, dtype=torch.float32)
-
-    got_public = state_passing_bwd_cute(
-        chunk_starts_f32,
-        m_chunk.detach(),
-        d_chunk_starts=d_chunk_starts.detach(),
-        d_final=d_final.detach(),
+    want = _state_passing_backward_reference(
+        inc,
+        m_chunk,
+        initial,
+        d_chunk_starts,
+        d_final,
     )
 
-    compiled = cast(
-        tuple[
-            object,
-            object,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            Callable[[], None],
-            Callable[[], None],
-        ],
-        compile_state_passing_bwd_kernels(
+    got_public = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        state_passing_bwd_cute(
             chunk_starts_f32,
             m_chunk.detach(),
             d_chunk_starts=d_chunk_starts.detach(),
             d_final=d_final.detach(),
-            return_launchers=True,
         ),
     )
-    (
-        _compiled_state,
-        _compiled_m,
-        d_inc,
-        d_m_chunk,
-        d_initial,
-        launch_sequential,
-        _launch_overlapped,
-    ) = compiled
-    launch_sequential()
+
+    compiled = cast(
+        tuple[object, torch.Tensor, torch.Tensor, torch.Tensor, Callable[[], None]],
+        compile_state_passing_bwd_kernel(
+            chunk_starts_f32,
+            m_chunk.detach(),
+            d_chunk_starts=d_chunk_starts.detach(),
+            d_final=d_final.detach(),
+            return_launcher=True,
+        ),
+    )
+    (_compiled, d_inc, d_m_chunk, d_initial, launch) = compiled
+    launch()
 
     got_compiled = (
         d_inc.to(dtype=torch.float32).contiguous(),
@@ -134,10 +160,11 @@ def test_compile_state_passing_bwd_kernels_matches_wrapper() -> None:
 
     for got_tensor, want_tensor in zip(got_compiled, got_public, strict=True):
         torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
+    _assert_state_passing_bwd_close(got_public, want)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_state_passing_bwd_overlapped_matches_sequential() -> None:
+def test_compile_state_passing_bwd_kernel_relaunch_is_idempotent() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
@@ -154,57 +181,46 @@ def test_compile_state_passing_bwd_overlapped_matches_sequential() -> None:
     chunk_starts_f32 = chunk_starts.detach().to(dtype=torch.float32).contiguous()
     d_chunk_starts = torch.randn_like(chunk_starts_f32)
     d_final = torch.randn_like(final_state, dtype=torch.float32)
+    want = _state_passing_backward_reference(
+        inc,
+        m_chunk,
+        initial,
+        d_chunk_starts,
+        d_final,
+    )
 
-    seq_bundle = cast(
-        tuple[
-            object,
-            object,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            Callable[[], None],
-            Callable[[], None],
-        ],
-        compile_state_passing_bwd_kernels(
-            chunk_starts_f32.clone(),
+    compiled = cast(
+        tuple[object, torch.Tensor, torch.Tensor, torch.Tensor, Callable[[], None]],
+        compile_state_passing_bwd_kernel(
+            chunk_starts_f32,
             m_chunk.detach(),
             d_chunk_starts=d_chunk_starts.detach(),
             d_final=d_final.detach(),
-            return_launchers=True,
+            return_launcher=True,
         ),
     )
-    ov_bundle = cast(
-        tuple[
-            object,
-            object,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            Callable[[], None],
-            Callable[[], None],
-        ],
-        compile_state_passing_bwd_kernels(
-            chunk_starts_f32.clone(),
-            m_chunk.detach(),
-            d_chunk_starts=d_chunk_starts.detach(),
-            d_final=d_final.detach(),
-            return_launchers=True,
-        ),
+    (_compiled, d_inc, d_m_chunk, d_initial, launch) = compiled
+
+    launch()
+    first = (
+        d_inc.clone(),
+        d_m_chunk.clone(),
+        d_initial.clone(),
+    )
+    launch()
+    second = (
+        d_inc.to(dtype=torch.float32).contiguous(),
+        d_m_chunk.to(dtype=torch.float32).contiguous(),
+        d_initial.to(dtype=torch.float32).contiguous(),
     )
 
-    seq_launch = seq_bundle[-2]
-    ov_launch = ov_bundle[-1]
-    seq_launch()
-    ov_launch()
-
-    seq_public = tuple(t.to(dtype=torch.float32).contiguous() for t in seq_bundle[2:5])
-    ov_public = tuple(t.to(dtype=torch.float32).contiguous() for t in ov_bundle[2:5])
-    for got_tensor, want_tensor in zip(ov_public, seq_public, strict=True):
+    for got_tensor, want_tensor in zip(second, first, strict=True):
         torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
+    _assert_state_passing_bwd_close(second, want)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_state_passing_bwd_reuses_cached_executors(
+def test_compile_state_passing_bwd_reuses_cached_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("cutlass")
@@ -225,7 +241,7 @@ def test_compile_state_passing_bwd_reuses_cached_executors(
     d_final = torch.randn_like(final_state, dtype=torch.float32)
 
     state_passing_bwd_mod._COMPILED_CACHE.clear()
-    compile_state_passing_bwd_kernels(
+    compile_state_passing_bwd_kernel(
         chunk_starts_f32,
         m_chunk.detach(),
         d_chunk_starts=d_chunk_starts.detach(),
@@ -236,7 +252,7 @@ def test_compile_state_passing_bwd_reuses_cached_executors(
         raise AssertionError("unexpected recompilation on cache hit")
 
     monkeypatch.setattr(state_passing_bwd_mod.cute, "compile", _unexpected_compile)
-    compile_state_passing_bwd_kernels(
+    compile_state_passing_bwd_kernel(
         chunk_starts_f32,
         m_chunk.detach(),
         d_chunk_starts=d_chunk_starts.detach(),

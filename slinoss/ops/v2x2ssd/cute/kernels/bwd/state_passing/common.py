@@ -1,23 +1,15 @@
-"""CuTe backward kernels for the ``v2x2ssd`` state-passing stage.
+"""CuTe backward helpers for the fused ``v2x2ssd`` state-passing stage.
 
-This stage is split into two bandwidth-oriented kernels:
+The fused kernel walks the backward chunk recurrence over one contiguous
+``S = P * D`` tile per CTA:
 
-1) Backprop through the chunk recurrence to produce gradients w.r.t. the
-   per-chunk increments and the initial state:
+1) It writes ``d_inc[c] = d_z_{c+1}``.
+2) It accumulates the local ``d_m_chunk[c]`` contribution from
+   ``(chunk_starts[c], d_z_{c+1})``.
+3) It updates ``d_z_c = d_chunk_starts[c] + conj(m_chunk[c]) * d_z_{c+1}``.
 
-   z_{c+1} = m_chunk[c] * z_c + inc[c]
-   chunk_starts[c] = z_c
-
-   Given upstream grads (d_chunk_starts, d_final), compute:
-     d_inc[c] = d_z_{c+1}
-     d_z_c = d_chunk_starts[c] + conj(m_chunk[c]) * d_z_{c+1}
-
-2) Gradient w.r.t. the per-chunk complex transport parameters m_chunk[c].
-   This is a reduction over the flattened state axis S=P*D. It consumes
-   (chunk_starts, d_inc) and produces d_m_chunk.
-
-Both kernels compute in fp32 and write fp32 outputs, matching the reference
-math.
+The full ``d_m_chunk`` reduction is completed by atomically accumulating the
+per-tile partials into the global output.
 """
 
 from __future__ import annotations

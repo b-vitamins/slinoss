@@ -1,4 +1,4 @@
-"""CuTe backward kernels for the ``v2x2ssd`` state-passing stage."""
+"""CuTe backward kernel for the fused ``v2x2ssd`` state-passing stage."""
 
 from __future__ import annotations
 
@@ -12,19 +12,10 @@ from .common import (
     _choose_copy_bits_for_linear_tiles,
     _torch_to_cutlass_dtype,
 )
-from .m import StatePassingBwdMAmpere
-from .state import StatePassingBwdStateAmpere
+from .state import StatePassingBwdAmpere
 
 
-_COMPILED_CACHE: dict[tuple, tuple[object, object]] = {}
-
-
-def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
-    if key in cache:
-        cache.pop(key, None)
-    elif len(cache) >= int(limit):
-        cache.pop(next(iter(cache)), None)
-    cache[key] = value
+_COMPILED_CACHE: dict[tuple, object] = {}
 
 
 def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -93,7 +84,8 @@ def _compiled_key(
     d_final_shape: tuple[int, ...],
     num_threads: int,
     pairs_per_thread: int,
-    copy_bits_state: int,
+    copy_bits_starts: int,
+    copy_bits_dstarts: int,
     copy_bits_out: int,
     copy_bits_final: int,
     alignments: tuple[int, ...],
@@ -107,90 +99,71 @@ def _compiled_key(
         d_final_shape,
         int(num_threads),
         int(pairs_per_thread),
-        int(copy_bits_state),
+        int(copy_bits_starts),
+        int(copy_bits_dstarts),
         int(copy_bits_out),
         int(copy_bits_final),
         alignments,
     )
 
 
-def _make_state_passing_state_host_wrapper(
+def _make_state_passing_host_wrapper(
     *,
     spec: tuple[int, ...],
     cfg: tuple[int, ...],
 ):
     B, H, C, P, D = spec
-    num_threads, pairs_per_thread, copy_bits_state, copy_bits_out, copy_bits_final = cfg
+    (
+        num_threads,
+        pairs_per_thread,
+        copy_bits_starts,
+        copy_bits_dstarts,
+        copy_bits_out,
+        copy_bits_final,
+    ) = cfg
 
+    starts_spec = _make_tensor_spec((B, H, C, P, D))
     d_starts_spec = _make_tensor_spec((B, H, C, P, D))
     d_final_spec = _make_tensor_spec((B, H, P, D))
     m_spec = _make_tensor_spec((B, H, C, 2))
     d_inc_spec = _make_tensor_spec((B, H, C, P, D))
+    d_m_spec = _make_tensor_spec((B, H, C, 2))
     d_initial_spec = _make_tensor_spec((B, H, P, D))
 
     @cute.jit
     def _state_host_wrapper(
+        Starts_ptr: cute.Pointer,
         DStarts_ptr: cute.Pointer,
         DFinal_ptr: cute.Pointer,
         M_ptr: cute.Pointer,
         DInc_ptr: cute.Pointer,
+        DM_ptr: cute.Pointer,
         DInit_ptr: cute.Pointer,
     ):
+        mStarts = _make_tensor_from_spec(Starts_ptr, starts_spec)
         mDStarts = _make_tensor_from_spec(DStarts_ptr, d_starts_spec)
         mDFinal = _make_tensor_from_spec(DFinal_ptr, d_final_spec)
         mM = _make_tensor_from_spec(M_ptr, m_spec)
         mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
+        mDM = _make_tensor_from_spec(DM_ptr, d_m_spec)
         mDInit = _make_tensor_from_spec(DInit_ptr, d_initial_spec)
 
-        kernel = StatePassingBwdStateAmpere(
+        kernel = StatePassingBwdAmpere(
             _TileConfig(
                 num_threads=num_threads,
                 pairs_per_thread=pairs_per_thread,
             ),
-            copy_bits_in=copy_bits_state,
+            copy_bits_starts=copy_bits_starts,
+            copy_bits_dstarts=copy_bits_dstarts,
             copy_bits_out=copy_bits_out,
             copy_bits_final=copy_bits_final,
         )
-        kernel(mDStarts, mDFinal, mM, mDInc, mDInit)
+        kernel(mStarts, mDStarts, mDFinal, mM, mDInc, mDM, mDInit)
 
     return _state_host_wrapper
 
 
-def _make_state_passing_m_host_wrapper(
-    *,
-    spec: tuple[int, ...],
-    cfg: tuple[int, ...],
-):
-    B, H, C, P, D = spec
-    num_threads, pairs_per_thread, copy_bits_state = cfg
-
-    starts_spec = _make_tensor_spec((B, H, C, P, D))
-    d_inc_spec = _make_tensor_spec((B, H, C, P, D))
-    d_m_spec = _make_tensor_spec((B, H, C, 2))
-
-    @cute.jit
-    def _m_host_wrapper(
-        Starts_ptr: cute.Pointer,
-        DInc_ptr: cute.Pointer,
-        DM_ptr: cute.Pointer,
-    ):
-        mStarts = _make_tensor_from_spec(Starts_ptr, starts_spec)
-        mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
-        mDM = _make_tensor_from_spec(DM_ptr, d_m_spec)
-
-        kernel = StatePassingBwdMAmpere(
-            _TileConfig(
-                num_threads=num_threads,
-                pairs_per_thread=pairs_per_thread,
-            ),
-            copy_bits_in=copy_bits_state,
-        )
-        kernel(mStarts, mDInc, mDM)
-
-    return _m_host_wrapper
-
-
-def compile_state_passing_bwd_kernels(
+def compile_state_passing_bwd_kernel(
     chunk_starts: torch.Tensor,
     m_chunk: torch.Tensor,
     *,
@@ -198,10 +171,9 @@ def compile_state_passing_bwd_kernels(
     d_final: torch.Tensor,
     num_threads: int = 128,
     pairs_per_thread: int = 8,
-    return_launchers: bool = False,
-    enable_overlapped_launcher: bool = True,
+    return_launcher: bool = False,
 ) -> tuple:
-    """Compile the standalone state-passing backward kernels and allocate outputs."""
+    """Compile the fused state-passing backward kernel and allocate outputs."""
 
     if chunk_starts.ndim != 5:
         raise ValueError("chunk_starts must be (B,H,C,P,D).")
@@ -236,24 +208,33 @@ def compile_state_passing_bwd_kernels(
         raise ValueError("pairs_per_thread must be positive.")
 
     S = P * D
-
     d_inc = torch.empty(
         (B, H, C, P, D), device=chunk_starts.device, dtype=torch.float32
     )
     d_initial = torch.empty(
         (B, H, P, D), device=chunk_starts.device, dtype=torch.float32
     )
-    d_m_chunk = torch.empty(
+    d_m_chunk = torch.zeros(
         (B, H, C, 2), device=chunk_starts.device, dtype=torch.float32
     )
 
-    copy_bits_state = _choose_copy_bits_for_linear_tiles(
-        d_chunk_starts,
+    starts_c = chunk_starts.contiguous()
+    d_starts_c = d_chunk_starts.contiguous()
+    d_final_c = d_final.contiguous()
+    m_c = m_chunk.contiguous()
+
+    copy_bits_starts = _choose_copy_bits_for_linear_tiles(
+        starts_c,
+        tile_stride_elems=S,
+        elems_per_thread=cfg.elems_per_thread,
+    )
+    copy_bits_dstarts = _choose_copy_bits_for_linear_tiles(
+        d_starts_c,
         tile_stride_elems=S,
         elems_per_thread=cfg.elems_per_thread,
     )
     copy_bits_final = _choose_copy_bits_for_linear_tiles(
-        d_final,
+        d_final_c,
         tile_stride_elems=S,
         elems_per_thread=cfg.elems_per_thread,
     )
@@ -263,21 +244,15 @@ def compile_state_passing_bwd_kernels(
         elems_per_thread=cfg.elems_per_thread,
     )
 
-    starts_c = chunk_starts.contiguous()
-    d_starts_c = d_chunk_starts.contiguous()
-    d_final_c = d_final.contiguous()
-    m_c = m_chunk.contiguous()
-
-    state_args, state_alignments = _make_ptr_args(
+    dynamic_args, alignments = _make_ptr_args(
+        starts_c,
         d_starts_c,
         d_final_c,
         m_c,
         d_inc,
+        d_m_chunk,
         d_initial,
     )
-    m_args, m_alignments = _make_ptr_args(starts_c, d_inc, d_m_chunk)
-    alignments = state_alignments + m_alignments
-
     cache_key = _compiled_key(
         device_index=(
             chunk_starts.device.index if chunk_starts.device.index is not None else -1
@@ -288,51 +263,36 @@ def compile_state_passing_bwd_kernels(
         d_final_shape=tuple(d_final.shape),
         num_threads=cfg.num_threads,
         pairs_per_thread=cfg.pairs_per_thread,
-        copy_bits_state=copy_bits_state,
+        copy_bits_starts=copy_bits_starts,
+        copy_bits_dstarts=copy_bits_dstarts,
         copy_bits_out=copy_bits_out,
         copy_bits_final=copy_bits_final,
         alignments=alignments,
     )
 
-    cached = _COMPILED_CACHE.get(cache_key)
-    if cached is None:
-        state_wrapper = _make_state_passing_state_host_wrapper(
+    compiled = _COMPILED_CACHE.get(cache_key)
+    if compiled is None:
+        host_wrapper = _make_state_passing_host_wrapper(
             spec=(B, H, C, P, D),
             cfg=(
                 cfg.num_threads,
                 cfg.pairs_per_thread,
-                copy_bits_state,
+                copy_bits_starts,
+                copy_bits_dstarts,
                 copy_bits_out,
                 copy_bits_final,
             ),
         )
-        m_wrapper = _make_state_passing_m_host_wrapper(
-            spec=(B, H, C, P, D),
-            cfg=(
-                cfg.num_threads,
-                cfg.pairs_per_thread,
-                copy_bits_state,
-            ),
-        )
-        compiled_state = cute.compile(state_wrapper, *state_args)
-        compiled_m = cute.compile(m_wrapper, *m_args)
-        cached = (compiled_state, compiled_m)
-        _COMPILED_CACHE[cache_key] = cached
-    else:
-        compiled_state, compiled_m = cached
+        compiled = cute.compile(host_wrapper, *dynamic_args)
+        _COMPILED_CACHE[cache_key] = compiled
 
-    def launch_sequential() -> None:
-        compiled_state(*state_args)
-        compiled_m(*m_args)
+    def launch() -> None:
+        d_m_chunk.zero_()
+        compiled(*dynamic_args)
 
-    # ``d_m_chunk`` depends on the freshly produced ``d_inc`` values, so this stage
-    # has no real overlapped schedule. Keep the second launcher only for interface
-    # compatibility with the larger backward stages.
-    launch_overlapped = launch_sequential
-
-    base = (compiled_state, compiled_m, d_inc, d_m_chunk, d_initial)
-    if return_launchers:
-        return (*base, launch_sequential, launch_overlapped)
+    base = (compiled, d_inc, d_m_chunk, d_initial)
+    if return_launcher:
+        return (*base, launch)
     return base
 
 
@@ -346,25 +306,18 @@ def state_passing_bwd_cute(
     pairs_per_thread: int = 8,
     return_d_initial: bool = True,
 ) -> tuple[torch.Tensor, ...]:
-    """Thin public wrapper over the compiled state-passing backward kernel bundle."""
-    (
-        _compiled_state,
-        _compiled_m,
-        d_inc,
-        d_m_chunk,
-        d_initial,
-        launch_sequential,
-        _launch_overlapped,
-    ) = compile_state_passing_bwd_kernels(
+    """Thin public wrapper over the fused state-passing backward kernel."""
+
+    _compiled, d_inc, d_m_chunk, d_initial, launch = compile_state_passing_bwd_kernel(
         chunk_starts,
         m_chunk,
         d_chunk_starts=d_chunk_starts,
         d_final=d_final,
         num_threads=num_threads,
         pairs_per_thread=pairs_per_thread,
-        return_launchers=True,
+        return_launcher=True,
     )
-    launch_sequential()
+    launch()
     if not return_d_initial:
         return (
             d_inc.to(dtype=torch.float32).contiguous(),
@@ -378,6 +331,6 @@ def state_passing_bwd_cute(
 
 
 __all__ = [
-    "compile_state_passing_bwd_kernels",
+    "compile_state_passing_bwd_kernel",
     "state_passing_bwd_cute",
 ]

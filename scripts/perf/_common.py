@@ -23,7 +23,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
     compile_chunk_increment_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (  # noqa: E402
-    compile_state_passing_bwd_kernels,
+    compile_state_passing_bwd_kernel,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (  # noqa: E402
     chunk_increment_cute,
@@ -611,14 +611,14 @@ def _build_state_passing_backward_callable(
         m_chunk,
         initial_states=initial_states.to(dtype=torch.float32).contiguous(),
     )
-    compiled = compile_state_passing_bwd_kernels(
+    compiled = compile_state_passing_bwd_kernel(
         chunk_starts_cute.to(dtype=torch.float32).contiguous(),
         m_chunk,
         d_chunk_starts=d_chunk_starts,
         d_final=d_final,
-        return_launchers=True,
+        return_launcher=True,
     )
-    launch_pipeline = compiled[-2]
+    launch_pipeline = compiled[-1]
     launch_pipeline()
     return launch_pipeline
 
