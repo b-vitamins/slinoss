@@ -84,8 +84,14 @@ class ChunkIncrementFwdAmpere:
             raise ValueError("chunk_size must be divisible by bK for this kernel")
         if self.bN % 2 != 0:
             raise ValueError("bN (D-tile) must be divisible by 2 because D = 2N")
-        if self.num_stages < 2:
-            raise ValueError("num_stages must be >= 2")
+        if self.num_stages < 1:
+            raise ValueError("num_stages must be >= 1")
+        if self.L == self.bK and self.bN == 64:
+            # A single K tile has no steady-state pipeline to overlap, so one
+            # shared-memory stage is sufficient and removes a dead A/B slab.
+            self.num_stages = 1
+        elif self.num_stages < 2:
+            raise ValueError("num_stages must be >= 2 for multi-tile kernels")
 
         self.mma_inst_shape = (16, 8, 16)
         mmaM, mmaN, mmaK = self.mma_inst_shape
@@ -117,10 +123,10 @@ class ChunkIncrementFwdAmpere:
         return cute.make_layout((self.bN,))
 
     def _warp_scan_layout(self):
-        return cute.make_layout((32, 2), stride=(2, 1))
+        return cute.make_layout((max(1, self.scan_threads // 32), 2), stride=(2, 1))
 
     def _output_alias_guard_layout(self):
-        return cute.make_layout((512,))
+        return cute.make_layout((256,))
 
     def _tail_pad_layout(self):
         return cute.make_layout((64,))
@@ -323,6 +329,21 @@ class ChunkIncrementFwdAmpere:
         atoms_layout = cute.make_layout(self.atom_layout_mnk)
         return cute.make_tiled_mma(op, atoms_layout, permutation_mnk=permutation_mnk)
 
+    def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
+        acc_layout_col_major = cute.make_layout(acc.layout.shape)
+        acc_layout_mn = cute.make_layout(
+            (
+                (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),
+                (acc_layout_col_major.shape[0][0], acc_layout_col_major.shape[2]),
+            ),
+            stride=(
+                (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),
+                (acc_layout_col_major.stride[0][0], acc_layout_col_major.stride[2]),
+            ),
+        )
+        acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
+        return cute.make_tensor(acc.iterator, acc_layout_mn)
+
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
@@ -345,7 +366,8 @@ class ChunkIncrementFwdAmpere:
             "sB": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
             ],
-            # Preserve the historical aliasing envelope for the sA -> sC epilogue reuse.
+            # Preserve the historical aliasing envelope for the shared-memory
+            # epilogue path used outside the 64-wide single-tile fast path.
             "output_alias_guard": cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(output_alias_guard_layout)
@@ -788,7 +810,10 @@ class ChunkIncrementFwdAmpere:
         num_iters = (total + self.num_threads - 1) // self.num_threads
 
         for kt in range(k_tile_count):
-            cute.arch.cp_async_wait_group(num_smem_stages - 2)
+            if cutlass.const_expr(num_smem_stages == 1):
+                cute.arch.cp_async_wait_group(0)
+            else:
+                cute.arch.cp_async_wait_group(num_smem_stages - 2)
             cute.arch.sync_threads()
 
             k_tile_offset = kt * self.bK
@@ -818,22 +843,23 @@ class ChunkIncrementFwdAmpere:
 
             cute.arch.sync_threads()
 
-            next_tile = kt + (num_smem_stages - 1)
-            if next_tile < k_tile_count:
-                cute.copy(
-                    tiled_copy_A,
-                    tAgA[None, None, None, k_tile_index],
-                    tAsA[None, None, None, smem_pipe_write],
-                    pred=tUpU,
-                )
-                cute.copy(
-                    tiled_copy_B,
-                    tBgB[None, None, None, k_tile_index],
-                    tBsB[None, None, None, smem_pipe_write],
-                    pred=tBpB,
-                )
-                k_tile_index = k_tile_index + 1
-                cute.arch.cp_async_commit_group()
+            if cutlass.const_expr(num_smem_stages > 1):
+                next_tile = kt + (num_smem_stages - 1)
+                if next_tile < k_tile_count:
+                    cute.copy(
+                        tiled_copy_A,
+                        tAgA[None, None, None, k_tile_index],
+                        tAsA[None, None, None, smem_pipe_write],
+                        pred=tUpU,
+                    )
+                    cute.copy(
+                        tiled_copy_B,
+                        tBgB[None, None, None, k_tile_index],
+                        tBsB[None, None, None, smem_pipe_write],
+                        pred=tBpB,
+                    )
+                    k_tile_index = k_tile_index + 1
+                    cute.arch.cp_async_commit_group()
 
             tCsA_p = tCsA_copy[None, None, None, smem_pipe_read]
             tCsB_p = tCsB_copy[None, None, None, smem_pipe_read]
@@ -913,19 +939,6 @@ class ChunkIncrementFwdAmpere:
 
         cute.arch.sync_threads()
 
-        cute.autovec_copy(tCrC, tCsC)
-        cute.arch.sync_threads()
-
-        total_elems = self.bM * self.bN
-        idx = tidx
-        while cute.elem_less(idx, total_elems):
-            m_idx = idx // self.bN
-            n_idx = idx - (m_idx * self.bN)
-            sC[m_idx, n_idx] = sC[m_idx, n_idx] + s_u0[m_idx] * s_b0[n_idx]
-            idx = idx + self.num_threads
-
-        cute.arch.sync_threads()
-
         ceilM, ceilN, _ = cute.ceil_div(mInc.shape, (self.bM, self.bN, 1))
         mcC = cute.make_identity_tensor(
             (cute.size(ceilM) * self.bM, cute.size(ceilN) * self.bN, 1)
@@ -936,36 +949,68 @@ class ChunkIncrementFwdAmpere:
             coord=tiler_coord,
             proj=(1, 1, None),
         )
-        tCcC = thr_copy_C.partition_S(cC)
+        if cutlass.const_expr(num_smem_stages == 1):
+            tCcC = thr_mma.partition_C(cC)
+            tCcC_mn = self._make_acc_tensor_mn_view(tCcC)
+            tCrC_mn = self._make_acc_tensor_mn_view(tCrC)
 
-        tCrC_epilogue = cute.make_fragment_like(tCgC_epilogue)
-        cute.copy(tiled_copy_C, tCsC_epilogue, tCrC_epilogue)
+            for r in cutlass.range_constexpr(cute.size(tCrC_mn.shape[0])):
+                for c in cutlass.range_constexpr(cute.size(tCrC_mn.shape[1])):
+                    row_idx = cutlass.Int32(tCcC_mn[r, c][0])
+                    col_idx = cutlass.Int32(tCcC_mn[r, c][1])
+                    if cute.elem_less(row_idx, mInc.shape[0]) and cute.elem_less(
+                        col_idx, mInc.shape[1]
+                    ):
+                        row_local = row_idx - tile_m0
+                        col_local = col_idx - tile_n0
+                        mInc[row_idx, col_idx, bidz] = (
+                            cutlass.Float32(tCrC_mn[r, c])
+                            + s_u0[row_local] * s_b0[col_local]
+                        )
+        else:
+            tCcC = thr_copy_C.partition_S(cC)
 
-        tCpC = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    tCgC_epilogue.shape[0][1],
-                    cute.size(tCgC_epilogue, mode=[1]),
-                    cute.size(tCgC_epilogue, mode=[2]),
+            cute.autovec_copy(tCrC, tCsC)
+            cute.arch.sync_threads()
+
+            total_elems = self.bM * self.bN
+            idx = tidx
+            while cute.elem_less(idx, total_elems):
+                m_idx = idx // self.bN
+                n_idx = idx - (m_idx * self.bN)
+                sC[m_idx, n_idx] = sC[m_idx, n_idx] + s_u0[m_idx] * s_b0[n_idx]
+                idx = idx + self.num_threads
+
+            cute.arch.sync_threads()
+
+            tCrC_epilogue = cute.make_fragment_like(tCgC_epilogue)
+            cute.copy(tiled_copy_C, tCsC_epilogue, tCrC_epilogue)
+
+            tCpC = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (
+                        tCgC_epilogue.shape[0][1],
+                        cute.size(tCgC_epilogue, mode=[1]),
+                        cute.size(tCgC_epilogue, mode=[2]),
+                    ),
+                    stride=(cute.size(tCgC_epilogue, mode=[1]), 1, 0),
                 ),
-                stride=(cute.size(tCgC_epilogue, mode=[1]), 1, 0),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in cutlass.range_constexpr(tCpC.shape[0]):
-            for m in cutlass.range_constexpr(tCpC.shape[1]):
-                tCpC[rest_v, m, 0] = cute.elem_less(
-                    tCcC[(0, rest_v), m, 0][0], mInc.shape[0]
-                )
-
-        for rest_v in cutlass.range_constexpr(tCpC.shape[0]):
-            for n in cutlass.range_constexpr(tCpC.shape[2]):
-                if cute.elem_less(tCcC[(0, rest_v), 0, n][1], mInc.shape[1]):
-                    cute.copy(
-                        tiled_copy_C,
-                        tCrC_epilogue[None, None, n],
-                        tCgC_epilogue[None, None, n],
-                        pred=tCpC[None, None, n],
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tCpC.shape[0]):
+                for m in cutlass.range_constexpr(tCpC.shape[1]):
+                    tCpC[rest_v, m, 0] = cute.elem_less(
+                        tCcC[(0, rest_v), m, 0][0], mInc.shape[0]
                     )
+
+            for rest_v in cutlass.range_constexpr(tCpC.shape[0]):
+                for n in cutlass.range_constexpr(tCpC.shape[2]):
+                    if cute.elem_less(tCcC[(0, rest_v), 0, n][1], mInc.shape[1]):
+                        cute.copy(
+                            tiled_copy_C,
+                            tCrC_epilogue[None, None, n],
+                            tCgC_epilogue[None, None, n],
+                            pred=tCpC[None, None, n],
+                        )
 
         return

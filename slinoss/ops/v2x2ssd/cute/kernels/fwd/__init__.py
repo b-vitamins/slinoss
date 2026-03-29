@@ -469,8 +469,6 @@ def _resolve_chunk_increment_cta_tiler(*, D: int) -> tuple[int, int, int]:
     # D=2N mixer shapes. Pick a tail-safe family instead of changing semantics.
     if D <= 96 or D % 96 == 0:
         return (64, 96, 32)
-    if D % 128 == 0:
-        return (64, 128, 32)
     return (64, 64, 32)
 
 
