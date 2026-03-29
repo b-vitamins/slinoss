@@ -31,7 +31,6 @@ import cutlass.utils as utils
 from .common import (
     LOG2_E,
     TWO_LOG2_E,
-    apply_complex_tap,
     complex_mul,
     conj_mul_phase,
 )
@@ -46,7 +45,7 @@ class ChunkScanBwdDLPLayoutBundle:
     sV_layout: object
     sQ_layout: object
     sK_layout: object
-    s_prod_t_layout: object
+    s_col_accum_layout: object
     s_scale_full_layout: object
     s_inv_scale_full_layout: object
     s_phase_full_layout: object
@@ -62,6 +61,7 @@ class ChunkScanBwdDLPLayoutBundle:
 @dataclass(frozen=True)
 class ChunkScanBwdDLPCopyBundle:
     gmem_tiled_copy_D: object
+    gmem_tiled_copy_P: object
 
 
 @dataclass(frozen=True)
@@ -188,6 +188,7 @@ class ChunkScanBwdDLPAmpere:
         p_tile = self.p_tile
         d_block = self._smem_block_size_D()
         n_tiles = self.L // kv_tile
+        meta_l = 1 if self.L == kv_tile else self.L
 
         swizzle_bits_D = self._swizzle_bits(d_block)
         sD_layout_atom = cute.make_composed_layout(
@@ -216,10 +217,12 @@ class ChunkScanBwdDLPAmpere:
             sV_layout=sV_layout,
             sQ_layout=sQ_layout,
             sK_layout=sK_layout,
-            s_prod_t_layout=cute.make_layout((kv_tile, kv_tile), stride=(kv_tile, 1)),
-            s_scale_full_layout=cute.make_layout((self.L,), stride=(1,)),
-            s_inv_scale_full_layout=cute.make_layout((self.L,), stride=(1,)),
-            s_phase_full_layout=cute.make_layout((self.L, 2), stride=(2, 1)),
+            s_col_accum_layout=cute.make_layout(
+                (self.num_threads // 32, 4, 4), stride=(16, 4, 1)
+            ),
+            s_scale_full_layout=cute.make_layout((meta_l,), stride=(1,)),
+            s_inv_scale_full_layout=cute.make_layout((meta_l,), stride=(1,)),
+            s_phase_full_layout=cute.make_layout((meta_l, 2), stride=(2, 1)),
             tile_prefix_log_layout=cute.make_layout((n_tiles,), stride=(1,)),
             tile_prefix_phase_layout=cute.make_layout((n_tiles, 2), stride=(2, 1)),
             s_row_layout=cute.make_layout((kv_tile,), stride=(1,)),
@@ -236,6 +239,7 @@ class ChunkScanBwdDLPAmpere:
         d_block = self._smem_block_size_D()
         Dp = self.D_padded
         n_tiles = self.L // kv_tile
+        meta_l = 1 if self.L == kv_tile else self.L
         return self._struct_size_bytes(
             [
                 (kv_tile * p_tile * in_bytes, 16),
@@ -245,9 +249,9 @@ class ChunkScanBwdDLPAmpere:
                 (self.P * in_bytes, 16),
                 (self.D * in_bytes, 16),
                 (self.L * 4, 4),
-                (self.L * 4, 4),
-                (self.L * 4, 4),
-                (self.L * 2 * 4, 16),
+                (meta_l * 4, 4),
+                (meta_l * 4, 4),
+                (meta_l * 2 * 4, 16),
                 (n_tiles * 4, 4),
                 (n_tiles * 2 * 4, 16),
                 (n_tiles * 4, 4),
@@ -258,7 +262,7 @@ class ChunkScanBwdDLPAmpere:
                 (kv_tile * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
-                (kv_tile * kv_tile * 4, 16),
+                ((self.num_threads // 32) * 4 * 4 * 4, 16),
                 (128 * 4, 16),
             ]
         )
@@ -302,13 +306,19 @@ class ChunkScanBwdDLPAmpere:
         self, in_dtype: type[cutlass.Numeric]
     ) -> ChunkScanBwdDLPCopyBundle:
         universal_copy_bits = 128
+        elems_per_copy = universal_copy_bits // in_dtype.width
         smem_k_block_size_D = self._smem_block_size_D()
-        tD_shape_dim_1 = smem_k_block_size_D // (universal_copy_bits // in_dtype.width)
+        tD_shape_dim_1 = smem_k_block_size_D // elems_per_copy
         tD_layout = cute.make_layout(
             (self.num_threads // tD_shape_dim_1, tD_shape_dim_1),
             stride=(tD_shape_dim_1, 1),
         )
-        v_in_layout = cute.make_layout((1, universal_copy_bits // in_dtype.width))
+        tP_shape_dim_1 = self.p_tile // elems_per_copy
+        tP_layout = cute.make_layout(
+            (self.num_threads // tP_shape_dim_1, tP_shape_dim_1),
+            stride=(tP_shape_dim_1, 1),
+        )
+        v_in_layout = cute.make_layout((1, elems_per_copy))
 
         atom_universal_copy_in = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -318,6 +328,9 @@ class ChunkScanBwdDLPAmpere:
         return ChunkScanBwdDLPCopyBundle(
             gmem_tiled_copy_D=cute.make_tiled_copy_tv(
                 atom_universal_copy_in, tD_layout, v_in_layout
+            ),
+            gmem_tiled_copy_P=cute.make_tiled_copy_tv(
+                atom_universal_copy_in, tP_layout, v_in_layout
             ),
         )
 
@@ -456,9 +469,9 @@ class ChunkScanBwdDLPAmpere:
                 ],
                 16,
             ],
-            "s_prod_t": cute.struct.Align[
+            "s_col_accum": cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(layouts.s_prod_t_layout)
+                    cutlass.Float32, cute.cosize(layouts.s_col_accum_layout)
                 ],
                 16,
             ],
@@ -575,6 +588,7 @@ class ChunkScanBwdDLPAmpere:
         layouts = self._make_layout_bundle()
         copies = self._make_copy_bundle(mU.element_type)
         gmem_tiled_copy_D = copies.gmem_tiled_copy_D
+        gmem_tiled_copy_P = copies.gmem_tiled_copy_P
         tiled_mma = self._make_tiled_mma(mU.element_type)
         s_u_prev_layout = layouts.s_u_prev_layout
         s_b_prev_layout = layouts.s_b_prev_layout
@@ -583,7 +597,7 @@ class ChunkScanBwdDLPAmpere:
         sV_layout = layouts.sV_layout
         sQ_layout = layouts.sQ_layout
         sK_layout = layouts.sK_layout
-        s_prod_t_layout = layouts.s_prod_t_layout
+        s_col_accum_layout = layouts.s_col_accum_layout
         s_scale_full_layout = layouts.s_scale_full_layout
         s_inv_scale_full_layout = layouts.s_inv_scale_full_layout
         s_phase_full_layout = layouts.s_phase_full_layout
@@ -601,7 +615,7 @@ class ChunkScanBwdDLPAmpere:
         sV_tile = storage.sV_tile.get_tensor(sV_layout)
         sQ_tile = storage.sQ_tile.get_tensor(sQ_layout)
         sK_tile = storage.sK_tile.get_tensor(sK_layout)
-        s_prod_t = storage.s_prod_t.get_tensor(s_prod_t_layout)
+        s_col_accum = storage.s_col_accum.get_tensor(s_col_accum_layout)
         s_u_prev = storage.s_u_prev.get_tensor(s_u_prev_layout)
         s_b_prev = storage.s_b_prev.get_tensor(s_b_prev_layout)
         s_dlp = storage.s_dlp.get_tensor(s_dlp_layout)
@@ -631,11 +645,9 @@ class ChunkScanBwdDLPAmpere:
         eps = cutlass.Float32(1.0e-20)
         one = cutlass.Float32(1.0)
 
-        for tile in range(n_tiles):
-            if warp == cutlass.Int32(tile % num_warps) and lane < cutlass.Int32(
-                kv_tile
-            ):
-                t = cutlass.Int32(tile * kv_tile) + lane
+        if cutlass.const_expr(n_tiles == 1):
+            if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
+                t = lane
                 mr = cutlass.Float32(mM[bidz, t, 0])
                 mi = cutlass.Float32(mM[bidz, t, 1])
                 mag2 = cutlass.Float32(mr * mr + mi * mi + eps)
@@ -661,55 +673,100 @@ class ChunkScanBwdDLPAmpere:
                     nr, ni = complex_mul(pr, pi, opr, opi)
                     pr = cutlass.select_(pred, nr, pr)
                     pi = cutlass.select_(pred, ni, pi)
-                s_scale_full[t] = logp
-                s_phase_full[t, 0] = pr
-                s_phase_full[t, 1] = pi
-                if lane == cutlass.Int32(kv_tile - 1):
-                    s_tile_end_log[tile] = logp
-                    s_tile_end_phase[tile, 0] = pr
-                    s_tile_end_phase[tile, 1] = pi
-        cute.arch.barrier()
-
-        if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
-            off_log = cutlass.Float32(0.0)
-            off_r = cutlass.Float32(1.0)
-            off_i = cutlass.Float32(0.0)
-            for tile in range(n_tiles):
-                s_tile_off_log[tile] = off_log
-                s_tile_off_phase[tile, 0] = off_r
-                s_tile_off_phase[tile, 1] = off_i
-                last_log = cutlass.Float32(s_tile_end_log[tile])
-                last_r = cutlass.Float32(s_tile_end_phase[tile, 0])
-                last_i = cutlass.Float32(s_tile_end_phase[tile, 1])
-                off_log = off_log + last_log
-                off_r, off_i = complex_mul(last_r, last_i, off_r, off_i)
-        cute.arch.barrier()
-
-        for tile in range(n_tiles):
-            if warp == cutlass.Int32(tile % num_warps) and lane < cutlass.Int32(
-                kv_tile
-            ):
-                t = cutlass.Int32(tile * kv_tile) + lane
-                logp = cutlass.Float32(s_scale_full[t]) + cutlass.Float32(
-                    s_tile_off_log[tile]
-                )
-                pr = cutlass.Float32(s_phase_full[t, 0])
-                pi = cutlass.Float32(s_phase_full[t, 1])
-                off_r = cutlass.Float32(s_tile_off_phase[tile, 0])
-                off_i = cutlass.Float32(s_tile_off_phase[tile, 1])
-                pr, pi = complex_mul(pr, pi, off_r, off_i)
-                mag2 = cutlass.Float32(pr * pr + pi * pi + eps)
-                inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
-                pr = pr * inv_mag
-                pi = pi * inv_mag
                 scale = cute.math.exp2(
                     logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
                 )
-                s_scale_full[t] = scale
-                s_inv_scale_full[t] = one / scale
-                s_phase_full[t, 0] = pr
-                s_phase_full[t, 1] = pi
-        cute.arch.barrier()
+                s_row_scale[lane] = scale
+                s_inv_row_scale[lane] = one / scale
+                s_phase_row[lane, 0] = pr
+                s_phase_row[lane, 1] = pi
+                s_phase_col[lane, 0] = pr
+                s_phase_col[lane, 1] = pi
+                s_tap_prev[lane, 0] = cutlass.Float32(mK[bidz, t, 0, 0])
+                s_tap_prev[lane, 1] = cutlass.Float32(mK[bidz, t, 0, 1])
+                s_tap_curr[lane, 0] = cutlass.Float32(mK[bidz, t, 1, 0])
+                s_tap_curr[lane, 1] = cutlass.Float32(mK[bidz, t, 1, 1])
+            cute.arch.barrier()
+        else:
+            for tile in range(n_tiles):
+                if warp == cutlass.Int32(tile % num_warps) and lane < cutlass.Int32(
+                    kv_tile
+                ):
+                    t = cutlass.Int32(tile * kv_tile) + lane
+                    mr = cutlass.Float32(mM[bidz, t, 0])
+                    mi = cutlass.Float32(mM[bidz, t, 1])
+                    mag2 = cutlass.Float32(mr * mr + mi * mi + eps)
+                    inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
+                    pr = mr * inv_mag
+                    pi = mi * inv_mag
+                    logp = cutlass.Float32(
+                        cute.math.log2(mag2, fastmath=False)
+                        * cutlass.Float32(0.25 / LOG2_E)
+                    )
+                    for offset in (1, 2, 4, 8, 16):
+                        other_log = cute.arch.shuffle_sync_up(
+                            logp, offset=offset, mask=-1, mask_and_clamp=0
+                        )
+                        opr = cute.arch.shuffle_sync_up(
+                            pr, offset=offset, mask=-1, mask_and_clamp=0
+                        )
+                        opi = cute.arch.shuffle_sync_up(
+                            pi, offset=offset, mask=-1, mask_and_clamp=0
+                        )
+                        pred = lane >= cutlass.Int32(offset)
+                        logp = cutlass.select_(pred, logp + other_log, logp)
+                        nr, ni = complex_mul(pr, pi, opr, opi)
+                        pr = cutlass.select_(pred, nr, pr)
+                        pi = cutlass.select_(pred, ni, pi)
+                    s_scale_full[t] = logp
+                    s_phase_full[t, 0] = pr
+                    s_phase_full[t, 1] = pi
+                    if lane == cutlass.Int32(kv_tile - 1):
+                        s_tile_end_log[tile] = logp
+                        s_tile_end_phase[tile, 0] = pr
+                        s_tile_end_phase[tile, 1] = pi
+            cute.arch.barrier()
+
+            if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
+                off_log = cutlass.Float32(0.0)
+                off_r = cutlass.Float32(1.0)
+                off_i = cutlass.Float32(0.0)
+                for tile in range(n_tiles):
+                    s_tile_off_log[tile] = off_log
+                    s_tile_off_phase[tile, 0] = off_r
+                    s_tile_off_phase[tile, 1] = off_i
+                    last_log = cutlass.Float32(s_tile_end_log[tile])
+                    last_r = cutlass.Float32(s_tile_end_phase[tile, 0])
+                    last_i = cutlass.Float32(s_tile_end_phase[tile, 1])
+                    off_log = off_log + last_log
+                    off_r, off_i = complex_mul(last_r, last_i, off_r, off_i)
+            cute.arch.barrier()
+
+            for tile in range(n_tiles):
+                if warp == cutlass.Int32(tile % num_warps) and lane < cutlass.Int32(
+                    kv_tile
+                ):
+                    t = cutlass.Int32(tile * kv_tile) + lane
+                    logp = cutlass.Float32(s_scale_full[t]) + cutlass.Float32(
+                        s_tile_off_log[tile]
+                    )
+                    pr = cutlass.Float32(s_phase_full[t, 0])
+                    pi = cutlass.Float32(s_phase_full[t, 1])
+                    off_r = cutlass.Float32(s_tile_off_phase[tile, 0])
+                    off_i = cutlass.Float32(s_tile_off_phase[tile, 1])
+                    pr, pi = complex_mul(pr, pi, off_r, off_i)
+                    mag2 = cutlass.Float32(pr * pr + pi * pi + eps)
+                    inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
+                    pr = pr * inv_mag
+                    pi = pi * inv_mag
+                    scale = cute.math.exp2(
+                        logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
+                    )
+                    s_scale_full[t] = scale
+                    s_inv_scale_full[t] = one / scale
+                    s_phase_full[t, 0] = pr
+                    s_phase_full[t, 1] = pi
+            cute.arch.barrier()
 
         prev_bidz = cutlass.select_(
             chunk > cutlass.Int32(0), bidz - cutlass.Int32(1), bidz
@@ -747,6 +804,7 @@ class ChunkScanBwdDLPAmpere:
         thr_mma = tiled_mma.get_slice(tidx)
 
         gmem_thr_copy_D = gmem_tiled_copy_D.get_slice(tidx)
+        gmem_thr_copy_P = gmem_tiled_copy_P.get_slice(tidx)
         mcS = cute.make_identity_tensor((mU.shape[0], self.L, mU.shape[2], self.L))
         mcKD = cute.make_identity_tensor((mU.shape[0], self.L, mU.shape[2], Dp))
         mcS_full = mcS[bidz, None, 0, None]
@@ -766,9 +824,12 @@ class ChunkScanBwdDLPAmpere:
         tSrV_tile = thr_mma.make_fragment_B(thr_mma.partition_B(sV_tile))
         tSsV_tile = thr_copy_B.partition_S(sV_tile)
         tSrV_tile_view = thr_copy_B.retile(tSrV_tile)
+        tDYsP = gmem_thr_copy_P.partition_D(sDY)
+        tVsP = gmem_thr_copy_P.partition_D(sV_tile)
         tSrK_score = thr_mma.make_fragment_B(thr_mma.partition_B(sK_tile))
         tSsK_score = thr_copy_B.partition_S(sK_tile)
         tSrK_score_view = thr_copy_B.retile(tSrK_score)
+        tKsD = gmem_thr_copy_D.partition_D(sK_tile)
 
         total_v_tile = cutlass.Int32(kv_tile * p_tile)
         iters_v_tile = (total_v_tile + self.num_threads - 1) // self.num_threads
@@ -782,18 +843,19 @@ class ChunkScanBwdDLPAmpere:
         ) // self.num_threads
         total_k_tile = cutlass.Int32(kv_tile * d_block)
         iters_k_tile = (total_k_tile + self.num_threads - 1) // self.num_threads
-        total_blk_tile = cutlass.Int32(kv_tile * kv_tile)
-        iters_blk_tile = (total_blk_tile + self.num_threads - 1) // self.num_threads
 
-        for m_tile in range(n_tiles):
+        for m_tile in cutlass.range_constexpr(n_tiles):
             m0 = cutlass.Int32(m_tile * kv_tile)
 
-            if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
-                t = m0 + lane
-                s_row_scale[lane] = cutlass.Float32(s_scale_full[t])
-                s_phase_row[lane, 0] = cutlass.Float32(s_phase_full[t, 0])
-                s_phase_row[lane, 1] = cutlass.Float32(s_phase_full[t, 1])
-            cute.arch.barrier()
+            if cutlass.const_expr(n_tiles == 1):
+                pass
+            else:
+                if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
+                    t = m0 + lane
+                    s_row_scale[lane] = cutlass.Float32(s_scale_full[t])
+                    s_phase_row[lane, 0] = cutlass.Float32(s_phase_full[t, 0])
+                    s_phase_row[lane, 1] = cutlass.Float32(s_phase_full[t, 1])
+                cute.arch.barrier()
 
             gC_tile = cute.local_tile(
                 mC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
@@ -860,51 +922,85 @@ class ChunkScanBwdDLPAmpere:
                     sQ_tile[t_local, d0 + 1] = qy0
             cute.arch.barrier()
 
-            for n_tile in range(m_tile + 1):
+            for n_tile in cutlass.range_constexpr(m_tile + 1):
                 n0 = cutlass.Int32(n_tile * kv_tile)
 
-                if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
-                    t = n0 + lane
-                    s_inv_row_scale[lane] = cutlass.Float32(s_inv_scale_full[t])
-                    s_phase_col[lane, 0] = cutlass.Float32(s_phase_full[t, 0])
-                    s_phase_col[lane, 1] = cutlass.Float32(s_phase_full[t, 1])
-                    s_tap_prev[lane, 0] = cutlass.Float32(mK[bidz, t, 0, 0])
-                    s_tap_prev[lane, 1] = cutlass.Float32(mK[bidz, t, 0, 1])
-                    s_tap_curr[lane, 0] = cutlass.Float32(mK[bidz, t, 1, 0])
-                    s_tap_curr[lane, 1] = cutlass.Float32(mK[bidz, t, 1, 1])
-                cute.arch.barrier()
+                if cutlass.const_expr(n_tiles == 1):
+                    pass
+                else:
+                    if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
+                        t = n0 + lane
+                        s_inv_row_scale[lane] = cutlass.Float32(s_inv_scale_full[t])
+                        s_phase_col[lane, 0] = cutlass.Float32(s_phase_full[t, 0])
+                        s_phase_col[lane, 1] = cutlass.Float32(s_phase_full[t, 1])
+                        s_tap_prev[lane, 0] = cutlass.Float32(mK[bidz, t, 0, 0])
+                        s_tap_prev[lane, 1] = cutlass.Float32(mK[bidz, t, 0, 1])
+                        s_tap_curr[lane, 0] = cutlass.Float32(mK[bidz, t, 1, 0])
+                        s_tap_curr[lane, 1] = cutlass.Float32(mK[bidz, t, 1, 1])
+                    cute.arch.barrier()
 
-                for pass_id in range(2):
+                for pass_id in cutlass.range_constexpr(2):
                     acc_dS_blk = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
                     acc_dS_blk.fill(0.0)
 
                     for p_tile_idx in cutlass.range_constexpr(n_p_tiles):
                         p0 = cutlass.Int32(p_tile_idx * p_tile)
-                        for it in range(iters_v_tile):
-                            idx = tidx + cutlass.Int32(it * self.num_threads)
-                            if idx < total_v_tile:
-                                t_local = idx // cutlass.Int32(p_tile)
-                                p_local = idx - t_local * cutlass.Int32(p_tile)
-                                row = m0 + t_local
-                                p = p0 + p_local
-                                dy = cutlass.Float32(0.0).to(mU.element_type)
-                                vv = cutlass.Float32(0.0).to(mU.element_type)
-                                if row < cutlass.Int32(self.L) and p < cutlass.Int32(
-                                    self.P
-                                ):
-                                    dy = mDOut[bidz, row, 0, p]
-                                    if pass_id == 1:
-                                        src_row = n0 + t_local
-                                        if src_row < cutlass.Int32(self.L):
-                                            vv = mU[bidz, src_row, 0, p]
-                                    else:
+                        if cutlass.const_expr(self.P == Pp):
+                            gDY = cute.local_tile(
+                                mDOut[bidz, None, 0, None],
+                                (kv_tile, p_tile),
+                                (m_tile, p_tile_idx),
+                            )
+                            tDYg = gmem_thr_copy_P.partition_S(gDY)
+                            cute.copy(gmem_tiled_copy_P, tDYg, tDYsP)
+                            if pass_id == 1:
+                                gV = cute.local_tile(
+                                    mU[bidz, None, 0, None],
+                                    (kv_tile, p_tile),
+                                    (n_tile, p_tile_idx),
+                                )
+                                tVg = gmem_thr_copy_P.partition_S(gV)
+                                cute.copy(gmem_tiled_copy_P, tVg, tVsP)
+                            else:
+                                for it in range(iters_v_tile):
+                                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                                    if idx < total_v_tile:
+                                        t_local = idx // cutlass.Int32(p_tile)
+                                        p_local = idx - t_local * cutlass.Int32(p_tile)
+                                        p = p0 + p_local
+                                        vv = cutlass.Float32(0.0).to(mU.element_type)
                                         src_row = n0 + t_local - cutlass.Int32(1)
                                         if src_row >= cutlass.Int32(0):
                                             vv = mU[bidz, src_row, 0, p]
                                         else:
                                             vv = s_u_prev[p]
-                                sDY[t_local, p_local] = dy
-                                sV_tile[t_local, p_local] = vv
+                                        sV_tile[t_local, p_local] = vv
+                        else:
+                            for it in range(iters_v_tile):
+                                idx = tidx + cutlass.Int32(it * self.num_threads)
+                                if idx < total_v_tile:
+                                    t_local = idx // cutlass.Int32(p_tile)
+                                    p_local = idx - t_local * cutlass.Int32(p_tile)
+                                    row = m0 + t_local
+                                    p = p0 + p_local
+                                    dy = cutlass.Float32(0.0).to(mU.element_type)
+                                    vv = cutlass.Float32(0.0).to(mU.element_type)
+                                    if row < cutlass.Int32(
+                                        self.L
+                                    ) and p < cutlass.Int32(self.P):
+                                        dy = mDOut[bidz, row, 0, p]
+                                        if pass_id == 1:
+                                            src_row = n0 + t_local
+                                            if src_row < cutlass.Int32(self.L):
+                                                vv = mU[bidz, src_row, 0, p]
+                                        else:
+                                            src_row = n0 + t_local - cutlass.Int32(1)
+                                            if src_row >= cutlass.Int32(0):
+                                                vv = mU[bidz, src_row, 0, p]
+                                            else:
+                                                vv = s_u_prev[p]
+                                    sDY[t_local, p_local] = dy
+                                    sV_tile[t_local, p_local] = vv
                         cute.arch.barrier()
 
                         for k in cutlass.range_constexpr(
@@ -932,10 +1028,25 @@ class ChunkScanBwdDLPAmpere:
                             )
                         cute.arch.barrier()
 
+                    if warp == cutlass.Int32(0) and lane < cutlass.Int32(kv_tile):
+                        pr = cutlass.Float32(s_phase_col[lane, 0])
+                        pi = cutlass.Float32(s_phase_col[lane, 1])
+                        if cutlass.const_expr(pass_id == 1):
+                            kr = cutlass.Float32(s_tap_curr[lane, 0])
+                            ki = cutlass.Float32(s_tap_curr[lane, 1])
+                            s_tap_curr[lane, 0] = kr * pr + ki * pi
+                            s_tap_curr[lane, 1] = kr * pi - ki * pr
+                        else:
+                            kr = cutlass.Float32(s_tap_prev[lane, 0])
+                            ki = cutlass.Float32(s_tap_prev[lane, 1])
+                            s_tap_prev[lane, 0] = kr * pr + ki * pi
+                            s_tap_prev[lane, 1] = kr * pi - ki * pr
+                    cute.arch.barrier()
+
                     acc_S_blk = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
                     acc_S_blk.fill(0.0)
 
-                    for d_tile in range(n_d_tiles):
+                    for d_tile in cutlass.range_constexpr(n_d_tiles):
                         d_base = cutlass.Int32(d_tile * d_block)
                         pairs_per_row = cutlass.Int32(d_block // 2)
 
@@ -946,25 +1057,34 @@ class ChunkScanBwdDLPAmpere:
                         tSsQ_blk = thr_copy_A.partition_S(sQ_blk)
                         tSrQ_blk_view = thr_copy_A.retile(tSrQ_blk)
 
-                        for it in range(iters_k_tile):
-                            idx = tidx + cutlass.Int32(it * self.num_threads)
-                            if idx < total_k_tile:
-                                t_local = idx // cutlass.Int32(d_block)
-                                d_local = idx - t_local * cutlass.Int32(d_block)
-                                d = d_base + d_local
-                                val = cutlass.Float32(0.0).to(mU.element_type)
-                                if d < cutlass.Int32(self.D):
-                                    t = n0 + t_local
-                                    if pass_id == 1:
-                                        if t < cutlass.Int32(self.L):
-                                            val = mB[bidz, t, 0, d]
-                                    else:
-                                        t_src = t - cutlass.Int32(1)
-                                        if t_src >= cutlass.Int32(0):
-                                            val = mB[bidz, t_src, 0, d]
+                        if cutlass.const_expr(self.D == Dp) and pass_id == 1:
+                            gK = cute.local_tile(
+                                mB[bidz, None, 0, None],
+                                (kv_tile, d_block),
+                                (n_tile, d_tile),
+                            )
+                            tKg = gmem_thr_copy_D.partition_S(gK)
+                            cute.copy(gmem_tiled_copy_D, tKg, tKsD)
+                        else:
+                            for it in range(iters_k_tile):
+                                idx = tidx + cutlass.Int32(it * self.num_threads)
+                                if idx < total_k_tile:
+                                    t_local = idx // cutlass.Int32(d_block)
+                                    d_local = idx - t_local * cutlass.Int32(d_block)
+                                    d = d_base + d_local
+                                    val = cutlass.Float32(0.0).to(mU.element_type)
+                                    if d < cutlass.Int32(self.D):
+                                        t = n0 + t_local
+                                        if pass_id == 1:
+                                            if t < cutlass.Int32(self.L):
+                                                val = mB[bidz, t, 0, d]
                                         else:
-                                            val = s_b_prev[d]
-                                sK_tile[t_local, d_local] = val
+                                            t_src = t - cutlass.Int32(1)
+                                            if t_src >= cutlass.Int32(0):
+                                                val = mB[bidz, t_src, 0, d]
+                                            else:
+                                                val = s_b_prev[d]
+                                    sK_tile[t_local, d_local] = val
                         cute.arch.barrier()
 
                         for it in range(iters_pairs_k_tile):
@@ -990,18 +1110,16 @@ class ChunkScanBwdDLPAmpere:
                                             cutlass.Float32
                                         )
                                     )
-                                    kr = cutlass.Float32(0.0)
-                                    ki = cutlass.Float32(0.0)
+                                    mix0 = cutlass.Float32(0.0)
+                                    mix1 = cutlass.Float32(0.0)
                                     if pass_id == 1:
-                                        kr = cutlass.Float32(s_tap_curr[t_local, 0])
-                                        ki = cutlass.Float32(s_tap_curr[t_local, 1])
+                                        mix0 = cutlass.Float32(s_tap_curr[t_local, 0])
+                                        mix1 = cutlass.Float32(s_tap_curr[t_local, 1])
                                     else:
-                                        kr = cutlass.Float32(s_tap_prev[t_local, 0])
-                                        ki = cutlass.Float32(s_tap_prev[t_local, 1])
-                                    tr, ti = apply_complex_tap(bx, by, kr, ki)
-                                    pr = cutlass.Float32(s_phase_col[t_local, 0])
-                                    pi = cutlass.Float32(s_phase_col[t_local, 1])
-                                    outx, outy = conj_mul_phase(tr, ti, pr, pi)
+                                        mix0 = cutlass.Float32(s_tap_prev[t_local, 0])
+                                        mix1 = cutlass.Float32(s_tap_prev[t_local, 1])
+                                    outx = bx * mix0 + by * mix1
+                                    outy = bx * mix1 - by * mix0
                                     out0 = outx.to(mU.element_type)
                                     out1 = outy.to(mU.element_type)
                                 sK_tile[t_local, d0_local + 0] = out0
@@ -1046,20 +1164,16 @@ class ChunkScanBwdDLPAmpere:
                     tScS_blk_mn = self._make_acc_tensor_mn_view(tScS_blk)
                     acc_dS_blk_mn = self._make_acc_tensor_mn_view(acc_dS_blk)
                     acc_S_blk_mn = self._make_acc_tensor_mn_view(acc_S_blk)
-                    for it in range(iters_blk_tile):
-                        idx = tidx + cutlass.Int32(it * self.num_threads)
-                        if idx < total_blk_tile:
-                            col = idx // cutlass.Int32(kv_tile)
-                            row = idx - col * cutlass.Int32(kv_tile)
-                            s_prod_t[col, row] = cutlass.Float32(0.0)
-                    cute.arch.barrier()
+                    col_acc0 = cutlass.Float32(0.0)
+                    col_acc1 = cutlass.Float32(0.0)
+                    col_acc2 = cutlass.Float32(0.0)
+                    col_acc3 = cutlass.Float32(0.0)
                     diag_tile = m_tile == n_tile
                     for r in cutlass.range_constexpr(cute.size(acc_S_blk_mn.shape[0])):
                         row_idx = cutlass.Int32(tScS_blk_mn[r, 0][1])
-                        row_local = row_idx - m0
                         rs = cutlass.Float32(0.0)
                         if cute.elem_less(row_idx, cutlass.Int32(self.L)):
-                            rs = cutlass.Float32(s_row_scale[row_local])
+                            rs = cutlass.Float32(s_row_scale[row_idx - m0])
                         for c in cutlass.range_constexpr(
                             cute.size(acc_S_blk_mn.shape[1])
                         ):
@@ -1077,17 +1191,81 @@ class ChunkScanBwdDLPAmpere:
                                     sc_f32 = acc_S_blk_mn[r, c] * scale
                                     ds_unscaled_f32 = acc_dS_blk_mn[r, c]
                                     prod = ds_unscaled_f32 * sc_f32
-                            s_prod_t[col_local, row_local] = prod
+                                    if c == 0:
+                                        col_acc0 = col_acc0 + prod
+                                    elif c == 1:
+                                        col_acc1 = col_acc1 + prod
+                                    elif c == 2:
+                                        col_acc2 = col_acc2 + prod
+                                    else:
+                                        col_acc3 = col_acc3 + prod
+
+                    for offset in (4, 8, 16):
+                        col_acc0 = col_acc0 + cute.arch.shuffle_sync_bfly(
+                            col_acc0, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        col_acc1 = col_acc1 + cute.arch.shuffle_sync_bfly(
+                            col_acc1, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        col_acc2 = col_acc2 + cute.arch.shuffle_sync_bfly(
+                            col_acc2, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        col_acc3 = col_acc3 + cute.arch.shuffle_sync_bfly(
+                            col_acc3, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+
+                    if lane < cutlass.Int32(4):
+                        s_col_accum[warp, lane, 0] = col_acc0
+                        s_col_accum[warp, lane, 1] = col_acc1
+                        s_col_accum[warp, lane, 2] = col_acc2
+                        s_col_accum[warp, lane, 3] = col_acc3
                     cute.arch.barrier()
 
-                    if warp == cutlass.Int32(2):
-                        i = lane
-                        n = n0 + i
-                        col_sum = cutlass.Float32(0.0)
-                        for ii in cutlass.range_constexpr(kv_tile):
-                            col_sum = col_sum + cutlass.Float32(s_prod_t[i, ii])
-                        if n < cutlass.Int32(self.L):
-                            s_dlp[n] = s_dlp[n] - cutlass.Float32(2.0) * col_sum
+                    if warp == cutlass.Int32(0) and lane < cutlass.Int32(8):
+                        src_lane = cutlass.select_(
+                            lane < cutlass.Int32(4), lane, lane - cutlass.Int32(4)
+                        )
+                        src_warp0 = cutlass.select_(
+                            lane < cutlass.Int32(4),
+                            cutlass.Int32(0),
+                            cutlass.Int32(2),
+                        )
+                        src_warp1 = src_warp0 + cutlass.Int32(1)
+                        base = cutlass.select_(
+                            lane < cutlass.Int32(4),
+                            cutlass.Int32(0),
+                            cutlass.Int32(8),
+                        ) + src_lane * cutlass.Int32(2)
+
+                        col_sum0 = cutlass.Float32(s_col_accum[src_warp0, src_lane, 0])
+                        col_sum0 = col_sum0 + cutlass.Float32(
+                            s_col_accum[src_warp1, src_lane, 0]
+                        )
+                        col_sum1 = cutlass.Float32(s_col_accum[src_warp0, src_lane, 1])
+                        col_sum1 = col_sum1 + cutlass.Float32(
+                            s_col_accum[src_warp1, src_lane, 1]
+                        )
+                        col_sum2 = cutlass.Float32(s_col_accum[src_warp0, src_lane, 2])
+                        col_sum2 = col_sum2 + cutlass.Float32(
+                            s_col_accum[src_warp1, src_lane, 2]
+                        )
+                        col_sum3 = cutlass.Float32(s_col_accum[src_warp0, src_lane, 3])
+                        col_sum3 = col_sum3 + cutlass.Float32(
+                            s_col_accum[src_warp1, src_lane, 3]
+                        )
+
+                        col0 = n0 + base
+                        col1 = col0 + cutlass.Int32(1)
+                        col2 = col0 + cutlass.Int32(16)
+                        col3 = col2 + cutlass.Int32(1)
+                        if col0 < cutlass.Int32(self.L):
+                            s_dlp[col0] = s_dlp[col0] - cutlass.Float32(2.0) * col_sum0
+                        if col1 < cutlass.Int32(self.L):
+                            s_dlp[col1] = s_dlp[col1] - cutlass.Float32(2.0) * col_sum1
+                        if col2 < cutlass.Int32(self.L):
+                            s_dlp[col2] = s_dlp[col2] - cutlass.Float32(2.0) * col_sum2
+                        if col3 < cutlass.Int32(self.L):
+                            s_dlp[col3] = s_dlp[col3] - cutlass.Float32(2.0) * col_sum3
                     cute.arch.barrier()
 
         cute.arch.barrier()
