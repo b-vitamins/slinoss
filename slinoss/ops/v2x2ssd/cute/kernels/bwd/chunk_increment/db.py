@@ -163,6 +163,26 @@ class ChunkIncrementBwdDBAmpere:
         )
         return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))
 
+    def _make_smem_layout_C(self, copy_bits: int, smem_tiler: tuple[int, int]):
+        major_mode_size = smem_tiler[1]
+        if major_mode_size >= 64:
+            if major_mode_size % 64 == 0:
+                major_mode_size = 64
+            elif major_mode_size % 32 == 0:
+                major_mode_size = 32
+            else:
+                major_mode_size = 64
+
+        swizzle_bits = int(math.log2(major_mode_size * self.c_dtype.width // copy_bits))
+        swizzle_bits = min(swizzle_bits, 3)
+        layout_atom_outer = cute.make_layout(
+            (8, major_mode_size), stride=(major_mode_size, 1)
+        )
+        layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits, 3, 3), 0, layout_atom_outer
+        )
+        return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1))
+
     def _make_gmem_tiled_copy_AB(
         self, atom_copy, dtype, major_mode, copy_bits, *, tile_m: int
     ):
@@ -228,7 +248,7 @@ class ChunkIncrementBwdDBAmpere:
             b_copy_bits,
             (self.bN, self.bK, self.num_stages),
         )
-        sC_layout = cute.make_layout((self.bM, self.bN), stride=(self.bN, 1))
+        sC_layout = self._make_smem_layout_C(128, (self.bM, self.bN))
         return ChunkIncrementBwdDBLayoutBundle(
             a_major_mode=a_major_mode,
             b_major_mode=b_major_mode,

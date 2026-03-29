@@ -92,7 +92,15 @@ class ChunkIncrementBwdDUAmpere:
             raise ValueError(
                 "D/bK must be >= (num_stages-1) for the cp.async pipeline."
             )
-
+        if (
+            self.D == 256
+            and self.bK == 32
+            and self.bN == self.L
+            and self.num_stages > 2
+        ):
+            # The training-hot DU shape has eight K tiles, so double buffering
+            # is sufficient and recovers one staged A/B slab.
+            self.num_stages = 2
         self.mma_inst_shape = (16, 8, 16)
         mmaM, mmaN, mmaK = self.mma_inst_shape
         atomM, atomN, atomK = self.atom_layout_mnk
@@ -268,6 +276,21 @@ class ChunkIncrementBwdDUAmpere:
         )
         tC = cute.make_layout(self.atom_layout_mnk)
         return cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
+
+    def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
+        acc_layout_col_major = cute.make_layout(acc.layout.shape)
+        acc_layout_mn = cute.make_layout(
+            (
+                (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),
+                (acc_layout_col_major.shape[0][0], acc_layout_col_major.shape[2]),
+            ),
+            stride=(
+                (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),
+                (acc_layout_col_major.stride[0][0], acc_layout_col_major.stride[2]),
+            ),
+        )
+        acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
+        return cute.make_tensor(acc.iterator, acc_layout_mn)
 
     def _make_copy_bundle(
         self,
@@ -506,9 +529,6 @@ class ChunkIncrementBwdDUAmpere:
         storage = smem.allocate(SharedStorage)
         sA = storage.sA.get_tensor(sA_layout)
         sB = storage.sB.get_tensor(sB_layout)
-        sC = cute.make_tensor(
-            cute.recast_ptr(sA.iterator, dtype=cutlass.Float32), sC_layout
-        )
         warp_scan_layout = self._warp_scan_layout()
         alpha_layout = self._alpha_layout()
         warp_re_total = storage.warp_re_total.get_tensor(warp_scan_layout)
@@ -529,7 +549,6 @@ class ChunkIncrementBwdDUAmpere:
         thr_mma = tiled_mma.get_slice(tidx)
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
-        tCsC = thr_mma.partition_C(sC)
         tCgC = thr_mma.partition_C(
             cute.local_tile(
                 mDU[None, None, bidz],
@@ -846,20 +865,30 @@ class ChunkIncrementBwdDUAmpere:
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        cute.autovec_copy(tCrC, tCsC)
-        cute.arch.sync_threads()
+        ceil_m = cute.ceil_div(mDU.shape[0], self.bM)
+        ceil_n = cute.ceil_div(mDU.shape[1], self.bN)
+        mcDU = cute.make_identity_tensor(
+            (cute.size(ceil_m) * self.bM, cute.size(ceil_n) * self.bN, 1)
+        )
+        cDU = cute.local_tile(
+            mcDU[None, None, bidz],
+            tiler=self.cta_tiler,
+            coord=tiler_coord,
+            proj=(1, 1, None),
+        )
+        tCcDU = thr_mma.partition_C(cDU)
+        tCcDU_mn = self._make_acc_tensor_mn_view(tCcDU)
+        tCrC_mn = self._make_acc_tensor_mn_view(tCrC)
 
-        tile_m0 = bidx * self.bM
-        tile_n0 = bidy * self.bN
-        total_elems = self.bM * self.bN
-        idx = tidx
-        while cute.elem_less(idx, total_elems):
-            m = idx // self.bN
-            n = idx - (m * self.bN)
-            g_m = tile_m0 + m
-            g_n = tile_n0 + n
-            if cute.elem_less(g_m, self.P) and cute.elem_less(g_n, self.L):
-                mDU[g_m, g_n, bidz] = sC[m, n].to(mDU.element_type)
-            idx = idx + self.num_threads
+        for r in cutlass.range_constexpr(cute.size(tCrC_mn.shape[0])):
+            for c in cutlass.range_constexpr(cute.size(tCrC_mn.shape[1])):
+                g_m = cutlass.Int32(tCcDU_mn[r, c][0])
+                g_n = cutlass.Int32(tCcDU_mn[r, c][1])
+                if cute.elem_less(g_m, mDU.shape[0]) and cute.elem_less(
+                    g_n, mDU.shape[1]
+                ):
+                    mDU[g_m, g_n, bidz] = cutlass.Float32(tCrC_mn[r, c]).to(
+                        mDU.element_type
+                    )
 
         return
