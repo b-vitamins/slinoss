@@ -38,6 +38,7 @@ from .common import (
 
 @dataclass(frozen=True)
 class ChunkScanBwdDLPLayoutBundle:
+    sPVK_layout: object
     s_u_prev_layout: object
     s_b_prev_layout: object
     s_dlp_layout: object
@@ -206,10 +207,12 @@ class ChunkScanBwdDLPAmpere:
             0,
             cute.make_layout((8, smem_k_block_size_P), stride=(smem_k_block_size_P, 1)),
         )
+        sPVK_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, 2 * p_tile), (0, 1))
         sDY_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
         sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
 
         return ChunkScanBwdDLPLayoutBundle(
+            sPVK_layout=sPVK_layout,
             s_u_prev_layout=cute.make_layout((self.P,), stride=(1,)),
             s_b_prev_layout=cute.make_layout((self.D,), stride=(1,)),
             s_dlp_layout=cute.make_layout((self.L,), stride=(1,)),
@@ -240,11 +243,13 @@ class ChunkScanBwdDLPAmpere:
         Dp = self.D_padded
         n_tiles = self.L // kv_tile
         meta_l = 1 if self.L == kv_tile else self.L
+        pvk_alias_bytes = max(
+            2 * kv_tile * p_tile * in_bytes,
+            kv_tile * d_block * in_bytes,
+        )
         return self._struct_size_bytes(
             [
-                (kv_tile * p_tile * in_bytes, 16),
-                (kv_tile * p_tile * in_bytes, 16),
-                (kv_tile * d_block * in_bytes, 16),
+                (pvk_alias_bytes, 16),
                 (kv_tile * Dp * in_bytes, 16),
                 (self.P * in_bytes, 16),
                 (self.D * in_bytes, 16),
@@ -367,14 +372,17 @@ class ChunkScanBwdDLPAmpere:
             pass
 
         SharedStorage.__annotations__ = {
-            "sDY": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sDY_layout)], 16
-            ],
-            "sV_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
-            ],
-            "sK_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sK_layout)], 16
+            # dY/V staging and K-score staging are lifetime-disjoint, so they
+            # share one CTA-local slab.
+            "sPVK_alias": cute.struct.Align[
+                cute.struct.MemRange[
+                    in_dtype,
+                    max(
+                        cute.cosize(layouts.sPVK_layout),
+                        cute.cosize(layouts.sK_layout),
+                    ),
+                ],
+                16,
             ],
             "sQ_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sQ_layout)], 16
@@ -593,8 +601,7 @@ class ChunkScanBwdDLPAmpere:
         s_u_prev_layout = layouts.s_u_prev_layout
         s_b_prev_layout = layouts.s_b_prev_layout
         s_dlp_layout = layouts.s_dlp_layout
-        sDY_layout = layouts.sDY_layout
-        sV_layout = layouts.sV_layout
+        sPVK_layout = layouts.sPVK_layout
         sQ_layout = layouts.sQ_layout
         sK_layout = layouts.sK_layout
         s_col_accum_layout = layouts.s_col_accum_layout
@@ -611,10 +618,11 @@ class ChunkScanBwdDLPAmpere:
         smem = cutlass.utils.SmemAllocator()
         SharedStorage = self._make_shared_storage(mU.element_type, layouts)
         storage = smem.allocate(SharedStorage)
-        sDY = storage.sDY.get_tensor(sDY_layout)
-        sV_tile = storage.sV_tile.get_tensor(sV_layout)
+        sPVK_alias = storage.sPVK_alias.get_tensor(sPVK_layout)
+        sDY = cute.local_tile(sPVK_alias, (kv_tile, p_tile), (0, 0))
+        sV_tile = cute.local_tile(sPVK_alias, (kv_tile, p_tile), (0, 1))
         sQ_tile = storage.sQ_tile.get_tensor(sQ_layout)
-        sK_tile = storage.sK_tile.get_tensor(sK_layout)
+        sK_tile = cute.make_tensor(sPVK_alias.iterator.align(16), sK_layout)
         s_col_accum = storage.s_col_accum.get_tensor(s_col_accum_layout)
         s_u_prev = storage.s_u_prev.get_tensor(s_u_prev_layout)
         s_b_prev = storage.s_b_prev.get_tensor(s_b_prev_layout)
