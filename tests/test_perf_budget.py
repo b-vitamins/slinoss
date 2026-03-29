@@ -68,9 +68,8 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
         "backward.v2x2ssd.chunk_scan.dz0": 0.3,
         "backward.v2x2ssd.chunk_scan.du": 0.4,
         "backward.v2x2ssd.chunk_scan.db": 0.5,
-        "backward.v2x2ssd.chunk_scan.dc": 0.3,
+        "backward.v2x2ssd.chunk_scan.dcdr": 0.3,
         "backward.v2x2ssd.chunk_scan.dlp": 0.2,
-        "backward.v2x2ssd.chunk_scan.dr": 0.1,
         "backward.v2x2ssd.chunk_scan.param_scan": 0.7,
     }
     derived = derive_nextchar_budget(sample)
@@ -86,8 +85,8 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
     assert derived["backward.v2x2ssd.chunk_increment.overhead"] == pytest.approx(0.6)
     assert derived["backward.v2x2ssd.state_passing.kernel_sum"] == pytest.approx(0.6)
     assert derived["backward.v2x2ssd.state_passing.overhead"] == pytest.approx(0.4)
-    assert derived["backward.v2x2ssd.chunk_scan.kernel_sum"] == pytest.approx(2.5)
-    assert derived["backward.v2x2ssd.chunk_scan.overhead"] == pytest.approx(0.5)
+    assert derived["backward.v2x2ssd.chunk_scan.kernel_sum"] == pytest.approx(2.4)
+    assert derived["backward.v2x2ssd.chunk_scan.overhead"] == pytest.approx(0.6)
     assert derived["forward.embed.total"] == 1.5
     assert derived["backward.embed.total"] == 1.0
     assert derived["forward.norms.total"] == pytest.approx(0.6)

@@ -25,7 +25,7 @@ from .chunk_scan import (
     _resolve_dz0_cta_tiler,
 )
 from .chunk_scan.db import ChunkScanBwdDBAmpere
-from .chunk_scan.dc import ChunkScanBwdDCAmpere
+from .chunk_scan.dcdr import ChunkScanBwdDCDRAmpere
 from .chunk_scan.dlp import ChunkScanBwdDLPAmpere
 from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
@@ -274,7 +274,7 @@ def _bwd_host_cache_key(
     chunk_size: int,
     scan_num_threads_du: int,
     scan_num_threads_db: int,
-    scan_num_threads_dc: int,
+    scan_num_threads_dcdr: int,
     scan_num_threads_param: int,
     state_num_threads: int,
     state_pairs_per_thread: int,
@@ -301,7 +301,7 @@ def _bwd_host_cache_key(
         int(chunk_size),
         int(scan_num_threads_du),
         int(scan_num_threads_db),
-        int(scan_num_threads_dc),
+        int(scan_num_threads_dcdr),
         int(scan_num_threads_param),
         int(state_num_threads),
         int(state_pairs_per_thread),
@@ -329,7 +329,7 @@ def _build_backward_args(
     compute_dtype: torch.dtype | None,
     scan_num_threads_du: int,
     scan_num_threads_db: int,
-    scan_num_threads_dc: int,
+    scan_num_threads_dcdr: int,
     scan_num_threads_param: int,
     state_num_threads: int,
     state_pairs_per_thread: int,
@@ -638,7 +638,7 @@ def _build_backward_args(
     cfg = (
         int(scan_num_threads_du),
         int(scan_num_threads_db),
-        int(scan_num_threads_dc),
+        int(scan_num_threads_dcdr),
         int(scan_num_threads_param),
         int(state_num_threads),
         int(state_pairs_per_thread),
@@ -718,7 +718,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
     (
         scan_num_threads_du,
         scan_num_threads_db,
-        scan_num_threads_dc,
+        scan_num_threads_dcdr,
         scan_num_threads_param,
         state_num_threads,
         state_pairs_per_thread,
@@ -902,19 +902,19 @@ def _make_v2x2ssd_bwd_host_wrapper(
             P=P,
             num_threads=scan_num_threads_db,
         )
-        scan_dc = ChunkScanBwdDCAmpere(
+        scan_dcdr = ChunkScanBwdDCDRAmpere(
             tc_dtype,
             chunk_size=L,
             D=D,
             P=P,
-            num_threads=scan_num_threads_dc,
+            num_threads=scan_num_threads_dcdr,
         )
         scan_dlp = ChunkScanBwdDLPAmpere(
             tc_dtype,
             chunk_size=L,
             D=D,
             P=P,
-            num_threads=scan_num_threads_dc,
+            num_threads=scan_num_threads_dcdr,
         )
         scan_param = ChunkScanBwdParamScanAmpere(
             chunk_size=L, num_threads=scan_num_threads_param
@@ -967,7 +967,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             mDMprev_scan,
             mDMcurr_scan,
         )
-        scan_dc(
+        scan_dcdr(
             mU_scan,
             mB_scan,
             mC_scan,
@@ -1093,7 +1093,7 @@ def compile_v2x2ssd_bwd_cute(
     compute_dtype: torch.dtype | None = None,
     scan_num_threads_du: int = 128,
     scan_num_threads_db: int = 128,
-    scan_num_threads_dc: int = 128,
+    scan_num_threads_dcdr: int = 128,
     scan_num_threads_param: int = 32,
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
@@ -1111,7 +1111,7 @@ def compile_v2x2ssd_bwd_cute(
         compute_dtype=compute_dtype,
         scan_num_threads_du=scan_num_threads_du,
         scan_num_threads_db=scan_num_threads_db,
-        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_dcdr=scan_num_threads_dcdr,
         scan_num_threads_param=scan_num_threads_param,
         state_num_threads=state_num_threads,
         state_pairs_per_thread=state_pairs_per_thread,
@@ -1130,7 +1130,7 @@ def compile_v2x2ssd_bwd_cute(
         chunk_size=int(chunk_size),
         scan_num_threads_du=int(scan_num_threads_du),
         scan_num_threads_db=int(scan_num_threads_db),
-        scan_num_threads_dc=int(scan_num_threads_dc),
+        scan_num_threads_dcdr=int(scan_num_threads_dcdr),
         scan_num_threads_param=int(scan_num_threads_param),
         state_num_threads=int(state_num_threads),
         state_pairs_per_thread=int(state_pairs_per_thread),
@@ -1166,7 +1166,7 @@ def _v2x2ssd_bwd_cute_impl(
     compute_dtype: torch.dtype | None = None,
     scan_num_threads_du: int = 128,
     scan_num_threads_db: int = 128,
-    scan_num_threads_dc: int = 128,
+    scan_num_threads_dcdr: int = 128,
     scan_num_threads_param: int = 32,
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
@@ -1205,7 +1205,7 @@ def _v2x2ssd_bwd_cute_impl(
         compute_dtype=compute_dtype,
         scan_num_threads_du=scan_num_threads_du,
         scan_num_threads_db=scan_num_threads_db,
-        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_dcdr=scan_num_threads_dcdr,
         scan_num_threads_param=scan_num_threads_param,
         state_num_threads=state_num_threads,
         state_pairs_per_thread=state_pairs_per_thread,
@@ -1228,7 +1228,7 @@ def _v2x2ssd_bwd_cute_impl(
         chunk_size=int(chunk_size),
         scan_num_threads_du=int(scan_num_threads_du),
         scan_num_threads_db=int(scan_num_threads_db),
-        scan_num_threads_dc=int(scan_num_threads_dc),
+        scan_num_threads_dcdr=int(scan_num_threads_dcdr),
         scan_num_threads_param=int(scan_num_threads_param),
         state_num_threads=int(state_num_threads),
         state_pairs_per_thread=int(state_pairs_per_thread),
@@ -1309,7 +1309,7 @@ def v2x2ssd_bwd_cute(
     compute_dtype: torch.dtype | None = None,
     scan_num_threads_du: int = 128,
     scan_num_threads_db: int = 128,
-    scan_num_threads_dc: int = 128,
+    scan_num_threads_dcdr: int = 128,
     scan_num_threads_param: int = 32,
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
@@ -1335,7 +1335,7 @@ def v2x2ssd_bwd_cute(
         compute_dtype=compute_dtype,
         scan_num_threads_du=scan_num_threads_du,
         scan_num_threads_db=scan_num_threads_db,
-        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_dcdr=scan_num_threads_dcdr,
         scan_num_threads_param=scan_num_threads_param,
         state_num_threads=state_num_threads,
         state_pairs_per_thread=state_pairs_per_thread,
@@ -1362,7 +1362,7 @@ def v2x2ssd_bwd_stateful_cute(
     compute_dtype: torch.dtype | None = None,
     scan_num_threads_du: int = 128,
     scan_num_threads_db: int = 128,
-    scan_num_threads_dc: int = 128,
+    scan_num_threads_dcdr: int = 128,
     scan_num_threads_param: int = 32,
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
@@ -1397,7 +1397,7 @@ def v2x2ssd_bwd_stateful_cute(
         compute_dtype=compute_dtype,
         scan_num_threads_du=scan_num_threads_du,
         scan_num_threads_db=scan_num_threads_db,
-        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_dcdr=scan_num_threads_dcdr,
         scan_num_threads_param=scan_num_threads_param,
         state_num_threads=state_num_threads,
         state_pairs_per_thread=state_pairs_per_thread,

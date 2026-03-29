@@ -649,7 +649,7 @@ def test_chunk_scan_bwd_rejects_oversized_dc_or_dlp_shapes_before_launch() -> No
 
     with pytest.raises(
         ValueError,
-        match=r"No supported chunk_scan backward (dc|dlp) kernel fits",
+        match=r"No supported chunk_scan backward (dcdr|dlp) kernel fits",
     ):
         compile_chunk_scan_bwd_kernels(
             U,

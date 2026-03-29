@@ -1,14 +1,14 @@
-"""CuTe backward ``dc`` workhorse for the ``v2x2ssd`` chunk-scan stage.
+"""CuTe backward ``dcdr`` workhorse for the ``v2x2ssd`` chunk-scan stage.
 
 This file is intentionally written in the same overall shape as the
-``v3x3ssd`` ``chunk_scan`` ``dc`` workhorse:
+``v3x3ssd`` ``chunk_scan`` ``dcdr`` workhorse:
 
 - one monolithic stage-native kernel class
 - direct public-stage inputs and outputs
 - full shared-memory metadata prepass from raw packed ``M``
 - row-tile ``dQ`` accumulation over causal ``n_tile`` blocks
 - off-term accumulation against ``Z0``
-- direct epilogue ownership of ``dC``
+- direct epilogue ownership of ``dC`` and ``dR``
 
 The adaptation is only in the scan algebra:
 
@@ -38,7 +38,7 @@ from .common import (
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCLayoutBundle:
+class ChunkScanBwdDCDRLayoutBundle:
     s_u_prev_layout: object
     s_b_prev_layout: object
     sDY_layout: object
@@ -61,7 +61,7 @@ class ChunkScanBwdDCLayoutBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCCopyBundle:
+class ChunkScanBwdDCDRCopyBundle:
     gmem_tiled_copy_D: object
     gmem_tiled_copy_D_async: object
     gmem_tiled_copy_P: object
@@ -70,15 +70,15 @@ class ChunkScanBwdDCCopyBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCKernelBundle:
-    layouts: ChunkScanBwdDCLayoutBundle
-    copies: ChunkScanBwdDCCopyBundle
+class ChunkScanBwdDCDRKernelBundle:
+    layouts: ChunkScanBwdDCDRLayoutBundle
+    copies: ChunkScanBwdDCDRCopyBundle
     tiled_mma: object
     smem_bytes: int
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCSupportInfo:
+class ChunkScanBwdDCDRSupportInfo:
     smem_capacity_bytes: int
     required_smem_bytes: int
 
@@ -87,14 +87,15 @@ class ChunkScanBwdDCSupportInfo:
         return self.required_smem_bytes <= self.smem_capacity_bytes
 
 
-class ChunkScanBwdDCAmpere:
-    """Ampere tensor-core kernel for ``dC``.
+class ChunkScanBwdDCDRAmpere:
+    """Ampere tensor-core kernel for ``dC`` and ``dR``.
 
     Computes, per chunk (BHC):
       - ``dC`` (queries)
+      - ``dR`` (packed rotation-row gradients)
 
     Notes:
-      - This kernel owns the contraction-heavy ``dc`` slice directly.
+      - This kernel owns the contraction-heavy ``dcdr`` slice directly.
       - Metadata is reconstructed inside the CTA from raw packed ``M``.
       - The heavy contractions follow the same overall pattern as ``v3``:
         ``dS = dY @ V^T``, score reconstruction, ``dQ += dS_scaled @ K_rot``,
@@ -102,7 +103,7 @@ class ChunkScanBwdDCAmpere:
     """
 
     _SUPPORT_INFO_CACHE: ClassVar[
-        dict[tuple[object, ...], ChunkScanBwdDCSupportInfo]
+        dict[tuple[object, ...], ChunkScanBwdDCDRSupportInfo]
     ] = {}
 
     def __init__(self, dtype, *, chunk_size, D, P, num_threads=128):
@@ -187,7 +188,7 @@ class ChunkScanBwdDCAmpere:
             return int(utils.get_smem_capacity_in_bytes(cc))
         return int(utils.get_smem_capacity_in_bytes("sm_80"))
 
-    def _make_layout_bundle(self) -> ChunkScanBwdDCLayoutBundle:
+    def _make_layout_bundle(self) -> ChunkScanBwdDCDRLayoutBundle:
         kv_tile = self.kv_tile
         p_tile = self.p_tile
         n_tiles = self.L // kv_tile
@@ -231,7 +232,7 @@ class ChunkScanBwdDCAmpere:
         )
         sDS_layout = cute.tile_to_shape(sBlk_layout_atom, (kv_tile, kv_tile), (0, 1))
 
-        return ChunkScanBwdDCLayoutBundle(
+        return ChunkScanBwdDCDRLayoutBundle(
             s_u_prev_layout=cute.make_layout((self.P,), stride=(1,)),
             s_b_prev_layout=cute.make_layout((self.D,), stride=(1,)),
             sDY_layout=sDY_layout,
@@ -287,9 +288,9 @@ class ChunkScanBwdDCAmpere:
         in_dtype: type[cutlass.Numeric],
         *,
         device_index: int | None = None,
-    ) -> ChunkScanBwdDCSupportInfo:
+    ) -> ChunkScanBwdDCDRSupportInfo:
         if in_dtype not in (cutlass.Float16, cutlass.BFloat16):
-            return ChunkScanBwdDCSupportInfo(0, 1)
+            return ChunkScanBwdDCDRSupportInfo(0, 1)
 
         if device_index is None:
             device_key = (
@@ -310,7 +311,7 @@ class ChunkScanBwdDCAmpere:
         if cached is not None:
             return cached
 
-        info = ChunkScanBwdDCSupportInfo(
+        info = ChunkScanBwdDCDRSupportInfo(
             smem_capacity_bytes=self._smem_capacity_bytes(device_key),
             required_smem_bytes=self._required_smem_bytes(in_dtype),
         )
@@ -319,7 +320,7 @@ class ChunkScanBwdDCAmpere:
 
     def _make_copy_bundle(
         self, in_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanBwdDCCopyBundle:
+    ) -> ChunkScanBwdDCDRCopyBundle:
         universal_copy_bits = 128
         async_elems_in = universal_copy_bits // in_dtype.width
         smem_k_block_size_D = self._smem_block_size_D()
@@ -367,7 +368,7 @@ class ChunkScanBwdDCAmpere:
             in_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
-        return ChunkScanBwdDCCopyBundle(
+        return ChunkScanBwdDCDRCopyBundle(
             gmem_tiled_copy_D=cute.make_tiled_copy_tv(
                 atom_universal_copy_in, tD_layout, v_in_layout
             ),
@@ -397,10 +398,10 @@ class ChunkScanBwdDCAmpere:
 
     def _make_kernel_bundle(
         self, in_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanBwdDCKernelBundle:
+    ) -> ChunkScanBwdDCDRKernelBundle:
         layouts = self._make_layout_bundle()
         shared_storage = self._make_shared_storage(in_dtype, layouts)
-        return ChunkScanBwdDCKernelBundle(
+        return ChunkScanBwdDCDRKernelBundle(
             layouts=layouts,
             copies=self._make_copy_bundle(in_dtype),
             tiled_mma=self._make_tiled_mma(in_dtype),
@@ -410,7 +411,7 @@ class ChunkScanBwdDCAmpere:
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
-        layouts: ChunkScanBwdDCLayoutBundle,
+        layouts: ChunkScanBwdDCDRLayoutBundle,
     ):
         class SharedStorage:
             pass
@@ -691,7 +692,7 @@ class ChunkScanBwdDCAmpere:
         n_p_tiles = Pp // p_tile
         n_tiles = self.L // kv_tile
 
-        layouts = ChunkScanBwdDCLayoutBundle(
+        layouts = ChunkScanBwdDCDRLayoutBundle(
             s_u_prev_layout=s_u_prev_layout,
             s_b_prev_layout=s_b_prev_layout,
             sDY_layout=sDY_layout,
@@ -1602,4 +1603,4 @@ class ChunkScanBwdDCAmpere:
                     mDR[bidz, t, 3] = s_row_dR[tidx, 3]
 
 
-__all__ = ["ChunkScanBwdDCAmpere"]
+__all__ = ["ChunkScanBwdDCDRAmpere"]
