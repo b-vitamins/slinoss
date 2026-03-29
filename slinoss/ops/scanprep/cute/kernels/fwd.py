@@ -197,6 +197,10 @@ class ScanPrepFwdFused:
                 s2 = cutlass.Float32(0.0)
                 s3 = cutlass.Float32(0.0)
                 num_n_iters = (self.n_size + 31) // 32
+                x0_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
+                x1_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
+                x2_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
+                x3_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
                 for n_iter in cutlass.range_constexpr(num_n_iters):
                     n = lane + n_iter * 32
                     if n < self.n_size:
@@ -204,6 +208,10 @@ class ScanPrepFwdFused:
                         x1 = cutlass.Float32(mBC[b, t, h, 1, n])
                         x2 = cutlass.Float32(mBC[b, t, h, 2, n])
                         x3 = cutlass.Float32(mBC[b, t, h, 3, n])
+                        x0_cache[n_iter] = x0
+                        x1_cache[n_iter] = x1
+                        x2_cache[n_iter] = x2
+                        x3_cache[n_iter] = x3
                         s0 = s0 + x0 * x0
                         s1 = s1 + x1 * x1
                         s2 = s2 + x2 * x2
@@ -229,10 +237,10 @@ class ScanPrepFwdFused:
                 for n_iter in cutlass.range_constexpr(num_n_iters):
                     n = lane + n_iter * 32
                     if n < self.n_size:
-                        b0 = cutlass.Float32(mBC[b, t, h, 0, n]) * inv0
-                        b1 = cutlass.Float32(mBC[b, t, h, 1, n]) * inv1
-                        c0 = cutlass.Float32(mBC[b, t, h, 2, n]) * inv2
-                        c1 = cutlass.Float32(mBC[b, t, h, 3, n]) * inv3
+                        b0 = x0_cache[n_iter] * inv0
+                        b1 = x1_cache[n_iter] * inv1
+                        c0 = x2_cache[n_iter] * inv2
+                        c1 = x3_cache[n_iter] * inv3
                         mBOut[b, h, t, 2 * n] = (
                             b0 * cutlass.Float32(mBScale[h, 0, n])
                         ).to(mBOut.element_type)

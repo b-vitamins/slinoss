@@ -130,7 +130,7 @@ def scanprep_bwd(
         device=bc.device,
         dtype=torch.float32,
     )
-    bias_grad = torch.empty((n_heads, 7), device=bc.device, dtype=torch.float32)
+    bias_grad = torch.zeros((n_heads, 7), device=bc.device, dtype=torch.float32)
 
     b_scale_in = (
         b_scale

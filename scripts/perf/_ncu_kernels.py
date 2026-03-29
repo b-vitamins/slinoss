@@ -517,9 +517,7 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         value_grad,
         bc_grad,
         dparams,
-        scale_partial,
         scale_grad,
-        bias_partial,
         bias_grad,
     )
     return KernelRunner(
