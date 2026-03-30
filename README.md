@@ -40,7 +40,8 @@ slinoss @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.1/slinoss
 
 CUDA installs that need both the CuTe backend and the compiled
 `setup.py` causal-conv extension should use the matching platform wheel plus the
-`cuda` extra. For Linux x86_64 on Python 3.11, that looks like:
+`cuda` extra. For Linux x86_64 on Python 3.11, 3.12, or 3.13, that means using
+the matching `cp311`, `cp312`, or `cp313` wheel. For example, on Python 3.11:
 
 ```txt
 slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.1/slinoss-0.1.1-cp311-cp311-linux_x86_64.whl
@@ -56,7 +57,8 @@ dependencies = [
 
 Replace `v0.1.1` and `0.1.1` with the release tag and package version you want
 to consume, and pick the wheel asset whose Python and platform tags match your
-environment.
+environment. Release CI currently publishes CUDA wheels for CPython 3.11, 3.12,
+and 3.13.
 
 ## Example
 

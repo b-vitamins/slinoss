@@ -102,11 +102,15 @@ jobs:
 
   build_cuda:
     if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
     runs-on: ubuntu-22.04
     timeout-minutes: 60
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      wheel_name: ${{ steps.wheel.outputs.wheel_name }}
     steps:
       - name: Check out
         uses: actions/checkout@v5
@@ -114,7 +118,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Read package metadata
@@ -236,7 +240,7 @@ jobs:
       - name: Upload CUDA wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: slinoss-cuda-wheel-${{ steps.meta.outputs.version }}
+          name: slinoss-cuda-wheel-${{ steps.meta.outputs.version }}-${{ matrix.python-version }}
           path: dist/${{ steps.wheel.outputs.wheel_name }}
 
   release:
@@ -257,8 +261,9 @@ jobs:
       - name: Download CUDA wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: slinoss-cuda-wheel-${{ needs.build_cuda.outputs.version }}
+          pattern: slinoss-cuda-wheel-${{ needs.build_pure.outputs.version }}-*
           path: dist
+          merge-multiple: true
 
       - name: Publish GitHub release artifacts
         uses: softprops/action-gh-release@v2
