@@ -30,6 +30,55 @@ def _expect_path(root: dict[str, Any], path: str) -> Any:
     return node
 
 
+def _validate_nextchar_budget_tree(
+    tree: dict[str, Any],
+    *,
+    require_stage_breakdown: bool,
+) -> None:
+    for path in (
+        "step.__stats__",
+        "forward.__stats__",
+        "backward.__stats__",
+        "forward.v2x2ssd.__stats__",
+        "backward.v2x2ssd.__stats__",
+        "forward.other.__stats__",
+        "backward.other.__stats__",
+        "forward.other.unattributed.__stats__",
+        "backward.other.unattributed.__stats__",
+        "forward.mixer.__stats__",
+        "backward.mixer.__stats__",
+        "forward.mixer.in_proj.__stats__",
+        "backward.mixer.in_proj.__stats__",
+        "forward.mixer.dw_conv.__stats__",
+        "backward.mixer.dw_conv.__stats__",
+        "forward.mixer.dw_conv_activation.__stats__",
+        "backward.mixer.dw_conv_activation.__stats__",
+        "forward.mixer.bc_emit.__stats__",
+        "backward.mixer.bc_emit.__stats__",
+        "forward.mixer.scanprep.__stats__",
+        "backward.mixer.scanprep.__stats__",
+        "forward.mixer.gate_skip.__stats__",
+        "backward.mixer.gate_skip.__stats__",
+        "forward.mixer.out_proj.__stats__",
+        "backward.mixer.out_proj.__stats__",
+        "forward.embed.__stats__",
+        "backward.embed.__stats__",
+        "forward.norms.__stats__",
+        "backward.norms.__stats__",
+        "forward.ffn.__stats__",
+        "backward.ffn.__stats__",
+        "forward.residual.__stats__",
+        "backward.residual.__stats__",
+        "forward.head.__stats__",
+        "backward.head.__stats__",
+    ):
+        _expect_path(tree, path)
+    if require_stage_breakdown:
+        _expect_path(tree, "backward.v2x2ssd.chunk_increment.__stats__")
+        _expect_path(tree, "backward.v2x2ssd.state_passing.__stats__")
+        _expect_path(tree, "backward.v2x2ssd.chunk_scan.__stats__")
+
+
 def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dict.")
@@ -70,25 +119,10 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
                 tree = _expect_dict(section, "tree")
                 _expect_dict(section, "regions")
                 _expect_dict(section, "cache_events")
-                _expect_path(tree, "step.__stats__")
-                _expect_path(tree, "forward.__stats__")
-                _expect_path(tree, "backward.__stats__")
-                _expect_path(tree, "forward.v2x2ssd.__stats__")
-                _expect_path(tree, "backward.v2x2ssd.__stats__")
-                _expect_path(tree, "forward.other.__stats__")
-                _expect_path(tree, "backward.other.__stats__")
-                _expect_path(tree, "forward.other.unattributed.__stats__")
-                _expect_path(tree, "backward.other.unattributed.__stats__")
-                _expect_path(tree, "forward.mixer.__stats__")
-                _expect_path(tree, "backward.mixer.__stats__")
-                _expect_path(tree, "forward.mixer.scanprep.__stats__")
-                _expect_path(tree, "backward.mixer.scanprep.__stats__")
-                _expect_path(tree, "forward.embed.__stats__")
-                _expect_path(tree, "backward.embed.__stats__")
-                _expect_path(tree, "forward.norms.__stats__")
-                _expect_path(tree, "backward.norms.__stats__")
-                _expect_path(tree, "forward.head.__stats__")
-                _expect_path(tree, "backward.head.__stats__")
+                _validate_nextchar_budget_tree(
+                    tree,
+                    require_stage_breakdown=False,
+                )
 
             _expect_dict(warm, "step")
             _expect_dict(warm, "tokens_per_s")
@@ -102,9 +136,10 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
                 raise ValueError(
                     f"Warm repeat_tokens_per_s for {case_name}/{backend_name} must be a dict."
                 )
-            _expect_path(warm["tree"], "backward.v2x2ssd.chunk_increment.__stats__")
-            _expect_path(warm["tree"], "backward.v2x2ssd.state_passing.__stats__")
-            _expect_path(warm["tree"], "backward.v2x2ssd.chunk_scan.__stats__")
+            _validate_nextchar_budget_tree(
+                warm["tree"],
+                require_stage_breakdown=True,
+            )
 
 
 def validate_nextchar_profile_payload(payload: dict[str, Any]) -> None:
@@ -119,11 +154,7 @@ def validate_nextchar_profile_payload(payload: dict[str, Any]) -> None:
     _expect(payload, "regions")
     _expect(payload, "budget")
     tree = _expect_dict(payload, "tree")
-    _expect_path(tree, "step.__stats__")
-    _expect_path(tree, "forward.__stats__")
-    _expect_path(tree, "backward.__stats__")
-    _expect_path(tree, "forward.mixer.scanprep.__stats__")
-    _expect_path(tree, "backward.mixer.scanprep.__stats__")
+    _validate_nextchar_budget_tree(tree, require_stage_breakdown=False)
 
 
 def validate_nextchar_decode_bench_payload(payload: dict[str, Any]) -> None:

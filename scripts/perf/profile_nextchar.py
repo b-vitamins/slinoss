@@ -26,6 +26,7 @@ from _nextchar import (  # noqa: E402
     random_batch,
     run_train_step_profiled,
 )
+from slinoss.perf import PerfRecorder  # noqa: E402
 from slinoss.perf.budget import (  # noqa: E402
     build_tree,
     summarize_budget_samples,
@@ -109,8 +110,6 @@ def main() -> int:
     ) as prof:
         for _ in range(total_steps):
             xb, yb = random_batch(cfg)
-            from slinoss.perf import PerfRecorder
-
             recorder = PerfRecorder(device=cfg.torch_device)
             with recorder.capture_step():
                 run_train_step_profiled(

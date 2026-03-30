@@ -522,15 +522,6 @@ class SLinOSSMixer(nn.Module):
         y_t, next_state = y_with_state
         return y_t.transpose(1, 2).contiguous(), next_state.contiguous()
 
-    def _build_scan_inputs(
-        self,
-        *,
-        value: torch.Tensor,
-        params: torch.Tensor,
-        bc: torch.Tensor,
-    ) -> ScanInputs:
-        return self.scanprep(value, params, bc)
-
     def _project_mixer_branches(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -567,13 +558,13 @@ class SLinOSSMixer(nn.Module):
 
         gate, value_raw, params, bc_flat = self._project_mixer_branches(x)
         conv_state_in = None if state is None else state.conv
-        conv_out, conv_state = self._apply_causal_depthwise_conv_with_state(
+        conv_out, conv_state = self._apply_causal_depthwise_conv(
             value_raw, conv_state_in
         )
         value = F.silu(conv_out)
         bc = self._reshape_bc(bc_flat, batch, T)
 
-        scan_inputs = self._build_scan_inputs(value=value, params=params, bc=bc)
+        scan_inputs = self.scanprep(value, params, bc)
         scan_state_in = None if state is None else state.scan
         scan_result = self._run_scan_backend(scan_inputs, scan_state_in, return_state)
         if return_state:
@@ -602,23 +593,7 @@ class SLinOSSMixer(nn.Module):
         )
         return out, next_state
 
-    def _apply_gate_skip(
-        self,
-        scan_y: torch.Tensor,
-        scan_u: torch.Tensor,
-        gate: torch.Tensor,
-        batch: int,
-        T: int,
-    ) -> torch.Tensor:
-        skip = self.skip.to(dtype=scan_u.dtype).view(1, self.n_heads, 1, self.d_head)
-        y = scan_y + scan_u * skip
-        y = y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner)
-        y = y * F.silu(gate).to(dtype=y.dtype)
-        if self.output_norm is not None:
-            y = self.output_norm(y)
-        return y
-
-    def _apply_gate_skip_and_project(
+    def _apply_gate_skip_headspace(
         self,
         scan_y: torch.Tensor,
         scan_u: torch.Tensor,
@@ -631,22 +606,43 @@ class SLinOSSMixer(nn.Module):
         gate_h = (
             F.silu(gate).view(batch, T, self.n_heads, self.d_head).permute(0, 2, 1, 3)
         )
-        y = y * gate_h.to(dtype=y.dtype)
+        return y * gate_h.to(dtype=y.dtype)
+
+    def _apply_gate_skip(
+        self,
+        scan_y: torch.Tensor,
+        scan_u: torch.Tensor,
+        gate: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> torch.Tensor:
+        y = self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+        y = y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner)
+        if self.output_norm is not None:
+            y = self.output_norm(y)
+        return y
+
+    def _project_headspace(self, y: torch.Tensor) -> torch.Tensor:
         weight = self.out_proj.weight.view(self.d_model, self.n_heads, self.d_head)
         return torch.einsum("bhtp,dhp->btd", y, weight)
+
+    def _apply_gate_skip_and_project(
+        self,
+        scan_y: torch.Tensor,
+        scan_u: torch.Tensor,
+        gate: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> torch.Tensor:
+        return self._project_headspace(
+            self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+        )
 
     def _reshape_bc(self, bc: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         expected = (batch, T, self.bc_proj_dim)
         if tuple(map(int, bc.shape)) != expected:
             raise ValueError(f"bc must be {expected}. Got {tuple(bc.shape)}.")
         return bc.view(batch, T, self.n_heads, 4, self.d_state)
-
-    def _apply_causal_depthwise_conv_with_state(
-        self,
-        value_raw: torch.Tensor,
-        conv_state: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._apply_causal_depthwise_conv(value_raw, conv_state)
 
     def _apply_causal_depthwise_conv_step(
         self,

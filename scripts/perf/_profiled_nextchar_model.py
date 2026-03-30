@@ -6,7 +6,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from _nextchar_model import FeedForward
 from slinoss.layers import SLinOSSMixer
@@ -16,7 +15,7 @@ from slinoss.perf import call_region
 
 
 class ProfiledSLinOSSMixer(SLinOSSMixer):
-    def _build_reference_scanprep_profiled(
+    def _profile_reference_scanprep(
         self,
         *,
         value: torch.Tensor,
@@ -50,7 +49,7 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
         )
         return ScanInputs(U=U, M=coeffs[0], K=coeffs[1], B=B, C=C)
 
-    def _build_scan_inputs(
+    def _profile_scanprep(
         self, *, value: torch.Tensor, params: torch.Tensor, bc: torch.Tensor
     ) -> ScanInputs:
         if isinstance(self.scanprep.backend, ReferenceScanPrepBackend):
@@ -58,7 +57,7 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
                 ScanInputs,
                 call_region(
                     "mixer.scanprep.total",
-                    self._build_reference_scanprep_profiled,
+                    self._profile_reference_scanprep,
                     value=value,
                     params=params,
                     bc=bc,
@@ -89,23 +88,24 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             next_state = SLinOSSMixerState() if state is None else state
             return (empty, next_state) if return_state else empty
 
-        proj = call_region("mixer.in_proj", self.in_proj, x)
-        gate, value_raw, params, bc_flat = torch.split(
-            proj,
-            [self.d_inner, self.d_inner, self.param_proj_dim, self.bc_proj_dim],
-            dim=-1,
+        gate, value_raw, params, bc_flat = call_region(
+            "mixer.in_proj",
+            self._project_mixer_branches,
+            x,
         )
         conv_state_in = None if state is None else state.conv
         conv_out, conv_state = call_region(
             "mixer.dw_conv",
-            self._apply_causal_depthwise_conv_with_state,
+            self._apply_causal_depthwise_conv,
             value_raw,
             conv_state_in,
         )
-        value = call_region("mixer.dw_conv_activation", F.silu, conv_out)
+        value = call_region(
+            "mixer.dw_conv_activation", torch.nn.functional.silu, conv_out
+        )
         bc = call_region("mixer.bc_emit", self._reshape_bc, bc_flat, batch, T)
 
-        scan_inputs = self._build_scan_inputs(value=value, params=params, bc=bc)
+        scan_inputs = self._profile_scanprep(value=value, params=params, bc=bc)
         scan_state_in = None if state is None else state.scan
         scan_result = call_region(
             "v2x2ssd.total",
@@ -120,16 +120,28 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        gated = call_region(
-            "mixer.gate_skip",
-            self._apply_gate_skip,
-            scan_y,
-            scan_inputs.U,
-            gate,
-            batch,
-            T,
-        )
-        out = call_region("mixer.out_proj", self.out_proj, gated)
+        if self.output_norm is None:
+            gated = call_region(
+                "mixer.gate_skip",
+                self._apply_gate_skip_headspace,
+                scan_y,
+                scan_inputs.U,
+                gate,
+                batch,
+                T,
+            )
+            out = call_region("mixer.out_proj", self._project_headspace, gated)
+        else:
+            gated = call_region(
+                "mixer.gate_skip",
+                self._apply_gate_skip,
+                scan_y,
+                scan_inputs.U,
+                gate,
+                batch,
+                T,
+            )
+            out = call_region("mixer.out_proj", self.out_proj, gated)
 
         if not return_state:
             return out
