@@ -14,8 +14,10 @@ class StatePassingCopyBundle:
     copy_starts_scalar: object
     copy_dstarts_vec: object
     copy_dstarts_scalar: object
-    copy_out_vec: object
-    copy_out_scalar: object
+    copy_dinc_vec: object
+    copy_dinc_scalar: object
+    copy_initial_vec: object
+    copy_initial_scalar: object
     copy_final_vec: object
     copy_final_scalar: object
     copy_m: object
@@ -30,13 +32,15 @@ class StatePassingBwdAmpere:
         *,
         copy_bits_starts: int,
         copy_bits_dstarts: int,
-        copy_bits_out: int,
+        copy_bits_dinc: int,
+        copy_bits_initial: int,
         copy_bits_final: int,
     ):
         self.cfg = cfg
         self.copy_bits_starts = int(copy_bits_starts)
         self.copy_bits_dstarts = int(copy_bits_dstarts)
-        self.copy_bits_out = int(copy_bits_out)
+        self.copy_bits_dinc = int(copy_bits_dinc)
+        self.copy_bits_initial = int(copy_bits_initial)
         self.copy_bits_final = int(copy_bits_final)
 
     @staticmethod
@@ -52,7 +56,8 @@ class StatePassingBwdAmpere:
         *,
         starts_dtype: type[cutlass.Numeric],
         dstarts_dtype: type[cutlass.Numeric],
-        out_dtype: type[cutlass.Numeric],
+        dinc_dtype: type[cutlass.Numeric],
+        initial_dtype: type[cutlass.Numeric],
         final_dtype: type[cutlass.Numeric],
         m_dtype: type[cutlass.Numeric],
     ) -> StatePassingCopyBundle:
@@ -65,8 +70,14 @@ class StatePassingBwdAmpere:
             copy_dstarts_scalar=self._make_copy_atom(
                 dstarts_dtype, dstarts_dtype.width
             ),
-            copy_out_vec=self._make_copy_atom(out_dtype, self.copy_bits_out),
-            copy_out_scalar=self._make_copy_atom(out_dtype, out_dtype.width),
+            copy_dinc_vec=self._make_copy_atom(dinc_dtype, self.copy_bits_dinc),
+            copy_dinc_scalar=self._make_copy_atom(dinc_dtype, dinc_dtype.width),
+            copy_initial_vec=self._make_copy_atom(
+                initial_dtype, self.copy_bits_initial
+            ),
+            copy_initial_scalar=self._make_copy_atom(
+                initial_dtype, initial_dtype.width
+            ),
             copy_final_vec=self._make_copy_atom(final_dtype, self.copy_bits_final),
             copy_final_scalar=self._make_copy_atom(final_dtype, final_dtype.width),
             copy_m=self._make_copy_atom(m_dtype, m_dtype.width * 2),
@@ -91,7 +102,8 @@ class StatePassingBwdAmpere:
         copies = self._make_copy_bundle(
             starts_dtype=chunk_starts.element_type,
             dstarts_dtype=d_chunk_starts.element_type,
-            out_dtype=d_inc.element_type,
+            dinc_dtype=d_inc.element_type,
+            initial_dtype=d_initial.element_type,
             final_dtype=d_final.element_type,
             m_dtype=m_chunk.element_type,
         )
@@ -125,8 +137,10 @@ class StatePassingBwdAmpere:
             copies.copy_starts_scalar,
             copies.copy_dstarts_vec,
             copies.copy_dstarts_scalar,
-            copies.copy_out_vec,
-            copies.copy_out_scalar,
+            copies.copy_dinc_vec,
+            copies.copy_dinc_scalar,
+            copies.copy_initial_vec,
+            copies.copy_initial_scalar,
             copies.copy_final_vec,
             copies.copy_final_scalar,
             copies.copy_m,
@@ -152,8 +166,10 @@ class StatePassingBwdAmpere:
         copy_starts_scalar,
         copy_dstarts_vec,
         copy_dstarts_scalar,
-        copy_out_vec,
-        copy_out_scalar,
+        copy_dinc_vec,
+        copy_dinc_scalar,
+        copy_initial_vec,
+        copy_initial_scalar,
         copy_final_vec,
         copy_final_scalar,
         copy_m,
@@ -206,9 +222,9 @@ class StatePassingBwdAmpere:
             frgTmp = cute.make_rmem_tensor_like(thrOut)
             frgTmp.store(accG.load().to(dinc_flat.element_type))
             if is_partial_tile:
-                cute.copy(copy_out_scalar, frgTmp, thrOut, pred=frgPred)
+                cute.copy(copy_dinc_scalar, frgTmp, thrOut, pred=frgPred)
             else:
-                cute.copy(copy_out_vec, frgTmp, thrOut)
+                cute.copy(copy_dinc_vec, frgTmp, thrOut)
 
             gStarts = starts_flat[bh, c, None]
             thrStarts = _thread_tile_view(
@@ -287,8 +303,8 @@ class StatePassingBwdAmpere:
         frgTmp = cute.make_rmem_tensor_like(thrI)
         frgTmp.store(accG.load().to(dinitial_flat.element_type))
         if is_partial_tile:
-            cute.copy(copy_out_scalar, frgTmp, thrI, pred=frgPred)
+            cute.copy(copy_initial_scalar, frgTmp, thrI, pred=frgPred)
         else:
-            cute.copy(copy_out_vec, frgTmp, thrI)
+            cute.copy(copy_initial_vec, frgTmp, thrI)
 
         return

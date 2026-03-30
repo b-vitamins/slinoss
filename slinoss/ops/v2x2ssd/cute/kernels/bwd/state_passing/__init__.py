@@ -86,7 +86,8 @@ def _compiled_key(
     pairs_per_thread: int,
     copy_bits_starts: int,
     copy_bits_dstarts: int,
-    copy_bits_out: int,
+    copy_bits_dinc: int,
+    copy_bits_initial: int,
     copy_bits_final: int,
     alignments: tuple[int, ...],
 ) -> tuple:
@@ -101,7 +102,8 @@ def _compiled_key(
         int(pairs_per_thread),
         int(copy_bits_starts),
         int(copy_bits_dstarts),
-        int(copy_bits_out),
+        int(copy_bits_dinc),
+        int(copy_bits_initial),
         int(copy_bits_final),
         alignments,
     )
@@ -118,7 +120,8 @@ def _make_state_passing_host_wrapper(
         pairs_per_thread,
         copy_bits_starts,
         copy_bits_dstarts,
-        copy_bits_out,
+        copy_bits_dinc,
+        copy_bits_initial,
         copy_bits_final,
     ) = cfg
 
@@ -155,7 +158,8 @@ def _make_state_passing_host_wrapper(
             ),
             copy_bits_starts=copy_bits_starts,
             copy_bits_dstarts=copy_bits_dstarts,
-            copy_bits_out=copy_bits_out,
+            copy_bits_dinc=copy_bits_dinc,
+            copy_bits_initial=copy_bits_initial,
             copy_bits_final=copy_bits_final,
         )
         kernel(mStarts, mDStarts, mDFinal, mM, mDInc, mDM, mDInit)
@@ -238,8 +242,13 @@ def compile_state_passing_bwd_kernel(
         tile_stride_elems=S,
         elems_per_thread=cfg.elems_per_thread,
     )
-    copy_bits_out = _choose_copy_bits_for_linear_tiles(
+    copy_bits_dinc = _choose_copy_bits_for_linear_tiles(
         d_inc,
+        tile_stride_elems=S,
+        elems_per_thread=cfg.elems_per_thread,
+    )
+    copy_bits_initial = _choose_copy_bits_for_linear_tiles(
+        d_initial,
         tile_stride_elems=S,
         elems_per_thread=cfg.elems_per_thread,
     )
@@ -265,7 +274,8 @@ def compile_state_passing_bwd_kernel(
         pairs_per_thread=cfg.pairs_per_thread,
         copy_bits_starts=copy_bits_starts,
         copy_bits_dstarts=copy_bits_dstarts,
-        copy_bits_out=copy_bits_out,
+        copy_bits_dinc=copy_bits_dinc,
+        copy_bits_initial=copy_bits_initial,
         copy_bits_final=copy_bits_final,
         alignments=alignments,
     )
@@ -279,7 +289,8 @@ def compile_state_passing_bwd_kernel(
                 cfg.pairs_per_thread,
                 copy_bits_starts,
                 copy_bits_dstarts,
-                copy_bits_out,
+                copy_bits_dinc,
+                copy_bits_initial,
                 copy_bits_final,
             ),
         )

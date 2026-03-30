@@ -139,6 +139,8 @@ def main() -> int:
             spec=(batch, t_size, heads, p_size, d_state),
             params_in_stride=tuple(int(s) for s in params.stride()),
             normalize_bc=args.normalize_bc,
+            store_rms_inv=bool(args.normalize_bc),
+            store_coeff_aux=True,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
             r_min=prep.r_min,

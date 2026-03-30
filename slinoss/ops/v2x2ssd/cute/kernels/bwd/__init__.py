@@ -41,16 +41,6 @@ _BWD_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
 _ZERO_PREV_CACHE_LIMIT = 8
 _ZERO_FINAL_GRAD_CACHE_LIMIT = 8
 _BWD_WORKSPACE_CACHE_LIMIT = 4
-_CAST_D_INC_NUM_THREADS = 256
-
-
-@cute.kernel
-def _cast_f32_to_tc_kernel(gSrc: cute.Tensor, gDst: cute.Tensor):
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    idx = bidx * int(_CAST_D_INC_NUM_THREADS) + tidx
-    if idx < gSrc.shape[0]:
-        gDst[idx] = gSrc[idx].to(gDst.element_type)
 
 
 def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
@@ -163,9 +153,6 @@ def _get_bwd_workspace(
         torch.empty((BH, n_chunks, P), device=device, dtype=tc_dtype),
         torch.empty((BH, n_chunks, D), device=device, dtype=tc_dtype),
         torch.empty((BHC, P, D), device=device, dtype=torch.float32),
-        torch.empty(
-            (batch_size, heads, n_chunks, P, D), device=device, dtype=torch.float32
-        ),
         torch.empty((batch_size, heads, n_chunks, P, D), device=device, dtype=tc_dtype),
         torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
         torch.empty(
@@ -240,15 +227,6 @@ def _make_tensor_from_spec(
     return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
 
 
-def _make_cast_f32_to_tc(*, total_elems: int, num_threads: int = 256):
-    if int(num_threads) != _CAST_D_INC_NUM_THREADS:
-        raise ValueError(
-            f"cast kernel expects {_CAST_D_INC_NUM_THREADS} threads, got {num_threads}."
-        )
-    grid_x = (int(total_elems) + _CAST_D_INC_NUM_THREADS - 1) // _CAST_D_INC_NUM_THREADS
-    return _cast_f32_to_tc_kernel, int(grid_x), _CAST_D_INC_NUM_THREADS
-
-
 def _bwd_host_cache_key(
     *,
     device_index: int,
@@ -270,7 +248,8 @@ def _bwd_host_cache_key(
     state_pairs_per_thread: int,
     state_copy_bits_starts: int,
     state_copy_bits_dstarts: int,
-    state_copy_bits_out: int,
+    state_copy_bits_dinc: int,
+    state_copy_bits_initial: int,
     state_copy_bits_final: int,
     n_d_tiles: int,
     dz0_cta_tiler: tuple[int, int, int],
@@ -297,7 +276,8 @@ def _bwd_host_cache_key(
         int(state_pairs_per_thread),
         int(state_copy_bits_starts),
         int(state_copy_bits_dstarts),
-        int(state_copy_bits_out),
+        int(state_copy_bits_dinc),
+        int(state_copy_bits_initial),
         int(state_copy_bits_final),
         int(n_d_tiles),
         dz0_cta_tiler,
@@ -487,7 +467,6 @@ def _build_backward_args(
         U_prev_chunks,
         B_prev_chunks,
         dZ0,
-        d_inc,
         d_inc_tc,
         d_initial,
         d_m_chunk,
@@ -560,8 +539,13 @@ def _build_backward_args(
         tile_stride_elems=P * D,
         elems_per_thread=state_cfg.elems_per_thread,
     )
-    state_copy_bits_out = _choose_copy_bits_for_linear_tiles(
-        d_inc,
+    state_copy_bits_dinc = _choose_copy_bits_for_linear_tiles(
+        d_inc_tc,
+        tile_stride_elems=P * D,
+        elems_per_thread=state_cfg.elems_per_thread,
+    )
+    state_copy_bits_initial = _choose_copy_bits_for_linear_tiles(
+        d_initial,
         tile_stride_elems=P * D,
         elems_per_thread=state_cfg.elems_per_thread,
     )
@@ -586,7 +570,6 @@ def _build_backward_args(
         U_prev_chunks,
         B_prev_chunks,
         dZ0,
-        d_inc,
         d_inc_tc,
         d_initial,
         d_m_chunk,
@@ -637,7 +620,8 @@ def _build_backward_args(
         int(state_pairs_per_thread),
         int(state_copy_bits_starts),
         int(state_copy_bits_dstarts),
-        int(state_copy_bits_out),
+        int(state_copy_bits_dinc),
+        int(state_copy_bits_initial),
         int(state_copy_bits_final),
         dz0_cta_tiler,
     )
@@ -717,7 +701,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
         state_pairs_per_thread,
         state_copy_bits_starts,
         state_copy_bits_dstarts,
-        state_copy_bits_out,
+        state_copy_bits_dinc,
+        state_copy_bits_initial,
         state_copy_bits_final,
         dz0_cta_tiler,
     ) = cfg
@@ -737,8 +722,6 @@ def _make_v2x2ssd_bwd_host_wrapper(
     dparam_scan_spec = _make_tensor_spec((BHC, 1, L, 2), stride=(L * 2, L * 2, 2, 1))
     dlp_param_spec = _make_tensor_spec((BHC, 1, L), stride=(L, L, 1))
     dr_param_spec = _make_tensor_spec((BHC, 1, L, 4), stride=(L * 4, L * 4, 4, 1))
-    flat_state_spec = _make_tensor_spec((BHC * P * D,))
-
     dz0_dout_spec = _make_tensor_spec((P, T_pad, BH), stride=(1, P, T_pad * P))
     dz0_c_spec = _make_tensor_spec((D, T_pad, BH), stride=(1, D, T_pad * D))
     dz0_m_spec = _make_tensor_spec((2, T_pad, BH), stride=(1, 2, T_pad * 2))
@@ -785,7 +768,6 @@ def _make_v2x2ssd_bwd_host_wrapper(
         U_prev_chunks_ptr: cute.Pointer,
         B_prev_chunks_ptr: cute.Pointer,
         dZ0_ptr: cute.Pointer,
-        d_inc_ptr: cute.Pointer,
         d_inc_tc_ptr: cute.Pointer,
         d_initial_ptr: cute.Pointer,
         d_m_chunk_ptr: cute.Pointer,
@@ -850,9 +832,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         mMchunk_state = _make_tensor_from_spec(m_chunk_ptr, m_chunk_state_spec)
         mDChunkStarts_state = _make_tensor_from_spec(dZ0_ptr, state_spec)
         mDFinal = _make_tensor_from_spec(d_final_ptr, final_state_spec)
-        mDInc_state = _make_tensor_from_spec(d_inc_ptr, state_spec)
-        mDInc_flat = _make_tensor_from_spec(d_inc_ptr, flat_state_spec)
-        mDInc_tc_flat = _make_tensor_from_spec(d_inc_tc_ptr, flat_state_spec)
+        mDInc_state = _make_tensor_from_spec(d_inc_tc_ptr, state_spec)
         mDInitial = _make_tensor_from_spec(d_initial_ptr, final_state_spec)
         mDMchunk_state = _make_tensor_from_spec(d_m_chunk_ptr, m_chunk_state_spec)
 
@@ -922,9 +902,6 @@ def _make_v2x2ssd_bwd_host_wrapper(
         scan_dz0 = ChunkScanBwdDZ0Ampere(
             tc_dtype, chunk_size=L, cta_tiler=dz0_cta_tiler
         )
-        cast_d_inc, cast_grid_x, cast_num_threads = _make_cast_f32_to_tc(
-            total_elems=BHC * P * D
-        )
 
         state_cfg = _TileConfig(
             num_threads=state_num_threads,
@@ -934,7 +911,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             state_cfg,
             copy_bits_starts=state_copy_bits_starts,
             copy_bits_dstarts=state_copy_bits_dstarts,
-            copy_bits_out=state_copy_bits_out,
+            copy_bits_dinc=state_copy_bits_dinc,
+            copy_bits_initial=state_copy_bits_initial,
             copy_bits_final=state_copy_bits_final,
         )
 
@@ -1023,10 +1001,6 @@ def _make_v2x2ssd_bwd_host_wrapper(
             mDInc_state,
             mDMchunk_state,
             mDInitial,
-        )
-        cast_d_inc(mDInc_flat, mDInc_tc_flat).launch(
-            grid=[cast_grid_x, 1, 1],
-            block=[cast_num_threads, 1, 1],
         )
 
         inc_db(
@@ -1129,9 +1103,10 @@ def compile_v2x2ssd_bwd_cute(
         state_pairs_per_thread=int(state_pairs_per_thread),
         state_copy_bits_starts=int(cfg[6]),
         state_copy_bits_dstarts=int(cfg[7]),
-        state_copy_bits_out=int(cfg[8]),
-        state_copy_bits_final=int(cfg[9]),
-        dz0_cta_tiler=cfg[10],
+        state_copy_bits_dinc=int(cfg[8]),
+        state_copy_bits_initial=int(cfg[9]),
+        state_copy_bits_final=int(cfg[10]),
+        dz0_cta_tiler=cfg[11],
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )
@@ -1229,9 +1204,10 @@ def _v2x2ssd_bwd_cute_impl(
         state_pairs_per_thread=int(state_pairs_per_thread),
         state_copy_bits_starts=int(cfg[6]),
         state_copy_bits_dstarts=int(cfg[7]),
-        state_copy_bits_out=int(cfg[8]),
-        state_copy_bits_final=int(cfg[9]),
-        dz0_cta_tiler=cfg[10],
+        state_copy_bits_dinc=int(cfg[8]),
+        state_copy_bits_initial=int(cfg[9]),
+        state_copy_bits_final=int(cfg[10]),
+        dz0_cta_tiler=cfg[11],
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )

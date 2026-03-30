@@ -245,6 +245,8 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             spec=(cfg.batch, cfg.T, cfg.heads, cfg.P, cfg.N),
             params_in_stride=params_in_stride,
             normalize_bc=cfg.normalize_bc,
+            store_rms_inv=bool(cfg.normalize_bc),
+            store_coeff_aux=True,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
             r_min=prep.r_min,
