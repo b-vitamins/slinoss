@@ -531,6 +531,22 @@ class SLinOSSMixer(nn.Module):
     ) -> ScanInputs:
         return self.scanprep(value, params, bc)
 
+    def _project_mixer_branches(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        weight = self.in_proj.weight
+        gate_value_end = 2 * self.d_inner
+        params_end = gate_value_end + self.param_proj_dim
+        gate_value = F.linear(x, weight[:gate_value_end, :])
+        gate, value_raw = torch.split(
+            gate_value,
+            [self.d_inner, self.d_inner],
+            dim=-1,
+        )
+        params = F.linear(x, weight[gate_value_end:params_end, :])
+        bc_flat = F.linear(x, weight[params_end:, :])
+        return gate, value_raw, params, bc_flat
+
     def forward(
         self,
         x: torch.Tensor,
@@ -549,12 +565,7 @@ class SLinOSSMixer(nn.Module):
             next_state = SLinOSSMixerState() if state is None else state
             return (empty, next_state) if return_state else empty
 
-        proj = self.in_proj(x)
-        gate, value_raw, params, bc_flat = torch.split(
-            proj,
-            [self.d_inner, self.d_inner, self.param_proj_dim, self.bc_proj_dim],
-            dim=-1,
-        )
+        gate, value_raw, params, bc_flat = self._project_mixer_branches(x)
         conv_state_in = None if state is None else state.conv
         conv_out, conv_state = self._apply_causal_depthwise_conv_with_state(
             value_raw, conv_state_in
@@ -571,8 +582,17 @@ class SLinOSSMixer(nn.Module):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        gated = self._apply_gate_skip(scan_y, scan_inputs.U, gate, batch, T)
-        out = self.out_proj(gated)
+        if self.output_norm is None:
+            out = self._apply_gate_skip_and_project(
+                scan_y,
+                scan_inputs.U,
+                gate,
+                batch,
+                T,
+            )
+        else:
+            gated = self._apply_gate_skip(scan_y, scan_inputs.U, gate, batch, T)
+            out = self.out_proj(gated)
 
         if not return_state:
             return out
@@ -597,6 +617,23 @@ class SLinOSSMixer(nn.Module):
         if self.output_norm is not None:
             y = self.output_norm(y)
         return y
+
+    def _apply_gate_skip_and_project(
+        self,
+        scan_y: torch.Tensor,
+        scan_u: torch.Tensor,
+        gate: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> torch.Tensor:
+        skip = self.skip.to(dtype=scan_u.dtype).view(1, self.n_heads, 1, self.d_head)
+        y = scan_y + scan_u * skip
+        gate_h = (
+            F.silu(gate).view(batch, T, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        )
+        y = y * gate_h.to(dtype=y.dtype)
+        weight = self.out_proj.weight.view(self.d_model, self.n_heads, self.d_head)
+        return torch.einsum("bhtp,dhp->btd", y, weight)
 
     def _reshape_bc(self, bc: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         expected = (batch, T, self.bc_proj_dim)
@@ -623,8 +660,14 @@ class SLinOSSMixer(nn.Module):
             )
 
         state_len = max(self.d_conv - 1, 0)
+        x = value_raw.unsqueeze(1)
+        x_t = x.transpose(1, 2)
+        if x_t.stride(1) == 1 and (
+            self.d_inner % 8 != 0 or x_t.stride(2) % 8 != 0 or x_t.stride(0) % 8 != 0
+        ):
+            x_t = x_t.contiguous()
+
         if state_len == 0:
-            x_t = value_raw.unsqueeze(-1).contiguous()
             if cconv1d_cuda_supported(x_t, self.dw_weight, activation="silu"):
                 y = cconv1d_cuda(
                     x_t,
@@ -637,9 +680,7 @@ class SLinOSSMixer(nn.Module):
                     (value_raw.shape[0], self.d_inner, 0)
                 )
 
-            y_seq, next_state = self._apply_cconv_reference(
-                value_raw.unsqueeze(1), None
-            )
+            y_seq, next_state = self._apply_cconv_reference(x, None)
             return F.silu(y_seq[:, 0, :]), next_state
 
         init = self._validate_conv_state(
@@ -649,8 +690,17 @@ class SLinOSSMixer(nn.Module):
             device=value_raw.device,
             dtype=value_raw.dtype,
         )
-        x_t = value_raw.unsqueeze(-1).contiguous()
         weight = self.dw_weight
+        if (
+            x_t.stride(1) != 1
+            or x_t.stride(2) % 8 != 0
+            or x_t.stride(0) % 8 != 0
+            or self.d_inner % 8 != 0
+        ):
+            y_seq, next_state = self._apply_cconv_reference(x, init.contiguous())
+            return F.silu(y_seq[:, 0, :]), next_state
+
+        init = init.transpose(1, 2).contiguous().transpose(1, 2)
         if cconv1d_cuda_supported(
             x_t,
             weight,
@@ -669,9 +719,7 @@ class SLinOSSMixer(nn.Module):
             y_t, next_state = y_with_state
             return y_t[..., 0].contiguous(), next_state.contiguous()
 
-        y_seq, next_state = self._apply_cconv_reference(
-            value_raw.unsqueeze(1), init.contiguous()
-        )
+        y_seq, next_state = self._apply_cconv_reference(x, init.contiguous())
         return F.silu(y_seq[:, 0, :]), next_state
 
     def _run_scan_backend(
@@ -801,12 +849,7 @@ class SLinOSSMixer(nn.Module):
         state: SLinOSSMixerState,
     ) -> torch.Tensor:
         batch = int(x.shape[0])
-        proj = self.in_proj(x)
-        gate, value_raw, params_flat, bc_flat = torch.split(
-            proj,
-            [self.d_inner, self.d_inner, self.param_proj_dim, self.bc_proj_dim],
-            dim=-1,
-        )
+        gate, value_raw, params_flat, bc_flat = self._project_mixer_branches(x)
         value, conv_next = self._apply_causal_depthwise_conv_step(value_raw, state.conv)
         if state.conv is None or tuple(state.conv.shape) != tuple(conv_next.shape):
             state.conv = conv_next

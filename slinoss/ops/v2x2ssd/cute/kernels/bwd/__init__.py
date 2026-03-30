@@ -229,7 +229,7 @@ def _public_from_packed_dk(
     T: int,
 ) -> torch.Tensor:
     B, H, C, L, _, F = map(int, x.shape)
-    return x.reshape(B, H, C * L, 2, F)[:, :, :T, :, :]
+    return x.reshape(B, H, C * L, 2, F)[:, :, :T, :, :].contiguous()
 
 
 def _make_tensor_from_spec(

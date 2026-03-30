@@ -175,9 +175,11 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
     assert not torch.allclose(
         ref_scanprep.last_inputs.value, zero_scanprep.last_inputs.value
     )
-    assert torch.allclose(ref_scanprep.last_inputs.bc, expected_bc)
-    assert torch.allclose(zero_scanprep.last_inputs.bc, expected_bc)
-    assert torch.allclose(ref_scanprep.last_inputs.bc, zero_scanprep.last_inputs.bc)
+    assert torch.allclose(ref_scanprep.last_inputs.bc, expected_bc, atol=1e-6)
+    assert torch.allclose(zero_scanprep.last_inputs.bc, expected_bc, atol=1e-6)
+    assert torch.allclose(
+        ref_scanprep.last_inputs.bc, zero_scanprep.last_inputs.bc, atol=1e-6
+    )
 
 
 def test_mixer_rejects_incompatible_d_state_for_cute_scan_backend() -> None:

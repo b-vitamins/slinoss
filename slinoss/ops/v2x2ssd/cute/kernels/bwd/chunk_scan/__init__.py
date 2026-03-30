@@ -1283,74 +1283,11 @@ def compile_chunk_scan_bwd_kernels(
         _launch_dlp()
         _launch_param()
 
-    stream_dz0 = None
-    stream_du = None
-    stream_db = None
-    stream_dcdr = None
-    ev_start = None
-    ev_dz0_done = None
-    ev_du_done = None
-    ev_db_done = None
-    ev_dcdr_done = None
-
-    if return_launchers and enable_overlapped_launcher:
-        (
-            stream_dz0,
-            stream_du,
-            stream_db,
-            stream_dcdr,
-            ev_start,
-            ev_dz0_done,
-            ev_du_done,
-            ev_db_done,
-            ev_dcdr_done,
-        ) = _get_overlap_resources(U.device)
-
     def launch_overlapped() -> None:
         # Structural dcdr/dlp changes are correctness-gated first; stream overlap
         # remains disabled because it has historically shown near-zero gain here.
+        # Do not allocate the dormant overlap streams/events on this path.
         launch_sequential()
-        return
-        if (
-            stream_dz0 is None
-            or stream_du is None
-            or stream_db is None
-            or stream_dcdr is None
-        ):
-            launch_sequential()
-            return
-
-        current = torch.cuda.current_stream(device=U.device)
-        current.record_event(ev_start)
-
-        stream_dz0.wait_event(ev_start)
-        stream_du.wait_event(ev_start)
-        stream_db.wait_event(ev_start)
-        stream_dcdr.wait_event(ev_start)
-
-        with torch.cuda.stream(stream_dz0):
-            _launch_dz0()
-            stream_dz0.record_event(ev_dz0_done)
-
-        with torch.cuda.stream(stream_du):
-            _launch_du()
-            stream_du.record_event(ev_du_done)
-
-        with torch.cuda.stream(stream_db):
-            _launch_db()
-            stream_db.record_event(ev_db_done)
-
-        with torch.cuda.stream(stream_dcdr):
-            _launch_dcdr()
-            _launch_dlp()
-            stream_dcdr.record_event(ev_dcdr_done)
-
-        current.wait_event(ev_db_done)
-        current.wait_event(ev_dcdr_done)
-        _launch_param()
-
-        current.wait_event(ev_dz0_done)
-        current.wait_event(ev_du_done)
 
     base = (
         compiled_dz0,
