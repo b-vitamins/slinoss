@@ -84,13 +84,26 @@ def _assumed_align(
     return elem_align
 
 
-def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+def _ptr_arg_cache_key(t: torch.Tensor) -> tuple[object, ...]:
     device_index = (
         int(t.device.index)
         if t.device.type == "cuda" and t.device.index is not None
         else -1
     )
-    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
+    return (
+        t.device.type,
+        device_index,
+        int(t.data_ptr()),
+        t.dtype,
+        tuple(int(dim) for dim in t.shape),
+        tuple(int(step) for step in t.stride()),
+    )
+
+
+def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+    # Distinct tensor views can share a base address. Keep separate Pointer
+    # instances for those views so multi-arg host wrappers do not collapse them.
+    key = _ptr_arg_cache_key(t)
     cached = _PTR_ARG_CACHE.get(key)
     if cached is not None:
         return cached

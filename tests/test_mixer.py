@@ -7,6 +7,7 @@ from slinoss.layers import (
     AutoScanBackend,
     CuteScanBackend,
     ReferenceCConv1dBackend,
+    ReferenceScanBackend,
     ReferenceScanPrepBackend,
     SLinOSSMixer,
     ScanInputs,
@@ -179,6 +180,77 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
     assert torch.allclose(zero_scanprep.last_inputs.bc, expected_bc, atol=1e-6)
     assert torch.allclose(
         ref_scanprep.last_inputs.bc, zero_scanprep.last_inputs.bc, atol=1e-6
+    )
+
+
+def test_mixer_cute_scan_matches_reference_for_issue_9_bf16_shape() -> None:
+    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    cute_mixer = SLinOSSMixer(
+        512,
+        d_state=128,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=128,
+        normalize_bc=True,
+        scanprep_backend=ReferenceScanPrepBackend(),
+        backend=AutoScanBackend(),
+        cconv_backend=ReferenceCConv1dBackend(),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    ref_mixer = SLinOSSMixer(
+        512,
+        d_state=128,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=128,
+        normalize_bc=True,
+        scanprep_backend=ReferenceScanPrepBackend(),
+        backend=ReferenceScanBackend(compute_dtype=torch.float32),
+        cconv_backend=ReferenceCConv1dBackend(),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    ref_mixer.load_state_dict(cute_mixer.state_dict())
+
+    x = torch.randn((1, 128, 512), device="cuda", dtype=torch.bfloat16)
+    y_cute = cute_mixer(x)
+    y_ref = ref_mixer(x)
+
+    assert torch.isfinite(y_cute).all()
+    torch.testing.assert_close(y_cute, y_ref, atol=1e-1, rtol=0.0)
+
+    state_cute = cute_mixer.init_state(1, device="cuda", dtype=torch.bfloat16)
+    state_ref = ref_mixer.init_state(1, device="cuda", dtype=torch.bfloat16)
+    y_cute_state, next_cute = cute_mixer(x, state=state_cute, return_state=True)
+    y_ref_state, next_ref = ref_mixer(x, state=state_ref, return_state=True)
+
+    assert torch.isfinite(y_cute_state).all()
+    torch.testing.assert_close(y_cute_state, y_ref_state, atol=1e-1, rtol=0.0)
+    assert next_cute.conv is not None
+    assert next_ref.conv is not None
+    assert next_cute.scan.state is not None
+    assert next_ref.scan.state is not None
+    assert next_cute.scan.b_prev is not None
+    assert next_ref.scan.b_prev is not None
+    assert next_cute.scan.u_prev is not None
+    assert next_ref.scan.u_prev is not None
+    torch.testing.assert_close(next_cute.conv, next_ref.conv, atol=1e-2, rtol=0.0)
+    torch.testing.assert_close(
+        next_cute.scan.state, next_ref.scan.state, atol=1e-1, rtol=0.0
+    )
+    torch.testing.assert_close(
+        next_cute.scan.b_prev, next_ref.scan.b_prev, atol=1e-1, rtol=0.0
+    )
+    torch.testing.assert_close(
+        next_cute.scan.u_prev, next_ref.scan.u_prev, atol=1e-2, rtol=0.0
     )
 
 

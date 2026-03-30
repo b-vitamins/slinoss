@@ -18,6 +18,7 @@ from slinoss.layers import (
     foh_taps_from_polar,
     principal_angle,
 )
+from slinoss.ops.scanprep.cute.common import make_ptr_arg
 from slinoss.ops.v2x2ssd import v2x2ssd
 
 
@@ -54,6 +55,19 @@ def test_foh_taps_match_midpoint_rule_at_identity() -> None:
     assert torch.allclose(k_curr[..., 0], half_dt, atol=1e-7, rtol=0.0)
     assert torch.equal(k_prev[..., 1], torch.zeros_like(half_dt))
     assert torch.equal(k_curr[..., 1], torch.zeros_like(half_dt))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_scanprep_ptr_cache_keeps_same_base_views_distinct() -> None:
+    pytest.importorskip("cutlass")
+
+    x = torch.empty((1, 1, 1, 2, 2), device="cuda", dtype=torch.float32)
+    base_ptr, _ = make_ptr_arg(x)
+    slice0_ptr, _ = make_ptr_arg(x[:, :, :, 0, :])
+    slice1_ptr, _ = make_ptr_arg(x[:, :, :, 1, :])
+
+    assert base_ptr is not slice0_ptr
+    assert base_ptr is not slice1_ptr
 
 
 def test_scanprep_coefficients_are_bounded_and_finite() -> None:
