@@ -664,8 +664,7 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
         dM,
         dKprev,
         dKcurr,
-        _launch_sequential,
-        _launch_overlapped,
+        launch,
     ) = compile_chunk_increment_bwd_kernels(
         U,
         M,
@@ -679,7 +678,7 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
         compute_dtype=torch.float32,
         return_launchers=True,
     )
-    stage_args = _closure_var(_launch_sequential, "stage_args")
+    stage_args = _closure_var(launch, "stage_args")
     if not isinstance(stage_args, tuple):
         raise RuntimeError(
             "chunk_increment_bwd launcher closure did not expose stage_args tuple."
@@ -927,8 +926,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         dM,
         dKprev,
         dKcurr,
-        _launch_sequential,
-        _launch_overlapped,
+        launch,
     ) = compile_chunk_scan_bwd_kernels(
         U,
         M,
@@ -944,12 +942,12 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         return_launchers=True,
     )
     raw_launchers = {
-        "chunk_scan_bwd_dz0": _closure_var(_launch_sequential, "_launch_dz0"),
-        "chunk_scan_bwd_du": _closure_var(_launch_sequential, "_launch_du"),
-        "chunk_scan_bwd_db": _closure_var(_launch_sequential, "_launch_db"),
-        "chunk_scan_bwd_dcdr": _closure_var(_launch_sequential, "_launch_dcdr"),
-        "chunk_scan_bwd_dlp": _closure_var(_launch_sequential, "_launch_dlp"),
-        "chunk_scan_bwd_param": _closure_var(_launch_sequential, "_launch_param"),
+        "chunk_scan_bwd_dz0": _closure_var(launch, "_launch_dz0"),
+        "chunk_scan_bwd_du": _closure_var(launch, "_launch_du"),
+        "chunk_scan_bwd_db": _closure_var(launch, "_launch_db"),
+        "chunk_scan_bwd_dcdr": _closure_var(launch, "_launch_dcdr"),
+        "chunk_scan_bwd_dlp": _closure_var(launch, "_launch_dlp"),
+        "chunk_scan_bwd_param": _closure_var(launch, "_launch_param"),
     }
     launchers: dict[str, Callable[[], None]] = {}
     for key, value in raw_launchers.items():

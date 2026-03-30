@@ -16,22 +16,7 @@ from .param_scan import ChunkScanBwdParamScanAmpere
 
 
 _COMPILED_CACHE: dict[tuple, tuple[object, ...]] = {}
-_OVERLAP_RESOURCES: dict[
-    int,
-    tuple[
-        torch.cuda.Stream,
-        torch.cuda.Stream,
-        torch.cuda.Stream,
-        torch.cuda.Stream,
-        torch.cuda.Event,
-        torch.cuda.Event,
-        torch.cuda.Event,
-        torch.cuda.Event,
-        torch.cuda.Event,
-    ],
-] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_OVERLAP_RESOURCES_LIMIT = 8
 _ZERO_PREV_CACHE_LIMIT = 8
 
 
@@ -62,42 +47,6 @@ def _tc_input_dtype(
     if dt == torch.float32:
         return torch.float16
     raise TypeError(f"Unsupported compute dtype: {dt}")
-
-
-def _get_overlap_resources(
-    device: torch.device,
-) -> tuple[
-    torch.cuda.Stream,
-    torch.cuda.Stream,
-    torch.cuda.Stream,
-    torch.cuda.Stream,
-    torch.cuda.Event,
-    torch.cuda.Event,
-    torch.cuda.Event,
-    torch.cuda.Event,
-    torch.cuda.Event,
-]:
-    device_index = device.index if device.index is not None else -1
-    cached = _OVERLAP_RESOURCES.get(device_index)
-    if cached is None:
-        cached = (
-            torch.cuda.Stream(device=device),
-            torch.cuda.Stream(device=device),
-            torch.cuda.Stream(device=device),
-            torch.cuda.Stream(device=device),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-        )
-        _cache_set(
-            _OVERLAP_RESOURCES,
-            device_index,
-            cached,
-            limit=_OVERLAP_RESOURCES_LIMIT,
-        )
-    return cached
 
 
 def _pad_zero_time(
@@ -827,7 +776,6 @@ def compile_chunk_scan_bwd_kernels(
     num_threads_dcdr: int = 128,
     num_threads_param: int = 32,
     return_launchers: bool = False,
-    enable_overlapped_launcher: bool = True,
 ) -> tuple:
     """Compile the standalone chunk-scan backward kernels and allocate outputs."""
     if (B_prev is None) ^ (U_prev is None):
@@ -1275,19 +1223,13 @@ def compile_chunk_scan_bwd_kernels(
         _ = keepalive
         compiled_param(*param_args)
 
-    def launch_sequential() -> None:
+    def launch() -> None:
         _launch_dz0()
         _launch_du()
         _launch_db()
         _launch_dcdr()
         _launch_dlp()
         _launch_param()
-
-    def launch_overlapped() -> None:
-        # Structural dcdr/dlp changes are correctness-gated first; stream overlap
-        # remains disabled because it has historically shown near-zero gain here.
-        # Do not allocate the dormant overlap streams/events on this path.
-        launch_sequential()
 
     base = (
         compiled_dz0,
@@ -1308,7 +1250,7 @@ def compile_chunk_scan_bwd_kernels(
         dkcurr_view,
     )
     if return_launchers:
-        return (*base, launch_sequential, launch_overlapped)
+        return (*base, launch)
     return base
 
 
@@ -1345,8 +1287,7 @@ def chunk_scan_bwd_cute(
         dM,
         dKprev,
         dKcurr,
-        _launch_sequential,
-        launch_overlapped,
+        launch,
     ) = compile_chunk_scan_bwd_kernels(
         U,
         M,
@@ -1361,7 +1302,7 @@ def chunk_scan_bwd_cute(
         compute_dtype=compute_dtype,
         return_launchers=True,
     )
-    launch_overlapped()
+    launch()
 
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)

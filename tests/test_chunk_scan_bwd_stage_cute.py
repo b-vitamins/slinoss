@@ -242,8 +242,8 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
     dM = compiled[13]
     dKprev = compiled[14]
     dKcurr = compiled[15]
-    launch_sequential = compiled[-2]
-    launch_sequential()
+    launch = compiled[-1]
+    launch()
 
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)
@@ -271,120 +271,6 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
     )
     for got_tensor, want_tensor, atol in zip(
         got_compiled, got_public, atol_by_slot, strict=True
-    ):
-        torch.testing.assert_close(got_tensor, want_tensor, atol=atol, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_bwd_overlapped_matches_sequential() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    batch, heads, T, N, P = 2, 2, 65, 8, 16
-    chunk_size = 32
-    device = torch.device("cuda")
-
-    U, M, K, B, C, B_prev, U_prev = _make_inputs(
-        batch=batch,
-        heads=heads,
-        T=T,
-        N=N,
-        P=P,
-        device=device,
-    )
-    inc, m_chunk = chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=T,
-        chunk_size=chunk_size,
-        compute_dtype=torch.float32,
-    )
-    chunk_starts, _ = state_passing(
-        inc,
-        m_chunk,
-        initial_states=None,
-        compute_dtype=torch.float32,
-    )
-    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
-
-    seq_bundle = compile_chunk_scan_bwd_kernels(
-        U,
-        M,
-        K,
-        B,
-        C,
-        chunk_starts,
-        d_out,
-        chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=torch.float32,
-        return_launchers=True,
-    )
-    ov_bundle = compile_chunk_scan_bwd_kernels(
-        U,
-        M,
-        K,
-        B,
-        C,
-        chunk_starts,
-        d_out,
-        chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=torch.float32,
-        return_launchers=True,
-    )
-
-    seq_launch = seq_bundle[-2]
-    ov_launch = ov_bundle[-1]
-    seq_launch()
-    ov_launch()
-
-    def public_from_bundle(
-        bundle: tuple[object, ...],
-    ) -> tuple[torch.Tensor, ...]:
-        dZ0 = cast(torch.Tensor, bundle[5])
-        dU = cast(torch.Tensor, bundle[6])
-        dB = cast(torch.Tensor, bundle[7])
-        dU_prev = cast(torch.Tensor, bundle[8])
-        dB_prev = cast(torch.Tensor, bundle[9])
-        dC = cast(torch.Tensor, bundle[11])
-        dM = cast(torch.Tensor, bundle[13])
-        dKprev = cast(torch.Tensor, bundle[14])
-        dKcurr = cast(torch.Tensor, bundle[15])
-
-        dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
-        dB_public = _fold_chunk_boundary_carries(dB, dB_prev)
-        return (
-            _public_from_chunked(dU_public, T=T),
-            _public_from_param_scan(dM, T=T),
-            _public_dk_from_parts(dKprev, dKcurr, T=T),
-            _public_from_chunked(dB_public, T=T),
-            _public_from_chunked(dC, T=T),
-            dZ0.to(dtype=torch.float32).contiguous(),
-            dB_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
-            dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
-        )
-
-    seq_public = public_from_bundle(seq_bundle)
-    ov_public = public_from_bundle(ov_bundle)
-    atol_by_slot = (
-        0.0,
-        5e-7,
-        2e-7,
-        2e-7,
-        0.0,
-        0.0,
-        2e-7,
-        0.0,
-    )
-    for got_tensor, want_tensor, atol in zip(
-        ov_public, seq_public, atol_by_slot, strict=True
     ):
         torch.testing.assert_close(got_tensor, want_tensor, atol=atol, rtol=0.0)
 
@@ -463,8 +349,8 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
         )
         dU = cast(torch.Tensor, compiled[6])
         dU_prev = cast(torch.Tensor, compiled[8])
-        launch_sequential = compiled[-2]
-        launch_sequential()
+        launch = compiled[-1]
+        launch()
 
         dU_public = _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=T)
         dU_prev_public = dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous()

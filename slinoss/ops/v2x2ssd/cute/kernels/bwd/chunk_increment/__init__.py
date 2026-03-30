@@ -544,7 +544,6 @@ def compile_chunk_increment_bwd_kernels(
     U_prev: torch.Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
     return_launchers: bool = False,
-    enable_overlapped_launcher: bool = True,
 ) -> tuple:
     """Compile the standalone chunk-increment backward kernels and allocate outputs."""
     if (B_prev is None) ^ (U_prev is None):
@@ -759,11 +758,8 @@ def compile_chunk_increment_bwd_kernels(
     dKprev_view = dKprev_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
     dKcurr_view = dKcurr_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
 
-    def launch_sequential() -> None:
+    def launch() -> None:
         compiled_stage(*stage_args)
-
-    def launch_overlapped() -> None:
-        launch_sequential()
 
     base = (
         compiled_db,
@@ -781,7 +777,7 @@ def compile_chunk_increment_bwd_kernels(
         dKcurr_view,
     )
     if return_launchers:
-        return (*base, launch_sequential, launch_overlapped)
+        return (*base, launch)
     return base
 
 
@@ -814,8 +810,7 @@ def chunk_increment_bwd_cute(
         dM,
         dKprev,
         dKcurr,
-        _launch_sequential,
-        launch_overlapped,
+        launch,
     ) = compile_chunk_increment_bwd_kernels(
         U,
         M,
@@ -829,7 +824,7 @@ def chunk_increment_bwd_cute(
         compute_dtype=compute_dtype,
         return_launchers=True,
     )
-    launch_overlapped()
+    launch()
 
     dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
     dB_public = _fold_chunk_boundary_carries(dB, dB_prev)

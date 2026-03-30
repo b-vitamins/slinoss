@@ -216,7 +216,6 @@ def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
             torch.Tensor,
             torch.Tensor,
             Callable[[], None],
-            Callable[[], None],
         ],
         compile_chunk_increment_bwd_kernels(
             U.detach(),
@@ -246,10 +245,9 @@ def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
         dM,
         dKprev,
         dKcurr,
-        launch_sequential,
-        _launch_overlapped,
+        launch,
     ) = compiled
-    launch_sequential()
+    launch()
 
     got_compiled = (
         _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=U.shape[2]),
