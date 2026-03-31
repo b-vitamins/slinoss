@@ -60,6 +60,81 @@ def _copy_mixer_state_(dst: SLinOSSMixerState, src: SLinOSSMixerState) -> None:
     _copy_scan_state_(dst.scan, src.scan)
 
 
+class _SplitMixerProjectionFn(torch.autograd.Function):
+    @staticmethod
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        d_inner: int,
+        param_proj_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        d_inner = int(d_inner)
+        param_proj_dim = int(param_proj_dim)
+        gate_value_end = 2 * d_inner
+        params_end = gate_value_end + param_proj_dim
+        x_flat = x.reshape(-1, x.shape[-1])
+        gate_value = torch.mm(x_flat, weight[:gate_value_end, :].t()).view(
+            *x.shape[:-1], gate_value_end
+        )
+        params = torch.mm(x_flat, weight[gate_value_end:params_end, :].t()).view(
+            *x.shape[:-1], param_proj_dim
+        )
+        bc_flat = torch.mm(x_flat, weight[params_end:, :].t()).view(
+            *x.shape[:-1], weight.shape[0] - params_end
+        )
+        gate, value_raw = torch.split(gate_value, [d_inner, d_inner], dim=-1)
+        ctx.save_for_backward(x, weight)
+        ctx.d_inner = d_inner
+        ctx.param_proj_dim = param_proj_dim
+        return gate, value_raw, params, bc_flat
+
+    @staticmethod
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx,
+        grad_gate: torch.Tensor,
+        grad_value: torch.Tensor,
+        grad_params: torch.Tensor,
+        grad_bc_flat: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:
+        x, weight = ctx.saved_tensors
+        d_inner = int(ctx.d_inner)
+        param_proj_dim = int(ctx.param_proj_dim)
+        gate_value_end = 2 * d_inner
+        params_end = gate_value_end + param_proj_dim
+        grad_x: torch.Tensor | None = None
+        grad_weight: torch.Tensor | None = None
+        if not (ctx.needs_input_grad[0] or ctx.needs_input_grad[1]):
+            return None, None, None, None
+
+        if ctx.needs_input_grad[0]:
+            grad_gate_flat = grad_gate.reshape(-1, d_inner)
+            grad_value_flat = grad_value.reshape(-1, d_inner)
+            grad_params_flat = grad_params.reshape(-1, param_proj_dim)
+            grad_bc_flat_2d = grad_bc_flat.reshape(-1, weight.shape[0] - params_end)
+            grad_x_flat = torch.mm(grad_bc_flat_2d, weight[params_end:, :])
+            grad_x_flat.addmm_(grad_gate_flat, weight[:d_inner, :])
+            grad_x_flat.addmm_(grad_value_flat, weight[d_inner:gate_value_end, :])
+            grad_x_flat.addmm_(grad_params_flat, weight[gate_value_end:params_end, :])
+            grad_x = grad_x_flat.view_as(x)
+        if ctx.needs_input_grad[1]:
+            x_flat = x.reshape(-1, x.shape[-1])
+            grad_gate_flat = grad_gate.reshape(-1, d_inner)
+            grad_value_flat = grad_value.reshape(-1, d_inner)
+            grad_params_flat = grad_params.reshape(-1, param_proj_dim)
+            grad_bc_flat_2d = grad_bc_flat.reshape(-1, weight.shape[0] - params_end)
+            grad_weight = torch.empty_like(weight)
+            grad_weight[:d_inner, :] = torch.mm(grad_gate_flat.t(), x_flat)
+            grad_weight[d_inner:gate_value_end, :] = torch.mm(
+                grad_value_flat.t(), x_flat
+            )
+            grad_weight[gate_value_end:params_end, :] = torch.mm(
+                grad_params_flat.t(), x_flat
+            )
+            grad_weight[params_end:, :] = torch.mm(grad_bc_flat_2d.t(), x_flat)
+        return grad_x, grad_weight, None, None
+
+
 class _MixerCudaGraphStepEngine:
     """Fixed-shape CUDA graph replay for one-token mixer decode."""
 
@@ -525,18 +600,15 @@ class SLinOSSMixer(nn.Module):
     def _project_mixer_branches(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        weight = self.in_proj.weight
-        gate_value_end = 2 * self.d_inner
-        params_end = gate_value_end + self.param_proj_dim
-        gate_value = F.linear(x, weight[:gate_value_end, :])
-        gate, value_raw = torch.split(
-            gate_value,
-            [self.d_inner, self.d_inner],
-            dim=-1,
+        return cast(
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            _SplitMixerProjectionFn.apply(
+                x,
+                self.in_proj.weight,
+                self.d_inner,
+                self.param_proj_dim,
+            ),
         )
-        params = F.linear(x, weight[gate_value_end:params_end, :])
-        bc_flat = F.linear(x, weight[params_end:, :])
-        return gate, value_raw, params, bc_flat
 
     def forward(
         self,
