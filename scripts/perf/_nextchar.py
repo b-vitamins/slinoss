@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+import os
 import statistics
 from time import perf_counter
 from typing import Any, Callable, TypeAlias, TypeVar
@@ -196,6 +197,72 @@ def _clip_params(model: NextCharModel) -> tuple[torch.nn.Parameter, ...]:
     return clip_params
 
 
+def _zero_param_grads_in_place(model: NextCharModel) -> None:
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.zero_()
+
+
+class _NextCharCudaGraphTrainer:
+    def __init__(
+        self,
+        model: NextCharModel,
+        optimizer: torch.optim.Optimizer,
+        *,
+        xb: torch.Tensor,
+        yb: torch.Tensor,
+        grad_clip: float,
+    ) -> None:
+        self.model = model
+        self.optimizer = optimizer
+        self.grad_clip = float(grad_clip)
+        self.device = xb.device
+        self.static_xb = xb.clone()
+        self.static_yb = yb.clone()
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_logits: torch.Tensor | None = None
+        self.static_loss: torch.Tensor | None = None
+        self._capture()
+
+    def _run_body(self) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = self.model(self.static_xb)
+        loss = _cross_entropy_logits(logits, self.static_yb)
+        loss.backward()
+        return logits, loss
+
+    def _capture(self) -> None:
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(device=self.device))
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.optimizer.zero_grad(set_to_none=True)
+                logits, loss = self._run_body()
+            del logits, loss
+        torch.cuda.current_stream(device=self.device).wait_stream(stream)
+        self.optimizer.zero_grad(set_to_none=False)
+        with torch.cuda.graph(self.graph):
+            self.static_logits, self.static_loss = self._run_body()
+
+    def step(
+        self,
+        xb: torch.Tensor,
+        yb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.static_xb.copy_(xb)
+        self.static_yb.copy_(yb)
+        _zero_param_grads_in_place(self.model)
+        self.graph.replay()
+        torch.nn.utils.clip_grad_norm_(
+            _clip_params(self.model),
+            max_norm=self.grad_clip,
+            foreach=xb.device.type == "cuda",
+        )
+        self.optimizer.step()
+        if self.static_logits is None or self.static_loss is None:
+            raise RuntimeError("CUDA graph did not materialize logits/loss.")
+        return self.static_logits, self.static_loss
+
+
 def run_train_step_clean(
     model: NextCharModel,
     optimizer: torch.optim.Optimizer,
@@ -319,6 +386,11 @@ def _run_clean_sequence(
     warmup: int,
     steps: int,
 ) -> tuple[float, list[float]]:
+    use_cuda_graph = (
+        backend == "cute"
+        and cfg.torch_device.type == "cuda"
+        and os.environ.get("SLINOSS_DISABLE_CUDA_GRAPH_BENCH") != "1"
+    )
     model, optimizer = build_model(cfg, backend=backend, instrumented=False)
     model.load_state_dict(initial_state)
     model.perf_trainable_params = tuple(
@@ -333,6 +405,40 @@ def _run_clean_sequence(
         device=cfg.torch_device,
     )
     del logits, loss
+
+    if use_cuda_graph:
+        model_state = deepcopy(model.state_dict())
+        optimizer_state = deepcopy(optimizer.state_dict())
+        del model, optimizer
+
+        model, optimizer = build_model(cfg, backend=backend, instrumented=False)
+        model.load_state_dict(model_state)
+        optimizer.load_state_dict(optimizer_state)
+        model.perf_trainable_params = tuple(
+            p for p in model.parameters() if p.requires_grad
+        )
+
+        capture_xb, capture_yb = batches[1]
+        trainer = _NextCharCudaGraphTrainer(
+            model,
+            optimizer,
+            xb=capture_xb,
+            yb=capture_yb,
+            grad_clip=cfg.grad_clip,
+        )
+
+        for xb, yb in batches[1 : 1 + warmup]:
+            trainer.step(xb, yb)
+
+        warm_step_ms: list[float] = []
+        for xb, yb in batches[1 + warmup : 1 + warmup + steps]:
+            step_ms, _ = _time_step(
+                lambda xb=xb, yb=yb: trainer.step(xb, yb),
+                device=cfg.torch_device,
+            )
+            warm_step_ms.append(step_ms)
+
+        return cold_step_ms, warm_step_ms
 
     for xb, yb in batches[1 : 1 + warmup]:
         run_train_step_clean(model, optimizer, xb, yb, grad_clip=cfg.grad_clip)

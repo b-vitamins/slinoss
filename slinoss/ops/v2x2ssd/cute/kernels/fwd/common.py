@@ -93,6 +93,7 @@ def _ptr_arg_cache_key(t: torch.Tensor) -> tuple[object, ...]:
     return (
         t.device.type,
         device_index,
+        int(id(t)),
         int(t.data_ptr()),
         t.dtype,
         tuple(int(dim) for dim in t.shape),

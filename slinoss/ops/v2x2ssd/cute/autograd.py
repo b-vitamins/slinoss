@@ -15,6 +15,14 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
 )
 
 
+def _clone_if_capturing(x: torch.Tensor | None) -> torch.Tensor | None:
+    if x is None:
+        return None
+    if x.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return x.clone()
+    return x
+
+
 def _prepare_backward_inputs(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -240,7 +248,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                     prepared_inputs=prepared_inputs,
                 ),
             )
-
+            dM_total = _clone_if_capturing(dM_total)
         if dB_last is not None:
             if dB_total is None:
                 dB_total = torch.zeros_like(B)

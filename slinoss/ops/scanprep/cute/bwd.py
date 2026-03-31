@@ -74,6 +74,84 @@ def _get_partial_workspace(
     return cached
 
 
+def _is_cuda_graph_capturing(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _capture_safe_small_grads(
+    *,
+    batch: int,
+    t_size: int,
+    n_heads: int,
+    d_state: int,
+    bc: torch.Tensor,
+    rms_inv: torch.Tensor,
+    dparams: torch.Tensor,
+    dB: torch.Tensor,
+    dC: torch.Tensor,
+    normalize_bc: bool,
+    b_scale: torch.Tensor | None,
+    c_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    dparams_heads = dparams.view(batch, t_size, n_heads, 13).to(torch.float32)
+    bias_grad = torch.stack(
+        (
+            dparams_heads[:, :, :, 0].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 1].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 2].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 5].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 6].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 7].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 8].sum(dim=(0, 1)),
+        ),
+        dim=1,
+    )
+    if not normalize_bc:
+        return bias_grad, None, None
+
+    reduce_chunk = 2048
+
+    def _reduce_scale_grad(
+        grad: torch.Tensor,
+        bc_channel: int,
+        rms_channel: int,
+    ) -> torch.Tensor:
+        out = torch.zeros((n_heads, d_state), device=bc.device, dtype=torch.float32)
+        for t0 in range(0, t_size, reduce_chunk):
+            t1 = min(t_size, t0 + reduce_chunk)
+            bc_chunk = (
+                bc[:, t0:t1, :, bc_channel, :].permute(0, 2, 1, 3).to(torch.float32)
+            )
+            grad_chunk = grad[:, :, t0:t1, :].to(torch.float32)
+            rms_chunk = (
+                rms_inv[:, :, t0:t1, rms_channel].unsqueeze(-1).to(torch.float32)
+            )
+            out.add_((grad_chunk * bc_chunk * rms_chunk).sum(dim=(0, 2)))
+        return out
+
+    d_b_scale = None
+    if b_scale is not None:
+        d_b_scale = torch.stack(
+            (
+                _reduce_scale_grad(dB[:, :, :, 0::2], 0, 0),
+                _reduce_scale_grad(dB[:, :, :, 1::2], 1, 1),
+            ),
+            dim=1,
+        )
+
+    d_c_scale = None
+    if c_scale is not None:
+        d_c_scale = torch.stack(
+            (
+                _reduce_scale_grad(dC[:, :, :, 0::2], 2, 2),
+                _reduce_scale_grad(dC[:, :, :, 1::2], 3, 3),
+            ),
+            dim=1,
+        )
+
+    return bias_grad, d_b_scale, d_c_scale
+
+
 def scanprep_bwd(
     *,
     bc: torch.Tensor,
@@ -335,8 +413,28 @@ def scanprep_bwd(
         bias_grad_ptr,
     )
 
-    d_b_scale = scale_grad[:, :2, :] if normalize_bc and b_scale is not None else None
-    d_c_scale = scale_grad[:, 2:, :] if normalize_bc and c_scale is not None else None
+    if _is_cuda_graph_capturing(bc.device):
+        bias_grad, d_b_scale, d_c_scale = _capture_safe_small_grads(
+            batch=batch,
+            t_size=t_size,
+            n_heads=n_heads,
+            d_state=d_state,
+            bc=bc_c,
+            rms_inv=rms_inv_c,
+            dparams=dparams,
+            dB=db_in,
+            dC=dc_in,
+            normalize_bc=normalize_bc,
+            b_scale=b_scale,
+            c_scale=c_scale,
+        )
+    else:
+        d_b_scale = (
+            scale_grad[:, :2, :] if normalize_bc and b_scale is not None else None
+        )
+        d_c_scale = (
+            scale_grad[:, 2:, :] if normalize_bc and c_scale is not None else None
+        )
     return (
         value_grad,
         dparams,
