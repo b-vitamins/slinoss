@@ -283,6 +283,75 @@ def test_chunk_scan_cute_matches_reference_stage() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_cute_is_repeatable_for_issue_9_shape() -> None:
+    pytest.importorskip("cutlass")
+
+    for output_dtype, atol in (
+        (torch.bfloat16, 5e-2),
+        (torch.float32, 5e-3),
+    ):
+        for _ in range(8):
+            torch.manual_seed(0)
+            U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+                batch=1,
+                heads=16,
+                T=128,
+                N=128,
+                P=64,
+                device=torch.device("cuda"),
+                value_dtype=torch.bfloat16,
+            )
+
+            inc_ref, m_ref = chunk_increment(
+                U,
+                M,
+                K,
+                B,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                T=U.shape[2],
+                chunk_size=128,
+                compute_dtype=torch.float32,
+            )
+            starts_ref, _ = state_passing(
+                inc_ref,
+                m_ref,
+                initial_states=initial_states,
+                compute_dtype=torch.float32,
+            )
+
+            y_ref = chunk_scan(
+                U,
+                M,
+                K,
+                B,
+                C,
+                starts_ref,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                T=U.shape[2],
+                chunk_size=128,
+                output_dtype=output_dtype,
+                compute_dtype=torch.float32,
+            )
+            y_cute = chunk_scan_cute(
+                U,
+                M,
+                K,
+                B,
+                C,
+                starts_ref,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                chunk_size=128,
+                output_dtype=output_dtype,
+                compute_dtype=torch.float32,
+            )
+
+            torch.testing.assert_close(y_cute, y_ref, atol=atol, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_cute_stateless_forward_is_mode_invariant() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)

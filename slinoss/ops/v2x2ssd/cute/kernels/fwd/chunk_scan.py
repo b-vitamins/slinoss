@@ -427,6 +427,9 @@ class ChunkScanFwdInnerAmpere:
                 tSrB[None, None, k],
                 acc,
             )
+        # All warps must finish consuming the staged shared tiles before the
+        # caller can repopulate the same storage for the next slice.
+        cute.arch.barrier()
 
     @cute.jit
     def _make_mma_accumulator(self, layout_or_shape, dtype):
@@ -534,6 +537,9 @@ class ChunkScanFwdInnerAmpere:
                 tOrVt[None, None, k],
                 acc_O,
             )
+        # The V tile aliases the main shared staging buffer in the fast path,
+        # so do not let later stages overwrite it until every warp is done.
+        cute.arch.barrier()
 
     @cute.jit
     def _store_output(
@@ -1954,7 +1960,6 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                             tSrQ,
                             tSrK,
                         )
-
                     k_col = n_block * n + tidx
                     if tidx < n:
                         if cute.elem_less(k_col, L):
