@@ -24,6 +24,7 @@ than any external wrapper surface. Compile/wrapper glue belongs in
 import math
 from dataclasses import dataclass
 
+from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -300,16 +301,19 @@ class ChunkIncrementFwdAmpere:
             tile_m=self.bN,
         )
 
+        # The chunk-increment epilogue writes an f32 accumulator tile through a
+        # row-major (P, D, BHC) view. Under TVM FFI the destination tile is not
+        # universally 128-bit aligned, so the output copy must stay scalar-width.
         atom_sync_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.c_dtype,
-            num_bits_per_copy=copy_bits,
+            num_bits_per_copy=32,
         )
         tiled_copy_C = self._make_gmem_tiled_copy_C(
             atom_sync_copy,
             self.c_dtype,
             layouts.c_major_mode,
-            copy_bits,
+            32,
         )
         return ChunkIncrementCopyBundle(
             tiled_copy_A=tiled_copy_A,
@@ -353,7 +357,6 @@ class ChunkIncrementFwdAmpere:
         u0_layout = self._u0_layout()
         b0_layout = self._b0_layout()
         warp_scan_layout = self._warp_scan_layout()
-        output_alias_guard_layout = self._output_alias_guard_layout()
         tail_pad_layout = self._tail_pad_layout()
 
         class SharedStorage:
@@ -366,12 +369,8 @@ class ChunkIncrementFwdAmpere:
             "sB": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
             ],
-            # Preserve the historical aliasing envelope for the shared-memory
-            # epilogue path used outside the 64-wide single-tile fast path.
-            "output_alias_guard": cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(output_alias_guard_layout)
-                ],
+            "sC": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(layouts.sC_layout)],
                 16,
             ],
             "alpha_prev": cute.struct.Align[
@@ -459,6 +458,51 @@ class ChunkIncrementFwdAmpere:
         )
 
     @cute.jit
+    def call_on_stream(
+        self,
+        mU: cute.Tensor,  # (P, T_pad, BH)
+        mB: cute.Tensor,  # (D, T_pad, BH)
+        mM: cute.Tensor,  # (2, T_pad, BH)
+        mKprev: cute.Tensor,  # (2, T_pad, BH)
+        mKcurr: cute.Tensor,  # (2, T_pad, BH)
+        mU_prev0: cute.Tensor,  # (P, BH)
+        mB_prev0: cute.Tensor,  # (D, BH)
+        mInc: cute.Tensor,  # (P, D, BHC) fp32
+        mMchunk: cute.Tensor,  # (2, BHC) fp32
+        stream: cuda.CUstream,
+    ):
+        bundle = self._make_kernel_bundle(mU, mB, mInc)
+        grid_dim = cute.ceil_div(mInc.shape, (self.bM, self.bN, 1))
+        grid_z = cute.size(mInc.shape[2])
+
+        self.kernel(
+            mU,
+            mB,
+            mM,
+            mKprev,
+            mKcurr,
+            mU_prev0,
+            mB_prev0,
+            mInc,
+            mMchunk,
+            bundle.layouts.a_major_mode,
+            bundle.layouts.b_major_mode,
+            bundle.layouts.sA_layout,
+            bundle.layouts.sB_layout,
+            bundle.layouts.sC_layout,
+            bundle.copies.tiled_copy_A,
+            bundle.copies.tiled_copy_B,
+            bundle.copies.tiled_copy_C,
+            bundle.tiled_mma,
+            bundle.SharedStorage,
+        ).launch(
+            grid=(cute.size(grid_dim[0]), cute.size(grid_dim[1]), grid_z),
+            block=[self.num_threads, 1, 1],
+            smem=bundle.smem_size,
+            stream=stream,
+        )
+
+    @cute.jit
     def _make_copy_row_predicate(
         self,
         partitioned_dst: cute.Tensor,
@@ -530,9 +574,7 @@ class ChunkIncrementFwdAmpere:
         storage = smem.allocate(SharedStorage)
         sA = storage.sA.get_tensor(sA_layout)
         sB = storage.sB.get_tensor(sB_layout)
-        sC = cute.make_tensor(
-            cute.recast_ptr(sA.iterator, dtype=self.c_dtype), sC_layout
-        )
+        sC = storage.sC.get_tensor(sC_layout)
         alpha_layout = self._alpha_layout()
         warp_scan_layout = self._warp_scan_layout()
         s_alpha_prev = storage.alpha_prev.get_tensor(alpha_layout)
@@ -983,8 +1025,8 @@ class ChunkIncrementFwdAmpere:
 
             cute.arch.sync_threads()
 
-            tCrC_epilogue = cute.make_fragment_like(tCgC_epilogue)
-            cute.copy(tiled_copy_C, tCsC_epilogue, tCrC_epilogue)
+            tCrC_epilogue = cute.make_fragment_like(tCsC_epilogue)
+            cute.autovec_copy(tCsC_epilogue, tCrC_epilogue)
 
             tCpC = cute.make_rmem_tensor(
                 cute.make_layout(

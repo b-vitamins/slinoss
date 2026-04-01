@@ -53,6 +53,8 @@ class ScanPrepFwdFused:
         *,
         spec: tuple[int, int, int, int, int],
         params_in_stride: tuple[int, int, int] | None = None,
+        b_scale_stride: tuple[int, int, int] | None = None,
+        c_scale_stride: tuple[int, int, int] | None = None,
         normalize_bc: bool,
         store_rms_inv: bool,
         store_coeff_aux: bool,
@@ -83,7 +85,17 @@ class ScanPrepFwdFused:
         self.bc_shape = (self.batch, self.t_size, self.h_size, 4, self.n_size)
         self.bc_stride = make_row_major_stride(self.bc_shape)
         self.scale_shape = (self.h_size, 2, self.n_size)
-        self.scale_stride = make_row_major_stride(self.scale_shape)
+        default_scale_stride = make_row_major_stride(self.scale_shape)
+        self.b_scale_stride = (
+            tuple(int(s) for s in b_scale_stride)
+            if b_scale_stride is not None
+            else default_scale_stride
+        )
+        self.c_scale_stride = (
+            tuple(int(s) for s in c_scale_stride)
+            if c_scale_stride is not None
+            else default_scale_stride
+        )
         self.bc_out_shape = (self.batch, self.h_size, self.t_size, 2 * self.n_size)
         self.bc_out_stride = make_row_major_stride(self.bc_out_shape)
         self.params_shape = (self.batch, self.t_size, self.h_size, 13)
@@ -512,10 +524,10 @@ class ScanPrepFwdFused:
             bc_ptr, cute.make_layout(self.bc_shape, stride=self.bc_stride)
         )
         mBScale = cute.make_tensor(
-            b_scale_ptr, cute.make_layout(self.scale_shape, stride=self.scale_stride)
+            b_scale_ptr, cute.make_layout(self.scale_shape, stride=self.b_scale_stride)
         )
         mCScale = cute.make_tensor(
-            c_scale_ptr, cute.make_layout(self.scale_shape, stride=self.scale_stride)
+            c_scale_ptr, cute.make_layout(self.scale_shape, stride=self.c_scale_stride)
         )
         mParams = cute.make_tensor(
             params_ptr, cute.make_layout(self.params_shape, stride=self.params_stride)

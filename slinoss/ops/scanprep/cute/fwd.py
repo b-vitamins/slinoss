@@ -172,6 +172,8 @@ def _scanprep_fwd_impl(
         else torch.empty((n_heads, 2, d_state), device=value.device, dtype=bc.dtype)
     )
     params_stride = tuple(int(s) for s in params.stride())
+    b_scale_stride = tuple(int(s) for s in b_scale_c.stride())
+    c_scale_stride = tuple(int(s) for s in c_scale_c.stride())
 
     value_ptr, value_align = make_ptr_arg(value_c)
     bc_ptr, bc_align = make_ptr_arg(bc_c)
@@ -203,6 +205,8 @@ def _scanprep_fwd_impl(
         bc_c.dtype,
         b_scale_c.dtype,
         c_scale_c.dtype,
+        b_scale_stride,
+        c_scale_stride,
         dt_bias.dtype,
         gamma_bias.dtype,
         omega_bias.dtype,
@@ -253,6 +257,8 @@ def _scanprep_fwd_impl(
             ScanPrepFwdFused(
                 spec=spec,
                 params_in_stride=params_stride,
+                b_scale_stride=b_scale_stride,
+                c_scale_stride=c_scale_stride,
                 normalize_bc=normalize_bc,
                 store_rms_inv=bool(return_aux and normalize_bc),
                 store_coeff_aux=bool(return_aux),

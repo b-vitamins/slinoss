@@ -16,6 +16,7 @@ Outputs are float32, matching the reference path.
 
 from dataclasses import dataclass
 
+from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
 
@@ -35,8 +36,10 @@ class StatePassingCopyBundle:
     copy_inc_scalar: object
     copy_out_vec: object
     copy_out_scalar: object
-    copy_state_vec: object
-    copy_state_scalar: object
+    copy_state_in_vec: object
+    copy_state_in_scalar: object
+    copy_state_out_vec: object
+    copy_state_out_scalar: object
     copy_m: object
 
 
@@ -56,7 +59,8 @@ class StatePassingFwdAmpere:
         vecs_per_thread: int = 8,
         copy_bits_in: int,
         copy_bits_out: int,
-        copy_bits_state: int,
+        copy_bits_state_in: int,
+        copy_bits_state_out: int,
         has_init: bool,
     ):
         self.num_threads = int(num_threads)
@@ -73,7 +77,8 @@ class StatePassingFwdAmpere:
 
         self.copy_bits_in = int(copy_bits_in)
         self.copy_bits_out = int(copy_bits_out)
-        self.copy_bits_state = int(copy_bits_state)
+        self.copy_bits_state_in = int(copy_bits_state_in)
+        self.copy_bits_state_out = int(copy_bits_state_out)
         self.has_init = bool(has_init)
 
     def _make_layout_bundle(
@@ -108,7 +113,8 @@ class StatePassingFwdAmpere:
         *,
         inc_dtype: type[cutlass.Numeric],
         out_dtype: type[cutlass.Numeric],
-        state_dtype: type[cutlass.Numeric],
+        state_in_dtype: type[cutlass.Numeric],
+        state_out_dtype: type[cutlass.Numeric],
         m_dtype: type[cutlass.Numeric],
     ) -> StatePassingCopyBundle:
         return StatePassingCopyBundle(
@@ -116,8 +122,18 @@ class StatePassingFwdAmpere:
             copy_inc_scalar=self._make_copy_atom(inc_dtype, inc_dtype.width),
             copy_out_vec=self._make_copy_atom(out_dtype, self.copy_bits_out),
             copy_out_scalar=self._make_copy_atom(out_dtype, out_dtype.width),
-            copy_state_vec=self._make_copy_atom(state_dtype, self.copy_bits_state),
-            copy_state_scalar=self._make_copy_atom(state_dtype, state_dtype.width),
+            copy_state_in_vec=self._make_copy_atom(
+                state_in_dtype, self.copy_bits_state_in
+            ),
+            copy_state_in_scalar=self._make_copy_atom(
+                state_in_dtype, state_in_dtype.width
+            ),
+            copy_state_out_vec=self._make_copy_atom(
+                state_out_dtype, self.copy_bits_state_out
+            ),
+            copy_state_out_scalar=self._make_copy_atom(
+                state_out_dtype, state_out_dtype.width
+            ),
             copy_m=self._make_copy_atom(m_dtype, m_dtype.width * 2),
         )
 
@@ -129,7 +145,8 @@ class StatePassingFwdAmpere:
         S: int,
         inc_dtype: type[cutlass.Numeric],
         out_dtype: type[cutlass.Numeric],
-        state_dtype: type[cutlass.Numeric],
+        state_in_dtype: type[cutlass.Numeric],
+        state_out_dtype: type[cutlass.Numeric],
         m_dtype: type[cutlass.Numeric],
     ) -> StatePassingKernelBundle:
         return StatePassingKernelBundle(
@@ -137,7 +154,8 @@ class StatePassingFwdAmpere:
             copies=self._make_copy_bundle(
                 inc_dtype=inc_dtype,
                 out_dtype=out_dtype,
-                state_dtype=state_dtype,
+                state_in_dtype=state_in_dtype,
+                state_out_dtype=state_out_dtype,
                 m_dtype=m_dtype,
             ),
         )
@@ -175,7 +193,8 @@ class StatePassingFwdAmpere:
             S=S,
             inc_dtype=inc.element_type,
             out_dtype=out_starts.element_type,
-            state_dtype=init_or_dummy.element_type,
+            state_in_dtype=init_or_dummy.element_type,
+            state_out_dtype=out_final.element_type,
             m_dtype=m_chunk.element_type,
         )
         layouts = bundle.layouts
@@ -205,12 +224,76 @@ class StatePassingFwdAmpere:
             copies.copy_inc_scalar,
             copies.copy_out_vec,
             copies.copy_out_scalar,
-            copies.copy_state_vec,
-            copies.copy_state_scalar,
+            copies.copy_state_in_vec,
+            copies.copy_state_in_scalar,
+            copies.copy_state_out_vec,
+            copies.copy_state_out_scalar,
             copies.copy_m,
         ).launch(
             grid=[grid_x, grid_y, 1],
             block=[self.num_threads, 1, 1],
+        )
+
+    @cute.jit
+    def call_on_stream(
+        self,
+        inc: cute.Tensor,  # (B,H,C,P,D)
+        m_chunk: cute.Tensor,  # (B,H,C,2)
+        out_starts: cute.Tensor,  # (B,H,C,P,D) fp32
+        out_final: cute.Tensor,  # (B,H,P,D) fp32
+        init_or_dummy: cute.Tensor,  # (B,H,P,D) or ignored when has_init=False
+        stream: cuda.CUstream,
+    ):
+        B, H, C, P, D = inc.shape
+        BH = B * H
+        S = P * D
+
+        bundle = self._make_kernel_bundle(
+            BH=BH,
+            C=C,
+            S=S,
+            inc_dtype=inc.element_type,
+            out_dtype=out_starts.element_type,
+            state_in_dtype=init_or_dummy.element_type,
+            state_out_dtype=out_final.element_type,
+            m_dtype=m_chunk.element_type,
+        )
+        layouts = bundle.layouts
+        copies = bundle.copies
+
+        inc_flat = cute.make_tensor(inc.iterator, layouts.layout_bcs)
+        m_flat = cute.make_tensor(m_chunk.iterator, layouts.layout_bcm)
+        out_starts_flat = cute.make_tensor(out_starts.iterator, layouts.layout_bcs)
+        out_final_flat = cute.make_tensor(out_final.iterator, layouts.layout_bs)
+        init_flat = cute.make_tensor(init_or_dummy.iterator, layouts.layout_bs)
+        idS = cute.make_identity_tensor(S)
+        cS = cute.zipped_divide(idS, tiler=layouts.tile_layout)
+
+        grid_x = cute.ceil_div(S, self.tile)
+        grid_y = BH
+
+        self.kernel(
+            inc_flat,
+            m_flat,
+            out_starts_flat,
+            out_final_flat,
+            init_flat,
+            cS,
+            layouts.tile_layout,
+            layouts.tv_layout,
+            copies.copy_inc_vec,
+            copies.copy_inc_scalar,
+            copies.copy_out_vec,
+            copies.copy_out_scalar,
+            copies.copy_state_in_vec,
+            copies.copy_state_in_scalar,
+            copies.copy_state_out_vec,
+            copies.copy_state_out_scalar,
+            copies.copy_m,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
         )
 
     @cute.kernel
@@ -228,8 +311,10 @@ class StatePassingFwdAmpere:
         copy_inc_scalar,
         copy_out_vec,
         copy_out_scalar,
-        copy_state_vec,
-        copy_state_scalar,
+        copy_state_in_vec,
+        copy_state_in_scalar,
+        copy_state_out_vec,
+        copy_state_out_scalar,
         copy_m,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -263,9 +348,9 @@ class StatePassingFwdAmpere:
             frgInit = cute.make_rmem_tensor_like(thrInit)
             frgInit.fill(0)
             if is_partial_tile:
-                cute.copy(copy_state_scalar, thrInit, frgInit, pred=frgPred)
+                cute.copy(copy_state_in_scalar, thrInit, frgInit, pred=frgPred)
             else:
-                cute.copy(copy_state_vec, thrInit, frgInit)
+                cute.copy(copy_state_in_vec, thrInit, frgInit)
             accZ.store(frgInit.load().to(cutlass.Float32))
 
         frgIn = cute.make_rmem_tensor_like(thrInit)
@@ -319,8 +404,8 @@ class StatePassingFwdAmpere:
 
         frgOut.store(accZ.load())
         if is_partial_tile:
-            cute.copy(copy_out_scalar, frgOut, thrF, pred=frgPred)
+            cute.copy(copy_state_out_scalar, frgOut, thrF, pred=frgPred)
         else:
-            cute.copy(copy_out_vec, frgOut, thrF)
+            cute.copy(copy_state_out_vec, frgOut, thrF)
 
         return

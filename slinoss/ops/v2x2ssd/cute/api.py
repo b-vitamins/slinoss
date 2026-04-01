@@ -151,6 +151,8 @@ def v2x2ssd_cute(
         )
         return Y
 
+    from .autograd import _materialize_boundary_tensor
+
     Y, final_state, _m_chunk, _chunk_starts = cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         v2x2ssd_fwd_cute(
@@ -169,9 +171,35 @@ def v2x2ssd_cute(
             return_intermediates=False,
         ),
     )
-    B_last = B[:, :, -1, :].to(dtype=odtype).contiguous()
-    U_last = U[:, :, -1, :].to(dtype=odtype).contiguous()
-    return Y, final_state.to(dtype=odtype).contiguous(), B_last, U_last
+    Y_out = cast(
+        torch.Tensor,
+        _materialize_boundary_tensor(
+            Y,
+            dtype=odtype,
+        ),
+    )
+    final_state_out = cast(
+        torch.Tensor,
+        _materialize_boundary_tensor(
+            final_state,
+            dtype=odtype,
+        ),
+    )
+    B_last = cast(
+        torch.Tensor,
+        _materialize_boundary_tensor(
+            B[:, :, -1, :],
+            dtype=odtype,
+        ),
+    )
+    U_last = cast(
+        torch.Tensor,
+        _materialize_boundary_tensor(
+            U[:, :, -1, :],
+            dtype=odtype,
+        ),
+    )
+    return Y_out, final_state_out, B_last, U_last
 
 
 __all__ = ["v2x2ssd_cute"]

@@ -279,6 +279,8 @@ def scanprep_bwd(
     coeff_aux_c = coeff_aux if coeff_aux.is_contiguous() else coeff_aux.contiguous()
     rms_inv_c = rms_inv if rms_inv.is_contiguous() else rms_inv.contiguous()
     du_stride = tuple(int(s) for s in du_in.stride())
+    b_scale_stride = tuple(int(s) for s in b_scale_in.stride())
+    c_scale_stride = tuple(int(s) for s in c_scale_in.stride())
 
     du_ptr, du_align = make_ptr_arg(du_in)
     bc_ptr, bc_align = make_ptr_arg(bc_c)
@@ -311,6 +313,8 @@ def scanprep_bwd(
         dk_in.dtype,
         b_scale_in.dtype,
         c_scale_in.dtype,
+        b_scale_stride,
+        c_scale_stride,
         rms_inv_c.dtype,
         coeff_aux_c.dtype,
         value_grad.dtype,
@@ -358,6 +362,8 @@ def scanprep_bwd(
             ScanPrepBwdFused(
                 spec=spec,
                 du_stride=du_stride,
+                b_scale_stride=b_scale_stride,
+                c_scale_stride=c_scale_stride,
                 normalize_bc=normalize_bc,
                 dt_min=dt_min,
                 dt_max=dt_max,

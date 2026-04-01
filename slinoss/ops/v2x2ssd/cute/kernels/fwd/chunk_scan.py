@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -485,6 +486,25 @@ class ChunkScanFwdInnerAmpere:
             else:
                 tSd[None, idx, None].fill(0)
 
+    @cute.jit
+    def _copy_gmem_rows_if_valid(
+        self,
+        gmem_tiled_copy: cute.TiledCopy,
+        tSg: cute.Tensor,
+        tSd: cute.Tensor,
+        tSc: cute.Tensor,
+        copy_pred: cute.Tensor,
+        row_limit: int,
+    ):
+        for idx in cutlass.range_constexpr(cute.size(tSd.shape[1])):
+            if cute.elem_less(tSc[0, idx, 0][1], row_limit):
+                cute.copy(
+                    gmem_tiled_copy,
+                    tSg[None, idx, None],
+                    tSd[None, idx, None],
+                    pred=copy_pred[None, idx, None],
+                )
+
     def _make_output_tile(self, mOut: cute.Tensor, bhc: int, m_block: int):
         mcO = cute.make_identity_tensor(mOut.layout.shape)
         return cute.local_tile(
@@ -594,7 +614,7 @@ class ChunkScanFwdInnerAmpere:
 
             tOcOut = gmem_thr_copy_O.partition_D(cO)
             tOpOut = self._make_copy_col_predicate(tOgO, tOcOut, mOut.layout.shape[3])
-            self._copy_gmem_rows_or_zero(
+            self._copy_gmem_rows_if_valid(
                 gmem_tiled_copy_O,
                 tOrO,
                 tOgO,
@@ -669,6 +689,7 @@ class ChunkScanFwdInnerAmpere:
         mLogprefix: cute.Tensor,
         mZ0: cute.Tensor,
         mOut: cute.Tensor,
+        stream: cuda.CUstream,
     ):
         if cutlass.const_expr(
             not (
@@ -744,6 +765,7 @@ class ChunkScanFwdInnerAmpere:
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
             smem=bundle.smem_size,
+            stream=stream,
         )
 
     @cute.kernel
@@ -1434,6 +1456,85 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             smem=bundle.smem_size,
         )
 
+    @cute.jit
+    def call_on_stream(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mK: cute.Tensor,
+        mZ0: cute.Tensor,
+        mU_prev0: cute.Tensor,
+        mB_prev0: cute.Tensor,
+        mOut: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(
+            mU.element_type not in (cutlass.Float16, cutlass.BFloat16)
+        ):
+            raise TypeError("U/B/C must be Float16/BFloat16 for the tensor-core path.")
+        if cutlass.const_expr(
+            not (
+                mU.element_type
+                == mB.element_type
+                == mC.element_type
+                == mU_prev0.element_type
+                == mB_prev0.element_type
+            )
+        ):
+            raise TypeError("U/B/C/U_prev0/B_prev0 must share element type.")
+        if cutlass.const_expr(mM.element_type != cutlass.Float32):
+            raise TypeError("M must be Float32.")
+        if cutlass.const_expr(mK.element_type != cutlass.Float32):
+            raise TypeError("K must be Float32.")
+        if cutlass.const_expr(mZ0.element_type != cutlass.Float32):
+            raise TypeError("Z0 must be Float32.")
+        if cutlass.const_expr(
+            mOut.element_type
+            not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
+        ):
+            raise TypeError("Out must be Float16/BFloat16/Float32.")
+
+        in_dtype = mU.element_type
+        out_dtype = mOut.element_type
+        bundle = self._make_kernel_bundle(in_dtype, out_dtype)
+        layouts = bundle.layouts
+        copies = bundle.copies
+        SharedStorage = self._make_shared_storage(in_dtype, layouts)
+        grid_dim = (
+            cute.ceil_div(mU.shape[1], self.m_block_size),
+            cute.size(mU.shape[0]),
+            1,
+        )
+        self.kernel(
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mZ0,
+            mU_prev0,
+            mB_prev0,
+            mOut,
+            layouts.sQ_layout,
+            layouts.sB_layout,
+            layouts.sK_layout,
+            layouts.sZ_layout,
+            layouts.sV_layout,
+            layouts.sO_layout,
+            copies.gmem_tiled_copy_D,
+            copies.gmem_tiled_copy_P,
+            copies.gmem_tiled_copy_O,
+            bundle.tiled_mma,
+            SharedStorage,
+        ).launch(
+            grid=grid_dim,
+            block=[self.num_threads, 1, 1],
+            smem=bundle.smem_size,
+            stream=stream,
+        )
+
     @cute.kernel
     def kernel(
         self,
@@ -2122,7 +2223,7 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
 
             tOcOut = gmem_thr_copy_O.partition_D(cO)
             tOpOut = self._make_copy_col_predicate(tOgO, tOcOut, mOut.layout.shape[3])
-            self._copy_gmem_rows_or_zero(
+            self._copy_gmem_rows_if_valid(
                 gmem_tiled_copy_O,
                 tOrO,
                 tOgO,

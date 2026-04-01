@@ -16,14 +16,17 @@ from .reference import (
 )
 
 
-def v2x2ssd_cute(*args: Any, **kwargs: Any):
+def _v2x2ssd_cute_impl(*args: Any, **kwargs: Any):
     """Compiler boundary for the CuTe scan JIT/runtime path."""
     from .cute import v2x2ssd_cute as _v2x2ssd_cute
 
     return _v2x2ssd_cute(*args, **kwargs)
 
 
-v2x2ssd_cute = cast(Callable[..., Any], torch.compiler.disable(v2x2ssd_cute))
+v2x2ssd_cute = cast(
+    Callable[..., Any],
+    torch.compiler.disable(_v2x2ssd_cute_impl),
+)
 
 
 __all__ = [

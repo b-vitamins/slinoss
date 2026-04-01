@@ -50,6 +50,8 @@ class ScanPrepBwdFused:
         *,
         spec: tuple[int, int, int, int, int, int],
         du_stride: tuple[int, int, int, int] | None = None,
+        b_scale_stride: tuple[int, int, int] | None = None,
+        c_scale_stride: tuple[int, int, int] | None = None,
         normalize_bc: bool,
         dt_min: float,
         dt_max: float,
@@ -88,7 +90,17 @@ class ScanPrepBwdFused:
         self.dparams_shape = (self.batch, self.t_size, self.h_size * self.param_dim)
         self.dparams_stride = make_row_major_stride(self.dparams_shape)
         self.scale_shape = (self.h_size, 2, self.n_size)
-        self.scale_stride = make_row_major_stride(self.scale_shape)
+        default_scale_stride = make_row_major_stride(self.scale_shape)
+        self.b_scale_stride = (
+            tuple(int(s) for s in b_scale_stride)
+            if b_scale_stride is not None
+            else default_scale_stride
+        )
+        self.c_scale_stride = (
+            tuple(int(s) for s in c_scale_stride)
+            if c_scale_stride is not None
+            else default_scale_stride
+        )
         self.scale_grad_shape = (self.h_size, 4, self.n_size)
         self.scale_grad_stride = make_row_major_stride(self.scale_grad_shape)
         self.bias_grad_shape = (self.h_size, 7)
@@ -1179,10 +1191,10 @@ class ScanPrepBwdFused:
             dc_ptr, cute.make_layout(self.grad_shape, stride=self.grad_stride)
         )
         mBScale = cute.make_tensor(
-            b_scale_ptr, cute.make_layout(self.scale_shape, stride=self.scale_stride)
+            b_scale_ptr, cute.make_layout(self.scale_shape, stride=self.b_scale_stride)
         )
         mCScale = cute.make_tensor(
-            c_scale_ptr, cute.make_layout(self.scale_shape, stride=self.scale_stride)
+            c_scale_ptr, cute.make_layout(self.scale_shape, stride=self.c_scale_stride)
         )
         mRmsInv = cute.make_tensor(
             rms_inv_ptr,

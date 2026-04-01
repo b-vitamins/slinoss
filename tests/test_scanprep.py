@@ -4,6 +4,7 @@ import math
 from typing import cast
 
 import torch
+import torch.nn as nn
 import pytest
 
 from slinoss.layers import (
@@ -29,6 +30,16 @@ def _pack_complex_pairs(z: torch.Tensor, *, real_dtype: torch.dtype) -> torch.Te
         .to(dtype=real_dtype)
         .contiguous()
     )
+
+
+def _make_noncontiguous_clone(x: torch.Tensor) -> torch.Tensor:
+    padded = torch.empty((*x.shape, 2), device=x.device, dtype=x.dtype)
+    padded[..., 0].copy_(x)
+    padded[..., 1].zero_()
+    out = padded[..., 0]
+    assert tuple(out.shape) == tuple(x.shape)
+    assert not out.is_contiguous()
+    return out
 
 
 def test_build_transition_from_polar_matches_complex_scalar() -> None:
@@ -267,6 +278,59 @@ def test_cute_scanprep_backend_matches_reference_forward() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cute_scanprep_backend_matches_reference_forward_with_noncontiguous_scales() -> (
+    None
+):
+    torch.manual_seed(0)
+    ref = SLinOSSScanPrep(
+        n_heads=3,
+        d_state=5,
+        d_head=4,
+        dt_min=1e-3,
+        dt_max=1e-1,
+        r_min=0.8,
+        r_max=0.98,
+        theta_bound=math.pi / 2.0,
+        k_max=0.25,
+        device="cuda",
+    )
+    cute = SLinOSSScanPrep(
+        n_heads=3,
+        d_state=5,
+        d_head=4,
+        dt_min=1e-3,
+        dt_max=1e-1,
+        r_min=0.8,
+        r_max=0.98,
+        theta_bound=math.pi / 2.0,
+        k_max=0.25,
+        device="cuda",
+        backend=CuteScanPrepBackend(),
+    )
+    cute.load_state_dict(ref.state_dict())
+    assert ref.b_scale is not None and ref.c_scale is not None
+    cute.b_scale = nn.Parameter(_make_noncontiguous_clone(ref.b_scale.detach()))
+    cute.c_scale = nn.Parameter(_make_noncontiguous_clone(ref.c_scale.detach()))
+    assert cute.b_scale is not None and cute.c_scale is not None
+    assert not cast(torch.Tensor, cute.b_scale).is_contiguous()
+    assert not cast(torch.Tensor, cute.c_scale).is_contiguous()
+
+    value = torch.randn((2, 7, 12), device="cuda", dtype=torch.float32)
+    params = torch.randn((2, 7, 3 * ref.param_dim), device="cuda", dtype=torch.float32)
+    bc = torch.randn((2, 7, 3, 4, 5), device="cuda", dtype=torch.float32)
+
+    with torch.no_grad():
+        got = cute(value, params, bc)
+        expect = ref(value, params, bc)
+
+    assert torch.equal(got.U, expect.U)
+    assert torch.allclose(got.B, expect.B, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.C, expect.C, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.M, expect.M, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(got.K, expect.K, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cute_scanprep_backend_matches_reference_gradients() -> None:
     torch.manual_seed(1)
     ref = SLinOSSScanPrep(
@@ -283,6 +347,110 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
         device="cuda",
     )
     cute.load_state_dict(ref.state_dict())
+
+    value_ref = torch.randn(
+        (2, 5, 8), device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    params_ref = torch.randn(
+        (2, 5, 2 * ref.param_dim),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    bc_ref = torch.randn(
+        (2, 5, 2, 4, 3), device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    value_cute = value_ref.detach().clone().requires_grad_(True)
+    params_cute = params_ref.detach().clone().requires_grad_(True)
+    bc_cute = bc_ref.detach().clone().requires_grad_(True)
+
+    out_ref = ref(value_ref, params_ref, bc_ref)
+    out_cute = cute(value_cute, params_cute, bc_cute)
+
+    g_u = torch.randn_like(out_ref.U)
+    g_m = torch.randn_like(out_ref.M)
+    g_k = torch.randn_like(out_ref.K)
+    g_b = torch.randn_like(out_ref.B)
+    g_c = torch.randn_like(out_ref.C)
+    loss_ref = (
+        (out_ref.U * g_u).sum()
+        + (out_ref.M * g_m).sum()
+        + (out_ref.K * g_k).sum()
+        + (out_ref.B * g_b).sum()
+        + (out_ref.C * g_c).sum()
+    )
+    loss_cute = (
+        (out_cute.U * g_u).sum()
+        + (out_cute.M * g_m).sum()
+        + (out_cute.K * g_k).sum()
+        + (out_cute.B * g_b).sum()
+        + (out_cute.C * g_c).sum()
+    )
+    loss_ref.backward()
+    loss_cute.backward()
+    grad_atol = 5e-5
+    grad_rtol = 5e-5
+
+    assert value_ref.grad is not None and value_cute.grad is not None
+    assert params_ref.grad is not None and params_cute.grad is not None
+    assert bc_ref.grad is not None and bc_cute.grad is not None
+    assert torch.allclose(
+        value_cute.grad, value_ref.grad, atol=grad_atol, rtol=grad_rtol
+    )
+    assert torch.allclose(
+        params_cute.grad, params_ref.grad, atol=grad_atol, rtol=grad_rtol
+    )
+    assert torch.allclose(bc_cute.grad, bc_ref.grad, atol=grad_atol, rtol=grad_rtol)
+
+    names = (
+        "dt_bias",
+        "gamma_bias",
+        "omega_bias",
+        "mix_r_bias",
+        "mix_theta_bias",
+        "mix_k_prev_bias",
+        "mix_k_curr_bias",
+        "b_scale",
+        "c_scale",
+    )
+    for name in names:
+        ref_grad = getattr(ref, name).grad
+        cute_grad = getattr(cute, name).grad
+        assert ref_grad is not None
+        assert cute_grad is not None
+        assert torch.allclose(
+            cast(torch.Tensor, cute_grad),
+            cast(torch.Tensor, ref_grad),
+            atol=grad_atol,
+            rtol=grad_rtol,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cute_scanprep_backend_matches_reference_gradients_with_noncontiguous_scales() -> (
+    None
+):
+    torch.manual_seed(1)
+    ref = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        device="cuda",
+    )
+    cute = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+        device="cuda",
+    )
+    cute.load_state_dict(ref.state_dict())
+    assert ref.b_scale is not None and ref.c_scale is not None
+    cute.b_scale = nn.Parameter(_make_noncontiguous_clone(ref.b_scale.detach()))
+    cute.c_scale = nn.Parameter(_make_noncontiguous_clone(ref.c_scale.detach()))
+    assert cute.b_scale is not None and cute.c_scale is not None
+    assert not cast(torch.Tensor, cute.b_scale).is_contiguous()
+    assert not cast(torch.Tensor, cute.c_scale).is_contiguous()
 
     value_ref = torch.randn(
         (2, 5, 8), device="cuda", dtype=torch.float32, requires_grad=True

@@ -23,6 +23,17 @@ def _clone_if_capturing(x: torch.Tensor | None) -> torch.Tensor | None:
     return x
 
 
+def _materialize_boundary_tensor(
+    x: torch.Tensor | None,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    if x is None:
+        return None
+    y = x if dtype is None or x.dtype == dtype else x.to(dtype=dtype)
+    return y.contiguous().clone()
+
+
 def _prepare_backward_inputs(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -99,9 +110,27 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                     return_final_state=True,
                 ),
             )
-            final_state_out = final_state.to(dtype=ctx.output_dtype).contiguous()
-            B_last = B_d[:, :, -1, :].to(dtype=ctx.output_dtype).contiguous()
-            U_last = U_d[:, :, -1, :].to(dtype=ctx.output_dtype).contiguous()
+            final_state_out = cast(
+                torch.Tensor,
+                _materialize_boundary_tensor(
+                    final_state,
+                    dtype=ctx.output_dtype,
+                ),
+            )
+            B_last = cast(
+                torch.Tensor,
+                _materialize_boundary_tensor(
+                    B_d[:, :, -1, :],
+                    dtype=ctx.output_dtype,
+                ),
+            )
+            U_last = cast(
+                torch.Tensor,
+                _materialize_boundary_tensor(
+                    U_d[:, :, -1, :],
+                    dtype=ctx.output_dtype,
+                ),
+            )
 
             saved_tensors = [U_d, M_d, K_d, B_d, C_d, m_chunk, chunk_starts]
             if ctx.has_prev_state:
@@ -257,6 +286,11 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
             if dU_total is None:
                 dU_total = torch.zeros_like(U)
             dU_total[:, :, -1, :].add_(dU_last.to(dtype=U.dtype))
+
+        if ctx.return_state:
+            d_initial_total = _materialize_boundary_tensor(d_initial_total)
+            dB_prev_total = _materialize_boundary_tensor(dB_prev_total)
+            dU_prev_total = _materialize_boundary_tensor(dU_prev_total)
 
         return (
             dU_total,

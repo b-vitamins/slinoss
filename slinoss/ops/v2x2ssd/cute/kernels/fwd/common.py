@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
-
-
-_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
-_PTR_ARG_CACHE_LIMIT = 32768
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -84,33 +82,9 @@ def _assumed_align(
     return elem_align
 
 
-def _ptr_arg_cache_key(t: torch.Tensor) -> tuple[object, ...]:
-    device_index = (
-        int(t.device.index)
-        if t.device.type == "cuda" and t.device.index is not None
-        else -1
-    )
-    return (
-        t.device.type,
-        device_index,
-        int(id(t)),
-        int(t.data_ptr()),
-        t.dtype,
-        tuple(int(dim) for dim in t.shape),
-        tuple(int(step) for step in t.stride()),
-    )
-
-
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    # Distinct tensor views can share a base address. Keep separate Pointer
-    # instances for those views so multi-arg host wrappers do not collapse them.
-    key = _ptr_arg_cache_key(t)
-    cached = _PTR_ARG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     align = _assumed_align(t)
-    cached = (
+    return (
         make_ptr(
             _torch_to_cutlass_dtype(t.dtype),
             t.data_ptr(),
@@ -119,10 +93,6 @@ def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
         ),
         align,
     )
-    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
-        _PTR_ARG_CACHE.clear()
-    _PTR_ARG_CACHE[key] = cached
-    return cached
 
 
 def _make_ptr_args(
@@ -135,6 +105,57 @@ def _make_ptr_args(
         ptrs.append(ptr)
         alignments.append(align)
     return tuple(ptrs), tuple(alignments)
+
+
+@dataclass(frozen=True)
+class PointerTensorArg:
+    """Pointer-backed JIT argument that preserves layout and alignment metadata.
+
+    Reconstructing a CuTe tensor from ``tensor.iterator`` inside a host wrapper
+    drops the pointer alignment contract carried by ``make_ptr(..., assumed_align=...)``.
+    Use this wrapper instead so the JIT call boundary preserves the pointer type
+    and the wrapper can rebuild the intended logical layout from explicit shape/stride.
+    """
+
+    ptr: object
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+
+    @classmethod
+    def from_tensor(
+        cls,
+        tensor: torch.Tensor,
+        *,
+        shape: tuple[int, ...],
+        stride: tuple[int, ...],
+    ) -> "PointerTensorArg":
+        ptr, _align = _make_ptr_arg(tensor)
+        return cls(
+            ptr=ptr,
+            shape=tuple(int(dim) for dim in shape),
+            stride=tuple(int(step) for step in stride),
+        )
+
+    def to_tensor(self) -> cute.Tensor:
+        return cute.make_tensor(
+            self.ptr, cute.make_layout(self.shape, stride=self.stride)
+        )
+
+    def __c_pointers__(self):
+        return self.ptr.__c_pointers__()
+
+    def __get_mlir_types__(self):
+        return self.ptr.__get_mlir_types__()
+
+    def __extract_mlir_values__(self):
+        return self.ptr.__extract_mlir_values__()
+
+    def __new_from_mlir_values__(self, values):
+        return PointerTensorArg(
+            ptr=self.ptr.__new_from_mlir_values__(values),
+            shape=self.shape,
+            stride=self.stride,
+        )
 
 
 def _pad_zero_time(
@@ -166,6 +187,7 @@ def _pad_m_identity(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
 
 
 __all__ = [
+    "PointerTensorArg",
     "_assumed_align",
     "_choose_copy_bits_for_linear_tiles",
     "_elem_bits",
