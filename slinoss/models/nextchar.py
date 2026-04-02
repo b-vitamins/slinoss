@@ -241,16 +241,19 @@ class _NextCharCudaGraphDecodeEngine:
     def _capture(self, state: NextCharDecodeState) -> None:
         snapshot = state.clone()
         stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(device=self.device))
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                _restore_decode_state_(state, snapshot)
+        current_stream = torch.cuda.current_stream(device=self.device)
+        stream.wait_stream(current_stream)
+        try:
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    _restore_decode_state_(state, snapshot)
+                    self.static_logits = self._run_body(state)
+            _restore_decode_state_(state, snapshot)
+            current_stream.wait_stream(stream)
+            with torch.cuda.graph(self.graph):
                 self.static_logits = self._run_body(state)
-        _restore_decode_state_(state, snapshot)
-        torch.cuda.current_stream(device=self.device).wait_stream(stream)
-        with torch.cuda.graph(self.graph):
-            self.static_logits = self._run_body(state)
-        _restore_decode_state_(state, snapshot)
+        finally:
+            _restore_decode_state_(state, snapshot)
 
     def decode_one(
         self,

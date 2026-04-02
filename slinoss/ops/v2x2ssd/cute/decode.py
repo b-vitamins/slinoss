@@ -10,10 +10,43 @@ import torch
 import cutlass.cute as cute
 
 from slinoss.ops.scanprep.cute.common import make_ptr_arg
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.common import _ensure_min_alignment
 
 from .kernels.decode import MixerDecodeStepFwd
 
 _DECODE_CACHE: dict[tuple[object, ...], object] = {}
+_DECODE_MIN_ALIGN = 16
+
+
+def _is_cuda_graph_capturing(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _raise_cold_capture_error(resource: str) -> None:
+    raise RuntimeError(
+        "CuTe mixer decode "
+        f"{resource} is cold during CUDA graph capture. "
+        "Warm the same mixer decode spec once outside capture before graph capture."
+    )
+
+
+def _aligned_empty(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return _ensure_min_alignment(
+        torch.empty(shape, device=device, dtype=dtype),
+        min_align=_DECODE_MIN_ALIGN,
+    )
+
+
+def _aligned_empty_like(tensor: torch.Tensor) -> torch.Tensor:
+    return _ensure_min_alignment(
+        torch.empty_like(tensor),
+        min_align=_DECODE_MIN_ALIGN,
+    )
 
 
 def _parse_env_int(name: str) -> int | None:
@@ -185,27 +218,36 @@ def mixer_decode_step_cute(
     state_c = (
         initial_states
         if initial_states is not None
-        else torch.zeros(
-            (batch, heads, P, 2 * N), device=value.device, dtype=value.dtype
+        else _ensure_min_alignment(
+            torch.zeros(
+                (batch, heads, P, 2 * N), device=value.device, dtype=value.dtype
+            ),
+            min_align=_DECODE_MIN_ALIGN,
         )
     )
     b_prev_c = (
         B_prev
         if B_prev is not None
-        else torch.zeros((batch, heads, 2 * N), device=value.device, dtype=value.dtype)
+        else _ensure_min_alignment(
+            torch.zeros((batch, heads, 2 * N), device=value.device, dtype=value.dtype),
+            min_align=_DECODE_MIN_ALIGN,
+        )
     )
     u_prev_c = (
         U_prev
         if U_prev is not None
-        else torch.zeros((batch, heads, P), device=value.device, dtype=value.dtype)
+        else _ensure_min_alignment(
+            torch.zeros((batch, heads, P), device=value.device, dtype=value.dtype),
+            min_align=_DECODE_MIN_ALIGN,
+        )
     )
 
-    y = torch.empty((batch, heads, P), device=value.device, dtype=output_dtype)
+    y = _aligned_empty((batch, heads, P), device=value.device, dtype=output_dtype)
     final_state = (
-        final_state_out if final_state_out is not None else torch.empty_like(state_c)
+        final_state_out if final_state_out is not None else _aligned_empty_like(state_c)
     )
-    b_last = b_last_out if b_last_out is not None else torch.empty_like(b_prev_c)
-    u_last = u_last_out if u_last_out is not None else torch.empty_like(u_prev_c)
+    b_last = b_last_out if b_last_out is not None else _aligned_empty_like(b_prev_c)
+    u_last = u_last_out if u_last_out is not None else _aligned_empty_like(u_prev_c)
     if tuple(map(int, final_state.shape)) != tuple(map(int, state_c.shape)):
         raise ValueError(
             f"final_state_out must be {tuple(state_c.shape)}. Got {tuple(final_state.shape)}."
@@ -219,8 +261,10 @@ def mixer_decode_step_cute(
             f"u_last_out must be {tuple(u_prev_c.shape)}. Got {tuple(u_last.shape)}."
         )
     if out_proj_weight is None:
-        out_proj = torch.empty((1, heads, P), device=value.device, dtype=value.dtype)
-        projected = torch.empty((batch, 1, 1), device=value.device, dtype=torch.float32)
+        out_proj = _aligned_empty((1, heads, P), device=value.device, dtype=value.dtype)
+        projected = _aligned_empty(
+            (batch, 1, 1), device=value.device, dtype=torch.float32
+        )
         d_model = 1
     else:
         d_model = int(out_proj_weight.shape[0])
@@ -253,7 +297,7 @@ def mixer_decode_step_cute(
             if out_proj_weight.is_contiguous()
             else out_proj_weight.contiguous()
         )
-        projected = torch.empty(
+        projected = _aligned_empty(
             (batch, heads, d_model), device=value.device, dtype=torch.float32
         )
         projected.zero_()
@@ -320,7 +364,9 @@ def mixer_decode_step_cute(
         b_last_out is not None and b_last_out.data_ptr() == b_prev_c.data_ptr()
     )
     b_last_kernel = (
-        torch.empty_like(b_prev_c) if b_prev_aliases_output and p_tiles > 1 else b_last
+        _aligned_empty_like(b_prev_c)
+        if b_prev_aliases_output and p_tiles > 1
+        else b_last
     )
     b_last_kernel_ptr, b_last_kernel_align = make_ptr_arg(b_last_kernel)
     b_last_kernel_stride = cast(
@@ -392,6 +438,8 @@ def mixer_decode_step_cute(
         torch.cuda.current_stream(device=value.device).cuda_stream
     )
     if compiled is None:
+        if _is_cuda_graph_capturing(value.device):
+            _raise_cold_capture_error("compile cache")
         compiled = cute.compile(
             MixerDecodeStepFwd(
                 spec=spec,
@@ -439,7 +487,7 @@ def mixer_decode_step_cute(
             u_last_ptr,
             out_proj_ptr,
             projected_ptr,
-            current_stream,
+            cute.runtime.make_fake_stream(),
         )
         _DECODE_CACHE[cache_key] = compiled
     cast(Callable[..., None], compiled)(

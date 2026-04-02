@@ -138,8 +138,6 @@ class _SplitMixerProjectionFn(torch.autograd.Function):
 class _MixerCudaGraphStepEngine:
     """Fixed-shape CUDA graph replay for one-token mixer decode."""
 
-    _disabled_configs: set[tuple[int, torch.dtype, int]] = set()
-
     def __init__(
         self,
         mixer: "SLinOSSMixer",
@@ -168,12 +166,6 @@ class _MixerCudaGraphStepEngine:
         device: torch.device,
         dtype: torch.dtype,
     ) -> bool:
-        if (
-            int(device.index or 0),
-            dtype,
-            int(batch_size),
-        ) in _MixerCudaGraphStepEngine._disabled_configs:
-            return False
         if not isinstance(
             mixer.decode_backend,
             (AutoMixerDecodeBackend, CuteMixerDecodeBackend),
@@ -185,29 +177,22 @@ class _MixerCudaGraphStepEngine:
             dtype=dtype,
         )
 
-    @classmethod
-    def disable(
-        cls,
-        *,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        cls._disabled_configs.add((int(device.index or 0), dtype, int(batch_size)))
-
     def _capture(self, state: SLinOSSMixerState) -> None:
         snapshot = state.clone()
         stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(device=self.device))
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                _copy_mixer_state_(state, snapshot)
+        current_stream = torch.cuda.current_stream(device=self.device)
+        stream.wait_stream(current_stream)
+        try:
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    _copy_mixer_state_(state, snapshot)
+                    self.static_y = self.mixer._step_inplace(self.x_buffer, state)
+            _copy_mixer_state_(state, snapshot)
+            current_stream.wait_stream(stream)
+            with torch.cuda.graph(self.graph):
                 self.static_y = self.mixer._step_inplace(self.x_buffer, state)
-        _copy_mixer_state_(state, snapshot)
-        torch.cuda.current_stream(device=self.device).wait_stream(stream)
-        with torch.cuda.graph(self.graph):
-            self.static_y = self.mixer._step_inplace(self.x_buffer, state)
-        _copy_mixer_state_(state, snapshot)
+        finally:
+            _copy_mixer_state_(state, snapshot)
 
     def step(
         self,
@@ -1058,24 +1043,13 @@ class SLinOSSMixer(nn.Module):
                 or engine.device != x_t.device
                 or engine.dtype != x_t.dtype
             ):
-                try:
-                    engine = _MixerCudaGraphStepEngine(
-                        self,
-                        next_state,
-                        batch_size=batch,
-                    )
-                except Exception:
-                    _MixerCudaGraphStepEngine.disable(
-                        batch_size=batch,
-                        device=x_t.device,
-                        dtype=x_t.dtype,
-                    )
-                    torch.cuda.synchronize(device=x_t.device)
-                    next_state._engine = None
-                    y_step = self._step_inplace(x_t, next_state)
-                else:
-                    next_state._engine = engine
-                    y_step, next_state = engine.step(x_t, next_state)
+                engine = _MixerCudaGraphStepEngine(
+                    self,
+                    next_state,
+                    batch_size=batch,
+                )
+                next_state._engine = engine
+                y_step, next_state = engine.step(x_t, next_state)
             else:
                 y_step, next_state = engine.step(x_t, next_state)
         else:

@@ -197,10 +197,17 @@ def _clip_params(model: NextCharModel) -> tuple[torch.nn.Parameter, ...]:
     return clip_params
 
 
-def _zero_param_grads_in_place(model: NextCharModel) -> None:
-    for param in model.parameters():
-        if param.grad is not None:
-            param.grad.zero_()
+def _materialized_param_grads(model: NextCharModel) -> tuple[torch.Tensor, ...]:
+    return tuple(param.grad for param in model.parameters() if param.grad is not None)
+
+
+def _zero_param_grads_in_place(grads: tuple[torch.Tensor, ...]) -> None:
+    if not grads:
+        return
+    if len(grads) == 1:
+        grads[0].zero_()
+        return
+    torch._foreach_zero_(grads)
 
 
 class _NextCharCudaGraphTrainer:
@@ -222,6 +229,7 @@ class _NextCharCudaGraphTrainer:
         self.graph = torch.cuda.CUDAGraph()
         self.static_logits: torch.Tensor | None = None
         self.static_loss: torch.Tensor | None = None
+        self._grad_buffers: tuple[torch.Tensor, ...] = ()
         self._capture()
 
     def _run_body(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -234,14 +242,17 @@ class _NextCharCudaGraphTrainer:
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(device=self.device))
         with torch.cuda.stream(stream):
+            # Match the captured path's persistent grad-buffer behavior during warmup.
+            self.optimizer.zero_grad(set_to_none=False)
             for _ in range(3):
-                self.optimizer.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=False)
                 logits, loss = self._run_body()
             del logits, loss
         torch.cuda.current_stream(device=self.device).wait_stream(stream)
         self.optimizer.zero_grad(set_to_none=False)
         with torch.cuda.graph(self.graph):
             self.static_logits, self.static_loss = self._run_body()
+        self._grad_buffers = _materialized_param_grads(self.model)
 
     def step(
         self,
@@ -250,7 +261,7 @@ class _NextCharCudaGraphTrainer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.static_xb.copy_(xb)
         self.static_yb.copy_(yb)
-        _zero_param_grads_in_place(self.model)
+        _zero_param_grads_in_place(self._grad_buffers)
         self.graph.replay()
         torch.nn.utils.clip_grad_norm_(
             _clip_params(self.model),

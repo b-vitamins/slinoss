@@ -5,9 +5,13 @@ import gc
 from typing import cast
 import weakref
 
+import cutlass.cute as cute
 import pytest
 import torch
 
+import slinoss.layers.mixer as mixer_mod
+import slinoss.models.nextchar as nextchar_mod
+import slinoss.ops.v2x2ssd.cute.decode as decode_mod
 from slinoss.layers import (
     ReferenceMixerDecodeBackend,
     ReferenceCConv1dBackend,
@@ -34,6 +38,75 @@ def _make_noncontiguous_clone(x: torch.Tensor) -> torch.Tensor:
     assert tuple(out.shape) == tuple(x.shape)
     assert not out.is_contiguous()
     return out
+
+
+def _make_decode_step_fixture(
+    *,
+    dtype: torch.dtype,
+    batch: int = 2,
+) -> tuple[
+    SLinOSSMixer,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    x = torch.randn((batch, 128), device="cuda", dtype=dtype)
+    state0 = mixer.init_state(batch, device="cuda", dtype=dtype)
+    proj = mixer.in_proj(x)
+    gate, value_raw, params_flat, bc_flat = torch.split(
+        proj,
+        [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
+        dim=-1,
+    )
+    value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+    value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
+    params_h = params_flat.view(
+        batch, mixer.n_heads, mixer.scanprep.param_dim
+    ).contiguous()
+    bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+    gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
+    skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
+    initial_states = torch.randn(
+        (batch, mixer.n_heads, mixer.d_head, 128),
+        device="cuda",
+        dtype=dtype,
+    )
+    b_prev = torch.randn(
+        (batch, mixer.n_heads, 128),
+        device="cuda",
+        dtype=dtype,
+    )
+    u_prev = torch.randn(
+        (batch, mixer.n_heads, mixer.d_head),
+        device="cuda",
+        dtype=dtype,
+    )
+    return (
+        mixer,
+        value_h,
+        params_h,
+        bc_h,
+        gate_h,
+        skip,
+        initial_states,
+        b_prev,
+        u_prev,
+    )
 
 
 def _force_reference_sequence_backends(model: NextCharLM) -> None:
@@ -225,6 +298,268 @@ def test_nextchar_decode_graph_engine_does_not_form_gc_cycle(
     finally:
         if was_enabled:
             gc.enable()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_nextchar_decode_graph_capture_restores_state_on_failure(
+    monkeypatch,
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    model = (
+        NextCharLM(
+            vocab_size=64,
+            block_size=16,
+            d_model=128,
+            n_layers=2,
+            d_state=64,
+            expand=2,
+            d_head=64,
+            d_conv=4,
+            chunk_size=32,
+        )
+        .to(device="cuda", dtype=dtype)
+        .eval()
+    )
+    state = model.init_decode_state(2, device="cuda", dtype=dtype)
+    snapshot = state.clone()
+
+    def fail_run_body(self, state_arg):
+        state_arg.position = 7
+        assert state_arg.position_buffer is not None
+        state_arg.position_buffer.fill_(7)
+        state_arg.layers[0].scan.b_prev.fill_(1)
+        raise RuntimeError("decode capture boom")
+
+    monkeypatch.setattr(
+        nextchar_mod._NextCharCudaGraphDecodeEngine,
+        "_run_body",
+        fail_run_body,
+    )
+
+    with pytest.raises(RuntimeError, match="decode capture boom"):
+        nextchar_mod._NextCharCudaGraphDecodeEngine(model, state, batch_size=2)
+
+    assert state.position == snapshot.position
+    assert state.position_buffer is not None
+    assert snapshot.position_buffer is not None
+    torch.testing.assert_close(state.position_buffer, snapshot.position_buffer)
+    assert state.layers[0].scan.b_prev is not None
+    assert snapshot.layers[0].scan.b_prev is not None
+    torch.testing.assert_close(
+        state.layers[0].scan.b_prev, snapshot.layers[0].scan.b_prev
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_graph_capture_restores_state_on_failure(
+    monkeypatch,
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    state = mixer.init_state(2, device="cuda", dtype=dtype)
+    snapshot = state.clone()
+
+    def fail_step(x, state_arg):
+        state_arg.scan.state.fill_(2)
+        state_arg.scan.b_prev.fill_(3)
+        state_arg.scan.u_prev.fill_(4)
+        assert state_arg.conv is not None
+        state_arg.conv.fill_(5)
+        raise RuntimeError("mixer capture boom")
+
+    monkeypatch.setattr(mixer, "_step_inplace", fail_step)
+
+    with pytest.raises(RuntimeError, match="mixer capture boom"):
+        mixer_mod._MixerCudaGraphStepEngine(mixer, state, batch_size=2)
+
+    assert state.conv is not None
+    assert snapshot.conv is not None
+    assert state.scan.state is not None
+    assert snapshot.scan.state is not None
+    assert state.scan.b_prev is not None
+    assert snapshot.scan.b_prev is not None
+    assert state.scan.u_prev is not None
+    assert snapshot.scan.u_prev is not None
+    torch.testing.assert_close(state.conv, snapshot.conv)
+    torch.testing.assert_close(state.scan.state, snapshot.scan.state)
+    torch.testing.assert_close(state.scan.b_prev, snapshot.scan.b_prev)
+    torch.testing.assert_close(state.scan.u_prev, snapshot.scan.u_prev)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_decode_step_cute_rejects_cold_cache_during_capture(
+    monkeypatch,
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    (
+        mixer,
+        value_h,
+        params_h,
+        bc_h,
+        gate_h,
+        skip,
+        initial_states,
+        b_prev,
+        u_prev,
+    ) = _make_decode_step_fixture(dtype=dtype)
+    decode_mod._DECODE_CACHE.clear()
+
+    compile_calls: list[bool] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_calls.append(True)
+        return orig_compile(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+
+    with pytest.raises(RuntimeError, match="decode .*cold during CUDA graph capture"):
+        with torch.no_grad():
+            mixer_decode_step_cute(
+                value_h,
+                params_h,
+                bc_h,
+                gate_h,
+                skip,
+                initial_states=initial_states,
+                B_prev=b_prev,
+                U_prev=u_prev,
+                dt_min=mixer.scanprep.dt_min,
+                dt_max=mixer.scanprep.dt_max,
+                r_min=mixer.scanprep.r_min,
+                r_max=mixer.scanprep.r_max,
+                theta_bound=mixer.scanprep.theta_bound,
+                k_max=mixer.scanprep.k_max,
+                eps=mixer.scanprep.eps,
+                dt_bias=mixer.scanprep.dt_bias,
+                gamma_bias=mixer.scanprep.gamma_bias,
+                omega_bias=mixer.scanprep.omega_bias,
+                mix_r_bias=mixer.scanprep.mix_r_bias,
+                mix_theta_bias=mixer.scanprep.mix_theta_bias,
+                mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+                mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+                b_scale=mixer.scanprep.b_scale,
+                c_scale=mixer.scanprep.c_scale,
+                output_dtype=dtype,
+            )
+
+    assert compile_calls == []
+    assert decode_mod._DECODE_CACHE == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
+    monkeypatch,
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    (
+        mixer,
+        value_h,
+        params_h,
+        bc_h,
+        gate_h,
+        skip,
+        initial_states,
+        b_prev,
+        u_prev,
+    ) = _make_decode_step_fixture(dtype=dtype)
+    decode_mod._DECODE_CACHE.clear()
+
+    with torch.no_grad():
+        mixer_decode_step_cute(
+            value_h,
+            params_h,
+            bc_h,
+            gate_h,
+            skip,
+            initial_states=initial_states,
+            B_prev=b_prev,
+            U_prev=u_prev,
+            dt_min=mixer.scanprep.dt_min,
+            dt_max=mixer.scanprep.dt_max,
+            r_min=mixer.scanprep.r_min,
+            r_max=mixer.scanprep.r_max,
+            theta_bound=mixer.scanprep.theta_bound,
+            k_max=mixer.scanprep.k_max,
+            eps=mixer.scanprep.eps,
+            dt_bias=mixer.scanprep.dt_bias,
+            gamma_bias=mixer.scanprep.gamma_bias,
+            omega_bias=mixer.scanprep.omega_bias,
+            mix_r_bias=mixer.scanprep.mix_r_bias,
+            mix_theta_bias=mixer.scanprep.mix_theta_bias,
+            mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+            mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+            b_scale=mixer.scanprep.b_scale,
+            c_scale=mixer.scanprep.c_scale,
+            output_dtype=dtype,
+        )
+
+    compile_calls: list[bool] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_calls.append(True)
+        return orig_compile(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+
+    with torch.no_grad():
+        mixer_decode_step_cute(
+            value_h,
+            params_h,
+            bc_h,
+            gate_h,
+            skip,
+            initial_states=initial_states,
+            B_prev=b_prev,
+            U_prev=u_prev,
+            dt_min=mixer.scanprep.dt_min,
+            dt_max=mixer.scanprep.dt_max,
+            r_min=mixer.scanprep.r_min,
+            r_max=mixer.scanprep.r_max,
+            theta_bound=mixer.scanprep.theta_bound,
+            k_max=mixer.scanprep.k_max,
+            eps=mixer.scanprep.eps,
+            dt_bias=mixer.scanprep.dt_bias,
+            gamma_bias=mixer.scanprep.gamma_bias,
+            omega_bias=mixer.scanprep.omega_bias,
+            mix_r_bias=mixer.scanprep.mix_r_bias,
+            mix_theta_bias=mixer.scanprep.mix_theta_bias,
+            mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+            mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+            b_scale=mixer.scanprep.b_scale,
+            c_scale=mixer.scanprep.c_scale,
+            output_dtype=dtype,
+        )
+
+    assert compile_calls == []
 
 
 def test_nextchar_decode_one_falls_back_on_cpu() -> None:
