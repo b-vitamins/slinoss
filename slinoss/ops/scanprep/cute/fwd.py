@@ -10,7 +10,11 @@ import cutlass.cute as cute
 
 from slinoss.perf import note_cache_event
 
-from .common import COEFF_AUX_FIELDS, make_ptr_arg
+from .common import (
+    COEFF_AUX_FIELDS,
+    assumed_align,
+    torch_to_cutlass_dtype,
+)
 from .kernels.fwd import ScanPrepFwdFused
 
 
@@ -40,6 +44,23 @@ def _cache_set(
     elif len(cache) >= _SCANPREP_DUMMY_CACHE_LIMIT:
         cache.pop(next(iter(cache)), None)
     cache[key] = value
+
+
+def _make_fake_tensor_arg(
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...] | None = None,
+    stride: tuple[int, ...] | None = None,
+    align: int | None = None,
+):
+    return cute.runtime.make_fake_tensor(
+        torch_to_cutlass_dtype(tensor.dtype),
+        tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
+        stride=tuple(
+            int(step) for step in (stride if stride is not None else tensor.stride())
+        ),
+        assumed_align=int(align if align is not None else assumed_align(tensor)),
+    )
 
 
 def _get_dummy_rms_inv(
@@ -191,25 +212,25 @@ def _scanprep_fwd_impl(
     b_scale_stride = tuple(int(s) for s in b_scale_c.stride())
     c_scale_stride = tuple(int(s) for s in c_scale_c.stride())
 
-    value_ptr, value_align = make_ptr_arg(value_c)
-    bc_ptr, bc_align = make_ptr_arg(bc_c)
-    b_scale_ptr, b_scale_align = make_ptr_arg(b_scale_c)
-    c_scale_ptr, c_scale_align = make_ptr_arg(c_scale_c)
-    params_ptr, params_align = make_ptr_arg(params)
-    dt_bias_ptr, dt_bias_align = make_ptr_arg(dt_bias)
-    gamma_bias_ptr, gamma_bias_align = make_ptr_arg(gamma_bias)
-    omega_bias_ptr, omega_bias_align = make_ptr_arg(omega_bias)
-    mix_r_bias_ptr, mix_r_bias_align = make_ptr_arg(mix_r_bias)
-    mix_theta_bias_ptr, mix_theta_bias_align = make_ptr_arg(mix_theta_bias)
-    mix_k_prev_bias_ptr, mix_k_prev_bias_align = make_ptr_arg(mix_k_prev_bias)
-    mix_k_curr_bias_ptr, mix_k_curr_bias_align = make_ptr_arg(mix_k_curr_bias)
-    u_ptr, u_align = make_ptr_arg(U)
-    b_ptr, b_align = make_ptr_arg(B)
-    c_ptr, c_align = make_ptr_arg(C)
-    m_ptr, m_align = make_ptr_arg(M)
-    k_ptr, k_align = make_ptr_arg(K)
-    rms_inv_ptr, rms_inv_align = make_ptr_arg(rms_inv)
-    coeff_aux_ptr, coeff_aux_align = make_ptr_arg(coeff_aux)
+    value_align = assumed_align(value_c)
+    bc_align = assumed_align(bc_c)
+    b_scale_align = assumed_align(b_scale_c)
+    c_scale_align = assumed_align(c_scale_c)
+    params_align = assumed_align(params)
+    dt_bias_align = assumed_align(dt_bias)
+    gamma_bias_align = assumed_align(gamma_bias)
+    omega_bias_align = assumed_align(omega_bias)
+    mix_r_bias_align = assumed_align(mix_r_bias)
+    mix_theta_bias_align = assumed_align(mix_theta_bias)
+    mix_k_prev_bias_align = assumed_align(mix_k_prev_bias)
+    mix_k_curr_bias_align = assumed_align(mix_k_curr_bias)
+    u_align = assumed_align(U)
+    b_align = assumed_align(B)
+    c_align = assumed_align(C)
+    m_align = assumed_align(M)
+    k_align = assumed_align(K)
+    rms_inv_align = assumed_align(rms_inv)
+    coeff_aux_align = assumed_align(coeff_aux)
 
     spec = (batch, t_size, int(n_heads), int(d_head), int(d_state))
     cache_key = (
@@ -288,49 +309,60 @@ def _scanprep_fwd_impl(
                 k_max=k_max,
                 eps=eps,
             ),
-            value_ptr,
-            bc_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            params_ptr,
-            dt_bias_ptr,
-            gamma_bias_ptr,
-            omega_bias_ptr,
-            mix_r_bias_ptr,
-            mix_theta_bias_ptr,
-            mix_k_prev_bias_ptr,
-            mix_k_curr_bias_ptr,
-            u_ptr,
-            b_ptr,
-            c_ptr,
-            m_ptr,
-            k_ptr,
-            rms_inv_ptr,
-            coeff_aux_ptr,
+            _make_fake_tensor_arg(value_c, align=value_align),
+            _make_fake_tensor_arg(bc_c, align=bc_align),
+            _make_fake_tensor_arg(
+                b_scale_c,
+                shape=(n_heads, 2, d_state),
+                stride=b_scale_stride,
+                align=b_scale_align,
+            ),
+            _make_fake_tensor_arg(
+                c_scale_c,
+                shape=(n_heads, 2, d_state),
+                stride=c_scale_stride,
+                align=c_scale_align,
+            ),
+            _make_fake_tensor_arg(params, align=params_align),
+            _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
+            _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
+            _make_fake_tensor_arg(omega_bias, align=omega_bias_align),
+            _make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
+            _make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
+            _make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
+            _make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
+            _make_fake_tensor_arg(U, align=u_align),
+            _make_fake_tensor_arg(B, align=b_align),
+            _make_fake_tensor_arg(C, align=c_align),
+            _make_fake_tensor_arg(M, align=m_align),
+            _make_fake_tensor_arg(K, align=k_align),
+            _make_fake_tensor_arg(rms_inv, align=rms_inv_align),
+            _make_fake_tensor_arg(coeff_aux, align=coeff_aux_align),
+            options="--enable-tvm-ffi",
         )
         _SCANPREP_FWD_CACHE[cache_key] = compiled
     else:
         note_cache_event("cute.scanprep.fwd.compile", hit=True)
     compiled(
-        value_ptr,
-        bc_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        params_ptr,
-        dt_bias_ptr,
-        gamma_bias_ptr,
-        omega_bias_ptr,
-        mix_r_bias_ptr,
-        mix_theta_bias_ptr,
-        mix_k_prev_bias_ptr,
-        mix_k_curr_bias_ptr,
-        u_ptr,
-        b_ptr,
-        c_ptr,
-        m_ptr,
-        k_ptr,
-        rms_inv_ptr,
-        coeff_aux_ptr,
+        value_c,
+        bc_c,
+        b_scale_c,
+        c_scale_c,
+        params,
+        dt_bias,
+        gamma_bias,
+        omega_bias,
+        mix_r_bias,
+        mix_theta_bias,
+        mix_k_prev_bias,
+        mix_k_curr_bias,
+        U,
+        B,
+        C,
+        M,
+        K,
+        rms_inv,
+        coeff_aux,
     )
     return U, M, K, B, C, rms_inv, coeff_aux
 

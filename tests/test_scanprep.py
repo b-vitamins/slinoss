@@ -262,6 +262,52 @@ def test_scanprep_fwd_cached_path_stays_capture_safe(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_scanprep_fwd_compile_enables_tvm_ffi(monkeypatch) -> None:
+    pytest.importorskip("cutlass")
+    prep, value, params, bc = _make_scanprep_cuda_fixture()
+    b_scale, c_scale = _detached_scales(prep)
+    scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
+
+    compile_options: list[object] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_options.append(kwargs.get("options"))
+        return orig_compile(*args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+
+    with torch.no_grad():
+        scanprep_fwd_cute(
+            value,
+            params,
+            bc,
+            n_heads=prep.n_heads,
+            d_state=prep.d_state,
+            d_head=prep.d_head,
+            normalize_bc=prep.normalize_bc,
+            dt_min=prep.dt_min,
+            dt_max=prep.dt_max,
+            r_min=prep.r_min,
+            r_max=prep.r_max,
+            theta_bound=prep.theta_bound,
+            k_max=prep.k_max,
+            eps=prep.eps,
+            dt_bias=prep.dt_bias.detach(),
+            gamma_bias=prep.gamma_bias.detach(),
+            omega_bias=prep.omega_bias.detach(),
+            mix_r_bias=prep.mix_r_bias.detach(),
+            mix_theta_bias=prep.mix_theta_bias.detach(),
+            mix_k_prev_bias=prep.mix_k_prev_bias.detach(),
+            mix_k_curr_bias=prep.mix_k_curr_bias.detach(),
+            b_scale=b_scale,
+            c_scale=c_scale,
+        )
+
+    assert compile_options == ["--enable-tvm-ffi"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     pytest.importorskip("cutlass")
     prep, value, params, bc = _make_scanprep_cuda_fixture()
