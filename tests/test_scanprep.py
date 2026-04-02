@@ -19,7 +19,7 @@ from slinoss.layers import (
     foh_taps_from_polar,
     principal_angle,
 )
-from slinoss.ops.scanprep.cute.common import make_ptr_arg
+from slinoss.ops.scanprep.cute.common import assumed_align, make_ptr_arg
 from slinoss.ops.v2x2ssd import v2x2ssd
 
 
@@ -79,6 +79,22 @@ def test_scanprep_ptr_cache_keeps_same_base_views_distinct() -> None:
 
     assert base_ptr is not slice0_ptr
     assert base_ptr is not slice1_ptr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_scanprep_ptr_args_use_actual_view_alignment(dtype: torch.dtype) -> None:
+    pytest.importorskip("cutlass")
+
+    base = torch.empty((257,), device="cuda", dtype=dtype)
+    view = base[1:]
+    assert view.is_contiguous()
+    assert view.data_ptr() % 4 == 2
+
+    _ptr, align = make_ptr_arg(view)
+
+    assert assumed_align(view) == view.element_size()
+    assert align == view.element_size()
 
 
 def test_scanprep_coefficients_are_bounded_and_finite() -> None:

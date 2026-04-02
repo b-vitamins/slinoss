@@ -67,7 +67,14 @@ def torch_to_cutlass_dtype(dtype: torch.dtype):
 
 
 def assumed_align(tensor: torch.Tensor) -> int:
-    return max(tensor.element_size(), 4)
+    elem_align = max(1, tensor.element_size())
+    ptr = int(tensor.data_ptr())
+    for align in (16, 8, 4):
+        if align < elem_align:
+            continue
+        if (ptr % align) == 0:
+            return align
+    return elem_align
 
 
 def ptr_arg_cache_key(tensor: torch.Tensor) -> tuple[object, ...]:
