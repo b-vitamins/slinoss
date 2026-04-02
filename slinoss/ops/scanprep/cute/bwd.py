@@ -59,6 +59,8 @@ def _get_partial_workspace(
         note_cache_event("cute.scanprep.bwd.partial_workspace", hit=True)
         return cached
     note_cache_event("cute.scanprep.bwd.partial_workspace", hit=False)
+    if _is_cuda_graph_capturing(device):
+        _raise_cold_capture_error("partial workspace cache")
     cached = (
         torch.empty(
             (scale_tile_count, n_heads, 4, d_state), device=device, dtype=torch.float32
@@ -76,6 +78,14 @@ def _get_partial_workspace(
 
 def _is_cuda_graph_capturing(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _raise_cold_capture_error(resource: str) -> None:
+    raise RuntimeError(
+        "CuTe scanprep backward "
+        f"{resource} is cold during CUDA graph capture. "
+        "Warm the same scanprep backward spec once outside capture before graph capture."
+    )
 
 
 def _capture_safe_small_grads(
@@ -358,6 +368,8 @@ def scanprep_bwd(
     compiled = _SCANPREP_BWD_CACHE.get(cache_key)
     if compiled is None:
         note_cache_event("cute.scanprep.bwd.compile", hit=False)
+        if _is_cuda_graph_capturing(bc.device):
+            _raise_cold_capture_error("launcher cache")
         compiled = cute.compile(
             ScanPrepBwdFused(
                 spec=spec,

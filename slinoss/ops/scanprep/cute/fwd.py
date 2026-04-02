@@ -20,6 +20,18 @@ _SCANPREP_DUMMY_COEFF_AUX_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 _SCANPREP_DUMMY_CACHE_LIMIT = 8
 
 
+def _is_cuda_graph_capturing(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _raise_cold_capture_error(resource: str) -> None:
+    raise RuntimeError(
+        "CuTe scanprep forward "
+        f"{resource} is cold during CUDA graph capture. "
+        "Warm the same scanprep forward spec once outside capture before graph capture."
+    )
+
+
 def _cache_set(
     cache: dict[tuple[object, ...], object], key: tuple[object, ...], value
 ) -> None:
@@ -49,6 +61,8 @@ def _get_dummy_rms_inv(
         note_cache_event("cute.scanprep.fwd.dummy_rms_inv", hit=True)
         return cached
     note_cache_event("cute.scanprep.fwd.dummy_rms_inv", hit=False)
+    if _is_cuda_graph_capturing(device):
+        _raise_cold_capture_error("dummy_rms_inv cache")
     cached = torch.empty(
         (batch, n_heads, t_size, 4), device=device, dtype=torch.float32
     )
@@ -75,6 +89,8 @@ def _get_dummy_coeff_aux(
         note_cache_event("cute.scanprep.fwd.dummy_coeff_aux", hit=True)
         return cached
     note_cache_event("cute.scanprep.fwd.dummy_coeff_aux", hit=False)
+    if _is_cuda_graph_capturing(device):
+        _raise_cold_capture_error("dummy_coeff_aux cache")
     cached = torch.empty(
         (batch, n_heads, COEFF_AUX_FIELDS, t_size), device=device, dtype=torch.float32
     )
@@ -253,6 +269,8 @@ def _scanprep_fwd_impl(
     compiled = _SCANPREP_FWD_CACHE.get(cache_key)
     if compiled is None:
         note_cache_event("cute.scanprep.fwd.compile", hit=False)
+        if _is_cuda_graph_capturing(value.device):
+            _raise_cold_capture_error("launcher cache")
         compiled = cute.compile(
             ScanPrepFwdFused(
                 spec=spec,
