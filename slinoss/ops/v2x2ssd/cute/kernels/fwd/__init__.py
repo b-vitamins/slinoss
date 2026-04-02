@@ -16,6 +16,7 @@ from .common import (
     _assumed_align,
     _choose_copy_bits_for_linear_tiles,
     _ensure_min_alignment,
+    _guard_prev_time_base,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -1194,6 +1195,8 @@ def _compile_chunk_scan_kernel_impl(
     U_tc = _ensure_min_alignment(U_tc, min_align=16)
     B_tc = _ensure_min_alignment(B_tc, min_align=16)
     C_tc = _ensure_min_alignment(C_tc, min_align=16)
+    U_scan = _guard_prev_time_base(U_tc, min_align=16)
+    B_scan = _guard_prev_time_base(B_tc, min_align=16)
 
     if B_prev is None:
         U_prev0, B_prev0 = _get_zero_prev_tensors(
@@ -1223,8 +1226,8 @@ def _compile_chunk_scan_kernel_impl(
     out_view = out_pad[:, :, :T, :]
 
     alignments = (
-        _assumed_align(U_tc),
-        _assumed_align(B_tc),
+        _assumed_align(U_scan),
+        _assumed_align(B_scan),
         _assumed_align(C_tc),
         _assumed_align(M_f),
         _assumed_align(K_f),
@@ -1234,8 +1237,8 @@ def _compile_chunk_scan_kernel_impl(
         _assumed_align(out_chunk),
     )
     runtime_tensors = (
-        U_tc,
-        B_tc,
+        U_scan,
+        B_scan,
         C_tc,
         M_f,
         K_f,
@@ -1245,8 +1248,8 @@ def _compile_chunk_scan_kernel_impl(
         out_chunk,
     )
     runtime_args = (
-        _make_pointer_tensor_arg(U_tc, u_spec),
-        _make_pointer_tensor_arg(B_tc, b_spec),
+        _make_pointer_tensor_arg(U_scan, u_spec),
+        _make_pointer_tensor_arg(B_scan, b_spec),
         _make_pointer_tensor_arg(C_tc, b_spec),
         _make_pointer_tensor_arg(M_f, m_spec),
         _make_pointer_tensor_arg(K_f, k_spec),
@@ -1892,9 +1895,11 @@ def _make_prepared_chunk_scan_launch(
     u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
         _chunk_scan_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
     )
+    U_scan = _guard_prev_time_base(U_tc, min_align=16)
+    B_scan = _guard_prev_time_base(B_tc, min_align=16)
     alignments = (
-        _assumed_align(U_tc),
-        _assumed_align(B_tc),
+        _assumed_align(U_scan),
+        _assumed_align(B_scan),
         _assumed_align(C_tc),
         _assumed_align(M_f),
         _assumed_align(K_f),
@@ -1904,8 +1909,8 @@ def _make_prepared_chunk_scan_launch(
         _assumed_align(out_chunk),
     )
     runtime_tensors = (
-        U_tc,
-        B_tc,
+        U_scan,
+        B_scan,
         C_tc,
         M_f,
         K_f,
@@ -1915,8 +1920,8 @@ def _make_prepared_chunk_scan_launch(
         out_chunk,
     )
     runtime_args = (
-        _make_pointer_tensor_arg(U_tc, u_spec),
-        _make_pointer_tensor_arg(B_tc, b_spec),
+        _make_pointer_tensor_arg(U_scan, u_spec),
+        _make_pointer_tensor_arg(B_scan, b_spec),
         _make_pointer_tensor_arg(C_tc, b_spec),
         _make_pointer_tensor_arg(M_f, m_spec),
         _make_pointer_tensor_arg(K_f, k_spec),

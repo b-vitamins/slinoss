@@ -99,6 +99,45 @@ def _ensure_min_alignment(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
     return aligned
 
 
+def _guard_prev_time_base(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
+    """Prepend a valid guard row before the visible time axis without changing layout.
+
+    The forward chunk-scan kernel forms a ``domain_offset(..., -1, ...)`` view over
+    flattened time-major inputs so it can read the previous timestep directly. For
+    the very first logical row, that shifted view would otherwise point before the
+    allocation base. This helper materializes one guarded row of backing storage
+    before the visible tensor while preserving the tensor's logical shape/stride.
+    """
+    base = _ensure_min_alignment(t, min_align=min_align)
+    if not base.is_contiguous():
+        raise ValueError("Expected a contiguous tensor before adding a guard row.")
+    if base.ndim < 3:
+        raise ValueError("Expected a tensor with an explicit time dimension.")
+
+    row_elems = int(base.stride()[2])
+    align_elems = max(1, int(min_align) // base.element_size())
+    guard_elems = ((row_elems + align_elems - 1) // align_elems) * align_elems
+
+    guarded_storage = torch.empty(
+        base.numel() + guard_elems,
+        device=base.device,
+        dtype=base.dtype,
+    )
+    guarded_storage[:guard_elems].zero_()
+    guarded_storage[guard_elems:].copy_(base.reshape(-1))
+    guarded = torch.as_strided(
+        guarded_storage,
+        size=tuple(int(dim) for dim in base.shape),
+        stride=tuple(int(step) for step in base.stride()),
+        storage_offset=guard_elems,
+    )
+    if _assumed_align(guarded) < int(min_align):
+        raise RuntimeError(
+            f"Failed to materialize a guarded tensor with assumed_align >= {min_align}."
+        )
+    return guarded
+
+
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
     align = _assumed_align(t)
     return (
@@ -209,6 +248,7 @@ __all__ = [
     "_choose_copy_bits_for_linear_tiles",
     "_elem_bits",
     "_ensure_min_alignment",
+    "_guard_prev_time_base",
     "_make_ptr_arg",
     "_make_ptr_args",
     "_pad_m_identity",
