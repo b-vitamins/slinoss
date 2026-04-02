@@ -71,6 +71,10 @@ def _current_torch_stream(device: torch.device) -> cuda.CUstream | None:
     return cuda.CUstream(int(torch_stream.cuda_stream))
 
 
+def _compile_stream_placeholder():
+    return cute.runtime.make_fake_stream()
+
+
 def _get_zero_prev_tensors(
     *,
     device: torch.device,
@@ -883,9 +887,12 @@ def _compile_chunk_increment_kernel_impl(
 
     compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
     if compiled is None:
-        compiled = _make_chunk_increment_host_wrapper(
+        host_wrapper = _make_chunk_increment_host_wrapper(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cta_tiler=cta_tiler,
+        )
+        compiled = cute.compile(
+            host_wrapper, *runtime_args, _compile_stream_placeholder()
         )
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
 
@@ -1046,7 +1053,7 @@ def _compile_state_passing_kernel_impl(
 
     compiled = _STATE_PASSING_CACHE.get(cache_key)
     if compiled is None:
-        compiled = _make_state_passing_host_wrapper(
+        host_wrapper = _make_state_passing_host_wrapper(
             spec=(B, H, C, P, D),
             cfg=(
                 num_threads,
@@ -1057,6 +1064,9 @@ def _compile_state_passing_kernel_impl(
                 copy_bits_state_out,
                 has_init,
             ),
+        )
+        compiled = cute.compile(
+            host_wrapper, *runtime_args, _compile_stream_placeholder()
         )
         _STATE_PASSING_CACHE[cache_key] = compiled
 
@@ -1296,13 +1306,16 @@ def _compile_chunk_scan_kernel_impl(
             device_index=device_index,
         ):
             raise ValueError("Resolved chunk_scan configuration is not supported.")
-        compiled = _make_chunk_scan_host_wrapper(
+        host_wrapper = _make_chunk_scan_host_wrapper(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cfg=(
                 resolved_m_block_size,
                 resolved_n_block_size,
                 resolved_num_threads,
             ),
+        )
+        compiled = cute.compile(
+            host_wrapper, *runtime_args, _compile_stream_placeholder()
         )
         _CHUNK_SCAN_CACHE[cache_key] = compiled
 
@@ -1763,9 +1776,12 @@ def _make_prepared_chunk_increment_launch(
     )
     compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
     if compiled is None:
-        compiled = _make_chunk_increment_host_wrapper(
+        host_wrapper = _make_chunk_increment_host_wrapper(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cta_tiler=cta_tiler,
+        )
+        compiled = cute.compile(
+            host_wrapper, *runtime_args, _compile_stream_placeholder()
         )
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
 
@@ -1840,7 +1856,7 @@ def _make_prepared_state_passing_launch(
     )
     compiled = _STATE_PASSING_CACHE.get(cache_key)
     if compiled is None:
-        compiled = _make_state_passing_host_wrapper(
+        host_wrapper = _make_state_passing_host_wrapper(
             spec=(B, H, C, P, D),
             cfg=(
                 num_threads,
@@ -1851,6 +1867,9 @@ def _make_prepared_state_passing_launch(
                 copy_bits_state_out,
                 has_init,
             ),
+        )
+        compiled = cute.compile(
+            host_wrapper, *runtime_args, _compile_stream_placeholder()
         )
         _STATE_PASSING_CACHE[cache_key] = compiled
 
@@ -1953,9 +1972,12 @@ def _make_prepared_chunk_scan_launch(
     )
     compiled = _CHUNK_SCAN_CACHE.get(cache_key)
     if compiled is None:
-        compiled = _make_chunk_scan_host_wrapper(
+        host_wrapper = _make_chunk_scan_host_wrapper(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cfg=(m_block_size, n_block_size, num_threads),
+        )
+        compiled = cute.compile(
+            host_wrapper, *runtime_args, _compile_stream_placeholder()
         )
         _CHUNK_SCAN_CACHE[cache_key] = compiled
 

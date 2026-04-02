@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 import pytest
 import torch
 
@@ -195,6 +196,76 @@ def test_chunk_scan_compile_entrypoint_reuses_cache() -> None:
     assert compiled_a is compiled_b
     assert out_chunk_a.shape == out_chunk_b.shape == (8, 32, 1, 16)
     assert out_view_a.shape == out_view_b.shape == (2, 2, 64, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_fwd_reuses_compiled_stage_launchers_for_aliased_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+
+    compile_calls = 0
+    real_compile = v2x2ssd_fwd_mod.cute.compile
+
+    def _counting_compile(*args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(v2x2ssd_fwd_mod.cute, "compile", _counting_compile)
+    v2x2ssd_fwd_mod._CHUNK_INCREMENT_CACHE.clear()
+    v2x2ssd_fwd_mod._STATE_PASSING_CACHE.clear()
+    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
+
+    try:
+        out_a, m_chunk_a, chunk_starts_a = cast(
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            v2x2ssd_fwd_cute(
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_size=chunk_size,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            ),
+        )
+        assert compile_calls == 3
+
+        out_b, m_chunk_b, chunk_starts_b = cast(
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            v2x2ssd_fwd_cute(
+                torch.ops.aten.alias.default(U),
+                torch.ops.aten.alias.default(M),
+                torch.ops.aten.alias.default(K),
+                torch.ops.aten.alias.default(B),
+                torch.ops.aten.alias.default(C),
+                chunk_size=chunk_size,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            ),
+        )
+        assert compile_calls == 3
+    finally:
+        v2x2ssd_fwd_mod._CHUNK_INCREMENT_CACHE.clear()
+        v2x2ssd_fwd_mod._STATE_PASSING_CACHE.clear()
+        v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
+
+    torch.testing.assert_close(out_a, out_b, atol=2e-3, rtol=0.0)
+    torch.testing.assert_close(m_chunk_a, m_chunk_b, atol=2e-3, rtol=0.0)
+    torch.testing.assert_close(chunk_starts_a, chunk_starts_b, atol=2e-3, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
