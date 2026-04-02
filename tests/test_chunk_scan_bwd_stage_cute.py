@@ -328,10 +328,9 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
         chunk_size=chunk_size,
     )
 
-    # The DU path is currently flaky at rare runs on SM86. Keep this stage gate
-    # strict, but allow bounded retries so transient launch noise does not mask
-    # structural regressions in unrelated kernels.
-    last_error: AssertionError | None = None
+    # Keep this as a short same-process repeatability check: the DU carry path
+    # used to corrupt boundary rows intermittently when its shared carry buffer
+    # was overwritten before every thread had finished reading it.
     for _attempt in range(3):
         compiled = compile_chunk_scan_bwd_kernels(
             U,
@@ -355,15 +354,8 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
         dU_public = _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=T)
         dU_prev_public = dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous()
 
-        try:
-            torch.testing.assert_close(dU_public, dU_ref, atol=2e-4, rtol=0.0)
-            torch.testing.assert_close(dU_prev_public, dU_prev_ref, atol=1e-4, rtol=0.0)
-            last_error = None
-            break
-        except AssertionError as err:
-            last_error = err
-    if last_error is not None:
-        raise last_error
+        torch.testing.assert_close(dU_public, dU_ref, atol=2e-4, rtol=0.0)
+        torch.testing.assert_close(dU_prev_public, dU_prev_ref, atol=1e-4, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

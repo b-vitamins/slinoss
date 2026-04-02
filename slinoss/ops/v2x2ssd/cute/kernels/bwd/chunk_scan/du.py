@@ -1171,6 +1171,7 @@ class ChunkScanBwdDUAmpere:
                             acc_curr_mn[r, c] = acc_curr_mn[r, c] + prev_f32.to(
                                 self.acc_dtype
                             )
+                cute.arch.barrier()
                 for it in range(iters_p_slice):
                     p_local = tidx + cutlass.Int32(it * self.num_threads)
                     if p_local < cutlass.Int32(p_tile):
