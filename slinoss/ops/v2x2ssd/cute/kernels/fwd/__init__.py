@@ -15,6 +15,7 @@ from .common import (
     PointerTensorArg,
     _assumed_align,
     _choose_copy_bits_for_linear_tiles,
+    _ensure_min_alignment,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -496,8 +497,12 @@ def _prepare_time_operand(
         and int(tensor.shape[2]) == T_pad
         and tensor.is_contiguous()
     ):
-        return tensor
-    return _pad_zero_time(tensor, T_pad=T_pad, dtype=dtype)
+        tensor = tensor
+    else:
+        tensor = _pad_zero_time(tensor, T_pad=T_pad, dtype=dtype)
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        tensor = _ensure_min_alignment(tensor, min_align=16)
+    return tensor
 
 
 def _prepare_m_operand(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
@@ -795,6 +800,8 @@ def _compile_chunk_increment_kernel_impl(
     B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
     M_f = _pad_m_identity(M, T_pad=T_pad)
     K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
+    U_tc = _ensure_min_alignment(U_tc, min_align=16)
+    B_tc = _ensure_min_alignment(B_tc, min_align=16)
 
     if U_prev0 is None:
         U_prev, B_prev = _get_zero_prev_tensors(
@@ -810,6 +817,8 @@ def _compile_chunk_increment_kernel_impl(
             raise ValueError("U_prev0/B_prev0 must be (B,H,P)/(B,H,D).")
         U_prev = U_prev0.to(dtype=tc_dtype).contiguous()
         B_prev = B_prev0.to(dtype=tc_dtype).contiguous()
+        U_prev = _ensure_min_alignment(U_prev, min_align=16)
+        B_prev = _ensure_min_alignment(B_prev, min_align=16)
 
     BH = Bsz * H
     BHC = BH * n_chunks
@@ -1182,6 +1191,9 @@ def _compile_chunk_scan_kernel_impl(
     C_tc = _pad_zero_time(C, T_pad=T_pad, dtype=tc_dtype)
     M_f = _pad_m_identity(M, T_pad=T_pad)
     K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
+    U_tc = _ensure_min_alignment(U_tc, min_align=16)
+    B_tc = _ensure_min_alignment(B_tc, min_align=16)
+    C_tc = _ensure_min_alignment(C_tc, min_align=16)
 
     if B_prev is None:
         U_prev0, B_prev0 = _get_zero_prev_tensors(
@@ -1197,6 +1209,8 @@ def _compile_chunk_scan_kernel_impl(
             raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
         B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
         U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
+        B_prev0 = _ensure_min_alignment(B_prev0, min_align=16)
+        U_prev0 = _ensure_min_alignment(U_prev0, min_align=16)
 
     chunk_starts_c = chunk_starts.contiguous()
     u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
@@ -1526,6 +1540,8 @@ def _build_forward_args(
     else:
         U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
         B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
+        U_prev0 = _ensure_min_alignment(U_prev0, min_align=16)
+        B_prev0 = _ensure_min_alignment(B_prev0, min_align=16)
 
     inc_chunk = _get_fwd_workspace(
         device=U.device,

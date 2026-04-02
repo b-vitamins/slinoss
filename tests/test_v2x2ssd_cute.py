@@ -71,6 +71,19 @@ def _make_scan_inputs(
     return U, M, K, B, C, initial_states, B_prev, U_prev
 
 
+def _make_underaligned_contiguous_view(t: torch.Tensor) -> torch.Tensor:
+    if t.element_size() != 2:
+        raise ValueError(
+            "Only 16-bit tensors can form the intended under-aligned view."
+        )
+    base = torch.empty((t.numel() + 1,), device=t.device, dtype=t.dtype)
+    view = base[1:].view_as(t)
+    view.copy_(t)
+    assert view.is_contiguous()
+    assert view.data_ptr() % 4 == 2
+    return view
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
     pytest.importorskip("cutlass")
@@ -922,6 +935,58 @@ def test_v2x2ssd_cute_matches_reference_forward_training_only() -> None:
         B,
         C,
         chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("value_dtype", [torch.float16, torch.bfloat16])
+def test_v2x2ssd_cute_accepts_underaligned_contiguous_activations(
+    value_dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=32,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+        value_dtype=value_dtype,
+    )
+    U_bad = _make_underaligned_contiguous_view(U)
+    B_bad = _make_underaligned_contiguous_view(B)
+    C_bad = _make_underaligned_contiguous_view(C)
+    chunk_size = 32
+
+    y_ref, _final_ref, _b_last_ref, _u_last_ref = v2x2ssd(
+        U_bad,
+        M,
+        K,
+        B_bad,
+        C_bad,
+        chunk_size=chunk_size,
+        initial_states=None,
+        B_prev=None,
+        U_prev=None,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    y_cute = v2x2ssd_cute(
+        U_bad,
+        M,
+        K,
+        B_bad,
+        C_bad,
+        chunk_size=chunk_size,
+        initial_states=None,
+        B_prev=None,
+        U_prev=None,
         compute_dtype=torch.float32,
         output_dtype=torch.float32,
     )

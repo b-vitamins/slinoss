@@ -82,6 +82,23 @@ def _assumed_align(
     return elem_align
 
 
+def _ensure_min_alignment(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
+    """Materialize a fresh contiguous buffer when the current view is under-aligned.
+
+    The forward CuTe fast paths use 128-bit cp.async staging for fp16/bf16
+    activations. Arbitrary contiguous views can legally be only 2-byte aligned,
+    so the launcher must normalize them before they cross the JIT boundary.
+    """
+    if _assumed_align(t) >= int(min_align):
+        return t
+    aligned = t.clone(memory_format=torch.contiguous_format)
+    if _assumed_align(aligned) < int(min_align):
+        raise RuntimeError(
+            f"Failed to materialize a buffer with assumed_align >= {min_align}."
+        )
+    return aligned
+
+
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
     align = _assumed_align(t)
     return (
@@ -191,6 +208,7 @@ __all__ = [
     "_assumed_align",
     "_choose_copy_bits_for_linear_tiles",
     "_elem_bits",
+    "_ensure_min_alignment",
     "_make_ptr_arg",
     "_make_ptr_args",
     "_pad_m_identity",
