@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import gc
 from typing import cast
+import weakref
 
 import pytest
 import torch
@@ -172,6 +174,57 @@ def test_nextchar_decode_one_matches_full_forward_on_supported_cuda(
     assert decode_state._engine is not None
     atol = 8e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-6
     torch.testing.assert_close(logits_decode, logits_full, atol=atol, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_nextchar_decode_graph_engine_does_not_form_gc_cycle(
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+
+        def _build_weakrefs():
+            model = (
+                NextCharLM(
+                    vocab_size=64,
+                    block_size=16,
+                    d_model=128,
+                    n_layers=2,
+                    d_state=64,
+                    expand=2,
+                    d_head=64,
+                    d_conv=4,
+                    chunk_size=32,
+                )
+                .to(device="cuda", dtype=dtype)
+                .eval()
+            )
+            state = model.init_decode_state(1, device="cuda", dtype=dtype)
+            idx = torch.randint(0, 64, (1,), device="cuda", dtype=torch.long)
+            with torch.no_grad():
+                logits, state = model.decode_one(idx, state)
+            assert state._engine is not None
+            engine = state._engine
+            refs = (
+                weakref.ref(engine),
+                weakref.ref(state),
+                weakref.ref(model),
+            )
+            del engine, logits, idx, state, model
+            return refs
+
+        wr_engine, wr_state, wr_model = _build_weakrefs()
+        assert wr_engine() is None
+        assert wr_state() is None
+        assert wr_model() is None
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_nextchar_decode_one_falls_back_on_cpu() -> None:

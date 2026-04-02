@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import cast
+import weakref
 
 import torch
 from torch import nn
@@ -184,7 +185,7 @@ class _NextCharCudaGraphDecodeEngine:
         batch_size: int,
     ) -> None:
         self.model = model
-        self.state = state
+        self._state_ref = weakref.ref(state)
         self.batch_size = int(batch_size)
         self.device = model.token_embed.weight.device
         self.idx_buffer = torch.zeros(
@@ -192,7 +193,7 @@ class _NextCharCudaGraphDecodeEngine:
         )
         self.graph = torch.cuda.CUDAGraph()
         self.static_logits: torch.Tensor | None = None
-        self._capture()
+        self._capture(state)
 
     @staticmethod
     def supported(model: "NextCharLM", *, batch_size: int) -> bool:
@@ -216,40 +217,48 @@ class _NextCharCudaGraphDecodeEngine:
                 return False
         return True
 
-    def _run_body(self) -> torch.Tensor:
-        if self.state.position_buffer is None:
+    def _get_captured_state(self) -> NextCharDecodeState:
+        state = self._state_ref()
+        if state is None:
+            raise RuntimeError("Decode graph state has been released.")
+        return state
+
+    def _run_body(self, state: NextCharDecodeState) -> torch.Tensor:
+        if state.position_buffer is None:
             raise RuntimeError("Decode state is missing a position buffer.")
         x = self.model.token_embed(self.idx_buffer)
-        pos = self.model.pos_embed[0].index_select(0, self.state.position_buffer)
+        pos = self.model.pos_embed[0].index_select(0, state.position_buffer)
         x = x + pos.expand(self.batch_size, -1)
         for block, layer_state in zip(
             cast(list[NextCharBlock], list(self.model.blocks)),
-            self.state.layers,
+            state.layers,
             strict=True,
         ):
             x = block.decode_one_inplace(x, layer_state)
         x = self.model.norm_f(x)
         return decode_linear(x, self.model.lm_head)
 
-    def _capture(self) -> None:
-        snapshot = self.state.clone()
+    def _capture(self, state: NextCharDecodeState) -> None:
+        snapshot = state.clone()
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(device=self.device))
         with torch.cuda.stream(stream):
             for _ in range(3):
-                _restore_decode_state_(self.state, snapshot)
-                self.static_logits = self._run_body()
-        _restore_decode_state_(self.state, snapshot)
+                _restore_decode_state_(state, snapshot)
+                self.static_logits = self._run_body(state)
+        _restore_decode_state_(state, snapshot)
         torch.cuda.current_stream(device=self.device).wait_stream(stream)
         with torch.cuda.graph(self.graph):
-            self.static_logits = self._run_body()
-        _restore_decode_state_(self.state, snapshot)
+            self.static_logits = self._run_body(state)
+        _restore_decode_state_(state, snapshot)
 
     def decode_one(
         self,
         idx: torch.Tensor,
         state: NextCharDecodeState,
     ) -> tuple[torch.Tensor, NextCharDecodeState]:
+        if self._get_captured_state() is not state:
+            raise RuntimeError("Decode graph engine is bound to a different state.")
         if state.position_buffer is None:
             raise RuntimeError("Decode state is missing a position buffer.")
         idx_c = idx.to(device=self.device, dtype=torch.long, non_blocking=True)
