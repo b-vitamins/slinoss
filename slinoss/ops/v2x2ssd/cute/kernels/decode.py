@@ -49,6 +49,10 @@ class MixerDecodeStepFwd:
         fuse_outproj: bool,
         state_stride: tuple[int, int, int, int] | None = None,
         final_state_stride: tuple[int, int, int, int] | None = None,
+        prev_b_stride: tuple[int, int, int] | None = None,
+        prev_u_stride: tuple[int, int, int] | None = None,
+        b_last_stride: tuple[int, int, int] | None = None,
+        u_last_stride: tuple[int, int, int] | None = None,
         state_align_bytes: int,
         tile_p: int,
         num_warps: int,
@@ -140,9 +144,29 @@ class MixerDecodeStepFwd:
             else tuple(int(v) for v in final_state_stride)
         )
         self.prev_b_shape = (self.batch, self.heads, self.d_size)
-        self.prev_b_stride = make_row_major_stride(self.prev_b_shape)
+        default_prev_b_stride = make_row_major_stride(self.prev_b_shape)
+        self.prev_b_stride = (
+            default_prev_b_stride
+            if prev_b_stride is None
+            else tuple(int(v) for v in prev_b_stride)
+        )
         self.prev_u_shape = self.value_shape
-        self.prev_u_stride = self.value_stride
+        default_prev_u_stride = self.value_stride
+        self.prev_u_stride = (
+            default_prev_u_stride
+            if prev_u_stride is None
+            else tuple(int(v) for v in prev_u_stride)
+        )
+        self.b_last_stride = (
+            self.prev_b_stride
+            if b_last_stride is None
+            else tuple(int(v) for v in b_last_stride)
+        )
+        self.u_last_stride = (
+            self.prev_u_stride
+            if u_last_stride is None
+            else tuple(int(v) for v in u_last_stride)
+        )
         self.y_shape = self.value_shape
         self.y_stride = self.value_stride
         self.bias_shape = (self.heads,)
@@ -326,10 +350,10 @@ class MixerDecodeStepFwd:
             cute.make_layout(self.state_shape, stride=self.final_state_stride),
         )
         mBLast = cute.make_tensor(
-            b_last_ptr, cute.make_layout(self.prev_b_shape, stride=self.prev_b_stride)
+            b_last_ptr, cute.make_layout(self.prev_b_shape, stride=self.b_last_stride)
         )
         mULast = cute.make_tensor(
-            u_last_ptr, cute.make_layout(self.prev_u_shape, stride=self.prev_u_stride)
+            u_last_ptr, cute.make_layout(self.prev_u_shape, stride=self.u_last_stride)
         )
         mOutProj = cute.make_tensor(
             out_proj_ptr,
@@ -372,6 +396,18 @@ class MixerDecodeStepFwd:
             copy_atom_value,
             cute.make_layout(self.tile_p // copy_elems_value),
             cute.make_layout(copy_elems_value),
+        )
+        copy_elems_u_prev = copy_elems_value if self.prev_u_stride[-1] == 1 else 1
+        copy_bits_u_prev = int(copy_elems_u_prev * p_dtype.width)
+        copy_atom_u_prev = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            p_dtype,
+            num_bits_per_copy=copy_bits_u_prev,
+        )
+        gmem_tiled_copy_u_prev = cute.make_tiled_copy_tv(
+            copy_atom_u_prev,
+            cute.make_layout(self.tile_p // copy_elems_u_prev),
+            cute.make_layout(copy_elems_u_prev),
         )
         copy_elems_skip = 1
         copy_bits_skip = int(copy_elems_skip * skip_dtype.width)
@@ -484,6 +520,7 @@ class MixerDecodeStepFwd:
             p_layout,
             gmem_tiled_copy_state,
             gmem_tiled_copy_value,
+            gmem_tiled_copy_u_prev,
             gmem_tiled_copy_skip,
         ).launch(
             grid=(self.p_tiles, self.heads, self.batch),
@@ -521,6 +558,7 @@ class MixerDecodeStepFwd:
         p_layout: cute.Layout,
         gmem_tiled_copy_state: cute.TiledCopy,
         gmem_tiled_copy_value: cute.TiledCopy,
+        gmem_tiled_copy_u_prev: cute.TiledCopy,
         gmem_tiled_copy_skip: cute.TiledCopy,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -602,19 +640,23 @@ class MixerDecodeStepFwd:
         thr_copy_value = gmem_tiled_copy_value.get_slice(lane_idx)
         tPgValue = thr_copy_value.partition_S(gValue)
         tPsValue = thr_copy_value.partition_D(sValue)
-        tPgUPrev = thr_copy_value.partition_S(gUPrev)
-        tPsUPrev = thr_copy_value.partition_D(sUPrev)
         tPgGate = thr_copy_value.partition_S(gGate)
         tPsGate = thr_copy_value.partition_D(sGate)
+        thr_copy_u_prev = gmem_tiled_copy_u_prev.get_slice(lane_idx)
+        tPgUPrev = thr_copy_u_prev.partition_S(gUPrev)
+        tPsUPrev = thr_copy_u_prev.partition_D(sUPrev)
 
         load_elems_value = cute.size(tPgValue.shape[0][0])
         num_loads_value = self.tile_p // load_elems_value
+        load_elems_u_prev = cute.size(tPgUPrev.shape[0][0])
+        num_loads_u_prev = self.tile_p // load_elems_u_prev
         num_loads_skip = self.tile_p
 
         if warp_idx == 0:
             if lane_idx < num_loads_value:
                 cute.copy(gmem_tiled_copy_value, tPgValue, tPsValue)
-                cute.copy(gmem_tiled_copy_value, tPgUPrev, tPsUPrev)
+            if lane_idx < num_loads_u_prev:
+                cute.copy(gmem_tiled_copy_u_prev, tPgUPrev, tPsUPrev)
 
         if warp_idx == 1:
             if lane_idx < num_loads_value:

@@ -265,6 +265,18 @@ def mixer_decode_step_cute(
         tuple[int, int, int, int],
         tuple(int(v) for v in final_state.stride()),
     )
+    prev_b_stride = cast(
+        tuple[int, int, int],
+        tuple(int(v) for v in b_prev_c.stride()),
+    )
+    prev_u_stride = cast(
+        tuple[int, int, int],
+        tuple(int(v) for v in u_prev_c.stride()),
+    )
+    u_last_stride = cast(
+        tuple[int, int, int],
+        tuple(int(v) for v in u_last.stride()),
+    )
 
     value_ptr, value_align = make_ptr_arg(value_c)
     params_ptr, params_align = make_ptr_arg(params_c)
@@ -311,6 +323,10 @@ def mixer_decode_step_cute(
         torch.empty_like(b_prev_c) if b_prev_aliases_output and p_tiles > 1 else b_last
     )
     b_last_kernel_ptr, b_last_kernel_align = make_ptr_arg(b_last_kernel)
+    b_last_kernel_stride = cast(
+        tuple[int, int, int],
+        tuple(int(v) for v in b_last_kernel.stride()),
+    )
 
     cache_key = (
         spec,
@@ -359,6 +375,10 @@ def mixer_decode_step_cute(
         projected_align,
         state_stride,
         final_state_stride,
+        prev_b_stride,
+        prev_u_stride,
+        b_last_kernel_stride,
+        u_last_stride,
         float(dt_min),
         float(dt_max),
         float(r_min),
@@ -379,6 +399,10 @@ def mixer_decode_step_cute(
                 fuse_outproj=bool(fuse_outproj),
                 state_stride=state_stride,
                 final_state_stride=final_state_stride,
+                prev_b_stride=prev_b_stride,
+                prev_u_stride=prev_u_stride,
+                b_last_stride=b_last_kernel_stride,
+                u_last_stride=u_last_stride,
                 state_align_bytes=state_align,
                 tile_p=tile_p,
                 num_warps=num_warps,
