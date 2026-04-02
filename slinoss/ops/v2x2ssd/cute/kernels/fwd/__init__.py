@@ -12,11 +12,12 @@ from slinoss.perf import note_cache_event
 from .chunk_increment import ChunkIncrementFwdAmpere
 from .chunk_scan import ChunkScanFwdAmpere
 from .common import (
-    PointerTensorArg,
     _assumed_align,
     _choose_copy_bits_for_linear_tiles,
+    _compile_env_stream_placeholder,
     _ensure_min_alignment,
     _guard_prev_time_base,
+    _make_fake_tensor_arg,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -62,17 +63,6 @@ def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
             stream = torch.cuda.current_stream(device=tensor.device)
         tensor.record_stream(stream)
         seen.add(ident)
-
-
-def _current_torch_stream(device: torch.device) -> cuda.CUstream | None:
-    if device.type != "cuda":
-        return None
-    torch_stream = torch.cuda.current_stream(device=device)
-    return cuda.CUstream(int(torch_stream.cuda_stream))
-
-
-def _compile_stream_placeholder():
-    return cute.runtime.make_fake_stream()
 
 
 def _get_zero_prev_tensors(
@@ -412,12 +402,20 @@ def _make_tensor_spec(
     return shape, stride
 
 
-def _make_pointer_tensor_arg(
+def _make_static_tensor_view(
+    tensor: cute.Tensor,
+    spec: tuple[tuple[int, ...], tuple[int, ...]],
+) -> cute.Tensor:
+    shape, stride = spec
+    return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=stride))
+
+
+def _make_runtime_tensor_view(
     tensor: torch.Tensor,
     spec: tuple[tuple[int, ...], tuple[int, ...]],
-) -> PointerTensorArg:
+) -> torch.Tensor:
     shape, stride = spec
-    return PointerTensorArg.from_tensor(tensor, shape=shape, stride=stride)
+    return torch.as_strided(tensor, size=shape, stride=stride)
 
 
 def _chunk_increment_tensor_specs(
@@ -631,26 +629,29 @@ def _make_chunk_scan_host_wrapper(
 
     @cute.jit
     def _chunk_scan_host_wrapper(
-        U_t: PointerTensorArg,
-        B_t: PointerTensorArg,
-        C_t: PointerTensorArg,
-        M_t: PointerTensorArg,
-        K_t: PointerTensorArg,
-        Z0_t: PointerTensorArg,
-        U_prev0_t: PointerTensorArg,
-        B_prev0_t: PointerTensorArg,
-        Out_t: PointerTensorArg,
+        U_t: cute.Tensor,
+        B_t: cute.Tensor,
+        C_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_t: cute.Tensor,
+        Z0_t: cute.Tensor,
+        U_prev0_t: cute.Tensor,
+        B_prev0_t: cute.Tensor,
+        Out_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        mU = U_t.to_tensor()
-        mB = B_t.to_tensor()
-        mC = C_t.to_tensor()
-        mM = M_t.to_tensor()
-        mK = K_t.to_tensor()
-        mZ0 = Z0_t.to_tensor()
-        mU_prev0 = U_prev0_t.to_tensor()
-        mB_prev0 = B_prev0_t.to_tensor()
-        mOut = Out_t.to_tensor()
+        u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
+            _chunk_scan_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
+        )
+        mU = _make_static_tensor_view(U_t, u_spec)
+        mB = _make_static_tensor_view(B_t, b_spec)
+        mC = _make_static_tensor_view(C_t, b_spec)
+        mM = _make_static_tensor_view(M_t, m_spec)
+        mK = _make_static_tensor_view(K_t, k_spec)
+        mZ0 = _make_static_tensor_view(Z0_t, z0_spec)
+        mU_prev0 = _make_static_tensor_view(U_prev0_t, u_prev_spec)
+        mB_prev0 = _make_static_tensor_view(B_prev0_t, b_prev_spec)
+        mOut = _make_static_tensor_view(Out_t, out_spec)
 
         chunk_scan = ChunkScanFwdAmpere(
             D=D,
@@ -676,28 +677,38 @@ def _make_chunk_increment_host_wrapper(
 
     @cute.jit
     def _chunk_increment_host_wrapper(
-        U_t: PointerTensorArg,
-        B_t: PointerTensorArg,
-        M_t: PointerTensorArg,
-        K_t: PointerTensorArg,
-        U_prev0_t: PointerTensorArg,
-        B_prev0_t: PointerTensorArg,
-        Inc_t: PointerTensorArg,
-        Mchunk_t: PointerTensorArg,
+        U_t: cute.Tensor,
+        B_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_t: cute.Tensor,
+        U_prev0_t: cute.Tensor,
+        B_prev0_t: cute.Tensor,
+        Inc_t: cute.Tensor,
+        Mchunk_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        mU = U_t.to_tensor()
-        mB = B_t.to_tensor()
-        mM = M_t.to_tensor()
-        mKprev = K_t.to_tensor()
+        (
+            u_spec,
+            b_spec,
+            m_spec,
+            k_spec,
+            u_prev_spec,
+            b_prev_spec,
+            inc_spec,
+            m_chunk_spec,
+        ) = _chunk_increment_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
+        mU = _make_static_tensor_view(U_t, u_spec)
+        mB = _make_static_tensor_view(B_t, b_spec)
+        mM = _make_static_tensor_view(M_t, m_spec)
+        mKprev = _make_static_tensor_view(K_t, k_spec)
         mKcurr = cute.make_tensor(mKprev.iterator + 2, mKprev.layout)
-        mU_prev0 = U_prev0_t.to_tensor()
-        mB_prev0 = B_prev0_t.to_tensor()
-        mInc = Inc_t.to_tensor()
-        mMchunk = Mchunk_t.to_tensor()
+        mU_prev0 = _make_static_tensor_view(U_prev0_t, u_prev_spec)
+        mB_prev0 = _make_static_tensor_view(B_prev0_t, b_prev_spec)
+        mInc = _make_static_tensor_view(Inc_t, inc_spec)
+        mMchunk = _make_static_tensor_view(Mchunk_t, m_chunk_spec)
 
         chunk_increment = ChunkIncrementFwdAmpere(
-            U_t.ptr.value_type,
+            mU.element_type,
             chunk_size=L,
             cta_tiler=cta_tiler,
         )
@@ -731,18 +742,21 @@ def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, .
 
     @cute.jit
     def _state_passing_host_wrapper(
-        Inc_t: PointerTensorArg,
-        M_t: PointerTensorArg,
-        OutStarts_t: PointerTensorArg,
-        OutFinal_t: PointerTensorArg,
-        Init_t: PointerTensorArg,
+        Inc_t: cute.Tensor,
+        M_t: cute.Tensor,
+        OutStarts_t: cute.Tensor,
+        OutFinal_t: cute.Tensor,
+        Init_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        mInc = Inc_t.to_tensor()
-        mM = M_t.to_tensor()
-        mOutStarts = OutStarts_t.to_tensor()
-        mOutFinal = OutFinal_t.to_tensor()
-        mInit = Init_t.to_tensor()
+        inc_spec, m_spec, out_starts_spec, out_final_spec = _state_passing_tensor_specs(
+            (B, H, C, P, D)
+        )
+        mInc = _make_static_tensor_view(Inc_t, inc_spec)
+        mM = _make_static_tensor_view(M_t, m_spec)
+        mOutStarts = _make_static_tensor_view(OutStarts_t, out_starts_spec)
+        mOutFinal = _make_static_tensor_view(OutFinal_t, out_final_spec)
+        mInit = _make_static_tensor_view(Init_t, out_final_spec)
 
         state_passing = StatePassingFwdAmpere(
             num_threads=num_threads,
@@ -863,14 +877,44 @@ def _compile_chunk_increment_kernel_impl(
         m_chunk_chunk,
     )
     runtime_args = (
-        _make_pointer_tensor_arg(U_tc, u_spec),
-        _make_pointer_tensor_arg(B_tc, b_spec),
-        _make_pointer_tensor_arg(M_f, m_spec),
-        _make_pointer_tensor_arg(K_f, k_spec),
-        _make_pointer_tensor_arg(U_prev, u_prev_spec),
-        _make_pointer_tensor_arg(B_prev, b_prev_spec),
-        _make_pointer_tensor_arg(inc_chunk, inc_spec),
-        _make_pointer_tensor_arg(m_chunk_chunk, m_chunk_spec),
+        _make_runtime_tensor_view(U_tc, u_spec),
+        _make_runtime_tensor_view(B_tc, b_spec),
+        _make_runtime_tensor_view(M_f, m_spec),
+        _make_runtime_tensor_view(K_f, k_spec),
+        _make_runtime_tensor_view(U_prev, u_prev_spec),
+        _make_runtime_tensor_view(B_prev, b_prev_spec),
+        _make_runtime_tensor_view(inc_chunk, inc_spec),
+        _make_runtime_tensor_view(m_chunk_chunk, m_chunk_spec),
+    )
+    compile_args = (
+        _make_fake_tensor_arg(
+            U_tc, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
+        ),
+        _make_fake_tensor_arg(
+            B_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
+        ),
+        _make_fake_tensor_arg(
+            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[2]
+        ),
+        _make_fake_tensor_arg(
+            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[3]
+        ),
+        _make_fake_tensor_arg(
+            U_prev, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[4]
+        ),
+        _make_fake_tensor_arg(
+            B_prev, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[5]
+        ),
+        _make_fake_tensor_arg(
+            inc_chunk, shape=inc_spec[0], stride=inc_spec[1], align=alignments[6]
+        ),
+        _make_fake_tensor_arg(
+            m_chunk_chunk,
+            shape=m_chunk_spec[0],
+            stride=m_chunk_spec[1],
+            align=alignments[7],
+        ),
+        _compile_env_stream_placeholder(),
     )
     cache_key = _chunk_increment_key(
         device_index=(U.device.index if U.device.index is not None else -1),
@@ -891,15 +935,11 @@ def _compile_chunk_increment_kernel_impl(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cta_tiler=cta_tiler,
         )
-        compiled = cute.compile(
-            host_wrapper, *runtime_args, _compile_stream_placeholder()
-        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
 
     def launch() -> None:
-        stream = _current_torch_stream(U.device)
-        assert stream is not None
-        compiled(*runtime_args, stream)
+        compiled(*runtime_args)
         _record_tensors_on_current_stream(*runtime_tensors)
 
     return compiled, inc_chunk, m_chunk_chunk, launch
@@ -1031,11 +1071,38 @@ def _compile_state_passing_kernel_impl(
     )
     keepalive = (inc_c, m_c, out_starts, out_final, init_c)
     runtime_args = (
-        _make_pointer_tensor_arg(inc_c, inc_spec),
-        _make_pointer_tensor_arg(m_c, m_spec),
-        _make_pointer_tensor_arg(out_starts, out_starts_spec),
-        _make_pointer_tensor_arg(out_final, out_final_spec),
-        _make_pointer_tensor_arg(init_arg, out_final_spec),
+        _make_runtime_tensor_view(inc_c, inc_spec),
+        _make_runtime_tensor_view(m_c, m_spec),
+        _make_runtime_tensor_view(out_starts, out_starts_spec),
+        _make_runtime_tensor_view(out_final, out_final_spec),
+        _make_runtime_tensor_view(init_arg, out_final_spec),
+    )
+    compile_args = (
+        _make_fake_tensor_arg(
+            inc_c, shape=inc_spec[0], stride=inc_spec[1], align=alignments[0]
+        ),
+        _make_fake_tensor_arg(
+            m_c, shape=m_spec[0], stride=m_spec[1], align=alignments[1]
+        ),
+        _make_fake_tensor_arg(
+            out_starts,
+            shape=out_starts_spec[0],
+            stride=out_starts_spec[1],
+            align=alignments[2],
+        ),
+        _make_fake_tensor_arg(
+            out_final,
+            shape=out_final_spec[0],
+            stride=out_final_spec[1],
+            align=alignments[3],
+        ),
+        _make_fake_tensor_arg(
+            init_arg,
+            shape=out_final_spec[0],
+            stride=out_final_spec[1],
+            align=alignments[4],
+        ),
+        _compile_env_stream_placeholder(),
     )
     cache_key = _state_passing_key(
         device_index=(inc.device.index if inc.device.index is not None else -1),
@@ -1065,15 +1132,11 @@ def _compile_state_passing_kernel_impl(
                 has_init,
             ),
         )
-        compiled = cute.compile(
-            host_wrapper, *runtime_args, _compile_stream_placeholder()
-        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _STATE_PASSING_CACHE[cache_key] = compiled
 
     def launch() -> None:
-        stream = _current_torch_stream(inc.device)
-        assert stream is not None
-        compiled(*runtime_args, stream)
+        compiled(*runtime_args)
         _record_tensors_on_current_stream(*keepalive)
 
     return compiled, out_starts, out_final, launch
@@ -1258,15 +1321,45 @@ def _compile_chunk_scan_kernel_impl(
         out_chunk,
     )
     runtime_args = (
-        _make_pointer_tensor_arg(U_scan, u_spec),
-        _make_pointer_tensor_arg(B_scan, b_spec),
-        _make_pointer_tensor_arg(C_tc, b_spec),
-        _make_pointer_tensor_arg(M_f, m_spec),
-        _make_pointer_tensor_arg(K_f, k_spec),
-        _make_pointer_tensor_arg(chunk_starts_c, z0_spec),
-        _make_pointer_tensor_arg(U_prev0, u_prev_spec),
-        _make_pointer_tensor_arg(B_prev0, b_prev_spec),
-        _make_pointer_tensor_arg(out_chunk, out_spec),
+        _make_runtime_tensor_view(U_scan, u_spec),
+        _make_runtime_tensor_view(B_scan, b_spec),
+        _make_runtime_tensor_view(C_tc, b_spec),
+        _make_runtime_tensor_view(M_f, m_spec),
+        _make_runtime_tensor_view(K_f, k_spec),
+        _make_runtime_tensor_view(chunk_starts_c, z0_spec),
+        _make_runtime_tensor_view(U_prev0, u_prev_spec),
+        _make_runtime_tensor_view(B_prev0, b_prev_spec),
+        _make_runtime_tensor_view(out_chunk, out_spec),
+    )
+    compile_args = (
+        _make_fake_tensor_arg(
+            U_scan, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
+        ),
+        _make_fake_tensor_arg(
+            B_scan, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
+        ),
+        _make_fake_tensor_arg(
+            C_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[2]
+        ),
+        _make_fake_tensor_arg(
+            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[3]
+        ),
+        _make_fake_tensor_arg(
+            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[4]
+        ),
+        _make_fake_tensor_arg(
+            chunk_starts_c, shape=z0_spec[0], stride=z0_spec[1], align=alignments[5]
+        ),
+        _make_fake_tensor_arg(
+            U_prev0, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[6]
+        ),
+        _make_fake_tensor_arg(
+            B_prev0, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[7]
+        ),
+        _make_fake_tensor_arg(
+            out_chunk, shape=out_spec[0], stride=out_spec[1], align=alignments[8]
+        ),
+        _compile_env_stream_placeholder(),
     )
     keepalive = runtime_tensors
 
@@ -1314,15 +1407,11 @@ def _compile_chunk_scan_kernel_impl(
                 resolved_num_threads,
             ),
         )
-        compiled = cute.compile(
-            host_wrapper, *runtime_args, _compile_stream_placeholder()
-        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _CHUNK_SCAN_CACHE[cache_key] = compiled
 
     def launch() -> None:
-        stream = _current_torch_stream(U.device)
-        assert stream is not None
-        compiled(*runtime_args, stream)
+        compiled(*runtime_args)
         _record_tensors_on_current_stream(*keepalive)
 
     return compiled, out_chunk, out_view, launch
@@ -1752,15 +1841,45 @@ def _make_prepared_chunk_increment_launch(
         _assumed_align(inc_chunk),
         _assumed_align(m_chunk_chunk),
     )
+    compile_args = (
+        _make_fake_tensor_arg(
+            U_tc, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
+        ),
+        _make_fake_tensor_arg(
+            B_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
+        ),
+        _make_fake_tensor_arg(
+            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[2]
+        ),
+        _make_fake_tensor_arg(
+            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[3]
+        ),
+        _make_fake_tensor_arg(
+            U_prev0, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[4]
+        ),
+        _make_fake_tensor_arg(
+            B_prev0, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[5]
+        ),
+        _make_fake_tensor_arg(
+            inc_chunk, shape=inc_spec[0], stride=inc_spec[1], align=alignments[6]
+        ),
+        _make_fake_tensor_arg(
+            m_chunk_chunk,
+            shape=m_chunk_spec[0],
+            stride=m_chunk_spec[1],
+            align=alignments[7],
+        ),
+        _compile_env_stream_placeholder(),
+    )
     runtime_args = (
-        _make_pointer_tensor_arg(U_tc, u_spec),
-        _make_pointer_tensor_arg(B_tc, b_spec),
-        _make_pointer_tensor_arg(M_f, m_spec),
-        _make_pointer_tensor_arg(K_f, k_spec),
-        _make_pointer_tensor_arg(U_prev0, u_prev_spec),
-        _make_pointer_tensor_arg(B_prev0, b_prev_spec),
-        _make_pointer_tensor_arg(inc_chunk, inc_spec),
-        _make_pointer_tensor_arg(m_chunk_chunk, m_chunk_spec),
+        _make_runtime_tensor_view(U_tc, u_spec),
+        _make_runtime_tensor_view(B_tc, b_spec),
+        _make_runtime_tensor_view(M_f, m_spec),
+        _make_runtime_tensor_view(K_f, k_spec),
+        _make_runtime_tensor_view(U_prev0, u_prev_spec),
+        _make_runtime_tensor_view(B_prev0, b_prev_spec),
+        _make_runtime_tensor_view(inc_chunk, inc_spec),
+        _make_runtime_tensor_view(m_chunk_chunk, m_chunk_spec),
     )
     cache_key = _chunk_increment_key(
         device_index=(U.device.index if U.device.index is not None else -1),
@@ -1780,15 +1899,11 @@ def _make_prepared_chunk_increment_launch(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cta_tiler=cta_tiler,
         )
-        compiled = cute.compile(
-            host_wrapper, *runtime_args, _compile_stream_placeholder()
-        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
 
     def launch() -> None:
-        stream = _current_torch_stream(U.device)
-        assert stream is not None
-        compiled(*runtime_args, stream)
+        compiled(*runtime_args)
         _record_tensors_on_current_stream(
             U_tc, B_tc, M_f, K_f, U_prev0, B_prev0, inc_chunk, m_chunk_chunk
         )
@@ -1835,11 +1950,38 @@ def _make_prepared_state_passing_launch(
     )
     runtime_tensors = (inc, m_chunk, chunk_starts, final_state, init_arg)
     runtime_args = (
-        _make_pointer_tensor_arg(inc, inc_spec),
-        _make_pointer_tensor_arg(m_chunk, m_spec),
-        _make_pointer_tensor_arg(chunk_starts, out_starts_spec),
-        _make_pointer_tensor_arg(final_state, out_final_spec),
-        _make_pointer_tensor_arg(init_arg, out_final_spec),
+        _make_runtime_tensor_view(inc, inc_spec),
+        _make_runtime_tensor_view(m_chunk, m_spec),
+        _make_runtime_tensor_view(chunk_starts, out_starts_spec),
+        _make_runtime_tensor_view(final_state, out_final_spec),
+        _make_runtime_tensor_view(init_arg, out_final_spec),
+    )
+    compile_args = (
+        _make_fake_tensor_arg(
+            inc, shape=inc_spec[0], stride=inc_spec[1], align=alignments[0]
+        ),
+        _make_fake_tensor_arg(
+            m_chunk, shape=m_spec[0], stride=m_spec[1], align=alignments[1]
+        ),
+        _make_fake_tensor_arg(
+            chunk_starts,
+            shape=out_starts_spec[0],
+            stride=out_starts_spec[1],
+            align=alignments[2],
+        ),
+        _make_fake_tensor_arg(
+            final_state,
+            shape=out_final_spec[0],
+            stride=out_final_spec[1],
+            align=alignments[3],
+        ),
+        _make_fake_tensor_arg(
+            init_arg,
+            shape=out_final_spec[0],
+            stride=out_final_spec[1],
+            align=alignments[4],
+        ),
+        _compile_env_stream_placeholder(),
     )
     cache_key = _state_passing_key(
         device_index=(inc.device.index if inc.device.index is not None else -1),
@@ -1868,15 +2010,11 @@ def _make_prepared_state_passing_launch(
                 has_init,
             ),
         )
-        compiled = cute.compile(
-            host_wrapper, *runtime_args, _compile_stream_placeholder()
-        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _STATE_PASSING_CACHE[cache_key] = compiled
 
     def launch() -> None:
-        stream = _current_torch_stream(inc.device)
-        assert stream is not None
-        compiled(*runtime_args, stream)
+        compiled(*runtime_args)
         _record_tensors_on_current_stream(*runtime_tensors)
 
     return launch
@@ -1939,15 +2077,56 @@ def _make_prepared_chunk_scan_launch(
         out_chunk,
     )
     runtime_args = (
-        _make_pointer_tensor_arg(U_scan, u_spec),
-        _make_pointer_tensor_arg(B_scan, b_spec),
-        _make_pointer_tensor_arg(C_tc, b_spec),
-        _make_pointer_tensor_arg(M_f, m_spec),
-        _make_pointer_tensor_arg(K_f, k_spec),
-        _make_pointer_tensor_arg(chunk_starts, z0_spec),
-        _make_pointer_tensor_arg(U_prev0, u_prev_spec),
-        _make_pointer_tensor_arg(B_prev0, b_prev_spec),
-        _make_pointer_tensor_arg(out_chunk, out_spec),
+        _make_runtime_tensor_view(U_scan, u_spec),
+        _make_runtime_tensor_view(B_scan, b_spec),
+        _make_runtime_tensor_view(C_tc, b_spec),
+        _make_runtime_tensor_view(M_f, m_spec),
+        _make_runtime_tensor_view(K_f, k_spec),
+        _make_runtime_tensor_view(chunk_starts, z0_spec),
+        _make_runtime_tensor_view(U_prev0, u_prev_spec),
+        _make_runtime_tensor_view(B_prev0, b_prev_spec),
+        _make_runtime_tensor_view(out_chunk, out_spec),
+    )
+    compile_args = (
+        _make_fake_tensor_arg(
+            U_scan, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
+        ),
+        _make_fake_tensor_arg(
+            B_scan, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
+        ),
+        _make_fake_tensor_arg(
+            C_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[2]
+        ),
+        _make_fake_tensor_arg(
+            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[3]
+        ),
+        _make_fake_tensor_arg(
+            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[4]
+        ),
+        _make_fake_tensor_arg(
+            chunk_starts, shape=z0_spec[0], stride=z0_spec[1], align=alignments[5]
+        ),
+        _make_fake_tensor_arg(
+            U_prev0, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[6]
+        ),
+        _make_fake_tensor_arg(
+            B_prev0, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[7]
+        ),
+        _make_fake_tensor_arg(
+            out_chunk, shape=out_spec[0], stride=out_spec[1], align=alignments[8]
+        ),
+        _compile_env_stream_placeholder(),
+    )
+    runtime_args = (
+        _make_runtime_tensor_view(U_scan, u_spec),
+        _make_runtime_tensor_view(B_scan, b_spec),
+        _make_runtime_tensor_view(C_tc, b_spec),
+        _make_runtime_tensor_view(M_f, m_spec),
+        _make_runtime_tensor_view(K_f, k_spec),
+        _make_runtime_tensor_view(chunk_starts, z0_spec),
+        _make_runtime_tensor_view(U_prev0, u_prev_spec),
+        _make_runtime_tensor_view(B_prev0, b_prev_spec),
+        _make_runtime_tensor_view(out_chunk, out_spec),
     )
     cache_key = _chunk_scan_key(
         device_index=(
@@ -1976,15 +2155,11 @@ def _make_prepared_chunk_scan_launch(
             spec=(Bsz, H, T_pad, P, D, n_chunks, L),
             cfg=(m_block_size, n_block_size, num_threads),
         )
-        compiled = cute.compile(
-            host_wrapper, *runtime_args, _compile_stream_placeholder()
-        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _CHUNK_SCAN_CACHE[cache_key] = compiled
 
     def launch() -> None:
-        stream = _current_torch_stream(U.device)
-        assert stream is not None
-        compiled(*runtime_args, stream)
+        compiled(*runtime_args)
         _record_tensors_on_current_stream(*runtime_tensors)
 
     return launch

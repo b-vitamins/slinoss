@@ -263,104 +263,114 @@ class MixerDecodeStepFwd:
     @cute.jit
     def __call__(
         self,
-        value_ptr: cute.Pointer,
-        params_ptr: cute.Pointer,
-        bc_ptr: cute.Pointer,
-        gate_ptr: cute.Pointer,
-        skip_ptr: cute.Pointer,
-        state_ptr: cute.Pointer,
-        b_prev_ptr: cute.Pointer,
-        u_prev_ptr: cute.Pointer,
-        dt_bias_ptr: cute.Pointer,
-        gamma_bias_ptr: cute.Pointer,
-        omega_bias_ptr: cute.Pointer,
-        mix_r_bias_ptr: cute.Pointer,
-        mix_theta_bias_ptr: cute.Pointer,
-        mix_k_prev_bias_ptr: cute.Pointer,
-        mix_k_curr_bias_ptr: cute.Pointer,
-        b_scale_ptr: cute.Pointer,
-        c_scale_ptr: cute.Pointer,
-        y_ptr: cute.Pointer,
-        final_state_ptr: cute.Pointer,
-        b_last_ptr: cute.Pointer,
-        u_last_ptr: cute.Pointer,
-        out_proj_ptr: cute.Pointer,
-        projected_ptr: cute.Pointer,
+        value: cute.Tensor,
+        params: cute.Tensor,
+        bc: cute.Tensor,
+        gate: cute.Tensor,
+        skip: cute.Tensor,
+        state: cute.Tensor,
+        b_prev: cute.Tensor,
+        u_prev: cute.Tensor,
+        dt_bias: cute.Tensor,
+        gamma_bias: cute.Tensor,
+        omega_bias: cute.Tensor,
+        mix_r_bias: cute.Tensor,
+        mix_theta_bias: cute.Tensor,
+        mix_k_prev_bias: cute.Tensor,
+        mix_k_curr_bias: cute.Tensor,
+        b_scale: cute.Tensor,
+        c_scale: cute.Tensor,
+        y: cute.Tensor,
+        final_state: cute.Tensor,
+        b_last: cute.Tensor,
+        u_last: cute.Tensor,
+        out_proj: cute.Tensor,
+        projected: cute.Tensor,
         stream: cuda.CUstream,
     ):
         mValue = cute.make_tensor(
-            value_ptr, cute.make_layout(self.value_shape, stride=self.value_stride)
+            value.iterator, cute.make_layout(self.value_shape, stride=self.value_stride)
         )
         mParams = cute.make_tensor(
-            params_ptr, cute.make_layout(self.params_shape, stride=self.params_stride)
+            params.iterator,
+            cute.make_layout(self.params_shape, stride=self.params_stride),
         )
         mBC = cute.make_tensor(
-            bc_ptr, cute.make_layout(self.bc_shape, stride=self.bc_stride)
+            bc.iterator, cute.make_layout(self.bc_shape, stride=self.bc_stride)
         )
         mGate = cute.make_tensor(
-            gate_ptr, cute.make_layout(self.gate_shape, stride=self.gate_stride)
+            gate.iterator, cute.make_layout(self.gate_shape, stride=self.gate_stride)
         )
         mSkip = cute.make_tensor(
-            skip_ptr, cute.make_layout(self.skip_shape, stride=self.skip_stride)
+            skip.iterator, cute.make_layout(self.skip_shape, stride=self.skip_stride)
         )
         mState = cute.make_tensor(
-            state_ptr, cute.make_layout(self.state_shape, stride=self.state_stride)
+            state.iterator, cute.make_layout(self.state_shape, stride=self.state_stride)
         )
         mBPrev = cute.make_tensor(
-            b_prev_ptr, cute.make_layout(self.prev_b_shape, stride=self.prev_b_stride)
+            b_prev.iterator,
+            cute.make_layout(self.prev_b_shape, stride=self.prev_b_stride),
         )
         mUPrev = cute.make_tensor(
-            u_prev_ptr, cute.make_layout(self.prev_u_shape, stride=self.prev_u_stride)
+            u_prev.iterator,
+            cute.make_layout(self.prev_u_shape, stride=self.prev_u_stride),
         )
         mDtBias = cute.make_tensor(
-            dt_bias_ptr, cute.make_layout(self.bias_shape, stride=self.bias_stride)
+            dt_bias.iterator, cute.make_layout(self.bias_shape, stride=self.bias_stride)
         )
         mGammaBias = cute.make_tensor(
-            gamma_bias_ptr, cute.make_layout(self.bias_shape, stride=self.bias_stride)
+            gamma_bias.iterator,
+            cute.make_layout(self.bias_shape, stride=self.bias_stride),
         )
         mOmegaBias = cute.make_tensor(
-            omega_bias_ptr, cute.make_layout(self.bias_shape, stride=self.bias_stride)
+            omega_bias.iterator,
+            cute.make_layout(self.bias_shape, stride=self.bias_stride),
         )
         mMixRBias = cute.make_tensor(
-            mix_r_bias_ptr, cute.make_layout(self.bias_shape, stride=self.bias_stride)
+            mix_r_bias.iterator,
+            cute.make_layout(self.bias_shape, stride=self.bias_stride),
         )
         mMixThetaBias = cute.make_tensor(
-            mix_theta_bias_ptr,
+            mix_theta_bias.iterator,
             cute.make_layout(self.bias_shape, stride=self.bias_stride),
         )
         mMixKPrevBias = cute.make_tensor(
-            mix_k_prev_bias_ptr,
+            mix_k_prev_bias.iterator,
             cute.make_layout(self.bias_shape, stride=self.bias_stride),
         )
         mMixKCurrBias = cute.make_tensor(
-            mix_k_curr_bias_ptr,
+            mix_k_curr_bias.iterator,
             cute.make_layout(self.bias_shape, stride=self.bias_stride),
         )
         mBScale = cute.make_tensor(
-            b_scale_ptr, cute.make_layout(self.scale_shape, stride=self.scale_stride)
+            b_scale.iterator,
+            cute.make_layout(self.scale_shape, stride=self.scale_stride),
         )
         mCScale = cute.make_tensor(
-            c_scale_ptr, cute.make_layout(self.scale_shape, stride=self.scale_stride)
+            c_scale.iterator,
+            cute.make_layout(self.scale_shape, stride=self.scale_stride),
         )
         mY = cute.make_tensor(
-            y_ptr, cute.make_layout(self.y_shape, stride=self.y_stride)
+            y.iterator, cute.make_layout(self.y_shape, stride=self.y_stride)
         )
         mFinalState = cute.make_tensor(
-            final_state_ptr,
+            final_state.iterator,
             cute.make_layout(self.state_shape, stride=self.final_state_stride),
         )
         mBLast = cute.make_tensor(
-            b_last_ptr, cute.make_layout(self.prev_b_shape, stride=self.b_last_stride)
+            b_last.iterator,
+            cute.make_layout(self.prev_b_shape, stride=self.b_last_stride),
         )
         mULast = cute.make_tensor(
-            u_last_ptr, cute.make_layout(self.prev_u_shape, stride=self.u_last_stride)
+            u_last.iterator,
+            cute.make_layout(self.prev_u_shape, stride=self.u_last_stride),
         )
         mOutProj = cute.make_tensor(
-            out_proj_ptr,
+            out_proj.iterator,
             cute.make_layout(self.out_proj_shape, stride=self.out_proj_stride),
         )
         mProjected = cute.make_tensor(
-            projected_ptr,
+            projected.iterator,
             cute.make_layout(self.projected_shape, stride=self.projected_stride),
         )
 

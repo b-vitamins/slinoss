@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -163,55 +161,25 @@ def _make_ptr_args(
     return tuple(ptrs), tuple(alignments)
 
 
-@dataclass(frozen=True)
-class PointerTensorArg:
-    """Pointer-backed JIT argument that preserves layout and alignment metadata.
+def _make_fake_tensor_arg(
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...] | None = None,
+    stride: tuple[int, ...] | None = None,
+    align: int | None = None,
+):
+    return cute.runtime.make_fake_tensor(
+        _torch_to_cutlass_dtype(tensor.dtype),
+        tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
+        stride=tuple(
+            int(step) for step in (stride if stride is not None else tensor.stride())
+        ),
+        assumed_align=int(align if align is not None else _assumed_align(tensor)),
+    )
 
-    Reconstructing a CuTe tensor from ``tensor.iterator`` inside a host wrapper
-    drops the pointer alignment contract carried by ``make_ptr(..., assumed_align=...)``.
-    Use this wrapper instead so the JIT call boundary preserves the pointer type
-    and the wrapper can rebuild the intended logical layout from explicit shape/stride.
-    """
 
-    ptr: object
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
-
-    @classmethod
-    def from_tensor(
-        cls,
-        tensor: torch.Tensor,
-        *,
-        shape: tuple[int, ...],
-        stride: tuple[int, ...],
-    ) -> "PointerTensorArg":
-        ptr, _align = _make_ptr_arg(tensor)
-        return cls(
-            ptr=ptr,
-            shape=tuple(int(dim) for dim in shape),
-            stride=tuple(int(step) for step in stride),
-        )
-
-    def to_tensor(self) -> cute.Tensor:
-        return cute.make_tensor(
-            self.ptr, cute.make_layout(self.shape, stride=self.stride)
-        )
-
-    def __c_pointers__(self):
-        return self.ptr.__c_pointers__()
-
-    def __get_mlir_types__(self):
-        return self.ptr.__get_mlir_types__()
-
-    def __extract_mlir_values__(self):
-        return self.ptr.__extract_mlir_values__()
-
-    def __new_from_mlir_values__(self, values):
-        return PointerTensorArg(
-            ptr=self.ptr.__new_from_mlir_values__(values),
-            shape=self.shape,
-            stride=self.stride,
-        )
+def _compile_env_stream_placeholder():
+    return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
 
 def _pad_zero_time(
@@ -243,12 +211,13 @@ def _pad_m_identity(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
 
 
 __all__ = [
-    "PointerTensorArg",
+    "_compile_env_stream_placeholder",
     "_assumed_align",
     "_choose_copy_bits_for_linear_tiles",
     "_elem_bits",
     "_ensure_min_alignment",
     "_guard_prev_time_base",
+    "_make_fake_tensor_arg",
     "_make_ptr_arg",
     "_make_ptr_args",
     "_pad_m_identity",

@@ -5,12 +5,15 @@ from __future__ import annotations
 import os
 from typing import Callable, cast
 
-import cuda.bindings.driver as cuda
 import torch
 import cutlass.cute as cute
 
-from slinoss.ops.scanprep.cute.common import make_ptr_arg
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.common import _ensure_min_alignment
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.common import (
+    _assumed_align,
+    _compile_env_stream_placeholder,
+    _ensure_min_alignment,
+    _make_fake_tensor_arg,
+)
 
 from .kernels.decode import MixerDecodeStepFwd
 
@@ -322,28 +325,28 @@ def mixer_decode_step_cute(
         tuple(int(v) for v in u_last.stride()),
     )
 
-    value_ptr, value_align = make_ptr_arg(value_c)
-    params_ptr, params_align = make_ptr_arg(params_c)
-    bc_ptr, bc_align = make_ptr_arg(bc_c)
-    gate_ptr, gate_align = make_ptr_arg(gate_c)
-    skip_ptr, skip_align = make_ptr_arg(skip_c)
-    state_ptr, state_align = make_ptr_arg(state_c)
-    b_prev_ptr, b_prev_align = make_ptr_arg(b_prev_c)
-    u_prev_ptr, u_prev_align = make_ptr_arg(u_prev_c)
-    dt_bias_ptr, dt_bias_align = make_ptr_arg(dt_bias)
-    gamma_bias_ptr, gamma_bias_align = make_ptr_arg(gamma_bias)
-    omega_bias_ptr, omega_bias_align = make_ptr_arg(omega_bias)
-    mix_r_bias_ptr, mix_r_bias_align = make_ptr_arg(mix_r_bias)
-    mix_theta_bias_ptr, mix_theta_bias_align = make_ptr_arg(mix_theta_bias)
-    mix_k_prev_bias_ptr, mix_k_prev_bias_align = make_ptr_arg(mix_k_prev_bias)
-    mix_k_curr_bias_ptr, mix_k_curr_bias_align = make_ptr_arg(mix_k_curr_bias)
-    b_scale_ptr, b_scale_align = make_ptr_arg(b_scale)
-    c_scale_ptr, c_scale_align = make_ptr_arg(c_scale)
-    y_ptr, y_align = make_ptr_arg(y)
-    final_state_ptr, final_state_align = make_ptr_arg(final_state)
-    u_last_ptr, u_last_align = make_ptr_arg(u_last)
-    out_proj_ptr, out_proj_align = make_ptr_arg(out_proj)
-    projected_ptr, projected_align = make_ptr_arg(projected)
+    value_align = _assumed_align(value_c)
+    params_align = _assumed_align(params_c)
+    bc_align = _assumed_align(bc_c)
+    gate_align = _assumed_align(gate_c)
+    skip_align = _assumed_align(skip_c)
+    state_align = _assumed_align(state_c)
+    b_prev_align = _assumed_align(b_prev_c)
+    u_prev_align = _assumed_align(u_prev_c)
+    dt_bias_align = _assumed_align(dt_bias)
+    gamma_bias_align = _assumed_align(gamma_bias)
+    omega_bias_align = _assumed_align(omega_bias)
+    mix_r_bias_align = _assumed_align(mix_r_bias)
+    mix_theta_bias_align = _assumed_align(mix_theta_bias)
+    mix_k_prev_bias_align = _assumed_align(mix_k_prev_bias)
+    mix_k_curr_bias_align = _assumed_align(mix_k_curr_bias)
+    b_scale_align = _assumed_align(b_scale)
+    c_scale_align = _assumed_align(c_scale)
+    y_align = _assumed_align(y)
+    final_state_align = _assumed_align(final_state)
+    u_last_align = _assumed_align(u_last)
+    out_proj_align = _assumed_align(out_proj)
+    projected_align = _assumed_align(projected)
 
     spec = (batch, heads, P, N)
     if fuse_outproj:
@@ -368,7 +371,7 @@ def mixer_decode_step_cute(
         if b_prev_aliases_output and p_tiles > 1
         else b_last
     )
-    b_last_kernel_ptr, b_last_kernel_align = make_ptr_arg(b_last_kernel)
+    b_last_kernel_align = _assumed_align(b_last_kernel)
     b_last_kernel_stride = cast(
         tuple[int, int, int],
         tuple(int(v) for v in b_last_kernel.stride()),
@@ -434,9 +437,6 @@ def mixer_decode_step_cute(
         float(eps),
     )
     compiled = _DECODE_CACHE.get(cache_key)
-    current_stream = cuda.CUstream(
-        torch.cuda.current_stream(device=value.device).cuda_stream
-    )
     if compiled is None:
         if _is_cuda_graph_capturing(value.device):
             _raise_cold_capture_error("compile cache")
@@ -464,57 +464,87 @@ def mixer_decode_step_cute(
                 k_max=k_max,
                 eps=eps,
             ),
-            value_ptr,
-            params_ptr,
-            bc_ptr,
-            gate_ptr,
-            skip_ptr,
-            state_ptr,
-            b_prev_ptr,
-            u_prev_ptr,
-            dt_bias_ptr,
-            gamma_bias_ptr,
-            omega_bias_ptr,
-            mix_r_bias_ptr,
-            mix_theta_bias_ptr,
-            mix_k_prev_bias_ptr,
-            mix_k_curr_bias_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            y_ptr,
-            final_state_ptr,
-            b_last_kernel_ptr,
-            u_last_ptr,
-            out_proj_ptr,
-            projected_ptr,
-            cute.runtime.make_fake_stream(),
+            _make_fake_tensor_arg(value_c, align=value_align),
+            _make_fake_tensor_arg(params_c, align=params_align),
+            _make_fake_tensor_arg(bc_c, align=bc_align),
+            _make_fake_tensor_arg(gate_c, align=gate_align),
+            _make_fake_tensor_arg(skip_c, align=skip_align),
+            _make_fake_tensor_arg(
+                state_c,
+                shape=tuple(int(v) for v in state_c.shape),
+                stride=state_stride,
+                align=state_align,
+            ),
+            _make_fake_tensor_arg(
+                b_prev_c,
+                shape=tuple(int(v) for v in b_prev_c.shape),
+                stride=prev_b_stride,
+                align=b_prev_align,
+            ),
+            _make_fake_tensor_arg(
+                u_prev_c,
+                shape=tuple(int(v) for v in u_prev_c.shape),
+                stride=prev_u_stride,
+                align=u_prev_align,
+            ),
+            _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
+            _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
+            _make_fake_tensor_arg(omega_bias, align=omega_bias_align),
+            _make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
+            _make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
+            _make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
+            _make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
+            _make_fake_tensor_arg(b_scale, align=b_scale_align),
+            _make_fake_tensor_arg(c_scale, align=c_scale_align),
+            _make_fake_tensor_arg(y, align=y_align),
+            _make_fake_tensor_arg(
+                final_state,
+                shape=tuple(int(v) for v in final_state.shape),
+                stride=final_state_stride,
+                align=final_state_align,
+            ),
+            _make_fake_tensor_arg(
+                b_last_kernel,
+                shape=tuple(int(v) for v in b_last_kernel.shape),
+                stride=b_last_kernel_stride,
+                align=b_last_kernel_align,
+            ),
+            _make_fake_tensor_arg(
+                u_last,
+                shape=tuple(int(v) for v in u_last.shape),
+                stride=u_last_stride,
+                align=u_last_align,
+            ),
+            _make_fake_tensor_arg(out_proj, align=out_proj_align),
+            _make_fake_tensor_arg(projected, align=projected_align),
+            _compile_env_stream_placeholder(),
+            options="--enable-tvm-ffi",
         )
         _DECODE_CACHE[cache_key] = compiled
     cast(Callable[..., None], compiled)(
-        value_ptr,
-        params_ptr,
-        bc_ptr,
-        gate_ptr,
-        skip_ptr,
-        state_ptr,
-        b_prev_ptr,
-        u_prev_ptr,
-        dt_bias_ptr,
-        gamma_bias_ptr,
-        omega_bias_ptr,
-        mix_r_bias_ptr,
-        mix_theta_bias_ptr,
-        mix_k_prev_bias_ptr,
-        mix_k_curr_bias_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        y_ptr,
-        final_state_ptr,
-        b_last_kernel_ptr,
-        u_last_ptr,
-        out_proj_ptr,
-        projected_ptr,
-        current_stream,
+        value_c,
+        params_c,
+        bc_c,
+        gate_c,
+        skip_c,
+        state_c,
+        b_prev_c,
+        u_prev_c,
+        dt_bias,
+        gamma_bias,
+        omega_bias,
+        mix_r_bias,
+        mix_theta_bias,
+        mix_k_prev_bias,
+        mix_k_curr_bias,
+        b_scale,
+        c_scale,
+        y,
+        final_state,
+        b_last_kernel,
+        u_last,
+        out_proj,
+        projected,
     )
     if b_last_kernel is not b_last:
         b_last.copy_(b_last_kernel)

@@ -1160,86 +1160,89 @@ class ScanPrepBwdFused:
     @cute.jit
     def __call__(
         self,
-        du_ptr: cute.Pointer,
-        bc_ptr: cute.Pointer,
-        db_ptr: cute.Pointer,
-        dc_ptr: cute.Pointer,
-        b_scale_ptr: cute.Pointer,
-        c_scale_ptr: cute.Pointer,
-        rms_inv_ptr: cute.Pointer,
-        coeff_aux_ptr: cute.Pointer,
-        dm_ptr: cute.Pointer,
-        dk_ptr: cute.Pointer,
-        value_grad_ptr: cute.Pointer,
-        bc_grad_ptr: cute.Pointer,
-        dparams_ptr: cute.Pointer,
-        scale_partial_ptr: cute.Pointer,
-        scale_grad_ptr: cute.Pointer,
-        bias_partial_ptr: cute.Pointer,
-        bias_grad_ptr: cute.Pointer,
+        du: cute.Tensor,
+        bc: cute.Tensor,
+        db: cute.Tensor,
+        dc: cute.Tensor,
+        b_scale: cute.Tensor,
+        c_scale: cute.Tensor,
+        rms_inv: cute.Tensor,
+        coeff_aux: cute.Tensor,
+        dm: cute.Tensor,
+        dk: cute.Tensor,
+        value_grad: cute.Tensor,
+        bc_grad: cute.Tensor,
+        dparams: cute.Tensor,
+        scale_partial: cute.Tensor,
+        scale_grad: cute.Tensor,
+        bias_partial: cute.Tensor,
+        bias_grad: cute.Tensor,
     ):
         mDU = cute.make_tensor(
-            du_ptr, cute.make_layout(self.du_shape, stride=self.du_stride)
+            du.iterator, cute.make_layout(self.du_shape, stride=self.du_stride)
         )
         mBC = cute.make_tensor(
-            bc_ptr, cute.make_layout(self.bc_shape, stride=self.bc_stride)
+            bc.iterator, cute.make_layout(self.bc_shape, stride=self.bc_stride)
         )
         mDB = cute.make_tensor(
-            db_ptr, cute.make_layout(self.grad_shape, stride=self.grad_stride)
+            db.iterator, cute.make_layout(self.grad_shape, stride=self.grad_stride)
         )
         mDC = cute.make_tensor(
-            dc_ptr, cute.make_layout(self.grad_shape, stride=self.grad_stride)
+            dc.iterator, cute.make_layout(self.grad_shape, stride=self.grad_stride)
         )
         mBScale = cute.make_tensor(
-            b_scale_ptr, cute.make_layout(self.scale_shape, stride=self.b_scale_stride)
+            b_scale.iterator,
+            cute.make_layout(self.scale_shape, stride=self.b_scale_stride),
         )
         mCScale = cute.make_tensor(
-            c_scale_ptr, cute.make_layout(self.scale_shape, stride=self.c_scale_stride)
+            c_scale.iterator,
+            cute.make_layout(self.scale_shape, stride=self.c_scale_stride),
         )
         mRmsInv = cute.make_tensor(
-            rms_inv_ptr,
+            rms_inv.iterator,
             cute.make_layout(self.rms_inv_shape, stride=self.rms_inv_stride),
         )
         mCoeffAux = cute.make_tensor(
-            coeff_aux_ptr,
+            coeff_aux.iterator,
             cute.make_layout(self.coeff_aux_shape, stride=self.coeff_aux_stride),
         )
         mDM = cute.make_tensor(
-            dm_ptr, cute.make_layout(self.m_shape, stride=self.m_stride)
+            dm.iterator, cute.make_layout(self.m_shape, stride=self.m_stride)
         )
         mDK = cute.make_tensor(
-            dk_ptr, cute.make_layout(self.k_shape, stride=self.k_stride)
+            dk.iterator, cute.make_layout(self.k_shape, stride=self.k_stride)
         )
         mValueGrad = cute.make_tensor(
-            value_grad_ptr, cute.make_layout(self.value_shape, stride=self.value_stride)
+            value_grad.iterator,
+            cute.make_layout(self.value_shape, stride=self.value_stride),
         )
         mBCGrad = cute.make_tensor(
-            bc_grad_ptr, cute.make_layout(self.bc_shape, stride=self.bc_stride)
+            bc_grad.iterator, cute.make_layout(self.bc_shape, stride=self.bc_stride)
         )
         mDParams = cute.make_tensor(
-            dparams_ptr,
+            dparams.iterator,
             cute.make_layout(self.dparams_shape, stride=self.dparams_stride),
         )
         mScalePartial = cute.make_tensor(
-            scale_partial_ptr,
+            scale_partial.iterator,
             cute.make_layout(
                 self.scale_partial_shape,
                 stride=self.scale_partial_stride,
             ),
         )
         mScaleGrad = cute.make_tensor(
-            scale_grad_ptr,
+            scale_grad.iterator,
             cute.make_layout(self.scale_grad_shape, stride=self.scale_grad_stride),
         )
         mBiasPartial = cute.make_tensor(
-            bias_partial_ptr,
+            bias_partial.iterator,
             cute.make_layout(
                 self.bias_partial_shape,
                 stride=self.bias_partial_stride,
             ),
         )
         mBiasGrad = cute.make_tensor(
-            bias_grad_ptr,
+            bias_grad.iterator,
             cute.make_layout(self.bias_grad_shape, stride=self.bias_grad_stride),
         )
         pack_scale_smem_bytes = (

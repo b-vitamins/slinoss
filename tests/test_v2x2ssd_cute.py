@@ -1114,23 +1114,32 @@ def test_chunk_scan_cute_normalizes_underaligned_chunk_starts(
         compute_dtype=torch.float32,
     )
     starts_bad = _make_underaligned_contiguous_storage_offset_view(starts_ref)
+    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
 
     observed_align_mod_16: list[int] = []
-    orig_make_pointer_tensor_arg = v2x2ssd_fwd_mod._make_pointer_tensor_arg
+    orig_make_fake_tensor_arg = v2x2ssd_fwd_mod._make_fake_tensor_arg
 
-    def wrapped_make_pointer_tensor_arg(
+    def wrapped_make_fake_tensor_arg(
         tensor: torch.Tensor,
-        spec: tuple[tuple[int, ...], tuple[int, ...]],
+        *,
+        shape: tuple[int, ...] | None = None,
+        stride: tuple[int, ...] | None = None,
+        align: int | None = None,
     ):
         if (
             tuple(tensor.shape) == tuple(starts_bad.shape)
             and tensor.dtype == torch.float32
         ):
             observed_align_mod_16.append(tensor.data_ptr() % 16)
-        return orig_make_pointer_tensor_arg(tensor, spec)
+        return orig_make_fake_tensor_arg(
+            tensor,
+            shape=shape,
+            stride=stride,
+            align=align,
+        )
 
     monkeypatch.setattr(
-        v2x2ssd_fwd_mod, "_make_pointer_tensor_arg", wrapped_make_pointer_tensor_arg
+        v2x2ssd_fwd_mod, "_make_fake_tensor_arg", wrapped_make_fake_tensor_arg
     )
 
     y_ref = chunk_scan(

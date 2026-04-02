@@ -8,7 +8,7 @@ import cutlass.cute as cute
 
 from slinoss.perf import note_cache_event
 
-from .common import make_ptr_arg
+from .common import assumed_align, torch_to_cutlass_dtype
 from .kernels.bwd import ScanPrepBwdFused
 
 
@@ -31,6 +31,23 @@ def _cache_set(
     elif len(cache) >= int(limit):
         cache.pop(next(iter(cache)), None)
     cache[key] = value
+
+
+def _make_fake_tensor_arg(
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...] | None = None,
+    stride: tuple[int, ...] | None = None,
+    align: int | None = None,
+):
+    return cute.runtime.make_fake_tensor(
+        torch_to_cutlass_dtype(tensor.dtype),
+        tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
+        stride=tuple(
+            int(step) for step in (stride if stride is not None else tensor.stride())
+        ),
+        assumed_align=int(align if align is not None else assumed_align(tensor)),
+    )
 
 
 def _get_partial_workspace(
@@ -292,23 +309,23 @@ def scanprep_bwd(
     b_scale_stride = tuple(int(s) for s in b_scale_in.stride())
     c_scale_stride = tuple(int(s) for s in c_scale_in.stride())
 
-    du_ptr, du_align = make_ptr_arg(du_in)
-    bc_ptr, bc_align = make_ptr_arg(bc_c)
-    db_ptr, db_align = make_ptr_arg(db_in)
-    dc_ptr, dc_align = make_ptr_arg(dc_in)
-    b_scale_ptr, b_scale_align = make_ptr_arg(b_scale_in)
-    c_scale_ptr, c_scale_align = make_ptr_arg(c_scale_in)
-    rms_inv_ptr, rms_inv_align = make_ptr_arg(rms_inv_c)
-    coeff_aux_ptr, coeff_aux_align = make_ptr_arg(coeff_aux_c)
-    dm_ptr, dm_align = make_ptr_arg(dm_in)
-    dk_ptr, dk_align = make_ptr_arg(dk_in)
-    value_grad_ptr, value_grad_align = make_ptr_arg(value_grad)
-    bc_grad_ptr, bc_grad_align = make_ptr_arg(bc_grad)
-    dparams_ptr, dparams_align = make_ptr_arg(dparams)
-    scale_partial_ptr, scale_partial_align = make_ptr_arg(scale_partial)
-    scale_grad_ptr, scale_grad_align = make_ptr_arg(scale_grad)
-    bias_partial_ptr, bias_partial_align = make_ptr_arg(bias_partial)
-    bias_grad_ptr, bias_grad_align = make_ptr_arg(bias_grad)
+    du_align = assumed_align(du_in)
+    bc_align = assumed_align(bc_c)
+    db_align = assumed_align(db_in)
+    dc_align = assumed_align(dc_in)
+    b_scale_align = assumed_align(b_scale_in)
+    c_scale_align = assumed_align(c_scale_in)
+    rms_inv_align = assumed_align(rms_inv_c)
+    coeff_aux_align = assumed_align(coeff_aux_c)
+    dm_align = assumed_align(dm_in)
+    dk_align = assumed_align(dk_in)
+    value_grad_align = assumed_align(value_grad)
+    bc_grad_align = assumed_align(bc_grad)
+    dparams_align = assumed_align(dparams)
+    scale_partial_align = assumed_align(scale_partial)
+    scale_grad_align = assumed_align(scale_grad)
+    bias_partial_align = assumed_align(bias_partial)
+    bias_grad_align = assumed_align(bias_grad)
 
     spec = (batch, t_size, int(n_heads), int(d_head), int(d_state), 13)
     cache_key = (
@@ -390,45 +407,56 @@ def scanprep_bwd(
                 scale_block_size=scale_block_size,
                 bias_block_size=bias_block_size,
             ),
-            du_ptr,
-            bc_ptr,
-            db_ptr,
-            dc_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            rms_inv_ptr,
-            coeff_aux_ptr,
-            dm_ptr,
-            dk_ptr,
-            value_grad_ptr,
-            bc_grad_ptr,
-            dparams_ptr,
-            scale_partial_ptr,
-            scale_grad_ptr,
-            bias_partial_ptr,
-            bias_grad_ptr,
+            _make_fake_tensor_arg(du_in, stride=du_stride, align=du_align),
+            _make_fake_tensor_arg(bc_c, align=bc_align),
+            _make_fake_tensor_arg(db_in, align=db_align),
+            _make_fake_tensor_arg(dc_in, align=dc_align),
+            _make_fake_tensor_arg(
+                b_scale_in,
+                shape=(n_heads, 2, d_state),
+                stride=b_scale_stride,
+                align=b_scale_align,
+            ),
+            _make_fake_tensor_arg(
+                c_scale_in,
+                shape=(n_heads, 2, d_state),
+                stride=c_scale_stride,
+                align=c_scale_align,
+            ),
+            _make_fake_tensor_arg(rms_inv_c, align=rms_inv_align),
+            _make_fake_tensor_arg(coeff_aux_c, align=coeff_aux_align),
+            _make_fake_tensor_arg(dm_in, align=dm_align),
+            _make_fake_tensor_arg(dk_in, align=dk_align),
+            _make_fake_tensor_arg(value_grad, align=value_grad_align),
+            _make_fake_tensor_arg(bc_grad, align=bc_grad_align),
+            _make_fake_tensor_arg(dparams, align=dparams_align),
+            _make_fake_tensor_arg(scale_partial, align=scale_partial_align),
+            _make_fake_tensor_arg(scale_grad, align=scale_grad_align),
+            _make_fake_tensor_arg(bias_partial, align=bias_partial_align),
+            _make_fake_tensor_arg(bias_grad, align=bias_grad_align),
+            options="--enable-tvm-ffi",
         )
         _SCANPREP_BWD_CACHE[cache_key] = compiled
     else:
         note_cache_event("cute.scanprep.bwd.compile", hit=True)
     compiled(
-        du_ptr,
-        bc_ptr,
-        db_ptr,
-        dc_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        rms_inv_ptr,
-        coeff_aux_ptr,
-        dm_ptr,
-        dk_ptr,
-        value_grad_ptr,
-        bc_grad_ptr,
-        dparams_ptr,
-        scale_partial_ptr,
-        scale_grad_ptr,
-        bias_partial_ptr,
-        bias_grad_ptr,
+        du_in,
+        bc_c,
+        db_in,
+        dc_in,
+        b_scale_in,
+        c_scale_in,
+        rms_inv_c,
+        coeff_aux_c,
+        dm_in,
+        dk_in,
+        value_grad,
+        bc_grad,
+        dparams,
+        scale_partial,
+        scale_grad,
+        bias_partial,
+        bias_grad,
     )
 
     if _is_cuda_graph_capturing(bc.device):

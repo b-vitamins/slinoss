@@ -562,6 +562,67 @@ def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
     assert compile_calls == []
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_decode_step_cute_compile_enables_tvm_ffi(
+    monkeypatch,
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    (
+        mixer,
+        value_h,
+        params_h,
+        bc_h,
+        gate_h,
+        skip,
+        initial_states,
+        b_prev,
+        u_prev,
+    ) = _make_decode_step_fixture(dtype=dtype)
+    decode_mod._DECODE_CACHE.clear()
+
+    compile_options: list[object] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_options.append(kwargs.get("options"))
+        return orig_compile(*args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+
+    with torch.no_grad():
+        mixer_decode_step_cute(
+            value_h,
+            params_h,
+            bc_h,
+            gate_h,
+            skip,
+            initial_states=initial_states,
+            B_prev=b_prev,
+            U_prev=u_prev,
+            dt_min=mixer.scanprep.dt_min,
+            dt_max=mixer.scanprep.dt_max,
+            r_min=mixer.scanprep.r_min,
+            r_max=mixer.scanprep.r_max,
+            theta_bound=mixer.scanprep.theta_bound,
+            k_max=mixer.scanprep.k_max,
+            eps=mixer.scanprep.eps,
+            dt_bias=mixer.scanprep.dt_bias.detach(),
+            gamma_bias=mixer.scanprep.gamma_bias.detach(),
+            omega_bias=mixer.scanprep.omega_bias.detach(),
+            mix_r_bias=mixer.scanprep.mix_r_bias.detach(),
+            mix_theta_bias=mixer.scanprep.mix_theta_bias.detach(),
+            mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias.detach(),
+            mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias.detach(),
+            b_scale=cast(torch.Tensor, mixer.scanprep.b_scale).detach(),
+            c_scale=cast(torch.Tensor, mixer.scanprep.c_scale).detach(),
+            output_dtype=dtype,
+        )
+
+    assert compile_options == ["--enable-tvm-ffi"]
+
+
 def test_nextchar_decode_one_falls_back_on_cpu() -> None:
     torch.manual_seed(0)
 
