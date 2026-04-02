@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import slinoss.ops.v2x2ssd.cute.kernels.bwd as v2x2ssd_bwd_mod
+import slinoss.ops.v2x2ssd.cute.kernels.fwd as v2x2ssd_fwd_mod
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _resolve_chunk_scan_launch_cfg,
@@ -81,6 +82,20 @@ def _make_underaligned_contiguous_view(t: torch.Tensor) -> torch.Tensor:
     view.copy_(t)
     assert view.is_contiguous()
     assert view.data_ptr() % 4 == 2
+    return view
+
+
+def _make_underaligned_contiguous_storage_offset_view(t: torch.Tensor) -> torch.Tensor:
+    base = torch.empty((t.numel() + 1,), device=t.device, dtype=t.dtype)
+    view = torch.as_strided(
+        base,
+        size=t.shape,
+        stride=t.stride(),
+        storage_offset=1,
+    )
+    view.copy_(t)
+    assert view.is_contiguous()
+    assert view.data_ptr() % 16 != 0
     return view
 
 
@@ -991,6 +1006,92 @@ def test_v2x2ssd_cute_accepts_underaligned_contiguous_activations(
         output_dtype=torch.float32,
     )
 
+    torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_cute_normalizes_underaligned_chunk_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+        value_dtype=torch.bfloat16,
+    )
+    inc_ref, m_ref = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=32,
+        compute_dtype=torch.float32,
+    )
+    starts_ref, _ = state_passing(
+        inc_ref,
+        m_ref,
+        initial_states=initial_states,
+        compute_dtype=torch.float32,
+    )
+    starts_bad = _make_underaligned_contiguous_storage_offset_view(starts_ref)
+
+    observed_align_mod_16: list[int] = []
+    orig_make_pointer_tensor_arg = v2x2ssd_fwd_mod._make_pointer_tensor_arg
+
+    def wrapped_make_pointer_tensor_arg(
+        tensor: torch.Tensor,
+        spec: tuple[tuple[int, ...], tuple[int, ...]],
+    ):
+        if (
+            tuple(tensor.shape) == tuple(starts_bad.shape)
+            and tensor.dtype == torch.float32
+        ):
+            observed_align_mod_16.append(tensor.data_ptr() % 16)
+        return orig_make_pointer_tensor_arg(tensor, spec)
+
+    monkeypatch.setattr(
+        v2x2ssd_fwd_mod, "_make_pointer_tensor_arg", wrapped_make_pointer_tensor_arg
+    )
+
+    y_ref = chunk_scan(
+        U,
+        M,
+        K,
+        B,
+        C,
+        starts_ref,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=32,
+        output_dtype=torch.bfloat16,
+        compute_dtype=torch.float32,
+    )
+    y_cute = chunk_scan_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        starts_bad,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        chunk_size=32,
+        output_dtype=torch.bfloat16,
+        compute_dtype=torch.float32,
+    )
+
+    assert observed_align_mod_16
+    assert observed_align_mod_16[-1] == 0
     torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
 
 

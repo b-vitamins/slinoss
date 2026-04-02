@@ -1213,6 +1213,7 @@ def _compile_chunk_scan_kernel_impl(
         U_prev0 = _ensure_min_alignment(U_prev0, min_align=16)
 
     chunk_starts_c = chunk_starts.contiguous()
+    chunk_starts_c = _ensure_min_alignment(chunk_starts_c, min_align=16)
     u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
         _chunk_scan_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
     )
@@ -1595,6 +1596,7 @@ def _build_forward_args(
             P=P,
             D=D,
         )
+    chunk_starts = _ensure_min_alignment(chunk_starts, min_align=16)
     m_chunk_chunk.zero_()
     m_chunk = m_chunk_chunk.reshape(Bsz, H, n_chunks, 2)
     out_chunk = torch.empty(
