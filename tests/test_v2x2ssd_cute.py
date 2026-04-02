@@ -638,7 +638,7 @@ def test_v2x2ssd_fwd_cute_stateful_forward_is_repeatable_for_issue_9_shape() -> 
     )
 
     with torch.no_grad():
-        out_a = v2x2ssd_fwd_cute(
+        reference = v2x2ssd_fwd_cute(
             U,
             M,
             K,
@@ -653,24 +653,24 @@ def test_v2x2ssd_fwd_cute_stateful_forward_is_repeatable_for_issue_9_shape() -> 
             return_final_state=True,
             return_intermediates=True,
         )
-        out_b = v2x2ssd_fwd_cute(
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_size=128,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            compute_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-            return_final_state=True,
-            return_intermediates=True,
-        )
-
-    for got, want in zip(out_b, out_a, strict=True):
-        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+        for _ in range(8):
+            replay = v2x2ssd_fwd_cute(
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_size=128,
+                initial_states=initial_states,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                compute_dtype=torch.float32,
+                output_dtype=torch.bfloat16,
+                return_final_state=True,
+                return_intermediates=True,
+            )
+            for got, want in zip(replay, reference, strict=True):
+                torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

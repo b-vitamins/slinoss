@@ -2187,6 +2187,10 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                             tOrVt[None, None, k],
                             acc_O,
                         )
+                    # The V tile aliases the main shared staging buffer in the
+                    # fast path, so do not let later stages overwrite it until
+                    # every warp is done.
+                    cute.arch.barrier()
 
         if cutlass.const_expr(mOut.element_type == cutlass.Float32):
             for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
