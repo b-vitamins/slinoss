@@ -261,10 +261,7 @@ def _public_from_chunked(
 ) -> torch.Tensor:
     B, H, C, L, F = map(int, x.shape)
     out = x.reshape(B, H, C * L, F)[:, :, :T, :]
-    target_dtype = out.dtype if dtype is None else dtype
-    if out.dtype != target_dtype:
-        out = out.to(dtype=target_dtype)
-    return out.contiguous()
+    return _materialize_public_output(x, out, dtype=dtype)
 
 
 def _fold_chunk_boundary_carries(
@@ -292,10 +289,7 @@ def _public_from_param_scan(
     if S != 1:
         raise ValueError("Only n_splits=1 is supported by the public wrapper.")
     out = x[:, :, :, 0, :, :].reshape(B, H, C * L, F)[:, :, :T, :]
-    target_dtype = out.dtype if dtype is None else dtype
-    if out.dtype != target_dtype:
-        out = out.to(dtype=target_dtype)
-    return out.contiguous()
+    return _materialize_public_output(x, out, dtype=dtype)
 
 
 def _public_dk_from_parts(
@@ -313,6 +307,24 @@ def _public_dk_from_parts(
     return (
         dK.reshape(B, H, C * L, 2, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
     )
+
+
+def _materialize_public_output(
+    source: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    target_dtype = out.dtype if dtype is None else dtype
+    if out.dtype != target_dtype:
+        out = out.to(dtype=target_dtype)
+    if not out.is_contiguous():
+        out = out.contiguous()
+    # Public returns must not alias cached workspace storage when the view
+    # already has the public layout and dtype.
+    if out.data_ptr() == source.data_ptr():
+        out = out.clone()
+    return out
 
 
 def _resolve_dz0_cta_tiler(*, D: int) -> tuple[int, int, int]:

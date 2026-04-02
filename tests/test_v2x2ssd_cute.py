@@ -1218,6 +1218,69 @@ def test_v2x2ssd_cute_stateful_backward_clears_fused_dm_chunk_workspace(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_bwd_stateful_public_grads_do_not_alias_workspace() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=2,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+
+    inc_ref, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc_ref,
+        m_chunk,
+        initial_states=initial_states,
+        compute_dtype=torch.float32,
+    )
+
+    def run(seed: int) -> tuple[torch.Tensor, ...]:
+        torch.manual_seed(seed)
+        d_out = torch.randn_like(U)
+        d_final = torch.randn_like(initial_states)
+        return v2x2ssd_bwd_mod.v2x2ssd_bwd_stateful_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            m_chunk,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            initial_state_dtype=initial_states.dtype,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            d_final_state=d_final,
+            compute_dtype=torch.float32,
+        )
+
+    grads_first = run(123)
+    grads_first_snapshot = tuple(t.clone() for t in grads_first)
+    _grads_second = run(456)
+    torch.cuda.synchronize()
+
+    for live, snap in zip(grads_first, grads_first_snapshot, strict=True):
+        torch.testing.assert_close(live, snap, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_cute_segmented_training_matches_single_pass_for_realistic_shape() -> (
     None
 ):

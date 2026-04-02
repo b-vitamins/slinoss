@@ -20,6 +20,7 @@ from .chunk_increment.du import ChunkIncrementBwdDUAmpere
 from .chunk_increment.param_scan import ChunkIncrementBwdParamScanAmpere
 from .chunk_scan import (
     _fold_chunk_boundary_carries,
+    _materialize_public_output,
     _public_from_chunked,
     _public_from_param_scan,
     _resolve_dz0_cta_tiler,
@@ -1256,13 +1257,21 @@ def _v2x2ssd_bwd_cute_impl(
         _public_from_packed_dk(dK_scan, T=U.shape[2]),
         _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
         _public_from_chunked(dC_scan, T=U.shape[2], dtype=C.dtype),
-        d_initial.to(dtype=initial_state_dtype or torch.float32).contiguous(),
-        dB_prev_scan[:, :, 0, :]
-        .to(dtype=B_prev.dtype if B_prev is not None else B.dtype)
-        .contiguous(),
-        dU_prev_scan[:, :, 0, :]
-        .to(dtype=U_prev.dtype if U_prev is not None else U.dtype)
-        .contiguous(),
+        _materialize_public_output(
+            d_initial,
+            d_initial,
+            dtype=initial_state_dtype or torch.float32,
+        ),
+        _materialize_public_output(
+            dB_prev_scan,
+            dB_prev_scan[:, :, 0, :],
+            dtype=B_prev.dtype if B_prev is not None else B.dtype,
+        ),
+        _materialize_public_output(
+            dU_prev_scan,
+            dU_prev_scan[:, :, 0, :],
+            dtype=U_prev.dtype if U_prev is not None else U.dtype,
+        ),
     )
 
 
