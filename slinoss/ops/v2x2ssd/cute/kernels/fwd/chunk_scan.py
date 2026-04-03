@@ -1,45 +1,29 @@
-"""CuTe forward kernels for the v2x2ssd chunk-scan stage.
+"""CuTe forward kernel for the ``v2x2ssd`` chunk-scan stage.
 
-This file mirrors the structural shape of
-``v3x3ssd.cute.kernels.fwd.chunk_scan``:
+``ChunkScanFwdAmpere`` is the live Ampere tensor-core implementation used by
+the forward path. It reconstructs prefix magnitude/phase metadata from ``M``,
+accumulates the off-term from ``Z0``, runs the two diagonal scan passes using
+the two complex taps in ``K``, and writes the stage output ``Out``.
 
-- ``ChunkScanFwdInnerAmpere`` owns the FA2-like inner workhorse over already
-  phase-rotated per-chunk operands.
-- ``ChunkScanFwdAmpere`` owns the end-to-end stage kernel, reconstructing the
-  per-step prefix metadata and complex tap application in-kernel before running
-  the same off-term + two diag passes.
+Tensor contracts:
 
-Unlike ``v3``, the ``v2`` scan uses complex scalars / complex taps instead of
-quaternion transport and 3x3 tap matrices:
+- ``U``: ``(BHC, L, 1, P)`` fp16/bf16 value input
+- ``B``: ``(BHC, L, 1, D)`` fp16/bf16 key-side packed complex input
+- ``C``: ``(BHC, L, 1, D)`` fp16/bf16 query-side packed complex input
+- ``M``: ``(BHC, L, 2)`` fp32 packed complex transitions
+- ``K``: ``(BHC, L, 2, 2)`` fp32 packed complex taps for the previous/current
+  diagonal passes
+- ``Z0``: ``(BHC, P, 1, D)`` fp32 packed complex initial state
+- ``U_prev0``: ``(BH, P)`` fp16/bf16 chunk-0 boundary value row
+- ``B_prev0``: ``(BH, D)`` fp16/bf16 chunk-0 boundary key row
+- ``Out``: ``(BHC, L, 1, P)`` fp16/bf16/fp32 stage output
 
-- ``M[t]`` is a complex scalar transition.
-- ``Kprev[t]`` / ``Kcurr[t]`` are complex scalar taps.
-- ``B[t]`` / ``C[t]`` / ``chunk_starts`` store complex pairs packed along the
-  trailing ``D = 2N`` dimension.
-
-The inner kernel expects already phase-rotated tensors:
-
-- ``Q = conj(C) * phase_prefix``               packed complex, ``(BHC, L, 1, D)``
-- ``Kprev = (Kprev tap * Bprev) * conj(phase_prefix)``
-- ``Kcurr = (Kcurr tap * Bcurr) * conj(phase_prefix)``
-- ``Vprev`` / ``Vcurr`` are real ``U`` streams, ``(BHC, L, 1, P)``
-- ``logprefix`` is the fp32 cumulative log-magnitude prefix, ``(BHC, L)``
-- ``Z0`` is the chunk-start state, packed complex, ``(BHC, P, 1, D)``
-- ``Out`` is real ``(BHC, L, 1, P)``
-
-The end-to-end kernel consumes raw stage inputs:
-
-- ``U``      ``(BHC, L, 1, P)``  fp16/bf16
-- ``B``      ``(BHC, L, 1, D)``  fp16/bf16
-- ``C``      ``(BHC, L, 1, D)``  fp16/bf16
-- ``M``      ``(BHC, L, 2)``     fp32 packed complex
-- ``K``      ``(BHC, L, 2, 2)``  fp32 packed complex taps
-- ``Z0``     ``(BHC, P, 1, D)``  fp32 packed complex states
-- ``U_prev0`` ``(BH, P)``        fp16/bf16
-- ``B_prev0`` ``(BH, D)``        fp16/bf16
+The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be
+even and conceptually corresponds to ``2 * N``.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import ClassVar
 
 import torch
@@ -72,19 +56,19 @@ class ChunkScanSupportInfo:
 
 @dataclass(frozen=True)
 class ChunkScanLayoutBundle:
-    sQ_layout: object
-    sB_layout: object
-    sK_layout: object
-    sZ_layout: object
-    sV_layout: object
-    sO_layout: object
+    query_layout: object
+    bz_alias_layout: object
+    key_layout: object
+    z_layout: object
+    value_layout: object
+    output_layout: object
 
 
 @dataclass(frozen=True)
 class ChunkScanCopyBundle:
-    gmem_tiled_copy_D: object
-    gmem_tiled_copy_P: object
-    gmem_tiled_copy_O: object
+    gmem_tiled_copy_d: object
+    gmem_tiled_copy_p: object
+    gmem_tiled_copy_output: object
 
 
 @dataclass(frozen=True)
@@ -92,6 +76,7 @@ class ChunkScanKernelBundle:
     layouts: ChunkScanLayoutBundle
     copies: ChunkScanCopyBundle
     tiled_mma: object
+    shared_storage_cls: object
     compute_smem_bytes: int
     output_smem_bytes: int
 
@@ -100,8 +85,8 @@ class ChunkScanKernelBundle:
         return max(self.compute_smem_bytes, self.output_smem_bytes)
 
 
-class ChunkScanFwdInnerAmpere:
-    """Ampere tensor-core inner kernel for the ``v2`` chunk-scan stage."""
+class ChunkScanFwdAmpere:
+    """Ampere tensor-core forward kernel for the ``v2x2ssd`` chunk-scan op."""
 
     _SUPPORTED_TILE_FAMILIES: tuple[tuple[int, int], ...] = (
         (64, 128),
@@ -154,10 +139,6 @@ class ChunkScanFwdInnerAmpere:
         return (self.L + self.n_block_size - 1) // self.n_block_size
 
     @property
-    def n_complex(self) -> int:
-        return self.D // 2
-
-    @property
     def num_warps(self) -> int:
         return self.num_threads // 32
 
@@ -184,17 +165,11 @@ class ChunkScanFwdInnerAmpere:
             return int(utils.get_smem_capacity_in_bytes(cc))
         return int(utils.get_smem_capacity_in_bytes("sm_80"))
 
-    def _q_smem_elems(self) -> int:
-        return int(self.m_block_size) * int(self.D_padded)
-
-    def _b_smem_elems(self) -> int:
-        return int(max(self.P_padded, self.n_block_size)) * int(self.D_padded)
-
     def _v_smem_elems(self) -> int:
         return int(self.n_block_size) * int(self.P_padded)
 
     def _v_alias_in_bz(self) -> bool:
-        """Whether ``sV`` can alias ``bz_alias`` storage instead of separate smem."""
+        """Return whether the staged value tile fits inside the ``bz_alias`` slab."""
         return self._v_smem_elems() <= self._b_smem_elems()
 
     @staticmethod
@@ -212,21 +187,40 @@ class ChunkScanFwdInnerAmpere:
         return cls._align_up(offset, max_align)
 
     def _compute_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
+        """Estimate dynamic SMEM for support checks without constructing layouts."""
         in_bytes = in_dtype.width // 8
-        fields = [
-            (self._q_smem_elems() * in_bytes, 16),
-            (self._b_smem_elems() * in_bytes, 16),
+        # Keep this accounting aligned with `_make_shared_storage`. It must stay
+        # host-only because the CuTe layout builders need an MLIR context.
+        compute_fields = [
+            ("q_tile", self._q_smem_elems() * in_bytes),
+            ("bz_alias", self._b_smem_elems() * in_bytes),
         ]
         if not self._v_alias_in_bz():
-            fields.append((self._v_smem_elems() * in_bytes, 16))
-        fields.append((self.m_block_size * 4, 16))
-        fields.append((self.n_block_size * 4, 16))
-        return self._struct_size_bytes(fields)
+            compute_fields.append(("v_tile", self._v_smem_elems() * in_bytes))
+        compute_fields.extend(
+            [
+                ("query_scale", self.m_block_size * 4),
+                ("key_scale", self.n_block_size * 4),
+                ("log_prefix", self.L * 4),
+                ("phase_re", self.L * 4),
+                ("phase_im", self.L * 4),
+                ("tap_phase_re", self.n_block_size * 4),
+                ("tap_phase_im", self.n_block_size * 4),
+                ("warp_log_total", self.num_warps * 4),
+                ("warp_log_offset", self.num_warps * 4),
+                ("warp_phase_total", self.num_warps * 2 * 4),
+                ("warp_phase_offset", self.num_warps * 2 * 4),
+            ]
+        )
+        return self._struct_size_bytes(
+            [(field_bytes, 16) for _, field_bytes in compute_fields]
+        )
 
     def _output_smem_bytes(self, out_dtype: type[cutlass.Numeric]) -> int:
         out_bytes = out_dtype.width // 8
+        output_fields = [("out_tile", self.m_block_size * self.P_padded * out_bytes)]
         return self._struct_size_bytes(
-            [(self.m_block_size * self.P_padded * out_bytes, 16)]
+            [(field_bytes, 16) for _, field_bytes in output_fields]
         )
 
     def _make_output_shared_storage(
@@ -234,111 +228,14 @@ class ChunkScanFwdInnerAmpere:
         out_dtype: type[cutlass.Numeric],
         layouts: ChunkScanLayoutBundle,
     ):
+        @cute.struct
         class SharedStorage:
-            pass
-
-        SharedStorage.__annotations__ = {
-            "out_tile": cute.struct.Align[
-                cute.struct.MemRange[out_dtype, cute.cosize(layouts.sO_layout)],
+            out_tile: cute.struct.Align[
+                cute.struct.MemRange[out_dtype, cute.cosize(layouts.output_layout)],
                 16,
             ]
-        }
-        return cute.struct(SharedStorage)
 
-    def _make_layout_bundle(
-        self, out_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanLayoutBundle:
-        Dp = self.D_padded
-        Pp = self.P_padded
-        m = self.m_block_size
-        n = self.n_block_size
-
-        smem_k_block_size_D = 64 if Dp % 64 == 0 else 32
-        swizzle_bits_D = 3 if smem_k_block_size_D == 64 else 2
-        sD_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_D, 3, 3),
-            0,
-            cute.make_layout((8, smem_k_block_size_D), stride=(smem_k_block_size_D, 1)),
-        )
-        sQ_layout = cute.tile_to_shape(sD_layout_atom, (m, Dp), (0, 1))
-        sB_layout = cute.tile_to_shape(sD_layout_atom, (max(Pp, n), Dp), (0, 1))
-        sK_layout = cute.tile_to_shape(sD_layout_atom, (n, Dp), (0, 1))
-        sZ_layout = cute.tile_to_shape(sD_layout_atom, (Pp, Dp), (0, 1))
-
-        smem_k_block_size_P = 64 if Pp % 64 == 0 else 32
-        swizzle_bits_P = 3 if smem_k_block_size_P == 64 else 2
-        sP_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_P, 3, 3),
-            0,
-            cute.make_layout((8, smem_k_block_size_P), stride=(smem_k_block_size_P, 1)),
-        )
-        sV_layout = cute.tile_to_shape(sP_layout_atom, (n, Pp), (0, 1))
-        sO_layout = cute.tile_to_shape(sP_layout_atom, (m, Pp), (0, 1))
-        if out_dtype == cutlass.Float32:
-            sO_layout = cute.make_layout((m, Pp), stride=(Pp, 1))
-
-        return ChunkScanLayoutBundle(
-            sQ_layout=sQ_layout,
-            sB_layout=sB_layout,
-            sK_layout=sK_layout,
-            sZ_layout=sZ_layout,
-            sV_layout=sV_layout,
-            sO_layout=sO_layout,
-        )
-
-    def _make_copy_bundle(
-        self,
-        in_dtype: type[cutlass.Numeric],
-        out_dtype: type[cutlass.Numeric],
-    ) -> ChunkScanCopyBundle:
-        universal_copy_bits = 128
-        Dp = self.D_padded
-        Pp = self.P_padded
-        async_elems_in = universal_copy_bits // in_dtype.width
-
-        smem_k_block_size_D = 64 if Dp % 64 == 0 else 32
-        tD_shape_dim_1 = smem_k_block_size_D // async_elems_in
-        tD_layout = cute.make_layout(
-            (self.num_threads // tD_shape_dim_1, tD_shape_dim_1),
-            stride=(tD_shape_dim_1, 1),
-        )
-        smem_k_block_size_P = 64 if Pp % 64 == 0 else 32
-        tP_shape_dim_1 = smem_k_block_size_P // async_elems_in
-        tP_layout = cute.make_layout(
-            (self.num_threads // tP_shape_dim_1, tP_shape_dim_1),
-            stride=(tP_shape_dim_1, 1),
-        )
-        v_in_layout = cute.make_layout((1, async_elems_in))
-
-        atom_async_copy_in = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(
-                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
-            ),
-            in_dtype,
-            num_bits_per_copy=universal_copy_bits,
-        )
-        gmem_tiled_copy_D = cute.make_tiled_copy_tv(
-            atom_async_copy_in, tD_layout, v_in_layout
-        )
-        gmem_tiled_copy_P = cute.make_tiled_copy_tv(
-            atom_async_copy_in, tP_layout, v_in_layout
-        )
-
-        store_elems = universal_copy_bits // out_dtype.width
-        atom_universal_copy_out = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            out_dtype,
-            num_bits_per_copy=universal_copy_bits,
-        )
-        v_out_layout = cute.make_layout((1, store_elems))
-        gmem_tiled_copy_O = cute.make_tiled_copy_tv(
-            atom_universal_copy_out, tP_layout, v_out_layout
-        )
-        return ChunkScanCopyBundle(
-            gmem_tiled_copy_D=gmem_tiled_copy_D,
-            gmem_tiled_copy_P=gmem_tiled_copy_P,
-            gmem_tiled_copy_O=gmem_tiled_copy_O,
-        )
+        return SharedStorage
 
     def _make_tiled_mma(self, in_dtype: type[cutlass.Numeric]):
         return cute.make_tiled_mma(
@@ -354,274 +251,16 @@ class ChunkScanFwdInnerAmpere:
     ) -> ChunkScanKernelBundle:
         layouts = self._make_layout_bundle(out_dtype)
         copies = self._make_copy_bundle(in_dtype, out_dtype)
-        shared_storage = self._make_shared_storage(in_dtype, layouts)
-        output_storage = self._make_output_shared_storage(out_dtype, layouts)
+        shared_storage_cls = self._make_shared_storage(in_dtype, layouts)
+        output_storage_cls = self._make_output_shared_storage(out_dtype, layouts)
         return ChunkScanKernelBundle(
             layouts=layouts,
             copies=copies,
             tiled_mma=self._make_tiled_mma(in_dtype),
-            compute_smem_bytes=int(shared_storage.size_in_bytes()),
-            output_smem_bytes=int(output_storage.size_in_bytes()),
+            shared_storage_cls=shared_storage_cls,
+            compute_smem_bytes=int(shared_storage_cls.size_in_bytes()),
+            output_smem_bytes=int(output_storage_cls.size_in_bytes()),
         )
-
-    def _make_shared_storage(
-        self,
-        in_dtype: type[cutlass.Numeric],
-        layouts: ChunkScanLayoutBundle,
-    ):
-        class SharedStorage:
-            pass
-
-        annotations = {
-            "q_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sQ_layout)], 16
-            ],
-            "bz_alias": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
-            ],
-        }
-        if not self._v_alias_in_bz():
-            annotations["v_tile"] = cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
-            ]
-        annotations["lp_q"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
-        ]
-        annotations["lp_k"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-        ]
-        SharedStorage.__annotations__ = annotations
-        return cute.struct(SharedStorage)
-
-    @cute.jit
-    def _accumulate_from_smem_mma(
-        self,
-        tiled_mma: cute.TiledMma,
-        acc: cute.Tensor,
-        smem_tiled_copy_A: cute.TiledCopy,
-        smem_tiled_copy_B: cute.TiledCopy,
-        tSsA: cute.Tensor,
-        tSrA_view: cute.Tensor,
-        tSsB: cute.Tensor,
-        tSrB_view: cute.Tensor,
-        tSrA: cute.Tensor,
-        tSrB: cute.Tensor,
-    ):
-        cute.copy(smem_tiled_copy_A, tSsA[None, None, 0], tSrA_view[None, None, 0])
-        cute.copy(smem_tiled_copy_B, tSsB[None, None, 0], tSrB_view[None, None, 0])
-        for k in cutlass.range_constexpr(cute.size(tSsA.shape[2])):
-            k_next = (k + 1) % cute.size(tSsA.shape[2])
-            cute.copy(
-                smem_tiled_copy_A,
-                tSsA[None, None, k_next],
-                tSrA_view[None, None, k_next],
-            )
-            cute.copy(
-                smem_tiled_copy_B,
-                tSsB[None, None, k_next],
-                tSrB_view[None, None, k_next],
-            )
-            cute.gemm(
-                tiled_mma,
-                acc,
-                tSrA[None, None, k],
-                tSrB[None, None, k],
-                acc,
-            )
-        # All warps must finish consuming the staged shared tiles before the
-        # caller can repopulate the same storage for the next slice.
-        cute.arch.barrier()
-
-    @cute.jit
-    def _make_mma_accumulator(self, layout_or_shape, dtype):
-        return cute.make_rmem_tensor(layout_or_shape, dtype)
-
-    @cute.jit
-    def _make_mma_accumulator_like(self, src, dtype):
-        return cute.make_rmem_tensor_like(src, dtype)
-
-    @cute.jit
-    def _make_copy_col_predicate(
-        self,
-        partitioned_tensor: cute.Tensor,
-        partitioned_coord: cute.Tensor,
-        col_limit: int,
-    ):
-        pred = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    partitioned_tensor.shape[0][1],
-                    cute.size(partitioned_tensor, mode=[1]),
-                    cute.size(partitioned_tensor, mode=[2]),
-                ),
-                stride=(cute.size(partitioned_tensor, mode=[2]), 0, 1),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in cutlass.range_constexpr(pred.shape[0]):
-            for rest_k in cutlass.range_constexpr(pred.shape[2]):
-                pred[rest_v, 0, rest_k] = cute.elem_less(
-                    partitioned_coord[(0, rest_v), 0, rest_k][3], col_limit
-                )
-        return pred
-
-    @cute.jit
-    def _copy_gmem_rows_or_zero(
-        self,
-        gmem_tiled_copy: cute.TiledCopy,
-        tSg: cute.Tensor,
-        tSd: cute.Tensor,
-        tSc: cute.Tensor,
-        copy_pred: cute.Tensor,
-        row_limit: int,
-    ):
-        for idx in cutlass.range_constexpr(cute.size(tSd.shape[1])):
-            if cute.elem_less(tSc[0, idx, 0][1], row_limit):
-                cute.copy(
-                    gmem_tiled_copy,
-                    tSg[None, idx, None],
-                    tSd[None, idx, None],
-                    pred=copy_pred[None, idx, None],
-                )
-            else:
-                tSd[None, idx, None].fill(0)
-
-    @cute.jit
-    def _copy_gmem_rows_if_valid(
-        self,
-        gmem_tiled_copy: cute.TiledCopy,
-        tSg: cute.Tensor,
-        tSd: cute.Tensor,
-        tSc: cute.Tensor,
-        copy_pred: cute.Tensor,
-        row_limit: int,
-    ):
-        for idx in cutlass.range_constexpr(cute.size(tSd.shape[1])):
-            if cute.elem_less(tSc[0, idx, 0][1], row_limit):
-                cute.copy(
-                    gmem_tiled_copy,
-                    tSg[None, idx, None],
-                    tSd[None, idx, None],
-                    pred=copy_pred[None, idx, None],
-                )
-
-    def _make_output_tile(self, mOut: cute.Tensor, bhc: int, m_block: int):
-        mcO = cute.make_identity_tensor(mOut.layout.shape)
-        return cute.local_tile(
-            mcO[bhc, None, 0, None],
-            (self.m_block_size, self.P_padded),
-            (m_block, 0),
-        )
-
-    @cute.jit
-    def _accumulate_scores_times_v(
-        self,
-        tiled_mma: cute.TiledMma,
-        acc_S: cute.Tensor,
-        acc_O: cute.Tensor,
-        score_dtype: type[cutlass.Numeric],
-        smem_tiled_copy_V: cute.TiledCopy,
-        tOsVt: cute.Tensor,
-        tOrVt_view: cute.Tensor,
-        tOrVt: cute.Tensor,
-    ):
-        rP = self._make_mma_accumulator_like(acc_S, score_dtype)
-        rP.store(acc_S.load().to(score_dtype))
-        rP_layout_divided = cute.logical_divide(rP.layout, (None, None, 2))
-        rP_mma_view = cute.make_layout(
-            (
-                (rP_layout_divided.shape[0], rP_layout_divided.shape[2][0]),
-                rP_layout_divided.shape[1],
-                rP_layout_divided.shape[2][1],
-            ),
-            stride=(
-                (rP_layout_divided.stride[0], rP_layout_divided.stride[2][0]),
-                rP_layout_divided.stride[1],
-                rP_layout_divided.stride[2][1],
-            ),
-        )
-        tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
-
-        cute.copy(smem_tiled_copy_V, tOsVt[None, None, 0], tOrVt_view[None, None, 0])
-        for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
-            k_next = (k + 1) % cute.size(tOrS.shape[2])
-            cute.copy(
-                smem_tiled_copy_V,
-                tOsVt[None, None, k_next],
-                tOrVt_view[None, None, k_next],
-            )
-            cute.gemm(
-                tiled_mma,
-                acc_O,
-                tOrS[None, None, k],
-                tOrVt[None, None, k],
-                acc_O,
-            )
-        # The V tile aliases the main shared staging buffer in the fast path,
-        # so do not let later stages overwrite it until every warp is done.
-        cute.arch.barrier()
-
-    @cute.jit
-    def _store_output(
-        self,
-        mOut: cute.Tensor,
-        gO: cute.Tensor,
-        cO: cute.Tensor,
-        sQ: cute.Tensor,
-        sO_layout: cute.Layout | cute.ComposedLayout,
-        gmem_tiled_copy_O: cute.TiledCopy,
-        tiled_mma: cute.TiledMma,
-        acc_O: cute.Tensor,
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        thr_mma = tiled_mma.get_slice(tidx)
-        tOcO = thr_mma.partition_C(cO)
-        tOcO_mn = self._make_acc_tensor_mn_view(tOcO)
-        acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
-
-        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
-            for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
-                row_idx = tOcO_mn[r, 0][1]
-                if cute.elem_less(row_idx, mOut.layout.shape[1]):
-                    for c in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
-                        col_idx = tOcO_mn[0, c][3]
-                        if cute.elem_less(col_idx, mOut.layout.shape[3]):
-                            mOut[tOcO_mn[r, c][0], row_idx, 0, col_idx] = (
-                                cutlass.Float32(acc_O_mn[r, c])
-                            )
-        else:
-            rO = cute.make_rmem_tensor_like(acc_O, mOut.element_type)
-            rO.store(acc_O.load().to(mOut.element_type))
-
-            sO = cute.make_tensor(
-                cute.recast_ptr(sQ.iterator, dtype=mOut.element_type), sO_layout
-            )
-            smem_copy_atom_O = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mOut.element_type
-            )
-            smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
-            smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
-            taccOrO = smem_thr_copy_O.retile(rO)
-            taccOsO = smem_thr_copy_O.partition_D(sO)
-            cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
-            cute.arch.barrier()
-
-            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-            tOsO = gmem_thr_copy_O.partition_S(sO)
-            tOgO = gmem_thr_copy_O.partition_D(gO)
-            tOrO = cute.make_rmem_tensor_like(tOgO, mOut.element_type)
-            cute.copy(gmem_tiled_copy_O, tOsO, tOrO)
-
-            tOcOut = gmem_thr_copy_O.partition_D(cO)
-            tOpOut = self._make_copy_col_predicate(tOgO, tOcOut, mOut.layout.shape[3])
-            self._copy_gmem_rows_if_valid(
-                gmem_tiled_copy_O,
-                tOrO,
-                tOgO,
-                tOcOut,
-                tOpOut,
-                mOut.layout.shape[1],
-            )
 
     def support_info(
         self,
@@ -678,474 +317,172 @@ class ChunkScanFwdInnerAmpere:
     ) -> bool:
         return self.support_info(dtype, out_dtype, device_index=device_index).supported
 
+    # Device copy/MMA helpers
     @cute.jit
-    def __call__(
+    def _accumulate_from_staged_tiles(
         self,
-        mQ: cute.Tensor,
-        mKprev: cute.Tensor,
-        mVprev: cute.Tensor,
-        mKcurr: cute.Tensor,
-        mVcurr: cute.Tensor,
-        mLogprefix: cute.Tensor,
-        mZ0: cute.Tensor,
-        mOut: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        if cutlass.const_expr(
-            not (
-                mQ.element_type
-                == mKprev.element_type
-                == mVprev.element_type
-                == mKcurr.element_type
-                == mVcurr.element_type
-                == mZ0.element_type
-            )
-        ):
-            raise TypeError("Q/K/V/Z0 must share the same element type.")
-
-        if cutlass.const_expr(
-            not (
-                mQ.element_type == cutlass.Float16
-                or mQ.element_type == cutlass.BFloat16
-            )
-        ):
-            raise TypeError("Tensor-core path supports only Float16/BFloat16 inputs.")
-
-        if cutlass.const_expr(mLogprefix.element_type != cutlass.Float32):
-            raise TypeError("logprefix must be Float32.")
-
-        if cutlass.const_expr(
-            mOut.element_type
-            not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
-        ):
-            raise TypeError("Output dtype must be Float16/BFloat16/Float32.")
-
-        if cutlass.const_expr(mQ.shape[2] != 1 or mKprev.shape[2] != 1):
-            raise ValueError("Q/K must be shaped as (BHC, L, 1, D).")
-        if cutlass.const_expr(mVprev.shape[2] != 1 or mVcurr.shape[2] != 1):
-            raise ValueError("V must be shaped as (BHC, L, 1, P).")
-        if cutlass.const_expr(mZ0.shape[2] != 1):
-            raise ValueError("Z0 must be shaped as (BHC, P, 1, D).")
-        if cutlass.const_expr(mOut.shape[2] != 1):
-            raise ValueError("Out must be shaped as (BHC, L, 1, P).")
-
-        in_dtype = mQ.element_type
-        out_dtype = mOut.element_type
-        bundle = self._make_kernel_bundle(in_dtype, out_dtype)
-        layouts = bundle.layouts
-        copies = bundle.copies
-        SharedStorage = self._make_shared_storage(in_dtype, layouts)
-        grid_dim = (
-            cute.ceil_div(mQ.shape[1], self.m_block_size),
-            cute.size(mQ.shape[0]),
-            1,
-        )
-
-        self.kernel(
-            mQ,
-            mKprev,
-            mVprev,
-            mKcurr,
-            mVcurr,
-            mLogprefix,
-            mZ0,
-            mOut,
-            layouts.sQ_layout,
-            layouts.sB_layout,
-            layouts.sK_layout,
-            layouts.sZ_layout,
-            layouts.sV_layout,
-            layouts.sO_layout,
-            copies.gmem_tiled_copy_D,
-            copies.gmem_tiled_copy_P,
-            copies.gmem_tiled_copy_O,
-            bundle.tiled_mma,
-            SharedStorage,
-        ).launch(
-            grid=grid_dim,
-            block=[self.num_threads, 1, 1],
-            smem=bundle.smem_size,
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        mQ: cute.Tensor,
-        mKprev: cute.Tensor,
-        mVprev: cute.Tensor,
-        mKcurr: cute.Tensor,
-        mVcurr: cute.Tensor,
-        mLogprefix: cute.Tensor,
-        mZ0: cute.Tensor,
-        mOut: cute.Tensor,
-        sQ_layout: cute.Layout | cute.ComposedLayout,
-        sB_layout: cute.Layout | cute.ComposedLayout,
-        sK_layout: cute.Layout | cute.ComposedLayout,
-        sZ_layout: cute.Layout | cute.ComposedLayout,
-        sV_layout: cute.Layout | cute.ComposedLayout,
-        sO_layout: cute.Layout | cute.ComposedLayout,
-        gmem_tiled_copy_D: cute.TiledCopy,
-        gmem_tiled_copy_P: cute.TiledCopy,
-        gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
-        SharedStorage: cutlass.Constexpr,
+        acc: cute.Tensor,
+        smem_tiled_copy_lhs: cute.TiledCopy,
+        smem_tiled_copy_rhs: cute.TiledCopy,
+        t_smem_lhs: cute.Tensor,
+        t_reg_lhs_view: cute.Tensor,
+        t_smem_rhs: cute.Tensor,
+        t_reg_rhs_view: cute.Tensor,
+        t_reg_lhs: cute.Tensor,
+        t_reg_rhs: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        m_block, bhc, _ = cute.arch.block_idx()
-
-        Dp = self.D_padded
-        Pp = self.P_padded
-        m = self.m_block_size
-        n = self.n_block_size
-        n_block_max = self.n_block_max
-        N = self.n_complex
-
-        gQ = cute.local_tile(mQ[bhc, None, 0, None], (m, Dp), (m_block, 0))
-        gKprev = cute.local_tile(mKprev[bhc, None, 0, None], (n, Dp), (None, 0))
-        gKcurr = cute.local_tile(mKcurr[bhc, None, 0, None], (n, Dp), (None, 0))
-        gVprev = cute.local_tile(mVprev[bhc, None, 0, None], (n, Pp), (None, 0))
-        gVcurr = cute.local_tile(mVcurr[bhc, None, 0, None], (n, Pp), (None, 0))
-        gZ0 = cute.local_tile(mZ0[bhc, None, 0, None], (Pp, Dp), (0, 0))
-        gO = cute.local_tile(mOut[bhc, None, 0, None], (m, Pp), (m_block, 0))
-
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        sQ = storage.q_tile.get_tensor(sQ_layout)
-        sB = storage.bz_alias.get_tensor(sB_layout)
-        if cutlass.const_expr(self._v_alias_in_bz()):
-            sV = cute.make_tensor(sB.iterator, sV_layout)
-        else:
-            sV = storage.v_tile.get_tensor(sV_layout)
-        sK = cute.make_tensor(sB.iterator, sK_layout)
-        sZ = cute.make_tensor(sB.iterator, sZ_layout)
-        sLpQ = storage.lp_q.get_tensor(cute.make_layout((m,), stride=(1,)))
-        sLpK = storage.lp_k.get_tensor(cute.make_layout((n,), stride=(1,)))
-
-        sVt = cute.composition(sV, cute.make_layout((Pp, n), stride=(n, 1)))
-
-        gmem_thr_copy_D = gmem_tiled_copy_D.get_slice(tidx)
-        tQgQ = gmem_thr_copy_D.partition_S(gQ)
-        tQsQ = gmem_thr_copy_D.partition_D(sQ)
-
-        tKgKprev = gmem_thr_copy_D.partition_S(gKprev)
-        tKgKcurr = gmem_thr_copy_D.partition_S(gKcurr)
-        tKsK = gmem_thr_copy_D.partition_D(sK)
-
-        tZgZ = gmem_thr_copy_D.partition_S(gZ0)
-        tZsZ = gmem_thr_copy_D.partition_D(sZ)
-
-        gmem_thr_copy_P = gmem_tiled_copy_P.get_slice(tidx)
-        tVgVprev = gmem_thr_copy_P.partition_S(gVprev)
-        tVgVcurr = gmem_thr_copy_P.partition_S(gVcurr)
-        tVsV = gmem_thr_copy_P.partition_D(sV)
-
-        mcQ = cute.make_identity_tensor(mQ.layout.shape)
-        cQ = cute.local_tile(mcQ[bhc, None, 0, None], (m, Dp), (m_block, 0))
-        tQcQ = gmem_thr_copy_D.partition_S(cQ)
-        tQpQ = self._make_copy_col_predicate(tQsQ, tQcQ, mQ.layout.shape[3])
-
-        mcK = cute.make_identity_tensor(mKprev.layout.shape)
-        cK0 = cute.local_tile(mcK[bhc, None, 0, None], (n, Dp), (0, 0))
-        tKcK0 = gmem_thr_copy_D.partition_S(cK0)
-        tKpK = self._make_copy_col_predicate(tKsK, tKcK0, mKprev.layout.shape[3])
-
-        mcZ = cute.make_identity_tensor(mZ0.layout.shape)
-        cZ = cute.local_tile(mcZ[bhc, None, 0, None], (Pp, Dp), (0, 0))
-        tZcZ = gmem_thr_copy_D.partition_S(cZ)
-        tZpZ = self._make_copy_col_predicate(tZsZ, tZcZ, mZ0.layout.shape[3])
-
-        mcV = cute.make_identity_tensor(mVcurr.layout.shape)
-        cV0 = cute.local_tile(mcV[bhc, None, 0, None], (n, Pp), (0, 0))
-        tVcV0 = gmem_thr_copy_P.partition_S(cV0)
-        tVpV = self._make_copy_col_predicate(tVsV, tVcV0, mVcurr.layout.shape[3])
-
-        thr_mma = tiled_mma.get_slice(tidx)
-        tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
-        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
-        tSrZ = thr_mma.make_fragment_B(thr_mma.partition_B(sZ))
-        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
-
-        acc_shape_O = thr_mma.partition_shape_C((m, Pp))
-        acc_O = cute.make_rmem_tensor(acc_shape_O, cutlass.Float32)
-        acc_O.fill(0.0)
-        acc_shape_S = thr_mma.partition_shape_C((m, n))
-        acc_template_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
-
-        smem_copy_atom_Q = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-            mQ.element_type,
+        cute.copy(
+            smem_tiled_copy_lhs,
+            t_smem_lhs[None, None, 0],
+            t_reg_lhs_view[None, None, 0],
         )
-        smem_copy_atom_K = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-            mQ.element_type,
+        cute.copy(
+            smem_tiled_copy_rhs,
+            t_smem_rhs[None, None, 0],
+            t_reg_rhs_view[None, None, 0],
         )
-        smem_copy_atom_V = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
-            mQ.element_type,
-        )
-
-        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_Q, tiled_mma)
-        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_K, tiled_mma)
-        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
-
-        smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
-        smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
-        smem_thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
-
-        tSsQ = smem_thr_copy_Q.partition_S(sQ)
-        tSrQ_view = smem_thr_copy_Q.retile(tSrQ)
-        tSsK = smem_thr_copy_K.partition_S(sK)
-        tSrK_view = smem_thr_copy_K.retile(tSrK)
-        tSsZ = smem_thr_copy_K.partition_S(sZ)
-        tSrZ_view = smem_thr_copy_K.retile(tSrZ)
-        tOsVt = smem_thr_copy_V.partition_S(sVt)
-        tOrVt_view = smem_thr_copy_V.retile(tOrVt)
-
-        q_row = m_block * m + tidx
-        if tidx < m:
-            scale = cutlass.Float32(0.0)
-            if cute.elem_less(q_row, mLogprefix.shape[1]):
-                lp = cutlass.Float32(mLogprefix[bhc, q_row])
-                scale = cute.math.exp2(lp * cutlass.Float32(LOG2_E), fastmath=True)
-            sLpQ[tidx] = scale
-
-        self._copy_gmem_rows_or_zero(
-            gmem_tiled_copy_D,
-            tQgQ,
-            tQsQ,
-            tQcQ,
-            tQpQ,
-            mQ.layout.shape[1],
-        )
-
-        self._copy_gmem_rows_or_zero(
-            gmem_tiled_copy_D,
-            tZgZ,
-            tZsZ,
-            tZcZ,
-            tZpZ,
-            mZ0.layout.shape[1],
-        )
-
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-
-        idx = tidx
-        total_z = self.P * N
-        while cute.elem_less(idx, total_z):
-            rr = idx // N
-            vv = idx - rr * N
-            imag_col = vv * 2 + 1
-            sZ[rr, imag_col] = -cutlass.Float32(sZ[rr, imag_col]).to(mQ.element_type)
-            idx = idx + self.num_threads
-        cute.arch.barrier()
-
-        self._accumulate_from_smem_mma(
-            tiled_mma,
-            acc_O,
-            smem_tiled_copy_Q,
-            smem_tiled_copy_K,
-            tSsQ,
-            tSrQ_view,
-            tSsZ,
-            tSrZ_view,
-            tSrQ,
-            tSrZ,
-        )
-
-        cO = self._make_output_tile(mOut, bhc, m_block)
-        tOcO = thr_mma.partition_C(cO)
-        tOcO_mn = self._make_acc_tensor_mn_view(tOcO)
-        acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
-
-        m_tile_start = m_block * m
-        for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
-            row_idx = tOcO_mn[r, 0][1]
-            if cute.elem_less(row_idx, mOut.layout.shape[1]):
-                scale = sLpQ[row_idx - m_tile_start]
-                acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
-
-        mcS = cute.make_identity_tensor(
-            (mQ.shape[0], mQ.shape[1], mQ.shape[2], mKprev.shape[1])
-        )
-
-        visible_n_block_max = cutlass.min(
-            cute.ceil_div((m_block + 1) * m, n), n_block_max
-        )
-        full_visible_n_blocks = (m_block * m) // n
-        for pass_id in cutlass.range_constexpr(2):
-            use_prev = cutlass.const_expr(pass_id == 0)
-            tKgK = tKgKprev if use_prev else tKgKcurr
-            tVgV = tVgVprev if use_prev else tVgVcurr
-
-            self._copy_gmem_rows_or_zero(
-                gmem_tiled_copy_D,
-                tKgK[None, None, None, 0],
-                tKsK,
-                tKcK0,
-                tKpK,
-                mKprev.layout.shape[1],
+        for k in cutlass.range_constexpr(cute.size(t_smem_lhs.shape[2])):
+            k_next = (k + 1) % cute.size(t_smem_lhs.shape[2])
+            cute.copy(
+                smem_tiled_copy_lhs,
+                t_smem_lhs[None, None, k_next],
+                t_reg_lhs_view[None, None, k_next],
             )
-            cute.arch.cp_async_commit_group()
+            cute.copy(
+                smem_tiled_copy_rhs,
+                t_smem_rhs[None, None, k_next],
+                t_reg_rhs_view[None, None, k_next],
+            )
+            cute.gemm(
+                tiled_mma,
+                acc,
+                t_reg_lhs[None, None, k],
+                t_reg_rhs[None, None, k],
+                acc,
+            )
+        # All warps must finish consuming the staged shared tiles before the
+        # caller can repopulate the same storage for the next slice.
+        cute.arch.barrier()
 
-            total_k = n * N
-            for n_block in cutlass.range_constexpr(self.n_block_max):
-                if cute.elem_less(n_block, visible_n_block_max):
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.barrier()
-
-                    idx = tidx
-                    while cute.elem_less(idx, total_k):
-                        rr = idx // N
-                        vv = idx - rr * N
-                        re_col = vv * 2 + 0
-                        im_col = vv * 2 + 1
-                        bre = cutlass.Float32(sK[rr, re_col])
-                        bim = cutlass.Float32(sK[rr, im_col])
-                        sK[rr, re_col] = bre.to(mQ.element_type)
-                        sK[rr, im_col] = (-bim).to(mQ.element_type)
-                        idx = idx + self.num_threads
-                    cute.arch.barrier()
-
-                    k_col = n_block * n + tidx
-                    if tidx < n:
-                        if cute.elem_less(k_col, mLogprefix.shape[1]):
-                            lp_s = cutlass.Float32(mLogprefix[bhc, k_col])
-                            sLpK[tidx] = cute.math.exp2(
-                                -lp_s * cutlass.Float32(LOG2_E), fastmath=True
-                            )
-                        else:
-                            sLpK[tidx] = 0.0
-
-                    if cutlass.const_expr(not self._v_alias_in_bz()):
-                        cV = cute.local_tile(
-                            mcV[bhc, None, 0, None], (n, Pp), (n_block, 0)
-                        )
-                        tVcV = gmem_thr_copy_P.partition_S(cV)
-                        self._copy_gmem_rows_or_zero(
-                            gmem_tiled_copy_P,
-                            tVgV[None, None, None, n_block],
-                            tVsV,
-                            tVcV,
-                            tVpV,
-                            mVcurr.layout.shape[1],
-                        )
-                        cute.arch.cp_async_commit_group()
-
-                    acc_S = cute.make_rmem_tensor_like(acc_template_S, cutlass.Float32)
-                    acc_S.fill(0.0)
-                    cute.copy(
-                        smem_tiled_copy_Q, tSsQ[None, None, 0], tSrQ_view[None, None, 0]
-                    )
-                    cute.copy(
-                        smem_tiled_copy_K, tSsK[None, None, 0], tSrK_view[None, None, 0]
-                    )
-                    for k in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
-                        k_next = (k + 1) % cute.size(tSsQ.shape[2])
-                        cute.copy(
-                            smem_tiled_copy_Q,
-                            tSsQ[None, None, k_next],
-                            tSrQ_view[None, None, k_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_K,
-                            tSsK[None, None, k_next],
-                            tSrK_view[None, None, k_next],
-                        )
-                        cute.gemm(
-                            tiled_mma,
-                            acc_S,
-                            tSrQ[None, None, k],
-                            tSrK[None, None, k],
-                            acc_S,
-                        )
-
-                    cS = cute.local_tile(
-                        mcS[bhc, None, 0, None], (m, n), (m_block, n_block)
-                    )
-                    tScS = thr_mma.partition_C(cS)
-                    tScS_mn = self._make_acc_tensor_mn_view(tScS)
-                    if cute.elem_less(n_block, full_visible_n_blocks):
-                        self._scale_and_mask_scores(
-                            acc_S,
-                            tScS_mn,
-                            sLpQ,
-                            sLpK,
-                            m_tile_start=m_tile_start,
-                            n_tile_start=n_block * n,
-                            seqlen=mQ.layout.shape[1],
-                            apply_mask=False,
-                        )
-                    else:
-                        self._scale_and_mask_scores(
-                            acc_S,
-                            tScS_mn,
-                            sLpQ,
-                            sLpK,
-                            m_tile_start=m_tile_start,
-                            n_tile_start=n_block * n,
-                            seqlen=mQ.layout.shape[1],
-                            apply_mask=True,
-                        )
-
-                    if cutlass.const_expr(self._v_alias_in_bz()):
-                        cV = cute.local_tile(
-                            mcV[bhc, None, 0, None], (n, Pp), (n_block, 0)
-                        )
-                        tVcV = gmem_thr_copy_P.partition_S(cV)
-                        self._copy_gmem_rows_or_zero(
-                            gmem_tiled_copy_P,
-                            tVgV[None, None, None, n_block],
-                            tVsV,
-                            tVcV,
-                            tVpV,
-                            mVcurr.layout.shape[1],
-                        )
-                        cute.arch.cp_async_commit_group()
-
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.barrier()
-
-                    self._accumulate_scores_times_v(
-                        tiled_mma,
-                        acc_S,
-                        acc_O,
-                        mQ.element_type,
-                        smem_tiled_copy_V,
-                        tOsVt,
-                        tOrVt_view,
-                        tOrVt,
-                    )
-
-                    if cute.elem_less(n_block + 1, visible_n_block_max):
-                        cK_next = cute.local_tile(
-                            mcK[bhc, None, 0, None], (n, Dp), (n_block + 1, 0)
-                        )
-                        tKcK_next = gmem_thr_copy_D.partition_S(cK_next)
-                        self._copy_gmem_rows_or_zero(
-                            gmem_tiled_copy_D,
-                            tKgK[None, None, None, n_block + 1],
-                            tKsK,
-                            tKcK_next,
-                            tKpK,
-                            mKprev.layout.shape[1],
-                        )
-                        cute.arch.cp_async_commit_group()
-
-        self._store_output(
-            mOut,
-            gO,
-            cO,
-            sQ,
-            sO_layout,
-            gmem_tiled_copy_O,
-            tiled_mma,
-            acc_O,
+    @cute.jit
+    def _make_copy_column_predicate(
+        self,
+        partitioned_tensor: cute.Tensor,
+        partitioned_coord: cute.Tensor,
+        col_limit: int,
+    ):
+        pred = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    partitioned_tensor.shape[0][1],
+                    cute.size(partitioned_tensor, mode=[1]),
+                    cute.size(partitioned_tensor, mode=[2]),
+                ),
+                stride=(cute.size(partitioned_tensor, mode=[2]), 0, 1),
+            ),
+            cutlass.Boolean,
         )
+        for rest_v in cutlass.range_constexpr(pred.shape[0]):
+            for rest_k in cutlass.range_constexpr(pred.shape[2]):
+                pred[rest_v, 0, rest_k] = cute.elem_less(
+                    partitioned_coord[(0, rest_v), 0, rest_k][3], col_limit
+                )
+        return pred
 
-    def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
+    @cute.jit
+    def _copy_rows_with_zero_fill(
+        self,
+        gmem_tiled_copy: cute.TiledCopy,
+        t_copy_src: cute.Tensor,
+        t_copy_dst: cute.Tensor,
+        t_coord: cute.Tensor,
+        copy_pred: cute.Tensor,
+        row_limit: int,
+    ):
+        for idx in cutlass.range_constexpr(cute.size(t_copy_dst.shape[1])):
+            if cute.elem_less(t_coord[0, idx, 0][1], row_limit):
+                cute.copy(
+                    gmem_tiled_copy,
+                    t_copy_src[None, idx, None],
+                    t_copy_dst[None, idx, None],
+                    pred=copy_pred[None, idx, None],
+                )
+            else:
+                t_copy_dst[None, idx, None].fill(0)
+
+    @cute.jit
+    def _copy_rows_if_valid(
+        self,
+        gmem_tiled_copy: cute.TiledCopy,
+        t_copy_src: cute.Tensor,
+        t_copy_dst: cute.Tensor,
+        t_coord: cute.Tensor,
+        copy_pred: cute.Tensor,
+        row_limit: int,
+    ):
+        for idx in cutlass.range_constexpr(cute.size(t_copy_dst.shape[1])):
+            if cute.elem_less(t_coord[0, idx, 0][1], row_limit):
+                cute.copy(
+                    gmem_tiled_copy,
+                    t_copy_src[None, idx, None],
+                    t_copy_dst[None, idx, None],
+                    pred=copy_pred[None, idx, None],
+                )
+
+    @cute.jit
+    def _accumulate_output_from_scores(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc_score: cute.Tensor,
+        acc_output: cute.Tensor,
+        score_dtype: type[cutlass.Numeric],
+        smem_tiled_copy_value: cute.TiledCopy,
+        t_smem_value_transposed: cute.Tensor,
+        t_reg_value_transposed_view: cute.Tensor,
+        t_reg_value_transposed: cute.Tensor,
+    ):
+        r_score = cute.make_rmem_tensor_like(acc_score, score_dtype)
+        r_score.store(acc_score.load().to(score_dtype))
+        r_score_layout_divided = cute.logical_divide(r_score.layout, (None, None, 2))
+        r_score_mma_view = cute.make_layout(
+            (
+                (r_score_layout_divided.shape[0], r_score_layout_divided.shape[2][0]),
+                r_score_layout_divided.shape[1],
+                r_score_layout_divided.shape[2][1],
+            ),
+            stride=(
+                (r_score_layout_divided.stride[0], r_score_layout_divided.stride[2][0]),
+                r_score_layout_divided.stride[1],
+                r_score_layout_divided.stride[2][1],
+            ),
+        )
+        t_reg_score = cute.make_tensor(r_score.iterator, r_score_mma_view)
+
+        cute.copy(
+            smem_tiled_copy_value,
+            t_smem_value_transposed[None, None, 0],
+            t_reg_value_transposed_view[None, None, 0],
+        )
+        for k in cutlass.range_constexpr(cute.size(t_reg_score.shape[2])):
+            k_next = (k + 1) % cute.size(t_reg_score.shape[2])
+            cute.copy(
+                smem_tiled_copy_value,
+                t_smem_value_transposed[None, None, k_next],
+                t_reg_value_transposed_view[None, None, k_next],
+            )
+            cute.gemm(
+                tiled_mma,
+                acc_output,
+                t_reg_score[None, None, k],
+                t_reg_value_transposed[None, None, k],
+                acc_output,
+            )
+        # The V tile aliases the main shared staging buffer in the fast path,
+        # so do not let later stages overwrite it until every warp is done.
+        cute.arch.barrier()
+
+    def _make_accumulator_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
         acc_layout_mn = cute.make_layout(
             (
@@ -1160,58 +497,17 @@ class ChunkScanFwdInnerAmpere:
         acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
         return cute.make_tensor(acc.iterator, acc_layout_mn)
 
-    @cute.jit
-    def _scale_and_mask_scores(
-        self,
-        acc_S: cute.Tensor,
-        tScS_mn: cute.Tensor,
-        sLpQ: cute.Tensor,
-        sLpK: cute.Tensor,
-        *,
-        m_tile_start: int,
-        n_tile_start: int,
-        seqlen: int,
-        apply_mask: cutlass.Constexpr,
-    ):
-        acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
-        scale_buf = cute.make_rmem_tensor(acc_S_mn[0, None].layout, cutlass.Float32)
-
-        for r in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
-            row_idx = cutlass.Int32(tScS_mn[r, 0][1])
-            row_scale = cutlass.Float32(1.0)
-            if cute.elem_less(row_idx, seqlen):
-                row_scale = cutlass.Float32(sLpQ[row_idx - m_tile_start])
-
-            col_limit = seqlen
-            if cutlass.const_expr(apply_mask):
-                col_limit = cutlass.min(row_idx + 1, seqlen)
-            for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
-                col_idx = cutlass.Int32(tScS_mn[0, c][3])
-                if cute.elem_less(col_limit, col_idx + 1) or cute.elem_less(
-                    seqlen, col_idx + 1
-                ):
-                    scale_buf[c] = 0.0
-                else:
-                    key_scale = cutlass.Float32(sLpK[col_idx - n_tile_start])
-                    scale_buf[c] = row_scale * key_scale
-
-            acc_row = acc_S_mn[r, None].load()
-            acc_S_mn[r, None] = acc_row * scale_buf.load()
-
-
-class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
-    """Ampere tensor-core end-to-end ``v2`` chunk-scan kernel."""
-
+    # End-to-end specialization
     def _d_stage_size(self) -> int:
-        """Shared-memory D slice width used by the end-to-end kernel."""
-        Dp = self.D_padded
-        if Dp <= 64:
-            return Dp
+        """Width of each staged ``D`` slice used by the end-to-end kernel."""
+        d_padded = self.D_padded
+        if d_padded <= 64:
+            return d_padded
         return 64
 
     def _d_stage_count(self) -> int:
-        Ds = self._d_stage_size()
-        return (self.D_padded + Ds - 1) // Ds
+        d_stage_width = self._d_stage_size()
+        return (self.D_padded + d_stage_width - 1) // d_stage_width
 
     def _q_smem_elems(self) -> int:
         return int(self.m_block_size) * int(self._d_stage_size())
@@ -1222,42 +518,54 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
     def _make_layout_bundle(
         self, out_dtype: type[cutlass.Numeric]
     ) -> ChunkScanLayoutBundle:
-        Ds = self._d_stage_size()
-        Pp = self.P_padded
-        m = self.m_block_size
-        n = self.n_block_size
+        d_stage_width = self._d_stage_size()
+        p_padded = self.P_padded
+        m_block_size = self.m_block_size
+        n_block_size = self.n_block_size
 
-        smem_k_block_size_D = 64 if Ds % 64 == 0 else 32
-        swizzle_bits_D = 3 if smem_k_block_size_D == 64 else 2
-        sD_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_D, 3, 3),
+        smem_k_block_size_d = 64 if d_stage_width % 64 == 0 else 32
+        swizzle_bits_d = 3 if smem_k_block_size_d == 64 else 2
+        d_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_d, 3, 3),
             0,
-            cute.make_layout((8, smem_k_block_size_D), stride=(smem_k_block_size_D, 1)),
+            cute.make_layout((8, smem_k_block_size_d), stride=(smem_k_block_size_d, 1)),
         )
-        sQ_layout = cute.tile_to_shape(sD_layout_atom, (m, Ds), (0, 1))
-        sB_layout = cute.tile_to_shape(sD_layout_atom, (max(Pp, n), Ds), (0, 1))
-        sK_layout = cute.tile_to_shape(sD_layout_atom, (n, Ds), (0, 1))
-        sZ_layout = cute.tile_to_shape(sD_layout_atom, (Pp, Ds), (0, 1))
+        query_layout = cute.tile_to_shape(
+            d_layout_atom, (m_block_size, d_stage_width), (0, 1)
+        )
+        bz_alias_layout = cute.tile_to_shape(
+            d_layout_atom, (max(p_padded, n_block_size), d_stage_width), (0, 1)
+        )
+        key_layout = cute.tile_to_shape(
+            d_layout_atom, (n_block_size, d_stage_width), (0, 1)
+        )
+        z_layout = cute.tile_to_shape(d_layout_atom, (p_padded, d_stage_width), (0, 1))
 
-        smem_k_block_size_P = 64 if Pp % 64 == 0 else 32
-        swizzle_bits_P = 3 if smem_k_block_size_P == 64 else 2
-        sP_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits_P, 3, 3),
+        smem_k_block_size_p = 64 if p_padded % 64 == 0 else 32
+        swizzle_bits_p = 3 if smem_k_block_size_p == 64 else 2
+        p_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits_p, 3, 3),
             0,
-            cute.make_layout((8, smem_k_block_size_P), stride=(smem_k_block_size_P, 1)),
+            cute.make_layout((8, smem_k_block_size_p), stride=(smem_k_block_size_p, 1)),
         )
-        sV_layout = cute.tile_to_shape(sP_layout_atom, (n, Pp), (0, 1))
-        sO_layout = cute.tile_to_shape(sP_layout_atom, (m, Pp), (0, 1))
+        value_layout = cute.tile_to_shape(
+            p_layout_atom, (n_block_size, p_padded), (0, 1)
+        )
+        output_layout = cute.tile_to_shape(
+            p_layout_atom, (m_block_size, p_padded), (0, 1)
+        )
         if out_dtype == cutlass.Float32:
-            sO_layout = cute.make_layout((m, Pp), stride=(Pp, 1))
+            output_layout = cute.make_layout(
+                (m_block_size, p_padded), stride=(p_padded, 1)
+            )
 
         return ChunkScanLayoutBundle(
-            sQ_layout=sQ_layout,
-            sB_layout=sB_layout,
-            sK_layout=sK_layout,
-            sZ_layout=sZ_layout,
-            sV_layout=sV_layout,
-            sO_layout=sO_layout,
+            query_layout=query_layout,
+            bz_alias_layout=bz_alias_layout,
+            key_layout=key_layout,
+            z_layout=z_layout,
+            value_layout=value_layout,
+            output_layout=output_layout,
         )
 
     def _make_copy_bundle(
@@ -1266,21 +574,21 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         out_dtype: type[cutlass.Numeric],
     ) -> ChunkScanCopyBundle:
         universal_copy_bits = 128
-        Ds = self._d_stage_size()
-        Pp = self.P_padded
+        d_stage_width = self._d_stage_size()
+        p_padded = self.P_padded
         async_elems_in = universal_copy_bits // in_dtype.width
 
-        smem_k_block_size_D = 64 if Ds % 64 == 0 else 32
-        tD_shape_dim_1 = smem_k_block_size_D // async_elems_in
-        tD_layout = cute.make_layout(
-            (self.num_threads // tD_shape_dim_1, tD_shape_dim_1),
-            stride=(tD_shape_dim_1, 1),
+        smem_k_block_size_d = 64 if d_stage_width % 64 == 0 else 32
+        t_d_shape_dim_1 = smem_k_block_size_d // async_elems_in
+        t_d_layout = cute.make_layout(
+            (self.num_threads // t_d_shape_dim_1, t_d_shape_dim_1),
+            stride=(t_d_shape_dim_1, 1),
         )
-        smem_k_block_size_P = 64 if Pp % 64 == 0 else 32
-        tP_shape_dim_1 = smem_k_block_size_P // async_elems_in
-        tP_layout = cute.make_layout(
-            (self.num_threads // tP_shape_dim_1, tP_shape_dim_1),
-            stride=(tP_shape_dim_1, 1),
+        smem_k_block_size_p = 64 if p_padded % 64 == 0 else 32
+        t_p_shape_dim_1 = smem_k_block_size_p // async_elems_in
+        t_p_layout = cute.make_layout(
+            (self.num_threads // t_p_shape_dim_1, t_p_shape_dim_1),
+            stride=(t_p_shape_dim_1, 1),
         )
         v_in_layout = cute.make_layout((1, async_elems_in))
 
@@ -1291,11 +599,11 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             in_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
-        gmem_tiled_copy_D = cute.make_tiled_copy_tv(
-            atom_async_copy_in, tD_layout, v_in_layout
+        gmem_tiled_copy_d = cute.make_tiled_copy_tv(
+            atom_async_copy_in, t_d_layout, v_in_layout
         )
-        gmem_tiled_copy_P = cute.make_tiled_copy_tv(
-            atom_async_copy_in, tP_layout, v_in_layout
+        gmem_tiled_copy_p = cute.make_tiled_copy_tv(
+            atom_async_copy_in, t_p_layout, v_in_layout
         )
 
         store_elems = universal_copy_bits // out_dtype.width
@@ -1305,82 +613,746 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             num_bits_per_copy=universal_copy_bits,
         )
         v_out_layout = cute.make_layout((1, store_elems))
-        gmem_tiled_copy_O = cute.make_tiled_copy_tv(
-            atom_universal_copy_out, tP_layout, v_out_layout
+        gmem_tiled_copy_output = cute.make_tiled_copy_tv(
+            atom_universal_copy_out, t_p_layout, v_out_layout
         )
         return ChunkScanCopyBundle(
-            gmem_tiled_copy_D=gmem_tiled_copy_D,
-            gmem_tiled_copy_P=gmem_tiled_copy_P,
-            gmem_tiled_copy_O=gmem_tiled_copy_O,
+            gmem_tiled_copy_d=gmem_tiled_copy_d,
+            gmem_tiled_copy_p=gmem_tiled_copy_p,
+            gmem_tiled_copy_output=gmem_tiled_copy_output,
         )
-
-    def can_implement(
-        self,
-        dtype: type[cutlass.Numeric],
-        out_dtype: type[cutlass.Numeric],
-        *,
-        device_index: int | None = None,
-    ) -> bool:
-        return self.support_info(dtype, out_dtype, device_index=device_index).supported
 
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
         layouts: ChunkScanLayoutBundle,
     ):
-        class SharedStorage:
-            pass
+        if self._v_alias_in_bz():
 
-        annotations = {
-            "q_tile": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sQ_layout)], 16
-            ],
-            "bz_alias": cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sB_layout)], 16
-            ],
-        }
-        if not self._v_alias_in_bz():
-            annotations["v_tile"] = cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.sV_layout)], 16
-            ]
-        annotations["lp_q"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
-        ]
-        annotations["lp_k"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-        ]
-        annotations["logpref"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.L], 16
-        ]
-        annotations["phase_re"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.L], 16
-        ]
-        annotations["phase_im"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.L], 16
-        ]
-        annotations["tap_phase_re"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-        ]
-        annotations["tap_phase_im"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-        ]
-        annotations["warp_log_total"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
-        ]
-        annotations["warp_log_offset"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
-        ]
-        annotations["warp_phase_total"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
-        ]
-        annotations["warp_phase_offset"] = cute.struct.Align[
-            cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
-        ]
-        SharedStorage.__annotations__ = annotations
-        return cute.struct(SharedStorage)
+            @cute.struct
+            class SharedStorage:
+                q_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.query_layout)],
+                    16,
+                ]
+                bz_alias: cute.struct.Align[
+                    cute.struct.MemRange[
+                        in_dtype, cute.cosize(layouts.bz_alias_layout)
+                    ],
+                    16,
+                ]
+                query_scale: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
+                ]
+                key_scale: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+                ]
+                log_prefix: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.L], 16
+                ]
+                phase_re: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.L], 16
+                ]
+                phase_im: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.L], 16
+                ]
+                tap_phase_re: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+                ]
+                tap_phase_im: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+                ]
+                warp_log_total: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
+                ]
+                warp_log_offset: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
+                ]
+                warp_phase_total: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
+                ]
+                warp_phase_offset: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
+                ]
+
+        else:
+
+            @cute.struct
+            class SharedStorage:
+                q_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.query_layout)],
+                    16,
+                ]
+                bz_alias: cute.struct.Align[
+                    cute.struct.MemRange[
+                        in_dtype, cute.cosize(layouts.bz_alias_layout)
+                    ],
+                    16,
+                ]
+                v_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.value_layout)],
+                    16,
+                ]
+                query_scale: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
+                ]
+                key_scale: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+                ]
+                log_prefix: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.L], 16
+                ]
+                phase_re: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.L], 16
+                ]
+                phase_im: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.L], 16
+                ]
+                tap_phase_re: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+                ]
+                tap_phase_im: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
+                ]
+                warp_log_total: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
+                ]
+                warp_log_offset: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps], 16
+                ]
+                warp_phase_total: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
+                ]
+                warp_phase_offset: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
+                ]
+
+        return SharedStorage
+
+    # Prefix helpers
+    @cute.jit
+    def _compute_phase_prefix_metadata(self, prefix_state: SimpleNamespace):
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+
+        seq_idx = tidx
+        logp = cutlass.Float32(0.0)
+        phase_re = cutlass.Float32(1.0)
+        phase_im = cutlass.Float32(0.0)
+
+        if tidx < self.L:
+            mr = cutlass.Float32(
+                prefix_state.m_transition[prefix_state.batch_head_chunk, seq_idx, 0]
+            )
+            mi = cutlass.Float32(
+                prefix_state.m_transition[prefix_state.batch_head_chunk, seq_idx, 1]
+            )
+            mag2 = mr * mr + mi * mi + cutlass.Float32(1.0e-20)
+            inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
+            phase_re = mr * inv_mag
+            phase_im = mi * inv_mag
+            logp = cute.math.log2(mag2, fastmath=False) * cutlass.Float32(0.5 / LOG2_E)
+
+        for offset in (1, 2, 4, 8, 16):
+            other_log = cute.arch.shuffle_sync_up(
+                logp, offset=offset, mask=-1, mask_and_clamp=0
+            )
+            other_phase_re = cute.arch.shuffle_sync_up(
+                phase_re, offset=offset, mask=-1, mask_and_clamp=0
+            )
+            other_phase_im = cute.arch.shuffle_sync_up(
+                phase_im, offset=offset, mask=-1, mask_and_clamp=0
+            )
+
+            pred = lane >= cutlass.Int32(offset)
+            logp = cutlass.select_(pred, logp + other_log, logp)
+            next_phase_re = phase_re * other_phase_re - phase_im * other_phase_im
+            next_phase_im = phase_re * other_phase_im + phase_im * other_phase_re
+            phase_re = cutlass.select_(pred, next_phase_re, phase_re)
+            phase_im = cutlass.select_(pred, next_phase_im, phase_im)
+
+        if lane == cutlass.Int32(31):
+            prefix_state.warp_log_total[warp] = logp
+            prefix_state.warp_phase_total[warp, 0] = phase_re
+            prefix_state.warp_phase_total[warp, 1] = phase_im
+        cute.arch.barrier()
+
+        if warp == cutlass.Int32(0):
+            w = lane
+            num_warps = cutlass.Int32(self.num_threads // 32)
+            has_warp = w < num_warps
+
+            warp_log = cutlass.select_(
+                has_warp, prefix_state.warp_log_total[w], cutlass.Float32(0.0)
+            )
+            warp_phase_re = cutlass.select_(
+                has_warp, prefix_state.warp_phase_total[w, 0], cutlass.Float32(1.0)
+            )
+            warp_phase_im = cutlass.select_(
+                has_warp, prefix_state.warp_phase_total[w, 1], cutlass.Float32(0.0)
+            )
+
+            for offset in (1, 2, 4, 8, 16):
+                other_log = cute.arch.shuffle_sync_up(
+                    warp_log, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                other_phase_re = cute.arch.shuffle_sync_up(
+                    warp_phase_re, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                other_phase_im = cute.arch.shuffle_sync_up(
+                    warp_phase_im, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                pred = lane >= cutlass.Int32(offset)
+                warp_log = cutlass.select_(pred, warp_log + other_log, warp_log)
+                next_warp_phase_re = (
+                    warp_phase_re * other_phase_re - warp_phase_im * other_phase_im
+                )
+                next_warp_phase_im = (
+                    warp_phase_re * other_phase_im + warp_phase_im * other_phase_re
+                )
+                warp_phase_re = cutlass.select_(pred, next_warp_phase_re, warp_phase_re)
+                warp_phase_im = cutlass.select_(pred, next_warp_phase_im, warp_phase_im)
+
+            warp_log_offset = cute.arch.shuffle_sync_up(
+                warp_log, offset=1, mask=-1, mask_and_clamp=0
+            )
+            warp_phase_re_offset = cute.arch.shuffle_sync_up(
+                warp_phase_re, offset=1, mask=-1, mask_and_clamp=0
+            )
+            warp_phase_im_offset = cute.arch.shuffle_sync_up(
+                warp_phase_im, offset=1, mask=-1, mask_and_clamp=0
+            )
+
+            is_first_warp = lane == cutlass.Int32(0)
+            warp_log_offset = cutlass.select_(
+                is_first_warp, cutlass.Float32(0.0), warp_log_offset
+            )
+            warp_phase_re_offset = cutlass.select_(
+                is_first_warp, cutlass.Float32(1.0), warp_phase_re_offset
+            )
+            warp_phase_im_offset = cutlass.select_(
+                is_first_warp, cutlass.Float32(0.0), warp_phase_im_offset
+            )
+
+            if has_warp:
+                prefix_state.warp_log_offset[w] = warp_log_offset
+                prefix_state.warp_phase_offset[w, 0] = warp_phase_re_offset
+                prefix_state.warp_phase_offset[w, 1] = warp_phase_im_offset
+
+        cute.arch.barrier()
+
+        warp_log_offset = prefix_state.warp_log_offset[warp]
+        warp_phase_re_offset = prefix_state.warp_phase_offset[warp, 0]
+        warp_phase_im_offset = prefix_state.warp_phase_offset[warp, 1]
+        logp = logp + warp_log_offset
+        next_phase_re = (
+            phase_re * warp_phase_re_offset - phase_im * warp_phase_im_offset
+        )
+        next_phase_im = (
+            phase_re * warp_phase_im_offset + phase_im * warp_phase_re_offset
+        )
+        phase_re, phase_im = next_phase_re, next_phase_im
+
+        if tidx < self.L:
+            prefix_state.s_log_prefix[seq_idx] = logp
+            prefix_state.s_phase_re[seq_idx] = phase_re
+            prefix_state.s_phase_im[seq_idx] = phase_im
+
+        cute.arch.barrier()
 
     @cute.jit
-    def __call__(
+    def _initialize_query_scales_from_prefix(
+        self,
+        prefix_state: SimpleNamespace,
+        s_query_scale: cute.Tensor,
+        *,
+        m_tile_start: int,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        q_row = m_tile_start + tidx
+        if tidx < self.m_block_size:
+            scale = cutlass.Float32(0.0)
+            if cute.elem_less(q_row, self.L):
+                scale = cute.math.exp2(
+                    cutlass.Float32(prefix_state.s_log_prefix[q_row])
+                    * cutlass.Float32(LOG2_E),
+                    fastmath=True,
+                )
+            s_query_scale[tidx] = scale
+
+    @cute.jit
+    def _initialize_key_scales_from_prefix(
+        self,
+        s_log_prefix: cute.Tensor,
+        s_key_scale: cute.Tensor,
+        *,
+        n_block: int,
+        seqlen: int,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        key_idx = n_block * self.n_block_size + tidx
+        if tidx < self.n_block_size:
+            if cute.elem_less(key_idx, seqlen):
+                log_prefix = cutlass.Float32(s_log_prefix[key_idx])
+                s_key_scale[tidx] = cute.math.exp2(
+                    -log_prefix * cutlass.Float32(LOG2_E), fastmath=True
+                )
+            else:
+                s_key_scale[tidx] = 0.0
+        cute.arch.barrier()
+
+    # Off-term helpers
+    @cute.jit
+    def _rotate_staged_query_tile_from_prefix(
+        self,
+        s_query: cute.Tensor,
+        s_phase_re: cute.Tensor,
+        s_phase_im: cute.Tensor,
+        *,
+        m_tile_start: int,
+        row_limit: int,
+        stage_width: int,
+        out_dtype: type[cutlass.Numeric],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        stage_complex = stage_width // 2
+        total_q_stage = self.m_block_size * stage_complex
+        idx = tidx
+        while cute.elem_less(idx, total_q_stage):
+            rr = idx // stage_complex
+            vv = idx - rr * stage_complex
+            q_row = m_tile_start + rr
+            if cute.elem_less(q_row, row_limit):
+                re_col = vv * 2 + 0
+                im_col = vv * 2 + 1
+                cre = cutlass.Float32(s_query[rr, re_col])
+                cim = cutlass.Float32(s_query[rr, im_col])
+                phase_re = cutlass.Float32(s_phase_re[q_row])
+                phase_im = cutlass.Float32(s_phase_im[q_row])
+                qre = cre * phase_re + cim * phase_im
+                qim = cre * phase_im - cim * phase_re
+                s_query[rr, re_col] = qre.to(out_dtype)
+                s_query[rr, im_col] = qim.to(out_dtype)
+            idx = idx + self.num_threads
+        cute.arch.barrier()
+
+    @cute.jit
+    def _load_conjugated_z0_stage(
+        self,
+        mZ0: cute.Tensor,
+        s_z: cute.Tensor,
+        *,
+        batch_head_chunk: int,
+        d_col_base: int,
+        stage_width: int,
+        out_dtype: type[cutlass.Numeric],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        vec = 4
+        vec_cols = stage_width // vec
+        total_vec = self.P_padded * vec_cols
+        idx = tidx
+        while cute.elem_less(idx, total_vec):
+            rr = idx // vec_cols
+            cc0 = (idx - rr * vec_cols) * vec
+            g_col = d_col_base + cc0
+
+            f0 = cutlass.Float32(0.0)
+            f1 = cutlass.Float32(0.0)
+            f2 = cutlass.Float32(0.0)
+            f3 = cutlass.Float32(0.0)
+            if cute.elem_less(rr, mZ0.layout.shape[1]) and cute.elem_less(
+                g_col + (vec - 1), mZ0.layout.shape[3]
+            ):
+                row = mZ0[batch_head_chunk, rr, 0, None]
+                row = cute.domain_offset((g_col,), row)
+                seg = cute.make_tensor(
+                    row.iterator.align(16), cute.make_layout((vec,), stride=(1,))
+                )
+                vals = seg.load()
+                f0 = cutlass.Float32(vals[0])
+                f1 = cutlass.Float32(vals[1])
+                f2 = cutlass.Float32(vals[2])
+                f3 = cutlass.Float32(vals[3])
+
+            s_z[rr, cc0 + 0] = f0.to(out_dtype)
+            s_z[rr, cc0 + 1] = (-f1).to(out_dtype)
+            s_z[rr, cc0 + 2] = f2.to(out_dtype)
+            s_z[rr, cc0 + 3] = (-f3).to(out_dtype)
+            idx = idx + self.num_threads
+        cute.arch.barrier()
+
+    @cute.jit
+    def _initialize_tap_phase_from_prefix(
+        self,
+        mK: cute.Tensor,
+        s_phase_re: cute.Tensor,
+        s_phase_im: cute.Tensor,
+        s_tap_phase_re: cute.Tensor,
+        s_tap_phase_im: cute.Tensor,
+        *,
+        batch_head_chunk: int,
+        n_block: int,
+        tap_idx: int,
+        row_limit: int,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        if tidx < self.n_block_size:
+            key_idx = n_block * self.n_block_size + tidx
+            tap_phase_re = cutlass.Float32(0.0)
+            tap_phase_im = cutlass.Float32(0.0)
+            if cute.elem_less(key_idx, row_limit):
+                tap_re = cutlass.Float32(mK[batch_head_chunk, key_idx, tap_idx, 0])
+                tap_im = cutlass.Float32(mK[batch_head_chunk, key_idx, tap_idx, 1])
+                phase_re = cutlass.Float32(s_phase_re[key_idx])
+                phase_im = cutlass.Float32(s_phase_im[key_idx])
+                tap_phase_re = tap_re * phase_re + tap_im * phase_im
+                tap_phase_im = tap_im * phase_re - tap_re * phase_im
+            s_tap_phase_re[tidx] = tap_phase_re
+            s_tap_phase_im[tidx] = tap_phase_im
+        cute.arch.barrier()
+
+    @cute.jit
+    def _inject_boundary_key_row(
+        self,
+        s_key: cute.Tensor,
+        mB_prev0: cute.Tensor,
+        *,
+        batch_head: int,
+        d_col_base: int,
+        stage_width: int,
+        out_dtype: type[cutlass.Numeric],
+        is_chunk0: cutlass.Boolean,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        ii = tidx
+        while cute.elem_less(ii, stage_width // 2):
+            re_col = ii * 2 + 0
+            im_col = ii * 2 + 1
+            g_col_re = d_col_base + re_col
+            g_col_im = d_col_base + im_col
+            bre0 = s_key[0, re_col]
+            bim0 = s_key[0, im_col]
+            breb = out_dtype(0)
+            bimb = out_dtype(0)
+            if cute.elem_less(g_col_re, mB_prev0.layout.shape[1]):
+                breb = mB_prev0[batch_head, g_col_re]
+            if cute.elem_less(g_col_im, mB_prev0.layout.shape[1]):
+                bimb = mB_prev0[batch_head, g_col_im]
+            s_key[0, re_col] = cutlass.select_(is_chunk0, breb, bre0)
+            s_key[0, im_col] = cutlass.select_(is_chunk0, bimb, bim0)
+            ii = ii + self.num_threads
+        cute.arch.barrier()
+
+    @cute.jit
+    def _apply_tap_phase_to_staged_keys(
+        self,
+        s_key: cute.Tensor,
+        s_tap_phase_re: cute.Tensor,
+        s_tap_phase_im: cute.Tensor,
+        *,
+        n_block: int,
+        stage_width: int,
+        row_limit: int,
+        out_dtype: type[cutlass.Numeric],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        total_k_stage = self.n_block_size * (stage_width // 2)
+        ii = tidx
+        while cute.elem_less(ii, total_k_stage):
+            rr = ii // (stage_width // 2)
+            vv = ii - rr * (stage_width // 2)
+            key_idx = n_block * self.n_block_size + rr
+            re_col = vv * 2 + 0
+            im_col = vv * 2 + 1
+            bre = cutlass.Float32(s_key[rr, re_col])
+            bim = cutlass.Float32(s_key[rr, im_col])
+            tap_phase_re = cutlass.Float32(0.0)
+            tap_phase_im = cutlass.Float32(0.0)
+            if cute.elem_less(key_idx, row_limit):
+                tap_phase_re = cutlass.Float32(s_tap_phase_re[rr])
+                tap_phase_im = cutlass.Float32(s_tap_phase_im[rr])
+
+            kre = bre * tap_phase_re - bim * tap_phase_im
+            kim = bre * tap_phase_im + bim * tap_phase_re
+            s_key[rr, re_col] = kre.to(out_dtype)
+            s_key[rr, im_col] = (-kim).to(out_dtype)
+            ii = ii + self.num_threads
+        cute.arch.barrier()
+
+    @cute.jit
+    def _inject_boundary_value_row(
+        self,
+        s_value: cute.Tensor,
+        mU_prev0: cute.Tensor,
+        *,
+        batch_head: int,
+        out_dtype: type[cutlass.Numeric],
+        is_chunk0: cutlass.Boolean,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+
+        ii = tidx
+        while cute.elem_less(ii, self.P_padded):
+            boundary = out_dtype(0)
+            old = s_value[0, ii]
+            if cute.elem_less(ii, self.P):
+                boundary = mU_prev0[batch_head, ii]
+            s_value[0, ii] = cutlass.select_(is_chunk0, boundary, old)
+            ii = ii + self.num_threads
+        cute.arch.barrier()
+
+    @cute.jit
+    def _accumulate_offterm_from_rotated_z0(
+        self,
+        offterm_state: SimpleNamespace,
+        prefix_state: SimpleNamespace,
+        mma_state: SimpleNamespace,
+    ):
+        d_stage_width = self._d_stage_size()
+
+        for d_stage_idx in cutlass.range_constexpr(self._d_stage_count()):
+            d_col_base = d_stage_idx * d_stage_width
+
+            g_query_stage = cute.local_tile(
+                offterm_state.m_query[offterm_state.batch_head_chunk, None, 0, None],
+                (self.m_block_size, d_stage_width),
+                (offterm_state.m_block, d_stage_idx),
+            )
+            c_query_stage = cute.local_tile(
+                offterm_state.coord_query[
+                    offterm_state.batch_head_chunk, None, 0, None
+                ],
+                (self.m_block_size, d_stage_width),
+                (offterm_state.m_block, d_stage_idx),
+            )
+            t_query_gmem = offterm_state.gmem_thr_copy_d.partition_S(g_query_stage)
+            t_query_coord = offterm_state.gmem_thr_copy_d.partition_S(c_query_stage)
+            t_query_pred = self._make_copy_column_predicate(
+                offterm_state.t_query_smem,
+                t_query_coord,
+                offterm_state.m_query.layout.shape[3],
+            )
+            self._copy_rows_with_zero_fill(
+                offterm_state.gmem_tiled_copy_d,
+                t_query_gmem,
+                offterm_state.t_query_smem,
+                t_query_coord,
+                t_query_pred,
+                offterm_state.m_query.layout.shape[1],
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            self._rotate_staged_query_tile_from_prefix(
+                offterm_state.s_query,
+                prefix_state.s_phase_re,
+                prefix_state.s_phase_im,
+                m_tile_start=offterm_state.m_tile_start,
+                row_limit=self.L,
+                stage_width=d_stage_width,
+                out_dtype=offterm_state.m_query.element_type,
+            )
+
+            self._load_conjugated_z0_stage(
+                offterm_state.m_z0,
+                offterm_state.s_z,
+                batch_head_chunk=offterm_state.batch_head_chunk,
+                d_col_base=d_col_base,
+                stage_width=d_stage_width,
+                out_dtype=offterm_state.m_query.element_type,
+            )
+
+            self._accumulate_from_staged_tiles(
+                mma_state.tiled_mma,
+                mma_state.acc_output,
+                mma_state.smem_tiled_copy_query,
+                mma_state.smem_tiled_copy_key,
+                mma_state.t_smem_query,
+                mma_state.t_reg_query_view,
+                mma_state.t_smem_z,
+                mma_state.t_reg_z_view,
+                mma_state.t_reg_query,
+                mma_state.t_reg_z,
+            )
+
+    # Diag helpers
+    @cute.jit
+    def _apply_score_scales_and_mask(
+        self,
+        acc_score: cute.Tensor,
+        t_score_coord_mn: cute.Tensor,
+        s_query_scale: cute.Tensor,
+        s_key_scale: cute.Tensor,
+        *,
+        m_tile_start: int,
+        n_tile_start: int,
+        seqlen: int,
+        apply_mask: cutlass.Constexpr,
+    ):
+        acc_score_mn = self._make_accumulator_mn_view(acc_score)
+        scale_buf = cute.make_rmem_tensor(acc_score_mn[0, None].layout, cutlass.Float32)
+
+        for r in cutlass.range_constexpr(cute.size(acc_score_mn.shape[0])):
+            row_idx = cutlass.Int32(t_score_coord_mn[r, 0][1])
+            row_scale = cutlass.Float32(1.0)
+            if cute.elem_less(row_idx, seqlen):
+                row_scale = cutlass.Float32(s_query_scale[row_idx - m_tile_start])
+
+            col_limit = seqlen
+            if cutlass.const_expr(apply_mask):
+                col_limit = cutlass.min(row_idx + 1, seqlen)
+            for c in cutlass.range_constexpr(cute.size(acc_score_mn.shape[1])):
+                col_idx = cutlass.Int32(t_score_coord_mn[0, c][3])
+                if cute.elem_less(col_limit, col_idx + 1) or cute.elem_less(
+                    seqlen, col_idx + 1
+                ):
+                    scale_buf[c] = 0.0
+                else:
+                    key_scale = cutlass.Float32(s_key_scale[col_idx - n_tile_start])
+                    scale_buf[c] = row_scale * key_scale
+
+            acc_row = acc_score_mn[r, None].load()
+            acc_score_mn[r, None] = acc_row * scale_buf.load()
+
+    # Epilogue helpers
+    def _make_output_coord_tile(
+        self, mOut: cute.Tensor, batch_head_chunk: int, m_block: int
+    ):
+        coord_output = cute.make_identity_tensor(mOut.layout.shape)
+        return cute.local_tile(
+            coord_output[batch_head_chunk, None, 0, None],
+            (self.m_block_size, self.P_padded),
+            (m_block, 0),
+        )
+
+    @cute.jit
+    def _scale_output_with_query_scales(
+        self,
+        acc_output_mn: cute.Tensor,
+        t_output_coord_mn: cute.Tensor,
+        s_query_scale: cute.Tensor,
+        *,
+        m_tile_start: int,
+        row_limit: int,
+    ):
+        for r in cutlass.range_constexpr(cute.size(acc_output_mn.shape[0])):
+            row_idx = t_output_coord_mn[r, 0][1]
+            if cute.elem_less(row_idx, row_limit):
+                scale = s_query_scale[row_idx - m_tile_start]
+                acc_output_mn[r, None] = acc_output_mn[r, None].load() * scale
+
+    @cute.jit
+    def _store_output_fp32(
+        self,
+        mOut: cute.Tensor,
+        t_output_coord_mn: cute.Tensor,
+        acc_output_mn: cute.Tensor,
+    ):
+        for r in cutlass.range_constexpr(cute.size(acc_output_mn.shape[0])):
+            row_idx = t_output_coord_mn[r, 0][1]
+            if cute.elem_less(row_idx, mOut.layout.shape[1]):
+                for c in cutlass.range_constexpr(cute.size(acc_output_mn.shape[1])):
+                    col_idx = t_output_coord_mn[0, c][3]
+                    if cute.elem_less(col_idx, mOut.layout.shape[3]):
+                        mOut[t_output_coord_mn[r, c][0], row_idx, 0, col_idx] = (
+                            cutlass.Float32(acc_output_mn[r, c])
+                        )
+
+    @cute.jit
+    def _store_output_staged(
+        self,
+        mOut: cute.Tensor,
+        g_output: cute.Tensor,
+        c_output: cute.Tensor,
+        s_query: cute.Tensor,
+        output_layout: cute.Layout | cute.ComposedLayout,
+        gmem_tiled_copy_output: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        acc_output: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        r_output = cute.make_rmem_tensor_like(acc_output, mOut.element_type)
+        r_output.store(acc_output.load().to(mOut.element_type))
+
+        s_output = cute.make_tensor(
+            cute.recast_ptr(s_query.iterator, dtype=mOut.element_type), output_layout
+        )
+        smem_copy_atom_output = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), mOut.element_type
+        )
+        smem_tiled_copy_output = cute.make_tiled_copy_C(
+            smem_copy_atom_output, tiled_mma
+        )
+        smem_thr_copy_output = smem_tiled_copy_output.get_slice(tidx)
+        t_acc_reg_output = smem_thr_copy_output.retile(r_output)
+        t_acc_smem_output = smem_thr_copy_output.partition_D(s_output)
+        cute.copy(smem_copy_atom_output, t_acc_reg_output, t_acc_smem_output)
+        cute.arch.barrier()
+
+        gmem_thr_copy_output = gmem_tiled_copy_output.get_slice(tidx)
+        t_smem_output = gmem_thr_copy_output.partition_S(s_output)
+        t_gmem_output = gmem_thr_copy_output.partition_D(g_output)
+        t_reg_output = cute.make_rmem_tensor_like(t_gmem_output, mOut.element_type)
+        cute.copy(gmem_tiled_copy_output, t_smem_output, t_reg_output)
+
+        t_output_coord = gmem_thr_copy_output.partition_D(c_output)
+        t_output_pred = self._make_copy_column_predicate(
+            t_gmem_output, t_output_coord, mOut.layout.shape[3]
+        )
+        self._copy_rows_if_valid(
+            gmem_tiled_copy_output,
+            t_reg_output,
+            t_gmem_output,
+            t_output_coord,
+            t_output_pred,
+            mOut.layout.shape[1],
+        )
+
+    @cute.jit
+    def _store_output(
+        self,
+        mOut: cute.Tensor,
+        g_output: cute.Tensor,
+        c_output: cute.Tensor,
+        s_query: cute.Tensor,
+        output_layout: cute.Layout | cute.ComposedLayout,
+        gmem_tiled_copy_output: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        acc_output: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        thr_mma = tiled_mma.get_slice(tidx)
+        t_output_coord = thr_mma.partition_C(c_output)
+        t_output_coord_mn = self._make_accumulator_mn_view(t_output_coord)
+        acc_output_mn = self._make_accumulator_mn_view(acc_output)
+
+        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
+            self._store_output_fp32(mOut, t_output_coord_mn, acc_output_mn)
+        else:
+            self._store_output_staged(
+                mOut,
+                g_output,
+                c_output,
+                s_query,
+                output_layout,
+                gmem_tiled_copy_output,
+                tiled_mma,
+                acc_output,
+            )
+
+    # Host launch API
+    @cute.jit
+    def _validate_main_operands(
         self,
         mU: cute.Tensor,
         mB: cute.Tensor,
@@ -1418,17 +1390,39 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         ):
             raise TypeError("Out must be Float16/BFloat16/Float32.")
 
+    def _launch_main_kernel(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mK: cute.Tensor,
+        mZ0: cute.Tensor,
+        mU_prev0: cute.Tensor,
+        mB_prev0: cute.Tensor,
+        mOut: cute.Tensor,
+        *,
+        stream: cuda.CUstream | None = None,
+    ):
         in_dtype = mU.element_type
         out_dtype = mOut.element_type
         bundle = self._make_kernel_bundle(in_dtype, out_dtype)
         layouts = bundle.layouts
         copies = bundle.copies
-        SharedStorage = self._make_shared_storage(in_dtype, layouts)
         grid_dim = (
             cute.ceil_div(mU.shape[1], self.m_block_size),
             cute.size(mU.shape[0]),
             1,
         )
+
+        launch_kwargs = {
+            "grid": grid_dim,
+            "block": [self.num_threads, 1, 1],
+            "smem": bundle.smem_size,
+        }
+        if stream is not None:
+            launch_kwargs["stream"] = stream
+
         self.kernel(
             mU,
             mB,
@@ -1439,22 +1433,34 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             mU_prev0,
             mB_prev0,
             mOut,
-            layouts.sQ_layout,
-            layouts.sB_layout,
-            layouts.sK_layout,
-            layouts.sZ_layout,
-            layouts.sV_layout,
-            layouts.sO_layout,
-            copies.gmem_tiled_copy_D,
-            copies.gmem_tiled_copy_P,
-            copies.gmem_tiled_copy_O,
+            layouts.query_layout,
+            layouts.bz_alias_layout,
+            layouts.key_layout,
+            layouts.z_layout,
+            layouts.value_layout,
+            layouts.output_layout,
+            copies.gmem_tiled_copy_d,
+            copies.gmem_tiled_copy_p,
+            copies.gmem_tiled_copy_output,
             bundle.tiled_mma,
-            SharedStorage,
-        ).launch(
-            grid=grid_dim,
-            block=[self.num_threads, 1, 1],
-            smem=bundle.smem_size,
-        )
+            bundle.shared_storage_cls,
+        ).launch(**launch_kwargs)
+
+    @cute.jit
+    def __call__(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mK: cute.Tensor,
+        mZ0: cute.Tensor,
+        mU_prev0: cute.Tensor,
+        mB_prev0: cute.Tensor,
+        mOut: cute.Tensor,
+    ):
+        self._validate_main_operands(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
+        self._launch_main_kernel(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
 
     @cute.jit
     def call_on_stream(
@@ -1470,44 +1476,8 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         mOut: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        if cutlass.const_expr(
-            mU.element_type not in (cutlass.Float16, cutlass.BFloat16)
-        ):
-            raise TypeError("U/B/C must be Float16/BFloat16 for the tensor-core path.")
-        if cutlass.const_expr(
-            not (
-                mU.element_type
-                == mB.element_type
-                == mC.element_type
-                == mU_prev0.element_type
-                == mB_prev0.element_type
-            )
-        ):
-            raise TypeError("U/B/C/U_prev0/B_prev0 must share element type.")
-        if cutlass.const_expr(mM.element_type != cutlass.Float32):
-            raise TypeError("M must be Float32.")
-        if cutlass.const_expr(mK.element_type != cutlass.Float32):
-            raise TypeError("K must be Float32.")
-        if cutlass.const_expr(mZ0.element_type != cutlass.Float32):
-            raise TypeError("Z0 must be Float32.")
-        if cutlass.const_expr(
-            mOut.element_type
-            not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
-        ):
-            raise TypeError("Out must be Float16/BFloat16/Float32.")
-
-        in_dtype = mU.element_type
-        out_dtype = mOut.element_type
-        bundle = self._make_kernel_bundle(in_dtype, out_dtype)
-        layouts = bundle.layouts
-        copies = bundle.copies
-        SharedStorage = self._make_shared_storage(in_dtype, layouts)
-        grid_dim = (
-            cute.ceil_div(mU.shape[1], self.m_block_size),
-            cute.size(mU.shape[0]),
-            1,
-        )
-        self.kernel(
+        self._validate_main_operands(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
+        self._launch_main_kernel(
             mU,
             mB,
             mC,
@@ -1517,24 +1487,10 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             mU_prev0,
             mB_prev0,
             mOut,
-            layouts.sQ_layout,
-            layouts.sB_layout,
-            layouts.sK_layout,
-            layouts.sZ_layout,
-            layouts.sV_layout,
-            layouts.sO_layout,
-            copies.gmem_tiled_copy_D,
-            copies.gmem_tiled_copy_P,
-            copies.gmem_tiled_copy_O,
-            bundle.tiled_mma,
-            SharedStorage,
-        ).launch(
-            grid=grid_dim,
-            block=[self.num_threads, 1, 1],
-            smem=bundle.smem_size,
             stream=stream,
         )
 
+    # Kernel entrypoint
     @cute.kernel
     def kernel(
         self,
@@ -1547,691 +1503,470 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         mU_prev0: cute.Tensor,
         mB_prev0: cute.Tensor,
         mOut: cute.Tensor,
-        sQ_layout: cute.Layout | cute.ComposedLayout,
-        sB_layout: cute.Layout | cute.ComposedLayout,
-        sK_layout: cute.Layout | cute.ComposedLayout,
-        sZ_layout: cute.Layout | cute.ComposedLayout,
-        sV_layout: cute.Layout | cute.ComposedLayout,
-        sO_layout: cute.Layout | cute.ComposedLayout,
-        gmem_tiled_copy_D: cute.TiledCopy,
-        gmem_tiled_copy_P: cute.TiledCopy,
-        gmem_tiled_copy_O: cute.TiledCopy,
+        query_layout: cute.Layout | cute.ComposedLayout,
+        bz_alias_layout: cute.Layout | cute.ComposedLayout,
+        key_layout: cute.Layout | cute.ComposedLayout,
+        z_layout: cute.Layout | cute.ComposedLayout,
+        value_layout: cute.Layout | cute.ComposedLayout,
+        output_layout: cute.Layout | cute.ComposedLayout,
+        gmem_tiled_copy_d: cute.TiledCopy,
+        gmem_tiled_copy_p: cute.TiledCopy,
+        gmem_tiled_copy_output: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
-        SharedStorage: cutlass.Constexpr,
+        shared_storage_cls: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, bhc, _ = cute.arch.block_idx()
+        m_block, batch_head_chunk, _ = cute.arch.block_idx()
 
-        Pp = self.P_padded
-        m = self.m_block_size
-        n = self.n_block_size
+        in_dtype = mU.element_type
+        p_padded = self.P_padded
+        m_block_size = self.m_block_size
+        n_block_size = self.n_block_size
+        d_stage_width = self._d_stage_size()
+        d_stage_count = self._d_stage_count()
         n_block_max = self.n_block_max
-        L = self.L
+        seq_len = self.L
+        m_tile_start = m_block * m_block_size
 
-        BH = mU_prev0.shape[0]
-        n_chunks = mU.shape[0] // BH
-        bh = bhc // n_chunks
-        chunk = bhc - bh * n_chunks
-        is_chunk0 = chunk == 0
+        batch_head_count = mU_prev0.shape[0]
+        n_chunks = mU.shape[0] // batch_head_count
+        batch_head = batch_head_chunk // n_chunks
+        chunk_index = batch_head_chunk - batch_head * n_chunks
+        is_chunk0 = chunk_index == 0
 
         smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        sQ = storage.q_tile.get_tensor(sQ_layout)
-        sB = storage.bz_alias.get_tensor(sB_layout)
+        storage = smem.allocate(shared_storage_cls)
+        s_query = storage.q_tile.get_tensor(query_layout)
+        s_bz_alias = storage.bz_alias.get_tensor(bz_alias_layout)
         if cutlass.const_expr(self._v_alias_in_bz()):
-            sV = cute.make_tensor(sB.iterator, sV_layout)
+            s_value = cute.make_tensor(s_bz_alias.iterator, value_layout)
         else:
-            sV = storage.v_tile.get_tensor(sV_layout)
-        sK = cute.make_tensor(sB.iterator, sK_layout)
-        sZ = cute.make_tensor(sB.iterator, sZ_layout)
+            s_value = storage.v_tile.get_tensor(value_layout)
+        s_key = cute.make_tensor(s_bz_alias.iterator, key_layout)
+        s_z = cute.make_tensor(s_bz_alias.iterator, z_layout)
 
-        sLpQ = storage.lp_q.get_tensor(cute.make_layout((m,), stride=(1,)))
-        sLpK = storage.lp_k.get_tensor(cute.make_layout((n,), stride=(1,)))
-        sLogpref = storage.logpref.get_tensor(cute.make_layout((L,), stride=(1,)))
-        sPhaseRe = storage.phase_re.get_tensor(cute.make_layout((L,), stride=(1,)))
-        sPhaseIm = storage.phase_im.get_tensor(cute.make_layout((L,), stride=(1,)))
-        sTapPhaseRe = storage.tap_phase_re.get_tensor(
-            cute.make_layout((n,), stride=(1,))
+        s_query_scale = storage.query_scale.get_tensor(
+            cute.make_layout((m_block_size,), stride=(1,))
         )
-        sTapPhaseIm = storage.tap_phase_im.get_tensor(
-            cute.make_layout((n,), stride=(1,))
+        s_key_scale = storage.key_scale.get_tensor(
+            cute.make_layout((n_block_size,), stride=(1,))
         )
-        warpLogTotal = storage.warp_log_total.get_tensor(
+        s_log_prefix = storage.log_prefix.get_tensor(
+            cute.make_layout((seq_len,), stride=(1,))
+        )
+        s_phase_re = storage.phase_re.get_tensor(
+            cute.make_layout((seq_len,), stride=(1,))
+        )
+        s_phase_im = storage.phase_im.get_tensor(
+            cute.make_layout((seq_len,), stride=(1,))
+        )
+        s_tap_phase_re = storage.tap_phase_re.get_tensor(
+            cute.make_layout((n_block_size,), stride=(1,))
+        )
+        s_tap_phase_im = storage.tap_phase_im.get_tensor(
+            cute.make_layout((n_block_size,), stride=(1,))
+        )
+        warp_log_total = storage.warp_log_total.get_tensor(
             cute.make_layout((self.num_warps,), stride=(1,))
         )
-        warpLogOffset = storage.warp_log_offset.get_tensor(
+        warp_log_offset = storage.warp_log_offset.get_tensor(
             cute.make_layout((self.num_warps,), stride=(1,))
         )
-        warpPhaseTotal = storage.warp_phase_total.get_tensor(
+        warp_phase_total = storage.warp_phase_total.get_tensor(
             cute.make_layout((self.num_warps, 2), stride=(2, 1))
         )
-        warpPhaseOffset = storage.warp_phase_offset.get_tensor(
+        warp_phase_offset = storage.warp_phase_offset.get_tensor(
             cute.make_layout((self.num_warps, 2), stride=(2, 1))
         )
 
-        sVt = cute.composition(sV, cute.make_layout((Pp, n), stride=(n, 1)))
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.warp_idx()
+        s_value_transposed = cute.composition(
+            s_value,
+            cute.make_layout((p_padded, n_block_size), stride=(n_block_size, 1)),
+        )
+        prefix_state = SimpleNamespace(
+            batch_head_chunk=batch_head_chunk,
+            m_transition=mM,
+            s_log_prefix=s_log_prefix,
+            s_phase_re=s_phase_re,
+            s_phase_im=s_phase_im,
+            warp_log_total=warp_log_total,
+            warp_log_offset=warp_log_offset,
+            warp_phase_total=warp_phase_total,
+            warp_phase_offset=warp_phase_offset,
+        )
+        self._compute_phase_prefix_metadata(prefix_state)
 
-        tt = tidx
-        logp = cutlass.Float32(0.0)
-        pr = cutlass.Float32(1.0)
-        pi = cutlass.Float32(0.0)
+        g_output = cute.local_tile(
+            mOut[batch_head_chunk, None, 0, None],
+            (m_block_size, p_padded),
+            (m_block, 0),
+        )
 
-        if tidx < L:
-            mr = cutlass.Float32(mM[bhc, tt, 0])
-            mi = cutlass.Float32(mM[bhc, tt, 1])
-            mag2 = mr * mr + mi * mi + cutlass.Float32(1.0e-20)
-            inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
-            pr = mr * inv_mag
-            pi = mi * inv_mag
-            logp = cute.math.log2(mag2, fastmath=False) * cutlass.Float32(0.5 / LOG2_E)
+        gmem_thr_copy_d = gmem_tiled_copy_d.get_slice(tidx)
+        gmem_thr_copy_p = gmem_tiled_copy_p.get_slice(tidx)
+        t_query_smem = gmem_thr_copy_d.partition_D(s_query)
+        t_key_smem = gmem_thr_copy_d.partition_D(s_key)
+        t_value_smem = gmem_thr_copy_p.partition_D(s_value)
 
-        for offset in (1, 2, 4, 8, 16):
-            other_log = cute.arch.shuffle_sync_up(
-                logp, offset=offset, mask=-1, mask_and_clamp=0
-            )
-            other_pr = cute.arch.shuffle_sync_up(
-                pr, offset=offset, mask=-1, mask_and_clamp=0
-            )
-            other_pi = cute.arch.shuffle_sync_up(
-                pi, offset=offset, mask=-1, mask_and_clamp=0
-            )
-
-            pred = lane >= cutlass.Int32(offset)
-            logp = cutlass.select_(pred, logp + other_log, logp)
-            next_pr = pr * other_pr - pi * other_pi
-            next_pi = pr * other_pi + pi * other_pr
-            pr = cutlass.select_(pred, next_pr, pr)
-            pi = cutlass.select_(pred, next_pi, pi)
-
-        if lane == cutlass.Int32(31):
-            warpLogTotal[warp] = logp
-            warpPhaseTotal[warp, 0] = pr
-            warpPhaseTotal[warp, 1] = pi
-        cute.arch.barrier()
-
-        if warp == cutlass.Int32(0):
-            w = lane
-            num_warps = cutlass.Int32(self.num_threads // 32)
-            has_warp = w < num_warps
-
-            wlog = cutlass.select_(has_warp, warpLogTotal[w], cutlass.Float32(0.0))
-            wpr = cutlass.select_(has_warp, warpPhaseTotal[w, 0], cutlass.Float32(1.0))
-            wpi = cutlass.select_(has_warp, warpPhaseTotal[w, 1], cutlass.Float32(0.0))
-
-            for offset in (1, 2, 4, 8, 16):
-                other_log = cute.arch.shuffle_sync_up(
-                    wlog, offset=offset, mask=-1, mask_and_clamp=0
-                )
-                other_pr = cute.arch.shuffle_sync_up(
-                    wpr, offset=offset, mask=-1, mask_and_clamp=0
-                )
-                other_pi = cute.arch.shuffle_sync_up(
-                    wpi, offset=offset, mask=-1, mask_and_clamp=0
-                )
-                pred = lane >= cutlass.Int32(offset)
-                wlog = cutlass.select_(pred, wlog + other_log, wlog)
-                next_wpr = wpr * other_pr - wpi * other_pi
-                next_wpi = wpr * other_pi + wpi * other_pr
-                wpr = cutlass.select_(pred, next_wpr, wpr)
-                wpi = cutlass.select_(pred, next_wpi, wpi)
-
-            off_log = cute.arch.shuffle_sync_up(
-                wlog, offset=1, mask=-1, mask_and_clamp=0
-            )
-            off_pr = cute.arch.shuffle_sync_up(wpr, offset=1, mask=-1, mask_and_clamp=0)
-            off_pi = cute.arch.shuffle_sync_up(wpi, offset=1, mask=-1, mask_and_clamp=0)
-
-            is_first_warp = lane == cutlass.Int32(0)
-            off_log = cutlass.select_(is_first_warp, cutlass.Float32(0.0), off_log)
-            off_pr = cutlass.select_(is_first_warp, cutlass.Float32(1.0), off_pr)
-            off_pi = cutlass.select_(is_first_warp, cutlass.Float32(0.0), off_pi)
-
-            if has_warp:
-                warpLogOffset[w] = off_log
-                warpPhaseOffset[w, 0] = off_pr
-                warpPhaseOffset[w, 1] = off_pi
-
-        cute.arch.barrier()
-
-        off_log = warpLogOffset[warp]
-        off_pr = warpPhaseOffset[warp, 0]
-        off_pi = warpPhaseOffset[warp, 1]
-        logp = logp + off_log
-        next_pr = pr * off_pr - pi * off_pi
-        next_pi = pr * off_pi + pi * off_pr
-        pr, pi = next_pr, next_pi
-
-        if tidx < L:
-            sLogpref[tt] = logp
-            sPhaseRe[tt] = pr
-            sPhaseIm[tt] = pi
-
-        cute.arch.barrier()
-
-        Ds = self._d_stage_size()
-        Ns = Ds // 2
-        d_stage_count = self._d_stage_count()
-        vec = 4
-
-        gO = cute.local_tile(mOut[bhc, None, 0, None], (m, Pp), (m_block, 0))
-
-        gmem_thr_copy_D = gmem_tiled_copy_D.get_slice(tidx)
-        gmem_thr_copy_P = gmem_tiled_copy_P.get_slice(tidx)
-        tQsQ = gmem_thr_copy_D.partition_D(sQ)
-        tKsK = gmem_thr_copy_D.partition_D(sK)
-        tVsV = gmem_thr_copy_P.partition_D(sV)
-
-        mcQ = cute.make_identity_tensor(mC.layout.shape)
-        mcK = cute.make_identity_tensor(mB.layout.shape)
-        mcV = cute.make_identity_tensor(mU.layout.shape)
-        mcS = cute.make_identity_tensor(
+        coord_query = cute.make_identity_tensor(mC.layout.shape)
+        coord_key = cute.make_identity_tensor(mB.layout.shape)
+        coord_value = cute.make_identity_tensor(mU.layout.shape)
+        coord_score = cute.make_identity_tensor(
             (mU.shape[0], mU.shape[1], mU.shape[2], mB.shape[1])
         )
 
-        cV0 = cute.local_tile(mcV[bhc, None, 0, None], (n, Pp), (0, 0))
-        tVcV0 = gmem_thr_copy_P.partition_S(cV0)
-        tVpV = self._make_copy_col_predicate(tVsV, tVcV0, mU.layout.shape[3])
+        coord_value_tile0 = cute.local_tile(
+            coord_value[batch_head_chunk, None, 0, None],
+            (n_block_size, p_padded),
+            (0, 0),
+        )
+        t_value_coord0 = gmem_thr_copy_p.partition_S(coord_value_tile0)
+        t_value_pred = self._make_copy_column_predicate(
+            t_value_smem, t_value_coord0, mU.layout.shape[3]
+        )
 
-        q_row = m_block * m + tidx
-        if tidx < m:
-            scale = cutlass.Float32(0.0)
-            if cute.elem_less(q_row, L):
-                scale = cute.math.exp2(
-                    cutlass.Float32(sLogpref[q_row]) * cutlass.Float32(LOG2_E),
-                    fastmath=True,
-                )
-            sLpQ[tidx] = scale
+        self._initialize_query_scales_from_prefix(
+            prefix_state,
+            s_query_scale,
+            m_tile_start=m_tile_start,
+        )
 
         thr_mma = tiled_mma.get_slice(tidx)
-        tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
-        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
-        tSrZ = thr_mma.make_fragment_B(thr_mma.partition_B(sZ))
-        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
+        t_reg_query = thr_mma.make_fragment_A(thr_mma.partition_A(s_query))
+        t_reg_key = thr_mma.make_fragment_B(thr_mma.partition_B(s_key))
+        t_reg_z = thr_mma.make_fragment_B(thr_mma.partition_B(s_z))
+        t_reg_value_transposed = thr_mma.make_fragment_B(
+            thr_mma.partition_B(s_value_transposed)
+        )
 
-        acc_shape_O = thr_mma.partition_shape_C((m, Pp))
-        acc_O = self._make_mma_accumulator(acc_shape_O, cutlass.Float32)
-        acc_O.fill(0.0)
-        acc_shape_S = thr_mma.partition_shape_C((m, n))
-        acc_template_S = self._make_mma_accumulator(acc_shape_S, cutlass.Float32)
+        acc_shape_output = thr_mma.partition_shape_C((m_block_size, p_padded))
+        acc_output = cute.make_rmem_tensor(acc_shape_output, cutlass.Float32)
+        acc_output.fill(0.0)
+        acc_shape_score = thr_mma.partition_shape_C((m_block_size, n_block_size))
+        acc_score_template = cute.make_rmem_tensor(acc_shape_score, cutlass.Float32)
 
-        smem_copy_atom_Q = cute.make_copy_atom(
+        smem_copy_atom_query = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             mU.element_type,
         )
-        smem_copy_atom_K = cute.make_copy_atom(
+        smem_copy_atom_key = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             mU.element_type,
         )
-        smem_copy_atom_V = cute.make_copy_atom(
+        smem_copy_atom_value = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
             mU.element_type,
         )
-        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_Q, tiled_mma)
-        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_K, tiled_mma)
-        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
+        smem_tiled_copy_query = cute.make_tiled_copy_A(smem_copy_atom_query, tiled_mma)
+        smem_tiled_copy_key = cute.make_tiled_copy_B(smem_copy_atom_key, tiled_mma)
+        smem_tiled_copy_value = cute.make_tiled_copy_B(smem_copy_atom_value, tiled_mma)
 
-        smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
-        smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
-        smem_thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
+        smem_thr_copy_query = smem_tiled_copy_query.get_slice(tidx)
+        smem_thr_copy_key = smem_tiled_copy_key.get_slice(tidx)
+        smem_thr_copy_value = smem_tiled_copy_value.get_slice(tidx)
 
-        tSsQ = smem_thr_copy_Q.partition_S(sQ)
-        tSrQ_view = smem_thr_copy_Q.retile(tSrQ)
-        tSsK = smem_thr_copy_K.partition_S(sK)
-        tSrK_view = smem_thr_copy_K.retile(tSrK)
-        tSsZ = smem_thr_copy_K.partition_S(sZ)
-        tSrZ_view = smem_thr_copy_K.retile(tSrZ)
-        tOsVt = smem_thr_copy_V.partition_S(sVt)
-        tOrVt_view = smem_thr_copy_V.retile(tOrVt)
+        t_smem_query = smem_thr_copy_query.partition_S(s_query)
+        t_reg_query_view = smem_thr_copy_query.retile(t_reg_query)
+        t_smem_key = smem_thr_copy_key.partition_S(s_key)
+        t_reg_key_view = smem_thr_copy_key.retile(t_reg_key)
+        t_smem_z = smem_thr_copy_key.partition_S(s_z)
+        t_reg_z_view = smem_thr_copy_key.retile(t_reg_z)
+        t_smem_value_transposed = smem_thr_copy_value.partition_S(s_value_transposed)
+        t_reg_value_transposed_view = smem_thr_copy_value.retile(t_reg_value_transposed)
 
-        # Off-term accumulation (Q x conj(Z0)) across staged D slices.
-        for d_stage_idx in cutlass.range_constexpr(d_stage_count):
-            d_col_base = d_stage_idx * Ds
+        offterm_state = SimpleNamespace(
+            batch_head_chunk=batch_head_chunk,
+            m_block=m_block,
+            m_tile_start=m_tile_start,
+            gmem_tiled_copy_d=gmem_tiled_copy_d,
+            gmem_thr_copy_d=gmem_thr_copy_d,
+            m_query=mC,
+            m_z0=mZ0,
+            coord_query=coord_query,
+            t_query_smem=t_query_smem,
+            s_query=s_query,
+            s_z=s_z,
+        )
+        mma_state = SimpleNamespace(
+            tiled_mma=tiled_mma,
+            thr_mma=thr_mma,
+            acc_output=acc_output,
+            acc_score_template=acc_score_template,
+            smem_tiled_copy_query=smem_tiled_copy_query,
+            smem_tiled_copy_key=smem_tiled_copy_key,
+            smem_tiled_copy_value=smem_tiled_copy_value,
+            t_smem_query=t_smem_query,
+            t_reg_query_view=t_reg_query_view,
+            t_smem_key=t_smem_key,
+            t_reg_key_view=t_reg_key_view,
+            t_smem_z=t_smem_z,
+            t_reg_z_view=t_reg_z_view,
+            t_smem_value_transposed=t_smem_value_transposed,
+            t_reg_value_transposed_view=t_reg_value_transposed_view,
+            t_reg_query=t_reg_query,
+            t_reg_key=t_reg_key,
+            t_reg_z=t_reg_z,
+            t_reg_value_transposed=t_reg_value_transposed,
+        )
+        self._accumulate_offterm_from_rotated_z0(
+            offterm_state,
+            prefix_state,
+            mma_state,
+        )
 
-            gQ_stage = cute.local_tile(
-                mC[bhc, None, 0, None], (m, Ds), (m_block, d_stage_idx)
-            )
-            cQ_stage = cute.local_tile(
-                mcQ[bhc, None, 0, None], (m, Ds), (m_block, d_stage_idx)
-            )
-            tQgQ = gmem_thr_copy_D.partition_S(gQ_stage)
-            tQcQ = gmem_thr_copy_D.partition_S(cQ_stage)
-            tQpQ = self._make_copy_col_predicate(tQsQ, tQcQ, mC.layout.shape[3])
-            self._copy_gmem_rows_or_zero(
-                gmem_tiled_copy_D,
-                tQgQ,
-                tQsQ,
-                tQcQ,
-                tQpQ,
-                mC.layout.shape[1],
-            )
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
-
-            total_q_stage = m * Ns
-            idx = tidx
-            while cute.elem_less(idx, total_q_stage):
-                rr = idx // Ns
-                vv = idx - rr * Ns
-                t_idx = m_block * m + rr
-                if cute.elem_less(t_idx, L):
-                    re_col = vv * 2 + 0
-                    im_col = vv * 2 + 1
-                    cre = cutlass.Float32(sQ[rr, re_col])
-                    cim = cutlass.Float32(sQ[rr, im_col])
-                    phase_re = cutlass.Float32(sPhaseRe[t_idx])
-                    phase_im = cutlass.Float32(sPhaseIm[t_idx])
-                    qre = cre * phase_re + cim * phase_im
-                    qim = cre * phase_im - cim * phase_re
-                    sQ[rr, re_col] = qre.to(mU.element_type)
-                    sQ[rr, im_col] = qim.to(mU.element_type)
-                idx = idx + self.num_threads
-            cute.arch.barrier()
-
-            vec_cols = Ds // vec
-            total_vec = Pp * vec_cols
-            v = tidx
-            while cute.elem_less(v, total_vec):
-                rr = v // vec_cols
-                cc0 = (v - rr * vec_cols) * vec
-                g_col = d_col_base + cc0
-
-                f0 = cutlass.Float32(0.0)
-                f1 = cutlass.Float32(0.0)
-                f2 = cutlass.Float32(0.0)
-                f3 = cutlass.Float32(0.0)
-                if cute.elem_less(rr, mZ0.layout.shape[1]) and cute.elem_less(
-                    g_col + (vec - 1), mZ0.layout.shape[3]
-                ):
-                    row = mZ0[bhc, rr, 0, None]
-                    row = cute.domain_offset((g_col,), row)
-                    seg = cute.make_tensor(
-                        row.iterator.align(16), cute.make_layout((vec,), stride=(1,))
-                    )
-                    r = seg.load()
-                    f0 = cutlass.Float32(r[0])
-                    f1 = cutlass.Float32(r[1])
-                    f2 = cutlass.Float32(r[2])
-                    f3 = cutlass.Float32(r[3])
-
-                sZ[rr, cc0 + 0] = f0.to(mU.element_type)
-                sZ[rr, cc0 + 1] = (-f1).to(mU.element_type)
-                sZ[rr, cc0 + 2] = f2.to(mU.element_type)
-                sZ[rr, cc0 + 3] = (-f3).to(mU.element_type)
-                v = v + self.num_threads
-            cute.arch.barrier()
-
-            self._accumulate_from_smem_mma(
-                tiled_mma,
-                acc_O,
-                smem_tiled_copy_Q,
-                smem_tiled_copy_K,
-                tSsQ,
-                tSrQ_view,
-                tSsZ,
-                tSrZ_view,
-                tSrQ,
-                tSrZ,
-            )
-
-        cO = self._make_output_tile(mOut, bhc, m_block)
-        tOcO = thr_mma.partition_C(cO)
-        tOcO_mn = self._make_acc_tensor_mn_view(tOcO)
-        acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
-        m_tile_start = m_block * m
-        for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
-            row_idx = tOcO_mn[r, 0][1]
-            if cute.elem_less(row_idx, L):
-                scale = sLpQ[row_idx - m_tile_start]
-                acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
+        c_output = self._make_output_coord_tile(mOut, batch_head_chunk, m_block)
+        t_output_coord = thr_mma.partition_C(c_output)
+        t_output_coord_mn = self._make_accumulator_mn_view(t_output_coord)
+        acc_output_mn = self._make_accumulator_mn_view(acc_output)
+        self._scale_output_with_query_scales(
+            acc_output_mn,
+            t_output_coord_mn,
+            s_query_scale,
+            m_tile_start=m_tile_start,
+            row_limit=seq_len,
+        )
 
         visible_n_block_max = cutlass.min(
-            cute.ceil_div((m_block + 1) * m, n), n_block_max
+            cute.ceil_div((m_block + 1) * m_block_size, n_block_size), n_block_max
         )
-        full_visible_n_blocks = (m_block * m) // n
+        full_visible_n_blocks = (m_block * m_block_size) // n_block_size
 
         for pass_id in cutlass.range_constexpr(2):
             use_prev = cutlass.const_expr(pass_id == 0)
 
-            mB_source = mB
-            mU_source = mU
+            m_key_pass = mB
+            m_value_pass = mU
             if cutlass.const_expr(use_prev):
-                mB_source = cute.domain_offset((0, -1, 0, 0), mB)
-                mU_source = cute.domain_offset((0, -1, 0, 0), mU)
+                m_key_pass = cute.domain_offset((0, -1, 0, 0), mB)
+                m_value_pass = cute.domain_offset((0, -1, 0, 0), mU)
+            tap_idx = 0 if cutlass.const_expr(use_prev) else 1
 
-            for n_block in cutlass.range_constexpr(self.n_block_max):
-                if cute.elem_less(n_block, visible_n_block_max):
-                    acc_S = self._make_mma_accumulator_like(
-                        acc_template_S, cutlass.Float32
+            for n_block in range(visible_n_block_max):
+                is_prev_boundary_block = cutlass.const_expr(use_prev) and n_block == 0
+                acc_score = cute.make_rmem_tensor_like(
+                    acc_score_template, cutlass.Float32
+                )
+                acc_score.fill(0.0)
+
+                self._initialize_tap_phase_from_prefix(
+                    mK,
+                    s_phase_re,
+                    s_phase_im,
+                    s_tap_phase_re,
+                    s_tap_phase_im,
+                    batch_head_chunk=batch_head_chunk,
+                    n_block=n_block,
+                    tap_idx=tap_idx,
+                    row_limit=seq_len,
+                )
+
+                for d_stage_idx in cutlass.range_constexpr(d_stage_count):
+                    d_col_base = d_stage_idx * d_stage_width
+
+                    g_query_stage = cute.local_tile(
+                        mC[batch_head_chunk, None, 0, None],
+                        (m_block_size, d_stage_width),
+                        (m_block, d_stage_idx),
                     )
-                    acc_S.fill(0.0)
-
-                    if tidx < n:
-                        key_idx = n_block * n + tidx
-                        tr = cutlass.Float32(0.0)
-                        ti = cutlass.Float32(0.0)
-                        if cute.elem_less(key_idx, L):
-                            tap_idx = 0 if cutlass.const_expr(use_prev) else 1
-                            tap_re = cutlass.Float32(mK[bhc, key_idx, tap_idx, 0])
-                            tap_im = cutlass.Float32(mK[bhc, key_idx, tap_idx, 1])
-                            phase_re = cutlass.Float32(sPhaseRe[key_idx])
-                            phase_im = cutlass.Float32(sPhaseIm[key_idx])
-                            tr = tap_re * phase_re + tap_im * phase_im
-                            ti = tap_im * phase_re - tap_re * phase_im
-                        sTapPhaseRe[tidx] = tr
-                        sTapPhaseIm[tidx] = ti
-                    cute.arch.barrier()
-
-                    for d_stage_idx in cutlass.range_constexpr(d_stage_count):
-                        d_col_base = d_stage_idx * Ds
-
-                        gQ_stage = cute.local_tile(
-                            mC[bhc, None, 0, None], (m, Ds), (m_block, d_stage_idx)
-                        )
-                        cQ_stage = cute.local_tile(
-                            mcQ[bhc, None, 0, None], (m, Ds), (m_block, d_stage_idx)
-                        )
-                        tQgQ = gmem_thr_copy_D.partition_S(gQ_stage)
-                        tQcQ = gmem_thr_copy_D.partition_S(cQ_stage)
-                        tQpQ = self._make_copy_col_predicate(
-                            tQsQ, tQcQ, mC.layout.shape[3]
-                        )
-                        self._copy_gmem_rows_or_zero(
-                            gmem_tiled_copy_D,
-                            tQgQ,
-                            tQsQ,
-                            tQcQ,
-                            tQpQ,
-                            mC.layout.shape[1],
-                        )
-
-                        gK_stage = cute.local_tile(
-                            mB_source[bhc, None, 0, None],
-                            (n, Ds),
-                            (n_block, d_stage_idx),
-                        )
-                        cK_stage = cute.local_tile(
-                            mcK[bhc, None, 0, None],
-                            (n, Ds),
-                            (n_block, d_stage_idx),
-                        )
-                        tKgK = gmem_thr_copy_D.partition_S(gK_stage)
-                        tKcK = gmem_thr_copy_D.partition_S(cK_stage)
-                        tKpK = self._make_copy_col_predicate(
-                            tKsK, tKcK, mB.layout.shape[3]
-                        )
-                        for ni in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                            row = tKcK[0, ni, 0][1]
-                            if cute.elem_less(row, mB.layout.shape[1]):
-                                if (
-                                    cutlass.const_expr(use_prev)
-                                    and n_block == 0
-                                    and is_chunk0
-                                    and cute.elem_less(row, 1)
-                                ):
-                                    tKsK[None, ni, None].fill(0)
-                                else:
-                                    cute.copy(
-                                        gmem_tiled_copy_D,
-                                        tKgK[None, ni, None],
-                                        tKsK[None, ni, None],
-                                        pred=tKpK[None, ni, None],
-                                    )
-                            else:
-                                tKsK[None, ni, None].fill(0)
-
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(0)
-                        cute.arch.barrier()
-
-                        total_q_stage = m * Ns
-                        idx = tidx
-                        while cute.elem_less(idx, total_q_stage):
-                            rr = idx // Ns
-                            vv = idx - rr * Ns
-                            t_idx = m_block * m + rr
-                            if cute.elem_less(t_idx, L):
-                                re_col = vv * 2 + 0
-                                im_col = vv * 2 + 1
-                                cre = cutlass.Float32(sQ[rr, re_col])
-                                cim = cutlass.Float32(sQ[rr, im_col])
-                                phase_re = cutlass.Float32(sPhaseRe[t_idx])
-                                phase_im = cutlass.Float32(sPhaseIm[t_idx])
-                                qre = cre * phase_re + cim * phase_im
-                                qim = cre * phase_im - cim * phase_re
-                                sQ[rr, re_col] = qre.to(mU.element_type)
-                                sQ[rr, im_col] = qim.to(mU.element_type)
-                            idx = idx + self.num_threads
-                        cute.arch.barrier()
-
-                        if cutlass.const_expr(use_prev) and n_block == 0:
-                            ii = tidx
-                            while cute.elem_less(ii, Ns):
-                                re_col = ii * 2 + 0
-                                im_col = ii * 2 + 1
-                                g_col_re = d_col_base + re_col
-                                g_col_im = d_col_base + im_col
-                                bre0 = sK[0, re_col]
-                                bim0 = sK[0, im_col]
-                                breb = mU.element_type(0)
-                                bimb = mU.element_type(0)
-                                if cute.elem_less(g_col_re, mB_prev0.layout.shape[1]):
-                                    breb = mB_prev0[bh, g_col_re]
-                                if cute.elem_less(g_col_im, mB_prev0.layout.shape[1]):
-                                    bimb = mB_prev0[bh, g_col_im]
-                                sK[0, re_col] = cutlass.select_(is_chunk0, breb, bre0)
-                                sK[0, im_col] = cutlass.select_(is_chunk0, bimb, bim0)
-                                ii = ii + self.num_threads
-                            cute.arch.barrier()
-
-                        total_k_stage = n * Ns
-                        ii = tidx
-                        while cute.elem_less(ii, total_k_stage):
-                            rr = ii // Ns
-                            vv = ii - rr * Ns
-                            key_idx = n_block * n + rr
-                            re_col = vv * 2 + 0
-                            im_col = vv * 2 + 1
-                            bre = cutlass.Float32(sK[rr, re_col])
-                            bim = cutlass.Float32(sK[rr, im_col])
-                            tr = cutlass.Float32(0.0)
-                            ti = cutlass.Float32(0.0)
-                            if cute.elem_less(key_idx, L):
-                                tr = cutlass.Float32(sTapPhaseRe[rr])
-                                ti = cutlass.Float32(sTapPhaseIm[rr])
-
-                            kre = bre * tr - bim * ti
-                            kim = bre * ti + bim * tr
-                            sK[rr, re_col] = kre.to(mU.element_type)
-                            sK[rr, im_col] = (-kim).to(mU.element_type)
-                            ii = ii + self.num_threads
-                        cute.arch.barrier()
-
-                        self._accumulate_from_smem_mma(
-                            tiled_mma,
-                            acc_S,
-                            smem_tiled_copy_Q,
-                            smem_tiled_copy_K,
-                            tSsQ,
-                            tSrQ_view,
-                            tSsK,
-                            tSrK_view,
-                            tSrQ,
-                            tSrK,
-                        )
-                    k_col = n_block * n + tidx
-                    if tidx < n:
-                        if cute.elem_less(k_col, L):
-                            lp_s = cutlass.Float32(sLogpref[k_col])
-                            sLpK[tidx] = cute.math.exp2(
-                                -lp_s * cutlass.Float32(LOG2_E), fastmath=True
-                            )
-                        else:
-                            sLpK[tidx] = 0.0
-                    cute.arch.barrier()
-
-                    cS = cute.local_tile(
-                        mcS[bhc, None, 0, None],
-                        (m, n),
-                        (m_block, n_block),
+                    c_query_stage = cute.local_tile(
+                        coord_query[batch_head_chunk, None, 0, None],
+                        (m_block_size, d_stage_width),
+                        (m_block, d_stage_idx),
                     )
-                    tScS = thr_mma.partition_C(cS)
-                    tScS_mn = self._make_acc_tensor_mn_view(tScS)
-                    if cute.elem_less(n_block, full_visible_n_blocks):
-                        self._scale_and_mask_scores(
-                            acc_S,
-                            tScS_mn,
-                            sLpQ,
-                            sLpK,
-                            m_tile_start=cutlass.Int32(m_tile_start),
-                            n_tile_start=n_block * n,
-                            seqlen=cutlass.Int32(L),
-                            apply_mask=False,
-                        )
-                    else:
-                        self._scale_and_mask_scores(
-                            acc_S,
-                            tScS_mn,
-                            sLpQ,
-                            sLpK,
-                            m_tile_start=cutlass.Int32(m_tile_start),
-                            n_tile_start=n_block * n,
-                            seqlen=cutlass.Int32(L),
-                            apply_mask=True,
-                        )
+                    t_query_gmem = gmem_thr_copy_d.partition_S(g_query_stage)
+                    t_query_coord = gmem_thr_copy_d.partition_S(c_query_stage)
+                    t_query_pred = self._make_copy_column_predicate(
+                        t_query_smem, t_query_coord, mC.layout.shape[3]
+                    )
+                    self._copy_rows_with_zero_fill(
+                        gmem_tiled_copy_d,
+                        t_query_gmem,
+                        t_query_smem,
+                        t_query_coord,
+                        t_query_pred,
+                        mC.layout.shape[1],
+                    )
 
-                    gVtile = cute.local_tile(
-                        mU_source[bhc, None, 0, None],
-                        (n, Pp),
-                        (n_block, 0),
+                    g_key_stage = cute.local_tile(
+                        m_key_pass[batch_head_chunk, None, 0, None],
+                        (n_block_size, d_stage_width),
+                        (n_block, d_stage_idx),
                     )
-                    tVgV = gmem_thr_copy_P.partition_S(gVtile)
-                    cV_tile = cute.local_tile(
-                        mcV[bhc, None, 0, None],
-                        (n, Pp),
-                        (n_block, 0),
+                    c_key_stage = cute.local_tile(
+                        coord_key[batch_head_chunk, None, 0, None],
+                        (n_block_size, d_stage_width),
+                        (n_block, d_stage_idx),
                     )
-                    tVcV = gmem_thr_copy_P.partition_S(cV_tile)
-                    for vi in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                        row = tVcV[0, vi, 0][1]
-                        if cute.elem_less(row, mU.layout.shape[1]):
+                    t_key_gmem = gmem_thr_copy_d.partition_S(g_key_stage)
+                    t_key_coord = gmem_thr_copy_d.partition_S(c_key_stage)
+                    t_key_pred = self._make_copy_column_predicate(
+                        t_key_smem, t_key_coord, mB.layout.shape[3]
+                    )
+                    for ni in cutlass.range_constexpr(cute.size(t_key_smem.shape[1])):
+                        row = t_key_coord[0, ni, 0][1]
+                        if cute.elem_less(row, mB.layout.shape[1]):
                             if (
-                                cutlass.const_expr(use_prev)
-                                and n_block == 0
+                                is_prev_boundary_block
                                 and is_chunk0
                                 and cute.elem_less(row, 1)
                             ):
-                                tVsV[None, vi, None].fill(0)
+                                t_key_smem[None, ni, None].fill(0)
                             else:
                                 cute.copy(
-                                    gmem_tiled_copy_P,
-                                    tVgV[None, vi, None],
-                                    tVsV[None, vi, None],
-                                    pred=tVpV[None, vi, None],
+                                    gmem_tiled_copy_d,
+                                    t_key_gmem[None, ni, None],
+                                    t_key_smem[None, ni, None],
+                                    pred=t_key_pred[None, ni, None],
                                 )
                         else:
-                            tVsV[None, vi, None].fill(0)
+                            t_key_smem[None, ni, None].fill(0)
+
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.barrier()
 
-                    if cutlass.const_expr(use_prev) and n_block == 0:
-                        ii = tidx
-                        while cute.elem_less(ii, Pp):
-                            boundary = mU.element_type(0)
-                            old = sV[0, ii]
-                            if cute.elem_less(ii, self.P):
-                                boundary = mU_prev0[bh, ii]
-                            sV[0, ii] = cutlass.select_(is_chunk0, boundary, old)
-                            ii = ii + self.num_threads
-                        cute.arch.barrier()
-
-                    rP = cute.make_rmem_tensor_like(acc_S, mU.element_type)
-                    rP.store(acc_S.load().to(mU.element_type))
-                    rP_layout_divided = cute.logical_divide(rP.layout, (None, None, 2))
-                    rP_mma_view = cute.make_layout(
-                        (
-                            (rP_layout_divided.shape[0], rP_layout_divided.shape[2][0]),
-                            rP_layout_divided.shape[1],
-                            rP_layout_divided.shape[2][1],
-                        ),
-                        stride=(
-                            (
-                                rP_layout_divided.stride[0],
-                                rP_layout_divided.stride[2][0],
-                            ),
-                            rP_layout_divided.stride[1],
-                            rP_layout_divided.stride[2][1],
-                        ),
+                    self._rotate_staged_query_tile_from_prefix(
+                        s_query,
+                        s_phase_re,
+                        s_phase_im,
+                        m_tile_start=m_tile_start,
+                        row_limit=seq_len,
+                        stage_width=d_stage_width,
+                        out_dtype=in_dtype,
                     )
-                    tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
 
-                    cute.copy(
-                        smem_tiled_copy_V,
-                        tOsVt[None, None, 0],
-                        tOrVt_view[None, None, 0],
+                    if is_prev_boundary_block:
+                        self._inject_boundary_key_row(
+                            s_key,
+                            mB_prev0,
+                            batch_head=batch_head,
+                            d_col_base=d_col_base,
+                            stage_width=d_stage_width,
+                            out_dtype=in_dtype,
+                            is_chunk0=is_chunk0,
+                        )
+
+                    self._apply_tap_phase_to_staged_keys(
+                        s_key,
+                        s_tap_phase_re,
+                        s_tap_phase_im,
+                        n_block=n_block,
+                        stage_width=d_stage_width,
+                        row_limit=seq_len,
+                        out_dtype=in_dtype,
                     )
-                    for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
-                        k_next = (k + 1) % cute.size(tOrS.shape[2])
-                        cute.copy(
-                            smem_tiled_copy_V,
-                            tOsVt[None, None, k_next],
-                            tOrVt_view[None, None, k_next],
-                        )
-                        cute.gemm(
-                            tiled_mma,
-                            acc_O,
-                            tOrS[None, None, k],
-                            tOrVt[None, None, k],
-                            acc_O,
-                        )
-                    # The V tile aliases the main shared staging buffer in the
-                    # fast path, so do not let later stages overwrite it until
-                    # every warp is done.
-                    cute.arch.barrier()
 
-        if cutlass.const_expr(mOut.element_type == cutlass.Float32):
-            for r in cutlass.range_constexpr(cute.size(acc_O_mn.shape[0])):
-                row_idx = tOcO_mn[r, 0][1]
-                if cute.elem_less(row_idx, mOut.layout.shape[1]):
-                    for c in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
-                        col_idx = tOcO_mn[0, c][3]
-                        if cute.elem_less(col_idx, mOut.layout.shape[3]):
-                            mOut[tOcO_mn[r, c][0], row_idx, 0, col_idx] = (
-                                cutlass.Float32(acc_O_mn[r, c])
+                    self._accumulate_from_staged_tiles(
+                        tiled_mma,
+                        acc_score,
+                        smem_tiled_copy_query,
+                        smem_tiled_copy_key,
+                        t_smem_query,
+                        t_reg_query_view,
+                        t_smem_key,
+                        t_reg_key_view,
+                        t_reg_query,
+                        t_reg_key,
+                    )
+
+                self._initialize_key_scales_from_prefix(
+                    s_log_prefix,
+                    s_key_scale,
+                    n_block=n_block,
+                    seqlen=seq_len,
+                )
+
+                c_score = cute.local_tile(
+                    coord_score[batch_head_chunk, None, 0, None],
+                    (m_block_size, n_block_size),
+                    (m_block, n_block),
+                )
+                t_score_coord = thr_mma.partition_C(c_score)
+                t_score_coord_mn = self._make_accumulator_mn_view(t_score_coord)
+                if cute.elem_less(n_block, full_visible_n_blocks):
+                    self._apply_score_scales_and_mask(
+                        acc_score,
+                        t_score_coord_mn,
+                        s_query_scale,
+                        s_key_scale,
+                        m_tile_start=cutlass.Int32(m_tile_start),
+                        n_tile_start=n_block * n_block_size,
+                        seqlen=cutlass.Int32(seq_len),
+                        apply_mask=False,
+                    )
+                else:
+                    self._apply_score_scales_and_mask(
+                        acc_score,
+                        t_score_coord_mn,
+                        s_query_scale,
+                        s_key_scale,
+                        m_tile_start=cutlass.Int32(m_tile_start),
+                        n_tile_start=n_block * n_block_size,
+                        seqlen=cutlass.Int32(seq_len),
+                        apply_mask=True,
+                    )
+
+                g_value = cute.local_tile(
+                    m_value_pass[batch_head_chunk, None, 0, None],
+                    (n_block_size, p_padded),
+                    (n_block, 0),
+                )
+                t_value_gmem = gmem_thr_copy_p.partition_S(g_value)
+                c_value = cute.local_tile(
+                    coord_value[batch_head_chunk, None, 0, None],
+                    (n_block_size, p_padded),
+                    (n_block, 0),
+                )
+                t_value_coord = gmem_thr_copy_p.partition_S(c_value)
+                for vi in cutlass.range_constexpr(cute.size(t_value_smem.shape[1])):
+                    row = t_value_coord[0, vi, 0][1]
+                    if cute.elem_less(row, mU.layout.shape[1]):
+                        if (
+                            is_prev_boundary_block
+                            and is_chunk0
+                            and cute.elem_less(row, 1)
+                        ):
+                            t_value_smem[None, vi, None].fill(0)
+                        else:
+                            cute.copy(
+                                gmem_tiled_copy_p,
+                                t_value_gmem[None, vi, None],
+                                t_value_smem[None, vi, None],
+                                pred=t_value_pred[None, vi, None],
                             )
-        else:
-            rO = cute.make_rmem_tensor_like(acc_O, mOut.element_type)
-            rO.store(acc_O.load().to(mOut.element_type))
+                    else:
+                        t_value_smem[None, vi, None].fill(0)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
 
-            sO = cute.make_tensor(
-                cute.recast_ptr(sQ.iterator, dtype=mOut.element_type), sO_layout
-            )
-            smem_copy_atom_O = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mOut.element_type
-            )
-            smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
-            smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
-            taccOrO = smem_thr_copy_O.retile(rO)
-            taccOsO = smem_thr_copy_O.partition_D(sO)
-            cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
-            cute.arch.barrier()
+                if is_prev_boundary_block:
+                    self._inject_boundary_value_row(
+                        s_value,
+                        mU_prev0,
+                        batch_head=batch_head,
+                        out_dtype=in_dtype,
+                        is_chunk0=is_chunk0,
+                    )
 
-            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-            tOsO = gmem_thr_copy_O.partition_S(sO)
-            tOgO = gmem_thr_copy_O.partition_D(gO)
-            tOrO = cute.make_rmem_tensor_like(tOgO, mOut.element_type)
-            cute.copy(gmem_tiled_copy_O, tOsO, tOrO)
+                self._accumulate_output_from_scores(
+                    tiled_mma,
+                    acc_score,
+                    acc_output,
+                    in_dtype,
+                    smem_tiled_copy_value,
+                    t_smem_value_transposed,
+                    t_reg_value_transposed_view,
+                    t_reg_value_transposed,
+                )
 
-            tOcOut = gmem_thr_copy_O.partition_D(cO)
-            tOpOut = self._make_copy_col_predicate(tOgO, tOcOut, mOut.layout.shape[3])
-            self._copy_gmem_rows_if_valid(
-                gmem_tiled_copy_O,
-                tOrO,
-                tOgO,
-                tOcOut,
-                tOpOut,
-                mOut.layout.shape[1],
-            )
+        self._store_output(
+            mOut,
+            g_output,
+            c_output,
+            s_query,
+            output_layout,
+            gmem_tiled_copy_output,
+            tiled_mma,
+            acc_output,
+        )
