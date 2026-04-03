@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 import torch
+import cutlass.cute as cute
 
 import slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing as state_passing_bwd_mod
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (
@@ -258,4 +259,47 @@ def test_compile_state_passing_bwd_reuses_cached_executor(
         d_chunk_starts=d_chunk_starts.detach(),
         d_final=d_final.detach(),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compile_state_passing_bwd_enables_tvm_ffi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    inc, m_chunk, initial = _make_inputs(
+        batch=2,
+        heads=2,
+        chunks=12,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+
+    chunk_starts, final_state = _state_passing_autograd(inc, m_chunk, initial)
+    chunk_starts_f32 = chunk_starts.detach().to(dtype=torch.float32).contiguous()
+    d_chunk_starts = torch.randn_like(chunk_starts_f32)
+    d_final = torch.randn_like(final_state, dtype=torch.float32)
+
+    compile_options: list[object] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_options.append(kwargs.get("options"))
+        return orig_compile(*args, **kwargs)
+
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+    state_passing_bwd_mod._COMPILED_CACHE.clear()
+    try:
+        compile_state_passing_bwd_kernel(
+            chunk_starts_f32,
+            m_chunk.detach(),
+            d_chunk_starts=d_chunk_starts.detach(),
+            d_final=d_final.detach(),
+        )
+    finally:
+        state_passing_bwd_mod._COMPILED_CACHE.clear()
+
+    assert compile_options == ["--enable-tvm-ffi"]
     torch.cuda.synchronize()

@@ -7,13 +7,9 @@ from typing import Any, cast
 import torch
 
 import cutlass
-import cutlass.cute as cute
 import cutlass.cute.math as cute_math
-from cutlass.cute.runtime import make_ptr
 
 _cutlass_max = cast(Any, getattr(cutlass, "max"))
-_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
-_PTR_ARG_CACHE_LIMIT = 32768
 
 COEFF_AUX_DT_U = 0
 COEFF_AUX_GAMMA_SIGMOID = 1
@@ -75,47 +71,6 @@ def assumed_align(tensor: torch.Tensor) -> int:
         if (ptr % align) == 0:
             return align
     return elem_align
-
-
-def ptr_arg_cache_key(tensor: torch.Tensor) -> tuple[object, ...]:
-    device_index = (
-        int(tensor.device.index)
-        if tensor.device.type == "cuda" and tensor.device.index is not None
-        else -1
-    )
-    return (
-        tensor.device.type,
-        device_index,
-        int(id(tensor)),
-        int(tensor.data_ptr()),
-        tensor.dtype,
-        tuple(int(dim) for dim in tensor.shape),
-        tuple(int(step) for step in tensor.stride()),
-    )
-
-
-def make_ptr_arg(tensor: torch.Tensor) -> tuple[object, int]:
-    # Distinct tensor views can share a base address. Keep separate Pointer
-    # instances for those views so multi-arg host wrappers do not collapse them.
-    key = ptr_arg_cache_key(tensor)
-    cached = _PTR_ARG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    align = assumed_align(tensor)
-    cached = (
-        make_ptr(
-            torch_to_cutlass_dtype(tensor.dtype),
-            tensor.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=align,
-        ),
-        align,
-    )
-    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
-        _PTR_ARG_CACHE.clear()
-    _PTR_ARG_CACHE[key] = cached
-    return cached
 
 
 def sigmoid(x):
@@ -216,7 +171,6 @@ __all__ = [
     "complex_mul",
     "complex_mul_conj",
     "lerp",
-    "make_ptr_arg",
     "make_row_major_stride",
     "principal_angle",
     "real_mul_conj",

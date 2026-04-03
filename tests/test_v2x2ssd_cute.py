@@ -15,7 +15,6 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     state_passing_cute,
     v2x2ssd_fwd_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.common import _make_ptr_arg
 from slinoss.ops.v2x2ssd.reference import chunk_increment, chunk_scan, state_passing
 
 
@@ -329,19 +328,6 @@ def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
         v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
 
     assert recorded["kwargs"] == {"options": "--enable-tvm-ffi"}
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_v2x2ssd_fwd_ptr_cache_keeps_same_base_views_distinct() -> None:
-    pytest.importorskip("cutlass")
-
-    x = torch.empty((1, 1, 1, 2, 2), device="cuda", dtype=torch.float32)
-    base_ptr, _ = _make_ptr_arg(x)
-    slice0_ptr, _ = _make_ptr_arg(x[:, :, :, 0, :])
-    slice1_ptr, _ = _make_ptr_arg(x[:, :, :, 1, :])
-
-    assert base_ptr is not slice0_ptr
-    assert base_ptr is not slice1_ptr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -23,7 +23,7 @@ from slinoss.layers import (
 import slinoss.ops.scanprep.cute.bwd as scanprep_bwd_mod
 import slinoss.ops.scanprep.cute.fwd as scanprep_fwd_mod
 from slinoss.ops.scanprep.cute.bwd import scanprep_bwd
-from slinoss.ops.scanprep.cute.common import assumed_align, make_ptr_arg
+from slinoss.ops.scanprep.cute.common import assumed_align
 from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute, scanprep_fwd_cute_with_aux
 from slinoss.ops.v2x2ssd import v2x2ssd
 
@@ -104,21 +104,8 @@ def test_foh_taps_match_midpoint_rule_at_identity() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_scanprep_ptr_cache_keeps_same_base_views_distinct() -> None:
-    pytest.importorskip("cutlass")
-
-    x = torch.empty((1, 1, 1, 2, 2), device="cuda", dtype=torch.float32)
-    base_ptr, _ = make_ptr_arg(x)
-    slice0_ptr, _ = make_ptr_arg(x[:, :, :, 0, :])
-    slice1_ptr, _ = make_ptr_arg(x[:, :, :, 1, :])
-
-    assert base_ptr is not slice0_ptr
-    assert base_ptr is not slice1_ptr
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-def test_scanprep_ptr_args_use_actual_view_alignment(dtype: torch.dtype) -> None:
+def test_scanprep_assumed_align_uses_actual_view_alignment(dtype: torch.dtype) -> None:
     pytest.importorskip("cutlass")
 
     base = torch.empty((257,), device="cuda", dtype=dtype)
@@ -126,10 +113,7 @@ def test_scanprep_ptr_args_use_actual_view_alignment(dtype: torch.dtype) -> None
     assert view.is_contiguous()
     assert view.data_ptr() % 4 == 2
 
-    _ptr, align = make_ptr_arg(view)
-
     assert assumed_align(view) == view.element_size()
-    assert align == view.element_size()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

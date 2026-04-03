@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
@@ -136,31 +135,6 @@ def _guard_prev_time_base(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
     return guarded
 
 
-def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    align = _assumed_align(t)
-    return (
-        make_ptr(
-            _torch_to_cutlass_dtype(t.dtype),
-            t.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=align,
-        ),
-        align,
-    )
-
-
-def _make_ptr_args(
-    *tensors: torch.Tensor,
-) -> tuple[tuple[object, ...], tuple[int, ...]]:
-    ptrs: list[object] = []
-    alignments: list[int] = []
-    for tensor in tensors:
-        ptr, align = _make_ptr_arg(tensor)
-        ptrs.append(ptr)
-        alignments.append(align)
-    return tuple(ptrs), tuple(alignments)
-
-
 def _make_fake_tensor_arg(
     tensor: torch.Tensor,
     *,
@@ -218,8 +192,6 @@ __all__ = [
     "_ensure_min_alignment",
     "_guard_prev_time_base",
     "_make_fake_tensor_arg",
-    "_make_ptr_arg",
-    "_make_ptr_args",
     "_pad_m_identity",
     "_pad_zero_time",
     "_tc_input_dtype",

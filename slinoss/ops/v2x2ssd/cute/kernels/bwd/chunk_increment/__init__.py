@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
 
+from ...fwd.common import _make_fake_tensor_arg
 from .boundary import ChunkIncrementBwdBoundaryAmpere
 from .common import _assumed_align, _torch_to_cutlass_dtype
 from .db import ChunkIncrementBwdDBAmpere
@@ -16,6 +16,21 @@ from .param_scan import ChunkIncrementBwdParamScanAmpere
 _COMPILED_CACHE: dict[tuple, tuple[object, object, object, object, object]] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_PREV_CACHE_LIMIT = 8
+
+
+def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
+    stream = None
+    seen: set[int] = set()
+    for tensor in tensors:
+        if tensor is None or tensor.device.type != "cuda":
+            continue
+        ident = id(tensor)
+        if ident in seen:
+            continue
+        if stream is None:
+            stream = torch.cuda.current_stream(device=tensor.device)
+        tensor.record_stream(stream)
+        seen.add(ident)
 
 
 def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
@@ -183,31 +198,6 @@ def _compiled_key(
     )
 
 
-def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    align = _assumed_align(t)
-    return (
-        make_ptr(
-            _torch_to_cutlass_dtype(t.dtype),
-            t.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=align,
-        ),
-        align,
-    )
-
-
-def _make_ptr_args(
-    *tensors: torch.Tensor,
-) -> tuple[tuple[object, ...], tuple[int, ...]]:
-    ptrs: list[object] = []
-    alignments: list[int] = []
-    for tensor in tensors:
-        ptr, align = _make_ptr_arg(tensor)
-        ptrs.append(ptr)
-        alignments.append(align)
-    return tuple(ptrs), tuple(alignments)
-
-
 def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
     if not shape:
         return ()
@@ -233,17 +223,18 @@ def _make_tensor_spec(
 
 
 def _make_tensor_from_spec(
-    ptr: cute.Pointer,
+    tensor: cute.Tensor,
     spec: tuple[tuple[int, ...], tuple[int, ...]],
 ):
     shape, stride = spec
-    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+    return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=stride))
 
 
 def _make_db_host_wrapper(
     *,
     spec: tuple[int, ...],
     cfg: tuple[int, ...],
+    cutlass_dtype,
 ):
     L, P, D, BHC = spec
     chunk_size, n_d_tiles = cfg
@@ -260,14 +251,14 @@ def _make_db_host_wrapper(
 
     @cute.jit
     def _db_host_wrapper(
-        U_ptr: cute.Pointer,
-        B_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        Kprev_ptr: cute.Pointer,
-        Kcurr_ptr: cute.Pointer,
-        DIncDP_ptr: cute.Pointer,
-        DB_ptr: cute.Pointer,
-        DMsumPart_ptr: cute.Pointer,
+        U_ptr: cute.Tensor,
+        B_ptr: cute.Tensor,
+        M_ptr: cute.Tensor,
+        Kprev_ptr: cute.Tensor,
+        Kcurr_ptr: cute.Tensor,
+        DIncDP_ptr: cute.Tensor,
+        DB_ptr: cute.Tensor,
+        DMsumPart_ptr: cute.Tensor,
     ):
         mU = _make_tensor_from_spec(U_ptr, u_spec)
         mB = _make_tensor_from_spec(B_ptr, b_spec)
@@ -279,7 +270,7 @@ def _make_db_host_wrapper(
         mDMsumPart = _make_tensor_from_spec(DMsumPart_ptr, d_msum_part_spec)
 
         kernel = ChunkIncrementBwdDBAmpere(
-            U_ptr.value_type,
+            cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
@@ -293,6 +284,7 @@ def _make_du_host_wrapper(
     *,
     spec: tuple[int, ...],
     cfg: tuple[int, ...],
+    cutlass_dtype,
 ):
     L, P, D, BHC = spec
     (chunk_size,) = cfg
@@ -304,12 +296,12 @@ def _make_du_host_wrapper(
 
     @cute.jit
     def _du_host_wrapper(
-        DInc_ptr: cute.Pointer,
-        B_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        Kprev_ptr: cute.Pointer,
-        Kcurr_ptr: cute.Pointer,
-        DU_ptr: cute.Pointer,
+        DInc_ptr: cute.Tensor,
+        B_ptr: cute.Tensor,
+        M_ptr: cute.Tensor,
+        Kprev_ptr: cute.Tensor,
+        Kcurr_ptr: cute.Tensor,
+        DU_ptr: cute.Tensor,
     ):
         mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
         mB = _make_tensor_from_spec(B_ptr, b_spec)
@@ -319,7 +311,7 @@ def _make_du_host_wrapper(
         mDU = _make_tensor_from_spec(DU_ptr, d_u_spec)
 
         kernel = ChunkIncrementBwdDUAmpere(
-            DInc_ptr.value_type,
+            cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
@@ -333,6 +325,7 @@ def _make_boundary_host_wrapper(
     *,
     spec: tuple[int, ...],
     cfg: tuple[int, ...],
+    cutlass_dtype,
 ):
     L, P, D, BHC = spec
     (chunk_size,) = cfg
@@ -345,14 +338,14 @@ def _make_boundary_host_wrapper(
 
     @cute.jit
     def _boundary_host_wrapper(
-        DInc_ptr: cute.Pointer,
-        BPrev_ptr: cute.Pointer,
-        UPrev_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        Kprev_ptr: cute.Pointer,
-        DUPrev_ptr: cute.Pointer,
-        DBPrev_ptr: cute.Pointer,
-        DMp0_ptr: cute.Pointer,
+        DInc_ptr: cute.Tensor,
+        BPrev_ptr: cute.Tensor,
+        UPrev_ptr: cute.Tensor,
+        M_ptr: cute.Tensor,
+        Kprev_ptr: cute.Tensor,
+        DUPrev_ptr: cute.Tensor,
+        DBPrev_ptr: cute.Tensor,
+        DMp0_ptr: cute.Tensor,
     ):
         mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_boundary_spec)
         mBPrev = _make_tensor_from_spec(BPrev_ptr, prev_b_spec)
@@ -364,7 +357,7 @@ def _make_boundary_host_wrapper(
         mDMp0 = _make_tensor_from_spec(DMp0_ptr, d_mp0_spec)
 
         kernel = ChunkIncrementBwdBoundaryAmpere(
-            DInc_ptr.value_type,
+            cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
@@ -393,15 +386,15 @@ def _make_param_host_wrapper(
 
     @cute.jit
     def _param_host_wrapper(
-        M_ptr: cute.Pointer,
-        Kprev_ptr: cute.Pointer,
-        Kcurr_ptr: cute.Pointer,
-        DMsumPart_ptr: cute.Pointer,
-        DMp0_ptr: cute.Pointer,
-        DMchunk_ptr: cute.Pointer,
-        DM_ptr: cute.Pointer,
-        DKprev_ptr: cute.Pointer,
-        DKcurr_ptr: cute.Pointer,
+        M_ptr: cute.Tensor,
+        Kprev_ptr: cute.Tensor,
+        Kcurr_ptr: cute.Tensor,
+        DMsumPart_ptr: cute.Tensor,
+        DMp0_ptr: cute.Tensor,
+        DMchunk_ptr: cute.Tensor,
+        DM_ptr: cute.Tensor,
+        DKprev_ptr: cute.Tensor,
+        DKcurr_ptr: cute.Tensor,
     ):
         mM = _make_tensor_from_spec(M_ptr, m_spec)
         mKprev = _make_tensor_from_spec(Kprev_ptr, m_spec)
@@ -436,6 +429,7 @@ def _make_stage_host_wrapper(
     *,
     spec: tuple[int, ...],
     cfg: tuple[int, ...],
+    cutlass_dtype,
 ):
     L, P, D, BHC = spec
     chunk_size, n_d_tiles = cfg
@@ -460,24 +454,24 @@ def _make_stage_host_wrapper(
 
     @cute.jit
     def _stage_host_wrapper(
-        U_ptr: cute.Pointer,
-        B_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        Kprev_ptr: cute.Pointer,
-        Kcurr_ptr: cute.Pointer,
-        DInc_ptr: cute.Pointer,
-        BPrev_ptr: cute.Pointer,
-        UPrev_ptr: cute.Pointer,
-        DB_ptr: cute.Pointer,
-        DU_ptr: cute.Pointer,
-        DBPrev_ptr: cute.Pointer,
-        DUPrev_ptr: cute.Pointer,
-        DMsumPart_ptr: cute.Pointer,
-        DMp0_ptr: cute.Pointer,
-        DMchunk_ptr: cute.Pointer,
-        DM_ptr: cute.Pointer,
-        DKprev_ptr: cute.Pointer,
-        DKcurr_ptr: cute.Pointer,
+        U_ptr: cute.Tensor,
+        B_ptr: cute.Tensor,
+        M_ptr: cute.Tensor,
+        Kprev_ptr: cute.Tensor,
+        Kcurr_ptr: cute.Tensor,
+        DInc_ptr: cute.Tensor,
+        BPrev_ptr: cute.Tensor,
+        UPrev_ptr: cute.Tensor,
+        DB_ptr: cute.Tensor,
+        DU_ptr: cute.Tensor,
+        DBPrev_ptr: cute.Tensor,
+        DUPrev_ptr: cute.Tensor,
+        DMsumPart_ptr: cute.Tensor,
+        DMp0_ptr: cute.Tensor,
+        DMchunk_ptr: cute.Tensor,
+        DM_ptr: cute.Tensor,
+        DKprev_ptr: cute.Tensor,
+        DKcurr_ptr: cute.Tensor,
     ):
         mU = _make_tensor_from_spec(U_ptr, u_spec)
         mB = _make_tensor_from_spec(B_ptr, b_spec)
@@ -501,19 +495,19 @@ def _make_stage_host_wrapper(
         mDKcurr = _make_tensor_from_spec(DKcurr_ptr, d_param_spec)
 
         k_db = ChunkIncrementBwdDBAmpere(
-            U_ptr.value_type,
+            cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
         )
         k_du = ChunkIncrementBwdDUAmpere(
-            DInc_ptr.value_type,
+            cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
         )
         k_boundary = ChunkIncrementBwdBoundaryAmpere(
-            DInc_ptr.value_type,
+            cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
@@ -633,7 +627,7 @@ def compile_chunk_increment_bwd_kernels(
     dKprev_out = torch.empty((2, L, BHC), device=U.device, dtype=torch.float32)
     dKcurr_out = torch.empty((2, L, BHC), device=U.device, dtype=torch.float32)
 
-    db_args, db_alignments = _make_ptr_args(
+    db_runtime_args = (
         U_tc,
         B_tc,
         M_f,
@@ -643,7 +637,7 @@ def compile_chunk_increment_bwd_kernels(
         dB,
         dMsum_part,
     )
-    du_args, du_alignments = _make_ptr_args(
+    du_runtime_args = (
         d_inc_tc,
         B_tc,
         M_f,
@@ -651,7 +645,7 @@ def compile_chunk_increment_bwd_kernels(
         Kcurr_blk,
         dU,
     )
-    boundary_args, boundary_alignments = _make_ptr_args(
+    boundary_runtime_args = (
         d_inc_tc,
         B_prev_chunks,
         U_prev_chunks,
@@ -661,7 +655,7 @@ def compile_chunk_increment_bwd_kernels(
         dB_prev,
         dMp0,
     )
-    param_args, param_alignments = _make_ptr_args(
+    param_runtime_args = (
         M_f,
         Kprev_blk,
         Kcurr_blk,
@@ -672,7 +666,7 @@ def compile_chunk_increment_bwd_kernels(
         dKprev_out,
         dKcurr_out,
     )
-    stage_args, stage_alignments = _make_ptr_args(
+    stage_runtime_args = (
         U_tc,
         B_tc,
         M_f,
@@ -692,6 +686,13 @@ def compile_chunk_increment_bwd_kernels(
         dKprev_out,
         dKcurr_out,
     )
+    db_alignments = tuple(_assumed_align(tensor) for tensor in db_runtime_args)
+    du_alignments = tuple(_assumed_align(tensor) for tensor in du_runtime_args)
+    boundary_alignments = tuple(
+        _assumed_align(tensor) for tensor in boundary_runtime_args
+    )
+    param_alignments = tuple(_assumed_align(tensor) for tensor in param_runtime_args)
+    stage_alignments = tuple(_assumed_align(tensor) for tensor in stage_runtime_args)
     cache_key = _compiled_key(
         device_index=(U.device.index if U.device.index is not None else -1),
         tc_dtype=tc_dtype,
@@ -711,14 +712,17 @@ def compile_chunk_increment_bwd_kernels(
         db_wrapper = _make_db_host_wrapper(
             spec=(L, P, D, BHC),
             cfg=(L, nDtiles),
+            cutlass_dtype=cutlass_dtype,
         )
         du_wrapper = _make_du_host_wrapper(
             spec=(L, P, D, BHC),
             cfg=(L,),
+            cutlass_dtype=cutlass_dtype,
         )
         boundary_wrapper = _make_boundary_host_wrapper(
             spec=(L, P, D, BHC),
             cfg=(L,),
+            cutlass_dtype=cutlass_dtype,
         )
         param_wrapper = _make_param_host_wrapper(
             spec=(L, BHC),
@@ -727,12 +731,55 @@ def compile_chunk_increment_bwd_kernels(
         stage_wrapper = _make_stage_host_wrapper(
             spec=(L, P, D, BHC),
             cfg=(L, nDtiles),
+            cutlass_dtype=cutlass_dtype,
         )
-        compiled_db = cute.compile(db_wrapper, *db_args)
-        compiled_du = cute.compile(du_wrapper, *du_args)
-        compiled_boundary = cute.compile(boundary_wrapper, *boundary_args)
-        compiled_param = cute.compile(param_wrapper, *param_args)
-        compiled_stage = cute.compile(stage_wrapper, *stage_args)
+        db_compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(db_runtime_args, db_alignments, strict=True)
+        )
+        du_compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(du_runtime_args, du_alignments, strict=True)
+        )
+        boundary_compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(
+                boundary_runtime_args, boundary_alignments, strict=True
+            )
+        )
+        param_compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(param_runtime_args, param_alignments, strict=True)
+        )
+        stage_compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(stage_runtime_args, stage_alignments, strict=True)
+        )
+        compiled_db = cute.compile(
+            db_wrapper,
+            *db_compile_args,
+            options="--enable-tvm-ffi",
+        )
+        compiled_du = cute.compile(
+            du_wrapper,
+            *du_compile_args,
+            options="--enable-tvm-ffi",
+        )
+        compiled_boundary = cute.compile(
+            boundary_wrapper,
+            *boundary_compile_args,
+            options="--enable-tvm-ffi",
+        )
+        compiled_param = cute.compile(
+            param_wrapper,
+            *param_compile_args,
+            options="--enable-tvm-ffi",
+        )
+        compiled_stage = cute.compile(
+            stage_wrapper,
+            *stage_compile_args,
+            options="--enable-tvm-ffi",
+        )
         cached = (
             compiled_db,
             compiled_du,
@@ -759,7 +806,8 @@ def compile_chunk_increment_bwd_kernels(
     dKcurr_view = dKcurr_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
 
     def launch() -> None:
-        compiled_stage(*stage_args)
+        compiled_stage(*stage_runtime_args)
+        _record_tensors_on_current_stream(*stage_runtime_args)
 
     base = (
         compiled_db,

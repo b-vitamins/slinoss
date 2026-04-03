@@ -4,18 +4,32 @@ from __future__ import annotations
 
 import torch
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
 
+from ...fwd.common import _make_fake_tensor_arg
 from .common import (
     _TileConfig,
     _assumed_align,
     _choose_copy_bits_for_linear_tiles,
-    _torch_to_cutlass_dtype,
 )
 from .state import StatePassingBwdAmpere
 
 
 _COMPILED_CACHE: dict[tuple, object] = {}
+
+
+def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
+    stream = None
+    seen: set[int] = set()
+    for tensor in tensors:
+        if tensor is None or tensor.device.type != "cuda":
+            continue
+        ident = id(tensor)
+        if ident in seen:
+            continue
+        if stream is None:
+            stream = torch.cuda.current_stream(device=tensor.device)
+        tensor.record_stream(stream)
+        seen.add(ident)
 
 
 def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -43,36 +57,11 @@ def _make_tensor_spec(
 
 
 def _make_tensor_from_spec(
-    ptr: cute.Pointer,
+    tensor: cute.Tensor,
     spec: tuple[tuple[int, ...], tuple[int, ...]],
 ):
     shape, stride = spec
-    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
-
-
-def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    align = _assumed_align(t)
-    return (
-        make_ptr(
-            _torch_to_cutlass_dtype(t.dtype),
-            t.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=align,
-        ),
-        align,
-    )
-
-
-def _make_ptr_args(
-    *tensors: torch.Tensor,
-) -> tuple[tuple[object, ...], tuple[int, ...]]:
-    ptrs: list[object] = []
-    alignments: list[int] = []
-    for tensor in tensors:
-        ptr, align = _make_ptr_arg(tensor)
-        ptrs.append(ptr)
-        alignments.append(align)
-    return tuple(ptrs), tuple(alignments)
+    return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=stride))
 
 
 def _compiled_key(
@@ -135,13 +124,13 @@ def _make_state_passing_host_wrapper(
 
     @cute.jit
     def _state_host_wrapper(
-        Starts_ptr: cute.Pointer,
-        DStarts_ptr: cute.Pointer,
-        DFinal_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        DInc_ptr: cute.Pointer,
-        DM_ptr: cute.Pointer,
-        DInit_ptr: cute.Pointer,
+        Starts_ptr: cute.Tensor,
+        DStarts_ptr: cute.Tensor,
+        DFinal_ptr: cute.Tensor,
+        M_ptr: cute.Tensor,
+        DInc_ptr: cute.Tensor,
+        DM_ptr: cute.Tensor,
+        DInit_ptr: cute.Tensor,
     ):
         mStarts = _make_tensor_from_spec(Starts_ptr, starts_spec)
         mDStarts = _make_tensor_from_spec(DStarts_ptr, d_starts_spec)
@@ -253,7 +242,7 @@ def compile_state_passing_bwd_kernel(
         elems_per_thread=cfg.elems_per_thread,
     )
 
-    dynamic_args, alignments = _make_ptr_args(
+    runtime_args = (
         starts_c,
         d_starts_c,
         d_final_c,
@@ -262,6 +251,7 @@ def compile_state_passing_bwd_kernel(
         d_m_chunk,
         d_initial,
     )
+    alignments = tuple(_assumed_align(tensor) for tensor in runtime_args)
     cache_key = _compiled_key(
         device_index=(
             chunk_starts.device.index if chunk_starts.device.index is not None else -1
@@ -294,12 +284,21 @@ def compile_state_passing_bwd_kernel(
                 copy_bits_final,
             ),
         )
-        compiled = cute.compile(host_wrapper, *dynamic_args)
+        compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(runtime_args, alignments, strict=True)
+        )
+        compiled = cute.compile(
+            host_wrapper,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
         _COMPILED_CACHE[cache_key] = compiled
 
     def launch() -> None:
         d_m_chunk.zero_()
-        compiled(*dynamic_args)
+        compiled(*runtime_args)
+        _record_tensors_on_current_stream(*runtime_args)
 
     base = (compiled, d_inc, d_m_chunk, d_initial)
     if return_launcher:
