@@ -213,11 +213,26 @@ def mixer_decode_step_cute(
             "out_proj_weight and projected_out must be provided together for fused projection."
         )
 
-    value_c = value if value.is_contiguous() else value.contiguous()
-    params_c = params if params.is_contiguous() else params.contiguous()
-    bc_c = bc if bc.is_contiguous() else bc.contiguous()
-    gate_c = gate if gate.is_contiguous() else gate.contiguous()
-    skip_c = skip if skip.is_contiguous() else skip.contiguous()
+    value_c = _ensure_min_alignment(
+        value if value.is_contiguous() else value.contiguous(),
+        min_align=_DECODE_MIN_ALIGN,
+    )
+    params_c = _ensure_min_alignment(
+        params if params.is_contiguous() else params.contiguous(),
+        min_align=_DECODE_MIN_ALIGN,
+    )
+    bc_c = _ensure_min_alignment(
+        bc if bc.is_contiguous() else bc.contiguous(),
+        min_align=_DECODE_MIN_ALIGN,
+    )
+    gate_c = _ensure_min_alignment(
+        gate if gate.is_contiguous() else gate.contiguous(),
+        min_align=_DECODE_MIN_ALIGN,
+    )
+    skip_c = _ensure_min_alignment(
+        skip if skip.is_contiguous() else skip.contiguous(),
+        min_align=_DECODE_MIN_ALIGN,
+    )
     state_c = (
         initial_states
         if initial_states is not None
@@ -300,30 +315,12 @@ def mixer_decode_step_cute(
             if out_proj_weight.is_contiguous()
             else out_proj_weight.contiguous()
         )
+        out_proj = _ensure_min_alignment(out_proj, min_align=_DECODE_MIN_ALIGN)
+        out_proj = out_proj.view(d_model, heads, P)
         projected = _aligned_empty(
             (batch, heads, d_model), device=value.device, dtype=torch.float32
         )
         projected.zero_()
-    state_stride = cast(
-        tuple[int, int, int, int],
-        tuple(int(v) for v in state_c.stride()),
-    )
-    final_state_stride = cast(
-        tuple[int, int, int, int],
-        tuple(int(v) for v in final_state.stride()),
-    )
-    prev_b_stride = cast(
-        tuple[int, int, int],
-        tuple(int(v) for v in b_prev_c.stride()),
-    )
-    prev_u_stride = cast(
-        tuple[int, int, int],
-        tuple(int(v) for v in u_prev_c.stride()),
-    )
-    u_last_stride = cast(
-        tuple[int, int, int],
-        tuple(int(v) for v in u_last.stride()),
-    )
 
     value_align = _assumed_align(value_c)
     params_align = _assumed_align(params_c)
@@ -348,7 +345,6 @@ def mixer_decode_step_cute(
     out_proj_align = _assumed_align(out_proj)
     projected_align = _assumed_align(projected)
 
-    spec = (batch, heads, P, N)
     if fuse_outproj:
         tile_p, num_warps, vec_n = _select_fused_decode_tuning(
             batch=batch,
@@ -372,13 +368,11 @@ def mixer_decode_step_cute(
         else b_last
     )
     b_last_kernel_align = _assumed_align(b_last_kernel)
-    b_last_kernel_stride = cast(
-        tuple[int, int, int],
-        tuple(int(v) for v in b_last_kernel.stride()),
-    )
 
     cache_key = (
-        spec,
+        int(heads),
+        int(P),
+        int(N),
         tile_p,
         num_warps,
         vec_n,
@@ -422,12 +416,7 @@ def mixer_decode_step_cute(
         u_last_align,
         out_proj_align,
         projected_align,
-        state_stride,
-        final_state_stride,
-        prev_b_stride,
-        prev_u_stride,
-        b_last_kernel_stride,
-        u_last_stride,
+        bool(u_prev_c.is_contiguous()),
         float(dt_min),
         float(dt_max),
         float(r_min),
@@ -442,16 +431,13 @@ def mixer_decode_step_cute(
             _raise_cold_capture_error("compile cache")
         compiled = cute.compile(
             MixerDecodeStepFwd(
-                spec=spec,
+                heads=heads,
+                p_size=P,
+                n_size=N,
                 d_model=d_model,
                 fuse_outproj=bool(fuse_outproj),
-                state_stride=state_stride,
-                final_state_stride=final_state_stride,
-                prev_b_stride=prev_b_stride,
-                prev_u_stride=prev_u_stride,
-                b_last_stride=b_last_kernel_stride,
-                u_last_stride=u_last_stride,
                 state_align_bytes=state_align,
+                u_prev_last_dim_contig=bool(u_prev_c.is_contiguous()),
                 tile_p=tile_p,
                 num_warps=num_warps,
                 vec_n=vec_n,
@@ -469,24 +455,9 @@ def mixer_decode_step_cute(
             _make_fake_tensor_arg(bc_c, align=bc_align),
             _make_fake_tensor_arg(gate_c, align=gate_align),
             _make_fake_tensor_arg(skip_c, align=skip_align),
-            _make_fake_tensor_arg(
-                state_c,
-                shape=tuple(int(v) for v in state_c.shape),
-                stride=state_stride,
-                align=state_align,
-            ),
-            _make_fake_tensor_arg(
-                b_prev_c,
-                shape=tuple(int(v) for v in b_prev_c.shape),
-                stride=prev_b_stride,
-                align=b_prev_align,
-            ),
-            _make_fake_tensor_arg(
-                u_prev_c,
-                shape=tuple(int(v) for v in u_prev_c.shape),
-                stride=prev_u_stride,
-                align=u_prev_align,
-            ),
+            _make_fake_tensor_arg(state_c, align=state_align, dynamic_stride=True),
+            _make_fake_tensor_arg(b_prev_c, align=b_prev_align, dynamic_stride=True),
+            _make_fake_tensor_arg(u_prev_c, align=u_prev_align, dynamic_stride=True),
             _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
             _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
             _make_fake_tensor_arg(omega_bias, align=omega_bias_align),
@@ -494,27 +465,16 @@ def mixer_decode_step_cute(
             _make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
             _make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
             _make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
-            _make_fake_tensor_arg(b_scale, align=b_scale_align),
-            _make_fake_tensor_arg(c_scale, align=c_scale_align),
+            _make_fake_tensor_arg(b_scale, align=b_scale_align, dynamic_stride=True),
+            _make_fake_tensor_arg(c_scale, align=c_scale_align, dynamic_stride=True),
             _make_fake_tensor_arg(y, align=y_align),
             _make_fake_tensor_arg(
-                final_state,
-                shape=tuple(int(v) for v in final_state.shape),
-                stride=final_state_stride,
-                align=final_state_align,
+                final_state, align=final_state_align, dynamic_stride=True
             ),
             _make_fake_tensor_arg(
-                b_last_kernel,
-                shape=tuple(int(v) for v in b_last_kernel.shape),
-                stride=b_last_kernel_stride,
-                align=b_last_kernel_align,
+                b_last_kernel, align=b_last_kernel_align, dynamic_stride=True
             ),
-            _make_fake_tensor_arg(
-                u_last,
-                shape=tuple(int(v) for v in u_last.shape),
-                stride=u_last_stride,
-                align=u_last_align,
-            ),
+            _make_fake_tensor_arg(u_last, align=u_last_align, dynamic_stride=True),
             _make_fake_tensor_arg(out_proj, align=out_proj_align),
             _make_fake_tensor_arg(projected, align=projected_align),
             _compile_env_stream_placeholder(),

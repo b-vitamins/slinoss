@@ -15,7 +15,6 @@ from slinoss.ops.scanprep.cute.common import (
     complex_div,
     complex_mul,
     lerp,
-    make_row_major_stride,
     principal_angle,
     real_mul_conj,
     sigmoid,
@@ -44,16 +43,13 @@ class MixerDecodeStepFwd:
     def __init__(
         self,
         *,
-        spec: tuple[int, int, int, int],
+        heads: int,
+        p_size: int,
+        n_size: int,
         d_model: int,
         fuse_outproj: bool,
-        state_stride: tuple[int, int, int, int] | None = None,
-        final_state_stride: tuple[int, int, int, int] | None = None,
-        prev_b_stride: tuple[int, int, int] | None = None,
-        prev_u_stride: tuple[int, int, int] | None = None,
-        b_last_stride: tuple[int, int, int] | None = None,
-        u_last_stride: tuple[int, int, int] | None = None,
         state_align_bytes: int,
+        u_prev_last_dim_contig: bool,
         tile_p: int,
         num_warps: int,
         vec_n: int,
@@ -66,8 +62,6 @@ class MixerDecodeStepFwd:
         k_max: float,
         eps: float,
     ) -> None:
-        batch, heads, p_size, n_size = spec
-        self.batch = int(batch)
         self.heads = int(heads)
         self.p_size = int(p_size)
         self.n_size = int(n_size)
@@ -80,6 +74,7 @@ class MixerDecodeStepFwd:
         self.num_threads = int(self.num_warps * cute.arch.WARP_SIZE)
         self.vec_n = int(vec_n)
         self.state_align_bytes = int(state_align_bytes)
+        self.u_prev_last_dim_contig = bool(u_prev_last_dim_contig)
         self.use_state_cp_async = bool(
             self.state_align_bytes >= 16
             and self.tile_p >= 64
@@ -120,65 +115,6 @@ class MixerDecodeStepFwd:
         )
 
         self.normalize_bc = bool(normalize_bc)
-
-        self.value_shape = (self.batch, self.heads, self.p_size)
-        self.value_stride = make_row_major_stride(self.value_shape)
-        self.params_shape = (self.batch, self.heads, 13)
-        self.params_stride = make_row_major_stride(self.params_shape)
-        self.bc_shape = (self.batch, self.heads, 4, self.n_size)
-        self.bc_stride = make_row_major_stride(self.bc_shape)
-        self.gate_shape = self.value_shape
-        self.gate_stride = self.value_stride
-        self.skip_shape = (self.heads, self.p_size)
-        self.skip_stride = make_row_major_stride(self.skip_shape)
-        self.state_shape = (self.batch, self.heads, self.p_size, self.d_size)
-        default_state_stride = make_row_major_stride(self.state_shape)
-        self.state_stride = (
-            default_state_stride
-            if state_stride is None
-            else tuple(int(v) for v in state_stride)
-        )
-        self.final_state_stride = (
-            self.state_stride
-            if final_state_stride is None
-            else tuple(int(v) for v in final_state_stride)
-        )
-        self.prev_b_shape = (self.batch, self.heads, self.d_size)
-        default_prev_b_stride = make_row_major_stride(self.prev_b_shape)
-        self.prev_b_stride = (
-            default_prev_b_stride
-            if prev_b_stride is None
-            else tuple(int(v) for v in prev_b_stride)
-        )
-        self.prev_u_shape = self.value_shape
-        default_prev_u_stride = self.value_stride
-        self.prev_u_stride = (
-            default_prev_u_stride
-            if prev_u_stride is None
-            else tuple(int(v) for v in prev_u_stride)
-        )
-        self.b_last_stride = (
-            self.prev_b_stride
-            if b_last_stride is None
-            else tuple(int(v) for v in b_last_stride)
-        )
-        self.u_last_stride = (
-            self.prev_u_stride
-            if u_last_stride is None
-            else tuple(int(v) for v in u_last_stride)
-        )
-        self.y_shape = self.value_shape
-        self.y_stride = self.value_stride
-        self.bias_shape = (self.heads,)
-        self.bias_stride = make_row_major_stride(self.bias_shape)
-        self.scale_shape = (self.heads, 2, self.n_size)
-        self.scale_stride = make_row_major_stride(self.scale_shape)
-        out_proj_d = self.d_model if self.fuse_outproj else 1
-        projected_heads = self.heads if self.fuse_outproj else 1
-        self.out_proj_shape = (out_proj_d, self.heads, self.p_size)
-        self.out_proj_stride = make_row_major_stride(self.out_proj_shape)
-        self.projected_shape = (self.batch, projected_heads, out_proj_d)
-        self.projected_stride = make_row_major_stride(self.projected_shape)
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
@@ -288,90 +224,107 @@ class MixerDecodeStepFwd:
         projected: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        batch = cute.size(value, mode=[0])
         mValue = cute.make_tensor(
-            value.iterator, cute.make_layout(self.value_shape, stride=self.value_stride)
+            value.iterator,
+            cute.make_layout(
+                (batch, self.heads, self.p_size),
+                stride=(self.heads * self.p_size, self.p_size, 1),
+            ),
         )
         mParams = cute.make_tensor(
             params.iterator,
-            cute.make_layout(self.params_shape, stride=self.params_stride),
+            cute.make_layout(
+                (batch, self.heads, 13),
+                stride=(self.heads * 13, 13, 1),
+            ),
         )
         mBC = cute.make_tensor(
-            bc.iterator, cute.make_layout(self.bc_shape, stride=self.bc_stride)
+            bc.iterator,
+            cute.make_layout(
+                (batch, self.heads, 4, self.n_size),
+                stride=(self.heads * 4 * self.n_size, 4 * self.n_size, self.n_size, 1),
+            ),
         )
         mGate = cute.make_tensor(
-            gate.iterator, cute.make_layout(self.gate_shape, stride=self.gate_stride)
+            gate.iterator,
+            cute.make_layout(
+                (batch, self.heads, self.p_size),
+                stride=(self.heads * self.p_size, self.p_size, 1),
+            ),
         )
         mSkip = cute.make_tensor(
-            skip.iterator, cute.make_layout(self.skip_shape, stride=self.skip_stride)
+            skip.iterator,
+            cute.make_layout((self.heads, self.p_size), stride=(self.p_size, 1)),
         )
-        mState = cute.make_tensor(
-            state.iterator, cute.make_layout(self.state_shape, stride=self.state_stride)
-        )
-        mBPrev = cute.make_tensor(
-            b_prev.iterator,
-            cute.make_layout(self.prev_b_shape, stride=self.prev_b_stride),
-        )
-        mUPrev = cute.make_tensor(
-            u_prev.iterator,
-            cute.make_layout(self.prev_u_shape, stride=self.prev_u_stride),
+        mState = state
+        mBPrev = b_prev
+        mUPrev = (
+            cute.make_tensor(
+                u_prev.iterator,
+                cute.make_layout(
+                    (batch, self.heads, self.p_size),
+                    stride=(self.heads * self.p_size, self.p_size, 1),
+                ),
+            )
+            if self.u_prev_last_dim_contig
+            else u_prev
         )
         mDtBias = cute.make_tensor(
-            dt_bias.iterator, cute.make_layout(self.bias_shape, stride=self.bias_stride)
+            dt_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mGammaBias = cute.make_tensor(
-            gamma_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
+            gamma_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mOmegaBias = cute.make_tensor(
-            omega_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
+            omega_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mMixRBias = cute.make_tensor(
-            mix_r_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
+            mix_r_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mMixThetaBias = cute.make_tensor(
-            mix_theta_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
+            mix_theta_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mMixKPrevBias = cute.make_tensor(
-            mix_k_prev_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
+            mix_k_prev_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mMixKCurrBias = cute.make_tensor(
-            mix_k_curr_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
+            mix_k_curr_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mBScale = cute.make_tensor(
-            b_scale.iterator,
-            cute.make_layout(self.scale_shape, stride=self.scale_stride),
-        )
-        mCScale = cute.make_tensor(
-            c_scale.iterator,
-            cute.make_layout(self.scale_shape, stride=self.scale_stride),
-        )
+        mBScale = b_scale
+        mCScale = c_scale
         mY = cute.make_tensor(
-            y.iterator, cute.make_layout(self.y_shape, stride=self.y_stride)
+            y.iterator,
+            cute.make_layout(
+                (batch, self.heads, self.p_size),
+                stride=(self.heads * self.p_size, self.p_size, 1),
+            ),
         )
-        mFinalState = cute.make_tensor(
-            final_state.iterator,
-            cute.make_layout(self.state_shape, stride=self.final_state_stride),
-        )
-        mBLast = cute.make_tensor(
-            b_last.iterator,
-            cute.make_layout(self.prev_b_shape, stride=self.b_last_stride),
-        )
-        mULast = cute.make_tensor(
-            u_last.iterator,
-            cute.make_layout(self.prev_u_shape, stride=self.u_last_stride),
-        )
+        mFinalState = final_state
+        mBLast = b_last
+        mULast = u_last
         mOutProj = cute.make_tensor(
             out_proj.iterator,
-            cute.make_layout(self.out_proj_shape, stride=self.out_proj_stride),
+            cute.make_layout(
+                (self.d_model if self.fuse_outproj else 1, self.heads, self.p_size),
+                stride=(self.heads * self.p_size, self.p_size, 1),
+            ),
         )
         mProjected = cute.make_tensor(
             projected.iterator,
-            cute.make_layout(self.projected_shape, stride=self.projected_stride),
+            cute.make_layout(
+                (
+                    batch,
+                    self.heads if self.fuse_outproj else 1,
+                    self.d_model if self.fuse_outproj else 1,
+                ),
+                stride=(
+                    (self.heads if self.fuse_outproj else 1)
+                    * (self.d_model if self.fuse_outproj else 1),
+                    self.d_model if self.fuse_outproj else 1,
+                    1,
+                ),
+            ),
         )
 
         state_tile_layout = cute.make_ordered_layout(
@@ -407,7 +360,7 @@ class MixerDecodeStepFwd:
             cute.make_layout(self.tile_p // copy_elems_value),
             cute.make_layout(copy_elems_value),
         )
-        copy_elems_u_prev = copy_elems_value if self.prev_u_stride[-1] == 1 else 1
+        copy_elems_u_prev = copy_elems_value if self.u_prev_last_dim_contig else 1
         copy_bits_u_prev = int(copy_elems_u_prev * p_dtype.width)
         copy_atom_u_prev = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -533,7 +486,7 @@ class MixerDecodeStepFwd:
             gmem_tiled_copy_u_prev,
             gmem_tiled_copy_skip,
         ).launch(
-            grid=(self.p_tiles, self.heads, self.batch),
+            grid=(self.p_tiles, self.heads, batch),
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
