@@ -7,6 +7,7 @@ import torch
 
 import slinoss.ops.v2x2ssd.cute.kernels.bwd as v2x2ssd_bwd_mod
 import slinoss.ops.v2x2ssd.cute.kernels.fwd as v2x2ssd_fwd_mod
+import slinoss.ops.v2x2ssd.cute.kernels.fwd.common as v2x2ssd_fwd_common_mod
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _resolve_chunk_scan_launch_cfg,
@@ -328,6 +329,33 @@ def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
         v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
 
     assert recorded["kwargs"] == {"options": "--enable-tvm-ffi"}
+
+
+def test_v2x2ssd_fake_tensor_arg_prefers_compact_for_row_major(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tensor = torch.empty((2, 3, 4), dtype=torch.float16)
+    calls: list[str] = []
+
+    def fake_compact(*args, **kwargs):
+        calls.append("compact")
+        return ("compact", args, kwargs)
+
+    def fake_tensor(*args, **kwargs):
+        calls.append("tensor")
+        return ("tensor", args, kwargs)
+
+    monkeypatch.setattr(
+        v2x2ssd_fwd_common_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
+    )
+    monkeypatch.setattr(
+        v2x2ssd_fwd_common_mod.cute.runtime, "make_fake_tensor", fake_tensor
+    )
+
+    result = v2x2ssd_fwd_common_mod._make_fake_tensor_arg(tensor)
+
+    assert calls == ["compact"]
+    assert result[0] == "compact"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

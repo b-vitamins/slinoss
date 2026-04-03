@@ -36,6 +36,17 @@ def _elem_bits(dt: torch.dtype) -> int:
     raise TypeError(f"Unsupported dtype: {dt}")
 
 
+def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= int(shape[i])
+    return tuple(stride)
+
+
 def _choose_copy_bits_for_linear_tiles(
     t: torch.Tensor,
     tile_stride_elems: int,
@@ -141,14 +152,40 @@ def _make_fake_tensor_arg(
     shape: tuple[int, ...] | None = None,
     stride: tuple[int, ...] | None = None,
     align: int | None = None,
+    dynamic_stride: bool = False,
 ):
+    fake_shape = tuple(
+        int(dim) for dim in (shape if shape is not None else tensor.shape)
+    )
+    fake_stride = tuple(
+        int(step) for step in (stride if stride is not None else tensor.stride())
+    )
+    assumed = int(align if align is not None else _assumed_align(tensor))
+    row_major_stride = tuple(reversed(range(len(fake_shape))))
+    if not dynamic_stride and fake_stride == tuple(_make_row_major_stride(fake_shape)):
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        return cute.runtime.make_fake_compact_tensor(
+            _torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride_order=row_major_stride,
+            assumed_align=assumed,
+        )
+    if dynamic_stride:
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        dynamic_fake_stride = tuple(
+            0 if step == 0 else cute.sym_int32() for step in fake_stride
+        )
+        return cute.runtime.make_fake_tensor(
+            _torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride=dynamic_fake_stride,
+            assumed_align=assumed,
+        )
     return cute.runtime.make_fake_tensor(
         _torch_to_cutlass_dtype(tensor.dtype),
-        tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
-        stride=tuple(
-            int(step) for step in (stride if stride is not None else tensor.stride())
-        ),
-        assumed_align=int(align if align is not None else _assumed_align(tensor)),
+        fake_shape,
+        stride=fake_stride,
+        assumed_align=assumed,
     )
 
 

@@ -13,7 +13,6 @@ from ..common import (
     COEFF_AUX_DT,
     COEFF_AUX_DT_U,
     COEFF_AUX_EXP_TERM,
-    COEFF_AUX_FIELDS,
     COEFF_AUX_GAMMA,
     COEFF_AUX_GAMMA_SIGMOID,
     COEFF_AUX_KAPPA1_IM,
@@ -38,7 +37,6 @@ from ..common import (
     COEFF_AUX_THETA_DIRECT_TANH,
     complex_div,
     lerp,
-    make_row_major_stride,
     principal_angle,
     sigmoid,
     softplus,
@@ -51,10 +49,9 @@ class ScanPrepFwdFused:
     def __init__(
         self,
         *,
-        spec: tuple[int, int, int, int, int],
-        params_in_stride: tuple[int, int, int] | None = None,
-        b_scale_stride: tuple[int, int, int] | None = None,
-        c_scale_stride: tuple[int, int, int] | None = None,
+        h_size: int,
+        p_size: int,
+        n_size: int,
         normalize_bc: bool,
         store_rms_inv: bool,
         store_coeff_aux: bool,
@@ -68,9 +65,6 @@ class ScanPrepFwdFused:
         pack_warps_per_block: int = 8,
         coeff_block_size: int = 256,
     ) -> None:
-        batch, t_size, h_size, p_size, n_size = spec
-        self.batch = int(batch)
-        self.t_size = int(t_size)
         self.h_size = int(h_size)
         self.p_size = int(p_size)
         self.n_size = int(n_size)
@@ -78,63 +72,10 @@ class ScanPrepFwdFused:
         self.store_rms_inv = bool(store_rms_inv)
         self.store_coeff_aux = bool(store_coeff_aux)
 
-        self.value_shape = (self.batch, self.t_size, self.h_size * self.p_size)
-        self.value_stride = make_row_major_stride(self.value_shape)
-        self.u_shape = (self.batch, self.h_size, self.t_size, self.p_size)
-        self.u_stride = make_row_major_stride(self.u_shape)
-        self.bc_shape = (self.batch, self.t_size, self.h_size, 4, self.n_size)
-        self.bc_stride = make_row_major_stride(self.bc_shape)
-        self.scale_shape = (self.h_size, 2, self.n_size)
-        default_scale_stride = make_row_major_stride(self.scale_shape)
-        self.b_scale_stride = (
-            tuple(int(s) for s in b_scale_stride)
-            if b_scale_stride is not None
-            else default_scale_stride
-        )
-        self.c_scale_stride = (
-            tuple(int(s) for s in c_scale_stride)
-            if c_scale_stride is not None
-            else default_scale_stride
-        )
-        self.bc_out_shape = (self.batch, self.h_size, self.t_size, 2 * self.n_size)
-        self.bc_out_stride = make_row_major_stride(self.bc_out_shape)
-        self.params_shape = (self.batch, self.t_size, self.h_size, 13)
-        if params_in_stride is not None:
-            params_b_stride, params_t_stride, params_flat_stride = (
-                int(params_in_stride[0]),
-                int(params_in_stride[1]),
-                int(params_in_stride[2]),
-            )
-            self.params_stride = (
-                params_b_stride,
-                params_t_stride,
-                13 * params_flat_stride,
-                params_flat_stride,
-            )
-        else:
-            self.params_stride = make_row_major_stride(self.params_shape)
-        self.bias_shape = (self.h_size,)
-        self.bias_stride = make_row_major_stride(self.bias_shape)
-        self.m_shape = (self.batch, self.h_size, self.t_size, 2)
-        self.m_stride = make_row_major_stride(self.m_shape)
-        self.k_shape = (self.batch, self.h_size, self.t_size, 2, 2)
-        self.k_stride = make_row_major_stride(self.k_shape)
-        self.rms_inv_shape = (self.batch, self.h_size, self.t_size, 4)
-        self.rms_inv_stride = make_row_major_stride(self.rms_inv_shape)
-        self.coeff_aux_shape = (self.batch, self.h_size, COEFF_AUX_FIELDS, self.t_size)
-        self.coeff_aux_stride = make_row_major_stride(self.coeff_aux_shape)
-
-        self.total_rows = self.batch * self.t_size * self.h_size
-        self.rows_per_batch = self.t_size * self.h_size
-        self.total_bt = self.batch * self.t_size
-
         self.pack_warps_per_block = int(pack_warps_per_block)
         if self.pack_warps_per_block <= 0:
             raise ValueError("pack_warps_per_block must be positive.")
         self.pack_block_size = self.pack_warps_per_block * 32
-        self.pack_grid_size = (
-            self.total_rows + self.pack_warps_per_block - 1
-        ) // self.pack_warps_per_block
 
         self.coeff_block_size = int(coeff_block_size)
         if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
@@ -143,10 +84,6 @@ class ScanPrepFwdFused:
         self.coeff_head_tile = self.coeff_block_size // 32
         if self.coeff_head_tile <= 0:
             raise ValueError("coeff_block_size must cover at least one warp.")
-        self.coeff_grid_x = (self.total_bt + self.coeff_t_tile - 1) // self.coeff_t_tile
-        self.coeff_grid_y = (
-            self.h_size + self.coeff_head_tile - 1
-        ) // self.coeff_head_tile
         self.coeff_smem_bytes = self.coeff_head_tile * 13 * (self.coeff_t_tile + 1) * 4
 
         self.dt_min = float(dt_min)
@@ -188,6 +125,7 @@ class ScanPrepFwdFused:
         mCOut: cute.Tensor,
         mRmsInv: cute.Tensor,
         total_rows_,
+        rows_per_batch_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -195,17 +133,16 @@ class ScanPrepFwdFused:
         lane = tidx - warp * 32
         row = bidx * self.pack_warps_per_block + warp
         if row < total_rows_:
-            b = row // self.rows_per_batch
-            rem = row - b * self.rows_per_batch
+            b = row // rows_per_batch_
+            rem = row - b * rows_per_batch_
             t = rem // self.h_size
             h = rem - t * self.h_size
 
-            p_base = h * self.p_size
             num_p_iters = (self.p_size + 31) // 32
             for p_iter in cutlass.range_constexpr(num_p_iters):
                 p = lane + p_iter * 32
                 if p < self.p_size:
-                    mU[b, h, t, p] = mValue[b, t, p_base + p]
+                    mU[b, h, t, p] = mValue[b, h, t, p]
 
             if cutlass.const_expr(self.normalize_bc):
                 s0 = cutlass.Float32(0.0)
@@ -301,6 +238,8 @@ class ScanPrepFwdFused:
         mMOut: cute.Tensor,
         mKOut: cute.Tensor,
         mCoeffAux: cute.Tensor,
+        total_bt_,
+        t_size_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         block_x, block_y, _ = cute.arch.block_idx()
@@ -325,9 +264,9 @@ class ScanPrepFwdFused:
         for load_t_iter in cutlass.range_constexpr(num_load_t_iters):
             load_t_local = warp + load_t_iter * self.coeff_head_tile
             load_bt = block_x * self.coeff_t_tile + load_t_local
-            if load_t_local < self.coeff_t_tile and load_bt < self.total_bt:
-                load_b = load_bt // self.t_size
-                load_t = load_bt - load_b * self.t_size
+            if load_t_local < self.coeff_t_tile and load_bt < total_bt_:
+                load_b = load_bt // t_size_
+                load_t = load_bt - load_b * t_size_
                 for flat_iter in cutlass.range_constexpr(num_load_flat_iters):
                     flat = lane + flat_iter * 32
                     if flat < self.coeff_head_tile * 13:
@@ -343,9 +282,9 @@ class ScanPrepFwdFused:
 
         bt = block_x * self.coeff_t_tile + lane
         h = block_y * self.coeff_head_tile + warp
-        if bt < self.total_bt and h < self.h_size:
-            b = bt // self.t_size
-            t = bt - b * self.t_size
+        if bt < total_bt_ and h < self.h_size:
+            b = bt // t_size_
+            t = bt - b * t_size_
 
             dt_raw = sParams[warp, 0, lane] + cutlass.Float32(mDtBias[h])
             gamma_raw = sParams[warp, 1, lane] + cutlass.Float32(mGammaBias[h])
@@ -517,101 +456,66 @@ class ScanPrepFwdFused:
         rms_inv: cute.Tensor,
         coeff_aux: cute.Tensor,
     ):
+        batch = cute.size(value, mode=[0])
+        t_size = cute.size(value, mode=[1])
+        total_rows = batch * t_size * self.h_size
+        rows_per_batch = t_size * self.h_size
+        total_bt = batch * t_size
+        pack_grid_size = (
+            total_rows + self.pack_warps_per_block - 1
+        ) // self.pack_warps_per_block
+        coeff_grid_x = (total_bt + self.coeff_t_tile - 1) // self.coeff_t_tile
+        coeff_grid_y = (self.h_size + self.coeff_head_tile - 1) // self.coeff_head_tile
+
         mValue = cute.make_tensor(
-            value.iterator, cute.make_layout(self.value_shape, stride=self.value_stride)
-        )
-        mBC = cute.make_tensor(
-            bc.iterator, cute.make_layout(self.bc_shape, stride=self.bc_stride)
-        )
-        mBScale = cute.make_tensor(
-            b_scale.iterator,
-            cute.make_layout(self.scale_shape, stride=self.b_scale_stride),
-        )
-        mCScale = cute.make_tensor(
-            c_scale.iterator,
-            cute.make_layout(self.scale_shape, stride=self.c_scale_stride),
+            value.iterator,
+            cute.make_layout(
+                (batch, self.h_size, t_size, self.p_size),
+                stride=(
+                    t_size * self.h_size * self.p_size,
+                    self.p_size,
+                    self.h_size * self.p_size,
+                    1,
+                ),
+            ),
         )
         mParams = cute.make_tensor(
             params.iterator,
-            cute.make_layout(self.params_shape, stride=self.params_stride),
-        )
-        mDtBias = cute.make_tensor(
-            dt_bias.iterator, cute.make_layout(self.bias_shape, stride=self.bias_stride)
-        )
-        mGammaBias = cute.make_tensor(
-            gamma_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
-        )
-        mOmegaBias = cute.make_tensor(
-            omega_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
-        )
-        mMixRBias = cute.make_tensor(
-            mix_r_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
-        )
-        mMixThetaBias = cute.make_tensor(
-            mix_theta_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
-        )
-        mMixKPrevBias = cute.make_tensor(
-            mix_k_prev_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
-        )
-        mMixKCurrBias = cute.make_tensor(
-            mix_k_curr_bias.iterator,
-            cute.make_layout(self.bias_shape, stride=self.bias_stride),
-        )
-        mU = cute.make_tensor(
-            u.iterator, cute.make_layout(self.u_shape, stride=self.u_stride)
-        )
-        mB = cute.make_tensor(
-            b.iterator, cute.make_layout(self.bc_out_shape, stride=self.bc_out_stride)
-        )
-        mC = cute.make_tensor(
-            c.iterator, cute.make_layout(self.bc_out_shape, stride=self.bc_out_stride)
-        )
-        mM = cute.make_tensor(
-            m.iterator, cute.make_layout(self.m_shape, stride=self.m_stride)
-        )
-        mK = cute.make_tensor(
-            k.iterator, cute.make_layout(self.k_shape, stride=self.k_stride)
-        )
-        mRmsInv = cute.make_tensor(
-            rms_inv.iterator,
-            cute.make_layout(self.rms_inv_shape, stride=self.rms_inv_stride),
-        )
-        mCoeffAux = cute.make_tensor(
-            coeff_aux.iterator,
-            cute.make_layout(self.coeff_aux_shape, stride=self.coeff_aux_stride),
+            cute.make_layout(
+                (batch, t_size, self.h_size, 13),
+                stride=(t_size * self.h_size * 13, self.h_size * 13, 13, 1),
+            ),
         )
         coeff_smem_bytes = int(self._coeff_shared_storage().size_in_bytes())
 
         self.pack_kernel(
             mValue,
-            mBC,
-            mBScale,
-            mCScale,
-            mU,
-            mB,
-            mC,
-            mRmsInv,
-            self.total_rows,
-        ).launch(grid=(self.pack_grid_size, 1, 1), block=(self.pack_block_size, 1, 1))
+            bc,
+            b_scale,
+            c_scale,
+            u,
+            b,
+            c,
+            rms_inv,
+            total_rows,
+            rows_per_batch,
+        ).launch(grid=(pack_grid_size, 1, 1), block=(self.pack_block_size, 1, 1))
         self.coeff_kernel(
             mParams,
-            mDtBias,
-            mGammaBias,
-            mOmegaBias,
-            mMixRBias,
-            mMixThetaBias,
-            mMixKPrevBias,
-            mMixKCurrBias,
-            mM,
-            mK,
-            mCoeffAux,
+            dt_bias,
+            gamma_bias,
+            omega_bias,
+            mix_r_bias,
+            mix_theta_bias,
+            mix_k_prev_bias,
+            mix_k_curr_bias,
+            m,
+            k,
+            coeff_aux,
+            total_bt,
+            t_size,
         ).launch(
-            grid=(self.coeff_grid_x, self.coeff_grid_y, 1),
+            grid=(coeff_grid_x, coeff_grid_y, 1),
             block=(self.coeff_block_size, 1, 1),
             smem=coeff_smem_bytes,
         )

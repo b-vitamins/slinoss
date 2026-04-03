@@ -13,6 +13,7 @@ from slinoss.perf import note_cache_event
 from .common import (
     COEFF_AUX_FIELDS,
     assumed_align,
+    make_row_major_stride,
     torch_to_cutlass_dtype,
 )
 from .kernels.fwd import ScanPrepFwdFused
@@ -52,14 +53,39 @@ def _make_fake_tensor_arg(
     shape: tuple[int, ...] | None = None,
     stride: tuple[int, ...] | None = None,
     align: int | None = None,
+    dynamic_stride: bool = False,
 ):
+    fake_shape = tuple(
+        int(dim) for dim in (shape if shape is not None else tensor.shape)
+    )
+    fake_stride = tuple(
+        int(step) for step in (stride if stride is not None else tensor.stride())
+    )
+    assumed = int(align if align is not None else assumed_align(tensor))
+    if not dynamic_stride and fake_stride == make_row_major_stride(fake_shape):
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        return cute.runtime.make_fake_compact_tensor(
+            torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride_order=tuple(reversed(range(len(fake_shape)))),
+            assumed_align=assumed,
+        )
+    if dynamic_stride:
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        dynamic_fake_stride = tuple(
+            0 if step == 0 else cute.sym_int32() for step in fake_stride
+        )
+        return cute.runtime.make_fake_tensor(
+            torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride=dynamic_fake_stride,
+            assumed_align=assumed,
+        )
     return cute.runtime.make_fake_tensor(
         torch_to_cutlass_dtype(tensor.dtype),
-        tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
-        stride=tuple(
-            int(step) for step in (stride if stride is not None else tensor.stride())
-        ),
-        assumed_align=int(align if align is not None else assumed_align(tensor)),
+        fake_shape,
+        stride=fake_stride,
+        assumed_align=assumed,
     )
 
 
@@ -155,6 +181,7 @@ def _scanprep_fwd_impl(
     torch.Tensor,
 ]:
     value_c = value if value.is_contiguous() else value.contiguous()
+    params_c = params if params.is_contiguous() else params.contiguous()
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
     batch, t_size, width = map(int, value_c.shape)
     if width != int(n_heads * d_head):
@@ -208,15 +235,11 @@ def _scanprep_fwd_impl(
         if c_scale is not None
         else torch.empty((n_heads, 2, d_state), device=value.device, dtype=bc.dtype)
     )
-    params_stride = tuple(int(s) for s in params.stride())
-    b_scale_stride = tuple(int(s) for s in b_scale_c.stride())
-    c_scale_stride = tuple(int(s) for s in c_scale_c.stride())
-
     value_align = assumed_align(value_c)
     bc_align = assumed_align(bc_c)
     b_scale_align = assumed_align(b_scale_c)
     c_scale_align = assumed_align(c_scale_c)
-    params_align = assumed_align(params)
+    params_align = assumed_align(params_c)
     dt_bias_align = assumed_align(dt_bias)
     gamma_bias_align = assumed_align(gamma_bias)
     omega_bias_align = assumed_align(omega_bias)
@@ -232,18 +255,16 @@ def _scanprep_fwd_impl(
     rms_inv_align = assumed_align(rms_inv)
     coeff_aux_align = assumed_align(coeff_aux)
 
-    spec = (batch, t_size, int(n_heads), int(d_head), int(d_state))
+    spec = (int(n_heads), int(d_head), int(d_state))
     cache_key = (
         spec,
         int(value.device.index or 0),
         bool(normalize_bc),
         value_c.dtype,
-        params.dtype,
+        params_c.dtype,
         bc_c.dtype,
         b_scale_c.dtype,
         c_scale_c.dtype,
-        b_scale_stride,
-        c_scale_stride,
         dt_bias.dtype,
         gamma_bias.dtype,
         omega_bias.dtype,
@@ -262,7 +283,6 @@ def _scanprep_fwd_impl(
         bc_align,
         b_scale_align,
         c_scale_align,
-        params_stride,
         params_align,
         dt_bias_align,
         gamma_bias_align,
@@ -294,10 +314,9 @@ def _scanprep_fwd_impl(
             _raise_cold_capture_error("launcher cache")
         compiled = cute.compile(
             ScanPrepFwdFused(
-                spec=spec,
-                params_in_stride=params_stride,
-                b_scale_stride=b_scale_stride,
-                c_scale_stride=c_scale_stride,
+                h_size=n_heads,
+                p_size=d_head,
+                n_size=d_state,
                 normalize_bc=normalize_bc,
                 store_rms_inv=bool(return_aux and normalize_bc),
                 store_coeff_aux=bool(return_aux),
@@ -311,19 +330,9 @@ def _scanprep_fwd_impl(
             ),
             _make_fake_tensor_arg(value_c, align=value_align),
             _make_fake_tensor_arg(bc_c, align=bc_align),
-            _make_fake_tensor_arg(
-                b_scale_c,
-                shape=(n_heads, 2, d_state),
-                stride=b_scale_stride,
-                align=b_scale_align,
-            ),
-            _make_fake_tensor_arg(
-                c_scale_c,
-                shape=(n_heads, 2, d_state),
-                stride=c_scale_stride,
-                align=c_scale_align,
-            ),
-            _make_fake_tensor_arg(params, align=params_align),
+            _make_fake_tensor_arg(b_scale_c, align=b_scale_align, dynamic_stride=True),
+            _make_fake_tensor_arg(c_scale_c, align=c_scale_align, dynamic_stride=True),
+            _make_fake_tensor_arg(params_c, align=params_align),
             _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
             _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
             _make_fake_tensor_arg(omega_bias, align=omega_bias_align),
@@ -348,7 +357,7 @@ def _scanprep_fwd_impl(
         bc_c,
         b_scale_c,
         c_scale_c,
-        params,
+        params_c,
         dt_bias,
         gamma_bias,
         omega_bias,

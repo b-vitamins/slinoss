@@ -8,29 +8,11 @@ import cutlass.cute as cute
 
 from slinoss.perf import note_cache_event
 
-from .common import assumed_align, torch_to_cutlass_dtype
+from .common import assumed_align, make_row_major_stride, torch_to_cutlass_dtype
 from .kernels.bwd import ScanPrepBwdFused
 
 
 _SCANPREP_BWD_CACHE: dict[tuple[object, ...], object] = {}
-_SCANPREP_BWD_PARTIAL_CACHE: dict[
-    tuple[object, ...], tuple[torch.Tensor, torch.Tensor]
-] = {}
-_SCANPREP_BWD_PARTIAL_CACHE_LIMIT = 8
-
-
-def _cache_set(
-    cache: dict[tuple[object, ...], object],
-    key: tuple[object, ...],
-    value,
-    *,
-    limit: int,
-) -> None:
-    if key in cache:
-        cache.pop(key, None)
-    elif len(cache) >= int(limit):
-        cache.pop(next(iter(cache)), None)
-    cache[key] = value
 
 
 def _make_fake_tensor_arg(
@@ -39,58 +21,40 @@ def _make_fake_tensor_arg(
     shape: tuple[int, ...] | None = None,
     stride: tuple[int, ...] | None = None,
     align: int | None = None,
+    dynamic_stride: bool = False,
 ):
+    fake_shape = tuple(
+        int(dim) for dim in (shape if shape is not None else tensor.shape)
+    )
+    fake_stride = tuple(
+        int(step) for step in (stride if stride is not None else tensor.stride())
+    )
+    assumed = int(align if align is not None else assumed_align(tensor))
+    if not dynamic_stride and fake_stride == make_row_major_stride(fake_shape):
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        return cute.runtime.make_fake_compact_tensor(
+            torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride_order=tuple(reversed(range(len(fake_shape)))),
+            assumed_align=assumed,
+        )
+    if dynamic_stride:
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        dynamic_fake_stride = tuple(
+            0 if step == 0 else cute.sym_int32() for step in fake_stride
+        )
+        return cute.runtime.make_fake_tensor(
+            torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride=dynamic_fake_stride,
+            assumed_align=assumed,
+        )
     return cute.runtime.make_fake_tensor(
         torch_to_cutlass_dtype(tensor.dtype),
-        tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
-        stride=tuple(
-            int(step) for step in (stride if stride is not None else tensor.stride())
-        ),
-        assumed_align=int(align if align is not None else assumed_align(tensor)),
+        fake_shape,
+        stride=fake_stride,
+        assumed_align=assumed,
     )
-
-
-def _get_partial_workspace(
-    *,
-    device: torch.device,
-    batch: int,
-    t_size: int,
-    n_heads: int,
-    d_state: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pack_bt_tile = 256
-    scale_tile_count = (batch * t_size + (pack_bt_tile - 1)) // pack_bt_tile
-    bias_tile_count = (batch * t_size + (256 - 1)) // 256
-    key = (
-        device.type,
-        device.index if device.index is not None else -1,
-        int(batch),
-        int(t_size),
-        int(n_heads),
-        int(d_state),
-        int(scale_tile_count),
-        int(bias_tile_count),
-    )
-    cached = _SCANPREP_BWD_PARTIAL_CACHE.get(key)
-    if cached is not None:
-        note_cache_event("cute.scanprep.bwd.partial_workspace", hit=True)
-        return cached
-    note_cache_event("cute.scanprep.bwd.partial_workspace", hit=False)
-    if _is_cuda_graph_capturing(device):
-        _raise_cold_capture_error("partial workspace cache")
-    cached = (
-        torch.empty(
-            (scale_tile_count, n_heads, 4, d_state), device=device, dtype=torch.float32
-        ),
-        torch.empty((bias_tile_count, n_heads, 7), device=device, dtype=torch.float32),
-    )
-    _cache_set(
-        _SCANPREP_BWD_PARTIAL_CACHE,
-        key,
-        cached,
-        limit=_SCANPREP_BWD_PARTIAL_CACHE_LIMIT,
-    )
-    return cached
 
 
 def _is_cuda_graph_capturing(device: torch.device) -> bool:
@@ -278,17 +242,9 @@ def scanprep_bwd(
     value_warps_per_block = 8
     pack_warps_per_block = 12
     coeff_block_size = 512
-    scale_block_size = 256
     bias_block_size = 224
     scale_grad = torch.zeros(
         (n_heads, 4, d_state), device=bc.device, dtype=torch.float32
-    )
-    scale_partial, bias_partial = _get_partial_workspace(
-        device=bc.device,
-        batch=batch,
-        t_size=t_size,
-        n_heads=n_heads,
-        d_state=d_state,
     )
     bias_grad = torch.zeros((n_heads, 7), device=bc.device, dtype=torch.float32)
 
@@ -305,9 +261,6 @@ def scanprep_bwd(
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
     coeff_aux_c = coeff_aux if coeff_aux.is_contiguous() else coeff_aux.contiguous()
     rms_inv_c = rms_inv if rms_inv.is_contiguous() else rms_inv.contiguous()
-    du_stride = tuple(int(s) for s in du_in.stride())
-    b_scale_stride = tuple(int(s) for s in b_scale_in.stride())
-    c_scale_stride = tuple(int(s) for s in c_scale_in.stride())
 
     du_align = assumed_align(du_in)
     bc_align = assumed_align(bc_c)
@@ -322,12 +275,10 @@ def scanprep_bwd(
     value_grad_align = assumed_align(value_grad)
     bc_grad_align = assumed_align(bc_grad)
     dparams_align = assumed_align(dparams)
-    scale_partial_align = assumed_align(scale_partial)
     scale_grad_align = assumed_align(scale_grad)
-    bias_partial_align = assumed_align(bias_partial)
     bias_grad_align = assumed_align(bias_grad)
 
-    spec = (batch, t_size, int(n_heads), int(d_head), int(d_state), 13)
+    spec = (int(n_heads), int(d_head), int(d_state), 13)
     cache_key = (
         spec,
         int(bc.device.index or 0),
@@ -340,18 +291,13 @@ def scanprep_bwd(
         dk_in.dtype,
         b_scale_in.dtype,
         c_scale_in.dtype,
-        b_scale_stride,
-        c_scale_stride,
         rms_inv_c.dtype,
         coeff_aux_c.dtype,
         value_grad.dtype,
         bc_grad.dtype,
         dparams.dtype,
-        scale_partial.dtype,
         scale_grad.dtype,
-        bias_partial.dtype,
         bias_grad.dtype,
-        du_stride,
         du_align,
         bc_align,
         db_align,
@@ -365,14 +311,11 @@ def scanprep_bwd(
         value_grad_align,
         bc_grad_align,
         dparams_align,
-        scale_partial_align,
         scale_grad_align,
-        bias_partial_align,
         bias_grad_align,
         int(value_warps_per_block),
         int(pack_warps_per_block),
         int(coeff_block_size),
-        int(scale_block_size),
         int(bias_block_size),
         float(dt_min),
         float(dt_max),
@@ -389,10 +332,10 @@ def scanprep_bwd(
             _raise_cold_capture_error("launcher cache")
         compiled = cute.compile(
             ScanPrepBwdFused(
-                spec=spec,
-                du_stride=du_stride,
-                b_scale_stride=b_scale_stride,
-                c_scale_stride=c_scale_stride,
+                h_size=n_heads,
+                p_size=d_head,
+                n_size=d_state,
+                param_dim=13,
                 normalize_bc=normalize_bc,
                 dt_min=dt_min,
                 dt_max=dt_max,
@@ -404,25 +347,14 @@ def scanprep_bwd(
                 value_warps_per_block=value_warps_per_block,
                 pack_warps_per_block=pack_warps_per_block,
                 coeff_block_size=coeff_block_size,
-                scale_block_size=scale_block_size,
                 bias_block_size=bias_block_size,
             ),
-            _make_fake_tensor_arg(du_in, stride=du_stride, align=du_align),
+            _make_fake_tensor_arg(du_in, align=du_align),
             _make_fake_tensor_arg(bc_c, align=bc_align),
             _make_fake_tensor_arg(db_in, align=db_align),
             _make_fake_tensor_arg(dc_in, align=dc_align),
-            _make_fake_tensor_arg(
-                b_scale_in,
-                shape=(n_heads, 2, d_state),
-                stride=b_scale_stride,
-                align=b_scale_align,
-            ),
-            _make_fake_tensor_arg(
-                c_scale_in,
-                shape=(n_heads, 2, d_state),
-                stride=c_scale_stride,
-                align=c_scale_align,
-            ),
+            _make_fake_tensor_arg(b_scale_in, align=b_scale_align, dynamic_stride=True),
+            _make_fake_tensor_arg(c_scale_in, align=c_scale_align, dynamic_stride=True),
             _make_fake_tensor_arg(rms_inv_c, align=rms_inv_align),
             _make_fake_tensor_arg(coeff_aux_c, align=coeff_aux_align),
             _make_fake_tensor_arg(dm_in, align=dm_align),
@@ -430,9 +362,7 @@ def scanprep_bwd(
             _make_fake_tensor_arg(value_grad, align=value_grad_align),
             _make_fake_tensor_arg(bc_grad, align=bc_grad_align),
             _make_fake_tensor_arg(dparams, align=dparams_align),
-            _make_fake_tensor_arg(scale_partial, align=scale_partial_align),
             _make_fake_tensor_arg(scale_grad, align=scale_grad_align),
-            _make_fake_tensor_arg(bias_partial, align=bias_partial_align),
             _make_fake_tensor_arg(bias_grad, align=bias_grad_align),
             options="--enable-tvm-ffi",
         )
@@ -453,9 +383,7 @@ def scanprep_bwd(
         value_grad,
         bc_grad,
         dparams,
-        scale_partial,
         scale_grad,
-        bias_partial,
         bias_grad,
     )
 
