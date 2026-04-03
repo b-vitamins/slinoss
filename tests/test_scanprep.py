@@ -135,7 +135,7 @@ def test_scanprep_fake_tensor_arg_prefers_compact_for_row_major(
     )
     monkeypatch.setattr(scanprep_fwd_mod.cute.runtime, "make_fake_tensor", fake_tensor)
 
-    result = scanprep_fwd_mod._make_fake_tensor_arg(tensor)
+    result = scanprep_fwd_mod.make_fake_tensor_arg(tensor)
 
     assert calls == ["compact"]
     assert result[0] == "compact"
@@ -160,7 +160,7 @@ def test_scanprep_fake_tensor_arg_falls_back_for_noncompact_layout(
     )
     monkeypatch.setattr(scanprep_bwd_mod.cute.runtime, "make_fake_tensor", fake_tensor)
 
-    result = scanprep_bwd_mod._make_fake_tensor_arg(
+    result = scanprep_bwd_mod.make_fake_tensor_arg(
         tensor,
         shape=(2, 3, 4),
         stride=(12, 1, 3),

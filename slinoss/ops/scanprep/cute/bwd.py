@@ -8,53 +8,11 @@ import cutlass.cute as cute
 
 from slinoss.perf import note_cache_event
 
-from .common import assumed_align, make_row_major_stride, torch_to_cutlass_dtype
+from .common import assumed_align, make_fake_tensor_arg
 from .kernels.bwd import ScanPrepBwdFused
 
 
 _SCANPREP_BWD_CACHE: dict[tuple[object, ...], object] = {}
-
-
-def _make_fake_tensor_arg(
-    tensor: torch.Tensor,
-    *,
-    shape: tuple[int, ...] | None = None,
-    stride: tuple[int, ...] | None = None,
-    align: int | None = None,
-    dynamic_stride: bool = False,
-):
-    fake_shape = tuple(
-        int(dim) for dim in (shape if shape is not None else tensor.shape)
-    )
-    fake_stride = tuple(
-        int(step) for step in (stride if stride is not None else tensor.stride())
-    )
-    assumed = int(align if align is not None else assumed_align(tensor))
-    if not dynamic_stride and fake_stride == make_row_major_stride(fake_shape):
-        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
-        return cute.runtime.make_fake_compact_tensor(
-            torch_to_cutlass_dtype(tensor.dtype),
-            dynamic_shape,
-            stride_order=tuple(reversed(range(len(fake_shape)))),
-            assumed_align=assumed,
-        )
-    if dynamic_stride:
-        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
-        dynamic_fake_stride = tuple(
-            0 if step == 0 else cute.sym_int32() for step in fake_stride
-        )
-        return cute.runtime.make_fake_tensor(
-            torch_to_cutlass_dtype(tensor.dtype),
-            dynamic_shape,
-            stride=dynamic_fake_stride,
-            assumed_align=assumed,
-        )
-    return cute.runtime.make_fake_tensor(
-        torch_to_cutlass_dtype(tensor.dtype),
-        fake_shape,
-        stride=fake_stride,
-        assumed_align=assumed,
-    )
 
 
 def _is_cuda_graph_capturing(device: torch.device) -> bool:
@@ -349,21 +307,21 @@ def scanprep_bwd(
                 coeff_block_size=coeff_block_size,
                 bias_block_size=bias_block_size,
             ),
-            _make_fake_tensor_arg(du_in, align=du_align),
-            _make_fake_tensor_arg(bc_c, align=bc_align),
-            _make_fake_tensor_arg(db_in, align=db_align),
-            _make_fake_tensor_arg(dc_in, align=dc_align),
-            _make_fake_tensor_arg(b_scale_in, align=b_scale_align, dynamic_stride=True),
-            _make_fake_tensor_arg(c_scale_in, align=c_scale_align, dynamic_stride=True),
-            _make_fake_tensor_arg(rms_inv_c, align=rms_inv_align),
-            _make_fake_tensor_arg(coeff_aux_c, align=coeff_aux_align),
-            _make_fake_tensor_arg(dm_in, align=dm_align),
-            _make_fake_tensor_arg(dk_in, align=dk_align),
-            _make_fake_tensor_arg(value_grad, align=value_grad_align),
-            _make_fake_tensor_arg(bc_grad, align=bc_grad_align),
-            _make_fake_tensor_arg(dparams, align=dparams_align),
-            _make_fake_tensor_arg(scale_grad, align=scale_grad_align),
-            _make_fake_tensor_arg(bias_grad, align=bias_grad_align),
+            make_fake_tensor_arg(du_in, align=du_align),
+            make_fake_tensor_arg(bc_c, align=bc_align),
+            make_fake_tensor_arg(db_in, align=db_align),
+            make_fake_tensor_arg(dc_in, align=dc_align),
+            make_fake_tensor_arg(b_scale_in, align=b_scale_align, dynamic_stride=True),
+            make_fake_tensor_arg(c_scale_in, align=c_scale_align, dynamic_stride=True),
+            make_fake_tensor_arg(rms_inv_c, align=rms_inv_align),
+            make_fake_tensor_arg(coeff_aux_c, align=coeff_aux_align),
+            make_fake_tensor_arg(dm_in, align=dm_align),
+            make_fake_tensor_arg(dk_in, align=dk_align),
+            make_fake_tensor_arg(value_grad, align=value_grad_align),
+            make_fake_tensor_arg(bc_grad, align=bc_grad_align),
+            make_fake_tensor_arg(dparams, align=dparams_align),
+            make_fake_tensor_arg(scale_grad, align=scale_grad_align),
+            make_fake_tensor_arg(bias_grad, align=bias_grad_align),
             options="--enable-tvm-ffi",
         )
         _SCANPREP_BWD_CACHE[cache_key] = compiled

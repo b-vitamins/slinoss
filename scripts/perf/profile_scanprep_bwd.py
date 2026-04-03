@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
-from slinoss.ops.scanprep.cute.common import make_ptr_arg  # noqa: E402
+from slinoss.ops.scanprep.cute.common import make_fake_tensor_arg  # noqa: E402
 from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 
@@ -99,13 +99,6 @@ def main() -> int:
     dK = torch.randn((batch, heads, t_size, 2, 2), device=device, dtype=torch.float32)
     dB = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
     dC = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
-    du_stride = (
-        int(dU.stride()[0]),
-        int(dU.stride()[1]),
-        int(dU.stride()[2]),
-        int(dU.stride()[3]),
-    )
-
     if args.normalize_bc:
         assert prep.b_scale is not None
         assert prep.c_scale is not None
@@ -149,43 +142,15 @@ def main() -> int:
         (batch, t_size, heads, 4, d_state), device=device, dtype=dtype
     )
     dparams = torch.empty((batch, t_size, heads * 13), device=device, dtype=dtype)
-    scale_tile_count = (batch * t_size + (256 - 1)) // 256
-    scale_partial = torch.empty(
-        (scale_tile_count, heads, 4, d_state),
-        device=device,
-        dtype=torch.float32,
-    )
     scale_grad = torch.zeros((heads, 4, d_state), device=device, dtype=torch.float32)
-    bias_tile_count = (batch * t_size + (256 - 1)) // 256
-    bias_partial = torch.empty(
-        (bias_tile_count, heads, 7),
-        device=device,
-        dtype=torch.float32,
-    )
     bias_grad = torch.empty((heads, 7), device=device, dtype=torch.float32)
-
-    du_ptr, _ = make_ptr_arg(dU)
-    bc_ptr, _ = make_ptr_arg(bc)
-    db_ptr, _ = make_ptr_arg(dB)
-    dc_ptr, _ = make_ptr_arg(dC)
-    b_scale_ptr, _ = make_ptr_arg(b_scale)
-    c_scale_ptr, _ = make_ptr_arg(c_scale)
-    rms_inv_ptr, _ = make_ptr_arg(rms_inv)
-    coeff_aux_ptr, _ = make_ptr_arg(coeff_aux)
-    dm_ptr, _ = make_ptr_arg(dM)
-    dk_ptr, _ = make_ptr_arg(dK)
-    value_grad_ptr, _ = make_ptr_arg(value_grad)
-    bc_grad_ptr, _ = make_ptr_arg(bc_grad)
-    dparams_ptr, _ = make_ptr_arg(dparams)
-    scale_partial_ptr, _ = make_ptr_arg(scale_partial)
-    scale_grad_ptr, _ = make_ptr_arg(scale_grad)
-    bias_partial_ptr, _ = make_ptr_arg(bias_partial)
-    bias_grad_ptr, _ = make_ptr_arg(bias_grad)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
-            spec=(batch, t_size, heads, p_size, d_state, 13),
-            du_stride=du_stride,
+            h_size=heads,
+            p_size=p_size,
+            n_size=d_state,
+            param_dim=13,
             normalize_bc=args.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
@@ -196,26 +161,24 @@ def main() -> int:
             eps=prep.eps,
             pack_warps_per_block=args.pack_warps_per_block,
             coeff_block_size=args.coeff_block_size,
-            scale_block_size=args.scale_block_size,
             bias_block_size=args.bias_block_size,
         ),
-        du_ptr,
-        bc_ptr,
-        db_ptr,
-        dc_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        rms_inv_ptr,
-        coeff_aux_ptr,
-        dm_ptr,
-        dk_ptr,
-        value_grad_ptr,
-        bc_grad_ptr,
-        dparams_ptr,
-        scale_partial_ptr,
-        scale_grad_ptr,
-        bias_partial_ptr,
-        bias_grad_ptr,
+        make_fake_tensor_arg(dU),
+        make_fake_tensor_arg(bc),
+        make_fake_tensor_arg(dB),
+        make_fake_tensor_arg(dC),
+        make_fake_tensor_arg(b_scale, dynamic_stride=True),
+        make_fake_tensor_arg(c_scale, dynamic_stride=True),
+        make_fake_tensor_arg(rms_inv),
+        make_fake_tensor_arg(coeff_aux),
+        make_fake_tensor_arg(dM),
+        make_fake_tensor_arg(dK),
+        make_fake_tensor_arg(value_grad),
+        make_fake_tensor_arg(bc_grad),
+        make_fake_tensor_arg(dparams),
+        make_fake_tensor_arg(scale_grad),
+        make_fake_tensor_arg(bias_grad),
+        options="--enable-tvm-ffi",
     )
 
     def prepare() -> None:
@@ -224,23 +187,21 @@ def main() -> int:
 
     def run() -> None:
         compiled(
-            du_ptr,
-            bc_ptr,
-            db_ptr,
-            dc_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            rms_inv_ptr,
-            coeff_aux_ptr,
-            dm_ptr,
-            dk_ptr,
-            value_grad_ptr,
-            bc_grad_ptr,
-            dparams_ptr,
-            scale_partial_ptr,
-            scale_grad_ptr,
-            bias_partial_ptr,
-            bias_grad_ptr,
+            dU,
+            bc,
+            dB,
+            dC,
+            b_scale,
+            c_scale,
+            rms_inv,
+            coeff_aux,
+            dM,
+            dK,
+            value_grad,
+            bc_grad,
+            dparams,
+            scale_grad,
+            bias_grad,
         )
 
     _profile_once(run, warmup=args.warmup, prepare=prepare)

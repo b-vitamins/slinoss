@@ -25,7 +25,7 @@ from _nextchar import DEFAULT_NEXTCHAR_PERF_CONFIG  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
     COEFF_AUX_FIELDS,
-    make_ptr_arg,
+    make_fake_tensor_arg,
 )
 from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
@@ -214,36 +214,11 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         b_scale = torch.empty((cfg.heads, 2, cfg.N), device=device, dtype=dtype)
         c_scale = torch.empty((cfg.heads, 2, cfg.N), device=device, dtype=dtype)
 
-    value_ptr, _ = make_ptr_arg(value)
-    bc_ptr, _ = make_ptr_arg(bc)
-    b_scale_ptr, _ = make_ptr_arg(b_scale)
-    c_scale_ptr, _ = make_ptr_arg(c_scale)
-    params_ptr, _ = make_ptr_arg(params)
-    dt_bias_ptr, _ = make_ptr_arg(prep.dt_bias.detach())
-    gamma_bias_ptr, _ = make_ptr_arg(prep.gamma_bias.detach())
-    omega_bias_ptr, _ = make_ptr_arg(prep.omega_bias.detach())
-    mix_r_bias_ptr, _ = make_ptr_arg(prep.mix_r_bias.detach())
-    mix_theta_bias_ptr, _ = make_ptr_arg(prep.mix_theta_bias.detach())
-    mix_k_prev_bias_ptr, _ = make_ptr_arg(prep.mix_k_prev_bias.detach())
-    mix_k_curr_bias_ptr, _ = make_ptr_arg(prep.mix_k_curr_bias.detach())
-    u_ptr, _ = make_ptr_arg(U)
-    b_ptr, _ = make_ptr_arg(B)
-    c_ptr, _ = make_ptr_arg(C)
-    m_ptr, _ = make_ptr_arg(M)
-    k_ptr, _ = make_ptr_arg(K)
-    rms_inv_ptr, _ = make_ptr_arg(rms_inv)
-    coeff_aux_ptr, _ = make_ptr_arg(coeff_aux)
-
-    params_in_stride = (
-        int(params.stride()[0]),
-        int(params.stride()[1]),
-        int(params.stride()[2]),
-    )
-
     compiled = cute.compile(
         ScanPrepFwdFused(
-            spec=(cfg.batch, cfg.T, cfg.heads, cfg.P, cfg.N),
-            params_in_stride=params_in_stride,
+            h_size=cfg.heads,
+            p_size=cfg.P,
+            n_size=cfg.N,
             normalize_bc=cfg.normalize_bc,
             store_rms_inv=bool(cfg.normalize_bc),
             store_coeff_aux=True,
@@ -257,48 +232,49 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             pack_warps_per_block=cfg.pack_warps_per_block,
             coeff_block_size=cfg.coeff_block_size_fwd,
         ),
-        value_ptr,
-        bc_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        params_ptr,
-        dt_bias_ptr,
-        gamma_bias_ptr,
-        omega_bias_ptr,
-        mix_r_bias_ptr,
-        mix_theta_bias_ptr,
-        mix_k_prev_bias_ptr,
-        mix_k_curr_bias_ptr,
-        u_ptr,
-        b_ptr,
-        c_ptr,
-        m_ptr,
-        k_ptr,
-        rms_inv_ptr,
-        coeff_aux_ptr,
+        make_fake_tensor_arg(value),
+        make_fake_tensor_arg(bc),
+        make_fake_tensor_arg(b_scale, dynamic_stride=True),
+        make_fake_tensor_arg(c_scale, dynamic_stride=True),
+        make_fake_tensor_arg(params),
+        make_fake_tensor_arg(prep.dt_bias.detach()),
+        make_fake_tensor_arg(prep.gamma_bias.detach()),
+        make_fake_tensor_arg(prep.omega_bias.detach()),
+        make_fake_tensor_arg(prep.mix_r_bias.detach()),
+        make_fake_tensor_arg(prep.mix_theta_bias.detach()),
+        make_fake_tensor_arg(prep.mix_k_prev_bias.detach()),
+        make_fake_tensor_arg(prep.mix_k_curr_bias.detach()),
+        make_fake_tensor_arg(U),
+        make_fake_tensor_arg(B),
+        make_fake_tensor_arg(C),
+        make_fake_tensor_arg(M),
+        make_fake_tensor_arg(K),
+        make_fake_tensor_arg(rms_inv),
+        make_fake_tensor_arg(coeff_aux),
+        options="--enable-tvm-ffi",
     )
 
     def launch() -> None:
         compiled(
-            value_ptr,
-            bc_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            params_ptr,
-            dt_bias_ptr,
-            gamma_bias_ptr,
-            omega_bias_ptr,
-            mix_r_bias_ptr,
-            mix_theta_bias_ptr,
-            mix_k_prev_bias_ptr,
-            mix_k_curr_bias_ptr,
-            u_ptr,
-            b_ptr,
-            c_ptr,
-            m_ptr,
-            k_ptr,
-            rms_inv_ptr,
-            coeff_aux_ptr,
+            value,
+            bc,
+            b_scale,
+            c_scale,
+            params,
+            prep.dt_bias.detach(),
+            prep.gamma_bias.detach(),
+            prep.omega_bias.detach(),
+            prep.mix_r_bias.detach(),
+            prep.mix_theta_bias.detach(),
+            prep.mix_k_prev_bias.detach(),
+            prep.mix_k_curr_bias.detach(),
+            U,
+            B,
+            C,
+            M,
+            K,
+            rms_inv,
+            coeff_aux,
         )
 
     effective_bytes = _tensor_bytes(
@@ -363,13 +339,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.heads, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     dC = torch.randn_like(dB)
-    du_stride = (
-        int(dU.stride()[0]),
-        int(dU.stride()[1]),
-        int(dU.stride()[2]),
-        int(dU.stride()[3]),
-    )
-
     if cfg.normalize_bc:
         assert prep.b_scale is not None
         assert prep.c_scale is not None
@@ -415,39 +384,15 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     dparams = torch.empty(
         (cfg.batch, cfg.T, cfg.heads * 13), device=device, dtype=dtype
     )
-    scale_tile_count = (cfg.batch * cfg.T + (256 - 1)) // 256
-    scale_partial = torch.empty(
-        (scale_tile_count, cfg.heads, 4, cfg.N), device=device, dtype=torch.float32
-    )
     scale_grad = torch.zeros((cfg.heads, 4, cfg.N), device=device, dtype=torch.float32)
-    bias_tile_count = (cfg.batch * cfg.T + (256 - 1)) // 256
-    bias_partial = torch.empty(
-        (bias_tile_count, cfg.heads, 7), device=device, dtype=torch.float32
-    )
     bias_grad = torch.empty((cfg.heads, 7), device=device, dtype=torch.float32)
-
-    du_ptr, _ = make_ptr_arg(dU)
-    bc_ptr, _ = make_ptr_arg(bc)
-    db_ptr, _ = make_ptr_arg(dB)
-    dc_ptr, _ = make_ptr_arg(dC)
-    b_scale_ptr, _ = make_ptr_arg(b_scale)
-    c_scale_ptr, _ = make_ptr_arg(c_scale)
-    rms_inv_ptr, _ = make_ptr_arg(rms_inv)
-    coeff_aux_ptr, _ = make_ptr_arg(coeff_aux)
-    dm_ptr, _ = make_ptr_arg(dM)
-    dk_ptr, _ = make_ptr_arg(dK)
-    value_grad_ptr, _ = make_ptr_arg(value_grad)
-    bc_grad_ptr, _ = make_ptr_arg(bc_grad)
-    dparams_ptr, _ = make_ptr_arg(dparams)
-    scale_partial_ptr, _ = make_ptr_arg(scale_partial)
-    scale_grad_ptr, _ = make_ptr_arg(scale_grad)
-    bias_partial_ptr, _ = make_ptr_arg(bias_partial)
-    bias_grad_ptr, _ = make_ptr_arg(bias_grad)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
-            spec=(cfg.batch, cfg.T, cfg.heads, cfg.P, cfg.N, 13),
-            du_stride=du_stride,
+            h_size=cfg.heads,
+            p_size=cfg.P,
+            n_size=cfg.N,
+            param_dim=13,
             normalize_bc=cfg.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
@@ -458,26 +403,24 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             eps=prep.eps,
             pack_warps_per_block=cfg.pack_warps_per_block,
             coeff_block_size=cfg.coeff_block_size_bwd,
-            scale_block_size=cfg.scale_block_size,
             bias_block_size=cfg.bias_block_size,
         ),
-        du_ptr,
-        bc_ptr,
-        db_ptr,
-        dc_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        rms_inv_ptr,
-        coeff_aux_ptr,
-        dm_ptr,
-        dk_ptr,
-        value_grad_ptr,
-        bc_grad_ptr,
-        dparams_ptr,
-        scale_partial_ptr,
-        scale_grad_ptr,
-        bias_partial_ptr,
-        bias_grad_ptr,
+        make_fake_tensor_arg(dU),
+        make_fake_tensor_arg(bc),
+        make_fake_tensor_arg(dB),
+        make_fake_tensor_arg(dC),
+        make_fake_tensor_arg(b_scale, dynamic_stride=True),
+        make_fake_tensor_arg(c_scale, dynamic_stride=True),
+        make_fake_tensor_arg(rms_inv),
+        make_fake_tensor_arg(coeff_aux),
+        make_fake_tensor_arg(dM),
+        make_fake_tensor_arg(dK),
+        make_fake_tensor_arg(value_grad),
+        make_fake_tensor_arg(bc_grad),
+        make_fake_tensor_arg(dparams),
+        make_fake_tensor_arg(scale_grad),
+        make_fake_tensor_arg(bias_grad),
+        options="--enable-tvm-ffi",
     )
 
     def prepare() -> None:
@@ -486,23 +429,21 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
 
     def launch() -> None:
         compiled(
-            du_ptr,
-            bc_ptr,
-            db_ptr,
-            dc_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            rms_inv_ptr,
-            coeff_aux_ptr,
-            dm_ptr,
-            dk_ptr,
-            value_grad_ptr,
-            bc_grad_ptr,
-            dparams_ptr,
-            scale_partial_ptr,
-            scale_grad_ptr,
-            bias_partial_ptr,
-            bias_grad_ptr,
+            dU,
+            bc,
+            dB,
+            dC,
+            b_scale,
+            c_scale,
+            rms_inv,
+            coeff_aux,
+            dM,
+            dK,
+            value_grad,
+            bc_grad,
+            dparams,
+            scale_grad,
+            bias_grad,
         )
 
     effective_bytes = _tensor_bytes(
@@ -680,10 +621,11 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
         compute_dtype=torch.float32,
         return_launchers=True,
     )
-    stage_args = _closure_var(launch, "stage_args")
+    launch_vars = _closure_vars(launch)
+    stage_args = launch_vars.get("stage_runtime_args", launch_vars.get("stage_args"))
     if not isinstance(stage_args, tuple):
         raise RuntimeError(
-            "chunk_increment_bwd launcher closure did not expose stage_args tuple."
+            "chunk_increment_bwd launcher closure did not expose stage runtime args."
         )
 
     db_args = (
@@ -846,11 +788,12 @@ def _build_v2x2ssd_state_passing_bwd_runners(
         d_final=d_final,
         return_launcher=True,
     )
-    compiled = _closure_var(launch, "compiled")
-    dynamic_args = _closure_var(launch, "dynamic_args")
+    launch_vars = _closure_vars(launch)
+    compiled = cast(Callable[..., None], launch_vars.get("compiled"))
+    dynamic_args = launch_vars.get("runtime_args", launch_vars.get("dynamic_args"))
     if not isinstance(dynamic_args, tuple):
         raise RuntimeError(
-            "state_passing_bwd launcher closure did not expose dynamic_args tuple."
+            "state_passing_bwd launcher closure did not expose runtime args."
         )
 
     def prepare() -> None:

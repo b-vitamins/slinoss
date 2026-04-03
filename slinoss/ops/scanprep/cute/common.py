@@ -7,6 +7,7 @@ from typing import Any, cast
 import torch
 
 import cutlass
+import cutlass.cute as cute
 import cutlass.cute.math as cute_math
 
 _cutlass_max = cast(Any, getattr(cutlass, "max"))
@@ -71,6 +72,48 @@ def assumed_align(tensor: torch.Tensor) -> int:
         if (ptr % align) == 0:
             return align
     return elem_align
+
+
+def make_fake_tensor_arg(
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...] | None = None,
+    stride: tuple[int, ...] | None = None,
+    align: int | None = None,
+    dynamic_stride: bool = False,
+):
+    fake_shape = tuple(
+        int(dim) for dim in (shape if shape is not None else tensor.shape)
+    )
+    fake_stride = tuple(
+        int(step) for step in (stride if stride is not None else tensor.stride())
+    )
+    assumed = int(align if align is not None else assumed_align(tensor))
+    if not dynamic_stride and fake_stride == make_row_major_stride(fake_shape):
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        return cute.runtime.make_fake_compact_tensor(
+            torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride_order=tuple(reversed(range(len(fake_shape)))),
+            assumed_align=assumed,
+        )
+    if dynamic_stride:
+        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
+        dynamic_fake_stride = tuple(
+            0 if step == 0 else cute.sym_int32() for step in fake_stride
+        )
+        return cute.runtime.make_fake_tensor(
+            torch_to_cutlass_dtype(tensor.dtype),
+            dynamic_shape,
+            stride=dynamic_fake_stride,
+            assumed_align=assumed,
+        )
+    return cute.runtime.make_fake_tensor(
+        torch_to_cutlass_dtype(tensor.dtype),
+        fake_shape,
+        stride=fake_stride,
+        assumed_align=assumed,
+    )
 
 
 def sigmoid(x):
@@ -171,6 +214,7 @@ __all__ = [
     "complex_mul",
     "complex_mul_conj",
     "lerp",
+    "make_fake_tensor_arg",
     "make_row_major_stride",
     "principal_angle",
     "real_mul_conj",

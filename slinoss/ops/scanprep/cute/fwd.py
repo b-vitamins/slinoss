@@ -13,8 +13,7 @@ from slinoss.perf import note_cache_event
 from .common import (
     COEFF_AUX_FIELDS,
     assumed_align,
-    make_row_major_stride,
-    torch_to_cutlass_dtype,
+    make_fake_tensor_arg,
 )
 from .kernels.fwd import ScanPrepFwdFused
 
@@ -45,48 +44,6 @@ def _cache_set(
     elif len(cache) >= _SCANPREP_DUMMY_CACHE_LIMIT:
         cache.pop(next(iter(cache)), None)
     cache[key] = value
-
-
-def _make_fake_tensor_arg(
-    tensor: torch.Tensor,
-    *,
-    shape: tuple[int, ...] | None = None,
-    stride: tuple[int, ...] | None = None,
-    align: int | None = None,
-    dynamic_stride: bool = False,
-):
-    fake_shape = tuple(
-        int(dim) for dim in (shape if shape is not None else tensor.shape)
-    )
-    fake_stride = tuple(
-        int(step) for step in (stride if stride is not None else tensor.stride())
-    )
-    assumed = int(align if align is not None else assumed_align(tensor))
-    if not dynamic_stride and fake_stride == make_row_major_stride(fake_shape):
-        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
-        return cute.runtime.make_fake_compact_tensor(
-            torch_to_cutlass_dtype(tensor.dtype),
-            dynamic_shape,
-            stride_order=tuple(reversed(range(len(fake_shape)))),
-            assumed_align=assumed,
-        )
-    if dynamic_stride:
-        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
-        dynamic_fake_stride = tuple(
-            0 if step == 0 else cute.sym_int32() for step in fake_stride
-        )
-        return cute.runtime.make_fake_tensor(
-            torch_to_cutlass_dtype(tensor.dtype),
-            dynamic_shape,
-            stride=dynamic_fake_stride,
-            assumed_align=assumed,
-        )
-    return cute.runtime.make_fake_tensor(
-        torch_to_cutlass_dtype(tensor.dtype),
-        fake_shape,
-        stride=fake_stride,
-        assumed_align=assumed,
-    )
 
 
 def _get_dummy_rms_inv(
@@ -328,25 +285,25 @@ def _scanprep_fwd_impl(
                 k_max=k_max,
                 eps=eps,
             ),
-            _make_fake_tensor_arg(value_c, align=value_align),
-            _make_fake_tensor_arg(bc_c, align=bc_align),
-            _make_fake_tensor_arg(b_scale_c, align=b_scale_align, dynamic_stride=True),
-            _make_fake_tensor_arg(c_scale_c, align=c_scale_align, dynamic_stride=True),
-            _make_fake_tensor_arg(params_c, align=params_align),
-            _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
-            _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
-            _make_fake_tensor_arg(omega_bias, align=omega_bias_align),
-            _make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
-            _make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
-            _make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
-            _make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
-            _make_fake_tensor_arg(U, align=u_align),
-            _make_fake_tensor_arg(B, align=b_align),
-            _make_fake_tensor_arg(C, align=c_align),
-            _make_fake_tensor_arg(M, align=m_align),
-            _make_fake_tensor_arg(K, align=k_align),
-            _make_fake_tensor_arg(rms_inv, align=rms_inv_align),
-            _make_fake_tensor_arg(coeff_aux, align=coeff_aux_align),
+            make_fake_tensor_arg(value_c, align=value_align),
+            make_fake_tensor_arg(bc_c, align=bc_align),
+            make_fake_tensor_arg(b_scale_c, align=b_scale_align, dynamic_stride=True),
+            make_fake_tensor_arg(c_scale_c, align=c_scale_align, dynamic_stride=True),
+            make_fake_tensor_arg(params_c, align=params_align),
+            make_fake_tensor_arg(dt_bias, align=dt_bias_align),
+            make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
+            make_fake_tensor_arg(omega_bias, align=omega_bias_align),
+            make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
+            make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
+            make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
+            make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
+            make_fake_tensor_arg(U, align=u_align),
+            make_fake_tensor_arg(B, align=b_align),
+            make_fake_tensor_arg(C, align=c_align),
+            make_fake_tensor_arg(M, align=m_align),
+            make_fake_tensor_arg(K, align=k_align),
+            make_fake_tensor_arg(rms_inv, align=rms_inv_align),
+            make_fake_tensor_arg(coeff_aux, align=coeff_aux_align),
             options="--enable-tvm-ffi",
         )
         _SCANPREP_FWD_CACHE[cache_key] = compiled

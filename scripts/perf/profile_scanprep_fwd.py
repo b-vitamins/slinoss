@@ -21,7 +21,7 @@ from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
     COEFF_AUX_FIELDS,
-    make_ptr_arg,
+    make_fake_tensor_arg,
 )
 from slinoss.ops.scanprep.cute.kernels.fwd import ScanPrepFwdFused  # noqa: E402
 
@@ -114,30 +114,11 @@ def main() -> int:
         b_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
         c_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
 
-    value_ptr, _ = make_ptr_arg(value)
-    bc_ptr, _ = make_ptr_arg(bc)
-    b_scale_ptr, _ = make_ptr_arg(b_scale)
-    c_scale_ptr, _ = make_ptr_arg(c_scale)
-    params_ptr, _ = make_ptr_arg(params)
-    dt_bias_ptr, _ = make_ptr_arg(prep.dt_bias.detach())
-    gamma_bias_ptr, _ = make_ptr_arg(prep.gamma_bias.detach())
-    omega_bias_ptr, _ = make_ptr_arg(prep.omega_bias.detach())
-    mix_r_bias_ptr, _ = make_ptr_arg(prep.mix_r_bias.detach())
-    mix_theta_bias_ptr, _ = make_ptr_arg(prep.mix_theta_bias.detach())
-    mix_k_prev_bias_ptr, _ = make_ptr_arg(prep.mix_k_prev_bias.detach())
-    mix_k_curr_bias_ptr, _ = make_ptr_arg(prep.mix_k_curr_bias.detach())
-    u_ptr, _ = make_ptr_arg(U)
-    b_ptr, _ = make_ptr_arg(B)
-    c_ptr, _ = make_ptr_arg(C)
-    m_ptr, _ = make_ptr_arg(M)
-    k_ptr, _ = make_ptr_arg(K)
-    rms_inv_ptr, _ = make_ptr_arg(rms_inv)
-    coeff_aux_ptr, _ = make_ptr_arg(coeff_aux)
-
     compiled = cute.compile(
         ScanPrepFwdFused(
-            spec=(batch, t_size, heads, p_size, d_state),
-            params_in_stride=tuple(int(s) for s in params.stride()),
+            h_size=heads,
+            p_size=p_size,
+            n_size=d_state,
             normalize_bc=args.normalize_bc,
             store_rms_inv=bool(args.normalize_bc),
             store_coeff_aux=True,
@@ -151,48 +132,49 @@ def main() -> int:
             pack_warps_per_block=args.pack_warps_per_block,
             coeff_block_size=args.coeff_block_size,
         ),
-        value_ptr,
-        bc_ptr,
-        b_scale_ptr,
-        c_scale_ptr,
-        params_ptr,
-        dt_bias_ptr,
-        gamma_bias_ptr,
-        omega_bias_ptr,
-        mix_r_bias_ptr,
-        mix_theta_bias_ptr,
-        mix_k_prev_bias_ptr,
-        mix_k_curr_bias_ptr,
-        u_ptr,
-        b_ptr,
-        c_ptr,
-        m_ptr,
-        k_ptr,
-        rms_inv_ptr,
-        coeff_aux_ptr,
+        make_fake_tensor_arg(value),
+        make_fake_tensor_arg(bc),
+        make_fake_tensor_arg(b_scale, dynamic_stride=True),
+        make_fake_tensor_arg(c_scale, dynamic_stride=True),
+        make_fake_tensor_arg(params),
+        make_fake_tensor_arg(prep.dt_bias.detach()),
+        make_fake_tensor_arg(prep.gamma_bias.detach()),
+        make_fake_tensor_arg(prep.omega_bias.detach()),
+        make_fake_tensor_arg(prep.mix_r_bias.detach()),
+        make_fake_tensor_arg(prep.mix_theta_bias.detach()),
+        make_fake_tensor_arg(prep.mix_k_prev_bias.detach()),
+        make_fake_tensor_arg(prep.mix_k_curr_bias.detach()),
+        make_fake_tensor_arg(U),
+        make_fake_tensor_arg(B),
+        make_fake_tensor_arg(C),
+        make_fake_tensor_arg(M),
+        make_fake_tensor_arg(K),
+        make_fake_tensor_arg(rms_inv),
+        make_fake_tensor_arg(coeff_aux),
+        options="--enable-tvm-ffi",
     )
 
     def run() -> None:
         compiled(
-            value_ptr,
-            bc_ptr,
-            b_scale_ptr,
-            c_scale_ptr,
-            params_ptr,
-            dt_bias_ptr,
-            gamma_bias_ptr,
-            omega_bias_ptr,
-            mix_r_bias_ptr,
-            mix_theta_bias_ptr,
-            mix_k_prev_bias_ptr,
-            mix_k_curr_bias_ptr,
-            u_ptr,
-            b_ptr,
-            c_ptr,
-            m_ptr,
-            k_ptr,
-            rms_inv_ptr,
-            coeff_aux_ptr,
+            value,
+            bc,
+            b_scale,
+            c_scale,
+            params,
+            prep.dt_bias.detach(),
+            prep.gamma_bias.detach(),
+            prep.omega_bias.detach(),
+            prep.mix_r_bias.detach(),
+            prep.mix_theta_bias.detach(),
+            prep.mix_k_prev_bias.detach(),
+            prep.mix_k_curr_bias.detach(),
+            U,
+            B,
+            C,
+            M,
+            K,
+            rms_inv,
+            coeff_aux,
         )
 
     _profile_once(run, warmup=args.warmup)
