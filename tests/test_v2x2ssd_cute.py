@@ -269,6 +269,69 @@ def test_v2x2ssd_fwd_reuses_compiled_stage_launchers_for_aliased_inputs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    inc_ref, m_ref = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    starts_ref, _ = state_passing(
+        inc_ref,
+        m_ref,
+        initial_states=initial_states,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn_like(U)
+
+    recorded: dict[str, object] = {}
+    real_compile = v2x2ssd_bwd_mod.cute.compile
+
+    def _recording_compile(*args, **kwargs):
+        recorded["kwargs"] = kwargs
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(v2x2ssd_bwd_mod.cute, "compile", _recording_compile)
+    v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+    try:
+        v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            m_ref,
+            starts_ref,
+            d_out,
+            chunk_size=chunk_size,
+            compute_dtype=torch.float32,
+        )
+    finally:
+        v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+
+    assert recorded["kwargs"] == {"options": "--enable-tvm-ffi"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_fwd_ptr_cache_keeps_same_base_views_distinct() -> None:
     pytest.importorskip("cutlass")
 

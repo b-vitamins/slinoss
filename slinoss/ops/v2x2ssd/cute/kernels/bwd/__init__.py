@@ -8,7 +8,8 @@ import cutlass.cute as cute
 from slinoss.perf import note_cache_event
 
 from ..fwd.common import (
-    _make_ptr_args,
+    _assumed_align,
+    _make_fake_tensor_arg,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -50,6 +51,21 @@ def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
     elif len(cache) >= int(limit):
         cache.pop(next(iter(cache)), None)
     cache[key] = value
+
+
+def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
+    stream = None
+    seen: set[int] = set()
+    for tensor in tensors:
+        if tensor is None or tensor.device.type != "cuda":
+            continue
+        ident = id(tensor)
+        if ident in seen:
+            continue
+        if stream is None:
+            stream = torch.cuda.current_stream(device=tensor.device)
+        tensor.record_stream(stream)
+        seen.add(ident)
 
 
 def _get_zero_prev_tensors(
@@ -221,11 +237,11 @@ def _public_from_packed_dk(
 
 
 def _make_tensor_from_spec(
-    ptr: cute.Pointer,
+    ptr: cute.Tensor,
     spec: tuple[tuple[int, ...], tuple[int, ...]],
 ):
     shape, stride = spec
-    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+    return cute.make_tensor(ptr.iterator, cute.make_layout(shape, stride=stride))
 
 
 def _bwd_host_cache_key(
@@ -316,7 +332,7 @@ def _build_backward_args(
     ]
     | None = None,
 ) -> tuple[
-    tuple[object, ...],
+    tuple[torch.Tensor, ...],
     tuple[int, ...],
     tuple[int, ...],
     tuple[object, ...],
@@ -600,7 +616,8 @@ def _build_backward_args(
         dKprev_inc,
         dKcurr_inc,
     ]
-    dynamic_args, alignments = _make_ptr_args(*ptr_tensors)
+    runtime_args = tuple(ptr_tensors)
+    alignments = tuple(_assumed_align(tensor) for tensor in runtime_args)
 
     spec = (
         Bsz,
@@ -663,7 +680,7 @@ def _build_backward_args(
         d_inc_tc,
     )
     return (
-        dynamic_args,
+        runtime_args,
         alignments,
         spec,
         cfg,
@@ -753,50 +770,50 @@ def _make_v2x2ssd_bwd_host_wrapper(
 
     @cute.jit
     def _v2x2ssd_bwd_host_wrapper(
-        U_ptr: cute.Pointer,
-        B_ptr: cute.Pointer,
-        C_ptr: cute.Pointer,
-        M_ptr: cute.Pointer,
-        K_ptr: cute.Pointer,
-        Kprev_ptr: cute.Pointer,
-        Kcurr_ptr: cute.Pointer,
-        dOut_ptr: cute.Pointer,
-        m_chunk_ptr: cute.Pointer,
-        chunk_starts_ptr: cute.Pointer,
-        U_prev0_ptr: cute.Pointer,
-        B_prev0_ptr: cute.Pointer,
-        d_final_ptr: cute.Pointer,
-        U_prev_chunks_ptr: cute.Pointer,
-        B_prev_chunks_ptr: cute.Pointer,
-        dZ0_ptr: cute.Pointer,
-        d_inc_tc_ptr: cute.Pointer,
-        d_initial_ptr: cute.Pointer,
-        d_m_chunk_ptr: cute.Pointer,
-        dU_scan_ptr: cute.Pointer,
-        dU_prev_scan_ptr: cute.Pointer,
-        dB_scan_ptr: cute.Pointer,
-        dB_prev_scan_ptr: cute.Pointer,
-        dC_scan_ptr: cute.Pointer,
-        dU_db_dummy_ptr: cute.Pointer,
-        dU_prev_db_dummy_ptr: cute.Pointer,
-        dB_du_dummy_ptr: cute.Pointer,
-        dB_prev_du_dummy_ptr: cute.Pointer,
-        dlogp_ptr: cute.Pointer,
-        dR_ptr: cute.Pointer,
-        dMp_scratch_ptr: cute.Pointer,
-        dMc_scratch_ptr: cute.Pointer,
-        dM_scan_ptr: cute.Pointer,
-        dKprev_scan_ptr: cute.Pointer,
-        dKcurr_scan_ptr: cute.Pointer,
-        dB_inc_ptr: cute.Pointer,
-        dB_prev_inc_ptr: cute.Pointer,
-        dU_inc_ptr: cute.Pointer,
-        dU_prev_inc_ptr: cute.Pointer,
-        dMsum_part_ptr: cute.Pointer,
-        dMp0_ptr: cute.Pointer,
-        dM_inc_ptr: cute.Pointer,
-        dKprev_inc_ptr: cute.Pointer,
-        dKcurr_inc_ptr: cute.Pointer,
+        U_ptr: cute.Tensor,
+        B_ptr: cute.Tensor,
+        C_ptr: cute.Tensor,
+        M_ptr: cute.Tensor,
+        K_ptr: cute.Tensor,
+        Kprev_ptr: cute.Tensor,
+        Kcurr_ptr: cute.Tensor,
+        dOut_ptr: cute.Tensor,
+        m_chunk_ptr: cute.Tensor,
+        chunk_starts_ptr: cute.Tensor,
+        U_prev0_ptr: cute.Tensor,
+        B_prev0_ptr: cute.Tensor,
+        d_final_ptr: cute.Tensor,
+        U_prev_chunks_ptr: cute.Tensor,
+        B_prev_chunks_ptr: cute.Tensor,
+        dZ0_ptr: cute.Tensor,
+        d_inc_tc_ptr: cute.Tensor,
+        d_initial_ptr: cute.Tensor,
+        d_m_chunk_ptr: cute.Tensor,
+        dU_scan_ptr: cute.Tensor,
+        dU_prev_scan_ptr: cute.Tensor,
+        dB_scan_ptr: cute.Tensor,
+        dB_prev_scan_ptr: cute.Tensor,
+        dC_scan_ptr: cute.Tensor,
+        dU_db_dummy_ptr: cute.Tensor,
+        dU_prev_db_dummy_ptr: cute.Tensor,
+        dB_du_dummy_ptr: cute.Tensor,
+        dB_prev_du_dummy_ptr: cute.Tensor,
+        dlogp_ptr: cute.Tensor,
+        dR_ptr: cute.Tensor,
+        dMp_scratch_ptr: cute.Tensor,
+        dMc_scratch_ptr: cute.Tensor,
+        dM_scan_ptr: cute.Tensor,
+        dKprev_scan_ptr: cute.Tensor,
+        dKcurr_scan_ptr: cute.Tensor,
+        dB_inc_ptr: cute.Tensor,
+        dB_prev_inc_ptr: cute.Tensor,
+        dU_inc_ptr: cute.Tensor,
+        dU_prev_inc_ptr: cute.Tensor,
+        dMsum_part_ptr: cute.Tensor,
+        dMp0_ptr: cute.Tensor,
+        dM_inc_ptr: cute.Tensor,
+        dKprev_inc_ptr: cute.Tensor,
+        dKcurr_inc_ptr: cute.Tensor,
     ):
         mU_scan = _make_tensor_from_spec(U_ptr, u_scan_spec)
         mB_scan = _make_tensor_from_spec(B_ptr, b_scan_spec)
@@ -867,7 +884,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dB_prev_du_dummy_ptr, d_dummy_b_prev_spec
         )
 
-        tc_dtype = U_ptr.value_type
+        tc_dtype = mU_scan.element_type
 
         scan_db = ChunkScanBwdDBAmpere(
             tc_dtype,
@@ -1066,7 +1083,7 @@ def compile_v2x2ssd_bwd_cute(
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
 ) -> object:
-    dynamic_args, alignments, spec, cfg, _outputs = _build_backward_args(
+    runtime_args, alignments, spec, cfg, _outputs = _build_backward_args(
         U,
         M,
         K,
@@ -1118,7 +1135,11 @@ def compile_v2x2ssd_bwd_cute(
 
     note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=False)
     host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
-    compiled = cute.compile(host_wrapper, *dynamic_args)
+    compile_args = tuple(
+        _make_fake_tensor_arg(tensor, align=align)
+        for tensor, align in zip(runtime_args, alignments, strict=True)
+    )
+    compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
     _BWD_HOST_CACHE[cache_key] = compiled
     return compiled
 
@@ -1163,7 +1184,7 @@ def _v2x2ssd_bwd_cute_impl(
     torch.Tensor,
     torch.Tensor,
 ]:
-    dynamic_args, alignments, spec, cfg, outputs = _build_backward_args(
+    runtime_args, alignments, spec, cfg, outputs = _build_backward_args(
         U,
         M,
         K,
@@ -1216,12 +1237,17 @@ def _v2x2ssd_bwd_cute_impl(
     if compiled is None:
         note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=False)
         host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
-        compiled = cute.compile(host_wrapper, *dynamic_args)
+        compile_args = tuple(
+            _make_fake_tensor_arg(tensor, align=align)
+            for tensor, align in zip(runtime_args, alignments, strict=True)
+        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _BWD_HOST_CACHE[cache_key] = compiled
     else:
         note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=True)
 
-    compiled(*dynamic_args)
+    compiled(*runtime_args)
+    _record_tensors_on_current_stream(*runtime_args)
 
     (
         d_initial,
