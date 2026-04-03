@@ -1032,6 +1032,10 @@ def _compile_state_passing_kernel_impl(
 
     out_starts = torch.empty((B, H, C, P, D), device=inc.device, dtype=torch.float32)
     out_final = torch.empty((B, H, P, D), device=inc.device, dtype=torch.float32)
+    # The state-passing kernel defines the live state domain but may leave
+    # untouched lanes outside that domain on issue-9-style shapes. The public
+    # final-state output must not depend on stale allocator contents.
+    out_final.zero_()
     inc_spec, m_spec, out_starts_spec, out_final_spec = _state_passing_tensor_specs(
         (B, H, C, P, D)
     )
@@ -1676,6 +1680,7 @@ def _build_forward_args(
         final_state_workspace = torch.empty(
             (Bsz, H, P, D), device=U.device, dtype=torch.float32
         )
+        final_state_workspace.zero_()
         final_state = final_state_workspace
     else:
         final_state = _get_dummy_final_state(

@@ -527,9 +527,12 @@ def _build_backward_args(
     dKprev_inc = dK_inc[0]
     dKcurr_inc = dK_inc[1]
 
-    # The fused state-passing backward kernel atomically accumulates d_m_chunk.
-    # This workspace is cached across calls, so it must be reset before launch.
+    # These workspaces are cached across calls. The fused backward path only
+    # defines the valid scan domain, so padded/tail lanes must start from zero
+    # rather than stale cache contents.
     d_m_chunk.zero_()
+    dM_scan.zero_()
+    dM_inc.zero_()
 
     U_prev_chunks[:, 0, :] = U_prev0.reshape(BH, P)
     B_prev_chunks[:, 0, :] = B_prev0.reshape(BH, D)

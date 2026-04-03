@@ -1604,6 +1604,131 @@ def test_v2x2ssd_bwd_stateful_public_grads_do_not_alias_workspace() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_segmented_training_ignores_stale_dm_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    orig_get_bwd_workspace = v2x2ssd_bwd_mod._get_bwd_workspace
+
+    def _poisoned_get_bwd_workspace(*args, **kwargs):
+        workspace = list(orig_get_bwd_workspace(*args, **kwargs))
+        workspace[19].fill_(123.0)  # dM_scan
+        workspace[27].fill_(123.0)  # dM_inc
+        return tuple(workspace)
+
+    monkeypatch.setattr(
+        v2x2ssd_bwd_mod, "_get_bwd_workspace", _poisoned_get_bwd_workspace
+    )
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=33,
+        N=64,
+        P=64,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    weight = torch.randn((1, 2, 33, 64), device="cuda", dtype=torch.float32)
+
+    full_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+    seg1_tensors = (
+        U[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+        M[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+        K[:, :, :17, :, :].contiguous().detach().clone().requires_grad_(True),
+        B[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+        C[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+    )
+    seg2_tensors = (
+        U[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+        M[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+        K[:, :, 17:, :, :].contiguous().detach().clone().requires_grad_(True),
+        B[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+        C[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+    )
+    initial_seg = initial_states.detach().clone().requires_grad_(True)
+    B_prev_seg = B_prev.detach().clone().requires_grad_(True)
+    U_prev_seg = U_prev.detach().clone().requires_grad_(True)
+
+    Y_full, _final_full, _B_last_full, _U_last_full = v2x2ssd_cute(
+        full_tensors[0],
+        full_tensors[1],
+        full_tensors[2],
+        full_tensors[3],
+        full_tensors[4],
+        chunk_size=chunk_size,
+        initial_states=full_tensors[5],
+        B_prev=full_tensors[6],
+        U_prev=full_tensors[7],
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+    loss_full = (Y_full * weight).sum()
+    full_grads = torch.autograd.grad(loss_full, full_tensors)
+
+    Y_a, final_state_a, B_last_a, U_last_a = v2x2ssd_cute(
+        seg1_tensors[0],
+        seg1_tensors[1],
+        seg1_tensors[2],
+        seg1_tensors[3],
+        seg1_tensors[4],
+        chunk_size=chunk_size,
+        initial_states=initial_seg,
+        B_prev=B_prev_seg,
+        U_prev=U_prev_seg,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+    Y_b, _final_state_b, _B_last_b, _U_last_b = v2x2ssd_cute(
+        seg2_tensors[0],
+        seg2_tensors[1],
+        seg2_tensors[2],
+        seg2_tensors[3],
+        seg2_tensors[4],
+        chunk_size=chunk_size,
+        initial_states=final_state_a,
+        B_prev=B_last_a,
+        U_prev=U_last_a,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+    Y_seg = torch.cat((Y_a, Y_b), dim=2)
+    loss_seg = (Y_seg * weight).sum()
+    seg_grads = torch.autograd.grad(
+        loss_seg,
+        (
+            *seg1_tensors,
+            *seg2_tensors,
+            initial_seg,
+            B_prev_seg,
+            U_prev_seg,
+        ),
+    )
+
+    torch.testing.assert_close(Y_seg, Y_full, atol=2e-4, rtol=0.0)
+    gradient_pairs = (
+        ("U", torch.cat((seg_grads[0], seg_grads[5]), dim=2), full_grads[0], 5e-4),
+        ("M", torch.cat((seg_grads[1], seg_grads[6]), dim=2), full_grads[1], 5e-3),
+        ("K", torch.cat((seg_grads[2], seg_grads[7]), dim=2), full_grads[2], 5e-3),
+        ("B", torch.cat((seg_grads[3], seg_grads[8]), dim=2), full_grads[3], 5e-3),
+        ("C", torch.cat((seg_grads[4], seg_grads[9]), dim=2), full_grads[4], 2e-3),
+        ("initial", seg_grads[10], full_grads[5], 5e-5),
+        ("B_prev", seg_grads[11], full_grads[6], 2e-3),
+        ("U_prev", seg_grads[12], full_grads[7], 5e-4),
+    )
+    for _name, got, want, atol in gradient_pairs:
+        torch.testing.assert_close(got, want, atol=atol, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_cute_segmented_training_matches_single_pass_for_realistic_shape() -> (
     None
 ):
