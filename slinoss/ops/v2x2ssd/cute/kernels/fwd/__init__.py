@@ -694,6 +694,142 @@ def _state_passing_key(
     )
 
 
+def _make_state_passing_cfg(
+    *,
+    num_threads: int,
+    vecs_per_thread: int,
+    copy_bits_in: int,
+    copy_bits_out: int,
+    copy_bits_state_in: int,
+    copy_bits_state_out: int,
+    has_init: bool,
+) -> tuple[int, int, int, int, int, int, bool]:
+    return (
+        int(num_threads),
+        int(vecs_per_thread),
+        int(copy_bits_in),
+        int(copy_bits_out),
+        int(copy_bits_state_in),
+        int(copy_bits_state_out),
+        bool(has_init),
+    )
+
+
+def _make_state_passing_launch_artifacts(
+    *,
+    increment: torch.Tensor,
+    chunk_multiplier: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    final_state: torch.Tensor,
+    initial_state_arg: torch.Tensor,
+    has_init: bool,
+    num_threads: int,
+    vecs_per_thread: int,
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, int, int, int, int, int, bool],
+    tuple[object, ...],
+    tuple[object, ...],
+    tuple,
+]:
+    B, H, C, P, D = map(int, increment.shape)
+    problem_spec = (B, H, C, P, D)
+    (
+        increment_spec,
+        chunk_multiplier_spec,
+        chunk_starts_spec,
+        final_state_spec,
+    ) = _state_passing_tensor_specs(problem_spec)
+
+    state_elem_count = P * D
+    elems_per_thread = 2 * int(vecs_per_thread)
+    copy_bits_in = _choose_copy_bits_for_linear_tiles(
+        increment,
+        tile_stride_elems=state_elem_count,
+        elems_per_thread=elems_per_thread,
+    )
+    copy_bits_out = _choose_copy_bits_for_linear_tiles(
+        chunk_starts,
+        tile_stride_elems=state_elem_count,
+        elems_per_thread=elems_per_thread,
+    )
+    copy_bits_state_in = 32
+    copy_bits_state_out = 32
+    kernel_cfg = _make_state_passing_cfg(
+        num_threads=num_threads,
+        vecs_per_thread=vecs_per_thread,
+        copy_bits_in=copy_bits_in,
+        copy_bits_out=copy_bits_out,
+        copy_bits_state_in=copy_bits_state_in,
+        copy_bits_state_out=copy_bits_state_out,
+        has_init=has_init,
+    )
+
+    alignments = (
+        _assumed_align(increment),
+        _assumed_align(chunk_multiplier),
+        _assumed_align(chunk_starts),
+        _assumed_align(final_state),
+        _assumed_align(initial_state_arg),
+    )
+    runtime_args = (
+        _make_runtime_tensor_view(increment, increment_spec),
+        _make_runtime_tensor_view(chunk_multiplier, chunk_multiplier_spec),
+        _make_runtime_tensor_view(chunk_starts, chunk_starts_spec),
+        _make_runtime_tensor_view(final_state, final_state_spec),
+        _make_runtime_tensor_view(initial_state_arg, final_state_spec),
+    )
+    compile_args = (
+        _make_fake_tensor_arg(
+            increment,
+            shape=increment_spec[0],
+            stride=increment_spec[1],
+            align=alignments[0],
+        ),
+        _make_fake_tensor_arg(
+            chunk_multiplier,
+            shape=chunk_multiplier_spec[0],
+            stride=chunk_multiplier_spec[1],
+            align=alignments[1],
+        ),
+        _make_fake_tensor_arg(
+            chunk_starts,
+            shape=chunk_starts_spec[0],
+            stride=chunk_starts_spec[1],
+            align=alignments[2],
+        ),
+        _make_fake_tensor_arg(
+            final_state,
+            shape=final_state_spec[0],
+            stride=final_state_spec[1],
+            align=alignments[3],
+        ),
+        _make_fake_tensor_arg(
+            initial_state_arg,
+            shape=final_state_spec[0],
+            stride=final_state_spec[1],
+            align=alignments[4],
+        ),
+        _compile_env_stream_placeholder(),
+    )
+    cache_key = _state_passing_key(
+        device_index=(
+            increment.device.index if increment.device.index is not None else -1
+        ),
+        inc_shape=tuple(increment.shape),
+        m_chunk_shape=tuple(chunk_multiplier.shape),
+        initial_shape=(tuple(initial_state_arg.shape) if has_init else None),
+        num_threads=num_threads,
+        vecs_per_thread=vecs_per_thread,
+        copy_bits_in=copy_bits_in,
+        copy_bits_out=copy_bits_out,
+        copy_bits_state_in=copy_bits_state_in,
+        copy_bits_state_out=copy_bits_state_out,
+        alignments=alignments,
+    )
+    return problem_spec, kernel_cfg, compile_args, runtime_args, cache_key
+
+
 def _chunk_scan_key(
     *,
     device_index: int,
@@ -851,7 +987,9 @@ def _make_chunk_increment_host_wrapper(
 
 
 def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, ...]):
-    B, H, C, P, D = spec
+    increment_spec, chunk_multiplier_spec, chunk_starts_spec, final_state_spec = (
+        _state_passing_tensor_specs(spec)
+    )
     (
         num_threads,
         vecs_per_thread,
@@ -861,37 +999,61 @@ def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, .
         copy_bits_state_out,
         has_init,
     ) = cfg
+    state_passing_kernel = StatePassingFwdAmpere(
+        num_threads=num_threads,
+        vecs_per_thread=vecs_per_thread,
+        copy_bits_in=copy_bits_in,
+        copy_bits_out=copy_bits_out,
+        copy_bits_state_in=copy_bits_state_in,
+        copy_bits_state_out=copy_bits_state_out,
+        has_init=has_init,
+    )
 
     @cute.jit
     def _state_passing_host_wrapper(
-        Inc_t: cute.Tensor,
-        M_t: cute.Tensor,
-        OutStarts_t: cute.Tensor,
-        OutFinal_t: cute.Tensor,
-        Init_t: cute.Tensor,
+        increment_t: cute.Tensor,
+        chunk_multiplier_t: cute.Tensor,
+        chunk_starts_t: cute.Tensor,
+        final_state_t: cute.Tensor,
+        initial_state_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        inc_spec, m_spec, out_starts_spec, out_final_spec = _state_passing_tensor_specs(
-            (B, H, C, P, D)
+        increment_view = _make_static_tensor_view(increment_t, increment_spec)
+        chunk_multiplier_view = _make_static_tensor_view(
+            chunk_multiplier_t, chunk_multiplier_spec
         )
-        mInc = _make_static_tensor_view(Inc_t, inc_spec)
-        mM = _make_static_tensor_view(M_t, m_spec)
-        mOutStarts = _make_static_tensor_view(OutStarts_t, out_starts_spec)
-        mOutFinal = _make_static_tensor_view(OutFinal_t, out_final_spec)
-        mInit = _make_static_tensor_view(Init_t, out_final_spec)
+        chunk_starts_view = _make_static_tensor_view(chunk_starts_t, chunk_starts_spec)
+        final_state_view = _make_static_tensor_view(final_state_t, final_state_spec)
+        initial_state_view = _make_static_tensor_view(initial_state_t, final_state_spec)
 
-        state_passing = StatePassingFwdAmpere(
-            num_threads=num_threads,
-            vecs_per_thread=vecs_per_thread,
-            copy_bits_in=copy_bits_in,
-            copy_bits_out=copy_bits_out,
-            copy_bits_state_in=copy_bits_state_in,
-            copy_bits_state_out=copy_bits_state_out,
-            has_init=has_init,
+        state_passing_kernel.call_on_stream(
+            increment_view,
+            chunk_multiplier_view,
+            chunk_starts_view,
+            final_state_view,
+            initial_state_view,
+            stream,
         )
-        state_passing.call_on_stream(mInc, mM, mOutStarts, mOutFinal, mInit, stream)
 
     return _state_passing_host_wrapper
+
+
+def _get_compiled_state_passing_kernel(
+    *,
+    problem_spec: tuple[int, ...],
+    kernel_cfg: tuple[int, int, int, int, int, int, bool],
+    compile_args: tuple[object, ...],
+    cache_key: tuple,
+):
+    compiled = _STATE_PASSING_CACHE.get(cache_key)
+    if compiled is None:
+        host_wrapper = _make_state_passing_host_wrapper(
+            spec=problem_spec,
+            cfg=kernel_cfg,
+        )
+        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
+        _STATE_PASSING_CACHE[cache_key] = compiled
+    return compiled
 
 
 def _compile_chunk_increment_kernel_impl(
@@ -1106,120 +1268,58 @@ def _compile_state_passing_kernel_impl(
         if initial_states.dtype != torch.float32:
             raise TypeError("initial_states must be float32.")
 
-    out_starts = torch.empty((B, H, C, P, D), device=inc.device, dtype=torch.float32)
-    out_final = torch.empty((B, H, P, D), device=inc.device, dtype=torch.float32)
+    chunk_starts = torch.empty((B, H, C, P, D), device=inc.device, dtype=torch.float32)
+    final_state = torch.empty((B, H, P, D), device=inc.device, dtype=torch.float32)
     # The state-passing kernel defines the live state domain but may leave
     # untouched lanes outside that domain on issue-9-style shapes. The public
     # final-state output must not depend on stale allocator contents.
-    out_final.zero_()
-    inc_spec, m_spec, out_starts_spec, out_final_spec = _state_passing_tensor_specs(
-        (B, H, C, P, D)
+    final_state.zero_()
+
+    increment_contig = inc.contiguous()
+    chunk_multiplier_contig = m_chunk.contiguous()
+    initial_state_contig = (
+        initial_states.contiguous() if initial_states is not None else None
     )
 
-    inc_c = inc.contiguous()
-    m_c = m_chunk.contiguous()
-    init_c = initial_states.contiguous() if initial_states is not None else None
-
-    if init_c is None:
-        init_arg = inc_c
+    if initial_state_contig is None:
+        initial_state_arg = increment_contig
         has_init = False
     else:
-        init_arg = init_c
+        initial_state_arg = initial_state_contig
         has_init = True
 
-    S = P * D
-    elems_per_thread = 2 * vecs_per_thread
-    copy_bits_in = _choose_copy_bits_for_linear_tiles(
-        inc_c,
-        tile_stride_elems=S,
-        elems_per_thread=elems_per_thread,
-    )
-    copy_bits_out = _choose_copy_bits_for_linear_tiles(
-        out_starts,
-        tile_stride_elems=S,
-        elems_per_thread=elems_per_thread,
-    )
-    copy_bits_state_in = 32
-    copy_bits_state_out = 32
-
-    alignments = (
-        _assumed_align(inc_c),
-        _assumed_align(m_c),
-        _assumed_align(out_starts),
-        _assumed_align(out_final),
-        _assumed_align(init_arg),
-    )
-    keepalive = (inc_c, m_c, out_starts, out_final, init_c)
-    runtime_args = (
-        _make_runtime_tensor_view(inc_c, inc_spec),
-        _make_runtime_tensor_view(m_c, m_spec),
-        _make_runtime_tensor_view(out_starts, out_starts_spec),
-        _make_runtime_tensor_view(out_final, out_final_spec),
-        _make_runtime_tensor_view(init_arg, out_final_spec),
-    )
-    compile_args = (
-        _make_fake_tensor_arg(
-            inc_c, shape=inc_spec[0], stride=inc_spec[1], align=alignments[0]
-        ),
-        _make_fake_tensor_arg(
-            m_c, shape=m_spec[0], stride=m_spec[1], align=alignments[1]
-        ),
-        _make_fake_tensor_arg(
-            out_starts,
-            shape=out_starts_spec[0],
-            stride=out_starts_spec[1],
-            align=alignments[2],
-        ),
-        _make_fake_tensor_arg(
-            out_final,
-            shape=out_final_spec[0],
-            stride=out_final_spec[1],
-            align=alignments[3],
-        ),
-        _make_fake_tensor_arg(
-            init_arg,
-            shape=out_final_spec[0],
-            stride=out_final_spec[1],
-            align=alignments[4],
-        ),
-        _compile_env_stream_placeholder(),
-    )
-    cache_key = _state_passing_key(
-        device_index=(inc.device.index if inc.device.index is not None else -1),
-        inc_shape=tuple(inc.shape),
-        m_chunk_shape=tuple(m_chunk.shape),
-        initial_shape=(None if initial_states is None else tuple(initial_states.shape)),
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-        copy_bits_in=copy_bits_in,
-        copy_bits_out=copy_bits_out,
-        copy_bits_state_in=copy_bits_state_in,
-        copy_bits_state_out=copy_bits_state_out,
-        alignments=alignments,
-    )
-
-    compiled = _STATE_PASSING_CACHE.get(cache_key)
-    if compiled is None:
-        host_wrapper = _make_state_passing_host_wrapper(
-            spec=(B, H, C, P, D),
-            cfg=(
-                num_threads,
-                vecs_per_thread,
-                copy_bits_in,
-                copy_bits_out,
-                copy_bits_state_in,
-                copy_bits_state_out,
-                has_init,
-            ),
+    problem_spec, kernel_cfg, compile_args, runtime_args, cache_key = (
+        _make_state_passing_launch_artifacts(
+            increment=increment_contig,
+            chunk_multiplier=chunk_multiplier_contig,
+            chunk_starts=chunk_starts,
+            final_state=final_state,
+            initial_state_arg=initial_state_arg,
+            has_init=has_init,
+            num_threads=num_threads,
+            vecs_per_thread=vecs_per_thread,
         )
-        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
-        _STATE_PASSING_CACHE[cache_key] = compiled
+    )
+    keepalive = (
+        increment_contig,
+        chunk_multiplier_contig,
+        chunk_starts,
+        final_state,
+        initial_state_contig,
+    )
+
+    compiled = _get_compiled_state_passing_kernel(
+        problem_spec=problem_spec,
+        kernel_cfg=kernel_cfg,
+        compile_args=compile_args,
+        cache_key=cache_key,
+    )
 
     def launch() -> None:
         compiled(*runtime_args)
         _record_tensors_on_current_stream(*keepalive)
 
-    return compiled, out_starts, out_final, launch
+    return compiled, chunk_starts, final_state, launch
 
 
 def compile_state_passing_kernel(
@@ -1231,14 +1331,14 @@ def compile_state_passing_kernel(
     vecs_per_thread: int = 8,
 ) -> tuple[object, torch.Tensor, torch.Tensor]:
     """Compile the forward state-passing kernel and allocate outputs."""
-    compiled, out_starts, out_final, _launch = _compile_state_passing_kernel_impl(
+    compiled, chunk_starts, final_state, _launch = _compile_state_passing_kernel_impl(
         inc,
         m_chunk,
         initial_states=initial_states,
         num_threads=num_threads,
         vecs_per_thread=vecs_per_thread,
     )
-    return compiled, out_starts, out_final
+    return compiled, chunk_starts, final_state
 
 
 def state_passing_cute(
@@ -1251,7 +1351,7 @@ def state_passing_cute(
     return_final_state: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Thin public wrapper over the compiled forward state-passing kernel."""
-    _compiled, out_starts, out_final, launch = _compile_state_passing_kernel_impl(
+    _compiled, chunk_starts, final_state, launch = _compile_state_passing_kernel_impl(
         inc,
         m_chunk,
         initial_states=initial_states,
@@ -1260,8 +1360,8 @@ def state_passing_cute(
     )
     launch()
     if not return_final_state:
-        return out_starts
-    return out_starts, out_final
+        return chunk_starts
+    return chunk_starts, final_state
 
 
 def _compile_chunk_scan_kernel_impl(
@@ -1948,96 +2048,26 @@ def _make_prepared_state_passing_launch(
     num_threads: int,
     vecs_per_thread: int,
 ) -> Callable[[], None]:
-    B, H, C, P, D = map(int, inc.shape)
-    init_arg = initial_state0 if has_init else inc
-    inc_spec, m_spec, out_starts_spec, out_final_spec = _state_passing_tensor_specs(
-        (B, H, C, P, D)
-    )
-    S = P * D
-    elems_per_thread = 2 * vecs_per_thread
-    copy_bits_in = _choose_copy_bits_for_linear_tiles(
-        inc,
-        tile_stride_elems=S,
-        elems_per_thread=elems_per_thread,
-    )
-    copy_bits_out = _choose_copy_bits_for_linear_tiles(
-        chunk_starts,
-        tile_stride_elems=S,
-        elems_per_thread=elems_per_thread,
-    )
-    copy_bits_state_in = 32
-    copy_bits_state_out = 32
-    alignments = (
-        _assumed_align(inc),
-        _assumed_align(m_chunk),
-        _assumed_align(chunk_starts),
-        _assumed_align(final_state),
-        _assumed_align(init_arg),
-    )
-    runtime_tensors = (inc, m_chunk, chunk_starts, final_state, init_arg)
-    runtime_args = (
-        _make_runtime_tensor_view(inc, inc_spec),
-        _make_runtime_tensor_view(m_chunk, m_spec),
-        _make_runtime_tensor_view(chunk_starts, out_starts_spec),
-        _make_runtime_tensor_view(final_state, out_final_spec),
-        _make_runtime_tensor_view(init_arg, out_final_spec),
-    )
-    compile_args = (
-        _make_fake_tensor_arg(
-            inc, shape=inc_spec[0], stride=inc_spec[1], align=alignments[0]
-        ),
-        _make_fake_tensor_arg(
-            m_chunk, shape=m_spec[0], stride=m_spec[1], align=alignments[1]
-        ),
-        _make_fake_tensor_arg(
-            chunk_starts,
-            shape=out_starts_spec[0],
-            stride=out_starts_spec[1],
-            align=alignments[2],
-        ),
-        _make_fake_tensor_arg(
-            final_state,
-            shape=out_final_spec[0],
-            stride=out_final_spec[1],
-            align=alignments[3],
-        ),
-        _make_fake_tensor_arg(
-            init_arg,
-            shape=out_final_spec[0],
-            stride=out_final_spec[1],
-            align=alignments[4],
-        ),
-        _compile_env_stream_placeholder(),
-    )
-    cache_key = _state_passing_key(
-        device_index=(inc.device.index if inc.device.index is not None else -1),
-        inc_shape=tuple(inc.shape),
-        m_chunk_shape=tuple(m_chunk.shape),
-        initial_shape=(tuple(initial_state0.shape) if has_init else None),
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-        copy_bits_in=copy_bits_in,
-        copy_bits_out=copy_bits_out,
-        copy_bits_state_in=copy_bits_state_in,
-        copy_bits_state_out=copy_bits_state_out,
-        alignments=alignments,
-    )
-    compiled = _STATE_PASSING_CACHE.get(cache_key)
-    if compiled is None:
-        host_wrapper = _make_state_passing_host_wrapper(
-            spec=(B, H, C, P, D),
-            cfg=(
-                num_threads,
-                vecs_per_thread,
-                copy_bits_in,
-                copy_bits_out,
-                copy_bits_state_in,
-                copy_bits_state_out,
-                has_init,
-            ),
+    initial_state_arg = initial_state0 if has_init else inc
+    problem_spec, kernel_cfg, compile_args, runtime_args, cache_key = (
+        _make_state_passing_launch_artifacts(
+            increment=inc,
+            chunk_multiplier=m_chunk,
+            chunk_starts=chunk_starts,
+            final_state=final_state,
+            initial_state_arg=initial_state_arg,
+            has_init=has_init,
+            num_threads=num_threads,
+            vecs_per_thread=vecs_per_thread,
         )
-        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
-        _STATE_PASSING_CACHE[cache_key] = compiled
+    )
+    runtime_tensors = (inc, m_chunk, chunk_starts, final_state, initial_state_arg)
+    compiled = _get_compiled_state_passing_kernel(
+        problem_spec=problem_spec,
+        kernel_cfg=kernel_cfg,
+        compile_args=compile_args,
+        cache_key=cache_key,
+    )
 
     def launch() -> None:
         compiled(*runtime_args)
