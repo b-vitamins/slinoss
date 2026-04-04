@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -12,6 +12,83 @@ pytest.importorskip("cutlass")
 import slinoss.ops.v2x2ssd.cute.aot as cute_aot_mod
 import slinoss.ops.v2x2ssd.cute.kernels.fwd as v2x2ssd_fwd_mod
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import v2x2ssd_fwd_cute
+
+
+@pytest.mark.parametrize(
+    ("raw_arch", "normalized"),
+    [
+        ("8.0", "sm_80"),
+        ("8.6+PTX", "sm_86"),
+        ("sm_89", "sm_89"),
+        ("compute_90", "sm_90"),
+        ("90", "sm_90"),
+        ("", ""),
+    ],
+)
+def test_normalize_arch_tag(raw_arch: str, normalized: str) -> None:
+    assert cute_aot_mod._normalize_arch_tag(raw_arch) == normalized
+
+
+def test_arch_tags_from_env_prefers_explicit_tags(monkeypatch) -> None:
+    monkeypatch.setenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", "sm_89,9.0,sm_89")
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0;8.6")
+    assert cute_aot_mod._arch_tags_from_env() == ("sm_89", "sm_90")
+
+
+def test_arch_tags_from_env_falls_back_to_torch_arch_list(monkeypatch) -> None:
+    monkeypatch.delenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", raising=False)
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0;8.6+PTX 8.0")
+    assert cute_aot_mod._arch_tags_from_env() == ("sm_80", "sm_86")
+
+
+def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
+    specs = cute_aot_mod.default_forward_aot_specs(("sm_80", "sm_86"))
+    assert specs
+    assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert len(specs) == (
+        len(cute_aot_mod._search_space_forward_specs(arch_tag="sm_80"))
+        + len(cute_aot_mod._search_space_forward_specs(arch_tag="sm_86"))
+    )
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "spec"),
+    [
+        (
+            "_compile_chunk_increment_aot",
+            cute_aot_mod._search_space_chunk_increment_specs(arch_tag="sm_80")[0],
+        ),
+        (
+            "_compile_state_passing_aot",
+            cute_aot_mod._search_space_state_passing_specs(arch_tag="sm_80")[0],
+        ),
+        (
+            "_compile_chunk_scan_aot",
+            cute_aot_mod._search_space_chunk_scan_specs(arch_tag="sm_80")[0],
+        ),
+        (
+            "_compile_forward_aot",
+            cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0],
+        ),
+    ],
+)
+def test_aot_compile_helpers_use_compile_only(
+    monkeypatch,
+    helper_name: str,
+    spec: object,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_compile(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return "compiled"
+
+    monkeypatch.setattr(cute_aot_mod.cute, "compile", _fake_compile)
+    helper = getattr(cute_aot_mod, helper_name)
+    compiled = helper(spec)
+    assert compiled == "compiled"
+    assert captured["kwargs"]["no_jit_engine"] is True
+    assert captured["kwargs"]["options"] == "--enable-tvm-ffi --gpu-arch=sm_80"
 
 
 def _pack_complex_pairs(z: torch.Tensor, *, real_dtype: torch.dtype) -> torch.Tensor:

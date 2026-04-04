@@ -255,6 +255,55 @@ _AOT_SEARCH_CHUNK_SIZES = (32, 64, 128, 256)
 _AOT_SEARCH_TC_DTYPES = (torch.float16, torch.bfloat16)
 
 
+def _normalize_arch_tag(raw_arch: str) -> str:
+    raw_arch = raw_arch.strip()
+    if not raw_arch:
+        return ""
+    if raw_arch.startswith("sm_"):
+        return raw_arch
+    if raw_arch.startswith("compute_"):
+        return "sm_" + raw_arch.removeprefix("compute_")
+    raw_arch = raw_arch.removesuffix("+PTX").strip()
+    if "." in raw_arch:
+        major, minor = raw_arch.split(".", 1)
+        return f"sm_{int(major)}{int(minor)}"
+    if raw_arch.isdigit():
+        return f"sm_{raw_arch}"
+    return raw_arch
+
+
+def _arch_tags_from_env() -> tuple[str, ...]:
+    explicit_arch_tags = os.environ.get(
+        "SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", ""
+    ).strip()
+    if explicit_arch_tags:
+        return tuple(
+            dict.fromkeys(
+                normalized
+                for normalized in (
+                    _normalize_arch_tag(value)
+                    for value in explicit_arch_tags.replace(",", ";").split(";")
+                )
+                if normalized
+            )
+        )
+
+    torch_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
+    if torch_arch_list:
+        return tuple(
+            dict.fromkeys(
+                normalized
+                for normalized in (
+                    _normalize_arch_tag(value)
+                    for value in torch_arch_list.replace(" ", ";").split(";")
+                )
+                if normalized
+            )
+        )
+
+    return ("any",)
+
+
 def _candidate_output_dtypes(tc_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     output_dtypes = [torch.float32]
     if tc_dtype != torch.float32:
@@ -375,9 +424,16 @@ def _search_space_forward_specs(*, arch_tag: str = "any") -> tuple[ForwardAOTSpe
     return tuple(specs)
 
 
-@lru_cache(maxsize=1)
-def default_forward_aot_specs() -> tuple[ForwardAOTSpec, ...]:
-    return _search_space_forward_specs()
+@lru_cache(maxsize=8)
+def default_forward_aot_specs(
+    arch_tags: tuple[str, ...] | None = None,
+) -> tuple[ForwardAOTSpec, ...]:
+    resolved_arch_tags = _arch_tags_from_env() if arch_tags is None else arch_tags
+    return tuple(
+        spec
+        for arch_tag in resolved_arch_tags
+        for spec in _search_space_forward_specs(arch_tag=arch_tag)
+    )
 
 
 def _chunk_increment_spec_from_record(record: dict[str, Any]) -> ChunkIncrementAOTSpec:
@@ -480,6 +536,13 @@ def _masked_compile_args_from_specs(
         for dtype, spec, align, dynamic_shape_mask, dynamic_stride_mask in tensor_specs
     ) + (_compile_env_stream_placeholder(),)
     return alignments, compile_args
+
+
+def _aot_compile_options(arch_tag: str) -> str:
+    options = ["--enable-tvm-ffi"]
+    if arch_tag and arch_tag != "any":
+        options.append(f"--gpu-arch={arch_tag}")
+    return " ".join(options)
 
 
 def _representative_chunk_increment_problem_shape(
@@ -774,7 +837,8 @@ def _compile_chunk_increment_aot(spec: ChunkIncrementAOTSpec):
     return cute.compile(
         _chunk_increment_aot_host_wrapper,
         *compile_args,
-        options="--enable-tvm-ffi",
+        options=_aot_compile_options(spec.arch_tag),
+        no_jit_engine=True,
     )
 
 
@@ -896,7 +960,8 @@ def _compile_state_passing_aot(spec: StatePassingAOTSpec):
     return cute.compile(
         _state_passing_aot_host_wrapper,
         *compile_args,
-        options="--enable-tvm-ffi",
+        options=_aot_compile_options(spec.arch_tag),
+        no_jit_engine=True,
     )
 
 
@@ -1011,7 +1076,8 @@ def _compile_chunk_scan_aot(spec: ChunkScanAOTSpec):
     return cute.compile(
         _chunk_scan_aot_host_wrapper,
         *compile_args,
-        options="--enable-tvm-ffi",
+        options=_aot_compile_options(spec.arch_tag),
+        no_jit_engine=True,
     )
 
 
@@ -1319,7 +1385,8 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
     return cute.compile(
         _forward_aot_host_wrapper,
         *compile_args,
-        options="--enable-tvm-ffi",
+        options=_aot_compile_options(spec.arch_tag),
+        no_jit_engine=True,
     )
 
 
@@ -1933,66 +2000,71 @@ def build_forward_aot_search_space_package(
     *,
     package_root: str | os.PathLike[str] | Path = _PACKAGED_AOT_ROOT,
     specs: tuple[ForwardAOTSpec, ...] | None = None,
+    arch_tags: tuple[str, ...] | None = None,
     clean: bool = True,
 ) -> tuple[ExportedTVMFFIModule, ...]:
     package_root = Path(package_root)
-    resolved_specs = default_forward_aot_specs() if specs is None else specs
+    resolved_arch_tags = _arch_tags_from_env() if arch_tags is None else arch_tags
+    resolved_specs = (
+        default_forward_aot_specs(resolved_arch_tags) if specs is None else specs
+    )
     if clean:
         shutil.rmtree(package_root / "artifacts", ignore_errors=True)
         shutil.rmtree(package_root / "runtime", ignore_errors=True)
         (package_root / "manifest.json").unlink(missing_ok=True)
     exported_modules: list[ExportedTVMFFIModule] = []
-    for spec in _search_space_chunk_increment_specs():
-        compiled = _compile_chunk_increment_aot(spec)
-        exported = export_tvm_ffi_compiled_module(
-            compiled,
-            kind="chunk_increment_fwd",
-            module_id=spec.module_id,
-            function_name=spec.module_id,
-            package_root=package_root,
-            keep_object_file=False,
-        )
-        register_aot_artifact(
-            kind="chunk_increment_fwd",
-            spec=spec,
-            exported=exported,
-            package_root=package_root,
-        )
-        exported_modules.append(exported)
-    for spec in _search_space_state_passing_specs():
-        compiled = _compile_state_passing_aot(spec)
-        exported = export_tvm_ffi_compiled_module(
-            compiled,
-            kind="state_passing_fwd",
-            module_id=spec.module_id,
-            function_name=spec.module_id,
-            package_root=package_root,
-            keep_object_file=False,
-        )
-        register_aot_artifact(
-            kind="state_passing_fwd",
-            spec=spec,
-            exported=exported,
-            package_root=package_root,
-        )
-        exported_modules.append(exported)
-    for spec in _search_space_chunk_scan_specs():
-        compiled = _compile_chunk_scan_aot(spec)
-        exported = export_tvm_ffi_compiled_module(
-            compiled,
-            kind="chunk_scan_fwd",
-            module_id=spec.module_id,
-            function_name=spec.module_id,
-            package_root=package_root,
-            keep_object_file=False,
-        )
-        register_aot_artifact(
-            kind="chunk_scan_fwd",
-            spec=spec,
-            exported=exported,
-            package_root=package_root,
-        )
-        exported_modules.append(exported)
+    for arch_tag in resolved_arch_tags:
+        for spec in _search_space_chunk_increment_specs(arch_tag=arch_tag):
+            compiled = _compile_chunk_increment_aot(spec)
+            exported = export_tvm_ffi_compiled_module(
+                compiled,
+                kind="chunk_increment_fwd",
+                module_id=spec.module_id,
+                function_name=spec.module_id,
+                package_root=package_root,
+                keep_object_file=False,
+            )
+            register_aot_artifact(
+                kind="chunk_increment_fwd",
+                spec=spec,
+                exported=exported,
+                package_root=package_root,
+            )
+            exported_modules.append(exported)
+        for spec in _search_space_state_passing_specs(arch_tag=arch_tag):
+            compiled = _compile_state_passing_aot(spec)
+            exported = export_tvm_ffi_compiled_module(
+                compiled,
+                kind="state_passing_fwd",
+                module_id=spec.module_id,
+                function_name=spec.module_id,
+                package_root=package_root,
+                keep_object_file=False,
+            )
+            register_aot_artifact(
+                kind="state_passing_fwd",
+                spec=spec,
+                exported=exported,
+                package_root=package_root,
+            )
+            exported_modules.append(exported)
+        for spec in _search_space_chunk_scan_specs(arch_tag=arch_tag):
+            compiled = _compile_chunk_scan_aot(spec)
+            exported = export_tvm_ffi_compiled_module(
+                compiled,
+                kind="chunk_scan_fwd",
+                module_id=spec.module_id,
+                function_name=spec.module_id,
+                package_root=package_root,
+                keep_object_file=False,
+            )
+            register_aot_artifact(
+                kind="chunk_scan_fwd",
+                spec=spec,
+                exported=exported,
+                package_root=package_root,
+            )
+            exported_modules.append(exported)
     for spec in resolved_specs:
         compiled = _compile_forward_aot(spec)
         exported = export_tvm_ffi_compiled_module(
