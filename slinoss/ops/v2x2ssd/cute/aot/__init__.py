@@ -253,6 +253,16 @@ _AOT_SEARCH_P = 64
 _AOT_SEARCH_D = 256
 _AOT_SEARCH_CHUNK_SIZES = (32, 64, 128, 256)
 _AOT_SEARCH_TC_DTYPES = (torch.float16, torch.bfloat16)
+_SUPPORTED_FORWARD_AOT_ARCH_TAGS = frozenset(
+    {
+        "sm_80",
+        "sm_86",
+        "sm_87",
+        "sm_89",
+        "sm_90",
+        "sm_90a",
+    }
+)
 
 
 def _normalize_arch_tag(raw_arch: str) -> str:
@@ -272,36 +282,65 @@ def _normalize_arch_tag(raw_arch: str) -> str:
     return raw_arch
 
 
+def _filter_supported_forward_aot_arch_tags(
+    arch_tags: tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            arch_tag
+            for arch_tag in arch_tags
+            if arch_tag == "any" or arch_tag in _SUPPORTED_FORWARD_AOT_ARCH_TAGS
+        )
+    )
+
+
 def _arch_tags_from_env() -> tuple[str, ...]:
     explicit_arch_tags = os.environ.get(
         "SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", ""
     ).strip()
     if explicit_arch_tags:
-        return tuple(
-            dict.fromkeys(
-                normalized
-                for normalized in (
-                    _normalize_arch_tag(value)
-                    for value in explicit_arch_tags.replace(",", ";").split(";")
+        return _filter_supported_forward_aot_arch_tags(
+            tuple(
+                dict.fromkeys(
+                    normalized
+                    for normalized in (
+                        _normalize_arch_tag(value)
+                        for value in explicit_arch_tags.replace(",", ";").split(";")
+                    )
+                    if normalized
                 )
-                if normalized
             )
         )
 
     torch_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
     if torch_arch_list:
-        return tuple(
-            dict.fromkeys(
-                normalized
-                for normalized in (
-                    _normalize_arch_tag(value)
-                    for value in torch_arch_list.replace(" ", ";").split(";")
+        return _filter_supported_forward_aot_arch_tags(
+            tuple(
+                dict.fromkeys(
+                    normalized
+                    for normalized in (
+                        _normalize_arch_tag(value)
+                        for value in torch_arch_list.replace(" ", ";").split(";")
+                    )
+                    if normalized
                 )
-                if normalized
             )
         )
 
-    return ("any",)
+    return ()
+
+
+def _resolve_forward_aot_arch_tags(
+    arch_tags: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    if arch_tags is None:
+        resolved_arch_tags = _arch_tags_from_env()
+        return resolved_arch_tags if resolved_arch_tags else ("any",)
+
+    resolved_arch_tags = _filter_supported_forward_aot_arch_tags(arch_tags)
+    if resolved_arch_tags:
+        return resolved_arch_tags
+    raise ValueError(f"Unsupported forward AOT arch tags: {arch_tags}")
 
 
 def _candidate_output_dtypes(tc_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -428,7 +467,7 @@ def _search_space_forward_specs(*, arch_tag: str = "any") -> tuple[ForwardAOTSpe
 def default_forward_aot_specs(
     arch_tags: tuple[str, ...] | None = None,
 ) -> tuple[ForwardAOTSpec, ...]:
-    resolved_arch_tags = _arch_tags_from_env() if arch_tags is None else arch_tags
+    resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
     return tuple(
         spec
         for arch_tag in resolved_arch_tags
@@ -2004,7 +2043,7 @@ def build_forward_aot_search_space_package(
     clean: bool = True,
 ) -> tuple[ExportedTVMFFIModule, ...]:
     package_root = Path(package_root)
-    resolved_arch_tags = _arch_tags_from_env() if arch_tags is None else arch_tags
+    resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
     resolved_specs = (
         default_forward_aot_specs(resolved_arch_tags) if specs is None else specs
     )

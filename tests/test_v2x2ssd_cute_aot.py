@@ -30,7 +30,7 @@ def test_normalize_arch_tag(raw_arch: str, normalized: str) -> None:
 
 
 def test_arch_tags_from_env_prefers_explicit_tags(monkeypatch) -> None:
-    monkeypatch.setenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", "sm_89,9.0,sm_89")
+    monkeypatch.setenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", "sm_70,sm_89,9.0,sm_89")
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0;8.6")
     assert cute_aot_mod._arch_tags_from_env() == ("sm_89", "sm_90")
 
@@ -38,6 +38,12 @@ def test_arch_tags_from_env_prefers_explicit_tags(monkeypatch) -> None:
 def test_arch_tags_from_env_falls_back_to_torch_arch_list(monkeypatch) -> None:
     monkeypatch.delenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", raising=False)
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0;8.6+PTX 8.0")
+    assert cute_aot_mod._arch_tags_from_env() == ("sm_80", "sm_86")
+
+
+def test_arch_tags_from_env_drops_unsupported_forward_arches(monkeypatch) -> None:
+    monkeypatch.delenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", raising=False)
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "7.0;8.0;8.6")
     assert cute_aot_mod._arch_tags_from_env() == ("sm_80", "sm_86")
 
 
@@ -49,6 +55,12 @@ def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
         len(cute_aot_mod._search_space_forward_specs(arch_tag="sm_80"))
         + len(cute_aot_mod._search_space_forward_specs(arch_tag="sm_86"))
     )
+
+
+def test_default_forward_aot_specs_drop_unsupported_requested_arch_tags() -> None:
+    specs = cute_aot_mod.default_forward_aot_specs(("sm_70", "sm_80"))
+    assert specs
+    assert {spec.arch_tag for spec in specs} == {"sm_80"}
 
 
 @pytest.mark.parametrize(
