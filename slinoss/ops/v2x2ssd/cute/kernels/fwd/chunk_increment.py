@@ -25,7 +25,9 @@ even and conceptually corresponds to ``2 * N``.
 
 import math
 from dataclasses import dataclass
+from typing import ClassVar
 
+import torch
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -58,8 +60,22 @@ class ChunkIncrementKernelBundle:
     smem_bytes: int
 
 
+@dataclass(frozen=True)
+class ChunkIncrementSupportInfo:
+    smem_capacity_bytes: int
+    required_smem_bytes: int
+
+    @property
+    def supported(self) -> bool:
+        return self.required_smem_bytes <= self.smem_capacity_bytes
+
+
 class ChunkIncrementFwdAmpere:
     """Ampere tensor-core forward kernel for the ``v2x2ssd`` chunk-increment op."""
+
+    _SUPPORT_INFO_CACHE: ClassVar[
+        dict[tuple[object, ...], ChunkIncrementSupportInfo]
+    ] = {}
 
     def __init__(
         self,
@@ -123,6 +139,90 @@ class ChunkIncrementFwdAmpere:
 
     def _warp_transition_layout(self):
         return cute.make_layout((max(1, self.scan_threads // 32), 2), stride=(2, 1))
+
+    def _smem_capacity_bytes(self, device_index: int | None = None) -> int:
+        if torch.cuda.is_available():
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(int(device_index))
+            capacity = int(getattr(props, "shared_memory_per_block_optin", 0))
+            if capacity > 0:
+                return capacity
+            cc = f"sm_{props.major}{props.minor}"
+            return int(utils.get_smem_capacity_in_bytes(cc))
+        return int(utils.get_smem_capacity_in_bytes("sm_80"))
+
+    @staticmethod
+    def _align_up(offset: int, align: int) -> int:
+        return ((offset + align - 1) // align) * align
+
+    @classmethod
+    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
+        offset = 0
+        max_align = 1
+        for size, align in fields:
+            offset = cls._align_up(offset, align)
+            offset += size
+            max_align = max(max_align, align)
+        return cls._align_up(offset, max_align)
+
+    def _required_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
+        in_bytes = in_dtype.width // 8
+        warp_count = max(1, self.scan_threads // 32)
+        fields = [
+            (self.bM * self.bK * self.num_stages * in_bytes, 16),
+            (self.bN * self.bK * self.num_stages * in_bytes, 16),
+            (self.bM * self.bN * 4, 16),
+            (self.L * 2 * 4, 4),
+            (self.L * 2 * 4, 4),
+            (self.bM * 4, 4),
+            (self.bN * 4, 4),
+            (warp_count * 2 * 4, 8),
+            (warp_count * 2 * 4, 8),
+        ]
+        return self._struct_size_bytes(fields)
+
+    def support_info(
+        self,
+        dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
+    ) -> ChunkIncrementSupportInfo:
+        if dtype not in (cutlass.Float16, cutlass.BFloat16):
+            return ChunkIncrementSupportInfo(0, 1)
+
+        if device_index is None:
+            device_key = (
+                int(torch.cuda.current_device()) if torch.cuda.is_available() else -1
+            )
+        else:
+            device_key = int(device_index)
+        cache_key = (
+            type(self),
+            self.L,
+            self.cta_tiler,
+            self.num_stages,
+            dtype,
+            device_key,
+        )
+        cached = self._SUPPORT_INFO_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        info = ChunkIncrementSupportInfo(
+            smem_capacity_bytes=self._smem_capacity_bytes(device_key),
+            required_smem_bytes=self._required_smem_bytes(dtype),
+        )
+        self._SUPPORT_INFO_CACHE[cache_key] = info
+        return info
+
+    def can_implement(
+        self,
+        dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
+    ) -> bool:
+        return self.support_info(dtype, device_index=device_index).supported
 
     def _make_operand_smem_layout(self, dtype, major_mode, copy_bits, smem_tiler):
         major_mode_size = (

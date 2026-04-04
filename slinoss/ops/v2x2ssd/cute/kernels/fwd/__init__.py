@@ -2176,6 +2176,13 @@ def tune_chunk_increment_cute(
     )
     best_config: ChunkIncrementConfig | None = None
     best_latency_ms = float("inf")
+    skipped_invalid_candidates = 0
+    candidate_configs = chunk_increment_candidate_configs(
+        P=int(problem_shape[3]),
+        D=int(problem_shape[4]),
+        chunk_size=resolved_chunk_size,
+        device_index=device_index,
+    )
     if candidate_specs:
         batch_size, heads, time_steps, P, D = _validate_chunk_increment_inputs(
             U,
@@ -2246,45 +2253,49 @@ def tune_chunk_increment_cute(
                 has_prev=U_prev is not None,
                 config=spec.config,
             )
-            latency_ms = benchmark_cuda_callable(
-                lambda: packaged(*runtime_artifacts.runtime_args),
-                device=U.device,
-                warmup_iterations=autotune_warmup_iterations(),
-                timed_iterations=autotune_iterations(),
-                before_iteration=lambda: _reset_chunk_increment_outputs(
-                    runtime_artifacts.outputs
-                ),
-            )
+            try:
+                latency_ms = benchmark_cuda_callable(
+                    lambda: packaged(*runtime_artifacts.runtime_args),
+                    device=U.device,
+                    warmup_iterations=autotune_warmup_iterations(),
+                    timed_iterations=autotune_iterations(),
+                    before_iteration=lambda: _reset_chunk_increment_outputs(
+                        runtime_artifacts.outputs
+                    ),
+                )
+            except Exception:
+                skipped_invalid_candidates += 1
+                continue
             if latency_ms < best_latency_ms:
                 best_latency_ms = latency_ms
                 best_config = spec.config
     else:
-        for config in chunk_increment_candidate_configs(
-            P=int(problem_shape[3]),
-            D=int(problem_shape[4]),
-            chunk_size=resolved_chunk_size,
-        ):
-            prepared = _make_chunk_increment_prepared_launch(
-                U,
-                M,
-                K,
-                B,
-                U_prev=U_prev,
-                B_prev=B_prev,
-                chunk_size=resolved_chunk_size,
-                compute_dtype=compute_dtype,
-                cta_tiler=config.cta_tiler,
-                num_stages=config.num_stages,
-            )
-            latency_ms = benchmark_cuda_callable(
-                lambda: prepared.compiled(*prepared.runtime_args),
-                device=U.device,
-                warmup_iterations=autotune_warmup_iterations(),
-                timed_iterations=autotune_iterations(),
-                before_iteration=lambda: _reset_chunk_increment_outputs(
-                    prepared.outputs
-                ),
-            )
+        for config in candidate_configs:
+            try:
+                prepared = _make_chunk_increment_prepared_launch(
+                    U,
+                    M,
+                    K,
+                    B,
+                    U_prev=U_prev,
+                    B_prev=B_prev,
+                    chunk_size=resolved_chunk_size,
+                    compute_dtype=compute_dtype,
+                    cta_tiler=config.cta_tiler,
+                    num_stages=config.num_stages,
+                )
+                latency_ms = benchmark_cuda_callable(
+                    lambda: prepared.compiled(*prepared.runtime_args),
+                    device=U.device,
+                    warmup_iterations=autotune_warmup_iterations(),
+                    timed_iterations=autotune_iterations(),
+                    before_iteration=lambda: _reset_chunk_increment_outputs(
+                        prepared.outputs
+                    ),
+                )
+            except Exception:
+                skipped_invalid_candidates += 1
+                continue
             if latency_ms < best_latency_ms:
                 best_latency_ms = latency_ms
                 best_config = config
@@ -2302,13 +2313,8 @@ def tune_chunk_increment_cute(
             "latency_ms": best_latency_ms,
             "candidate_count": len(candidate_specs)
             if candidate_specs
-            else len(
-                chunk_increment_candidate_configs(
-                    P=int(problem_shape[3]),
-                    D=int(problem_shape[4]),
-                    chunk_size=resolved_chunk_size,
-                )
-            ),
+            else len(candidate_configs),
+            "skipped_invalid_candidates": skipped_invalid_candidates,
             "source": "packaged_aot" if candidate_specs else "jit",
         },
     )
@@ -2356,6 +2362,7 @@ def tune_state_passing_cute(
     )
     best_config: StatePassingConfig | None = None
     best_latency_ms = float("inf")
+    skipped_invalid_candidates = 0
     if candidate_specs:
         increment_contig = increment.contiguous()
         chunk_multiplier_contig = chunk_multiplier.contiguous()
@@ -2389,15 +2396,19 @@ def tune_state_passing_cute(
                 num_threads=spec.config.num_threads,
                 vecs_per_thread=spec.config.vecs_per_thread,
             )
-            latency_ms = benchmark_cuda_callable(
-                lambda: packaged(*runtime_artifacts.runtime_args),
-                device=increment.device,
-                warmup_iterations=autotune_warmup_iterations(),
-                timed_iterations=autotune_iterations(),
-                before_iteration=lambda: _reset_state_passing_outputs(
-                    runtime_artifacts.outputs
-                ),
-            )
+            try:
+                latency_ms = benchmark_cuda_callable(
+                    lambda: packaged(*runtime_artifacts.runtime_args),
+                    device=increment.device,
+                    warmup_iterations=autotune_warmup_iterations(),
+                    timed_iterations=autotune_iterations(),
+                    before_iteration=lambda: _reset_state_passing_outputs(
+                        runtime_artifacts.outputs
+                    ),
+                )
+            except Exception:
+                skipped_invalid_candidates += 1
+                continue
             if latency_ms < best_latency_ms:
                 best_latency_ms = latency_ms
                 best_config = spec.config
@@ -2405,20 +2416,26 @@ def tune_state_passing_cute(
         for config in state_passing_candidate_configs(
             P=P, D=D, has_init=initial_states is not None
         ):
-            prepared = _make_state_passing_prepared_launch(
-                increment,
-                chunk_multiplier,
-                initial_states=initial_states,
-                num_threads=config.num_threads,
-                vecs_per_thread=config.vecs_per_thread,
-            )
-            latency_ms = benchmark_cuda_callable(
-                lambda: prepared.compiled(*prepared.runtime_args),
-                device=increment.device,
-                warmup_iterations=autotune_warmup_iterations(),
-                timed_iterations=autotune_iterations(),
-                before_iteration=lambda: _reset_state_passing_outputs(prepared.outputs),
-            )
+            try:
+                prepared = _make_state_passing_prepared_launch(
+                    increment,
+                    chunk_multiplier,
+                    initial_states=initial_states,
+                    num_threads=config.num_threads,
+                    vecs_per_thread=config.vecs_per_thread,
+                )
+                latency_ms = benchmark_cuda_callable(
+                    lambda: prepared.compiled(*prepared.runtime_args),
+                    device=increment.device,
+                    warmup_iterations=autotune_warmup_iterations(),
+                    timed_iterations=autotune_iterations(),
+                    before_iteration=lambda: _reset_state_passing_outputs(
+                        prepared.outputs
+                    ),
+                )
+            except Exception:
+                skipped_invalid_candidates += 1
+                continue
             if latency_ms < best_latency_ms:
                 best_latency_ms = latency_ms
                 best_config = config
@@ -2437,6 +2454,7 @@ def tune_state_passing_cute(
                     P=P, D=D, has_init=initial_states is not None
                 )
             ),
+            "skipped_invalid_candidates": skipped_invalid_candidates,
             "source": "packaged_aot" if candidate_specs else "jit",
         },
     )
@@ -2516,6 +2534,7 @@ def tune_chunk_scan_cute(
     )
     best_config: ChunkScanConfig | None = None
     best_latency_ms = float("inf")
+    skipped_invalid_candidates = 0
     if candidate_specs:
         U_tc = _pad_zero_time(U, T_pad=padded_time, dtype=tc_dtype)
         B_tc = _pad_zero_time(B, T_pad=padded_time, dtype=tc_dtype)
@@ -2584,15 +2603,19 @@ def tune_chunk_scan_cute(
                 resolved_num_threads=spec.config.num_threads,
                 has_prev=B_prev is not None,
             )
-            latency_ms = benchmark_cuda_callable(
-                lambda: packaged(*runtime_artifacts.runtime_args),
-                device=U.device,
-                warmup_iterations=autotune_warmup_iterations(),
-                timed_iterations=autotune_iterations(),
-                before_iteration=lambda: _reset_chunk_scan_outputs(
-                    runtime_artifacts.outputs
-                ),
-            )
+            try:
+                latency_ms = benchmark_cuda_callable(
+                    lambda: packaged(*runtime_artifacts.runtime_args),
+                    device=U.device,
+                    warmup_iterations=autotune_warmup_iterations(),
+                    timed_iterations=autotune_iterations(),
+                    before_iteration=lambda: _reset_chunk_scan_outputs(
+                        runtime_artifacts.outputs
+                    ),
+                )
+            except Exception:
+                skipped_invalid_candidates += 1
+                continue
             if latency_ms < best_latency_ms:
                 best_latency_ms = latency_ms
                 best_config = spec.config
@@ -2605,29 +2628,35 @@ def tune_chunk_scan_cute(
             output_dtype=output_dtype,
             device_index=device_index,
         ):
-            prepared = _make_chunk_scan_prepared_launch(
-                U,
-                M,
-                K,
-                B,
-                C,
-                chunk_starts,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                chunk_size=resolved_chunk_size,
-                m_block_size=config.m_block_size,
-                n_block_size=config.n_block_size,
-                num_threads=config.num_threads,
-                compute_dtype=compute_dtype,
-                output_dtype=output_dtype,
-            )
-            latency_ms = benchmark_cuda_callable(
-                lambda: prepared.compiled(*prepared.runtime_args),
-                device=U.device,
-                warmup_iterations=autotune_warmup_iterations(),
-                timed_iterations=autotune_iterations(),
-                before_iteration=lambda: _reset_chunk_scan_outputs(prepared.outputs),
-            )
+            try:
+                prepared = _make_chunk_scan_prepared_launch(
+                    U,
+                    M,
+                    K,
+                    B,
+                    C,
+                    chunk_starts,
+                    B_prev=B_prev,
+                    U_prev=U_prev,
+                    chunk_size=resolved_chunk_size,
+                    m_block_size=config.m_block_size,
+                    n_block_size=config.n_block_size,
+                    num_threads=config.num_threads,
+                    compute_dtype=compute_dtype,
+                    output_dtype=output_dtype,
+                )
+                latency_ms = benchmark_cuda_callable(
+                    lambda: prepared.compiled(*prepared.runtime_args),
+                    device=U.device,
+                    warmup_iterations=autotune_warmup_iterations(),
+                    timed_iterations=autotune_iterations(),
+                    before_iteration=lambda: _reset_chunk_scan_outputs(
+                        prepared.outputs
+                    ),
+                )
+            except Exception:
+                skipped_invalid_candidates += 1
+                continue
             if latency_ms < best_latency_ms:
                 best_latency_ms = latency_ms
                 best_config = config
@@ -2651,6 +2680,7 @@ def tune_chunk_scan_cute(
                     device_index=device_index,
                 )
             ),
+            "skipped_invalid_candidates": skipped_invalid_candidates,
             "source": "packaged_aot" if candidate_specs else "jit",
         },
     )
@@ -2727,6 +2757,7 @@ def tune_v2x2ssd_fwd_cute(
             )
     best_bundle: ForwardConfigBundle | None = None
     best_latency_ms = float("inf")
+    skipped_invalid_candidates = 0
     for config_bundle in forward_bundle_candidates(
         P=input_info.P,
         D=input_info.D,
@@ -2736,48 +2767,54 @@ def tune_v2x2ssd_fwd_cute(
         device_index=input_info.device_index,
         has_init=initial_states is not None,
     ):
-        runtime_artifacts = _make_forward_runtime_artifacts(
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_size=chunk_size,
-            compute_dtype=compute_dtype,
-            output_dtype=output_dtype,
-            m_block_size=config_bundle.chunk_scan.m_block_size,
-            n_block_size=config_bundle.chunk_scan.n_block_size,
-            scan_num_threads=config_bundle.chunk_scan.num_threads,
-            state_num_threads=config_bundle.state_passing.num_threads,
-            state_vecs_per_thread=config_bundle.state_passing.vecs_per_thread,
-            initial_states=initial_states,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            return_final_state=True,
-            return_intermediates=True,
-            prepared_inputs=None,
-            validate_runtime_contract=True,
-            config_bundle=config_bundle,
-        )
-        compiled = _get_compiled_v2x2ssd_fwd_kernel(
-            U=U,
-            M=M,
-            K=K,
-            B=B,
-            C=C,
-            compute_dtype=compute_dtype,
-            output_dtype=output_dtype,
-            compile_artifacts=_make_forward_compile_artifacts_from_runtime_artifacts(
-                runtime_artifacts
-            ),
-        )
-        latency_ms = benchmark_cuda_callable(
-            lambda: compiled(*runtime_artifacts.runtime_args),
-            device=U.device,
-            warmup_iterations=autotune_warmup_iterations(),
-            timed_iterations=autotune_iterations(),
-            before_iteration=lambda: _reset_forward_runtime_outputs(runtime_artifacts),
-        )
+        try:
+            runtime_artifacts = _make_forward_runtime_artifacts(
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_size=chunk_size,
+                compute_dtype=compute_dtype,
+                output_dtype=output_dtype,
+                m_block_size=config_bundle.chunk_scan.m_block_size,
+                n_block_size=config_bundle.chunk_scan.n_block_size,
+                scan_num_threads=config_bundle.chunk_scan.num_threads,
+                state_num_threads=config_bundle.state_passing.num_threads,
+                state_vecs_per_thread=config_bundle.state_passing.vecs_per_thread,
+                initial_states=initial_states,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                return_final_state=True,
+                return_intermediates=True,
+                prepared_inputs=None,
+                validate_runtime_contract=True,
+                config_bundle=config_bundle,
+            )
+            compiled = _get_compiled_v2x2ssd_fwd_kernel(
+                U=U,
+                M=M,
+                K=K,
+                B=B,
+                C=C,
+                compute_dtype=compute_dtype,
+                output_dtype=output_dtype,
+                compile_artifacts=_make_forward_compile_artifacts_from_runtime_artifacts(
+                    runtime_artifacts
+                ),
+            )
+            latency_ms = benchmark_cuda_callable(
+                lambda: compiled(*runtime_artifacts.runtime_args),
+                device=U.device,
+                warmup_iterations=autotune_warmup_iterations(),
+                timed_iterations=autotune_iterations(),
+                before_iteration=lambda: _reset_forward_runtime_outputs(
+                    runtime_artifacts
+                ),
+            )
+        except Exception:
+            skipped_invalid_candidates += 1
+            continue
         if latency_ms < best_latency_ms:
             best_latency_ms = latency_ms
             best_bundle = config_bundle
@@ -2800,6 +2837,7 @@ def tune_v2x2ssd_fwd_cute(
                     has_init=initial_states is not None,
                 )
             ),
+            "skipped_invalid_candidates": skipped_invalid_candidates,
             "source": "jit",
         },
     )
@@ -4187,13 +4225,16 @@ def _benchmark_packaged_forward_aot_spec(
         validate_runtime_contract=True,
         config_bundle=spec.config_bundle,
     )
-    return benchmark_cuda_callable(
-        lambda: packaged(*runtime_artifacts.runtime_args),
-        device=U.device,
-        warmup_iterations=autotune_warmup_iterations(),
-        timed_iterations=autotune_iterations(),
-        before_iteration=lambda: _reset_forward_runtime_outputs(runtime_artifacts),
-    )
+    try:
+        return benchmark_cuda_callable(
+            lambda: packaged(*runtime_artifacts.runtime_args),
+            device=U.device,
+            warmup_iterations=autotune_warmup_iterations(),
+            timed_iterations=autotune_iterations(),
+            before_iteration=lambda: _reset_forward_runtime_outputs(runtime_artifacts),
+        )
+    except Exception:
+        return None
 
 
 def _resolve_forward_autotune_bundle(
@@ -4272,6 +4313,7 @@ def _resolve_forward_autotune_bundle(
 
     best_spec = None
     best_latency_ms = float("inf")
+    skipped_invalid_candidates = 0
     for spec in candidate_specs:
         latency_ms = _benchmark_packaged_forward_aot_spec(
             U=U,
@@ -4287,7 +4329,10 @@ def _resolve_forward_autotune_bundle(
             U_prev=U_prev,
             spec=spec,
         )
-        if latency_ms is None or latency_ms >= best_latency_ms:
+        if latency_ms is None:
+            skipped_invalid_candidates += 1
+            continue
+        if latency_ms >= best_latency_ms:
             continue
         best_latency_ms = latency_ms
         best_spec = spec
@@ -4302,6 +4347,7 @@ def _resolve_forward_autotune_bundle(
         metadata={
             "latency_ms": best_latency_ms,
             "candidate_count": len(candidate_specs),
+            "skipped_invalid_candidates": skipped_invalid_candidates,
             "source": "packaged_aot",
         },
     )

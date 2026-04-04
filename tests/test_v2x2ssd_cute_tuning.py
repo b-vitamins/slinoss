@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     v2x2ssd_fwd_cute,
 )
 import slinoss.ops.v2x2ssd.cute.kernels.fwd as v2x2ssd_fwd_mod
+import slinoss.ops.v2x2ssd.cute.tuning.fwd as tuning_fwd_mod
 from slinoss.ops.v2x2ssd.cute.tuning import (
     ChunkIncrementConfig,
     ChunkScanConfig,
@@ -23,6 +25,33 @@ from slinoss.ops.v2x2ssd.cute.tuning import (
     store_tuning_record,
 )
 from slinoss.ops.v2x2ssd.cute.tuning.hardware import current_hardware_fingerprint
+
+
+def test_chunk_increment_candidate_configs_prune_unsupported_device_configs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_config = ChunkIncrementConfig(cta_tiler=(64, 128, 64), num_stages=3)
+    good_config = ChunkIncrementConfig(cta_tiler=(64, 128, 64), num_stages=2)
+
+    def _fake_can_implement(self, dtype, *, device_index=None):
+        return (
+            self.cta_tiler != bad_config.cta_tiler
+            or self.num_stages != bad_config.num_stages
+        )
+
+    monkeypatch.setattr(
+        tuning_fwd_mod.ChunkIncrementFwdAmpere,
+        "can_implement",
+        _fake_can_implement,
+    )
+    configs = tuning_fwd_mod.chunk_increment_candidate_configs(
+        P=64,
+        D=256,
+        chunk_size=128,
+        device_index=0,
+    )
+    assert bad_config not in configs
+    assert good_config in configs
 
 
 def _pack_complex_pairs(z: torch.Tensor, *, real_dtype: torch.dtype) -> torch.Tensor:
@@ -130,6 +159,74 @@ def test_tune_chunk_increment_cute_reuses_cached_record(
             compute_dtype=torch.float32,
         )
         == cached_config
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tune_chunk_increment_cute_skips_invalid_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    torch.manual_seed(0)
+    monkeypatch.setenv("SLINOSS_CUTE_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("SLINOSS_CUTE_AUTOTUNE", "force")
+    U, M, K, B, _C, _initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1, heads=1, T=64, N=8, P=64, device=torch.device("cuda")
+    )
+    bad_config = ChunkIncrementConfig(cta_tiler=(64, 128, 64), num_stages=3)
+    good_config = ChunkIncrementConfig(cta_tiler=(64, 64, 32), num_stages=2)
+    monkeypatch.setattr(
+        v2x2ssd_fwd_mod,
+        "_matching_packaged_chunk_increment_specs",
+        lambda **kwargs: (),
+    )
+    monkeypatch.setattr(
+        v2x2ssd_fwd_mod,
+        "chunk_increment_candidate_configs",
+        lambda **kwargs: (bad_config, good_config),
+    )
+
+    def _fake_make_chunk_increment_prepared_launch(*args, **kwargs):
+        if (
+            kwargs["cta_tiler"] == bad_config.cta_tiler
+            and kwargs["num_stages"] == bad_config.num_stages
+        ):
+            raise RuntimeError("CUDA Error: cudaErrorInvalidValue")
+        return SimpleNamespace(
+            compiled=lambda *runtime_args: None,
+            runtime_args=(),
+            outputs=SimpleNamespace(
+                increment_chunk=torch.empty(
+                    (1, 64, 16), device="cuda", dtype=torch.float32
+                ),
+                chunk_multiplier_storage=torch.empty(
+                    (1, 2), device="cuda", dtype=torch.float32
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        v2x2ssd_fwd_mod,
+        "_make_chunk_increment_prepared_launch",
+        _fake_make_chunk_increment_prepared_launch,
+    )
+    monkeypatch.setattr(
+        v2x2ssd_fwd_mod,
+        "benchmark_cuda_callable",
+        lambda *args, **kwargs: 1.0,
+    )
+
+    assert (
+        tune_chunk_increment_cute(
+            U,
+            M,
+            K,
+            B,
+            U_prev=U_prev,
+            B_prev=B_prev,
+            chunk_size=32,
+            compute_dtype=torch.float32,
+        )
+        == good_config
     )
 
 

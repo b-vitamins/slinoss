@@ -54,6 +54,7 @@ def _chunk_increment_candidate_space(
     P: int,
     D: int,
     chunk_size: int,
+    device_index: int | None = None,
 ) -> Iterable[ChunkIncrementConfig]:
     for bM in (32, 64):
         if bM > int(P) or int(P) % int(bM) != 0:
@@ -68,13 +69,18 @@ def _chunk_increment_candidate_space(
                     num_stage_values = (2, 3)
                 for num_stages in num_stage_values:
                     try:
-                        ChunkIncrementFwdAmpere(
+                        kernel = ChunkIncrementFwdAmpere(
                             cutlass.Float16,
                             chunk_size=int(chunk_size),
                             cta_tiler=(int(bM), int(bN), int(bK)),
                             num_stages=int(num_stages),
                         )
                     except Exception:
+                        continue
+                    if device_index is not None and not kernel.can_implement(
+                        cutlass.Float16,
+                        device_index=device_index,
+                    ):
                         continue
                     yield ChunkIncrementConfig(
                         cta_tiler=(int(bM), int(bN), int(bK)),
@@ -87,12 +93,18 @@ def chunk_increment_candidate_configs(
     P: int,
     D: int,
     chunk_size: int,
+    device_index: int | None = None,
 ) -> tuple[ChunkIncrementConfig, ...]:
     """Return the curated chunk-increment config family for this problem."""
 
     seen: set[tuple[object, ...]] = set()
     configs: list[ChunkIncrementConfig] = []
-    for config in _chunk_increment_candidate_space(P=P, D=D, chunk_size=chunk_size):
+    for config in _chunk_increment_candidate_space(
+        P=P,
+        D=D,
+        chunk_size=chunk_size,
+        device_index=device_index,
+    ):
         if config.cache_key in seen:
             continue
         seen.add(config.cache_key)
@@ -226,6 +238,7 @@ def forward_bundle_candidates(
         P=P,
         D=D,
         chunk_size=chunk_size,
+        device_index=device_index,
     )
     state_passing_candidates = state_passing_candidate_configs(
         P=P,
