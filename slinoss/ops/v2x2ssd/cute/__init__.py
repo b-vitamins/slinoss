@@ -15,10 +15,12 @@ The staged forward decomposition remains:
 - ``chunk_scan``
 
 Ahead-of-time export/load helpers live under :mod:`slinoss.ops.v2x2ssd.cute.aot`.
+Autotuning helpers live under :mod:`slinoss.ops.v2x2ssd.cute.tuning`.
 """
 
 from . import aot
+from . import tuning
 from .api import v2x2ssd_cute
 from .decode import mixer_decode_step_cute
 
-__all__ = ["aot", "v2x2ssd_cute", "mixer_decode_step_cute"]
+__all__ = ["aot", "tuning", "v2x2ssd_cute", "mixer_decode_step_cute"]

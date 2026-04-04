@@ -167,7 +167,10 @@ def v2x2ssd_cute(
             output_dtype=odtype,
             compute_dtype=rdtype,
             return_final_state=True,
-            return_intermediates=False,
+            # Keep the boundary-return path on fresh intermediates. This
+            # matches the autograd wrapper and avoids coupling public state
+            # materialization to cached no-grad workspaces.
+            return_intermediates=True,
         ),
     )
     Y_out = cast(

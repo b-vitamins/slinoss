@@ -200,12 +200,16 @@ jobs:
       - name: Verify CUDA wheel contents
         run: |
           python - <<'PY'
+          import json
           from pathlib import Path
           import zipfile
 
           wheel = Path("dist/${{ steps.wheel.outputs.wheel_name }}")
           with zipfile.ZipFile(wheel) as zf:
               names = set(zf.namelist())
+              manifest = json.loads(
+                  zf.read("slinoss/ops/v2x2ssd/cute/aot/manifest.json").decode("utf-8")
+              )
 
           required = "slinoss/_C/__init__.py"
           if required not in names:
@@ -242,6 +246,22 @@ jobs:
           if not aot_members:
               raise SystemExit(
                   f"Expected packaged forward AOT shared libraries in {wheel.name}"
+              )
+          expected_kinds = {
+              "chunk_increment_fwd",
+              "state_passing_fwd",
+              "chunk_scan_fwd",
+              "v2x2ssd_fwd",
+          }
+          packaged_kinds = {
+              str(record.get("kind"))
+              for record in manifest.get("artifacts", [])
+          }
+          missing_kinds = sorted(expected_kinds - packaged_kinds)
+          if missing_kinds:
+              raise SystemExit(
+                  f"Expected packaged forward AOT search-space kinds in {wheel.name}, "
+                  f"missing {missing_kinds}"
               )
           if aot_object_members:
               raise SystemExit(
