@@ -6,6 +6,7 @@ from typing import Literal, overload, cast
 
 import torch
 
+from .common import _materialize_boundary_tensor
 from slinoss.ops.v2x2ssd.reference import (
     _resolve_dtypes,
     _resolve_empty_outputs,
@@ -70,7 +71,7 @@ def v2x2ssd_cute(
     import cutlass  # noqa: F401
     import cutlass.cute as cute  # noqa: F401
 
-    from .kernels.fwd import v2x2ssd_fwd_cute
+    from .kernels.fwd import _v2x2ssd_fwd_cute_prevalidated
 
     batch_size, n_heads, T, N, P = _validate_inputs(
         U, M, K, B, C, initial_states, B_prev, U_prev
@@ -134,7 +135,7 @@ def v2x2ssd_cute(
     if not return_state:
         Y, _m_chunk, _chunk_starts = cast(
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-            v2x2ssd_fwd_cute(
+            _v2x2ssd_fwd_cute_prevalidated(
                 U,
                 M,
                 K,
@@ -151,11 +152,9 @@ def v2x2ssd_cute(
         )
         return Y
 
-    from .autograd import _materialize_boundary_tensor
-
     Y, final_state, _m_chunk, _chunk_starts = cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        v2x2ssd_fwd_cute(
+        _v2x2ssd_fwd_cute_prevalidated(
             U,
             M,
             K,

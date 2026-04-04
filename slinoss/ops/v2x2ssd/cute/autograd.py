@@ -6,12 +6,13 @@ from typing import cast
 
 import torch
 
+from .common import _materialize_boundary_tensor
 from slinoss.ops.v2x2ssd.cute.kernels.bwd import v2x2ssd_bwd_stateful_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _prepare_m_operand,
     _prepare_time_operand,
     _tc_input_dtype,
-    v2x2ssd_fwd_cute,
+    _v2x2ssd_fwd_cute_prevalidated,
 )
 
 
@@ -21,17 +22,6 @@ def _clone_if_capturing(x: torch.Tensor | None) -> torch.Tensor | None:
     if x.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         return x.clone()
     return x
-
-
-def _materialize_boundary_tensor(
-    x: torch.Tensor | None,
-    *,
-    dtype: torch.dtype | None = None,
-) -> torch.Tensor | None:
-    if x is None:
-        return None
-    y = x if dtype is None or x.dtype == dtype else x.to(dtype=dtype)
-    return y.contiguous().clone()
 
 
 def _prepare_backward_inputs(
@@ -45,14 +35,14 @@ def _prepare_backward_inputs(
     compute_dtype: torch.dtype | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n_chunks = (int(U.shape[2]) + int(chunk_size) - 1) // int(chunk_size)
-    T_pad = n_chunks * int(chunk_size)
+    padded_time = n_chunks * int(chunk_size)
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     return (
-        _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype),
-        _prepare_m_operand(M, T_pad=T_pad),
-        _prepare_time_operand(K, T_pad=T_pad, dtype=torch.float32),
-        _prepare_time_operand(B, T_pad=T_pad, dtype=tc_dtype),
-        _prepare_time_operand(C, T_pad=T_pad, dtype=tc_dtype),
+        _prepare_time_operand(U, padded_time=padded_time, dtype=tc_dtype),
+        _prepare_m_operand(M, padded_time=padded_time),
+        _prepare_time_operand(K, padded_time=padded_time, dtype=torch.float32),
+        _prepare_time_operand(B, padded_time=padded_time, dtype=tc_dtype),
+        _prepare_time_operand(C, padded_time=padded_time, dtype=tc_dtype),
     )
 
 
@@ -95,7 +85,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         if ctx.return_state:
             Y, final_state, m_chunk, chunk_starts = cast(
                 tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                v2x2ssd_fwd_cute(
+                _v2x2ssd_fwd_cute_prevalidated(
                     U_d,
                     M_d,
                     K_d,
@@ -142,7 +132,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         else:
             Y, m_chunk, chunk_starts = cast(
                 tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                v2x2ssd_fwd_cute(
+                _v2x2ssd_fwd_cute_prevalidated(
                     U_d,
                     M_d,
                     K_d,

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import torch
 from cuda.bindings import driver as cuda
 import cutlass.cute as cute
-from typing import Callable
 
+from slinoss._cute_runtime import make_runtime_tensor_spec_view
 from slinoss.perf import note_cache_event
 
 from .chunk_increment import ChunkIncrementFwdAmpere
@@ -18,6 +19,7 @@ from .common import (
     _ensure_min_alignment,
     _guard_prev_time_base,
     _make_fake_tensor_arg,
+    _make_fake_tensor_spec_arg,
     _pad_m_identity,
     _pad_zero_time,
     _tc_input_dtype,
@@ -29,6 +31,7 @@ from .state_passing import StatePassingFwdAmpere
 _CHUNK_INCREMENT_CACHE: dict[tuple, object] = {}
 _STATE_PASSING_CACHE: dict[tuple, object] = {}
 _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
+_FWD_HOST_CACHE: dict[tuple, object] = {}
 _FWD_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
 _FWD_NO_GRAD_INTERMEDIATE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -39,6 +42,144 @@ _FWD_NO_GRAD_INTERMEDIATE_CACHE_LIMIT = 4
 _ZERO_PREV_CACHE_LIMIT = 8
 _ZERO_INITIAL_STATE_CACHE_LIMIT = 8
 _DUMMY_FINAL_STATE_CACHE_LIMIT = 8
+
+
+@dataclass(frozen=True)
+class ForwardOutputs:
+    output: torch.Tensor
+    final_state: torch.Tensor | None
+    chunk_multiplier: torch.Tensor
+    chunk_starts: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ForwardRuntimeArtifacts:
+    runtime_args: tuple[torch.Tensor, ...]
+    alignments: tuple[int, ...]
+    problem_shape: tuple[int, ...]
+    launch_cfg: tuple[int, ...]
+    outputs: ForwardOutputs
+
+
+@dataclass(frozen=True)
+class ForwardCompileArtifacts:
+    problem_shape: tuple[int, ...]
+    launch_cfg: tuple[int, ...]
+    compile_args: tuple[object, ...]
+    alignments: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ForwardInputInfo:
+    batch_size: int
+    heads: int
+    time_steps: int
+    P: int
+    D: int
+    chunk_size: int
+    n_chunks: int
+    padded_time: int
+    tc_dtype: torch.dtype
+    device_index: int
+    resolved_m_block: int
+    resolved_n_block: int
+    resolved_scan_num_threads: int
+
+
+@dataclass(frozen=True)
+class ChunkIncrementOutputs:
+    increment_chunk: torch.Tensor
+    chunk_multiplier_storage: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ChunkIncrementRuntimeArtifacts:
+    problem_shape: tuple[int, ...]
+    cta_tiler: tuple[int, int, int]
+    compile_args: tuple[object, ...]
+    runtime_args: tuple[torch.Tensor, ...]
+    cache_key: tuple
+    outputs: ChunkIncrementOutputs
+
+
+@dataclass(frozen=True)
+class ChunkIncrementCompileArtifacts:
+    problem_shape: tuple[int, ...]
+    cta_tiler: tuple[int, int, int]
+    compile_args: tuple[object, ...]
+    alignments: tuple[int, ...]
+    cache_key: tuple
+
+
+@dataclass(frozen=True)
+class PreparedChunkIncrementLaunch:
+    compiled: object
+    runtime_args: tuple[torch.Tensor, ...]
+    outputs: ChunkIncrementOutputs
+
+
+@dataclass(frozen=True)
+class StatePassingOutputs:
+    chunk_starts: torch.Tensor
+    final_state: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StatePassingRuntimeArtifacts:
+    problem_shape: tuple[int, ...]
+    launch_cfg: tuple[int, int, int, int, int, int, bool]
+    compile_args: tuple[object, ...]
+    runtime_args: tuple[torch.Tensor, ...]
+    cache_key: tuple
+    outputs: StatePassingOutputs
+
+
+@dataclass(frozen=True)
+class StatePassingCompileArtifacts:
+    problem_shape: tuple[int, ...]
+    launch_cfg: tuple[int, int, int, int, int, int, bool]
+    compile_args: tuple[object, ...]
+    alignments: tuple[int, ...]
+    cache_key: tuple
+
+
+@dataclass(frozen=True)
+class PreparedStatePassingLaunch:
+    compiled: object
+    runtime_args: tuple[torch.Tensor, ...]
+    outputs: StatePassingOutputs
+
+
+@dataclass(frozen=True)
+class ChunkScanOutputs:
+    output_chunk: torch.Tensor
+    output_view: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ChunkScanRuntimeArtifacts:
+    problem_shape: tuple[int, ...]
+    launch_cfg: tuple[int, int, int]
+    compile_args: tuple[object, ...]
+    runtime_args: tuple[torch.Tensor, ...]
+    cache_key: tuple
+    outputs: ChunkScanOutputs
+
+
+@dataclass(frozen=True)
+class ChunkScanCompileArtifacts:
+    problem_shape: tuple[int, ...]
+    launch_cfg: tuple[int, int, int]
+    compile_args: tuple[object, ...]
+    alignments: tuple[int, ...]
+    cache_key: tuple
+
+
+@dataclass(frozen=True)
+class PreparedChunkScanLaunch:
+    compiled: object
+    runtime_args: tuple[torch.Tensor, ...]
+    outputs: ChunkScanOutputs
 
 
 def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
@@ -236,38 +377,40 @@ def _get_no_grad_intermediates(
     return cached
 
 
-def _resolve_chunk_scan_n_block_size(L: int, requested: int) -> int:
+def _resolve_chunk_scan_n_block_size(chunk_size: int, requested: int) -> int:
     if requested <= 0:
         raise ValueError("n_block_size must be positive.")
     if requested % 16 != 0:
         raise ValueError("n_block_size must be a multiple of 16.")
-    if L % requested == 0:
+    if chunk_size % requested == 0:
         return requested
-    limit = min(L, requested)
+    limit = min(chunk_size, requested)
     candidate = limit - (limit % 16)
     while candidate >= 16:
-        if L % candidate == 0:
+        if chunk_size % candidate == 0:
             return candidate
         candidate -= 16
     raise ValueError(
-        f"No valid n_block_size multiple of 16 divides chunk_size={L} "
+        f"No valid n_block_size multiple of 16 divides chunk_size={chunk_size} "
         f"for requested n_block_size={requested}."
     )
 
 
-def _iter_chunk_scan_n_block_candidates(L: int, requested: int):
-    candidate = _resolve_chunk_scan_n_block_size(L, requested)
+def _iter_chunk_scan_n_block_candidates(chunk_size: int, requested: int):
+    candidate = _resolve_chunk_scan_n_block_size(chunk_size, requested)
     while candidate >= 16:
-        if L % candidate == 0:
+        if chunk_size % candidate == 0:
             yield candidate
         candidate -= 16
 
 
-def _chunk_scan_supported_tile_families(L: int) -> tuple[tuple[int, int], ...]:
+def _chunk_scan_supported_tile_families(
+    chunk_size: int,
+) -> tuple[tuple[int, int], ...]:
     return tuple(
         (m_block_size, num_threads)
         for m_block_size, num_threads in ChunkScanFwdAmpere._SUPPORTED_TILE_FAMILIES
-        if m_block_size <= L
+        if m_block_size <= chunk_size
     )
 
 
@@ -280,7 +423,7 @@ def _resolve_chunk_scan_launch_cfg(
     *,
     D: int,
     P: int,
-    L: int,
+    chunk_size: int,
     tc_dtype: torch.dtype,
     output_dtype: torch.dtype,
     device_index: int,
@@ -288,10 +431,10 @@ def _resolve_chunk_scan_launch_cfg(
     requested_n_block_size: int,
     requested_num_threads: int,
 ) -> tuple[int, int, int]:
-    supported_families = _chunk_scan_supported_tile_families(L)
+    supported_families = _chunk_scan_supported_tile_families(chunk_size)
     if not supported_families:
         raise ValueError(
-            f"chunk_size={L} is too small for the CuTe chunk_scan tile families; "
+            f"chunk_size={chunk_size} is too small for the CuTe chunk_scan tile families; "
             "supported chunk sizes must be at least 16."
         )
 
@@ -311,7 +454,7 @@ def _resolve_chunk_scan_launch_cfg(
                 str(m_block_size) for m_block_size, _ in supported_families
             )
             raise ValueError(
-                f"Unsupported chunk_scan m_block_size={resolved_m_block_size} for chunk_size={L}. "
+                f"Unsupported chunk_scan m_block_size={resolved_m_block_size} for chunk_size={chunk_size}. "
                 f"Supported tile families use m_block_size in {{{supported_m}}}."
             )
 
@@ -337,7 +480,7 @@ def _resolve_chunk_scan_launch_cfg(
                 )
                 raise ValueError(
                     f"Unsupported chunk_scan num_threads={requested_num_threads} for "
-                    f"chunk_size={L}. Supported tile families use num_threads in "
+                    f"chunk_size={chunk_size}. Supported tile families use num_threads in "
                     f"{{{supported_threads}}}."
                 )
 
@@ -346,12 +489,12 @@ def _resolve_chunk_scan_launch_cfg(
     attempts: list[str] = []
     for m_block_size, num_threads in candidate_families:
         for n_block_size in _iter_chunk_scan_n_block_candidates(
-            L, requested_n_block_size
+            chunk_size, requested_n_block_size
         ):
             kernel = ChunkScanFwdAmpere(
                 D=D,
                 P=P,
-                L=L,
+                L=chunk_size,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 num_threads=num_threads,
@@ -374,7 +517,7 @@ def _resolve_chunk_scan_launch_cfg(
         attempt_summary += f"; ... {len(attempts) - 4} more"
     raise ValueError(
         f"No supported chunk_scan tile family fits {device_label} for "
-        f"(chunk_size={L}, D={D}, P={P}). Tried: {attempt_summary}"
+        f"(chunk_size={chunk_size}, D={D}, P={P}). Tried: {attempt_summary}"
     )
 
 
@@ -402,24 +545,79 @@ def _make_tensor_spec(
     return shape, stride
 
 
-def _make_static_tensor_view(
+def _make_static_tensor_spec_view(
     tensor: cute.Tensor,
-    spec: tuple[tuple[int, ...], tuple[int, ...]],
+    tensor_spec: tuple[tuple[int, ...], tuple[int, ...]],
 ) -> cute.Tensor:
-    shape, stride = spec
+    shape, stride = tensor_spec
     return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=stride))
 
 
-def _make_runtime_tensor_view(
-    tensor: torch.Tensor,
-    spec: tuple[tuple[int, ...], tuple[int, ...]],
-) -> torch.Tensor:
-    shape, stride = spec
-    return torch.as_strided(tensor, size=shape, stride=stride)
+def _make_runtime_tensor_views_from_specs(
+    *tensor_specs: tuple[torch.Tensor, tuple[tuple[int, ...], tuple[int, ...]]],
+) -> tuple[torch.Tensor, ...]:
+    return tuple(
+        make_runtime_tensor_spec_view(tensor, spec) for tensor, spec in tensor_specs
+    )
+
+
+def _make_tvm_ffi_runtime_and_compile_args_from_specs(
+    *tensor_specs: tuple[
+        torch.Tensor,
+        torch.dtype,
+        tuple[tuple[int, ...], tuple[int, ...]],
+    ],
+) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...], tuple[object, ...]]:
+    runtime_args = _make_runtime_tensor_views_from_specs(
+        *((tensor, spec) for tensor, _dtype, spec in tensor_specs)
+    )
+    alignments = tuple(_assumed_align(tensor) for tensor in runtime_args)
+    _, compile_args = _make_tvm_ffi_compile_args_from_specs(
+        *(
+            (dtype, spec, align)
+            for (_tensor, dtype, spec), align in zip(
+                tensor_specs, alignments, strict=True
+            )
+        )
+    )
+    return runtime_args, alignments, compile_args
+
+
+def _make_tvm_ffi_compile_args(
+    runtime_args: tuple[torch.Tensor, ...],
+    *,
+    alignments: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], tuple[object, ...]]:
+    resolved_alignments = (
+        tuple(_assumed_align(tensor) for tensor in runtime_args)
+        if alignments is None
+        else tuple(int(align) for align in alignments)
+    )
+    compile_args = tuple(
+        _make_fake_tensor_arg(tensor, align=align)
+        for tensor, align in zip(runtime_args, resolved_alignments, strict=True)
+    ) + (_compile_env_stream_placeholder(),)
+    return resolved_alignments, compile_args
+
+
+def _make_tvm_ffi_compile_args_from_specs(
+    *tensor_specs: tuple[torch.dtype, tuple[tuple[int, ...], tuple[int, ...]], int],
+) -> tuple[tuple[int, ...], tuple[object, ...]]:
+    alignments = tuple(int(align) for _, _, align in tensor_specs)
+    compile_args = tuple(
+        _make_fake_tensor_spec_arg(
+            dtype=dtype,
+            shape=spec[0],
+            stride=spec[1],
+            align=align,
+        )
+        for dtype, spec, align in tensor_specs
+    ) + (_compile_env_stream_placeholder(),)
+    return alignments, compile_args
 
 
 def _chunk_increment_tensor_specs(
-    spec: tuple[int, ...],
+    problem_shape: tuple[int, ...],
 ) -> tuple[
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
@@ -430,39 +628,58 @@ def _chunk_increment_tensor_specs(
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
 ]:
-    Bsz, H, T_pad, P, D, n_chunks, _L = spec
-    BH = Bsz * H
-    BHC = BH * n_chunks
+    batch_size, heads, padded_time, P, D, n_chunks, _chunk_size = problem_shape
+    batch_head_count = batch_size * heads
+    batch_head_chunk_count = batch_head_count * n_chunks
     return (
-        _make_tensor_spec((P, T_pad, BH), stride=(1, P, T_pad * P)),
-        _make_tensor_spec((D, T_pad, BH), stride=(1, D, T_pad * D)),
-        _make_tensor_spec((2, T_pad, BH), stride=(1, 2, T_pad * 2)),
-        _make_tensor_spec((2, T_pad, BH), stride=(1, 4, T_pad * 4)),
-        _make_tensor_spec((P, BH), stride=(1, P)),
-        _make_tensor_spec((D, BH), stride=(1, D)),
-        _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D)),
-        _make_tensor_spec((2, BHC), stride=(1, 2)),
+        _make_tensor_spec(
+            (P, padded_time, batch_head_count),
+            stride=(1, P, padded_time * P),
+        ),
+        _make_tensor_spec(
+            (D, padded_time, batch_head_count),
+            stride=(1, D, padded_time * D),
+        ),
+        _make_tensor_spec(
+            (2, padded_time, batch_head_count),
+            stride=(1, 2, padded_time * 2),
+        ),
+        _make_tensor_spec(
+            (2, padded_time, batch_head_count),
+            stride=(1, 4, padded_time * 4),
+        ),
+        _make_tensor_spec((P, batch_head_count), stride=(1, P)),
+        _make_tensor_spec((D, batch_head_count), stride=(1, D)),
+        _make_tensor_spec((P, D, batch_head_chunk_count), stride=(D, 1, P * D)),
+        _make_tensor_spec((2, batch_head_chunk_count), stride=(1, 2)),
     )
 
 
-def _resolve_chunk_increment_problem_spec(
+def _resolve_chunk_increment_problem_shape(
     *,
     U: torch.Tensor,
     B: torch.Tensor,
-    U_tc: torch.Tensor,
+    padded_time: int,
     chunk_size: int,
 ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
-    Bsz, H, _T, P = map(int, U.shape)
+    batch_size, heads, _time_steps, P = map(int, U.shape)
     D = int(B.shape[-1])
-    L = int(chunk_size)
-    T_pad = int(U_tc.shape[2])
-    n_chunks = T_pad // L
-    problem_spec = (Bsz, H, T_pad, P, D, n_chunks, L)
+    resolved_chunk_size = int(chunk_size)
+    n_chunks = int(padded_time) // resolved_chunk_size
+    problem_shape = (
+        batch_size,
+        heads,
+        int(padded_time),
+        P,
+        D,
+        n_chunks,
+        resolved_chunk_size,
+    )
     cta_tiler = _resolve_chunk_increment_cta_tiler(D=D)
-    return problem_spec, cta_tiler
+    return problem_shape, cta_tiler
 
 
-def _make_chunk_increment_launch_artifacts(
+def _make_chunk_increment_runtime_artifacts(
     *,
     U: torch.Tensor,
     M: torch.Tensor,
@@ -472,26 +689,21 @@ def _make_chunk_increment_launch_artifacts(
     B_tc: torch.Tensor,
     M_f: torch.Tensor,
     K_f: torch.Tensor,
-    U_prev0: torch.Tensor,
-    B_prev0: torch.Tensor,
+    U_prev_state: torch.Tensor,
+    B_prev_state: torch.Tensor,
     inc_chunk: torch.Tensor,
-    m_chunk_tile: torch.Tensor,
+    chunk_multiplier_storage: torch.Tensor,
     chunk_size: int,
     compute_dtype: torch.dtype | None,
     has_prev: bool,
-) -> tuple[
-    tuple[int, ...],
-    tuple[int, int, int],
-    tuple[object, ...],
-    tuple[object, ...],
-    tuple[object, ...],
-]:
-    problem_spec, cta_tiler = _resolve_chunk_increment_problem_spec(
+) -> ChunkIncrementRuntimeArtifacts:
+    problem_shape, cta_tiler = _resolve_chunk_increment_problem_shape(
         U=U,
         B=B,
-        U_tc=U_tc,
+        padded_time=int(U_tc.shape[2]),
         chunk_size=chunk_size,
     )
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     (
         u_spec,
         b_spec,
@@ -501,81 +713,107 @@ def _make_chunk_increment_launch_artifacts(
         b_prev_spec,
         inc_spec,
         m_chunk_spec,
-    ) = _chunk_increment_tensor_specs(problem_spec)
-    alignments = (
-        _assumed_align(U_tc),
-        _assumed_align(B_tc),
-        _assumed_align(M_f),
-        _assumed_align(K_f),
-        _assumed_align(U_prev0),
-        _assumed_align(B_prev0),
-        _assumed_align(inc_chunk),
-        _assumed_align(m_chunk_tile),
-    )
-    compile_args = (
-        _make_fake_tensor_arg(
-            U_tc, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
-        ),
-        _make_fake_tensor_arg(
-            B_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
-        ),
-        _make_fake_tensor_arg(
-            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[2]
-        ),
-        _make_fake_tensor_arg(
-            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[3]
-        ),
-        _make_fake_tensor_arg(
-            U_prev0, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[4]
-        ),
-        _make_fake_tensor_arg(
-            B_prev0, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[5]
-        ),
-        _make_fake_tensor_arg(
-            inc_chunk, shape=inc_spec[0], stride=inc_spec[1], align=alignments[6]
-        ),
-        _make_fake_tensor_arg(
-            m_chunk_tile,
-            shape=m_chunk_spec[0],
-            stride=m_chunk_spec[1],
-            align=alignments[7],
-        ),
-        _compile_env_stream_placeholder(),
-    )
-    runtime_args = (
-        _make_runtime_tensor_view(U_tc, u_spec),
-        _make_runtime_tensor_view(B_tc, b_spec),
-        _make_runtime_tensor_view(M_f, m_spec),
-        _make_runtime_tensor_view(K_f, k_spec),
-        _make_runtime_tensor_view(U_prev0, u_prev_spec),
-        _make_runtime_tensor_view(B_prev0, b_prev_spec),
-        _make_runtime_tensor_view(inc_chunk, inc_spec),
-        _make_runtime_tensor_view(m_chunk_tile, m_chunk_spec),
+    ) = _chunk_increment_tensor_specs(problem_shape)
+    runtime_args, alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (U_tc, tc_dtype, u_spec),
+            (B_tc, tc_dtype, b_spec),
+            (M_f, torch.float32, m_spec),
+            (K_f, torch.float32, k_spec),
+            (U_prev_state, tc_dtype, u_prev_spec),
+            (B_prev_state, tc_dtype, b_prev_spec),
+            (inc_chunk, torch.float32, inc_spec),
+            (chunk_multiplier_storage, torch.float32, m_chunk_spec),
+        )
     )
     cache_key = _chunk_increment_key(
         device_index=(U.device.index if U.device.index is not None else -1),
-        tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
-        U_shape=tuple(U.shape),
-        M_shape=tuple(M.shape),
-        K_shape=tuple(K.shape),
-        B_shape=tuple(B.shape),
-        chunk_size=problem_spec[-1],
+        tc_dtype=tc_dtype,
+        problem_shape=problem_shape,
         has_prev=has_prev,
         cta_tiler=cta_tiler,
         alignments=alignments,
     )
-    return problem_spec, cta_tiler, compile_args, runtime_args, cache_key
+    return ChunkIncrementRuntimeArtifacts(
+        problem_shape=problem_shape,
+        cta_tiler=cta_tiler,
+        compile_args=compile_args,
+        runtime_args=runtime_args,
+        cache_key=cache_key,
+        outputs=ChunkIncrementOutputs(
+            increment_chunk=inc_chunk,
+            chunk_multiplier_storage=chunk_multiplier_storage,
+        ),
+    )
+
+
+def _make_chunk_increment_compile_artifacts(
+    U: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    has_prev: bool,
+) -> ChunkIncrementCompileArtifacts:
+    batch_size, heads, time_steps, P = map(int, U.shape)
+    resolved_chunk_size = int(chunk_size)
+    n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
+    padded_time = n_chunks * resolved_chunk_size
+    problem_shape, cta_tiler = _resolve_chunk_increment_problem_shape(
+        U=U,
+        B=B,
+        padded_time=padded_time,
+        chunk_size=resolved_chunk_size,
+    )
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    (
+        u_spec,
+        b_spec,
+        m_spec,
+        k_spec,
+        u_prev_spec,
+        b_prev_spec,
+        increment_spec,
+        chunk_multiplier_spec,
+    ) = _chunk_increment_tensor_specs(problem_shape)
+    tc_align = _compile_min_align_for_dtype(tc_dtype)
+    fp32_align = _compile_min_align_for_dtype(torch.float32)
+    alignments, compile_args = _make_tvm_ffi_compile_args_from_specs(
+        (tc_dtype, u_spec, tc_align),
+        (tc_dtype, b_spec, tc_align),
+        (torch.float32, m_spec, fp32_align),
+        (torch.float32, k_spec, fp32_align),
+        (tc_dtype, u_prev_spec, tc_align),
+        (tc_dtype, b_prev_spec, tc_align),
+        (torch.float32, increment_spec, fp32_align),
+        (torch.float32, chunk_multiplier_spec, fp32_align),
+    )
+    cache_key = _chunk_increment_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=tc_dtype,
+        problem_shape=problem_shape,
+        has_prev=has_prev,
+        cta_tiler=cta_tiler,
+        alignments=alignments,
+    )
+    return ChunkIncrementCompileArtifacts(
+        problem_shape=problem_shape,
+        cta_tiler=cta_tiler,
+        compile_args=compile_args,
+        alignments=alignments,
+        cache_key=cache_key,
+    )
 
 
 def _state_passing_tensor_specs(
-    spec: tuple[int, ...],
+    problem_shape: tuple[int, ...],
 ) -> tuple[
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
 ]:
-    B, H, C, P, D = spec
+    B, H, C, P, D = problem_shape
     return (
         _make_tensor_spec((B, H, C, P, D)),
         _make_tensor_spec((B, H, C, 2)),
@@ -585,7 +823,7 @@ def _state_passing_tensor_specs(
 
 
 def _chunk_scan_tensor_specs(
-    spec: tuple[int, ...],
+    problem_shape: tuple[int, ...],
 ) -> tuple[
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
@@ -596,55 +834,86 @@ def _chunk_scan_tensor_specs(
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
 ]:
-    Bsz, H, _T_pad, P, D, n_chunks, L = spec
-    BH = Bsz * H
-    BHC = BH * n_chunks
+    batch_size, heads, _padded_time, P, D, n_chunks, chunk_size = problem_shape
+    batch_head_count = batch_size * heads
+    batch_head_chunk_count = batch_head_count * n_chunks
     return (
-        _make_tensor_spec((BHC, L, 1, P)),
-        _make_tensor_spec((BHC, L, 1, D)),
-        _make_tensor_spec((BHC, L, 2)),
-        _make_tensor_spec((BHC, L, 2, 2)),
-        _make_tensor_spec((BHC, P, 1, D)),
-        _make_tensor_spec((BH, P)),
-        _make_tensor_spec((BH, D)),
-        _make_tensor_spec((BHC, L, 1, P)),
+        _make_tensor_spec((batch_head_chunk_count, chunk_size, 1, P)),
+        _make_tensor_spec((batch_head_chunk_count, chunk_size, 1, D)),
+        _make_tensor_spec((batch_head_chunk_count, chunk_size, 2)),
+        _make_tensor_spec((batch_head_chunk_count, chunk_size, 2, 2)),
+        _make_tensor_spec((batch_head_chunk_count, P, 1, D)),
+        _make_tensor_spec((batch_head_count, P)),
+        _make_tensor_spec((batch_head_count, D)),
+        _make_tensor_spec((batch_head_chunk_count, chunk_size, 1, P)),
     )
+
+
+def _compile_min_align_for_dtype(dtype: torch.dtype) -> int:
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return 16
+    return max(4, torch.empty((), dtype=dtype).element_size())
+
+
+def _choose_copy_bits_for_linear_tiles_from_properties(
+    *,
+    dtype: torch.dtype,
+    assumed_align: int,
+    tile_stride_elems: int,
+    elems_per_thread: int,
+    candidates_bits: tuple[int, ...] = (128, 64, 32),
+) -> int:
+    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    elem_bits = elem_bytes * 8
+    stride_bytes = int(tile_stride_elems) * elem_bytes
+    best = elem_bits
+    for bits in candidates_bits:
+        if bits < elem_bits or bits % elem_bits != 0:
+            continue
+        vec_elems = bits // elem_bits
+        if int(elems_per_thread) % vec_elems != 0:
+            continue
+        align = bits // 8
+        if int(assumed_align) >= align and stride_bytes % align == 0:
+            best = bits
+            break
+    return best
 
 
 def _prepare_time_operand(
     tensor: torch.Tensor,
     *,
-    T_pad: int,
+    padded_time: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     if (
         tensor.dtype == dtype
-        and int(tensor.shape[2]) == T_pad
+        and int(tensor.shape[2]) == padded_time
         and tensor.is_contiguous()
     ):
         tensor = tensor
     else:
-        tensor = _pad_zero_time(tensor, T_pad=T_pad, dtype=dtype)
+        tensor = _pad_zero_time(tensor, T_pad=padded_time, dtype=dtype)
     if tensor.dtype in (torch.float16, torch.bfloat16):
         tensor = _ensure_min_alignment(tensor, min_align=16)
     return tensor
 
 
-def _prepare_m_operand(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
-    if int(M.shape[2]) == T_pad and M.dtype == torch.float32 and M.is_contiguous():
+def _prepare_m_operand(M: torch.Tensor, *, padded_time: int) -> torch.Tensor:
+    if (
+        int(M.shape[2]) == padded_time
+        and M.dtype == torch.float32
+        and M.is_contiguous()
+    ):
         return M
-    return _pad_m_identity(M, T_pad=T_pad)
+    return _pad_m_identity(M, T_pad=padded_time)
 
 
 def _chunk_increment_key(
     *,
     device_index: int,
     tc_dtype: torch.dtype,
-    U_shape: tuple[int, ...],
-    M_shape: tuple[int, ...],
-    K_shape: tuple[int, ...],
-    B_shape: tuple[int, ...],
-    chunk_size: int,
+    problem_shape: tuple[int, ...],
     has_prev: bool,
     cta_tiler: tuple[int, int, int],
     alignments: tuple[int, ...],
@@ -653,11 +922,7 @@ def _chunk_increment_key(
         "chunk_increment_fwd",
         device_index,
         tc_dtype,
-        U_shape,
-        M_shape,
-        K_shape,
-        B_shape,
-        int(chunk_size),
+        tuple(int(dim) for dim in problem_shape),
         has_prev,
         tuple(int(dim) for dim in cta_tiler),
         alignments,
@@ -667,29 +932,15 @@ def _chunk_increment_key(
 def _state_passing_key(
     *,
     device_index: int,
-    inc_shape: tuple[int, ...],
-    m_chunk_shape: tuple[int, ...],
-    initial_shape: tuple[int, ...] | None,
-    num_threads: int,
-    vecs_per_thread: int,
-    copy_bits_in: int,
-    copy_bits_out: int,
-    copy_bits_state_in: int,
-    copy_bits_state_out: int,
+    problem_shape: tuple[int, ...],
+    launch_cfg: tuple[int, int, int, int, int, int, bool],
     alignments: tuple[int, ...],
 ) -> tuple:
     return (
         "state_passing_fwd",
         device_index,
-        inc_shape,
-        m_chunk_shape,
-        initial_shape,
-        int(num_threads),
-        int(vecs_per_thread),
-        int(copy_bits_in),
-        int(copy_bits_out),
-        int(copy_bits_state_in),
-        int(copy_bits_state_out),
+        tuple(int(dim) for dim in problem_shape),
+        tuple(bool(dim) if isinstance(dim, bool) else int(dim) for dim in launch_cfg),
         alignments,
     )
 
@@ -715,7 +966,7 @@ def _make_state_passing_cfg(
     )
 
 
-def _make_state_passing_launch_artifacts(
+def _make_state_passing_runtime_artifacts(
     *,
     increment: torch.Tensor,
     chunk_multiplier: torch.Tensor,
@@ -725,21 +976,15 @@ def _make_state_passing_launch_artifacts(
     has_init: bool,
     num_threads: int,
     vecs_per_thread: int,
-) -> tuple[
-    tuple[int, ...],
-    tuple[int, int, int, int, int, int, bool],
-    tuple[object, ...],
-    tuple[object, ...],
-    tuple,
-]:
+) -> StatePassingRuntimeArtifacts:
     B, H, C, P, D = map(int, increment.shape)
-    problem_spec = (B, H, C, P, D)
+    problem_shape = (B, H, C, P, D)
     (
         increment_spec,
         chunk_multiplier_spec,
         chunk_starts_spec,
         final_state_spec,
-    ) = _state_passing_tensor_specs(problem_spec)
+    ) = _state_passing_tensor_specs(problem_shape)
 
     state_elem_count = P * D
     elems_per_thread = 2 * int(vecs_per_thread)
@@ -755,7 +1000,7 @@ def _make_state_passing_launch_artifacts(
     )
     copy_bits_state_in = 32
     copy_bits_state_out = 32
-    kernel_cfg = _make_state_passing_cfg(
+    launch_cfg = _make_state_passing_cfg(
         num_threads=num_threads,
         vecs_per_thread=vecs_per_thread,
         copy_bits_in=copy_bits_in,
@@ -765,69 +1010,100 @@ def _make_state_passing_launch_artifacts(
         has_init=has_init,
     )
 
-    alignments = (
-        _assumed_align(increment),
-        _assumed_align(chunk_multiplier),
-        _assumed_align(chunk_starts),
-        _assumed_align(final_state),
-        _assumed_align(initial_state_arg),
-    )
-    runtime_args = (
-        _make_runtime_tensor_view(increment, increment_spec),
-        _make_runtime_tensor_view(chunk_multiplier, chunk_multiplier_spec),
-        _make_runtime_tensor_view(chunk_starts, chunk_starts_spec),
-        _make_runtime_tensor_view(final_state, final_state_spec),
-        _make_runtime_tensor_view(initial_state_arg, final_state_spec),
-    )
-    compile_args = (
-        _make_fake_tensor_arg(
-            increment,
-            shape=increment_spec[0],
-            stride=increment_spec[1],
-            align=alignments[0],
-        ),
-        _make_fake_tensor_arg(
-            chunk_multiplier,
-            shape=chunk_multiplier_spec[0],
-            stride=chunk_multiplier_spec[1],
-            align=alignments[1],
-        ),
-        _make_fake_tensor_arg(
-            chunk_starts,
-            shape=chunk_starts_spec[0],
-            stride=chunk_starts_spec[1],
-            align=alignments[2],
-        ),
-        _make_fake_tensor_arg(
-            final_state,
-            shape=final_state_spec[0],
-            stride=final_state_spec[1],
-            align=alignments[3],
-        ),
-        _make_fake_tensor_arg(
-            initial_state_arg,
-            shape=final_state_spec[0],
-            stride=final_state_spec[1],
-            align=alignments[4],
-        ),
-        _compile_env_stream_placeholder(),
+    runtime_args, alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (increment, torch.float32, increment_spec),
+            (chunk_multiplier, torch.float32, chunk_multiplier_spec),
+            (chunk_starts, torch.float32, chunk_starts_spec),
+            (final_state, torch.float32, final_state_spec),
+            (initial_state_arg, torch.float32, final_state_spec),
+        )
     )
     cache_key = _state_passing_key(
         device_index=(
             increment.device.index if increment.device.index is not None else -1
         ),
-        inc_shape=tuple(increment.shape),
-        m_chunk_shape=tuple(chunk_multiplier.shape),
-        initial_shape=(tuple(initial_state_arg.shape) if has_init else None),
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
+        alignments=alignments,
+    )
+    return StatePassingRuntimeArtifacts(
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
+        compile_args=compile_args,
+        runtime_args=runtime_args,
+        cache_key=cache_key,
+        outputs=StatePassingOutputs(
+            chunk_starts=chunk_starts,
+            final_state=final_state,
+        ),
+    )
+
+
+def _make_state_passing_compile_artifacts(
+    increment: torch.Tensor,
+    chunk_multiplier: torch.Tensor,
+    *,
+    has_init: bool,
+    num_threads: int,
+    vecs_per_thread: int,
+) -> StatePassingCompileArtifacts:
+    B, H, C, P, D = map(int, increment.shape)
+    problem_shape = (B, H, C, P, D)
+    (
+        increment_spec,
+        chunk_multiplier_spec,
+        chunk_starts_spec,
+        final_state_spec,
+    ) = _state_passing_tensor_specs(problem_shape)
+    state_elem_count = P * D
+    elems_per_thread = 2 * int(vecs_per_thread)
+    fp32_align = _compile_min_align_for_dtype(torch.float32)
+    copy_bits_in = _choose_copy_bits_for_linear_tiles_from_properties(
+        dtype=torch.float32,
+        assumed_align=fp32_align,
+        tile_stride_elems=state_elem_count,
+        elems_per_thread=elems_per_thread,
+    )
+    copy_bits_out = _choose_copy_bits_for_linear_tiles_from_properties(
+        dtype=torch.float32,
+        assumed_align=fp32_align,
+        tile_stride_elems=state_elem_count,
+        elems_per_thread=elems_per_thread,
+    )
+    copy_bits_state_in = 32
+    copy_bits_state_out = 32
+    launch_cfg = _make_state_passing_cfg(
         num_threads=num_threads,
         vecs_per_thread=vecs_per_thread,
         copy_bits_in=copy_bits_in,
         copy_bits_out=copy_bits_out,
         copy_bits_state_in=copy_bits_state_in,
         copy_bits_state_out=copy_bits_state_out,
+        has_init=has_init,
+    )
+    alignments, compile_args = _make_tvm_ffi_compile_args_from_specs(
+        (torch.float32, increment_spec, fp32_align),
+        (torch.float32, chunk_multiplier_spec, fp32_align),
+        (torch.float32, chunk_starts_spec, fp32_align),
+        (torch.float32, final_state_spec, fp32_align),
+        (torch.float32, final_state_spec, fp32_align),
+    )
+    cache_key = _state_passing_key(
+        device_index=(
+            increment.device.index if increment.device.index is not None else -1
+        ),
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
         alignments=alignments,
     )
-    return problem_spec, kernel_cfg, compile_args, runtime_args, cache_key
+    return StatePassingCompileArtifacts(
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
+        compile_args=compile_args,
+        alignments=alignments,
+        cache_key=cache_key,
+    )
 
 
 def _chunk_scan_key(
@@ -835,13 +1111,7 @@ def _chunk_scan_key(
     device_index: int,
     tc_dtype: torch.dtype,
     out_dtype: torch.dtype,
-    U_shape: tuple[int, ...],
-    M_shape: tuple[int, ...],
-    K_shape: tuple[int, ...],
-    B_shape: tuple[int, ...],
-    C_shape: tuple[int, ...],
-    chunk_starts_shape: tuple[int, ...],
-    chunk_size: int,
+    problem_shape: tuple[int, ...],
     m_block_size: int,
     n_block_size: int,
     num_threads: int,
@@ -853,17 +1123,31 @@ def _chunk_scan_key(
         device_index,
         tc_dtype,
         out_dtype,
-        U_shape,
-        M_shape,
-        K_shape,
-        B_shape,
-        C_shape,
-        chunk_starts_shape,
-        int(chunk_size),
+        tuple(int(dim) for dim in problem_shape),
         int(m_block_size),
         int(n_block_size),
         int(num_threads),
         has_prev,
+        alignments,
+    )
+
+
+def _fwd_host_cache_key(
+    *,
+    device_index: int,
+    tc_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    problem_shape: tuple[int, ...],
+    launch_cfg: tuple[int, ...],
+    alignments: tuple[int, ...],
+) -> tuple:
+    return (
+        "v2x2ssd_fwd",
+        device_index,
+        tc_dtype,
+        out_dtype,
+        tuple(int(dim) for dim in problem_shape),
+        tuple(bool(dim) if isinstance(dim, bool) else int(dim) for dim in launch_cfg),
         alignments,
     )
 
@@ -877,13 +1161,147 @@ def _resolve_chunk_increment_cta_tiler(*, D: int) -> tuple[int, int, int]:
     return (64, 64, 32)
 
 
+def _validate_chunk_increment_inputs(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    U_prev: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+) -> tuple[int, int, int, int, int]:
+    if (U_prev is None) ^ (B_prev is None):
+        raise ValueError("U_prev and B_prev must be passed together (or both omitted).")
+    if U.device.type != "cuda":
+        raise ValueError("CUDA tensor required.")
+    if U.dtype != B.dtype:
+        raise ValueError("U and B must share dtype.")
+    if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("U/B must be float16/bfloat16/float32.")
+    if M.dtype != torch.float32 or K.dtype != torch.float32:
+        raise TypeError("M and K must be float32.")
+
+    batch_size, heads, time_steps, P = map(int, U.shape)
+    D = int(B.shape[-1])
+    if B.shape != (batch_size, heads, time_steps, D):
+        raise ValueError("B must be (B,H,T,D) matching U.")
+    if M.shape != (batch_size, heads, time_steps, 2):
+        raise ValueError(f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}.")
+    if K.shape != (batch_size, heads, time_steps, 2, 2):
+        raise ValueError(
+            f"K must be (B,H,T,2,2)={(batch_size, heads, time_steps, 2, 2)}."
+        )
+    if D % 2 != 0:
+        raise ValueError("B last dim must be divisible by 2.")
+    if U_prev is not None and (
+        U_prev.shape != (batch_size, heads, P) or B_prev.shape != (batch_size, heads, D)
+    ):
+        raise ValueError("U_prev/B_prev must be (B,H,P)/(B,H,D).")
+    return batch_size, heads, time_steps, P, D
+
+
+def _validate_state_passing_inputs(
+    increment: torch.Tensor,
+    chunk_multiplier: torch.Tensor,
+    *,
+    initial_states: torch.Tensor | None,
+) -> tuple[int, int, int, int, int]:
+    if increment.ndim != 5:
+        raise ValueError(
+            f"increment must be (B,H,C,P,D). Got {tuple(increment.shape)}."
+        )
+    if chunk_multiplier.ndim != 4 or chunk_multiplier.shape[-1] != 2:
+        raise ValueError(
+            f"chunk_multiplier must be (B,H,C,2). Got {tuple(chunk_multiplier.shape)}."
+        )
+    if increment.device.type != "cuda":
+        raise ValueError("CUDA tensor required.")
+    if increment.dtype != torch.float32 or chunk_multiplier.dtype != torch.float32:
+        raise TypeError(
+            "increment and chunk_multiplier must be float32 at the stage boundary."
+        )
+
+    B, H, C, P, D = map(int, increment.shape)
+    if D % 2 != 0:
+        raise ValueError("increment last dim must be divisible by 2.")
+    if tuple(chunk_multiplier.shape[:3]) != (B, H, C):
+        raise ValueError("chunk_multiplier leading dims must match increment.")
+    if initial_states is not None:
+        if tuple(initial_states.shape) != (B, H, P, D):
+            raise ValueError("initial_states must be (B,H,P,D) and match increment.")
+        if initial_states.dtype != torch.float32:
+            raise TypeError("initial_states must be float32.")
+    return B, H, C, P, D
+
+
+def _validate_chunk_scan_inputs(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    *,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+    chunk_size: int,
+    output_dtype: torch.dtype,
+) -> tuple[int, int, int, int, int, int]:
+    if (B_prev is None) ^ (U_prev is None):
+        raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
+    if U.device.type != "cuda":
+        raise ValueError("CUDA tensor required.")
+    if U.dtype != B.dtype or U.dtype != C.dtype:
+        raise ValueError("U/B/C must share dtype.")
+    if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("U/B/C must be float16/bfloat16/float32.")
+    if M.dtype != torch.float32 or K.dtype != torch.float32:
+        raise TypeError("M and K must be float32.")
+    if chunk_starts.dtype != torch.float32:
+        raise TypeError("chunk_starts must be float32.")
+    if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("output_dtype must be float16/bfloat16/float32.")
+
+    batch_size, heads, time_steps, P = map(int, U.shape)
+    D = int(B.shape[-1])
+    if B.shape != (batch_size, heads, time_steps, D) or C.shape != (
+        batch_size,
+        heads,
+        time_steps,
+        D,
+    ):
+        raise ValueError("B/C must be (B,H,T,D) matching U.")
+    if M.shape != (batch_size, heads, time_steps, 2):
+        raise ValueError(f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}.")
+    if K.shape != (batch_size, heads, time_steps, 2, 2):
+        raise ValueError(
+            f"K must be (B,H,T,2,2)={(batch_size, heads, time_steps, 2, 2)}."
+        )
+    if D % 2 != 0:
+        raise ValueError("B/C last dim must be divisible by 2.")
+
+    resolved_chunk_size = int(chunk_size)
+    if resolved_chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
+    if tuple(chunk_starts.shape) != (batch_size, heads, n_chunks, P, D):
+        raise ValueError(
+            f"chunk_starts must be (B,H,C,P,D) ={(batch_size, heads, n_chunks, P, D)}."
+        )
+    if B_prev is not None and (
+        B_prev.shape != (batch_size, heads, D) or U_prev.shape != (batch_size, heads, P)
+    ):
+        raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+    return batch_size, heads, time_steps, P, D, n_chunks
+
+
 def _make_chunk_scan_host_wrapper(
     *,
-    spec: tuple[int, ...],
-    cfg: tuple[int, ...],
+    problem_shape: tuple[int, ...],
+    launch_cfg: tuple[int, ...],
 ):
-    Bsz, H, T_pad, P, D, n_chunks, L = spec
-    m_block_size, n_block_size, num_threads = cfg
+    batch_size, heads, padded_time, P, D, n_chunks, chunk_size = problem_shape
+    m_block_size, n_block_size, num_threads = launch_cfg
 
     @cute.jit
     def _chunk_scan_host_wrapper(
@@ -893,28 +1311,30 @@ def _make_chunk_scan_host_wrapper(
         M_t: cute.Tensor,
         K_t: cute.Tensor,
         Z0_t: cute.Tensor,
-        U_prev0_t: cute.Tensor,
-        B_prev0_t: cute.Tensor,
+        U_prev_t: cute.Tensor,
+        B_prev_t: cute.Tensor,
         Out_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
         u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
-            _chunk_scan_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
+            _chunk_scan_tensor_specs(
+                (batch_size, heads, padded_time, P, D, n_chunks, chunk_size)
+            )
         )
-        mU = _make_static_tensor_view(U_t, u_spec)
-        mB = _make_static_tensor_view(B_t, b_spec)
-        mC = _make_static_tensor_view(C_t, b_spec)
-        mM = _make_static_tensor_view(M_t, m_spec)
-        mK = _make_static_tensor_view(K_t, k_spec)
-        mZ0 = _make_static_tensor_view(Z0_t, z0_spec)
-        mU_prev0 = _make_static_tensor_view(U_prev0_t, u_prev_spec)
-        mB_prev0 = _make_static_tensor_view(B_prev0_t, b_prev_spec)
-        mOut = _make_static_tensor_view(Out_t, out_spec)
+        mU = _make_static_tensor_spec_view(U_t, u_spec)
+        mB = _make_static_tensor_spec_view(B_t, b_spec)
+        mC = _make_static_tensor_spec_view(C_t, b_spec)
+        mM = _make_static_tensor_spec_view(M_t, m_spec)
+        mK = _make_static_tensor_spec_view(K_t, k_spec)
+        mZ0 = _make_static_tensor_spec_view(Z0_t, z0_spec)
+        mU_prev0 = _make_static_tensor_spec_view(U_prev_t, u_prev_spec)
+        mB_prev0 = _make_static_tensor_spec_view(B_prev_t, b_prev_spec)
+        mOut = _make_static_tensor_spec_view(Out_t, out_spec)
 
         chunk_scan = ChunkScanFwdAmpere(
             D=D,
             P=P,
-            L=L,
+            L=chunk_size,
             m_block_size=m_block_size,
             n_block_size=n_block_size,
             num_threads=num_threads,
@@ -926,12 +1346,181 @@ def _make_chunk_scan_host_wrapper(
     return _chunk_scan_host_wrapper
 
 
+def _make_chunk_scan_runtime_artifacts(
+    *,
+    U_scan: torch.Tensor,
+    B_scan: torch.Tensor,
+    C_tc: torch.Tensor,
+    M_f: torch.Tensor,
+    K_f: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    U_prev_state: torch.Tensor,
+    B_prev_state: torch.Tensor,
+    output_chunk: torch.Tensor,
+    batch_size: int,
+    heads: int,
+    padded_time: int,
+    P: int,
+    D: int,
+    n_chunks: int,
+    chunk_size: int,
+    tc_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    device_index: int,
+    resolved_m_block_size: int,
+    resolved_n_block_size: int,
+    resolved_num_threads: int,
+    has_prev: bool,
+) -> ChunkScanRuntimeArtifacts:
+    problem_shape = (batch_size, heads, padded_time, P, D, n_chunks, chunk_size)
+    (
+        u_spec,
+        b_spec,
+        m_spec,
+        k_spec,
+        z0_spec,
+        u_prev_spec,
+        b_prev_spec,
+        output_spec,
+    ) = _chunk_scan_tensor_specs(problem_shape)
+    runtime_args, alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (U_scan, tc_dtype, u_spec),
+            (B_scan, tc_dtype, b_spec),
+            (C_tc, tc_dtype, b_spec),
+            (M_f, torch.float32, m_spec),
+            (K_f, torch.float32, k_spec),
+            (chunk_starts, torch.float32, z0_spec),
+            (U_prev_state, tc_dtype, u_prev_spec),
+            (B_prev_state, tc_dtype, b_prev_spec),
+            (output_chunk, output_dtype, output_spec),
+        )
+    )
+    cache_key = _chunk_scan_key(
+        device_index=device_index,
+        tc_dtype=tc_dtype,
+        out_dtype=output_dtype,
+        problem_shape=problem_shape,
+        m_block_size=resolved_m_block_size,
+        n_block_size=resolved_n_block_size,
+        num_threads=resolved_num_threads,
+        has_prev=has_prev,
+        alignments=alignments,
+    )
+    return ChunkScanRuntimeArtifacts(
+        problem_shape=problem_shape,
+        launch_cfg=(
+            resolved_m_block_size,
+            resolved_n_block_size,
+            resolved_num_threads,
+        ),
+        compile_args=compile_args,
+        runtime_args=runtime_args,
+        cache_key=cache_key,
+        outputs=ChunkScanOutputs(
+            output_chunk=output_chunk,
+            output_view=output_chunk.reshape(
+                batch_size, heads, n_chunks, chunk_size, 1, P
+            ).reshape(batch_size, heads, padded_time, P),
+        ),
+    )
+
+
+def _make_chunk_scan_compile_artifacts(
+    U: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    output_dtype: torch.dtype,
+    device_index: int,
+    m_block_size: int | None,
+    n_block_size: int,
+    num_threads: int,
+    has_prev: bool,
+) -> ChunkScanCompileArtifacts:
+    batch_size, heads, time_steps, P = map(int, U.shape)
+    D = int(B.shape[-1])
+    resolved_chunk_size = int(chunk_size)
+    n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
+    padded_time = n_chunks * resolved_chunk_size
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    resolved_m_block_size, resolved_n_block_size, resolved_num_threads = (
+        _resolve_chunk_scan_launch_cfg(
+            D=D,
+            P=P,
+            chunk_size=resolved_chunk_size,
+            tc_dtype=tc_dtype,
+            output_dtype=output_dtype,
+            device_index=device_index,
+            requested_m_block_size=m_block_size,
+            requested_n_block_size=int(n_block_size),
+            requested_num_threads=int(num_threads),
+        )
+    )
+    problem_shape = (
+        batch_size,
+        heads,
+        padded_time,
+        P,
+        D,
+        n_chunks,
+        resolved_chunk_size,
+    )
+    (
+        u_spec,
+        b_spec,
+        m_spec,
+        k_spec,
+        z0_spec,
+        u_prev_spec,
+        b_prev_spec,
+        output_spec,
+    ) = _chunk_scan_tensor_specs(problem_shape)
+    tc_align = _compile_min_align_for_dtype(tc_dtype)
+    fp32_align = _compile_min_align_for_dtype(torch.float32)
+    output_align = _compile_min_align_for_dtype(output_dtype)
+    alignments, compile_args = _make_tvm_ffi_compile_args_from_specs(
+        (tc_dtype, u_spec, tc_align),
+        (tc_dtype, b_spec, tc_align),
+        (tc_dtype, b_spec, tc_align),
+        (torch.float32, m_spec, fp32_align),
+        (torch.float32, k_spec, fp32_align),
+        (torch.float32, z0_spec, fp32_align),
+        (tc_dtype, u_prev_spec, tc_align),
+        (tc_dtype, b_prev_spec, tc_align),
+        (output_dtype, output_spec, output_align),
+    )
+    cache_key = _chunk_scan_key(
+        device_index=device_index,
+        tc_dtype=tc_dtype,
+        out_dtype=output_dtype,
+        problem_shape=problem_shape,
+        m_block_size=resolved_m_block_size,
+        n_block_size=resolved_n_block_size,
+        num_threads=resolved_num_threads,
+        has_prev=has_prev,
+        alignments=alignments,
+    )
+    return ChunkScanCompileArtifacts(
+        problem_shape=problem_shape,
+        launch_cfg=(
+            resolved_m_block_size,
+            resolved_n_block_size,
+            resolved_num_threads,
+        ),
+        compile_args=compile_args,
+        alignments=alignments,
+        cache_key=cache_key,
+    )
+
+
 def _make_chunk_increment_host_wrapper(
     *,
-    spec: tuple[int, ...],
+    problem_shape: tuple[int, ...],
     cta_tiler: tuple[int, int, int],
 ):
-    Bsz, H, T_pad, P, D, n_chunks, L = spec
+    batch_size, heads, padded_time, P, D, n_chunks, chunk_size = problem_shape
 
     @cute.jit
     def _chunk_increment_host_wrapper(
@@ -939,10 +1528,10 @@ def _make_chunk_increment_host_wrapper(
         B_t: cute.Tensor,
         M_t: cute.Tensor,
         K_t: cute.Tensor,
-        U_prev0_t: cute.Tensor,
-        B_prev0_t: cute.Tensor,
-        Inc_t: cute.Tensor,
-        Mchunk_t: cute.Tensor,
+        U_prev_t: cute.Tensor,
+        B_prev_t: cute.Tensor,
+        increment_t: cute.Tensor,
+        chunk_multiplier_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
         (
@@ -954,20 +1543,24 @@ def _make_chunk_increment_host_wrapper(
             b_prev_spec,
             inc_spec,
             m_chunk_spec,
-        ) = _chunk_increment_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
-        mU = _make_static_tensor_view(U_t, u_spec)
-        mB = _make_static_tensor_view(B_t, b_spec)
-        mM = _make_static_tensor_view(M_t, m_spec)
-        mKprev = _make_static_tensor_view(K_t, k_spec)
+        ) = _chunk_increment_tensor_specs(
+            (batch_size, heads, padded_time, P, D, n_chunks, chunk_size)
+        )
+        mU = _make_static_tensor_spec_view(U_t, u_spec)
+        mB = _make_static_tensor_spec_view(B_t, b_spec)
+        mM = _make_static_tensor_spec_view(M_t, m_spec)
+        mKprev = _make_static_tensor_spec_view(K_t, k_spec)
         mKcurr = cute.make_tensor(mKprev.iterator + 2, mKprev.layout)
-        mU_prev0 = _make_static_tensor_view(U_prev0_t, u_prev_spec)
-        mB_prev0 = _make_static_tensor_view(B_prev0_t, b_prev_spec)
-        mInc = _make_static_tensor_view(Inc_t, inc_spec)
-        mMchunk = _make_static_tensor_view(Mchunk_t, m_chunk_spec)
+        mU_prev = _make_static_tensor_spec_view(U_prev_t, u_prev_spec)
+        mB_prev = _make_static_tensor_spec_view(B_prev_t, b_prev_spec)
+        mIncrement = _make_static_tensor_spec_view(increment_t, inc_spec)
+        mChunkMultiplier = _make_static_tensor_spec_view(
+            chunk_multiplier_t, m_chunk_spec
+        )
 
         chunk_increment = ChunkIncrementFwdAmpere(
             mU.element_type,
-            chunk_size=L,
+            chunk_size=chunk_size,
             cta_tiler=cta_tiler,
         )
         chunk_increment.call_on_stream(
@@ -976,19 +1569,21 @@ def _make_chunk_increment_host_wrapper(
             mM,
             mKprev,
             mKcurr,
-            mU_prev0,
-            mB_prev0,
-            mInc,
-            mMchunk,
+            mU_prev,
+            mB_prev,
+            mIncrement,
+            mChunkMultiplier,
             stream,
         )
 
     return _chunk_increment_host_wrapper
 
 
-def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, ...]):
+def _make_state_passing_host_wrapper(
+    *, problem_shape: tuple[int, ...], launch_cfg: tuple[int, ...]
+):
     increment_spec, chunk_multiplier_spec, chunk_starts_spec, final_state_spec = (
-        _state_passing_tensor_specs(spec)
+        _state_passing_tensor_specs(problem_shape)
     )
     (
         num_threads,
@@ -998,7 +1593,7 @@ def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, .
         copy_bits_state_in,
         copy_bits_state_out,
         has_init,
-    ) = cfg
+    ) = launch_cfg
     state_passing_kernel = StatePassingFwdAmpere(
         num_threads=num_threads,
         vecs_per_thread=vecs_per_thread,
@@ -1018,13 +1613,19 @@ def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, .
         initial_state_t: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        increment_view = _make_static_tensor_view(increment_t, increment_spec)
-        chunk_multiplier_view = _make_static_tensor_view(
+        increment_view = _make_static_tensor_spec_view(increment_t, increment_spec)
+        chunk_multiplier_view = _make_static_tensor_spec_view(
             chunk_multiplier_t, chunk_multiplier_spec
         )
-        chunk_starts_view = _make_static_tensor_view(chunk_starts_t, chunk_starts_spec)
-        final_state_view = _make_static_tensor_view(final_state_t, final_state_spec)
-        initial_state_view = _make_static_tensor_view(initial_state_t, final_state_spec)
+        chunk_starts_view = _make_static_tensor_spec_view(
+            chunk_starts_t, chunk_starts_spec
+        )
+        final_state_view = _make_static_tensor_spec_view(
+            final_state_t, final_state_spec
+        )
+        initial_state_view = _make_static_tensor_spec_view(
+            initial_state_t, final_state_spec
+        )
 
         state_passing_kernel.call_on_stream(
             increment_view,
@@ -1038,537 +1639,254 @@ def _make_state_passing_host_wrapper(*, spec: tuple[int, ...], cfg: tuple[int, .
     return _state_passing_host_wrapper
 
 
+def _make_v2x2ssd_fwd_host_wrapper(
+    *,
+    problem_shape: tuple[int, ...],
+    launch_cfg: tuple[int, ...],
+):
+    batch_size, heads, padded_time, P, D, n_chunks, chunk_size = problem_shape
+    (
+        m_block_size,
+        n_block_size,
+        scan_num_threads,
+        state_num_threads,
+        state_vecs_per_thread,
+        state_copy_bits_in,
+        state_copy_bits_out,
+        state_copy_bits_state_in,
+        state_copy_bits_state_out,
+        has_init,
+    ) = launch_cfg
+    chunk_increment_spec = _chunk_increment_tensor_specs(problem_shape)
+    state_passing_spec = _state_passing_tensor_specs(
+        (batch_size, heads, n_chunks, P, D)
+    )
+    chunk_scan_spec = _chunk_scan_tensor_specs(problem_shape)
+    state_passing_kernel = StatePassingFwdAmpere(
+        num_threads=state_num_threads,
+        vecs_per_thread=state_vecs_per_thread,
+        copy_bits_in=state_copy_bits_in,
+        copy_bits_out=state_copy_bits_out,
+        copy_bits_state_in=state_copy_bits_state_in,
+        copy_bits_state_out=state_copy_bits_state_out,
+        has_init=has_init,
+    )
+
+    @cute.jit
+    def _v2x2ssd_fwd_host_wrapper(
+        U_increment_t: cute.Tensor,
+        B_increment_t: cute.Tensor,
+        M_increment_t: cute.Tensor,
+        K_increment_t: cute.Tensor,
+        U_prev_increment_t: cute.Tensor,
+        B_prev_increment_t: cute.Tensor,
+        increment_t: cute.Tensor,
+        chunk_multiplier_t: cute.Tensor,
+        increment_state_t: cute.Tensor,
+        chunk_multiplier_state_t: cute.Tensor,
+        chunk_starts_t: cute.Tensor,
+        final_state_t: cute.Tensor,
+        initial_state_t: cute.Tensor,
+        U_scan_t: cute.Tensor,
+        B_scan_t: cute.Tensor,
+        C_scan_t: cute.Tensor,
+        M_scan_t: cute.Tensor,
+        K_scan_t: cute.Tensor,
+        Z0_scan_t: cute.Tensor,
+        U_prev_scan_t: cute.Tensor,
+        B_prev_scan_t: cute.Tensor,
+        output_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        (
+            u_increment_spec,
+            b_increment_spec,
+            m_increment_spec,
+            k_increment_spec,
+            u_prev_increment_spec,
+            b_prev_increment_spec,
+            increment_spec,
+            chunk_multiplier_spec,
+        ) = chunk_increment_spec
+        (
+            increment_state_spec,
+            chunk_multiplier_state_spec,
+            chunk_starts_spec,
+            final_state_spec,
+        ) = state_passing_spec
+        (
+            u_scan_spec,
+            b_scan_spec,
+            m_scan_spec,
+            k_scan_spec,
+            z0_scan_spec,
+            u_prev_scan_spec,
+            b_prev_scan_spec,
+            output_spec,
+        ) = chunk_scan_spec
+
+        U_increment_view = _make_static_tensor_spec_view(
+            U_increment_t, u_increment_spec
+        )
+        B_increment_view = _make_static_tensor_spec_view(
+            B_increment_t, b_increment_spec
+        )
+        M_increment_view = _make_static_tensor_spec_view(
+            M_increment_t, m_increment_spec
+        )
+        K_previous_view = _make_static_tensor_spec_view(K_increment_t, k_increment_spec)
+        K_current_view = cute.make_tensor(
+            K_previous_view.iterator + 2, K_previous_view.layout
+        )
+        U_prev_increment_view = _make_static_tensor_spec_view(
+            U_prev_increment_t, u_prev_increment_spec
+        )
+        B_prev_increment_view = _make_static_tensor_spec_view(
+            B_prev_increment_t, b_prev_increment_spec
+        )
+        increment_view = _make_static_tensor_spec_view(increment_t, increment_spec)
+        chunk_multiplier_view = _make_static_tensor_spec_view(
+            chunk_multiplier_t, chunk_multiplier_spec
+        )
+
+        chunk_increment_kernel = ChunkIncrementFwdAmpere(
+            U_increment_view.element_type,
+            chunk_size=chunk_size,
+            cta_tiler=_resolve_chunk_increment_cta_tiler(D=D),
+        )
+        chunk_increment_kernel.call_on_stream(
+            U_increment_view,
+            B_increment_view,
+            M_increment_view,
+            K_previous_view,
+            K_current_view,
+            U_prev_increment_view,
+            B_prev_increment_view,
+            increment_view,
+            chunk_multiplier_view,
+            stream,
+        )
+
+        increment_state_view = _make_static_tensor_spec_view(
+            increment_state_t, increment_state_spec
+        )
+        chunk_multiplier_state_view = _make_static_tensor_spec_view(
+            chunk_multiplier_state_t, chunk_multiplier_state_spec
+        )
+        chunk_starts_view = _make_static_tensor_spec_view(
+            chunk_starts_t, chunk_starts_spec
+        )
+        final_state_view = _make_static_tensor_spec_view(
+            final_state_t, final_state_spec
+        )
+        initial_state_view = _make_static_tensor_spec_view(
+            initial_state_t, final_state_spec
+        )
+        state_passing_kernel.call_on_stream(
+            increment_state_view,
+            chunk_multiplier_state_view,
+            chunk_starts_view,
+            final_state_view,
+            initial_state_view,
+            stream,
+        )
+
+        U_scan_view = _make_static_tensor_spec_view(U_scan_t, u_scan_spec)
+        B_scan_view = _make_static_tensor_spec_view(B_scan_t, b_scan_spec)
+        C_scan_view = _make_static_tensor_spec_view(C_scan_t, b_scan_spec)
+        M_scan_view = _make_static_tensor_spec_view(M_scan_t, m_scan_spec)
+        K_scan_view = _make_static_tensor_spec_view(K_scan_t, k_scan_spec)
+        Z0_scan_view = _make_static_tensor_spec_view(Z0_scan_t, z0_scan_spec)
+        U_prev_scan_view = _make_static_tensor_spec_view(
+            U_prev_scan_t, u_prev_scan_spec
+        )
+        B_prev_scan_view = _make_static_tensor_spec_view(
+            B_prev_scan_t, b_prev_scan_spec
+        )
+        output_view = _make_static_tensor_spec_view(output_t, output_spec)
+
+        chunk_scan_kernel = ChunkScanFwdAmpere(
+            D=D,
+            P=P,
+            L=chunk_size,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            num_threads=scan_num_threads,
+        )
+        chunk_scan_kernel.call_on_stream(
+            U_scan_view,
+            B_scan_view,
+            C_scan_view,
+            M_scan_view,
+            K_scan_view,
+            Z0_scan_view,
+            U_prev_scan_view,
+            B_prev_scan_view,
+            output_view,
+            stream,
+        )
+
+    return _v2x2ssd_fwd_host_wrapper
+
+
 def _get_compiled_state_passing_kernel(
     *,
-    problem_spec: tuple[int, ...],
-    kernel_cfg: tuple[int, int, int, int, int, int, bool],
+    problem_shape: tuple[int, ...],
+    launch_cfg: tuple[int, int, int, int, int, int, bool],
     compile_args: tuple[object, ...],
     cache_key: tuple,
 ):
     compiled = _STATE_PASSING_CACHE.get(cache_key)
     if compiled is None:
         host_wrapper = _make_state_passing_host_wrapper(
-            spec=problem_spec,
-            cfg=kernel_cfg,
+            problem_shape=problem_shape,
+            launch_cfg=launch_cfg,
         )
         compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _STATE_PASSING_CACHE[cache_key] = compiled
     return compiled
 
 
-def _compile_chunk_increment_kernel_impl(
-    U: torch.Tensor,
-    M: torch.Tensor,
-    K: torch.Tensor,
-    B: torch.Tensor,
+def _get_compiled_chunk_increment_kernel(
     *,
-    U_prev0: torch.Tensor | None = None,
-    B_prev0: torch.Tensor | None = None,
-    chunk_size: int,
-    compute_dtype: torch.dtype | None = None,
-) -> tuple[object, torch.Tensor, torch.Tensor, Callable[[], None]]:
-    """Compile the forward chunk-increment kernel, allocate outputs, and build a launcher."""
-    if (U_prev0 is None) ^ (B_prev0 is None):
-        raise ValueError(
-            "U_prev0 and B_prev0 must be passed together (or both omitted)."
-        )
-    if U.device.type != "cuda":
-        raise ValueError("CUDA tensor required.")
-    if U.dtype != B.dtype:
-        raise ValueError("U and B must share dtype.")
-    if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("U/B must be float16/bfloat16/float32.")
-    if M.dtype != torch.float32 or K.dtype != torch.float32:
-        raise TypeError("M and K must be float32.")
-
-    Bsz, H, T, P = map(int, U.shape)
-    D = int(B.shape[-1])
-    if B.shape != (Bsz, H, T, D):
-        raise ValueError("B must be (B,H,T,D) matching U.")
-    if M.shape != (Bsz, H, T, 2):
-        raise ValueError(f"M must be (B,H,T,2)={(Bsz, H, T, 2)}.")
-    if K.shape != (Bsz, H, T, 2, 2):
-        raise ValueError(f"K must be (B,H,T,2,2)={(Bsz, H, T, 2, 2)}.")
-    if D % 2 != 0:
-        raise ValueError("B last dim must be divisible by 2.")
-
-    L = int(chunk_size)
-    if L <= 0:
-        raise ValueError("chunk_size must be positive.")
-    n_chunks = (T + L - 1) // L
-    T_pad = n_chunks * L
-
-    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
-    U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
-    B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
-    M_f = _pad_m_identity(M, T_pad=T_pad)
-    K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
-    U_tc = _ensure_min_alignment(U_tc, min_align=16)
-    B_tc = _ensure_min_alignment(B_tc, min_align=16)
-
-    if U_prev0 is None:
-        U_prev, B_prev = _get_zero_prev_tensors(
-            device=U.device,
-            dtype=tc_dtype,
-            batch_size=Bsz,
-            heads=H,
-            P=P,
-            D=D,
-        )
-    else:
-        if U_prev0.shape != (Bsz, H, P) or B_prev0.shape != (Bsz, H, D):
-            raise ValueError("U_prev0/B_prev0 must be (B,H,P)/(B,H,D).")
-        U_prev = U_prev0.to(dtype=tc_dtype).contiguous()
-        B_prev = B_prev0.to(dtype=tc_dtype).contiguous()
-        U_prev = _ensure_min_alignment(U_prev, min_align=16)
-        B_prev = _ensure_min_alignment(B_prev, min_align=16)
-
-    batch_head_count = Bsz * H
-    batch_head_chunk_count = batch_head_count * n_chunks
-
-    inc_chunk = torch.zeros(
-        (batch_head_chunk_count, P, D), device=U.device, dtype=torch.float32
-    )
-    m_chunk_tile = torch.zeros(
-        (batch_head_chunk_count, 2), device=U.device, dtype=torch.float32
-    )
-
-    (
-        problem_spec,
-        cta_tiler,
-        compile_args,
-        runtime_args,
-        cache_key,
-    ) = _make_chunk_increment_launch_artifacts(
-        U=U,
-        M=M,
-        K=K,
-        B=B,
-        U_tc=U_tc,
-        B_tc=B_tc,
-        M_f=M_f,
-        K_f=K_f,
-        U_prev0=U_prev,
-        B_prev0=B_prev,
-        inc_chunk=inc_chunk,
-        m_chunk_tile=m_chunk_tile,
-        chunk_size=L,
-        compute_dtype=compute_dtype,
-        has_prev=U_prev0 is not None,
-    )
-    runtime_tensors = (
-        U_tc,
-        B_tc,
-        M_f,
-        K_f,
-        U_prev,
-        B_prev,
-        inc_chunk,
-        m_chunk_tile,
-    )
-
+    problem_shape: tuple[int, ...],
+    cta_tiler: tuple[int, int, int],
+    compile_args: tuple[object, ...],
+    cache_key: tuple,
+):
     compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
     if compiled is None:
         host_wrapper = _make_chunk_increment_host_wrapper(
-            spec=problem_spec,
+            problem_shape=problem_shape,
             cta_tiler=cta_tiler,
         )
         compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
-
-    def launch() -> None:
-        compiled(*runtime_args)
-        _record_tensors_on_current_stream(*runtime_tensors)
-
-    return compiled, inc_chunk, m_chunk_tile, launch
+    return compiled
 
 
-def compile_chunk_increment_kernel(
-    U: torch.Tensor,
-    M: torch.Tensor,
-    K: torch.Tensor,
-    B: torch.Tensor,
+def _get_compiled_chunk_scan_kernel(
     *,
-    U_prev0: torch.Tensor | None = None,
-    B_prev0: torch.Tensor | None = None,
+    problem_shape: tuple[int, ...],
+    launch_cfg: tuple[int, int, int],
+    compile_args: tuple[object, ...],
+    cache_key: tuple,
+    tc_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    device_index: int,
+    D: int,
+    P: int,
     chunk_size: int,
-    compute_dtype: torch.dtype | None = None,
-) -> tuple[object, torch.Tensor, torch.Tensor]:
-    """Compile the forward chunk-increment kernel and allocate outputs."""
-    compiled, inc_chunk, m_chunk_tile, _launch = _compile_chunk_increment_kernel_impl(
-        U,
-        M,
-        K,
-        B,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-    )
-    return compiled, inc_chunk, m_chunk_tile
-
-
-def chunk_increment_cute(
-    U: torch.Tensor,
-    M: torch.Tensor,
-    K: torch.Tensor,
-    B: torch.Tensor,
-    *,
-    U_prev0: torch.Tensor | None = None,
-    B_prev0: torch.Tensor | None = None,
-    chunk_size: int,
-    compute_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Thin public wrapper over the compiled forward chunk-increment kernel."""
-    _compiled, inc_chunk, m_chunk_tile, launch = _compile_chunk_increment_kernel_impl(
-        U,
-        M,
-        K,
-        B,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-    )
-    launch()
-    batch_head_count = int(U.shape[0]) * int(U.shape[1])
-    n_chunks = inc_chunk.shape[0] // batch_head_count
-    return (
-        inc_chunk.reshape(U.shape[0], U.shape[1], n_chunks, U.shape[-1], B.shape[-1]),
-        m_chunk_tile.reshape(U.shape[0], U.shape[1], n_chunks, 2),
-    )
-
-
-def _compile_state_passing_kernel_impl(
-    inc: torch.Tensor,
-    m_chunk: torch.Tensor,
-    *,
-    initial_states: torch.Tensor | None,
-    num_threads: int = 128,
-    vecs_per_thread: int = 8,
-) -> tuple[object, torch.Tensor, torch.Tensor, Callable[[], None]]:
-    """Compile the forward state-passing kernel, allocate outputs, and build a launcher."""
-    if inc.ndim != 5:
-        raise ValueError(f"inc must be (B,H,C,P,D). Got {tuple(inc.shape)}.")
-    if m_chunk.ndim != 4 or m_chunk.shape[-1] != 2:
-        raise ValueError(f"m_chunk must be (B,H,C,2). Got {tuple(m_chunk.shape)}.")
-    if inc.device.type != "cuda":
-        raise ValueError("CUDA tensor required.")
-    if inc.dtype != torch.float32 or m_chunk.dtype != torch.float32:
-        raise TypeError("inc and m_chunk must be float32 at the stage boundary.")
-
-    B, H, C, P, D = map(int, inc.shape)
-    if D % 2 != 0:
-        raise ValueError("inc last dim must be divisible by 2.")
-    if tuple(m_chunk.shape[:3]) != (B, H, C):
-        raise ValueError("m_chunk leading dims must match inc.")
-    if initial_states is not None:
-        if tuple(initial_states.shape) != (B, H, P, D):
-            raise ValueError("initial_states must be (B,H,P,D) and match inc.")
-        if initial_states.dtype != torch.float32:
-            raise TypeError("initial_states must be float32.")
-
-    chunk_starts = torch.empty((B, H, C, P, D), device=inc.device, dtype=torch.float32)
-    final_state = torch.empty((B, H, P, D), device=inc.device, dtype=torch.float32)
-    # The state-passing kernel defines the live state domain but may leave
-    # untouched lanes outside that domain on issue-9-style shapes. The public
-    # final-state output must not depend on stale allocator contents.
-    final_state.zero_()
-
-    increment_contig = inc.contiguous()
-    chunk_multiplier_contig = m_chunk.contiguous()
-    initial_state_contig = (
-        initial_states.contiguous() if initial_states is not None else None
-    )
-
-    if initial_state_contig is None:
-        initial_state_arg = increment_contig
-        has_init = False
-    else:
-        initial_state_arg = initial_state_contig
-        has_init = True
-
-    problem_spec, kernel_cfg, compile_args, runtime_args, cache_key = (
-        _make_state_passing_launch_artifacts(
-            increment=increment_contig,
-            chunk_multiplier=chunk_multiplier_contig,
-            chunk_starts=chunk_starts,
-            final_state=final_state,
-            initial_state_arg=initial_state_arg,
-            has_init=has_init,
-            num_threads=num_threads,
-            vecs_per_thread=vecs_per_thread,
-        )
-    )
-    keepalive = (
-        increment_contig,
-        chunk_multiplier_contig,
-        chunk_starts,
-        final_state,
-        initial_state_contig,
-    )
-
-    compiled = _get_compiled_state_passing_kernel(
-        problem_spec=problem_spec,
-        kernel_cfg=kernel_cfg,
-        compile_args=compile_args,
-        cache_key=cache_key,
-    )
-
-    def launch() -> None:
-        compiled(*runtime_args)
-        _record_tensors_on_current_stream(*keepalive)
-
-    return compiled, chunk_starts, final_state, launch
-
-
-def compile_state_passing_kernel(
-    inc: torch.Tensor,
-    m_chunk: torch.Tensor,
-    *,
-    initial_states: torch.Tensor | None,
-    num_threads: int = 128,
-    vecs_per_thread: int = 8,
-) -> tuple[object, torch.Tensor, torch.Tensor]:
-    """Compile the forward state-passing kernel and allocate outputs."""
-    compiled, chunk_starts, final_state, _launch = _compile_state_passing_kernel_impl(
-        inc,
-        m_chunk,
-        initial_states=initial_states,
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-    )
-    return compiled, chunk_starts, final_state
-
-
-def state_passing_cute(
-    inc: torch.Tensor,
-    m_chunk: torch.Tensor,
-    *,
-    initial_states: torch.Tensor | None,
-    num_threads: int = 128,
-    vecs_per_thread: int = 8,
-    return_final_state: bool = True,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Thin public wrapper over the compiled forward state-passing kernel."""
-    _compiled, chunk_starts, final_state, launch = _compile_state_passing_kernel_impl(
-        inc,
-        m_chunk,
-        initial_states=initial_states,
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-    )
-    launch()
-    if not return_final_state:
-        return chunk_starts
-    return chunk_starts, final_state
-
-
-def _compile_chunk_scan_kernel_impl(
-    U: torch.Tensor,
-    M: torch.Tensor,
-    K: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    chunk_starts: torch.Tensor,
-    *,
-    B_prev: torch.Tensor | None = None,
-    U_prev: torch.Tensor | None = None,
-    chunk_size: int = 64,
-    m_block_size: int | None = None,
-    n_block_size: int = 64,
-    num_threads: int = 128,
-    compute_dtype: torch.dtype | None = None,
-    output_dtype: torch.dtype = torch.float32,
-) -> tuple[object, torch.Tensor, torch.Tensor, Callable[[], None]]:
-    """Compile the end-to-end forward chunk-scan kernel, allocate outputs, and build a launcher."""
-    if (B_prev is None) ^ (U_prev is None):
-        raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
-    if U.device.type != "cuda":
-        raise ValueError("CUDA tensor required.")
-    if U.dtype != B.dtype or U.dtype != C.dtype:
-        raise ValueError("U/B/C must share dtype.")
-    if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("U/B/C must be float16/bfloat16/float32.")
-    if M.dtype != torch.float32 or K.dtype != torch.float32:
-        raise TypeError("M and K must be float32.")
-    if chunk_starts.dtype != torch.float32:
-        raise TypeError("chunk_starts must be float32.")
-    if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("output_dtype must be float16/bfloat16/float32.")
-
-    Bsz, H, T, P = map(int, U.shape)
-    D = int(B.shape[-1])
-    if B.shape != (Bsz, H, T, D) or C.shape != (Bsz, H, T, D):
-        raise ValueError("B/C must be (B,H,T,D) matching U.")
-    if M.shape != (Bsz, H, T, 2):
-        raise ValueError(f"M must be (B,H,T,2)={(Bsz, H, T, 2)}.")
-    if K.shape != (Bsz, H, T, 2, 2):
-        raise ValueError(f"K must be (B,H,T,2,2)={(Bsz, H, T, 2, 2)}.")
-    if D % 2 != 0:
-        raise ValueError("B/C last dim must be divisible by 2.")
-
-    L = int(chunk_size)
-    if L <= 0:
-        raise ValueError("chunk_size must be positive.")
-    n_chunks = (T + L - 1) // L
-    T_pad = n_chunks * L
-    BH = Bsz * H
-    BHC = BH * n_chunks
-    device_index = (
-        int(U.device.index)
-        if U.device.index is not None
-        else torch.cuda.current_device()
-    )
-    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
-    resolved_m_block_size, resolved_n_block_size, resolved_num_threads = (
-        _resolve_chunk_scan_launch_cfg(
-            D=D,
-            P=P,
-            L=L,
-            tc_dtype=tc_dtype,
-            output_dtype=output_dtype,
-            device_index=device_index,
-            requested_m_block_size=m_block_size,
-            requested_n_block_size=int(n_block_size),
-            requested_num_threads=int(num_threads),
-        )
-    )
-
-    if tuple(chunk_starts.shape) != (Bsz, H, n_chunks, P, D):
-        raise ValueError(
-            f"chunk_starts must be (B,H,C,P,D) ={(Bsz, H, n_chunks, P, D)}."
-        )
-
-    U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
-    B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
-    C_tc = _pad_zero_time(C, T_pad=T_pad, dtype=tc_dtype)
-    M_f = _pad_m_identity(M, T_pad=T_pad)
-    K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
-    U_tc = _ensure_min_alignment(U_tc, min_align=16)
-    B_tc = _ensure_min_alignment(B_tc, min_align=16)
-    C_tc = _ensure_min_alignment(C_tc, min_align=16)
-    U_scan = _guard_prev_time_base(U_tc, min_align=16)
-    B_scan = _guard_prev_time_base(B_tc, min_align=16)
-
-    if B_prev is None:
-        U_prev0, B_prev0 = _get_zero_prev_tensors(
-            device=U.device,
-            dtype=tc_dtype,
-            batch_size=Bsz,
-            heads=H,
-            P=P,
-            D=D,
-        )
-    else:
-        if B_prev.shape != (Bsz, H, D) or U_prev.shape != (Bsz, H, P):
-            raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
-        B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
-        U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
-        B_prev0 = _ensure_min_alignment(B_prev0, min_align=16)
-        U_prev0 = _ensure_min_alignment(U_prev0, min_align=16)
-
-    chunk_starts_c = chunk_starts.contiguous()
-    chunk_starts_c = _ensure_min_alignment(chunk_starts_c, min_align=16)
-    u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
-        _chunk_scan_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
-    )
-
-    out_chunk = torch.empty((BHC, L, 1, P), device=U.device, dtype=output_dtype)
-    out_pad = out_chunk.reshape(Bsz, H, n_chunks, L, 1, P).reshape(Bsz, H, T_pad, P)
-    out_view = out_pad[:, :, :T, :]
-
-    alignments = (
-        _assumed_align(U_scan),
-        _assumed_align(B_scan),
-        _assumed_align(C_tc),
-        _assumed_align(M_f),
-        _assumed_align(K_f),
-        _assumed_align(chunk_starts_c),
-        _assumed_align(U_prev0),
-        _assumed_align(B_prev0),
-        _assumed_align(out_chunk),
-    )
-    runtime_tensors = (
-        U_scan,
-        B_scan,
-        C_tc,
-        M_f,
-        K_f,
-        chunk_starts_c,
-        U_prev0,
-        B_prev0,
-        out_chunk,
-    )
-    runtime_args = (
-        _make_runtime_tensor_view(U_scan, u_spec),
-        _make_runtime_tensor_view(B_scan, b_spec),
-        _make_runtime_tensor_view(C_tc, b_spec),
-        _make_runtime_tensor_view(M_f, m_spec),
-        _make_runtime_tensor_view(K_f, k_spec),
-        _make_runtime_tensor_view(chunk_starts_c, z0_spec),
-        _make_runtime_tensor_view(U_prev0, u_prev_spec),
-        _make_runtime_tensor_view(B_prev0, b_prev_spec),
-        _make_runtime_tensor_view(out_chunk, out_spec),
-    )
-    compile_args = (
-        _make_fake_tensor_arg(
-            U_scan, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
-        ),
-        _make_fake_tensor_arg(
-            B_scan, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
-        ),
-        _make_fake_tensor_arg(
-            C_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[2]
-        ),
-        _make_fake_tensor_arg(
-            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[3]
-        ),
-        _make_fake_tensor_arg(
-            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[4]
-        ),
-        _make_fake_tensor_arg(
-            chunk_starts_c, shape=z0_spec[0], stride=z0_spec[1], align=alignments[5]
-        ),
-        _make_fake_tensor_arg(
-            U_prev0, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[6]
-        ),
-        _make_fake_tensor_arg(
-            B_prev0, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[7]
-        ),
-        _make_fake_tensor_arg(
-            out_chunk, shape=out_spec[0], stride=out_spec[1], align=alignments[8]
-        ),
-        _compile_env_stream_placeholder(),
-    )
-    keepalive = runtime_tensors
-
-    cache_key = _chunk_scan_key(
-        device_index=device_index,
-        tc_dtype=tc_dtype,
-        out_dtype=output_dtype,
-        U_shape=tuple(U.shape),
-        M_shape=tuple(M.shape),
-        K_shape=tuple(K.shape),
-        B_shape=tuple(B.shape),
-        C_shape=tuple(C.shape),
-        chunk_starts_shape=tuple(chunk_starts.shape),
-        chunk_size=L,
-        m_block_size=resolved_m_block_size,
-        n_block_size=resolved_n_block_size,
-        num_threads=resolved_num_threads,
-        has_prev=B_prev is not None,
-        alignments=alignments,
-    )
-
+):
     compiled = _CHUNK_SCAN_CACHE.get(cache_key)
     if compiled is None:
         in_cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
         out_cutlass_dtype = _torch_to_cutlass_dtype(output_dtype)
+        resolved_m_block_size, resolved_n_block_size, resolved_num_threads = launch_cfg
         kernel = ChunkScanFwdAmpere(
             D=D,
             P=P,
-            L=L,
+            L=chunk_size,
             m_block_size=resolved_m_block_size,
             n_block_size=resolved_n_block_size,
             num_threads=resolved_num_threads,
@@ -1580,24 +1898,291 @@ def _compile_chunk_scan_kernel_impl(
         ):
             raise ValueError("Resolved chunk_scan configuration is not supported.")
         host_wrapper = _make_chunk_scan_host_wrapper(
-            spec=(Bsz, H, T_pad, P, D, n_chunks, L),
-            cfg=(
-                resolved_m_block_size,
-                resolved_n_block_size,
-                resolved_num_threads,
-            ),
+            problem_shape=problem_shape,
+            launch_cfg=launch_cfg,
         )
         compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
         _CHUNK_SCAN_CACHE[cache_key] = compiled
-
-    def launch() -> None:
-        compiled(*runtime_args)
-        _record_tensors_on_current_stream(*keepalive)
-
-    return compiled, out_chunk, out_view, launch
+    return compiled
 
 
-def compile_chunk_scan_kernel(
+def compile_chunk_increment_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    U_prev: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+) -> object:
+    """Compile the chunk-increment host wrapper with TVM FFI enabled."""
+    _validate_chunk_increment_inputs(
+        U,
+        M,
+        K,
+        B,
+        U_prev=U_prev,
+        B_prev=B_prev,
+    )
+    if int(chunk_size) <= 0:
+        raise ValueError("chunk_size must be positive.")
+    compile_artifacts = _make_chunk_increment_compile_artifacts(
+        U,
+        B,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        has_prev=U_prev is not None,
+    )
+    return _get_compiled_chunk_increment_kernel(
+        problem_shape=compile_artifacts.problem_shape,
+        cta_tiler=compile_artifacts.cta_tiler,
+        compile_args=compile_artifacts.compile_args,
+        cache_key=compile_artifacts.cache_key,
+    )
+
+
+def _make_chunk_increment_prepared_launch(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    U_prev: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+) -> PreparedChunkIncrementLaunch:
+    """Prepare runtime arguments and outputs for the forward chunk-increment kernel."""
+    batch_size, heads, time_steps, P, D = _validate_chunk_increment_inputs(
+        U,
+        M,
+        K,
+        B,
+        U_prev=U_prev,
+        B_prev=B_prev,
+    )
+
+    resolved_chunk_size = int(chunk_size)
+    if resolved_chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
+    padded_time = n_chunks * resolved_chunk_size
+
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    U_tc = _pad_zero_time(U, T_pad=padded_time, dtype=tc_dtype)
+    B_tc = _pad_zero_time(B, T_pad=padded_time, dtype=tc_dtype)
+    M_f = _pad_m_identity(M, T_pad=padded_time)
+    K_f = _pad_zero_time(K, T_pad=padded_time, dtype=torch.float32)
+    U_tc = _ensure_min_alignment(U_tc, min_align=16)
+    B_tc = _ensure_min_alignment(B_tc, min_align=16)
+
+    if U_prev is None:
+        U_prev_state, B_prev_state = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=batch_size,
+            heads=heads,
+            P=P,
+            D=D,
+        )
+    else:
+        U_prev_state = U_prev.to(dtype=tc_dtype).contiguous()
+        B_prev_state = B_prev.to(dtype=tc_dtype).contiguous()
+        U_prev_state = _ensure_min_alignment(U_prev_state, min_align=16)
+        B_prev_state = _ensure_min_alignment(B_prev_state, min_align=16)
+
+    batch_head_count = batch_size * heads
+    batch_head_chunk_count = batch_head_count * n_chunks
+
+    inc_chunk = torch.zeros(
+        (batch_head_chunk_count, P, D), device=U.device, dtype=torch.float32
+    )
+    chunk_multiplier_storage = torch.zeros(
+        (batch_head_chunk_count, 2), device=U.device, dtype=torch.float32
+    )
+
+    runtime_artifacts = _make_chunk_increment_runtime_artifacts(
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        U_tc=U_tc,
+        B_tc=B_tc,
+        M_f=M_f,
+        K_f=K_f,
+        U_prev_state=U_prev_state,
+        B_prev_state=B_prev_state,
+        inc_chunk=inc_chunk,
+        chunk_multiplier_storage=chunk_multiplier_storage,
+        chunk_size=resolved_chunk_size,
+        compute_dtype=compute_dtype,
+        has_prev=U_prev is not None,
+    )
+    compiled = _get_compiled_chunk_increment_kernel(
+        problem_shape=runtime_artifacts.problem_shape,
+        cta_tiler=runtime_artifacts.cta_tiler,
+        compile_args=runtime_artifacts.compile_args,
+        cache_key=runtime_artifacts.cache_key,
+    )
+    return PreparedChunkIncrementLaunch(
+        compiled=compiled,
+        runtime_args=runtime_artifacts.runtime_args,
+        outputs=runtime_artifacts.outputs,
+    )
+
+
+def chunk_increment_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    U_prev: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Thin public wrapper over the compiled forward chunk-increment kernel."""
+    prepared = _make_chunk_increment_prepared_launch(
+        U,
+        M,
+        K,
+        B,
+        U_prev=U_prev,
+        B_prev=B_prev,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+    )
+    prepared.compiled(*prepared.runtime_args)
+    _record_tensors_on_current_stream(*prepared.runtime_args)
+    inc_chunk = prepared.outputs.increment_chunk
+    chunk_multiplier_storage = prepared.outputs.chunk_multiplier_storage
+    batch_head_count = int(U.shape[0]) * int(U.shape[1])
+    n_chunks = inc_chunk.shape[0] // batch_head_count
+    return (
+        inc_chunk.reshape(U.shape[0], U.shape[1], n_chunks, U.shape[-1], B.shape[-1]),
+        chunk_multiplier_storage.reshape(U.shape[0], U.shape[1], n_chunks, 2),
+    )
+
+
+def compile_state_passing_cute(
+    increment: torch.Tensor,
+    chunk_multiplier: torch.Tensor,
+    *,
+    initial_states: torch.Tensor | None,
+    num_threads: int = 128,
+    vecs_per_thread: int = 8,
+) -> object:
+    """Compile the state-passing host wrapper with TVM FFI enabled."""
+    _validate_state_passing_inputs(
+        increment,
+        chunk_multiplier,
+        initial_states=initial_states,
+    )
+    compile_artifacts = _make_state_passing_compile_artifacts(
+        increment,
+        chunk_multiplier,
+        has_init=initial_states is not None,
+        num_threads=num_threads,
+        vecs_per_thread=vecs_per_thread,
+    )
+    return _get_compiled_state_passing_kernel(
+        problem_shape=compile_artifacts.problem_shape,
+        launch_cfg=compile_artifacts.launch_cfg,
+        compile_args=compile_artifacts.compile_args,
+        cache_key=compile_artifacts.cache_key,
+    )
+
+
+def _make_state_passing_prepared_launch(
+    increment: torch.Tensor,
+    chunk_multiplier: torch.Tensor,
+    *,
+    initial_states: torch.Tensor | None,
+    num_threads: int = 128,
+    vecs_per_thread: int = 8,
+) -> PreparedStatePassingLaunch:
+    """Prepare runtime arguments and outputs for the forward state-passing kernel."""
+    B, H, C, P, D = _validate_state_passing_inputs(
+        increment,
+        chunk_multiplier,
+        initial_states=initial_states,
+    )
+
+    chunk_starts = torch.empty(
+        (B, H, C, P, D), device=increment.device, dtype=torch.float32
+    )
+    final_state = torch.empty(
+        (B, H, P, D), device=increment.device, dtype=torch.float32
+    )
+    # The state-passing kernel defines the live state domain but may leave
+    # untouched lanes outside that domain on issue-9-style shapes. The public
+    # final-state output must not depend on stale allocator contents.
+    final_state.zero_()
+
+    increment_contig = increment.contiguous()
+    chunk_multiplier_contig = chunk_multiplier.contiguous()
+    initial_state_contig = (
+        initial_states.contiguous() if initial_states is not None else None
+    )
+
+    if initial_state_contig is None:
+        initial_state_arg = increment_contig
+        has_init = False
+    else:
+        initial_state_arg = initial_state_contig
+        has_init = True
+
+    runtime_artifacts = _make_state_passing_runtime_artifacts(
+        increment=increment_contig,
+        chunk_multiplier=chunk_multiplier_contig,
+        chunk_starts=chunk_starts,
+        final_state=final_state,
+        initial_state_arg=initial_state_arg,
+        has_init=has_init,
+        num_threads=num_threads,
+        vecs_per_thread=vecs_per_thread,
+    )
+    compiled = _get_compiled_state_passing_kernel(
+        problem_shape=runtime_artifacts.problem_shape,
+        launch_cfg=runtime_artifacts.launch_cfg,
+        compile_args=runtime_artifacts.compile_args,
+        cache_key=runtime_artifacts.cache_key,
+    )
+    return PreparedStatePassingLaunch(
+        compiled=compiled,
+        runtime_args=runtime_artifacts.runtime_args,
+        outputs=runtime_artifacts.outputs,
+    )
+
+
+def state_passing_cute(
+    increment: torch.Tensor,
+    chunk_multiplier: torch.Tensor,
+    *,
+    initial_states: torch.Tensor | None,
+    num_threads: int = 128,
+    vecs_per_thread: int = 8,
+    return_final_state: bool = True,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Thin public wrapper over the compiled forward state-passing kernel."""
+    prepared = _make_state_passing_prepared_launch(
+        increment,
+        chunk_multiplier,
+        initial_states=initial_states,
+        num_threads=num_threads,
+        vecs_per_thread=vecs_per_thread,
+    )
+    prepared.compiled(*prepared.runtime_args)
+    _record_tensors_on_current_stream(*prepared.runtime_args)
+    if not return_final_state:
+        return prepared.outputs.chunk_starts
+    return prepared.outputs.chunk_starts, prepared.outputs.final_state
+
+
+def compile_chunk_scan_cute(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
@@ -1613,9 +2198,9 @@ def compile_chunk_scan_kernel(
     num_threads: int = 128,
     compute_dtype: torch.dtype | None = None,
     output_dtype: torch.dtype = torch.float32,
-) -> tuple[object, torch.Tensor, torch.Tensor]:
-    """Compile the end-to-end forward chunk-scan kernel and allocate outputs."""
-    compiled, out_chunk, out_view, _launch = _compile_chunk_scan_kernel_impl(
+) -> object:
+    """Compile the chunk-scan host wrapper with TVM FFI enabled."""
+    batch_size, heads, _time_steps, P, D, _n_chunks = _validate_chunk_scan_inputs(
         U,
         M,
         K,
@@ -1625,13 +2210,174 @@ def compile_chunk_scan_kernel(
         B_prev=B_prev,
         U_prev=U_prev,
         chunk_size=chunk_size,
+        output_dtype=output_dtype,
+    )
+    device_index = (
+        int(U.device.index)
+        if U.device.index is not None
+        else torch.cuda.current_device()
+    )
+    compile_artifacts = _make_chunk_scan_compile_artifacts(
+        U,
+        B,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        device_index=device_index,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
         num_threads=num_threads,
-        compute_dtype=compute_dtype,
+        has_prev=B_prev is not None,
+    )
+    return _get_compiled_chunk_scan_kernel(
+        problem_shape=compile_artifacts.problem_shape,
+        launch_cfg=compile_artifacts.launch_cfg,
+        compile_args=compile_artifacts.compile_args,
+        cache_key=compile_artifacts.cache_key,
+        tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
+        output_dtype=output_dtype,
+        device_index=device_index,
+        D=D,
+        P=P,
+        chunk_size=int(chunk_size),
+    )
+
+
+def _make_chunk_scan_prepared_launch(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    *,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    chunk_size: int = 64,
+    m_block_size: int | None = None,
+    n_block_size: int = 64,
+    num_threads: int = 128,
+    compute_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype = torch.float32,
+) -> PreparedChunkScanLaunch:
+    """Prepare runtime arguments and outputs for the end-to-end forward chunk-scan kernel."""
+    batch_size, heads, time_steps, P, D, n_chunks = _validate_chunk_scan_inputs(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        chunk_size=chunk_size,
         output_dtype=output_dtype,
     )
-    return compiled, out_chunk, out_view
+
+    resolved_chunk_size = int(chunk_size)
+    padded_time = n_chunks * resolved_chunk_size
+    batch_head_count = batch_size * heads
+    batch_head_chunk_count = batch_head_count * n_chunks
+    device_index = (
+        int(U.device.index)
+        if U.device.index is not None
+        else torch.cuda.current_device()
+    )
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    resolved_m_block_size, resolved_n_block_size, resolved_num_threads = (
+        _resolve_chunk_scan_launch_cfg(
+            D=D,
+            P=P,
+            chunk_size=resolved_chunk_size,
+            tc_dtype=tc_dtype,
+            output_dtype=output_dtype,
+            device_index=device_index,
+            requested_m_block_size=m_block_size,
+            requested_n_block_size=int(n_block_size),
+            requested_num_threads=int(num_threads),
+        )
+    )
+
+    U_tc = _pad_zero_time(U, T_pad=padded_time, dtype=tc_dtype)
+    B_tc = _pad_zero_time(B, T_pad=padded_time, dtype=tc_dtype)
+    C_tc = _pad_zero_time(C, T_pad=padded_time, dtype=tc_dtype)
+    M_f = _pad_m_identity(M, T_pad=padded_time)
+    K_f = _pad_zero_time(K, T_pad=padded_time, dtype=torch.float32)
+    U_tc = _ensure_min_alignment(U_tc, min_align=16)
+    B_tc = _ensure_min_alignment(B_tc, min_align=16)
+    C_tc = _ensure_min_alignment(C_tc, min_align=16)
+    U_scan = _guard_prev_time_base(U_tc, min_align=16)
+    B_scan = _guard_prev_time_base(B_tc, min_align=16)
+
+    if B_prev is None:
+        U_prev_state, B_prev_state = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=batch_size,
+            heads=heads,
+            P=P,
+            D=D,
+        )
+    else:
+        B_prev_state = B_prev.to(dtype=tc_dtype).contiguous()
+        U_prev_state = U_prev.to(dtype=tc_dtype).contiguous()
+        B_prev_state = _ensure_min_alignment(B_prev_state, min_align=16)
+        U_prev_state = _ensure_min_alignment(U_prev_state, min_align=16)
+
+    chunk_starts_c = chunk_starts.contiguous()
+    chunk_starts_c = _ensure_min_alignment(chunk_starts_c, min_align=16)
+    out_chunk = torch.empty(
+        (batch_head_chunk_count, resolved_chunk_size, 1, P),
+        device=U.device,
+        dtype=output_dtype,
+    )
+    runtime_artifacts = _make_chunk_scan_runtime_artifacts(
+        U_scan=U_scan,
+        B_scan=B_scan,
+        C_tc=C_tc,
+        M_f=M_f,
+        K_f=K_f,
+        chunk_starts=chunk_starts_c,
+        U_prev_state=U_prev_state,
+        B_prev_state=B_prev_state,
+        output_chunk=out_chunk,
+        batch_size=batch_size,
+        heads=heads,
+        padded_time=padded_time,
+        P=P,
+        D=D,
+        n_chunks=n_chunks,
+        chunk_size=resolved_chunk_size,
+        tc_dtype=tc_dtype,
+        output_dtype=output_dtype,
+        device_index=device_index,
+        resolved_m_block_size=resolved_m_block_size,
+        resolved_n_block_size=resolved_n_block_size,
+        resolved_num_threads=resolved_num_threads,
+        has_prev=B_prev is not None,
+    )
+
+    compiled = _get_compiled_chunk_scan_kernel(
+        problem_shape=runtime_artifacts.problem_shape,
+        launch_cfg=runtime_artifacts.launch_cfg,
+        compile_args=runtime_artifacts.compile_args,
+        cache_key=runtime_artifacts.cache_key,
+        tc_dtype=tc_dtype,
+        output_dtype=output_dtype,
+        device_index=device_index,
+        D=D,
+        P=P,
+        chunk_size=resolved_chunk_size,
+    )
+
+    return PreparedChunkScanLaunch(
+        compiled=compiled,
+        runtime_args=runtime_artifacts.runtime_args,
+        outputs=ChunkScanOutputs(
+            output_chunk=runtime_artifacts.outputs.output_chunk,
+            output_view=runtime_artifacts.outputs.output_view[:, :, :time_steps, :],
+        ),
+    )
 
 
 def chunk_scan_cute(
@@ -1652,7 +2398,7 @@ def chunk_scan_cute(
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Thin public wrapper over the compiled forward chunk-scan kernel."""
-    _compiled, _out_chunk, out_view, launch = _compile_chunk_scan_kernel_impl(
+    prepared = _make_chunk_scan_prepared_launch(
         U,
         M,
         K,
@@ -1668,11 +2414,130 @@ def chunk_scan_cute(
         compute_dtype=compute_dtype,
         output_dtype=output_dtype,
     )
-    launch()
-    return out_view
+    prepared.compiled(*prepared.runtime_args)
+    _record_tensors_on_current_stream(*prepared.runtime_args)
+    return prepared.outputs.output_view
 
 
-def _build_forward_args(
+def _make_forward_input_info(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    output_dtype: torch.dtype,
+    m_block_size: int | None,
+    n_block_size: int,
+    scan_num_threads: int,
+    initial_states: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+    validate_runtime_contract: bool,
+) -> ForwardInputInfo:
+    if validate_runtime_contract:
+        if U.device.type != "cuda":
+            raise ValueError("CUDA tensor required.")
+        if (B_prev is None) ^ (U_prev is None):
+            raise ValueError(
+                "B_prev and U_prev must be passed together (or both omitted)."
+            )
+        if U.dtype != B.dtype or U.dtype != C.dtype:
+            raise ValueError("U/B/C must share dtype.")
+        if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError("U/B/C must be float16/bfloat16/float32.")
+        if M.dtype != torch.float32 or K.dtype != torch.float32:
+            raise TypeError("M and K must be float32.")
+        if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError("output_dtype must be float16/bfloat16/float32.")
+
+    batch_size, heads, time_steps, P = map(int, U.shape)
+    D = int(B.shape[-1])
+    if validate_runtime_contract:
+        if B.shape != (batch_size, heads, time_steps, D) or C.shape != (
+            batch_size,
+            heads,
+            time_steps,
+            D,
+        ):
+            raise ValueError("B/C must be (B,H,T,D) matching U.")
+        if M.shape != (batch_size, heads, time_steps, 2):
+            raise ValueError(
+                f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}."
+            )
+        if K.shape != (batch_size, heads, time_steps, 2, 2):
+            raise ValueError(
+                f"K must be (B,H,T,2,2)={(batch_size, heads, time_steps, 2, 2)}."
+            )
+        if D % 2 != 0:
+            raise ValueError("B/C last dim must be divisible by 2.")
+        if initial_states is not None:
+            if not torch.is_floating_point(initial_states):
+                raise TypeError("initial_states must be floating-point.")
+            if tuple(initial_states.shape) != (batch_size, heads, P, D):
+                raise ValueError(
+                    "initial_states must be (B,H,P,D) matching scan inputs."
+                )
+            if initial_states.device != U.device:
+                raise ValueError("initial_states must be on the same device as U.")
+        if B_prev is not None:
+            if not torch.is_floating_point(B_prev) or not torch.is_floating_point(
+                U_prev
+            ):
+                raise TypeError("B_prev and U_prev must be floating-point.")
+            if tuple(B_prev.shape) != (batch_size, heads, D) or tuple(U_prev.shape) != (
+                batch_size,
+                heads,
+                P,
+            ):
+                raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+            if B_prev.device != U.device or U_prev.device != U.device:
+                raise ValueError("B_prev and U_prev must be on the same device as U.")
+
+    resolved_chunk_size = int(chunk_size)
+    if resolved_chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
+    padded_time = n_chunks * resolved_chunk_size
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    device_index = (
+        int(U.device.index)
+        if U.device.index is not None
+        else torch.cuda.current_device()
+    )
+    resolved_m_block, resolved_n_block, resolved_scan_num_threads = (
+        _resolve_chunk_scan_launch_cfg(
+            D=D,
+            P=P,
+            chunk_size=resolved_chunk_size,
+            tc_dtype=tc_dtype,
+            output_dtype=output_dtype,
+            device_index=device_index,
+            requested_m_block_size=m_block_size,
+            requested_n_block_size=int(n_block_size),
+            requested_num_threads=int(scan_num_threads),
+        )
+    )
+    return ForwardInputInfo(
+        batch_size=batch_size,
+        heads=heads,
+        time_steps=time_steps,
+        P=P,
+        D=D,
+        chunk_size=resolved_chunk_size,
+        n_chunks=n_chunks,
+        padded_time=padded_time,
+        tc_dtype=tc_dtype,
+        device_index=device_index,
+        resolved_m_block=resolved_m_block,
+        resolved_n_block=resolved_n_block,
+        resolved_scan_num_threads=resolved_scan_num_threads,
+    )
+
+
+def _make_forward_runtime_artifacts(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
@@ -1700,89 +2565,50 @@ def _build_forward_args(
         torch.Tensor,
     ]
     | None = None,
-) -> tuple[
-    list[object],
-    tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
-    tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor],
-]:
-    if U.device.type != "cuda":
-        raise ValueError("CUDA tensor required.")
-    if (B_prev is None) ^ (U_prev is None):
-        raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
-    if U.dtype != B.dtype or U.dtype != C.dtype:
-        raise ValueError("U/B/C must share dtype.")
-    if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("U/B/C must be float16/bfloat16/float32.")
-    if M.dtype != torch.float32 or K.dtype != torch.float32:
-        raise TypeError("M and K must be float32.")
-    if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("output_dtype must be float16/bfloat16/float32.")
-
-    Bsz, H, T, P = map(int, U.shape)
-    D = int(B.shape[-1])
-    if B.shape != (Bsz, H, T, D) or C.shape != (Bsz, H, T, D):
-        raise ValueError("B/C must be (B,H,T,D) matching U.")
-    if M.shape != (Bsz, H, T, 2):
-        raise ValueError(f"M must be (B,H,T,2)={(Bsz, H, T, 2)}.")
-    if K.shape != (Bsz, H, T, 2, 2):
-        raise ValueError(f"K must be (B,H,T,2,2)={(Bsz, H, T, 2, 2)}.")
-    if D % 2 != 0:
-        raise ValueError("B/C last dim must be divisible by 2.")
-    if initial_states is not None:
-        if not torch.is_floating_point(initial_states):
-            raise TypeError("initial_states must be floating-point.")
-        if tuple(initial_states.shape) != (Bsz, H, P, D):
-            raise ValueError("initial_states must be (B,H,P,D) matching scan inputs.")
-        if initial_states.device != U.device:
-            raise ValueError("initial_states must be on the same device as U.")
-    if B_prev is not None:
-        if not torch.is_floating_point(B_prev) or not torch.is_floating_point(U_prev):
-            raise TypeError("B_prev and U_prev must be floating-point.")
-        if tuple(B_prev.shape) != (Bsz, H, D) or tuple(U_prev.shape) != (Bsz, H, P):
-            raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
-        if B_prev.device != U.device or U_prev.device != U.device:
-            raise ValueError("B_prev and U_prev must be on the same device as U.")
-
-    L = int(chunk_size)
-    if L <= 0:
-        raise ValueError("chunk_size must be positive.")
-    n_chunks = (T + L - 1) // L
-    T_pad = n_chunks * L
-
-    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
-    device_index = (
-        int(U.device.index)
-        if U.device.index is not None
-        else torch.cuda.current_device()
+    validate_runtime_contract: bool = True,
+) -> ForwardRuntimeArtifacts:
+    input_info = _make_forward_input_info(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        scan_num_threads=scan_num_threads,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        validate_runtime_contract=validate_runtime_contract,
     )
-    resolved_m_block, resolved_n_block, resolved_scan_num_threads = (
-        _resolve_chunk_scan_launch_cfg(
-            D=D,
-            P=P,
-            L=L,
-            tc_dtype=tc_dtype,
-            output_dtype=output_dtype,
-            device_index=device_index,
-            requested_m_block_size=m_block_size,
-            requested_n_block_size=int(n_block_size),
-            requested_num_threads=int(scan_num_threads),
-        )
-    )
+    batch_size = input_info.batch_size
+    heads = input_info.heads
+    time_steps = input_info.time_steps
+    P = input_info.P
+    D = input_info.D
+    resolved_chunk_size = input_info.chunk_size
+    n_chunks = input_info.n_chunks
+    padded_time = input_info.padded_time
+    tc_dtype = input_info.tc_dtype
+    resolved_m_block = input_info.resolved_m_block
+    resolved_n_block = input_info.resolved_n_block
+    resolved_scan_num_threads = input_info.resolved_scan_num_threads
 
     if prepared_inputs is None:
-        U_tc = _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype)
-        M_f = _prepare_m_operand(M, T_pad=T_pad)
-        K_f = _prepare_time_operand(K, T_pad=T_pad, dtype=torch.float32)
-        B_tc = _prepare_time_operand(B, T_pad=T_pad, dtype=tc_dtype)
-        C_tc = _prepare_time_operand(C, T_pad=T_pad, dtype=tc_dtype)
+        U_tc = _prepare_time_operand(U, padded_time=padded_time, dtype=tc_dtype)
+        M_f = _prepare_m_operand(M, padded_time=padded_time)
+        K_f = _prepare_time_operand(K, padded_time=padded_time, dtype=torch.float32)
+        B_tc = _prepare_time_operand(B, padded_time=padded_time, dtype=tc_dtype)
+        C_tc = _prepare_time_operand(C, padded_time=padded_time, dtype=tc_dtype)
     else:
         U_tc, M_f, K_f, B_tc, C_tc = prepared_inputs
-        expected_u_shape = (Bsz, H, T_pad, P)
-        expected_b_shape = (Bsz, H, T_pad, D)
-        expected_m_shape = (Bsz, H, T_pad, 2)
-        expected_k_shape = (Bsz, H, T_pad, 2, 2)
+        expected_u_shape = (batch_size, heads, padded_time, P)
+        expected_b_shape = (batch_size, heads, padded_time, D)
+        expected_m_shape = (batch_size, heads, padded_time, 2)
+        expected_k_shape = (batch_size, heads, padded_time, 2, 2)
         if (
             tuple(U_tc.shape) != expected_u_shape
             or U_tc.dtype != tc_dtype
@@ -1815,35 +2641,35 @@ def _build_forward_args(
             raise ValueError("prepared K_f must match padded scan parameter layout.")
 
     if B_prev is None:
-        U_prev0, B_prev0 = _get_zero_prev_tensors(
+        U_prev_state, B_prev_state = _get_zero_prev_tensors(
             device=U.device,
             dtype=tc_dtype,
-            batch_size=Bsz,
-            heads=H,
+            batch_size=batch_size,
+            heads=heads,
             P=P,
             D=D,
         )
     else:
-        U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
-        B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
-        U_prev0 = _ensure_min_alignment(U_prev0, min_align=16)
-        B_prev0 = _ensure_min_alignment(B_prev0, min_align=16)
+        U_prev_state = U_prev.to(dtype=tc_dtype).contiguous()
+        B_prev_state = B_prev.to(dtype=tc_dtype).contiguous()
+        U_prev_state = _ensure_min_alignment(U_prev_state, min_align=16)
+        B_prev_state = _ensure_min_alignment(B_prev_state, min_align=16)
 
     inc_chunk = _get_fwd_workspace(
         device=U.device,
-        batch_size=Bsz,
-        heads=H,
+        batch_size=batch_size,
+        heads=heads,
         n_chunks=n_chunks,
         P=P,
         D=D,
     )
     inc_chunk.zero_()
-    inc = inc_chunk.reshape(Bsz, H, n_chunks, P, D)
+    increment = inc_chunk.reshape(batch_size, heads, n_chunks, P, D)
     if initial_states is None:
         initial_state0 = _get_zero_initial_state(
             device=U.device,
-            batch_size=Bsz,
-            heads=H,
+            batch_size=batch_size,
+            heads=heads,
             P=P,
             D=D,
         )
@@ -1854,41 +2680,54 @@ def _build_forward_args(
     final_state_workspace = None
     if return_final_state:
         final_state_workspace = torch.empty(
-            (Bsz, H, P, D), device=U.device, dtype=torch.float32
+            (batch_size, heads, P, D), device=U.device, dtype=torch.float32
         )
         final_state_workspace.zero_()
         final_state = final_state_workspace
     else:
         final_state = _get_dummy_final_state(
             device=U.device,
-            batch_size=Bsz,
-            heads=H,
+            batch_size=batch_size,
+            heads=heads,
             P=P,
             D=D,
         )
     if return_intermediates:
-        m_chunk_tile = torch.empty(
-            (Bsz * H * n_chunks, 2), device=U.device, dtype=torch.float32
+        chunk_multiplier_storage = torch.empty(
+            (batch_size * heads * n_chunks, 2),
+            device=U.device,
+            dtype=torch.float32,
         )
         chunk_starts = torch.empty(
-            (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
+            (batch_size, heads, n_chunks, P, D),
+            device=U.device,
+            dtype=torch.float32,
         )
     else:
-        m_chunk_tile, chunk_starts = _get_no_grad_intermediates(
+        chunk_multiplier_storage, chunk_starts = _get_no_grad_intermediates(
             device=U.device,
-            batch_size=Bsz,
-            heads=H,
+            batch_size=batch_size,
+            heads=heads,
             n_chunks=n_chunks,
             P=P,
             D=D,
         )
     chunk_starts = _ensure_min_alignment(chunk_starts, min_align=16)
-    m_chunk_tile.zero_()
-    m_chunk = m_chunk_tile.reshape(Bsz, H, n_chunks, 2)
+    chunk_multiplier_storage.zero_()
+    chunk_multiplier = chunk_multiplier_storage.reshape(batch_size, heads, n_chunks, 2)
     out_chunk = torch.empty(
-        (Bsz * H * n_chunks, L, 1, P), device=U.device, dtype=output_dtype
+        (batch_size * heads * n_chunks, resolved_chunk_size, 1, P),
+        device=U.device,
+        dtype=output_dtype,
     )
-    out_pad = out_chunk.reshape(Bsz, H, n_chunks, L, 1, P).reshape(Bsz, H, T_pad, P)
+    out_pad = out_chunk.reshape(
+        batch_size,
+        heads,
+        n_chunks,
+        resolved_chunk_size,
+        1,
+        P,
+    ).reshape(batch_size, heads, padded_time, P)
 
     state_elems_per_thread = 2 * int(state_vecs_per_thread)
     state_tile_stride_elems = P * D
@@ -1905,36 +2744,78 @@ def _build_forward_args(
     state_copy_bits_state_in = 32
     state_copy_bits_state_out = 32
 
-    alignments = tuple(
-        _assumed_align(tensor)
-        for tensor in (
-            U_tc,
-            B_tc,
-            C_tc,
-            M_f,
-            K_f,
-            U_prev0,
-            B_prev0,
-            inc_chunk,
-            m_chunk_tile,
-            chunk_starts,
-            final_state,
-            initial_state0,
-            out_chunk,
-            out_pad,
-        )
+    U_scan = _guard_prev_time_base(U_tc, min_align=16)
+    B_scan = _guard_prev_time_base(B_tc, min_align=16)
+    chunk_increment_spec = _chunk_increment_tensor_specs(
+        (batch_size, heads, padded_time, P, D, n_chunks, resolved_chunk_size)
     )
-    dynamic_args: tuple[object, ...] = ()
-    spec = (
-        Bsz,
-        H,
-        T_pad,
+    state_passing_spec = _state_passing_tensor_specs(
+        (batch_size, heads, n_chunks, P, D)
+    )
+    chunk_scan_spec = _chunk_scan_tensor_specs(
+        (batch_size, heads, padded_time, P, D, n_chunks, resolved_chunk_size)
+    )
+    (
+        u_increment_spec,
+        b_increment_spec,
+        m_increment_spec,
+        k_increment_spec,
+        u_prev_increment_spec,
+        b_prev_increment_spec,
+        increment_spec,
+        chunk_multiplier_spec,
+    ) = chunk_increment_spec
+    (
+        increment_state_spec,
+        chunk_multiplier_state_spec,
+        chunk_starts_spec,
+        final_state_spec,
+    ) = state_passing_spec
+    (
+        u_scan_spec,
+        b_scan_spec,
+        m_scan_spec,
+        k_scan_spec,
+        z0_scan_spec,
+        u_prev_scan_spec,
+        b_prev_scan_spec,
+        output_spec,
+    ) = chunk_scan_spec
+    runtime_args = (
+        make_runtime_tensor_spec_view(U_tc, u_increment_spec),
+        make_runtime_tensor_spec_view(B_tc, b_increment_spec),
+        make_runtime_tensor_spec_view(M_f, m_increment_spec),
+        make_runtime_tensor_spec_view(K_f, k_increment_spec),
+        make_runtime_tensor_spec_view(U_prev_state, u_prev_increment_spec),
+        make_runtime_tensor_spec_view(B_prev_state, b_prev_increment_spec),
+        make_runtime_tensor_spec_view(inc_chunk, increment_spec),
+        make_runtime_tensor_spec_view(chunk_multiplier_storage, chunk_multiplier_spec),
+        make_runtime_tensor_spec_view(increment, increment_state_spec),
+        make_runtime_tensor_spec_view(chunk_multiplier, chunk_multiplier_state_spec),
+        make_runtime_tensor_spec_view(chunk_starts, chunk_starts_spec),
+        make_runtime_tensor_spec_view(final_state, final_state_spec),
+        make_runtime_tensor_spec_view(initial_state0, final_state_spec),
+        make_runtime_tensor_spec_view(U_scan, u_scan_spec),
+        make_runtime_tensor_spec_view(B_scan, b_scan_spec),
+        make_runtime_tensor_spec_view(C_tc, b_scan_spec),
+        make_runtime_tensor_spec_view(M_f, m_scan_spec),
+        make_runtime_tensor_spec_view(K_f, k_scan_spec),
+        make_runtime_tensor_spec_view(chunk_starts, z0_scan_spec),
+        make_runtime_tensor_spec_view(U_prev_state, u_prev_scan_spec),
+        make_runtime_tensor_spec_view(B_prev_state, b_prev_scan_spec),
+        make_runtime_tensor_spec_view(out_chunk, output_spec),
+    )
+    alignments = tuple(_assumed_align(tensor) for tensor in runtime_args)
+    problem_shape = (
+        batch_size,
+        heads,
+        padded_time,
         P,
         D,
         n_chunks,
-        L,
+        resolved_chunk_size,
     )
-    cfg = (
+    launch_cfg = (
         resolved_m_block,
         resolved_n_block,
         resolved_scan_num_threads,
@@ -1946,279 +2827,298 @@ def _build_forward_args(
         int(state_copy_bits_state_out),
         has_init,
     )
-    return (
-        dynamic_args,
-        alignments,
-        spec,
-        cfg,
-        (
-            out_pad[:, :, :T, :],
-            final_state_workspace,
-            m_chunk,
-            chunk_starts,
-        ),
-        (
-            U_tc,
-            B_tc,
-            C_tc,
-            M_f,
-            K_f,
-            U_prev0,
-            B_prev0,
-            inc_chunk,
-            inc,
-            m_chunk_tile,
-            m_chunk,
-            chunk_starts,
-            final_state,
-            initial_state0,
-            out_chunk,
-            out_pad,
+    return ForwardRuntimeArtifacts(
+        runtime_args=runtime_args,
+        alignments=alignments,
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
+        outputs=ForwardOutputs(
+            output=out_pad[:, :, :time_steps, :],
+            final_state=final_state_workspace,
+            chunk_multiplier=chunk_multiplier,
+            chunk_starts=chunk_starts,
         ),
     )
 
 
-def _make_prepared_chunk_increment_launch(
-    *,
+def _make_forward_compile_artifacts(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
     B: torch.Tensor,
-    U_tc: torch.Tensor,
-    B_tc: torch.Tensor,
-    M_f: torch.Tensor,
-    K_f: torch.Tensor,
-    U_prev0: torch.Tensor,
-    B_prev0: torch.Tensor,
-    inc_chunk: torch.Tensor,
-    m_chunk_tile: torch.Tensor,
+    C: torch.Tensor,
+    *,
     chunk_size: int,
     compute_dtype: torch.dtype | None,
-    has_prev: bool,
-) -> Callable[[], None]:
-    (
-        problem_spec,
-        cta_tiler,
-        compile_args,
-        runtime_args,
-        cache_key,
-    ) = _make_chunk_increment_launch_artifacts(
-        U=U,
-        M=M,
-        K=K,
-        B=B,
-        U_tc=U_tc,
-        B_tc=B_tc,
-        M_f=M_f,
-        K_f=K_f,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        inc_chunk=inc_chunk,
-        m_chunk_tile=m_chunk_tile,
+    output_dtype: torch.dtype,
+    m_block_size: int | None,
+    n_block_size: int,
+    scan_num_threads: int,
+    state_num_threads: int,
+    state_vecs_per_thread: int,
+    initial_states: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+) -> ForwardCompileArtifacts:
+    input_info = _make_forward_input_info(
+        U,
+        M,
+        K,
+        B,
+        C,
         chunk_size=chunk_size,
         compute_dtype=compute_dtype,
-        has_prev=has_prev,
+        output_dtype=output_dtype,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        scan_num_threads=scan_num_threads,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        validate_runtime_contract=True,
     )
-    compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
-    if compiled is None:
-        host_wrapper = _make_chunk_increment_host_wrapper(
-            spec=problem_spec,
-            cta_tiler=cta_tiler,
-        )
-        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
-        _CHUNK_INCREMENT_CACHE[cache_key] = compiled
-
-    def launch() -> None:
-        compiled(*runtime_args)
-        _record_tensors_on_current_stream(
-            U_tc, B_tc, M_f, K_f, U_prev0, B_prev0, inc_chunk, m_chunk_tile
-        )
-
-    return launch
-
-
-def _make_prepared_state_passing_launch(
-    *,
-    inc: torch.Tensor,
-    m_chunk: torch.Tensor,
-    chunk_starts: torch.Tensor,
-    final_state: torch.Tensor,
-    initial_state0: torch.Tensor,
-    has_init: bool,
-    num_threads: int,
-    vecs_per_thread: int,
-) -> Callable[[], None]:
-    initial_state_arg = initial_state0 if has_init else inc
-    problem_spec, kernel_cfg, compile_args, runtime_args, cache_key = (
-        _make_state_passing_launch_artifacts(
-            increment=inc,
-            chunk_multiplier=m_chunk,
-            chunk_starts=chunk_starts,
-            final_state=final_state,
-            initial_state_arg=initial_state_arg,
-            has_init=has_init,
-            num_threads=num_threads,
-            vecs_per_thread=vecs_per_thread,
-        )
+    batch_size = input_info.batch_size
+    heads = input_info.heads
+    P = input_info.P
+    D = input_info.D
+    resolved_chunk_size = input_info.chunk_size
+    n_chunks = input_info.n_chunks
+    padded_time = input_info.padded_time
+    tc_dtype = input_info.tc_dtype
+    state_tile_stride_elems = P * D
+    state_elems_per_thread = 2 * int(state_vecs_per_thread)
+    state_assumed_align = _compile_min_align_for_dtype(torch.float32)
+    state_copy_bits_in = _choose_copy_bits_for_linear_tiles_from_properties(
+        dtype=torch.float32,
+        assumed_align=state_assumed_align,
+        tile_stride_elems=state_tile_stride_elems,
+        elems_per_thread=state_elems_per_thread,
     )
-    runtime_tensors = (inc, m_chunk, chunk_starts, final_state, initial_state_arg)
-    compiled = _get_compiled_state_passing_kernel(
-        problem_spec=problem_spec,
-        kernel_cfg=kernel_cfg,
+    state_copy_bits_out = _choose_copy_bits_for_linear_tiles_from_properties(
+        dtype=torch.float32,
+        assumed_align=state_assumed_align,
+        tile_stride_elems=state_tile_stride_elems,
+        elems_per_thread=state_elems_per_thread,
+    )
+    state_copy_bits_state_in = 32
+    state_copy_bits_state_out = 32
+    problem_shape = (
+        batch_size,
+        heads,
+        padded_time,
+        P,
+        D,
+        n_chunks,
+        resolved_chunk_size,
+    )
+    launch_cfg = (
+        input_info.resolved_m_block,
+        input_info.resolved_n_block,
+        input_info.resolved_scan_num_threads,
+        int(state_num_threads),
+        int(state_vecs_per_thread),
+        int(state_copy_bits_in),
+        int(state_copy_bits_out),
+        int(state_copy_bits_state_in),
+        int(state_copy_bits_state_out),
+        initial_states is not None,
+    )
+
+    chunk_increment_spec = _chunk_increment_tensor_specs(problem_shape)
+    state_passing_spec = _state_passing_tensor_specs(
+        (batch_size, heads, n_chunks, P, D)
+    )
+    chunk_scan_spec = _chunk_scan_tensor_specs(problem_shape)
+    (
+        u_increment_spec,
+        b_increment_spec,
+        m_increment_spec,
+        k_increment_spec,
+        u_prev_increment_spec,
+        b_prev_increment_spec,
+        increment_spec,
+        chunk_multiplier_spec,
+    ) = chunk_increment_spec
+    (
+        increment_state_spec,
+        chunk_multiplier_state_spec,
+        chunk_starts_spec,
+        final_state_spec,
+    ) = state_passing_spec
+    (
+        u_scan_spec,
+        b_scan_spec,
+        m_scan_spec,
+        k_scan_spec,
+        z0_scan_spec,
+        u_prev_scan_spec,
+        b_prev_scan_spec,
+        output_spec,
+    ) = chunk_scan_spec
+    fp32_align = _compile_min_align_for_dtype(torch.float32)
+    tc_align = _compile_min_align_for_dtype(tc_dtype)
+    out_align = _compile_min_align_for_dtype(output_dtype)
+    alignments, compile_args = _make_tvm_ffi_compile_args_from_specs(
+        (tc_dtype, u_increment_spec, tc_align),
+        (tc_dtype, b_increment_spec, tc_align),
+        (torch.float32, m_increment_spec, fp32_align),
+        (torch.float32, k_increment_spec, fp32_align),
+        (tc_dtype, u_prev_increment_spec, tc_align),
+        (tc_dtype, b_prev_increment_spec, tc_align),
+        (torch.float32, increment_spec, fp32_align),
+        (torch.float32, chunk_multiplier_spec, fp32_align),
+        (torch.float32, increment_state_spec, fp32_align),
+        (torch.float32, chunk_multiplier_state_spec, fp32_align),
+        (torch.float32, chunk_starts_spec, fp32_align),
+        (torch.float32, final_state_spec, fp32_align),
+        (torch.float32, final_state_spec, fp32_align),
+        (tc_dtype, u_scan_spec, tc_align),
+        (tc_dtype, b_scan_spec, tc_align),
+        (tc_dtype, b_scan_spec, tc_align),
+        (torch.float32, m_scan_spec, fp32_align),
+        (torch.float32, k_scan_spec, fp32_align),
+        (torch.float32, z0_scan_spec, fp32_align),
+        (tc_dtype, u_prev_scan_spec, tc_align),
+        (tc_dtype, b_prev_scan_spec, tc_align),
+        (output_dtype, output_spec, out_align),
+    )
+    return ForwardCompileArtifacts(
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
         compile_args=compile_args,
-        cache_key=cache_key,
+        alignments=alignments,
     )
 
-    def launch() -> None:
-        compiled(*runtime_args)
-        _record_tensors_on_current_stream(*runtime_tensors)
 
-    return launch
+def _make_forward_compile_artifacts_from_runtime_artifacts(
+    runtime_artifacts: ForwardRuntimeArtifacts,
+) -> ForwardCompileArtifacts:
+    _, compile_args = _make_tvm_ffi_compile_args(
+        runtime_artifacts.runtime_args,
+        alignments=runtime_artifacts.alignments,
+    )
+    return ForwardCompileArtifacts(
+        problem_shape=runtime_artifacts.problem_shape,
+        launch_cfg=runtime_artifacts.launch_cfg,
+        compile_args=compile_args,
+        alignments=runtime_artifacts.alignments,
+    )
 
 
-def _make_prepared_chunk_scan_launch(
+def _get_compiled_v2x2ssd_fwd_kernel(
     *,
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    U_tc: torch.Tensor,
-    B_tc: torch.Tensor,
-    C_tc: torch.Tensor,
-    M_f: torch.Tensor,
-    K_f: torch.Tensor,
-    chunk_starts: torch.Tensor,
-    U_prev0: torch.Tensor,
-    B_prev0: torch.Tensor,
-    out_chunk: torch.Tensor,
-    chunk_size: int,
-    m_block_size: int,
-    n_block_size: int,
-    num_threads: int,
     compute_dtype: torch.dtype | None,
     output_dtype: torch.dtype,
-    has_prev: bool,
-) -> Callable[[], None]:
-    Bsz, H, _T, P = map(int, U.shape)
-    D = int(B.shape[-1])
-    L = int(chunk_size)
-    T_pad = int(U_tc.shape[2])
-    n_chunks = T_pad // L
-    u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
-        _chunk_scan_tensor_specs((Bsz, H, T_pad, P, D, n_chunks, L))
-    )
-    U_scan = _guard_prev_time_base(U_tc, min_align=16)
-    B_scan = _guard_prev_time_base(B_tc, min_align=16)
-    alignments = (
-        _assumed_align(U_scan),
-        _assumed_align(B_scan),
-        _assumed_align(C_tc),
-        _assumed_align(M_f),
-        _assumed_align(K_f),
-        _assumed_align(chunk_starts),
-        _assumed_align(U_prev0),
-        _assumed_align(B_prev0),
-        _assumed_align(out_chunk),
-    )
-    runtime_tensors = (
-        U_scan,
-        B_scan,
-        C_tc,
-        M_f,
-        K_f,
-        chunk_starts,
-        U_prev0,
-        B_prev0,
-        out_chunk,
-    )
-    runtime_args = (
-        _make_runtime_tensor_view(U_scan, u_spec),
-        _make_runtime_tensor_view(B_scan, b_spec),
-        _make_runtime_tensor_view(C_tc, b_spec),
-        _make_runtime_tensor_view(M_f, m_spec),
-        _make_runtime_tensor_view(K_f, k_spec),
-        _make_runtime_tensor_view(chunk_starts, z0_spec),
-        _make_runtime_tensor_view(U_prev0, u_prev_spec),
-        _make_runtime_tensor_view(B_prev0, b_prev_spec),
-        _make_runtime_tensor_view(out_chunk, out_spec),
-    )
-    compile_args = (
-        _make_fake_tensor_arg(
-            U_scan, shape=u_spec[0], stride=u_spec[1], align=alignments[0]
-        ),
-        _make_fake_tensor_arg(
-            B_scan, shape=b_spec[0], stride=b_spec[1], align=alignments[1]
-        ),
-        _make_fake_tensor_arg(
-            C_tc, shape=b_spec[0], stride=b_spec[1], align=alignments[2]
-        ),
-        _make_fake_tensor_arg(
-            M_f, shape=m_spec[0], stride=m_spec[1], align=alignments[3]
-        ),
-        _make_fake_tensor_arg(
-            K_f, shape=k_spec[0], stride=k_spec[1], align=alignments[4]
-        ),
-        _make_fake_tensor_arg(
-            chunk_starts, shape=z0_spec[0], stride=z0_spec[1], align=alignments[5]
-        ),
-        _make_fake_tensor_arg(
-            U_prev0, shape=u_prev_spec[0], stride=u_prev_spec[1], align=alignments[6]
-        ),
-        _make_fake_tensor_arg(
-            B_prev0, shape=b_prev_spec[0], stride=b_prev_spec[1], align=alignments[7]
-        ),
-        _make_fake_tensor_arg(
-            out_chunk, shape=out_spec[0], stride=out_spec[1], align=alignments[8]
-        ),
-        _compile_env_stream_placeholder(),
-    )
-    runtime_args = (
-        _make_runtime_tensor_view(U_scan, u_spec),
-        _make_runtime_tensor_view(B_scan, b_spec),
-        _make_runtime_tensor_view(C_tc, b_spec),
-        _make_runtime_tensor_view(M_f, m_spec),
-        _make_runtime_tensor_view(K_f, k_spec),
-        _make_runtime_tensor_view(chunk_starts, z0_spec),
-        _make_runtime_tensor_view(U_prev0, u_prev_spec),
-        _make_runtime_tensor_view(B_prev0, b_prev_spec),
-        _make_runtime_tensor_view(out_chunk, out_spec),
-    )
-    cache_key = _chunk_scan_key(
-        device_index=(
-            U.device.index
-            if U.device.index is not None
-            else torch.cuda.current_device()
-        ),
+    compile_artifacts: ForwardCompileArtifacts,
+):
+    cache_key = _fwd_host_cache_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
         tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
         out_dtype=output_dtype,
-        U_shape=tuple(U.shape),
-        M_shape=tuple(M.shape),
-        K_shape=tuple(K.shape),
-        B_shape=tuple(B.shape),
-        C_shape=tuple(C.shape),
-        chunk_starts_shape=tuple(chunk_starts.shape),
-        chunk_size=L,
+        problem_shape=compile_artifacts.problem_shape,
+        launch_cfg=compile_artifacts.launch_cfg,
+        alignments=compile_artifacts.alignments,
+    )
+    compiled = _FWD_HOST_CACHE.get(cache_key)
+    if compiled is not None:
+        note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=True)
+        return compiled
+
+    note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=False)
+    host_wrapper = _make_v2x2ssd_fwd_host_wrapper(
+        problem_shape=compile_artifacts.problem_shape,
+        launch_cfg=compile_artifacts.launch_cfg,
+    )
+    compiled = cute.compile(
+        host_wrapper, *compile_artifacts.compile_args, options="--enable-tvm-ffi"
+    )
+    _FWD_HOST_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _run_v2x2ssd_fwd_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    output_dtype: torch.dtype,
+    m_block_size: int | None,
+    n_block_size: int,
+    scan_num_threads: int,
+    state_num_threads: int,
+    state_vecs_per_thread: int,
+    initial_states: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+    return_final_state: bool,
+    return_intermediates: bool,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None,
+    validate_runtime_contract: bool,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    runtime_artifacts = _make_forward_runtime_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
-        num_threads=num_threads,
-        has_prev=has_prev,
-        alignments=alignments,
+        scan_num_threads=scan_num_threads,
+        state_num_threads=state_num_threads,
+        state_vecs_per_thread=state_vecs_per_thread,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        return_final_state=return_final_state,
+        return_intermediates=return_intermediates,
+        prepared_inputs=prepared_inputs,
+        validate_runtime_contract=validate_runtime_contract,
     )
-    compiled = _CHUNK_SCAN_CACHE.get(cache_key)
-    if compiled is None:
-        host_wrapper = _make_chunk_scan_host_wrapper(
-            spec=(Bsz, H, T_pad, P, D, n_chunks, L),
-            cfg=(m_block_size, n_block_size, num_threads),
-        )
-        compiled = cute.compile(host_wrapper, *compile_args, options="--enable-tvm-ffi")
-        _CHUNK_SCAN_CACHE[cache_key] = compiled
-
-    def launch() -> None:
-        compiled(*runtime_args)
-        _record_tensors_on_current_stream(*runtime_tensors)
-
-    return launch
+    compile_artifacts = _make_forward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    compiled = _get_compiled_v2x2ssd_fwd_kernel(
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        C=C,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        compile_artifacts=compile_artifacts,
+    )
+    compiled(*runtime_artifacts.runtime_args)
+    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
+    output = runtime_artifacts.outputs.output
+    final_state = runtime_artifacts.outputs.final_state
+    chunk_multiplier = runtime_artifacts.outputs.chunk_multiplier
+    chunk_starts = runtime_artifacts.outputs.chunk_starts
+    if not return_final_state:
+        return output, chunk_multiplier, chunk_starts
+    assert final_state is not None
+    return output, final_state, chunk_multiplier, chunk_starts
 
 
 def compile_v2x2ssd_fwd_cute(
@@ -2240,7 +3140,7 @@ def compile_v2x2ssd_fwd_cute(
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
 ) -> object:
-    _dynamic_args, _alignments, _spec, cfg, _outputs, keepalive = _build_forward_args(
+    compile_artifacts = _make_forward_compile_artifacts(
         U,
         M,
         K,
@@ -2258,82 +3158,16 @@ def compile_v2x2ssd_fwd_cute(
         B_prev=B_prev,
         U_prev=U_prev,
     )
-    (
-        U_tc,
-        B_tc,
-        C_tc,
-        M_f,
-        K_f,
-        U_prev0,
-        B_prev0,
-        inc_chunk,
-        inc,
-        m_chunk_tile,
-        m_chunk,
-        chunk_starts,
-        final_state,
-        initial_state0,
-        out_chunk,
-        out_pad,
-    ) = keepalive
-    launch_inc = _make_prepared_chunk_increment_launch(
-        U=U,
-        M=M,
-        K=K,
-        B=B,
-        U_tc=U_tc,
-        B_tc=B_tc,
-        M_f=M_f,
-        K_f=K_f,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        inc_chunk=inc_chunk,
-        m_chunk_tile=m_chunk_tile,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-        has_prev=B_prev is not None,
-    )
-    launch_state = _make_prepared_state_passing_launch(
-        inc=inc,
-        m_chunk=m_chunk,
-        chunk_starts=chunk_starts,
-        final_state=final_state,
-        initial_state0=initial_state0,
-        has_init=bool(cfg[9]),
-        num_threads=int(cfg[3]),
-        vecs_per_thread=int(cfg[4]),
-    )
-    launch_scan = _make_prepared_chunk_scan_launch(
+    return _get_compiled_v2x2ssd_fwd_kernel(
         U=U,
         M=M,
         K=K,
         B=B,
         C=C,
-        U_tc=U_tc,
-        B_tc=B_tc,
-        C_tc=C_tc,
-        M_f=M_f,
-        K_f=K_f,
-        chunk_starts=chunk_starts,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        out_chunk=out_chunk,
-        chunk_size=chunk_size,
-        m_block_size=int(cfg[0]),
-        n_block_size=int(cfg[1]),
-        num_threads=int(cfg[2]),
         compute_dtype=compute_dtype,
         output_dtype=output_dtype,
-        has_prev=B_prev is not None,
+        compile_artifacts=compile_artifacts,
     )
-
-    def launch() -> None:
-        launch_inc()
-        launch_state()
-        launch_scan()
-        _record_tensors_on_current_stream(*keepalive)
-
-    return launch
 
 
 def v2x2ssd_fwd_cute(
@@ -2368,7 +3202,7 @@ def v2x2ssd_fwd_cute(
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 ):
-    _dynamic_args, _alignments, _spec, cfg, outputs, keepalive = _build_forward_args(
+    return _run_v2x2ssd_fwd_cute(
         U,
         M,
         K,
@@ -2388,93 +3222,72 @@ def v2x2ssd_fwd_cute(
         return_final_state=return_final_state,
         return_intermediates=return_intermediates,
         prepared_inputs=prepared_inputs,
+        validate_runtime_contract=True,
     )
-    (
-        U_tc,
-        B_tc,
-        C_tc,
-        M_f,
-        K_f,
-        U_prev0,
-        B_prev0,
-        inc_chunk,
-        inc,
-        m_chunk_tile,
-        m_chunk,
-        chunk_starts,
-        final_state,
-        initial_state0,
-        out_chunk,
-        out_pad,
-    ) = keepalive
-    launch_inc = _make_prepared_chunk_increment_launch(
-        U=U,
-        M=M,
-        K=K,
-        B=B,
-        U_tc=U_tc,
-        B_tc=B_tc,
-        M_f=M_f,
-        K_f=K_f,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        inc_chunk=inc_chunk,
-        m_chunk_tile=m_chunk_tile,
+
+
+def _v2x2ssd_fwd_cute_prevalidated(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype = torch.float32,
+    m_block_size: int | None = None,
+    n_block_size: int = 64,
+    scan_num_threads: int = 128,
+    state_num_threads: int = 128,
+    state_vecs_per_thread: int = 8,
+    initial_states: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    return_final_state: bool = False,
+    return_intermediates: bool = True,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    return _run_v2x2ssd_fwd_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
         chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-        has_prev=B_prev is not None,
-    )
-    launch_state = _make_prepared_state_passing_launch(
-        inc=inc,
-        m_chunk=m_chunk,
-        chunk_starts=chunk_starts,
-        final_state=final_state,
-        initial_state0=initial_state0,
-        has_init=bool(cfg[9]),
-        num_threads=int(cfg[3]),
-        vecs_per_thread=int(cfg[4]),
-    )
-    launch_scan = _make_prepared_chunk_scan_launch(
-        U=U,
-        M=M,
-        K=K,
-        B=B,
-        C=C,
-        U_tc=U_tc,
-        B_tc=B_tc,
-        C_tc=C_tc,
-        M_f=M_f,
-        K_f=K_f,
-        chunk_starts=chunk_starts,
-        U_prev0=U_prev0,
-        B_prev0=B_prev0,
-        out_chunk=out_chunk,
-        chunk_size=chunk_size,
-        m_block_size=int(cfg[0]),
-        n_block_size=int(cfg[1]),
-        num_threads=int(cfg[2]),
         compute_dtype=compute_dtype,
         output_dtype=output_dtype,
-        has_prev=B_prev is not None,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        scan_num_threads=scan_num_threads,
+        state_num_threads=state_num_threads,
+        state_vecs_per_thread=state_vecs_per_thread,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        return_final_state=return_final_state,
+        return_intermediates=return_intermediates,
+        prepared_inputs=prepared_inputs,
+        validate_runtime_contract=False,
     )
-    launch_inc()
-    launch_state()
-    state_chunk_starts = chunk_starts
-    state_final_state = final_state
-    launch_scan()
-    _record_tensors_on_current_stream(*keepalive)
-    Y, final_state, m_chunk, chunk_starts = outputs
-    if not return_final_state:
-        return Y, m_chunk, chunk_starts
-    return Y, state_final_state, m_chunk, state_chunk_starts
 
 
 __all__ = [
     "chunk_increment_cute",
     "chunk_scan_cute",
-    "compile_chunk_increment_kernel",
-    "compile_chunk_scan_kernel",
-    "compile_state_passing_kernel",
+    "compile_chunk_increment_cute",
+    "compile_chunk_scan_cute",
+    "compile_state_passing_cute",
     "compile_v2x2ssd_fwd_cute",
     "state_passing_cute",
     "v2x2ssd_fwd_cute",

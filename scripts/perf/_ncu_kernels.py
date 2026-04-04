@@ -40,9 +40,9 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (  # noqa: E402
     compile_state_passing_bwd_kernel,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (  # noqa: E402
-    _compile_chunk_increment_kernel_impl,
-    _compile_chunk_scan_kernel_impl,
-    _compile_state_passing_kernel_impl,
+    _make_chunk_increment_prepared_launch,
+    _make_chunk_scan_prepared_launch,
+    _make_state_passing_prepared_launch,
     chunk_increment_cute,
 )
 
@@ -488,32 +488,34 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
     D = B.shape[-1]
     tc_dtype = _tc_input_dtype(cfg.dtype)
 
-    _compiled_inc, inc_chunk, m_chunk_chunk, launch_inc = (
-        _compile_chunk_increment_kernel_impl(
-            U,
-            M,
-            K,
-            B,
-            U_prev0=U_prev,
-            B_prev0=B_prev,
-            chunk_size=cfg.chunk_size,
-            compute_dtype=torch.float32,
-        )
+    prepared_increment = _make_chunk_increment_prepared_launch(
+        U,
+        M,
+        K,
+        B,
+        U_prev=U_prev,
+        B_prev=B_prev,
+        chunk_size=cfg.chunk_size,
+        compute_dtype=torch.float32,
     )
-    launch_inc()
-    inc = inc_chunk.reshape(cfg.batch, cfg.heads, n_chunks, cfg.P, D)
-    m_chunk = m_chunk_chunk.reshape(cfg.batch, cfg.heads, n_chunks, 2)
-
-    _compiled_state, chunk_starts, final_state, launch_state = (
-        _compile_state_passing_kernel_impl(
-            inc,
-            m_chunk,
-            initial_states=initial_states,
-        )
+    prepared_increment.compiled(*prepared_increment.runtime_args)
+    inc_chunk = prepared_increment.outputs.increment_chunk
+    chunk_multiplier_storage = prepared_increment.outputs.chunk_multiplier_storage
+    increment = inc_chunk.reshape(cfg.batch, cfg.heads, n_chunks, cfg.P, D)
+    chunk_multiplier = chunk_multiplier_storage.reshape(
+        cfg.batch, cfg.heads, n_chunks, 2
     )
-    launch_state()
 
-    _compiled_scan, out_chunk, _out_view, launch_scan = _compile_chunk_scan_kernel_impl(
+    prepared_state = _make_state_passing_prepared_launch(
+        increment,
+        chunk_multiplier,
+        initial_states=initial_states,
+    )
+    prepared_state.compiled(*prepared_state.runtime_args)
+    chunk_starts = prepared_state.outputs.chunk_starts
+    final_state = prepared_state.outputs.final_state
+
+    prepared_scan = _make_chunk_scan_prepared_launch(
         U,
         M,
         K,
@@ -526,6 +528,7 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
         compute_dtype=torch.float32,
         output_dtype=torch.float32,
     )
+    out_chunk = prepared_scan.outputs.output_chunk
 
     bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
     bytes_bc = _shape_bytes((cfg.batch, cfg.heads, T_pad, D), tc_dtype)
@@ -540,17 +543,25 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 + bytes_bc
                 + bytes_m
                 + bytes_k
-                + _tensor_bytes(U_prev, B_prev, inc_chunk, m_chunk_chunk)
+                + _tensor_bytes(U_prev, B_prev, inc_chunk, chunk_multiplier_storage)
             ),
-            launch=launch_inc,
+            launch=lambda prepared=prepared_increment: prepared.compiled(
+                *prepared.runtime_args
+            ),
             prepare=_noop,
         ),
         "state_passing_fwd": KernelRunner(
             name="state_passing_fwd",
             effective_bytes=_tensor_bytes(
-                inc, m_chunk, initial_states, chunk_starts, final_state
+                increment,
+                chunk_multiplier,
+                initial_states,
+                chunk_starts,
+                final_state,
             ),
-            launch=launch_state,
+            launch=lambda prepared=prepared_state: prepared.compiled(
+                *prepared.runtime_args
+            ),
             prepare=_noop,
         ),
         "chunk_scan_fwd": KernelRunner(
@@ -563,7 +574,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 + bytes_k
                 + _tensor_bytes(chunk_starts, U_prev, B_prev, out_chunk)
             ),
-            launch=launch_scan,
+            launch=lambda prepared=prepared_scan: prepared.compiled(
+                *prepared.runtime_args
+            ),
             prepare=_noop,
         ),
     }
@@ -587,8 +600,8 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
+        B_prev=B_prev,
+        U_prev=U_prev,
         compute_dtype=torch.float32,
     )
     d_inc = torch.randn_like(inc)
@@ -760,18 +773,17 @@ def _build_v2x2ssd_state_passing_bwd_runners(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
+        B_prev=B_prev,
+        U_prev=U_prev,
         compute_dtype=torch.float32,
     )
-    _compiled_state, chunk_starts, _final_state, launch_state = (
-        _compile_state_passing_kernel_impl(
-            inc,
-            m_chunk,
-            initial_states=initial_states,
-        )
+    prepared_state = _make_state_passing_prepared_launch(
+        inc,
+        m_chunk,
+        initial_states=initial_states,
     )
-    launch_state()
+    prepared_state.compiled(*prepared_state.runtime_args)
+    chunk_starts = prepared_state.outputs.chunk_starts
 
     d_chunk_starts = torch.randn_like(chunk_starts)
     d_final = torch.randn_like(initial_states)
@@ -837,18 +849,17 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
+        B_prev=B_prev,
+        U_prev=U_prev,
         compute_dtype=torch.float32,
     )
-    _compiled_state, chunk_starts, _final_state, launch_state = (
-        _compile_state_passing_kernel_impl(
-            inc,
-            m_chunk,
-            initial_states=initial_states,
-        )
+    prepared_state = _make_state_passing_prepared_launch(
+        inc,
+        m_chunk,
+        initial_states=initial_states,
     )
-    launch_state()
+    prepared_state.compiled(*prepared_state.runtime_args)
+    chunk_starts = prepared_state.outputs.chunk_starts
     d_out = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, cfg.P),
         device=cfg.torch_device,

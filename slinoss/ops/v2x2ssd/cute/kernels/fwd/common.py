@@ -154,18 +154,33 @@ def _make_fake_tensor_arg(
     align: int | None = None,
     dynamic_stride: bool = False,
 ):
-    fake_shape = tuple(
-        int(dim) for dim in (shape if shape is not None else tensor.shape)
+    return _make_fake_tensor_spec_arg(
+        dtype=tensor.dtype,
+        shape=tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
+        stride=tuple(
+            int(step) for step in (stride if stride is not None else tensor.stride())
+        ),
+        align=int(align if align is not None else _assumed_align(tensor)),
+        dynamic_stride=dynamic_stride,
     )
-    fake_stride = tuple(
-        int(step) for step in (stride if stride is not None else tensor.stride())
-    )
-    assumed = int(align if align is not None else _assumed_align(tensor))
+
+
+def _make_fake_tensor_spec_arg(
+    *,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    align: int,
+    dynamic_stride: bool = False,
+):
+    fake_shape = tuple(int(dim) for dim in shape)
+    fake_stride = tuple(int(step) for step in stride)
+    assumed = int(align)
     row_major_stride = tuple(reversed(range(len(fake_shape))))
     if not dynamic_stride and fake_stride == tuple(_make_row_major_stride(fake_shape)):
         dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
         return cute.runtime.make_fake_compact_tensor(
-            _torch_to_cutlass_dtype(tensor.dtype),
+            _torch_to_cutlass_dtype(dtype),
             dynamic_shape,
             stride_order=row_major_stride,
             assumed_align=assumed,
@@ -176,13 +191,13 @@ def _make_fake_tensor_arg(
             0 if step == 0 else cute.sym_int32() for step in fake_stride
         )
         return cute.runtime.make_fake_tensor(
-            _torch_to_cutlass_dtype(tensor.dtype),
+            _torch_to_cutlass_dtype(dtype),
             dynamic_shape,
             stride=dynamic_fake_stride,
             assumed_align=assumed,
         )
     return cute.runtime.make_fake_tensor(
-        _torch_to_cutlass_dtype(tensor.dtype),
+        _torch_to_cutlass_dtype(dtype),
         fake_shape,
         stride=fake_stride,
         assumed_align=assumed,
@@ -229,6 +244,7 @@ __all__ = [
     "_ensure_min_alignment",
     "_guard_prev_time_base",
     "_make_fake_tensor_arg",
+    "_make_fake_tensor_spec_arg",
     "_pad_m_identity",
     "_pad_zero_time",
     "_tc_input_dtype",

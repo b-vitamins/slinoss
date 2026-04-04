@@ -39,7 +39,7 @@ def _compact_stride_order(stride: tuple[int, ...]) -> tuple[int, ...]:
     )
 
 
-def _make_runtime_tensor_view(
+def make_runtime_tensor_spec_view(
     tensor: torch.Tensor,
     spec: TensorSpec,
 ) -> torch.Tensor:
@@ -114,7 +114,7 @@ def to_cute_runtime_tensor_view(
     dynamic_modes: Iterable[int],
     compact: bool = True,
 ):
-    runtime_view = _make_runtime_tensor_view(tensor, spec)
+    runtime_view = make_runtime_tensor_spec_view(tensor, spec)
     if not compact:
         return to_cute_layout_dynamic_tensor(runtime_view, align=align)
     return to_cute_compact_dynamic_tensor(
@@ -127,6 +127,7 @@ def to_cute_runtime_tensor_view(
 
 __all__ = [
     "ensure_cute_runtime_env",
+    "make_runtime_tensor_spec_view",
     "to_cute_runtime_tensor_view",
     "to_cute_compact_dynamic_tensor",
     "to_cute_layout_dynamic_tensor",

@@ -357,8 +357,8 @@ def _build_forward_callable(
                 K,
                 B,
                 chunk_size=cfg.chunk_size,
-                B_prev0=B_prev,
-                U_prev0=U_prev,
+                B_prev=B_prev,
+                U_prev=U_prev,
                 compute_dtype=torch.float32,
             )
         fn()
@@ -381,8 +381,8 @@ def _build_forward_callable(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
+        B_prev=B_prev,
+        U_prev=U_prev,
         compute_dtype=torch.float32,
     )
 
@@ -708,8 +708,8 @@ def _build_chunk_scan_backward_callable(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
+        B_prev=B_prev,
+        U_prev=U_prev,
         compute_dtype=torch.float32,
     )
     starts_cute, _ = state_passing_cute(

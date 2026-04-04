@@ -233,8 +233,8 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
                 K,
                 B,
                 chunk_size=chunk_size,
-                B_prev0=B_prev,
-                U_prev0=U_prev,
+                B_prev=B_prev,
+                U_prev=U_prev,
                 compute_dtype=torch.float32,
             )
         fn()
@@ -257,8 +257,8 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
         K,
         B,
         chunk_size=chunk_size,
-        B_prev0=B_prev,
-        U_prev0=U_prev,
+        B_prev=B_prev,
+        U_prev=U_prev,
         compute_dtype=torch.float32,
     )
 
