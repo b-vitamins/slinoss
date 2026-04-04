@@ -104,8 +104,75 @@ jobs:
           name: slinoss-pure-wheel-${{ steps.meta.outputs.version }}
           path: dist/${{ steps.meta.outputs.wheel_name }}
 
+  build_cuda_aot_payload:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: "12.8.0"
+          method: network
+          sub-packages: '["nvcc"]'
+
+      - name: Show nvcc version
+        run: nvcc -V
+
+      - name: Install build tooling
+        run: >
+          python -m pip install --upgrade pip "setuptools>=69" wheel build
+
+      - name: Install PyTorch CUDA wheel
+        run: >
+          python -m pip install --upgrade
+          "torch==${TORCH_VERSION}"
+
+      - name: Install CuTe AOT build dependencies
+        run: >
+          python -m pip install --upgrade
+          "nvidia-cutlass-dsl==4.4.2"
+          "cuda-python==12.9.4"
+          "apache-tvm-ffi==0.1.9"
+
+      - name: Clean AOT payload output
+        run: rm -rf /tmp/slinoss-cute-forward-aot
+
+      - name: Build CUDA forward AOT payload
+        env:
+          CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+          TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
+          SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS: "8.0;8.6;8.9;9.0"
+        run: >
+          python scripts/build_cute_forward_aot.py
+          --package-root /tmp/slinoss-cute-forward-aot
+
+      - name: Verify CUDA forward AOT payload
+        run: |
+          test -f /tmp/slinoss-cute-forward-aot/manifest.json
+          test -d /tmp/slinoss-cute-forward-aot/artifacts
+          test -d /tmp/slinoss-cute-forward-aot/runtime
+
+      - name: Upload CUDA forward AOT payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: slinoss-cute-forward-aot
+          path: /tmp/slinoss-cute-forward-aot
+
   build_cuda:
     if: github.event_name != 'pull_request'
+    needs:
+      - build_cuda_aot_payload
     strategy:
       fail-fast: false
       matrix:
@@ -174,12 +241,17 @@ jobs:
           rm -rf slinoss/ops/v2x2ssd/cute/aot/runtime
           rm -f slinoss/ops/v2x2ssd/cute/aot/manifest.json
 
+      - name: Download CUDA forward AOT payload
+        uses: actions/download-artifact@v4
+        with:
+          name: slinoss-cute-forward-aot
+          path: /tmp/slinoss-cute-forward-aot
+
       - name: Build CUDA wheel
         env:
           CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
           TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
-          SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS: "8.0;8.6;8.9;9.0"
-          SLINOSS_BUILD_CUTE_FORWARD_AOT: "1"
+          SLINOSS_CUTE_FORWARD_AOT_PAYLOAD_DIR: "/tmp/slinoss-cute-forward-aot"
         run: python -m build --wheel --no-isolation
 
       - name: Capture CUDA wheel name

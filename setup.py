@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import warnings
 from pathlib import Path
+from typing import Any
 
 from setuptools import setup
 from setuptools.command.build_py import build_py as _build_py
@@ -42,6 +44,13 @@ def _want_cute_forward_aot() -> bool:
     return os.environ.get("SLINOSS_BUILD_CUTE_FORWARD_AOT", "0") == "1"
 
 
+def _cute_forward_aot_payload_dir() -> Path | None:
+    payload_dir = os.environ.get("SLINOSS_CUTE_FORWARD_AOT_PAYLOAD_DIR", "").strip()
+    if not payload_dir:
+        return None
+    return Path(payload_dir)
+
+
 def _build_cute_forward_aot(package_root: Path) -> None:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
@@ -53,25 +62,41 @@ def _build_cute_forward_aot(package_root: Path) -> None:
     build_forward_aot_search_space_package(package_root=package_root, clean=True)
 
 
+def _stage_cute_forward_aot_payload(source_root: Path, package_root: Path) -> None:
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    from slinoss._wheel_aot import stage_cute_forward_aot_payload
+
+    shutil.rmtree(package_root / "artifacts", ignore_errors=True)
+    shutil.rmtree(package_root / "runtime", ignore_errors=True)
+    (package_root / "manifest.json").unlink(missing_ok=True)
+    stage_cute_forward_aot_payload(source_root, package_root)
+
+
 class BuildPyWithCuteForwardAOT(_build_py):
     """Optionally package prebuilt CuTe forward AOT artifacts into wheels."""
 
     def run(self):
         super().run()
-        if not _want_cute_forward_aot():
-            return
-
         package_root = (
             Path(self.build_lib) / "slinoss" / "ops" / "v2x2ssd" / "cute" / "aot"
         )
         package_root.mkdir(parents=True, exist_ok=True)
-        _build_cute_forward_aot(package_root)
+        payload_dir = _cute_forward_aot_payload_dir()
+        if payload_dir is not None:
+            _stage_cute_forward_aot_payload(payload_dir, package_root)
+            return
+        if _want_cute_forward_aot():
+            _build_cute_forward_aot(package_root)
 
 
 ext_modules = []
-cmdclass: dict[str, object] = {"build_py": BuildPyWithCuteForwardAOT}
+cmdclass: dict[str, Any] = {"build_py": BuildPyWithCuteForwardAOT}
 
 if _want_cuda_extension():
+    assert CUDAExtension is not None
+    assert BuildExtension is not None
     ext_modules.append(
         CUDAExtension(
             name="slinoss._C.cconv1d_cuda",
