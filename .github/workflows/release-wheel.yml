@@ -55,7 +55,11 @@ jobs:
             "torch==${TORCH_VERSION}"
 
       - name: Clean build artifacts
-        run: rm -rf build dist *.egg-info
+        run: |
+          rm -rf build dist *.egg-info
+          rm -rf slinoss/ops/v2x2ssd/cute/aot/artifacts
+          rm -rf slinoss/ops/v2x2ssd/cute/aot/runtime
+          rm -f slinoss/ops/v2x2ssd/cute/aot/manifest.json
 
       - name: Build universal wheel
         env:
@@ -156,13 +160,25 @@ jobs:
           python -m pip install --upgrade
           "torch==${TORCH_VERSION}"
 
+      - name: Install CuTe AOT build dependencies
+        run: >
+          python -m pip install --upgrade
+          "nvidia-cutlass-dsl==4.4.2"
+          "cuda-python==12.9.4"
+          "apache-tvm-ffi==0.1.9"
+
       - name: Clean build artifacts
-        run: rm -rf build dist *.egg-info
+        run: |
+          rm -rf build dist *.egg-info
+          rm -rf slinoss/ops/v2x2ssd/cute/aot/artifacts
+          rm -rf slinoss/ops/v2x2ssd/cute/aot/runtime
+          rm -f slinoss/ops/v2x2ssd/cute/aot/manifest.json
 
       - name: Build CUDA wheel
         env:
           CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
           TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
+          SLINOSS_BUILD_CUTE_FORWARD_AOT: "1"
         run: python -m build --wheel --no-isolation
 
       - name: Capture CUDA wheel name
@@ -195,6 +211,10 @@ jobs:
           if required not in names:
               raise SystemExit(f"Missing {required} in {wheel.name}")
 
+          aot_manifest = "slinoss/ops/v2x2ssd/cute/aot/manifest.json"
+          if aot_manifest not in names:
+              raise SystemExit(f"Missing {aot_manifest} in {wheel.name}")
+
           extension_members = [
               name
               for name in names
@@ -206,6 +226,40 @@ jobs:
                   f"found {extension_members}"
               )
           print("cuda-wheel-extension", extension_members[0])
+
+          aot_members = [
+              name
+              for name in names
+              if name.startswith("slinoss/ops/v2x2ssd/cute/aot/artifacts/")
+              and name.endswith(".so")
+          ]
+          aot_object_members = [
+              name
+              for name in names
+              if name.startswith("slinoss/ops/v2x2ssd/cute/aot/artifacts/")
+              and name.endswith(".o")
+          ]
+          if not aot_members:
+              raise SystemExit(
+                  f"Expected packaged forward AOT shared libraries in {wheel.name}"
+              )
+          if aot_object_members:
+              raise SystemExit(
+                  f"Did not expect packaged forward AOT object files in {wheel.name}: "
+                  f"{aot_object_members}"
+              )
+          runtime_members = [
+              name
+              for name in names
+              if name.startswith("slinoss/ops/v2x2ssd/cute/aot/runtime/")
+              and name.endswith(".so")
+          ]
+          if len(runtime_members) < 2:
+              raise SystemExit(
+                  f"Expected packaged CuTe/TVM runtime libs in {wheel.name}, "
+                  f"found {runtime_members}"
+              )
+          print("cuda-wheel-aot-count", len(aot_members))
           PY
 
       - name: Smoke install CUDA wheel
@@ -222,11 +276,13 @@ jobs:
           import cutlass  # noqa: F401
           import cuda  # noqa: F401
           import slinoss
+          from slinoss.ops.v2x2ssd.cute.aot import list_packaged_forward_aot_specs
           from slinoss.layers import SLinOSSMixer
           from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
 
           print("slinoss_import", slinoss.__file__)
           assert cconv1d_is_available(), cconv1d_load_error()
+          assert list_packaged_forward_aot_specs(), "expected packaged forward AOT specs"
           mixer = SLinOSSMixer(
               d_model=32,
               d_state=32,

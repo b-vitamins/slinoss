@@ -1339,8 +1339,17 @@ def _make_chunk_scan_host_wrapper(
             n_block_size=n_block_size,
             num_threads=num_threads,
         )
-        chunk_scan.call_on_stream(
-            mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut, stream
+        chunk_scan._launch_main_kernel(
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mZ0,
+            mU_prev0,
+            mB_prev0,
+            mOut,
+            stream=stream,
         )
 
     return _chunk_scan_host_wrapper
@@ -1563,7 +1572,7 @@ def _make_chunk_increment_host_wrapper(
             chunk_size=chunk_size,
             cta_tiler=cta_tiler,
         )
-        chunk_increment.call_on_stream(
+        chunk_increment._launch_kernel(
             mU,
             mB,
             mM,
@@ -1573,7 +1582,7 @@ def _make_chunk_increment_host_wrapper(
             mB_prev,
             mIncrement,
             mChunkMultiplier,
-            stream,
+            stream=stream,
         )
 
     return _chunk_increment_host_wrapper
@@ -1754,7 +1763,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             chunk_size=chunk_size,
             cta_tiler=_resolve_chunk_increment_cta_tiler(D=D),
         )
-        chunk_increment_kernel.call_on_stream(
+        chunk_increment_kernel._launch_kernel(
             U_increment_view,
             B_increment_view,
             M_increment_view,
@@ -1764,7 +1773,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             B_prev_increment_view,
             increment_view,
             chunk_multiplier_view,
-            stream,
+            stream=stream,
         )
 
         increment_state_view = _make_static_tensor_spec_view(
@@ -1813,7 +1822,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             n_block_size=n_block_size,
             num_threads=scan_num_threads,
         )
-        chunk_scan_kernel.call_on_stream(
+        chunk_scan_kernel._launch_main_kernel(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -1823,7 +1832,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             U_prev_scan_view,
             B_prev_scan_view,
             output_view,
-            stream,
+            stream=stream,
         )
 
     return _v2x2ssd_fwd_host_wrapper
@@ -3016,6 +3025,11 @@ def _get_compiled_v2x2ssd_fwd_kernel(
     output_dtype: torch.dtype,
     compile_artifacts: ForwardCompileArtifacts,
 ):
+    from slinoss.ops.v2x2ssd.cute.aot import (
+        ForwardAOTSpec,
+        try_load_packaged_v2x2ssd_fwd_function,
+    )
+
     cache_key = _fwd_host_cache_key(
         device_index=(U.device.index if U.device.index is not None else -1),
         tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
@@ -3029,6 +3043,32 @@ def _get_compiled_v2x2ssd_fwd_kernel(
         note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=True)
         return compiled
 
+    forward_aot_spec = ForwardAOTSpec(
+        P=int(compile_artifacts.problem_shape[3]),
+        D=int(compile_artifacts.problem_shape[4]),
+        chunk_size=int(compile_artifacts.problem_shape[6]),
+        tc_dtype_name={
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[_tc_input_dtype(U.dtype, compute_dtype)],
+        output_dtype_name={
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[output_dtype],
+        launch_cfg=tuple(
+            bool(v) if isinstance(v, bool) else int(v)
+            for v in compile_artifacts.launch_cfg
+        ),
+    )
+    packaged = try_load_packaged_v2x2ssd_fwd_function(forward_aot_spec)
+    if packaged is not None:
+        note_cache_event("cute.v2x2ssd.fwd.host_aot", hit=True)
+        _FWD_HOST_CACHE[cache_key] = packaged
+        return packaged
+
+    note_cache_event("cute.v2x2ssd.fwd.host_aot", hit=False)
     note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=False)
     host_wrapper = _make_v2x2ssd_fwd_host_wrapper(
         problem_shape=compile_artifacts.problem_shape,

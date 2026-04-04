@@ -24,6 +24,7 @@ dependencies = [
 cuda = [
   "nvidia-cutlass-dsl==4.4.2",
   "cuda-python==12.9.4",
+  "apache-tvm-ffi==0.1.9",
 ]
 dev = [
   "build>=1.2",
@@ -34,3 +35,11 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["slinoss*"]
+
+[tool.setuptools.package-data]
+"slinoss.ops.v2x2ssd.cute.aot" = [
+  "manifest.json",
+  "artifacts/*.json",
+  "artifacts/*.so",
+  "runtime/*.so",
+]

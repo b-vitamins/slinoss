@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import sys
 import warnings
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build_py import build_py as _build_py
 
 try:
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
@@ -36,8 +38,38 @@ def _want_cuda_extension() -> bool:
     return True
 
 
+def _want_cute_forward_aot() -> bool:
+    return os.environ.get("SLINOSS_BUILD_CUTE_FORWARD_AOT", "0") == "1"
+
+
+def _build_cute_forward_aot(package_root: Path) -> None:
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    from slinoss._cute_runtime import ensure_cute_runtime_env
+    from slinoss.ops.v2x2ssd.cute.aot import build_default_forward_aot_package
+
+    ensure_cute_runtime_env()
+    build_default_forward_aot_package(package_root=package_root, clean=True)
+
+
+class BuildPyWithCuteForwardAOT(_build_py):
+    """Optionally package prebuilt CuTe forward AOT artifacts into wheels."""
+
+    def run(self):
+        super().run()
+        if not _want_cute_forward_aot():
+            return
+
+        package_root = (
+            Path(self.build_lib) / "slinoss" / "ops" / "v2x2ssd" / "cute" / "aot"
+        )
+        package_root.mkdir(parents=True, exist_ok=True)
+        _build_cute_forward_aot(package_root)
+
+
 ext_modules = []
-cmdclass: dict[str, object] = {}
+cmdclass: dict[str, object] = {"build_py": BuildPyWithCuteForwardAOT}
 
 if _want_cuda_extension():
     ext_modules.append(
