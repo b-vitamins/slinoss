@@ -35,7 +35,7 @@ depend on a GitHub Releases wheel.
 Reference / CPU installs can use the universal wheel:
 
 ```txt
-slinoss @ https://github.com/b-vitamins/slinoss/releases/download/v0.4.0/slinoss-0.4.0-py3-none-any.whl
+slinoss @ https://github.com/b-vitamins/slinoss/releases/download/v0.4.1/slinoss-0.4.1-py3-none-any.whl
 ```
 
 CUDA installs that need both the CuTe backend and the compiled
@@ -44,18 +44,18 @@ CUDA installs that need both the CuTe backend and the compiled
 the matching `cp311`, `cp312`, or `cp313` wheel. For example, on Python 3.11:
 
 ```txt
-slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.4.0/slinoss-0.4.0-cp311-cp311-linux_x86_64.whl
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.4.1/slinoss-0.4.1-cp311-cp311-linux_x86_64.whl
 ```
 
 In `pyproject.toml`, the equivalent is:
 
 ```toml
 dependencies = [
-  "slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.4.0/slinoss-0.4.0-cp311-cp311-linux_x86_64.whl",
+  "slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.4.1/slinoss-0.4.1-cp311-cp311-linux_x86_64.whl",
 ]
 ```
 
-Replace `v0.4.0` and `0.4.0` with the release tag and package version you want
+Replace `v0.4.1` and `0.4.1` with the release tag and package version you want
 to consume, and pick the wheel asset whose Python and platform tags match your
 environment. Release CI currently publishes CUDA wheels for CPython 3.11, 3.12,
 and 3.13.

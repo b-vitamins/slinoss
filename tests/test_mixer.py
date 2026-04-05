@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from slinoss.layers import (
     ScanPrepInputs,
     ScanState,
 )
+from slinoss.layers.mixer import _SplitMixerProjectionFn
 
 
 class SpyBackend:
@@ -73,6 +76,14 @@ class ZeroConvBackend:
         state_len = max(owner.d_conv - 1, 0)
         next_state = x.new_zeros((x.shape[0], owner.d_inner, state_len))
         return torch.zeros_like(x), next_state
+
+
+def _cuda_amp_dtype_supported(dtype: torch.dtype) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if dtype == torch.bfloat16:
+        return torch.cuda.is_bf16_supported()
+    return dtype == torch.float16
 
 
 def _make_mixer(*, backend: object | None = None) -> SLinOSSMixer:
@@ -663,3 +674,88 @@ def test_mixer_segmented_forward_matches_single_pass() -> None:
     assert state.scan.b_prev is not None
     assert state.scan.u_prev is not None
     assert torch.allclose(y_full, torch.cat([y_a, y_b], dim=1), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("amp_dtype", [torch.float16, torch.bfloat16])
+def test_split_mixer_projection_backward_supports_cuda_autocast(
+    amp_dtype: torch.dtype,
+) -> None:
+    if not _cuda_amp_dtype_supported(amp_dtype):
+        pytest.skip("CUDA autocast dtype is unavailable")
+
+    d_model = 16
+    d_inner = 8
+    param_proj_dim = 6
+    out_rows = 2 * d_inner + param_proj_dim + 10
+    x = torch.randn(
+        (2, 3, d_model),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    weight = torch.randn(
+        (out_rows, d_model),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    with torch.autocast("cuda", dtype=amp_dtype):
+        gate, value, params, bc = cast(
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            _SplitMixerProjectionFn.apply(
+                x,
+                weight,
+                d_inner,
+                param_proj_dim,
+            ),
+        )
+        loss = (
+            gate.square().mean()
+            + value.square().mean()
+            + params.square().mean()
+            + bc.square().mean()
+        )
+
+    loss.backward()
+
+    assert x.grad is not None
+    assert weight.grad is not None
+    assert x.grad.dtype == x.dtype
+    assert weight.grad.dtype == weight.dtype
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(weight.grad).all()
+
+
+@pytest.mark.parametrize("amp_dtype", [torch.float16, torch.bfloat16])
+def test_mixer_backward_supports_cuda_autocast(amp_dtype: torch.dtype) -> None:
+    if not _cuda_amp_dtype_supported(amp_dtype):
+        pytest.skip("CUDA autocast dtype is unavailable")
+
+    mixer = SLinOSSMixer(
+        32,
+        d_state=8,
+        expand=2,
+        d_head=16,
+        d_conv=3,
+        chunk_size=4,
+        normalize_bc=True,
+        scanprep_backend=ReferenceScanPrepBackend(),
+        backend=ReferenceScanBackend(compute_dtype=torch.float32),
+        cconv_backend=ReferenceCConv1dBackend(),
+        device="cuda",
+        dtype=torch.float32,
+    ).train()
+    x = torch.randn((2, 8, 32), device="cuda", dtype=torch.float32, requires_grad=True)
+
+    with torch.autocast("cuda", dtype=amp_dtype):
+        loss = mixer(x).square().mean()
+
+    loss.backward()
+
+    assert x.grad is not None
+    assert mixer.in_proj.weight.grad is not None
+    assert x.grad.dtype == x.dtype
+    assert mixer.in_proj.weight.grad.dtype == mixer.in_proj.weight.dtype
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(mixer.in_proj.weight.grad).all()

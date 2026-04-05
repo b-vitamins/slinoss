@@ -60,6 +60,19 @@ def _copy_mixer_state_(dst: SLinOSSMixerState, src: SLinOSSMixerState) -> None:
     _copy_scan_state_(dst.scan, src.scan)
 
 
+def _promote_dtypes(*dtypes: torch.dtype) -> torch.dtype:
+    result = dtypes[0]
+    for dtype in dtypes[1:]:
+        result = torch.promote_types(result, dtype)
+    return result
+
+
+def _to_dtype_if_needed(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if x.dtype == dtype:
+        return x
+    return x.to(dtype=dtype)
+
+
 class _SplitMixerProjectionFn(torch.autograd.Function):
     @staticmethod
     def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -108,22 +121,73 @@ class _SplitMixerProjectionFn(torch.autograd.Function):
             return None, None, None, None
 
         if ctx.needs_input_grad[0]:
-            grad_gate_flat = grad_gate.reshape(-1, d_inner)
-            grad_value_flat = grad_value.reshape(-1, d_inner)
-            grad_params_flat = grad_params.reshape(-1, param_proj_dim)
-            grad_bc_flat_2d = grad_bc_flat.reshape(-1, weight.shape[0] - params_end)
-            grad_x_flat = torch.mm(grad_bc_flat_2d, weight[params_end:, :])
-            grad_x_flat.addmm_(grad_gate_flat, weight[:d_inner, :])
-            grad_x_flat.addmm_(grad_value_flat, weight[d_inner:gate_value_end, :])
-            grad_x_flat.addmm_(grad_params_flat, weight[gate_value_end:params_end, :])
+            grad_input_dtype = _promote_dtypes(
+                weight.dtype,
+                grad_gate.dtype,
+                grad_value.dtype,
+                grad_params.dtype,
+                grad_bc_flat.dtype,
+            )
+            grad_gate_flat = _to_dtype_if_needed(
+                grad_gate.reshape(-1, d_inner), grad_input_dtype
+            )
+            grad_value_flat = _to_dtype_if_needed(
+                grad_value.reshape(-1, d_inner), grad_input_dtype
+            )
+            grad_params_flat = _to_dtype_if_needed(
+                grad_params.reshape(-1, param_proj_dim), grad_input_dtype
+            )
+            grad_bc_flat_2d = _to_dtype_if_needed(
+                grad_bc_flat.reshape(-1, weight.shape[0] - params_end),
+                grad_input_dtype,
+            )
+            grad_x_flat = torch.mm(
+                grad_bc_flat_2d,
+                _to_dtype_if_needed(weight[params_end:, :], grad_input_dtype),
+            )
+            grad_x_flat.addmm_(
+                grad_gate_flat,
+                _to_dtype_if_needed(weight[:d_inner, :], grad_input_dtype),
+            )
+            grad_x_flat.addmm_(
+                grad_value_flat,
+                _to_dtype_if_needed(
+                    weight[d_inner:gate_value_end, :],
+                    grad_input_dtype,
+                ),
+            )
+            grad_x_flat.addmm_(
+                grad_params_flat,
+                _to_dtype_if_needed(
+                    weight[gate_value_end:params_end, :],
+                    grad_input_dtype,
+                ),
+            )
+            grad_x_flat = _to_dtype_if_needed(grad_x_flat, x.dtype)
             grad_x = grad_x_flat.view_as(x)
         if ctx.needs_input_grad[1]:
-            x_flat = x.reshape(-1, x.shape[-1])
-            grad_gate_flat = grad_gate.reshape(-1, d_inner)
-            grad_value_flat = grad_value.reshape(-1, d_inner)
-            grad_params_flat = grad_params.reshape(-1, param_proj_dim)
-            grad_bc_flat_2d = grad_bc_flat.reshape(-1, weight.shape[0] - params_end)
-            grad_weight = torch.empty_like(weight)
+            grad_weight_dtype = _promote_dtypes(
+                x.dtype,
+                grad_gate.dtype,
+                grad_value.dtype,
+                grad_params.dtype,
+                grad_bc_flat.dtype,
+            )
+            x_flat = _to_dtype_if_needed(x.reshape(-1, x.shape[-1]), grad_weight_dtype)
+            grad_gate_flat = _to_dtype_if_needed(
+                grad_gate.reshape(-1, d_inner), grad_weight_dtype
+            )
+            grad_value_flat = _to_dtype_if_needed(
+                grad_value.reshape(-1, d_inner), grad_weight_dtype
+            )
+            grad_params_flat = _to_dtype_if_needed(
+                grad_params.reshape(-1, param_proj_dim), grad_weight_dtype
+            )
+            grad_bc_flat_2d = _to_dtype_if_needed(
+                grad_bc_flat.reshape(-1, weight.shape[0] - params_end),
+                grad_weight_dtype,
+            )
+            grad_weight = torch.empty_like(weight, dtype=grad_weight_dtype)
             grad_weight[:d_inner, :] = torch.mm(grad_gate_flat.t(), x_flat)
             grad_weight[d_inner:gate_value_end, :] = torch.mm(
                 grad_value_flat.t(), x_flat
@@ -132,6 +196,7 @@ class _SplitMixerProjectionFn(torch.autograd.Function):
                 grad_params_flat.t(), x_flat
             )
             grad_weight[params_end:, :] = torch.mm(grad_bc_flat_2d.t(), x_flat)
+            grad_weight = _to_dtype_if_needed(grad_weight, weight.dtype)
         return grad_x, grad_weight, None, None
 
 
