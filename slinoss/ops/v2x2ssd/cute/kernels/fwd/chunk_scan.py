@@ -778,67 +778,33 @@ class ChunkScanFwdAmpere:
             prefix_state.warp_phase_total[warp, 1] = phase_im
         cute.arch.barrier()
 
-        if warp == cutlass.Int32(0):
-            w = lane
-            num_warps = cutlass.Int32(self.num_threads // 32)
-            has_warp = w < num_warps
+        # Per the Hopper diagnosis for Issue #9, the inter-warp shuffle-based
+        # exclusive scan in this block can trigger the H100 illegal-address fault
+        # surface. A single-lane shared-memory scan preserves the same prefix
+        # algebra while sidestepping that Hopper-specific failure mode.
+        if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
+            running_log = cutlass.Float32(0.0)
+            running_phase_re = cutlass.Float32(1.0)
+            running_phase_im = cutlass.Float32(0.0)
+            for w in cutlass.range_constexpr(self.num_warps):
+                prefix_state.warp_log_offset[w] = running_log
+                prefix_state.warp_phase_offset[w, 0] = running_phase_re
+                prefix_state.warp_phase_offset[w, 1] = running_phase_im
 
-            warp_log = cutlass.select_(
-                has_warp, prefix_state.warp_log_total[w], cutlass.Float32(0.0)
-            )
-            warp_phase_re = cutlass.select_(
-                has_warp, prefix_state.warp_phase_total[w, 0], cutlass.Float32(1.0)
-            )
-            warp_phase_im = cutlass.select_(
-                has_warp, prefix_state.warp_phase_total[w, 1], cutlass.Float32(0.0)
-            )
-
-            for offset in (1, 2, 4, 8, 16):
-                other_log = cute.arch.shuffle_sync_up(
-                    warp_log, offset=offset, mask=-1, mask_and_clamp=0
+                total_log = prefix_state.warp_log_total[w]
+                total_phase_re = prefix_state.warp_phase_total[w, 0]
+                total_phase_im = prefix_state.warp_phase_total[w, 1]
+                next_running_phase_re = (
+                    running_phase_re * total_phase_re
+                    - running_phase_im * total_phase_im
                 )
-                other_phase_re = cute.arch.shuffle_sync_up(
-                    warp_phase_re, offset=offset, mask=-1, mask_and_clamp=0
+                next_running_phase_im = (
+                    running_phase_re * total_phase_im
+                    + running_phase_im * total_phase_re
                 )
-                other_phase_im = cute.arch.shuffle_sync_up(
-                    warp_phase_im, offset=offset, mask=-1, mask_and_clamp=0
-                )
-                pred = lane >= cutlass.Int32(offset)
-                warp_log = cutlass.select_(pred, warp_log + other_log, warp_log)
-                next_warp_phase_re = (
-                    warp_phase_re * other_phase_re - warp_phase_im * other_phase_im
-                )
-                next_warp_phase_im = (
-                    warp_phase_re * other_phase_im + warp_phase_im * other_phase_re
-                )
-                warp_phase_re = cutlass.select_(pred, next_warp_phase_re, warp_phase_re)
-                warp_phase_im = cutlass.select_(pred, next_warp_phase_im, warp_phase_im)
-
-            warp_log_offset = cute.arch.shuffle_sync_up(
-                warp_log, offset=1, mask=-1, mask_and_clamp=0
-            )
-            warp_phase_re_offset = cute.arch.shuffle_sync_up(
-                warp_phase_re, offset=1, mask=-1, mask_and_clamp=0
-            )
-            warp_phase_im_offset = cute.arch.shuffle_sync_up(
-                warp_phase_im, offset=1, mask=-1, mask_and_clamp=0
-            )
-
-            is_first_warp = lane == cutlass.Int32(0)
-            warp_log_offset = cutlass.select_(
-                is_first_warp, cutlass.Float32(0.0), warp_log_offset
-            )
-            warp_phase_re_offset = cutlass.select_(
-                is_first_warp, cutlass.Float32(1.0), warp_phase_re_offset
-            )
-            warp_phase_im_offset = cutlass.select_(
-                is_first_warp, cutlass.Float32(0.0), warp_phase_im_offset
-            )
-
-            if has_warp:
-                prefix_state.warp_log_offset[w] = warp_log_offset
-                prefix_state.warp_phase_offset[w, 0] = warp_phase_re_offset
-                prefix_state.warp_phase_offset[w, 1] = warp_phase_im_offset
+                running_log = running_log + total_log
+                running_phase_re = next_running_phase_re
+                running_phase_im = next_running_phase_im
 
         cute.arch.barrier()
 
