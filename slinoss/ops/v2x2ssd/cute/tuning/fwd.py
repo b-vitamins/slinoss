@@ -25,7 +25,10 @@ from .types import (
 def autotune_mode() -> str:
     """Return the configured autotune mode."""
 
-    mode = os.environ.get("SLINOSS_CUTE_AUTOTUNE", "1").strip().lower()
+    # Keep implicit runtime behavior stable and cheap until the release path has
+    # a measured curated payload again. Explicit tuning entry points and
+    # `SLINOSS_CUTE_AUTOTUNE=1/force` still exercise the full machinery.
+    mode = os.environ.get("SLINOSS_CUTE_AUTOTUNE", "0").strip().lower()
     if mode in {"0", "false", "off", "disable", "disabled"}:
         return "0"
     if mode in {"force", "retune"}:

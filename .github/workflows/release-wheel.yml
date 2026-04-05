@@ -148,7 +148,7 @@ jobs:
       - name: Clean AOT payload output
         run: rm -rf /tmp/slinoss-cute-forward-aot
 
-      - name: Build CUDA forward AOT payload
+      - name: Build CUDA default forward AOT payload
         env:
           CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
           TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
@@ -157,11 +157,29 @@ jobs:
           python scripts/build_cute_forward_aot.py
           --package-root /tmp/slinoss-cute-forward-aot
 
-      - name: Verify CUDA forward AOT payload
+      - name: Verify CUDA default forward AOT payload
         run: |
-          test -f /tmp/slinoss-cute-forward-aot/manifest.json
-          test -d /tmp/slinoss-cute-forward-aot/artifacts
-          test -d /tmp/slinoss-cute-forward-aot/runtime
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          package_root = Path("/tmp/slinoss-cute-forward-aot")
+          manifest = json.loads((package_root / "manifest.json").read_text())
+          if not (package_root / "artifacts").is_dir():
+              raise SystemExit("Missing forward AOT artifacts directory")
+          if not (package_root / "runtime").is_dir():
+              raise SystemExit("Missing forward AOT runtime directory")
+          packaged_kinds = {
+              str(record.get("kind"))
+              for record in manifest.get("artifacts", [])
+          }
+          if packaged_kinds != {"v2x2ssd_fwd"}:
+              raise SystemExit(
+                  f"Expected only packaged forward defaults, found kinds: {sorted(packaged_kinds)}"
+              )
+          if not manifest.get("artifacts"):
+              raise SystemExit("Expected at least one packaged forward AOT artifact")
+          PY
 
       - name: Upload CUDA forward AOT payload
         uses: actions/upload-artifact@v4
@@ -320,21 +338,15 @@ jobs:
               raise SystemExit(
                   f"Expected packaged forward AOT shared libraries in {wheel.name}"
               )
-          expected_kinds = {
-              "chunk_increment_fwd",
-              "state_passing_fwd",
-              "chunk_scan_fwd",
-              "v2x2ssd_fwd",
-          }
+          expected_kinds = {"v2x2ssd_fwd"}
           packaged_kinds = {
               str(record.get("kind"))
               for record in manifest.get("artifacts", [])
           }
-          missing_kinds = sorted(expected_kinds - packaged_kinds)
-          if missing_kinds:
+          if packaged_kinds != expected_kinds:
               raise SystemExit(
-                  f"Expected packaged forward AOT search-space kinds in {wheel.name}, "
-                  f"missing {missing_kinds}"
+                  f"Expected only packaged forward default kinds in {wheel.name}, "
+                  f"found {sorted(packaged_kinds)}"
               )
           if aot_object_members:
               raise SystemExit(

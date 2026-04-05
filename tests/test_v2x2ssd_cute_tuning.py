@@ -27,6 +27,12 @@ from slinoss.ops.v2x2ssd.cute.tuning import (
 from slinoss.ops.v2x2ssd.cute.tuning.hardware import current_hardware_fingerprint
 
 
+def test_autotune_mode_defaults_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SLINOSS_CUTE_AUTOTUNE", raising=False)
+    assert tuning_fwd_mod.autotune_mode() == "0"
+    assert not tuning_fwd_mod.autotune_enabled()
+
+
 def test_chunk_increment_candidate_configs_prune_unsupported_device_configs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -327,6 +333,7 @@ def test_resolve_forward_autotune_bundle_reuses_cached_record(
 ) -> None:
     torch.manual_seed(0)
     monkeypatch.setenv("SLINOSS_CUTE_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("SLINOSS_CUTE_AUTOTUNE", "1")
     U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
         batch=1, heads=1, T=64, N=8, P=64, device=torch.device("cuda")
     )

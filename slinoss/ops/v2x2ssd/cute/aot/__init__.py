@@ -10,6 +10,9 @@ runtime path:
 The packaged forward AOT path is intentionally specialized to the forward
 kernel/model configuration (for example ``P``, ``D``, chunk size, dtypes, and
 launch policy) while remaining dynamic in batch/time via runtime tensor views.
+
+Release builds should stay on a curated default payload. The full autotune
+search-space package remains available as an explicit offline build surface.
 """
 
 from __future__ import annotations
@@ -253,6 +256,7 @@ _AOT_SEARCH_P = 64
 _AOT_SEARCH_D = 256
 _AOT_SEARCH_CHUNK_SIZES = (32, 64, 128, 256)
 _AOT_SEARCH_TC_DTYPES = (torch.float16, torch.bfloat16)
+_DEFAULT_FORWARD_AOT_CHUNK_SIZES = (32, 64, 128)
 _SUPPORTED_FORWARD_AOT_ARCH_TAGS = frozenset(
     {
         "sm_80",
@@ -348,6 +352,43 @@ def _candidate_output_dtypes(tc_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     if tc_dtype != torch.float32:
         output_dtypes.append(tc_dtype)
     return tuple(output_dtypes)
+
+
+def _default_chunk_scan_config(*, chunk_size: int) -> ChunkScanConfig:
+    from ..kernels.fwd import (
+        _chunk_scan_supported_tile_families,
+        _resolve_chunk_scan_n_block_size,
+    )
+
+    supported_families = _chunk_scan_supported_tile_families(int(chunk_size))
+    if not supported_families:
+        raise ValueError(
+            f"chunk_size={int(chunk_size)} is too small for the default forward AOT payload."
+        )
+    m_block_size, num_threads = supported_families[0]
+    return ChunkScanConfig(
+        m_block_size=int(m_block_size),
+        n_block_size=int(_resolve_chunk_scan_n_block_size(int(chunk_size), 64)),
+        num_threads=int(num_threads),
+    )
+
+
+def _default_forward_config_bundle(
+    *,
+    chunk_size: int,
+    tc_dtype: torch.dtype,
+) -> ForwardConfigBundle:
+    from ..kernels.fwd import _resolve_default_chunk_increment_config
+
+    return ForwardConfigBundle(
+        chunk_increment=_resolve_default_chunk_increment_config(
+            tc_dtype=tc_dtype,
+            D=_AOT_SEARCH_D,
+            chunk_size=int(chunk_size),
+        ),
+        state_passing=StatePassingConfig(num_threads=128, vecs_per_thread=8),
+        chunk_scan=_default_chunk_scan_config(chunk_size=int(chunk_size)),
+    )
 
 
 def _search_space_chunk_increment_specs(
@@ -465,7 +506,7 @@ def _search_space_forward_specs(*, arch_tag: str = "any") -> tuple[ForwardAOTSpe
 
 
 @lru_cache(maxsize=8)
-def default_forward_aot_specs(
+def search_space_forward_aot_specs(
     arch_tags: tuple[str, ...] | None = None,
 ) -> tuple[ForwardAOTSpec, ...]:
     resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
@@ -473,6 +514,32 @@ def default_forward_aot_specs(
         spec
         for arch_tag in resolved_arch_tags
         for spec in _search_space_forward_specs(arch_tag=arch_tag)
+    )
+
+
+@lru_cache(maxsize=8)
+def default_forward_aot_specs(
+    arch_tags: tuple[str, ...] | None = None,
+) -> tuple[ForwardAOTSpec, ...]:
+    resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
+    return tuple(
+        ForwardAOTSpec(
+            arch_tag=arch_tag,
+            P=_AOT_SEARCH_P,
+            D=_AOT_SEARCH_D,
+            chunk_size=chunk_size,
+            tc_dtype_name=_dtype_name(tc_dtype),
+            output_dtype_name=_dtype_name(tc_dtype),
+            config_bundle=_default_forward_config_bundle(
+                chunk_size=chunk_size,
+                tc_dtype=tc_dtype,
+            ),
+            has_init=has_init,
+        )
+        for arch_tag in resolved_arch_tags
+        for chunk_size in _DEFAULT_FORWARD_AOT_CHUNK_SIZES
+        for tc_dtype in _AOT_SEARCH_TC_DTYPES
+        for has_init in (False, True)
     )
 
 
@@ -2046,7 +2113,7 @@ def build_forward_aot_search_space_package(
     package_root = Path(package_root)
     resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
     resolved_specs = (
-        default_forward_aot_specs(resolved_arch_tags) if specs is None else specs
+        search_space_forward_aot_specs(resolved_arch_tags) if specs is None else specs
     )
     if clean:
         shutil.rmtree(package_root / "artifacts", ignore_errors=True)
@@ -2129,13 +2196,34 @@ def build_default_forward_aot_package(
     *,
     package_root: str | os.PathLike[str] | Path = _PACKAGED_AOT_ROOT,
     specs: tuple[ForwardAOTSpec, ...] | None = None,
+    arch_tags: tuple[str, ...] | None = None,
     clean: bool = True,
 ) -> tuple[ExportedTVMFFIModule, ...]:
-    return build_forward_aot_search_space_package(
-        package_root=package_root,
-        specs=specs,
-        clean=clean,
-    )
+    package_root = Path(package_root)
+    resolved_specs = default_forward_aot_specs(arch_tags) if specs is None else specs
+    if clean:
+        shutil.rmtree(package_root / "artifacts", ignore_errors=True)
+        shutil.rmtree(package_root / "runtime", ignore_errors=True)
+        (package_root / "manifest.json").unlink(missing_ok=True)
+    exported_modules: list[ExportedTVMFFIModule] = []
+    for spec in resolved_specs:
+        compiled = _compile_forward_aot(spec)
+        exported = export_tvm_ffi_compiled_module(
+            compiled,
+            kind="v2x2ssd_fwd",
+            module_id=spec.module_id,
+            function_name=spec.module_id,
+            package_root=package_root,
+            keep_object_file=False,
+        )
+        register_aot_artifact(
+            kind="v2x2ssd_fwd",
+            spec=spec,
+            exported=exported,
+            package_root=package_root,
+        )
+        exported_modules.append(exported)
+    return tuple(exported_modules)
 
 
 __all__ = [
@@ -2163,6 +2251,7 @@ __all__ = [
     "load_tvm_ffi_function",
     "load_tvm_ffi_module",
     "register_aot_artifact",
+    "search_space_forward_aot_specs",
     "try_load_packaged_chunk_increment_function",
     "try_load_packaged_chunk_scan_function",
     "try_load_packaged_state_passing_function",

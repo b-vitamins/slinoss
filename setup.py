@@ -56,10 +56,10 @@ def _build_cute_forward_aot(package_root: Path) -> None:
         sys.path.insert(0, str(ROOT))
 
     from slinoss._cute_runtime import ensure_cute_runtime_env
-    from slinoss.ops.v2x2ssd.cute.aot import build_forward_aot_search_space_package
+    from slinoss.ops.v2x2ssd.cute.aot import build_default_forward_aot_package
 
     ensure_cute_runtime_env()
-    build_forward_aot_search_space_package(package_root=package_root, clean=True)
+    build_default_forward_aot_package(package_root=package_root, clean=True)
 
 
 def _stage_cute_forward_aot_payload(source_root: Path, package_root: Path) -> None:

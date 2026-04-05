@@ -51,9 +51,15 @@ def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
     specs = cute_aot_mod.default_forward_aot_specs(("sm_80", "sm_86"))
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert {spec.chunk_size for spec in specs} == set(
+        cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES
+    )
+    assert {spec.output_dtype_name for spec in specs} == {"float16", "bfloat16"}
     assert len(specs) == (
-        len(cute_aot_mod._search_space_forward_specs(arch_tag="sm_80"))
-        + len(cute_aot_mod._search_space_forward_specs(arch_tag="sm_86"))
+        2
+        * len(cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES)
+        * len(cute_aot_mod._AOT_SEARCH_TC_DTYPES)
+        * 2
     )
 
 
@@ -61,6 +67,97 @@ def test_default_forward_aot_specs_drop_unsupported_requested_arch_tags() -> Non
     specs = cute_aot_mod.default_forward_aot_specs(("sm_70", "sm_80"))
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80"}
+
+
+def test_search_space_forward_aot_specs_expand_beyond_default_specs() -> None:
+    default_specs = cute_aot_mod.default_forward_aot_specs(("sm_80",))
+    search_specs = cute_aot_mod.search_space_forward_aot_specs(("sm_80",))
+    assert len(search_specs) > len(default_specs)
+    assert set(cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES) <= {
+        spec.chunk_size for spec in search_specs
+    }
+    assert {spec.chunk_size for spec in search_specs} <= set(
+        cute_aot_mod._AOT_SEARCH_CHUNK_SIZES
+    )
+    assert {spec.output_dtype_name for spec in search_specs} == {
+        "float16",
+        "bfloat16",
+        "float32",
+    }
+
+
+def test_build_default_forward_aot_package_only_exports_forward_specs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    specs = cute_aot_mod.default_forward_aot_specs(("sm_80",))[:2]
+    compiled_ids: list[str] = []
+    exported_kinds: list[str] = []
+    registered_kinds: list[str] = []
+
+    def _stage_compile_should_not_run(spec: object):
+        raise AssertionError(f"unexpected stage compile for {spec!r}")
+
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "_compile_chunk_increment_aot",
+        _stage_compile_should_not_run,
+    )
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "_compile_state_passing_aot",
+        _stage_compile_should_not_run,
+    )
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "_compile_chunk_scan_aot",
+        _stage_compile_should_not_run,
+    )
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "_compile_forward_aot",
+        lambda spec: compiled_ids.append(spec.module_id) or "compiled",
+    )
+
+    def _fake_export(
+        compiled,
+        *,
+        kind: str,
+        module_id: str,
+        function_name: str,
+        package_root,
+        keep_object_file: bool = True,
+    ):
+        exported_kinds.append(kind)
+        package_root = Path(package_root)
+        return cute_aot_mod.ExportedTVMFFIModule(
+            kind=kind,
+            module_id=module_id,
+            function_name=function_name,
+            object_file=None,
+            shared_library=package_root / "artifacts" / f"{module_id}.so",
+            metadata_file=package_root / "artifacts" / f"{module_id}.json",
+        )
+
+    monkeypatch.setattr(cute_aot_mod, "export_tvm_ffi_compiled_module", _fake_export)
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "register_aot_artifact",
+        lambda **kwargs: registered_kinds.append(kwargs["kind"]),
+    )
+
+    exported = cute_aot_mod.build_default_forward_aot_package(
+        package_root=tmp_path,
+        specs=specs,
+        clean=False,
+    )
+
+    assert [module.module_id for module in exported] == [
+        spec.module_id for spec in specs
+    ]
+    assert compiled_ids == [spec.module_id for spec in specs]
+    assert exported_kinds == ["v2x2ssd_fwd", "v2x2ssd_fwd"]
+    assert registered_kinds == ["v2x2ssd_fwd", "v2x2ssd_fwd"]
 
 
 @pytest.mark.parametrize(
