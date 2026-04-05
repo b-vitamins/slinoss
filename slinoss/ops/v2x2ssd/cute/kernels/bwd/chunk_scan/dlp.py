@@ -31,8 +31,10 @@ import cutlass.utils as utils
 from .common import (
     LOG2_E,
     TWO_LOG2_E,
+    clamp_nonpositive_prefix_log,
     complex_mul,
     conj_mul_phase,
+    safe_cast_to_dtype,
 )
 
 
@@ -681,8 +683,9 @@ class ChunkScanBwdDLPAmpere:
                     nr, ni = complex_mul(pr, pi, opr, opi)
                     pr = cutlass.select_(pred, nr, pr)
                     pi = cutlass.select_(pred, ni, pi)
+                stable_logp = clamp_nonpositive_prefix_log(logp)
                 scale = cute.math.exp2(
-                    logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
+                    stable_logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
                 )
                 s_row_scale[lane] = scale
                 s_inv_row_scale[lane] = one / scale
@@ -767,8 +770,9 @@ class ChunkScanBwdDLPAmpere:
                     inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
                     pr = pr * inv_mag
                     pi = pi * inv_mag
+                    stable_logp = clamp_nonpositive_prefix_log(logp)
                     scale = cute.math.exp2(
-                        logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
+                        stable_logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
                     )
                     s_scale_full[t] = scale
                     s_inv_scale_full[t] = one / scale
@@ -924,8 +928,8 @@ class ChunkScanBwdDLPAmpere:
                         pr = cutlass.Float32(s_phase_row[t_local, 0])
                         pi = cutlass.Float32(s_phase_row[t_local, 1])
                         qx, qy = conj_mul_phase(cx, cy, pr, pi)
-                        qx0 = qx.to(mU.element_type)
-                        qy0 = qy.to(mU.element_type)
+                        qx0 = safe_cast_to_dtype(qx, mU.element_type)
+                        qy0 = safe_cast_to_dtype(qy, mU.element_type)
                     sQ_tile[t_local, d0 + 0] = qx0
                     sQ_tile[t_local, d0 + 1] = qy0
             cute.arch.barrier()
@@ -1128,8 +1132,8 @@ class ChunkScanBwdDLPAmpere:
                                         mix1 = cutlass.Float32(s_tap_prev[t_local, 1])
                                     outx = bx * mix0 + by * mix1
                                     outy = bx * mix1 - by * mix0
-                                    out0 = outx.to(mU.element_type)
-                                    out1 = outy.to(mU.element_type)
+                                    out0 = safe_cast_to_dtype(outx, mU.element_type)
+                                    out1 = safe_cast_to_dtype(outy, mU.element_type)
                                 sK_tile[t_local, d0_local + 0] = out0
                                 sK_tile[t_local, d0_local + 1] = out1
                         cute.arch.barrier()

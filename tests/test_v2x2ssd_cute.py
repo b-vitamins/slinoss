@@ -731,6 +731,25 @@ def test_v2x2ssd_fake_tensor_arg_prefers_compact_for_row_major(
     assert result[0] == "compact"
 
 
+def test_tc_input_dtype_preserves_outer_contract() -> None:
+    assert v2x2ssd_fwd_common_mod._tc_input_dtype(torch.float16, None) == torch.float16
+    assert (
+        v2x2ssd_fwd_common_mod._tc_input_dtype(torch.float16, torch.float32)
+        == torch.float16
+    )
+    assert (
+        v2x2ssd_fwd_common_mod._tc_input_dtype(torch.bfloat16, torch.float32)
+        == torch.bfloat16
+    )
+    assert v2x2ssd_fwd_common_mod._tc_input_dtype(torch.float32, None) == torch.float16
+    assert (
+        v2x2ssd_fwd_common_mod._tc_input_dtype(torch.float32, torch.float32)
+        == torch.float16
+    )
+    with pytest.raises(TypeError):
+        v2x2ssd_fwd_common_mod._tc_input_dtype(torch.float16, torch.float64)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_state_passing_cute_matches_reference_stage() -> None:
     pytest.importorskip("cutlass")
@@ -880,7 +899,12 @@ def test_chunk_scan_cute_is_repeatable_for_issue_9_shape() -> None:
 
     for output_dtype, atol in (
         (torch.bfloat16, 5e-2),
-        (torch.float32, 5e-3),
+        # With the bf16-preserving TC path, the direct stage comparison now
+        # measures true bf16 operand staging rather than the old hidden fp16
+        # narrowing. On the issue-9 shape that raises the float32-output gap to
+        # about 1.22e-2 against the full-fp32 reference, so keep the tolerance
+        # just above that measured ceiling.
+        (torch.float32, 1.5e-2),
     ):
         for _ in range(8):
             torch.manual_seed(0)
@@ -1387,14 +1411,15 @@ def test_v2x2ssd_cute_stateful_forward_respects_current_stream() -> None:
         expected_checksum = out_ref[1].float().sum().cpu()
         torch.cuda.synchronize()
 
+        # The checksum is only a stream-routing sentinel here. With bf16 TC
+        # staging the corrected path accumulates enough deterministic rounding
+        # drift to move the sum by about 3.7e-2 while the synchronized
+        # elementwise state error stays around 1e-3.
         torch.testing.assert_close(
-            final_checksum,
-            expected_checksum,
-            atol=1e-2,
-            rtol=0.0,
+            final_checksum, expected_checksum, atol=5e-2, rtol=0.0
         )
         torch.testing.assert_close(out_cute[0], out_ref[0], atol=1e-1, rtol=0.0)
-        torch.testing.assert_close(out_cute[1], out_ref[1], atol=1e-1, rtol=0.0)
+        torch.testing.assert_close(out_cute[1], out_ref[1], atol=2e-3, rtol=0.0)
         torch.testing.assert_close(out_cute[2], out_ref[2], atol=1e-1, rtol=0.0)
         torch.testing.assert_close(out_cute[3], out_ref[3], atol=1e-2, rtol=0.0)
 

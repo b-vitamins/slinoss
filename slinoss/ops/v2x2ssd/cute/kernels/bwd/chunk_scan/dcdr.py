@@ -32,8 +32,10 @@ from .common import (
     LOG2_E,
     TWO_LOG2_E,
     apply_complex_tap,
+    clamp_nonpositive_prefix_log,
     complex_mul,
     conj_mul_phase,
+    safe_cast_to_dtype,
 )
 
 
@@ -820,8 +822,9 @@ class ChunkScanBwdDCDRAmpere:
                 inv_mag = cutlass.Float32(cute.math.rsqrt(mag2, fastmath=True))
                 pr = pr * inv_mag
                 pi = pi * inv_mag
+                stable_logp = clamp_nonpositive_prefix_log(logp)
                 scale = cute.math.exp2(
-                    logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
+                    stable_logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
                 )
                 s_scale_full[t] = scale
                 s_inv_scale_full[t] = one / scale
@@ -1239,8 +1242,8 @@ class ChunkScanBwdDCDRAmpere:
                                     pr = cutlass.Float32(s_phase_col[t_local, 0])
                                     pi = cutlass.Float32(s_phase_col[t_local, 1])
                                     outx, outy = conj_mul_phase(tr, ti, pr, pi)
-                                    out0 = outx.to(mU.element_type)
-                                    out1 = outy.to(mU.element_type)
+                                    out0 = safe_cast_to_dtype(outx, mU.element_type)
+                                    out1 = safe_cast_to_dtype(outy, mU.element_type)
                                 sK_blk[t_local, d0_local + 0] = out0
                                 sK_blk[t_local, d0_local + 1] = out1
                         cute.arch.barrier()
@@ -1370,8 +1373,9 @@ class ChunkScanBwdDCDRAmpere:
                                             )
                                             scale = rs * inv_rs
                                             ds_unscaled_f32 = acc_dS_blk_mn[r, c]
-                                            ds_scaled_q0 = (ds_unscaled_f32 * scale).to(
-                                                mU.element_type
+                                            ds_scaled_q0 = safe_cast_to_dtype(
+                                                ds_unscaled_f32 * scale,
+                                                mU.element_type,
                                             )
                                     tCrDS_blk_mn[r, c] = ds_scaled_q0
                             cute.autovec_copy(tCrDS_blk, tCsDS_blk)
@@ -1434,8 +1438,12 @@ class ChunkScanBwdDCDRAmpere:
                                 if cutlass.const_expr(
                                     mZ0.element_type == cutlass.Float32
                                 ):
-                                    out0 = mZ0[bidz, p, d0 + 0].to(mU.element_type)
-                                    out1 = (-mZ0[bidz, p, d0 + 1]).to(mU.element_type)
+                                    out0 = safe_cast_to_dtype(
+                                        mZ0[bidz, p, d0 + 0], mU.element_type
+                                    )
+                                    out1 = safe_cast_to_dtype(
+                                        -mZ0[bidz, p, d0 + 1], mU.element_type
+                                    )
                                 else:
                                     out0 = mZ0[bidz, p, d0 + 0]
                                     out1 = -mZ0[bidz, p, d0 + 1]
@@ -1485,7 +1493,9 @@ class ChunkScanBwdDCDRAmpere:
 
                 tCsDQ = thr_mma.partition_C(sK_blk)
                 tCrDQ = cute.make_fragment_like(tCsDQ, mU.element_type)
-                tCrDQ[None] = acc_dQ_total.load().to(mU.element_type)
+                acc_dQ_vals = acc_dQ_total.load()
+                for i in cutlass.range_constexpr(cute.size(tCrDQ)):
+                    tCrDQ[i] = safe_cast_to_dtype(acc_dQ_vals[i], mU.element_type)
                 cute.autovec_copy(tCrDQ, tCsDQ)
                 cute.arch.barrier()
 
@@ -1523,8 +1533,8 @@ class ChunkScanBwdDCDRAmpere:
                             dR01_sum = dR01_sum + dq0 * c1
                             dR10_sum = dR10_sum + dq1 * c0
                             dR11_sum = dR11_sum + dq1 * c1
-                            out0 = dc0.to(mU.element_type)
-                            out1 = dc1.to(mU.element_type)
+                            out0 = safe_cast_to_dtype(dc0, mU.element_type)
+                            out1 = safe_cast_to_dtype(dc1, mU.element_type)
                         sK_blk[row_local, d0_local + 0] = out0
                         sK_blk[row_local, d0_local + 1] = out1
                         vv = vv + cutlass.Int32(32)

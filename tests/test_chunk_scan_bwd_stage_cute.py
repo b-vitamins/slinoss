@@ -355,8 +355,11 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
         dU_public = _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=T)
         dU_prev_public = dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous()
 
-        torch.testing.assert_close(dU_public, dU_ref, atol=2e-4, rtol=0.0)
-        torch.testing.assert_close(dU_prev_public, dU_prev_ref, atol=1e-4, rtol=0.0)
+        # Float32 stage inputs now preserve bf16 tensor-core staging instead of
+        # narrowing to fp16, so the DU path follows a slightly different but
+        # still well-behaved low-precision contract than the old test budget.
+        torch.testing.assert_close(dU_public, dU_ref, atol=1e-3, rtol=0.0)
+        torch.testing.assert_close(dU_prev_public, dU_prev_ref, atol=6e-4, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

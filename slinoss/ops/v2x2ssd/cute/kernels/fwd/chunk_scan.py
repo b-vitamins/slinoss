@@ -33,6 +33,56 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 
 LOG2_E = 1.4426950408889634
+# Default scanprep settings keep valid chunk-local prefix logs near zero. This
+# floor only catches broken prefix reconstructions before they spill into
+# 0/inf scales and poison later GEMMs.
+MIN_STABLE_PREFIX_LOG = -40.0
+FLOAT16_FINITE_MAX = 65504.0
+BFLOAT16_FINITE_MAX = 3.3895313892515355e38
+FLOAT32_FINITE_MAX = 3.4028234663852886e38
+
+
+@cute.jit
+def clamp_nonpositive_prefix_log(logp):
+    logp = cutlass.Float32(logp)
+    zero = cutlass.Float32(0.0)
+    min_log = cutlass.Float32(MIN_STABLE_PREFIX_LOG)
+    pos_inf = cutlass.Float32(float("inf"))
+    neg_inf = cutlass.Float32(float("-inf"))
+    clamped = cutlass.select_(logp > zero, zero, logp)
+    clamped = cutlass.select_(clamped < min_log, min_log, clamped)
+    clamped = cutlass.select_(logp == pos_inf, logp, clamped)
+    clamped = cutlass.select_(logp == neg_inf, logp, clamped)
+    clamped = cutlass.select_(logp != logp, logp, clamped)
+    return clamped
+
+
+@cute.jit
+def clamp_finite_for_dtype(x, dtype):
+    x = cutlass.Float32(x)
+    pos_inf = cutlass.Float32(float("inf"))
+    neg_inf = cutlass.Float32(float("-inf"))
+    max_abs = cutlass.Float32(FLOAT32_FINITE_MAX)
+    if cutlass.const_expr(dtype == cutlass.Float16):
+        max_abs = cutlass.Float32(FLOAT16_FINITE_MAX)
+    elif cutlass.const_expr(dtype == cutlass.BFloat16):
+        max_abs = cutlass.Float32(BFLOAT16_FINITE_MAX)
+    clamped = cutlass.select_(x > max_abs, max_abs, x)
+    clamped = cutlass.select_(clamped < -max_abs, -max_abs, clamped)
+    clamped = cutlass.select_(x == pos_inf, x, clamped)
+    clamped = cutlass.select_(x == neg_inf, x, clamped)
+    clamped = cutlass.select_(x != x, x, clamped)
+    return clamped
+
+
+@cute.jit
+def safe_cast_to_dtype(x, dtype):
+    x = clamp_finite_for_dtype(x, dtype)
+    if cutlass.const_expr(dtype == cutlass.Float16):
+        return cutlass.Float16(x)
+    if cutlass.const_expr(dtype == cutlass.BFloat16):
+        return cutlass.BFloat16(x)
+    return cutlass.Float32(x)
 
 
 @dataclass(frozen=True)
@@ -200,7 +250,6 @@ class ChunkScanFwdAmpere:
         compute_fields.extend(
             [
                 ("query_scale", self.m_block_size * 4),
-                ("key_scale", self.n_block_size * 4),
                 ("log_prefix", self.L * 4),
                 ("phase_re", self.L * 4),
                 ("phase_im", self.L * 4),
@@ -443,7 +492,9 @@ class ChunkScanFwdAmpere:
         t_reg_value_transposed: cute.Tensor,
     ):
         r_score = cute.make_rmem_tensor_like(acc_score, score_dtype)
-        r_score.store(acc_score.load().to(score_dtype))
+        acc_score_vals = acc_score.load()
+        for i in cutlass.range_constexpr(cute.size(r_score)):
+            r_score[i] = safe_cast_to_dtype(acc_score_vals[i], score_dtype)
         r_score_layout_divided = cute.logical_divide(r_score.layout, (None, None, 2))
         r_score_mma_view = cute.make_layout(
             (
@@ -644,9 +695,6 @@ class ChunkScanFwdAmpere:
                 query_scale: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
                 ]
-                key_scale: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
-                ]
                 log_prefix: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Float32, self.L], 16
                 ]
@@ -695,9 +743,6 @@ class ChunkScanFwdAmpere:
                 ]
                 query_scale: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Float32, self.m_block_size], 16
-                ]
-                key_scale: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Float32, self.n_block_size], 16
                 ]
                 log_prefix: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Float32, self.L], 16
@@ -841,34 +886,14 @@ class ChunkScanFwdAmpere:
         if tidx < self.m_block_size:
             scale = cutlass.Float32(0.0)
             if cute.elem_less(q_row, self.L):
+                log_prefix = clamp_nonpositive_prefix_log(
+                    prefix_state.s_log_prefix[q_row]
+                )
                 scale = cute.math.exp2(
-                    cutlass.Float32(prefix_state.s_log_prefix[q_row])
-                    * cutlass.Float32(LOG2_E),
+                    log_prefix * cutlass.Float32(LOG2_E),
                     fastmath=True,
                 )
             s_query_scale[tidx] = scale
-
-    @cute.jit
-    def _initialize_key_scales_from_prefix(
-        self,
-        s_log_prefix: cute.Tensor,
-        s_key_scale: cute.Tensor,
-        *,
-        n_block: int,
-        seqlen: int,
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-
-        key_idx = n_block * self.n_block_size + tidx
-        if tidx < self.n_block_size:
-            if cute.elem_less(key_idx, seqlen):
-                log_prefix = cutlass.Float32(s_log_prefix[key_idx])
-                s_key_scale[tidx] = cute.math.exp2(
-                    -log_prefix * cutlass.Float32(LOG2_E), fastmath=True
-                )
-            else:
-                s_key_scale[tidx] = 0.0
-        cute.arch.barrier()
 
     # Off-term helpers
     @cute.jit
@@ -1157,11 +1182,8 @@ class ChunkScanFwdAmpere:
         self,
         acc_score: cute.Tensor,
         t_score_coord_mn: cute.Tensor,
-        s_query_scale: cute.Tensor,
-        s_key_scale: cute.Tensor,
+        s_log_prefix: cute.Tensor,
         *,
-        m_tile_start: int,
-        n_tile_start: int,
         seqlen: int,
         apply_mask: cutlass.Constexpr,
     ):
@@ -1170,13 +1192,13 @@ class ChunkScanFwdAmpere:
 
         for r in cutlass.range_constexpr(cute.size(acc_score_mn.shape[0])):
             row_idx = cutlass.Int32(t_score_coord_mn[r, 0][1])
-            row_scale = cutlass.Float32(1.0)
+            row_log = cutlass.Float32(0.0)
+            col_limit = cutlass.Int32(0)
             if cute.elem_less(row_idx, seqlen):
-                row_scale = cutlass.Float32(s_query_scale[row_idx - m_tile_start])
-
-            col_limit = seqlen
-            if cutlass.const_expr(apply_mask):
-                col_limit = cutlass.min(row_idx + 1, seqlen)
+                row_log = cutlass.Float32(s_log_prefix[row_idx])
+                col_limit = seqlen
+                if cutlass.const_expr(apply_mask):
+                    col_limit = cutlass.min(row_idx + 1, seqlen)
             for c in cutlass.range_constexpr(cute.size(acc_score_mn.shape[1])):
                 col_idx = cutlass.Int32(t_score_coord_mn[0, c][3])
                 if cute.elem_less(col_limit, col_idx + 1) or cute.elem_less(
@@ -1184,8 +1206,11 @@ class ChunkScanFwdAmpere:
                 ):
                     scale_buf[c] = 0.0
                 else:
-                    key_scale = cutlass.Float32(s_key_scale[col_idx - n_tile_start])
-                    scale_buf[c] = row_scale * key_scale
+                    col_log = cutlass.Float32(s_log_prefix[col_idx])
+                    relative_log = clamp_nonpositive_prefix_log(row_log - col_log)
+                    scale_buf[c] = cute.math.exp2(
+                        relative_log * cutlass.Float32(LOG2_E), fastmath=True
+                    )
 
             acc_row = acc_score_mn[r, None].load()
             acc_score_mn[r, None] = acc_row * scale_buf.load()
@@ -1248,7 +1273,9 @@ class ChunkScanFwdAmpere:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         r_output = cute.make_rmem_tensor_like(acc_output, mOut.element_type)
-        r_output.store(acc_output.load().to(mOut.element_type))
+        acc_output_vals = acc_output.load()
+        for i in cutlass.range_constexpr(cute.size(r_output)):
+            r_output[i] = safe_cast_to_dtype(acc_output_vals[i], mOut.element_type)
 
         s_output = cute.make_tensor(
             cute.recast_ptr(s_query.iterator, dtype=mOut.element_type), output_layout
@@ -1513,9 +1540,6 @@ class ChunkScanFwdAmpere:
 
         s_query_scale = storage.query_scale.get_tensor(
             cute.make_layout((m_block_size,), stride=(1,))
-        )
-        s_key_scale = storage.key_scale.get_tensor(
-            cute.make_layout((n_block_size,), stride=(1,))
         )
         s_log_prefix = storage.log_prefix.get_tensor(
             cute.make_layout((seq_len,), stride=(1,))
@@ -1835,13 +1859,6 @@ class ChunkScanFwdAmpere:
                         t_reg_key,
                     )
 
-                self._initialize_key_scales_from_prefix(
-                    s_log_prefix,
-                    s_key_scale,
-                    n_block=n_block,
-                    seqlen=seq_len,
-                )
-
                 c_score = cute.local_tile(
                     coord_score[batch_head_chunk, None, 0, None],
                     (m_block_size, n_block_size),
@@ -1853,10 +1870,7 @@ class ChunkScanFwdAmpere:
                     self._apply_score_scales_and_mask(
                         acc_score,
                         t_score_coord_mn,
-                        s_query_scale,
-                        s_key_scale,
-                        m_tile_start=cutlass.Int32(m_tile_start),
-                        n_tile_start=n_block * n_block_size,
+                        s_log_prefix,
                         seqlen=cutlass.Int32(seq_len),
                         apply_mask=False,
                     )
@@ -1864,10 +1878,7 @@ class ChunkScanFwdAmpere:
                     self._apply_score_scales_and_mask(
                         acc_score,
                         t_score_coord_mn,
-                        s_query_scale,
-                        s_key_scale,
-                        m_tile_start=cutlass.Int32(m_tile_start),
-                        n_tile_start=n_block * n_block_size,
+                        s_log_prefix,
                         seqlen=cutlass.Int32(seq_len),
                         apply_mask=True,
                     )

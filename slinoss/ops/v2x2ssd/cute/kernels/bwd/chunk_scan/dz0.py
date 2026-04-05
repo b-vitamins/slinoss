@@ -28,7 +28,14 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 
-from .common import LOG2_E, TWO_LOG2_E, complex_mul, mul_conj_phase
+from .common import (
+    LOG2_E,
+    TWO_LOG2_E,
+    clamp_nonpositive_prefix_log,
+    complex_mul,
+    mul_conj_phase,
+    safe_cast_to_dtype,
+)
 
 
 @dataclass(frozen=True)
@@ -727,7 +734,10 @@ class ChunkScanBwdDZ0Ampere:
         ur = ur * phase_inv
         ui = ui * phase_inv
 
-        s_row[tidx] = cute.math.exp2(logp * cutlass.Float32(TWO_LOG2_E), fastmath=True)
+        stable_logp = clamp_nonpositive_prefix_log(logp)
+        s_row[tidx] = cute.math.exp2(
+            stable_logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
+        )
         s_phase[tidx, 0] = ur
         s_phase[tidx, 1] = ui
 
@@ -770,7 +780,9 @@ class ChunkScanBwdDZ0Ampere:
                     t_global = k_tile_offset + kk
                     a = cutlass.Float32(sA[mm, kk, smem_pipe_read])
                     a = a * cutlass.Float32(s_row[t_global])
-                    sA[mm, kk, smem_pipe_read] = a.to(mDOut.element_type)
+                    sA[mm, kk, smem_pipe_read] = safe_cast_to_dtype(
+                        a, mDOut.element_type
+                    )
 
             nvec = self.bN // 2
             total_b = self.bK * nvec
@@ -787,8 +799,12 @@ class ChunkScanBwdDZ0Ampere:
                     pr = cutlass.Float32(s_phase[t_global, 0])
                     pi = cutlass.Float32(s_phase[t_global, 1])
                     rr, ri = mul_conj_phase(xr, xi, pr, pi)
-                    sB[d0 + 0, kk, smem_pipe_read] = rr.to(mC.element_type)
-                    sB[d0 + 1, kk, smem_pipe_read] = ri.to(mC.element_type)
+                    sB[d0 + 0, kk, smem_pipe_read] = safe_cast_to_dtype(
+                        rr, mC.element_type
+                    )
+                    sB[d0 + 1, kk, smem_pipe_read] = safe_cast_to_dtype(
+                        ri, mC.element_type
+                    )
 
             cute.arch.sync_threads()
 

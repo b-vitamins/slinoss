@@ -11,6 +11,11 @@ import cutlass.cute as cute
 import cutlass.cute.math as cute_math
 
 _cutlass_max = cast(Any, getattr(cutlass, "max"))
+_cutlass_select = cast(Any, getattr(cutlass, "select_"))
+FLOAT16_FINITE_MAX = 65504.0
+BFLOAT16_FINITE_MAX = 3.3895313892515355e38
+FLOAT32_FINITE_MAX = 3.4028234663852886e38
+COMPLEX_DIV_DENOM_FLOOR = 1.0e-30
 
 COEFF_AUX_DT_U = 0
 COEFF_AUX_GAMMA_SIGMOID = 1
@@ -152,9 +157,36 @@ def complex_div(num_re, num_im, den_re, den_im):
     den_re_f = cutlass.Float32(den_re)
     den_im_f = cutlass.Float32(den_im)
     denom = den_re_f * den_re_f + den_im_f * den_im_f
+    denom = _cutlass_max(denom, cutlass.Float32(COMPLEX_DIV_DENOM_FLOOR))
     out_re = (num_re_f * den_re_f + num_im_f * den_im_f) / denom
     out_im = (num_im_f * den_re_f - num_re_f * den_im_f) / denom
     return cutlass.Float32(out_re), cutlass.Float32(out_im)
+
+
+def clamp_finite_for_dtype(x, dtype):
+    x = cutlass.Float32(x)
+    pos_inf = cutlass.Float32(float("inf"))
+    neg_inf = cutlass.Float32(float("-inf"))
+    max_abs = cutlass.Float32(FLOAT32_FINITE_MAX)
+    if dtype == cutlass.Float16:
+        max_abs = cutlass.Float32(FLOAT16_FINITE_MAX)
+    elif dtype == cutlass.BFloat16:
+        max_abs = cutlass.Float32(BFLOAT16_FINITE_MAX)
+    clamped = _cutlass_select(x > max_abs, max_abs, x)
+    clamped = _cutlass_select(clamped < -max_abs, -max_abs, clamped)
+    clamped = _cutlass_select(x == pos_inf, x, clamped)
+    clamped = _cutlass_select(x == neg_inf, x, clamped)
+    clamped = _cutlass_select(x != x, x, clamped)
+    return clamped
+
+
+def safe_cast_to_dtype(x, dtype):
+    x = clamp_finite_for_dtype(x, dtype)
+    if dtype == cutlass.Float16:
+        return cutlass.Float16(x)
+    if dtype == cutlass.BFloat16:
+        return cutlass.BFloat16(x)
+    return cutlass.Float32(x)
 
 
 def complex_mul(a_re, a_im, b_re, b_im):
@@ -218,6 +250,7 @@ __all__ = [
     "make_row_major_stride",
     "principal_angle",
     "real_mul_conj",
+    "safe_cast_to_dtype",
     "sigmoid",
     "softplus",
     "torch_to_cutlass_dtype",

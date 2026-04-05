@@ -38,6 +38,7 @@ from ..common import (
     complex_mul_conj,
     make_row_major_stride,
     real_mul_conj,
+    safe_cast_to_dtype,
 )
 
 
@@ -353,12 +354,14 @@ class ScanPrepBwdFused:
                                     x1 = x1_cache[n_iter]
                                     dy0 = dy0_cache[n_iter]
                                     dy1 = dy1_cache[n_iter]
-                                    mBCGrad[b, t, h, 0, n] = (
-                                        inv0 * dy0 - x0 * inv0_cubed * dot0
-                                    ).to(mBCGrad.element_type)
-                                    mBCGrad[b, t, h, 1, n] = (
-                                        inv1 * dy1 - x1 * inv1_cubed * dot1
-                                    ).to(mBCGrad.element_type)
+                                    mBCGrad[b, t, h, 0, n] = safe_cast_to_dtype(
+                                        inv0 * dy0 - x0 * inv0_cubed * dot0,
+                                        mBCGrad.element_type,
+                                    )
+                                    mBCGrad[b, t, h, 1, n] = safe_cast_to_dtype(
+                                        inv1 * dy1 - x1 * inv1_cubed * dot1,
+                                        mBCGrad.element_type,
+                                    )
 
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         n = lane + n_iter * 32
@@ -448,12 +451,14 @@ class ScanPrepBwdFused:
                                     x3 = x3_cache[n_iter]
                                     dy2 = dy2_cache[n_iter]
                                     dy3 = dy3_cache[n_iter]
-                                    mBCGrad[b, t, h, 2, n] = (
-                                        inv2 * dy2 - x2 * inv2_cubed * dot2
-                                    ).to(mBCGrad.element_type)
-                                    mBCGrad[b, t, h, 3, n] = (
-                                        inv3 * dy3 - x3 * inv3_cubed * dot3
-                                    ).to(mBCGrad.element_type)
+                                    mBCGrad[b, t, h, 2, n] = safe_cast_to_dtype(
+                                        inv2 * dy2 - x2 * inv2_cubed * dot2,
+                                        mBCGrad.element_type,
+                                    )
+                                    mBCGrad[b, t, h, 3, n] = safe_cast_to_dtype(
+                                        inv3 * dy3 - x3 * inv3_cubed * dot3,
+                                        mBCGrad.element_type,
+                                    )
 
                     for n_iter in cutlass.range_constexpr(num_n_iters):
                         n = lane + n_iter * 32
@@ -878,9 +883,12 @@ class ScanPrepBwdFused:
                     if flat < self.coeff_flat_tile:
                         store_h = h_base + flat // self.param_dim
                         if store_h < self.h_size:
-                            mDParams[store_b, store_t, p_base + flat] = sDParams[
-                                store_t_local, flat
-                            ].to(mDParams.element_type)
+                            mDParams[store_b, store_t, p_base + flat] = (
+                                safe_cast_to_dtype(
+                                    sDParams[store_t_local, flat],
+                                    mDParams.element_type,
+                                )
+                            )
 
     @cute.kernel
     def bias_grad_kernel(

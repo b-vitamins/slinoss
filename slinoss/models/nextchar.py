@@ -253,6 +253,7 @@ class _NextCharCudaGraphDecodeEngine:
             with torch.cuda.graph(self.graph):
                 self.static_logits = self._run_body(state)
         finally:
+            current_stream.wait_stream(stream)
             _restore_decode_state_(state, snapshot)
 
     def decode_one(

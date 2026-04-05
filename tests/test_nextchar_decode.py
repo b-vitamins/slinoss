@@ -1014,6 +1014,92 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
     torch.testing.assert_close(u_last_nc, u_last_ref, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="CUDA bf16 is required",
+)
+def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    dtype = torch.bfloat16
+    bad_dtype = torch.float16
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    batch = 2
+    x = torch.randn((batch, 128), device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        state0 = mixer.init_state(batch, device="cuda", dtype=dtype)
+        proj = mixer.in_proj(x)
+        gate, value_raw, params_flat, bc_flat = torch.split(
+            proj,
+            [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
+            dim=-1,
+        )
+        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+        value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
+        params_h = params_flat.view(
+            batch, mixer.n_heads, mixer.scanprep.param_dim
+        ).contiguous()
+        bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+        gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
+        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
+
+        initial_states = torch.randn(
+            (batch, mixer.n_heads, mixer.d_head, 128),
+            device="cuda",
+            dtype=bad_dtype,
+        )
+        b_prev = torch.randn(
+            (batch, mixer.n_heads, 128),
+            device="cuda",
+            dtype=bad_dtype,
+        )
+        u_prev = torch.randn(
+            (batch, mixer.n_heads, mixer.d_head),
+            device="cuda",
+            dtype=bad_dtype,
+        )
+
+        with pytest.raises(ValueError, match="must use torch.bfloat16"):
+            mixer_decode_step_cute(
+                value_h,
+                params_h,
+                bc_h,
+                gate_h,
+                skip,
+                initial_states=initial_states,
+                B_prev=b_prev,
+                U_prev=u_prev,
+                dt_min=mixer.scanprep.dt_min,
+                dt_max=mixer.scanprep.dt_max,
+                r_min=mixer.scanprep.r_min,
+                r_max=mixer.scanprep.r_max,
+                theta_bound=mixer.scanprep.theta_bound,
+                k_max=mixer.scanprep.k_max,
+                eps=mixer.scanprep.eps,
+                dt_bias=mixer.scanprep.dt_bias,
+                gamma_bias=mixer.scanprep.gamma_bias,
+                omega_bias=mixer.scanprep.omega_bias,
+                mix_r_bias=mixer.scanprep.mix_r_bias,
+                mix_theta_bias=mixer.scanprep.mix_theta_bias,
+                mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+                mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+                b_scale=mixer.scanprep.b_scale,
+                c_scale=mixer.scanprep.c_scale,
+                output_dtype=dtype,
+            )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
 def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
@@ -1137,6 +1223,97 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
     torch.testing.assert_close(final_out, final_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(b_last_out_got, b_last_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(u_last_out_got, u_last_ref, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="CUDA bf16 is required",
+)
+def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    dtype = torch.bfloat16
+    bad_dtype = torch.float16
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    batch = 2
+    x = torch.randn((batch, 128), device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        state0 = mixer.init_state(batch, device="cuda", dtype=dtype)
+        proj = mixer.in_proj(x)
+        gate, value_raw, params_flat, bc_flat = torch.split(
+            proj,
+            [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
+            dim=-1,
+        )
+        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+        value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
+        params_h = params_flat.view(
+            batch, mixer.n_heads, mixer.scanprep.param_dim
+        ).contiguous()
+        bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+        gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
+        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
+        initial_states = torch.randn(
+            (batch, mixer.n_heads, mixer.d_head, 128),
+            device="cuda",
+            dtype=dtype,
+        )
+        b_prev = torch.randn(
+            (batch, mixer.n_heads, 128),
+            device="cuda",
+            dtype=dtype,
+        )
+        u_prev = torch.randn(
+            (batch, mixer.n_heads, mixer.d_head),
+            device="cuda",
+            dtype=dtype,
+        )
+        final_state_out = torch.empty_like(initial_states, dtype=bad_dtype)
+        b_last_out = torch.empty_like(b_prev, dtype=bad_dtype)
+        u_last_out = torch.empty_like(u_prev, dtype=bad_dtype)
+
+        with pytest.raises(ValueError, match="must use torch.bfloat16"):
+            mixer_decode_step_cute(
+                value_h,
+                params_h,
+                bc_h,
+                gate_h,
+                skip,
+                initial_states=initial_states,
+                B_prev=b_prev,
+                U_prev=u_prev,
+                dt_min=mixer.scanprep.dt_min,
+                dt_max=mixer.scanprep.dt_max,
+                r_min=mixer.scanprep.r_min,
+                r_max=mixer.scanprep.r_max,
+                theta_bound=mixer.scanprep.theta_bound,
+                k_max=mixer.scanprep.k_max,
+                eps=mixer.scanprep.eps,
+                dt_bias=mixer.scanprep.dt_bias,
+                gamma_bias=mixer.scanprep.gamma_bias,
+                omega_bias=mixer.scanprep.omega_bias,
+                mix_r_bias=mixer.scanprep.mix_r_bias,
+                mix_theta_bias=mixer.scanprep.mix_theta_bias,
+                mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+                mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+                b_scale=mixer.scanprep.b_scale,
+                c_scale=mixer.scanprep.c_scale,
+                output_dtype=dtype,
+                final_state_out=final_state_out,
+                b_last_out=b_last_out,
+                u_last_out=u_last_out,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

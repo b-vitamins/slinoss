@@ -362,6 +362,7 @@ def _search_space_chunk_increment_specs(
                 P=_AOT_SEARCH_P,
                 D=_AOT_SEARCH_D,
                 chunk_size=chunk_size,
+                tc_dtype=tc_dtype,
             ):
                 specs.append(
                     ChunkIncrementAOTSpec(

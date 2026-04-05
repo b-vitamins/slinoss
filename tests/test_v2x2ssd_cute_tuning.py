@@ -48,6 +48,7 @@ def test_chunk_increment_candidate_configs_prune_unsupported_device_configs(
         P=64,
         D=256,
         chunk_size=128,
+        tc_dtype=torch.float16,
         device_index=0,
     )
     assert bad_config not in configs

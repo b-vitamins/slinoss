@@ -158,6 +158,36 @@ def _make_scan_inputs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_infer_v2x2ssd_fwd_aot_spec_uses_fp16_tc_dtype_for_float32_inputs() -> None:
+    torch.manual_seed(0)
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=1,
+        T=32,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+        value_dtype=torch.float32,
+    )
+
+    spec = cute_aot_mod.infer_v2x2ssd_fwd_aot_spec(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+    )
+
+    assert spec.tc_dtype == torch.float16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_export_v2x2ssd_fwd_cute_aot_roundtrips_through_loaded_module(
     tmp_path: Path,
 ) -> None:

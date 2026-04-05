@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import cutlass.cute as cute
 
+from ....common import _tc_input_dtype
 from ...fwd.common import _make_fake_tensor_arg
 from .boundary import ChunkIncrementBwdBoundaryAmpere
 from .common import _assumed_align, _torch_to_cutlass_dtype
@@ -67,17 +68,6 @@ def _get_zero_prev_tensors(
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
-
-
-def _tc_input_dtype(
-    input_dtype: torch.dtype, compute_dtype: torch.dtype | None
-) -> torch.dtype:
-    dt = input_dtype if compute_dtype is None else compute_dtype
-    if dt in (torch.float16, torch.bfloat16):
-        return dt
-    if dt == torch.float32:
-        return torch.float16
-    raise TypeError(f"Unsupported compute dtype: {dt}")
 
 
 def _pad_zero_time(

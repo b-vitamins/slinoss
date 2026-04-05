@@ -192,6 +192,7 @@ class _MixerCudaGraphStepEngine:
             with torch.cuda.graph(self.graph):
                 self.static_y = self.mixer._step_inplace(self.x_buffer, state)
         finally:
+            current_stream.wait_stream(stream)
             _copy_mixer_state_(state, snapshot)
 
     def step(
@@ -658,12 +659,15 @@ class SLinOSSMixer(nn.Module):
         batch: int,
         T: int,
     ) -> torch.Tensor:
-        skip = self.skip.to(dtype=scan_u.dtype).view(1, self.n_heads, 1, self.d_head)
-        y = scan_y + scan_u * skip
-        gate_h = (
-            F.silu(gate).view(batch, T, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        skip = self.skip.view(1, self.n_heads, 1, self.d_head)
+        y_fp32 = scan_y.to(torch.float32)
+        u_fp32 = scan_u.to(torch.float32)
+        gate_fp32 = F.silu(gate.to(torch.float32)).view(
+            batch, T, self.n_heads, self.d_head
         )
-        return y * gate_h.to(dtype=y.dtype)
+        gate_fp32 = gate_fp32.permute(0, 2, 1, 3)
+        mixed = (y_fp32 + u_fp32 * skip.to(torch.float32)) * gate_fp32
+        return mixed.to(dtype=scan_y.dtype)
 
     def _apply_gate_skip(
         self,

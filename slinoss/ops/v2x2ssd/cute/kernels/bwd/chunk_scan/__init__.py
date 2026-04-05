@@ -6,6 +6,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+from ....common import _tc_input_dtype
 from ...fwd.common import _make_fake_tensor_arg
 
 from .db import ChunkScanBwdDBAmpere
@@ -52,17 +53,6 @@ def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
     if dt == torch.float32:
         return cutlass.Float32
     raise TypeError(f"Unsupported dtype: {dt}")
-
-
-def _tc_input_dtype(
-    input_dtype: torch.dtype, compute_dtype: torch.dtype | None
-) -> torch.dtype:
-    dt = input_dtype if compute_dtype is None else compute_dtype
-    if dt in (torch.float16, torch.bfloat16):
-        return dt
-    if dt == torch.float32:
-        return torch.float16
-    raise TypeError(f"Unsupported compute dtype: {dt}")
 
 
 def _pad_zero_time(

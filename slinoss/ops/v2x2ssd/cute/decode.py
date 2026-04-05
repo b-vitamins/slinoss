@@ -150,6 +150,24 @@ def _validate_decode_inputs(
     return batch, heads, P, N
 
 
+def _require_decode_tensor_contract(
+    tensor: torch.Tensor | None,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    if tensor is None:
+        return
+    if tuple(map(int, tensor.shape)) != shape:
+        raise ValueError(f"{name} must be {shape}. Got {tuple(tensor.shape)}.")
+    if tensor.device != device:
+        raise ValueError(f"{name} must live on {device}. Got {tensor.device}.")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must use {dtype}. Got {tensor.dtype}.")
+
+
 def mixer_decode_step_cute(
     value: torch.Tensor,
     params: torch.Tensor,
@@ -212,6 +230,51 @@ def mixer_decode_step_cute(
         raise ValueError(
             "out_proj_weight and projected_out must be provided together for fused projection."
         )
+    state_shape = (batch, heads, P, 2 * N)
+    b_prev_shape = (batch, heads, 2 * N)
+    u_prev_shape = (batch, heads, P)
+    _require_decode_tensor_contract(
+        initial_states,
+        name="initial_states",
+        shape=state_shape,
+        device=value.device,
+        dtype=value.dtype,
+    )
+    _require_decode_tensor_contract(
+        B_prev,
+        name="B_prev",
+        shape=b_prev_shape,
+        device=value.device,
+        dtype=value.dtype,
+    )
+    _require_decode_tensor_contract(
+        U_prev,
+        name="U_prev",
+        shape=u_prev_shape,
+        device=value.device,
+        dtype=value.dtype,
+    )
+    _require_decode_tensor_contract(
+        final_state_out,
+        name="final_state_out",
+        shape=state_shape,
+        device=value.device,
+        dtype=value.dtype,
+    )
+    _require_decode_tensor_contract(
+        b_last_out,
+        name="b_last_out",
+        shape=b_prev_shape,
+        device=value.device,
+        dtype=value.dtype,
+    )
+    _require_decode_tensor_contract(
+        u_last_out,
+        name="u_last_out",
+        shape=u_prev_shape,
+        device=value.device,
+        dtype=value.dtype,
+    )
 
     value_c = _ensure_min_alignment(
         value if value.is_contiguous() else value.contiguous(),
@@ -266,18 +329,6 @@ def mixer_decode_step_cute(
     )
     b_last = b_last_out if b_last_out is not None else _aligned_empty_like(b_prev_c)
     u_last = u_last_out if u_last_out is not None else _aligned_empty_like(u_prev_c)
-    if tuple(map(int, final_state.shape)) != tuple(map(int, state_c.shape)):
-        raise ValueError(
-            f"final_state_out must be {tuple(state_c.shape)}. Got {tuple(final_state.shape)}."
-        )
-    if tuple(map(int, b_last.shape)) != tuple(map(int, b_prev_c.shape)):
-        raise ValueError(
-            f"b_last_out must be {tuple(b_prev_c.shape)}. Got {tuple(b_last.shape)}."
-        )
-    if tuple(map(int, u_last.shape)) != tuple(map(int, u_prev_c.shape)):
-        raise ValueError(
-            f"u_last_out must be {tuple(u_prev_c.shape)}. Got {tuple(u_last.shape)}."
-        )
     if out_proj_weight is None:
         out_proj = _aligned_empty((1, heads, P), device=value.device, dtype=value.dtype)
         projected = _aligned_empty(

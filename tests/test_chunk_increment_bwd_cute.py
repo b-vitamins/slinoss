@@ -146,18 +146,34 @@ def test_chunk_increment_bwd_cute_matches_autograd() -> None:
         )
     )
 
-    # The stage-native backward follows the same tensor-core contract as the
-    # corresponding v3 kernels: fp16 transport, fp32 accumulation, and exact
-    # public reassembly. The right correctness bar here is principled
-    # low-precision agreement, not bitwise parity with the fp32 reference.
-    rtol_h, atol_h = 2e-3, 5e-3
+    # The stage-native backward now preserves the outer low-precision operand
+    # policy: fp16 stays fp16, bf16 stays bf16, and float32 inputs stage
+    # through bf16 rather than silently narrowing to fp16. The right
+    # correctness bar here is principled low-precision agreement, not bitwise
+    # parity with the fp32 reference.
+    atol_by_grad = {
+        "dU": 2e-3,
+        "dM": 6e-3,
+        "dK": 1.5e-2,
+        "dB": 1e-2,
+        "dB_prev": 1e-5,
+        "dU_prev": 1e-6,
+    }
 
-    torch.testing.assert_close(dU_cute, dU_ref, atol=atol_h, rtol=rtol_h)
-    torch.testing.assert_close(dM_cute, dM_ref, atol=atol_h, rtol=rtol_h)
-    torch.testing.assert_close(dK_cute, dK_ref, atol=atol_h, rtol=rtol_h)
-    torch.testing.assert_close(dB_cute, dB_ref, atol=atol_h, rtol=rtol_h)
-    torch.testing.assert_close(dB_prev_cute, dB_prev_ref, atol=atol_h, rtol=rtol_h)
-    torch.testing.assert_close(dU_prev_cute, dU_prev_ref, atol=atol_h, rtol=rtol_h)
+    for name, got, want in (
+        ("dU", dU_cute, dU_ref),
+        ("dM", dM_cute, dM_ref),
+        ("dK", dK_cute, dK_ref),
+        ("dB", dB_cute, dB_ref),
+        ("dB_prev", dB_prev_cute, dB_prev_ref),
+        ("dU_prev", dU_prev_cute, dU_prev_ref),
+    ):
+        torch.testing.assert_close(
+            got,
+            want,
+            atol=atol_by_grad[name],
+            rtol=0.0,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import cutlass
 import torch
 from cuda.bindings import driver as cuda
 import cutlass.cute as cute
@@ -733,18 +732,20 @@ def _make_chunk_increment_runtime_artifacts(
         padded_time=int(U_tc.shape[2]),
         chunk_size=chunk_size,
     )
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     resolved_config = (
         _resolve_default_chunk_increment_config(
+            tc_dtype=tc_dtype,
             D=int(B.shape[-1]),
             chunk_size=int(chunk_size),
         )
         if config is None
         else _normalize_chunk_increment_config(
+            tc_dtype=tc_dtype,
             chunk_size=int(chunk_size),
             config=config,
         )
     )
-    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     (
         u_spec,
         b_spec,
@@ -807,18 +808,20 @@ def _make_chunk_increment_compile_artifacts(
         padded_time=padded_time,
         chunk_size=resolved_chunk_size,
     )
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     resolved_config = (
         _resolve_default_chunk_increment_config(
+            tc_dtype=tc_dtype,
             D=int(B.shape[-1]),
             chunk_size=resolved_chunk_size,
         )
         if config is None
         else _normalize_chunk_increment_config(
+            tc_dtype=tc_dtype,
             chunk_size=resolved_chunk_size,
             config=config,
         )
     )
-    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     (
         u_spec,
         b_spec,
@@ -1228,11 +1231,12 @@ def _resolve_chunk_increment_cta_tiler(*, D: int) -> tuple[int, int, int]:
 
 def _normalize_chunk_increment_config(
     *,
+    tc_dtype: torch.dtype,
     chunk_size: int,
     config: ChunkIncrementConfig,
 ) -> ChunkIncrementConfig:
     normalized_kernel = ChunkIncrementFwdAmpere(
-        cutlass.Float16,
+        _torch_to_cutlass_dtype(tc_dtype),
         chunk_size=int(chunk_size),
         cta_tiler=tuple(int(v) for v in config.cta_tiler),
         num_stages=int(config.num_stages),
@@ -1245,10 +1249,12 @@ def _normalize_chunk_increment_config(
 
 def _resolve_default_chunk_increment_config(
     *,
+    tc_dtype: torch.dtype,
     D: int,
     chunk_size: int,
 ) -> ChunkIncrementConfig:
     return _normalize_chunk_increment_config(
+        tc_dtype=tc_dtype,
         chunk_size=chunk_size,
         config=ChunkIncrementConfig(
             cta_tiler=_resolve_chunk_increment_cta_tiler(D=D),
@@ -2181,6 +2187,7 @@ def tune_chunk_increment_cute(
         P=int(problem_shape[3]),
         D=int(problem_shape[4]),
         chunk_size=resolved_chunk_size,
+        tc_dtype=tc_dtype,
         device_index=device_index,
     )
     if candidate_specs:
@@ -2301,6 +2308,7 @@ def tune_chunk_increment_cute(
                 best_config = config
     if best_config is None:
         return _resolve_default_chunk_increment_config(
+            tc_dtype=tc_dtype,
             D=int(problem_shape[4]),
             chunk_size=int(problem_shape[6]),
         )
@@ -3584,11 +3592,13 @@ def _make_forward_runtime_artifacts(
     resolved_scan_num_threads = input_info.resolved_scan_num_threads
     resolved_chunk_increment_config = (
         _resolve_default_chunk_increment_config(
+            tc_dtype=tc_dtype,
             D=D,
             chunk_size=resolved_chunk_size,
         )
         if config_bundle is None
         else _normalize_chunk_increment_config(
+            tc_dtype=tc_dtype,
             chunk_size=resolved_chunk_size,
             config=config_bundle.chunk_increment,
         )
@@ -3918,11 +3928,13 @@ def _make_forward_compile_artifacts(
     tc_dtype = input_info.tc_dtype
     resolved_chunk_increment_config = (
         _resolve_default_chunk_increment_config(
+            tc_dtype=tc_dtype,
             D=D,
             chunk_size=resolved_chunk_size,
         )
         if config_bundle is None
         else _normalize_chunk_increment_config(
+            tc_dtype=tc_dtype,
             chunk_size=resolved_chunk_size,
             config=config_bundle.chunk_increment,
         )

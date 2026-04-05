@@ -54,8 +54,13 @@ def _chunk_increment_candidate_space(
     P: int,
     D: int,
     chunk_size: int,
+    tc_dtype: torch.dtype,
     device_index: int | None = None,
 ) -> Iterable[ChunkIncrementConfig]:
+    cutlass_tc_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+    }[tc_dtype]
     for bM in (32, 64):
         if bM > int(P) or int(P) % int(bM) != 0:
             continue
@@ -70,7 +75,7 @@ def _chunk_increment_candidate_space(
                 for num_stages in num_stage_values:
                     try:
                         kernel = ChunkIncrementFwdAmpere(
-                            cutlass.Float16,
+                            cutlass_tc_dtype,
                             chunk_size=int(chunk_size),
                             cta_tiler=(int(bM), int(bN), int(bK)),
                             num_stages=int(num_stages),
@@ -78,7 +83,7 @@ def _chunk_increment_candidate_space(
                     except Exception:
                         continue
                     if device_index is not None and not kernel.can_implement(
-                        cutlass.Float16,
+                        cutlass_tc_dtype,
                         device_index=device_index,
                     ):
                         continue
@@ -93,6 +98,7 @@ def chunk_increment_candidate_configs(
     P: int,
     D: int,
     chunk_size: int,
+    tc_dtype: torch.dtype,
     device_index: int | None = None,
 ) -> tuple[ChunkIncrementConfig, ...]:
     """Return the curated chunk-increment config family for this problem."""
@@ -103,6 +109,7 @@ def chunk_increment_candidate_configs(
         P=P,
         D=D,
         chunk_size=chunk_size,
+        tc_dtype=tc_dtype,
         device_index=device_index,
     ):
         if config.cache_key in seen:
@@ -238,6 +245,7 @@ def forward_bundle_candidates(
         P=P,
         D=D,
         chunk_size=chunk_size,
+        tc_dtype=tc_dtype,
         device_index=device_index,
     )
     state_passing_candidates = state_passing_candidate_configs(

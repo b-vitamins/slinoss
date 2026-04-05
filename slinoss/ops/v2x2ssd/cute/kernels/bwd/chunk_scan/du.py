@@ -24,8 +24,10 @@ from .common import (
     LOG2_E,
     TWO_LOG2_E,
     apply_complex_tap,
+    clamp_nonpositive_prefix_log,
     complex_mul,
     conj_mul_phase,
+    safe_cast_to_dtype,
 )
 
 
@@ -311,7 +313,7 @@ class ChunkScanBwdDUAmpere:
                 ],
                 16,
             ]
-            sDV_carry: cute.struct.Align[cute.struct.MemRange[mU.element_type, Pp], 8]
+            sDV_carry: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, Pp], 8]
             s_dlp: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, self.L], 4]
             s_row_scale: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.L], 4
@@ -517,8 +519,9 @@ class ChunkScanBwdDUAmpere:
         ur, ui = complex_mul(ur, ui, off_r, off_i)
 
         if tidx < cutlass.Int32(self.L):
+            stable_logp = clamp_nonpositive_prefix_log(logp)
             row_scale = cute.math.exp2(
-                logp * cutlass.Float32(TWO_LOG2_E), fastmath=False
+                stable_logp * cutlass.Float32(TWO_LOG2_E), fastmath=False
             )
             s_row_scale[tidx] = row_scale
             s_inv_row_scale[tidx] = cutlass.Float32(1.0) / row_scale
@@ -620,7 +623,7 @@ class ChunkScanBwdDUAmpere:
         for it in range(iters_p_padded):
             p = tidx + cutlass.Int32(it * self.num_threads)
             if p < cutlass.Int32(Pp):
-                sDV_carry[p] = cutlass.Float32(0.0).to(mU.element_type)
+                sDV_carry[p] = cutlass.Float32(0.0)
         cute.arch.barrier()
 
         for n_tile_rev in cutlass.range_constexpr(n_tiles):
@@ -725,8 +728,12 @@ class ChunkScanBwdDUAmpere:
                                 pr = cutlass.Float32(s_phase[t, 0])
                                 pi = cutlass.Float32(s_phase[t, 1])
                                 kx, ky = conj_mul_phase(tr, ti, pr, pi)
-                                sK_tile[t_local, d0 + 0] = kx.to(mU.element_type)
-                                sK_tile[t_local, d0 + 1] = ky.to(mU.element_type)
+                                sK_tile[t_local, d0 + 0] = safe_cast_to_dtype(
+                                    kx, mU.element_type
+                                )
+                                sK_tile[t_local, d0 + 1] = safe_cast_to_dtype(
+                                    ky, mU.element_type
+                                )
                     cute.arch.barrier()
 
                     for it in range(iters_pairs_stage):
@@ -742,8 +749,12 @@ class ChunkScanBwdDUAmpere:
                                 pr = cutlass.Float32(s_phase[t, 0])
                                 pi = cutlass.Float32(s_phase[t, 1])
                                 rx, ry = conj_mul_phase(x, y, pr, pi)
-                                sQ_m[t_local, d0 + 0] = rx.to(mU.element_type)
-                                sQ_m[t_local, d0 + 1] = ry.to(mU.element_type)
+                                sQ_m[t_local, d0 + 0] = safe_cast_to_dtype(
+                                    rx, mU.element_type
+                                )
+                                sQ_m[t_local, d0 + 1] = safe_cast_to_dtype(
+                                    ry, mU.element_type
+                                )
                     cute.arch.barrier()
 
                     tSrQ_m = thr_mma.make_fragment_A(thr_mma.partition_A(sQ_m))
@@ -791,7 +802,9 @@ class ChunkScanBwdDUAmpere:
                         sc_f32 = cutlass.Float32(0.0)
                         if cute.elem_less(col_idx, row_idx + 1):
                             sc_f32 = acc_S_blk_mn[r, c] * (rs * inv_rs)
-                        sS_blk[col_local, row_local] = sc_f32.to(mU.element_type)
+                        sS_blk[col_local, row_local] = safe_cast_to_dtype(
+                            sc_f32, mU.element_type
+                        )
                 cute.arch.barrier()
 
                 for p_tile_idx in cutlass.range_constexpr(n_p_tiles):
@@ -982,8 +995,12 @@ class ChunkScanBwdDUAmpere:
                                 pr = cutlass.Float32(s_phase[t, 0])
                                 pi = cutlass.Float32(s_phase[t, 1])
                                 kx, ky = conj_mul_phase(tr, ti, pr, pi)
-                                sK_tile[t_local, d0 + 0] = kx.to(mU.element_type)
-                                sK_tile[t_local, d0 + 1] = ky.to(mU.element_type)
+                                sK_tile[t_local, d0 + 0] = safe_cast_to_dtype(
+                                    kx, mU.element_type
+                                )
+                                sK_tile[t_local, d0 + 1] = safe_cast_to_dtype(
+                                    ky, mU.element_type
+                                )
                     cute.arch.barrier()
 
                     for it in range(iters_pairs_stage):
@@ -999,8 +1016,12 @@ class ChunkScanBwdDUAmpere:
                                 pr = cutlass.Float32(s_phase[t, 0])
                                 pi = cutlass.Float32(s_phase[t, 1])
                                 rx, ry = conj_mul_phase(x, y, pr, pi)
-                                sQ_m[t_local, d0 + 0] = rx.to(mU.element_type)
-                                sQ_m[t_local, d0 + 1] = ry.to(mU.element_type)
+                                sQ_m[t_local, d0 + 0] = safe_cast_to_dtype(
+                                    rx, mU.element_type
+                                )
+                                sQ_m[t_local, d0 + 1] = safe_cast_to_dtype(
+                                    ry, mU.element_type
+                                )
                     cute.arch.barrier()
 
                     tSrQ_m = thr_mma.make_fragment_A(thr_mma.partition_A(sQ_m))
@@ -1048,7 +1069,9 @@ class ChunkScanBwdDUAmpere:
                         sc_f32 = cutlass.Float32(0.0)
                         if cute.elem_less(col_idx, row_idx + 1):
                             sc_f32 = acc_S_blk_mn[r, c] * (rs * inv_rs)
-                        sS_blk[col_local, row_local] = sc_f32.to(mU.element_type)
+                        sS_blk[col_local, row_local] = safe_cast_to_dtype(
+                            sc_f32, mU.element_type
+                        )
                 cute.arch.barrier()
 
                 for p_tile_idx in cutlass.range_constexpr(n_p_tiles):
@@ -1165,9 +1188,7 @@ class ChunkScanBwdDUAmpere:
                                         ].to(cutlass.Float32)
                                     )
                                 else:
-                                    prev_f32 = cutlass.Float32(
-                                        sDV_carry[col_idx].to(cutlass.Float32)
-                                    )
+                                    prev_f32 = cutlass.Float32(sDV_carry[col_idx])
                             acc_curr_mn[r, c] = acc_curr_mn[r, c] + prev_f32.to(
                                 self.acc_dtype
                             )
@@ -1175,13 +1196,17 @@ class ChunkScanBwdDUAmpere:
                 for it in range(iters_p_slice):
                     p_local = tidx + cutlass.Int32(it * self.num_threads)
                     if p_local < cutlass.Int32(p_tile):
-                        sDV_carry[p_base + p_local] = sPrev_tile[0, p_local]
+                        sDV_carry[p_base + p_local] = cutlass.Float32(
+                            sPrev_tile[0, p_local].to(cutlass.Float32)
+                        )
                 cute.arch.barrier()
 
                 if cutlass.const_expr(self.P == Pp):
                     tCsV = thr_mma.partition_C(sV_tile)
                     tCrOut = cute.make_fragment_like(tCsV, mU.element_type)
-                    tCrOut[None] = acc_dV_tiles[p_tile_idx].load().to(mU.element_type)
+                    acc_dV_vals = acc_dV_tiles[p_tile_idx].load()
+                    for i in cutlass.range_constexpr(cute.size(tCrOut)):
+                        tCrOut[i] = safe_cast_to_dtype(acc_dV_vals[i], mU.element_type)
                     cute.autovec_copy(tCrOut, tCsV)
                 else:
                     for r in cutlass.range_constexpr(cute.size(acc_curr_mn.shape[0])):
@@ -1246,7 +1271,9 @@ class ChunkScanBwdDUAmpere:
         for it in range(iters_p):
             p = tidx + cutlass.Int32(it * self.num_threads)
             if p < cutlass.Int32(self.P):
-                mDU_prev[bidz, p] = sDV_carry[p]
+                mDU_prev[bidz, p] = safe_cast_to_dtype(
+                    sDV_carry[p], mDU_prev.element_type
+                )
         cute.arch.barrier()
 
 

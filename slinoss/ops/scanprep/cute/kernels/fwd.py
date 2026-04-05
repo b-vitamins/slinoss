@@ -38,6 +38,7 @@ from ..common import (
     complex_div,
     lerp,
     principal_angle,
+    safe_cast_to_dtype,
     sigmoid,
     softplus,
 )
@@ -194,35 +195,43 @@ class ScanPrepFwdFused:
                         b1 = x1_cache[n_iter] * inv1
                         c0 = x2_cache[n_iter] * inv2
                         c1 = x3_cache[n_iter] * inv3
-                        mBOut[b, h, t, 2 * n] = (
-                            b0 * cutlass.Float32(mBScale[h, 0, n])
-                        ).to(mBOut.element_type)
-                        mBOut[b, h, t, 2 * n + 1] = (
-                            b1 * cutlass.Float32(mBScale[h, 1, n])
-                        ).to(mBOut.element_type)
-                        mCOut[b, h, t, 2 * n] = (
-                            c0 * cutlass.Float32(mCScale[h, 0, n])
-                        ).to(mCOut.element_type)
-                        mCOut[b, h, t, 2 * n + 1] = (
-                            c1 * cutlass.Float32(mCScale[h, 1, n])
-                        ).to(mCOut.element_type)
+                        mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
+                            b0 * cutlass.Float32(mBScale[h, 0, n]),
+                            mBOut.element_type,
+                        )
+                        mBOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
+                            b1 * cutlass.Float32(mBScale[h, 1, n]),
+                            mBOut.element_type,
+                        )
+                        mCOut[b, h, t, 2 * n] = safe_cast_to_dtype(
+                            c0 * cutlass.Float32(mCScale[h, 0, n]),
+                            mCOut.element_type,
+                        )
+                        mCOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
+                            c1 * cutlass.Float32(mCScale[h, 1, n]),
+                            mCOut.element_type,
+                        )
             else:
                 num_n_iters = (self.n_size + 31) // 32
                 for n_iter in cutlass.range_constexpr(num_n_iters):
                     n = lane + n_iter * 32
                     if n < self.n_size:
-                        mBOut[b, h, t, 2 * n] = cutlass.Float32(mBC[b, t, h, 0, n]).to(
-                            mBOut.element_type
+                        mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, h, 0, n]),
+                            mBOut.element_type,
                         )
-                        mBOut[b, h, t, 2 * n + 1] = cutlass.Float32(
-                            mBC[b, t, h, 1, n]
-                        ).to(mBOut.element_type)
-                        mCOut[b, h, t, 2 * n] = cutlass.Float32(mBC[b, t, h, 2, n]).to(
-                            mCOut.element_type
+                        mBOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, h, 1, n]),
+                            mBOut.element_type,
                         )
-                        mCOut[b, h, t, 2 * n + 1] = cutlass.Float32(
-                            mBC[b, t, h, 3, n]
-                        ).to(mCOut.element_type)
+                        mCOut[b, h, t, 2 * n] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, h, 2, n]),
+                            mCOut.element_type,
+                        )
+                        mCOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, h, 3, n]),
+                            mCOut.element_type,
+                        )
 
     @cute.kernel
     def coeff_kernel(
