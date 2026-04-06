@@ -20,16 +20,11 @@ def scanprep_cute(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> ScanInputs:
@@ -37,7 +32,7 @@ def scanprep_cute(
 
     Public contract:
     - ``value``: ``(B, T, H * P)`` post-conv/post-activation mixer values
-    - ``params``: ``(B, T, H * 13)`` flat scanprep parameter stream
+    - ``params``: ``(B, T, H * 5)`` flat scanprep parameter stream
     - ``bc``: ``(B, T, H, 4, N)`` mixer-emitted BC tensor
     - output: packed scan-native ``(U, M, K, B, C)``
 
@@ -62,7 +57,7 @@ def scanprep_cute(
         )
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
-            "Expected value=(B,T,H*P), params=(B,T,H*13), bc=(B,T,H,4,N). "
+            "Expected value=(B,T,H*P), params=(B,T,H*5), bc=(B,T,H,4,N). "
             f"Got {tuple(value.shape)}, {tuple(params.shape)}, {tuple(bc.shape)}."
         )
     supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
@@ -85,9 +80,6 @@ def scanprep_cute(
             gamma_bias,
             omega_bias,
             mix_r_bias,
-            mix_theta_bias,
-            mix_k_prev_bias,
-            mix_k_curr_bias,
             b_scale,
             c_scale,
         )
@@ -107,16 +99,11 @@ def scanprep_cute(
             dt_max=dt_max,
             r_min=r_min,
             r_max=r_max,
-            theta_bound=theta_bound,
-            k_max=k_max,
             eps=eps,
             dt_bias=dt_bias,
             gamma_bias=gamma_bias,
             omega_bias=omega_bias,
             mix_r_bias=mix_r_bias,
-            mix_theta_bias=mix_theta_bias,
-            mix_k_prev_bias=mix_k_prev_bias,
-            mix_k_curr_bias=mix_k_curr_bias,
             b_scale=b_scale,
             c_scale=c_scale,
         )
@@ -136,16 +123,11 @@ def scanprep_cute(
         dt_max=dt_max,
         r_min=r_min,
         r_max=r_max,
-        theta_bound=theta_bound,
-        k_max=k_max,
         eps=eps,
         dt_bias=dt_bias,
         gamma_bias=gamma_bias,
         omega_bias=omega_bias,
         mix_r_bias=mix_r_bias,
-        mix_theta_bias=mix_theta_bias,
-        mix_k_prev_bias=mix_k_prev_bias,
-        mix_k_curr_bias=mix_k_curr_bias,
         b_scale=b_scale,
         c_scale=c_scale,
     )

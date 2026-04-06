@@ -12,6 +12,7 @@ from slinoss.perf import note_cache_event
 
 from .common import (
     COEFF_AUX_FIELDS,
+    SCANPREP_PARAM_DIM,
     assumed_align,
     make_fake_tensor_arg,
 )
@@ -115,16 +116,11 @@ def _scanprep_fwd_impl(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
     return_aux: bool,
@@ -143,9 +139,15 @@ def _scanprep_fwd_impl(
     batch, t_size, width = map(int, value_c.shape)
     if width != int(n_heads * d_head):
         raise ValueError(f"value width must be {n_heads * d_head}. Got {width}.")
-    if tuple(map(int, params.shape)) != (batch, t_size, int(n_heads * 13)):
+    if tuple(map(int, params.shape)) != (
+        batch,
+        t_size,
+        int(n_heads * SCANPREP_PARAM_DIM),
+    ):
         raise ValueError(
-            f"params must be {(batch, t_size, int(n_heads * 13))}. Got {tuple(params.shape)}."
+            "params must be "
+            f"{(batch, t_size, int(n_heads * SCANPREP_PARAM_DIM))}. "
+            f"Got {tuple(params.shape)}."
         )
     if tuple(map(int, bc_c.shape)) != (batch, t_size, int(n_heads), 4, int(d_state)):
         raise ValueError(
@@ -201,9 +203,6 @@ def _scanprep_fwd_impl(
     gamma_bias_align = assumed_align(gamma_bias)
     omega_bias_align = assumed_align(omega_bias)
     mix_r_bias_align = assumed_align(mix_r_bias)
-    mix_theta_bias_align = assumed_align(mix_theta_bias)
-    mix_k_prev_bias_align = assumed_align(mix_k_prev_bias)
-    mix_k_curr_bias_align = assumed_align(mix_k_curr_bias)
     u_align = assumed_align(U)
     b_align = assumed_align(B)
     c_align = assumed_align(C)
@@ -226,9 +225,6 @@ def _scanprep_fwd_impl(
         gamma_bias.dtype,
         omega_bias.dtype,
         mix_r_bias.dtype,
-        mix_theta_bias.dtype,
-        mix_k_prev_bias.dtype,
-        mix_k_curr_bias.dtype,
         U.dtype,
         M.dtype,
         K.dtype,
@@ -245,9 +241,6 @@ def _scanprep_fwd_impl(
         gamma_bias_align,
         omega_bias_align,
         mix_r_bias_align,
-        mix_theta_bias_align,
-        mix_k_prev_bias_align,
-        mix_k_curr_bias_align,
         u_align,
         b_align,
         c_align,
@@ -260,8 +253,6 @@ def _scanprep_fwd_impl(
         float(dt_max),
         float(r_min),
         float(r_max),
-        float(theta_bound),
-        float(k_max),
         float(eps),
     )
     compiled = _SCANPREP_FWD_CACHE.get(cache_key)
@@ -281,8 +272,6 @@ def _scanprep_fwd_impl(
                 dt_max=dt_max,
                 r_min=r_min,
                 r_max=r_max,
-                theta_bound=theta_bound,
-                k_max=k_max,
                 eps=eps,
             ),
             make_fake_tensor_arg(value_c, align=value_align),
@@ -294,9 +283,6 @@ def _scanprep_fwd_impl(
             make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
             make_fake_tensor_arg(omega_bias, align=omega_bias_align),
             make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
-            make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
-            make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
-            make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
             make_fake_tensor_arg(U, align=u_align),
             make_fake_tensor_arg(B, align=b_align),
             make_fake_tensor_arg(C, align=c_align),
@@ -319,9 +305,6 @@ def _scanprep_fwd_impl(
         gamma_bias,
         omega_bias,
         mix_r_bias,
-        mix_theta_bias,
-        mix_k_prev_bias,
-        mix_k_curr_bias,
         U,
         B,
         C,
@@ -346,16 +329,11 @@ def scanprep_fwd_cute(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -371,16 +349,11 @@ def scanprep_fwd_cute(
         dt_max=dt_max,
         r_min=r_min,
         r_max=r_max,
-        theta_bound=theta_bound,
-        k_max=k_max,
         eps=eps,
         dt_bias=dt_bias,
         gamma_bias=gamma_bias,
         omega_bias=omega_bias,
         mix_r_bias=mix_r_bias,
-        mix_theta_bias=mix_theta_bias,
-        mix_k_prev_bias=mix_k_prev_bias,
-        mix_k_curr_bias=mix_k_curr_bias,
         b_scale=b_scale,
         c_scale=c_scale,
         return_aux=False,
@@ -401,16 +374,11 @@ def scanprep_fwd_cute_with_aux(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> tuple[
@@ -444,16 +412,11 @@ def scanprep_fwd_cute_with_aux(
             dt_max=dt_max,
             r_min=r_min,
             r_max=r_max,
-            theta_bound=theta_bound,
-            k_max=k_max,
             eps=eps,
             dt_bias=dt_bias,
             gamma_bias=gamma_bias,
             omega_bias=omega_bias,
             mix_r_bias=mix_r_bias,
-            mix_theta_bias=mix_theta_bias,
-            mix_k_prev_bias=mix_k_prev_bias,
-            mix_k_curr_bias=mix_k_curr_bias,
             b_scale=b_scale,
             c_scale=c_scale,
             return_aux=True,

@@ -90,7 +90,9 @@ def main() -> int:
     ).to(dtype=dtype)
 
     value = torch.randn((batch, t_size, heads * p_size), device=device, dtype=dtype)
-    params = torch.randn((batch, t_size, heads * 13), device=device, dtype=dtype)
+    params = torch.randn(
+        (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
+    )
     bc = torch.randn((batch, t_size, heads, 4, d_state), device=device, dtype=dtype)
 
     U = torch.empty((batch, heads, t_size, p_size), device=device, dtype=dtype)
@@ -126,8 +128,6 @@ def main() -> int:
             dt_max=prep.dt_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
-            theta_bound=prep.theta_bound,
-            k_max=prep.k_max,
             eps=prep.eps,
             pack_warps_per_block=args.pack_warps_per_block,
             coeff_block_size=args.coeff_block_size,
@@ -141,9 +141,6 @@ def main() -> int:
         make_fake_tensor_arg(prep.gamma_bias.detach()),
         make_fake_tensor_arg(prep.omega_bias.detach()),
         make_fake_tensor_arg(prep.mix_r_bias.detach()),
-        make_fake_tensor_arg(prep.mix_theta_bias.detach()),
-        make_fake_tensor_arg(prep.mix_k_prev_bias.detach()),
-        make_fake_tensor_arg(prep.mix_k_curr_bias.detach()),
         make_fake_tensor_arg(U),
         make_fake_tensor_arg(B),
         make_fake_tensor_arg(C),
@@ -165,9 +162,6 @@ def main() -> int:
             prep.gamma_bias.detach(),
             prep.omega_bias.detach(),
             prep.mix_r_bias.detach(),
-            prep.mix_theta_bias.detach(),
-            prep.mix_k_prev_bias.detach(),
-            prep.mix_k_curr_bias.detach(),
             U,
             B,
             C,

@@ -8,6 +8,7 @@ from typing import Callable, cast
 import torch
 import cutlass.cute as cute
 
+from slinoss.ops.scanprep.cute.common import SCANPREP_PARAM_DIM
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.common import (
     _assumed_align,
     _compile_env_stream_placeholder,
@@ -113,8 +114,10 @@ def _validate_decode_inputs(
 ) -> tuple[int, int, int, int]:
     if value.ndim != 3:
         raise ValueError(f"value must be (B,H,P). Got {tuple(value.shape)}.")
-    if params.ndim != 3 or params.shape[-1] != 13:
-        raise ValueError(f"params must be (B,H,13). Got {tuple(params.shape)}.")
+    if params.ndim != 3 or params.shape[-1] != SCANPREP_PARAM_DIM:
+        raise ValueError(
+            f"params must be (B,H,{SCANPREP_PARAM_DIM}). Got {tuple(params.shape)}."
+        )
     if bc.ndim != 4 or bc.shape[-2] != 4:
         raise ValueError(f"bc must be (B,H,4,N). Got {tuple(bc.shape)}.")
     if gate.shape != value.shape:
@@ -182,16 +185,11 @@ def mixer_decode_step_cute(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
     output_dtype: torch.dtype,
@@ -385,9 +383,6 @@ def mixer_decode_step_cute(
     gamma_bias_align = _assumed_align(gamma_bias)
     omega_bias_align = _assumed_align(omega_bias)
     mix_r_bias_align = _assumed_align(mix_r_bias)
-    mix_theta_bias_align = _assumed_align(mix_theta_bias)
-    mix_k_prev_bias_align = _assumed_align(mix_k_prev_bias)
-    mix_k_curr_bias_align = _assumed_align(mix_k_curr_bias)
     b_scale_align = _assumed_align(b_scale)
     c_scale_align = _assumed_align(c_scale)
     y_align = _assumed_align(y)
@@ -456,9 +451,6 @@ def mixer_decode_step_cute(
         gamma_bias_align,
         omega_bias_align,
         mix_r_bias_align,
-        mix_theta_bias_align,
-        mix_k_prev_bias_align,
-        mix_k_curr_bias_align,
         b_scale_align,
         c_scale_align,
         y_align,
@@ -472,8 +464,6 @@ def mixer_decode_step_cute(
         float(dt_max),
         float(r_min),
         float(r_max),
-        float(theta_bound),
-        float(k_max),
         float(eps),
     )
     compiled = _DECODE_CACHE.get(cache_key)
@@ -497,8 +487,6 @@ def mixer_decode_step_cute(
                 dt_max=dt_max,
                 r_min=r_min,
                 r_max=r_max,
-                theta_bound=theta_bound,
-                k_max=k_max,
                 eps=eps,
             ),
             _make_fake_tensor_arg(value_c, align=value_align),
@@ -513,9 +501,6 @@ def mixer_decode_step_cute(
             _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
             _make_fake_tensor_arg(omega_bias, align=omega_bias_align),
             _make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
-            _make_fake_tensor_arg(mix_theta_bias, align=mix_theta_bias_align),
-            _make_fake_tensor_arg(mix_k_prev_bias, align=mix_k_prev_bias_align),
-            _make_fake_tensor_arg(mix_k_curr_bias, align=mix_k_curr_bias_align),
             _make_fake_tensor_arg(b_scale, align=b_scale_align, dynamic_stride=True),
             _make_fake_tensor_arg(c_scale, align=c_scale_align, dynamic_stride=True),
             _make_fake_tensor_arg(y, align=y_align),
@@ -545,9 +530,6 @@ def mixer_decode_step_cute(
         gamma_bias,
         omega_bias,
         mix_r_bias,
-        mix_theta_bias,
-        mix_k_prev_bias,
-        mix_k_curr_bias,
         b_scale,
         c_scale,
         y,

@@ -43,9 +43,7 @@ def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
 class SLinOSSScanPrep(nn.Module):
     """Builds canonical scan inputs from post-conv activations and parameter streams."""
 
-    param_dim: int = 13
-    _sigmoid_param_idx = (0, 3, 5, 6, 7, 8)
-    _tanh_param_idx = (4, 9, 10, 11, 12)
+    param_dim: int = 5
 
     def __init__(
         self,
@@ -60,8 +58,6 @@ class SLinOSSScanPrep(nn.Module):
         dt_init_floor: float = 1e-4,
         r_min: float = 0.9,
         r_max: float = 1.0,
-        theta_bound: float = math.pi,
-        k_max: float = 0.5,
         eps: float = 1e-8,
         device: torch.device | str | None = None,
     ) -> None:
@@ -81,11 +77,6 @@ class SLinOSSScanPrep(nn.Module):
             0.0 < r_min <= r_max <= 1.0,
             f"Require 0 < r_min <= r_max <= 1. Got {r_min}, {r_max}.",
         )
-        _require(
-            0.0 < theta_bound <= math.pi,
-            f"theta_bound must be in (0, pi]. Got {theta_bound}.",
-        )
-        _require(k_max > 0.0, f"k_max must be positive. Got {k_max}.")
 
         self.n_heads = int(n_heads)
         self.d_state = int(d_state)
@@ -99,8 +90,6 @@ class SLinOSSScanPrep(nn.Module):
         self.dt_init_floor = float(dt_init_floor)
         self.r_min = float(r_min)
         self.r_max = float(r_max)
-        self.theta_bound = float(theta_bound)
-        self.k_max = float(k_max)
         self.eps = float(eps)
 
         fp32 = torch.float32
@@ -114,15 +103,6 @@ class SLinOSSScanPrep(nn.Module):
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
         self.mix_r_bias = nn.Parameter(
-            torch.empty((self.n_heads,), device=device, dtype=fp32)
-        )
-        self.mix_theta_bias = nn.Parameter(
-            torch.empty((self.n_heads,), device=device, dtype=fp32)
-        )
-        self.mix_k_prev_bias = nn.Parameter(
-            torch.empty((self.n_heads,), device=device, dtype=fp32)
-        )
-        self.mix_k_curr_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
         if self.normalize_bc:
@@ -139,16 +119,6 @@ class SLinOSSScanPrep(nn.Module):
         self.register_buffer(
             "_zero_bias",
             torch.zeros((self.n_heads,), device=device, dtype=fp32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_sigmoid_idx_tensor",
-            torch.tensor(self._sigmoid_param_idx, device=device, dtype=torch.long),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_tanh_idx_tensor",
-            torch.tensor(self._tanh_param_idx, device=device, dtype=torch.long),
             persistent=False,
         )
         self.reset_parameters()
@@ -172,13 +142,6 @@ class SLinOSSScanPrep(nn.Module):
             self.gamma_bias.copy_(_inv_softplus(gamma0))
             self.omega_bias.copy_(omega0)
             self.mix_r_bias.copy_(_logit(torch.full_like(self.mix_r_bias, 0.9)))
-            self.mix_theta_bias.copy_(_logit(torch.full_like(self.mix_theta_bias, 0.9)))
-            self.mix_k_prev_bias.copy_(
-                _logit(torch.full_like(self.mix_k_prev_bias, 0.95))
-            )
-            self.mix_k_curr_bias.copy_(
-                _logit(torch.full_like(self.mix_k_curr_bias, 0.95))
-            )
             if self.b_scale is not None:
                 self.b_scale.fill_(1.0)
             if self.c_scale is not None:
@@ -192,15 +155,7 @@ class SLinOSSScanPrep(nn.Module):
                 self.gamma_bias,
                 self.omega_bias,
                 zero,
-                zero,
                 self.mix_r_bias,
-                self.mix_theta_bias,
-                self.mix_k_prev_bias,
-                self.mix_k_curr_bias,
-                zero,
-                zero,
-                zero,
-                zero,
             ),
             dim=-1,
         )
@@ -234,50 +189,25 @@ class SLinOSSScanPrep(nn.Module):
             gamma_raw,
             omega_raw,
             r_raw,
-            theta_raw,
             mix_r_raw,
-            mix_theta_raw,
-            mix_k_prev_raw,
-            mix_k_curr_raw,
-            _k_prev_re,
-            _k_prev_im,
-            _k_curr_re,
-            _k_curr_im,
         ) = p.unbind(dim=-1)
-
-        sigmoid_idx = cast(torch.Tensor, self._sigmoid_idx_tensor)
-        (
-            dt_u,
-            r_direct_u,
-            mix_r,
-            mix_theta,
-            mix_k_prev,
-            mix_k_curr,
-        ) = torch.sigmoid(p.index_select(-1, sigmoid_idx)).unbind(dim=-1)
+        dt_u = torch.sigmoid(dt_raw)
+        r_direct_u = torch.sigmoid(r_raw)
+        mix_r = torch.sigmoid(mix_r_raw)
         dt = self.dt_min + (self.dt_max - self.dt_min) * dt_u
         gamma = F.softplus(gamma_raw)
         omega = omega_raw
 
         r_struct = self.r_min + (self.r_max - self.r_min) * torch.exp(-gamma * dt)
-        theta_struct = omega * dt
-
-        tanh_idx = cast(torch.Tensor, self._tanh_idx_tensor)
-        tanh_outputs = torch.tanh(p.index_select(-1, tanh_idx))
-        theta_direct = self.theta_bound * tanh_outputs[..., 0]
-        k_prev_learned = self.k_max * tanh_outputs[..., 1:3]
-        k_curr_learned = self.k_max * tanh_outputs[..., 3:5]
+        theta = principal_angle(omega * dt)
         r_direct = self.r_min + (self.r_max - self.r_min) * r_direct_u
 
         r = torch.lerp(r_direct, r_struct, mix_r)
-        theta = principal_angle(torch.lerp(theta_direct, theta_struct, mix_theta))
-
         log_r_f = torch.log(r)
         rho = torch.polar(r, theta)
-        k_prev_struct, k_curr_struct = _foh_taps_from_normalized(
+        k_prev, k_curr = _foh_taps_from_normalized(
             dt, log_r_f, theta, rho, eps=self.eps
         )
-        k_prev = torch.lerp(k_prev_learned, k_prev_struct, mix_k_prev.unsqueeze(-1))
-        k_curr = torch.lerp(k_curr_learned, k_curr_struct, mix_k_curr.unsqueeze(-1))
 
         M = _pack_complex(rho)
         K = torch.stack([k_prev, k_curr], dim=-2)
@@ -369,16 +299,11 @@ class SLinOSSScanPrep(nn.Module):
             dt_max=self.dt_max,
             r_min=self.r_min,
             r_max=self.r_max,
-            theta_bound=self.theta_bound,
-            k_max=self.k_max,
             eps=self.eps,
             dt_bias=self.dt_bias,
             gamma_bias=self.gamma_bias,
             omega_bias=self.omega_bias,
             mix_r_bias=self.mix_r_bias,
-            mix_theta_bias=self.mix_theta_bias,
-            mix_k_prev_bias=self.mix_k_prev_bias,
-            mix_k_curr_bias=self.mix_k_curr_bias,
             b_scale=self.b_scale,
             c_scale=self.c_scale,
         )

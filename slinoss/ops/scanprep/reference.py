@@ -102,16 +102,11 @@ def scanprep_scan_coeffs_from_flat_params(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference ``(M, K)`` generation from flat ``(B, T, H * param_dim)`` params."""
     if params.ndim != 3 or params.shape[-1] != n_heads * param_dim:
@@ -128,15 +123,7 @@ def scanprep_scan_coeffs_from_flat_params(
             gamma_bias,
             omega_bias,
             zero,
-            zero,
             mix_r_bias,
-            mix_theta_bias,
-            mix_k_prev_bias,
-            mix_k_curr_bias,
-            zero,
-            zero,
-            zero,
-            zero,
         ),
         dim=-1,
     )
@@ -146,29 +133,17 @@ def scanprep_scan_coeffs_from_flat_params(
     gamma = F.softplus(p[..., 1])
     omega = p[..., 2]
     r_direct_u = torch.sigmoid(p[..., 3])
-    theta_direct = theta_bound * torch.tanh(p[..., 4])
-    mix_r = torch.sigmoid(p[..., 5])
-    mix_theta = torch.sigmoid(p[..., 6])
-    mix_k_prev = torch.sigmoid(p[..., 7]).unsqueeze(-1)
-    mix_k_curr = torch.sigmoid(p[..., 8]).unsqueeze(-1)
-    k_prev_learned = k_max * torch.tanh(p[..., 9:11])
-    k_curr_learned = k_max * torch.tanh(p[..., 11:13])
+    mix_r = torch.sigmoid(p[..., 4])
 
     dt = dt_min + (dt_max - dt_min) * dt_u
     r_struct = r_min + (r_max - r_min) * torch.exp(-gamma * dt)
-    theta_struct = omega * dt
+    theta = principal_angle(omega * dt)
     r_direct = r_min + (r_max - r_min) * r_direct_u
 
     r = torch.lerp(r_direct, r_struct, mix_r)
-    theta = principal_angle(torch.lerp(theta_direct, theta_struct, mix_theta))
-
     log_r_f = torch.log(r)
     rho = torch.polar(r, theta)
-    k_prev_struct, k_curr_struct = _foh_taps_from_normalized(
-        dt, log_r_f, theta, rho, eps=eps
-    )
-    k_prev = torch.lerp(k_prev_learned, k_prev_struct, mix_k_prev)
-    k_curr = torch.lerp(k_curr_learned, k_curr_struct, mix_k_curr)
+    k_prev, k_curr = _foh_taps_from_normalized(dt, log_r_f, theta, rho, eps=eps)
 
     M = _pack_complex(rho)
     K = torch.stack([k_prev, k_curr], dim=-2)

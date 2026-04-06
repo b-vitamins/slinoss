@@ -52,7 +52,7 @@ class MixerDecodeInputs:
 
     Shapes:
     - ``value``: ``(batch, heads, P)`` post-conv/post-activation value token
-    - ``params``: ``(batch, heads, 13)`` flat scanprep parameter token
+    - ``params``: ``(batch, heads, param_dim)`` flat scanprep parameter token
     - ``bc``: ``(batch, heads, 4, N)`` raw mixer-emitted BC token
     - ``gate``: ``(batch, heads, P)`` token-local gating vector
     - ``skip``: ``(heads, P)`` per-head skip vector

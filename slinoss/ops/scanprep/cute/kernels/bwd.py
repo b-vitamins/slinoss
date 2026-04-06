@@ -8,7 +8,6 @@ import cutlass.cute as cute
 
 from ..common import (
     COEFF_AUX_DELTA_R,
-    COEFF_AUX_DELTA_THETA,
     COEFF_AUX_DT,
     COEFF_AUX_DT_U,
     COEFF_AUX_EXP_TERM,
@@ -18,22 +17,14 @@ from ..common import (
     COEFF_AUX_KAPPA1_RE,
     COEFF_AUX_KAPPA2_IM,
     COEFF_AUX_KAPPA2_RE,
-    COEFF_AUX_K_CURR_TANH_IM,
-    COEFF_AUX_K_CURR_TANH_RE,
-    COEFF_AUX_K_PREV_TANH_IM,
-    COEFF_AUX_K_PREV_TANH_RE,
     COEFF_AUX_LOG_R,
-    COEFF_AUX_MIX_K_CURR,
-    COEFF_AUX_MIX_K_PREV,
     COEFF_AUX_MIX_R,
-    COEFF_AUX_MIX_THETA,
     COEFF_AUX_OMEGA,
     COEFF_AUX_R,
     COEFF_AUX_RHO_IM,
     COEFF_AUX_RHO_RE,
     COEFF_AUX_R_DIRECT_U,
     COEFF_AUX_THETA,
-    COEFF_AUX_THETA_DIRECT_TANH,
     complex_div,
     complex_mul_conj,
     make_row_major_stride,
@@ -57,8 +48,6 @@ class ScanPrepBwdFused:
         dt_max: float,
         r_min: float,
         r_max: float,
-        theta_bound: float,
-        k_max: float,
         eps: float,
         value_warps_per_block: int = 8,
         pack_warps_per_block: int = 12,
@@ -73,7 +62,7 @@ class ScanPrepBwdFused:
 
         self.scale_grad_shape = (self.h_size, 4, self.n_size)
         self.scale_grad_stride = make_row_major_stride(self.scale_grad_shape)
-        self.bias_grad_shape = (self.h_size, 7)
+        self.bias_grad_shape = (self.h_size, 4)
         self.bias_grad_stride = make_row_major_stride(self.bias_grad_shape)
 
         self.value_warps_per_block = int(value_warps_per_block)
@@ -122,14 +111,12 @@ class ScanPrepBwdFused:
         if self.bias_block_size <= 0 or self.bias_block_size % 32 != 0:
             raise ValueError("bias_block_size must be a positive multiple of 32.")
         self.bias_warps_per_block = self.bias_block_size // 32
-        if self.bias_warps_per_block < 7:
-            raise ValueError("bias_block_size must cover at least seven warps.")
+        if self.bias_warps_per_block < 4:
+            raise ValueError("bias_block_size must cover at least four warps.")
         self.bias_bt_tile = 256
 
         self.dt_scale = float(dt_max - dt_min)
         self.r_scale = float(r_max - r_min)
-        self.theta_bound = float(theta_bound)
-        self.k_max = float(k_max)
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
@@ -578,30 +565,11 @@ class ScanPrepBwdFused:
             gamma_sigmoid = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_GAMMA_SIGMOID, t])
             omega = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_OMEGA, t])
             r_direct_u = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_R_DIRECT_U, t])
-            theta_direct_tanh = cutlass.Float32(
-                mCoeffAux[b, h, COEFF_AUX_THETA_DIRECT_TANH, t]
-            )
             mix_r = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_MIX_R, t])
-            mix_theta = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_MIX_THETA, t])
-            mix_k_prev = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_MIX_K_PREV, t])
-            mix_k_curr = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_MIX_K_CURR, t])
-            k_prev_tanh_re = cutlass.Float32(
-                mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_RE, t]
-            )
-            k_prev_tanh_im = cutlass.Float32(
-                mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_IM, t]
-            )
-            k_curr_tanh_re = cutlass.Float32(
-                mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_RE, t]
-            )
-            k_curr_tanh_im = cutlass.Float32(
-                mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_IM, t]
-            )
             dt = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_DT, t])
             gamma = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_GAMMA, t])
             exp_term = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_EXP_TERM, t])
             delta_r = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_DELTA_R, t])
-            delta_theta = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_DELTA_THETA, t])
             r = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_R, t])
             theta = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_THETA, t])
             rho_re = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_RHO_RE, t])
@@ -612,21 +580,11 @@ class ScanPrepBwdFused:
             kappa2_re = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_KAPPA2_RE, t])
             kappa2_im = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_KAPPA2_IM, t])
 
-            k_prev_learned_re = cutlass.Float32(self.k_max) * k_prev_tanh_re
-            k_prev_learned_im = cutlass.Float32(self.k_max) * k_prev_tanh_im
-            k_curr_learned_re = cutlass.Float32(self.k_max) * k_curr_tanh_re
-            k_curr_learned_im = cutlass.Float32(self.k_max) * k_curr_tanh_im
-
             z_re = log_r
             z_im = theta
             z2_re = z_re * z_re - z_im * z_im
             z2_im = cutlass.Float32(2.0) * z_re * z_im
             z_norm_sq = z_re * z_re + z_im * z_im
-
-            k_prev_struct_re = dt * kappa2_re
-            k_prev_struct_im = dt * kappa2_im
-            k_curr_struct_re = dt * (kappa1_re - kappa2_re)
-            k_curr_struct_im = dt * (kappa1_im - kappa2_im)
 
             g_rho_re = cutlass.Float32(mDM[b, h, t, 0])
             g_rho_im = cutlass.Float32(mDM[b, h, t, 1])
@@ -635,29 +593,10 @@ class ScanPrepBwdFused:
             g_k_curr_re = cutlass.Float32(mDK[b, h, t, 1, 0])
             g_k_curr_im = cutlass.Float32(mDK[b, h, t, 1, 1])
 
-            one_minus_mix_k_prev = cutlass.Float32(1.0) - mix_k_prev
-            one_minus_mix_k_curr = cutlass.Float32(1.0) - mix_k_curr
-            g_k_prev_learned_re = g_k_prev_re * one_minus_mix_k_prev
-            g_k_prev_learned_im = g_k_prev_im * one_minus_mix_k_prev
-            g_k_prev_struct_re = g_k_prev_re * mix_k_prev
-            g_k_prev_struct_im = g_k_prev_im * mix_k_prev
-            g_mix_k_prev = real_mul_conj(
-                g_k_prev_re,
-                g_k_prev_im,
-                k_prev_struct_re - k_prev_learned_re,
-                k_prev_struct_im - k_prev_learned_im,
-            )
-
-            g_k_curr_learned_re = g_k_curr_re * one_minus_mix_k_curr
-            g_k_curr_learned_im = g_k_curr_im * one_minus_mix_k_curr
-            g_k_curr_struct_re = g_k_curr_re * mix_k_curr
-            g_k_curr_struct_im = g_k_curr_im * mix_k_curr
-            g_mix_k_curr = real_mul_conj(
-                g_k_curr_re,
-                g_k_curr_im,
-                k_curr_struct_re - k_curr_learned_re,
-                k_curr_struct_im - k_curr_learned_im,
-            )
+            g_k_prev_struct_re = g_k_prev_re
+            g_k_prev_struct_im = g_k_prev_im
+            g_k_curr_struct_re = g_k_curr_re
+            g_k_curr_struct_im = g_k_curr_im
 
             kappa_diff_re = kappa1_re - kappa2_re
             kappa_diff_im = kappa1_im - kappa2_im
@@ -797,11 +736,6 @@ class ScanPrepBwdFused:
             g_theta = g_theta + g_z_im
             g_r = g_r + g_log_r / r
 
-            one_minus_mix_theta = cutlass.Float32(1.0) - mix_theta
-            g_theta_direct = g_theta * one_minus_mix_theta
-            g_theta_struct = g_theta * mix_theta
-            g_mix_theta = g_theta * delta_theta
-
             one_minus_mix_r = cutlass.Float32(1.0) - mix_r
             g_r_direct = g_r * one_minus_mix_r
             g_r_struct = g_r * mix_r
@@ -812,43 +746,15 @@ class ScanPrepBwdFused:
             g_x = g_exp_term * exp_term
             g_gamma = g_x * (-dt)
             g_dt = g_dt + g_x * (-gamma)
-            g_omega = g_theta_struct * dt
-            g_dt = g_dt + g_theta_struct * omega
+            g_omega = g_theta * dt
+            g_dt = g_dt + g_theta * omega
             g_dt_u = g_dt * cutlass.Float32(self.dt_scale)
 
             d0 = g_dt_u * dt_u * (cutlass.Float32(1.0) - dt_u)
             d1 = g_gamma * gamma_sigmoid
             d2 = g_omega
             d3 = g_r_direct_u * r_direct_u * (cutlass.Float32(1.0) - r_direct_u)
-            d4 = (
-                g_theta_direct
-                * cutlass.Float32(self.theta_bound)
-                * (cutlass.Float32(1.0) - theta_direct_tanh * theta_direct_tanh)
-            )
-            d5 = g_mix_r * mix_r * (cutlass.Float32(1.0) - mix_r)
-            d6 = g_mix_theta * mix_theta * (cutlass.Float32(1.0) - mix_theta)
-            d7 = g_mix_k_prev * mix_k_prev * (cutlass.Float32(1.0) - mix_k_prev)
-            d8 = g_mix_k_curr * mix_k_curr * (cutlass.Float32(1.0) - mix_k_curr)
-            d9 = (
-                g_k_prev_learned_re
-                * cutlass.Float32(self.k_max)
-                * (cutlass.Float32(1.0) - k_prev_tanh_re * k_prev_tanh_re)
-            )
-            d10 = (
-                g_k_prev_learned_im
-                * cutlass.Float32(self.k_max)
-                * (cutlass.Float32(1.0) - k_prev_tanh_im * k_prev_tanh_im)
-            )
-            d11 = (
-                g_k_curr_learned_re
-                * cutlass.Float32(self.k_max)
-                * (cutlass.Float32(1.0) - k_curr_tanh_re * k_curr_tanh_re)
-            )
-            d12 = (
-                g_k_curr_learned_im
-                * cutlass.Float32(self.k_max)
-                * (cutlass.Float32(1.0) - k_curr_tanh_im * k_curr_tanh_im)
-            )
+            d4 = g_mix_r * mix_r * (cutlass.Float32(1.0) - mix_r)
 
             flat_base = warp * self.param_dim
             sDParams[lane, flat_base + 0] = d0
@@ -856,14 +762,6 @@ class ScanPrepBwdFused:
             sDParams[lane, flat_base + 2] = d2
             sDParams[lane, flat_base + 3] = d3
             sDParams[lane, flat_base + 4] = d4
-            sDParams[lane, flat_base + 5] = d5
-            sDParams[lane, flat_base + 6] = d6
-            sDParams[lane, flat_base + 7] = d7
-            sDParams[lane, flat_base + 8] = d8
-            sDParams[lane, flat_base + 9] = d9
-            sDParams[lane, flat_base + 10] = d10
-            sDParams[lane, flat_base + 11] = d11
-            sDParams[lane, flat_base + 12] = d12
 
         cute.arch.sync_threads()
 
@@ -902,7 +800,7 @@ class ScanPrepBwdFused:
         h, tile_idx, _ = cute.arch.block_idx()
         warp = tidx // 32
         lane = tidx - warp * 32
-        if h < self.h_size and warp < 7:
+        if h < self.h_size and warp < 4:
             p_idx = cutlass.Int32(0)
             if warp == 0:
                 p_idx = 0
@@ -910,14 +808,8 @@ class ScanPrepBwdFused:
                 p_idx = 1
             elif warp == 2:
                 p_idx = 2
-            elif warp == 3:
-                p_idx = 5
-            elif warp == 4:
-                p_idx = 6
-            elif warp == 5:
-                p_idx = 7
             else:
-                p_idx = 8
+                p_idx = 4
 
             acc = cutlass.Float32(0.0)
             p_base = h * self.param_dim

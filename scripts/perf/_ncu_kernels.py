@@ -25,6 +25,7 @@ from _nextchar import DEFAULT_NEXTCHAR_PERF_CONFIG  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
     COEFF_AUX_FIELDS,
+    SCANPREP_PARAM_DIM,
     make_fake_tensor_arg,
 )
 from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux  # noqa: E402
@@ -180,7 +181,9 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     value = torch.randn(
         (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
     )
-    params = torch.randn((cfg.batch, cfg.T, cfg.heads * 13), device=device, dtype=dtype)
+    params = torch.randn(
+        (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM), device=device, dtype=dtype
+    )
     bc = torch.randn(
         (cfg.batch, cfg.T, cfg.heads, 4, cfg.N), device=device, dtype=dtype
     )
@@ -226,8 +229,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             dt_max=prep.dt_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
-            theta_bound=prep.theta_bound,
-            k_max=prep.k_max,
             eps=prep.eps,
             pack_warps_per_block=cfg.pack_warps_per_block,
             coeff_block_size=cfg.coeff_block_size_fwd,
@@ -241,9 +242,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         make_fake_tensor_arg(prep.gamma_bias.detach()),
         make_fake_tensor_arg(prep.omega_bias.detach()),
         make_fake_tensor_arg(prep.mix_r_bias.detach()),
-        make_fake_tensor_arg(prep.mix_theta_bias.detach()),
-        make_fake_tensor_arg(prep.mix_k_prev_bias.detach()),
-        make_fake_tensor_arg(prep.mix_k_curr_bias.detach()),
         make_fake_tensor_arg(U),
         make_fake_tensor_arg(B),
         make_fake_tensor_arg(C),
@@ -265,9 +263,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             prep.gamma_bias.detach(),
             prep.omega_bias.detach(),
             prep.mix_r_bias.detach(),
-            prep.mix_theta_bias.detach(),
-            prep.mix_k_prev_bias.detach(),
-            prep.mix_k_curr_bias.detach(),
             U,
             B,
             C,
@@ -287,9 +282,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         prep.gamma_bias.detach(),
         prep.omega_bias.detach(),
         prep.mix_r_bias.detach(),
-        prep.mix_theta_bias.detach(),
-        prep.mix_k_prev_bias.detach(),
-        prep.mix_k_curr_bias.detach(),
         U,
         B,
         C,
@@ -323,7 +315,9 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
     )
     params_flat = torch.randn(
-        (cfg.batch, cfg.T, cfg.heads * 13), device=device, dtype=dtype
+        (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
+        device=device,
+        dtype=dtype,
     )
     bc = torch.randn(
         (cfg.batch, cfg.T, cfg.heads, 4, cfg.N), device=device, dtype=dtype
@@ -361,16 +355,11 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             dt_max=prep.dt_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
-            theta_bound=prep.theta_bound,
-            k_max=prep.k_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
             gamma_bias=prep.gamma_bias.detach(),
             omega_bias=prep.omega_bias.detach(),
             mix_r_bias=prep.mix_r_bias.detach(),
-            mix_theta_bias=prep.mix_theta_bias.detach(),
-            mix_k_prev_bias=prep.mix_k_prev_bias.detach(),
-            mix_k_curr_bias=prep.mix_k_curr_bias.detach(),
             b_scale=b_scale if cfg.normalize_bc else None,
             c_scale=c_scale if cfg.normalize_bc else None,
         )
@@ -382,24 +371,24 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.T, cfg.heads, 4, cfg.N), device=device, dtype=dtype
     )
     dparams = torch.empty(
-        (cfg.batch, cfg.T, cfg.heads * 13), device=device, dtype=dtype
+        (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
+        device=device,
+        dtype=dtype,
     )
     scale_grad = torch.zeros((cfg.heads, 4, cfg.N), device=device, dtype=torch.float32)
-    bias_grad = torch.empty((cfg.heads, 7), device=device, dtype=torch.float32)
+    bias_grad = torch.empty((cfg.heads, 4), device=device, dtype=torch.float32)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
             h_size=cfg.heads,
             p_size=cfg.P,
             n_size=cfg.N,
-            param_dim=13,
+            param_dim=prep.param_dim,
             normalize_bc=cfg.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
-            theta_bound=prep.theta_bound,
-            k_max=prep.k_max,
             eps=prep.eps,
             pack_warps_per_block=cfg.pack_warps_per_block,
             coeff_block_size=cfg.coeff_block_size_bwd,
@@ -498,7 +487,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
         chunk_size=cfg.chunk_size,
         compute_dtype=torch.float32,
     )
-    prepared_increment.compiled(*prepared_increment.runtime_args)
+    cast(Callable[..., None], prepared_increment.compiled)(
+        *prepared_increment.runtime_args
+    )
     inc_chunk = prepared_increment.outputs.increment_chunk
     chunk_multiplier_storage = prepared_increment.outputs.chunk_multiplier_storage
     increment = inc_chunk.reshape(cfg.batch, cfg.heads, n_chunks, cfg.P, D)
@@ -511,7 +502,7 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
         chunk_multiplier,
         initial_states=initial_states,
     )
-    prepared_state.compiled(*prepared_state.runtime_args)
+    cast(Callable[..., None], prepared_state.compiled)(*prepared_state.runtime_args)
     chunk_starts = prepared_state.outputs.chunk_starts
     final_state = prepared_state.outputs.final_state
 
@@ -545,9 +536,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 + bytes_k
                 + _tensor_bytes(U_prev, B_prev, inc_chunk, chunk_multiplier_storage)
             ),
-            launch=lambda prepared=prepared_increment: prepared.compiled(
-                *prepared.runtime_args
-            ),
+            launch=lambda prepared=prepared_increment: cast(
+                Callable[..., None], prepared.compiled
+            )(*prepared.runtime_args),
             prepare=_noop,
         ),
         "state_passing_fwd": KernelRunner(
@@ -559,9 +550,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 chunk_starts,
                 final_state,
             ),
-            launch=lambda prepared=prepared_state: prepared.compiled(
-                *prepared.runtime_args
-            ),
+            launch=lambda prepared=prepared_state: cast(
+                Callable[..., None], prepared.compiled
+            )(*prepared.runtime_args),
             prepare=_noop,
         ),
         "chunk_scan_fwd": KernelRunner(
@@ -574,9 +565,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 + bytes_k
                 + _tensor_bytes(chunk_starts, U_prev, B_prev, out_chunk)
             ),
-            launch=lambda prepared=prepared_scan: prepared.compiled(
-                *prepared.runtime_args
-            ),
+            launch=lambda prepared=prepared_scan: cast(
+                Callable[..., None], prepared.compiled
+            )(*prepared.runtime_args),
             prepare=_noop,
         ),
     }
@@ -782,7 +773,7 @@ def _build_v2x2ssd_state_passing_bwd_runners(
         m_chunk,
         initial_states=initial_states,
     )
-    prepared_state.compiled(*prepared_state.runtime_args)
+    cast(Callable[..., None], prepared_state.compiled)(*prepared_state.runtime_args)
     chunk_starts = prepared_state.outputs.chunk_starts
 
     d_chunk_starts = torch.randn_like(chunk_starts)
@@ -858,7 +849,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         m_chunk,
         initial_states=initial_states,
     )
-    prepared_state.compiled(*prepared_state.runtime_args)
+    cast(Callable[..., None], prepared_state.compiled)(*prepared_state.runtime_args)
     chunk_starts = prepared_state.outputs.chunk_starts
     d_out = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, cfg.P),

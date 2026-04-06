@@ -9,7 +9,6 @@ import cutlass.cute.math as cute_math
 
 from ..common import (
     COEFF_AUX_DELTA_R,
-    COEFF_AUX_DELTA_THETA,
     COEFF_AUX_DT,
     COEFF_AUX_DT_U,
     COEFF_AUX_EXP_TERM,
@@ -19,22 +18,15 @@ from ..common import (
     COEFF_AUX_KAPPA1_RE,
     COEFF_AUX_KAPPA2_IM,
     COEFF_AUX_KAPPA2_RE,
-    COEFF_AUX_K_CURR_TANH_IM,
-    COEFF_AUX_K_CURR_TANH_RE,
-    COEFF_AUX_K_PREV_TANH_IM,
-    COEFF_AUX_K_PREV_TANH_RE,
     COEFF_AUX_LOG_R,
-    COEFF_AUX_MIX_K_CURR,
-    COEFF_AUX_MIX_K_PREV,
     COEFF_AUX_MIX_R,
-    COEFF_AUX_MIX_THETA,
     COEFF_AUX_OMEGA,
     COEFF_AUX_R,
     COEFF_AUX_RHO_IM,
     COEFF_AUX_RHO_RE,
     COEFF_AUX_R_DIRECT_U,
     COEFF_AUX_THETA,
-    COEFF_AUX_THETA_DIRECT_TANH,
+    SCANPREP_PARAM_DIM,
     complex_div,
     lerp,
     principal_angle,
@@ -60,8 +52,6 @@ class ScanPrepFwdFused:
         dt_max: float,
         r_min: float,
         r_max: float,
-        theta_bound: float,
-        k_max: float,
         eps: float,
         pack_warps_per_block: int = 8,
         coeff_block_size: int = 256,
@@ -85,21 +75,25 @@ class ScanPrepFwdFused:
         self.coeff_head_tile = self.coeff_block_size // 32
         if self.coeff_head_tile <= 0:
             raise ValueError("coeff_block_size must cover at least one warp.")
-        self.coeff_smem_bytes = self.coeff_head_tile * 13 * (self.coeff_t_tile + 1) * 4
+        self.coeff_smem_bytes = (
+            self.coeff_head_tile * SCANPREP_PARAM_DIM * (self.coeff_t_tile + 1) * 4
+        )
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
-        self.theta_bound = float(theta_bound)
-        self.k_max = float(k_max)
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
     def _coeff_shared_storage(self):
         coeff_layout = cute.make_layout(
-            (self.coeff_head_tile, 13, self.coeff_t_tile + 1),
-            stride=(13 * (self.coeff_t_tile + 1), self.coeff_t_tile + 1, 1),
+            (self.coeff_head_tile, SCANPREP_PARAM_DIM, self.coeff_t_tile + 1),
+            stride=(
+                SCANPREP_PARAM_DIM * (self.coeff_t_tile + 1),
+                self.coeff_t_tile + 1,
+                1,
+            ),
         )
 
         class SharedStorage:
@@ -241,9 +235,6 @@ class ScanPrepFwdFused:
         mGammaBias: cute.Tensor,
         mOmegaBias: cute.Tensor,
         mMixRBias: cute.Tensor,
-        mMixThetaBias: cute.Tensor,
-        mMixKPrevBias: cute.Tensor,
-        mMixKCurrBias: cute.Tensor,
         mMOut: cute.Tensor,
         mKOut: cute.Tensor,
         mCoeffAux: cute.Tensor,
@@ -259,8 +250,12 @@ class ScanPrepFwdFused:
         sParams = smem.allocate_tensor(
             cutlass.Float32,
             cute.make_layout(
-                (self.coeff_head_tile, 13, self.coeff_t_tile + 1),
-                stride=(13 * (self.coeff_t_tile + 1), self.coeff_t_tile + 1, 1),
+                (self.coeff_head_tile, SCANPREP_PARAM_DIM, self.coeff_t_tile + 1),
+                stride=(
+                    SCANPREP_PARAM_DIM * (self.coeff_t_tile + 1),
+                    self.coeff_t_tile + 1,
+                    1,
+                ),
             ),
             16,
         )
@@ -269,7 +264,7 @@ class ScanPrepFwdFused:
         num_load_t_iters = (
             self.coeff_t_tile + self.coeff_head_tile - 1
         ) // self.coeff_head_tile
-        num_load_flat_iters = (self.coeff_head_tile * 13 + 31) // 32
+        num_load_flat_iters = (self.coeff_head_tile * SCANPREP_PARAM_DIM + 31) // 32
         for load_t_iter in cutlass.range_constexpr(num_load_t_iters):
             load_t_local = warp + load_t_iter * self.coeff_head_tile
             load_bt = block_x * self.coeff_t_tile + load_t_local
@@ -278,9 +273,9 @@ class ScanPrepFwdFused:
                 load_t = load_bt - load_b * t_size_
                 for flat_iter in cutlass.range_constexpr(num_load_flat_iters):
                     flat = lane + flat_iter * 32
-                    if flat < self.coeff_head_tile * 13:
-                        local_h = flat // 13
-                        param_idx = flat - local_h * 13
+                    if flat < self.coeff_head_tile * SCANPREP_PARAM_DIM:
+                        local_h = flat // SCANPREP_PARAM_DIM
+                        param_idx = flat - local_h * SCANPREP_PARAM_DIM
                         load_h = h_base + local_h
                         if load_h < self.h_size:
                             sParams[local_h, param_idx, load_t_local] = cutlass.Float32(
@@ -299,48 +294,26 @@ class ScanPrepFwdFused:
             gamma_raw = sParams[warp, 1, lane] + cutlass.Float32(mGammaBias[h])
             omega_raw = sParams[warp, 2, lane] + cutlass.Float32(mOmegaBias[h])
             r_raw = sParams[warp, 3, lane]
-            theta_raw = sParams[warp, 4, lane]
-            mix_r_raw = sParams[warp, 5, lane] + cutlass.Float32(mMixRBias[h])
-            mix_theta_raw = sParams[warp, 6, lane] + cutlass.Float32(mMixThetaBias[h])
-            mix_k_prev_raw = sParams[warp, 7, lane] + cutlass.Float32(mMixKPrevBias[h])
-            mix_k_curr_raw = sParams[warp, 8, lane] + cutlass.Float32(mMixKCurrBias[h])
-            k_prev_re_raw = sParams[warp, 9, lane]
-            k_prev_im_raw = sParams[warp, 10, lane]
-            k_curr_re_raw = sParams[warp, 11, lane]
-            k_curr_im_raw = sParams[warp, 12, lane]
+            mix_r_raw = sParams[warp, 4, lane] + cutlass.Float32(mMixRBias[h])
 
             dt_u = sigmoid(dt_raw)
             gamma = softplus(gamma_raw)
             gamma_sigmoid = sigmoid(gamma_raw)
             omega = omega_raw
             r_direct_u = sigmoid(r_raw)
-            theta_direct_tanh = cute_math.tanh(theta_raw)
-            theta_direct = cutlass.Float32(self.theta_bound) * theta_direct_tanh
             mix_r = sigmoid(mix_r_raw)
-            mix_theta = sigmoid(mix_theta_raw)
-            mix_k_prev = sigmoid(mix_k_prev_raw)
-            mix_k_curr = sigmoid(mix_k_curr_raw)
-            k_prev_tanh_re = cute_math.tanh(k_prev_re_raw)
-            k_prev_tanh_im = cute_math.tanh(k_prev_im_raw)
-            k_curr_tanh_re = cute_math.tanh(k_curr_re_raw)
-            k_curr_tanh_im = cute_math.tanh(k_curr_im_raw)
-            k_prev_learned_re = cutlass.Float32(self.k_max) * k_prev_tanh_re
-            k_prev_learned_im = cutlass.Float32(self.k_max) * k_prev_tanh_im
-            k_curr_learned_re = cutlass.Float32(self.k_max) * k_curr_tanh_re
-            k_curr_learned_im = cutlass.Float32(self.k_max) * k_curr_tanh_im
 
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
             exp_term = cute_math.exp(-(gamma * dt))
             r_struct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * exp_term
             )
-            theta_struct = omega * dt
+            theta = principal_angle(omega * dt)
             r_direct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * r_direct_u
             )
 
             r = lerp(r_direct, r_struct, mix_r)
-            theta = principal_angle(lerp(theta_direct, theta_struct, mix_theta))
 
             rho_re = r * cute_math.cos(theta)
             rho_im = r * cute_math.sin(theta)
@@ -401,37 +374,23 @@ class ScanPrepFwdFused:
             k_curr_re = dt * kappa1_re - k_prev_re
             k_curr_im = dt * kappa1_im - k_prev_im
 
-            out_prev_re = lerp(k_prev_learned_re, k_prev_re, mix_k_prev)
-            out_prev_im = lerp(k_prev_learned_im, k_prev_im, mix_k_prev)
-            out_curr_re = lerp(k_curr_learned_re, k_curr_re, mix_k_curr)
-            out_curr_im = lerp(k_curr_learned_im, k_curr_im, mix_k_curr)
-
             mMOut[b, h, t, 0] = rho_re
             mMOut[b, h, t, 1] = rho_im
-            mKOut[b, h, t, 0, 0] = out_prev_re
-            mKOut[b, h, t, 0, 1] = out_prev_im
-            mKOut[b, h, t, 1, 0] = out_curr_re
-            mKOut[b, h, t, 1, 1] = out_curr_im
+            mKOut[b, h, t, 0, 0] = k_prev_re
+            mKOut[b, h, t, 0, 1] = k_prev_im
+            mKOut[b, h, t, 1, 0] = k_curr_re
+            mKOut[b, h, t, 1, 1] = k_curr_im
 
             if cutlass.const_expr(self.store_coeff_aux):
                 mCoeffAux[b, h, COEFF_AUX_DT_U, t] = dt_u
                 mCoeffAux[b, h, COEFF_AUX_GAMMA_SIGMOID, t] = gamma_sigmoid
                 mCoeffAux[b, h, COEFF_AUX_OMEGA, t] = omega
                 mCoeffAux[b, h, COEFF_AUX_R_DIRECT_U, t] = r_direct_u
-                mCoeffAux[b, h, COEFF_AUX_THETA_DIRECT_TANH, t] = theta_direct_tanh
                 mCoeffAux[b, h, COEFF_AUX_MIX_R, t] = mix_r
-                mCoeffAux[b, h, COEFF_AUX_MIX_THETA, t] = mix_theta
-                mCoeffAux[b, h, COEFF_AUX_MIX_K_PREV, t] = mix_k_prev
-                mCoeffAux[b, h, COEFF_AUX_MIX_K_CURR, t] = mix_k_curr
-                mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_RE, t] = k_prev_tanh_re
-                mCoeffAux[b, h, COEFF_AUX_K_PREV_TANH_IM, t] = k_prev_tanh_im
-                mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_RE, t] = k_curr_tanh_re
-                mCoeffAux[b, h, COEFF_AUX_K_CURR_TANH_IM, t] = k_curr_tanh_im
                 mCoeffAux[b, h, COEFF_AUX_DT, t] = dt
                 mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
                 mCoeffAux[b, h, COEFF_AUX_EXP_TERM, t] = exp_term
                 mCoeffAux[b, h, COEFF_AUX_DELTA_R, t] = r_struct - r_direct
-                mCoeffAux[b, h, COEFF_AUX_DELTA_THETA, t] = theta_struct - theta_direct
                 mCoeffAux[b, h, COEFF_AUX_R, t] = r
                 mCoeffAux[b, h, COEFF_AUX_THETA, t] = theta
                 mCoeffAux[b, h, COEFF_AUX_RHO_RE, t] = rho_re
@@ -454,9 +413,6 @@ class ScanPrepFwdFused:
         gamma_bias: cute.Tensor,
         omega_bias: cute.Tensor,
         mix_r_bias: cute.Tensor,
-        mix_theta_bias: cute.Tensor,
-        mix_k_prev_bias: cute.Tensor,
-        mix_k_curr_bias: cute.Tensor,
         u: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
@@ -491,8 +447,13 @@ class ScanPrepFwdFused:
         mParams = cute.make_tensor(
             params.iterator,
             cute.make_layout(
-                (batch, t_size, self.h_size, 13),
-                stride=(t_size * self.h_size * 13, self.h_size * 13, 13, 1),
+                (batch, t_size, self.h_size, SCANPREP_PARAM_DIM),
+                stride=(
+                    t_size * self.h_size * SCANPREP_PARAM_DIM,
+                    self.h_size * SCANPREP_PARAM_DIM,
+                    SCANPREP_PARAM_DIM,
+                    1,
+                ),
             ),
         )
         coeff_smem_bytes = int(self._coeff_shared_storage().size_in_bytes())
@@ -515,9 +476,6 @@ class ScanPrepFwdFused:
             gamma_bias,
             omega_bias,
             mix_r_bias,
-            mix_theta_bias,
-            mix_k_prev_bias,
-            mix_k_curr_bias,
             m,
             k,
             coeff_aux,

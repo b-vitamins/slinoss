@@ -8,7 +8,7 @@ import cutlass.cute as cute
 
 from slinoss.perf import note_cache_event
 
-from .common import assumed_align, make_fake_tensor_arg
+from .common import SCANPREP_PARAM_DIM, assumed_align, make_fake_tensor_arg
 from .kernels.bwd import ScanPrepBwdFused
 
 
@@ -42,16 +42,15 @@ def _capture_safe_small_grads(
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    dparams_heads = dparams.view(batch, t_size, n_heads, 13).to(torch.float32)
+    dparams_heads = dparams.view(batch, t_size, n_heads, SCANPREP_PARAM_DIM).to(
+        torch.float32
+    )
     bias_grad = torch.stack(
         (
             dparams_heads[:, :, :, 0].sum(dim=(0, 1)),
             dparams_heads[:, :, :, 1].sum(dim=(0, 1)),
             dparams_heads[:, :, :, 2].sum(dim=(0, 1)),
-            dparams_heads[:, :, :, 5].sum(dim=(0, 1)),
-            dparams_heads[:, :, :, 6].sum(dim=(0, 1)),
-            dparams_heads[:, :, :, 7].sum(dim=(0, 1)),
-            dparams_heads[:, :, :, 8].sum(dim=(0, 1)),
+            dparams_heads[:, :, :, 4].sum(dim=(0, 1)),
         ),
         dim=1,
     )
@@ -121,15 +120,10 @@ def scanprep_bwd(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -195,7 +189,9 @@ def scanprep_bwd(
     )
     bc_grad = torch.empty_like(bc)
     dparams = torch.empty(
-        (batch, t_size, n_heads * 13), device=bc.device, dtype=params_dtype
+        (batch, t_size, n_heads * SCANPREP_PARAM_DIM),
+        device=bc.device,
+        dtype=params_dtype,
     )
     value_warps_per_block = 8
     pack_warps_per_block = 12
@@ -204,7 +200,7 @@ def scanprep_bwd(
     scale_grad = torch.zeros(
         (n_heads, 4, d_state), device=bc.device, dtype=torch.float32
     )
-    bias_grad = torch.zeros((n_heads, 7), device=bc.device, dtype=torch.float32)
+    bias_grad = torch.zeros((n_heads, 4), device=bc.device, dtype=torch.float32)
 
     b_scale_in = (
         b_scale
@@ -236,7 +232,7 @@ def scanprep_bwd(
     scale_grad_align = assumed_align(scale_grad)
     bias_grad_align = assumed_align(bias_grad)
 
-    spec = (int(n_heads), int(d_head), int(d_state), 13)
+    spec = (int(n_heads), int(d_head), int(d_state), SCANPREP_PARAM_DIM)
     cache_key = (
         spec,
         int(bc.device.index or 0),
@@ -279,8 +275,6 @@ def scanprep_bwd(
         float(dt_max),
         float(r_min),
         float(r_max),
-        float(theta_bound),
-        float(k_max),
         float(eps),
     )
     compiled = _SCANPREP_BWD_CACHE.get(cache_key)
@@ -293,14 +287,12 @@ def scanprep_bwd(
                 h_size=n_heads,
                 p_size=d_head,
                 n_size=d_state,
-                param_dim=13,
+                param_dim=SCANPREP_PARAM_DIM,
                 normalize_bc=normalize_bc,
                 dt_min=dt_min,
                 dt_max=dt_max,
                 r_min=r_min,
                 r_max=r_max,
-                theta_bound=theta_bound,
-                k_max=k_max,
                 eps=eps,
                 value_warps_per_block=value_warps_per_block,
                 pack_warps_per_block=pack_warps_per_block,
@@ -375,9 +367,6 @@ def scanprep_bwd(
         bias_grad[:, 1],
         bias_grad[:, 2],
         bias_grad[:, 3],
-        bias_grad[:, 4],
-        bias_grad[:, 5],
-        bias_grad[:, 6],
         d_b_scale,
         d_c_scale,
     )

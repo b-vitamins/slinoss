@@ -25,16 +25,11 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         dt_max: float,
         r_min: float,
         r_max: float,
-        theta_bound: float,
-        k_max: float,
         eps: float,
         dt_bias: torch.Tensor,
         gamma_bias: torch.Tensor,
         omega_bias: torch.Tensor,
         mix_r_bias: torch.Tensor,
-        mix_theta_bias: torch.Tensor,
-        mix_k_prev_bias: torch.Tensor,
-        mix_k_curr_bias: torch.Tensor,
         b_scale: torch.Tensor,
         c_scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -48,8 +43,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         ctx.dt_max = float(dt_max)
         ctx.r_min = float(r_min)
         ctx.r_max = float(r_max)
-        ctx.theta_bound = float(theta_bound)
-        ctx.k_max = float(k_max)
         ctx.eps = float(eps)
 
         value_d = value.detach()
@@ -59,9 +52,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         gamma_bias_d = gamma_bias.detach()
         omega_bias_d = omega_bias.detach()
         mix_r_bias_d = mix_r_bias.detach()
-        mix_theta_bias_d = mix_theta_bias.detach()
-        mix_k_prev_bias_d = mix_k_prev_bias.detach()
-        mix_k_curr_bias_d = mix_k_curr_bias.detach()
         b_scale_d = b_scale.detach()
         c_scale_d = c_scale.detach()
 
@@ -77,16 +67,11 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=dt_max,
             r_min=r_min,
             r_max=r_max,
-            theta_bound=theta_bound,
-            k_max=k_max,
             eps=eps,
             dt_bias=dt_bias_d,
             gamma_bias=gamma_bias_d,
             omega_bias=omega_bias_d,
             mix_r_bias=mix_r_bias_d,
-            mix_theta_bias=mix_theta_bias_d,
-            mix_k_prev_bias=mix_k_prev_bias_d,
-            mix_k_curr_bias=mix_k_curr_bias_d,
             b_scale=b_scale_d if normalize_bc else None,
             c_scale=c_scale_d if normalize_bc else None,
         )
@@ -125,9 +110,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             d_gamma_bias,
             d_omega_bias,
             d_mix_r_bias,
-            d_mix_theta_bias,
-            d_mix_k_prev_bias,
-            d_mix_k_curr_bias,
             d_b_scale,
             d_c_scale,
         ) = scanprep_bwd(
@@ -149,8 +131,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=ctx.dt_max,
             r_min=ctx.r_min,
             r_max=ctx.r_max,
-            theta_bound=ctx.theta_bound,
-            k_max=ctx.k_max,
             eps=ctx.eps,
             b_scale=b_scale if ctx.normalize_bc else None,
             c_scale=c_scale if ctx.normalize_bc else None,
@@ -168,15 +148,10 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             None,
             None,
             None,
-            None,
-            None,
             d_dt_bias,
             d_gamma_bias,
             d_omega_bias,
             d_mix_r_bias,
-            d_mix_theta_bias,
-            d_mix_k_prev_bias,
-            d_mix_k_curr_bias,
             d_b_scale,
             d_c_scale,
         )
@@ -195,16 +170,11 @@ def scanprep_cute_training_autograd(
     dt_max: float,
     r_min: float,
     r_max: float,
-    theta_bound: float,
-    k_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     omega_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    mix_theta_bias: torch.Tensor,
-    mix_k_prev_bias: torch.Tensor,
-    mix_k_curr_bias: torch.Tensor,
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -232,16 +202,11 @@ def scanprep_cute_training_autograd(
             float(dt_max),
             float(r_min),
             float(r_max),
-            float(theta_bound),
-            float(k_max),
             float(eps),
             dt_bias,
             gamma_bias,
             omega_bias,
             mix_r_bias,
-            mix_theta_bias,
-            mix_k_prev_bias,
-            mix_k_curr_bias,
             b_scale_in,
             c_scale_in,
         ),

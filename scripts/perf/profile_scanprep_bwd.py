@@ -92,7 +92,9 @@ def main() -> int:
     ).to(dtype=dtype)
 
     value = torch.randn((batch, t_size, heads * p_size), device=device, dtype=dtype)
-    params_flat = torch.randn((batch, t_size, heads * 13), device=device, dtype=dtype)
+    params_flat = torch.randn(
+        (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
+    )
     bc = torch.randn((batch, t_size, heads, 4, d_state), device=device, dtype=dtype)
     dU = torch.randn((batch, heads, t_size, p_size), device=device, dtype=dtype)
     dM = torch.randn((batch, heads, t_size, 2), device=device, dtype=torch.float32)
@@ -121,16 +123,11 @@ def main() -> int:
             dt_max=prep.dt_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
-            theta_bound=prep.theta_bound,
-            k_max=prep.k_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
             gamma_bias=prep.gamma_bias.detach(),
             omega_bias=prep.omega_bias.detach(),
             mix_r_bias=prep.mix_r_bias.detach(),
-            mix_theta_bias=prep.mix_theta_bias.detach(),
-            mix_k_prev_bias=prep.mix_k_prev_bias.detach(),
-            mix_k_curr_bias=prep.mix_k_curr_bias.detach(),
             b_scale=b_scale if args.normalize_bc else None,
             c_scale=c_scale if args.normalize_bc else None,
         )
@@ -141,23 +138,23 @@ def main() -> int:
     bc_grad = torch.empty(
         (batch, t_size, heads, 4, d_state), device=device, dtype=dtype
     )
-    dparams = torch.empty((batch, t_size, heads * 13), device=device, dtype=dtype)
+    dparams = torch.empty(
+        (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
+    )
     scale_grad = torch.zeros((heads, 4, d_state), device=device, dtype=torch.float32)
-    bias_grad = torch.empty((heads, 7), device=device, dtype=torch.float32)
+    bias_grad = torch.empty((heads, 4), device=device, dtype=torch.float32)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
             h_size=heads,
             p_size=p_size,
             n_size=d_state,
-            param_dim=13,
+            param_dim=prep.param_dim,
             normalize_bc=args.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
-            theta_bound=prep.theta_bound,
-            k_max=prep.k_max,
             eps=prep.eps,
             pack_warps_per_block=args.pack_warps_per_block,
             coeff_block_size=args.coeff_block_size,

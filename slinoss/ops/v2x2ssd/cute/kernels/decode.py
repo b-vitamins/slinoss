@@ -12,6 +12,7 @@ import cutlass.cute as cute
 import cutlass.cute.math as cute_math
 
 from slinoss.ops.scanprep.cute.common import (
+    SCANPREP_PARAM_DIM,
     complex_div,
     complex_mul,
     lerp,
@@ -27,7 +28,7 @@ class MixerDecodeStepFwd:
 
     Contract:
     - ``value`` / ``gate``: ``(B, H, P)``
-    - ``params``: ``(B, H, 13)``
+    - ``params``: ``(B, H, 5)``
     - ``bc``: ``(B, H, 4, N)``
     - ``skip``: ``(H, P)``
     - ``state``: ``(B, H, P, 2N)``
@@ -58,8 +59,6 @@ class MixerDecodeStepFwd:
         dt_max: float,
         r_min: float,
         r_max: float,
-        theta_bound: float,
-        k_max: float,
         eps: float,
     ) -> None:
         self.heads = int(heads)
@@ -120,8 +119,6 @@ class MixerDecodeStepFwd:
         self.dt_scale = float(dt_max - dt_min)
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
-        self.theta_bound = float(theta_bound)
-        self.k_max = float(k_max)
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
@@ -211,9 +208,6 @@ class MixerDecodeStepFwd:
         gamma_bias: cute.Tensor,
         omega_bias: cute.Tensor,
         mix_r_bias: cute.Tensor,
-        mix_theta_bias: cute.Tensor,
-        mix_k_prev_bias: cute.Tensor,
-        mix_k_curr_bias: cute.Tensor,
         b_scale: cute.Tensor,
         c_scale: cute.Tensor,
         y: cute.Tensor,
@@ -235,8 +229,12 @@ class MixerDecodeStepFwd:
         mParams = cute.make_tensor(
             params.iterator,
             cute.make_layout(
-                (batch, self.heads, 13),
-                stride=(self.heads * 13, 13, 1),
+                (batch, self.heads, SCANPREP_PARAM_DIM),
+                stride=(
+                    self.heads * SCANPREP_PARAM_DIM,
+                    SCANPREP_PARAM_DIM,
+                    1,
+                ),
             ),
         )
         mBC = cute.make_tensor(
@@ -281,15 +279,6 @@ class MixerDecodeStepFwd:
         )
         mMixRBias = cute.make_tensor(
             mix_r_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
-        )
-        mMixThetaBias = cute.make_tensor(
-            mix_theta_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
-        )
-        mMixKPrevBias = cute.make_tensor(
-            mix_k_prev_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
-        )
-        mMixKCurrBias = cute.make_tensor(
-            mix_k_curr_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mBScale = b_scale
         mCScale = c_scale
@@ -468,9 +457,6 @@ class MixerDecodeStepFwd:
             mGammaBias,
             mOmegaBias,
             mMixRBias,
-            mMixThetaBias,
-            mMixKPrevBias,
-            mMixKCurrBias,
             mBScale,
             mCScale,
             mY,
@@ -506,9 +492,6 @@ class MixerDecodeStepFwd:
         mGammaBias: cute.Tensor,
         mOmegaBias: cute.Tensor,
         mMixRBias: cute.Tensor,
-        mMixThetaBias: cute.Tensor,
-        mMixKPrevBias: cute.Tensor,
-        mMixKCurrBias: cute.Tensor,
         mBScale: cute.Tensor,
         mCScale: cute.Tensor,
         mY: cute.Tensor,
@@ -658,57 +641,26 @@ class MixerDecodeStepFwd:
                 mOmegaBias[bidh]
             )
             r_raw = cutlass.Float32(mParams[bidb, bidh, 3])
-            theta_raw = cutlass.Float32(mParams[bidb, bidh, 4])
-            mix_r_raw = cutlass.Float32(mParams[bidb, bidh, 5]) + cutlass.Float32(
+            mix_r_raw = cutlass.Float32(mParams[bidb, bidh, 4]) + cutlass.Float32(
                 mMixRBias[bidh]
             )
-            mix_theta_raw = cutlass.Float32(mParams[bidb, bidh, 6]) + cutlass.Float32(
-                mMixThetaBias[bidh]
-            )
-            mix_k_prev_raw = cutlass.Float32(mParams[bidb, bidh, 7]) + cutlass.Float32(
-                mMixKPrevBias[bidh]
-            )
-            mix_k_curr_raw = cutlass.Float32(mParams[bidb, bidh, 8]) + cutlass.Float32(
-                mMixKCurrBias[bidh]
-            )
-            k_prev_re_raw = cutlass.Float32(mParams[bidb, bidh, 9])
-            k_prev_im_raw = cutlass.Float32(mParams[bidb, bidh, 10])
-            k_curr_re_raw = cutlass.Float32(mParams[bidb, bidh, 11])
-            k_curr_im_raw = cutlass.Float32(mParams[bidb, bidh, 12])
 
             dt_u = sigmoid(dt_raw)
             gamma = softplus(gamma_raw)
             omega = omega_raw
             r_direct_u = sigmoid(r_raw)
-            theta_direct = cutlass.Float32(self.theta_bound) * cute_math.tanh(theta_raw)
             mix_r = sigmoid(mix_r_raw)
-            mix_theta = sigmoid(mix_theta_raw)
-            mix_k_prev = sigmoid(mix_k_prev_raw)
-            mix_k_curr = sigmoid(mix_k_curr_raw)
-            k_prev_learned_re = cutlass.Float32(self.k_max) * cute_math.tanh(
-                k_prev_re_raw
-            )
-            k_prev_learned_im = cutlass.Float32(self.k_max) * cute_math.tanh(
-                k_prev_im_raw
-            )
-            k_curr_learned_re = cutlass.Float32(self.k_max) * cute_math.tanh(
-                k_curr_re_raw
-            )
-            k_curr_learned_im = cutlass.Float32(self.k_max) * cute_math.tanh(
-                k_curr_im_raw
-            )
 
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
             r_struct = cutlass.Float32(self.r_min) + cutlass.Float32(
                 self.r_scale
             ) * cute_math.exp(-(gamma * dt))
-            theta_struct = omega * dt
+            theta = principal_angle(omega * dt)
             r_direct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * r_direct_u
             )
 
             r = lerp(r_direct, r_struct, mix_r)
-            theta = principal_angle(lerp(theta_direct, theta_struct, mix_theta))
             rho_re = r * cute_math.cos(theta)
             rho_im = r * cute_math.sin(theta)
 
@@ -769,10 +721,10 @@ class MixerDecodeStepFwd:
             k_curr_re = dt * kappa1_re - k_prev_re
             k_curr_im = dt * kappa1_im - k_prev_im
 
-            tap_prev_re = lerp(k_prev_learned_re, k_prev_re, mix_k_prev)
-            tap_prev_im = lerp(k_prev_learned_im, k_prev_im, mix_k_prev)
-            tap_curr_re = lerp(k_curr_learned_re, k_curr_re, mix_k_curr)
-            tap_curr_im = lerp(k_curr_learned_im, k_curr_im, mix_k_curr)
+            tap_prev_re = k_prev_re
+            tap_prev_im = k_prev_im
+            tap_curr_re = k_curr_re
+            tap_curr_im = k_curr_im
 
         rho_re = cute.arch.shuffle_sync(rho_re, 0)
         rho_im = cute.arch.shuffle_sync(rho_im, 0)
