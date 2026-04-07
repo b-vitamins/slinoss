@@ -94,7 +94,6 @@ def _make_mixer(*, backend: object | None = None) -> SLinOSSMixer:
         d_head=6,
         d_conv=3,
         chunk_size=4,
-        normalize_bc=True,
         backend=backend,  # type: ignore[arg-type]
     )
 
@@ -154,7 +153,6 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         scanprep_backend=ref_scanprep,  # type: ignore[arg-type]
         backend=ref_backend,  # type: ignore[arg-type]
     )
@@ -165,7 +163,6 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         scanprep_backend=zero_scanprep,  # type: ignore[arg-type]
         cconv_backend=ZeroConvBackend(),  # type: ignore[arg-type]
         backend=zero_backend,  # type: ignore[arg-type]
@@ -174,7 +171,7 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
 
     x = torch.randn((2, 65, 128), dtype=torch.float32)
     expected_bc = mixer.in_proj(x)[..., -mixer.bc_proj_dim :].view(
-        2, 65, mixer.n_heads, 4, mixer.d_state
+        2, 65, mixer.n_heads, mixer.scanprep.bc_param_rows, mixer.d_state
     )
 
     mixer(x)
@@ -208,7 +205,6 @@ def test_mixer_cute_scan_matches_reference_for_issue_9_bf16_shape() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=128,
-        normalize_bc=True,
         scanprep_backend=ReferenceScanPrepBackend(),
         backend=AutoScanBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
@@ -222,7 +218,6 @@ def test_mixer_cute_scan_matches_reference_for_issue_9_bf16_shape() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=128,
-        normalize_bc=True,
         scanprep_backend=ReferenceScanPrepBackend(),
         backend=ReferenceScanBackend(compute_dtype=torch.float32),
         cconv_backend=ReferenceCConv1dBackend(),
@@ -277,7 +272,6 @@ def test_mixer_rejects_incompatible_d_state_for_cute_scan_backend() -> None:
         d_head=6,
         d_conv=3,
         chunk_size=4,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float16,
     )
@@ -303,7 +297,6 @@ def test_mixer_backward_supports_issue_2_shape() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float16,
     )
@@ -336,7 +329,6 @@ def test_mixer_forward_supports_issue_3_shape() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float16,
     )
@@ -361,7 +353,6 @@ def test_mixer_backward_supports_issue_5_shape() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float16,
     )
@@ -394,7 +385,6 @@ def test_mixer_cute_stateless_forward_is_mode_invariant_for_issue_6() -> None:
         d_head=128,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float32,
     ).eval()
@@ -427,7 +417,6 @@ def test_mixer_torch_compile_contains_only_intentional_compiler_boundaries() -> 
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float16,
     ).eval()
@@ -457,7 +446,6 @@ def test_mixer_torch_compile_runs_training_with_cute_boundaries() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=64,
-        normalize_bc=True,
         device="cuda",
         dtype=torch.float16,
     ).train()
@@ -506,7 +494,6 @@ def test_mixer_cute_segmented_forward_matches_single_pass() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=32,
-        normalize_bc=True,
         backend=CuteScanBackend(),
         scanprep_backend=ReferenceScanPrepBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
@@ -564,7 +551,6 @@ def test_mixer_cute_segmented_training_matches_single_pass() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=32,
-        normalize_bc=True,
         backend=CuteScanBackend(),
         scanprep_backend=ReferenceScanPrepBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
@@ -578,7 +564,6 @@ def test_mixer_cute_segmented_training_matches_single_pass() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=32,
-        normalize_bc=True,
         backend=CuteScanBackend(),
         scanprep_backend=ReferenceScanPrepBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
@@ -739,7 +724,6 @@ def test_mixer_backward_supports_cuda_autocast(amp_dtype: torch.dtype) -> None:
         d_head=16,
         d_conv=3,
         chunk_size=4,
-        normalize_bc=True,
         scanprep_backend=ReferenceScanPrepBackend(),
         backend=ReferenceScanBackend(compute_dtype=torch.float32),
         cconv_backend=ReferenceCConv1dBackend(),

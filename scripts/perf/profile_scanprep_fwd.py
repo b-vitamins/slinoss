@@ -6,9 +6,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import cast
 
-import torch
 import cutlass.cute as cute
+import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
@@ -33,11 +34,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--T", type=int, default=2048, help="Sequence length.")
     parser.add_argument("--P", type=int, default=64, help="Head width.")
     parser.add_argument("--N", type=int, default=128, help="State width.")
-    parser.add_argument(
-        "--dtype",
-        choices=("fp16", "bf16", "fp32"),
-        default="fp16",
-    )
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -48,13 +45,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pack-warps-per-block", type=int, default=8)
     parser.add_argument("--coeff-block-size", type=int, default=256)
-    parser.add_argument(
-        "--no-normalize-bc",
-        action="store_false",
-        dest="normalize_bc",
-        help="Disable BC normalization to isolate the non-normalized path.",
-    )
-    parser.set_defaults(normalize_bc=True)
     return parser.parse_args()
 
 
@@ -85,7 +75,6 @@ def main() -> int:
         n_heads=heads,
         d_state=d_state,
         d_head=p_size,
-        normalize_bc=args.normalize_bc,
         device=device,
     ).to(dtype=dtype)
 
@@ -93,39 +82,34 @@ def main() -> int:
     params = torch.randn(
         (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
     )
-    bc = torch.randn((batch, t_size, heads, 4, d_state), device=device, dtype=dtype)
+    bc_amp = torch.randn(
+        (batch, t_size, heads, prep.bc_param_rows, d_state),
+        device=device,
+        dtype=dtype,
+    )
+    bc = prep._parameterize_scan_bc_rows(bc_amp)
 
     U = torch.empty((batch, heads, t_size, p_size), device=device, dtype=dtype)
     M = torch.empty((batch, heads, t_size, 2), device=device, dtype=torch.float32)
     K = torch.empty((batch, heads, t_size, 2, 2), device=device, dtype=torch.float32)
     B = torch.empty((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
     C = torch.empty_like(B)
-    rms_inv = torch.empty((batch, heads, t_size, 4), device=device, dtype=torch.float32)
     coeff_aux = torch.empty(
         (batch, heads, COEFF_AUX_FIELDS, t_size),
         device=device,
         dtype=torch.float32,
     )
 
-    if args.normalize_bc:
-        assert prep.b_scale is not None
-        assert prep.c_scale is not None
-        b_scale = prep.b_scale.detach().contiguous()
-        c_scale = prep.c_scale.detach().contiguous()
-    else:
-        b_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
-        c_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
-
     compiled = cute.compile(
         ScanPrepFwdFused(
             h_size=heads,
             p_size=p_size,
             n_size=d_state,
-            normalize_bc=args.normalize_bc,
-            store_rms_inv=bool(args.normalize_bc),
             store_coeff_aux=True,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
@@ -134,19 +118,18 @@ def main() -> int:
         ),
         make_fake_tensor_arg(value),
         make_fake_tensor_arg(bc),
-        make_fake_tensor_arg(b_scale, dynamic_stride=True),
-        make_fake_tensor_arg(c_scale, dynamic_stride=True),
         make_fake_tensor_arg(params),
         make_fake_tensor_arg(prep.dt_bias.detach()),
-        make_fake_tensor_arg(prep.gamma_bias.detach()),
-        make_fake_tensor_arg(prep.omega_bias.detach()),
+        make_fake_tensor_arg(prep.zeta_bias.detach()),
+        make_fake_tensor_arg(prep.omega_mod_bias.detach()),
+        make_fake_tensor_arg(prep.omega_natural_bias.detach()),
         make_fake_tensor_arg(prep.mix_r_bias.detach()),
+        make_fake_tensor_arg(cast(torch.Tensor, prep.omega_sign).detach()),
         make_fake_tensor_arg(U),
         make_fake_tensor_arg(B),
         make_fake_tensor_arg(C),
         make_fake_tensor_arg(M),
         make_fake_tensor_arg(K),
-        make_fake_tensor_arg(rms_inv),
         make_fake_tensor_arg(coeff_aux),
         options="--enable-tvm-ffi",
     )
@@ -155,36 +138,24 @@ def main() -> int:
         compiled(
             value,
             bc,
-            b_scale,
-            c_scale,
             params,
             prep.dt_bias.detach(),
-            prep.gamma_bias.detach(),
-            prep.omega_bias.detach(),
+            prep.zeta_bias.detach(),
+            prep.omega_mod_bias.detach(),
+            prep.omega_natural_bias.detach(),
             prep.mix_r_bias.detach(),
+            cast(torch.Tensor, prep.omega_sign).detach(),
             U,
             B,
             C,
             M,
             K,
-            rms_inv,
             coeff_aux,
         )
 
     _profile_once(run, warmup=args.warmup)
-    checksum = (
-        U.sum()
-        + M.sum()
-        + K.sum()
-        + B.sum()
-        + C.sum()
-        + coeff_aux.sum()
-        + rms_inv.sum()
-    )
-    print(
-        f"B={batch} H={heads} T={t_size} P={p_size} N={d_state} "
-        f"dtype={args.dtype} normalize_bc={args.normalize_bc}"
-    )
+    checksum = U.sum() + M.sum() + K.sum() + B.sum() + C.sum() + coeff_aux.sum()
+    print(f"B={batch} H={heads} T={t_size} P={p_size} N={d_state} dtype={args.dtype}")
     print(f"checksum={float(checksum):.6f}")
     return 0
 

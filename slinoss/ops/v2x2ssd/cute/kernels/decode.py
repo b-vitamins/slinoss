@@ -28,7 +28,7 @@ class MixerDecodeStepFwd:
 
     Contract:
     - ``value`` / ``gate``: ``(B, H, P)``
-    - ``params``: ``(B, H, 5)``
+    - ``params``: ``(B, H, 4)``
     - ``bc``: ``(B, H, 4, N)``
     - ``skip``: ``(H, P)``
     - ``state``: ``(B, H, P, 2N)``
@@ -54,9 +54,10 @@ class MixerDecodeStepFwd:
         tile_p: int,
         num_warps: int,
         vec_n: int,
-        normalize_bc: bool,
         dt_min: float,
         dt_max: float,
+        omega_min: float,
+        zeta_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -113,12 +114,14 @@ class MixerDecodeStepFwd:
             (self.d_model + self.num_threads - 1) // self.num_threads
         )
 
-        self.normalize_bc = bool(normalize_bc)
-
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
+        self.omega_min = float(omega_min)
+        self.zeta_max = float(zeta_max)
+        self.omega_mod_scale = 0.25
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
+        self.eps = float(eps)
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
 
@@ -205,11 +208,11 @@ class MixerDecodeStepFwd:
         b_prev: cute.Tensor,
         u_prev: cute.Tensor,
         dt_bias: cute.Tensor,
-        gamma_bias: cute.Tensor,
-        omega_bias: cute.Tensor,
+        zeta_bias: cute.Tensor,
+        omega_mod_bias: cute.Tensor,
+        omega_natural_bias: cute.Tensor,
         mix_r_bias: cute.Tensor,
-        b_scale: cute.Tensor,
-        c_scale: cute.Tensor,
+        omega_sign: cute.Tensor,
         y: cute.Tensor,
         final_state: cute.Tensor,
         b_last: cute.Tensor,
@@ -271,17 +274,21 @@ class MixerDecodeStepFwd:
         mDtBias = cute.make_tensor(
             dt_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mGammaBias = cute.make_tensor(
-            gamma_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mZetaBias = cute.make_tensor(
+            zeta_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mOmegaBias = cute.make_tensor(
-            omega_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mOmegaModBias = cute.make_tensor(
+            omega_mod_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        )
+        mOmegaNaturalBias = cute.make_tensor(
+            omega_natural_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mMixRBias = cute.make_tensor(
             mix_r_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mBScale = b_scale
-        mCScale = c_scale
+        mOmegaSign = cute.make_tensor(
+            omega_sign.iterator, cute.make_layout((self.heads,), stride=(1,))
+        )
         mY = cute.make_tensor(
             y.iterator,
             cute.make_layout(
@@ -322,7 +329,6 @@ class MixerDecodeStepFwd:
         )
         p_layout = cute.make_layout((self.tile_p,))
         vec_layout = cute.make_layout((self.n_size,))
-        bc_reduce_layout = cute.make_layout((4, self.num_warps))
         acc_layout = cute.make_layout((self.n_groups, self.tile_p))
 
         state_dtype = mState.element_type
@@ -432,11 +438,6 @@ class MixerDecodeStepFwd:
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
                 128,
             ]
-            inv: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4], 16]
-            bc_reduce: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(bc_reduce_layout)],
-                32,
-            ]
             acc_partial: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(acc_layout)],
                 128,
@@ -454,11 +455,11 @@ class MixerDecodeStepFwd:
             mBPrev,
             mUPrev,
             mDtBias,
-            mGammaBias,
-            mOmegaBias,
+            mZetaBias,
+            mOmegaModBias,
+            mOmegaNaturalBias,
             mMixRBias,
-            mBScale,
-            mCScale,
+            mOmegaSign,
             mY,
             mFinalState,
             mBLast,
@@ -489,11 +490,11 @@ class MixerDecodeStepFwd:
         mBPrev: cute.Tensor,
         mUPrev: cute.Tensor,
         mDtBias: cute.Tensor,
-        mGammaBias: cute.Tensor,
-        mOmegaBias: cute.Tensor,
+        mZetaBias: cute.Tensor,
+        mOmegaModBias: cute.Tensor,
+        mOmegaNaturalBias: cute.Tensor,
         mMixRBias: cute.Tensor,
-        mBScale: cute.Tensor,
-        mCScale: cute.Tensor,
+        mOmegaSign: cute.Tensor,
         mY: cute.Tensor,
         mFinalState: cute.Tensor,
         mBLast: cute.Tensor,
@@ -546,7 +547,6 @@ class MixerDecodeStepFwd:
         # Shared storage
         # ------------------------------------------------------------------
         vec_layout = cute.make_layout((self.n_size,))
-        bc_reduce_layout = cute.make_layout((4, self.num_warps))
         acc_layout = cute.make_layout((self.n_groups, self.tile_p))
 
         smem = cutlass.utils.SmemAllocator()
@@ -568,8 +568,6 @@ class MixerDecodeStepFwd:
         beta_curr_re = storage.beta_curr_re.get_tensor(vec_layout)
         beta_curr_im = storage.beta_curr_im.get_tensor(vec_layout)
 
-        inv_s = storage.inv.get_tensor(cute.make_layout((4,)))
-        bc_reduce = storage.bc_reduce.get_tensor(bc_reduce_layout)
         acc_partial = storage.acc_partial.get_tensor(acc_layout)
 
         # ------------------------------------------------------------------
@@ -631,27 +629,39 @@ class MixerDecodeStepFwd:
         tap_curr_im = cutlass.Float32(0.0)
 
         if lane_idx == 0:
-            dt_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
-                mDtBias[bidh]
+            zeta_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
+                mZetaBias[bidh]
             )
-            gamma_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
-                mGammaBias[bidh]
+            omega_mod_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
+                mOmegaModBias[bidh]
             )
-            omega_raw = cutlass.Float32(mParams[bidb, bidh, 2]) + cutlass.Float32(
-                mOmegaBias[bidh]
-            )
-            r_raw = cutlass.Float32(mParams[bidb, bidh, 3])
-            mix_r_raw = cutlass.Float32(mParams[bidb, bidh, 4]) + cutlass.Float32(
+            r_raw = cutlass.Float32(mParams[bidb, bidh, 2])
+            mix_r_raw = cutlass.Float32(mParams[bidb, bidh, 3]) + cutlass.Float32(
                 mMixRBias[bidh]
             )
 
-            dt_u = sigmoid(dt_raw)
-            gamma = softplus(gamma_raw)
-            omega = omega_raw
+            dt_u = sigmoid(cutlass.Float32(mDtBias[bidh]))
+            dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
+            zeta = cutlass.Float32(self.zeta_max) * sigmoid(zeta_raw)
+            omega_tanh = cute_math.tanh(omega_mod_raw)
+            omega_scale = cute_math.exp(
+                cutlass.Float32(self.omega_mod_scale) * omega_tanh
+            )
+            omega_natural = cutlass.Float32(self.omega_min) + softplus(
+                cutlass.Float32(mOmegaNaturalBias[bidh])
+            )
+            omega_drive = omega_natural * omega_scale
+            gamma = zeta * omega_drive
+            under = cutlass.max(
+                cutlass.Float32(self.eps),
+                cutlass.Float32(1.0) - zeta * zeta,
+            )
+            omega = (
+                cutlass.Float32(mOmegaSign[bidh]) * omega_drive * cute_math.sqrt(under)
+            )
             r_direct_u = sigmoid(r_raw)
             mix_r = sigmoid(mix_r_raw)
 
-            dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
             r_struct = cutlass.Float32(self.r_min) + cutlass.Float32(
                 self.r_scale
             ) * cute_math.exp(-(gamma * dt))
@@ -734,62 +744,27 @@ class MixerDecodeStepFwd:
         tap_curr_im = cute.arch.shuffle_sync(tap_curr_im, 0)
 
         # ------------------------------------------------------------------
-        # BC normalization + beta preparation
+        # BC preparation
         # ------------------------------------------------------------------
-        norm0 = cutlass.Float32(0.0)
-        norm1 = cutlass.Float32(0.0)
-        norm2 = cutlass.Float32(0.0)
-        norm3 = cutlass.Float32(0.0)
         bc0 = cutlass.Float32(0.0)
         bc1 = cutlass.Float32(0.0)
         bc2 = cutlass.Float32(0.0)
         bc3 = cutlass.Float32(0.0)
-        active_bc_warps = (self.n_size + cute.arch.WARP_SIZE - 1) // cute.arch.WARP_SIZE
 
         if tidx < self.n_size:
             bc0 = cutlass.Float32(mBC[bidb, bidh, 0, tidx])
             bc1 = cutlass.Float32(mBC[bidb, bidh, 1, tidx])
             bc2 = cutlass.Float32(mBC[bidb, bidh, 2, tidx])
             bc3 = cutlass.Float32(mBC[bidb, bidh, 3, tidx])
-            norm0 = bc0 * bc0
-            norm1 = bc1 * bc1
-            norm2 = bc2 * bc2
-            norm3 = bc3 * bc3
-
-        if warp_idx < active_bc_warps:
-            norm0 = self._warp_reduce_sum(norm0)
-            norm1 = self._warp_reduce_sum(norm1)
-            norm2 = self._warp_reduce_sum(norm2)
-            norm3 = self._warp_reduce_sum(norm3)
-
-        if lane_idx == 0 and warp_idx < active_bc_warps:
-            bc_reduce[0, warp_idx] = norm0
-            bc_reduce[1, warp_idx] = norm1
-            bc_reduce[2, warp_idx] = norm2
-            bc_reduce[3, warp_idx] = norm3
-
-        cute.arch.barrier()
-
-        if warp_idx == 0 and lane_idx < 4:
-            total = cutlass.Float32(0.0)
-            for w in cutlass.range_constexpr(active_bc_warps):
-                total = total + bc_reduce[lane_idx, w]
-            denom = cutlass.Float32(self.n_size)
-            inv_s[lane_idx] = cute.rsqrt(total / denom + cutlass.Float32(1.0e-5))
 
         cute.arch.barrier()
 
         if tidx < self.n_size:
             n = tidx
-            b_re_v = bc0 * inv_s[0]
-            b_im_v = bc1 * inv_s[1]
-            c_re_v = bc2 * inv_s[2]
-            c_im_v = bc3 * inv_s[3]
-            if self.normalize_bc:
-                b_re_v = b_re_v * cutlass.Float32(mBScale[bidh, 0, n])
-                b_im_v = b_im_v * cutlass.Float32(mBScale[bidh, 1, n])
-                c_re_v = c_re_v * cutlass.Float32(mCScale[bidh, 0, n])
-                c_im_v = c_im_v * cutlass.Float32(mCScale[bidh, 1, n])
+            b_re_v = bc0
+            b_im_v = bc1
+            c_re_v = bc2
+            c_im_v = bc3
 
             b_re[n] = b_re_v
             b_im[n] = b_im_v

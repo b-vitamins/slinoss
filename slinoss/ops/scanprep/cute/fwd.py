@@ -20,7 +20,6 @@ from .kernels.fwd import ScanPrepFwdFused
 
 
 _SCANPREP_FWD_CACHE: dict[tuple[object, ...], object] = {}
-_SCANPREP_DUMMY_RMS_INV_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 _SCANPREP_DUMMY_COEFF_AUX_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 _SCANPREP_DUMMY_CACHE_LIMIT = 8
 
@@ -45,34 +44,6 @@ def _cache_set(
     elif len(cache) >= _SCANPREP_DUMMY_CACHE_LIMIT:
         cache.pop(next(iter(cache)), None)
     cache[key] = value
-
-
-def _get_dummy_rms_inv(
-    *,
-    device: torch.device,
-    batch: int,
-    n_heads: int,
-    t_size: int,
-) -> torch.Tensor:
-    key = (
-        device.type,
-        device.index if device.index is not None else -1,
-        int(batch),
-        int(n_heads),
-        int(t_size),
-    )
-    cached = _SCANPREP_DUMMY_RMS_INV_CACHE.get(key)
-    if cached is not None:
-        note_cache_event("cute.scanprep.fwd.dummy_rms_inv", hit=True)
-        return cached
-    note_cache_event("cute.scanprep.fwd.dummy_rms_inv", hit=False)
-    if _is_cuda_graph_capturing(device):
-        _raise_cold_capture_error("dummy_rms_inv cache")
-    cached = torch.empty(
-        (batch, n_heads, t_size, 4), device=device, dtype=torch.float32
-    )
-    _cache_set(_SCANPREP_DUMMY_RMS_INV_CACHE, key, cached)
-    return cached
 
 
 def _get_dummy_coeff_aux(
@@ -111,21 +82,21 @@ def _scanprep_fwd_impl(
     n_heads: int,
     d_state: int,
     d_head: int,
-    normalize_bc: bool,
     dt_min: float,
     dt_max: float,
+    omega_min: float,
+    zeta_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
+    zeta_bias: torch.Tensor,
+    omega_mod_bias: torch.Tensor,
+    omega_natural_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    b_scale: torch.Tensor | None,
-    c_scale: torch.Tensor | None,
+    omega_sign: torch.Tensor,
     return_aux: bool,
 ) -> tuple[
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -168,89 +139,71 @@ def _scanprep_fwd_impl(
     )
     C = torch.empty_like(B)
     if return_aux:
-        rms_inv = torch.empty(
-            (batch, n_heads, t_size, 4), device=value.device, dtype=torch.float32
-        )
         coeff_aux = torch.empty(
             (batch, n_heads, COEFF_AUX_FIELDS, t_size),
             device=value.device,
             dtype=torch.float32,
         )
     else:
-        rms_inv = _get_dummy_rms_inv(
-            device=value.device, batch=batch, n_heads=n_heads, t_size=t_size
-        )
         coeff_aux = _get_dummy_coeff_aux(
             device=value.device, batch=batch, n_heads=n_heads, t_size=t_size
         )
 
-    b_scale_c = (
-        b_scale
-        if b_scale is not None
-        else torch.empty((n_heads, 2, d_state), device=value.device, dtype=bc.dtype)
-    )
-    c_scale_c = (
-        c_scale
-        if c_scale is not None
-        else torch.empty((n_heads, 2, d_state), device=value.device, dtype=bc.dtype)
-    )
     value_align = assumed_align(value_c)
     bc_align = assumed_align(bc_c)
-    b_scale_align = assumed_align(b_scale_c)
-    c_scale_align = assumed_align(c_scale_c)
     params_align = assumed_align(params_c)
     dt_bias_align = assumed_align(dt_bias)
-    gamma_bias_align = assumed_align(gamma_bias)
-    omega_bias_align = assumed_align(omega_bias)
+    zeta_bias_align = assumed_align(zeta_bias)
+    omega_mod_bias_align = assumed_align(omega_mod_bias)
+    omega_natural_bias_align = assumed_align(omega_natural_bias)
     mix_r_bias_align = assumed_align(mix_r_bias)
+    omega_sign_align = assumed_align(omega_sign)
     u_align = assumed_align(U)
     b_align = assumed_align(B)
     c_align = assumed_align(C)
     m_align = assumed_align(M)
     k_align = assumed_align(K)
-    rms_inv_align = assumed_align(rms_inv)
     coeff_aux_align = assumed_align(coeff_aux)
 
     spec = (int(n_heads), int(d_head), int(d_state))
     cache_key = (
         spec,
         int(value.device.index or 0),
-        bool(normalize_bc),
         value_c.dtype,
         params_c.dtype,
         bc_c.dtype,
-        b_scale_c.dtype,
-        c_scale_c.dtype,
         dt_bias.dtype,
-        gamma_bias.dtype,
-        omega_bias.dtype,
+        zeta_bias.dtype,
+        omega_mod_bias.dtype,
+        omega_natural_bias.dtype,
         mix_r_bias.dtype,
+        omega_sign.dtype,
         U.dtype,
         M.dtype,
         K.dtype,
         B.dtype,
         C.dtype,
-        rms_inv.dtype,
         coeff_aux.dtype,
         value_align,
         bc_align,
-        b_scale_align,
-        c_scale_align,
         params_align,
         dt_bias_align,
-        gamma_bias_align,
-        omega_bias_align,
+        zeta_bias_align,
+        omega_mod_bias_align,
+        omega_natural_bias_align,
         mix_r_bias_align,
+        omega_sign_align,
         u_align,
         b_align,
         c_align,
         m_align,
         k_align,
-        rms_inv_align,
         coeff_aux_align,
         bool(return_aux),
         float(dt_min),
         float(dt_max),
+        float(omega_min),
+        float(zeta_max),
         float(r_min),
         float(r_max),
         float(eps),
@@ -265,30 +218,29 @@ def _scanprep_fwd_impl(
                 h_size=n_heads,
                 p_size=d_head,
                 n_size=d_state,
-                normalize_bc=normalize_bc,
-                store_rms_inv=bool(return_aux and normalize_bc),
                 store_coeff_aux=bool(return_aux),
                 dt_min=dt_min,
                 dt_max=dt_max,
+                omega_min=omega_min,
+                zeta_max=zeta_max,
                 r_min=r_min,
                 r_max=r_max,
                 eps=eps,
             ),
             make_fake_tensor_arg(value_c, align=value_align),
             make_fake_tensor_arg(bc_c, align=bc_align),
-            make_fake_tensor_arg(b_scale_c, align=b_scale_align, dynamic_stride=True),
-            make_fake_tensor_arg(c_scale_c, align=c_scale_align, dynamic_stride=True),
             make_fake_tensor_arg(params_c, align=params_align),
             make_fake_tensor_arg(dt_bias, align=dt_bias_align),
-            make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
-            make_fake_tensor_arg(omega_bias, align=omega_bias_align),
+            make_fake_tensor_arg(zeta_bias, align=zeta_bias_align),
+            make_fake_tensor_arg(omega_mod_bias, align=omega_mod_bias_align),
+            make_fake_tensor_arg(omega_natural_bias, align=omega_natural_bias_align),
             make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
+            make_fake_tensor_arg(omega_sign, align=omega_sign_align),
             make_fake_tensor_arg(U, align=u_align),
             make_fake_tensor_arg(B, align=b_align),
             make_fake_tensor_arg(C, align=c_align),
             make_fake_tensor_arg(M, align=m_align),
             make_fake_tensor_arg(K, align=k_align),
-            make_fake_tensor_arg(rms_inv, align=rms_inv_align),
             make_fake_tensor_arg(coeff_aux, align=coeff_aux_align),
             options="--enable-tvm-ffi",
         )
@@ -298,22 +250,21 @@ def _scanprep_fwd_impl(
     compiled(
         value_c,
         bc_c,
-        b_scale_c,
-        c_scale_c,
         params_c,
         dt_bias,
-        gamma_bias,
-        omega_bias,
+        zeta_bias,
+        omega_mod_bias,
+        omega_natural_bias,
         mix_r_bias,
+        omega_sign,
         U,
         B,
         C,
         M,
         K,
-        rms_inv,
         coeff_aux,
     )
-    return U, M, K, B, C, rms_inv, coeff_aux
+    return U, M, K, B, C, coeff_aux
 
 
 def scanprep_fwd_cute(
@@ -324,38 +275,40 @@ def scanprep_fwd_cute(
     n_heads: int,
     d_state: int,
     d_head: int,
-    normalize_bc: bool,
     dt_min: float,
     dt_max: float,
+    omega_min: float,
+    zeta_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
+    zeta_bias: torch.Tensor,
+    omega_mod_bias: torch.Tensor,
+    omega_natural_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    b_scale: torch.Tensor | None,
-    c_scale: torch.Tensor | None,
+    omega_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    U, M, K, B, C, _, _ = _scanprep_fwd_impl(
+    U, M, K, B, C, _ = _scanprep_fwd_impl(
         value,
         params,
         bc,
         n_heads=n_heads,
         d_state=d_state,
         d_head=d_head,
-        normalize_bc=normalize_bc,
         dt_min=dt_min,
         dt_max=dt_max,
+        omega_min=omega_min,
+        zeta_max=zeta_max,
         r_min=r_min,
         r_max=r_max,
         eps=eps,
         dt_bias=dt_bias,
-        gamma_bias=gamma_bias,
-        omega_bias=omega_bias,
+        zeta_bias=zeta_bias,
+        omega_mod_bias=omega_mod_bias,
+        omega_natural_bias=omega_natural_bias,
         mix_r_bias=mix_r_bias,
-        b_scale=b_scale,
-        c_scale=c_scale,
+        omega_sign=omega_sign,
         return_aux=False,
     )
     return U, M, K, B, C
@@ -369,20 +322,20 @@ def scanprep_fwd_cute_with_aux(
     n_heads: int,
     d_state: int,
     d_head: int,
-    normalize_bc: bool,
     dt_min: float,
     dt_max: float,
+    omega_min: float,
+    zeta_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
+    zeta_bias: torch.Tensor,
+    omega_mod_bias: torch.Tensor,
+    omega_natural_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    b_scale: torch.Tensor | None,
-    c_scale: torch.Tensor | None,
+    omega_sign: torch.Tensor,
 ) -> tuple[
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -398,7 +351,6 @@ def scanprep_fwd_cute_with_aux(
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
-            torch.Tensor,
         ],
         _scanprep_fwd_impl(
             value,
@@ -407,18 +359,19 @@ def scanprep_fwd_cute_with_aux(
             n_heads=n_heads,
             d_state=d_state,
             d_head=d_head,
-            normalize_bc=normalize_bc,
             dt_min=dt_min,
             dt_max=dt_max,
+            omega_min=omega_min,
+            zeta_max=zeta_max,
             r_min=r_min,
             r_max=r_max,
             eps=eps,
             dt_bias=dt_bias,
-            gamma_bias=gamma_bias,
-            omega_bias=omega_bias,
+            zeta_bias=zeta_bias,
+            omega_mod_bias=omega_mod_bias,
+            omega_natural_bias=omega_natural_bias,
             mix_r_bias=mix_r_bias,
-            b_scale=b_scale,
-            c_scale=c_scale,
+            omega_sign=omega_sign,
             return_aux=True,
         ),
     )

@@ -67,12 +67,9 @@ class ScanPrepPerfConfig:
     dtype: torch.dtype = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
     device: str = "cuda"
     seed: int = 0
-    normalize_bc: bool = True
     pack_warps_per_block: int = 8
     coeff_block_size_fwd: int = 256
     coeff_block_size_bwd: int = 512
-    scale_block_size: int = 256
-    bias_block_size: int = 224
 
     @property
     def torch_device(self) -> torch.device:
@@ -174,7 +171,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         n_heads=cfg.heads,
         d_state=cfg.N,
         d_head=cfg.P,
-        normalize_bc=cfg.normalize_bc,
         device=device,
     ).to(dtype=dtype)
 
@@ -184,9 +180,12 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     params = torch.randn(
         (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM), device=device, dtype=dtype
     )
-    bc = torch.randn(
-        (cfg.batch, cfg.T, cfg.heads, 4, cfg.N), device=device, dtype=dtype
+    bc_amp = torch.randn(
+        (cfg.batch, cfg.T, cfg.heads, prep.bc_param_rows, cfg.N),
+        device=device,
+        dtype=dtype,
     )
+    bc = prep._parameterize_scan_bc_rows(bc_amp)
 
     U = torch.empty((cfg.batch, cfg.heads, cfg.T, cfg.P), device=device, dtype=dtype)
     M = torch.empty(
@@ -199,34 +198,22 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.heads, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     C = torch.empty_like(B)
-    rms_inv = torch.empty(
-        (cfg.batch, cfg.heads, cfg.T, 4), device=device, dtype=torch.float32
-    )
     coeff_aux = torch.empty(
         (cfg.batch, cfg.heads, COEFF_AUX_FIELDS, cfg.T),
         device=device,
         dtype=torch.float32,
     )
 
-    if cfg.normalize_bc:
-        assert prep.b_scale is not None
-        assert prep.c_scale is not None
-        b_scale = prep.b_scale.detach().contiguous()
-        c_scale = prep.c_scale.detach().contiguous()
-    else:
-        b_scale = torch.empty((cfg.heads, 2, cfg.N), device=device, dtype=dtype)
-        c_scale = torch.empty((cfg.heads, 2, cfg.N), device=device, dtype=dtype)
-
     compiled = cute.compile(
         ScanPrepFwdFused(
             h_size=cfg.heads,
             p_size=cfg.P,
             n_size=cfg.N,
-            normalize_bc=cfg.normalize_bc,
-            store_rms_inv=bool(cfg.normalize_bc),
             store_coeff_aux=True,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
@@ -235,19 +222,18 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         ),
         make_fake_tensor_arg(value),
         make_fake_tensor_arg(bc),
-        make_fake_tensor_arg(b_scale, dynamic_stride=True),
-        make_fake_tensor_arg(c_scale, dynamic_stride=True),
         make_fake_tensor_arg(params),
         make_fake_tensor_arg(prep.dt_bias.detach()),
-        make_fake_tensor_arg(prep.gamma_bias.detach()),
-        make_fake_tensor_arg(prep.omega_bias.detach()),
+        make_fake_tensor_arg(prep.zeta_bias.detach()),
+        make_fake_tensor_arg(prep.omega_mod_bias.detach()),
+        make_fake_tensor_arg(prep.omega_natural_bias.detach()),
         make_fake_tensor_arg(prep.mix_r_bias.detach()),
+        make_fake_tensor_arg(cast(torch.Tensor, prep.omega_sign).detach()),
         make_fake_tensor_arg(U),
         make_fake_tensor_arg(B),
         make_fake_tensor_arg(C),
         make_fake_tensor_arg(M),
         make_fake_tensor_arg(K),
-        make_fake_tensor_arg(rms_inv),
         make_fake_tensor_arg(coeff_aux),
         options="--enable-tvm-ffi",
     )
@@ -256,38 +242,36 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         compiled(
             value,
             bc,
-            b_scale,
-            c_scale,
             params,
             prep.dt_bias.detach(),
-            prep.gamma_bias.detach(),
-            prep.omega_bias.detach(),
+            prep.zeta_bias.detach(),
+            prep.omega_mod_bias.detach(),
+            prep.omega_natural_bias.detach(),
             prep.mix_r_bias.detach(),
+            cast(torch.Tensor, prep.omega_sign).detach(),
             U,
             B,
             C,
             M,
             K,
-            rms_inv,
             coeff_aux,
         )
 
     effective_bytes = _tensor_bytes(
         value,
         bc,
-        b_scale,
-        c_scale,
         params,
         prep.dt_bias.detach(),
-        prep.gamma_bias.detach(),
-        prep.omega_bias.detach(),
+        prep.zeta_bias.detach(),
+        prep.omega_mod_bias.detach(),
+        prep.omega_natural_bias.detach(),
         prep.mix_r_bias.detach(),
+        cast(torch.Tensor, prep.omega_sign).detach(),
         U,
         B,
         C,
         M,
         K,
-        rms_inv,
         coeff_aux,
     )
     return KernelRunner(
@@ -307,7 +291,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         n_heads=cfg.heads,
         d_state=cfg.N,
         d_head=cfg.P,
-        normalize_bc=cfg.normalize_bc,
         device=device,
     ).to(dtype=dtype)
 
@@ -319,9 +302,12 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         device=device,
         dtype=dtype,
     )
-    bc = torch.randn(
-        (cfg.batch, cfg.T, cfg.heads, 4, cfg.N), device=device, dtype=dtype
+    bc_amp = torch.randn(
+        (cfg.batch, cfg.T, cfg.heads, prep.bc_param_rows, cfg.N),
+        device=device,
+        dtype=dtype,
     )
+    bc = prep._parameterize_scan_bc_rows(bc_amp)
     dU = torch.randn((cfg.batch, cfg.heads, cfg.T, cfg.P), device=device, dtype=dtype)
     dM = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, 2), device=device, dtype=torch.float32
@@ -333,35 +319,27 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.heads, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     dC = torch.randn_like(dB)
-    if cfg.normalize_bc:
-        assert prep.b_scale is not None
-        assert prep.c_scale is not None
-        b_scale = prep.b_scale.detach().contiguous()
-        c_scale = prep.c_scale.detach().contiguous()
-    else:
-        b_scale = torch.empty((cfg.heads, 2, cfg.N), device=device, dtype=dtype)
-        c_scale = torch.empty((cfg.heads, 2, cfg.N), device=device, dtype=dtype)
-
     with torch.no_grad():
-        _, _, _, _, _, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+        _, _, _, _, _, coeff_aux = scanprep_fwd_cute_with_aux(
             value,
             params_flat,
             bc,
             n_heads=cfg.heads,
             d_state=cfg.N,
             d_head=cfg.P,
-            normalize_bc=cfg.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
+            zeta_bias=prep.zeta_bias.detach(),
+            omega_mod_bias=prep.omega_mod_bias.detach(),
+            omega_natural_bias=prep.omega_natural_bias.detach(),
             mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale if cfg.normalize_bc else None,
-            c_scale=c_scale if cfg.normalize_bc else None,
+            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
         )
 
     value_grad = torch.empty(
@@ -375,8 +353,7 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         device=device,
         dtype=dtype,
     )
-    scale_grad = torch.zeros((cfg.heads, 4, cfg.N), device=device, dtype=torch.float32)
-    bias_grad = torch.empty((cfg.heads, 4), device=device, dtype=torch.float32)
+    bias_grad = torch.zeros((cfg.heads, 5), device=device, dtype=torch.float32)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
@@ -384,36 +361,34 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             p_size=cfg.P,
             n_size=cfg.N,
             param_dim=prep.param_dim,
-            normalize_bc=cfg.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             pack_warps_per_block=cfg.pack_warps_per_block,
             coeff_block_size=cfg.coeff_block_size_bwd,
-            bias_block_size=cfg.bias_block_size,
         ),
         make_fake_tensor_arg(dU),
         make_fake_tensor_arg(bc),
         make_fake_tensor_arg(dB),
         make_fake_tensor_arg(dC),
-        make_fake_tensor_arg(b_scale, dynamic_stride=True),
-        make_fake_tensor_arg(c_scale, dynamic_stride=True),
-        make_fake_tensor_arg(rms_inv),
         make_fake_tensor_arg(coeff_aux),
         make_fake_tensor_arg(dM),
         make_fake_tensor_arg(dK),
+        make_fake_tensor_arg(prep.dt_bias.detach()),
+        make_fake_tensor_arg(prep.omega_natural_bias.detach()),
+        make_fake_tensor_arg(cast(torch.Tensor, prep.omega_sign).detach()),
         make_fake_tensor_arg(value_grad),
         make_fake_tensor_arg(bc_grad),
         make_fake_tensor_arg(dparams),
-        make_fake_tensor_arg(scale_grad),
         make_fake_tensor_arg(bias_grad),
         options="--enable-tvm-ffi",
     )
 
     def prepare() -> None:
-        scale_grad.zero_()
         bias_grad.zero_()
 
     def launch() -> None:
@@ -422,16 +397,15 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             bc,
             dB,
             dC,
-            b_scale,
-            c_scale,
-            rms_inv,
             coeff_aux,
             dM,
             dK,
+            prep.dt_bias.detach(),
+            prep.omega_natural_bias.detach(),
+            cast(torch.Tensor, prep.omega_sign).detach(),
             value_grad,
             bc_grad,
             dparams,
-            scale_grad,
             bias_grad,
         )
 
@@ -440,16 +414,15 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         bc,
         dB,
         dC,
-        b_scale,
-        c_scale,
-        rms_inv,
         coeff_aux,
         dM,
         dK,
+        prep.dt_bias.detach(),
+        prep.omega_natural_bias.detach(),
+        cast(torch.Tensor, prep.omega_sign).detach(),
         value_grad,
         bc_grad,
         dparams,
-        scale_grad,
         bias_grad,
     )
     return KernelRunner(

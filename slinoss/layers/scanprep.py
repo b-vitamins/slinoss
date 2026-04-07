@@ -43,7 +43,9 @@ def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
 class SLinOSSScanPrep(nn.Module):
     """Builds canonical scan inputs from post-conv activations and parameter streams."""
 
-    param_dim: int = 5
+    param_dim: int = 4
+    bc_param_rows: int = 2
+    omega_mod_scale: float = 0.25
 
     def __init__(
         self,
@@ -51,11 +53,14 @@ class SLinOSSScanPrep(nn.Module):
         n_heads: int,
         d_state: int,
         d_head: int,
-        normalize_bc: bool = True,
         backend: ScanPrepBackend | None = None,
         dt_min: float = 1e-4,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-4,
+        omega_min: float = 0.1,
+        zeta_max: float = 0.7,
+        theta_init_min: float = 0.2,
+        theta_init_max: float = 1.0,
         r_min: float = 0.9,
         r_max: float = 1.0,
         eps: float = 1e-8,
@@ -73,6 +78,16 @@ class SLinOSSScanPrep(nn.Module):
             0.0 < dt_init_floor <= dt_max,
             f"Require 0 < dt_init_floor <= dt_max. Got {dt_init_floor}.",
         )
+        _require(omega_min >= 0.0, f"Require omega_min >= 0. Got {omega_min}.")
+        _require(
+            0.0 < zeta_max < 1.0,
+            f"Require 0 < zeta_max < 1. Got {zeta_max}.",
+        )
+        _require(
+            0.0 < theta_init_min <= theta_init_max < math.pi,
+            "Require 0 < theta_init_min <= theta_init_max < pi. Got "
+            f"{theta_init_min}, {theta_init_max}.",
+        )
         _require(
             0.0 < r_min <= r_max <= 1.0,
             f"Require 0 < r_min <= r_max <= 1. Got {r_min}, {r_max}.",
@@ -82,12 +97,15 @@ class SLinOSSScanPrep(nn.Module):
         self.d_state = int(d_state)
         self.d_head = int(d_head)
         self.d_inner = int(self.n_heads * self.d_head)
-        self.normalize_bc = bool(normalize_bc)
         self.backend = AutoScanPrepBackend() if backend is None else backend
 
         self.dt_min = float(dt_min)
         self.dt_max = float(dt_max)
         self.dt_init_floor = float(dt_init_floor)
+        self.omega_min = float(omega_min)
+        self.zeta_max = float(zeta_max)
+        self.theta_init_min = float(theta_init_min)
+        self.theta_init_max = float(theta_init_max)
         self.r_min = float(r_min)
         self.r_max = float(r_max)
         self.eps = float(eps)
@@ -96,26 +114,35 @@ class SLinOSSScanPrep(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
-        self.gamma_bias = nn.Parameter(
+        self.zeta_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
-        self.omega_bias = nn.Parameter(
+        self.omega_mod_bias = nn.Parameter(
+            torch.empty((self.n_heads,), device=device, dtype=fp32)
+        )
+        self.omega_natural_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
         self.mix_r_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
-        if self.normalize_bc:
-            self.b_scale = nn.Parameter(
-                torch.ones((self.n_heads, 2, self.d_state), device=device, dtype=fp32)
+        self.bc_complex_base = nn.Parameter(
+            torch.empty(
+                (self.n_heads, 2, self.d_state),
+                device=device,
+                dtype=torch.complex64,
             )
-            self.c_scale = nn.Parameter(
-                torch.ones((self.n_heads, 2, self.d_state), device=device, dtype=fp32)
-            )
-        else:
-            self.b_scale = None
-            self.c_scale = None
+        )
 
+        self.register_buffer(
+            "omega_sign",
+            torch.where(
+                torch.arange(self.n_heads, device=device) % 2 == 0,
+                torch.ones((self.n_heads,), device=device, dtype=fp32),
+                -torch.ones((self.n_heads,), device=device, dtype=fp32),
+            ),
+            persistent=True,
+        )
         self.register_buffer(
             "_zero_bias",
             torch.zeros((self.n_heads,), device=device, dtype=fp32),
@@ -134,26 +161,51 @@ class SLinOSSScanPrep(nn.Module):
             + math.log(dt_lo)
         )
         dt_u0 = (dt0 - self.dt_min) / (self.dt_max - self.dt_min)
-        gamma0 = torch.full_like(self.gamma_bias, 1.0)
-        omega0 = torch.zeros_like(self.omega_bias)
+
+        theta_lo = max(self.omega_min * float(dt0.min()), self.theta_init_min)
+        theta_hi = self.theta_init_max
+        if self.n_heads == 1:
+            theta0 = torch.full_like(self.omega_natural_bias, theta_hi)
+        else:
+            theta0 = torch.logspace(
+                math.log10(theta_lo),
+                math.log10(theta_hi),
+                self.n_heads,
+                device=self.dt_bias.device,
+                dtype=torch.float32,
+            )
+        omega_natural0 = theta0 / dt0.clamp_min(1.0e-6)
+        zeta0 = (torch.ones_like(theta0) / omega_natural0.clamp_min(1.0e-6)).clamp(
+            min=0.05,
+            max=self.zeta_max * 0.8,
+        )
 
         with torch.no_grad():
             self.dt_bias.copy_(_logit(dt_u0))
-            self.gamma_bias.copy_(_inv_softplus(gamma0))
-            self.omega_bias.copy_(omega0)
+            self.zeta_bias.copy_(_logit(zeta0 / self.zeta_max))
+            self.omega_mod_bias.zero_()
+            self.omega_natural_bias.copy_(
+                _inv_softplus((omega_natural0 - self.omega_min).clamp_min(1.0e-6))
+            )
             self.mix_r_bias.copy_(_logit(torch.full_like(self.mix_r_bias, 0.9)))
-            if self.b_scale is not None:
-                self.b_scale.fill_(1.0)
-            if self.c_scale is not None:
-                self.c_scale.fill_(1.0)
+
+            phase_grid = torch.linspace(
+                -math.pi,
+                math.pi,
+                self.n_heads * 2 * self.d_state + 1,
+                device=self.dt_bias.device,
+                dtype=torch.float32,
+            )[:-1].view(self.n_heads, 2, self.d_state)
+            self.bc_complex_base.copy_(
+                torch.polar(torch.ones_like(phase_grid), phase_grid).to(torch.complex64)
+            )
 
     def _flat_param_bias(self) -> torch.Tensor:
         zero = cast(torch.Tensor, self._zero_bias)
         return torch.stack(
             (
-                self.dt_bias,
-                self.gamma_bias,
-                self.omega_bias,
+                self.zeta_bias,
+                self.omega_mod_bias,
                 zero,
                 self.mix_r_bias,
             ),
@@ -184,19 +236,26 @@ class SLinOSSScanPrep(nn.Module):
 
         p = params.permute(0, 2, 1, 3).to(torch.float32)
         p = p + self._flat_param_bias().view(1, self.n_heads, 1, self.param_dim)
-        (
-            dt_raw,
-            gamma_raw,
-            omega_raw,
-            r_raw,
-            mix_r_raw,
-        ) = p.unbind(dim=-1)
-        dt_u = torch.sigmoid(dt_raw)
+        zeta_raw, omega_mod_raw, r_raw, mix_r_raw = p.unbind(dim=-1)
+
+        dt = (
+            self.dt_min
+            + (self.dt_max - self.dt_min)
+            * torch.sigmoid(self.dt_bias).view(1, self.n_heads, 1)
+        ).expand_as(zeta_raw)
         r_direct_u = torch.sigmoid(r_raw)
         mix_r = torch.sigmoid(mix_r_raw)
-        dt = self.dt_min + (self.dt_max - self.dt_min) * dt_u
-        gamma = F.softplus(gamma_raw)
-        omega = omega_raw
+
+        omega_natural = self.omega_min + F.softplus(self.omega_natural_bias).view(
+            1, self.n_heads, 1
+        )
+        omega_scale = torch.exp(self.omega_mod_scale * torch.tanh(omega_mod_raw))
+        omega_drive = omega_natural * omega_scale
+        zeta = self.zeta_max * torch.sigmoid(zeta_raw)
+        gamma = zeta * omega_drive
+        under = (1.0 - zeta.square()).clamp_min(self.eps)
+        omega_sign = cast(torch.Tensor, self.omega_sign)
+        omega = omega_sign.view(1, self.n_heads, 1) * omega_drive * torch.sqrt(under)
 
         r_struct = self.r_min + (self.r_max - self.r_min) * torch.exp(-gamma * dt)
         theta = principal_angle(omega * dt)
@@ -224,10 +283,29 @@ class SLinOSSScanPrep(nn.Module):
         assert dt is not None and r is not None and theta is not None
         return SLinOSSScanPrepCoefficients(M=M, K=K, dt=dt, r=r, theta=theta)
 
-    def _normalize_bc(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        x_f = F.rms_norm(x.to(torch.float32), (self.d_state,), eps=1e-5)
-        scaled = x_f.mul(scale.view(1, 1, self.n_heads, x.shape[-2], self.d_state))
-        return scaled.to(dtype=x.dtype)
+    def _parameterize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
+        if bc.ndim != 5 or bc.shape[2:] != (
+            self.n_heads,
+            self.bc_param_rows,
+            self.d_state,
+        ):
+            raise ValueError(
+                "bc must be "
+                f"(batch, T, heads, {self.bc_param_rows}, d_state). "
+                f"Got {tuple(bc.shape)}."
+            )
+        amp = F.softplus(bc.to(torch.float32))
+        complex_rows = amp.to(torch.complex64) * self.bc_complex_base.view(
+            1, 1, self.n_heads, 2, self.d_state
+        )
+        bc_ri = torch.view_as_real(complex_rows).permute(0, 1, 2, 3, 5, 4).contiguous()
+        return bc_ri.reshape(
+            bc.shape[0],
+            bc.shape[1],
+            self.n_heads,
+            4,
+            self.d_state,
+        ).to(dtype=bc.dtype)
 
     def _pack_scan_u(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         if value.ndim != 3 or value.shape[-1] != self.d_inner:
@@ -239,14 +317,6 @@ class SLinOSSScanPrep(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-
-    def _normalize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
-        if self.normalize_bc:
-            assert self.b_scale is not None and self.c_scale is not None
-            return self._normalize_bc(
-                bc, torch.cat((self.b_scale, self.c_scale), dim=1)
-            )
-        return bc
 
     def _pack_scan_bc(
         self,
@@ -281,31 +351,33 @@ class SLinOSSScanPrep(nn.Module):
     def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs:
         batch, T, _ = map(int, inputs.value.shape)
         U = self._pack_scan_u(inputs.value, batch, T)
-        bc = self._normalize_scan_bc_rows(inputs.bc)
-        B, C = self._pack_scan_bc(bc, batch, T)
+        bc_rows = self._parameterize_scan_bc_rows(inputs.bc)
+        B, C = self._pack_scan_bc(bc_rows, batch, T)
         M, K = self._scan_coeffs_from_flat_params(inputs.params, batch, T)
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
     def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs:
+        bc_rows = self._parameterize_scan_bc_rows(inputs.bc)
         return scanprep_cute(
             inputs.value,
             inputs.params,
-            inputs.bc,
+            bc_rows,
             n_heads=self.n_heads,
             d_state=self.d_state,
             d_head=self.d_head,
-            normalize_bc=self.normalize_bc,
             dt_min=self.dt_min,
             dt_max=self.dt_max,
+            omega_min=self.omega_min,
+            zeta_max=self.zeta_max,
             r_min=self.r_min,
             r_max=self.r_max,
             eps=self.eps,
             dt_bias=self.dt_bias,
-            gamma_bias=self.gamma_bias,
-            omega_bias=self.omega_bias,
+            zeta_bias=self.zeta_bias,
+            omega_mod_bias=self.omega_mod_bias,
+            omega_natural_bias=self.omega_natural_bias,
             mix_r_bias=self.mix_r_bias,
-            b_scale=self.b_scale,
-            c_scale=self.c_scale,
+            omega_sign=cast(torch.Tensor, self.omega_sign),
         )
 
     def forward(

@@ -6,9 +6,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import cast
 
-import torch
 import cutlass.cute as cute
+import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
@@ -31,11 +32,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--T", type=int, default=2048, help="Sequence length.")
     parser.add_argument("--P", type=int, default=64, help="Head width.")
     parser.add_argument("--N", type=int, default=128, help="State width.")
-    parser.add_argument(
-        "--dtype",
-        choices=("fp16", "bf16", "fp32"),
-        default="fp16",
-    )
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -46,15 +43,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pack-warps-per-block", type=int, default=12)
     parser.add_argument("--coeff-block-size", type=int, default=512)
-    parser.add_argument("--scale-block-size", type=int, default=256)
-    parser.add_argument("--bias-block-size", type=int, default=224)
-    parser.add_argument(
-        "--no-normalize-bc",
-        action="store_false",
-        dest="normalize_bc",
-        help="Disable BC normalization to isolate the non-normalized backward path.",
-    )
-    parser.set_defaults(normalize_bc=True)
     return parser.parse_args()
 
 
@@ -87,49 +75,46 @@ def main() -> int:
         n_heads=heads,
         d_state=d_state,
         d_head=p_size,
-        normalize_bc=args.normalize_bc,
         device=device,
     ).to(dtype=dtype)
 
     value = torch.randn((batch, t_size, heads * p_size), device=device, dtype=dtype)
-    params_flat = torch.randn(
+    params = torch.randn(
         (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
     )
-    bc = torch.randn((batch, t_size, heads, 4, d_state), device=device, dtype=dtype)
+    bc_amp = torch.randn(
+        (batch, t_size, heads, prep.bc_param_rows, d_state),
+        device=device,
+        dtype=dtype,
+    )
+    bc = prep._parameterize_scan_bc_rows(bc_amp)
     dU = torch.randn((batch, heads, t_size, p_size), device=device, dtype=dtype)
     dM = torch.randn((batch, heads, t_size, 2), device=device, dtype=torch.float32)
     dK = torch.randn((batch, heads, t_size, 2, 2), device=device, dtype=torch.float32)
     dB = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
-    dC = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
-    if args.normalize_bc:
-        assert prep.b_scale is not None
-        assert prep.c_scale is not None
-        b_scale = prep.b_scale.detach().contiguous()
-        c_scale = prep.c_scale.detach().contiguous()
-    else:
-        b_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
-        c_scale = torch.empty((heads, 2, d_state), device=device, dtype=dtype)
+    dC = torch.randn_like(dB)
 
     with torch.no_grad():
-        _, _, _, _, _, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+        _, _, _, _, _, coeff_aux = scanprep_fwd_cute_with_aux(
             value,
-            params_flat,
+            params,
             bc,
             n_heads=heads,
             d_state=d_state,
             d_head=p_size,
-            normalize_bc=args.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
+            zeta_bias=prep.zeta_bias.detach(),
+            omega_mod_bias=prep.omega_mod_bias.detach(),
+            omega_natural_bias=prep.omega_natural_bias.detach(),
             mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale if args.normalize_bc else None,
-            c_scale=c_scale if args.normalize_bc else None,
+            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
         )
 
     value_grad = torch.empty(
@@ -141,8 +126,7 @@ def main() -> int:
     dparams = torch.empty(
         (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
     )
-    scale_grad = torch.zeros((heads, 4, d_state), device=device, dtype=torch.float32)
-    bias_grad = torch.empty((heads, 4), device=device, dtype=torch.float32)
+    bias_grad = torch.zeros((heads, 5), device=device, dtype=torch.float32)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
@@ -150,36 +134,34 @@ def main() -> int:
             p_size=p_size,
             n_size=d_state,
             param_dim=prep.param_dim,
-            normalize_bc=args.normalize_bc,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             pack_warps_per_block=args.pack_warps_per_block,
             coeff_block_size=args.coeff_block_size,
-            bias_block_size=args.bias_block_size,
         ),
         make_fake_tensor_arg(dU),
         make_fake_tensor_arg(bc),
         make_fake_tensor_arg(dB),
         make_fake_tensor_arg(dC),
-        make_fake_tensor_arg(b_scale, dynamic_stride=True),
-        make_fake_tensor_arg(c_scale, dynamic_stride=True),
-        make_fake_tensor_arg(rms_inv),
         make_fake_tensor_arg(coeff_aux),
         make_fake_tensor_arg(dM),
         make_fake_tensor_arg(dK),
+        make_fake_tensor_arg(prep.dt_bias.detach()),
+        make_fake_tensor_arg(prep.omega_natural_bias.detach()),
+        make_fake_tensor_arg(cast(torch.Tensor, prep.omega_sign).detach()),
         make_fake_tensor_arg(value_grad),
         make_fake_tensor_arg(bc_grad),
         make_fake_tensor_arg(dparams),
-        make_fake_tensor_arg(scale_grad),
         make_fake_tensor_arg(bias_grad),
         options="--enable-tvm-ffi",
     )
 
     def prepare() -> None:
-        scale_grad.zero_()
         bias_grad.zero_()
 
     def run() -> None:
@@ -188,31 +170,21 @@ def main() -> int:
             bc,
             dB,
             dC,
-            b_scale,
-            c_scale,
-            rms_inv,
             coeff_aux,
             dM,
             dK,
+            prep.dt_bias.detach(),
+            prep.omega_natural_bias.detach(),
+            cast(torch.Tensor, prep.omega_sign).detach(),
             value_grad,
             bc_grad,
             dparams,
-            scale_grad,
             bias_grad,
         )
 
     _profile_once(run, warmup=args.warmup, prepare=prepare)
-    checksum = (
-        value_grad.sum()
-        + bc_grad.sum()
-        + dparams.sum()
-        + bias_grad.sum()
-        + scale_grad.sum()
-    )
-    print(
-        f"B={batch} H={heads} T={t_size} P={p_size} N={d_state} "
-        f"dtype={args.dtype} normalize_bc={args.normalize_bc}"
-    )
+    checksum = value_grad.sum() + bc_grad.sum() + dparams.sum() + bias_grad.sum()
+    print(f"B={batch} H={heads} T={t_size} P={p_size} N={d_state} dtype={args.dtype}")
     print(f"checksum={float(checksum):.6f}")
     return 0
 

@@ -100,13 +100,17 @@ def scanprep_scan_coeffs_from_flat_params(
     param_dim: int,
     dt_min: float,
     dt_max: float,
+    omega_min: float,
+    zeta_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
+    zeta_bias: torch.Tensor,
+    omega_mod_bias: torch.Tensor,
+    omega_natural_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
+    omega_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference ``(M, K)`` generation from flat ``(B, T, H * param_dim)`` params."""
     if params.ndim != 3 or params.shape[-1] != n_heads * param_dim:
@@ -116,12 +120,11 @@ def scanprep_scan_coeffs_from_flat_params(
 
     p = params.view(params.shape[0], params.shape[1], n_heads, param_dim)
     p = p.permute(0, 2, 1, 3).to(torch.float32)
-    zero = torch.zeros_like(dt_bias)
+    zero = torch.zeros_like(zeta_bias)
     bias = torch.stack(
         (
-            dt_bias,
-            gamma_bias,
-            omega_bias,
+            zeta_bias,
+            omega_mod_bias,
             zero,
             mix_r_bias,
         ),
@@ -129,13 +132,21 @@ def scanprep_scan_coeffs_from_flat_params(
     )
     p = p + bias.view(1, n_heads, 1, param_dim)
 
-    dt_u = torch.sigmoid(p[..., 0])
-    gamma = F.softplus(p[..., 1])
-    omega = p[..., 2]
-    r_direct_u = torch.sigmoid(p[..., 3])
-    mix_r = torch.sigmoid(p[..., 4])
+    zeta_raw = p[..., 0]
+    omega_mod_raw = p[..., 1]
+    r_direct_u = torch.sigmoid(p[..., 2])
+    mix_r = torch.sigmoid(p[..., 3])
 
-    dt = dt_min + (dt_max - dt_min) * dt_u
+    dt = (
+        dt_min + (dt_max - dt_min) * torch.sigmoid(dt_bias).view(1, n_heads, 1)
+    ).expand_as(zeta_raw)
+    omega_natural = omega_min + F.softplus(omega_natural_bias).view(1, n_heads, 1)
+    omega_scale = torch.exp(0.25 * torch.tanh(omega_mod_raw))
+    omega_drive = omega_natural * omega_scale
+    zeta = zeta_max * torch.sigmoid(zeta_raw)
+    gamma = zeta * omega_drive
+    under = (1.0 - zeta.square()).clamp_min(float(eps))
+    omega = omega_sign.view(1, n_heads, 1) * omega_drive * torch.sqrt(under)
     r_struct = r_min + (r_max - r_min) * torch.exp(-gamma * dt)
     theta = principal_angle(omega * dt)
     r_direct = r_min + (r_max - r_min) * r_direct_u

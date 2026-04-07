@@ -289,10 +289,13 @@ class SLinOSSMixer(nn.Module):
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-3,
+        omega_min: float = 0.1,
+        zeta_max: float = 0.7,
+        theta_init_min: float = 0.2,
+        theta_init_max: float = 1.0,
         r_min: float = 0.9,
         r_max: float = 0.9999,
         eps: float = 1e-8,
-        normalize_bc: bool = True,
         backend: ScanBackend | None = None,
         decode_backend: MixerDecodeBackend | None = None,
         device: torch.device | str | None = None,
@@ -312,7 +315,6 @@ class SLinOSSMixer(nn.Module):
         self.d_head = int(d_head)
         self.d_conv = int(d_conv)
         self.chunk_size = int(chunk_size)
-        self.normalize_bc = bool(normalize_bc)
 
         self.d_inner = int(self.expand * self.d_model)
         _require(
@@ -326,11 +328,14 @@ class SLinOSSMixer(nn.Module):
             n_heads=self.n_heads,
             d_state=self.d_state,
             d_head=self.d_head,
-            normalize_bc=normalize_bc,
             backend=scanprep_backend,
             dt_min=dt_min,
             dt_max=dt_max,
             dt_init_floor=dt_init_floor,
+            omega_min=omega_min,
+            zeta_max=zeta_max,
+            theta_init_min=theta_init_min,
+            theta_init_max=theta_init_max,
             r_min=r_min,
             r_max=r_max,
             eps=eps,
@@ -345,7 +350,7 @@ class SLinOSSMixer(nn.Module):
         )
 
         self.param_proj_dim = self.n_heads * self.scanprep.param_dim
-        self.bc_proj_dim = self.n_heads * 4 * self.d_state
+        self.bc_proj_dim = self.n_heads * self.scanprep.bc_param_rows * self.d_state
         self.in_proj = nn.Linear(
             self.d_model,
             2 * self.d_inner + self.param_proj_dim + self.bc_proj_dim,
@@ -364,10 +369,6 @@ class SLinOSSMixer(nn.Module):
         self.skip = nn.Parameter(
             torch.ones((self.d_inner,), device=device, dtype=torch.float32)
         )
-        if self.normalize_bc:
-            self.output_norm: nn.Module | None = None
-        else:
-            self.output_norm = nn.RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
 
         self.reset_parameters()
 
@@ -692,17 +693,13 @@ class SLinOSSMixer(nn.Module):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        if self.output_norm is None:
-            out = self._apply_gate_skip_and_project(
-                scan_y,
-                scan_inputs.U,
-                gate,
-                batch,
-                T,
-            )
-        else:
-            gated = self._apply_gate_skip(scan_y, scan_inputs.U, gate, batch, T)
-            out = self.out_proj(gated)
+        out = self._apply_gate_skip_and_project(
+            scan_y,
+            scan_inputs.U,
+            gate,
+            batch,
+            T,
+        )
 
         if not return_state:
             return out
@@ -739,10 +736,7 @@ class SLinOSSMixer(nn.Module):
         T: int,
     ) -> torch.Tensor:
         y = self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
-        y = y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner)
-        if self.output_norm is not None:
-            y = self.output_norm(y)
-        return y
+        return y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner)
 
     def _project_headspace(self, y: torch.Tensor) -> torch.Tensor:
         weight = self.out_proj.weight.view(self.d_model, self.n_heads, self.d_head)
@@ -764,7 +758,13 @@ class SLinOSSMixer(nn.Module):
         expected = (batch, T, self.bc_proj_dim)
         if tuple(map(int, bc.shape)) != expected:
             raise ValueError(f"bc must be {expected}. Got {tuple(bc.shape)}.")
-        return bc.view(batch, T, self.n_heads, 4, self.d_state)
+        return bc.view(
+            batch,
+            T,
+            self.n_heads,
+            self.scanprep.bc_param_rows,
+            self.d_state,
+        )
 
     def _apply_causal_depthwise_conv_step(
         self,
@@ -873,8 +873,6 @@ class SLinOSSMixer(nn.Module):
             return False
         if self.d_head != 64 or self.d_state != 64:
             return False
-        if not self.normalize_bc or self.output_norm is not None:
-            return False
         return True
 
     def _decode_step_reference(
@@ -885,7 +883,9 @@ class SLinOSSMixer(nn.Module):
         batch = int(inputs.value.shape[0])
         value = inputs.value.reshape(batch, 1, self.d_inner).contiguous()
         params = inputs.params.reshape(batch, 1, self.param_proj_dim).contiguous()
-        bc = inputs.bc.reshape(batch, 1, self.n_heads, 4, self.d_state).contiguous()
+        bc = inputs.bc.reshape(
+            batch, 1, self.n_heads, self.scanprep.bc_param_rows, self.d_state
+        ).contiguous()
         gate = inputs.gate.reshape(batch, 1, self.d_inner).contiguous()
 
         scan_inputs = self.scanprep._prepare_inputs_reference(
@@ -925,7 +925,7 @@ class SLinOSSMixer(nn.Module):
         gated, final_state, b_last, u_last = mixer_decode_step_cute(
             inputs.value,
             inputs.params,
-            inputs.bc,
+            self.scanprep._parameterize_scan_bc_rows(inputs.bc.unsqueeze(1))[:, 0, ...],
             inputs.gate,
             inputs.skip,
             initial_states=state.state,
@@ -933,15 +933,17 @@ class SLinOSSMixer(nn.Module):
             U_prev=state.u_prev,
             dt_min=self.scanprep.dt_min,
             dt_max=self.scanprep.dt_max,
+            omega_min=self.scanprep.omega_min,
+            zeta_max=self.scanprep.zeta_max,
             r_min=self.scanprep.r_min,
             r_max=self.scanprep.r_max,
             eps=self.scanprep.eps,
             dt_bias=self.scanprep.dt_bias,
-            gamma_bias=self.scanprep.gamma_bias,
-            omega_bias=self.scanprep.omega_bias,
+            zeta_bias=self.scanprep.zeta_bias,
+            omega_mod_bias=self.scanprep.omega_mod_bias,
+            omega_natural_bias=self.scanprep.omega_natural_bias,
             mix_r_bias=self.scanprep.mix_r_bias,
-            b_scale=self.scanprep.b_scale,
-            c_scale=self.scanprep.c_scale,
+            omega_sign=cast(torch.Tensor, self.scanprep.omega_sign),
             output_dtype=inputs.value.dtype,
             final_state_out=state.state,
             b_last_out=state.b_prev,
@@ -973,7 +975,12 @@ class SLinOSSMixer(nn.Module):
             params=params_flat.view(
                 batch, self.n_heads, self.scanprep.param_dim
             ).contiguous(),
-            bc=bc_flat.view(batch, self.n_heads, 4, self.d_state).contiguous(),
+            bc=bc_flat.view(
+                batch,
+                self.n_heads,
+                self.scanprep.bc_param_rows,
+                self.d_state,
+            ).contiguous(),
             gate=gate.view(batch, self.n_heads, self.d_head).contiguous(),
             skip=self.skip.view(self.n_heads, self.d_head),
         )

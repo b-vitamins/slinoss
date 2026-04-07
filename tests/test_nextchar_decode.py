@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import gc
-from typing import cast
+from typing import Any, cast
 import weakref
 
 import cutlass.cute as cute
@@ -38,6 +38,33 @@ def _make_noncontiguous_clone(x: torch.Tensor) -> torch.Tensor:
     assert tuple(out.shape) == tuple(x.shape)
     assert not out.is_contiguous()
     return out
+
+
+def _decode_scanprep_kwargs(
+    mixer: SLinOSSMixer,
+    *,
+    detach: bool = False,
+) -> dict[str, Any]:
+    scanprep = mixer.scanprep
+
+    def _maybe_detach(x: torch.Tensor) -> torch.Tensor:
+        return x.detach() if detach else x
+
+    return {
+        "dt_min": scanprep.dt_min,
+        "dt_max": scanprep.dt_max,
+        "omega_min": scanprep.omega_min,
+        "zeta_max": scanprep.zeta_max,
+        "r_min": scanprep.r_min,
+        "r_max": scanprep.r_max,
+        "eps": scanprep.eps,
+        "dt_bias": _maybe_detach(scanprep.dt_bias),
+        "zeta_bias": _maybe_detach(scanprep.zeta_bias),
+        "omega_mod_bias": _maybe_detach(scanprep.omega_mod_bias),
+        "omega_natural_bias": _maybe_detach(scanprep.omega_natural_bias),
+        "mix_r_bias": _maybe_detach(scanprep.mix_r_bias),
+        "omega_sign": _maybe_detach(cast(torch.Tensor, scanprep.omega_sign)),
+    }
 
 
 def _make_decode_step_fixture(
@@ -78,7 +105,15 @@ def _make_decode_step_fixture(
     params_h = params_flat.view(
         batch, mixer.n_heads, mixer.scanprep.param_dim
     ).contiguous()
-    bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+    bc_amp = bc_flat.view(
+        batch,
+        mixer.n_heads,
+        mixer.scanprep.bc_param_rows,
+        mixer.d_state,
+    ).contiguous()
+    bc_h = mixer.scanprep._parameterize_scan_bc_rows(bc_amp.unsqueeze(1))[
+        :, 0, ...
+    ].contiguous()
     gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
     skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
     initial_states = torch.randn(
@@ -446,17 +481,7 @@ def test_mixer_decode_step_cute_rejects_cold_cache_during_capture(
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
-                dt_min=mixer.scanprep.dt_min,
-                dt_max=mixer.scanprep.dt_max,
-                r_min=mixer.scanprep.r_min,
-                r_max=mixer.scanprep.r_max,
-                eps=mixer.scanprep.eps,
-                dt_bias=mixer.scanprep.dt_bias,
-                gamma_bias=mixer.scanprep.gamma_bias,
-                omega_bias=mixer.scanprep.omega_bias,
-                mix_r_bias=mixer.scanprep.mix_r_bias,
-                b_scale=mixer.scanprep.b_scale,
-                c_scale=mixer.scanprep.c_scale,
+                **_decode_scanprep_kwargs(mixer),
                 output_dtype=dtype,
             )
 
@@ -496,17 +521,7 @@ def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
         )
 
@@ -530,17 +545,7 @@ def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
         )
 
@@ -586,17 +591,7 @@ def test_mixer_decode_step_cute_compile_enables_tvm_ffi(
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias.detach(),
-            gamma_bias=mixer.scanprep.gamma_bias.detach(),
-            omega_bias=mixer.scanprep.omega_bias.detach(),
-            mix_r_bias=mixer.scanprep.mix_r_bias.detach(),
-            b_scale=cast(torch.Tensor, mixer.scanprep.b_scale).detach(),
-            c_scale=cast(torch.Tensor, mixer.scanprep.c_scale).detach(),
+            **_decode_scanprep_kwargs(mixer, detach=True),
             output_dtype=dtype,
         )
 
@@ -644,17 +639,7 @@ def test_mixer_decode_step_cute_reuses_compiled_executor_across_batch_shapes(
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
-                dt_min=mixer.scanprep.dt_min,
-                dt_max=mixer.scanprep.dt_max,
-                r_min=mixer.scanprep.r_min,
-                r_max=mixer.scanprep.r_max,
-                eps=mixer.scanprep.eps,
-                dt_bias=mixer.scanprep.dt_bias.detach(),
-                gamma_bias=mixer.scanprep.gamma_bias.detach(),
-                omega_bias=mixer.scanprep.omega_bias.detach(),
-                mix_r_bias=mixer.scanprep.mix_r_bias.detach(),
-                b_scale=cast(torch.Tensor, mixer.scanprep.b_scale).detach(),
-                c_scale=cast(torch.Tensor, mixer.scanprep.c_scale).detach(),
+                **_decode_scanprep_kwargs(mixer, detach=True),
                 output_dtype=dtype,
             )
 
@@ -908,7 +893,12 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
         ).contiguous()
-        bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+        bc_amp = bc_flat.view(
+            batch, mixer.n_heads, mixer.scanprep.bc_param_rows, mixer.d_state
+        ).contiguous()
+        bc_h = mixer.scanprep._parameterize_scan_bc_rows(bc_amp.unsqueeze(1))[
+            :, 0, ...
+        ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
@@ -937,17 +927,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
         )
         y_nc, final_nc, b_last_nc, u_last_nc = mixer_decode_step_cute(
@@ -959,17 +939,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
             initial_states=initial_states,
             B_prev=_make_noncontiguous_clone(b_prev),
             U_prev=_make_noncontiguous_clone(u_prev),
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
         )
 
@@ -1015,7 +985,12 @@ def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
         ).contiguous()
-        bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+        bc_amp = bc_flat.view(
+            batch, mixer.n_heads, mixer.scanprep.bc_param_rows, mixer.d_state
+        ).contiguous()
+        bc_h = mixer.scanprep._parameterize_scan_bc_rows(bc_amp.unsqueeze(1))[
+            :, 0, ...
+        ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
@@ -1045,17 +1020,7 @@ def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
-                dt_min=mixer.scanprep.dt_min,
-                dt_max=mixer.scanprep.dt_max,
-                r_min=mixer.scanprep.r_min,
-                r_max=mixer.scanprep.r_max,
-                eps=mixer.scanprep.eps,
-                dt_bias=mixer.scanprep.dt_bias,
-                gamma_bias=mixer.scanprep.gamma_bias,
-                omega_bias=mixer.scanprep.omega_bias,
-                mix_r_bias=mixer.scanprep.mix_r_bias,
-                b_scale=mixer.scanprep.b_scale,
-                c_scale=mixer.scanprep.c_scale,
+                **_decode_scanprep_kwargs(mixer),
                 output_dtype=dtype,
             )
 
@@ -1094,7 +1059,12 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
         ).contiguous()
-        bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+        bc_amp = bc_flat.view(
+            batch, mixer.n_heads, mixer.scanprep.bc_param_rows, mixer.d_state
+        ).contiguous()
+        bc_h = mixer.scanprep._parameterize_scan_bc_rows(bc_amp.unsqueeze(1))[
+            :, 0, ...
+        ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
@@ -1123,17 +1093,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
         )
 
@@ -1149,17 +1109,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
             final_state_out=final_state_out,
             b_last_out=b_last_out,
@@ -1211,7 +1161,12 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
         ).contiguous()
-        bc_h = bc_flat.view(batch, mixer.n_heads, 4, mixer.d_state).contiguous()
+        bc_amp = bc_flat.view(
+            batch, mixer.n_heads, mixer.scanprep.bc_param_rows, mixer.d_state
+        ).contiguous()
+        bc_h = mixer.scanprep._parameterize_scan_bc_rows(bc_amp.unsqueeze(1))[
+            :, 0, ...
+        ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
         initial_states = torch.randn(
@@ -1243,17 +1198,7 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
-                dt_min=mixer.scanprep.dt_min,
-                dt_max=mixer.scanprep.dt_max,
-                r_min=mixer.scanprep.r_min,
-                r_max=mixer.scanprep.r_max,
-                eps=mixer.scanprep.eps,
-                dt_bias=mixer.scanprep.dt_bias,
-                gamma_bias=mixer.scanprep.gamma_bias,
-                omega_bias=mixer.scanprep.omega_bias,
-                mix_r_bias=mixer.scanprep.mix_r_bias,
-                b_scale=mixer.scanprep.b_scale,
-                c_scale=mixer.scanprep.c_scale,
+                **_decode_scanprep_kwargs(mixer),
                 output_dtype=dtype,
                 final_state_out=final_state_out,
                 b_last_out=b_last_out,
@@ -1297,7 +1242,12 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
         params_h = params_flat.view(
             x.shape[0], mixer.n_heads, mixer.scanprep.param_dim
         ).contiguous()
-        bc_h = bc_flat.view(x.shape[0], mixer.n_heads, 4, mixer.d_state).contiguous()
+        bc_amp = bc_flat.view(
+            x.shape[0], mixer.n_heads, mixer.scanprep.bc_param_rows, mixer.d_state
+        ).contiguous()
+        bc_h = mixer.scanprep._parameterize_scan_bc_rows(bc_amp.unsqueeze(1))[
+            :, 0, ...
+        ].contiguous()
         gate_h = gate.view(x.shape[0], mixer.n_heads, mixer.d_head).contiguous()
         skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
@@ -1313,17 +1263,7 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             initial_states=state_ref,
             B_prev=b_prev_ref,
             U_prev=u_prev_ref,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
         )
 
@@ -1339,17 +1279,7 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             initial_states=state_alias,
             B_prev=b_prev_alias,
             U_prev=u_prev_alias,
-            dt_min=mixer.scanprep.dt_min,
-            dt_max=mixer.scanprep.dt_max,
-            r_min=mixer.scanprep.r_min,
-            r_max=mixer.scanprep.r_max,
-            eps=mixer.scanprep.eps,
-            dt_bias=mixer.scanprep.dt_bias,
-            gamma_bias=mixer.scanprep.gamma_bias,
-            omega_bias=mixer.scanprep.omega_bias,
-            mix_r_bias=mixer.scanprep.mix_r_bias,
-            b_scale=mixer.scanprep.b_scale,
-            c_scale=mixer.scanprep.c_scale,
+            **_decode_scanprep_kwargs(mixer),
             output_dtype=dtype,
             final_state_out=state_alias,
             b_last_out=b_prev_alias,

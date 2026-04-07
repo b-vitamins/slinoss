@@ -15,49 +15,34 @@ def scanprep_cute(
     n_heads: int,
     d_state: int,
     d_head: int,
-    normalize_bc: bool,
     dt_min: float,
     dt_max: float,
+    omega_min: float,
+    zeta_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
+    zeta_bias: torch.Tensor,
+    omega_mod_bias: torch.Tensor,
+    omega_natural_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    b_scale: torch.Tensor | None,
-    c_scale: torch.Tensor | None,
+    omega_sign: torch.Tensor,
 ) -> ScanInputs:
-    """CuTe scanprep contract for stateless mixer execution.
-
-    Public contract:
-    - ``value``: ``(B, T, H * P)`` post-conv/post-activation mixer values
-    - ``params``: ``(B, T, H * 5)`` flat scanprep parameter stream
-    - ``bc``: ``(B, T, H, 4, N)`` mixer-emitted BC tensor
-    - output: packed scan-native ``(U, M, K, B, C)``
-
-    Design constraints:
-    - BC generation stays outside this backend
-    - stateless forward numerics are shared across grad-enabled and no-grad
-      execution; autograd is layered on top only when gradients are recorded
-    - the default eager/reference backend remains the source of truth until the
-      fused CuTe implementation is complete
-    """
+    """CuTe scanprep contract for stateless mixer execution."""
     if (
         value.device.type != "cuda"
         or params.device.type != "cuda"
         or bc.device.type != "cuda"
     ):
         raise ValueError("CuTe scanprep requires CUDA tensors.")
-    if normalize_bc and (b_scale is None or c_scale is None):
-        raise ValueError("normalize_bc=True requires b_scale and c_scale tensors.")
     if n_heads <= 0 or d_state <= 0 or d_head <= 0:
         raise ValueError(
             f"Invalid scanprep dimensions: n_heads={n_heads}, d_state={d_state}, d_head={d_head}."
         )
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
-            "Expected value=(B,T,H*P), params=(B,T,H*5), bc=(B,T,H,4,N). "
+            "Expected value=(B,T,H*P), params=(B,T,H*4), bc=(B,T,H,4,N). "
             f"Got {tuple(value.shape)}, {tuple(params.shape)}, {tuple(bc.shape)}."
         )
     supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
@@ -77,11 +62,10 @@ def scanprep_cute(
             params,
             bc,
             dt_bias,
-            gamma_bias,
-            omega_bias,
+            zeta_bias,
+            omega_mod_bias,
+            omega_natural_bias,
             mix_r_bias,
-            b_scale,
-            c_scale,
         )
     )
     if needs_autograd:
@@ -94,18 +78,19 @@ def scanprep_cute(
             n_heads=n_heads,
             d_state=d_state,
             d_head=d_head,
-            normalize_bc=normalize_bc,
             dt_min=dt_min,
             dt_max=dt_max,
+            omega_min=omega_min,
+            zeta_max=zeta_max,
             r_min=r_min,
             r_max=r_max,
             eps=eps,
             dt_bias=dt_bias,
-            gamma_bias=gamma_bias,
-            omega_bias=omega_bias,
+            zeta_bias=zeta_bias,
+            omega_mod_bias=omega_mod_bias,
+            omega_natural_bias=omega_natural_bias,
             mix_r_bias=mix_r_bias,
-            b_scale=b_scale,
-            c_scale=c_scale,
+            omega_sign=omega_sign,
         )
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
@@ -118,18 +103,19 @@ def scanprep_cute(
         n_heads=n_heads,
         d_state=d_state,
         d_head=d_head,
-        normalize_bc=normalize_bc,
         dt_min=dt_min,
         dt_max=dt_max,
+        omega_min=omega_min,
+        zeta_max=zeta_max,
         r_min=r_min,
         r_max=r_max,
         eps=eps,
         dt_bias=dt_bias,
-        gamma_bias=gamma_bias,
-        omega_bias=omega_bias,
+        zeta_bias=zeta_bias,
+        omega_mod_bias=omega_mod_bias,
+        omega_natural_bias=omega_natural_bias,
         mix_r_bias=mix_r_bias,
-        b_scale=b_scale,
-        c_scale=c_scale,
+        omega_sign=omega_sign,
     )
     return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 

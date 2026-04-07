@@ -122,7 +122,6 @@ class NextCharBlock(nn.Module):
             d_head=d_head,
             d_conv=d_conv,
             chunk_size=chunk_size,
-            normalize_bc=True,
         )
         self.norm2 = nn.RMSNorm(d_model)
         self.ff = FeedForward(d_model)

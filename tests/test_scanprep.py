@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import math
-from typing import cast
+from typing import Any, cast
 
 import cutlass.cute as cute
-import torch
-import torch.nn as nn
 import pytest
+import torch
 
 from slinoss.layers import (
     AutoScanPrepBackend,
     CuteScanPrepBackend,
-    ReferenceScanPrepBackend,
     ReferenceScanBackend,
+    ReferenceScanPrepBackend,
     SLinOSSScanPrep,
     ScanInputs,
     ScanState,
@@ -47,6 +46,38 @@ def _make_noncontiguous_clone(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _scanprep_runtime_kwargs(
+    prep: SLinOSSScanPrep,
+    *,
+    detach: bool = False,
+) -> dict[str, Any]:
+    def _maybe_detach(x: torch.Tensor) -> torch.Tensor:
+        return x.detach() if detach else x
+
+    return {
+        "n_heads": prep.n_heads,
+        "d_state": prep.d_state,
+        "d_head": prep.d_head,
+        "dt_min": prep.dt_min,
+        "dt_max": prep.dt_max,
+        "omega_min": prep.omega_min,
+        "zeta_max": prep.zeta_max,
+        "r_min": prep.r_min,
+        "r_max": prep.r_max,
+        "eps": prep.eps,
+        "dt_bias": _maybe_detach(prep.dt_bias),
+        "zeta_bias": _maybe_detach(prep.zeta_bias),
+        "omega_mod_bias": _maybe_detach(prep.omega_mod_bias),
+        "omega_natural_bias": _maybe_detach(prep.omega_natural_bias),
+        "mix_r_bias": _maybe_detach(prep.mix_r_bias),
+        "omega_sign": _maybe_detach(cast(torch.Tensor, prep.omega_sign)),
+    }
+
+
+def _canonical_bc(prep: SLinOSSScanPrep, bc_amp: torch.Tensor) -> torch.Tensor:
+    return prep._parameterize_scan_bc_rows(bc_amp)
+
+
 def _make_scanprep_cuda_fixture(
     *,
     dtype: torch.dtype = torch.float16,
@@ -64,15 +95,12 @@ def _make_scanprep_cuda_fixture(
     ).to(dtype=dtype)
     value = torch.randn((2, 5, 8), device="cuda", dtype=dtype)
     params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=dtype)
-    bc = torch.randn((2, 5, 2, 4, 3), device="cuda", dtype=dtype)
-    return prep, value, params, bc
-
-
-def _detached_scales(prep: SLinOSSScanPrep) -> tuple[torch.Tensor, torch.Tensor]:
-    assert prep.b_scale is not None and prep.c_scale is not None
-    return cast(torch.Tensor, prep.b_scale.detach()), cast(
-        torch.Tensor, prep.c_scale.detach()
+    bc_amp = torch.randn(
+        (2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state),
+        device="cuda",
+        dtype=dtype,
     )
+    return prep, value, params, bc_amp
 
 
 def test_build_transition_from_polar_matches_complex_scalar() -> None:
@@ -171,10 +199,9 @@ def test_scanprep_fake_tensor_arg_falls_back_for_noncompact_layout(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_fwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
     scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
-    scanprep_fwd_mod._SCANPREP_DUMMY_RMS_INV_CACHE.clear()
     scanprep_fwd_mod._SCANPREP_DUMMY_COEFF_AUX_CACHE.clear()
 
     compile_calls: list[bool] = []
@@ -193,58 +220,27 @@ def test_scanprep_fwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
                 value,
                 params,
                 bc,
-                n_heads=prep.n_heads,
-                d_state=prep.d_state,
-                d_head=prep.d_head,
-                normalize_bc=prep.normalize_bc,
-                dt_min=prep.dt_min,
-                dt_max=prep.dt_max,
-                r_min=prep.r_min,
-                r_max=prep.r_max,
-                eps=prep.eps,
-                dt_bias=prep.dt_bias.detach(),
-                gamma_bias=prep.gamma_bias.detach(),
-                omega_bias=prep.omega_bias.detach(),
-                mix_r_bias=prep.mix_r_bias.detach(),
-                b_scale=b_scale,
-                c_scale=c_scale,
+                **_scanprep_runtime_kwargs(prep, detach=True),
             )
 
     assert compile_calls == []
     assert scanprep_fwd_mod._SCANPREP_FWD_CACHE == {}
-    assert scanprep_fwd_mod._SCANPREP_DUMMY_RMS_INV_CACHE == {}
     assert scanprep_fwd_mod._SCANPREP_DUMMY_COEFF_AUX_CACHE == {}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_fwd_cached_path_stays_capture_safe(monkeypatch) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
     scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
-    scanprep_fwd_mod._SCANPREP_DUMMY_RMS_INV_CACHE.clear()
-    scanprep_fwd_mod._SCANPREP_DUMMY_COEFF_AUX_CACHE.clear()
 
     with torch.no_grad():
         scanprep_fwd_cute(
             value,
             params,
             bc,
-            n_heads=prep.n_heads,
-            d_state=prep.d_state,
-            d_head=prep.d_head,
-            normalize_bc=prep.normalize_bc,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale,
-            c_scale=c_scale,
+            **_scanprep_runtime_kwargs(prep, detach=True),
         )
 
     compile_calls: list[bool] = []
@@ -262,21 +258,7 @@ def test_scanprep_fwd_cached_path_stays_capture_safe(monkeypatch) -> None:
             value,
             params,
             bc,
-            n_heads=prep.n_heads,
-            d_state=prep.d_state,
-            d_head=prep.d_head,
-            normalize_bc=prep.normalize_bc,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale,
-            c_scale=c_scale,
+            **_scanprep_runtime_kwargs(prep, detach=True),
         )
 
     assert compile_calls == []
@@ -285,10 +267,8 @@ def test_scanprep_fwd_cached_path_stays_capture_safe(monkeypatch) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_fwd_compile_enables_tvm_ffi(monkeypatch) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
-    scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
-
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
     compile_options: list[object] = []
     orig_compile = cute.compile
 
@@ -296,6 +276,7 @@ def test_scanprep_fwd_compile_enables_tvm_ffi(monkeypatch) -> None:
         compile_options.append(kwargs.get("options"))
         return orig_compile(*args, **kwargs)
 
+    scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
     with torch.no_grad():
@@ -303,21 +284,7 @@ def test_scanprep_fwd_compile_enables_tvm_ffi(monkeypatch) -> None:
             value,
             params,
             bc,
-            n_heads=prep.n_heads,
-            d_state=prep.d_state,
-            d_head=prep.d_head,
-            normalize_bc=prep.normalize_bc,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale,
-            c_scale=c_scale,
+            **_scanprep_runtime_kwargs(prep, detach=True),
         )
 
     assert compile_options == ["--enable-tvm-ffi"]
@@ -328,82 +295,63 @@ def test_scanprep_fwd_reuses_compiled_executor_across_batch_time_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
-    value_alt = torch.randn((3, 7, value.shape[-1]), device="cuda", dtype=value.dtype)
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
+    value_alt = torch.randn((3, 7, 8), device="cuda", dtype=value.dtype)
     params_alt = torch.randn(
-        (3, 7, params.shape[-1]), device="cuda", dtype=params.dtype
+        (3, 7, prep.n_heads * prep.param_dim),
+        device="cuda",
+        dtype=params.dtype,
     )
-    bc_alt = torch.randn((3, 7, *bc.shape[2:]), device="cuda", dtype=bc.dtype)
-    scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
+    bc_alt = _canonical_bc(
+        prep,
+        torch.randn(
+            (3, 7, prep.n_heads, prep.bc_param_rows, prep.d_state),
+            device="cuda",
+            dtype=bc_amp.dtype,
+        ),
+    )
 
-    compile_calls = 0
+    compile_calls: list[bool] = []
     orig_compile = cute.compile
 
     def wrapped_compile(*args, **kwargs):
-        nonlocal compile_calls
-        compile_calls += 1
+        compile_calls.append(True)
         return orig_compile(*args, **kwargs)
 
+    scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
     with torch.no_grad():
-        for value_in, params_in, bc_in in (
-            (value, params, bc),
-            (value_alt, params_alt, bc_alt),
-        ):
-            scanprep_fwd_cute(
-                value_in,
-                params_in,
-                bc_in,
-                n_heads=prep.n_heads,
-                d_state=prep.d_state,
-                d_head=prep.d_head,
-                normalize_bc=prep.normalize_bc,
-                dt_min=prep.dt_min,
-                dt_max=prep.dt_max,
-                r_min=prep.r_min,
-                r_max=prep.r_max,
-                eps=prep.eps,
-                dt_bias=prep.dt_bias.detach(),
-                gamma_bias=prep.gamma_bias.detach(),
-                omega_bias=prep.omega_bias.detach(),
-                mix_r_bias=prep.mix_r_bias.detach(),
-                b_scale=b_scale,
-                c_scale=c_scale,
-            )
+        scanprep_fwd_cute(
+            value,
+            params,
+            bc,
+            **_scanprep_runtime_kwargs(prep, detach=True),
+        )
+        scanprep_fwd_cute(
+            value_alt,
+            params_alt,
+            bc_alt,
+            **_scanprep_runtime_kwargs(prep, detach=True),
+        )
 
-    assert compile_calls == 1
+    assert compile_calls == [True]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
-    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
-
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
     with torch.no_grad():
-        U, M, K, B, C, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
             value,
             params,
             bc,
-            n_heads=prep.n_heads,
-            d_state=prep.d_state,
-            d_head=prep.d_head,
-            normalize_bc=prep.normalize_bc,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale,
-            c_scale=c_scale,
+            **_scanprep_runtime_kwargs(prep, detach=True),
         )
+    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
 
     compile_calls: list[bool] = []
     orig_compile = cute.compile
@@ -419,7 +367,6 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
         scanprep_bwd(
             bc=bc,
             coeff_aux=coeff_aux,
-            rms_inv=rms_inv,
             dU=torch.randn_like(U),
             dM=torch.randn_like(M),
             dK=torch.randn_like(K),
@@ -428,16 +375,18 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
             n_heads=prep.n_heads,
             d_head=prep.d_head,
             d_state=prep.d_state,
-            normalize_bc=prep.normalize_bc,
             value_dtype=value.dtype,
             params_dtype=params.dtype,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
-            b_scale=b_scale,
-            c_scale=c_scale,
+            dt_bias=prep.dt_bias.detach(),
+            omega_natural_bias=prep.omega_natural_bias.detach(),
+            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
         )
 
     assert compile_calls == []
@@ -447,35 +396,18 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
-    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
-
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
     with torch.no_grad():
-        U, M, K, B, C, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
             value,
             params,
             bc,
-            n_heads=prep.n_heads,
-            d_state=prep.d_state,
-            d_head=prep.d_head,
-            normalize_bc=prep.normalize_bc,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale,
-            c_scale=c_scale,
+            **_scanprep_runtime_kwargs(prep, detach=True),
         )
         scanprep_bwd(
             bc=bc,
             coeff_aux=coeff_aux,
-            rms_inv=rms_inv,
             dU=torch.randn_like(U),
             dM=torch.randn_like(M),
             dK=torch.randn_like(K),
@@ -484,16 +416,18 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
             n_heads=prep.n_heads,
             d_head=prep.d_head,
             d_state=prep.d_state,
-            normalize_bc=prep.normalize_bc,
             value_dtype=value.dtype,
             params_dtype=params.dtype,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
+            omega_min=prep.omega_min,
+            zeta_max=prep.zeta_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
-            b_scale=b_scale,
-            c_scale=c_scale,
+            dt_bias=prep.dt_bias.detach(),
+            omega_natural_bias=prep.omega_natural_bias.detach(),
+            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
         )
 
     compile_calls: list[bool] = []
@@ -509,7 +443,6 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
     scanprep_bwd(
         bc=bc,
         coeff_aux=coeff_aux,
-        rms_inv=rms_inv,
         dU=torch.randn_like(U),
         dM=torch.randn_like(M),
         dK=torch.randn_like(K),
@@ -518,16 +451,18 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
         n_heads=prep.n_heads,
         d_head=prep.d_head,
         d_state=prep.d_state,
-        normalize_bc=prep.normalize_bc,
         value_dtype=value.dtype,
         params_dtype=params.dtype,
         dt_min=prep.dt_min,
         dt_max=prep.dt_max,
+        omega_min=prep.omega_min,
+        zeta_max=prep.zeta_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
-        b_scale=b_scale,
-        c_scale=c_scale,
+        dt_bias=prep.dt_bias.detach(),
+        omega_natural_bias=prep.omega_natural_bias.detach(),
+        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
     )
 
     assert compile_calls == []
@@ -536,30 +471,14 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
-    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
-
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
     with torch.no_grad():
-        U, M, K, B, C, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
             value,
             params,
             bc,
-            n_heads=prep.n_heads,
-            d_state=prep.d_state,
-            d_head=prep.d_head,
-            normalize_bc=prep.normalize_bc,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            gamma_bias=prep.gamma_bias.detach(),
-            omega_bias=prep.omega_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            b_scale=b_scale,
-            c_scale=c_scale,
+            **_scanprep_runtime_kwargs(prep, detach=True),
         )
 
     compile_options: list[object] = []
@@ -569,12 +488,12 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
         compile_options.append(kwargs.get("options"))
         return orig_compile(*args, **kwargs)
 
+    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
     scanprep_bwd(
         bc=bc,
         coeff_aux=coeff_aux,
-        rms_inv=rms_inv,
         dU=torch.randn_like(U),
         dM=torch.randn_like(M),
         dK=torch.randn_like(K),
@@ -583,16 +502,18 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
         n_heads=prep.n_heads,
         d_head=prep.d_head,
         d_state=prep.d_state,
-        normalize_bc=prep.normalize_bc,
         value_dtype=value.dtype,
         params_dtype=params.dtype,
         dt_min=prep.dt_min,
         dt_max=prep.dt_max,
+        omega_min=prep.omega_min,
+        zeta_max=prep.zeta_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
-        b_scale=b_scale,
-        c_scale=c_scale,
+        dt_bias=prep.dt_bias.detach(),
+        omega_natural_bias=prep.omega_natural_bias.detach(),
+        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
     )
 
     assert compile_options == ["--enable-tvm-ffi"]
@@ -603,99 +524,108 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("cutlass")
-    prep, value, params, bc = _make_scanprep_cuda_fixture()
-    b_scale, c_scale = _detached_scales(prep)
-    value_alt = torch.randn((3, 7, value.shape[-1]), device="cuda", dtype=value.dtype)
-    params_alt = torch.randn(
-        (3, 7, params.shape[-1]), device="cuda", dtype=params.dtype
-    )
-    bc_alt = torch.randn((3, 7, *bc.shape[2:]), device="cuda", dtype=bc.dtype)
-    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
+    with torch.no_grad():
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+            value,
+            params,
+            bc,
+            **_scanprep_runtime_kwargs(prep, detach=True),
+        )
 
-    compile_calls = 0
+    value_alt = torch.randn((3, 7, 8), device="cuda", dtype=value.dtype)
+    params_alt = torch.randn(
+        (3, 7, prep.n_heads * prep.param_dim),
+        device="cuda",
+        dtype=params.dtype,
+    )
+    bc_alt = _canonical_bc(
+        prep,
+        torch.randn(
+            (3, 7, prep.n_heads, prep.bc_param_rows, prep.d_state),
+            device="cuda",
+            dtype=bc_amp.dtype,
+        ),
+    )
+    with torch.no_grad():
+        U_alt, M_alt, K_alt, B_alt, C_alt, coeff_aux_alt = scanprep_fwd_cute_with_aux(
+            value_alt,
+            params_alt,
+            bc_alt,
+            **_scanprep_runtime_kwargs(prep, detach=True),
+        )
+
+    compile_calls: list[bool] = []
     orig_compile = cute.compile
 
     def wrapped_compile(*args, **kwargs):
-        nonlocal compile_calls
-        compile_calls += 1
+        compile_calls.append(True)
         return orig_compile(*args, **kwargs)
 
+    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
-    with torch.no_grad():
-        for value_in, params_in, bc_in in (
-            (value, params, bc),
-            (value_alt, params_alt, bc_alt),
-        ):
-            U, M, K, B, C, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
-                value_in,
-                params_in,
-                bc_in,
-                n_heads=prep.n_heads,
-                d_state=prep.d_state,
-                d_head=prep.d_head,
-                normalize_bc=prep.normalize_bc,
-                dt_min=prep.dt_min,
-                dt_max=prep.dt_max,
-                r_min=prep.r_min,
-                r_max=prep.r_max,
-                eps=prep.eps,
-                dt_bias=prep.dt_bias.detach(),
-                gamma_bias=prep.gamma_bias.detach(),
-                omega_bias=prep.omega_bias.detach(),
-                mix_r_bias=prep.mix_r_bias.detach(),
-                b_scale=b_scale,
-                c_scale=c_scale,
-            )
-            scanprep_bwd(
-                bc=bc_in,
-                coeff_aux=coeff_aux,
-                rms_inv=rms_inv,
-                dU=torch.randn_like(U),
-                dM=torch.randn_like(M),
-                dK=torch.randn_like(K),
-                dB=torch.randn_like(B),
-                dC=torch.randn_like(C),
-                n_heads=prep.n_heads,
-                d_head=prep.d_head,
-                d_state=prep.d_state,
-                normalize_bc=prep.normalize_bc,
-                value_dtype=value_in.dtype,
-                params_dtype=params_in.dtype,
-                dt_min=prep.dt_min,
-                dt_max=prep.dt_max,
-                r_min=prep.r_min,
-                r_max=prep.r_max,
-                eps=prep.eps,
-                b_scale=b_scale,
-                c_scale=c_scale,
-            )
+    scanprep_bwd(
+        bc=bc,
+        coeff_aux=coeff_aux,
+        dU=torch.randn_like(U),
+        dM=torch.randn_like(M),
+        dK=torch.randn_like(K),
+        dB=torch.randn_like(B),
+        dC=torch.randn_like(C),
+        n_heads=prep.n_heads,
+        d_head=prep.d_head,
+        d_state=prep.d_state,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        dt_min=prep.dt_min,
+        dt_max=prep.dt_max,
+        omega_min=prep.omega_min,
+        zeta_max=prep.zeta_max,
+        r_min=prep.r_min,
+        r_max=prep.r_max,
+        eps=prep.eps,
+        dt_bias=prep.dt_bias.detach(),
+        omega_natural_bias=prep.omega_natural_bias.detach(),
+        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+    )
+    scanprep_bwd(
+        bc=bc_alt,
+        coeff_aux=coeff_aux_alt,
+        dU=torch.randn_like(U_alt),
+        dM=torch.randn_like(M_alt),
+        dK=torch.randn_like(K_alt),
+        dB=torch.randn_like(B_alt),
+        dC=torch.randn_like(C_alt),
+        n_heads=prep.n_heads,
+        d_head=prep.d_head,
+        d_state=prep.d_state,
+        value_dtype=value_alt.dtype,
+        params_dtype=params_alt.dtype,
+        dt_min=prep.dt_min,
+        dt_max=prep.dt_max,
+        omega_min=prep.omega_min,
+        zeta_max=prep.zeta_max,
+        r_min=prep.r_min,
+        r_max=prep.r_max,
+        eps=prep.eps,
+        dt_bias=prep.dt_bias.detach(),
+        omega_natural_bias=prep.omega_natural_bias.detach(),
+        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+    )
 
-    assert compile_calls == 1
+    assert compile_calls == [True]
 
 
 def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     torch.manual_seed(0)
-    prep = SLinOSSScanPrep(
-        n_heads=3,
-        d_state=4,
-        d_head=2,
-        dt_min=1e-3,
-        dt_max=1e-1,
-        r_min=0.8,
-        r_max=0.98,
-    )
-    params = torch.randn((2, 7, 3, prep.param_dim), dtype=torch.float32)
+    prep = SLinOSSScanPrep(n_heads=2, d_state=3, d_head=4)
+    params = torch.randn((2, 9, prep.n_heads * prep.param_dim), dtype=torch.float32)
 
-    out = prep.coefficients(params)
-    m = torch.view_as_complex(out.M)
-    r = torch.abs(m)
+    out = prep.coefficients(params.view(2, 9, prep.n_heads, prep.param_dim))
+    radius = torch.linalg.vector_norm(out.M, dim=-1)
 
-    assert out.M.shape == (2, 3, 7, 2)
-    assert out.K.shape == (2, 3, 7, 2, 2)
-    assert out.dt.shape == (2, 3, 7)
-    assert out.r.shape == (2, 3, 7)
-    assert out.theta.shape == (2, 3, 7)
     assert torch.isfinite(out.M).all()
     assert torch.isfinite(out.K).all()
     assert torch.isfinite(out.dt).all()
@@ -705,7 +635,7 @@ def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     assert bool((out.dt <= prep.dt_max).all())
     assert bool((out.r >= prep.r_min).all())
     assert bool((out.r <= prep.r_max).all())
-    assert torch.allclose(r, out.r, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(radius, out.r, atol=1e-6, rtol=1e-6)
 
 
 def test_cute_scanprep_backend_requires_cuda() -> None:
@@ -717,7 +647,7 @@ def test_cute_scanprep_backend_requires_cuda() -> None:
     )
     value = torch.randn((2, 5, 8), dtype=torch.float32)
     params = torch.randn((2, 5, 2 * prep.param_dim), dtype=torch.float32)
-    bc = torch.randn((2, 5, 2, 4, 3), dtype=torch.float32)
+    bc = torch.randn((2, 5, 2, prep.bc_param_rows, 3), dtype=torch.float32)
 
     with pytest.raises(ValueError, match="CuTe scanprep requires CUDA tensors"):
         prep(value, params, bc)
@@ -734,7 +664,7 @@ def test_auto_scanprep_backend_uses_reference_on_cpu() -> None:
 
     value = torch.randn((2, 5, 8), dtype=torch.float32)
     params = torch.randn((2, 5, 2 * prep.param_dim), dtype=torch.float32)
-    bc = torch.randn((2, 5, 2, 4, 3), dtype=torch.float32)
+    bc = torch.randn((2, 5, 2, prep.bc_param_rows, 3), dtype=torch.float32)
 
     got = prep(value, params, bc)
 
@@ -774,7 +704,9 @@ def test_auto_scanprep_backend_uses_cute_on_cuda_fp32() -> None:
 
     value = torch.randn((2, 5, 8), device="cuda", dtype=torch.float32)
     params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=torch.float32)
-    bc = torch.randn((2, 5, 2, 4, 3), device="cuda", dtype=torch.float32)
+    bc = torch.randn(
+        (2, 5, 2, prep.bc_param_rows, 3), device="cuda", dtype=torch.float32
+    )
 
     with torch.no_grad():
         got = prep(value, params, bc)
@@ -810,7 +742,7 @@ def test_auto_scanprep_backend_uses_cute_on_cuda_training_dtypes(
 
     value = torch.randn((2, 5, 8), device="cuda", dtype=dtype)
     params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=dtype)
-    bc = torch.randn((2, 5, 2, 4, 3), device="cuda", dtype=dtype)
+    bc = torch.randn((2, 5, 2, prep.bc_param_rows, 3), device="cuda", dtype=dtype)
 
     with torch.no_grad():
         got = prep(value, params, bc)
@@ -836,7 +768,7 @@ def test_cute_scanprep_backend_matches_reference_forward() -> None:
         r_max=0.98,
         device="cuda",
     )
-    cute = SLinOSSScanPrep(
+    cute_prep = SLinOSSScanPrep(
         n_heads=3,
         d_state=5,
         d_head=4,
@@ -847,63 +779,16 @@ def test_cute_scanprep_backend_matches_reference_forward() -> None:
         device="cuda",
         backend=CuteScanPrepBackend(),
     )
-    cute.load_state_dict(ref.state_dict())
+    cute_prep.load_state_dict(ref.state_dict())
 
     value = torch.randn((2, 7, 12), device="cuda", dtype=torch.float32)
     params = torch.randn((2, 7, 3 * ref.param_dim), device="cuda", dtype=torch.float32)
-    bc = torch.randn((2, 7, 3, 4, 5), device="cuda", dtype=torch.float32)
+    bc = torch.randn(
+        (2, 7, 3, ref.bc_param_rows, 5), device="cuda", dtype=torch.float32
+    )
 
     with torch.no_grad():
-        got = cute(value, params, bc)
-        expect = ref(value, params, bc)
-
-    assert torch.equal(got.U, expect.U)
-    assert torch.allclose(got.B, expect.B, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(got.C, expect.C, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(got.M, expect.M, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(got.K, expect.K, atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cute_scanprep_backend_matches_reference_forward_with_noncontiguous_scales() -> (
-    None
-):
-    torch.manual_seed(0)
-    ref = SLinOSSScanPrep(
-        n_heads=3,
-        d_state=5,
-        d_head=4,
-        dt_min=1e-3,
-        dt_max=1e-1,
-        r_min=0.8,
-        r_max=0.98,
-        device="cuda",
-    )
-    cute = SLinOSSScanPrep(
-        n_heads=3,
-        d_state=5,
-        d_head=4,
-        dt_min=1e-3,
-        dt_max=1e-1,
-        r_min=0.8,
-        r_max=0.98,
-        device="cuda",
-        backend=CuteScanPrepBackend(),
-    )
-    cute.load_state_dict(ref.state_dict())
-    assert ref.b_scale is not None and ref.c_scale is not None
-    cute.b_scale = nn.Parameter(_make_noncontiguous_clone(ref.b_scale.detach()))
-    cute.c_scale = nn.Parameter(_make_noncontiguous_clone(ref.c_scale.detach()))
-    assert cute.b_scale is not None and cute.c_scale is not None
-    assert not cast(torch.Tensor, cute.b_scale).is_contiguous()
-    assert not cast(torch.Tensor, cute.c_scale).is_contiguous()
-
-    value = torch.randn((2, 7, 12), device="cuda", dtype=torch.float32)
-    params = torch.randn((2, 7, 3 * ref.param_dim), device="cuda", dtype=torch.float32)
-    bc = torch.randn((2, 7, 3, 4, 5), device="cuda", dtype=torch.float32)
-
-    with torch.no_grad():
-        got = cute(value, params, bc)
+        got = cute_prep(value, params, bc)
         expect = ref(value, params, bc)
 
     assert torch.equal(got.U, expect.U)
@@ -922,14 +807,14 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
         d_head=4,
         device="cuda",
     )
-    cute = SLinOSSScanPrep(
+    cute_prep = SLinOSSScanPrep(
         n_heads=2,
         d_state=3,
         d_head=4,
         backend=CuteScanPrepBackend(),
         device="cuda",
     )
-    cute.load_state_dict(ref.state_dict())
+    cute_prep.load_state_dict(ref.state_dict())
 
     value_ref = torch.randn(
         (2, 5, 8), device="cuda", dtype=torch.float32, requires_grad=True
@@ -941,14 +826,17 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
         requires_grad=True,
     )
     bc_ref = torch.randn(
-        (2, 5, 2, 4, 3), device="cuda", dtype=torch.float32, requires_grad=True
+        (2, 5, 2, ref.bc_param_rows, 3),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
     )
     value_cute = value_ref.detach().clone().requires_grad_(True)
     params_cute = params_ref.detach().clone().requires_grad_(True)
     bc_cute = bc_ref.detach().clone().requires_grad_(True)
 
     out_ref = ref(value_ref, params_ref, bc_ref)
-    out_cute = cute(value_cute, params_cute, bc_cute)
+    out_cute = cute_prep(value_cute, params_cute, bc_cute)
 
     g_u = torch.randn_like(out_ref.U)
     g_m = torch.randn_like(out_ref.M)
@@ -987,116 +875,15 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
 
     names = (
         "dt_bias",
-        "gamma_bias",
-        "omega_bias",
+        "zeta_bias",
+        "omega_mod_bias",
+        "omega_natural_bias",
         "mix_r_bias",
-        "b_scale",
-        "c_scale",
+        "bc_complex_base",
     )
     for name in names:
         ref_grad = getattr(ref, name).grad
-        cute_grad = getattr(cute, name).grad
-        assert ref_grad is not None
-        assert cute_grad is not None
-        assert torch.allclose(
-            cast(torch.Tensor, cute_grad),
-            cast(torch.Tensor, ref_grad),
-            atol=grad_atol,
-            rtol=grad_rtol,
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cute_scanprep_backend_matches_reference_gradients_with_noncontiguous_scales() -> (
-    None
-):
-    torch.manual_seed(1)
-    ref = SLinOSSScanPrep(
-        n_heads=2,
-        d_state=3,
-        d_head=4,
-        device="cuda",
-    )
-    cute = SLinOSSScanPrep(
-        n_heads=2,
-        d_state=3,
-        d_head=4,
-        backend=CuteScanPrepBackend(),
-        device="cuda",
-    )
-    cute.load_state_dict(ref.state_dict())
-    assert ref.b_scale is not None and ref.c_scale is not None
-    cute.b_scale = nn.Parameter(_make_noncontiguous_clone(ref.b_scale.detach()))
-    cute.c_scale = nn.Parameter(_make_noncontiguous_clone(ref.c_scale.detach()))
-    assert cute.b_scale is not None and cute.c_scale is not None
-    assert not cast(torch.Tensor, cute.b_scale).is_contiguous()
-    assert not cast(torch.Tensor, cute.c_scale).is_contiguous()
-
-    value_ref = torch.randn(
-        (2, 5, 8), device="cuda", dtype=torch.float32, requires_grad=True
-    )
-    params_ref = torch.randn(
-        (2, 5, 2 * ref.param_dim),
-        device="cuda",
-        dtype=torch.float32,
-        requires_grad=True,
-    )
-    bc_ref = torch.randn(
-        (2, 5, 2, 4, 3), device="cuda", dtype=torch.float32, requires_grad=True
-    )
-    value_cute = value_ref.detach().clone().requires_grad_(True)
-    params_cute = params_ref.detach().clone().requires_grad_(True)
-    bc_cute = bc_ref.detach().clone().requires_grad_(True)
-
-    out_ref = ref(value_ref, params_ref, bc_ref)
-    out_cute = cute(value_cute, params_cute, bc_cute)
-
-    g_u = torch.randn_like(out_ref.U)
-    g_m = torch.randn_like(out_ref.M)
-    g_k = torch.randn_like(out_ref.K)
-    g_b = torch.randn_like(out_ref.B)
-    g_c = torch.randn_like(out_ref.C)
-    loss_ref = (
-        (out_ref.U * g_u).sum()
-        + (out_ref.M * g_m).sum()
-        + (out_ref.K * g_k).sum()
-        + (out_ref.B * g_b).sum()
-        + (out_ref.C * g_c).sum()
-    )
-    loss_cute = (
-        (out_cute.U * g_u).sum()
-        + (out_cute.M * g_m).sum()
-        + (out_cute.K * g_k).sum()
-        + (out_cute.B * g_b).sum()
-        + (out_cute.C * g_c).sum()
-    )
-    loss_ref.backward()
-    loss_cute.backward()
-    grad_atol = 5e-5
-    grad_rtol = 5e-5
-
-    assert value_ref.grad is not None and value_cute.grad is not None
-    assert params_ref.grad is not None and params_cute.grad is not None
-    assert bc_ref.grad is not None and bc_cute.grad is not None
-    assert torch.allclose(
-        value_cute.grad, value_ref.grad, atol=grad_atol, rtol=grad_rtol
-    )
-    assert torch.allclose(
-        params_cute.grad, params_ref.grad, atol=grad_atol, rtol=grad_rtol
-    )
-    assert torch.allclose(bc_cute.grad, bc_ref.grad, atol=grad_atol, rtol=grad_rtol)
-
-    names = (
-        "dt_bias",
-        "gamma_bias",
-        "omega_bias",
-        "mix_r_bias",
-        "b_scale",
-        "c_scale",
-    )
-    for name in names:
-        ref_grad = getattr(ref, name).grad
-        cute_grad = getattr(cute, name).grad
+        cute_grad = getattr(cute_prep, name).grad
         assert ref_grad is not None
         assert cute_grad is not None
         assert torch.allclose(

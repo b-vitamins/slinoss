@@ -31,7 +31,9 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             T,
         )
         bc = call_region(
-            "mixer.scanprep.bc_norm", self.scanprep._normalize_scan_bc_rows, bc
+            "mixer.scanprep.bc_parameterize",
+            self.scanprep._parameterize_scan_bc_rows,
+            bc,
         )
         coeffs = call_region(
             "mixer.scanprep.coefficients",
@@ -120,28 +122,16 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        if self.output_norm is None:
-            gated = call_region(
-                "mixer.gate_skip",
-                self._apply_gate_skip_headspace,
-                scan_y,
-                scan_inputs.U,
-                gate,
-                batch,
-                T,
-            )
-            out = call_region("mixer.out_proj", self._project_headspace, gated)
-        else:
-            gated = call_region(
-                "mixer.gate_skip",
-                self._apply_gate_skip,
-                scan_y,
-                scan_inputs.U,
-                gate,
-                batch,
-                T,
-            )
-            out = call_region("mixer.out_proj", self.out_proj, gated)
+        gated = call_region(
+            "mixer.gate_skip",
+            self._apply_gate_skip_headspace,
+            scan_y,
+            scan_inputs.U,
+            gate,
+            batch,
+            T,
+        )
+        out = call_region("mixer.out_proj", self._project_headspace, gated)
 
         if not return_state:
             return out
@@ -172,7 +162,6 @@ class ProfiledNextCharBlock(nn.Module):
             d_head=d_head,
             d_conv=d_conv,
             chunk_size=chunk_size,
-            normalize_bc=True,
         )
         self.norm2 = nn.RMSNorm(d_model)
         self.ff = FeedForward(d_model)

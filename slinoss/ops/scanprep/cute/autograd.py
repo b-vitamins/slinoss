@@ -20,27 +20,29 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         n_heads: int,
         d_state: int,
         d_head: int,
-        normalize_bc: bool,
         dt_min: float,
         dt_max: float,
+        omega_min: float,
+        zeta_max: float,
         r_min: float,
         r_max: float,
         eps: float,
         dt_bias: torch.Tensor,
-        gamma_bias: torch.Tensor,
-        omega_bias: torch.Tensor,
+        zeta_bias: torch.Tensor,
+        omega_mod_bias: torch.Tensor,
+        omega_natural_bias: torch.Tensor,
         mix_r_bias: torch.Tensor,
-        b_scale: torch.Tensor,
-        c_scale: torch.Tensor,
+        omega_sign: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.n_heads = int(n_heads)
         ctx.d_state = int(d_state)
         ctx.d_head = int(d_head)
-        ctx.normalize_bc = bool(normalize_bc)
         ctx.value_dtype = value.dtype
         ctx.params_dtype = params.dtype
         ctx.dt_min = float(dt_min)
         ctx.dt_max = float(dt_max)
+        ctx.omega_min = float(omega_min)
+        ctx.zeta_max = float(zeta_max)
         ctx.r_min = float(r_min)
         ctx.r_max = float(r_max)
         ctx.eps = float(eps)
@@ -49,39 +51,40 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         params_d = params.detach()
         bc_d = bc.detach()
         dt_bias_d = dt_bias.detach()
-        gamma_bias_d = gamma_bias.detach()
-        omega_bias_d = omega_bias.detach()
+        zeta_bias_d = zeta_bias.detach()
+        omega_mod_bias_d = omega_mod_bias.detach()
+        omega_natural_bias_d = omega_natural_bias.detach()
         mix_r_bias_d = mix_r_bias.detach()
-        b_scale_d = b_scale.detach()
-        c_scale_d = c_scale.detach()
+        omega_sign_d = omega_sign.detach()
 
-        U, M, K, B, C, rms_inv, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
             value_d,
-            n_heads=n_heads,
             params=params_d,
             bc=bc_d,
+            n_heads=n_heads,
             d_state=d_state,
             d_head=d_head,
-            normalize_bc=normalize_bc,
             dt_min=dt_min,
             dt_max=dt_max,
+            omega_min=omega_min,
+            zeta_max=zeta_max,
             r_min=r_min,
             r_max=r_max,
             eps=eps,
             dt_bias=dt_bias_d,
-            gamma_bias=gamma_bias_d,
-            omega_bias=omega_bias_d,
+            zeta_bias=zeta_bias_d,
+            omega_mod_bias=omega_mod_bias_d,
+            omega_natural_bias=omega_natural_bias_d,
             mix_r_bias=mix_r_bias_d,
-            b_scale=b_scale_d if normalize_bc else None,
-            c_scale=c_scale_d if normalize_bc else None,
+            omega_sign=omega_sign_d,
         )
 
         ctx.save_for_backward(
             bc_d,
-            rms_inv,
             coeff_aux,
-            b_scale_d,
-            c_scale_d,
+            dt_bias_d,
+            omega_natural_bias_d,
+            omega_sign_d,
         )
         return U, M, K, B, C
 
@@ -94,28 +97,20 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         dB: torch.Tensor | None,
         dC: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
-        (
-            bc,
-            rms_inv,
-            coeff_aux,
-            b_scale,
-            c_scale,
-        ) = ctx.saved_tensors
+        bc, coeff_aux, dt_bias, omega_natural_bias, omega_sign = ctx.saved_tensors
 
         (
             dvalue,
             dparams,
             dbc,
             d_dt_bias,
-            d_gamma_bias,
-            d_omega_bias,
+            d_zeta_bias,
+            d_omega_mod_bias,
+            d_omega_natural_bias,
             d_mix_r_bias,
-            d_b_scale,
-            d_c_scale,
         ) = scanprep_bwd(
             bc=bc,
             coeff_aux=coeff_aux,
-            rms_inv=rms_inv,
             dU=dU,
             dM=dM,
             dK=dK,
@@ -124,16 +119,18 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             n_heads=ctx.n_heads,
             d_head=ctx.d_head,
             d_state=ctx.d_state,
-            normalize_bc=ctx.normalize_bc,
             value_dtype=ctx.value_dtype,
             params_dtype=ctx.params_dtype,
             dt_min=ctx.dt_min,
             dt_max=ctx.dt_max,
+            omega_min=ctx.omega_min,
+            zeta_max=ctx.zeta_max,
             r_min=ctx.r_min,
             r_max=ctx.r_max,
             eps=ctx.eps,
-            b_scale=b_scale if ctx.normalize_bc else None,
-            c_scale=c_scale if ctx.normalize_bc else None,
+            dt_bias=dt_bias,
+            omega_natural_bias=omega_natural_bias,
+            omega_sign=omega_sign,
         )
         return (
             dvalue,
@@ -148,12 +145,13 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             d_dt_bias,
-            d_gamma_bias,
-            d_omega_bias,
+            d_zeta_bias,
+            d_omega_mod_bias,
+            d_omega_natural_bias,
             d_mix_r_bias,
-            d_b_scale,
-            d_c_scale,
+            None,
         )
 
 
@@ -165,29 +163,20 @@ def scanprep_cute_training_autograd(
     n_heads: int,
     d_state: int,
     d_head: int,
-    normalize_bc: bool,
     dt_min: float,
     dt_max: float,
+    omega_min: float,
+    zeta_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
-    omega_bias: torch.Tensor,
+    zeta_bias: torch.Tensor,
+    omega_mod_bias: torch.Tensor,
+    omega_natural_bias: torch.Tensor,
     mix_r_bias: torch.Tensor,
-    b_scale: torch.Tensor | None,
-    c_scale: torch.Tensor | None,
+    omega_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    b_scale_in = (
-        b_scale
-        if b_scale is not None
-        else torch.empty((0,), device=value.device, dtype=value.dtype)
-    )
-    c_scale_in = (
-        c_scale
-        if c_scale is not None
-        else torch.empty((0,), device=value.device, dtype=value.dtype)
-    )
     return cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         _ScanPrepCuTeFn.apply(
@@ -197,18 +186,19 @@ def scanprep_cute_training_autograd(
             int(n_heads),
             int(d_state),
             int(d_head),
-            bool(normalize_bc),
             float(dt_min),
             float(dt_max),
+            float(omega_min),
+            float(zeta_max),
             float(r_min),
             float(r_max),
             float(eps),
             dt_bias,
-            gamma_bias,
-            omega_bias,
+            zeta_bias,
+            omega_mod_bias,
+            omega_natural_bias,
             mix_r_bias,
-            b_scale_in,
-            c_scale_in,
+            omega_sign,
         ),
     )
 

@@ -10,10 +10,7 @@ import cutlass.cute.math as cute_math
 from ..common import (
     COEFF_AUX_DELTA_R,
     COEFF_AUX_DT,
-    COEFF_AUX_DT_U,
     COEFF_AUX_EXP_TERM,
-    COEFF_AUX_GAMMA,
-    COEFF_AUX_GAMMA_SIGMOID,
     COEFF_AUX_KAPPA1_IM,
     COEFF_AUX_KAPPA1_RE,
     COEFF_AUX_KAPPA2_IM,
@@ -21,11 +18,14 @@ from ..common import (
     COEFF_AUX_LOG_R,
     COEFF_AUX_MIX_R,
     COEFF_AUX_OMEGA,
+    COEFF_AUX_OMEGA_DRIVE,
+    COEFF_AUX_OMEGA_TANH,
     COEFF_AUX_R,
     COEFF_AUX_RHO_IM,
     COEFF_AUX_RHO_RE,
     COEFF_AUX_R_DIRECT_U,
     COEFF_AUX_THETA,
+    COEFF_AUX_ZETA,
     SCANPREP_PARAM_DIM,
     complex_div,
     lerp,
@@ -45,11 +45,11 @@ class ScanPrepFwdFused:
         h_size: int,
         p_size: int,
         n_size: int,
-        normalize_bc: bool,
-        store_rms_inv: bool,
         store_coeff_aux: bool,
         dt_min: float,
         dt_max: float,
+        omega_min: float,
+        zeta_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -59,8 +59,6 @@ class ScanPrepFwdFused:
         self.h_size = int(h_size)
         self.p_size = int(p_size)
         self.n_size = int(n_size)
-        self.normalize_bc = bool(normalize_bc)
-        self.store_rms_inv = bool(store_rms_inv)
         self.store_coeff_aux = bool(store_coeff_aux)
 
         self.pack_warps_per_block = int(pack_warps_per_block)
@@ -81,44 +79,23 @@ class ScanPrepFwdFused:
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
+        self.omega_min = float(omega_min)
+        self.zeta_max = float(zeta_max)
+        self.omega_mod_scale = 0.25
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
+        self.eps = float(eps)
         z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
         self.z_thresh_sq = float(z_thresh * z_thresh)
-
-    def _coeff_shared_storage(self):
-        coeff_layout = cute.make_layout(
-            (self.coeff_head_tile, SCANPREP_PARAM_DIM, self.coeff_t_tile + 1),
-            stride=(
-                SCANPREP_PARAM_DIM * (self.coeff_t_tile + 1),
-                self.coeff_t_tile + 1,
-                1,
-            ),
-        )
-
-        class SharedStorage:
-            pass
-
-        SharedStorage.__annotations__ = {
-            "sParams": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(coeff_layout)],
-                16,
-            ]
-        }
-
-        return cute.struct(SharedStorage)
 
     @cute.kernel
     def pack_kernel(
         self,
         mValue: cute.Tensor,
         mBC: cute.Tensor,
-        mBScale: cute.Tensor,
-        mCScale: cute.Tensor,
         mU: cute.Tensor,
         mBOut: cute.Tensor,
         mCOut: cute.Tensor,
-        mRmsInv: cute.Tensor,
         total_rows_,
         rows_per_batch_,
     ):
@@ -139,102 +116,37 @@ class ScanPrepFwdFused:
                 if p < self.p_size:
                     mU[b, h, t, p] = mValue[b, h, t, p]
 
-            if cutlass.const_expr(self.normalize_bc):
-                s0 = cutlass.Float32(0.0)
-                s1 = cutlass.Float32(0.0)
-                s2 = cutlass.Float32(0.0)
-                s3 = cutlass.Float32(0.0)
-                num_n_iters = (self.n_size + 31) // 32
-                x0_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
-                x1_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
-                x2_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
-                x3_cache = cute.make_rmem_tensor((num_n_iters,), cutlass.Float32)
-                for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
-                    if n < self.n_size:
-                        x0 = cutlass.Float32(mBC[b, t, h, 0, n])
-                        x1 = cutlass.Float32(mBC[b, t, h, 1, n])
-                        x2 = cutlass.Float32(mBC[b, t, h, 2, n])
-                        x3 = cutlass.Float32(mBC[b, t, h, 3, n])
-                        x0_cache[n_iter] = x0
-                        x1_cache[n_iter] = x1
-                        x2_cache[n_iter] = x2
-                        x3_cache[n_iter] = x3
-                        s0 = s0 + x0 * x0
-                        s1 = s1 + x1 * x1
-                        s2 = s2 + x2 * x2
-                        s3 = s3 + x3 * x3
-
-                s0 = cute.arch.warp_reduction_sum(s0, threads_in_group=32)
-                s1 = cute.arch.warp_reduction_sum(s1, threads_in_group=32)
-                s2 = cute.arch.warp_reduction_sum(s2, threads_in_group=32)
-                s3 = cute.arch.warp_reduction_sum(s3, threads_in_group=32)
-                denom = cutlass.Float32(self.n_size)
-                eps_bc = cutlass.Float32(1.0e-5)
-                inv0 = cute.rsqrt(s0 / denom + eps_bc)
-                inv1 = cute.rsqrt(s1 / denom + eps_bc)
-                inv2 = cute.rsqrt(s2 / denom + eps_bc)
-                inv3 = cute.rsqrt(s3 / denom + eps_bc)
-
-                if cutlass.const_expr(self.store_rms_inv) and lane == 0:
-                    mRmsInv[b, h, t, 0] = inv0
-                    mRmsInv[b, h, t, 1] = inv1
-                    mRmsInv[b, h, t, 2] = inv2
-                    mRmsInv[b, h, t, 3] = inv3
-
-                for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
-                    if n < self.n_size:
-                        b0 = x0_cache[n_iter] * inv0
-                        b1 = x1_cache[n_iter] * inv1
-                        c0 = x2_cache[n_iter] * inv2
-                        c1 = x3_cache[n_iter] * inv3
-                        mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
-                            b0 * cutlass.Float32(mBScale[h, 0, n]),
-                            mBOut.element_type,
-                        )
-                        mBOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
-                            b1 * cutlass.Float32(mBScale[h, 1, n]),
-                            mBOut.element_type,
-                        )
-                        mCOut[b, h, t, 2 * n] = safe_cast_to_dtype(
-                            c0 * cutlass.Float32(mCScale[h, 0, n]),
-                            mCOut.element_type,
-                        )
-                        mCOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
-                            c1 * cutlass.Float32(mCScale[h, 1, n]),
-                            mCOut.element_type,
-                        )
-            else:
-                num_n_iters = (self.n_size + 31) // 32
-                for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
-                    if n < self.n_size:
-                        mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
-                            cutlass.Float32(mBC[b, t, h, 0, n]),
-                            mBOut.element_type,
-                        )
-                        mBOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
-                            cutlass.Float32(mBC[b, t, h, 1, n]),
-                            mBOut.element_type,
-                        )
-                        mCOut[b, h, t, 2 * n] = safe_cast_to_dtype(
-                            cutlass.Float32(mBC[b, t, h, 2, n]),
-                            mCOut.element_type,
-                        )
-                        mCOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
-                            cutlass.Float32(mBC[b, t, h, 3, n]),
-                            mCOut.element_type,
-                        )
+            num_n_iters = (self.n_size + 31) // 32
+            for n_iter in cutlass.range_constexpr(num_n_iters):
+                n = lane + n_iter * 32
+                if n < self.n_size:
+                    mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
+                        cutlass.Float32(mBC[b, t, h, 0, n]),
+                        mBOut.element_type,
+                    )
+                    mBOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
+                        cutlass.Float32(mBC[b, t, h, 1, n]),
+                        mBOut.element_type,
+                    )
+                    mCOut[b, h, t, 2 * n] = safe_cast_to_dtype(
+                        cutlass.Float32(mBC[b, t, h, 2, n]),
+                        mCOut.element_type,
+                    )
+                    mCOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
+                        cutlass.Float32(mBC[b, t, h, 3, n]),
+                        mCOut.element_type,
+                    )
 
     @cute.kernel
     def coeff_kernel(
         self,
         mParams: cute.Tensor,
         mDtBias: cute.Tensor,
-        mGammaBias: cute.Tensor,
-        mOmegaBias: cute.Tensor,
+        mZetaBias: cute.Tensor,
+        mOmegaModBias: cute.Tensor,
+        mOmegaNaturalBias: cute.Tensor,
         mMixRBias: cute.Tensor,
+        mOmegaSign: cute.Tensor,
         mMOut: cute.Tensor,
         mKOut: cute.Tensor,
         mCoeffAux: cute.Tensor,
@@ -290,20 +202,31 @@ class ScanPrepFwdFused:
             b = bt // t_size_
             t = bt - b * t_size_
 
-            dt_raw = sParams[warp, 0, lane] + cutlass.Float32(mDtBias[h])
-            gamma_raw = sParams[warp, 1, lane] + cutlass.Float32(mGammaBias[h])
-            omega_raw = sParams[warp, 2, lane] + cutlass.Float32(mOmegaBias[h])
-            r_raw = sParams[warp, 3, lane]
-            mix_r_raw = sParams[warp, 4, lane] + cutlass.Float32(mMixRBias[h])
+            zeta_raw = sParams[warp, 0, lane] + cutlass.Float32(mZetaBias[h])
+            omega_mod_raw = sParams[warp, 1, lane] + cutlass.Float32(mOmegaModBias[h])
+            r_raw = sParams[warp, 2, lane]
+            mix_r_raw = sParams[warp, 3, lane] + cutlass.Float32(mMixRBias[h])
 
-            dt_u = sigmoid(dt_raw)
-            gamma = softplus(gamma_raw)
-            gamma_sigmoid = sigmoid(gamma_raw)
-            omega = omega_raw
+            dt_u = sigmoid(cutlass.Float32(mDtBias[h]))
+            dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
+            zeta = cutlass.Float32(self.zeta_max) * sigmoid(zeta_raw)
+            omega_tanh = cute_math.tanh(omega_mod_raw)
+            omega_scale = cute_math.exp(
+                cutlass.Float32(self.omega_mod_scale) * omega_tanh
+            )
+            omega_natural = cutlass.Float32(self.omega_min) + softplus(
+                cutlass.Float32(mOmegaNaturalBias[h])
+            )
+            omega_drive = omega_natural * omega_scale
+            gamma = zeta * omega_drive
+            under = cutlass.max(
+                cutlass.Float32(self.eps),
+                cutlass.Float32(1.0) - zeta * zeta,
+            )
+            omega = cutlass.Float32(mOmegaSign[h]) * omega_drive * cute_math.sqrt(under)
             r_direct_u = sigmoid(r_raw)
             mix_r = sigmoid(mix_r_raw)
 
-            dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
             exp_term = cute_math.exp(-(gamma * dt))
             r_struct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * exp_term
@@ -312,7 +235,6 @@ class ScanPrepFwdFused:
             r_direct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * r_direct_u
             )
-
             r = lerp(r_direct, r_struct, mix_r)
 
             rho_re = r * cute_math.cos(theta)
@@ -382,13 +304,13 @@ class ScanPrepFwdFused:
             mKOut[b, h, t, 1, 1] = k_curr_im
 
             if cutlass.const_expr(self.store_coeff_aux):
-                mCoeffAux[b, h, COEFF_AUX_DT_U, t] = dt_u
-                mCoeffAux[b, h, COEFF_AUX_GAMMA_SIGMOID, t] = gamma_sigmoid
+                mCoeffAux[b, h, COEFF_AUX_ZETA, t] = zeta
+                mCoeffAux[b, h, COEFF_AUX_OMEGA_TANH, t] = omega_tanh
+                mCoeffAux[b, h, COEFF_AUX_OMEGA_DRIVE, t] = omega_drive
                 mCoeffAux[b, h, COEFF_AUX_OMEGA, t] = omega
                 mCoeffAux[b, h, COEFF_AUX_R_DIRECT_U, t] = r_direct_u
                 mCoeffAux[b, h, COEFF_AUX_MIX_R, t] = mix_r
                 mCoeffAux[b, h, COEFF_AUX_DT, t] = dt
-                mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
                 mCoeffAux[b, h, COEFF_AUX_EXP_TERM, t] = exp_term
                 mCoeffAux[b, h, COEFF_AUX_DELTA_R, t] = r_struct - r_direct
                 mCoeffAux[b, h, COEFF_AUX_R, t] = r
@@ -406,19 +328,18 @@ class ScanPrepFwdFused:
         self,
         value: cute.Tensor,
         bc: cute.Tensor,
-        b_scale: cute.Tensor,
-        c_scale: cute.Tensor,
         params: cute.Tensor,
         dt_bias: cute.Tensor,
-        gamma_bias: cute.Tensor,
-        omega_bias: cute.Tensor,
+        zeta_bias: cute.Tensor,
+        omega_mod_bias: cute.Tensor,
+        omega_natural_bias: cute.Tensor,
         mix_r_bias: cute.Tensor,
+        omega_sign: cute.Tensor,
         u: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
         m: cute.Tensor,
         k: cute.Tensor,
-        rms_inv: cute.Tensor,
         coeff_aux: cute.Tensor,
     ):
         batch = cute.size(value, mode=[0])
@@ -456,26 +377,25 @@ class ScanPrepFwdFused:
                 ),
             ),
         )
-        coeff_smem_bytes = int(self._coeff_shared_storage().size_in_bytes())
+        coeff_smem_bytes = self.coeff_smem_bytes
 
         self.pack_kernel(
             mValue,
             bc,
-            b_scale,
-            c_scale,
             u,
             b,
             c,
-            rms_inv,
             total_rows,
             rows_per_batch,
         ).launch(grid=(pack_grid_size, 1, 1), block=(self.pack_block_size, 1, 1))
         self.coeff_kernel(
             mParams,
             dt_bias,
-            gamma_bias,
-            omega_bias,
+            zeta_bias,
+            omega_mod_bias,
+            omega_natural_bias,
             mix_r_bias,
+            omega_sign,
             m,
             k,
             coeff_aux,
