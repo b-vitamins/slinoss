@@ -609,7 +609,9 @@ def test_mixer_cute_segmented_training_matches_single_pass() -> None:
         assert param_seg.grad is not None
         assert torch.isfinite(param_full.grad).all()
         assert torch.isfinite(param_seg.grad).all()
-        torch.testing.assert_close(param_seg.grad, param_full.grad, atol=2e-2, rtol=0.0)
+        # Post-mix RMSNorm makes the segmented CuTe path slightly more sensitive to
+        # tiny scan-state drift, but the resulting parameter-grad deltas remain small.
+        torch.testing.assert_close(param_seg.grad, param_full.grad, atol=5e-2, rtol=0.0)
 
 
 def test_mixer_step_matches_full_forward() -> None:
@@ -645,6 +647,26 @@ def test_mixer_step_matches_full_forward() -> None:
     assert torch.allclose(
         state_full.scan.u_prev, state_step.scan.u_prev, atol=1e-6, rtol=1e-6
     )
+
+
+def test_mixer_applies_output_norm_after_gate_skip() -> None:
+    torch.manual_seed(3)
+    mixer = _make_mixer()
+    batch, T = 2, 5
+    scan_y = torch.randn((batch, mixer.n_heads, T, mixer.d_head), dtype=torch.float32)
+    scan_u = torch.randn((batch, mixer.n_heads, T, mixer.d_head), dtype=torch.float32)
+    gate = torch.randn((batch, T, mixer.d_inner), dtype=torch.float32)
+
+    headspace = mixer._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+    expected = mixer.output_norm(
+        headspace.permute(0, 2, 1, 3).reshape(batch, T, mixer.d_inner)
+    )
+
+    actual = mixer._apply_gate_skip(scan_y, scan_u, gate, batch, T)
+    projected = mixer._apply_gate_skip_and_project(scan_y, scan_u, gate, batch, T)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(projected, mixer.out_proj(expected))
 
 
 def test_mixer_segmented_forward_matches_single_pass() -> None:

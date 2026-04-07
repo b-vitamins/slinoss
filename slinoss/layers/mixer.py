@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import cast
 
 import torch
@@ -369,6 +368,7 @@ class SLinOSSMixer(nn.Module):
         self.skip = nn.Parameter(
             torch.ones((self.d_inner,), device=device, dtype=torch.float32)
         )
+        self.output_norm = nn.RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
 
         self.reset_parameters()
 
@@ -736,7 +736,7 @@ class SLinOSSMixer(nn.Module):
         T: int,
     ) -> torch.Tensor:
         y = self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
-        return y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner)
+        return self.output_norm(y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner))
 
     def _project_headspace(self, y: torch.Tensor) -> torch.Tensor:
         weight = self.out_proj.weight.view(self.d_model, self.n_heads, self.d_head)
@@ -750,8 +750,9 @@ class SLinOSSMixer(nn.Module):
         batch: int,
         T: int,
     ) -> torch.Tensor:
-        return self._project_headspace(
-            self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+        y = self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+        return self.out_proj(
+            self.output_norm(y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner))
         )
 
     def _reshape_bc(self, bc: torch.Tensor, batch: int, T: int) -> torch.Tensor:
@@ -986,19 +987,16 @@ class SLinOSSMixer(nn.Module):
         )
         gated: torch.Tensor | None = None
         fused_out: torch.Tensor | None = None
-        use_fused_outproj = (
-            isinstance(
-                self.decode_backend, (AutoMixerDecodeBackend, CuteMixerDecodeBackend)
-            )
-            and batch == 1
-            and os.getenv("SLINOSS_MIXER_DECODE_FUSE_OUTPROJ", "0") == "1"
-            and self._supports_cute_decode(
-                batch_size=batch,
-                device=x.device,
-                dtype=x.dtype,
-            )
-            and self.out_proj.bias is None
+        use_cute_decode = isinstance(
+            self.decode_backend, (AutoMixerDecodeBackend, CuteMixerDecodeBackend)
+        ) and self._supports_cute_decode(
+            batch_size=batch,
+            device=x.device,
+            dtype=x.dtype,
         )
+        # The fused decode out-projection would bypass output_norm and diverge from
+        # full-forward semantics. Keep it disabled until the kernel can absorb the norm.
+        use_fused_outproj = False
         if use_fused_outproj:
             projected_fp32 = torch.empty(
                 (batch, self.d_model), device=x.device, dtype=torch.float32
@@ -1040,6 +1038,9 @@ class SLinOSSMixer(nn.Module):
             return fused_out
         if gated is None:
             raise RuntimeError("CuTe decode path did not produce gated output.")
+        if use_cute_decode:
+            gated = self.output_norm(gated)
+        assert gated is not None
         return decode_linear(gated, self.out_proj)
 
     def step_cuda_fast(
