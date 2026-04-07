@@ -652,6 +652,20 @@ def test_scanprep_real_dtype_cast_preserves_complex_bc_base() -> None:
     torch.testing.assert_close(prep.bc_complex_base, before)
 
 
+def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
+    torch.manual_seed(0)
+    prep = SLinOSSScanPrep(n_heads=2, d_state=3, d_head=4)
+    bc = torch.randn((2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state))
+
+    B_pairs, C_pairs = prep._parameterize_scan_bc_pairs(bc)
+    bc_rows = prep._parameterize_scan_bc_rows(bc)
+
+    torch.testing.assert_close(bc_rows[..., 0, :], B_pairs[..., 0])
+    torch.testing.assert_close(bc_rows[..., 1, :], B_pairs[..., 1])
+    torch.testing.assert_close(bc_rows[..., 2, :], C_pairs[..., 0])
+    torch.testing.assert_close(bc_rows[..., 3, :], C_pairs[..., 1])
+
+
 def test_cute_scanprep_backend_requires_cuda() -> None:
     prep = SLinOSSScanPrep(
         n_heads=2,

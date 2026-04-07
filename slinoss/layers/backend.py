@@ -20,7 +20,7 @@ class ScanPrepInputs:
     Shapes:
     - ``value``: ``(batch, T, heads * P)``
     - ``params``: ``(batch, T, heads * param_dim)``
-    - ``bc``: ``(batch, T, heads, 4, N)``
+    - ``bc``: ``(batch, T, heads, 2, N)``
     """
 
     value: torch.Tensor
@@ -53,7 +53,7 @@ class MixerDecodeInputs:
     Shapes:
     - ``value``: ``(batch, heads, P)`` post-conv/post-activation value token
     - ``params``: ``(batch, heads, param_dim)`` flat scanprep parameter token
-    - ``bc``: ``(batch, heads, 4, N)`` raw mixer-emitted BC token
+    - ``bc``: ``(batch, heads, 2, N)`` raw mixer-emitted BC token
     - ``gate``: ``(batch, heads, P)`` token-local gating vector
     - ``skip``: ``(heads, P)`` per-head skip vector
     """

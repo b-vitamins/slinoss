@@ -314,18 +314,44 @@ class SLinOSSScanPrep(nn.Module):
                 f"(batch, T, heads, {self.bc_param_rows}, d_state). "
                 f"Got {tuple(bc.shape)}."
             )
-        amp = F.softplus(bc.to(torch.float32))
-        complex_rows = amp.to(torch.complex64) * self.bc_complex_base.view(
-            1, 1, self.n_heads, 2, self.d_state
+        B_pairs, C_pairs = self._parameterize_scan_bc_pairs(bc)
+        return torch.stack(
+            (
+                B_pairs[..., 0],
+                B_pairs[..., 1],
+                C_pairs[..., 0],
+                C_pairs[..., 1],
+            ),
+            dim=3,
         )
-        bc_ri = torch.view_as_real(complex_rows).permute(0, 1, 2, 3, 5, 4).contiguous()
-        return bc_ri.reshape(
-            bc.shape[0],
-            bc.shape[1],
+
+    def _parameterize_scan_bc_pairs(
+        self,
+        bc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if bc.ndim != 5 or bc.shape[2:] != (
             self.n_heads,
-            4,
+            self.bc_param_rows,
             self.d_state,
-        ).to(dtype=bc.dtype)
+        ):
+            raise ValueError(
+                "bc must be "
+                f"(batch, T, heads, {self.bc_param_rows}, d_state). "
+                f"Got {tuple(bc.shape)}."
+            )
+
+        work_dtype = bc.dtype if bc.dtype == torch.float32 else torch.float32
+        amp = F.softplus(bc.to(work_dtype)).to(dtype=bc.dtype)
+        base_ri = torch.view_as_real(self.bc_complex_base).to(
+            device=bc.device,
+            dtype=bc.dtype,
+        )
+
+        b_amp = amp[..., 0, :].unsqueeze(-1)
+        c_amp = amp[..., 1, :].unsqueeze(-1)
+        B_pairs = b_amp * base_ri[:, 0, :, :].view(1, 1, self.n_heads, self.d_state, 2)
+        C_pairs = c_amp * base_ri[:, 1, :, :].view(1, 1, self.n_heads, self.d_state, 2)
+        return B_pairs.contiguous(), C_pairs.contiguous()
 
     def _pack_scan_u(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         if value.ndim != 3 or value.shape[-1] != self.d_inner:
@@ -340,19 +366,22 @@ class SLinOSSScanPrep(nn.Module):
 
     def _pack_scan_bc(
         self,
-        bc: torch.Tensor,
+        B_pairs: torch.Tensor,
+        C_pairs: torch.Tensor,
         batch: int,
         T: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if bc.ndim != 5 or bc.shape[2:] != (self.n_heads, 4, self.d_state):
-            raise ValueError(
-                f"bc must be (batch, T, heads, 4, d_state). Got {tuple(bc.shape)}."
-            )
-        packed = bc.permute(0, 2, 1, 4, 3).reshape(
-            batch, self.n_heads, T, self.d_state, 4
+        expected = (batch, T, self.n_heads, self.d_state, 2)
+        if tuple(map(int, B_pairs.shape)) != expected:
+            raise ValueError(f"B_pairs must be {expected}. Got {tuple(B_pairs.shape)}.")
+        if tuple(map(int, C_pairs.shape)) != expected:
+            raise ValueError(f"C_pairs must be {expected}. Got {tuple(C_pairs.shape)}.")
+        B = B_pairs.permute(0, 2, 1, 3, 4).reshape(
+            batch, self.n_heads, T, 2 * self.d_state
         )
-        B = packed[..., :2].reshape(batch, self.n_heads, T, 2 * self.d_state)
-        C = packed[..., 2:].reshape(batch, self.n_heads, T, 2 * self.d_state)
+        C = C_pairs.permute(0, 2, 1, 3, 4).reshape(
+            batch, self.n_heads, T, 2 * self.d_state
+        )
         return B, C
 
     def _scan_coeffs_from_flat_params(
@@ -371,8 +400,8 @@ class SLinOSSScanPrep(nn.Module):
     def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs:
         batch, T, _ = map(int, inputs.value.shape)
         U = self._pack_scan_u(inputs.value, batch, T)
-        bc_rows = self._parameterize_scan_bc_rows(inputs.bc)
-        B, C = self._pack_scan_bc(bc_rows, batch, T)
+        B_pairs, C_pairs = self._parameterize_scan_bc_pairs(inputs.bc)
+        B, C = self._pack_scan_bc(B_pairs, C_pairs, batch, T)
         M, K = self._scan_coeffs_from_flat_params(inputs.params, batch, T)
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
