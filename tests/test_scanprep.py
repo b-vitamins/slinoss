@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any, cast
 
 import cutlass.cute as cute
@@ -636,6 +637,19 @@ def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     assert bool((out.r >= prep.r_min).all())
     assert bool((out.r <= prep.r_max).all())
     assert torch.allclose(radius, out.r, atol=1e-6, rtol=1e-6)
+
+
+def test_scanprep_real_dtype_cast_preserves_complex_bc_base() -> None:
+    prep = SLinOSSScanPrep(n_heads=2, d_state=3, d_head=4)
+    before = prep.bc_complex_base.detach().clone()
+
+    with warnings.catch_warnings(record=True) as caught:
+        prep = prep.to(dtype=torch.float16)
+
+    assert caught == []
+    assert prep.bc_complex_base.is_complex()
+    assert prep.bc_complex_base.dtype == torch.complex64
+    torch.testing.assert_close(prep.bc_complex_base, before)
 
 
 def test_cute_scanprep_backend_requires_cuda() -> None:

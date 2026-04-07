@@ -34,7 +34,9 @@ def configure_optim(
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    use_fused = any(p.is_cuda for p in decay) or any(p.is_cuda for p in no_decay)
+    use_fused = (
+        any(p.is_cuda for p in decay) or any(p.is_cuda for p in no_decay)
+    ) and not any(torch.is_complex(p) for p in model.parameters())
     return torch.optim.AdamW(
         groups,
         lr=lr,

@@ -150,6 +150,26 @@ class SLinOSSScanPrep(nn.Module):
         )
         self.reset_parameters()
 
+    def _apply(self, fn):  # type: ignore[override]
+        bc_complex_base = self._parameters.pop("bc_complex_base", None)
+        super()._apply(fn)
+        if bc_complex_base is None:
+            return self
+
+        probe = fn(torch.empty((), device=bc_complex_base.device, dtype=torch.float32))
+        restored = nn.Parameter(
+            bc_complex_base.detach().to(
+                device=probe.device, dtype=bc_complex_base.dtype
+            ),
+            requires_grad=bc_complex_base.requires_grad,
+        )
+        if bc_complex_base.grad is not None:
+            restored.grad = bc_complex_base.grad.detach().to(
+                device=probe.device, dtype=bc_complex_base.dtype
+            )
+        self._parameters["bc_complex_base"] = restored
+        return self
+
     def reset_parameters(self) -> None:
         dt_lo = max(self.dt_min, self.dt_init_floor)
         dt_hi = self.dt_max
