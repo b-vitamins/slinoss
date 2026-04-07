@@ -121,6 +121,8 @@ def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
     assert spy.last_inputs.K.shape == (2, 4, 5, 2, 2)
     assert spy.last_inputs.B.shape == (2, 4, 5, 6)
     assert spy.last_inputs.C.shape == (2, 4, 5, 6)
+    assert spy.last_inputs.B.is_contiguous()
+    assert spy.last_inputs.C.is_contiguous()
     assert state.conv.shape == (2, 24, 2)
     assert state.scan.state.shape == (2, 4, 6, 6)
     assert state.scan.b_prev.shape == (2, 4, 6)

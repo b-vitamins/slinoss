@@ -376,11 +376,15 @@ class SLinOSSScanPrep(nn.Module):
             raise ValueError(f"B_pairs must be {expected}. Got {tuple(B_pairs.shape)}.")
         if tuple(map(int, C_pairs.shape)) != expected:
             raise ValueError(f"C_pairs must be {expected}. Got {tuple(C_pairs.shape)}.")
-        B = B_pairs.permute(0, 2, 1, 3, 4).reshape(
-            batch, self.n_heads, T, 2 * self.d_state
+        B = (
+            B_pairs.permute(0, 2, 1, 3, 4)
+            .reshape(batch, self.n_heads, T, 2 * self.d_state)
+            .contiguous()
         )
-        C = C_pairs.permute(0, 2, 1, 3, 4).reshape(
-            batch, self.n_heads, T, 2 * self.d_state
+        C = (
+            C_pairs.permute(0, 2, 1, 3, 4)
+            .reshape(batch, self.n_heads, T, 2 * self.d_state)
+            .contiguous()
         )
         return B, C
 

@@ -666,6 +666,24 @@ def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
     torch.testing.assert_close(bc_rows[..., 3, :], C_pairs[..., 1])
 
 
+def test_scanprep_reference_pack_produces_contiguous_bc() -> None:
+    torch.manual_seed(0)
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=ReferenceScanPrepBackend(),
+    )
+    value = torch.randn((2, 5, prep.d_inner), dtype=torch.float32)
+    params = torch.randn((2, 5, prep.n_heads * prep.param_dim), dtype=torch.float32)
+    bc = torch.randn((2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state))
+
+    out = prep(value, params, bc)
+
+    assert out.B.is_contiguous()
+    assert out.C.is_contiguous()
+
+
 def test_cute_scanprep_backend_requires_cuda() -> None:
     prep = SLinOSSScanPrep(
         n_heads=2,
