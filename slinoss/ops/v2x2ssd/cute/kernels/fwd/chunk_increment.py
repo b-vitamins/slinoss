@@ -950,59 +950,30 @@ class ChunkIncrementFwdAmpere:
         cute.arch.sync_threads()
 
         if cutlass.const_expr(self.scan_threads > 32):
-            if warp_idx == cutlass.Int32(0):
-                warp_lane = lane_idx
-                has_scan_warp = warp_lane < scan_warp_count
+            # Per the Hopper diagnosis for the LM calibration crash, the
+            # inter-warp shuffle-based exclusive scan in this block can trigger
+            # the H100 illegal-address fault surface. A single-lane
+            # shared-memory scan preserves the same suffix algebra while
+            # sidestepping that Hopper-specific failure mode.
+            if warp_idx == cutlass.Int32(0) and lane_idx == cutlass.Int32(0):
+                running_transition_re = cutlass.Float32(1.0)
+                running_transition_im = cutlass.Float32(0.0)
+                for w in cutlass.range_constexpr(self.scan_threads // 32):
+                    s_warp_transition_offset[w, 0] = running_transition_re
+                    s_warp_transition_offset[w, 1] = running_transition_im
 
-                warp_transition_re = cutlass.select_(
-                    has_scan_warp,
-                    s_warp_transition_total[warp_lane, 0],
-                    cutlass.Float32(1.0),
-                )
-                warp_transition_im = cutlass.select_(
-                    has_scan_warp,
-                    s_warp_transition_total[warp_lane, 1],
-                    cutlass.Float32(0.0),
-                )
-
-                for offset in (1, 2, 4, 8, 16):
-                    prior_re = cute.arch.shuffle_sync_up(
-                        warp_transition_re, offset=offset, mask=-1, mask_and_clamp=0
+                    total_transition_re = s_warp_transition_total[w, 0]
+                    total_transition_im = s_warp_transition_total[w, 1]
+                    next_running_transition_re = (
+                        running_transition_re * total_transition_re
+                        - running_transition_im * total_transition_im
                     )
-                    prior_im = cute.arch.shuffle_sync_up(
-                        warp_transition_im, offset=offset, mask=-1, mask_and_clamp=0
+                    next_running_transition_im = (
+                        running_transition_re * total_transition_im
+                        + running_transition_im * total_transition_re
                     )
-                    should_update = lane_idx >= cutlass.Int32(offset)
-                    next_re = (
-                        prior_re * warp_transition_re - prior_im * warp_transition_im
-                    )
-                    next_im = (
-                        prior_re * warp_transition_im + prior_im * warp_transition_re
-                    )
-                    warp_transition_re = cutlass.select_(
-                        should_update, next_re, warp_transition_re
-                    )
-                    warp_transition_im = cutlass.select_(
-                        should_update, next_im, warp_transition_im
-                    )
-
-                warp_offset_re = cute.arch.shuffle_sync_up(
-                    warp_transition_re, offset=1, mask=-1, mask_and_clamp=0
-                )
-                warp_offset_im = cute.arch.shuffle_sync_up(
-                    warp_transition_im, offset=1, mask=-1, mask_and_clamp=0
-                )
-                is_first_lane = lane_idx == cutlass.Int32(0)
-                warp_offset_re = cutlass.select_(
-                    is_first_lane, cutlass.Float32(1.0), warp_offset_re
-                )
-                warp_offset_im = cutlass.select_(
-                    is_first_lane, cutlass.Float32(0.0), warp_offset_im
-                )
-
-                if has_scan_warp:
-                    s_warp_transition_offset[warp_lane, 0] = warp_offset_re
-                    s_warp_transition_offset[warp_lane, 1] = warp_offset_im
+                    running_transition_re = next_running_transition_re
+                    running_transition_im = next_running_transition_im
 
             cute.arch.sync_threads()
 
