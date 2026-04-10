@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--d-model", type=int, default=96)
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--d-state", type=int, default=16)
-    p.add_argument("--expand", type=int, default=2)
+    p.add_argument("--expand", type=float, default=2.0)
     p.add_argument("--d-head", type=int, default=32)
     p.add_argument("--d-conv", type=int, default=4)
     p.add_argument("--chunk-size", type=int, default=32)
@@ -197,11 +197,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.chunk_size <= args.block_size,
         f"chunk_size={args.chunk_size} must be <= block_size={args.block_size}.",
     )
-    _require(
-        (args.expand * args.d_model) % args.d_head == 0,
-        "expand * d_model must be divisible by d_head.",
-    )
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")

@@ -45,7 +45,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=default_cfg.d_model)
     parser.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
     parser.add_argument("--d-state", type=int, default=default_cfg.d_state)
-    parser.add_argument("--expand", type=int, default=default_cfg.expand)
+    parser.add_argument("--expand", type=float, default=default_cfg.expand)
     parser.add_argument("--d-head", type=int, default=default_cfg.d_head)
     parser.add_argument("--d-conv", type=int, default=default_cfg.d_conv)
     parser.add_argument("--chunk-size", type=int, default=default_cfg.chunk_size)

@@ -123,10 +123,9 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             scan_state = None
 
         gated = call_region(
-            "mixer.gate_skip",
-            self._apply_gate_skip_headspace,
+            "mixer.gate",
+            self._apply_gate_headspace,
             scan_y,
-            scan_inputs.U,
             gate,
             batch,
             T,
@@ -148,7 +147,7 @@ class ProfiledNextCharBlock(nn.Module):
         d_model: int,
         *,
         d_state: int,
-        expand: int,
+        expand: float,
         d_head: int,
         d_conv: int,
         chunk_size: int,
@@ -188,7 +187,7 @@ class ProfiledNextCharLM(nn.Module):
         d_model: int,
         n_layers: int,
         d_state: int,
-        expand: int,
+        expand: float,
         d_head: int,
         d_conv: int,
         chunk_size: int,

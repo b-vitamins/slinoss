@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from typing import cast
 
 import torch
 
@@ -29,7 +30,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-state", type=int, default=64)
-    parser.add_argument("--expand", type=int, default=2)
+    parser.add_argument("--expand", type=float, default=2.0)
     parser.add_argument("--d-head", type=int, default=64)
     parser.add_argument("--d-conv", type=int, default=4)
     parser.add_argument("--chunk-size", type=int, default=32)
@@ -74,12 +75,16 @@ def _run_case(args: argparse.Namespace, *, batch_size: int) -> dict[str, object]
         iterations=args.iterations,
         repeat=args.repeat,
     )
+    mean_ms = cast(float, stats["mean_ms"])
+    min_ms = cast(float, stats["min_ms"])
+    max_ms = cast(float, stats["max_ms"])
+    samples_ms = cast(list[float], stats["samples_ms"])
     return {
         "batch_size": batch_size,
-        "mean_us": float(stats["mean_ms"]) * 1000.0,
-        "min_us": float(stats["min_ms"]) * 1000.0,
-        "max_us": float(stats["max_ms"]) * 1000.0,
-        "samples_us": [float(sample) * 1000.0 for sample in stats["samples_ms"]],
+        "mean_us": mean_ms * 1000.0,
+        "min_us": min_ms * 1000.0,
+        "max_us": max_ms * 1000.0,
+        "samples_us": [sample * 1000.0 for sample in samples_ms],
     }
 
 

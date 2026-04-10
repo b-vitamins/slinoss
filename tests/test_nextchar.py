@@ -33,7 +33,7 @@ def test_nextchar_defaults_match_reference_run() -> None:
     assert args.d_model == 96
     assert args.n_layers == 2
     assert args.d_state == 16
-    assert args.expand == 2
+    assert args.expand == 2.0
     assert args.d_head == 32
     assert args.d_conv == 4
     assert args.chunk_size == 32
@@ -52,6 +52,27 @@ def test_nextchar_model_forward_shape() -> None:
         d_state=8,
         expand=2,
         d_head=16,
+        d_conv=4,
+        chunk_size=8,
+    )
+    idx = torch.randint(0, 32, (2, 16), dtype=torch.long)
+
+    logits = model(idx)
+
+    assert logits.shape == (2, 16, 32)
+    assert torch.isfinite(logits).all()
+
+
+def test_nextchar_model_supports_fractional_expand() -> None:
+    mod = _load_example_module()
+    model = mod.NextCharLM(
+        vocab_size=32,
+        block_size=16,
+        d_model=128,
+        n_layers=2,
+        d_state=16,
+        expand=1.5,
+        d_head=32,
         d_conv=4,
         chunk_size=8,
     )

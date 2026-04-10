@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from _nextchar_model import NextCharLM, configure_optim
 from _profiled_nextchar_model import ProfiledNextCharLM
 from slinoss.layers import SLinOSSMixer
+from slinoss.layers.mixer import _quantize_inner_dim
 from slinoss.layers.backend import (
     AutoCConv1dBackend,
     AutoMixerDecodeBackend,
@@ -41,7 +42,7 @@ class NextCharPerfConfig:
     d_model: int = 736
     n_layers: int = 3
     d_state: int = 128
-    expand: int = 2
+    expand: float = 2.0
     d_head: int = 64
     d_conv: int = 4
     chunk_size: int = 32
@@ -58,7 +59,8 @@ class NextCharPerfConfig:
 
     @property
     def n_heads(self) -> int:
-        return (self.expand * self.d_model) // self.d_head
+        d_inner = _quantize_inner_dim(self.expand * self.d_model, self.d_head)
+        return d_inner // self.d_head
 
     @property
     def perf_config_dict(self) -> dict[str, Any]:
@@ -246,8 +248,7 @@ class _NextCharCudaGraphTrainer:
             self.optimizer.zero_grad(set_to_none=False)
             for _ in range(3):
                 self.optimizer.zero_grad(set_to_none=False)
-                logits, loss = self._run_body()
-            del logits, loss
+                self._run_body()
         torch.cuda.current_stream(device=self.device).wait_stream(stream)
         self.optimizer.zero_grad(set_to_none=False)
         with torch.cuda.graph(self.graph):
