@@ -143,7 +143,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     out["forward.mixer.scanprep.pack_bc"] = sample.get(
         "forward.mixer.scanprep.pack_bc", 0.0
     )
-    out["forward.mixer.gate_skip"] = sample.get("forward.mixer.gate_skip", 0.0)
+    out["forward.mixer.gate"] = sample.get("forward.mixer.gate", 0.0)
     out["forward.mixer.out_proj"] = sample.get("forward.mixer.out_proj", 0.0)
     out["forward.mixer.total"] = (
         out["forward.mixer.in_proj"]
@@ -151,7 +151,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         + out["forward.mixer.dw_conv_activation"]
         + out["forward.mixer.bc_emit"]
         + out["forward.mixer.scanprep.total"]
-        + out["forward.mixer.gate_skip"]
+        + out["forward.mixer.gate"]
         + out["forward.mixer.out_proj"]
     )
     out["backward.mixer.in_proj"] = sample.get("backward.mixer.in_proj", 0.0)
@@ -173,7 +173,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     out["backward.mixer.scanprep.pack_bc"] = sample.get(
         "backward.mixer.scanprep.pack_bc", 0.0
     )
-    out["backward.mixer.gate_skip"] = sample.get("backward.mixer.gate_skip", 0.0)
+    out["backward.mixer.gate"] = sample.get("backward.mixer.gate", 0.0)
     out["backward.mixer.out_proj"] = sample.get("backward.mixer.out_proj", 0.0)
     out["backward.mixer.total"] = (
         out["backward.mixer.in_proj"]
@@ -181,7 +181,7 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         + out["backward.mixer.dw_conv_activation"]
         + out["backward.mixer.bc_emit"]
         + out["backward.mixer.scanprep.total"]
-        + out["backward.mixer.gate_skip"]
+        + out["backward.mixer.gate"]
         + out["backward.mixer.out_proj"]
     )
 

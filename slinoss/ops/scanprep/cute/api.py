@@ -7,6 +7,20 @@ import torch
 from slinoss.layers.backend import ScanInputs
 
 
+def _match_scan_io_dtype(
+    U: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Enforce the v2x2ssd contract that U/B/C share dtype."""
+    target_dtype = U.dtype
+    if B.dtype != target_dtype:
+        B = B.to(dtype=target_dtype)
+    if C.dtype != target_dtype:
+        C = C.to(dtype=target_dtype)
+    return B, C
+
+
 def scanprep_cute(
     value: torch.Tensor,
     params: torch.Tensor,
@@ -17,17 +31,18 @@ def scanprep_cute(
     d_head: int,
     dt_min: float,
     dt_max: float,
-    omega_min: float,
-    zeta_max: float,
+    theta_init_min: float,
+    theta_init_max: float,
+    gamma_min: float,
+    gamma_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    zeta_bias: torch.Tensor,
-    omega_mod_bias: torch.Tensor,
-    omega_natural_bias: torch.Tensor,
-    mix_r_bias: torch.Tensor,
-    omega_sign: torch.Tensor,
+    gamma_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
+    theta_bias: torch.Tensor,
+    theta_sign: torch.Tensor,
 ) -> ScanInputs:
     """CuTe scanprep contract for stateless mixer execution."""
     if (
@@ -42,7 +57,7 @@ def scanprep_cute(
         )
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
-            "Expected value=(B,T,H*P), params=(B,T,H*4), bc=(B,T,H,4,N). "
+            "Expected value=(B,T,H*P), params=(B,T,H*2), bc=(B,T,H,4,N). "
             f"Got {tuple(value.shape)}, {tuple(params.shape)}, {tuple(bc.shape)}."
         )
     supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
@@ -62,10 +77,9 @@ def scanprep_cute(
             params,
             bc,
             dt_bias,
-            zeta_bias,
-            omega_mod_bias,
-            omega_natural_bias,
-            mix_r_bias,
+            gamma_bias,
+            theta_mod_bias,
+            theta_bias,
         )
     )
     if needs_autograd:
@@ -80,18 +94,20 @@ def scanprep_cute(
             d_head=d_head,
             dt_min=dt_min,
             dt_max=dt_max,
-            omega_min=omega_min,
-            zeta_max=zeta_max,
+            theta_init_min=theta_init_min,
+            theta_init_max=theta_init_max,
+            gamma_min=gamma_min,
+            gamma_max=gamma_max,
             r_min=r_min,
             r_max=r_max,
             eps=eps,
             dt_bias=dt_bias,
-            zeta_bias=zeta_bias,
-            omega_mod_bias=omega_mod_bias,
-            omega_natural_bias=omega_natural_bias,
-            mix_r_bias=mix_r_bias,
-            omega_sign=omega_sign,
+            gamma_bias=gamma_bias,
+            theta_mod_bias=theta_mod_bias,
+            theta_bias=theta_bias,
+            theta_sign=theta_sign,
         )
+        B, C = _match_scan_io_dtype(U, B, C)
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
     from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute
@@ -105,18 +121,20 @@ def scanprep_cute(
         d_head=d_head,
         dt_min=dt_min,
         dt_max=dt_max,
-        omega_min=omega_min,
-        zeta_max=zeta_max,
+        theta_init_min=theta_init_min,
+        theta_init_max=theta_init_max,
+        gamma_min=gamma_min,
+        gamma_max=gamma_max,
         r_min=r_min,
         r_max=r_max,
         eps=eps,
         dt_bias=dt_bias,
-        zeta_bias=zeta_bias,
-        omega_mod_bias=omega_mod_bias,
-        omega_natural_bias=omega_natural_bias,
-        mix_r_bias=mix_r_bias,
-        omega_sign=omega_sign,
+        gamma_bias=gamma_bias,
+        theta_mod_bias=theta_mod_bias,
+        theta_bias=theta_bias,
+        theta_sign=theta_sign,
     )
+    B, C = _match_scan_io_dtype(U, B, C)
     return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
 

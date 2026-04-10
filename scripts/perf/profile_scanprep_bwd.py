@@ -104,17 +104,18 @@ def main() -> int:
             d_head=p_size,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
-            omega_min=prep.omega_min,
-            zeta_max=prep.zeta_max,
+            theta_init_min=prep.theta_init_min,
+            theta_init_max=prep.theta_init_max,
+            gamma_min=prep.gamma_min,
+            gamma_max=prep.gamma_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
-            zeta_bias=prep.zeta_bias.detach(),
-            omega_mod_bias=prep.omega_mod_bias.detach(),
-            omega_natural_bias=prep.omega_natural_bias.detach(),
-            mix_r_bias=prep.mix_r_bias.detach(),
-            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+            gamma_bias=prep.gamma_bias.detach(),
+            theta_mod_bias=prep.theta_mod_bias.detach(),
+            theta_bias=prep.theta_bias.detach(),
+            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
         )
 
     value_grad = torch.empty(
@@ -126,7 +127,7 @@ def main() -> int:
     dparams = torch.empty(
         (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
     )
-    bias_grad = torch.zeros((heads, 5), device=device, dtype=torch.float32)
+    bias_grad = torch.zeros((heads, 4), device=device, dtype=torch.float32)
 
     compiled = cute.compile(
         ScanPrepBwdFused(
@@ -136,8 +137,10 @@ def main() -> int:
             param_dim=prep.param_dim,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
-            omega_min=prep.omega_min,
-            zeta_max=prep.zeta_max,
+            theta_init_min=prep.theta_init_min,
+            theta_init_max=prep.theta_init_max,
+            gamma_min=prep.gamma_min,
+            gamma_max=prep.gamma_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
@@ -152,8 +155,8 @@ def main() -> int:
         make_fake_tensor_arg(dM),
         make_fake_tensor_arg(dK),
         make_fake_tensor_arg(prep.dt_bias.detach()),
-        make_fake_tensor_arg(prep.omega_natural_bias.detach()),
-        make_fake_tensor_arg(cast(torch.Tensor, prep.omega_sign).detach()),
+        make_fake_tensor_arg(prep.theta_bias.detach()),
+        make_fake_tensor_arg(cast(torch.Tensor, prep.theta_sign).detach()),
         make_fake_tensor_arg(value_grad),
         make_fake_tensor_arg(bc_grad),
         make_fake_tensor_arg(dparams),
@@ -174,8 +177,8 @@ def main() -> int:
             dM,
             dK,
             prep.dt_bias.detach(),
-            prep.omega_natural_bias.detach(),
-            cast(torch.Tensor, prep.omega_sign).detach(),
+            prep.theta_bias.detach(),
+            cast(torch.Tensor, prep.theta_sign).detach(),
             value_grad,
             bc_grad,
             dparams,

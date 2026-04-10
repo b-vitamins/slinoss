@@ -72,6 +72,16 @@ def _to_dtype_if_needed(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return x.to(dtype=dtype)
 
 
+def _quantize_inner_dim(raw_d_inner: float, d_head: int) -> int:
+    """Round a desired inner width to the nearest valid multiple of ``d_head``."""
+
+    if raw_d_inner <= 0.0:
+        raise ValueError(f"raw_d_inner must be positive. Got {raw_d_inner}.")
+    units = raw_d_inner / float(d_head)
+    quantized_units = max(1, int(math.floor(units + 0.5)))
+    return int(quantized_units * d_head)
+
+
 class _SplitMixerProjectionFn(torch.autograd.Function):
     @staticmethod
     def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -279,7 +289,7 @@ class SLinOSSMixer(nn.Module):
         d_model: int,
         *,
         d_state: int = 128,
-        expand: int = 2,
+        expand: float = 2,
         d_head: int = 64,
         d_conv: int = 4,
         chunk_size: int = 64,
@@ -288,12 +298,13 @@ class SLinOSSMixer(nn.Module):
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-3,
-        omega_min: float = 0.1,
-        zeta_max: float = 0.7,
+        gamma_min: float = 2.0,
+        gamma_max: float = 8.0,
         theta_init_min: float = 0.2,
         theta_init_max: float = 1.0,
         r_min: float = 0.9,
         r_max: float = 0.9999,
+        bc_gain_max: float = 2.0,
         eps: float = 1e-8,
         backend: ScanBackend | None = None,
         decode_backend: MixerDecodeBackend | None = None,
@@ -310,12 +321,12 @@ class SLinOSSMixer(nn.Module):
 
         self.d_model = int(d_model)
         self.d_state = int(d_state)
-        self.expand = int(expand)
+        self.expand = float(expand)
         self.d_head = int(d_head)
         self.d_conv = int(d_conv)
         self.chunk_size = int(chunk_size)
 
-        self.d_inner = int(self.expand * self.d_model)
+        self.d_inner = _quantize_inner_dim(self.expand * self.d_model, self.d_head)
         _require(
             self.d_inner % self.d_head == 0,
             f"expand * d_model = {self.d_inner} must be divisible by d_head = {self.d_head}.",
@@ -331,12 +342,13 @@ class SLinOSSMixer(nn.Module):
             dt_min=dt_min,
             dt_max=dt_max,
             dt_init_floor=dt_init_floor,
-            omega_min=omega_min,
-            zeta_max=zeta_max,
+            gamma_min=gamma_min,
+            gamma_max=gamma_max,
             theta_init_min=theta_init_min,
             theta_init_max=theta_init_max,
             r_min=r_min,
             r_max=r_max,
+            bc_gain_max=bc_gain_max,
             eps=eps,
             device=device,
         )
@@ -363,18 +375,11 @@ class SLinOSSMixer(nn.Module):
         self.out_proj = nn.Linear(
             self.d_inner, self.d_model, bias=False, **factory_kwargs
         )
-
-        # The manuscript writes D ⊙ U_t, so the skip lives at the scan-channel level.
-        self.skip = nn.Parameter(
-            torch.ones((self.d_inner,), device=device, dtype=torch.float32)
-        )
         self.output_norm = nn.RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        with torch.no_grad():
-            self.skip.fill_(1.0)
         nn.init.kaiming_uniform_(
             self.dw_weight.view(self.d_inner, 1, self.d_conv), a=math.sqrt(5.0)
         )
@@ -693,13 +698,7 @@ class SLinOSSMixer(nn.Module):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        out = self._apply_gate_skip_and_project(
-            scan_y,
-            scan_inputs.U,
-            gate,
-            batch,
-            T,
-        )
+        out = self._apply_gate_and_project(scan_y, gate, batch, T)
 
         if not return_state:
             return out
@@ -709,48 +708,43 @@ class SLinOSSMixer(nn.Module):
         )
         return out, next_state
 
-    def _apply_gate_skip_headspace(
+    def _apply_gate_headspace(
         self,
         scan_y: torch.Tensor,
-        scan_u: torch.Tensor,
         gate: torch.Tensor,
         batch: int,
         T: int,
     ) -> torch.Tensor:
-        skip = self.skip.view(1, self.n_heads, 1, self.d_head)
         y_fp32 = scan_y.to(torch.float32)
-        u_fp32 = scan_u.to(torch.float32)
         gate_fp32 = F.silu(gate.to(torch.float32)).view(
             batch, T, self.n_heads, self.d_head
         )
         gate_fp32 = gate_fp32.permute(0, 2, 1, 3)
-        mixed = (y_fp32 + u_fp32 * skip.to(torch.float32)) * gate_fp32
+        mixed = y_fp32 * gate_fp32
         return mixed.to(dtype=scan_y.dtype)
 
-    def _apply_gate_skip(
+    def _apply_gate(
         self,
         scan_y: torch.Tensor,
-        scan_u: torch.Tensor,
         gate: torch.Tensor,
         batch: int,
         T: int,
     ) -> torch.Tensor:
-        y = self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+        y = self._apply_gate_headspace(scan_y, gate, batch, T)
         return self.output_norm(y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner))
 
     def _project_headspace(self, y: torch.Tensor) -> torch.Tensor:
         weight = self.out_proj.weight.view(self.d_model, self.n_heads, self.d_head)
         return torch.einsum("bhtp,dhp->btd", y, weight)
 
-    def _apply_gate_skip_and_project(
+    def _apply_gate_and_project(
         self,
         scan_y: torch.Tensor,
-        scan_u: torch.Tensor,
         gate: torch.Tensor,
         batch: int,
         T: int,
     ) -> torch.Tensor:
-        y = self._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+        y = self._apply_gate_headspace(scan_y, gate, batch, T)
         return self.out_proj(
             self.output_norm(y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner))
         )
@@ -909,7 +903,7 @@ class SLinOSSMixer(nn.Module):
             compute_dtype=compute_dtype,
             output_dtype=value.dtype,
         )
-        gated = self._apply_gate_skip(scan_y, scan_inputs.U, gate, batch, 1)[:, 0, :]
+        gated = self._apply_gate(scan_y, gate, batch, 1)[:, 0, :]
         next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
         return gated.contiguous(), next_state
 
@@ -928,23 +922,23 @@ class SLinOSSMixer(nn.Module):
             inputs.params,
             self.scanprep._parameterize_scan_bc_rows(inputs.bc.unsqueeze(1))[:, 0, ...],
             inputs.gate,
-            inputs.skip,
             initial_states=state.state,
             B_prev=state.b_prev,
             U_prev=state.u_prev,
             dt_min=self.scanprep.dt_min,
             dt_max=self.scanprep.dt_max,
-            omega_min=self.scanprep.omega_min,
-            zeta_max=self.scanprep.zeta_max,
+            theta_init_min=self.scanprep.theta_init_min,
+            theta_init_max=self.scanprep.theta_init_max,
+            gamma_min=self.scanprep.gamma_min,
+            gamma_max=self.scanprep.gamma_max,
             r_min=self.scanprep.r_min,
             r_max=self.scanprep.r_max,
             eps=self.scanprep.eps,
             dt_bias=self.scanprep.dt_bias,
-            zeta_bias=self.scanprep.zeta_bias,
-            omega_mod_bias=self.scanprep.omega_mod_bias,
-            omega_natural_bias=self.scanprep.omega_natural_bias,
-            mix_r_bias=self.scanprep.mix_r_bias,
-            omega_sign=cast(torch.Tensor, self.scanprep.omega_sign),
+            gamma_bias=self.scanprep.gamma_bias,
+            theta_mod_bias=self.scanprep.theta_mod_bias,
+            theta_bias=self.scanprep.theta_bias,
+            theta_sign=cast(torch.Tensor, self.scanprep.theta_sign),
             output_dtype=inputs.value.dtype,
             final_state_out=state.state,
             b_last_out=state.b_prev,
@@ -983,7 +977,6 @@ class SLinOSSMixer(nn.Module):
                 self.d_state,
             ).contiguous(),
             gate=gate.view(batch, self.n_heads, self.d_head).contiguous(),
-            skip=self.skip.view(self.n_heads, self.d_head),
         )
         gated: torch.Tensor | None = None
         fused_out: torch.Tensor | None = None

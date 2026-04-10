@@ -53,17 +53,18 @@ def _decode_scanprep_kwargs(
     return {
         "dt_min": scanprep.dt_min,
         "dt_max": scanprep.dt_max,
-        "omega_min": scanprep.omega_min,
-        "zeta_max": scanprep.zeta_max,
+        "theta_init_min": scanprep.theta_init_min,
+        "theta_init_max": scanprep.theta_init_max,
+        "gamma_min": scanprep.gamma_min,
+        "gamma_max": scanprep.gamma_max,
         "r_min": scanprep.r_min,
         "r_max": scanprep.r_max,
         "eps": scanprep.eps,
         "dt_bias": _maybe_detach(scanprep.dt_bias),
-        "zeta_bias": _maybe_detach(scanprep.zeta_bias),
-        "omega_mod_bias": _maybe_detach(scanprep.omega_mod_bias),
-        "omega_natural_bias": _maybe_detach(scanprep.omega_natural_bias),
-        "mix_r_bias": _maybe_detach(scanprep.mix_r_bias),
-        "omega_sign": _maybe_detach(cast(torch.Tensor, scanprep.omega_sign)),
+        "gamma_bias": _maybe_detach(scanprep.gamma_bias),
+        "theta_mod_bias": _maybe_detach(scanprep.theta_mod_bias),
+        "theta_bias": _maybe_detach(scanprep.theta_bias),
+        "theta_sign": _maybe_detach(cast(torch.Tensor, scanprep.theta_sign)),
     }
 
 
@@ -73,7 +74,6 @@ def _make_decode_step_fixture(
     batch: int = 2,
 ) -> tuple[
     SLinOSSMixer,
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -115,7 +115,6 @@ def _make_decode_step_fixture(
         :, 0, ...
     ].contiguous()
     gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
-    skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
     initial_states = torch.randn(
         (batch, mixer.n_heads, mixer.d_head, 128),
         device="cuda",
@@ -137,7 +136,6 @@ def _make_decode_step_fixture(
         params_h,
         bc_h,
         gate_h,
-        skip,
         initial_states,
         b_prev,
         u_prev,
@@ -453,7 +451,6 @@ def test_mixer_decode_step_cute_rejects_cold_cache_during_capture(
         params_h,
         bc_h,
         gate_h,
-        skip,
         initial_states,
         b_prev,
         u_prev,
@@ -477,7 +474,6 @@ def test_mixer_decode_step_cute_rejects_cold_cache_during_capture(
                 params_h,
                 bc_h,
                 gate_h,
-                skip,
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
@@ -504,7 +500,6 @@ def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
         params_h,
         bc_h,
         gate_h,
-        skip,
         initial_states,
         b_prev,
         u_prev,
@@ -517,7 +512,6 @@ def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
@@ -541,7 +535,6 @@ def test_mixer_decode_step_cute_cached_path_stays_capture_safe(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
@@ -565,7 +558,6 @@ def test_mixer_decode_step_cute_compile_enables_tvm_ffi(
         params_h,
         bc_h,
         gate_h,
-        skip,
         initial_states,
         b_prev,
         u_prev,
@@ -587,7 +579,6 @@ def test_mixer_decode_step_cute_compile_enables_tvm_ffi(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
@@ -625,7 +616,6 @@ def test_mixer_decode_step_cute_reuses_compiled_executor_across_batch_shapes(
                 params_h,
                 bc_h,
                 gate_h,
-                skip,
                 initial_states,
                 b_prev,
                 u_prev,
@@ -635,7 +625,6 @@ def test_mixer_decode_step_cute_reuses_compiled_executor_across_batch_shapes(
                 params_h,
                 bc_h,
                 gate_h,
-                skip,
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
@@ -900,7 +889,6 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
             :, 0, ...
         ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
-        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
@@ -923,7 +911,6 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
@@ -935,7 +922,6 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=_make_noncontiguous_clone(b_prev),
             U_prev=_make_noncontiguous_clone(u_prev),
@@ -992,7 +978,6 @@ def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
             :, 0, ...
         ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
-        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
@@ -1016,7 +1001,6 @@ def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
                 params_h,
                 bc_h,
                 gate_h,
-                skip,
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
@@ -1066,7 +1050,6 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
             :, 0, ...
         ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
-        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
@@ -1089,7 +1072,6 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
@@ -1105,7 +1087,6 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=initial_states,
             B_prev=b_prev,
             U_prev=u_prev,
@@ -1168,7 +1149,6 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
             :, 0, ...
         ].contiguous()
         gate_h = gate.view(batch, mixer.n_heads, mixer.d_head).contiguous()
-        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
             device="cuda",
@@ -1194,7 +1174,6 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
                 params_h,
                 bc_h,
                 gate_h,
-                skip,
                 initial_states=initial_states,
                 B_prev=b_prev,
                 U_prev=u_prev,
@@ -1249,7 +1228,6 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             :, 0, ...
         ].contiguous()
         gate_h = gate.view(x.shape[0], mixer.n_heads, mixer.d_head).contiguous()
-        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
 
         state_ref = state.scan.state.clone()
         b_prev_ref = state.scan.b_prev.clone()
@@ -1259,7 +1237,6 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=state_ref,
             B_prev=b_prev_ref,
             U_prev=u_prev_ref,
@@ -1275,7 +1252,6 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             params_h,
             bc_h,
             gate_h,
-            skip,
             initial_states=state_alias,
             B_prev=b_prev_alias,
             U_prev=u_prev_alias,

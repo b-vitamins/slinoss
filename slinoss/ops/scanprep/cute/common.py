@@ -17,27 +17,23 @@ BFLOAT16_FINITE_MAX = 3.3895313892515355e38
 FLOAT32_FINITE_MAX = 3.4028234663852886e38
 COMPLEX_DIV_DENOM_FLOOR = 1.0e-30
 
-SCANPREP_PARAM_DIM = 4
+SCANPREP_PARAM_DIM = 2
 
-COEFF_AUX_ZETA = 0
-COEFF_AUX_OMEGA_TANH = 1
-COEFF_AUX_OMEGA_DRIVE = 2
-COEFF_AUX_OMEGA = 3
-COEFF_AUX_R_DIRECT_U = 4
-COEFF_AUX_MIX_R = 5
-COEFF_AUX_DT = 6
-COEFF_AUX_EXP_TERM = 7
-COEFF_AUX_DELTA_R = 8
-COEFF_AUX_R = 9
-COEFF_AUX_THETA = 10
-COEFF_AUX_RHO_RE = 11
-COEFF_AUX_RHO_IM = 12
-COEFF_AUX_LOG_R = 13
-COEFF_AUX_KAPPA1_RE = 14
-COEFF_AUX_KAPPA1_IM = 15
-COEFF_AUX_KAPPA2_RE = 16
-COEFF_AUX_KAPPA2_IM = 17
-COEFF_AUX_FIELDS = 18
+COEFF_AUX_GAMMA = 0
+COEFF_AUX_THETA_TANH = 1
+COEFF_AUX_THETA_DRIVE = 2
+COEFF_AUX_DT = 3
+COEFF_AUX_EXP_TERM = 4
+COEFF_AUX_R = 5
+COEFF_AUX_THETA = 6
+COEFF_AUX_RHO_RE = 7
+COEFF_AUX_RHO_IM = 8
+COEFF_AUX_LOG_R = 9
+COEFF_AUX_KAPPA1_RE = 10
+COEFF_AUX_KAPPA1_IM = 11
+COEFF_AUX_KAPPA2_RE = 12
+COEFF_AUX_KAPPA2_IM = 13
+COEFF_AUX_FIELDS = 14
 
 
 def make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -128,13 +124,6 @@ def softplus(x):
     )
 
 
-def lerp(a, b, w):
-    a_f = cutlass.Float32(a)
-    b_f = cutlass.Float32(b)
-    w_f = cutlass.Float32(w)
-    return cutlass.Float32(a_f + w_f * (b_f - a_f))
-
-
 def principal_angle(theta):
     theta_f = cutlass.Float32(theta)
     sin_theta = cutlass.Float32(cute_math.sin(theta_f))
@@ -204,7 +193,6 @@ def real_mul_conj(a_re, a_im, b_re, b_im):
 
 __all__ = [
     "SCANPREP_PARAM_DIM",
-    "COEFF_AUX_DELTA_R",
     "COEFF_AUX_DT",
     "COEFF_AUX_EXP_TERM",
     "COEFF_AUX_FIELDS",
@@ -213,21 +201,17 @@ __all__ = [
     "COEFF_AUX_KAPPA2_IM",
     "COEFF_AUX_KAPPA2_RE",
     "COEFF_AUX_LOG_R",
-    "COEFF_AUX_MIX_R",
-    "COEFF_AUX_OMEGA",
-    "COEFF_AUX_OMEGA_DRIVE",
-    "COEFF_AUX_OMEGA_TANH",
     "COEFF_AUX_R",
     "COEFF_AUX_RHO_IM",
     "COEFF_AUX_RHO_RE",
-    "COEFF_AUX_R_DIRECT_U",
     "COEFF_AUX_THETA",
-    "COEFF_AUX_ZETA",
+    "COEFF_AUX_THETA_DRIVE",
+    "COEFF_AUX_THETA_TANH",
+    "COEFF_AUX_GAMMA",
     "assumed_align",
     "complex_div",
     "complex_mul",
     "complex_mul_conj",
-    "lerp",
     "make_fake_tensor_arg",
     "make_row_major_stride",
     "principal_angle",

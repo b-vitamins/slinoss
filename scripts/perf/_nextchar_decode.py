@@ -331,7 +331,7 @@ def estimate_lower_bound(
         flops_simt += batch_size * n_heads * (40.0 * d_state)  # scanprep scalar work
         flops_simt += (
             batch_size * n_heads * d_head * (24.0 * d_state + 8.0)
-        )  # recurrent update + gate/skip
+        )  # recurrent update + gate
         flops_simt += 4.0 * batch_size * d_model  # residual adds
         flops_simt += 8.0 * batch_size * hidden  # GELU
 

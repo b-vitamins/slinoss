@@ -6,7 +6,6 @@ import math
 from dataclasses import dataclass
 
 import torch
-from torch.nn import functional as F
 
 
 def principal_angle(theta: torch.Tensor) -> torch.Tensor:
@@ -100,17 +99,18 @@ def scanprep_scan_coeffs_from_flat_params(
     param_dim: int,
     dt_min: float,
     dt_max: float,
-    omega_min: float,
-    zeta_max: float,
+    theta_init_min: float,
+    theta_init_max: float,
+    gamma_min: float,
+    gamma_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    zeta_bias: torch.Tensor,
-    omega_mod_bias: torch.Tensor,
-    omega_natural_bias: torch.Tensor,
-    mix_r_bias: torch.Tensor,
-    omega_sign: torch.Tensor,
+    gamma_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
+    theta_bias: torch.Tensor,
+    theta_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference ``(M, K)`` generation from flat ``(B, T, H * param_dim)`` params."""
     if params.ndim != 3 or params.shape[-1] != n_heads * param_dim:
@@ -120,38 +120,30 @@ def scanprep_scan_coeffs_from_flat_params(
 
     p = params.view(params.shape[0], params.shape[1], n_heads, param_dim)
     p = p.permute(0, 2, 1, 3).to(torch.float32)
-    zero = torch.zeros_like(zeta_bias)
     bias = torch.stack(
         (
-            zeta_bias,
-            omega_mod_bias,
-            zero,
-            mix_r_bias,
+            gamma_bias,
+            theta_mod_bias,
         ),
         dim=-1,
     )
     p = p + bias.view(1, n_heads, 1, param_dim)
 
-    zeta_raw = p[..., 0]
-    omega_mod_raw = p[..., 1]
-    r_direct_u = torch.sigmoid(p[..., 2])
-    mix_r = torch.sigmoid(p[..., 3])
+    gamma_raw = p[..., 0]
+    theta_mod_raw = p[..., 1]
 
     dt = (
         dt_min + (dt_max - dt_min) * torch.sigmoid(dt_bias).view(1, n_heads, 1)
-    ).expand_as(zeta_raw)
-    omega_natural = omega_min + F.softplus(omega_natural_bias).view(1, n_heads, 1)
-    omega_scale = torch.exp(0.25 * torch.tanh(omega_mod_raw))
-    omega_drive = omega_natural * omega_scale
-    zeta = zeta_max * torch.sigmoid(zeta_raw)
-    gamma = zeta * omega_drive
-    under = (1.0 - zeta.square()).clamp_min(float(eps))
-    omega = omega_sign.view(1, n_heads, 1) * omega_drive * torch.sqrt(under)
-    r_struct = r_min + (r_max - r_min) * torch.exp(-gamma * dt)
-    theta = principal_angle(omega * dt)
-    r_direct = r_min + (r_max - r_min) * r_direct_u
-
-    r = torch.lerp(r_direct, r_struct, mix_r)
+    ).expand_as(gamma_raw)
+    theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
+    theta_u = torch.sigmoid(
+        theta_bias.view(1, n_heads, 1) + 0.25 * torch.tanh(theta_mod_raw)
+    )
+    theta_drive = theta_init_min + theta_span * theta_u
+    gamma = gamma_min + (gamma_max - gamma_min) * torch.sigmoid(gamma_raw)
+    theta = principal_angle(theta_sign.view(1, n_heads, 1) * theta_drive)
+    r_struct = r_min + (r_max - r_min) * torch.exp(-(gamma * dt))
+    r = r_struct
     log_r_f = torch.log(r)
     rho = torch.polar(r, theta)
     k_prev, k_curr = _foh_taps_from_normalized(dt, log_r_f, theta, rho, eps=eps)

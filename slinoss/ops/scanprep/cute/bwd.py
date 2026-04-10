@@ -43,16 +43,17 @@ def scanprep_bwd(
     params_dtype: torch.dtype,
     dt_min: float,
     dt_max: float,
-    omega_min: float,
-    zeta_max: float,
+    theta_init_min: float,
+    theta_init_max: float,
+    gamma_min: float,
+    gamma_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    omega_natural_bias: torch.Tensor,
-    omega_sign: torch.Tensor,
+    theta_bias: torch.Tensor,
+    theta_sign: torch.Tensor,
 ) -> tuple[
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -120,7 +121,7 @@ def scanprep_bwd(
         device=bc.device,
         dtype=params_dtype,
     )
-    bias_grad = torch.zeros((n_heads, 5), device=bc.device, dtype=torch.float32)
+    bias_grad = torch.zeros((n_heads, 4), device=bc.device, dtype=torch.float32)
 
     bc_c = bc if bc.is_contiguous() else bc.contiguous()
     coeff_aux_c = coeff_aux if coeff_aux.is_contiguous() else coeff_aux.contiguous()
@@ -131,8 +132,8 @@ def scanprep_bwd(
     dc_align = assumed_align(dc_in)
     coeff_aux_align = assumed_align(coeff_aux_c)
     dt_bias_align = assumed_align(dt_bias)
-    omega_natural_bias_align = assumed_align(omega_natural_bias)
-    omega_sign_align = assumed_align(omega_sign)
+    theta_bias_align = assumed_align(theta_bias)
+    theta_sign_align = assumed_align(theta_sign)
     dm_align = assumed_align(dm_in)
     dk_align = assumed_align(dk_in)
     value_grad_align = assumed_align(value_grad)
@@ -152,8 +153,8 @@ def scanprep_bwd(
         dk_in.dtype,
         coeff_aux_c.dtype,
         dt_bias.dtype,
-        omega_natural_bias.dtype,
-        omega_sign.dtype,
+        theta_bias.dtype,
+        theta_sign.dtype,
         value_grad.dtype,
         bc_grad.dtype,
         dparams.dtype,
@@ -164,8 +165,8 @@ def scanprep_bwd(
         dc_align,
         coeff_aux_align,
         dt_bias_align,
-        omega_natural_bias_align,
-        omega_sign_align,
+        theta_bias_align,
+        theta_sign_align,
         dm_align,
         dk_align,
         value_grad_align,
@@ -174,8 +175,10 @@ def scanprep_bwd(
         bias_grad_align,
         float(dt_min),
         float(dt_max),
-        float(omega_min),
-        float(zeta_max),
+        float(theta_init_min),
+        float(theta_init_max),
+        float(gamma_min),
+        float(gamma_max),
         float(r_min),
         float(r_max),
         float(eps),
@@ -193,8 +196,10 @@ def scanprep_bwd(
                 param_dim=SCANPREP_PARAM_DIM,
                 dt_min=dt_min,
                 dt_max=dt_max,
-                omega_min=omega_min,
-                zeta_max=zeta_max,
+                theta_init_min=theta_init_min,
+                theta_init_max=theta_init_max,
+                gamma_min=gamma_min,
+                gamma_max=gamma_max,
                 r_min=r_min,
                 r_max=r_max,
                 eps=eps,
@@ -206,8 +211,8 @@ def scanprep_bwd(
             make_fake_tensor_arg(dm_in, align=dm_align),
             make_fake_tensor_arg(dk_in, align=dk_align),
             make_fake_tensor_arg(dt_bias, align=dt_bias_align),
-            make_fake_tensor_arg(omega_natural_bias, align=omega_natural_bias_align),
-            make_fake_tensor_arg(omega_sign, align=omega_sign_align),
+            make_fake_tensor_arg(theta_bias, align=theta_bias_align),
+            make_fake_tensor_arg(theta_sign, align=theta_sign_align),
             make_fake_tensor_arg(value_grad, align=value_grad_align),
             make_fake_tensor_arg(bc_grad, align=bc_grad_align),
             make_fake_tensor_arg(dparams, align=dparams_align),
@@ -226,8 +231,8 @@ def scanprep_bwd(
         dm_in,
         dk_in,
         dt_bias,
-        omega_natural_bias,
-        omega_sign,
+        theta_bias,
+        theta_sign,
         value_grad,
         bc_grad,
         dparams,
@@ -242,7 +247,6 @@ def scanprep_bwd(
         bias_grad[:, 1].contiguous(),
         bias_grad[:, 2].contiguous(),
         bias_grad[:, 3].contiguous(),
-        bias_grad[:, 4].contiguous(),
     )
 
 

@@ -107,7 +107,6 @@ def _validate_decode_inputs(
     params: torch.Tensor,
     bc: torch.Tensor,
     gate: torch.Tensor,
-    skip: torch.Tensor,
     initial_states: torch.Tensor | None,
     B_prev: torch.Tensor | None,
     U_prev: torch.Tensor | None,
@@ -128,8 +127,6 @@ def _validate_decode_inputs(
     if tuple(map(int, bc.shape[:2])) != (batch, heads):
         raise ValueError("bc leading dims must match value.")
     N = int(bc.shape[-1])
-    if tuple(map(int, skip.shape)) != (heads, P):
-        raise ValueError(f"skip must be {(heads, P)}. Got {tuple(skip.shape)}.")
     if (B_prev is None) ^ (U_prev is None):
         raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
     if initial_states is not None and tuple(map(int, initial_states.shape)) != (
@@ -176,24 +173,24 @@ def mixer_decode_step_cute(
     params: torch.Tensor,
     bc: torch.Tensor,
     gate: torch.Tensor,
-    skip: torch.Tensor,
     *,
     initial_states: torch.Tensor | None,
     B_prev: torch.Tensor | None,
     U_prev: torch.Tensor | None,
     dt_min: float,
     dt_max: float,
-    omega_min: float,
-    zeta_max: float,
+    theta_init_min: float,
+    theta_init_max: float,
+    gamma_min: float,
+    gamma_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    zeta_bias: torch.Tensor,
-    omega_mod_bias: torch.Tensor,
-    omega_natural_bias: torch.Tensor,
-    mix_r_bias: torch.Tensor,
-    omega_sign: torch.Tensor,
+    gamma_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
+    theta_bias: torch.Tensor,
+    theta_sign: torch.Tensor,
     output_dtype: torch.dtype,
     final_state_out: torch.Tensor | None = None,
     b_last_out: torch.Tensor | None = None,
@@ -206,7 +203,6 @@ def mixer_decode_step_cute(
         params,
         bc,
         gate,
-        skip,
         initial_states,
         B_prev,
         U_prev,
@@ -290,10 +286,6 @@ def mixer_decode_step_cute(
         gate if gate.is_contiguous() else gate.contiguous(),
         min_align=_DECODE_MIN_ALIGN,
     )
-    skip_c = _ensure_min_alignment(
-        skip if skip.is_contiguous() else skip.contiguous(),
-        min_align=_DECODE_MIN_ALIGN,
-    )
     state_c = (
         initial_states
         if initial_states is not None
@@ -375,16 +367,14 @@ def mixer_decode_step_cute(
     params_align = _assumed_align(params_c)
     bc_align = _assumed_align(bc_c)
     gate_align = _assumed_align(gate_c)
-    skip_align = _assumed_align(skip_c)
     state_align = _assumed_align(state_c)
     b_prev_align = _assumed_align(b_prev_c)
     u_prev_align = _assumed_align(u_prev_c)
     dt_bias_align = _assumed_align(dt_bias)
-    zeta_bias_align = _assumed_align(zeta_bias)
-    omega_mod_bias_align = _assumed_align(omega_mod_bias)
-    omega_natural_bias_align = _assumed_align(omega_natural_bias)
-    mix_r_bias_align = _assumed_align(mix_r_bias)
-    omega_sign_align = _assumed_align(omega_sign)
+    gamma_bias_align = _assumed_align(gamma_bias)
+    theta_mod_bias_align = _assumed_align(theta_mod_bias)
+    theta_bias_align = _assumed_align(theta_bias)
+    theta_sign_align = _assumed_align(theta_sign)
     y_align = _assumed_align(y)
     final_state_align = _assumed_align(final_state)
     u_last_align = _assumed_align(u_last)
@@ -429,10 +419,14 @@ def mixer_decode_step_cute(
         params_c.dtype,
         bc_c.dtype,
         gate_c.dtype,
-        skip_c.dtype,
         state_c.dtype,
         b_prev_c.dtype,
         u_prev_c.dtype,
+        dt_bias.dtype,
+        gamma_bias.dtype,
+        theta_mod_bias.dtype,
+        theta_bias.dtype,
+        theta_sign.dtype,
         y.dtype,
         final_state.dtype,
         b_last.dtype,
@@ -443,16 +437,14 @@ def mixer_decode_step_cute(
         params_align,
         bc_align,
         gate_align,
-        skip_align,
         state_align,
         b_prev_align,
         u_prev_align,
         dt_bias_align,
-        zeta_bias_align,
-        omega_mod_bias_align,
-        omega_natural_bias_align,
-        mix_r_bias_align,
-        omega_sign_align,
+        gamma_bias_align,
+        theta_mod_bias_align,
+        theta_bias_align,
+        theta_sign_align,
         y_align,
         final_state_align,
         b_last_kernel_align,
@@ -462,8 +454,10 @@ def mixer_decode_step_cute(
         bool(u_prev_c.is_contiguous()),
         float(dt_min),
         float(dt_max),
-        float(omega_min),
-        float(zeta_max),
+        float(theta_init_min),
+        float(theta_init_max),
+        float(gamma_min),
+        float(gamma_max),
         float(r_min),
         float(r_max),
         float(eps),
@@ -486,8 +480,10 @@ def mixer_decode_step_cute(
                 vec_n=vec_n,
                 dt_min=dt_min,
                 dt_max=dt_max,
-                omega_min=omega_min,
-                zeta_max=zeta_max,
+                theta_init_min=theta_init_min,
+                theta_init_max=theta_init_max,
+                gamma_min=gamma_min,
+                gamma_max=gamma_max,
                 r_min=r_min,
                 r_max=r_max,
                 eps=eps,
@@ -496,16 +492,14 @@ def mixer_decode_step_cute(
             _make_fake_tensor_arg(params_c, align=params_align),
             _make_fake_tensor_arg(bc_c, align=bc_align),
             _make_fake_tensor_arg(gate_c, align=gate_align),
-            _make_fake_tensor_arg(skip_c, align=skip_align),
             _make_fake_tensor_arg(state_c, align=state_align, dynamic_stride=True),
             _make_fake_tensor_arg(b_prev_c, align=b_prev_align, dynamic_stride=True),
             _make_fake_tensor_arg(u_prev_c, align=u_prev_align, dynamic_stride=True),
             _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
-            _make_fake_tensor_arg(zeta_bias, align=zeta_bias_align),
-            _make_fake_tensor_arg(omega_mod_bias, align=omega_mod_bias_align),
-            _make_fake_tensor_arg(omega_natural_bias, align=omega_natural_bias_align),
-            _make_fake_tensor_arg(mix_r_bias, align=mix_r_bias_align),
-            _make_fake_tensor_arg(omega_sign, align=omega_sign_align),
+            _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
+            _make_fake_tensor_arg(theta_mod_bias, align=theta_mod_bias_align),
+            _make_fake_tensor_arg(theta_bias, align=theta_bias_align),
+            _make_fake_tensor_arg(theta_sign, align=theta_sign_align),
             _make_fake_tensor_arg(y, align=y_align),
             _make_fake_tensor_arg(
                 final_state, align=final_state_align, dynamic_stride=True
@@ -525,16 +519,14 @@ def mixer_decode_step_cute(
         params_c,
         bc_c,
         gate_c,
-        skip_c,
         state_c,
         b_prev_c,
         u_prev_c,
         dt_bias,
-        zeta_bias,
-        omega_mod_bias,
-        omega_natural_bias,
-        mix_r_bias,
-        omega_sign,
+        gamma_bias,
+        theta_mod_bias,
+        theta_bias,
+        theta_sign,
         y,
         final_state,
         b_last_kernel,

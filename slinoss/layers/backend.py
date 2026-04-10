@@ -55,14 +55,12 @@ class MixerDecodeInputs:
     - ``params``: ``(batch, heads, param_dim)`` flat scanprep parameter token
     - ``bc``: ``(batch, heads, 2, N)`` raw mixer-emitted BC token
     - ``gate``: ``(batch, heads, P)`` token-local gating vector
-    - ``skip``: ``(heads, P)`` per-head skip vector
     """
 
     value: torch.Tensor
     params: torch.Tensor
     bc: torch.Tensor
     gate: torch.Tensor
-    skip: torch.Tensor
 
 
 if TYPE_CHECKING:

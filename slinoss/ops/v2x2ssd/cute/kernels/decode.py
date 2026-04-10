@@ -15,11 +15,9 @@ from slinoss.ops.scanprep.cute.common import (
     SCANPREP_PARAM_DIM,
     complex_div,
     complex_mul,
-    lerp,
     principal_angle,
     real_mul_conj,
     sigmoid,
-    softplus,
 )
 
 
@@ -28,9 +26,8 @@ class MixerDecodeStepFwd:
 
     Contract:
     - ``value`` / ``gate``: ``(B, H, P)``
-    - ``params``: ``(B, H, 4)``
+    - ``params``: ``(B, H, 2)``
     - ``bc``: ``(B, H, 4, N)``
-    - ``skip``: ``(H, P)``
     - ``state``: ``(B, H, P, 2N)``
     - ``b_prev``: ``(B, H, 2N)``
     - ``u_prev``: ``(B, H, P)``
@@ -56,8 +53,10 @@ class MixerDecodeStepFwd:
         vec_n: int,
         dt_min: float,
         dt_max: float,
-        omega_min: float,
-        zeta_max: float,
+        theta_init_min: float,
+        theta_init_max: float,
+        gamma_min: float,
+        gamma_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -116,9 +115,11 @@ class MixerDecodeStepFwd:
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
-        self.omega_min = float(omega_min)
-        self.zeta_max = float(zeta_max)
-        self.omega_mod_scale = 0.25
+        self.theta_init_min = float(theta_init_min)
+        self.theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
+        self.gamma_min = float(gamma_min)
+        self.gamma_span = float(gamma_max - gamma_min)
+        self.theta_mod_scale = 0.25
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
         self.eps = float(eps)
@@ -203,16 +204,14 @@ class MixerDecodeStepFwd:
         params: cute.Tensor,
         bc: cute.Tensor,
         gate: cute.Tensor,
-        skip: cute.Tensor,
         state: cute.Tensor,
         b_prev: cute.Tensor,
         u_prev: cute.Tensor,
         dt_bias: cute.Tensor,
-        zeta_bias: cute.Tensor,
-        omega_mod_bias: cute.Tensor,
-        omega_natural_bias: cute.Tensor,
-        mix_r_bias: cute.Tensor,
-        omega_sign: cute.Tensor,
+        gamma_bias: cute.Tensor,
+        theta_mod_bias: cute.Tensor,
+        theta_bias: cute.Tensor,
+        theta_sign: cute.Tensor,
         y: cute.Tensor,
         final_state: cute.Tensor,
         b_last: cute.Tensor,
@@ -254,10 +253,6 @@ class MixerDecodeStepFwd:
                 stride=(self.heads * self.p_size, self.p_size, 1),
             ),
         )
-        mSkip = cute.make_tensor(
-            skip.iterator,
-            cute.make_layout((self.heads, self.p_size), stride=(self.p_size, 1)),
-        )
         mState = state
         mBPrev = b_prev
         mUPrev = (
@@ -274,20 +269,17 @@ class MixerDecodeStepFwd:
         mDtBias = cute.make_tensor(
             dt_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mZetaBias = cute.make_tensor(
-            zeta_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mGammaBias = cute.make_tensor(
+            gamma_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mOmegaModBias = cute.make_tensor(
-            omega_mod_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mThetaModBias = cute.make_tensor(
+            theta_mod_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mOmegaNaturalBias = cute.make_tensor(
-            omega_natural_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mThetaBias = cute.make_tensor(
+            theta_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mMixRBias = cute.make_tensor(
-            mix_r_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
-        )
-        mOmegaSign = cute.make_tensor(
-            omega_sign.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mThetaSign = cute.make_tensor(
+            theta_sign.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mY = cute.make_tensor(
             y.iterator,
@@ -333,7 +325,6 @@ class MixerDecodeStepFwd:
 
         state_dtype = mState.element_type
         p_dtype = mValue.element_type
-        skip_dtype = mSkip.element_type
 
         gmem_tiled_copy_state = self._make_gmem_tiled_copy(
             state_dtype,
@@ -367,18 +358,6 @@ class MixerDecodeStepFwd:
             cute.make_layout(self.tile_p // copy_elems_u_prev),
             cute.make_layout(copy_elems_u_prev),
         )
-        copy_elems_skip = 1
-        copy_bits_skip = int(copy_elems_skip * skip_dtype.width)
-        copy_atom_skip = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            skip_dtype,
-            num_bits_per_copy=copy_bits_skip,
-        )
-        gmem_tiled_copy_skip = cute.make_tiled_copy_tv(
-            copy_atom_skip,
-            cute.make_layout(self.tile_p // copy_elems_skip),
-            cute.make_layout(copy_elems_skip),
-        )
 
         @cute.struct
         class SharedStorage:
@@ -396,10 +375,6 @@ class MixerDecodeStepFwd:
             ]
             sGate: cute.struct.Align[
                 cute.struct.MemRange[p_dtype, cute.cosize(p_layout)],
-                128,
-            ]
-            sSkip: cute.struct.Align[
-                cute.struct.MemRange[skip_dtype, cute.cosize(p_layout)],
                 128,
             ]
             sY: cute.struct.Align[
@@ -450,16 +425,14 @@ class MixerDecodeStepFwd:
             mParams,
             mBC,
             mGate,
-            mSkip,
             mState,
             mBPrev,
             mUPrev,
             mDtBias,
-            mZetaBias,
-            mOmegaModBias,
-            mOmegaNaturalBias,
-            mMixRBias,
-            mOmegaSign,
+            mGammaBias,
+            mThetaModBias,
+            mThetaBias,
+            mThetaSign,
             mY,
             mFinalState,
             mBLast,
@@ -471,7 +444,6 @@ class MixerDecodeStepFwd:
             gmem_tiled_copy_state,
             gmem_tiled_copy_value,
             gmem_tiled_copy_u_prev,
-            gmem_tiled_copy_skip,
         ).launch(
             grid=(self.p_tiles, self.heads, batch),
             block=(self.num_threads, 1, 1),
@@ -485,16 +457,14 @@ class MixerDecodeStepFwd:
         mParams: cute.Tensor,
         mBC: cute.Tensor,
         mGate: cute.Tensor,
-        mSkip: cute.Tensor,
         mState: cute.Tensor,
         mBPrev: cute.Tensor,
         mUPrev: cute.Tensor,
         mDtBias: cute.Tensor,
-        mZetaBias: cute.Tensor,
-        mOmegaModBias: cute.Tensor,
-        mOmegaNaturalBias: cute.Tensor,
-        mMixRBias: cute.Tensor,
-        mOmegaSign: cute.Tensor,
+        mGammaBias: cute.Tensor,
+        mThetaModBias: cute.Tensor,
+        mThetaBias: cute.Tensor,
+        mThetaSign: cute.Tensor,
         mY: cute.Tensor,
         mFinalState: cute.Tensor,
         mBLast: cute.Tensor,
@@ -506,7 +476,6 @@ class MixerDecodeStepFwd:
         gmem_tiled_copy_state: cute.TiledCopy,
         gmem_tiled_copy_value: cute.TiledCopy,
         gmem_tiled_copy_u_prev: cute.TiledCopy,
-        gmem_tiled_copy_skip: cute.TiledCopy,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
@@ -539,7 +508,6 @@ class MixerDecodeStepFwd:
         gValue = cute.local_tile(mValue[bidb, bidh, None], (self.tile_p,), (bidp,))
         gUPrev = cute.local_tile(mUPrev[bidb, bidh, None], (self.tile_p,), (bidp,))
         gGate = cute.local_tile(mGate[bidb, bidh, None], (self.tile_p,), (bidp,))
-        gSkip = cute.local_tile(mSkip[bidh, None], (self.tile_p,), (bidp,))
         gY = cute.local_tile(mY[bidb, bidh, None], (self.tile_p,), (bidp,))
         gULast = cute.local_tile(mULast[bidb, bidh, None], (self.tile_p,), (bidp,))
 
@@ -556,7 +524,6 @@ class MixerDecodeStepFwd:
         sValue = storage.sValue.get_tensor(p_layout)
         sUPrev = storage.sUPrev.get_tensor(p_layout)
         sGate = storage.sGate.get_tensor(p_layout)
-        sSkip = storage.sSkip.get_tensor(p_layout)
         sY = storage.sY.get_tensor(p_layout)
 
         b_re = storage.b_re.get_tensor(vec_layout)
@@ -580,7 +547,7 @@ class MixerDecodeStepFwd:
         if self.use_state_cp_async:
             cute.arch.cp_async_commit_group()
 
-        # Warp-specialized token-local loads (value/u_prev and gate/skip).
+        # Warp-specialized token-local loads (value/u_prev and gate).
         thr_copy_value = gmem_tiled_copy_value.get_slice(lane_idx)
         tPgValue = thr_copy_value.partition_S(gValue)
         tPsValue = thr_copy_value.partition_D(sValue)
@@ -594,7 +561,6 @@ class MixerDecodeStepFwd:
         num_loads_value = self.tile_p // load_elems_value
         load_elems_u_prev = cute.size(tPgUPrev.shape[0][0])
         num_loads_u_prev = self.tile_p // load_elems_u_prev
-        num_loads_skip = self.tile_p
 
         if warp_idx == 0:
             if lane_idx < num_loads_value:
@@ -605,16 +571,6 @@ class MixerDecodeStepFwd:
         if warp_idx == 1:
             if lane_idx < num_loads_value:
                 cute.copy(gmem_tiled_copy_value, tPgGate, tPsGate)
-            skip_passes = (
-                num_loads_skip + cute.arch.WARP_SIZE - 1
-            ) // cute.arch.WARP_SIZE
-            for skip_pass in cutlass.range_constexpr(skip_passes):
-                skip_thread = lane_idx + skip_pass * cute.arch.WARP_SIZE
-                if skip_thread < num_loads_skip:
-                    thr_copy_skip = gmem_tiled_copy_skip.get_slice(skip_thread)
-                    tPgSkip = thr_copy_skip.partition_S(gSkip)
-                    tPsSkip = thr_copy_skip.partition_D(sSkip)
-                    cute.copy(gmem_tiled_copy_skip, tPgSkip, tPsSkip)
 
         cute.arch.sync_threads()
 
@@ -629,48 +585,32 @@ class MixerDecodeStepFwd:
         tap_curr_im = cutlass.Float32(0.0)
 
         if lane_idx == 0:
-            zeta_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
-                mZetaBias[bidh]
+            gamma_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
+                mGammaBias[bidh]
             )
-            omega_mod_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
-                mOmegaModBias[bidh]
-            )
-            r_raw = cutlass.Float32(mParams[bidb, bidh, 2])
-            mix_r_raw = cutlass.Float32(mParams[bidb, bidh, 3]) + cutlass.Float32(
-                mMixRBias[bidh]
+            theta_mod_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
+                mThetaModBias[bidh]
             )
 
             dt_u = sigmoid(cutlass.Float32(mDtBias[bidh]))
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
-            zeta = cutlass.Float32(self.zeta_max) * sigmoid(zeta_raw)
-            omega_tanh = cute_math.tanh(omega_mod_raw)
-            omega_scale = cute_math.exp(
-                cutlass.Float32(self.omega_mod_scale) * omega_tanh
+            gamma = cutlass.Float32(self.gamma_min) + cutlass.Float32(
+                self.gamma_span
+            ) * sigmoid(gamma_raw)
+            theta_tanh = cute_math.tanh(theta_mod_raw)
+            theta_u = sigmoid(
+                cutlass.Float32(mThetaBias[bidh])
+                + cutlass.Float32(self.theta_mod_scale) * theta_tanh
             )
-            omega_natural = cutlass.Float32(self.omega_min) + softplus(
-                cutlass.Float32(mOmegaNaturalBias[bidh])
+            theta_drive = (
+                cutlass.Float32(self.theta_init_min)
+                + cutlass.Float32(self.theta_span) * theta_u
             )
-            omega_drive = omega_natural * omega_scale
-            gamma = zeta * omega_drive
-            under = cutlass.max(
-                cutlass.Float32(self.eps),
-                cutlass.Float32(1.0) - zeta * zeta,
-            )
-            omega = (
-                cutlass.Float32(mOmegaSign[bidh]) * omega_drive * cute_math.sqrt(under)
-            )
-            r_direct_u = sigmoid(r_raw)
-            mix_r = sigmoid(mix_r_raw)
-
+            theta = principal_angle(cutlass.Float32(mThetaSign[bidh]) * theta_drive)
             r_struct = cutlass.Float32(self.r_min) + cutlass.Float32(
                 self.r_scale
             ) * cute_math.exp(-(gamma * dt))
-            theta = principal_angle(omega * dt)
-            r_direct = (
-                cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * r_direct_u
-            )
-
-            r = lerp(r_direct, r_struct, mix_r)
+            r = r_struct
             rho_re = r * cute_math.cos(theta)
             rho_im = r * cute_math.sin(theta)
 
@@ -860,7 +800,7 @@ class MixerDecodeStepFwd:
                 u_curr = cutlass.Float32(sValue[p])
                 gate = cutlass.Float32(sGate[p])
                 silu_gate = gate * sigmoid(gate)
-                y = (acc + u_curr * cutlass.Float32(sSkip[p])) * silu_gate
+                y = acc * silu_gate
                 sY[p] = y.to(sY.element_type)
                 gY[p] = y.to(mY.element_type)
                 gULast[p] = u_curr.to(mULast.element_type)

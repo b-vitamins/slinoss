@@ -16,7 +16,7 @@ from slinoss.layers import (
     ScanPrepInputs,
     ScanState,
 )
-from slinoss.layers.mixer import _SplitMixerProjectionFn
+from slinoss.layers.mixer import _SplitMixerProjectionFn, _quantize_inner_dim
 
 
 class SpyBackend:
@@ -191,6 +191,34 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
     assert torch.allclose(
         ref_scanprep.last_inputs.bc, zero_scanprep.last_inputs.bc, atol=1e-6
     )
+
+
+def test_quantize_inner_dim_rounds_to_nearest_head_multiple() -> None:
+    assert _quantize_inner_dim(192.0, 64) == 192
+    assert _quantize_inner_dim(193.0, 64) == 192
+    assert _quantize_inner_dim(224.0, 64) == 256
+
+
+def test_mixer_supports_fractional_expand() -> None:
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=1.5,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+    )
+    x = torch.randn((2, 5, 128), dtype=torch.float32)
+
+    y = mixer(x)
+
+    assert mixer.expand == pytest.approx(1.5)
+    assert mixer.d_inner == 192
+    assert mixer.n_heads == 3
+    assert mixer.in_proj.out_features == (
+        2 * mixer.d_inner + mixer.param_proj_dim + mixer.bc_proj_dim
+    )
+    assert y.shape == (2, 5, 128)
 
 
 def test_mixer_cute_scan_matches_reference_for_issue_9_bf16_shape() -> None:
@@ -649,21 +677,20 @@ def test_mixer_step_matches_full_forward() -> None:
     )
 
 
-def test_mixer_applies_output_norm_after_gate_skip() -> None:
+def test_mixer_applies_output_norm_after_gate() -> None:
     torch.manual_seed(3)
     mixer = _make_mixer()
     batch, T = 2, 5
     scan_y = torch.randn((batch, mixer.n_heads, T, mixer.d_head), dtype=torch.float32)
-    scan_u = torch.randn((batch, mixer.n_heads, T, mixer.d_head), dtype=torch.float32)
     gate = torch.randn((batch, T, mixer.d_inner), dtype=torch.float32)
 
-    headspace = mixer._apply_gate_skip_headspace(scan_y, scan_u, gate, batch, T)
+    headspace = mixer._apply_gate_headspace(scan_y, gate, batch, T)
     expected = mixer.output_norm(
         headspace.permute(0, 2, 1, 3).reshape(batch, T, mixer.d_inner)
     )
 
-    actual = mixer._apply_gate_skip(scan_y, scan_u, gate, batch, T)
-    projected = mixer._apply_gate_skip_and_project(scan_y, scan_u, gate, batch, T)
+    actual = mixer._apply_gate(scan_y, gate, batch, T)
+    projected = mixer._apply_gate_and_project(scan_y, gate, batch, T)
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(projected, mixer.out_proj(expected))

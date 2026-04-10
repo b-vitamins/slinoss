@@ -61,17 +61,18 @@ def _scanprep_runtime_kwargs(
         "d_head": prep.d_head,
         "dt_min": prep.dt_min,
         "dt_max": prep.dt_max,
-        "omega_min": prep.omega_min,
-        "zeta_max": prep.zeta_max,
+        "theta_init_min": prep.theta_init_min,
+        "theta_init_max": prep.theta_init_max,
+        "gamma_min": prep.gamma_min,
+        "gamma_max": prep.gamma_max,
         "r_min": prep.r_min,
         "r_max": prep.r_max,
         "eps": prep.eps,
         "dt_bias": _maybe_detach(prep.dt_bias),
-        "zeta_bias": _maybe_detach(prep.zeta_bias),
-        "omega_mod_bias": _maybe_detach(prep.omega_mod_bias),
-        "omega_natural_bias": _maybe_detach(prep.omega_natural_bias),
-        "mix_r_bias": _maybe_detach(prep.mix_r_bias),
-        "omega_sign": _maybe_detach(cast(torch.Tensor, prep.omega_sign)),
+        "gamma_bias": _maybe_detach(prep.gamma_bias),
+        "theta_mod_bias": _maybe_detach(prep.theta_mod_bias),
+        "theta_bias": _maybe_detach(prep.theta_bias),
+        "theta_sign": _maybe_detach(cast(torch.Tensor, prep.theta_sign)),
     }
 
 
@@ -380,14 +381,16 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
             params_dtype=params.dtype,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
-            omega_min=prep.omega_min,
-            zeta_max=prep.zeta_max,
+            theta_init_min=prep.theta_init_min,
+            theta_init_max=prep.theta_init_max,
+            gamma_min=prep.gamma_min,
+            gamma_max=prep.gamma_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
-            omega_natural_bias=prep.omega_natural_bias.detach(),
-            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+            theta_bias=prep.theta_bias.detach(),
+            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
         )
 
     assert compile_calls == []
@@ -421,14 +424,16 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
             params_dtype=params.dtype,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
-            omega_min=prep.omega_min,
-            zeta_max=prep.zeta_max,
+            theta_init_min=prep.theta_init_min,
+            theta_init_max=prep.theta_init_max,
+            gamma_min=prep.gamma_min,
+            gamma_max=prep.gamma_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
             dt_bias=prep.dt_bias.detach(),
-            omega_natural_bias=prep.omega_natural_bias.detach(),
-            omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+            theta_bias=prep.theta_bias.detach(),
+            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
         )
 
     compile_calls: list[bool] = []
@@ -456,14 +461,16 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
         params_dtype=params.dtype,
         dt_min=prep.dt_min,
         dt_max=prep.dt_max,
-        omega_min=prep.omega_min,
-        zeta_max=prep.zeta_max,
+        theta_init_min=prep.theta_init_min,
+        theta_init_max=prep.theta_init_max,
+        gamma_min=prep.gamma_min,
+        gamma_max=prep.gamma_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
         dt_bias=prep.dt_bias.detach(),
-        omega_natural_bias=prep.omega_natural_bias.detach(),
-        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+        theta_bias=prep.theta_bias.detach(),
+        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
     )
 
     assert compile_calls == []
@@ -507,14 +514,16 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
         params_dtype=params.dtype,
         dt_min=prep.dt_min,
         dt_max=prep.dt_max,
-        omega_min=prep.omega_min,
-        zeta_max=prep.zeta_max,
+        theta_init_min=prep.theta_init_min,
+        theta_init_max=prep.theta_init_max,
+        gamma_min=prep.gamma_min,
+        gamma_max=prep.gamma_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
         dt_bias=prep.dt_bias.detach(),
-        omega_natural_bias=prep.omega_natural_bias.detach(),
-        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+        theta_bias=prep.theta_bias.detach(),
+        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
     )
 
     assert compile_options == ["--enable-tvm-ffi"]
@@ -582,14 +591,16 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
         params_dtype=params.dtype,
         dt_min=prep.dt_min,
         dt_max=prep.dt_max,
-        omega_min=prep.omega_min,
-        zeta_max=prep.zeta_max,
+        theta_init_min=prep.theta_init_min,
+        theta_init_max=prep.theta_init_max,
+        gamma_min=prep.gamma_min,
+        gamma_max=prep.gamma_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
         dt_bias=prep.dt_bias.detach(),
-        omega_natural_bias=prep.omega_natural_bias.detach(),
-        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+        theta_bias=prep.theta_bias.detach(),
+        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
     )
     scanprep_bwd(
         bc=bc_alt,
@@ -606,14 +617,16 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
         params_dtype=params_alt.dtype,
         dt_min=prep.dt_min,
         dt_max=prep.dt_max,
-        omega_min=prep.omega_min,
-        zeta_max=prep.zeta_max,
+        theta_init_min=prep.theta_init_min,
+        theta_init_max=prep.theta_init_max,
+        gamma_min=prep.gamma_min,
+        gamma_max=prep.gamma_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
         dt_bias=prep.dt_bias.detach(),
-        omega_natural_bias=prep.omega_natural_bias.detach(),
-        omega_sign=cast(torch.Tensor, prep.omega_sign).detach(),
+        theta_bias=prep.theta_bias.detach(),
+        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
     )
 
     assert compile_calls == [True]
@@ -664,6 +677,20 @@ def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
     torch.testing.assert_close(bc_rows[..., 1, :], B_pairs[..., 1])
     torch.testing.assert_close(bc_rows[..., 2, :], C_pairs[..., 0])
     torch.testing.assert_close(bc_rows[..., 3, :], C_pairs[..., 1])
+
+
+def test_scanprep_parameterized_bc_pairs_have_bounded_complex_row_gain() -> None:
+    torch.manual_seed(0)
+    prep = SLinOSSScanPrep(n_heads=2, d_state=5, d_head=4, bc_gain_max=1.25)
+    bc = torch.randn((2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state)) * 20.0
+
+    B_pairs, C_pairs = prep._parameterize_scan_bc_pairs(bc)
+
+    B_rms = B_pairs.square().sum(dim=-1, dtype=torch.float32).mean(dim=-1).sqrt()
+    C_rms = C_pairs.square().sum(dim=-1, dtype=torch.float32).mean(dim=-1).sqrt()
+
+    assert bool((B_rms <= prep.bc_gain_max + 1e-5).all())
+    assert bool((C_rms <= prep.bc_gain_max + 1e-5).all())
 
 
 def test_scanprep_reference_pack_produces_contiguous_bc() -> None:
@@ -802,6 +829,34 @@ def test_auto_scanprep_backend_uses_cute_on_cuda_training_dtypes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cute_scanprep_matches_bc_outputs_to_u_dtype(dtype: torch.dtype) -> None:
+    pytest.importorskip("cutlass")
+
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+        device="cuda",
+    ).to(dtype=dtype)
+    value = torch.randn((2, 5, 8), device="cuda", dtype=dtype)
+    params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=dtype)
+    bc = torch.randn(
+        (2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        out = prep(value, params, bc)
+
+    assert out.U.dtype == dtype
+    assert out.B.dtype == dtype
+    assert out.C.dtype == dtype
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cute_scanprep_backend_matches_reference_forward() -> None:
     torch.manual_seed(0)
     ref = SLinOSSScanPrep(
@@ -851,6 +906,7 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
         n_heads=2,
         d_state=3,
         d_head=4,
+        backend=ReferenceScanPrepBackend(),
         device="cuda",
     )
     cute_prep = SLinOSSScanPrep(
@@ -921,10 +977,9 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
 
     names = (
         "dt_bias",
-        "zeta_bias",
-        "omega_mod_bias",
-        "omega_natural_bias",
-        "mix_r_bias",
+        "gamma_bias",
+        "theta_mod_bias",
+        "theta_bias",
         "bc_complex_base",
     )
     for name in names:

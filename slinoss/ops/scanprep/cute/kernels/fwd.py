@@ -8,31 +8,25 @@ import cutlass.cute as cute
 import cutlass.cute.math as cute_math
 
 from ..common import (
-    COEFF_AUX_DELTA_R,
     COEFF_AUX_DT,
     COEFF_AUX_EXP_TERM,
+    COEFF_AUX_GAMMA,
     COEFF_AUX_KAPPA1_IM,
     COEFF_AUX_KAPPA1_RE,
     COEFF_AUX_KAPPA2_IM,
     COEFF_AUX_KAPPA2_RE,
     COEFF_AUX_LOG_R,
-    COEFF_AUX_MIX_R,
-    COEFF_AUX_OMEGA,
-    COEFF_AUX_OMEGA_DRIVE,
-    COEFF_AUX_OMEGA_TANH,
     COEFF_AUX_R,
     COEFF_AUX_RHO_IM,
     COEFF_AUX_RHO_RE,
-    COEFF_AUX_R_DIRECT_U,
     COEFF_AUX_THETA,
-    COEFF_AUX_ZETA,
+    COEFF_AUX_THETA_DRIVE,
+    COEFF_AUX_THETA_TANH,
     SCANPREP_PARAM_DIM,
     complex_div,
-    lerp,
     principal_angle,
     safe_cast_to_dtype,
     sigmoid,
-    softplus,
 )
 
 
@@ -48,8 +42,10 @@ class ScanPrepFwdFused:
         store_coeff_aux: bool,
         dt_min: float,
         dt_max: float,
-        omega_min: float,
-        zeta_max: float,
+        theta_init_min: float,
+        theta_init_max: float,
+        gamma_min: float,
+        gamma_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -79,9 +75,11 @@ class ScanPrepFwdFused:
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
-        self.omega_min = float(omega_min)
-        self.zeta_max = float(zeta_max)
-        self.omega_mod_scale = 0.25
+        self.theta_init_min = float(theta_init_min)
+        self.theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
+        self.gamma_min = float(gamma_min)
+        self.gamma_span = float(gamma_max - gamma_min)
+        self.theta_mod_scale = 0.25
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
         self.eps = float(eps)
@@ -142,11 +140,10 @@ class ScanPrepFwdFused:
         self,
         mParams: cute.Tensor,
         mDtBias: cute.Tensor,
-        mZetaBias: cute.Tensor,
-        mOmegaModBias: cute.Tensor,
-        mOmegaNaturalBias: cute.Tensor,
-        mMixRBias: cute.Tensor,
-        mOmegaSign: cute.Tensor,
+        mGammaBias: cute.Tensor,
+        mThetaModBias: cute.Tensor,
+        mThetaBias: cute.Tensor,
+        mThetaSign: cute.Tensor,
         mMOut: cute.Tensor,
         mKOut: cute.Tensor,
         mCoeffAux: cute.Tensor,
@@ -202,40 +199,30 @@ class ScanPrepFwdFused:
             b = bt // t_size_
             t = bt - b * t_size_
 
-            zeta_raw = sParams[warp, 0, lane] + cutlass.Float32(mZetaBias[h])
-            omega_mod_raw = sParams[warp, 1, lane] + cutlass.Float32(mOmegaModBias[h])
-            r_raw = sParams[warp, 2, lane]
-            mix_r_raw = sParams[warp, 3, lane] + cutlass.Float32(mMixRBias[h])
+            gamma_raw = sParams[warp, 0, lane] + cutlass.Float32(mGammaBias[h])
+            theta_mod_raw = sParams[warp, 1, lane] + cutlass.Float32(mThetaModBias[h])
 
             dt_u = sigmoid(cutlass.Float32(mDtBias[h]))
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
-            zeta = cutlass.Float32(self.zeta_max) * sigmoid(zeta_raw)
-            omega_tanh = cute_math.tanh(omega_mod_raw)
-            omega_scale = cute_math.exp(
-                cutlass.Float32(self.omega_mod_scale) * omega_tanh
+            gamma = cutlass.Float32(self.gamma_min) + cutlass.Float32(
+                self.gamma_span
+            ) * sigmoid(gamma_raw)
+            theta_tanh = cute_math.tanh(theta_mod_raw)
+            theta_u = sigmoid(
+                cutlass.Float32(mThetaBias[h])
+                + cutlass.Float32(self.theta_mod_scale) * theta_tanh
             )
-            omega_natural = cutlass.Float32(self.omega_min) + softplus(
-                cutlass.Float32(mOmegaNaturalBias[h])
+            theta_drive = (
+                cutlass.Float32(self.theta_init_min)
+                + cutlass.Float32(self.theta_span) * theta_u
             )
-            omega_drive = omega_natural * omega_scale
-            gamma = zeta * omega_drive
-            under = cutlass.max(
-                cutlass.Float32(self.eps),
-                cutlass.Float32(1.0) - zeta * zeta,
-            )
-            omega = cutlass.Float32(mOmegaSign[h]) * omega_drive * cute_math.sqrt(under)
-            r_direct_u = sigmoid(r_raw)
-            mix_r = sigmoid(mix_r_raw)
+            theta = principal_angle(cutlass.Float32(mThetaSign[h]) * theta_drive)
 
             exp_term = cute_math.exp(-(gamma * dt))
             r_struct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * exp_term
             )
-            theta = principal_angle(omega * dt)
-            r_direct = (
-                cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * r_direct_u
-            )
-            r = lerp(r_direct, r_struct, mix_r)
+            r = r_struct
 
             rho_re = r * cute_math.cos(theta)
             rho_im = r * cute_math.sin(theta)
@@ -304,15 +291,11 @@ class ScanPrepFwdFused:
             mKOut[b, h, t, 1, 1] = k_curr_im
 
             if cutlass.const_expr(self.store_coeff_aux):
-                mCoeffAux[b, h, COEFF_AUX_ZETA, t] = zeta
-                mCoeffAux[b, h, COEFF_AUX_OMEGA_TANH, t] = omega_tanh
-                mCoeffAux[b, h, COEFF_AUX_OMEGA_DRIVE, t] = omega_drive
-                mCoeffAux[b, h, COEFF_AUX_OMEGA, t] = omega
-                mCoeffAux[b, h, COEFF_AUX_R_DIRECT_U, t] = r_direct_u
-                mCoeffAux[b, h, COEFF_AUX_MIX_R, t] = mix_r
+                mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
+                mCoeffAux[b, h, COEFF_AUX_THETA_TANH, t] = theta_tanh
+                mCoeffAux[b, h, COEFF_AUX_THETA_DRIVE, t] = theta_drive
                 mCoeffAux[b, h, COEFF_AUX_DT, t] = dt
                 mCoeffAux[b, h, COEFF_AUX_EXP_TERM, t] = exp_term
-                mCoeffAux[b, h, COEFF_AUX_DELTA_R, t] = r_struct - r_direct
                 mCoeffAux[b, h, COEFF_AUX_R, t] = r
                 mCoeffAux[b, h, COEFF_AUX_THETA, t] = theta
                 mCoeffAux[b, h, COEFF_AUX_RHO_RE, t] = rho_re
@@ -330,11 +313,10 @@ class ScanPrepFwdFused:
         bc: cute.Tensor,
         params: cute.Tensor,
         dt_bias: cute.Tensor,
-        zeta_bias: cute.Tensor,
-        omega_mod_bias: cute.Tensor,
-        omega_natural_bias: cute.Tensor,
-        mix_r_bias: cute.Tensor,
-        omega_sign: cute.Tensor,
+        gamma_bias: cute.Tensor,
+        theta_mod_bias: cute.Tensor,
+        theta_bias: cute.Tensor,
+        theta_sign: cute.Tensor,
         u: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
@@ -391,11 +373,10 @@ class ScanPrepFwdFused:
         self.coeff_kernel(
             mParams,
             dt_bias,
-            zeta_bias,
-            omega_mod_bias,
-            omega_natural_bias,
-            mix_r_bias,
-            omega_sign,
+            gamma_bias,
+            theta_mod_bias,
+            theta_bias,
+            theta_sign,
             m,
             k,
             coeff_aux,
