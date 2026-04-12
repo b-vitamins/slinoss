@@ -704,6 +704,222 @@ def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
     assert recorded["kwargs"] == {"options": "--enable-tvm-ffi"}
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compile_v2x2ssd_bwd_cute_reuses_cached_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    increment, chunk_multiplier = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        increment,
+        chunk_multiplier,
+        initial_states=initial_states,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn_like(U)
+
+    compile_calls = 0
+    real_compile = v2x2ssd_bwd_mod.cute.compile
+
+    def _counting_compile(*args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(v2x2ssd_bwd_mod.cute, "compile", _counting_compile)
+    v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+    try:
+        compiled_a = v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_multiplier,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            compute_dtype=torch.float32,
+        )
+        compiled_b = v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_multiplier,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            compute_dtype=torch.float32,
+        )
+        assert compile_calls == 1
+        assert compiled_a is compiled_b
+    finally:
+        v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compile_v2x2ssd_bwd_cute_reuses_cache_for_same_padded_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    inputs_a = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=33,
+        N=8,
+        P=16,
+        device=device,
+    )
+    inputs_b = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=60,
+        N=8,
+        P=16,
+        device=device,
+    )
+
+    def _compile_case(inputs: tuple[torch.Tensor, ...]) -> object:
+        U, M, K, B, C, initial_states, B_prev, U_prev = inputs
+        increment, chunk_multiplier = chunk_increment(
+            U,
+            M,
+            K,
+            B,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            T=U.shape[2],
+            chunk_size=chunk_size,
+            compute_dtype=torch.float32,
+        )
+        chunk_starts, _ = state_passing(
+            increment,
+            chunk_multiplier,
+            initial_states=initial_states,
+            compute_dtype=torch.float32,
+        )
+        d_out = torch.randn_like(U)
+        return v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_multiplier,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            compute_dtype=torch.float32,
+        )
+
+    compile_calls = 0
+    real_compile = v2x2ssd_bwd_mod.cute.compile
+
+    def _counting_compile(*args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(v2x2ssd_bwd_mod.cute, "compile", _counting_compile)
+    v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+    try:
+        compiled_a = _compile_case(inputs_a)
+        compiled_b = _compile_case(inputs_b)
+        assert compile_calls == 1
+        assert compiled_a is compiled_b
+    finally:
+        v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compile_v2x2ssd_bwd_cute_avoids_runtime_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    increment, chunk_multiplier = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        increment,
+        chunk_multiplier,
+        initial_states=initial_states,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn_like(U)
+
+    def _unexpected_make_backward_runtime_artifacts(*args, **kwargs):
+        raise AssertionError("compile_v2x2ssd_bwd_cute should not build runtime args")
+
+    monkeypatch.setattr(
+        v2x2ssd_bwd_mod,
+        "_make_backward_runtime_artifacts",
+        _unexpected_make_backward_runtime_artifacts,
+    )
+    v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+    try:
+        compiled = v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_multiplier,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            compute_dtype=torch.float32,
+        )
+        assert compiled is not None
+    finally:
+        v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+
+
 def test_v2x2ssd_fake_tensor_arg_prefers_compact_for_row_major(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

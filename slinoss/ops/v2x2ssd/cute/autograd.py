@@ -7,7 +7,7 @@ from typing import cast
 import torch
 
 from .common import _materialize_boundary_tensor
-from slinoss.ops.v2x2ssd.cute.kernels.bwd import v2x2ssd_bwd_stateful_cute
+from slinoss.ops.v2x2ssd.cute.kernels.bwd import _v2x2ssd_bwd_cute_prevalidated
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _prepare_m_operand,
     _prepare_time_operand,
@@ -249,7 +249,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                     torch.Tensor,
                     torch.Tensor,
                 ],
-                v2x2ssd_bwd_stateful_cute(
+                _v2x2ssd_bwd_cute_prevalidated(
                     U,
                     M,
                     K,
