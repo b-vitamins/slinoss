@@ -33,25 +33,31 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
         torch.Tensor,
     ]:
         del params_flat, bc, unused_kwargs
-        batch, t_size, value_width = map(int, value.shape)
+        batch_size, t_size, value_width = map(int, value.shape)
         u = torch.empty(
-            (batch, n_heads, t_size, d_head), device=value.device, dtype=value.dtype
+            (batch_size, n_heads, t_size, d_head),
+            device=value.device,
+            dtype=value.dtype,
         )
         m = torch.empty(
-            (batch, n_heads, t_size, 2), device=value.device, dtype=torch.float32
+            (batch_size, n_heads, t_size, 2),
+            device=value.device,
+            dtype=torch.float32,
         )
         k = torch.empty(
-            (batch, n_heads, t_size, 2, 2), device=value.device, dtype=torch.float32
+            (batch_size, n_heads, t_size, 2, 2),
+            device=value.device,
+            dtype=torch.float32,
         )
         b = torch.empty(
-            (batch, n_heads, t_size, 2 * d_state),
+            (batch_size, n_heads, t_size, 2 * d_state),
             device=value.device,
             dtype=value.dtype,
         )
         c = torch.empty_like(b)
         assert value_width > 0
         coeff_aux = torch.empty(
-            (batch, n_heads, ncu_kernels.COEFF_AUX_FIELDS, t_size),
+            (batch_size, n_heads, ncu_kernels.COEFF_AUX_FIELDS, t_size),
             device=value.device,
             dtype=torch.float32,
         )

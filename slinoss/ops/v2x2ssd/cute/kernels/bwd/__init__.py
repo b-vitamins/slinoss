@@ -939,7 +939,10 @@ def _make_v2x2ssd_bwd_host_wrapper(
 
         inc_db = ChunkIncrementBwdDBAmpere(tc_dtype, chunk_size=L, D=D, P=P)
         inc_boundary = ChunkIncrementBwdBoundaryAmpere(tc_dtype, chunk_size=L, D=D, P=P)
-        inc_param = ChunkIncrementBwdParamScanAmpere(chunk_size=L, nDtiles=n_d_tiles)
+        inc_param = ChunkIncrementBwdParamScanAmpere(
+            chunk_size=L,
+            n_d_tiles=n_d_tiles,
+        )
         inc_du = ChunkIncrementBwdDUAmpere(tc_dtype, chunk_size=L, D=D, P=P)
 
         scan_db(

@@ -2,16 +2,14 @@
 
 This file implements the minimal shared surface for the staged backward split:
 
-  - ``db``: tensor-core ``dB`` workhorse plus ``dM_sum`` partial reductions
+  - ``db``: tensor-core ``dB`` workhorse plus ``DMsumPart`` partial reductions
   - ``du``: tensor-core ``dU`` workhorse
-  - ``boundary``: rank-1 boundary gradients and ``dMp0``
-  - ``param_scan``: per-chunk scan-backward for ``dM`` and ``dK``
+  - ``boundary``: rank-1 boundary gradients plus ``DMp0``
+  - ``param_scan``: per-chunk scan-backward for ``dM``, ``dKprev``, and ``dKcurr``
 
 The package-level ``__init__.py`` owns orchestration. This module should stay
 small and only hold truly shared helpers.
 """
-
-from __future__ import annotations
 
 import torch
 

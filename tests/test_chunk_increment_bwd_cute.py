@@ -59,26 +59,29 @@ def _make_inputs(
     return U, M, K, B, B_prev, U_prev
 
 
-def _public_from_chunked(x: torch.Tensor, *, T: int) -> torch.Tensor:
-    B, H, C, L, F = map(int, x.shape)
-    return x.reshape(B, H, C * L, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
-
-
-def _public_from_param_scan(x: torch.Tensor, *, T: int) -> torch.Tensor:
-    B, H, C, L, F = map(int, x.shape)
-    return x.reshape(B, H, C * L, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+def _public_from_chunked_output(x: torch.Tensor, *, time_steps: int) -> torch.Tensor:
+    batch_size, heads, n_chunks, chunk_size, feature_size = map(int, x.shape)
+    return (
+        x.reshape(batch_size, heads, n_chunks * chunk_size, feature_size)[
+            :, :, :time_steps, :
+        ]
+        .to(dtype=torch.float32)
+        .contiguous()
+    )
 
 
 def _public_dk_from_parts(
-    dKprev: torch.Tensor,
-    dKcurr: torch.Tensor,
+    d_kprev: torch.Tensor,
+    d_kcurr: torch.Tensor,
     *,
-    T: int,
+    time_steps: int,
 ) -> torch.Tensor:
-    dK = torch.stack((dKprev, dKcurr), dim=4)
-    B, H, C, L, _, F = map(int, dK.shape)
+    d_k = torch.stack((d_kprev, d_kcurr), dim=4)
+    batch_size, heads, n_chunks, chunk_size, _, feature_size = map(int, d_k.shape)
     return (
-        dK.reshape(B, H, C * L, 2, F)[:, :, :T, :, :]
+        d_k.reshape(batch_size, heads, n_chunks * chunk_size, 2, feature_size)[
+            :, :, :time_steps, :, :
+        ]
         .to(dtype=torch.float32)
         .contiguous()
     )
@@ -267,10 +270,16 @@ def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
     launch()
 
     got_compiled = (
-        _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=U.shape[2]),
-        _public_from_param_scan(dM, T=U.shape[2]),
-        _public_dk_from_parts(dKprev, dKcurr, T=U.shape[2]),
-        _public_from_chunked(_fold_chunk_boundary_carries(dB, dB_prev), T=U.shape[2]),
+        _public_from_chunked_output(
+            _fold_chunk_boundary_carries(dU, dU_prev),
+            time_steps=U.shape[2],
+        ),
+        _public_from_chunked_output(dM, time_steps=U.shape[2]),
+        _public_dk_from_parts(dKprev, dKcurr, time_steps=U.shape[2]),
+        _public_from_chunked_output(
+            _fold_chunk_boundary_carries(dB, dB_prev),
+            time_steps=U.shape[2],
+        ),
         dB_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
         dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
     )
