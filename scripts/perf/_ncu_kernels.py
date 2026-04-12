@@ -119,13 +119,6 @@ def _closure_vars(fn: Callable[..., object]) -> dict[str, object]:
     return {name: cell.cell_contents for name, cell in zip(names, cells, strict=False)}
 
 
-def _closure_var(fn: Callable[..., object], name: str) -> object:
-    vars_map = _closure_vars(fn)
-    if name not in vars_map:
-        raise RuntimeError(f"Missing closure variable '{name}' for function {fn}.")
-    return vars_map[name]
-
-
 def _seed_all(seed: int) -> None:
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
@@ -828,25 +821,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         device=cfg.torch_device,
         dtype=torch.float32,
     )
-    (
-        _compiled_dz0,
-        _compiled_du,
-        _compiled_db,
-        _compiled_dcdr,
-        _compiled_param,
-        dZ0,
-        dU,
-        dB,
-        dU_prev,
-        dB_prev,
-        dlogp,
-        dC,
-        dR,
-        dM,
-        dKprev,
-        dKcurr,
-        launch,
-    ) = compile_chunk_scan_bwd_kernels(
+    prepared = compile_chunk_scan_bwd_kernels(
         U,
         M,
         K,
@@ -858,23 +833,19 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
         B_prev=B_prev,
         U_prev=U_prev,
         compute_dtype=torch.float32,
-        return_launchers=True,
     )
-    raw_launchers = {
-        "chunk_scan_bwd_dz0": _closure_var(launch, "_launch_dz0"),
-        "chunk_scan_bwd_du": _closure_var(launch, "_launch_du"),
-        "chunk_scan_bwd_db": _closure_var(launch, "_launch_db"),
-        "chunk_scan_bwd_dcdr": _closure_var(launch, "_launch_dcdr"),
-        "chunk_scan_bwd_dlp": _closure_var(launch, "_launch_dlp"),
-        "chunk_scan_bwd_param": _closure_var(launch, "_launch_param"),
+    outputs = prepared.outputs
+    launchers: dict[str, Callable[[], None]] = {
+        "chunk_scan_bwd_dz0": cast(Callable[[], None], prepared.launchers.dz0),
+        "chunk_scan_bwd_du": cast(Callable[[], None], prepared.launchers.du),
+        "chunk_scan_bwd_db": cast(Callable[[], None], prepared.launchers.db),
+        "chunk_scan_bwd_dcdr": cast(Callable[[], None], prepared.launchers.dcdr),
+        "chunk_scan_bwd_dlp": cast(Callable[[], None], prepared.launchers.dlp),
+        "chunk_scan_bwd_param": cast(
+            Callable[[], None],
+            prepared.launchers.param_scan,
+        ),
     }
-    launchers: dict[str, Callable[[], None]] = {}
-    for key, value in raw_launchers.items():
-        if not callable(value):
-            raise RuntimeError(
-                f"Expected callable closure for {key}, got {type(value)!r}."
-            )
-        launchers[key] = cast(Callable[[], None], value)
 
     T_pad = _t_pad(cfg.T, cfg.chunk_size)
     D = B.shape[-1]
@@ -897,7 +868,10 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
     return {
         "chunk_scan_bwd_dz0": KernelRunner(
             name="chunk_scan_bwd_dz0",
-            effective_bytes=bytes_d_out + bytes_b + bytes_m + _tensor_bytes(dZ0),
+            effective_bytes=bytes_d_out
+            + bytes_b
+            + bytes_m
+            + _tensor_bytes(outputs.chunk_start_grad),
             launch=launchers["chunk_scan_bwd_dz0"],
             prepare=_noop,
         ),
@@ -909,7 +883,17 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
-            + _tensor_bytes(U_prev, B_prev, dU, dB, dU_prev, dB_prev, dlogp, dM, dM),
+            + _tensor_bytes(
+                U_prev,
+                B_prev,
+                outputs.value_grad_chunk,
+                outputs.key_grad_chunk,
+                outputs.value_boundary_grad,
+                outputs.key_boundary_grad,
+                outputs.logprefix_grad,
+                outputs.transition_grad,
+                outputs.transition_grad,
+            ),
             launch=launchers["chunk_scan_bwd_du"],
             prepare=_noop,
         ),
@@ -921,7 +905,17 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
-            + _tensor_bytes(U_prev, B_prev, dU, dB, dU_prev, dB_prev, dlogp, dM, dM),
+            + _tensor_bytes(
+                U_prev,
+                B_prev,
+                outputs.value_grad_chunk,
+                outputs.key_grad_chunk,
+                outputs.value_boundary_grad,
+                outputs.key_boundary_grad,
+                outputs.logprefix_grad,
+                outputs.transition_grad,
+                outputs.transition_grad,
+            ),
             launch=launchers["chunk_scan_bwd_db"],
             prepare=_noop,
         ),
@@ -933,7 +927,14 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
-            + _tensor_bytes(U_prev, B_prev, chunk_starts, dC, dlogp, dR)
+            + _tensor_bytes(
+                U_prev,
+                B_prev,
+                chunk_starts,
+                outputs.query_grad_chunk,
+                outputs.logprefix_grad,
+                outputs.rotation_grad,
+            )
             + bytes_dphase,
             launch=launchers["chunk_scan_bwd_dcdr"],
             prepare=_noop,
@@ -946,7 +947,7 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
-            + _tensor_bytes(U_prev, B_prev, dlogp),
+            + _tensor_bytes(U_prev, B_prev, outputs.logprefix_grad),
             launch=launchers["chunk_scan_bwd_dlp"],
             prepare=_noop,
         ),
@@ -955,7 +956,15 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             effective_bytes=bytes_m
             + bytes_k
             + bytes_dphase
-            + _tensor_bytes(dlogp, dR, dM, dM, dM, dKprev, dKcurr),
+            + _tensor_bytes(
+                outputs.logprefix_grad,
+                outputs.rotation_grad,
+                outputs.transition_grad,
+                outputs.transition_grad,
+                outputs.transition_grad,
+                outputs.tap_prev_grad,
+                outputs.tap_curr_grad,
+            ),
             launch=launchers["chunk_scan_bwd_param"],
             prepare=prepare_param,
             note="integrated stage in chunk_scan_bwd",

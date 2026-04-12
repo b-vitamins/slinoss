@@ -1,29 +1,28 @@
-"""CuTe backward ``dz0`` workhorse for the ``v2x2ssd`` chunk-scan stage.
+"""CuTe backward kernel for the ``v2x2ssd`` chunk-scan ``dZ0`` stage.
 
-This file is intentionally written in the same overall shape as the
-``v3x3ssd`` ``chunk_scan`` ``dz0`` workhorse:
+``ChunkScanBwdDZ0Ampere`` is the live Ampere tensor-core implementation used by
+the backward path to accumulate the public chunk-start state gradient ``dZ0``.
+It reconstructs prefix magnitude/phase metadata from the raw packed-complex
+transitions ``M``, scales ``dOut`` tile-by-tile, rotates ``C`` by the conjugate
+prefix phase, and runs one tensor-core GEMM that writes ``dZ0`` directly.
 
-- one monolithic stage-native kernel class
-- ``__call__`` only builds layouts, copies, MMA, shared memory, and launch
-- the kernel maps ``bidz`` to ``(bh, chunk)``
-- prefix metadata is reconstructed inside the CTA from raw stage inputs
-- ``dOut`` and ``C`` are transformed tile-by-tile in shared memory
-- one tensor-core GEMM produces public ``dZ0`` directly
+Tensor contracts:
 
-The adaptation is only in the scan algebra:
+- ``dOut``: ``(P, T, BH)`` fp16/bf16 packed row/column-major operand
+- ``C``: ``(D, T, BH)`` fp16/bf16 packed complex query-side operand
+- ``M``: ``(2, T, BH)`` fp32 packed complex transitions
+- ``dZ0``: ``(P, D, BHC)`` fp32 public chunk-start state gradient
 
-- quaternion transport becomes unit-complex transport
-- 3-vectors become interleaved complex pairs
-- ``trans`` becomes raw packed complex transitions ``M``
-- ``row_scale`` is the prefix magnitude, and the column transform is
-  ``C * conj(phase_prefix)``
+The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be even
+and conceptually corresponds to ``2 * N``.
 """
-
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import ClassVar
 
+import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -39,22 +38,42 @@ from .common import (
 
 
 @dataclass(frozen=True)
+class ChunkScanBwdDZ0SupportInfo:
+    smem_capacity_bytes: int
+    prefix_smem_bytes: int
+    operand_smem_bytes: int
+    output_smem_bytes: int
+
+    @property
+    def required_smem_bytes(self) -> int:
+        return self.prefix_smem_bytes + max(
+            self.operand_smem_bytes,
+            self.output_smem_bytes,
+        )
+
+    @property
+    def supported(self) -> bool:
+        return self.required_smem_bytes <= self.smem_capacity_bytes
+
+
+@dataclass(frozen=True)
 class ChunkScanBwdDZ0LayoutBundle:
-    a_major_mode: object
-    b_major_mode: object
+    dout_major_mode: object
     c_major_mode: object
-    sA_layout: object
-    sB_layout: object
-    sC_layout: object
+    dz0_major_mode: object
+    dout_layout: object
+    c_layout: object
+    output_layout: object
+    output_alias_pad_layout: object
 
 
 @dataclass(frozen=True)
 class ChunkScanBwdDZ0CopyBundle:
-    tiled_copy_A: object
-    tiled_copy_B: object
-    tiled_copy_C: object
-    tiled_copy_s2r_A: object
-    tiled_copy_s2r_B: object
+    gmem_tiled_copy_dout: object
+    gmem_tiled_copy_c: object
+    gmem_tiled_copy_output: object
+    smem_tiled_copy_dout: object
+    smem_tiled_copy_c: object
 
 
 @dataclass(frozen=True)
@@ -62,15 +81,31 @@ class ChunkScanBwdDZ0KernelBundle:
     layouts: ChunkScanBwdDZ0LayoutBundle
     copies: ChunkScanBwdDZ0CopyBundle
     tiled_mma: object
-    smem_bytes: int
+    shared_storage_cls: object
+    prefix_smem_bytes: int
+    operand_smem_bytes: int
+    output_smem_bytes: int
 
     @property
     def smem_size(self) -> int:
-        return self.smem_bytes
+        return self.prefix_smem_bytes + max(
+            self.operand_smem_bytes,
+            self.output_smem_bytes,
+        )
 
 
 class ChunkScanBwdDZ0Ampere:
-    """Ampere tensor-core kernel for ``dZ0`` (fp16/bf16 inputs, accum fp32)."""
+    """Ampere tensor-core backward kernel for the ``v2x2ssd`` ``dZ0`` slice.
+
+    This kernel owns the public chunk-start state gradient. It reconstructs the
+    prefix magnitude and phase metadata from raw packed ``M``, scales the
+    staged ``dOut`` tiles, rotates ``C`` by the conjugate prefix phase, and
+    runs one tensor-core GEMM that writes ``dZ0`` directly.
+    """
+
+    _SUPPORT_INFO_CACHE: ClassVar[
+        dict[tuple[object, ...], ChunkScanBwdDZ0SupportInfo]
+    ] = {}
 
     def __init__(
         self,
@@ -86,62 +121,162 @@ class ChunkScanBwdDZ0Ampere:
         self.c_dtype = cutlass.Float32
 
         self.L = int(chunk_size)
-        self.cta_tiler = cta_tiler
+        self.cta_tiler = tuple(int(dim) for dim in cta_tiler)
+        self.atom_layout_mnk = tuple(int(dim) for dim in atom_layout_mnk)
         self.num_stages = int(num_stages)
-        self.atom_layout_mnk = atom_layout_mnk
 
-        self.bM, self.bN, self.bK = map(int, self.cta_tiler)
+        if self.ab_dtype not in (cutlass.Float16, cutlass.BFloat16):
+            raise TypeError("dtype must be Float16/BFloat16 for the tensor-core path.")
+
+        self.bM, self.bN, self.bK = self.cta_tiler
         if self.L % self.bK != 0:
             raise ValueError("chunk_size must be divisible by bK for this kernel.")
-        k_tile_count = self.L // self.bK
-        if (self.num_stages - 1) > k_tile_count:
+        if self.bN % 2 != 0:
+            raise ValueError("bN (D tile) must be divisible by 2 because D = 2N.")
+        if self.num_stages < 2:
+            raise ValueError("num_stages must be >= 2.")
+        if (self.num_stages - 1) > self.k_tile_count:
             raise ValueError(
                 "num_stages too large for chunk_size/bK (insufficient K tiles)."
             )
-        if self.bN % 2 != 0:
-            raise ValueError("bN (D-tile) must be divisible by 2 because D = 2N.")
-        if self.num_stages < 2:
-            raise ValueError("num_stages must be >= 2.")
 
         self.mma_inst_shape = (16, 8, 16)
-        mmaM, mmaN, mmaK = self.mma_inst_shape
-        atomM, atomN, atomK = self.atom_layout_mnk
+        mma_m, mma_n, mma_k = self.mma_inst_shape
+        atom_m, atom_n, atom_k = self.atom_layout_mnk
+        self.num_threads = atom_m * atom_n * atom_k * 32
 
-        self.num_threads = atomM * atomN * atomK * 32
         if self.L > self.num_threads:
             raise ValueError("chunk_size too large for this CTA thread count.")
-
-        if self.bM % (atomM * mmaM) != 0:
-            raise ValueError("bM must be divisible by MMA instruction shape.")
-        if self.bN % (atomN * mmaN * 2) != 0:
-            raise ValueError("bN must be divisible by MMA instruction shape.")
-        if atomK != 1:
+        if self.bM % (atom_m * mma_m) != 0:
+            raise ValueError("bM must be divisible by the MMA instruction shape.")
+        if self.bN % (atom_n * mma_n * 2) != 0:
+            raise ValueError("bN must be divisible by the MMA instruction shape.")
+        if atom_k != 1:
             raise ValueError("atom_layout_mnk K must be 1.")
-        if self.bK % mmaK != 0:
-            raise ValueError("bK must be divisible by MMA instruction shape.")
+        if self.bK % mma_k != 0:
+            raise ValueError("bK must be divisible by the MMA instruction shape.")
 
-    def _row_layout(self):
-        return cute.make_layout((self.num_threads,), stride=(1,))
+    @property
+    def k_tile_count(self) -> int:
+        return self.L // self.bK
 
-    def _phase_layout(self):
-        return cute.make_layout((self.num_threads, 2), stride=(2, 1))
+    @property
+    def num_warps(self) -> int:
+        return self.num_threads // 32
 
-    def _output_alias_guard_layout(
+    def _smem_capacity_bytes(self, device_index: int | None = None) -> int:
+        if torch.cuda.is_available():
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(int(device_index))
+            capacity = int(getattr(props, "shared_memory_per_block_optin", 0))
+            if capacity > 0:
+                return capacity
+            cc = f"sm_{props.major}{props.minor}"
+            return int(utils.get_smem_capacity_in_bytes(cc))
+        return int(utils.get_smem_capacity_in_bytes("sm_80"))
+
+    def _dout_smem_elems(self) -> int:
+        return self.bM * self.bK * self.num_stages
+
+    def _c_smem_elems(self) -> int:
+        return self.bN * self.bK * self.num_stages
+
+    def _output_smem_elems(self) -> int:
+        return self.bM * self.bN
+
+    def _prefix_smem_bytes(self) -> int:
+        prefix_fields = [
+            (self.L * 4, 16),
+            (self.L * 4, 16),
+            (self.L * 4, 16),
+            (self.num_warps * 4, 16),
+            (self.num_warps * 4, 16),
+            (self.num_warps * 2 * 4, 16),
+            (self.num_warps * 2 * 4, 16),
+        ]
+        return self._struct_size_bytes(prefix_fields)
+
+    def _operand_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
+        input_bytes = in_dtype.width // 8
+        operand_fields = [
+            (self._dout_smem_elems() * input_bytes, 16),
+            (self._c_smem_elems() * input_bytes, 16),
+        ]
+        return self._struct_size_bytes(operand_fields)
+
+    def _output_smem_bytes(self) -> int:
+        output_bytes = self.c_dtype.width // 8
+        return self._struct_size_bytes([(self._output_smem_elems() * output_bytes, 16)])
+
+    @staticmethod
+    def _align_up(offset: int, align: int) -> int:
+        return ((offset + align - 1) // align) * align
+
+    @classmethod
+    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
+        offset = 0
+        max_align = 1
+        for size, align in fields:
+            offset = cls._align_up(offset, align)
+            offset += size
+            max_align = max(max_align, align)
+        return cls._align_up(offset, max_align)
+
+    def support_info(
         self,
-        in_a_dtype: type[cutlass.Numeric],
-        in_b_dtype: type[cutlass.Numeric],
-        sA_layout: cute.ComposedLayout,
-        sB_layout: cute.ComposedLayout,
-        sC_layout: cute.Layout,
-    ):
-        smem_size_AB = cute.cosize(sA_layout) * (in_a_dtype.width // 8) + cute.cosize(
-            sB_layout
-        ) * (in_b_dtype.width // 8)
-        smem_size_C = cute.size_in_bytes(self.c_dtype, sC_layout)
-        pad_bytes = max(0, int(smem_size_C) - int(smem_size_AB))
-        return cute.make_layout((((pad_bytes + 3) // 4),), stride=(1,))
+        *,
+        device_index: int | None = None,
+    ) -> ChunkScanBwdDZ0SupportInfo:
+        if device_index is None:
+            device_key = (
+                int(torch.cuda.current_device()) if torch.cuda.is_available() else -1
+            )
+        else:
+            device_key = int(device_index)
 
-    def _make_smem_layout_AB(self, dtype, major_mode, copy_bits, smem_tiler):
+        cache_key = (
+            type(self),
+            self.ab_dtype,
+            self.L,
+            self.cta_tiler,
+            self.atom_layout_mnk,
+            self.num_stages,
+            device_key,
+        )
+        cached = self._SUPPORT_INFO_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        info = ChunkScanBwdDZ0SupportInfo(
+            smem_capacity_bytes=self._smem_capacity_bytes(device_index=device_key),
+            prefix_smem_bytes=self._prefix_smem_bytes(),
+            operand_smem_bytes=self._operand_smem_bytes(self.ab_dtype),
+            output_smem_bytes=self._output_smem_bytes(),
+        )
+        self._SUPPORT_INFO_CACHE[cache_key] = info
+        return info
+
+    def can_implement(self, *, device_index: int | None = None) -> bool:
+        return self.support_info(device_index=device_index).supported
+
+    # Host-side bundle builders
+    def _prefix_row_layout(self) -> cute.Layout:
+        return cute.make_layout((self.L,), stride=(1,))
+
+    def _warp_prefix_row_layout(self) -> cute.Layout:
+        return cute.make_layout((self.num_warps,), stride=(1,))
+
+    def _warp_prefix_phase_layout(self) -> cute.Layout:
+        return cute.make_layout((self.num_warps, 2), stride=(2, 1))
+
+    def _make_operand_smem_layout(
+        self,
+        dtype: type[cutlass.Numeric],
+        major_mode,
+        copy_bits: int,
+        smem_tiler: tuple[int, int, int],
+    ):
         major_mode_size = (
             smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
         )
@@ -155,7 +290,6 @@ class ChunkScanBwdDZ0Ampere:
 
         swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits))
         swizzle_bits = min(swizzle_bits, 3)
-
         layout_atom_outer = (
             cute.make_layout((8, major_mode_size), stride=(major_mode_size, 1))
             if major_mode == utils.LayoutEnum.ROW_MAJOR
@@ -168,54 +302,72 @@ class ChunkScanBwdDZ0Ampere:
         )
         return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))
 
-    def _make_smem_layout_C(self, dtype, major_mode, copy_bits, smem_tiler):
-        major_mode_size = (
-            smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
-        )
-        major_mode_size = 64 if major_mode_size >= 64 else major_mode_size
-        swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits))
-        swizzle_bits = min(swizzle_bits, 3)
+    def _make_output_layout(self) -> cute.Layout:
+        return cute.make_layout((self.bM, self.bN), stride=(self.bN, 1))
 
-        layout_atom_outer = (
-            cute.make_layout((8, major_mode_size), stride=(major_mode_size, 1))
-            if major_mode == utils.LayoutEnum.ROW_MAJOR
-            else cute.make_layout((major_mode_size, 8), stride=(1, major_mode_size))
-        )
-        layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits, 3, 4),
-            0,
-            layout_atom_outer,
-        )
-        if major_mode == utils.LayoutEnum.COL_MAJOR:
-            layout_atom = cute.make_composed_layout(
-                cute.make_swizzle(0, 3, 4), 0, layout_atom_outer
-            )
-        return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1))
+    def _operand_smem_bytes_from_layouts(
+        self,
+        dout_layout: cute.Layout,
+        c_layout: cute.Layout,
+    ) -> int:
+        operand_fields = [
+            (int(cute.size_in_bytes(self.ab_dtype, dout_layout)), 16),
+            (int(cute.size_in_bytes(self.ab_dtype, c_layout)), 16),
+        ]
+        return self._struct_size_bytes(operand_fields)
 
-    def _make_gmem_tiled_copy_AB(
-        self, atom_copy, dtype, major_mode, copy_bits, *, tile_m: int
+    def _output_smem_bytes_from_layout(
+        self,
+        output_layout: cute.Layout,
+    ) -> int:
+        return self._struct_size_bytes(
+            [(int(cute.size_in_bytes(self.c_dtype, output_layout)), 16)]
+        )
+
+    def _make_output_alias_pad_layout(
+        self,
+        dout_layout: cute.Layout,
+        c_layout: cute.Layout,
+        output_layout: cute.Layout,
+    ) -> cute.Layout:
+        operand_smem_bytes = self._operand_smem_bytes_from_layouts(
+            dout_layout,
+            c_layout,
+        )
+        output_smem_bytes = self._output_smem_bytes_from_layout(output_layout)
+        pad_bytes = max(0, output_smem_bytes - operand_smem_bytes)
+        return cute.make_layout((((pad_bytes + 3) // 4),), stride=(1,))
+
+    def _make_gmem_tiled_copy_input(
+        self,
+        atom_copy,
+        dtype: type[cutlass.Numeric],
+        major_mode,
+        copy_bits: int,
+        *,
+        tile_m: int,
     ):
         copy_elems = copy_bits // dtype.width
-        shape_dim_1 = cute.size(self.bK) // copy_elems
+        shape_dim_1 = self.bK // copy_elems
         thread_layout = cute.make_layout(
-            (self.num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
+            (self.num_threads // shape_dim_1, shape_dim_1),
+            stride=(shape_dim_1, 1),
         )
         if major_mode != utils.LayoutEnum.ROW_MAJOR:
             shape_dim_0 = (int(tile_m) + int(copy_elems) - 1) // int(copy_elems)
             if shape_dim_0 > self.num_threads:
                 raise ValueError("tile_m too large for vectorized col-major copy.")
-
-            tm = None
-            for cand in range(shape_dim_0, self.num_threads + 1):
-                if self.num_threads % cand == 0:
-                    tm = cand
+            thread_m = None
+            for candidate in range(shape_dim_0, self.num_threads + 1):
+                if self.num_threads % candidate == 0:
+                    thread_m = candidate
                     break
-            if tm is None:
+            if thread_m is None:
                 raise ValueError(
                     "Internal error: failed to find divisor for col-major copy."
                 )
             thread_layout = cute.make_layout(
-                (tm, self.num_threads // tm), stride=(1, tm)
+                (thread_m, self.num_threads // thread_m), stride=(1, thread_m)
             )
         value_layout = (
             cute.make_layout((1, copy_elems))
@@ -224,11 +376,16 @@ class ChunkScanBwdDZ0Ampere:
         )
         return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
 
-    def _make_gmem_tiled_copy_C(self, atom_copy, dtype, major_mode, copy_bits):
+    def _make_gmem_tiled_copy_output(
+        self,
+        atom_copy,
+        dtype: type[cutlass.Numeric],
+        major_mode,
+        copy_bits: int,
+    ):
         copy_elems = copy_bits // dtype.width
         if major_mode == utils.LayoutEnum.ROW_MAJOR:
             value_layout = cute.make_layout((1, copy_elems))
-
             best_tm = None
             best_tn = None
             for tm in range(1, self.num_threads + 1):
@@ -245,7 +402,7 @@ class ChunkScanBwdDZ0Ampere:
                     best_tm = tm
                     best_tn = tn
             if best_tm is None:
-                shape_dim_1 = cute.size(self.bN) // copy_elems
+                shape_dim_1 = self.bN // copy_elems
                 thread_layout = cute.make_layout(
                     (self.num_threads // shape_dim_1, shape_dim_1),
                     stride=(shape_dim_1, 1),
@@ -260,16 +417,18 @@ class ChunkScanBwdDZ0Ampere:
         shape_dim_0 = (int(self.bM) + int(copy_elems) - 1) // int(copy_elems)
         if shape_dim_0 > self.num_threads:
             raise ValueError("bM too large for vectorized col-major store.")
-        tm = None
-        for cand in range(shape_dim_0, self.num_threads + 1):
-            if self.num_threads % cand == 0:
-                tm = cand
+        thread_m = None
+        for candidate in range(shape_dim_0, self.num_threads + 1):
+            if self.num_threads % candidate == 0:
+                thread_m = candidate
                 break
-        if tm is None:
+        if thread_m is None:
             raise ValueError(
                 "Internal error: failed to find divisor for col-major store."
             )
-        thread_layout = cute.make_layout((tm, self.num_threads // tm), stride=(1, tm))
+        thread_layout = cute.make_layout(
+            (thread_m, self.num_threads // thread_m), stride=(1, thread_m)
+        )
         return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
 
     def _make_layout_bundle(
@@ -278,146 +437,167 @@ class ChunkScanBwdDZ0Ampere:
         mC: cute.Tensor,
         mDZ0: cute.Tensor,
     ) -> ChunkScanBwdDZ0LayoutBundle:
-        a_major_mode = utils.LayoutEnum.from_tensor(mDOut)
-        b_major_mode = utils.LayoutEnum.from_tensor(mC)
-        c_major_mode = utils.LayoutEnum.from_tensor(mDZ0)
-        ab_copy_bits = 128
-        sA_layout = self._make_smem_layout_AB(
-            mDOut.element_type,
-            a_major_mode,
-            ab_copy_bits,
+        copy_bits = 128
+        dout_major_mode = utils.LayoutEnum.from_tensor(mDOut)
+        c_major_mode = utils.LayoutEnum.from_tensor(mC)
+        dz0_major_mode = utils.LayoutEnum.from_tensor(mDZ0)
+        dout_layout = self._make_operand_smem_layout(
+            self.ab_dtype,
+            dout_major_mode,
+            copy_bits,
             (self.bM, self.bK, self.num_stages),
         )
-        sB_layout = self._make_smem_layout_AB(
-            mC.element_type,
-            b_major_mode,
-            ab_copy_bits,
+        c_layout = self._make_operand_smem_layout(
+            self.ab_dtype,
+            c_major_mode,
+            copy_bits,
             (self.bN, self.bK, self.num_stages),
         )
-        sC_layout = cute.make_layout((self.bM, self.bN), stride=(self.bN, 1))
+        output_layout = self._make_output_layout()
         return ChunkScanBwdDZ0LayoutBundle(
-            a_major_mode=a_major_mode,
-            b_major_mode=b_major_mode,
+            dout_major_mode=dout_major_mode,
             c_major_mode=c_major_mode,
-            sA_layout=sA_layout,
-            sB_layout=sB_layout,
-            sC_layout=sC_layout,
+            dz0_major_mode=dz0_major_mode,
+            dout_layout=dout_layout,
+            c_layout=c_layout,
+            output_layout=output_layout,
+            output_alias_pad_layout=self._make_output_alias_pad_layout(
+                dout_layout,
+                c_layout,
+                output_layout,
+            ),
         )
 
     def _make_tiled_mma(self):
         op = cute.nvgpu.warp.MmaF16BF16Op(
-            self.ab_dtype, self.acc_dtype, self.mma_inst_shape
+            self.ab_dtype,
+            self.acc_dtype,
+            self.mma_inst_shape,
         )
         permutation_mnk = (
             self.atom_layout_mnk[0] * self.mma_inst_shape[0],
             self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
             self.atom_layout_mnk[2] * self.mma_inst_shape[2],
         )
-        tC = cute.make_layout(self.atom_layout_mnk)
-        return cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
+        return cute.make_tiled_mma(
+            op,
+            cute.make_layout(self.atom_layout_mnk),
+            permutation_mnk=permutation_mnk,
+        )
 
     def _make_copy_bundle(
         self,
         layouts: ChunkScanBwdDZ0LayoutBundle,
-        in_a_dtype: type[cutlass.Numeric],
-        in_b_dtype: type[cutlass.Numeric],
         tiled_mma: cute.TiledMma,
     ) -> ChunkScanBwdDZ0CopyBundle:
-        ab_copy_bits = 128
+        copy_bits = 128
         atom_async_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(
                 cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
             ),
-            in_a_dtype,
-            num_bits_per_copy=ab_copy_bits,
+            self.ab_dtype,
+            num_bits_per_copy=copy_bits,
         )
-        tiled_copy_A = self._make_gmem_tiled_copy_AB(
-            atom_async_copy,
-            in_a_dtype,
-            layouts.a_major_mode,
-            ab_copy_bits,
-            tile_m=self.bM,
-        )
-        tiled_copy_B = self._make_gmem_tiled_copy_AB(
-            atom_async_copy,
-            in_b_dtype,
-            layouts.b_major_mode,
-            ab_copy_bits,
-            tile_m=self.bN,
-        )
-        c_copy_bits = 128
-        atom_sync_copy = cute.make_copy_atom(
+        atom_output_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.c_dtype,
-            num_bits_per_copy=c_copy_bits,
+            num_bits_per_copy=copy_bits,
         )
-        tiled_copy_C = self._make_gmem_tiled_copy_C(
-            atom_sync_copy, self.c_dtype, layouts.c_major_mode, c_copy_bits
-        )
-        atom_copy_s2r_A = cute.make_copy_atom(
+        atom_smem_to_reg_dout = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                layouts.a_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+                layouts.dout_major_mode != utils.LayoutEnum.ROW_MAJOR,
+                4,
             ),
-            in_a_dtype,
+            self.ab_dtype,
         )
-        atom_copy_s2r_B = cute.make_copy_atom(
+        atom_smem_to_reg_c = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                layouts.b_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+                layouts.c_major_mode != utils.LayoutEnum.ROW_MAJOR,
+                4,
             ),
-            in_b_dtype,
+            self.ab_dtype,
         )
         return ChunkScanBwdDZ0CopyBundle(
-            tiled_copy_A=tiled_copy_A,
-            tiled_copy_B=tiled_copy_B,
-            tiled_copy_C=tiled_copy_C,
-            tiled_copy_s2r_A=cute.make_tiled_copy_A(atom_copy_s2r_A, tiled_mma),
-            tiled_copy_s2r_B=cute.make_tiled_copy_B(atom_copy_s2r_B, tiled_mma),
+            gmem_tiled_copy_dout=self._make_gmem_tiled_copy_input(
+                atom_async_copy,
+                self.ab_dtype,
+                layouts.dout_major_mode,
+                copy_bits,
+                tile_m=self.bM,
+            ),
+            gmem_tiled_copy_c=self._make_gmem_tiled_copy_input(
+                atom_async_copy,
+                self.ab_dtype,
+                layouts.c_major_mode,
+                copy_bits,
+                tile_m=self.bN,
+            ),
+            gmem_tiled_copy_output=self._make_gmem_tiled_copy_output(
+                atom_output_copy,
+                self.c_dtype,
+                layouts.dz0_major_mode,
+                copy_bits,
+            ),
+            smem_tiled_copy_dout=cute.make_tiled_copy_A(
+                atom_smem_to_reg_dout,
+                tiled_mma,
+            ),
+            smem_tiled_copy_c=cute.make_tiled_copy_B(atom_smem_to_reg_c, tiled_mma),
         )
 
     def _make_shared_storage(
         self,
-        in_a_dtype: type[cutlass.Numeric],
-        in_b_dtype: type[cutlass.Numeric],
-        sA_layout: cute.ComposedLayout,
-        sB_layout: cute.ComposedLayout,
-        sC_layout: cute.Layout,
+        layouts: ChunkScanBwdDZ0LayoutBundle,
     ):
-        row_layout = self._row_layout()
-        phase_layout = self._phase_layout()
-        output_alias_guard_layout = self._output_alias_guard_layout(
-            in_a_dtype, in_b_dtype, sA_layout, sB_layout, sC_layout
-        )
-
+        @cute.struct
         class SharedStorage:
-            pass
-
-        SharedStorage.__annotations__ = {
-            "s_row": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(row_layout)], 4
-            ],
-            "s_phase": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(phase_layout)], 8
-            ],
-            "s_logp": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(row_layout)], 4
-            ],
-            "s_phase_scan": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(phase_layout)], 8
-            ],
-            "sA": cute.struct.Align[
-                cute.struct.MemRange[in_a_dtype, cute.cosize(sA_layout)], 16
-            ],
-            "sB": cute.struct.Align[
-                cute.struct.MemRange[in_b_dtype, cute.cosize(sB_layout)], 16
-            ],
-            "output_alias_guard": cute.struct.Align[
+            prefix_scale: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.L],
+                16,
+            ]
+            prefix_phase_re: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.L],
+                16,
+            ]
+            prefix_phase_im: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.L],
+                16,
+            ]
+            warp_prefix_log_total: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.num_warps],
+                16,
+            ]
+            warp_prefix_log_offset: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.num_warps],
+                16,
+            ]
+            warp_prefix_phase_total: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.num_warps * 2],
+                16,
+            ]
+            warp_prefix_phase_offset: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.num_warps * 2],
+                16,
+            ]
+            dout_tile: cute.struct.Align[
+                cute.struct.MemRange[self.ab_dtype, cute.cosize(layouts.dout_layout)],
+                16,
+            ]
+            c_tile: cute.struct.Align[
+                cute.struct.MemRange[self.ab_dtype, cute.cosize(layouts.c_layout)],
+                16,
+            ]
+            # Extend the staged operand slab when the aliased fp32 output tile
+            # is larger than the staged fp16/bf16 input footprint.
+            output_alias_pad: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(output_alias_guard_layout)
+                    cutlass.Float32,
+                    cute.cosize(layouts.output_alias_pad_layout),
                 ],
                 16,
-            ],
-        }
-        return cute.struct(SharedStorage)
+            ]
+
+        return SharedStorage
 
     def _make_kernel_bundle(
         self,
@@ -427,56 +607,905 @@ class ChunkScanBwdDZ0Ampere:
     ) -> ChunkScanBwdDZ0KernelBundle:
         layouts = self._make_layout_bundle(mDOut, mC, mDZ0)
         tiled_mma = self._make_tiled_mma()
-        copies = self._make_copy_bundle(
-            layouts, mDOut.element_type, mC.element_type, tiled_mma
-        )
-        shared_storage = self._make_shared_storage(
-            mDOut.element_type,
-            mC.element_type,
-            layouts.sA_layout,
-            layouts.sB_layout,
-            layouts.sC_layout,
-        )
-        return ChunkScanBwdDZ0KernelBundle(
+        copies = self._make_copy_bundle(layouts, tiled_mma)
+        shared_storage_cls = self._make_shared_storage(layouts)
+        bundle = ChunkScanBwdDZ0KernelBundle(
             layouts=layouts,
             copies=copies,
             tiled_mma=tiled_mma,
-            smem_bytes=int(shared_storage.size_in_bytes()),
+            shared_storage_cls=shared_storage_cls,
+            prefix_smem_bytes=self._prefix_smem_bytes(),
+            operand_smem_bytes=self._operand_smem_bytes_from_layouts(
+                layouts.dout_layout,
+                layouts.c_layout,
+            ),
+            output_smem_bytes=self._output_smem_bytes_from_layout(
+                layouts.output_layout
+            ),
+        )
+        actual_smem_bytes = int(shared_storage_cls.size_in_bytes())
+        if actual_smem_bytes != bundle.smem_size:
+            raise ValueError(
+                "Shared storage accounting drifted from the declared layout bundle: "
+                f"{actual_smem_bytes}B actual vs {bundle.smem_size}B expected."
+            )
+        return bundle
+
+    # Kernel state builders
+    def _decode_batch_head_chunk(
+        self,
+        mDOut: cute.Tensor,
+        mDZ0: cute.Tensor,
+        batch_head_chunk: int,
+    ) -> SimpleNamespace:
+        batch_head_count = mDOut.shape[2]
+        batch_head_chunk_count = mDZ0.shape[2]
+        n_chunks = batch_head_chunk_count // batch_head_count
+        batch_head = batch_head_chunk // n_chunks
+        return SimpleNamespace(
+            batch_head=batch_head,
+            chunk_start=(batch_head_chunk - batch_head * n_chunks) * self.L,
         )
 
-    @cute.jit(preprocess=True)
-    def __call__(
+    def _make_output_gmem_tile(
         self,
-        mDOut: cute.Tensor,  # (P, T, BH)   fp16/bf16
-        mC: cute.Tensor,  # (D, T, BH)   fp16/bf16
-        mM: cute.Tensor,  # (2, T, BH)   fp32
-        mDZ0: cute.Tensor,  # (P, D, BHC)  fp32
+        mDZ0: cute.Tensor,
+        batch_head_chunk: int,
+        block_m: int,
+        block_n: int,
+    ):
+        return cute.local_tile(
+            mDZ0[None, None, batch_head_chunk],
+            tiler=self.cta_tiler,
+            coord=(block_m, block_n, None),
+            proj=(1, 1, None),
+        )
+
+    def _make_output_shared_tensor(
+        self,
+        s_dout: cute.Tensor,
+        output_layout: cute.Layout,
+    ):
+        return cute.make_tensor(
+            cute.recast_ptr(s_dout.iterator, dtype=self.c_dtype),
+            output_layout,
+        )
+
+    def _make_shared_tensor_bundle(
+        self,
+        storage,
+        dout_layout: cute.ComposedLayout,
+        c_layout: cute.ComposedLayout,
+        output_layout: cute.Layout,
+    ) -> SimpleNamespace:
+        s_dout = storage.dout_tile.get_tensor(dout_layout)
+        return SimpleNamespace(
+            prefix_scale=storage.prefix_scale.get_tensor(self._prefix_row_layout()),
+            prefix_phase_re=storage.prefix_phase_re.get_tensor(
+                self._prefix_row_layout()
+            ),
+            prefix_phase_im=storage.prefix_phase_im.get_tensor(
+                self._prefix_row_layout()
+            ),
+            warp_prefix_log_total=storage.warp_prefix_log_total.get_tensor(
+                self._warp_prefix_row_layout()
+            ),
+            warp_prefix_log_offset=storage.warp_prefix_log_offset.get_tensor(
+                self._warp_prefix_row_layout()
+            ),
+            warp_prefix_phase_total=storage.warp_prefix_phase_total.get_tensor(
+                self._warp_prefix_phase_layout()
+            ),
+            warp_prefix_phase_offset=storage.warp_prefix_phase_offset.get_tensor(
+                self._warp_prefix_phase_layout()
+            ),
+            s_dout=s_dout,
+            s_c=storage.c_tile.get_tensor(c_layout),
+            s_output=self._make_output_shared_tensor(s_dout, output_layout),
+        )
+
+    def _make_input_coord_tiles(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        tile_info: SimpleNamespace,
+        block_m: int,
+        block_n: int,
+    ) -> SimpleNamespace:
+        coord_dout_base = cute.domain_offset(
+            (0, tile_info.chunk_start, 0),
+            cute.make_identity_tensor(mDOut.layout.shape),
+        )
+        coord_c_base = cute.domain_offset(
+            (0, tile_info.chunk_start, 0),
+            cute.make_identity_tensor(mC.layout.shape),
+        )
+        return SimpleNamespace(
+            dout_coord=cute.local_tile(
+                coord_dout_base[None, None, tile_info.batch_head],
+                tiler=self.cta_tiler,
+                coord=(block_m, block_n, None),
+                proj=(1, None, 1),
+            ),
+            c_coord=cute.local_tile(
+                coord_c_base[None, None, tile_info.batch_head],
+                tiler=self.cta_tiler,
+                coord=(block_m, block_n, None),
+                proj=(None, 1, 1),
+            ),
+        )
+
+    def _make_input_gmem_tiles(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        tile_info: SimpleNamespace,
+        block_m: int,
+        block_n: int,
+    ) -> SimpleNamespace:
+        g_dout_base = cute.domain_offset((0, tile_info.chunk_start, 0), mDOut)
+        g_c_base = cute.domain_offset((0, tile_info.chunk_start, 0), mC)
+        g_dout = cute.local_tile(
+            g_dout_base[None, None, tile_info.batch_head],
+            tiler=self.cta_tiler,
+            coord=(block_m, block_n, None),
+            proj=(1, None, 1),
+        )
+        g_c = cute.local_tile(
+            g_c_base[None, None, tile_info.batch_head],
+            tiler=self.cta_tiler,
+            coord=(block_m, block_n, None),
+            proj=(None, 1, 1),
+        )
+        return SimpleNamespace(
+            g_dout=cute.make_tensor(g_dout.iterator.align(16), g_dout.layout),
+            g_c=cute.make_tensor(g_c.iterator.align(16), g_c.layout),
+        )
+
+    def _make_input_stage_state(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        tile_info: SimpleNamespace,
+        shared_tensors: SimpleNamespace,
+        gmem_tiled_copy_dout: cute.TiledCopy,
+        gmem_tiled_copy_c: cute.TiledCopy,
+        *,
+        tidx: int,
+        block_m: int,
+        block_n: int,
+    ) -> SimpleNamespace:
+        gmem_thr_copy_dout = gmem_tiled_copy_dout.get_slice(tidx)
+        gmem_thr_copy_c = gmem_tiled_copy_c.get_slice(tidx)
+        t_dout_smem = gmem_thr_copy_dout.partition_D(shared_tensors.s_dout)
+        t_c_smem = gmem_thr_copy_c.partition_D(shared_tensors.s_c)
+
+        coord_tiles = self._make_input_coord_tiles(
+            mDOut,
+            mC,
+            tile_info,
+            block_m,
+            block_n,
+        )
+        gmem_tiles = self._make_input_gmem_tiles(
+            mDOut,
+            mC,
+            tile_info,
+            block_m,
+            block_n,
+        )
+
+        return SimpleNamespace(
+            gmem_tiled_copy_dout=gmem_tiled_copy_dout,
+            gmem_tiled_copy_c=gmem_tiled_copy_c,
+            s_dout=shared_tensors.s_dout,
+            s_c=shared_tensors.s_c,
+            t_dout_smem=t_dout_smem,
+            t_c_smem=t_c_smem,
+            t_dout_gmem=gmem_thr_copy_dout.partition_S(gmem_tiles.g_dout),
+            t_c_gmem=gmem_thr_copy_c.partition_S(gmem_tiles.g_c),
+            t_dout_pred=self._make_input_copy_row_predicate(
+                t_dout_smem,
+                gmem_thr_copy_dout.partition_S(coord_tiles.dout_coord),
+                mDOut.shape[0],
+            ),
+            t_c_pred=self._make_input_copy_row_predicate(
+                t_c_smem,
+                gmem_thr_copy_c.partition_S(coord_tiles.c_coord),
+                mC.shape[0],
+            ),
+        )
+
+    def _make_mma_state(
+        self,
+        tiled_mma: cute.TiledMma,
+        smem_tiled_copy_dout: cute.TiledCopy,
+        smem_tiled_copy_c: cute.TiledCopy,
+        shared_tensors: SimpleNamespace,
+        g_output: cute.Tensor,
+        *,
+        tidx: int,
+    ) -> SimpleNamespace:
+        thr_mma = tiled_mma.get_slice(tidx)
+        t_smem_dout_mma = thr_mma.partition_A(shared_tensors.s_dout)
+        t_smem_c_mma = thr_mma.partition_B(shared_tensors.s_c)
+        t_output_smem_mma = thr_mma.partition_C(shared_tensors.s_output)
+        t_output_gmem_mma = thr_mma.partition_C(g_output)
+
+        t_reg_dout = tiled_mma.make_fragment_A(t_smem_dout_mma[None, None, None, 0])
+        t_reg_c = tiled_mma.make_fragment_B(t_smem_c_mma[None, None, None, 0])
+        acc_output = tiled_mma.make_fragment_C(t_output_gmem_mma)
+        acc_output.fill(0.0)
+
+        smem_thr_copy_dout = smem_tiled_copy_dout.get_slice(tidx)
+        smem_thr_copy_c = smem_tiled_copy_c.get_slice(tidx)
+        return SimpleNamespace(
+            tiled_mma=tiled_mma,
+            smem_tiled_copy_dout=smem_tiled_copy_dout,
+            smem_tiled_copy_c=smem_tiled_copy_c,
+            t_output_smem_mma=t_output_smem_mma,
+            acc_output=acc_output,
+            t_smem_dout_copy=smem_thr_copy_dout.partition_S(shared_tensors.s_dout),
+            t_reg_dout_copy=smem_thr_copy_dout.retile(t_reg_dout),
+            t_smem_c_copy=smem_thr_copy_c.partition_S(shared_tensors.s_c),
+            t_reg_c_copy=smem_thr_copy_c.retile(t_reg_c),
+            t_reg_dout=t_reg_dout,
+            t_reg_c=t_reg_c,
+        )
+
+    def _make_prefix_state(
+        self,
+        mM: cute.Tensor,
+        tile_info: SimpleNamespace,
+        shared_tensors: SimpleNamespace,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            batch_head=tile_info.batch_head,
+            chunk_start=tile_info.chunk_start,
+            m_transition=mM,
+            prefix_scale=shared_tensors.prefix_scale,
+            prefix_phase_re=shared_tensors.prefix_phase_re,
+            prefix_phase_im=shared_tensors.prefix_phase_im,
+            warp_prefix_log_total=shared_tensors.warp_prefix_log_total,
+            warp_prefix_log_offset=shared_tensors.warp_prefix_log_offset,
+            warp_prefix_phase_total=shared_tensors.warp_prefix_phase_total,
+            warp_prefix_phase_offset=shared_tensors.warp_prefix_phase_offset,
+        )
+
+    def _make_output_coord_tile(
+        self,
+        mDZ0: cute.Tensor,
+        batch_head_chunk: int,
+        block_m: int,
+        block_n: int,
+    ):
+        coord_output = cute.make_identity_tensor(mDZ0.layout.shape)
+        return cute.local_tile(
+            coord_output[None, None, batch_head_chunk],
+            tiler=self.cta_tiler,
+            coord=(block_m, block_n, None),
+            proj=(1, 1, None),
+        )
+
+    def _make_output_state(
+        self,
+        mDZ0: cute.Tensor,
+        g_output: cute.Tensor,
+        shared_tensors: SimpleNamespace,
+        mma_state: SimpleNamespace,
+        gmem_tiled_copy_output: cute.TiledCopy,
+        *,
+        tidx: int,
+        batch_head_chunk: int,
+        block_m: int,
+        block_n: int,
+    ) -> SimpleNamespace:
+        gmem_thr_copy_output = gmem_tiled_copy_output.get_slice(tidx)
+        t_output_smem_epilogue = gmem_thr_copy_output.partition_S(
+            shared_tensors.s_output
+        )
+        t_output_gmem_epilogue = gmem_thr_copy_output.partition_D(g_output)
+        output_coord_tile = self._make_output_coord_tile(
+            mDZ0,
+            batch_head_chunk,
+            block_m,
+            block_n,
+        )
+        t_output_coord = gmem_thr_copy_output.partition_S(output_coord_tile)
+        return SimpleNamespace(
+            gmem_tiled_copy_output=gmem_tiled_copy_output,
+            t_output_smem_mma=mma_state.t_output_smem_mma,
+            t_output_smem_epilogue=t_output_smem_epilogue,
+            t_output_gmem_epilogue=t_output_gmem_epilogue,
+            t_output_pred=self._make_output_copy_predicate(
+                t_output_gmem_epilogue,
+                t_output_coord,
+                row_limit=mDZ0.shape[0],
+                col_limit=mDZ0.shape[1],
+            ),
+        )
+
+    # Device copy/MMA helpers
+    @cute.jit
+    def _accumulate_from_staged_tiles(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc_output: cute.Tensor,
+        smem_tiled_copy_dout: cute.TiledCopy,
+        smem_tiled_copy_c: cute.TiledCopy,
+        t_smem_dout: cute.Tensor,
+        t_reg_dout_copy: cute.Tensor,
+        t_smem_c: cute.Tensor,
+        t_reg_c_copy: cute.Tensor,
+        t_reg_dout: cute.Tensor,
+        t_reg_c: cute.Tensor,
+    ):
+        cute.copy(
+            smem_tiled_copy_dout,
+            t_smem_dout[None, None, 0],
+            t_reg_dout_copy[None, None, 0],
+        )
+        cute.copy(
+            smem_tiled_copy_c,
+            t_smem_c[None, None, 0],
+            t_reg_c_copy[None, None, 0],
+        )
+        for k_block in cutlass.range_constexpr(cute.size(t_smem_dout.shape[2])):
+            k_block_next = (k_block + 1) % cute.size(t_smem_dout.shape[2])
+            cute.copy(
+                smem_tiled_copy_dout,
+                t_smem_dout[None, None, k_block_next],
+                t_reg_dout_copy[None, None, k_block_next],
+            )
+            cute.copy(
+                smem_tiled_copy_c,
+                t_smem_c[None, None, k_block_next],
+                t_reg_c_copy[None, None, k_block_next],
+            )
+            cute.gemm(
+                tiled_mma,
+                acc_output,
+                t_reg_dout[None, None, k_block],
+                t_reg_c[None, None, k_block],
+                acc_output,
+            )
+        cute.arch.barrier()
+
+    @cute.jit
+    def _make_input_copy_row_predicate(
+        self,
+        partitioned_tensor: cute.Tensor,
+        partitioned_coord: cute.Tensor,
+        row_limit: int,
+    ):
+        pred = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    partitioned_tensor.shape[0][1],
+                    cute.size(partitioned_tensor, mode=[1]),
+                    cute.size(partitioned_tensor, mode=[2]),
+                ),
+                stride=(cute.size(partitioned_tensor, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in range(pred.shape[0]):
+            for row in range(pred.shape[1]):
+                pred[rest_v, row, 0] = cute.elem_less(
+                    partitioned_coord[(0, rest_v), row, 0, 0][0],
+                    row_limit,
+                )
+        return pred
+
+    @cute.jit
+    def _copy_input_stage_tile(
+        self,
+        gmem_tiled_copy: cute.TiledCopy,
+        t_copy_src: cute.Tensor,
+        t_copy_dst: cute.Tensor,
+        copy_pred: cute.Tensor,
+        *,
+        tile_index: int,
+        smem_stage: int,
+    ):
+        cute.copy(
+            gmem_tiled_copy,
+            t_copy_src[None, None, None, tile_index],
+            t_copy_dst[None, None, None, smem_stage],
+            pred=copy_pred,
+        )
+
+    @cute.jit
+    def _zero_staged_input_tiles(self, input_state: SimpleNamespace):
+        input_state.t_dout_smem.fill(0)
+        input_state.t_c_smem.fill(0)
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _prefetch_input_tile_pair(
+        self,
+        input_state: SimpleNamespace,
+        *,
+        tile_index: int,
+        smem_stage: int,
+    ):
+        self._copy_input_stage_tile(
+            input_state.gmem_tiled_copy_dout,
+            input_state.t_dout_gmem,
+            input_state.t_dout_smem,
+            input_state.t_dout_pred,
+            tile_index=tile_index,
+            smem_stage=smem_stage,
+        )
+        self._copy_input_stage_tile(
+            input_state.gmem_tiled_copy_c,
+            input_state.t_c_gmem,
+            input_state.t_c_smem,
+            input_state.t_c_pred,
+            tile_index=tile_index,
+            smem_stage=smem_stage,
+        )
+
+    @cute.jit
+    def _prefetch_initial_input_tiles(self, input_state: SimpleNamespace):
+        next_k_tile = cutlass.Int32(0)
+        for smem_stage in cutlass.range_constexpr(self.num_stages - 1):
+            self._prefetch_input_tile_pair(
+                input_state,
+                tile_index=next_k_tile,
+                smem_stage=smem_stage,
+            )
+            next_k_tile = next_k_tile + 1
+            cute.arch.cp_async_commit_group()
+        return next_k_tile
+
+    # Prefix helpers
+    @cute.jit
+    def _load_local_prefix_transition(
+        self,
+        prefix_state: SimpleNamespace,
+        tidx,
+    ):
+        logp = cutlass.Float32(0.0)
+        phase_re = cutlass.Float32(1.0)
+        phase_im = cutlass.Float32(0.0)
+        if tidx < self.L:
+            time_idx = prefix_state.chunk_start + tidx
+            mr = cutlass.Float32(
+                prefix_state.m_transition[0, time_idx, prefix_state.batch_head]
+            )
+            mi = cutlass.Float32(
+                prefix_state.m_transition[1, time_idx, prefix_state.batch_head]
+            )
+            mag2 = mr * mr + mi * mi + cutlass.Float32(1.0e-20)
+            inv_mag = cutlass.Float32(cute.math.rsqrt(mag2))
+            phase_re = mr * inv_mag
+            phase_im = mi * inv_mag
+            logp = cute.math.log2(mag2, fastmath=False) * cutlass.Float32(0.25 / LOG2_E)
+        return logp, phase_re, phase_im
+
+    @cute.jit
+    def _scan_prefix_within_warp(self, logp, phase_re, phase_im, lane):
+        for offset in (1, 2, 4, 8, 16):
+            other_log = cute.arch.shuffle_sync_up(
+                logp,
+                offset=offset,
+                mask=-1,
+                mask_and_clamp=0,
+            )
+            other_phase_re = cute.arch.shuffle_sync_up(
+                phase_re,
+                offset=offset,
+                mask=-1,
+                mask_and_clamp=0,
+            )
+            other_phase_im = cute.arch.shuffle_sync_up(
+                phase_im,
+                offset=offset,
+                mask=-1,
+                mask_and_clamp=0,
+            )
+            has_prefix = lane >= cutlass.Int32(offset)
+            logp = cutlass.select_(has_prefix, logp + other_log, logp)
+            next_phase_re, next_phase_im = complex_mul(
+                phase_re,
+                phase_im,
+                other_phase_re,
+                other_phase_im,
+            )
+            phase_re = cutlass.select_(has_prefix, next_phase_re, phase_re)
+            phase_im = cutlass.select_(has_prefix, next_phase_im, phase_im)
+        return logp, phase_re, phase_im
+
+    @cute.jit
+    def _populate_warp_prefix_offsets(
+        self,
+        prefix_state: SimpleNamespace,
+        warp,
+        lane,
+        logp,
+        phase_re,
+        phase_im,
+    ):
+        if lane == cutlass.Int32(31):
+            prefix_state.warp_prefix_log_total[warp] = logp
+            prefix_state.warp_prefix_phase_total[warp, 0] = phase_re
+            prefix_state.warp_prefix_phase_total[warp, 1] = phase_im
+        cute.arch.barrier()
+
+        if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
+            running_log = cutlass.Float32(0.0)
+            running_phase_re = cutlass.Float32(1.0)
+            running_phase_im = cutlass.Float32(0.0)
+            for warp_idx in cutlass.range_constexpr(self.num_warps):
+                prefix_state.warp_prefix_log_offset[warp_idx] = running_log
+                prefix_state.warp_prefix_phase_offset[warp_idx, 0] = running_phase_re
+                prefix_state.warp_prefix_phase_offset[warp_idx, 1] = running_phase_im
+
+                total_log = prefix_state.warp_prefix_log_total[warp_idx]
+                total_phase_re = prefix_state.warp_prefix_phase_total[warp_idx, 0]
+                total_phase_im = prefix_state.warp_prefix_phase_total[warp_idx, 1]
+                next_running_phase_re = (
+                    running_phase_re * total_phase_re
+                    - running_phase_im * total_phase_im
+                )
+                next_running_phase_im = (
+                    running_phase_re * total_phase_im
+                    + running_phase_im * total_phase_re
+                )
+                running_log = running_log + total_log
+                running_phase_re = next_running_phase_re
+                running_phase_im = next_running_phase_im
+        cute.arch.barrier()
+
+    @cute.jit
+    def _apply_warp_prefix_offset(
+        self,
+        prefix_state: SimpleNamespace,
+        warp,
+        logp,
+        phase_re,
+        phase_im,
+    ):
+        warp_log_offset = prefix_state.warp_prefix_log_offset[warp]
+        warp_phase_re_offset = prefix_state.warp_prefix_phase_offset[warp, 0]
+        warp_phase_im_offset = prefix_state.warp_prefix_phase_offset[warp, 1]
+        logp = logp + warp_log_offset
+        phase_re, phase_im = complex_mul(
+            phase_re,
+            phase_im,
+            warp_phase_re_offset,
+            warp_phase_im_offset,
+        )
+
+        phase_norm2 = phase_re * phase_re + phase_im * phase_im
+        phase_inv = cutlass.Float32(
+            cute.math.rsqrt(phase_norm2 + cutlass.Float32(1.0e-20))
+        )
+        phase_re = phase_re * phase_inv
+        phase_im = phase_im * phase_inv
+        return logp, phase_re, phase_im
+
+    @cute.jit
+    def _store_prefix_metadata(
+        self,
+        prefix_state: SimpleNamespace,
+        tidx,
+        logp,
+        phase_re,
+        phase_im,
+    ):
+        if tidx < self.L:
+            stable_logp = clamp_nonpositive_prefix_log(logp)
+            prefix_state.prefix_scale[tidx] = cute.math.exp2(
+                stable_logp * cutlass.Float32(TWO_LOG2_E),
+                fastmath=True,
+            )
+            prefix_state.prefix_phase_re[tidx] = phase_re
+            prefix_state.prefix_phase_im[tidx] = phase_im
+        cute.arch.barrier()
+
+    @cute.jit
+    def _compute_phase_prefix_metadata(self, prefix_state: SimpleNamespace):
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+
+        logp, phase_re, phase_im = self._load_local_prefix_transition(
+            prefix_state, tidx
+        )
+        logp, phase_re, phase_im = self._scan_prefix_within_warp(
+            logp,
+            phase_re,
+            phase_im,
+            lane,
+        )
+        self._populate_warp_prefix_offsets(
+            prefix_state,
+            warp,
+            lane,
+            logp,
+            phase_re,
+            phase_im,
+        )
+        logp, phase_re, phase_im = self._apply_warp_prefix_offset(
+            prefix_state,
+            warp,
+            logp,
+            phase_re,
+            phase_im,
+        )
+        self._store_prefix_metadata(
+            prefix_state,
+            tidx,
+            logp,
+            phase_re,
+            phase_im,
+        )
+
+    # Mainloop helpers
+    @cute.jit
+    def _scale_staged_dout_tile_from_prefix(
+        self,
+        s_dout: cute.Tensor,
+        prefix_scale: cute.Tensor,
+        *,
+        k_tile_offset: int,
+        smem_pipe_read: int,
+        out_dtype: type[cutlass.Numeric],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        idx = tidx
+        while idx < cutlass.Int32(self.bM * self.bK):
+            row_idx = idx // self.bK
+            k_idx = idx - row_idx * self.bK
+            time_idx = k_tile_offset + k_idx
+            value = cutlass.Float32(s_dout[row_idx, k_idx, smem_pipe_read])
+            value = value * cutlass.Float32(prefix_scale[time_idx])
+            s_dout[row_idx, k_idx, smem_pipe_read] = safe_cast_to_dtype(
+                value, out_dtype
+            )
+            idx = idx + self.num_threads
+
+    @cute.jit
+    def _rotate_staged_c_tile_from_prefix(
+        self,
+        s_c: cute.Tensor,
+        prefix_phase_re: cute.Tensor,
+        prefix_phase_im: cute.Tensor,
+        *,
+        k_tile_offset: int,
+        smem_pipe_read: int,
+        out_dtype: type[cutlass.Numeric],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        idx = tidx
+        while idx < cutlass.Int32(self.bK * (self.bN // 2)):
+            k_idx = idx // (self.bN // 2)
+            vec_idx = idx - k_idx * (self.bN // 2)
+            time_idx = k_tile_offset + k_idx
+            d_col = vec_idx * 2
+            xr = cutlass.Float32(s_c[d_col + 0, k_idx, smem_pipe_read])
+            xi = cutlass.Float32(s_c[d_col + 1, k_idx, smem_pipe_read])
+            rr, ri = mul_conj_phase(
+                xr,
+                xi,
+                cutlass.Float32(prefix_phase_re[time_idx]),
+                cutlass.Float32(prefix_phase_im[time_idx]),
+            )
+            s_c[d_col + 0, k_idx, smem_pipe_read] = safe_cast_to_dtype(rr, out_dtype)
+            s_c[d_col + 1, k_idx, smem_pipe_read] = safe_cast_to_dtype(ri, out_dtype)
+            idx = idx + self.num_threads
+
+    @cute.jit
+    def _run_mainloop(
+        self,
+        input_state: SimpleNamespace,
+        mma_state: SimpleNamespace,
+        prefix_state: SimpleNamespace,
+        *,
+        dout_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
+    ):
+        next_k_tile = self._prefetch_initial_input_tiles(input_state)
+        for k_tile in cutlass.range_constexpr(self.k_tile_count):
+            smem_pipe_read = k_tile % self.num_stages
+            smem_pipe_write = (k_tile + (self.num_stages - 1)) % self.num_stages
+
+            cute.arch.cp_async_wait_group(self.num_stages - 2)
+            cute.arch.sync_threads()
+
+            k_tile_offset = k_tile * self.bK
+            self._scale_staged_dout_tile_from_prefix(
+                input_state.s_dout,
+                prefix_state.prefix_scale,
+                k_tile_offset=k_tile_offset,
+                smem_pipe_read=smem_pipe_read,
+                out_dtype=dout_dtype,
+            )
+            self._rotate_staged_c_tile_from_prefix(
+                input_state.s_c,
+                prefix_state.prefix_phase_re,
+                prefix_state.prefix_phase_im,
+                k_tile_offset=k_tile_offset,
+                smem_pipe_read=smem_pipe_read,
+                out_dtype=c_dtype,
+            )
+            cute.arch.sync_threads()
+
+            self._accumulate_from_staged_tiles(
+                mma_state.tiled_mma,
+                mma_state.acc_output,
+                mma_state.smem_tiled_copy_dout,
+                mma_state.smem_tiled_copy_c,
+                mma_state.t_smem_dout_copy[None, None, None, smem_pipe_read],
+                mma_state.t_reg_dout_copy,
+                mma_state.t_smem_c_copy[None, None, None, smem_pipe_read],
+                mma_state.t_reg_c_copy,
+                mma_state.t_reg_dout,
+                mma_state.t_reg_c,
+            )
+
+            if k_tile + (self.num_stages - 1) < self.k_tile_count:
+                self._prefetch_input_tile_pair(
+                    input_state,
+                    tile_index=next_k_tile,
+                    smem_stage=smem_pipe_write,
+                )
+                next_k_tile = next_k_tile + 1
+                cute.arch.cp_async_commit_group()
+
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+    # Epilogue helpers
+    @cute.jit
+    def _make_output_copy_predicate(
+        self,
+        t_output_gmem: cute.Tensor,
+        t_output_coord: cute.Tensor,
+        *,
+        row_limit: int,
+        col_limit: int,
+    ):
+        pred = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    t_output_gmem.shape[0][1],
+                    cute.size(t_output_gmem, mode=[1]),
+                    cute.size(t_output_gmem, mode=[2]),
+                ),
+                stride=(
+                    cute.size(t_output_gmem, mode=[1])
+                    * cute.size(t_output_gmem, mode=[2]),
+                    cute.size(t_output_gmem, mode=[2]),
+                    1,
+                ),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in range(pred.shape[0]):
+            for col in range(pred.shape[2]):
+                col_ok = cute.elem_less(
+                    t_output_coord[(0, rest_v), 0, col][1],
+                    col_limit,
+                )
+                for row in range(pred.shape[1]):
+                    row_ok = cute.elem_less(
+                        t_output_coord[(0, rest_v), row, 0][0],
+                        row_limit,
+                    )
+                    pred[rest_v, row, col] = col_ok & row_ok
+        return pred
+
+    @cute.jit
+    def _store_output(
+        self,
+        acc_output: cute.Tensor,
+        t_output_smem_mma: cute.Tensor,
+        t_output_smem_epilogue: cute.Tensor,
+        t_output_gmem_epilogue: cute.Tensor,
+        t_output_pred: cute.Tensor,
+        gmem_tiled_copy_output: cute.TiledCopy,
+    ):
+        cute.autovec_copy(acc_output, t_output_smem_mma)
+        cute.arch.sync_threads()
+
+        r_output = cute.make_rmem_tensor_like(t_output_smem_epilogue, self.c_dtype)
+        cute.autovec_copy(t_output_smem_epilogue, r_output)
+        for col in range(t_output_pred.shape[2]):
+            cute.copy(
+                gmem_tiled_copy_output,
+                r_output[None, None, col],
+                t_output_gmem_epilogue[None, None, col],
+                pred=t_output_pred[None, None, col],
+            )
+
+    # Host launch API
+    @cute.jit(preprocess=True)
+    def _validate_main_operands(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mDZ0: cute.Tensor,
+    ):
+        if cutlass.const_expr(
+            mDOut.element_type not in (cutlass.Float16, cutlass.BFloat16)
+        ):
+            raise TypeError("dOut/C must be Float16/BFloat16 for the tensor-core path.")
+        if cutlass.const_expr(mDOut.element_type != mC.element_type):
+            raise TypeError("dOut and C must share element type.")
+        if cutlass.const_expr(mDOut.element_type != self.ab_dtype):
+            raise TypeError("dOut/C element type must match the kernel input dtype.")
+        if cutlass.const_expr(mM.element_type != cutlass.Float32):
+            raise TypeError("M must be Float32.")
+        if cutlass.const_expr(mDZ0.element_type != cutlass.Float32):
+            raise TypeError("dZ0 must be Float32.")
+
+    def _launch_main_kernel(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mDZ0: cute.Tensor,
+        *,
+        stream=None,
     ):
         bundle = self._make_kernel_bundle(mDOut, mC, mDZ0)
-
         grid_dim = cute.ceil_div(mDZ0.shape, (self.bM, self.bN, 1))
-        grid_z = cute.size(mDZ0.shape[2])
-
+        launch_kwargs = {
+            "grid": (
+                cute.size(grid_dim[0]),
+                cute.size(grid_dim[1]),
+                cute.size(mDZ0.shape[2]),
+            ),
+            "block": [self.num_threads, 1, 1],
+            "smem": bundle.smem_size,
+        }
+        if stream is not None:
+            launch_kwargs["stream"] = stream
         self.kernel(
             mDOut,
             mC,
             mM,
             mDZ0,
-            bundle.layouts.sA_layout,
-            bundle.layouts.sB_layout,
-            bundle.layouts.sC_layout,
-            bundle.copies.tiled_copy_A,
-            bundle.copies.tiled_copy_B,
-            bundle.copies.tiled_copy_C,
-            bundle.copies.tiled_copy_s2r_A,
-            bundle.copies.tiled_copy_s2r_B,
+            bundle.layouts.dout_layout,
+            bundle.layouts.c_layout,
+            bundle.layouts.output_layout,
+            bundle.copies.gmem_tiled_copy_dout,
+            bundle.copies.gmem_tiled_copy_c,
+            bundle.copies.gmem_tiled_copy_output,
+            bundle.copies.smem_tiled_copy_dout,
+            bundle.copies.smem_tiled_copy_c,
             bundle.tiled_mma,
-        ).launch(
-            grid=(cute.size(grid_dim[0]), cute.size(grid_dim[1]), grid_z),
-            block=[self.num_threads, 1, 1],
-            smem=bundle.smem_size,
-        )
+            bundle.shared_storage_cls,
+        ).launch(**launch_kwargs)
 
+    @cute.jit(preprocess=True)
+    def __call__(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mDZ0: cute.Tensor,
+    ):
+        self._validate_main_operands(mDOut, mC, mM, mDZ0)
+        self._launch_main_kernel(mDOut, mC, mM, mDZ0)
+
+    @cute.jit(preprocess=True)
+    def call_on_stream(
+        self,
+        mDOut: cute.Tensor,
+        mC: cute.Tensor,
+        mM: cute.Tensor,
+        mDZ0: cute.Tensor,
+        stream,
+    ):
+        self._validate_main_operands(mDOut, mC, mM, mDZ0)
+        self._launch_main_kernel(mDOut, mC, mM, mDZ0, stream=stream)
+
+    # Kernel entrypoint
     @cute.kernel(preprocess=True)
     def kernel(
         self,
@@ -484,414 +1513,91 @@ class ChunkScanBwdDZ0Ampere:
         mC: cute.Tensor,  # (D, T, BH)
         mM: cute.Tensor,  # (2, T, BH)
         mDZ0: cute.Tensor,  # (P, D, BHC)
-        sA_layout: cute.ComposedLayout,
-        sB_layout: cute.ComposedLayout,
-        sC_layout: cute.Layout,
-        tiled_copy_A: cute.TiledCopy,
-        tiled_copy_B: cute.TiledCopy,
-        tiled_copy_C: cute.TiledCopy,
-        tiled_copy_s2r_A: cute.TiledCopy,
-        tiled_copy_s2r_B: cute.TiledCopy,
+        dout_layout: cute.ComposedLayout,
+        c_layout: cute.ComposedLayout,
+        output_layout: cute.Layout,
+        gmem_tiled_copy_dout: cute.TiledCopy,
+        gmem_tiled_copy_c: cute.TiledCopy,
+        gmem_tiled_copy_output: cute.TiledCopy,
+        smem_tiled_copy_dout: cute.TiledCopy,
+        smem_tiled_copy_c: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
+        shared_storage_cls: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, bidz = cute.arch.block_idx()
+        block_m, block_n, batch_head_chunk = cute.arch.block_idx()
 
-        BH = mDOut.shape[2]
-        BHC = mDZ0.shape[2]
-        n_chunks = BHC // BH
-        bh = bidz // n_chunks
-        chunk = bidz - bh * n_chunks
-        chunk_start = chunk * self.L
-
-        gC = cute.local_tile(
-            mDZ0[None, None, bidz],
-            tiler=self.cta_tiler,
-            coord=(bidx, bidy, None),
-            proj=(1, 1, None),
+        tile_info = self._decode_batch_head_chunk(mDOut, mDZ0, batch_head_chunk)
+        g_output = self._make_output_gmem_tile(
+            mDZ0,
+            batch_head_chunk,
+            block_m,
+            block_n,
         )
 
         smem = cutlass.utils.SmemAllocator()
-        SharedStorage = self._make_shared_storage(
-            mDOut.element_type, mC.element_type, sA_layout, sB_layout, sC_layout
-        )
-        storage = smem.allocate(SharedStorage)
-        s_row = storage.s_row.get_tensor(self._row_layout())
-        s_phase = storage.s_phase.get_tensor(self._phase_layout())
-        s_logp = storage.s_logp.get_tensor(self._row_layout())
-        s_phase_scan = storage.s_phase_scan.get_tensor(self._phase_layout())
-        sA = storage.sA.get_tensor(sA_layout)
-        sB = storage.sB.get_tensor(sB_layout)
-        sC = cute.make_tensor(
-            cute.recast_ptr(sA.iterator, dtype=cutlass.Float32), sC_layout
+        storage = smem.allocate(shared_storage_cls)
+        shared_tensors = self._make_shared_tensor_bundle(
+            storage,
+            dout_layout,
+            c_layout,
+            output_layout,
         )
 
-        thr_copy_A = tiled_copy_A.get_slice(tidx)
-        thr_copy_B = tiled_copy_B.get_slice(tidx)
-        thr_copy_C = tiled_copy_C.get_slice(tidx)
-
-        tAsA = thr_copy_A.partition_D(sA)
-        tBsB = thr_copy_B.partition_D(sB)
-        tCsC_ep = thr_copy_C.partition_S(sC)
-        tCgC_ep = thr_copy_C.partition_D(gC)
-
-        thr_mma = tiled_mma.get_slice(tidx)
-        tCsA = thr_mma.partition_A(sA)
-        tCsB = thr_mma.partition_B(sB)
-        tCsC = thr_mma.partition_C(sC)
-        tCgC = thr_mma.partition_C(gC)
-
-        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
-        tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
-        tCrC = tiled_mma.make_fragment_C(tCgC)
-        tCrC.fill(0.0)
-
-        thr_copy_ld_A = tiled_copy_s2r_A.get_slice(tidx)
-        thr_copy_ld_B = tiled_copy_s2r_B.get_slice(tidx)
-        tCsA_copy = thr_copy_ld_A.partition_S(sA)
-        tCrA_copy = thr_copy_ld_A.retile(tCrA)
-        tCsB_copy = thr_copy_ld_B.partition_S(sB)
-        tCrB_copy = thr_copy_ld_B.retile(tCrB)
-
-        mcA = cute.make_identity_tensor(mDOut.layout.shape)
-        mcB = cute.make_identity_tensor(mC.layout.shape)
-        mcA_off = cute.domain_offset((0, chunk_start, 0), mcA)
-        mcB_off = cute.domain_offset((0, chunk_start, 0), mcB)
-
-        cA = cute.local_tile(
-            mcA_off[None, None, bh],
-            tiler=self.cta_tiler,
-            coord=(bidx, bidy, None),
-            proj=(1, None, 1),
+        input_state = self._make_input_stage_state(
+            mDOut,
+            mC,
+            tile_info,
+            shared_tensors,
+            gmem_tiled_copy_dout,
+            gmem_tiled_copy_c,
+            tidx=tidx,
+            block_m=block_m,
+            block_n=block_n,
         )
-        cB = cute.local_tile(
-            mcB_off[None, None, bh],
-            tiler=self.cta_tiler,
-            coord=(bidx, bidy, None),
-            proj=(None, 1, 1),
+        mma_state = self._make_mma_state(
+            tiled_mma,
+            smem_tiled_copy_dout,
+            smem_tiled_copy_c,
+            shared_tensors,
+            g_output,
+            tidx=tidx,
         )
-        tAcA = thr_copy_A.partition_S(cA)
-        tBcB = thr_copy_B.partition_S(cB)
-
-        tApA = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    tAsA.shape[0][1],
-                    cute.size(tAsA, mode=[1]),
-                    cute.size(tAsA, mode=[2]),
-                ),
-                stride=(cute.size(tAsA, mode=[1]), 1, 0),
-            ),
-            cutlass.Boolean,
+        prefix_state = self._make_prefix_state(
+            mM,
+            tile_info,
+            shared_tensors,
         )
-        tBpB = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    tBsB.shape[0][1],
-                    cute.size(tBsB, mode=[1]),
-                    cute.size(tBsB, mode=[2]),
-                ),
-                stride=(cute.size(tBsB, mode=[1]), 1, 0),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in range(tApA.shape[0]):
-            for m in range(tApA.shape[1]):
-                tApA[rest_v, m, 0] = cute.elem_less(
-                    tAcA[(0, rest_v), m, 0, 0][0], mDOut.shape[0]
-                )
-        for rest_v in range(tBpB.shape[0]):
-            for n in range(tBpB.shape[1]):
-                tBpB[rest_v, n, 0] = cute.elem_less(
-                    tBcB[(0, rest_v), n, 0, 0][0], mC.shape[0]
-                )
+        self._compute_phase_prefix_metadata(prefix_state)
 
-        k_tile_count = self.L // self.bK
-        mA_off = cute.domain_offset((0, chunk_start, 0), mDOut)
-        mB_off = cute.domain_offset((0, chunk_start, 0), mC)
-
-        gA = cute.local_tile(
-            mA_off[None, None, bh],
-            tiler=self.cta_tiler,
-            coord=(bidx, bidy, None),
-            proj=(1, None, 1),
-        )
-        gB = cute.local_tile(
-            mB_off[None, None, bh],
-            tiler=self.cta_tiler,
-            coord=(bidx, bidy, None),
-            proj=(None, 1, 1),
-        )
-        gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
-        gB = cute.make_tensor(gB.iterator.align(16), gB.layout)
-
-        tAgA = thr_copy_A.partition_S(gA)
-        tBgB = thr_copy_B.partition_S(gB)
-
-        tAsA.fill(0)
-        tBsB.fill(0)
-        cute.arch.sync_threads()
-
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.warp_idx()
-
-        t_raw = cutlass.Int32(chunk_start) + tidx
-        t_max = cutlass.Int32(chunk_start + (self.L - 1))
-        t_safe = cutlass.select_(t_raw > t_max, t_max, t_raw)
-
-        mr = cutlass.Float32(mM[0, t_safe, bh].to(cutlass.Float32))
-        mi = cutlass.Float32(mM[1, t_safe, bh].to(cutlass.Float32))
-
-        pred_t = tidx < cutlass.Int32(self.L)
-        mr = cutlass.Float32(cutlass.select_(pred_t, mr, cutlass.Float32(1.0)))
-        mi = cutlass.Float32(cutlass.select_(pred_t, mi, cutlass.Float32(0.0)))
-
-        eps = cutlass.Float32(1.0e-20)
-        mag2 = cutlass.Float32(mr * mr + mi * mi + eps)
-        inv_mag = cutlass.Float32(cute.math.rsqrt(mag2))
-        ur = mr * inv_mag
-        ui = mi * inv_mag
-        logp = cutlass.Float32(
-            cute.math.log2(mag2, fastmath=False) * cutlass.Float32(0.25 / LOG2_E)
+        self._zero_staged_input_tiles(input_state)
+        self._run_mainloop(
+            input_state,
+            mma_state,
+            prefix_state,
+            dout_dtype=mDOut.element_type,
+            c_dtype=mC.element_type,
         )
 
-        for offset in (1, 2, 4, 8, 16):
-            other_log = cute.arch.shuffle_sync_up(
-                logp, offset=offset, mask=-1, mask_and_clamp=0
-            )
-            orr = cute.arch.shuffle_sync_up(
-                ur, offset=offset, mask=-1, mask_and_clamp=0
-            )
-            oii = cute.arch.shuffle_sync_up(
-                ui, offset=offset, mask=-1, mask_and_clamp=0
-            )
-
-            pred = lane >= cutlass.Int32(offset)
-            logp = cutlass.select_(pred, logp + other_log, logp)
-
-            nr, ni = complex_mul(ur, ui, orr, oii)
-            ur = cutlass.select_(pred, nr, ur)
-            ui = cutlass.select_(pred, ni, ui)
-
-        s_logp[tidx] = logp
-        s_phase_scan[tidx, 0] = ur
-        s_phase_scan[tidx, 1] = ui
-        cute.arch.barrier()
-
-        t0 = cutlass.Int32(31)
-        t1 = cutlass.Int32(63)
-        t2 = cutlass.Int32(95)
-        log0 = cutlass.Float32(s_logp[t0])
-        log1 = cutlass.Float32(0.0)
-        log2 = cutlass.Float32(0.0)
-        p0r = cutlass.Float32(s_phase_scan[t0, 0])
-        p0i = cutlass.Float32(s_phase_scan[t0, 1])
-        p1r = cutlass.Float32(1.0)
-        p1i = cutlass.Float32(0.0)
-        p2r = cutlass.Float32(1.0)
-        p2i = cutlass.Float32(0.0)
-        if cutlass.const_expr(self.num_threads > 32):
-            log1 = cutlass.Float32(s_logp[t1])
-            p1r = cutlass.Float32(s_phase_scan[t1, 0])
-            p1i = cutlass.Float32(s_phase_scan[t1, 1])
-        if cutlass.const_expr(self.num_threads > 64):
-            log2 = cutlass.Float32(s_logp[t2])
-            p2r = cutlass.Float32(s_phase_scan[t2, 0])
-            p2i = cutlass.Float32(s_phase_scan[t2, 1])
-
-        off1_log = log0
-        off2_log = log0 + log1
-        off3_log = log0 + log1 + log2
-
-        off2r, off2i = complex_mul(p1r, p1i, p0r, p0i)
-        off3r, off3i = complex_mul(p2r, p2i, off2r, off2i)
-
-        pred_w1 = warp >= cutlass.Int32(1)
-        pred_w2 = warp >= cutlass.Int32(2)
-        pred_w3 = warp >= cutlass.Int32(3)
-
-        off_log = cutlass.Float32(0.0)
-        off_r = cutlass.Float32(1.0)
-        off_i = cutlass.Float32(0.0)
-
-        off_log = cutlass.select_(pred_w1, off1_log, off_log)
-        off_r = cutlass.select_(pred_w1, p0r, off_r)
-        off_i = cutlass.select_(pred_w1, p0i, off_i)
-
-        off_log = cutlass.select_(pred_w2, off2_log, off_log)
-        off_r = cutlass.select_(pred_w2, off2r, off_r)
-        off_i = cutlass.select_(pred_w2, off2i, off_i)
-
-        off_log = cutlass.select_(pred_w3, off3_log, off_log)
-        off_r = cutlass.select_(pred_w3, off3r, off_r)
-        off_i = cutlass.select_(pred_w3, off3i, off_i)
-
-        logp = logp + off_log
-        ur, ui = complex_mul(ur, ui, off_r, off_i)
-
-        phase_n2 = cutlass.Float32(ur * ur + ui * ui)
-        phase_inv = cutlass.Float32(cute.math.rsqrt(phase_n2 + eps))
-        ur = ur * phase_inv
-        ui = ui * phase_inv
-
-        stable_logp = clamp_nonpositive_prefix_log(logp)
-        s_row[tidx] = cute.math.exp2(
-            stable_logp * cutlass.Float32(TWO_LOG2_E), fastmath=True
+        output_state = self._make_output_state(
+            mDZ0,
+            g_output,
+            shared_tensors,
+            mma_state,
+            gmem_tiled_copy_output,
+            tidx=tidx,
+            batch_head_chunk=batch_head_chunk,
+            block_m=block_m,
+            block_n=block_n,
         )
-        s_phase[tidx, 0] = ur
-        s_phase[tidx, 1] = ui
-
-        cute.arch.barrier()
-
-        num_smem_stages = self.num_stages
-        k_tile_index = cutlass.Int32(0)
-        for st in range(num_smem_stages - 1):
-            cute.copy(
-                tiled_copy_A,
-                tAgA[None, None, None, k_tile_index],
-                tAsA[None, None, None, st],
-                pred=tApA,
-            )
-            cute.copy(
-                tiled_copy_B,
-                tBgB[None, None, None, k_tile_index],
-                tBsB[None, None, None, st],
-                pred=tBpB,
-            )
-            k_tile_index = k_tile_index + 1
-            cute.arch.cp_async_commit_group()
-
-        num_k_block = cute.size(tCrA, mode=[2])
-
-        for kt in range(k_tile_count):
-            smem_pipe_read = kt % num_smem_stages
-            smem_pipe_write = (kt + (num_smem_stages - 1)) % num_smem_stages
-            cute.arch.cp_async_wait_group(num_smem_stages - 2)
-            cute.arch.sync_threads()
-
-            k_tile_offset = kt * self.bK
-            total_a = self.bM * self.bK
-            iters_a = (total_a + self.num_threads - 1) // self.num_threads
-            for it in range(iters_a):
-                idx = tidx + cutlass.Int32(it * self.num_threads)
-                if idx < cutlass.Int32(total_a):
-                    mm = idx // self.bK
-                    kk = idx - mm * self.bK
-                    t_global = k_tile_offset + kk
-                    a = cutlass.Float32(sA[mm, kk, smem_pipe_read])
-                    a = a * cutlass.Float32(s_row[t_global])
-                    sA[mm, kk, smem_pipe_read] = safe_cast_to_dtype(
-                        a, mDOut.element_type
-                    )
-
-            nvec = self.bN // 2
-            total_b = self.bK * nvec
-            iters_b = (total_b + self.num_threads - 1) // self.num_threads
-            for it in range(iters_b):
-                idx = tidx + cutlass.Int32(it * self.num_threads)
-                if idx < cutlass.Int32(total_b):
-                    kk = idx // nvec
-                    vv = idx - kk * nvec
-                    t_global = k_tile_offset + kk
-                    d0 = vv * 2
-                    xr = cutlass.Float32(sB[d0 + 0, kk, smem_pipe_read])
-                    xi = cutlass.Float32(sB[d0 + 1, kk, smem_pipe_read])
-                    pr = cutlass.Float32(s_phase[t_global, 0])
-                    pi = cutlass.Float32(s_phase[t_global, 1])
-                    rr, ri = mul_conj_phase(xr, xi, pr, pi)
-                    sB[d0 + 0, kk, smem_pipe_read] = safe_cast_to_dtype(
-                        rr, mC.element_type
-                    )
-                    sB[d0 + 1, kk, smem_pipe_read] = safe_cast_to_dtype(
-                        ri, mC.element_type
-                    )
-
-            cute.arch.sync_threads()
-
-            tCsA_p = tCsA_copy[None, None, None, smem_pipe_read]
-            tCsB_p = tCsB_copy[None, None, None, smem_pipe_read]
-            cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, 0], tCrA_copy[None, None, 0])
-            cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, 0], tCrB_copy[None, None, 0])
-            for kb in cutlass.range(num_k_block, unroll_full=True):
-                kb_next = (kb + 1) % num_k_block
-                cute.copy(
-                    tiled_copy_s2r_A,
-                    tCsA_p[None, None, kb_next],
-                    tCrA_copy[None, None, kb_next],
-                )
-                cute.copy(
-                    tiled_copy_s2r_B,
-                    tCsB_p[None, None, kb_next],
-                    tCrB_copy[None, None, kb_next],
-                )
-                cute.gemm(
-                    tiled_mma, tCrC, tCrA[None, None, kb], tCrB[None, None, kb], tCrC
-                )
-
-            next_tile = kt + (num_smem_stages - 1)
-            if next_tile < k_tile_count:
-                cute.copy(
-                    tiled_copy_A,
-                    tAgA[None, None, None, k_tile_index],
-                    tAsA[None, None, None, smem_pipe_write],
-                    pred=tApA,
-                )
-                cute.copy(
-                    tiled_copy_B,
-                    tBgB[None, None, None, k_tile_index],
-                    tBsB[None, None, None, smem_pipe_write],
-                    pred=tBpB,
-                )
-                k_tile_index = k_tile_index + 1
-                cute.arch.cp_async_commit_group()
-
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-
-        cute.autovec_copy(tCrC, tCsC)
-        cute.arch.sync_threads()
-        tCrC_ep = cute.make_rmem_tensor_like(tCsC_ep, self.c_dtype)
-        cute.autovec_copy(tCsC_ep, tCrC_ep)
-
-        ceilM, ceilN, _ = cute.ceil_div(mDZ0.shape, (self.bM, self.bN, 1))
-        mcC = cute.make_identity_tensor(
-            (cute.size(ceilM) * self.bM, cute.size(ceilN) * self.bN, 1)
+        self._store_output(
+            mma_state.acc_output,
+            output_state.t_output_smem_mma,
+            output_state.t_output_smem_epilogue,
+            output_state.t_output_gmem_epilogue,
+            output_state.t_output_pred,
+            output_state.gmem_tiled_copy_output,
         )
-        cC = cute.local_tile(
-            mcC[None, None, bidz],
-            tiler=self.cta_tiler,
-            coord=(bidx, bidy, None),
-            proj=(1, 1, None),
-        )
-        tCcC = thr_copy_C.partition_S(cC)
-        tCpC = cute.make_rmem_tensor(
-            cute.make_layout(
-                (
-                    tCgC_ep.shape[0][1],
-                    cute.size(tCgC_ep, mode=[1]),
-                    cute.size(tCgC_ep, mode=[2]),
-                ),
-                stride=(
-                    cute.size(tCgC_ep, mode=[1]) * cute.size(tCgC_ep, mode=[2]),
-                    cute.size(tCgC_ep, mode=[2]),
-                    1,
-                ),
-            ),
-            cutlass.Boolean,
-        )
-        for rest_v in range(tCpC.shape[0]):
-            for n in range(tCpC.shape[2]):
-                n_ok = cute.elem_less(tCcC[(0, rest_v), 0, n][1], mDZ0.shape[1])
-                for m in range(tCpC.shape[1]):
-                    m_ok = cute.elem_less(tCcC[(0, rest_v), m, 0][0], mDZ0.shape[0])
-                    tCpC[rest_v, m, n] = n_ok & m_ok
-        for n in range(tCpC.shape[2]):
-            cute.copy(
-                tiled_copy_C,
-                tCrC_ep[None, None, n],
-                tCgC_ep[None, None, n],
-                pred=tCpC[None, None, n],
-            )
 
 
 __all__ = ["ChunkScanBwdDZ0Ampere"]

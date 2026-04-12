@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import cast
 import math
 
@@ -170,6 +171,44 @@ def _reference_boundary_grads(
     )
 
 
+def _reference_param_grads(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    B_prev: torch.Tensor,
+    U_prev: torch.Tensor,
+    T: int,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M_ref = M.detach().clone().requires_grad_(True)
+    K_ref = K.detach().clone().requires_grad_(True)
+    y_ref = ref_chunk_scan(
+        U,
+        M_ref,
+        K_ref,
+        B,
+        C,
+        chunk_starts,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        output_dtype=torch.float32,
+        compute_dtype=torch.float32,
+    )
+    loss = (y_ref * d_out).sum()
+    dM_ref, dK_ref = torch.autograd.grad(loss, (M_ref, K_ref))
+    return (
+        dM_ref.to(dtype=torch.float32).contiguous(),
+        dK_ref.to(dtype=torch.float32).contiguous(),
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
     pytest.importorskip("cutlass")
@@ -220,7 +259,7 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
         compute_dtype=torch.float32,
     )
 
-    compiled = compile_chunk_scan_bwd_kernels(
+    prepared = compile_chunk_scan_bwd_kernels(
         U,
         M,
         K,
@@ -232,32 +271,15 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
         B_prev=B_prev,
         U_prev=U_prev,
         compute_dtype=torch.float32,
-        return_launchers=True,
     )
-    dZ0 = compiled[5]
-    dU = compiled[6]
-    dB = compiled[7]
-    dU_prev = compiled[8]
-    dB_prev = compiled[9]
-    dC = compiled[11]
-    dM = compiled[13]
-    dKprev = compiled[14]
-    dKcurr = compiled[15]
-    launch = compiled[-1]
-    launch()
+    prepared.launch()
 
-    dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
-    dB_public = _fold_chunk_boundary_carries(dB, dB_prev)
-
-    got_compiled = (
-        _public_from_chunked(dU_public, T=T),
-        _public_from_param_scan(dM, T=T),
-        _public_dk_from_parts(dKprev, dKcurr, T=T),
-        _public_from_chunked(dB_public, T=T),
-        _public_from_chunked(dC, T=T),
-        dZ0.to(dtype=torch.float32).contiguous(),
-        dB_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
-        dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
+    got_compiled = prepared.outputs.public_outputs(
+        T=T,
+        value_dtype=U.dtype,
+        key_dtype=B.dtype,
+        query_dtype=C.dtype,
+        return_prev_grads=True,
     )
 
     atol_by_slot = (
@@ -333,7 +355,7 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
     # used to corrupt boundary rows intermittently when its shared carry buffer
     # was overwritten before every thread had finished reading it.
     for _attempt in range(3):
-        compiled = compile_chunk_scan_bwd_kernels(
+        prepared = compile_chunk_scan_bwd_kernels(
             U,
             M,
             K,
@@ -345,21 +367,92 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
             B_prev=B_prev,
             U_prev=U_prev,
             compute_dtype=torch.float32,
-            return_launchers=True,
         )
-        dU = cast(torch.Tensor, compiled[6])
-        dU_prev = cast(torch.Tensor, compiled[8])
-        launch = compiled[-1]
-        launch()
+        prepared.launch()
 
-        dU_public = _public_from_chunked(_fold_chunk_boundary_carries(dU, dU_prev), T=T)
-        dU_prev_public = dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous()
+        public_outputs = prepared.outputs.public_outputs(
+            T=T,
+            value_dtype=U.dtype,
+            key_dtype=B.dtype,
+            query_dtype=C.dtype,
+            return_prev_grads=True,
+        )
+        dU_public = cast(torch.Tensor, public_outputs[0])
+        dU_prev_public = cast(torch.Tensor, public_outputs[-1]).to(dtype=torch.float32)
 
         # Float32 stage inputs now preserve bf16 tensor-core staging instead of
         # narrowing to fp16, so the DU path follows a slightly different but
         # still well-behaved low-precision contract than the old test budget.
         torch.testing.assert_close(dU_public, dU_ref, atol=1e-3, rtol=0.0)
         torch.testing.assert_close(dU_prev_public, dU_prev_ref, atol=6e-4, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_param_outputs_match_reference() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 2, 2, 65, 8, 16
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    dM_ref, dK_ref = _reference_param_grads(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+    )
+
+    _dU, dM, dK, _dB, _dC, _dZ0, _dB_prev, _dU_prev = chunk_scan_bwd_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(dM, dM_ref, atol=7e-4, rtol=0.0)
+    torch.testing.assert_close(dK, dK_ref, atol=1e-3, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -599,6 +692,140 @@ def test_chunk_scan_bwd_rejects_oversized_dc_or_dlp_shapes_before_launch() -> No
     with pytest.raises(
         ValueError,
         match=r"No supported chunk_scan backward (dcdr|dlp) kernel fits",
+    ):
+        compile_chunk_scan_bwd_kernels(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_rejects_unsupported_db_shapes_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 2, 2, 65, 8, 16
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        chunk_scan_bwd_mod.ChunkScanBwdDBAmpere,
+        "support_info",
+        lambda self, in_dtype, *, device_index=None: SimpleNamespace(
+            supported=False,
+            required_smem_bytes=123456,
+            smem_capacity_bytes=65536,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"No supported chunk_scan backward db kernel fits",
+    ):
+        compile_chunk_scan_bwd_kernels(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_starts,
+            d_out,
+            chunk_size=chunk_size,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_rejects_unsupported_du_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 2, 2, 65, 8, 16
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        chunk_scan_bwd_mod.ChunkScanBwdDUAmpere,
+        "support_info",
+        lambda self, in_dtype, *, device_index=None: SimpleNamespace(
+            supported=False,
+            required_smem_bytes=131072,
+            smem_capacity_bytes=65536,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"No supported chunk_scan backward du kernel fits",
     ):
         compile_chunk_scan_bwd_kernels(
             U,

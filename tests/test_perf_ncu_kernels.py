@@ -23,7 +23,7 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
         n_heads: int,
         d_state: int,
         d_head: int,
-        **_: object,
+        **unused_kwargs: object,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -32,7 +32,8 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
         torch.Tensor,
         torch.Tensor,
     ]:
-        batch, t_size, _ = map(int, value.shape)
+        del params_flat, bc, unused_kwargs
+        batch, t_size, value_width = map(int, value.shape)
         u = torch.empty(
             (batch, n_heads, t_size, d_head), device=value.device, dtype=value.dtype
         )
@@ -48,6 +49,7 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
             dtype=value.dtype,
         )
         c = torch.empty_like(b)
+        assert value_width > 0
         coeff_aux = torch.empty(
             (batch, n_heads, ncu_kernels.COEFF_AUX_FIELDS, t_size),
             device=value.device,

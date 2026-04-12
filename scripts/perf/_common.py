@@ -717,7 +717,7 @@ def _build_chunk_scan_backward_callable(
         m_cute,
         initial_states=initial_states.to(dtype=torch.float32).contiguous(),
     )
-    compiled = compile_chunk_scan_bwd_kernels(
+    prepared = compile_chunk_scan_bwd_kernels(
         U,
         M,
         K,
@@ -729,12 +729,10 @@ def _build_chunk_scan_backward_callable(
         B_prev=B_prev,
         U_prev=U_prev,
         compute_dtype=torch.float32,
-        return_launchers=True,
     )
-    launch = compiled[-1]
 
     def fn() -> None:
-        launch()
+        prepared.launch()
 
     fn()
     return fn
