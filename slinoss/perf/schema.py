@@ -30,6 +30,20 @@ def _expect_path(root: dict[str, Any], path: str) -> Any:
     return node
 
 
+def _validate_memory_summary(memory: dict[str, Any]) -> None:
+    for label in ("peak_allocated_bytes", "peak_reserved_bytes"):
+        summary = _expect_dict(memory, label)
+        for key in (
+            "mean_bytes",
+            "median_bytes",
+            "min_bytes",
+            "max_bytes",
+            "stdev_bytes",
+            "num_samples",
+        ):
+            _expect(summary, key)
+
+
 def _validate_nextchar_budget_tree(
     tree: dict[str, Any],
     *,
@@ -119,6 +133,13 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
                 tree = _expect_dict(section, "tree")
                 _expect_dict(section, "regions")
                 _expect_dict(section, "cache_events")
+                memory = section.get("memory")
+                if memory is not None:
+                    if not isinstance(memory, dict):
+                        raise ValueError(
+                            f"Memory summary for {case_name}/{backend_name} must be a dict."
+                        )
+                    _validate_memory_summary(memory)
                 _validate_nextchar_budget_tree(
                     tree,
                     require_stage_breakdown=False,

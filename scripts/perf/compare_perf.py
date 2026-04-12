@@ -66,6 +66,25 @@ def _select_tps_summary(workload: dict[str, Any]) -> tuple[dict[str, Any], str]:
     return warm["tokens_per_s"], "tokens_per_s"
 
 
+def _select_memory_summary(
+    workload: dict[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any] | None:
+    warm = workload.get("warm")
+    if not isinstance(warm, dict):
+        return None
+    memory = warm.get("memory")
+    if not isinstance(memory, dict):
+        return None
+    summary = memory.get(label)
+    return summary if isinstance(summary, dict) else None
+
+
+def _bytes_to_mib(num_bytes: float) -> float:
+    return float(num_bytes) / float(1024**2)
+
+
 def _ci95_halfwidth(summary: dict[str, Any], *, key: str) -> float | None:
     count = int(float(summary.get("num_samples", 0.0)))
     if count <= 1:
@@ -126,6 +145,24 @@ def main() -> int:
         + "  "
         f"delta={after_tps - before_tps:+.2f}"
     )
+    for label in ("peak_allocated_bytes", "peak_reserved_bytes"):
+        before_memory = _select_memory_summary(before_workload, label=label)
+        after_memory = _select_memory_summary(after_workload, label=label)
+        if before_memory is None or after_memory is None:
+            continue
+        before_value = float(before_memory["mean_bytes"])
+        after_value = float(after_memory["mean_bytes"])
+        before_ci = _ci95_halfwidth(before_memory, key="stdev_bytes")
+        after_ci = _ci95_halfwidth(after_memory, key="stdev_bytes")
+        print(
+            f"{label} "
+            f"{_bytes_to_mib(before_value):.2f} MiB"
+            + (f" +- {_bytes_to_mib(before_ci):.2f}" if before_ci is not None else "")
+            + f" -> {_bytes_to_mib(after_value):.2f} MiB"
+            + (f" +- {_bytes_to_mib(after_ci):.2f}" if after_ci is not None else "")
+            + "  "
+            f"delta={_bytes_to_mib(after_value - before_value):+.2f} MiB"
+        )
     combined_step_ci = None
     if before_step_ci is not None and after_step_ci is not None:
         combined_step_ci = math.sqrt(before_step_ci**2 + after_step_ci**2)
@@ -175,6 +212,28 @@ def main() -> int:
             "delta": after_tps - before_tps,
             "before_ci95_halfwidth": before_tps_ci,
             "after_ci95_halfwidth": after_tps_ci,
+        },
+        "memory": {
+            label: {
+                "before": float(before_summary["mean_bytes"]),
+                "after": float(after_summary["mean_bytes"]),
+                "delta": float(after_summary["mean_bytes"])
+                - float(before_summary["mean_bytes"]),
+                "before_ci95_halfwidth": _ci95_halfwidth(
+                    before_summary, key="stdev_bytes"
+                ),
+                "after_ci95_halfwidth": _ci95_halfwidth(
+                    after_summary, key="stdev_bytes"
+                ),
+            }
+            for label in ("peak_allocated_bytes", "peak_reserved_bytes")
+            for before_summary, after_summary in [
+                (
+                    _select_memory_summary(before_workload, label=label),
+                    _select_memory_summary(after_workload, label=label),
+                )
+            ]
+            if before_summary is not None and after_summary is not None
         },
         "ranked": ranked,
     }

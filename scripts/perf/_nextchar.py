@@ -34,9 +34,21 @@ def _cross_entropy_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.
     return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
 
 
+def _step_memory_stats(device: torch.device) -> dict[str, int]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {
+            "peak_allocated_bytes": 0,
+            "peak_reserved_bytes": 0,
+        }
+    return {
+        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+    }
+
+
 @dataclass(frozen=True)
 class NextCharPerfConfig:
-    batch_size: int = 8
+    batch_size: int = 4
     block_size: int = 2048
     vocab_size: int = 256
     d_model: int = 736
@@ -350,6 +362,29 @@ def _time_step(
     return (ended - started) * 1000.0, out
 
 
+def _time_step_with_memory(
+    fn: Callable[[], T],
+    *,
+    device: torch.device,
+) -> tuple[float, T, dict[str, int]]:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        stream = torch.cuda.current_stream(device=device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(stream)
+        out = fn()
+        end.record(stream)
+        torch.cuda.synchronize(device)
+        return float(start.elapsed_time(end)), out, _step_memory_stats(device)
+
+    started = perf_counter()
+    out = fn()
+    ended = perf_counter()
+    return (ended - started) * 1000.0, out, _step_memory_stats(device)
+
+
 def _run_profiled_sequence(
     cfg: NextCharPerfConfig,
     *,
@@ -397,7 +432,7 @@ def _run_clean_sequence(
     batches: list[tuple[torch.Tensor, torch.Tensor]],
     warmup: int,
     steps: int,
-) -> tuple[float, list[float]]:
+) -> tuple[float, dict[str, int], list[float], list[dict[str, int]]]:
     use_cuda_graph = (
         backend == "cute"
         and cfg.torch_device.type == "cuda"
@@ -410,7 +445,7 @@ def _run_clean_sequence(
     )
 
     cold_xb, cold_yb = batches[0]
-    cold_step_ms, (logits, loss) = _time_step(
+    cold_step_ms, (logits, loss), cold_memory = _time_step_with_memory(
         lambda: run_train_step_clean(
             model, optimizer, cold_xb, cold_yb, grad_clip=cfg.grad_clip
         ),
@@ -443,29 +478,33 @@ def _run_clean_sequence(
             trainer.step(xb, yb)
 
         warm_step_ms: list[float] = []
+        warm_memory: list[dict[str, int]] = []
         for xb, yb in batches[1 + warmup : 1 + warmup + steps]:
-            step_ms, _ = _time_step(
+            step_ms, _, step_memory = _time_step_with_memory(
                 lambda xb=xb, yb=yb: trainer.step(xb, yb),
                 device=cfg.torch_device,
             )
             warm_step_ms.append(step_ms)
+            warm_memory.append(step_memory)
 
-        return cold_step_ms, warm_step_ms
+        return cold_step_ms, cold_memory, warm_step_ms, warm_memory
 
     for xb, yb in batches[1 : 1 + warmup]:
         run_train_step_clean(model, optimizer, xb, yb, grad_clip=cfg.grad_clip)
 
     warm_step_ms: list[float] = []
+    warm_memory: list[dict[str, int]] = []
     for xb, yb in batches[1 + warmup : 1 + warmup + steps]:
-        step_ms, _ = _time_step(
+        step_ms, _, step_memory = _time_step_with_memory(
             lambda xb=xb, yb=yb: run_train_step_clean(
                 model, optimizer, xb, yb, grad_clip=cfg.grad_clip
             ),
             device=cfg.torch_device,
         )
         warm_step_ms.append(step_ms)
+        warm_memory.append(step_memory)
 
-    return cold_step_ms, warm_step_ms
+    return cold_step_ms, cold_memory, warm_step_ms, warm_memory
 
 
 def run_bench_step(
@@ -489,11 +528,18 @@ def run_bench_step(
         )
 
     cold_step_ms = 0.0
+    cold_memory: dict[str, int] = {}
     warm_step_ms: list[float] = []
+    warm_memory: list[dict[str, int]] = []
     warm_repeat_step_mean_ms: list[float] = []
     repeat_count = max(1, int(repeat))
     for repeat_idx in range(repeat_count):
-        repeat_cold_ms, repeat_warm_step_ms = _run_clean_sequence(
+        (
+            repeat_cold_ms,
+            repeat_cold_memory,
+            repeat_warm_step_ms,
+            repeat_warm_memory,
+        ) = _run_clean_sequence(
             cfg,
             backend=backend,
             initial_state=fixture.initial_state,
@@ -503,7 +549,9 @@ def run_bench_step(
         )
         if repeat_idx == 0:
             cold_step_ms = repeat_cold_ms
+            cold_memory = repeat_cold_memory
         warm_step_ms.extend(repeat_warm_step_ms)
+        warm_memory.extend(repeat_warm_memory)
         if repeat_warm_step_ms:
             warm_repeat_step_mean_ms.append(
                 float(statistics.fmean(repeat_warm_step_ms))
@@ -522,7 +570,9 @@ def run_bench_step(
 
     return {
         "cold_step_ms": cold_step_ms,
+        "cold_memory": cold_memory,
         "warm_step_ms": warm_step_ms,
+        "warm_memory": warm_memory,
         "warm_repeat_step_mean_ms": warm_repeat_step_mean_ms,
         "cold_profile": cold_profile,
         "warm_profile": warm_profile,

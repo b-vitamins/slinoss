@@ -44,6 +44,29 @@ from _nextchar import (  # noqa: E402
 from slinoss.perf.schema import validate_nextchar_bench_payload  # noqa: E402
 
 
+def _summarize_byte_samples(samples: list[float]) -> dict[str, float]:
+    return {
+        key.replace("_ms", "_bytes"): value
+        for key, value in summarize_scalar_samples(samples).items()
+    }
+
+
+def _summarize_memory_samples(
+    samples: list[dict[str, int]],
+) -> dict[str, dict[str, float]]:
+    labels = ("peak_allocated_bytes", "peak_reserved_bytes")
+    return {
+        label: _summarize_byte_samples(
+            [float(sample.get(label, 0)) for sample in samples]
+        )
+        for label in labels
+    }
+
+
+def _bytes_to_mib(num_bytes: float) -> float:
+    return float(num_bytes) / float(1024**2)
+
+
 def _parse_args() -> argparse.Namespace:
     default_cfg = DEFAULT_NEXTCHAR_PERF_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
@@ -159,6 +182,8 @@ def _summarize_workload(
     cold = result["cold_profile"]
     warm_steps = result["warm_profile"]
     tokens_per_step = int(result["tokens_per_step"])
+    cold_memory = dict(result["cold_memory"])
+    warm_memory = list(result["warm_memory"])
     step_total_samples = [float(ms) for ms in result["warm_step_ms"]]
     repeat_step_samples = [float(ms) for ms in result["warm_repeat_step_mean_ms"]]
 
@@ -208,6 +233,7 @@ def _summarize_workload(
             "budget": cold_budget,
             "tree": cold_tree,
             "cache_events": summarize_cache_samples([cold["cache_events"]]),
+            "memory": _summarize_memory_samples([cold_memory]),
         },
         "warm": {
             "step": summarize_scalar_samples(step_total_samples),
@@ -218,6 +244,7 @@ def _summarize_workload(
             "budget": warm_budget,
             "tree": warm_tree,
             "cache_events": summarize_cache_samples(warm_cache_samples),
+            "memory": _summarize_memory_samples(warm_memory),
         },
     }
 
@@ -338,9 +365,17 @@ def main() -> int:
             warm = case_payload["workload"][backend]["warm"]
             step_mean = float(warm["step"]["mean_ms"])
             tps_mean = float(warm["tokens_per_s"]["mean"])
+            peak_alloc_mib = _bytes_to_mib(
+                float(warm["memory"]["peak_allocated_bytes"]["mean_bytes"])
+            )
+            peak_res_mib = _bytes_to_mib(
+                float(warm["memory"]["peak_reserved_bytes"]["mean_bytes"])
+            )
             print(
                 f"{case_name}/{backend}: step_mean_ms={step_mean:.6f} "
-                f"tokens_per_s={tps_mean:.2f}"
+                f"tokens_per_s={tps_mean:.2f} "
+                f"peak_allocated_mib={peak_alloc_mib:.2f} "
+                f"peak_reserved_mib={peak_res_mib:.2f}"
             )
 
     if args.json_out is not None:
