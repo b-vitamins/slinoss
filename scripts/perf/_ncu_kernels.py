@@ -374,7 +374,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             coeff_block_size=cfg.coeff_block_size_bwd,
         ),
         make_fake_tensor_arg(dU),
-        make_fake_tensor_arg(bc),
         make_fake_tensor_arg(dB),
         make_fake_tensor_arg(dC),
         make_fake_tensor_arg(coeff_aux),
@@ -396,7 +395,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     def launch() -> None:
         compiled(
             dU,
-            bc,
             dB,
             dC,
             coeff_aux,
@@ -413,7 +411,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
 
     effective_bytes = _tensor_bytes(
         dU,
-        bc,
         dB,
         dC,
         coeff_aux,
