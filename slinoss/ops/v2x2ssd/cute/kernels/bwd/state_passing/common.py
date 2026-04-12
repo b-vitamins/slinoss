@@ -1,34 +1,99 @@
-"""CuTe backward helpers for the fused ``v2x2ssd`` state-passing stage.
+"""Shared Python-side helpers for backward ``v2x2ssd`` state passing.
 
-The fused kernel walks the backward chunk recurrence over one contiguous
-``S = P * D`` tile per CTA:
+This module stays intentionally small. It carries only the pieces shared by the
+backward wrapper and kernel:
 
-1) It writes ``d_inc[c] = d_z_{c+1}``.
-2) It accumulates the local ``d_m_chunk[c]`` contribution from
-   ``(chunk_starts[c], d_z_{c+1})``.
-3) It updates ``d_z_c = d_chunk_starts[c] + conj(m_chunk[c]) * d_z_{c+1}``.
-
-The full ``d_m_chunk`` reduction is completed by atomically accumulating the
-per-tile partials into the global output.
+- tensor-spec construction and static view materialization
+- TVM FFI runtime and compile argument builders
+- copy-width selection for linear state tiles
+- assumed-alignment inference for fake/runtime tensor views
+- tile configuration metadata
 """
-
-from __future__ import annotations
 
 from dataclasses import dataclass
 
-import cutlass
 import cutlass.cute as cute
 import torch
 
+from slinoss._cute_runtime import TensorSpec, make_runtime_tensor_spec_view
 
-def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
-    if dt == torch.float16:
-        return cutlass.Float16
-    if dt == torch.bfloat16:
-        return cutlass.BFloat16
-    if dt == torch.float32:
-        return cutlass.Float32
-    raise TypeError(f"Unsupported dtype: {dt}")
+from ...fwd.common import _compile_env_stream_placeholder, _make_fake_tensor_spec_arg
+
+
+def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
+    """Extend raw-pointer tensor lifetimes through the current CUDA stream."""
+    stream = None
+    seen: set[int] = set()
+    for tensor in tensors:
+        if tensor is None or tensor.device.type != "cuda":
+            continue
+        ident = id(tensor)
+        if ident in seen:
+            continue
+        if stream is None:
+            stream = torch.cuda.current_stream(device=tensor.device)
+        tensor.record_stream(stream)
+        seen.add(ident)
+
+
+def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= int(shape[i])
+    return tuple(stride)
+
+
+def _make_tensor_spec(
+    shape: tuple[int, ...],
+    *,
+    stride: tuple[int, ...] | None = None,
+) -> TensorSpec:
+    resolved_shape = tuple(int(dim) for dim in shape)
+    resolved_stride = (
+        _make_row_major_stride(resolved_shape)
+        if stride is None
+        else tuple(int(step) for step in stride)
+    )
+    return resolved_shape, resolved_stride
+
+
+def _make_static_tensor_spec_view(
+    tensor: cute.Tensor,
+    tensor_spec: TensorSpec,
+) -> cute.Tensor:
+    shape, stride = tensor_spec
+    return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=stride))
+
+
+def _make_runtime_tensor_views_from_specs(
+    *tensor_specs: tuple[torch.Tensor, TensorSpec],
+) -> tuple[torch.Tensor, ...]:
+    return tuple(
+        make_runtime_tensor_spec_view(tensor, spec) for tensor, spec in tensor_specs
+    )
+
+
+def _make_tvm_ffi_runtime_and_compile_args_from_specs(
+    *tensor_specs: tuple[torch.Tensor, torch.dtype, TensorSpec],
+) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...], tuple[object, ...]]:
+    runtime_args = _make_runtime_tensor_views_from_specs(
+        *((tensor, spec) for tensor, _dtype, spec in tensor_specs)
+    )
+    alignments = tuple(_assumed_align(tensor) for tensor in runtime_args)
+    compile_args = tuple(
+        _make_fake_tensor_spec_arg(
+            dtype=dtype,
+            shape=spec[0],
+            stride=spec[1],
+            align=align,
+        )
+        for (_tensor, dtype, spec), align in zip(tensor_specs, alignments, strict=True)
+    ) + (_compile_env_stream_placeholder(),)
+    return runtime_args, alignments, compile_args
 
 
 def _elem_bits(dt: torch.dtype) -> int:
@@ -94,45 +159,3 @@ class _TileConfig:
     @property
     def tile(self) -> int:
         return int(self.num_threads) * self.elems_per_thread
-
-
-@dataclass(frozen=True)
-class StatePassingLayoutBundle:
-    layout_bcs: object
-    layout_bcm: object
-    layout_bs: object
-    tile_layout: object
-    tv_layout: object
-
-
-def _make_layout_bundle(
-    *,
-    BH: int,
-    C: int,
-    S: int,
-    cfg: _TileConfig,
-) -> StatePassingLayoutBundle:
-    return StatePassingLayoutBundle(
-        layout_bcs=cute.make_layout((BH, C, S), stride=(C * S, S, 1)),
-        layout_bcm=cute.make_layout((BH, C, 2), stride=(C * 2, 2, 1)),
-        layout_bs=cute.make_layout((BH, S), stride=(S, 1)),
-        tile_layout=cute.make_layout(cfg.tile),
-        tv_layout=cute.make_layout(
-            (cfg.num_threads, cfg.elems_per_thread),
-            stride=(cfg.elems_per_thread, 1),
-        ),
-    )
-
-
-@cute.jit
-def _thread_tile_view(
-    g_tensor: cute.Tensor,
-    tile_layout: cute.Layout,
-    cta_coord,
-    tv_layout: cute.Layout,
-    tidx: cutlass.Int32,
-):
-    t_tensor = cute.zipped_divide(g_tensor, tiler=tile_layout)
-    cta_tensor = t_tensor[cta_coord]
-    tid_tensor = cute.composition(cta_tensor, tv_layout)
-    return tid_tensor[tidx, None]

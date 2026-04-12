@@ -241,7 +241,7 @@ def test_compile_state_passing_bwd_reuses_cached_executor(
     d_chunk_starts = torch.randn_like(chunk_starts_f32)
     d_final = torch.randn_like(final_state, dtype=torch.float32)
 
-    state_passing_bwd_mod._COMPILED_CACHE.clear()
+    state_passing_bwd_mod._STATE_PASSING_BWD_CACHE.clear()
     compile_state_passing_bwd_kernel(
         chunk_starts_f32,
         m_chunk.detach(),
@@ -290,7 +290,7 @@ def test_compile_state_passing_bwd_enables_tvm_ffi(
         return orig_compile(*args, **kwargs)
 
     monkeypatch.setattr(cute, "compile", wrapped_compile)
-    state_passing_bwd_mod._COMPILED_CACHE.clear()
+    state_passing_bwd_mod._STATE_PASSING_BWD_CACHE.clear()
     try:
         compile_state_passing_bwd_kernel(
             chunk_starts_f32,
@@ -299,7 +299,7 @@ def test_compile_state_passing_bwd_enables_tvm_ffi(
             d_final=d_final.detach(),
         )
     finally:
-        state_passing_bwd_mod._COMPILED_CACHE.clear()
+        state_passing_bwd_mod._STATE_PASSING_BWD_CACHE.clear()
 
     assert compile_options == ["--enable-tvm-ffi"]
     torch.cuda.synchronize()

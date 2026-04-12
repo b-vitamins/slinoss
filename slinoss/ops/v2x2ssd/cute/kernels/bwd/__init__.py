@@ -33,7 +33,7 @@ from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
 from .chunk_scan.param_scan import ChunkScanBwdParamScanAmpere
 from .state_passing.common import _TileConfig, _choose_copy_bits_for_linear_tiles
-from .state_passing.state import StatePassingBwdAmpere
+from .state_passing import StatePassingBwdAmpere
 
 
 _BWD_HOST_CACHE: dict[tuple, object] = {}

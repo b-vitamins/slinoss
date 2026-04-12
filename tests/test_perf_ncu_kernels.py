@@ -33,7 +33,7 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
         torch.Tensor,
     ]:
         del params_flat, bc, unused_kwargs
-        batch_size, t_size, value_width = map(int, value.shape)
+        batch_size, t_size, _unused_channels = map(int, value.shape)
         u = torch.empty(
             (batch_size, n_heads, t_size, d_head),
             device=value.device,
@@ -55,7 +55,6 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
             dtype=value.dtype,
         )
         c = torch.empty_like(b)
-        assert value_width > 0
         coeff_aux = torch.empty(
             (batch_size, n_heads, ncu_kernels.COEFF_AUX_FIELDS, t_size),
             device=value.device,
