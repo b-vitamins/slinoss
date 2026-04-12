@@ -431,10 +431,11 @@ class SLinOSSMixer(nn.Module):
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        del dtype
         return torch.zeros(
             (batch_size, self.n_heads, 2 * self.d_state, self.d_head),
             device=device,
-            dtype=dtype,
+            dtype=torch.float32,
         ).transpose(-1, -2)
 
     def _ensure_fast_decode_state_layout(
@@ -445,11 +446,12 @@ class SLinOSSMixer(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
+        del dtype
         if state.scan.state is None:
             state.scan.state = self._make_decode_state_tensor(
                 batch_size,
                 device=device,
-                dtype=dtype,
+                dtype=torch.float32,
             )
             return
         if state.scan.state.shape != (
@@ -463,14 +465,14 @@ class SLinOSSMixer(nn.Module):
                 f"{(batch_size, self.n_heads, self.d_head, 2 * self.d_state)}. "
                 f"Got {tuple(state.scan.state.shape)}."
             )
-        if state.scan.state.device != device or state.scan.state.dtype != dtype:
-            state.scan.state = state.scan.state.to(device=device, dtype=dtype)
+        if state.scan.state.device != device or state.scan.state.dtype != torch.float32:
+            state.scan.state = state.scan.state.to(device=device, dtype=torch.float32)
         if state.scan.state.stride()[-2:] == (1, self.d_head):
             return
         fast_state = self._make_decode_state_tensor(
             batch_size,
             device=device,
-            dtype=dtype,
+            dtype=torch.float32,
         )
         fast_state.copy_(state.scan.state)
         state.scan.state = fast_state
@@ -901,8 +903,11 @@ class SLinOSSMixer(nn.Module):
             B_prev=state.b_prev,
             U_prev=state.u_prev,
             compute_dtype=compute_dtype,
-            output_dtype=value.dtype,
+            output_dtype=torch.float32,
         )
+        scan_y = scan_y.to(dtype=value.dtype)
+        b_last = b_last.to(dtype=value.dtype)
+        u_last = u_last.to(dtype=value.dtype)
         gated = self._apply_gate(scan_y, gate, batch, 1)[:, 0, :]
         next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
         return gated.contiguous(), next_state
@@ -987,6 +992,13 @@ class SLinOSSMixer(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
+        if use_cute_decode:
+            self._ensure_fast_decode_state_layout(
+                state,
+                batch_size=batch,
+                device=x.device,
+                dtype=x.dtype,
+            )
         # The fused decode out-projection would bypass output_norm and diverge from
         # full-forward semantics. Keep it disabled until the kernel can absorb the norm.
         use_fused_outproj = False
@@ -1007,6 +1019,8 @@ class SLinOSSMixer(nn.Module):
             state.scan.state is None
             or scan_next.state is None
             or tuple(state.scan.state.shape) != tuple(scan_next.state.shape)
+            or state.scan.state.device != scan_next.state.device
+            or state.scan.state.dtype != scan_next.state.dtype
         ):
             state.scan.state = scan_next.state
         elif state.scan.state is not scan_next.state:

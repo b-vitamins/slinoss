@@ -156,7 +156,7 @@ def _require_decode_tensor_contract(
     name: str,
     shape: tuple[int, ...],
     device: torch.device,
-    dtype: torch.dtype,
+    dtype: torch.dtype | tuple[torch.dtype, ...],
 ) -> None:
     if tensor is None:
         return
@@ -164,8 +164,10 @@ def _require_decode_tensor_contract(
         raise ValueError(f"{name} must be {shape}. Got {tuple(tensor.shape)}.")
     if tensor.device != device:
         raise ValueError(f"{name} must live on {device}. Got {tensor.device}.")
-    if tensor.dtype != dtype:
-        raise ValueError(f"{name} must use {dtype}. Got {tensor.dtype}.")
+    allowed_dtypes = dtype if isinstance(dtype, tuple) else (dtype,)
+    if tensor.dtype not in allowed_dtypes:
+        expected = " or ".join(str(dt) for dt in allowed_dtypes)
+        raise ValueError(f"{name} must use {expected}. Got {tensor.dtype}.")
 
 
 def mixer_decode_step_cute(
@@ -227,12 +229,13 @@ def mixer_decode_step_cute(
     state_shape = (batch, heads, P, 2 * N)
     b_prev_shape = (batch, heads, 2 * N)
     u_prev_shape = (batch, heads, P)
+    state_dtype = torch.float32
     _require_decode_tensor_contract(
         initial_states,
         name="initial_states",
         shape=state_shape,
         device=value.device,
-        dtype=value.dtype,
+        dtype=state_dtype,
     )
     _require_decode_tensor_contract(
         B_prev,
@@ -253,7 +256,7 @@ def mixer_decode_step_cute(
         name="final_state_out",
         shape=state_shape,
         device=value.device,
-        dtype=value.dtype,
+        dtype=state_dtype,
     )
     _require_decode_tensor_contract(
         b_last_out,
@@ -291,7 +294,7 @@ def mixer_decode_step_cute(
         if initial_states is not None
         else _ensure_min_alignment(
             torch.zeros(
-                (batch, heads, P, 2 * N), device=value.device, dtype=value.dtype
+                (batch, heads, P, 2 * N), device=value.device, dtype=state_dtype
             ),
             min_align=_DECODE_MIN_ALIGN,
         )

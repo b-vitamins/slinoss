@@ -118,7 +118,7 @@ def _make_decode_step_fixture(
     initial_states = torch.randn(
         (batch, mixer.n_heads, mixer.d_head, 128),
         device="cuda",
-        dtype=dtype,
+        dtype=torch.float32,
     )
     b_prev = torch.randn(
         (batch, mixer.n_heads, 128),
@@ -197,10 +197,15 @@ def test_mixer_step_supported_cuda_matches_forward_without_calling_forward(
     assert state_full.scan.b_prev is not None and state_step.scan.b_prev is not None
     assert state_full.scan.u_prev is not None and state_step.scan.u_prev is not None
     assert state_step._engine is not None
+    assert state_full.scan.state.dtype == dtype
+    assert state_step.scan.state.dtype == torch.float32
     assert state_step.scan.state.stride()[-2:] == (1, mixer.d_head)
     torch.testing.assert_close(state_step.conv, state_full.conv, atol=atol, rtol=0.0)
     torch.testing.assert_close(
-        state_step.scan.state, state_full.scan.state, atol=atol, rtol=0.0
+        state_step.scan.state,
+        state_full.scan.state.to(dtype=torch.float32),
+        atol=atol,
+        rtol=0.0,
     )
     torch.testing.assert_close(
         state_step.scan.b_prev, state_full.scan.b_prev, atol=atol, rtol=0.0
@@ -231,12 +236,14 @@ def test_mixer_init_decode_state_uses_decode_layout_only_for_cute_path(
     fast_state = mixer.init_decode_state(1, device="cuda", dtype=dtype)
     assert fast_state.scan.state is not None
     assert tuple(fast_state.scan.state.shape) == (1, mixer.n_heads, mixer.d_head, 128)
+    assert fast_state.scan.state.dtype == torch.float32
     assert not fast_state.scan.state.is_contiguous()
     assert fast_state.scan.state.stride()[-2:] == (1, mixer.d_head)
 
     mixer.decode_backend = ReferenceMixerDecodeBackend()
     ref_state = mixer.init_decode_state(1, device="cuda", dtype=dtype)
     assert ref_state.scan.state is not None
+    assert ref_state.scan.state.dtype == dtype
     assert ref_state.scan.state.is_contiguous()
 
 
@@ -893,7 +900,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
             device="cuda",
-            dtype=dtype,
+            dtype=torch.float32,
         )
         b_prev = torch.randn(
             (batch, mixer.n_heads, 128),
@@ -987,15 +994,15 @@ def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
         b_prev = torch.randn(
             (batch, mixer.n_heads, 128),
             device="cuda",
-            dtype=bad_dtype,
+            dtype=dtype,
         )
         u_prev = torch.randn(
             (batch, mixer.n_heads, mixer.d_head),
             device="cuda",
-            dtype=bad_dtype,
+            dtype=dtype,
         )
 
-        with pytest.raises(ValueError, match="must use torch.bfloat16"):
+        with pytest.raises(ValueError, match="must use torch.float32"):
             mixer_decode_step_cute(
                 value_h,
                 params_h,
@@ -1054,7 +1061,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
             device="cuda",
-            dtype=dtype,
+            dtype=torch.float32,
         )
         b_prev = torch.randn(
             (batch, mixer.n_heads, 128),
@@ -1152,7 +1159,7 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
         initial_states = torch.randn(
             (batch, mixer.n_heads, mixer.d_head, 128),
             device="cuda",
-            dtype=dtype,
+            dtype=torch.float32,
         )
         b_prev = torch.randn(
             (batch, mixer.n_heads, 128),
@@ -1165,10 +1172,10 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
             dtype=dtype,
         )
         final_state_out = torch.empty_like(initial_states, dtype=bad_dtype)
-        b_last_out = torch.empty_like(b_prev, dtype=bad_dtype)
-        u_last_out = torch.empty_like(u_prev, dtype=bad_dtype)
+        b_last_out = torch.empty_like(b_prev)
+        u_last_out = torch.empty_like(u_prev)
 
-        with pytest.raises(ValueError, match="must use torch.bfloat16"):
+        with pytest.raises(ValueError, match="must use torch.float32"):
             mixer_decode_step_cute(
                 value_h,
                 params_h,
@@ -1229,7 +1236,7 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
         ].contiguous()
         gate_h = gate.view(x.shape[0], mixer.n_heads, mixer.d_head).contiguous()
 
-        state_ref = state.scan.state.clone()
+        state_ref = state.scan.state.to(dtype=torch.float32)
         b_prev_ref = state.scan.b_prev.clone()
         u_prev_ref = state.scan.u_prev.clone()
         y_ref, final_ref, b_last_ref, u_last_ref = mixer_decode_step_cute(
@@ -1244,7 +1251,7 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             output_dtype=dtype,
         )
 
-        state_alias = state.scan.state.clone()
+        state_alias = state.scan.state.to(dtype=torch.float32)
         b_prev_alias = state.scan.b_prev.clone()
         u_prev_alias = state.scan.u_prev.clone()
         y_alias, final_alias, b_last_alias, u_last_alias = mixer_decode_step_cute(
