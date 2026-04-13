@@ -1,6 +1,4 @@
-"""Reference scanprep boundary for the SLinOSS mixer."""
-
-from __future__ import annotations
+"""Scan preparation layer definitions for the SLinOSS mixer."""
 
 import math
 from typing import cast
@@ -11,13 +9,12 @@ from torch.nn import functional as F
 
 from slinoss.ops.scanprep import (
     SLinOSSScanPrepCoefficients,
-    build_transition_from_polar,
-    foh_taps_from_polar,
     principal_angle,
     scanprep_cute,
 )
 from slinoss.ops.scanprep.reference import _foh_taps_from_normalized, _pack_complex
 
+from ._validation import _require
 from .backend import (
     AutoScanPrepBackend,
     ScanInputs,
@@ -26,22 +23,18 @@ from .backend import (
 )
 
 
-def _require(cond: bool, msg: str) -> None:
-    if not cond:
-        raise ValueError(msg)
-
-
 def _logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     p = p.clamp(min=float(eps), max=1.0 - float(eps))
     return torch.log(p) - torch.log1p(-p)
 
 
 class SLinOSSScanPrep(nn.Module):
-    """Builds canonical scan inputs from post-conv activations and parameter streams."""
+    """Converts mixer value, parameter, and BC streams into scan inputs."""
 
     param_dim: int = 2
     bc_param_rows: int = 2
     theta_mod_scale: float = 0.25
+    theta_sign: torch.Tensor
 
     def __init__(
         self,
@@ -50,9 +43,9 @@ class SLinOSSScanPrep(nn.Module):
         d_state: int,
         d_head: int,
         backend: ScanPrepBackend | None = None,
-        dt_min: float = 1e-4,
+        dt_min: float = 3e-2,
         dt_max: float = 1e-1,
-        dt_init_floor: float = 1e-4,
+        dt_init_floor: float = 3e-2,
         gamma_min: float = 2.0,
         gamma_max: float = 8.0,
         theta_init_min: float = 0.2,
@@ -88,10 +81,7 @@ class SLinOSSScanPrep(nn.Module):
             0.0 < r_min <= r_max <= 1.0,
             f"Require 0 < r_min <= r_max <= 1. Got {r_min}, {r_max}.",
         )
-        _require(
-            bc_gain_max > 0.0,
-            f"Require bc_gain_max > 0. Got {bc_gain_max}.",
-        )
+        _require(bc_gain_max > 0.0, f"Require bc_gain_max > 0. Got {bc_gain_max}.")
 
         self.n_heads = int(n_heads)
         self.d_state = int(d_state)
@@ -145,7 +135,7 @@ class SLinOSSScanPrep(nn.Module):
         self.reset_parameters()
 
     def _head_init_targets(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return a general lattice of sane initial ``(dt, theta)`` targets."""
+        """Returns per-head ``(dt, theta)`` initialization targets."""
 
         dt_lo = max(self.dt_min, self.dt_init_floor)
         dt_hi = self.dt_max
@@ -178,25 +168,14 @@ class SLinOSSScanPrep(nn.Module):
         theta0 = torch.stack([pair[1] for pair in pairs[: self.n_heads]])
         return dt0, theta0
 
-    def _apply(self, fn):  # type: ignore[override]
-        bc_complex_base = self._parameters.pop("bc_complex_base", None)
-        super()._apply(fn)
-        if bc_complex_base is None:
-            return self
-
-        probe = fn(torch.empty((), device=bc_complex_base.device, dtype=torch.float32))
-        restored = nn.Parameter(
-            bc_complex_base.detach().to(
-                device=probe.device, dtype=bc_complex_base.dtype
-            ),
-            requires_grad=bc_complex_base.requires_grad,
-        )
-        if bc_complex_base.grad is not None:
-            restored.grad = bc_complex_base.grad.detach().to(
-                device=probe.device, dtype=bc_complex_base.dtype
-            )
-        self._parameters["bc_complex_base"] = restored
-        return self
+    def _make_initial_phase_grid(self) -> torch.Tensor:
+        return torch.linspace(
+            -math.pi,
+            math.pi,
+            self.n_heads * 2 * self.d_state + 1,
+            device=self.dt_bias.device,
+            dtype=torch.float32,
+        )[:-1].view(self.n_heads, 2, self.d_state)
 
     def reset_parameters(self) -> None:
         dt0, theta0 = self._head_init_targets()
@@ -211,28 +190,42 @@ class SLinOSSScanPrep(nn.Module):
             )
             self.theta_mod_bias.zero_()
             self.theta_bias.copy_(_logit(theta_u0))
-
-            phase_grid = torch.linspace(
-                -math.pi,
-                math.pi,
-                self.n_heads * 2 * self.d_state + 1,
-                device=self.dt_bias.device,
-                dtype=torch.float32,
-            )[:-1].view(self.n_heads, 2, self.d_state)
+            phase_grid = self._make_initial_phase_grid()
             self.bc_complex_base.copy_(
                 torch.polar(torch.ones_like(phase_grid), phase_grid).to(torch.complex64)
             )
 
-    def _flat_param_bias(self) -> torch.Tensor:
-        return torch.stack(
-            (
-                self.gamma_bias,
-                self.theta_mod_bias,
-            ),
-            dim=-1,
-        )
+    def _apply(self, fn):  # type: ignore[override]
+        bc_complex_base = self._parameters.pop("bc_complex_base", None)
+        super()._apply(fn)
+        if bc_complex_base is None:
+            return self
 
-    def _compute_coefficients(
+        probe = fn(torch.empty((), device=bc_complex_base.device, dtype=torch.float32))
+        restored = nn.Parameter(
+            bc_complex_base.detach().to(
+                device=probe.device,
+                dtype=bc_complex_base.dtype,
+            ),
+            requires_grad=bc_complex_base.requires_grad,
+        )
+        if bc_complex_base.grad is not None:
+            restored.grad = bc_complex_base.grad.detach().to(
+                device=probe.device,
+                dtype=bc_complex_base.dtype,
+            )
+        self._parameters["bc_complex_base"] = restored
+        return self
+
+    def coefficients(self, params: torch.Tensor) -> SLinOSSScanPrepCoefficients:
+        M, K, dt, r, theta = self._make_scan_coefficients(params, include_aux=True)
+        assert dt is not None and r is not None and theta is not None
+        return SLinOSSScanPrepCoefficients(M=M, K=K, dt=dt, r=r, theta=theta)
+
+    def _make_param_bias(self) -> torch.Tensor:
+        return torch.stack((self.gamma_bias, self.theta_mod_bias), dim=-1)
+
+    def _make_scan_coefficients(
         self,
         params: torch.Tensor,
         *,
@@ -244,18 +237,10 @@ class SLinOSSScanPrep(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        if params.ndim != 4 or params.shape[-2] != self.n_heads:
-            raise ValueError(
-                f"Expected params shape (batch, T, {self.n_heads}, {self.param_dim}), "
-                f"got {tuple(params.shape)}."
-            )
-        if params.shape[-1] != self.param_dim:
-            raise ValueError(
-                f"Expected last dim {self.param_dim}, got {int(params.shape[-1])}."
-            )
+        self._validate_coeff_params(params)
 
         p = params.permute(0, 2, 1, 3).to(torch.float32)
-        p = p + self._flat_param_bias().view(1, self.n_heads, 1, self.param_dim)
+        p = p + self._make_param_bias().view(1, self.n_heads, 1, self.param_dim)
         gamma_raw, theta_mod_raw = p.unbind(dim=-1)
 
         dt = (
@@ -263,7 +248,6 @@ class SLinOSSScanPrep(nn.Module):
             + (self.dt_max - self.dt_min)
             * torch.sigmoid(self.dt_bias).view(1, self.n_heads, 1)
         ).expand_as(gamma_raw)
-
         theta_u = torch.sigmoid(
             self.theta_bias.view(1, self.n_heads, 1)
             + self.theta_mod_scale * torch.tanh(theta_mod_raw)
@@ -275,97 +259,89 @@ class SLinOSSScanPrep(nn.Module):
         theta_sign = cast(torch.Tensor, self.theta_sign)
         theta = theta_sign.view(1, self.n_heads, 1) * theta_drive
 
-        r_struct = self.r_min + (self.r_max - self.r_min) * torch.exp(-(gamma * dt))
-        r = r_struct
+        r = self.r_min + (self.r_max - self.r_min) * torch.exp(-(gamma * dt))
         log_r_f = torch.log(r)
         theta = principal_angle(theta)
         rho = torch.polar(r, theta)
         k_prev, k_curr = _foh_taps_from_normalized(
-            dt, log_r_f, theta, rho, eps=self.eps
+            dt,
+            log_r_f,
+            theta,
+            rho,
+            eps=self.eps,
         )
 
         M = _pack_complex(rho)
-        K = torch.stack([k_prev, k_curr], dim=-2)
+        K = torch.stack((k_prev, k_curr), dim=-2)
         if not include_aux:
             return M, K, None, None, None
         return M, K, dt, r, theta
 
-    def scan_coeffs(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        M, K, _, _, _ = self._compute_coefficients(params, include_aux=False)
-        return M, K
-
-    def coefficients(self, params: torch.Tensor) -> SLinOSSScanPrepCoefficients:
-        M, K, dt, r, theta = self._compute_coefficients(params, include_aux=True)
-        assert dt is not None and r is not None and theta is not None
-        return SLinOSSScanPrepCoefficients(M=M, K=K, dt=dt, r=r, theta=theta)
-
-    def _parameterize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
-        if bc.ndim != 5 or bc.shape[2:] != (
-            self.n_heads,
-            self.bc_param_rows,
-            self.d_state,
-        ):
-            raise ValueError(
-                "bc must be "
-                f"(batch, T, heads, {self.bc_param_rows}, d_state). "
-                f"Got {tuple(bc.shape)}."
-            )
-        B_pairs, C_pairs = self._parameterize_scan_bc_pairs(bc)
-        return torch.stack(
-            (
-                B_pairs[..., 0],
-                B_pairs[..., 1],
-                C_pairs[..., 0],
-                C_pairs[..., 1],
-            ),
-            dim=3,
+    def _validate_coeff_params(self, params: torch.Tensor) -> None:
+        expected = (self.n_heads, self.param_dim)
+        _require(
+            params.ndim == 4 and tuple(params.shape[-2:]) == expected,
+            f"Expected params shape (batch, T, {self.n_heads}, {self.param_dim}), "
+            f"got {tuple(params.shape)}.",
         )
+
+    def _validate_scan_bc(self, bc: torch.Tensor) -> None:
+        expected = (self.n_heads, self.bc_param_rows, self.d_state)
+        _require(
+            bc.ndim == 5 and tuple(bc.shape[2:]) == expected,
+            "bc must be "
+            f"(batch, T, heads, {self.bc_param_rows}, d_state). "
+            f"Got {tuple(bc.shape)}.",
+        )
+
+    def _normalize_scan_bc_pairs(self, bc_pairs: torch.Tensor) -> torch.Tensor:
+        mag_sq = bc_pairs.square().sum(dim=-1, dtype=torch.float32)
+        row_rms = mag_sq.mean(dim=-1, keepdim=True).clamp_min(self.eps).sqrt()
+        row_rms_expanded = row_rms.unsqueeze(-1).to(dtype=bc_pairs.dtype)
+        direction = bc_pairs / row_rms_expanded
+        bounded_gain = self.bc_gain_max * torch.tanh(row_rms / self.bc_gain_max)
+        return direction * bounded_gain.unsqueeze(-1).to(dtype=bc_pairs.dtype)
 
     def _parameterize_scan_bc_pairs(
         self,
         bc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if bc.ndim != 5 or bc.shape[2:] != (
-            self.n_heads,
-            self.bc_param_rows,
-            self.d_state,
-        ):
-            raise ValueError(
-                "bc must be "
-                f"(batch, T, heads, {self.bc_param_rows}, d_state). "
-                f"Got {tuple(bc.shape)}."
-            )
+        self._validate_scan_bc(bc)
 
-        amp = F.softplus(bc)
-        base_ri = torch.view_as_real(self.bc_complex_base).to(
+        bc_amplitude = F.softplus(bc)
+        bc_complex_base = torch.view_as_real(self.bc_complex_base).to(
             device=bc.device,
             dtype=bc.dtype,
         )
-
-        b_raw = amp[..., 0, :].unsqueeze(-1) * base_ri[:, 0, :, :].view(
-            1, 1, self.n_heads, self.d_state, 2
+        b_pairs = bc_amplitude[..., 0, :].unsqueeze(-1) * bc_complex_base[
+            :, 0, :, :
+        ].view(1, 1, self.n_heads, self.d_state, 2)
+        c_pairs = bc_amplitude[..., 1, :].unsqueeze(-1) * bc_complex_base[
+            :, 1, :, :
+        ].view(1, 1, self.n_heads, self.d_state, 2)
+        return (
+            self._normalize_scan_bc_pairs(b_pairs).contiguous(),
+            self._normalize_scan_bc_pairs(c_pairs).contiguous(),
         )
-        c_raw = amp[..., 1, :].unsqueeze(-1) * base_ri[:, 1, :, :].view(
-            1, 1, self.n_heads, self.d_state, 2
+
+    def _parameterize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
+        b_pairs, c_pairs = self._parameterize_scan_bc_pairs(bc)
+        return torch.stack(
+            (b_pairs[..., 0], b_pairs[..., 1], c_pairs[..., 0], c_pairs[..., 1]),
+            dim=3,
         )
 
-        def _normalize_complex_rows(raw_pairs: torch.Tensor) -> torch.Tensor:
-            mag_sq = raw_pairs.square().sum(dim=-1, dtype=torch.float32)
-            row_rms = mag_sq.mean(dim=-1, keepdim=True).clamp_min(self.eps).sqrt()
-            row_rms_expanded = row_rms.unsqueeze(-1).to(dtype=raw_pairs.dtype)
-            direction = raw_pairs / row_rms_expanded
-            bounded_gain = self.bc_gain_max * torch.tanh(row_rms / self.bc_gain_max)
-            return direction * bounded_gain.unsqueeze(-1).to(dtype=raw_pairs.dtype)
-
-        B_pairs = _normalize_complex_rows(b_raw)
-        C_pairs = _normalize_complex_rows(c_raw)
-        return B_pairs.contiguous(), C_pairs.contiguous()
-
-    def _pack_scan_u(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
-        if value.ndim != 3 or value.shape[-1] != self.d_inner:
-            raise ValueError(
-                f"value must be (batch, T, {self.d_inner}). Got {tuple(value.shape)}."
-            )
+    def _pack_scan_u(
+        self,
+        value: torch.Tensor,
+        *,
+        batch: int,
+        T: int,
+    ) -> torch.Tensor:
+        _require(
+            value.ndim == 3 and value.shape[-1] == self.d_inner,
+            f"value must be (batch, T, {self.d_inner}). Got {tuple(value.shape)}.",
+        )
         return (
             value.view(batch, T, self.n_heads, self.d_head)
             .permute(0, 2, 1, 3)
@@ -376,14 +352,19 @@ class SLinOSSScanPrep(nn.Module):
         self,
         B_pairs: torch.Tensor,
         C_pairs: torch.Tensor,
+        *,
         batch: int,
         T: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         expected = (batch, T, self.n_heads, self.d_state, 2)
-        if tuple(map(int, B_pairs.shape)) != expected:
-            raise ValueError(f"B_pairs must be {expected}. Got {tuple(B_pairs.shape)}.")
-        if tuple(map(int, C_pairs.shape)) != expected:
-            raise ValueError(f"C_pairs must be {expected}. Got {tuple(C_pairs.shape)}.")
+        _require(
+            tuple(map(int, B_pairs.shape)) == expected,
+            f"B_pairs must be {expected}. Got {tuple(B_pairs.shape)}.",
+        )
+        _require(
+            tuple(map(int, C_pairs.shape)) == expected,
+            f"C_pairs must be {expected}. Got {tuple(C_pairs.shape)}.",
+        )
         B = (
             B_pairs.permute(0, 2, 1, 3, 4)
             .reshape(batch, self.n_heads, T, 2 * self.d_state)
@@ -396,25 +377,34 @@ class SLinOSSScanPrep(nn.Module):
         )
         return B, C
 
-    def _scan_coeffs_from_flat_params(
+    def _make_scan_coefficients_from_flat_params(
         self,
         params: torch.Tensor,
+        *,
         batch: int,
         T: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         expected = self.n_heads * self.param_dim
-        if params.ndim != 3 or params.shape[-1] != expected:
-            raise ValueError(
-                f"params must be (batch, T, {expected}). Got {tuple(params.shape)}."
-            )
-        return self.scan_coeffs(params.view(batch, T, self.n_heads, self.param_dim))
+        _require(
+            params.ndim == 3 and params.shape[-1] == expected,
+            f"params must be (batch, T, {expected}). Got {tuple(params.shape)}.",
+        )
+        M, K, _, _, _ = self._make_scan_coefficients(
+            params.view(batch, T, self.n_heads, self.param_dim),
+            include_aux=False,
+        )
+        return M, K
 
     def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs:
         batch, T, _ = map(int, inputs.value.shape)
-        U = self._pack_scan_u(inputs.value, batch, T)
-        B_pairs, C_pairs = self._parameterize_scan_bc_pairs(inputs.bc)
-        B, C = self._pack_scan_bc(B_pairs, C_pairs, batch, T)
-        M, K = self._scan_coeffs_from_flat_params(inputs.params, batch, T)
+        U = self._pack_scan_u(inputs.value, batch=batch, T=T)
+        b_pairs, c_pairs = self._parameterize_scan_bc_pairs(inputs.bc)
+        B, C = self._pack_scan_bc(b_pairs, c_pairs, batch=batch, T=T)
+        M, K = self._make_scan_coefficients_from_flat_params(
+            inputs.params,
+            batch=batch,
+            T=T,
+        )
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
     def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs:
@@ -451,10 +441,4 @@ class SLinOSSScanPrep(nn.Module):
         return self.backend(self, ScanPrepInputs(value=value, params=params, bc=bc))
 
 
-__all__ = [
-    "SLinOSSScanPrepCoefficients",
-    "SLinOSSScanPrep",
-    "build_transition_from_polar",
-    "foh_taps_from_polar",
-    "principal_angle",
-]
+__all__ = ["SLinOSSScanPrep"]

@@ -16,6 +16,8 @@ from slinoss.layers import (
     SLinOSSScanPrep,
     ScanInputs,
     ScanState,
+)
+from slinoss.ops.scanprep import (
     build_transition_from_polar,
     foh_taps_from_polar,
     principal_angle,

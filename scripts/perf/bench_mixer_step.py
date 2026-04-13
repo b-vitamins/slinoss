@@ -25,7 +25,6 @@ from slinoss.layers import SLinOSSMixer  # noqa: E402
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-sizes", default="1,2,4,8,16")
-    parser.add_argument("--mode", choices=("public", "raw"), default="public")
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--d-model", type=int, default=128)
@@ -58,16 +57,9 @@ def _run_case(args: argparse.Namespace, *, batch_size: int) -> dict[str, object]
     x = mixer.in_proj.weight.new_empty((batch_size, args.d_model)).normal_()
     state = mixer.init_decode_state(batch_size, device=args.device, dtype=dtype)
 
-    if args.mode == "public":
-
-        def fn() -> object:
-            with torch.no_grad():
-                return mixer.step_inplace(x, state)
-    else:
-
-        def fn() -> object:
-            with torch.no_grad():
-                return mixer._step_inplace(x, state)
+    def fn() -> object:
+        with torch.no_grad():
+            return mixer.step(x, state, inplace=True)
 
     stats = benchmark(
         fn,
@@ -102,7 +94,6 @@ def main() -> int:
     payload = {
         "kind": "bench_mixer_step",
         "schema_version": 1,
-        "mode": args.mode,
         "dtype": args.dtype,
         "device": args.device,
         "d_model": args.d_model,

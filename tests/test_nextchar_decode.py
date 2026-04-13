@@ -9,9 +9,10 @@ import cutlass.cute as cute
 import pytest
 import torch
 
-import slinoss.layers.mixer as mixer_mod
 import slinoss.models.nextchar as nextchar_mod
-import slinoss.ops.v2x2ssd.cute.decode as decode_mod
+from slinoss.ops.mixer.convolution import apply_causal_depthwise_conv_step
+import slinoss.ops.mixer.step as mixer_step_mod
+import slinoss.ops.v2x2ssd.cute.step as decode_mod
 from slinoss.layers import (
     ReferenceMixerDecodeBackend,
     ReferenceCConv1dBackend,
@@ -20,7 +21,7 @@ from slinoss.layers import (
     SLinOSSMixer,
 )
 from slinoss.models import NextCharBlock, NextCharLM
-from slinoss.ops.v2x2ssd.cute.decode import mixer_decode_step_cute
+from slinoss.ops.v2x2ssd.cute.step import mixer_decode_step_cute
 
 
 def _cuda_decode_dtypes() -> list[torch.dtype]:
@@ -100,7 +101,7 @@ def _make_decode_step_fixture(
         [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
         dim=-1,
     )
-    value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+    value, _ = apply_causal_depthwise_conv_step(mixer, value_raw, state0.conv)
     value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
     params_h = params_flat.view(
         batch, mixer.n_heads, mixer.scanprep.param_dim
@@ -144,7 +145,7 @@ def _make_decode_step_fixture(
 
 def _force_reference_sequence_backends(model: NextCharLM) -> None:
     for block in cast(list[NextCharBlock], list(model.blocks)):
-        block.mixer.backend = ReferenceScanBackend(compute_dtype=torch.float32)
+        block.mixer.scan_backend = ReferenceScanBackend(compute_dtype=torch.float32)
         block.mixer.scanprep.backend = ReferenceScanPrepBackend()
         block.mixer.cconv_backend = ReferenceCConv1dBackend()
         block.mixer.decode_backend = ReferenceMixerDecodeBackend()
@@ -416,7 +417,8 @@ def test_mixer_graph_capture_restores_state_on_failure(
     state = mixer.init_state(2, device="cuda", dtype=dtype)
     snapshot = state.clone()
 
-    def fail_step(x, state_arg):
+    def fail_step(_mixer, x, state_arg):
+        del x
         state_arg.scan.state.fill_(2)
         state_arg.scan.b_prev.fill_(3)
         state_arg.scan.u_prev.fill_(4)
@@ -424,10 +426,10 @@ def test_mixer_graph_capture_restores_state_on_failure(
         state_arg.conv.fill_(5)
         raise RuntimeError("mixer capture boom")
 
-    monkeypatch.setattr(mixer, "_step_inplace", fail_step)
+    monkeypatch.setattr(mixer_step_mod, "run_inplace_decode_step", fail_step)
 
     with pytest.raises(RuntimeError, match="mixer capture boom"):
-        mixer_mod._MixerCudaGraphStepEngine(mixer, state, batch_size=2)
+        mixer_step_mod.MixerCudaGraphStepEngine(mixer, state, batch_size=2)
 
     assert state.conv is not None
     assert snapshot.conv is not None
@@ -725,7 +727,7 @@ def test_mixer_step_supported_cuda_matches_reference_backends(
         dtype=dtype,
     ).eval()
     mixer_ref = deepcopy(mixer).eval()
-    mixer_ref.backend = ReferenceScanBackend(compute_dtype=torch.float32)
+    mixer_ref.scan_backend = ReferenceScanBackend(compute_dtype=torch.float32)
     mixer_ref.scanprep.backend = ReferenceScanPrepBackend()
     mixer_ref.cconv_backend = ReferenceCConv1dBackend()
     mixer_ref.decode_backend = ReferenceMixerDecodeBackend()
@@ -884,7 +886,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_prev_inputs(
             [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
             dim=-1,
         )
-        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+        value, _ = apply_causal_depthwise_conv_step(mixer, value_raw, state0.conv)
         value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
@@ -973,7 +975,7 @@ def test_mixer_decode_step_cute_rejects_mismatched_state_dtypes() -> None:
             [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
             dim=-1,
         )
-        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+        value, _ = apply_causal_depthwise_conv_step(mixer, value_raw, state0.conv)
         value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
@@ -1045,7 +1047,7 @@ def test_mixer_decode_step_cute_matches_noncontiguous_output_buffers(
             [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
             dim=-1,
         )
-        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+        value, _ = apply_causal_depthwise_conv_step(mixer, value_raw, state0.conv)
         value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
@@ -1144,7 +1146,7 @@ def test_mixer_decode_step_cute_rejects_mismatched_output_buffer_dtypes() -> Non
             [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
             dim=-1,
         )
-        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state0.conv)
+        value, _ = apply_causal_depthwise_conv_step(mixer, value_raw, state0.conv)
         value_h = value.view(batch, mixer.n_heads, mixer.d_head).contiguous()
         params_h = params_flat.view(
             batch, mixer.n_heads, mixer.scanprep.param_dim
@@ -1223,7 +1225,7 @@ def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
             [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
             dim=-1,
         )
-        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state.conv)
+        value, _ = apply_causal_depthwise_conv_step(mixer, value_raw, state.conv)
         value_h = value.view(x.shape[0], mixer.n_heads, mixer.d_head).contiguous()
         params_h = params_flat.view(
             x.shape[0], mixer.n_heads, mixer.scanprep.param_dim

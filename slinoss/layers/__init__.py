@@ -1,4 +1,4 @@
-"""SLinOSS model-side modules."""
+"""Public exports for the SLinOSS layer package."""
 
 from .backend import (
     AutoCConv1dBackend,
@@ -21,42 +21,32 @@ from .backend import (
     ScanPrepBackend,
     ScanPrepInputs,
 )
-from .scanprep import (
-    SLinOSSScanPrep,
-    SLinOSSScanPrepCoefficients,
-    build_transition_from_polar,
-    foh_taps_from_polar,
-    principal_angle,
-)
+from .scanprep import SLinOSSScanPrep
 from .mixer import SLinOSSMixer
 from .state import SLinOSSMixerState, ScanState
 
 __all__ = [
-    "ScanInputs",
     "CConv1dBackend",
-    "ReferenceCConv1dBackend",
-    "CudaCConv1dBackend",
     "AutoCConv1dBackend",
-    "ScanPrepInputs",
-    "ScanBackend",
-    "ScanPrepBackend",
-    "ReferenceScanBackend",
-    "ReferenceScanPrepBackend",
-    "CuteScanPrepBackend",
-    "CuteScanBackend",
+    "AutoMixerDecodeBackend",
     "AutoScanBackend",
     "AutoScanPrepBackend",
-    "MixerDecodeInputs",
-    "MixerDecodeBackend",
-    "ReferenceMixerDecodeBackend",
+    "CudaCConv1dBackend",
     "CuteMixerDecodeBackend",
-    "AutoMixerDecodeBackend",
+    "CuteScanBackend",
+    "CuteScanPrepBackend",
+    "MixerDecodeBackend",
+    "MixerDecodeInputs",
+    "ReferenceCConv1dBackend",
+    "ReferenceMixerDecodeBackend",
+    "ReferenceScanBackend",
+    "ReferenceScanPrepBackend",
+    "ScanBackend",
+    "ScanInputs",
+    "ScanPrepBackend",
+    "ScanPrepInputs",
     "ScanState",
     "SLinOSSMixerState",
-    "SLinOSSScanPrepCoefficients",
-    "SLinOSSScanPrep",
     "SLinOSSMixer",
-    "principal_angle",
-    "build_transition_from_polar",
-    "foh_taps_from_polar",
+    "SLinOSSScanPrep",
 ]

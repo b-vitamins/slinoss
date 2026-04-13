@@ -1,7 +1,5 @@
 """Shared nextchar model with decode support."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import cast
 import weakref
@@ -10,9 +8,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from slinoss.layers import AutoMixerDecodeBackend, CuteMixerDecodeBackend, SLinOSSMixer
+from slinoss.layers import SLinOSSMixer
 from slinoss.layers.state import SLinOSSMixerState
-from slinoss.ops.decode_linear import decode_linear
+from slinoss.ops.decode import decode_linear
 
 
 def configure_optim(
@@ -150,26 +148,16 @@ class NextCharBlock(nn.Module):
         state: SLinOSSMixerState,
     ) -> torch.Tensor:
         norm1 = self.norm1(x)
-        x = x + self.mixer._step_inplace(norm1, state)
+        mixer_output, _ = self.mixer.step(norm1, state, inplace=True)
+        x = x + mixer_output
         norm2 = self.norm2(x)
         x = x + self.ff.decode_one(norm2)
         return x
 
 
-def _copy_mixer_state_(dst: SLinOSSMixerState, src: SLinOSSMixerState) -> None:
-    if dst.conv is not None and src.conv is not None:
-        dst.conv.copy_(src.conv)
-    if dst.scan.state is not None and src.scan.state is not None:
-        dst.scan.state.copy_(src.scan.state)
-    if dst.scan.b_prev is not None and src.scan.b_prev is not None:
-        dst.scan.b_prev.copy_(src.scan.b_prev)
-    if dst.scan.u_prev is not None and src.scan.u_prev is not None:
-        dst.scan.u_prev.copy_(src.scan.u_prev)
-
-
 def _restore_decode_state_(dst: NextCharDecodeState, src: NextCharDecodeState) -> None:
     for dst_layer, src_layer in zip(dst.layers, src.layers, strict=True):
-        _copy_mixer_state_(dst_layer, src_layer)
+        dst_layer.copy_(src_layer)
     dst.position = int(src.position)
     if dst.position_buffer is not None and src.position_buffer is not None:
         dst.position_buffer.copy_(src.position_buffer)
@@ -205,12 +193,7 @@ class _NextCharCudaGraphDecodeEngine:
         if batch_size not in (1, 2, 4, 8, 16):
             return False
         for block in cast(list[NextCharBlock], list(model.blocks)):
-            if not isinstance(
-                block.mixer.decode_backend,
-                (AutoMixerDecodeBackend, CuteMixerDecodeBackend),
-            ):
-                return False
-            if not block.mixer._supports_cute_decode(
+            if not block.mixer._supports_fast_decode(
                 batch_size=batch_size,
                 device=model.token_embed.weight.device,
                 dtype=model.token_embed.weight.dtype,

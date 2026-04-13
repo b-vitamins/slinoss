@@ -21,6 +21,6 @@ Autotuning helpers live under :mod:`slinoss.ops.v2x2ssd.cute.tuning`.
 from . import aot
 from . import tuning
 from .api import v2x2ssd_cute
-from .decode import mixer_decode_step_cute
+from .step import mixer_decode_step_cute
 
 __all__ = ["aot", "tuning", "v2x2ssd_cute", "mixer_decode_step_cute"]

@@ -1,21 +1,31 @@
-"""Backend boundaries for SLinOSS scan preparation and scan operators."""
-
-from __future__ import annotations
+"""Backend protocols, adapters, and canonical inputs for SLinOSS layers."""
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
+from slinoss.ops.mixer.convolution import (
+    apply_cuda_causal_depthwise_conv,
+    apply_reference_causal_depthwise_conv,
+)
+from slinoss.ops.mixer.step import (
+    run_cute_decode_step,
+    run_reference_decode_step,
+    supports_cute_decode,
+)
 from slinoss.ops.cconv1d import cconv1d_cuda_supported, cconv1d_is_available
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 
 from .state import ScanState
 
 
-@dataclass(frozen=True)
+_CUDA_MATH_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@dataclass(frozen=True, slots=True)
 class ScanPrepInputs:
-    """Canonical inputs for the scanprep backend.
+    """Canonical inputs for scan preparation backends.
 
     Shapes:
     - ``value``: ``(batch, T, heads * P)``
@@ -28,9 +38,9 @@ class ScanPrepInputs:
     bc: torch.Tensor
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ScanInputs:
-    """Canonical packed inputs for a v2x2 scan backend.
+    """Canonical packed inputs for scan backends.
 
     Shapes:
     - ``U``: ``(batch, heads, T, P)``
@@ -46,9 +56,9 @@ class ScanInputs:
     C: torch.Tensor
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MixerDecodeInputs:
-    """Canonical per-token mixer decode inputs.
+    """Canonical per-token inputs for mixer decode backends.
 
     Shapes:
     - ``value``: ``(batch, heads, P)`` post-conv/post-activation value token
@@ -69,48 +79,109 @@ if TYPE_CHECKING:
         def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs: ...
         def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs: ...
 
+    class _MixerScanPrepOwner(Protocol):
+        @property
+        def param_dim(self) -> int: ...
+
+        @property
+        def bc_param_rows(self) -> int: ...
+
+        @property
+        def dt_min(self) -> float: ...
+
+        @property
+        def dt_max(self) -> float: ...
+
+        @property
+        def theta_init_min(self) -> float: ...
+
+        @property
+        def theta_init_max(self) -> float: ...
+
+        @property
+        def gamma_min(self) -> float: ...
+
+        @property
+        def gamma_max(self) -> float: ...
+
+        @property
+        def r_min(self) -> float: ...
+
+        @property
+        def r_max(self) -> float: ...
+
+        @property
+        def eps(self) -> float: ...
+
+        @property
+        def dt_bias(self) -> torch.Tensor: ...
+
+        @property
+        def gamma_bias(self) -> torch.Tensor: ...
+
+        @property
+        def theta_mod_bias(self) -> torch.Tensor: ...
+
+        @property
+        def theta_bias(self) -> torch.Tensor: ...
+
+        @property
+        def theta_sign(self) -> torch.Tensor: ...
+
+        def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs: ...
+
+        def _parameterize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor: ...
+
     class _CConvOwner(Protocol):
-        d_conv: int
+        @property
+        def d_inner(self) -> int: ...
+
+        @property
+        def d_conv(self) -> int: ...
 
         @property
         def dw_weight(self) -> torch.Tensor: ...
 
-        def _apply_cconv_reference(
-            self,
-            x: torch.Tensor,
-            conv_state: torch.Tensor | None,
-        ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-        def _apply_cconv_cuda(
-            self,
-            x: torch.Tensor,
-            conv_state: torch.Tensor | None,
-        ) -> tuple[torch.Tensor, torch.Tensor]: ...
+        @property
+        def dw_bias(self) -> torch.Tensor: ...
 
     class _MixerDecodeOwner(Protocol):
-        def _supports_cute_decode(
+        @property
+        def d_inner(self) -> int: ...
+
+        @property
+        def d_head(self) -> int: ...
+
+        @property
+        def d_state(self) -> int: ...
+
+        @property
+        def n_heads(self) -> int: ...
+
+        @property
+        def param_proj_dim(self) -> int: ...
+
+        @property
+        def scanprep(self) -> "_MixerScanPrepOwner": ...
+
+        @property
+        def out_proj(self) -> torch.nn.Module: ...
+
+        @property
+        def out_norm(self) -> torch.nn.Module: ...
+
+        def _gate(
             self,
+            scan_output: torch.Tensor,
+            gate: torch.Tensor,
             *,
             batch_size: int,
-            device: torch.device,
-            dtype: torch.dtype,
-        ) -> bool: ...
-
-        def _decode_step_reference(
-            self,
-            inputs: "MixerDecodeInputs",
-            state: ScanState,
-        ) -> tuple[torch.Tensor, ScanState]: ...
-
-        def _decode_step_cute(
-            self,
-            inputs: "MixerDecodeInputs",
-            state: ScanState,
-        ) -> tuple[torch.Tensor, ScanState]: ...
+            time_steps: int,
+        ) -> torch.Tensor: ...
 
 
 class ScanPrepBackend(Protocol):
-    """Hot-swappable SLinOSS scanprep backend."""
+    """Protocol for scan preparation backends."""
 
     def __call__(
         self,
@@ -120,7 +191,7 @@ class ScanPrepBackend(Protocol):
 
 
 class ReferenceScanPrepBackend:
-    """Reference backend for preparing scan-native ``(U, M, K, B, C)`` inputs."""
+    """Reference implementation of scan preparation."""
 
     def __call__(
         self,
@@ -131,11 +202,7 @@ class ReferenceScanPrepBackend:
 
 
 class CuteScanPrepBackend:
-    """Explicit CuTe scanprep backend.
-
-    This is not the default yet. The eager/reference path remains the source of
-    truth until the fused CuTe implementation is complete.
-    """
+    """CuTe implementation of scan preparation."""
 
     def __call__(
         self,
@@ -146,7 +213,7 @@ class CuteScanPrepBackend:
 
 
 class AutoScanPrepBackend:
-    """Default scanprep backend. CUDA fusion will route here later."""
+    """Selects the scan preparation implementation from the input tensors."""
 
     def __init__(self) -> None:
         self.reference = ReferenceScanPrepBackend()
@@ -157,20 +224,12 @@ class AutoScanPrepBackend:
         owner: "_ScanPrepOwner",
         inputs: ScanPrepInputs,
     ) -> ScanInputs:
-        use_cute = (
-            inputs.value.device.type == "cuda"
-            and inputs.params.device.type == "cuda"
-            and inputs.bc.device.type == "cuda"
-            and inputs.value.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and inputs.params.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and inputs.bc.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        )
-        backend = self.cute if use_cute else self.reference
+        backend = self.cute if _should_use_cute_scanprep(inputs) else self.reference
         return backend(owner, inputs)
 
 
 class CConv1dBackend(Protocol):
-    """Hot-swappable depthwise causal conv1d backend."""
+    """Protocol for depthwise causal convolution backends."""
 
     def __call__(
         self,
@@ -181,7 +240,7 @@ class CConv1dBackend(Protocol):
 
 
 class ReferenceCConv1dBackend:
-    """Reference depthwise causal conv1d backend."""
+    """Reference implementation of depthwise causal convolution."""
 
     def __call__(
         self,
@@ -189,11 +248,11 @@ class ReferenceCConv1dBackend:
         x: torch.Tensor,
         conv_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return owner._apply_cconv_reference(x, conv_state)
+        return apply_reference_causal_depthwise_conv(owner, x, conv_state)
 
 
 class CudaCConv1dBackend:
-    """CUDA depthwise causal conv1d backend."""
+    """CUDA implementation of depthwise causal convolution."""
 
     def __call__(
         self,
@@ -202,12 +261,12 @@ class CudaCConv1dBackend:
         conv_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not cconv1d_is_available():
-            return owner._apply_cconv_reference(x, conv_state)
-        return owner._apply_cconv_cuda(x, conv_state)
+            return apply_reference_causal_depthwise_conv(owner, x, conv_state)
+        return apply_cuda_causal_depthwise_conv(owner, x, conv_state)
 
 
 class AutoCConv1dBackend:
-    """Default depthwise causal conv1d backend."""
+    """Selects the depthwise causal convolution implementation."""
 
     def __init__(self) -> None:
         self.reference = ReferenceCConv1dBackend()
@@ -219,22 +278,12 @@ class AutoCConv1dBackend:
         x: torch.Tensor,
         conv_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        use_cuda = (
-            x.device.type == "cuda"
-            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and owner.d_conv in (2, 3, 4)
-            and cconv1d_cuda_supported(
-                x.transpose(1, 2),
-                owner.dw_weight,
-                activation=None,
-            )
-        )
-        backend = self.cuda if use_cuda else self.reference
+        backend = self.cuda if _should_use_cuda_cconv(owner, x) else self.reference
         return backend(owner, x, conv_state)
 
 
 class ScanBackend(Protocol):
-    """Hot-swappable SLinOSS scan backend."""
+    """Protocol for scan backends."""
 
     def __call__(
         self,
@@ -247,7 +296,7 @@ class ScanBackend(Protocol):
 
 
 class MixerDecodeBackend(Protocol):
-    """Hot-swappable per-token mixer decode backend."""
+    """Protocol for per-token mixer decode backends."""
 
     def supports(
         self,
@@ -266,14 +315,78 @@ class MixerDecodeBackend(Protocol):
     ) -> tuple[torch.Tensor, ScanState]: ...
 
 
+def _all_tensors_on_cuda(*tensors: torch.Tensor) -> bool:
+    return all(tensor.device.type == "cuda" for tensor in tensors)
+
+
+def _all_tensors_supported(
+    *tensors: torch.Tensor,
+    dtypes: tuple[torch.dtype, ...],
+) -> bool:
+    return all(tensor.dtype in dtypes for tensor in tensors)
+
+
 def _default_compute_dtype(dtype: torch.dtype) -> torch.dtype | None:
     if dtype in (torch.float16, torch.bfloat16):
         return torch.float32
     return None
 
 
+def _resolve_scan_call(
+    *,
+    inputs: ScanInputs,
+    state: ScanState | None,
+    return_state: bool | None,
+    compute_dtype: torch.dtype | None,
+) -> tuple[ScanState, bool, torch.dtype, torch.dtype | None]:
+    resolved_return_state = state is not None if return_state is None else return_state
+    output_dtype = inputs.U.dtype
+    resolved_compute_dtype = compute_dtype
+    if resolved_compute_dtype is None:
+        resolved_compute_dtype = _default_compute_dtype(output_dtype)
+    return (
+        ScanState() if state is None else state,
+        bool(resolved_return_state),
+        output_dtype,
+        resolved_compute_dtype,
+    )
+
+
+def _make_next_scan_state(
+    *,
+    final_state: torch.Tensor,
+    b_last: torch.Tensor,
+    u_last: torch.Tensor,
+) -> ScanState:
+    return ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
+
+
+def _should_use_cute_scanprep(inputs: ScanPrepInputs) -> bool:
+    return _all_tensors_on_cuda(inputs.value, inputs.params, inputs.bc) and (
+        _all_tensors_supported(
+            inputs.value,
+            inputs.params,
+            inputs.bc,
+            dtypes=_CUDA_MATH_DTYPES,
+        )
+    )
+
+
+def _should_use_cuda_cconv(owner: "_CConvOwner", x: torch.Tensor) -> bool:
+    return (
+        x.device.type == "cuda"
+        and x.dtype in _CUDA_MATH_DTYPES
+        and owner.d_conv in (2, 3, 4)
+        and cconv1d_cuda_supported(
+            x.transpose(1, 2),
+            owner.dw_weight,
+            activation=None,
+        )
+    )
+
+
 class ReferenceScanBackend:
-    """Reference backend that wraps the staged ``v2x2ssd`` implementation."""
+    """Reference implementation of the scan operator."""
 
     def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
         self.compute_dtype = compute_dtype
@@ -286,13 +399,12 @@ class ReferenceScanBackend:
         state: ScanState | None = None,
         return_state: bool | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ScanState]:
-        if return_state is None:
-            return_state = state is not None
-        scan_state = ScanState() if state is None else state
-        output_dtype = inputs.U.dtype
-        compute_dtype = self.compute_dtype
-        if compute_dtype is None:
-            compute_dtype = _default_compute_dtype(output_dtype)
+        scan_state, return_state, output_dtype, compute_dtype = _resolve_scan_call(
+            inputs=inputs,
+            state=state,
+            return_state=return_state,
+            compute_dtype=self.compute_dtype,
+        )
 
         y, final_state, b_last, u_last = v2x2ssd(
             inputs.U,
@@ -309,12 +421,15 @@ class ReferenceScanBackend:
         )
         if not return_state:
             return y
-        next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
-        return y, next_state
+        return y, _make_next_scan_state(
+            final_state=final_state,
+            b_last=b_last,
+            u_last=u_last,
+        )
 
 
 class CuteScanBackend:
-    """CuTe backend wrapper for the staged ``v2x2ssd`` operator."""
+    """CuTe implementation of the scan operator."""
 
     def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
         self.compute_dtype = compute_dtype
@@ -327,14 +442,12 @@ class CuteScanBackend:
         state: ScanState | None = None,
         return_state: bool | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ScanState]:
-        if return_state is None:
-            return_state = state is not None
-        scan_state = ScanState() if state is None else state
-
-        output_dtype = inputs.U.dtype
-        compute_dtype = self.compute_dtype
-        if compute_dtype is None:
-            compute_dtype = _default_compute_dtype(output_dtype)
+        scan_state, return_state, output_dtype, compute_dtype = _resolve_scan_call(
+            inputs=inputs,
+            state=state,
+            return_state=return_state,
+            compute_dtype=self.compute_dtype,
+        )
 
         if not return_state:
             return cast(
@@ -371,12 +484,15 @@ class CuteScanBackend:
                 return_state=True,
             ),
         )
-        next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
-        return y, next_state
+        return y, _make_next_scan_state(
+            final_state=final_state,
+            b_last=b_last,
+            u_last=u_last,
+        )
 
 
 class AutoScanBackend:
-    """Default backend that routes CUDA inputs to CuTe and others to reference."""
+    """Selects the scan implementation from the input tensors."""
 
     def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
         self.compute_dtype = compute_dtype
@@ -403,7 +519,7 @@ class AutoScanBackend:
 
 
 class ReferenceMixerDecodeBackend:
-    """Reference backend for per-token mixer decode."""
+    """Reference implementation of per-token mixer decode."""
 
     def supports(
         self,
@@ -422,11 +538,11 @@ class ReferenceMixerDecodeBackend:
         inputs: MixerDecodeInputs,
         state: ScanState,
     ) -> tuple[torch.Tensor, ScanState]:
-        return owner._decode_step_reference(inputs, state)
+        return run_reference_decode_step(owner, inputs, state)
 
 
 class CuteMixerDecodeBackend:
-    """CuTe backend for per-token mixer decode."""
+    """CuTe implementation of per-token mixer decode."""
 
     def supports(
         self,
@@ -436,7 +552,8 @@ class CuteMixerDecodeBackend:
         device: torch.device,
         dtype: torch.dtype,
     ) -> bool:
-        return owner._supports_cute_decode(
+        return supports_cute_decode(
+            owner,
             batch_size=batch_size,
             device=device,
             dtype=dtype,
@@ -448,11 +565,11 @@ class CuteMixerDecodeBackend:
         inputs: MixerDecodeInputs,
         state: ScanState,
     ) -> tuple[torch.Tensor, ScanState]:
-        return owner._decode_step_cute(inputs, state)
+        return run_cute_decode_step(owner, inputs, state)
 
 
 class AutoMixerDecodeBackend:
-    """Default per-token mixer decode backend."""
+    """Selects the per-token mixer decode implementation."""
 
     def __init__(self) -> None:
         self.reference = ReferenceMixerDecodeBackend()

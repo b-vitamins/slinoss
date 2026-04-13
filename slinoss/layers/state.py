@@ -1,6 +1,4 @@
-"""Named state objects for SLinOSS streaming and backend interaction."""
-
-from __future__ import annotations
+"""State containers for streaming SLinOSS execution."""
 
 from dataclasses import dataclass, field
 
@@ -32,9 +30,31 @@ def _maybe_to(
     return x
 
 
+def _copy_if_present_(dst: torch.Tensor | None, src: torch.Tensor | None) -> None:
+    if dst is not None and src is not None:
+        dst.copy_(src)
+
+
+def _adopt_tensor(
+    current: torch.Tensor | None,
+    updated: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if current is None or updated is None:
+        return updated
+    if (
+        tuple(current.shape) != tuple(updated.shape)
+        or current.device != updated.device
+        or current.dtype != updated.dtype
+    ):
+        return updated
+    if current is not updated:
+        current.copy_(updated)
+    return current
+
+
 @dataclass
 class ScanState:
-    """Named recurrent state for the v2x2 scan backend.
+    """Recurrent state for scan backends.
 
     All tensors use the canonical packed layout expected by ``v2x2ssd``:
 
@@ -46,6 +66,18 @@ class ScanState:
     state: torch.Tensor | None = None
     b_prev: torch.Tensor | None = None
     u_prev: torch.Tensor | None = None
+
+    def copy_(self, other: "ScanState") -> "ScanState":
+        _copy_if_present_(self.state, other.state)
+        _copy_if_present_(self.b_prev, other.b_prev)
+        _copy_if_present_(self.u_prev, other.u_prev)
+        return self
+
+    def adopt_(self, other: "ScanState") -> "ScanState":
+        self.state = _adopt_tensor(self.state, other.state)
+        self.b_prev = _adopt_tensor(self.b_prev, other.b_prev)
+        self.u_prev = _adopt_tensor(self.u_prev, other.u_prev)
+        return self
 
     def detach(self) -> "ScanState":
         return ScanState(
@@ -76,11 +108,21 @@ class ScanState:
 
 @dataclass
 class SLinOSSMixerState:
-    """Named streaming state for the full SLinOSS mixer."""
+    """Streaming state for ``SLinOSSMixer``."""
 
     conv: torch.Tensor | None = None
     scan: ScanState = field(default_factory=ScanState)
     _engine: object | None = field(default=None, repr=False, compare=False)
+
+    def copy_(self, other: "SLinOSSMixerState") -> "SLinOSSMixerState":
+        _copy_if_present_(self.conv, other.conv)
+        self.scan.copy_(other.scan)
+        return self
+
+    def adopt_(self, other: "SLinOSSMixerState") -> "SLinOSSMixerState":
+        self.conv = _adopt_tensor(self.conv, other.conv)
+        self.scan.adopt_(other.scan)
+        return self
 
     def detach(self) -> "SLinOSSMixerState":
         return SLinOSSMixerState(

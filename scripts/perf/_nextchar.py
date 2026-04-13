@@ -13,7 +13,6 @@ from torch.nn import functional as F
 from _nextchar_model import NextCharLM, configure_optim
 from _profiled_nextchar_model import ProfiledNextCharLM
 from slinoss.layers import SLinOSSMixer
-from slinoss.layers.mixer import _quantize_inner_dim
 from slinoss.layers.backend import (
     AutoCConv1dBackend,
     AutoMixerDecodeBackend,
@@ -71,7 +70,10 @@ class NextCharPerfConfig:
 
     @property
     def n_heads(self) -> int:
-        d_inner = _quantize_inner_dim(self.expand * self.d_model, self.d_head)
+        d_inner = SLinOSSMixer._quantize_inner_dim(
+            self.expand * self.d_model,
+            self.d_head,
+        )
         return d_inner // self.d_head
 
     @property
@@ -140,7 +142,7 @@ def _configure_backend(model: NextCharModel, *, backend: str) -> None:
     )
     for module in model.modules():
         if isinstance(module, SLinOSSMixer):
-            module.backend = scan_backend
+            module.scan_backend = scan_backend
             module.scanprep.backend = scanprep_backend
             module.cconv_backend = cconv_backend
             module.decode_backend = decode_backend

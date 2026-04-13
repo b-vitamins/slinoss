@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 from slinoss.layers import (
     AutoScanBackend,
@@ -16,7 +17,7 @@ from slinoss.layers import (
     ScanPrepInputs,
     ScanState,
 )
-from slinoss.layers.mixer import _SplitMixerProjectionFn, _quantize_inner_dim
+from slinoss.ops.mixer.projection import _SplitMixerProjectionFn
 
 
 class SpyBackend:
@@ -86,7 +87,7 @@ def _cuda_amp_dtype_supported(dtype: torch.dtype) -> bool:
     return dtype == torch.float16
 
 
-def _make_mixer(*, backend: object | None = None) -> SLinOSSMixer:
+def _make_mixer(*, scan_backend: object | None = None) -> SLinOSSMixer:
     return SLinOSSMixer(
         12,
         d_state=3,
@@ -94,14 +95,14 @@ def _make_mixer(*, backend: object | None = None) -> SLinOSSMixer:
         d_head=6,
         d_conv=3,
         chunk_size=4,
-        backend=backend,  # type: ignore[arg-type]
+        scan_backend=scan_backend,  # type: ignore[arg-type]
     )
 
 
 def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
     torch.manual_seed(0)
     spy = SpyBackend()
-    mixer = _make_mixer(backend=spy)
+    mixer = _make_mixer(scan_backend=spy)
     x = torch.randn((2, 5, 12), dtype=torch.float32)
 
     y, state = mixer(x, return_state=True)
@@ -131,7 +132,7 @@ def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
 
 def test_mixer_defaults_to_auto_scan_backend() -> None:
     mixer = _make_mixer()
-    assert isinstance(mixer.backend, AutoScanBackend)
+    assert isinstance(mixer.scan_backend, AutoScanBackend)
 
 
 def test_mixer_emits_bc_from_in_proj() -> None:
@@ -156,7 +157,7 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
         d_conv=4,
         chunk_size=64,
         scanprep_backend=ref_scanprep,  # type: ignore[arg-type]
-        backend=ref_backend,  # type: ignore[arg-type]
+        scan_backend=ref_backend,  # type: ignore[arg-type]
     )
     zero_mixer = SLinOSSMixer(
         128,
@@ -167,7 +168,7 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
         chunk_size=64,
         scanprep_backend=zero_scanprep,  # type: ignore[arg-type]
         cconv_backend=ZeroConvBackend(),  # type: ignore[arg-type]
-        backend=zero_backend,  # type: ignore[arg-type]
+        scan_backend=zero_backend,  # type: ignore[arg-type]
     )
     zero_mixer.load_state_dict(mixer.state_dict())
 
@@ -194,9 +195,9 @@ def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
 
 
 def test_quantize_inner_dim_rounds_to_nearest_head_multiple() -> None:
-    assert _quantize_inner_dim(192.0, 64) == 192
-    assert _quantize_inner_dim(193.0, 64) == 192
-    assert _quantize_inner_dim(224.0, 64) == 256
+    assert SLinOSSMixer._quantize_inner_dim(192.0, 64) == 192
+    assert SLinOSSMixer._quantize_inner_dim(193.0, 64) == 192
+    assert SLinOSSMixer._quantize_inner_dim(224.0, 64) == 256
 
 
 def test_mixer_supports_fractional_expand() -> None:
@@ -236,7 +237,7 @@ def test_mixer_cute_scan_matches_reference_for_issue_9_bf16_shape() -> None:
         d_conv=4,
         chunk_size=128,
         scanprep_backend=ReferenceScanPrepBackend(),
-        backend=AutoScanBackend(),
+        scan_backend=AutoScanBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
         device="cuda",
         dtype=torch.bfloat16,
@@ -249,7 +250,7 @@ def test_mixer_cute_scan_matches_reference_for_issue_9_bf16_shape() -> None:
         d_conv=4,
         chunk_size=128,
         scanprep_backend=ReferenceScanPrepBackend(),
-        backend=ReferenceScanBackend(compute_dtype=torch.float32),
+        scan_backend=ReferenceScanBackend(compute_dtype=torch.float32),
         cconv_backend=ReferenceCConv1dBackend(),
         device="cuda",
         dtype=torch.bfloat16,
@@ -524,7 +525,7 @@ def test_mixer_cute_segmented_forward_matches_single_pass() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=32,
-        backend=CuteScanBackend(),
+        scan_backend=CuteScanBackend(),
         scanprep_backend=ReferenceScanPrepBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
         device="cuda",
@@ -581,7 +582,7 @@ def test_mixer_cute_segmented_training_matches_single_pass() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=32,
-        backend=CuteScanBackend(),
+        scan_backend=CuteScanBackend(),
         scanprep_backend=ReferenceScanPrepBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
         device="cuda",
@@ -594,7 +595,7 @@ def test_mixer_cute_segmented_training_matches_single_pass() -> None:
         d_head=64,
         d_conv=4,
         chunk_size=32,
-        backend=CuteScanBackend(),
+        scan_backend=CuteScanBackend(),
         scanprep_backend=ReferenceScanPrepBackend(),
         cconv_backend=ReferenceCConv1dBackend(),
         device="cuda",
@@ -684,13 +685,30 @@ def test_mixer_applies_output_norm_after_gate() -> None:
     scan_y = torch.randn((batch, mixer.n_heads, T, mixer.d_head), dtype=torch.float32)
     gate = torch.randn((batch, T, mixer.d_inner), dtype=torch.float32)
 
-    headspace = mixer._apply_gate_headspace(scan_y, gate, batch, T)
-    expected = mixer.output_norm(
-        headspace.permute(0, 2, 1, 3).reshape(batch, T, mixer.d_inner)
+    expected = mixer.out_norm(
+        (
+            scan_y
+            * F.silu(gate)
+            .view(batch, T, mixer.n_heads, mixer.d_head)
+            .permute(
+                0,
+                2,
+                1,
+                3,
+            )
+        )
+        .permute(0, 2, 1, 3)
+        .reshape(batch, T, mixer.d_inner)
     )
-
-    actual = mixer._apply_gate(scan_y, gate, batch, T)
-    projected = mixer._apply_gate_and_project(scan_y, gate, batch, T)
+    actual = mixer.out_norm(
+        mixer._gate(
+            scan_y,
+            gate,
+            batch_size=batch,
+            time_steps=T,
+        )
+    )
+    projected = mixer.out_proj(actual)
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(projected, mixer.out_proj(expected))
@@ -776,7 +794,7 @@ def test_mixer_backward_supports_cuda_autocast(amp_dtype: torch.dtype) -> None:
         d_conv=3,
         chunk_size=4,
         scanprep_backend=ReferenceScanPrepBackend(),
-        backend=ReferenceScanBackend(compute_dtype=torch.float32),
+        scan_backend=ReferenceScanBackend(compute_dtype=torch.float32),
         cconv_backend=ReferenceCConv1dBackend(),
         device="cuda",
         dtype=torch.float32,
