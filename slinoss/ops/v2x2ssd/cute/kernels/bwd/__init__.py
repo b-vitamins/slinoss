@@ -1949,14 +1949,533 @@ def _make_v2x2ssd_bwd_host_wrapper(
     return _v2x2ssd_bwd_host_wrapper
 
 
+def _make_v2x2ssd_bwd_aot_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg: BackwardLaunchConfig,
+):
+    _batch_size, _heads, _padded_time, P, D, _n_chunks, chunk_size, n_d_tiles = (
+        problem_shape
+    )
+    (
+        scan_num_threads_du,
+        scan_num_threads_db,
+        scan_num_threads_dcdr,
+        scan_num_threads_param,
+        state_num_threads,
+        state_pairs_per_thread,
+        state_copy_bits_starts,
+        state_copy_bits_dstarts,
+        state_copy_bits_dinc,
+        state_copy_bits_initial,
+        state_copy_bits_final,
+        dz0_cta_tiler,
+    ) = launch_cfg
+
+    @cute.jit
+    def _v2x2ssd_bwd_aot_host_wrapper(
+        U_scan_view: cute.Tensor,
+        B_scan_view: cute.Tensor,
+        C_scan_view: cute.Tensor,
+        M_scan_view: cute.Tensor,
+        K_scan_view: cute.Tensor,
+        d_out_scan_view: cute.Tensor,
+        chunk_starts_scan_view: cute.Tensor,
+        U_prev_scan_view: cute.Tensor,
+        B_prev_scan_view: cute.Tensor,
+        dU_scan_view: cute.Tensor,
+        dB_scan_view: cute.Tensor,
+        dU_prev_scan_view: cute.Tensor,
+        dB_prev_scan_view: cute.Tensor,
+        dlogp_scan_view: cute.Tensor,
+        dlogp_param_view: cute.Tensor,
+        dM_previous_scan_view: cute.Tensor,
+        dM_current_scan_view: cute.Tensor,
+        dM_previous_param_view: cute.Tensor,
+        dM_current_param_view: cute.Tensor,
+        dC_scan_view: cute.Tensor,
+        dR_scan_view: cute.Tensor,
+        dR_param_view: cute.Tensor,
+        dM_scan_view: cute.Tensor,
+        dK_previous_scan_view: cute.Tensor,
+        dK_current_scan_view: cute.Tensor,
+        d_out_dz0_view: cute.Tensor,
+        C_dz0_view: cute.Tensor,
+        M_dz0_view: cute.Tensor,
+        d_chunk_starts_scan_view: cute.Tensor,
+        chunk_starts_state_view: cute.Tensor,
+        chunk_multiplier_state_view: cute.Tensor,
+        d_chunk_starts_state_view: cute.Tensor,
+        d_final_state_view: cute.Tensor,
+        d_increment_state_view: cute.Tensor,
+        d_initial_state_view: cute.Tensor,
+        d_chunk_multiplier_state_view: cute.Tensor,
+        U_increment_view: cute.Tensor,
+        B_increment_view: cute.Tensor,
+        M_increment_view: cute.Tensor,
+        K_previous_increment_view: cute.Tensor,
+        K_current_increment_view: cute.Tensor,
+        d_increment_dp_view: cute.Tensor,
+        d_increment_view: cute.Tensor,
+        d_increment_boundary_view: cute.Tensor,
+        B_prev_chunks_view: cute.Tensor,
+        U_prev_chunks_view: cute.Tensor,
+        dB_increment_view: cute.Tensor,
+        dU_increment_view: cute.Tensor,
+        dB_prev_increment_view: cute.Tensor,
+        dU_prev_increment_view: cute.Tensor,
+        dM_sum_part_view: cute.Tensor,
+        dMp0_view: cute.Tensor,
+        d_chunk_multiplier_increment_view: cute.Tensor,
+        dM_increment_view: cute.Tensor,
+        dK_previous_increment_view: cute.Tensor,
+        dK_current_increment_view: cute.Tensor,
+        dU_db_dummy_view: cute.Tensor,
+        dU_prev_db_dummy_view: cute.Tensor,
+        dB_du_dummy_view: cute.Tensor,
+        dB_prev_du_dummy_view: cute.Tensor,
+    ):
+        tc_dtype = U_scan_view.element_type
+
+        chunk_scan_db_kernel = ChunkScanBwdDBAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=scan_num_threads_db,
+        )
+        chunk_scan_dcdr_kernel = ChunkScanBwdDCDRAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=scan_num_threads_dcdr,
+        )
+        chunk_scan_dlp_kernel = ChunkScanBwdDLPAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=scan_num_threads_dcdr,
+        )
+        chunk_scan_param_kernel = ChunkScanBwdParamScanAmpere(
+            chunk_size=chunk_size,
+            num_threads=scan_num_threads_param,
+        )
+        chunk_scan_du_kernel = ChunkScanBwdDUAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            num_threads=scan_num_threads_du,
+        )
+        chunk_scan_dz0_kernel = ChunkScanBwdDZ0Ampere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            cta_tiler=dz0_cta_tiler,
+        )
+
+        state_config = _TileConfig(
+            num_threads=state_num_threads,
+            pairs_per_thread=state_pairs_per_thread,
+        )
+        state_passing_kernel = StatePassingBwdAmpere(
+            state_config,
+            copy_bits_starts=state_copy_bits_starts,
+            copy_bits_dstarts=state_copy_bits_dstarts,
+            copy_bits_dinc=state_copy_bits_dinc,
+            copy_bits_initial=state_copy_bits_initial,
+            copy_bits_final=state_copy_bits_final,
+        )
+
+        chunk_increment_db_kernel = ChunkIncrementBwdDBAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        chunk_increment_boundary_kernel = ChunkIncrementBwdBoundaryAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        chunk_increment_param_kernel = ChunkIncrementBwdParamScanAmpere(
+            chunk_size=chunk_size,
+            n_d_tiles=n_d_tiles,
+        )
+        chunk_increment_du_kernel = ChunkIncrementBwdDUAmpere(
+            tc_dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+
+        chunk_scan_db_kernel(
+            U_scan_view,
+            B_scan_view,
+            C_scan_view,
+            M_scan_view,
+            K_scan_view,
+            d_out_scan_view,
+            U_prev_scan_view,
+            B_prev_scan_view,
+            dU_db_dummy_view,
+            dB_scan_view,
+            dU_prev_db_dummy_view,
+            dB_prev_scan_view,
+            dlogp_scan_view,
+            dM_previous_scan_view,
+            dM_current_scan_view,
+        )
+        chunk_scan_dcdr_kernel(
+            U_scan_view,
+            B_scan_view,
+            C_scan_view,
+            M_scan_view,
+            K_scan_view,
+            d_out_scan_view,
+            U_prev_scan_view,
+            B_prev_scan_view,
+            chunk_starts_scan_view,
+            dC_scan_view,
+            dlogp_scan_view,
+            dR_scan_view,
+        )
+        chunk_scan_dlp_kernel(
+            U_scan_view,
+            B_scan_view,
+            C_scan_view,
+            M_scan_view,
+            K_scan_view,
+            d_out_scan_view,
+            U_prev_scan_view,
+            B_prev_scan_view,
+            dlogp_scan_view,
+        )
+        chunk_scan_param_kernel(
+            M_scan_view,
+            K_scan_view,
+            dlogp_param_view,
+            dM_previous_param_view,
+            dM_current_param_view,
+            dR_param_view,
+            dM_scan_view,
+            dK_previous_scan_view,
+            dK_current_scan_view,
+        )
+        chunk_scan_du_kernel(
+            U_scan_view,
+            B_scan_view,
+            C_scan_view,
+            M_scan_view,
+            K_scan_view,
+            d_out_scan_view,
+            U_prev_scan_view,
+            B_prev_scan_view,
+            dU_scan_view,
+            dB_du_dummy_view,
+            dU_prev_scan_view,
+            dB_prev_du_dummy_view,
+            dlogp_scan_view,
+            dM_previous_scan_view,
+            dM_current_scan_view,
+        )
+        chunk_scan_dz0_kernel(
+            d_out_dz0_view,
+            C_dz0_view,
+            M_dz0_view,
+            d_chunk_starts_scan_view,
+        )
+
+        state_passing_kernel(
+            chunk_starts_state_view,
+            d_chunk_starts_state_view,
+            d_final_state_view,
+            chunk_multiplier_state_view,
+            d_increment_state_view,
+            d_chunk_multiplier_state_view,
+            d_initial_state_view,
+        )
+
+        chunk_increment_db_kernel(
+            U_increment_view,
+            B_increment_view,
+            M_increment_view,
+            K_previous_increment_view,
+            K_current_increment_view,
+            d_increment_dp_view,
+            dB_increment_view,
+            dM_sum_part_view,
+        )
+        chunk_increment_boundary_kernel(
+            d_increment_boundary_view,
+            B_prev_chunks_view,
+            U_prev_chunks_view,
+            M_increment_view,
+            K_previous_increment_view,
+            dU_prev_increment_view,
+            dB_prev_increment_view,
+            dMp0_view,
+        )
+        chunk_increment_param_kernel(
+            M_increment_view,
+            K_previous_increment_view,
+            K_current_increment_view,
+            dM_sum_part_view,
+            dMp0_view,
+            d_chunk_multiplier_increment_view,
+            dM_increment_view,
+            dK_previous_increment_view,
+            dK_current_increment_view,
+        )
+        chunk_increment_du_kernel(
+            d_increment_view,
+            B_increment_view,
+            M_increment_view,
+            K_previous_increment_view,
+            K_current_increment_view,
+            dU_increment_view,
+        )
+
+    return _v2x2ssd_bwd_aot_host_wrapper
+
+
+def _make_backward_aot_runtime_args(
+    runtime_args: tuple[torch.Tensor, ...],
+    *,
+    problem_shape: BackwardProblemShape,
+) -> tuple[torch.Tensor, ...]:
+    (
+        U_t,
+        B_t,
+        C_t,
+        M_t,
+        K_t,
+        K_previous_t,
+        K_current_t,
+        d_out_t,
+        chunk_multiplier_t,
+        chunk_starts_t,
+        U_prev_state_t,
+        B_prev_state_t,
+        d_final_state_t,
+        U_prev_chunks_t,
+        B_prev_chunks_t,
+        d_chunk_starts_t,
+        d_increment_t,
+        d_initial_state_t,
+        d_chunk_multiplier_t,
+        dU_scan_t,
+        dU_prev_scan_t,
+        dB_scan_t,
+        dB_prev_scan_t,
+        dC_scan_t,
+        dU_db_dummy_t,
+        dU_prev_db_dummy_t,
+        dB_du_dummy_t,
+        dB_prev_du_dummy_t,
+        dlogp_t,
+        dR_t,
+        dM_previous_scratch_t,
+        dM_current_scratch_t,
+        dM_scan_t,
+        dK_previous_scan_t,
+        dK_current_scan_t,
+        dB_increment_t,
+        dB_prev_increment_t,
+        dU_increment_t,
+        dU_prev_increment_t,
+        dM_sum_part_t,
+        dMp0_t,
+        dM_increment_t,
+        dK_previous_increment_t,
+        dK_current_increment_t,
+    ) = runtime_args
+    chunk_scan_specs = _chunk_scan_bwd_tensor_specs(problem_shape)
+    state_passing_specs = _state_passing_bwd_tensor_specs(problem_shape)
+    chunk_increment_specs = _chunk_increment_bwd_tensor_specs(problem_shape)
+    (
+        U_scan_spec,
+        B_scan_spec,
+        M_scan_spec,
+        K_scan_spec,
+        chunk_starts_scan_spec,
+        U_prev_scan_spec,
+        B_prev_scan_spec,
+        dlogp_scan_spec,
+        dM_scan_scratch_spec,
+        dR_scan_spec,
+        d_param_scan_spec,
+        dlogp_param_spec,
+        dR_param_spec,
+        d_out_dz0_spec,
+        C_dz0_spec,
+        M_dz0_spec,
+        d_chunk_starts_scan_spec,
+        dU_db_dummy_spec,
+        dB_du_dummy_spec,
+        dU_prev_dummy_spec,
+        dB_prev_dummy_spec,
+    ) = chunk_scan_specs
+    (
+        chunk_starts_state_spec,
+        chunk_multiplier_state_spec,
+        final_state_spec,
+    ) = state_passing_specs
+    (
+        U_increment_spec,
+        dU_increment_spec,
+        B_increment_spec,
+        M_increment_spec,
+        K_increment_spec,
+        d_increment_spec,
+        d_increment_dp_spec,
+        d_increment_boundary_spec,
+        U_prev_chunks_spec,
+        B_prev_chunks_spec,
+        dM_sum_part_spec,
+        dMp0_spec,
+        d_chunk_multiplier_increment_spec,
+        d_param_increment_spec,
+    ) = chunk_increment_specs
+    return (
+        make_runtime_tensor_spec_view(U_t, U_scan_spec),
+        make_runtime_tensor_spec_view(B_t, B_scan_spec),
+        make_runtime_tensor_spec_view(C_t, B_scan_spec),
+        make_runtime_tensor_spec_view(M_t, M_scan_spec),
+        make_runtime_tensor_spec_view(K_t, K_scan_spec),
+        make_runtime_tensor_spec_view(d_out_t, U_scan_spec),
+        make_runtime_tensor_spec_view(chunk_starts_t, chunk_starts_scan_spec),
+        make_runtime_tensor_spec_view(U_prev_state_t, U_prev_scan_spec),
+        make_runtime_tensor_spec_view(B_prev_state_t, B_prev_scan_spec),
+        make_runtime_tensor_spec_view(dU_scan_t, U_scan_spec),
+        make_runtime_tensor_spec_view(dB_scan_t, B_scan_spec),
+        make_runtime_tensor_spec_view(dU_prev_scan_t, dU_prev_dummy_spec),
+        make_runtime_tensor_spec_view(dB_prev_scan_t, dB_prev_dummy_spec),
+        make_runtime_tensor_spec_view(dlogp_t, dlogp_scan_spec),
+        make_runtime_tensor_spec_view(dlogp_t, dlogp_param_spec),
+        make_runtime_tensor_spec_view(dM_previous_scratch_t, dM_scan_scratch_spec),
+        make_runtime_tensor_spec_view(dM_current_scratch_t, dM_scan_scratch_spec),
+        make_runtime_tensor_spec_view(dM_previous_scratch_t, d_param_scan_spec),
+        make_runtime_tensor_spec_view(dM_current_scratch_t, d_param_scan_spec),
+        make_runtime_tensor_spec_view(dC_scan_t, B_scan_spec),
+        make_runtime_tensor_spec_view(dR_t, dR_scan_spec),
+        make_runtime_tensor_spec_view(dR_t, dR_param_spec),
+        make_runtime_tensor_spec_view(dM_scan_t, d_param_scan_spec),
+        make_runtime_tensor_spec_view(dK_previous_scan_t, d_param_scan_spec),
+        make_runtime_tensor_spec_view(dK_current_scan_t, d_param_scan_spec),
+        make_runtime_tensor_spec_view(d_out_t, d_out_dz0_spec),
+        make_runtime_tensor_spec_view(C_t, C_dz0_spec),
+        make_runtime_tensor_spec_view(M_t, M_dz0_spec),
+        make_runtime_tensor_spec_view(d_chunk_starts_t, d_chunk_starts_scan_spec),
+        make_runtime_tensor_spec_view(chunk_starts_t, chunk_starts_state_spec),
+        make_runtime_tensor_spec_view(chunk_multiplier_t, chunk_multiplier_state_spec),
+        make_runtime_tensor_spec_view(d_chunk_starts_t, chunk_starts_state_spec),
+        make_runtime_tensor_spec_view(d_final_state_t, final_state_spec),
+        make_runtime_tensor_spec_view(d_increment_t, chunk_starts_state_spec),
+        make_runtime_tensor_spec_view(d_initial_state_t, final_state_spec),
+        make_runtime_tensor_spec_view(
+            d_chunk_multiplier_t, chunk_multiplier_state_spec
+        ),
+        make_runtime_tensor_spec_view(U_t, U_increment_spec),
+        make_runtime_tensor_spec_view(B_t, B_increment_spec),
+        make_runtime_tensor_spec_view(M_t, M_increment_spec),
+        make_runtime_tensor_spec_view(K_previous_t, K_increment_spec),
+        make_runtime_tensor_spec_view(K_current_t, K_increment_spec),
+        make_runtime_tensor_spec_view(d_increment_t, d_increment_dp_spec),
+        make_runtime_tensor_spec_view(d_increment_t, d_increment_spec),
+        make_runtime_tensor_spec_view(d_increment_t, d_increment_boundary_spec),
+        make_runtime_tensor_spec_view(B_prev_chunks_t, B_prev_chunks_spec),
+        make_runtime_tensor_spec_view(U_prev_chunks_t, U_prev_chunks_spec),
+        make_runtime_tensor_spec_view(dB_increment_t, B_increment_spec),
+        make_runtime_tensor_spec_view(dU_increment_t, dU_increment_spec),
+        make_runtime_tensor_spec_view(dB_prev_increment_t, B_prev_chunks_spec),
+        make_runtime_tensor_spec_view(dU_prev_increment_t, U_prev_chunks_spec),
+        make_runtime_tensor_spec_view(dM_sum_part_t, dM_sum_part_spec),
+        make_runtime_tensor_spec_view(dMp0_t, dMp0_spec),
+        make_runtime_tensor_spec_view(
+            d_chunk_multiplier_t, d_chunk_multiplier_increment_spec
+        ),
+        make_runtime_tensor_spec_view(dM_increment_t, d_param_increment_spec),
+        make_runtime_tensor_spec_view(dK_previous_increment_t, d_param_increment_spec),
+        make_runtime_tensor_spec_view(dK_current_increment_t, d_param_increment_spec),
+        make_runtime_tensor_spec_view(dU_db_dummy_t, dU_db_dummy_spec),
+        make_runtime_tensor_spec_view(dU_prev_db_dummy_t, dU_prev_dummy_spec),
+        make_runtime_tensor_spec_view(dB_du_dummy_t, dB_du_dummy_spec),
+        make_runtime_tensor_spec_view(dB_prev_du_dummy_t, dB_prev_dummy_spec),
+    )
+
+
+def _make_packaged_v2x2ssd_bwd_callable(
+    packaged: object,
+    *,
+    problem_shape: BackwardProblemShape,
+):
+    def _packaged_v2x2ssd_bwd_callable(*runtime_args):
+        return packaged(
+            *_make_backward_aot_runtime_args(
+                runtime_args,
+                problem_shape=problem_shape,
+            )
+        )
+
+    return _packaged_v2x2ssd_bwd_callable
+
+
 def _get_compiled_v2x2ssd_bwd_kernel(
     compile_artifacts: BackwardCompileArtifacts,
 ):
+    from slinoss.ops.v2x2ssd.cute.aot import (
+        BackwardAOTSpec,
+        ChunkScanBackwardConfig,
+        StatePassingBackwardConfig,
+        try_load_packaged_v2x2ssd_bwd_function,
+    )
+    from slinoss.ops.v2x2ssd.cute.tuning.hardware import current_hardware_fingerprint
+
     compiled = _BWD_HOST_CACHE.get(compile_artifacts.cache_key)
     if compiled is not None:
         note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=True)
         return compiled
 
+    device_index = (
+        int(compile_artifacts.device_index)
+        if int(compile_artifacts.device_index) >= 0
+        else torch.cuda.current_device()
+    )
+    backward_aot_spec = BackwardAOTSpec(
+        arch_tag=current_hardware_fingerprint(device_index=device_index).arch_tag,
+        P=int(compile_artifacts.problem_shape[3]),
+        D=int(compile_artifacts.problem_shape[4]),
+        chunk_size=int(compile_artifacts.problem_shape[6]),
+        tc_dtype_name={
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[compile_artifacts.tc_dtype],
+        chunk_scan_config=ChunkScanBackwardConfig(
+            num_threads_du=int(compile_artifacts.launch_cfg[0]),
+            num_threads_db=int(compile_artifacts.launch_cfg[1]),
+            num_threads_dcdr=int(compile_artifacts.launch_cfg[2]),
+            num_threads_param=int(compile_artifacts.launch_cfg[3]),
+        ),
+        state_passing_config=StatePassingBackwardConfig(
+            num_threads=int(compile_artifacts.launch_cfg[4]),
+            pairs_per_thread=int(compile_artifacts.launch_cfg[5]),
+        ),
+    )
+    packaged = try_load_packaged_v2x2ssd_bwd_function(backward_aot_spec)
+    if packaged is not None:
+        note_cache_event("cute.v2x2ssd.bwd.host_aot", hit=True)
+        wrapped_packaged = _make_packaged_v2x2ssd_bwd_callable(
+            packaged,
+            problem_shape=compile_artifacts.problem_shape,
+        )
+        _BWD_HOST_CACHE[compile_artifacts.cache_key] = wrapped_packaged
+        return wrapped_packaged
+
+    note_cache_event("cute.v2x2ssd.bwd.host_aot", hit=False)
     note_cache_event("cute.v2x2ssd.bwd.host_compile", hit=False)
     host_wrapper = _make_v2x2ssd_bwd_host_wrapper(
         problem_shape=compile_artifacts.problem_shape,

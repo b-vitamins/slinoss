@@ -615,17 +615,6 @@ class ChunkIncrementBwdDBAmpere:
             == mKcurr.shape[1]
             == mDB.shape[0]
         )
-        batch_head_chunk_dims_match = (
-            mU.shape[2]
-            == mB.shape[2]
-            == mM.shape[2]
-            == mKprev.shape[2]
-            == mKcurr.shape[2]
-            == mDIncDP.shape[2]
-            == mDB.shape[2]
-            == mDMsumPart.shape[3]
-        )
-
         if cutlass.const_expr(not value_stream_dtype_ok):
             raise TypeError("U/B/DIncDP/DB must share element type.")
         if cutlass.const_expr(
@@ -638,8 +627,6 @@ class ChunkIncrementBwdDBAmpere:
             raise ValueError(
                 "U/B/M/Kprev/Kcurr/DB must share the chunk time dimension."
             )
-        if cutlass.const_expr(not batch_head_chunk_dims_match):
-            raise ValueError("All operands must share the batch-head-chunk dimension.")
         if cutlass.const_expr(mB.shape[1] % 2 != 0):
             raise ValueError("B/DB D dimension must be even because D stores pairs.")
         if cutlass.const_expr(mDIncDP.shape[0] != mB.shape[1]):

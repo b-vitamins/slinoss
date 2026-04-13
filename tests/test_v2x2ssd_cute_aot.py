@@ -10,7 +10,9 @@ import torch
 pytest.importorskip("cutlass")
 
 import slinoss.ops.v2x2ssd.cute.aot as cute_aot_mod
+import slinoss.ops.v2x2ssd.cute.kernels.bwd as v2x2ssd_bwd_mod
 import slinoss.ops.v2x2ssd.cute.kernels.fwd as v2x2ssd_fwd_mod
+from slinoss.ops.v2x2ssd.cute.tuning.hardware import current_hardware_fingerprint
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import v2x2ssd_fwd_cute
 
 
@@ -30,18 +32,21 @@ def test_normalize_arch_tag(raw_arch: str, normalized: str) -> None:
 
 
 def test_arch_tags_from_env_prefers_explicit_tags(monkeypatch) -> None:
-    monkeypatch.setenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", "sm_70,sm_89,9.0,sm_89")
+    monkeypatch.setenv("SLINOSS_CUTE_AOT_ARCH_TAGS", "sm_70,sm_89,9.0,sm_89")
+    monkeypatch.setenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", "sm_80")
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0;8.6")
     assert cute_aot_mod._arch_tags_from_env() == ("sm_89", "sm_90")
 
 
 def test_arch_tags_from_env_falls_back_to_torch_arch_list(monkeypatch) -> None:
+    monkeypatch.delenv("SLINOSS_CUTE_AOT_ARCH_TAGS", raising=False)
     monkeypatch.delenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", raising=False)
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0;8.6+PTX 8.0")
     assert cute_aot_mod._arch_tags_from_env() == ("sm_80", "sm_86")
 
 
 def test_arch_tags_from_env_drops_unsupported_forward_arches(monkeypatch) -> None:
+    monkeypatch.delenv("SLINOSS_CUTE_AOT_ARCH_TAGS", raising=False)
     monkeypatch.delenv("SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", raising=False)
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "7.0;8.0;8.6")
     assert cute_aot_mod._arch_tags_from_env() == ("sm_80", "sm_86")
@@ -67,6 +72,21 @@ def test_default_forward_aot_specs_drop_unsupported_requested_arch_tags() -> Non
     specs = cute_aot_mod.default_forward_aot_specs(("sm_70", "sm_80"))
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80"}
+
+
+def test_default_backward_aot_specs_expand_requested_arch_tags() -> None:
+    specs = cute_aot_mod.default_backward_aot_specs(("sm_80", "sm_86"))
+    assert specs
+    assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert {spec.chunk_size for spec in specs} == set(
+        cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES
+    )
+    assert {spec.tc_dtype_name for spec in specs} == {"float16", "bfloat16"}
+    assert len(specs) == (
+        2
+        * len(cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES)
+        * len(cute_aot_mod._AOT_SEARCH_TC_DTYPES)
+    )
 
 
 def test_search_space_forward_aot_specs_expand_beyond_default_specs() -> None:
@@ -160,6 +180,111 @@ def test_build_default_forward_aot_package_only_exports_forward_specs(
     assert registered_kinds == ["v2x2ssd_fwd", "v2x2ssd_fwd"]
 
 
+def test_build_default_backward_aot_package_only_exports_backward_specs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    specs = cute_aot_mod.default_backward_aot_specs(("sm_80",))[:2]
+    compiled_ids: list[str] = []
+    exported_kinds: list[str] = []
+    registered_kinds: list[str] = []
+
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "_compile_backward_aot",
+        lambda spec: compiled_ids.append(spec.module_id) or "compiled",
+    )
+
+    def _fake_export(
+        compiled,
+        *,
+        kind: str,
+        module_id: str,
+        function_name: str,
+        package_root,
+        keep_object_file: bool = True,
+    ):
+        exported_kinds.append(kind)
+        package_root = Path(package_root)
+        return cute_aot_mod.ExportedTVMFFIModule(
+            kind=kind,
+            module_id=module_id,
+            function_name=function_name,
+            object_file=None,
+            shared_library=package_root / "artifacts" / f"{module_id}.so",
+            metadata_file=package_root / "artifacts" / f"{module_id}.json",
+        )
+
+    monkeypatch.setattr(cute_aot_mod, "export_tvm_ffi_compiled_module", _fake_export)
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "register_aot_artifact",
+        lambda **kwargs: registered_kinds.append(kwargs["kind"]),
+    )
+
+    exported = cute_aot_mod.build_default_backward_aot_package(
+        package_root=tmp_path,
+        specs=specs,
+        clean=False,
+    )
+
+    assert [module.module_id for module in exported] == [
+        spec.module_id for spec in specs
+    ]
+    assert compiled_ids == [spec.module_id for spec in specs]
+    assert exported_kinds == ["v2x2ssd_bwd", "v2x2ssd_bwd"]
+    assert registered_kinds == ["v2x2ssd_bwd", "v2x2ssd_bwd"]
+
+
+def test_build_default_cute_aot_package_builds_forward_then_backward(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_forward(*, package_root, specs=None, arch_tags=None, clean=True):
+        calls.append(("forward", clean))
+        return (
+            cute_aot_mod.ExportedTVMFFIModule(
+                kind="v2x2ssd_fwd",
+                module_id="fwd",
+                function_name="fwd",
+                object_file=None,
+                shared_library=Path(package_root) / "artifacts" / "fwd.so",
+                metadata_file=Path(package_root) / "artifacts" / "fwd.json",
+            ),
+        )
+
+    def _fake_backward(*, package_root, specs=None, arch_tags=None, clean=True):
+        calls.append(("backward", clean))
+        return (
+            cute_aot_mod.ExportedTVMFFIModule(
+                kind="v2x2ssd_bwd",
+                module_id="bwd",
+                function_name="bwd",
+                object_file=None,
+                shared_library=Path(package_root) / "artifacts" / "bwd.so",
+                metadata_file=Path(package_root) / "artifacts" / "bwd.json",
+            ),
+        )
+
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "build_default_forward_aot_package",
+        _fake_forward,
+    )
+    monkeypatch.setattr(
+        cute_aot_mod,
+        "build_default_backward_aot_package",
+        _fake_backward,
+    )
+
+    exported = cute_aot_mod.build_default_cute_aot_package(package_root=tmp_path)
+
+    assert calls == [("forward", True), ("backward", False)]
+    assert [module.kind for module in exported] == ["v2x2ssd_fwd", "v2x2ssd_bwd"]
+
+
 @pytest.mark.parametrize(
     ("helper_name", "spec"),
     [
@@ -178,6 +303,10 @@ def test_build_default_forward_aot_package_only_exports_forward_specs(
         (
             "_compile_forward_aot",
             cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0],
+        ),
+        (
+            "_compile_backward_aot",
+            cute_aot_mod.default_backward_aot_specs(("sm_80",))[0],
         ),
     ],
 )
@@ -252,6 +381,71 @@ def _make_scan_inputs(
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
     return U, M, K, B, C, initial_states, B_prev, U_prev
+
+
+def _make_backward_inputs(
+    *,
+    batch: int,
+    heads: int,
+    T: int,
+    N: int,
+    P: int,
+    device: torch.device,
+    value_dtype: torch.dtype = torch.float16,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+        value_dtype=value_dtype,
+    )
+    _output, _final_state, m_chunk, chunk_starts = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        v2x2ssd_fwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=32,
+            compute_dtype=torch.float32,
+            output_dtype=value_dtype,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            return_final_state=True,
+            return_intermediates=True,
+        ),
+    )
+    d_out = torch.randn_like(U)
+    return (
+        U,
+        M,
+        K,
+        B,
+        C,
+        initial_states,
+        B_prev,
+        U_prev,
+        m_chunk,
+        chunk_starts,
+        d_out,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -345,7 +539,8 @@ def test_export_v2x2ssd_fwd_cute_aot_roundtrips_through_loaded_module(
         exported.shared_library,
         function_name=exported.function_name,
     )
-    loaded(*runtime_artifacts.runtime_args)
+    wrapped_loaded = v2x2ssd_fwd_mod._make_packaged_v2x2ssd_fwd_callable(loaded)
+    wrapped_loaded(*runtime_artifacts.runtime_args)
     torch.cuda.synchronize(device)
 
     reference = v2x2ssd_fwd_cute(
@@ -398,6 +593,9 @@ def test_v2x2ssd_fwd_cute_prefers_packaged_aot_over_jit(
         P=16,
         device=device,
     )
+    arch_tag = current_hardware_fingerprint(
+        device_index=torch.cuda.current_device()
+    ).arch_tag
 
     cute_aot_mod.export_v2x2ssd_fwd_cute_aot(
         U,
@@ -411,6 +609,7 @@ def test_v2x2ssd_fwd_cute_prefers_packaged_aot_over_jit(
         initial_states=initial_states,
         B_prev=B_prev,
         U_prev=U_prev,
+        arch_tag=arch_tag,
         package_root=tmp_path,
     )
 
@@ -438,6 +637,190 @@ def test_v2x2ssd_fwd_cute_prefers_packaged_aot_over_jit(
         return_intermediates=False,
     )
     assert len(out) == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_export_v2x2ssd_bwd_cute_aot_roundtrips_through_loaded_module(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    (
+        U,
+        M,
+        K,
+        B,
+        C,
+        initial_states,
+        B_prev,
+        U_prev,
+        m_chunk,
+        chunk_starts,
+        d_out,
+    ) = _make_backward_inputs(
+        batch=1,
+        heads=1,
+        T=32,
+        N=8,
+        P=16,
+        device=device,
+    )
+    d_final_state = torch.randn_like(initial_states)
+
+    exported = cute_aot_mod.export_v2x2ssd_bwd_cute_aot(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        package_root=tmp_path,
+    )
+    assert exported.object_file is not None
+    assert exported.object_file.is_file()
+    assert exported.shared_library.is_file()
+    assert exported.metadata_file.is_file()
+
+    runtime_artifacts = v2x2ssd_bwd_mod._make_backward_runtime_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        scan_num_threads_du=128,
+        scan_num_threads_db=128,
+        scan_num_threads_dcdr=128,
+        scan_num_threads_param=32,
+        state_num_threads=128,
+        state_pairs_per_thread=8,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        d_final_state=d_final_state,
+        prepared_inputs=None,
+        validate_runtime_contract=True,
+    )
+    loaded = cute_aot_mod.load_tvm_ffi_function(
+        exported.shared_library,
+        function_name=exported.function_name,
+    )
+    wrapped_loaded = v2x2ssd_bwd_mod._make_packaged_v2x2ssd_bwd_callable(
+        loaded,
+        problem_shape=runtime_artifacts.problem_shape,
+    )
+    wrapped_loaded(*runtime_artifacts.runtime_args)
+    torch.cuda.synchronize(device)
+
+    runtime_public = v2x2ssd_bwd_mod._materialize_backward_public_outputs(
+        runtime_artifacts,
+        time_steps=U.shape[2],
+        U_dtype=U.dtype,
+        B_dtype=B.dtype,
+        C_dtype=C.dtype,
+        initial_state_dtype=initial_states.dtype,
+        B_prev=B_prev,
+        U_prev=U_prev,
+    )
+    reference = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        d_final_state=d_final_state,
+    )
+    for actual, expected in zip(runtime_public, reference, strict=True):
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_bwd_cute_prefers_packaged_aot_over_jit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    (
+        U,
+        M,
+        K,
+        B,
+        C,
+        initial_states,
+        B_prev,
+        U_prev,
+        m_chunk,
+        chunk_starts,
+        d_out,
+    ) = _make_backward_inputs(
+        batch=1,
+        heads=1,
+        T=32,
+        N=8,
+        P=16,
+        device=device,
+    )
+    d_final_state = torch.randn_like(initial_states)
+    arch_tag = current_hardware_fingerprint(
+        device_index=torch.cuda.current_device()
+    ).arch_tag
+
+    cute_aot_mod.export_v2x2ssd_bwd_cute_aot(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        arch_tag=arch_tag,
+        package_root=tmp_path,
+    )
+
+    monkeypatch.setattr(cute_aot_mod, "_PACKAGED_AOT_ROOT", tmp_path)
+    cute_aot_mod.clear_packaged_aot_cache()
+    v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+
+    def _compile_should_not_run(*args, **kwargs):
+        raise AssertionError("expected packaged AOT backward to bypass cute.compile")
+
+    monkeypatch.setattr(v2x2ssd_bwd_mod.cute, "compile", _compile_should_not_run)
+    grads = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        d_final_state=d_final_state,
+    )
+    assert len(grads) == 8
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

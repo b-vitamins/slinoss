@@ -1,18 +1,20 @@
-"""Ahead-of-time helpers for the CuTe ``v2x2ssd`` forward stack.
+"""Ahead-of-time helpers for the CuTe ``v2x2ssd`` stack.
 
-This module keeps the AOT surface explicit and separate from the eager/JIT
-runtime path:
+This module keeps the packaged TVM-FFI surface explicit and separate from the
+eager/JIT runtime path:
 
-- compile/export helpers for the forward stages and combined forward
+- compile/export helpers for combined forward and backward wrappers
+- compile/export helpers for the public forward stages
+- packaged-artifact discovery and load helpers for release-built modules
 - a small TVM-FFI export/load wrapper around CuTe runtime APIs
-- packaged-artifact discovery for release-built forward modules
 
-The packaged forward AOT path is intentionally specialized to the forward
-kernel/model configuration (for example ``P``, ``D``, chunk size, dtypes, and
-launch policy) while remaining dynamic in batch/time via runtime tensor views.
+The packaged AOT path stays specialized to the kernel/model configuration
+(for example ``P``, ``D``, chunk size, dtypes, and launch policy) while
+remaining dynamic in batch/time via runtime tensor views.
 
-Release builds should stay on a curated default payload. The full autotune
-search-space package remains available as an explicit offline build surface.
+Release builds should stay on curated default payloads. The wider forward
+autotune search-space package remains available as an explicit offline build
+surface.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ _PACKAGED_AOT_MANIFEST = _PACKAGED_AOT_ROOT / "manifest.json"
 _PACKAGED_AOT_RUNTIME_DIR = _PACKAGED_AOT_ROOT / "runtime"
 _PACKAGED_AOT_ARTIFACT_DIR = _PACKAGED_AOT_ROOT / "artifacts"
 _PACKAGED_FORWARD_CACHE: dict[str, object] = {}
+_PACKAGED_BACKWARD_CACHE: dict[str, object] = {}
 _PACKAGED_STAGE_CACHE: dict[str, object] = {}
 
 
@@ -252,12 +255,74 @@ class ForwardAOTSpec:
         )
 
 
+@dataclass(frozen=True)
+class ChunkScanBackwardConfig:
+    num_threads_du: int
+    num_threads_db: int
+    num_threads_dcdr: int
+    num_threads_param: int
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "ChunkScanBackwardConfig":
+        return cls(
+            num_threads_du=int(record["num_threads_du"]),
+            num_threads_db=int(record["num_threads_db"]),
+            num_threads_dcdr=int(record["num_threads_dcdr"]),
+            num_threads_param=int(record["num_threads_param"]),
+        )
+
+
+@dataclass(frozen=True)
+class StatePassingBackwardConfig:
+    num_threads: int
+    pairs_per_thread: int
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "StatePassingBackwardConfig":
+        return cls(
+            num_threads=int(record["num_threads"]),
+            pairs_per_thread=int(record["pairs_per_thread"]),
+        )
+
+
+@dataclass(frozen=True)
+class BackwardAOTSpec:
+    arch_tag: str
+    P: int
+    D: int
+    chunk_size: int
+    tc_dtype_name: str
+    chunk_scan_config: ChunkScanBackwardConfig
+    state_passing_config: StatePassingBackwardConfig
+
+    @property
+    def tc_dtype(self) -> torch.dtype:
+        return _dtype_from_name(self.tc_dtype_name)
+
+    @property
+    def module_id(self) -> str:
+        return _sanitize_stem(
+            "v2x2ssd_bwd"
+            f"__arch{self.arch_tag}"
+            f"__p{self.P}_d{self.D}_l{self.chunk_size}"
+            f"__tc{_dtype_tag(self.tc_dtype)}"
+            f"__scan"
+            f"{self.chunk_scan_config.num_threads_du}"
+            f"x{self.chunk_scan_config.num_threads_db}"
+            f"x{self.chunk_scan_config.num_threads_dcdr}"
+            f"x{self.chunk_scan_config.num_threads_param}"
+            f"__state"
+            f"{self.state_passing_config.num_threads}"
+            f"x{self.state_passing_config.pairs_per_thread}"
+        )
+
+
 _AOT_SEARCH_P = 64
 _AOT_SEARCH_D = 256
 _AOT_SEARCH_CHUNK_SIZES = (32, 64, 128, 256)
 _AOT_SEARCH_TC_DTYPES = (torch.float16, torch.bfloat16)
 _DEFAULT_FORWARD_AOT_CHUNK_SIZES = (32, 64, 128)
-_SUPPORTED_FORWARD_AOT_ARCH_TAGS = frozenset(
+_SUPPORTED_CUTE_AOT_ARCH_TAGS = frozenset(
     {
         "sm_80",
         "sm_86",
@@ -286,24 +351,26 @@ def _normalize_arch_tag(raw_arch: str) -> str:
     return raw_arch
 
 
-def _filter_supported_forward_aot_arch_tags(
+def _filter_supported_cute_aot_arch_tags(
     arch_tags: tuple[str, ...],
 ) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
             arch_tag
             for arch_tag in arch_tags
-            if arch_tag == "any" or arch_tag in _SUPPORTED_FORWARD_AOT_ARCH_TAGS
+            if arch_tag == "any" or arch_tag in _SUPPORTED_CUTE_AOT_ARCH_TAGS
         )
     )
 
 
 def _arch_tags_from_env() -> tuple[str, ...]:
-    explicit_arch_tags = os.environ.get(
-        "SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", ""
-    ).strip()
+    explicit_arch_tags = os.environ.get("SLINOSS_CUTE_AOT_ARCH_TAGS", "").strip()
+    if not explicit_arch_tags:
+        explicit_arch_tags = os.environ.get(
+            "SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS", ""
+        ).strip()
     if explicit_arch_tags:
-        return _filter_supported_forward_aot_arch_tags(
+        return _filter_supported_cute_aot_arch_tags(
             tuple(
                 dict.fromkeys(
                     normalized
@@ -318,7 +385,7 @@ def _arch_tags_from_env() -> tuple[str, ...]:
 
     torch_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
     if torch_arch_list:
-        return _filter_supported_forward_aot_arch_tags(
+        return _filter_supported_cute_aot_arch_tags(
             tuple(
                 dict.fromkeys(
                     normalized
@@ -334,17 +401,17 @@ def _arch_tags_from_env() -> tuple[str, ...]:
     return ()
 
 
-def _resolve_forward_aot_arch_tags(
+def _resolve_cute_aot_arch_tags(
     arch_tags: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     if arch_tags is None:
         resolved_arch_tags = _arch_tags_from_env()
         return resolved_arch_tags if resolved_arch_tags else ("any",)
 
-    resolved_arch_tags = _filter_supported_forward_aot_arch_tags(arch_tags)
+    resolved_arch_tags = _filter_supported_cute_aot_arch_tags(arch_tags)
     if resolved_arch_tags:
         return resolved_arch_tags
-    raise ValueError(f"Unsupported forward AOT arch tags: {arch_tags}")
+    raise ValueError(f"Unsupported CuTe AOT arch tags: {arch_tags}")
 
 
 def _candidate_output_dtypes(tc_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -388,6 +455,22 @@ def _default_forward_config_bundle(
         ),
         state_passing=StatePassingConfig(num_threads=128, vecs_per_thread=8),
         chunk_scan=_default_chunk_scan_config(chunk_size=int(chunk_size)),
+    )
+
+
+def _default_backward_chunk_scan_config() -> ChunkScanBackwardConfig:
+    return ChunkScanBackwardConfig(
+        num_threads_du=128,
+        num_threads_db=128,
+        num_threads_dcdr=128,
+        num_threads_param=32,
+    )
+
+
+def _default_backward_state_passing_config() -> StatePassingBackwardConfig:
+    return StatePassingBackwardConfig(
+        num_threads=128,
+        pairs_per_thread=8,
     )
 
 
@@ -509,7 +592,7 @@ def _search_space_forward_specs(*, arch_tag: str = "any") -> tuple[ForwardAOTSpe
 def search_space_forward_aot_specs(
     arch_tags: tuple[str, ...] | None = None,
 ) -> tuple[ForwardAOTSpec, ...]:
-    resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
+    resolved_arch_tags = _resolve_cute_aot_arch_tags(arch_tags)
     return tuple(
         spec
         for arch_tag in resolved_arch_tags
@@ -521,7 +604,7 @@ def search_space_forward_aot_specs(
 def default_forward_aot_specs(
     arch_tags: tuple[str, ...] | None = None,
 ) -> tuple[ForwardAOTSpec, ...]:
-    resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
+    resolved_arch_tags = _resolve_cute_aot_arch_tags(arch_tags)
     return tuple(
         ForwardAOTSpec(
             arch_tag=arch_tag,
@@ -540,6 +623,29 @@ def default_forward_aot_specs(
         for chunk_size in _DEFAULT_FORWARD_AOT_CHUNK_SIZES
         for tc_dtype in _AOT_SEARCH_TC_DTYPES
         for has_init in (False, True)
+    )
+
+
+@lru_cache(maxsize=8)
+def default_backward_aot_specs(
+    arch_tags: tuple[str, ...] | None = None,
+) -> tuple[BackwardAOTSpec, ...]:
+    resolved_arch_tags = _resolve_cute_aot_arch_tags(arch_tags)
+    default_scan_config = _default_backward_chunk_scan_config()
+    default_state_config = _default_backward_state_passing_config()
+    return tuple(
+        BackwardAOTSpec(
+            arch_tag=arch_tag,
+            P=_AOT_SEARCH_P,
+            D=_AOT_SEARCH_D,
+            chunk_size=chunk_size,
+            tc_dtype_name=_dtype_name(tc_dtype),
+            chunk_scan_config=default_scan_config,
+            state_passing_config=default_state_config,
+        )
+        for arch_tag in resolved_arch_tags
+        for chunk_size in _DEFAULT_FORWARD_AOT_CHUNK_SIZES
+        for tc_dtype in _AOT_SEARCH_TC_DTYPES
     )
 
 
@@ -591,6 +697,22 @@ def _forward_spec_from_record(record: dict[str, Any]) -> ForwardAOTSpec:
     )
 
 
+def _backward_spec_from_record(record: dict[str, Any]) -> BackwardAOTSpec:
+    return BackwardAOTSpec(
+        arch_tag=str(record["arch_tag"]),
+        P=int(record["P"]),
+        D=int(record["D"]),
+        chunk_size=int(record["chunk_size"]),
+        tc_dtype_name=str(record["tc_dtype_name"]),
+        chunk_scan_config=ChunkScanBackwardConfig.from_record(
+            cast(dict[str, Any], record["chunk_scan_config"])
+        ),
+        state_passing_config=StatePassingBackwardConfig.from_record(
+            cast(dict[str, Any], record["state_passing_config"])
+        ),
+    )
+
+
 def _make_masked_fake_tensor_spec_arg(
     *,
     dtype: torch.dtype,
@@ -626,6 +748,7 @@ def _masked_compile_args_from_specs(
         tuple[bool, ...],
         tuple[bool, ...],
     ],
+    include_stream_placeholder: bool = True,
 ) -> tuple[tuple[int, ...], tuple[object, ...]]:
     from ..kernels.fwd.common import _compile_env_stream_placeholder
 
@@ -641,7 +764,9 @@ def _masked_compile_args_from_specs(
             dynamic_stride_mask=dynamic_stride_mask,
         )
         for dtype, spec, align, dynamic_shape_mask, dynamic_stride_mask in tensor_specs
-    ) + (_compile_env_stream_placeholder(),)
+    )
+    if include_stream_placeholder:
+        compile_args += (_compile_env_stream_placeholder(),)
     return alignments, compile_args
 
 
@@ -672,6 +797,23 @@ def _representative_chunk_scan_problem_shape(
 
 def _representative_forward_problem_shape(spec: ForwardAOTSpec) -> tuple[int, ...]:
     return (2, 2, 2 * spec.chunk_size, spec.P, spec.D, 2, spec.chunk_size)
+
+
+def _representative_backward_problem_shape(spec: BackwardAOTSpec):
+    from ..kernels.bwd import BackwardProblemShape, _torch_to_cutlass_dtype
+    from ..kernels.bwd.chunk_increment.db import ChunkIncrementBwdDBAmpere
+
+    chunk_increment_db = ChunkIncrementBwdDBAmpere(
+        _torch_to_cutlass_dtype(spec.tc_dtype),
+        chunk_size=spec.chunk_size,
+        D=spec.D,
+        P=spec.P,
+    )
+    n_d_tiles = (spec.D + chunk_increment_db.bN - 1) // chunk_increment_db.bN
+    return cast(
+        BackwardProblemShape,
+        (2, 2, 2 * spec.chunk_size, spec.P, spec.D, 2, spec.chunk_size, n_d_tiles),
+    )
 
 
 def _infer_chunk_increment_aot_spec(
@@ -862,6 +1004,75 @@ def infer_v2x2ssd_fwd_aot_spec(
         output_dtype_name=_dtype_name(output_dtype),
         config_bundle=compile_artifacts.config_bundle,
         has_init=initial_states is not None,
+    )
+
+
+def infer_v2x2ssd_bwd_aot_spec(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    m_chunk: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+    scan_num_threads_du: int = 128,
+    scan_num_threads_db: int = 128,
+    scan_num_threads_dcdr: int = 128,
+    scan_num_threads_param: int = 32,
+    state_num_threads: int = 128,
+    state_pairs_per_thread: int = 8,
+    arch_tag: str = "any",
+) -> BackwardAOTSpec:
+    from ..kernels.bwd import _make_backward_compile_artifacts
+
+    compile_artifacts = _make_backward_compile_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        scan_num_threads_du=scan_num_threads_du,
+        scan_num_threads_db=scan_num_threads_db,
+        scan_num_threads_dcdr=scan_num_threads_dcdr,
+        scan_num_threads_param=scan_num_threads_param,
+        state_num_threads=state_num_threads,
+        state_pairs_per_thread=state_pairs_per_thread,
+    )
+    (
+        _batch_size,
+        _heads,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        resolved_chunk_size,
+        _n_d_tiles,
+    ) = compile_artifacts.problem_shape
+    return BackwardAOTSpec(
+        arch_tag=arch_tag,
+        P=int(P),
+        D=int(D),
+        chunk_size=int(resolved_chunk_size),
+        tc_dtype_name=_dtype_name(compile_artifacts.tc_dtype),
+        chunk_scan_config=ChunkScanBackwardConfig(
+            num_threads_du=int(compile_artifacts.launch_cfg[0]),
+            num_threads_db=int(compile_artifacts.launch_cfg[1]),
+            num_threads_dcdr=int(compile_artifacts.launch_cfg[2]),
+            num_threads_param=int(compile_artifacts.launch_cfg[3]),
+        ),
+        state_passing_config=StatePassingBackwardConfig(
+            num_threads=int(compile_artifacts.launch_cfg[4]),
+            pairs_per_thread=int(compile_artifacts.launch_cfg[5]),
+        ),
     )
 
 
@@ -1497,6 +1708,455 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
     )
 
 
+def _compile_backward_aot(spec: BackwardAOTSpec):
+    from ..kernels.bwd import (
+        BackwardInputInfo,
+        _chunk_increment_bwd_tensor_specs,
+        _chunk_scan_bwd_tensor_specs,
+        _compile_min_align_for_dtype,
+        _make_backward_launch_cfg,
+        _make_v2x2ssd_bwd_aot_host_wrapper,
+        _resolve_dz0_cta_tiler,
+        _state_passing_bwd_tensor_specs,
+    )
+
+    problem_shape = _representative_backward_problem_shape(spec)
+    batch_size, heads, padded_time, _P, D, n_chunks, chunk_size, n_d_tiles = (
+        problem_shape
+    )
+    input_info = BackwardInputInfo(
+        batch_size=batch_size,
+        heads=heads,
+        time_steps=padded_time,
+        P=spec.P,
+        D=spec.D,
+        chunk_size=chunk_size,
+        n_chunks=n_chunks,
+        padded_time=padded_time,
+        tc_dtype=spec.tc_dtype,
+        device_index=-1,
+        n_d_tiles=n_d_tiles,
+        dz0_cta_tiler=_resolve_dz0_cta_tiler(D=D),
+    )
+    launch_cfg = _make_backward_launch_cfg(
+        input_info=input_info,
+        scan_num_threads_du=spec.chunk_scan_config.num_threads_du,
+        scan_num_threads_db=spec.chunk_scan_config.num_threads_db,
+        scan_num_threads_dcdr=spec.chunk_scan_config.num_threads_dcdr,
+        scan_num_threads_param=spec.chunk_scan_config.num_threads_param,
+        state_num_threads=spec.state_passing_config.num_threads,
+        state_pairs_per_thread=spec.state_passing_config.pairs_per_thread,
+    )
+    tc_align = _compile_min_align_for_dtype(spec.tc_dtype)
+    fp32_align = _compile_min_align_for_dtype(torch.float32)
+    k_current_align = 8
+    (
+        U_scan_spec,
+        B_scan_spec,
+        M_scan_spec,
+        K_scan_spec,
+        chunk_starts_scan_spec,
+        U_prev_scan_spec,
+        B_prev_scan_spec,
+        dlogp_scan_spec,
+        dM_scan_scratch_spec,
+        dR_scan_spec,
+        d_param_scan_spec,
+        dlogp_param_spec,
+        dR_param_spec,
+        d_out_dz0_spec,
+        C_dz0_spec,
+        M_dz0_spec,
+        d_chunk_starts_scan_spec,
+        dU_db_dummy_spec,
+        dB_du_dummy_spec,
+        dU_prev_dummy_spec,
+        dB_prev_dummy_spec,
+    ) = _chunk_scan_bwd_tensor_specs(problem_shape)
+    (
+        chunk_starts_state_spec,
+        chunk_multiplier_state_spec,
+        final_state_spec,
+    ) = _state_passing_bwd_tensor_specs(problem_shape)
+    (
+        U_increment_spec,
+        dU_increment_spec,
+        B_increment_spec,
+        M_increment_spec,
+        K_increment_spec,
+        d_increment_spec,
+        d_increment_dp_spec,
+        d_increment_boundary_spec,
+        U_prev_chunks_spec,
+        B_prev_chunks_spec,
+        dM_sum_part_spec,
+        dMp0_spec,
+        d_chunk_multiplier_increment_spec,
+        d_param_increment_spec,
+    ) = _chunk_increment_bwd_tensor_specs(problem_shape)
+    _alignments, compile_args = _masked_compile_args_from_specs(
+        (
+            spec.tc_dtype,
+            U_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            B_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            B_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            M_scan_spec,
+            fp32_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            K_scan_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            U_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            chunk_starts_scan_spec,
+            fp32_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (spec.tc_dtype, U_prev_scan_spec, tc_align, (True, False), (False, False)),
+        (spec.tc_dtype, B_prev_scan_spec, tc_align, (True, False), (False, False)),
+        (
+            spec.tc_dtype,
+            U_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            B_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (spec.tc_dtype, dU_prev_dummy_spec, tc_align, (True, False), (False, False)),
+        (spec.tc_dtype, dB_prev_dummy_spec, tc_align, (True, False), (False, False)),
+        (torch.float32, dlogp_scan_spec, fp32_align, (True, False), (False, False)),
+        (
+            torch.float32,
+            dlogp_param_spec,
+            fp32_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            dM_scan_scratch_spec,
+            fp32_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            dM_scan_scratch_spec,
+            fp32_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            d_param_scan_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            d_param_scan_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            B_scan_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            dR_scan_spec,
+            fp32_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            dR_param_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            d_param_scan_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            d_param_scan_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            torch.float32,
+            d_param_scan_spec,
+            fp32_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            d_out_dz0_spec,
+            tc_align,
+            (False, True, True),
+            (False, False, True),
+        ),
+        (
+            spec.tc_dtype,
+            C_dz0_spec,
+            tc_align,
+            (False, True, True),
+            (False, False, True),
+        ),
+        (
+            torch.float32,
+            M_dz0_spec,
+            fp32_align,
+            (False, True, True),
+            (False, False, True),
+        ),
+        (
+            torch.float32,
+            d_chunk_starts_scan_spec,
+            fp32_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            chunk_starts_state_spec,
+            fp32_align,
+            (True, True, True, False, False),
+            (True, True, False, False, False),
+        ),
+        (
+            torch.float32,
+            chunk_multiplier_state_spec,
+            fp32_align,
+            (True, True, True, False),
+            (True, True, False, False),
+        ),
+        (
+            torch.float32,
+            chunk_starts_state_spec,
+            fp32_align,
+            (True, True, True, False, False),
+            (True, True, False, False, False),
+        ),
+        (
+            torch.float32,
+            final_state_spec,
+            fp32_align,
+            (True, True, False, False),
+            (True, False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            chunk_starts_state_spec,
+            tc_align,
+            (True, True, True, False, False),
+            (True, True, False, False, False),
+        ),
+        (
+            torch.float32,
+            final_state_spec,
+            fp32_align,
+            (True, True, False, False),
+            (True, False, False, False),
+        ),
+        (
+            torch.float32,
+            chunk_multiplier_state_spec,
+            fp32_align,
+            (True, True, True, False),
+            (True, True, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            U_increment_spec,
+            tc_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            B_increment_spec,
+            tc_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            M_increment_spec,
+            fp32_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            K_increment_spec,
+            fp32_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            torch.float32,
+            K_increment_spec,
+            k_current_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            d_increment_dp_spec,
+            tc_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            d_increment_spec,
+            tc_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            d_increment_boundary_spec,
+            tc_align,
+            (True, False, False),
+            (False, False, False),
+        ),
+        (spec.tc_dtype, B_prev_chunks_spec, tc_align, (False, True), (False, False)),
+        (spec.tc_dtype, U_prev_chunks_spec, tc_align, (False, True), (False, False)),
+        (
+            spec.tc_dtype,
+            B_increment_spec,
+            tc_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (
+            spec.tc_dtype,
+            dU_increment_spec,
+            tc_align,
+            (False, False, True),
+            (False, False, False),
+        ),
+        (spec.tc_dtype, B_prev_chunks_spec, tc_align, (False, True), (False, False)),
+        (spec.tc_dtype, U_prev_chunks_spec, tc_align, (False, True), (False, False)),
+        (
+            torch.float32,
+            dM_sum_part_spec,
+            fp32_align,
+            (False, False, False, True),
+            (True, True, True, False),
+        ),
+        (torch.float32, dMp0_spec, fp32_align, (False, True), (True, False)),
+        (
+            torch.float32,
+            d_chunk_multiplier_increment_spec,
+            fp32_align,
+            (False, True),
+            (False, False),
+        ),
+        (
+            torch.float32,
+            d_param_increment_spec,
+            fp32_align,
+            (False, False, True),
+            (True, True, False),
+        ),
+        (
+            torch.float32,
+            d_param_increment_spec,
+            fp32_align,
+            (False, False, True),
+            (True, True, False),
+        ),
+        (
+            torch.float32,
+            d_param_increment_spec,
+            fp32_align,
+            (False, False, True),
+            (True, True, False),
+        ),
+        (
+            spec.tc_dtype,
+            dU_db_dummy_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (spec.tc_dtype, dU_prev_dummy_spec, tc_align, (True, False), (False, False)),
+        (
+            spec.tc_dtype,
+            dB_du_dummy_spec,
+            tc_align,
+            (True, False, False, False),
+            (False, False, False, False),
+        ),
+        (spec.tc_dtype, dB_prev_dummy_spec, tc_align, (True, False), (False, False)),
+        include_stream_placeholder=False,
+    )
+    host_wrapper = _make_v2x2ssd_bwd_aot_host_wrapper(
+        problem_shape=problem_shape,
+        launch_cfg=launch_cfg,
+    )
+    return cute.compile(
+        host_wrapper,
+        *compile_args,
+        options=_aot_compile_options(spec.arch_tag),
+        no_jit_engine=True,
+    )
+
+
 def export_tvm_ffi_compiled_module(
     compiled,
     *,
@@ -1725,67 +2385,37 @@ def list_packaged_forward_aot_specs(
     )
 
 
-def try_load_packaged_v2x2ssd_fwd_function(
-    spec: ForwardAOTSpec,
+def list_packaged_backward_aot_specs(
     *,
     package_root: str | os.PathLike[str] | Path | None = None,
-):
-    """Return a packaged forward AOT function if one matches ``spec``."""
-    if os.environ.get("SLINOSS_DISABLE_CUTE_AOT") == "1":
-        return None
-
-    package_root = _PACKAGED_AOT_ROOT if package_root is None else Path(package_root)
-    module_id = spec.module_id
-    cached = _PACKAGED_FORWARD_CACHE.get(module_id)
-    if cached is not None:
-        return cached
-
-    record = next(
-        (
-            candidate
-            for candidate in _list_packaged_aot_records(
-                kind="v2x2ssd_fwd",
-                package_root=package_root,
-                arch_tag=spec.arch_tag,
-            )
-            if candidate.get("id") == module_id
-        ),
-        None,
+    arch_tag: str | None = None,
+) -> tuple[BackwardAOTSpec, ...]:
+    return tuple(
+        _backward_spec_from_record(cast(dict[str, Any], record["spec"]))
+        for record in _list_packaged_aot_records(
+            kind="v2x2ssd_bwd",
+            package_root=package_root,
+            arch_tag=arch_tag,
+        )
     )
-    if record is None:
-        return None
-
-    function_name = str(record["function_name"])
-    shared_library = package_root / str(record["shared_library"])
-    object_file_rel = record.get("object_file")
-    candidate_paths = [shared_library]
-    if object_file_rel:
-        candidate_paths.append(package_root / str(object_file_rel))
-    for module_path in candidate_paths:
-        if not module_path.exists():
-            continue
-        try:
-            loaded = load_tvm_ffi_function(module_path, function_name=function_name)
-        except Exception:
-            continue
-        _PACKAGED_FORWARD_CACHE[module_id] = loaded
-        return loaded
-    return None
 
 
-def _try_load_packaged_stage_function(
+def _try_load_packaged_compiled_function(
     *,
     kind: str,
     module_id: str,
     arch_tag: str,
+    cache: dict[str, object],
     package_root: str | os.PathLike[str] | Path | None = None,
 ):
     if os.environ.get("SLINOSS_DISABLE_CUTE_AOT") == "1":
         return None
+
     package_root = _PACKAGED_AOT_ROOT if package_root is None else Path(package_root)
-    cached = _PACKAGED_STAGE_CACHE.get(module_id)
+    cached = cache.get(module_id)
     if cached is not None:
         return cached
+
     record = next(
         (
             candidate
@@ -1800,6 +2430,7 @@ def _try_load_packaged_stage_function(
     )
     if record is None:
         return None
+
     function_name = str(record["function_name"])
     shared_library = package_root / str(record["shared_library"])
     object_file_rel = record.get("object_file")
@@ -1813,9 +2444,55 @@ def _try_load_packaged_stage_function(
             loaded = load_tvm_ffi_function(module_path, function_name=function_name)
         except Exception:
             continue
-        _PACKAGED_STAGE_CACHE[module_id] = loaded
+        cache[module_id] = loaded
         return loaded
     return None
+
+
+def try_load_packaged_v2x2ssd_fwd_function(
+    spec: ForwardAOTSpec,
+    *,
+    package_root: str | os.PathLike[str] | Path | None = None,
+):
+    """Return a packaged forward AOT function if one matches ``spec``."""
+    return _try_load_packaged_compiled_function(
+        kind="v2x2ssd_fwd",
+        module_id=spec.module_id,
+        arch_tag=spec.arch_tag,
+        cache=_PACKAGED_FORWARD_CACHE,
+        package_root=package_root,
+    )
+
+
+def try_load_packaged_v2x2ssd_bwd_function(
+    spec: BackwardAOTSpec,
+    *,
+    package_root: str | os.PathLike[str] | Path | None = None,
+):
+    """Return a packaged backward AOT function if one matches ``spec``."""
+    return _try_load_packaged_compiled_function(
+        kind="v2x2ssd_bwd",
+        module_id=spec.module_id,
+        arch_tag=spec.arch_tag,
+        cache=_PACKAGED_BACKWARD_CACHE,
+        package_root=package_root,
+    )
+
+
+def _try_load_packaged_stage_function(
+    *,
+    kind: str,
+    module_id: str,
+    arch_tag: str,
+    package_root: str | os.PathLike[str] | Path | None = None,
+):
+    return _try_load_packaged_compiled_function(
+        kind=kind,
+        module_id=module_id,
+        arch_tag=arch_tag,
+        cache=_PACKAGED_STAGE_CACHE,
+        package_root=package_root,
+    )
 
 
 def try_load_packaged_chunk_increment_function(
@@ -1857,9 +2534,14 @@ def try_load_packaged_chunk_scan_function(
     )
 
 
-def clear_packaged_forward_aot_cache() -> None:
+def clear_packaged_aot_cache() -> None:
     _PACKAGED_FORWARD_CACHE.clear()
+    _PACKAGED_BACKWARD_CACHE.clear()
     _PACKAGED_STAGE_CACHE.clear()
+
+
+def clear_packaged_forward_aot_cache() -> None:
+    clear_packaged_aot_cache()
 
 
 def export_chunk_increment_cute_aot(
@@ -2024,19 +2706,6 @@ def export_v2x2ssd_fwd_cute_aot(
     U_prev: torch.Tensor | None = None,
     package_root: str | os.PathLike[str] | Path,
 ) -> ExportedTVMFFIModule:
-    resolved_arch_tag = arch_tag
-    if resolved_arch_tag == "any" and U.is_cuda:
-        from ..tuning.hardware import current_hardware_fingerprint
-
-        device_index = (
-            int(U.device.index)
-            if U.device.index is not None
-            else torch.cuda.current_device()
-        )
-        resolved_arch_tag = current_hardware_fingerprint(
-            device_index=device_index
-        ).arch_tag
-
     spec = infer_v2x2ssd_fwd_aot_spec(
         U,
         M,
@@ -2053,7 +2722,7 @@ def export_v2x2ssd_fwd_cute_aot(
         state_vecs_per_thread=state_vecs_per_thread,
         chunk_increment_cta_tiler=chunk_increment_cta_tiler,
         chunk_increment_num_stages=chunk_increment_num_stages,
-        arch_tag=resolved_arch_tag,
+        arch_tag=arch_tag,
         initial_states=initial_states,
         B_prev=B_prev,
         U_prev=U_prev,
@@ -2068,6 +2737,63 @@ def export_v2x2ssd_fwd_cute_aot(
     )
     register_aot_artifact(
         kind="v2x2ssd_fwd",
+        spec=spec,
+        exported=exported,
+        package_root=package_root,
+    )
+    return exported
+
+
+def export_v2x2ssd_bwd_cute_aot(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    m_chunk: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+    scan_num_threads_du: int = 128,
+    scan_num_threads_db: int = 128,
+    scan_num_threads_dcdr: int = 128,
+    scan_num_threads_param: int = 32,
+    state_num_threads: int = 128,
+    state_pairs_per_thread: int = 8,
+    arch_tag: str = "any",
+    package_root: str | os.PathLike[str] | Path,
+) -> ExportedTVMFFIModule:
+    spec = infer_v2x2ssd_bwd_aot_spec(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        scan_num_threads_du=scan_num_threads_du,
+        scan_num_threads_db=scan_num_threads_db,
+        scan_num_threads_dcdr=scan_num_threads_dcdr,
+        scan_num_threads_param=scan_num_threads_param,
+        state_num_threads=state_num_threads,
+        state_pairs_per_thread=state_pairs_per_thread,
+        arch_tag=arch_tag,
+    )
+    compiled = _compile_backward_aot(spec)
+    exported = export_tvm_ffi_compiled_module(
+        compiled,
+        kind="v2x2ssd_bwd",
+        module_id=spec.module_id,
+        function_name=spec.module_id,
+        package_root=package_root,
+    )
+    register_aot_artifact(
+        kind="v2x2ssd_bwd",
         spec=spec,
         exported=exported,
         package_root=package_root,
@@ -2124,7 +2850,7 @@ def build_forward_aot_search_space_package(
     clean: bool = True,
 ) -> tuple[ExportedTVMFFIModule, ...]:
     package_root = Path(package_root)
-    resolved_arch_tags = _resolve_forward_aot_arch_tags(arch_tags)
+    resolved_arch_tags = _resolve_cute_aot_arch_tags(arch_tags)
     resolved_specs = (
         search_space_forward_aot_specs(resolved_arch_tags) if specs is None else specs
     )
@@ -2239,24 +2965,92 @@ def build_default_forward_aot_package(
     return tuple(exported_modules)
 
 
+def build_default_backward_aot_package(
+    *,
+    package_root: str | os.PathLike[str] | Path = _PACKAGED_AOT_ROOT,
+    specs: tuple[BackwardAOTSpec, ...] | None = None,
+    arch_tags: tuple[str, ...] | None = None,
+    clean: bool = True,
+) -> tuple[ExportedTVMFFIModule, ...]:
+    package_root = Path(package_root)
+    resolved_specs = default_backward_aot_specs(arch_tags) if specs is None else specs
+    if clean:
+        shutil.rmtree(package_root / "artifacts", ignore_errors=True)
+        shutil.rmtree(package_root / "runtime", ignore_errors=True)
+        (package_root / "manifest.json").unlink(missing_ok=True)
+    exported_modules: list[ExportedTVMFFIModule] = []
+    for spec in resolved_specs:
+        compiled = _compile_backward_aot(spec)
+        exported = export_tvm_ffi_compiled_module(
+            compiled,
+            kind="v2x2ssd_bwd",
+            module_id=spec.module_id,
+            function_name=spec.module_id,
+            package_root=package_root,
+            keep_object_file=False,
+        )
+        register_aot_artifact(
+            kind="v2x2ssd_bwd",
+            spec=spec,
+            exported=exported,
+            package_root=package_root,
+        )
+        exported_modules.append(exported)
+    return tuple(exported_modules)
+
+
+def build_default_cute_aot_package(
+    *,
+    package_root: str | os.PathLike[str] | Path = _PACKAGED_AOT_ROOT,
+    forward_specs: tuple[ForwardAOTSpec, ...] | None = None,
+    backward_specs: tuple[BackwardAOTSpec, ...] | None = None,
+    arch_tags: tuple[str, ...] | None = None,
+    clean: bool = True,
+) -> tuple[ExportedTVMFFIModule, ...]:
+    package_root = Path(package_root)
+    exported_forward = build_default_forward_aot_package(
+        package_root=package_root,
+        specs=forward_specs,
+        arch_tags=arch_tags,
+        clean=clean,
+    )
+    exported_backward = build_default_backward_aot_package(
+        package_root=package_root,
+        specs=backward_specs,
+        arch_tags=arch_tags,
+        clean=False,
+    )
+    return (*exported_forward, *exported_backward)
+
+
 __all__ = [
+    "BackwardAOTSpec",
     "ChunkIncrementAOTSpec",
+    "ChunkScanBackwardConfig",
     "ChunkScanAOTSpec",
     "ExportedTVMFFIModule",
     "ForwardAOTSpec",
     "StatePassingAOTSpec",
+    "StatePassingBackwardConfig",
+    "build_default_backward_aot_package",
+    "build_default_cute_aot_package",
     "build_default_forward_aot_package",
     "build_forward_aot_search_space_package",
+    "clear_packaged_aot_cache",
     "clear_packaged_forward_aot_cache",
+    "default_backward_aot_specs",
     "default_forward_aot_specs",
     "export_chunk_increment_cute_aot",
     "export_chunk_scan_cute_aot",
     "export_state_passing_cute_aot",
     "export_tvm_ffi_compiled_module",
+    "export_v2x2ssd_bwd_cute_aot",
     "export_tuned_v2x2ssd_fwd_cute_aot",
     "export_v2x2ssd_fwd_cute_aot",
     "find_tvm_ffi_runtime_libraries",
+    "infer_v2x2ssd_bwd_aot_spec",
     "infer_v2x2ssd_fwd_aot_spec",
+    "list_packaged_backward_aot_specs",
     "list_packaged_chunk_increment_aot_specs",
     "list_packaged_chunk_scan_aot_specs",
     "list_packaged_forward_aot_specs",
@@ -2268,5 +3062,6 @@ __all__ = [
     "try_load_packaged_chunk_increment_function",
     "try_load_packaged_chunk_scan_function",
     "try_load_packaged_state_passing_function",
+    "try_load_packaged_v2x2ssd_bwd_function",
     "try_load_packaged_v2x2ssd_fwd_function",
 ]

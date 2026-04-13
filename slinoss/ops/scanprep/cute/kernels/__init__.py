@@ -609,6 +609,37 @@ def _compile_scanprep_fwd_kernel(
     )
 
 
+def _make_scanprep_fwd_aot_spec(
+    runtime_artifacts: ForwardRuntimeArtifacts,
+    *,
+    config: ScanPrepConfig,
+    arch_tag: str,
+):
+    from slinoss._cute_aot import _dtype_name
+    from ..aot import ForwardAOTSpec
+
+    value_arg, bc_arg, params_arg = runtime_artifacts.runtime_args[:3]
+    bias_args = runtime_artifacts.runtime_args[3:8]
+    bias_dtype_names = {_dtype_name(tensor.dtype) for tensor in bias_args}
+    if len(bias_dtype_names) != 1:
+        raise ValueError(
+            f"Expected one shared scanprep forward bias dtype. Got {sorted(bias_dtype_names)}."
+        )
+    input_info = runtime_artifacts.input_info
+    return ForwardAOTSpec(
+        arch_tag=arch_tag,
+        heads=input_info.heads,
+        d_head=input_info.d_head,
+        d_state=input_info.d_state,
+        value_dtype_name=_dtype_name(value_arg.dtype),
+        params_dtype_name=_dtype_name(params_arg.dtype),
+        bc_dtype_name=_dtype_name(bc_arg.dtype),
+        bias_dtype_name=next(iter(bias_dtype_names)),
+        store_coeff_aux=runtime_artifacts.store_coeff_aux,
+        config=config,
+    )
+
+
 def _get_compiled_scanprep_fwd_kernel(
     runtime_artifacts: ForwardRuntimeArtifacts,
     compile_artifacts: ForwardCompileArtifacts,
@@ -616,11 +647,26 @@ def _get_compiled_scanprep_fwd_kernel(
     device: torch.device,
     config: ScanPrepConfig,
 ) -> object:
+    from slinoss._cute_aot import current_cuda_arch_tag
+    from ..aot import try_load_packaged_scanprep_fwd_function
+
     cache_key = compile_artifacts.cache_key
     compiled = _SCANPREP_FWD_CACHE.get(cache_key)
     if compiled is not None:
         note_cache_event("cute.scanprep.fwd.host_compile", hit=True)
         return compiled
+    packaged = try_load_packaged_scanprep_fwd_function(
+        _make_scanprep_fwd_aot_spec(
+            runtime_artifacts,
+            config=config,
+            arch_tag=current_cuda_arch_tag(device),
+        )
+    )
+    if packaged is not None:
+        note_cache_event("cute.scanprep.fwd.host_aot", hit=True)
+        _SCANPREP_FWD_CACHE[cache_key] = packaged
+        return packaged
+    note_cache_event("cute.scanprep.fwd.host_aot", hit=False)
     note_cache_event("cute.scanprep.fwd.host_compile", hit=False)
     if _is_cuda_graph_capturing(device):
         _raise_cold_capture_error("forward", "launcher cache")
@@ -1161,6 +1207,35 @@ def _compile_scanprep_bwd_kernel(
     )
 
 
+def _make_scanprep_bwd_aot_spec(
+    runtime_artifacts: BackwardRuntimeArtifacts,
+    *,
+    config: ScanPrepConfig,
+    arch_tag: str,
+):
+    from slinoss._cute_aot import _dtype_name
+    from ..aot import BackwardAOTSpec
+
+    input_info = runtime_artifacts.input_info
+    bias_args = runtime_artifacts.runtime_args[6:9]
+    bias_dtype_names = {_dtype_name(tensor.dtype) for tensor in bias_args}
+    if len(bias_dtype_names) != 1:
+        raise ValueError(
+            f"Expected one shared scanprep backward bias dtype. Got {sorted(bias_dtype_names)}."
+        )
+    return BackwardAOTSpec(
+        arch_tag=arch_tag,
+        heads=input_info.heads,
+        d_head=input_info.d_head,
+        d_state=input_info.d_state,
+        bc_dtype_name=_dtype_name(runtime_artifacts.outputs.bc_grad.dtype),
+        value_grad_dtype_name=_dtype_name(runtime_artifacts.outputs.value_grad.dtype),
+        params_grad_dtype_name=_dtype_name(runtime_artifacts.outputs.dparams.dtype),
+        bias_dtype_name=next(iter(bias_dtype_names)),
+        config=config,
+    )
+
+
 def _get_compiled_scanprep_bwd_kernel(
     runtime_artifacts: BackwardRuntimeArtifacts,
     compile_artifacts: BackwardCompileArtifacts,
@@ -1168,11 +1243,26 @@ def _get_compiled_scanprep_bwd_kernel(
     device: torch.device,
     config: ScanPrepConfig,
 ) -> object:
+    from slinoss._cute_aot import current_cuda_arch_tag
+    from ..aot import try_load_packaged_scanprep_bwd_function
+
     cache_key = compile_artifacts.cache_key
     compiled = _SCANPREP_BWD_CACHE.get(cache_key)
     if compiled is not None:
         note_cache_event("cute.scanprep.bwd.host_compile", hit=True)
         return compiled
+    packaged = try_load_packaged_scanprep_bwd_function(
+        _make_scanprep_bwd_aot_spec(
+            runtime_artifacts,
+            config=config,
+            arch_tag=current_cuda_arch_tag(device),
+        )
+    )
+    if packaged is not None:
+        note_cache_event("cute.scanprep.bwd.host_aot", hit=True)
+        _SCANPREP_BWD_CACHE[cache_key] = packaged
+        return packaged
+    note_cache_event("cute.scanprep.bwd.host_aot", hit=False)
     note_cache_event("cute.scanprep.bwd.host_compile", hit=False)
     if _is_cuda_graph_capturing(device):
         _raise_cold_capture_error("backward", "launcher cache")

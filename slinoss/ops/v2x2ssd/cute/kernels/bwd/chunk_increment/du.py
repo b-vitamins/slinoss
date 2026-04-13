@@ -570,14 +570,6 @@ class ChunkIncrementBwdDUAmpere:
             == mKcurr.element_type
             == cutlass.Float32
         )
-        batch_head_chunk_dims_match = (
-            mDInc.shape[2]
-            == mB.shape[2]
-            == mM.shape[2]
-            == mKprev.shape[2]
-            == mKcurr.shape[2]
-            == mDU.shape[2]
-        )
 
         if cutlass.const_expr(not input_dtype_ok):
             raise TypeError("DInc/B/DU must share element type.")
@@ -606,8 +598,6 @@ class ChunkIncrementBwdDUAmpere:
             raise ValueError("DU must have shape (P, L, BHC) matching kernel config.")
         if cutlass.const_expr(mB.shape[1] % 2 != 0):
             raise ValueError("B D dimension must be even because D stores pairs.")
-        if cutlass.const_expr(not batch_head_chunk_dims_match):
-            raise ValueError("All operands must share the BHC dimension.")
 
     def _launch_kernel(
         self,

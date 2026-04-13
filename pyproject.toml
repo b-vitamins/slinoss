@@ -43,3 +43,9 @@ include = ["slinoss*"]
   "artifacts/*.so",
   "runtime/*.so",
 ]
+"slinoss.ops.scanprep.cute.aot" = [
+  "manifest.json",
+  "artifacts/*.json",
+  "artifacts/*.so",
+  "runtime/*.so",
+]

@@ -317,17 +317,6 @@ class ChunkIncrementBwdBoundaryAmpere:
             == mDUPrev.element_type
             == mDBPrev.element_type
         )
-        batch_head_chunk_dims_match = (
-            mDInc.shape[0]
-            == mBPrev.shape[1]
-            == mUPrev.shape[1]
-            == mM.shape[2]
-            == mKprev.shape[2]
-            == mDUPrev.shape[1]
-            == mDBPrev.shape[1]
-            == mDMp0.shape[1]
-        )
-
         if cutlass.const_expr(not value_stream_dtype_ok):
             raise TypeError(
                 "Boundary value streams and outputs must share element type."
@@ -349,9 +338,9 @@ class ChunkIncrementBwdBoundaryAmpere:
             raise ValueError("DIncBoundary and UPrev must agree on the P dimension.")
         if cutlass.const_expr(mDInc.shape[2] != mBPrev.shape[0]):
             raise ValueError("DIncBoundary and BPrev must agree on the D dimension.")
-        if cutlass.const_expr(mDUPrev.shape != mUPrev.shape):
+        if cutlass.const_expr(mDUPrev.shape[0] != mUPrev.shape[0]):
             raise ValueError("DUPrev must match UPrev.")
-        if cutlass.const_expr(mDBPrev.shape != mBPrev.shape):
+        if cutlass.const_expr(mDBPrev.shape[0] != mBPrev.shape[0]):
             raise ValueError("DBPrev must match BPrev.")
         if cutlass.const_expr(mM.shape[0] != 2 or mKprev.shape[0] != 2):
             raise ValueError("M and Kprev must have leading packed-complex extent 2.")
@@ -359,8 +348,6 @@ class ChunkIncrementBwdBoundaryAmpere:
             raise ValueError("DMp0 must have leading packed-complex extent 2.")
         if cutlass.const_expr(mM.shape[1] != mKprev.shape[1]):
             raise ValueError("M and Kprev must share the chunk time dimension.")
-        if cutlass.const_expr(not batch_head_chunk_dims_match):
-            raise ValueError("All boundary operands must share the BHC dimension.")
         if cutlass.const_expr(mBPrev.shape[0] % 2 != 0):
             raise ValueError("BPrev D dimension must be even because D stores pairs.")
 

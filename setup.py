@@ -40,59 +40,107 @@ def _want_cuda_extension() -> bool:
     return True
 
 
-def _want_cute_forward_aot() -> bool:
-    return os.environ.get("SLINOSS_BUILD_CUTE_FORWARD_AOT", "0") == "1"
+def _want_cute_aot() -> bool:
+    return (
+        os.environ.get(
+            "SLINOSS_BUILD_CUTE_AOT",
+            os.environ.get("SLINOSS_BUILD_CUTE_FORWARD_AOT", "0"),
+        )
+        == "1"
+    )
 
 
-def _cute_forward_aot_payload_dir() -> Path | None:
-    payload_dir = os.environ.get("SLINOSS_CUTE_FORWARD_AOT_PAYLOAD_DIR", "").strip()
+def _cute_aot_payload_dir() -> Path | None:
+    payload_dir = os.environ.get("SLINOSS_CUTE_AOT_PAYLOAD_DIR", "").strip()
+    if not payload_dir:
+        payload_dir = os.environ.get("SLINOSS_CUTE_FORWARD_AOT_PAYLOAD_DIR", "").strip()
     if not payload_dir:
         return None
     return Path(payload_dir)
 
 
-def _build_cute_forward_aot(package_root: Path) -> None:
+def _build_cute_aot(package_root: Path) -> None:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
     from slinoss._cute_runtime import ensure_cute_runtime_env
-    from slinoss.ops.v2x2ssd.cute.aot import build_default_forward_aot_package
+    from slinoss.ops.scanprep.cute.aot import (
+        build_default_cute_aot_package as build_default_scanprep_cute_aot_package,
+    )
+    from slinoss.ops.v2x2ssd.cute.aot import (
+        build_default_cute_aot_package as build_default_v2x2ssd_cute_aot_package,
+    )
 
     ensure_cute_runtime_env()
-    build_default_forward_aot_package(package_root=package_root, clean=True)
+    build_default_v2x2ssd_cute_aot_package(
+        package_root=package_root / "v2x2ssd",
+        clean=True,
+    )
+    build_default_scanprep_cute_aot_package(
+        package_root=package_root / "scanprep",
+        clean=True,
+    )
 
 
-def _stage_cute_forward_aot_payload(source_root: Path, package_root: Path) -> None:
+def _stage_cute_aot_payload(source_root: Path, package_root: Path) -> None:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-    from slinoss._wheel_aot import stage_cute_forward_aot_payload
+    from slinoss._wheel_aot import stage_cute_aot_payload
 
     shutil.rmtree(package_root / "artifacts", ignore_errors=True)
     shutil.rmtree(package_root / "runtime", ignore_errors=True)
     (package_root / "manifest.json").unlink(missing_ok=True)
-    stage_cute_forward_aot_payload(source_root, package_root)
+    stage_cute_aot_payload(source_root, package_root)
 
 
-class BuildPyWithCuteForwardAOT(_build_py):
-    """Optionally package prebuilt CuTe forward AOT artifacts into wheels."""
+def _stage_cute_aot_bundle(
+    source_root: Path,
+    package_roots: dict[str, Path],
+) -> None:
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    from slinoss._wheel_aot import stage_cute_aot_bundle
+
+    for package_root in package_roots.values():
+        shutil.rmtree(package_root / "artifacts", ignore_errors=True)
+        shutil.rmtree(package_root / "runtime", ignore_errors=True)
+        (package_root / "manifest.json").unlink(missing_ok=True)
+    stage_cute_aot_bundle(source_root, package_roots)
+
+
+class BuildPyWithCuteAOT(_build_py):
+    """Optionally package prebuilt CuTe AOT artifacts into wheels."""
 
     def run(self):
         super().run()
-        package_root = (
-            Path(self.build_lib) / "slinoss" / "ops" / "v2x2ssd" / "cute" / "aot"
-        )
-        package_root.mkdir(parents=True, exist_ok=True)
-        payload_dir = _cute_forward_aot_payload_dir()
+        package_roots = {
+            "v2x2ssd": (
+                Path(self.build_lib) / "slinoss" / "ops" / "v2x2ssd" / "cute" / "aot"
+            ),
+            "scanprep": (
+                Path(self.build_lib) / "slinoss" / "ops" / "scanprep" / "cute" / "aot"
+            ),
+        }
+        for package_root in package_roots.values():
+            package_root.mkdir(parents=True, exist_ok=True)
+        payload_dir = _cute_aot_payload_dir()
         if payload_dir is not None:
-            _stage_cute_forward_aot_payload(payload_dir, package_root)
+            if any(
+                (payload_dir / name / "manifest.json").is_file()
+                for name in package_roots
+            ):
+                _stage_cute_aot_bundle(payload_dir, package_roots)
+            else:
+                _stage_cute_aot_payload(payload_dir, package_roots["v2x2ssd"])
             return
-        if _want_cute_forward_aot():
-            _build_cute_forward_aot(package_root)
+        if _want_cute_aot():
+            _build_cute_aot(Path(self.build_lib) / "slinoss" / "ops")
 
 
 ext_modules = []
-cmdclass: dict[str, Any] = {"build_py": BuildPyWithCuteForwardAOT}
+cmdclass: dict[str, Any] = {"build_py": BuildPyWithCuteAOT}
 
 if _want_cuda_extension():
     assert CUDAExtension is not None

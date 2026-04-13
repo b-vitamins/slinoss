@@ -98,25 +98,20 @@ class ChunkScanBwdParamScanAmpere:
         if cutlass.const_expr(mM.shape[1] != self.L or mM.shape[2] != 2):
             raise ValueError("M must be shaped as (BHC, L, 2).")
         if cutlass.const_expr(
-            mK.shape[0] != mM.shape[0]
-            or mK.shape[1] != self.L
-            or mK.shape[2] != 2
-            or mK.shape[3] != 2
+            mK.shape[1] != self.L or mK.shape[2] != 2 or mK.shape[3] != 2
         ):
             raise ValueError("K must be shaped as (BHC, L, 2, 2) matching M.")
         if cutlass.const_expr(
-            mDLogPrefix.shape[0] != mM.shape[0] or mDLogPrefix.shape[2] != self.L
+            mDLogPrefix.shape[1] != 1 or mDLogPrefix.shape[2] != self.L
         ):
             raise ValueError(
                 "dlogprefix must be shaped as (BHC, n_splits, L) matching M."
             )
         if cutlass.const_expr(
-            mDMprev.shape[0] != mM.shape[0]
-            or mDMprev.shape[1] != mDLogPrefix.shape[1]
+            mDMprev.shape[1] != 1
             or mDMprev.shape[2] != self.L
             or mDMprev.shape[3] != 2
-            or mDMcurr.shape[0] != mM.shape[0]
-            or mDMcurr.shape[1] != mDLogPrefix.shape[1]
+            or mDMcurr.shape[1] != 1
             or mDMcurr.shape[2] != self.L
             or mDMcurr.shape[3] != 2
         ):
@@ -124,20 +119,23 @@ class ChunkScanBwdParamScanAmpere:
                 "dMprev/dMcurr must be shaped as (BHC, n_splits, L, 2) matching dlogprefix."
             )
         if cutlass.const_expr(
-            mDR.shape[0] != mM.shape[0]
-            or mDR.shape[1] != mDLogPrefix.shape[1]
-            or mDR.shape[2] != self.L
-            or mDR.shape[3] != 4
+            mDR.shape[1] != 1 or mDR.shape[2] != self.L or mDR.shape[3] != 4
         ):
             raise ValueError(
                 "dR must be shaped as (BHC, n_splits, L, 4) matching dlogprefix."
             )
-        if cutlass.const_expr(mDM.shape != mDMprev.shape):
-            raise ValueError("dM output must match dMprev shape.")
-        if cutlass.const_expr(mDKprev.shape != mDMprev.shape):
-            raise ValueError("dKprev output must match dMprev shape.")
-        if cutlass.const_expr(mDKcurr.shape != mDMcurr.shape):
-            raise ValueError("dKcurr output must match dMcurr shape.")
+        if cutlass.const_expr(
+            mDM.shape[1] != 1 or mDM.shape[2] != self.L or mDM.shape[3] != 2
+        ):
+            raise ValueError("dM output must be shaped as (BHC, n_splits, L, 2).")
+        if cutlass.const_expr(
+            mDKprev.shape[1] != 1 or mDKprev.shape[2] != self.L or mDKprev.shape[3] != 2
+        ):
+            raise ValueError("dKprev output must be shaped as (BHC, n_splits, L, 2).")
+        if cutlass.const_expr(
+            mDKcurr.shape[1] != 1 or mDKcurr.shape[2] != self.L or mDKcurr.shape[3] != 2
+        ):
+            raise ValueError("dKcurr output must be shaped as (BHC, n_splits, L, 2).")
 
     def _launch_main_kernel(
         self,

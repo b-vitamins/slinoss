@@ -196,8 +196,6 @@ class ChunkIncrementBwdParamScanAmpere:
         mDKprev: cute.Tensor,
         mDKcurr: cute.Tensor,
     ):
-        batch_head_chunk_count = mM.shape[2]
-
         if cutlass.const_expr(
             mM.element_type != cutlass.Float32
             or mKprev.element_type != cutlass.Float32
@@ -210,33 +208,28 @@ class ChunkIncrementBwdParamScanAmpere:
             or mDKcurr.element_type != cutlass.Float32
         ):
             raise TypeError("param_scan operands and outputs must all be Float32.")
-        if cutlass.const_expr(batch_head_chunk_count <= 0):
-            raise ValueError("BHC must be positive.")
         if cutlass.const_expr(mM.shape[0] != 2 or mM.shape[1] != self.L):
             raise ValueError("M must be (2, L, BHC).")
-        if cutlass.const_expr(mKprev.shape != mM.shape):
-            raise ValueError("Kprev must match M shape.")
-        if cutlass.const_expr(mKcurr.shape != mM.shape):
-            raise ValueError("Kcurr must match M shape.")
+        if cutlass.const_expr(mKprev.shape[0] != 2 or mKprev.shape[1] != self.L):
+            raise ValueError("Kprev must be (2, L, BHC).")
+        if cutlass.const_expr(mKcurr.shape[0] != 2 or mKcurr.shape[1] != self.L):
+            raise ValueError("Kcurr must be (2, L, BHC).")
         if cutlass.const_expr(
             mDMsumPart.shape[0] != 2
             or mDMsumPart.shape[1] != self.L
             or mDMsumPart.shape[2] != self.n_d_tiles
-            or mDMsumPart.shape[3] != batch_head_chunk_count
         ):
             raise ValueError("DMsumPart must be (2, L, n_d_tiles, BHC).")
-        if cutlass.const_expr(
-            mDMp0.shape[0] != 2 or mDMp0.shape[1] != batch_head_chunk_count
-        ):
+        if cutlass.const_expr(mDMp0.shape[0] != 2):
             raise ValueError("DMp0 must be (2, BHC).")
-        if cutlass.const_expr(mDMchunk.shape != mDMp0.shape):
-            raise ValueError("DMchunk must match DMp0 shape.")
-        if cutlass.const_expr(mDM.shape != mM.shape):
-            raise ValueError("DM output must match M shape.")
-        if cutlass.const_expr(mDKprev.shape != mM.shape):
-            raise ValueError("DKprev output must match M shape.")
-        if cutlass.const_expr(mDKcurr.shape != mM.shape):
-            raise ValueError("DKcurr output must match M shape.")
+        if cutlass.const_expr(mDMchunk.shape[0] != 2):
+            raise ValueError("DMchunk must be (2, BHC).")
+        if cutlass.const_expr(mDM.shape[0] != 2 or mDM.shape[1] != self.L):
+            raise ValueError("DM output must be (2, L, BHC).")
+        if cutlass.const_expr(mDKprev.shape[0] != 2 or mDKprev.shape[1] != self.L):
+            raise ValueError("DKprev output must be (2, L, BHC).")
+        if cutlass.const_expr(mDKcurr.shape[0] != 2 or mDKcurr.shape[1] != self.L):
+            raise ValueError("DKcurr output must be (2, L, BHC).")
 
     def _launch_kernel(
         self,

@@ -60,6 +60,9 @@ jobs:
           rm -rf slinoss/ops/v2x2ssd/cute/aot/artifacts
           rm -rf slinoss/ops/v2x2ssd/cute/aot/runtime
           rm -f slinoss/ops/v2x2ssd/cute/aot/manifest.json
+          rm -rf slinoss/ops/scanprep/cute/aot/artifacts
+          rm -rf slinoss/ops/scanprep/cute/aot/runtime
+          rm -f slinoss/ops/scanprep/cute/aot/manifest.json
 
       - name: Build universal wheel
         env:
@@ -146,46 +149,53 @@ jobs:
           "apache-tvm-ffi==0.1.9"
 
       - name: Clean AOT payload output
-        run: rm -rf /tmp/slinoss-cute-forward-aot
+        run: rm -rf /tmp/slinoss-cute-aot
 
-      - name: Build CUDA default forward AOT payload
+      - name: Build CUDA default CuTe AOT payload
         env:
           CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
           TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
-          SLINOSS_CUTE_FORWARD_AOT_ARCH_TAGS: "8.0;8.6;8.9;9.0"
+          SLINOSS_CUTE_AOT_ARCH_TAGS: "8.0;8.6;8.9;9.0"
         run: >
-          python scripts/build_cute_forward_aot.py
-          --package-root /tmp/slinoss-cute-forward-aot
+          python scripts/build_cute_aot.py
+          --package-root /tmp/slinoss-cute-aot
 
-      - name: Verify CUDA default forward AOT payload
+      - name: Verify CUDA default CuTe AOT payload
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          package_root = Path("/tmp/slinoss-cute-forward-aot")
-          manifest = json.loads((package_root / "manifest.json").read_text())
-          if not (package_root / "artifacts").is_dir():
-              raise SystemExit("Missing forward AOT artifacts directory")
-          if not (package_root / "runtime").is_dir():
-              raise SystemExit("Missing forward AOT runtime directory")
-          packaged_kinds = {
-              str(record.get("kind"))
-              for record in manifest.get("artifacts", [])
+          package_root = Path("/tmp/slinoss-cute-aot")
+          expected = {
+              "v2x2ssd": {"v2x2ssd_fwd", "v2x2ssd_bwd"},
+              "scanprep": {"scanprep_fwd", "scanprep_bwd"},
           }
-          if packaged_kinds != {"v2x2ssd_fwd"}:
-              raise SystemExit(
-                  f"Expected only packaged forward defaults, found kinds: {sorted(packaged_kinds)}"
-              )
-          if not manifest.get("artifacts"):
-              raise SystemExit("Expected at least one packaged forward AOT artifact")
+          for name, expected_kinds in expected.items():
+              payload_root = package_root / name
+              manifest = json.loads((payload_root / "manifest.json").read_text())
+              if not (payload_root / "artifacts").is_dir():
+                  raise SystemExit(f"Missing CuTe AOT artifacts directory for {name}")
+              if not (payload_root / "runtime").is_dir():
+                  raise SystemExit(f"Missing CuTe AOT runtime directory for {name}")
+              packaged_kinds = {
+                  str(record.get("kind"))
+                  for record in manifest.get("artifacts", [])
+              }
+              if packaged_kinds != expected_kinds:
+                  raise SystemExit(
+                      f"Expected packaged kinds {sorted(expected_kinds)} for {name}, "
+                      f"found {sorted(packaged_kinds)}"
+                  )
+              if not manifest.get("artifacts"):
+                  raise SystemExit(f"Expected packaged CuTe AOT artifacts for {name}")
           PY
 
-      - name: Upload CUDA forward AOT payload
+      - name: Upload CUDA AOT payload
         uses: actions/upload-artifact@v4
         with:
-          name: slinoss-cute-forward-aot
-          path: /tmp/slinoss-cute-forward-aot
+          name: slinoss-cute-aot
+          path: /tmp/slinoss-cute-aot
 
   build_cuda:
     if: github.event_name != 'pull_request'
@@ -258,18 +268,21 @@ jobs:
           rm -rf slinoss/ops/v2x2ssd/cute/aot/artifacts
           rm -rf slinoss/ops/v2x2ssd/cute/aot/runtime
           rm -f slinoss/ops/v2x2ssd/cute/aot/manifest.json
+          rm -rf slinoss/ops/scanprep/cute/aot/artifacts
+          rm -rf slinoss/ops/scanprep/cute/aot/runtime
+          rm -f slinoss/ops/scanprep/cute/aot/manifest.json
 
-      - name: Download CUDA forward AOT payload
+      - name: Download CUDA AOT payload
         uses: actions/download-artifact@v4
         with:
-          name: slinoss-cute-forward-aot
-          path: /tmp/slinoss-cute-forward-aot
+          name: slinoss-cute-aot
+          path: /tmp/slinoss-cute-aot
 
       - name: Build CUDA wheel
         env:
           CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
           TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
-          SLINOSS_CUTE_FORWARD_AOT_PAYLOAD_DIR: "/tmp/slinoss-cute-forward-aot"
+          SLINOSS_CUTE_AOT_PAYLOAD_DIR: "/tmp/slinoss-cute-aot"
         run: python -m build --wheel --no-isolation
 
       - name: Capture CUDA wheel name
@@ -298,8 +311,11 @@ jobs:
           wheel = Path("dist/${{ steps.wheel.outputs.wheel_name }}")
           with zipfile.ZipFile(wheel) as zf:
               names = set(zf.namelist())
-              manifest = json.loads(
+              v2_manifest = json.loads(
                   zf.read("slinoss/ops/v2x2ssd/cute/aot/manifest.json").decode("utf-8")
+              )
+              scanprep_manifest = json.loads(
+                  zf.read("slinoss/ops/scanprep/cute/aot/manifest.json").decode("utf-8")
               )
 
           required = "slinoss/_C/__init__.py"
@@ -309,6 +325,9 @@ jobs:
           aot_manifest = "slinoss/ops/v2x2ssd/cute/aot/manifest.json"
           if aot_manifest not in names:
               raise SystemExit(f"Missing {aot_manifest} in {wheel.name}")
+          scanprep_aot_manifest = "slinoss/ops/scanprep/cute/aot/manifest.json"
+          if scanprep_aot_manifest not in names:
+              raise SystemExit(f"Missing {scanprep_aot_manifest} in {wheel.name}")
 
           extension_members = [
               name
@@ -322,41 +341,61 @@ jobs:
               )
           print("cuda-wheel-extension", extension_members[0])
 
-          aot_members = [
+          v2_aot_members = [
               name
               for name in names
               if name.startswith("slinoss/ops/v2x2ssd/cute/aot/artifacts/")
               and name.endswith(".so")
           ]
+          scanprep_aot_members = [
+              name
+              for name in names
+              if name.startswith("slinoss/ops/scanprep/cute/aot/artifacts/")
+              and name.endswith(".so")
+          ]
           aot_object_members = [
               name
               for name in names
-              if name.startswith("slinoss/ops/v2x2ssd/cute/aot/artifacts/")
+              if (
+                  name.startswith("slinoss/ops/v2x2ssd/cute/aot/artifacts/")
+                  or name.startswith("slinoss/ops/scanprep/cute/aot/artifacts/")
+              )
               and name.endswith(".o")
           ]
-          if not aot_members:
-              raise SystemExit(
-                  f"Expected packaged forward AOT shared libraries in {wheel.name}"
-              )
-          expected_kinds = {"v2x2ssd_fwd"}
-          packaged_kinds = {
+          if not v2_aot_members:
+              raise SystemExit(f"Expected packaged v2x2ssd AOT shared libraries in {wheel.name}")
+          if not scanprep_aot_members:
+              raise SystemExit(f"Expected packaged scanprep AOT shared libraries in {wheel.name}")
+          v2_packaged_kinds = {
               str(record.get("kind"))
-              for record in manifest.get("artifacts", [])
+              for record in v2_manifest.get("artifacts", [])
           }
-          if packaged_kinds != expected_kinds:
+          if v2_packaged_kinds != {"v2x2ssd_fwd", "v2x2ssd_bwd"}:
               raise SystemExit(
-                  f"Expected only packaged forward default kinds in {wheel.name}, "
-                  f"found {sorted(packaged_kinds)}"
+                  f"Expected packaged v2x2ssd defaults in {wheel.name}, "
+                  f"found {sorted(v2_packaged_kinds)}"
+              )
+          scanprep_packaged_kinds = {
+              str(record.get("kind"))
+              for record in scanprep_manifest.get("artifacts", [])
+          }
+          if scanprep_packaged_kinds != {"scanprep_fwd", "scanprep_bwd"}:
+              raise SystemExit(
+                  f"Expected packaged scanprep defaults in {wheel.name}, "
+                  f"found {sorted(scanprep_packaged_kinds)}"
               )
           if aot_object_members:
               raise SystemExit(
-                  f"Did not expect packaged forward AOT object files in {wheel.name}: "
+                  f"Did not expect packaged CuTe AOT object files in {wheel.name}: "
                   f"{aot_object_members}"
               )
           runtime_members = [
               name
               for name in names
-              if name.startswith("slinoss/ops/v2x2ssd/cute/aot/runtime/")
+              if (
+                  name.startswith("slinoss/ops/v2x2ssd/cute/aot/runtime/")
+                  or name.startswith("slinoss/ops/scanprep/cute/aot/runtime/")
+              )
               and name.endswith(".so")
           ]
           if len(runtime_members) < 2:
@@ -364,7 +403,7 @@ jobs:
                   f"Expected packaged CuTe/TVM runtime libs in {wheel.name}, "
                   f"found {runtime_members}"
               )
-          print("cuda-wheel-aot-count", len(aot_members))
+          print("cuda-wheel-aot-count", len(v2_aot_members) + len(scanprep_aot_members))
           PY
 
       - name: Smoke install CUDA wheel
@@ -381,13 +420,17 @@ jobs:
           import cutlass  # noqa: F401
           import cuda  # noqa: F401
           import slinoss
-          from slinoss.ops.v2x2ssd.cute.aot import list_packaged_forward_aot_specs
+          from slinoss.ops.v2x2ssd.cute.aot import (
+              list_packaged_backward_aot_specs,
+              list_packaged_forward_aot_specs,
+          )
           from slinoss.layers import SLinOSSMixer
           from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
 
           print("slinoss_import", slinoss.__file__)
           assert cconv1d_is_available(), cconv1d_load_error()
           assert list_packaged_forward_aot_specs(), "expected packaged forward AOT specs"
+          assert list_packaged_backward_aot_specs(), "expected packaged backward AOT specs"
           mixer = SLinOSSMixer(
               d_model=32,
               d_state=32,
