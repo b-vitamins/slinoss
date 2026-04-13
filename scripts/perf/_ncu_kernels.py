@@ -28,7 +28,7 @@ from slinoss.ops.scanprep.cute.common import (  # noqa: E402
     SCANPREP_PARAM_DIM,
     make_fake_tensor_arg,
 )
-from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux  # noqa: E402
+from slinoss.ops.scanprep.cute.kernels import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.fwd import ScanPrepFwdFused  # noqa: E402
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402

@@ -20,11 +20,18 @@ from slinoss.layers import (
     foh_taps_from_polar,
     principal_angle,
 )
-import slinoss.ops.scanprep.cute.bwd as scanprep_bwd_mod
-import slinoss.ops.scanprep.cute.fwd as scanprep_fwd_mod
-from slinoss.ops.scanprep.cute.bwd import scanprep_bwd
+import slinoss.ops.scanprep.cute.kernels as scanprep_bwd_mod
+import slinoss.ops.scanprep.cute.kernels as scanprep_fwd_mod
+from slinoss.ops.scanprep.cute.kernels import (
+    compile_scanprep_bwd_cute,
+    compile_scanprep_fwd_cute,
+    scanprep_bwd_cute,
+)
 from slinoss.ops.scanprep.cute.common import assumed_align
-from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute, scanprep_fwd_cute_with_aux
+from slinoss.ops.scanprep.cute.kernels import (
+    scanprep_fwd_cute,
+    scanprep_fwd_cute_with_aux,
+)
 from slinoss.ops.v2x2ssd import v2x2ssd
 
 
@@ -293,6 +300,32 @@ def test_scanprep_fwd_compile_enables_tvm_ffi(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compile_scanprep_fwd_cute_enables_tvm_ffi(monkeypatch) -> None:
+    pytest.importorskip("cutlass")
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
+    compile_options: list[object] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_options.append(kwargs.get("options"))
+        return orig_compile(*args, **kwargs)
+
+    scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+
+    compiled = compile_scanprep_fwd_cute(
+        value,
+        params,
+        bc,
+        **_scanprep_runtime_kwargs(prep, detach=True),
+    )
+
+    assert callable(compiled)
+    assert compile_options == ["--enable-tvm-ffi"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_scanprep_fwd_reuses_compiled_executor_across_batch_time_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -366,7 +399,7 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
     with pytest.raises(RuntimeError, match="backward .*cold during CUDA graph capture"):
-        scanprep_bwd(
+        scanprep_bwd_cute(
             bc=bc,
             coeff_aux=coeff_aux,
             dU=torch.randn_like(U),
@@ -409,7 +442,7 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
             bc,
             **_scanprep_runtime_kwargs(prep, detach=True),
         )
-        scanprep_bwd(
+        scanprep_bwd_cute(
             bc=bc,
             coeff_aux=coeff_aux,
             dU=torch.randn_like(U),
@@ -446,7 +479,7 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
-    scanprep_bwd(
+    scanprep_bwd_cute(
         bc=bc,
         coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
@@ -499,7 +532,7 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
     scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
-    scanprep_bwd(
+    scanprep_bwd_cute(
         bc=bc,
         coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
@@ -526,6 +559,60 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
         theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
     )
 
+    assert compile_options == ["--enable-tvm-ffi"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compile_scanprep_bwd_cute_enables_tvm_ffi(monkeypatch) -> None:
+    pytest.importorskip("cutlass")
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
+    bc = _canonical_bc(prep, bc_amp)
+    with torch.no_grad():
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+            value,
+            params,
+            bc,
+            **_scanprep_runtime_kwargs(prep, detach=True),
+        )
+
+    compile_options: list[object] = []
+    orig_compile = cute.compile
+
+    def wrapped_compile(*args, **kwargs):
+        compile_options.append(kwargs.get("options"))
+        return orig_compile(*args, **kwargs)
+
+    scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
+    monkeypatch.setattr(cute, "compile", wrapped_compile)
+
+    compiled = compile_scanprep_bwd_cute(
+        bc=bc,
+        coeff_aux=coeff_aux,
+        dU=torch.randn_like(U),
+        dM=torch.randn_like(M),
+        dK=torch.randn_like(K),
+        dB=torch.randn_like(B),
+        dC=torch.randn_like(C),
+        n_heads=prep.n_heads,
+        d_head=prep.d_head,
+        d_state=prep.d_state,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        dt_min=prep.dt_min,
+        dt_max=prep.dt_max,
+        theta_init_min=prep.theta_init_min,
+        theta_init_max=prep.theta_init_max,
+        gamma_min=prep.gamma_min,
+        gamma_max=prep.gamma_max,
+        r_min=prep.r_min,
+        r_max=prep.r_max,
+        eps=prep.eps,
+        dt_bias=prep.dt_bias.detach(),
+        theta_bias=prep.theta_bias.detach(),
+        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+    )
+
+    assert callable(compiled)
     assert compile_options == ["--enable-tvm-ffi"]
 
 
@@ -576,7 +663,7 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
     scanprep_bwd_mod._SCANPREP_BWD_CACHE.clear()
     monkeypatch.setattr(cute, "compile", wrapped_compile)
 
-    scanprep_bwd(
+    scanprep_bwd_cute(
         bc=bc,
         coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
@@ -602,7 +689,7 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
         theta_bias=prep.theta_bias.detach(),
         theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
     )
-    scanprep_bwd(
+    scanprep_bwd_cute(
         bc=bc_alt,
         coeff_aux=coeff_aux_alt,
         dU=torch.randn_like(U_alt),

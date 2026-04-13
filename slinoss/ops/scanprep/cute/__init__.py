@@ -1,4 +1,4 @@
-"""CuTe-facing API surface for the scanprep operator."""
+"""CuTe-facing API surface for the ``scanprep`` operator."""
 
 from .api import scanprep_cute
 

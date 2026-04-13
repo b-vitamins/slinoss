@@ -1,7 +1,4 @@
-# pyright: reportIndexIssue=false, reportOperatorIssue=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false, reportPrivateImportUsage=false, reportOptionalMemberAccess=false, reportGeneralTypeIssues=false
-"""Split backward kernels for the CuTe scanprep backend."""
-
-from __future__ import annotations
+"""CuTe backward kernels for the ``scanprep`` backend."""
 
 import cutlass
 import cutlass.cute as cute
@@ -25,6 +22,14 @@ from ..common import (
     complex_mul_conj,
     real_mul_conj,
     safe_cast_to_dtype,
+)
+from .common import (
+    _cosize,
+    _launchable,
+    _llvm_ptr,
+    _make_layout,
+    _size,
+    _struct,
 )
 
 
@@ -57,8 +62,7 @@ class ScanPrepBwdFused:
         self.param_dim = int(param_dim)
 
         self.value_warps_per_block = int(value_warps_per_block)
-        if self.value_warps_per_block <= 0:
-            raise ValueError("value_warps_per_block must be positive.")
+        self._validate_value_warps_per_block()
         self.value_rows_per_round = self.value_warps_per_block
         self.value_block_size = self.value_warps_per_block * 32
         self.value_bt_tile = 256
@@ -68,13 +72,7 @@ class ScanPrepBwdFused:
 
         self.pack_role_warps = 2
         self.pack_warps_per_block = int(pack_warps_per_block)
-        if (
-            self.pack_warps_per_block <= 0
-            or self.pack_warps_per_block % self.pack_role_warps != 0
-        ):
-            raise ValueError(
-                "pack_warps_per_block must be a positive multiple of pack_role_warps."
-            )
+        self._validate_pack_warps_per_block()
         self.pack_rows_per_round = self.pack_warps_per_block // self.pack_role_warps
         self.pack_block_size = self.pack_warps_per_block * 32
         self.pack_bt_tile = 256
@@ -83,12 +81,9 @@ class ScanPrepBwdFused:
         ) // self.pack_rows_per_round
 
         self.coeff_block_size = int(coeff_block_size)
-        if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
-            raise ValueError("coeff_block_size must be a positive multiple of 32.")
+        self._validate_coeff_block_size()
         self.coeff_t_tile = 32
         self.coeff_head_tile = self.coeff_block_size // 32
-        if self.coeff_head_tile <= 0:
-            raise ValueError("coeff_block_size must cover at least one warp.")
         self.coeff_flat_tile = self.coeff_head_tile * self.param_dim
         self.coeff_flat_pad = self.coeff_flat_tile + 1
         self.coeff_smem_bytes = self.coeff_t_tile * self.coeff_flat_pad * 4
@@ -102,11 +97,86 @@ class ScanPrepBwdFused:
         self.theta_mod_scale = 0.25
         self.r_scale = float(r_max - r_min)
         self.eps = float(eps)
-        z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
-        self.z_thresh_sq = float(z_thresh * z_thresh)
+        self.z_thresh_sq = self._resolve_z_thresh_sq()
 
-    def _coeff_shared_storage(self):
-        coeff_layout = cute.make_layout(
+    def _validate_value_warps_per_block(self) -> None:
+        if self.value_warps_per_block <= 0:
+            raise ValueError("value_warps_per_block must be positive.")
+
+    def _validate_pack_warps_per_block(self) -> None:
+        if (
+            self.pack_warps_per_block <= 0
+            or self.pack_warps_per_block % self.pack_role_warps != 0
+        ):
+            raise ValueError(
+                "pack_warps_per_block must be a positive multiple of pack_role_warps."
+            )
+
+    def _validate_coeff_block_size(self) -> None:
+        if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
+            raise ValueError("coeff_block_size must be a positive multiple of 32.")
+        if self.coeff_block_size < 32:
+            raise ValueError("coeff_block_size must cover at least one warp.")
+
+    def _resolve_z_thresh_sq(self) -> float:
+        z_thresh = float(max(1.0e-4, (max(float(self.eps), 1.0e-12)) ** 0.5))
+        return float(z_thresh * z_thresh)
+
+    def _value_grid_shape(self, *, total_bt) -> tuple[int, int, int]:
+        return (
+            (total_bt + self.value_bt_tile - 1) // self.value_bt_tile,
+            self.h_size,
+            1,
+        )
+
+    def _pack_grid_shape(self, *, total_bt) -> tuple[int, int, int]:
+        return (
+            (total_bt + self.pack_bt_tile - 1) // self.pack_bt_tile,
+            self.h_size,
+            1,
+        )
+
+    def _coeff_grid_shape(self, *, total_bt) -> tuple[int, int, int]:
+        return (
+            (total_bt + self.coeff_t_tile - 1) // self.coeff_t_tile,
+            (self.h_size + self.coeff_head_tile - 1) // self.coeff_head_tile,
+            1,
+        )
+
+    def _make_value_grad_view(self, value_grad: cute.Tensor, *, batch, time_steps):
+        return cute.make_tensor(
+            value_grad.iterator,
+            _make_layout(
+                (batch, time_steps, self.h_size * self.p_size),
+                stride=(
+                    time_steps * self.h_size * self.p_size,
+                    self.h_size * self.p_size,
+                    1,
+                ),
+            ),
+        )
+
+    def _make_param_grad_view(self, dparams: cute.Tensor, *, batch, time_steps):
+        return cute.make_tensor(
+            dparams.iterator,
+            _make_layout(
+                (batch, time_steps, self.h_size * self.param_dim),
+                stride=(
+                    time_steps * self.h_size * self.param_dim,
+                    self.h_size * self.param_dim,
+                    1,
+                ),
+            ),
+        )
+
+    def _make_bias_grad_view(self, bias_grad: cute.Tensor):
+        return cute.make_tensor(
+            bias_grad.iterator,
+            _make_layout((self.h_size, 4), stride=(4, 1)),
+        )
+
+    def _make_coeff_shared_storage(self):
+        coeff_layout = _make_layout(
             (self.coeff_t_tile, self.coeff_flat_pad),
             stride=(self.coeff_flat_pad, 1),
         )
@@ -115,16 +185,16 @@ class ScanPrepBwdFused:
             pass
 
         SharedStorage.__annotations__ = {
-            "sDParams": cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(coeff_layout)],
+            "sDParams": _struct().Align[
+                _struct().MemRange[cutlass.Float32, _cosize(coeff_layout)],
                 16,
             ]
         }
 
-        return cute.struct(SharedStorage)
+        return _struct()(SharedStorage)
 
     @cute.kernel
-    def value_grad_kernel(
+    def _unpack_value_grads(
         self,
         mDU: cute.Tensor,
         mValueGrad: cute.Tensor,
@@ -139,7 +209,7 @@ class ScanPrepBwdFused:
         if h < self.h_size:
             p_base = h * self.p_size
             num_p_iters = (self.p_size + 31) // 32
-            for round_iter in cutlass.range_constexpr(self.value_rounds):
+            for round_iter in cutlass.range_constexpr(self.value_rounds):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                 bt = (
                     block_bt * self.value_bt_tile
                     + round_iter * self.value_rows_per_round
@@ -148,13 +218,13 @@ class ScanPrepBwdFused:
                 if bt < total_bt_:
                     b = bt // t_size_
                     t = bt - b * t_size_
-                    for p_iter in cutlass.range_constexpr(num_p_iters):
+                    for p_iter in cutlass.range_constexpr(num_p_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                         p = lane + p_iter * 32
                         if p < self.p_size:
                             mValueGrad[b, t, p_base + p] = mDU[b, h, t, p]
 
     @cute.kernel
-    def pack_grads_kernel(
+    def _pack_bc_grads(
         self,
         mDB: cute.Tensor,
         mDC: cute.Tensor,
@@ -171,7 +241,7 @@ class ScanPrepBwdFused:
 
         if h < self.h_size and role < self.pack_role_warps:
             num_n_iters = (self.n_size + 31) // 32
-            for round_iter in cutlass.range_constexpr(self.pack_rounds):
+            for round_iter in cutlass.range_constexpr(self.pack_rounds):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                 bt = (
                     block_bt * self.pack_bt_tile
                     + round_iter * self.pack_rows_per_round
@@ -181,20 +251,20 @@ class ScanPrepBwdFused:
                     b = bt // t_size_
                     t = bt - b * t_size_
                     if role == 0:
-                        for n_iter in cutlass.range_constexpr(num_n_iters):
+                        for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                             n = lane + n_iter * 32
                             if n < self.n_size:
                                 mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
                                 mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
                     else:
-                        for n_iter in cutlass.range_constexpr(num_n_iters):
+                        for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                             n = lane + n_iter * 32
                             if n < self.n_size:
                                 mBCGrad[b, t, h, 2, n] = mDC[b, h, t, 2 * n]
                                 mBCGrad[b, t, h, 3, n] = mDC[b, h, t, 2 * n + 1]
 
     @cute.kernel
-    def coeff_grad_kernel(
+    def _accumulate_coeff_grads(
         self,
         mCoeffAux: cute.Tensor,
         mDM: cute.Tensor,
@@ -218,7 +288,7 @@ class ScanPrepBwdFused:
         smem = cutlass.utils.SmemAllocator()
         sDParams = smem.allocate_tensor(
             cutlass.Float32,
-            cute.make_layout(
+            _make_layout(
                 (self.coeff_t_tile, self.coeff_flat_pad),
                 stride=(self.coeff_flat_pad, 1),
             ),
@@ -442,16 +512,16 @@ class ScanPrepBwdFused:
 
             bias_base = h * 4
             cute.arch.atomic_add(
-                (mBiasGrad.iterator + bias_base + 0).llvm_ptr, g_dt_bias
+                _llvm_ptr(mBiasGrad.iterator + bias_base + 0), g_dt_bias
             )
             cute.arch.atomic_add(
-                (mBiasGrad.iterator + bias_base + 1).llvm_ptr, g_gamma_raw
+                _llvm_ptr(mBiasGrad.iterator + bias_base + 1), g_gamma_raw
             )
             cute.arch.atomic_add(
-                (mBiasGrad.iterator + bias_base + 2).llvm_ptr, g_theta_mod_raw
+                _llvm_ptr(mBiasGrad.iterator + bias_base + 2), g_theta_mod_raw
             )
             cute.arch.atomic_add(
-                (mBiasGrad.iterator + bias_base + 3).llvm_ptr, g_theta_bias
+                _llvm_ptr(mBiasGrad.iterator + bias_base + 3), g_theta_bias
             )
 
         cute.arch.sync_threads()
@@ -460,14 +530,14 @@ class ScanPrepBwdFused:
             self.coeff_t_tile + self.coeff_head_tile - 1
         ) // self.coeff_head_tile
         num_store_flat_iters = (self.coeff_flat_tile + 31) // 32
-        for store_t_iter in cutlass.range_constexpr(num_store_t_iters):
+        for store_t_iter in cutlass.range_constexpr(num_store_t_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
             store_t_local = warp + store_t_iter * self.coeff_head_tile
             store_bt = block_x * self.coeff_t_tile + store_t_local
             if store_t_local < self.coeff_t_tile and store_bt < total_bt_:
                 store_b = store_bt // t_size_
                 store_t = store_bt - store_b * t_size_
                 p_base = h_base * self.param_dim
-                for flat_iter in cutlass.range_constexpr(num_store_flat_iters):
+                for flat_iter in cutlass.range_constexpr(num_store_flat_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                     flat = lane + flat_iter * 32
                     if flat < self.coeff_flat_tile:
                         store_h = h_base + flat // self.param_dim
@@ -496,76 +566,64 @@ class ScanPrepBwdFused:
         dparams: cute.Tensor,
         bias_grad: cute.Tensor,
     ):
-        batch = cute.size(bc_grad, mode=[0])
-        t_size = cute.size(bc_grad, mode=[1])
+        batch = _size(bc_grad, mode=[0])
+        t_size = _size(bc_grad, mode=[1])
         total_bt = batch * t_size
-        value_grid_x = (total_bt + self.value_bt_tile - 1) // self.value_bt_tile
-        pack_grid_x = (total_bt + self.pack_bt_tile - 1) // self.pack_bt_tile
-        coeff_grid_x = (total_bt + self.coeff_t_tile - 1) // self.coeff_t_tile
-        coeff_grid_y = (self.h_size + self.coeff_head_tile - 1) // self.coeff_head_tile
+        value_grid = self._value_grid_shape(total_bt=total_bt)
+        pack_grid = self._pack_grid_shape(total_bt=total_bt)
+        coeff_grid = self._coeff_grid_shape(total_bt=total_bt)
+        value_grad_view = self._make_value_grad_view(
+            value_grad,
+            batch=batch,
+            time_steps=t_size,
+        )
+        param_grad_view = self._make_param_grad_view(
+            dparams,
+            batch=batch,
+            time_steps=t_size,
+        )
+        bias_grad_view = self._make_bias_grad_view(bias_grad)
 
-        mValueGrad = cute.make_tensor(
-            value_grad.iterator,
-            cute.make_layout(
-                (batch, t_size, self.h_size * self.p_size),
-                stride=(
-                    t_size * self.h_size * self.p_size,
-                    self.h_size * self.p_size,
-                    1,
-                ),
-            ),
-        )
-        mDParams = cute.make_tensor(
-            dparams.iterator,
-            cute.make_layout(
-                (batch, t_size, self.h_size * self.param_dim),
-                stride=(
-                    t_size * self.h_size * self.param_dim,
-                    self.h_size * self.param_dim,
-                    1,
-                ),
-            ),
-        )
-        mBiasGrad = cute.make_tensor(
-            bias_grad.iterator,
-            cute.make_layout((self.h_size, 4), stride=(4, 1)),
-        )
-        coeff_smem_bytes = int(self._coeff_shared_storage().size_in_bytes())
-
-        self.value_grad_kernel(
-            du,
-            mValueGrad,
-            total_bt,
-            t_size,
+        _launchable(
+            self._unpack_value_grads(
+                du,
+                value_grad_view,
+                total_bt,
+                t_size,
+            )
         ).launch(
-            grid=(value_grid_x, self.h_size, 1),
+            grid=value_grid,
             block=(self.value_block_size, 1, 1),
         )
-        self.pack_grads_kernel(
-            db,
-            dc,
-            bc_grad,
-            total_bt,
-            t_size,
+        _launchable(
+            self._pack_bc_grads(
+                db,
+                dc,
+                bc_grad,
+                total_bt,
+                t_size,
+            )
         ).launch(
-            grid=(pack_grid_x, self.h_size, 1),
+            grid=pack_grid,
             block=(self.pack_block_size, 1, 1),
         )
-        self.coeff_grad_kernel(
-            coeff_aux,
-            dm,
-            dk,
-            dt_bias,
-            theta_bias,
-            theta_sign,
-            mDParams,
-            mBiasGrad,
-            total_bt,
-            t_size,
+        _launchable(
+            self._accumulate_coeff_grads(
+                coeff_aux,
+                dm,
+                dk,
+                dt_bias,
+                theta_bias,
+                theta_sign,
+                param_grad_view,
+                bias_grad_view,
+                total_bt,
+                t_size,
+            )
         ).launch(
-            grid=(coeff_grid_x, coeff_grid_y, 1),
+            grid=coeff_grid,
             block=(self.coeff_block_size, 1, 1),
-            smem=coeff_smem_bytes,
+            smem=int(self._make_coeff_shared_storage().size_in_bytes()),
         )
 
 

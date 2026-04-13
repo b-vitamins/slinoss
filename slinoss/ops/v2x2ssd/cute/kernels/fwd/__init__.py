@@ -4078,6 +4078,19 @@ def _make_forward_compile_artifacts_from_runtime_artifacts(
     )
 
 
+def _make_forward_aot_runtime_args(
+    runtime_args: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    return runtime_args
+
+
+def _make_packaged_v2x2ssd_fwd_callable(packaged: object):
+    def _packaged_v2x2ssd_fwd_callable(*runtime_args):
+        return packaged(*_make_forward_aot_runtime_args(runtime_args))
+
+    return _packaged_v2x2ssd_fwd_callable
+
+
 def _get_compiled_v2x2ssd_fwd_kernel(
     *,
     U: torch.Tensor,
@@ -4094,6 +4107,11 @@ def _get_compiled_v2x2ssd_fwd_kernel(
         try_load_packaged_v2x2ssd_fwd_function,
     )
 
+    device_index = (
+        int(U.device.index)
+        if U.device.index is not None
+        else torch.cuda.current_device()
+    )
     cache_key = _fwd_host_cache_key(
         device_index=(U.device.index if U.device.index is not None else -1),
         tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
@@ -4109,7 +4127,7 @@ def _get_compiled_v2x2ssd_fwd_kernel(
         return compiled
 
     forward_aot_spec = ForwardAOTSpec(
-        arch_tag="any",
+        arch_tag=current_hardware_fingerprint(device_index=device_index).arch_tag,
         P=int(compile_artifacts.problem_shape[3]),
         D=int(compile_artifacts.problem_shape[4]),
         chunk_size=int(compile_artifacts.problem_shape[6]),
@@ -4129,8 +4147,9 @@ def _get_compiled_v2x2ssd_fwd_kernel(
     packaged = try_load_packaged_v2x2ssd_fwd_function(forward_aot_spec)
     if packaged is not None:
         note_cache_event("cute.v2x2ssd.fwd.host_aot", hit=True)
-        _FWD_HOST_CACHE[cache_key] = packaged
-        return packaged
+        wrapped_packaged = _make_packaged_v2x2ssd_fwd_callable(packaged)
+        _FWD_HOST_CACHE[cache_key] = wrapped_packaged
+        return wrapped_packaged
 
     note_cache_event("cute.v2x2ssd.fwd.host_aot", hit=False)
     note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=False)

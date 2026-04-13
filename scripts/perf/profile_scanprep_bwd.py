@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import make_fake_tensor_arg  # noqa: E402
-from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux  # noqa: E402
+from slinoss.ops.scanprep.cute.kernels import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 
 

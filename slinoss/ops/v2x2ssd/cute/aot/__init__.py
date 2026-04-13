@@ -2024,6 +2024,19 @@ def export_v2x2ssd_fwd_cute_aot(
     U_prev: torch.Tensor | None = None,
     package_root: str | os.PathLike[str] | Path,
 ) -> ExportedTVMFFIModule:
+    resolved_arch_tag = arch_tag
+    if resolved_arch_tag == "any" and U.is_cuda:
+        from ..tuning.hardware import current_hardware_fingerprint
+
+        device_index = (
+            int(U.device.index)
+            if U.device.index is not None
+            else torch.cuda.current_device()
+        )
+        resolved_arch_tag = current_hardware_fingerprint(
+            device_index=device_index
+        ).arch_tag
+
     spec = infer_v2x2ssd_fwd_aot_spec(
         U,
         M,
@@ -2040,7 +2053,7 @@ def export_v2x2ssd_fwd_cute_aot(
         state_vecs_per_thread=state_vecs_per_thread,
         chunk_increment_cta_tiler=chunk_increment_cta_tiler,
         chunk_increment_num_stages=chunk_increment_num_stages,
-        arch_tag=arch_tag,
+        arch_tag=resolved_arch_tag,
         initial_states=initial_states,
         B_prev=B_prev,
         U_prev=U_prev,

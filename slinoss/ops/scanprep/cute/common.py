@@ -1,6 +1,4 @@
-"""Shared CuTe helpers for the fused scanprep backend."""
-
-from __future__ import annotations
+"""Shared CuTe helpers for the fused ``scanprep`` backend."""
 
 from typing import Any, cast
 
@@ -64,6 +62,14 @@ def assumed_align(tensor: torch.Tensor) -> int:
         if (ptr % align) == 0:
             return align
     return elem_align
+
+
+def contiguous_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def tensor_compile_signature(tensor: torch.Tensor) -> tuple[torch.dtype, int]:
+    return tensor.dtype, assumed_align(tensor)
 
 
 def make_fake_tensor_arg(
@@ -209,6 +215,7 @@ __all__ = [
     "COEFF_AUX_THETA_TANH",
     "COEFF_AUX_GAMMA",
     "assumed_align",
+    "contiguous_tensor",
     "complex_div",
     "complex_mul",
     "complex_mul_conj",
@@ -219,5 +226,6 @@ __all__ = [
     "safe_cast_to_dtype",
     "sigmoid",
     "softplus",
+    "tensor_compile_signature",
     "torch_to_cutlass_dtype",
 ]

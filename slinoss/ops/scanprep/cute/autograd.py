@@ -1,13 +1,10 @@
-"""Training autograd wrapper for the CuTe scanprep operator."""
-
-from __future__ import annotations
+"""Autograd wrapper for the CuTe ``scanprep`` operator."""
 
 from typing import cast
 
 import torch
 
-from slinoss.ops.scanprep.cute.bwd import scanprep_bwd
-from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute_with_aux
+from .kernels import _scanprep_bwd_cute_prevalidated, _scanprep_fwd_cute_prevalidated
 
 
 class _ScanPrepCuTeFn(torch.autograd.Function):
@@ -59,10 +56,10 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         theta_bias_d = theta_bias.detach()
         theta_sign_d = theta_sign.detach()
 
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+        outputs = _scanprep_fwd_cute_prevalidated(
             value_d,
-            params=params_d,
-            bc=bc_d,
+            params_d,
+            bc_d,
             n_heads=n_heads,
             d_state=d_state,
             d_head=d_head,
@@ -80,16 +77,16 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             theta_mod_bias=theta_mod_bias_d,
             theta_bias=theta_bias_d,
             theta_sign=theta_sign_d,
+            store_coeff_aux=True,
         )
-
         ctx.save_for_backward(
             bc_d,
-            coeff_aux,
+            outputs.coeff_aux,
             dt_bias_d,
             theta_bias_d,
             theta_sign_d,
         )
-        return U, M, K, B, C
+        return outputs.U, outputs.M, outputs.K, outputs.B, outputs.C
 
     @staticmethod
     def backward(  # type: ignore[override]
@@ -101,16 +98,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         dC: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
         bc, coeff_aux, dt_bias, theta_bias, theta_sign = ctx.saved_tensors
-
-        (
-            dvalue,
-            dparams,
-            dbc,
-            d_dt_bias,
-            d_gamma_bias,
-            d_theta_mod_bias,
-            d_theta_bias,
-        ) = scanprep_bwd(
+        outputs = _scanprep_bwd_cute_prevalidated(
             bc=bc,
             coeff_aux=coeff_aux,
             dU=dU,
@@ -137,9 +125,9 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             theta_sign=theta_sign,
         )
         return (
-            dvalue,
-            dparams,
-            dbc,
+            outputs.value_grad,
+            outputs.dparams,
+            outputs.bc_grad,
             None,
             None,
             None,
@@ -152,10 +140,10 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             None,
             None,
             None,
-            d_dt_bias,
-            d_gamma_bias,
-            d_theta_mod_bias,
-            d_theta_bias,
+            outputs.bias_grad[:, 0].contiguous(),
+            outputs.bias_grad[:, 1].contiguous(),
+            outputs.bias_grad[:, 2].contiguous(),
+            outputs.bias_grad[:, 3].contiguous(),
             None,
         )
 

@@ -1,7 +1,4 @@
-# pyright: reportIndexIssue=false, reportOperatorIssue=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false, reportPrivateImportUsage=false, reportGeneralTypeIssues=false
-"""Split forward kernels for the CuTe scanprep backend."""
-
-from __future__ import annotations
+"""CuTe forward kernels for the ``scanprep`` backend."""
 
 import cutlass
 import cutlass.cute as cute
@@ -28,10 +25,11 @@ from ..common import (
     safe_cast_to_dtype,
     sigmoid,
 )
+from .common import _launchable, _make_layout, _size
 
 
 class ScanPrepFwdFused:
-    """Two-stage forward launcher for row-pack and coefficient generation."""
+    """Two-stage forward launcher for row packing and coefficient generation."""
 
     def __init__(
         self,
@@ -58,17 +56,13 @@ class ScanPrepFwdFused:
         self.store_coeff_aux = bool(store_coeff_aux)
 
         self.pack_warps_per_block = int(pack_warps_per_block)
-        if self.pack_warps_per_block <= 0:
-            raise ValueError("pack_warps_per_block must be positive.")
+        self._validate_pack_warps_per_block()
         self.pack_block_size = self.pack_warps_per_block * 32
 
         self.coeff_block_size = int(coeff_block_size)
-        if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
-            raise ValueError("coeff_block_size must be a positive multiple of 32.")
+        self._validate_coeff_block_size()
         self.coeff_t_tile = 32
         self.coeff_head_tile = self.coeff_block_size // 32
-        if self.coeff_head_tile <= 0:
-            raise ValueError("coeff_block_size must cover at least one warp.")
         self.coeff_smem_bytes = (
             self.coeff_head_tile * SCANPREP_PARAM_DIM * (self.coeff_t_tile + 1) * 4
         )
@@ -83,11 +77,66 @@ class ScanPrepFwdFused:
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
         self.eps = float(eps)
-        z_thresh = float(max(1.0e-4, (max(float(eps), 1.0e-12)) ** 0.5))
-        self.z_thresh_sq = float(z_thresh * z_thresh)
+        self.z_thresh_sq = self._resolve_z_thresh_sq()
+
+    def _validate_pack_warps_per_block(self) -> None:
+        if self.pack_warps_per_block <= 0:
+            raise ValueError("pack_warps_per_block must be positive.")
+
+    def _validate_coeff_block_size(self) -> None:
+        if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
+            raise ValueError("coeff_block_size must be a positive multiple of 32.")
+        if self.coeff_block_size < 32:
+            raise ValueError("coeff_block_size must cover at least one warp.")
+
+    def _resolve_z_thresh_sq(self) -> float:
+        z_thresh = float(max(1.0e-4, (max(float(self.eps), 1.0e-12)) ** 0.5))
+        return float(z_thresh * z_thresh)
+
+    def _pack_grid_shape(self, *, total_rows) -> tuple[int, int, int]:
+        return (
+            (total_rows + self.pack_warps_per_block - 1) // self.pack_warps_per_block,
+            1,
+            1,
+        )
+
+    def _coeff_grid_shape(self, *, total_bt) -> tuple[int, int, int]:
+        return (
+            (total_bt + self.coeff_t_tile - 1) // self.coeff_t_tile,
+            (self.h_size + self.coeff_head_tile - 1) // self.coeff_head_tile,
+            1,
+        )
+
+    def _make_value_view(self, value: cute.Tensor, *, batch, time_steps):
+        return cute.make_tensor(
+            value.iterator,
+            _make_layout(
+                (batch, self.h_size, time_steps, self.p_size),
+                stride=(
+                    time_steps * self.h_size * self.p_size,
+                    self.p_size,
+                    self.h_size * self.p_size,
+                    1,
+                ),
+            ),
+        )
+
+    def _make_param_view(self, params: cute.Tensor, *, batch, time_steps):
+        return cute.make_tensor(
+            params.iterator,
+            _make_layout(
+                (batch, time_steps, self.h_size, SCANPREP_PARAM_DIM),
+                stride=(
+                    time_steps * self.h_size * SCANPREP_PARAM_DIM,
+                    self.h_size * SCANPREP_PARAM_DIM,
+                    SCANPREP_PARAM_DIM,
+                    1,
+                ),
+            ),
+        )
 
     @cute.kernel
-    def pack_kernel(
+    def _pack_rows(
         self,
         mValue: cute.Tensor,
         mBC: cute.Tensor,
@@ -109,13 +158,13 @@ class ScanPrepFwdFused:
             h = rem - t * self.h_size
 
             num_p_iters = (self.p_size + 31) // 32
-            for p_iter in cutlass.range_constexpr(num_p_iters):
+            for p_iter in cutlass.range_constexpr(num_p_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                 p = lane + p_iter * 32
                 if p < self.p_size:
                     mU[b, h, t, p] = mValue[b, h, t, p]
 
             num_n_iters = (self.n_size + 31) // 32
-            for n_iter in cutlass.range_constexpr(num_n_iters):
+            for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                 n = lane + n_iter * 32
                 if n < self.n_size:
                     mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
@@ -136,7 +185,7 @@ class ScanPrepFwdFused:
                     )
 
     @cute.kernel
-    def coeff_kernel(
+    def _compute_coefficients(
         self,
         mParams: cute.Tensor,
         mDtBias: cute.Tensor,
@@ -158,7 +207,7 @@ class ScanPrepFwdFused:
         smem = cutlass.utils.SmemAllocator()
         sParams = smem.allocate_tensor(
             cutlass.Float32,
-            cute.make_layout(
+            _make_layout(
                 (self.coeff_head_tile, SCANPREP_PARAM_DIM, self.coeff_t_tile + 1),
                 stride=(
                     SCANPREP_PARAM_DIM * (self.coeff_t_tile + 1),
@@ -174,13 +223,13 @@ class ScanPrepFwdFused:
             self.coeff_t_tile + self.coeff_head_tile - 1
         ) // self.coeff_head_tile
         num_load_flat_iters = (self.coeff_head_tile * SCANPREP_PARAM_DIM + 31) // 32
-        for load_t_iter in cutlass.range_constexpr(num_load_t_iters):
+        for load_t_iter in cutlass.range_constexpr(num_load_t_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
             load_t_local = warp + load_t_iter * self.coeff_head_tile
             load_bt = block_x * self.coeff_t_tile + load_t_local
             if load_t_local < self.coeff_t_tile and load_bt < total_bt_:
                 load_b = load_bt // t_size_
                 load_t = load_bt - load_b * t_size_
-                for flat_iter in cutlass.range_constexpr(num_load_flat_iters):
+                for flat_iter in cutlass.range_constexpr(num_load_flat_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                     flat = lane + flat_iter * 32
                     if flat < self.coeff_head_tile * SCANPREP_PARAM_DIM:
                         local_h = flat // SCANPREP_PARAM_DIM
@@ -290,7 +339,7 @@ class ScanPrepFwdFused:
             mKOut[b, h, t, 1, 0] = k_curr_re
             mKOut[b, h, t, 1, 1] = k_curr_im
 
-            if cutlass.const_expr(self.store_coeff_aux):
+            if cutlass.const_expr(self.store_coeff_aux):  # pyright: ignore[reportPrivateImportUsage]
                 mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
                 mCoeffAux[b, h, COEFF_AUX_THETA_TANH, t] = theta_tanh
                 mCoeffAux[b, h, COEFF_AUX_THETA_DRIVE, t] = theta_drive
@@ -324,68 +373,45 @@ class ScanPrepFwdFused:
         k: cute.Tensor,
         coeff_aux: cute.Tensor,
     ):
-        batch = cute.size(value, mode=[0])
-        t_size = cute.size(value, mode=[1])
+        batch = _size(value, mode=[0])
+        t_size = _size(value, mode=[1])
         total_rows = batch * t_size * self.h_size
         rows_per_batch = t_size * self.h_size
         total_bt = batch * t_size
-        pack_grid_size = (
-            total_rows + self.pack_warps_per_block - 1
-        ) // self.pack_warps_per_block
-        coeff_grid_x = (total_bt + self.coeff_t_tile - 1) // self.coeff_t_tile
-        coeff_grid_y = (self.h_size + self.coeff_head_tile - 1) // self.coeff_head_tile
+        pack_grid = self._pack_grid_shape(total_rows=total_rows)
+        coeff_grid = self._coeff_grid_shape(total_bt=total_bt)
+        value_view = self._make_value_view(value, batch=batch, time_steps=t_size)
+        param_view = self._make_param_view(params, batch=batch, time_steps=t_size)
 
-        mValue = cute.make_tensor(
-            value.iterator,
-            cute.make_layout(
-                (batch, self.h_size, t_size, self.p_size),
-                stride=(
-                    t_size * self.h_size * self.p_size,
-                    self.p_size,
-                    self.h_size * self.p_size,
-                    1,
-                ),
-            ),
-        )
-        mParams = cute.make_tensor(
-            params.iterator,
-            cute.make_layout(
-                (batch, t_size, self.h_size, SCANPREP_PARAM_DIM),
-                stride=(
-                    t_size * self.h_size * SCANPREP_PARAM_DIM,
-                    self.h_size * SCANPREP_PARAM_DIM,
-                    SCANPREP_PARAM_DIM,
-                    1,
-                ),
-            ),
-        )
-        coeff_smem_bytes = self.coeff_smem_bytes
-
-        self.pack_kernel(
-            mValue,
-            bc,
-            u,
-            b,
-            c,
-            total_rows,
-            rows_per_batch,
-        ).launch(grid=(pack_grid_size, 1, 1), block=(self.pack_block_size, 1, 1))
-        self.coeff_kernel(
-            mParams,
-            dt_bias,
-            gamma_bias,
-            theta_mod_bias,
-            theta_bias,
-            theta_sign,
-            m,
-            k,
-            coeff_aux,
-            total_bt,
-            t_size,
+        _launchable(
+            self._pack_rows(
+                value_view,
+                bc,
+                u,
+                b,
+                c,
+                total_rows,
+                rows_per_batch,
+            )
+        ).launch(grid=pack_grid, block=(self.pack_block_size, 1, 1))
+        _launchable(
+            self._compute_coefficients(
+                param_view,
+                dt_bias,
+                gamma_bias,
+                theta_mod_bias,
+                theta_bias,
+                theta_sign,
+                m,
+                k,
+                coeff_aux,
+                total_bt,
+                t_size,
+            )
         ).launch(
-            grid=(coeff_grid_x, coeff_grid_y, 1),
+            grid=coeff_grid,
             block=(self.coeff_block_size, 1, 1),
-            smem=coeff_smem_bytes,
+            smem=self.coeff_smem_bytes,
         )
 
 
