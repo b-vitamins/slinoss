@@ -48,6 +48,7 @@ class ChunkScanBwdStageLaunchers:
 
 @dataclass(frozen=True)
 class ChunkScanBwdOutputs:
+    bc_groups: int
     chunk_start_grad: torch.Tensor
     value_grad_chunk: torch.Tensor
     key_grad_chunk: torch.Tensor
@@ -69,6 +70,18 @@ class ChunkScanBwdOutputs:
         query_dtype: torch.dtype,
         return_prev_grads: bool,
     ) -> tuple[torch.Tensor, ...]:
+        key_grad_chunk = _reduce_heads_to_bc_groups(
+            self.key_grad_chunk,
+            bc_groups=self.bc_groups,
+        )
+        key_boundary_grad = _reduce_heads_to_bc_groups(
+            self.key_boundary_grad,
+            bc_groups=self.bc_groups,
+        )
+        query_grad_chunk = _reduce_heads_to_bc_groups(
+            self.query_grad_chunk,
+            bc_groups=self.bc_groups,
+        )
         value_grad = _public_from_chunked_with_boundary_carries(
             self.value_grad_chunk,
             self.value_boundary_grad,
@@ -76,8 +89,8 @@ class ChunkScanBwdOutputs:
             dtype=value_dtype,
         )
         key_grad = _public_from_chunked_with_boundary_carries(
-            self.key_grad_chunk,
-            self.key_boundary_grad,
+            key_grad_chunk,
+            key_boundary_grad,
             T=T,
             dtype=key_dtype,
         )
@@ -86,13 +99,13 @@ class ChunkScanBwdOutputs:
             _public_from_param_scan(self.transition_grad, T=T),
             _public_dk_from_parts(self.tap_prev_grad, self.tap_curr_grad, T=T),
             key_grad,
-            _public_from_chunked(self.query_grad_chunk, T=T, dtype=query_dtype),
+            _public_from_chunked(query_grad_chunk, T=T, dtype=query_dtype),
             self.chunk_start_grad.to(dtype=torch.float32).contiguous(),
         )
         if not return_prev_grads:
             return public_outputs
         return public_outputs + (
-            self.key_boundary_grad[:, :, 0, :].to(dtype=key_dtype).contiguous(),
+            key_boundary_grad[:, :, 0, :].to(dtype=key_dtype).contiguous(),
             self.value_boundary_grad[:, :, 0, :].to(dtype=value_dtype).contiguous(),
         )
 
@@ -273,6 +286,7 @@ def _get_zero_prev_tensors(
     dtype: torch.dtype,
     batch_size: int,
     heads: int,
+    bc_groups: int,
     P: int,
     D: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -282,6 +296,7 @@ def _get_zero_prev_tensors(
         dtype,
         int(batch_size),
         int(heads),
+        int(bc_groups),
         int(P),
         int(D),
     )
@@ -289,10 +304,29 @@ def _get_zero_prev_tensors(
     if cached is None:
         cached = (
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
-            torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
+            torch.zeros((batch_size, bc_groups, D), device=device, dtype=dtype),
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
+
+
+def _reduce_heads_to_bc_groups(
+    x: torch.Tensor,
+    *,
+    bc_groups: int,
+) -> torch.Tensor:
+    if x.ndim < 2:
+        raise ValueError("Expected tensor with a head axis at dim=1.")
+    batch_size, heads = map(int, x.shape[:2])
+    if heads % bc_groups != 0:
+        raise ValueError(
+            f"bc_groups must divide heads. Got heads={heads}, bc_groups={bc_groups}."
+        )
+    if heads == bc_groups:
+        return x
+    heads_per_group = heads // bc_groups
+    grouped_shape = (batch_size, bc_groups, heads_per_group, *x.shape[2:])
+    return x.reshape(grouped_shape).sum(dim=2)
 
 
 def _chunk_scan_device_label(device_index: int) -> str:
@@ -990,10 +1024,10 @@ def _compiled_key(
 def _make_dz0_host_wrapper(
     *,
     spec: tuple[tuple[int, ...], ...],
-    cfg: tuple[int, tuple[int, int, int]],
+    cfg: tuple[int, tuple[int, int, int], int, int],
     cutlass_dtype,
 ):
-    chunk_size, dz0_cta_tiler = cfg
+    chunk_size, dz0_cta_tiler, heads, bc_groups = cfg
     d_out_spec, c_spec, m_spec, dz0_spec = spec
 
     @cute.jit
@@ -1012,6 +1046,8 @@ def _make_dz0_host_wrapper(
             cutlass_dtype,
             chunk_size=chunk_size,
             cta_tiler=dz0_cta_tiler,
+            heads=heads,
+            bc_groups=bc_groups,
         )
         kernel(mDOut, mC, mM, mDZ0)
 
@@ -1024,7 +1060,7 @@ def _make_du_host_wrapper(
     cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    chunk_size, D, P, num_threads = cfg
+    chunk_size, D, P, num_threads, heads, bc_groups = cfg
     (
         u_spec,
         b_spec,
@@ -1085,6 +1121,8 @@ def _make_du_host_wrapper(
             D=D,
             P=P,
             num_threads=num_threads,
+            heads=heads,
+            bc_groups=bc_groups,
         )
         kernel(
             mU,
@@ -1113,7 +1151,7 @@ def _make_db_host_wrapper(
     cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    chunk_size, D, P, num_threads = cfg
+    chunk_size, D, P, num_threads, heads, bc_groups = cfg
     (
         u_spec,
         b_spec,
@@ -1172,6 +1210,8 @@ def _make_db_host_wrapper(
             D=D,
             P=P,
             num_threads=num_threads,
+            heads=heads,
+            bc_groups=bc_groups,
         )
         kernel(
             mU,
@@ -1200,7 +1240,7 @@ def _make_dcdr_host_wrapper(
     kernel_cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    chunk_size, D, P, num_threads = kernel_cfg
+    chunk_size, D, P, num_threads, heads, bc_groups = kernel_cfg
     (
         u_spec,
         b_spec,
@@ -1250,6 +1290,8 @@ def _make_dcdr_host_wrapper(
             D=D,
             P=P,
             num_threads=num_threads,
+            heads=heads,
+            bc_groups=bc_groups,
         )
         kernel(
             mU,
@@ -1275,7 +1317,7 @@ def _make_dlp_host_wrapper(
     cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    chunk_size, D, P, num_threads = cfg
+    chunk_size, D, P, num_threads, heads, bc_groups = cfg
     (
         u_spec,
         b_spec,
@@ -1316,6 +1358,8 @@ def _make_dlp_host_wrapper(
             D=D,
             P=P,
             num_threads=num_threads,
+            heads=heads,
+            bc_groups=bc_groups,
         )
         kernel(
             mU,
@@ -1406,9 +1450,12 @@ def compile_chunk_scan_bwd_kernels(
         raise ValueError("CUDA tensor required.")
 
     Bsz, H, T, P = map(int, U.shape)
+    G = int(B.shape[1])
     D = int(B.shape[-1])
-    if B.shape != (Bsz, H, T, D) or C.shape != (Bsz, H, T, D):
-        raise ValueError("B/C must be (B,H,T,D) matching U.")
+    if H % G != 0:
+        raise ValueError(f"bc_groups must divide heads. Got heads={H}, bc_groups={G}.")
+    if B.shape != (Bsz, G, T, D) or C.shape != (Bsz, G, T, D):
+        raise ValueError("B/C must be (B,G,T,D) with contiguous head-to-group mapping.")
     if M.shape != (Bsz, H, T, 2):
         raise ValueError(f"M must be (B,H,T,2)={(Bsz, H, T, 2)}.")
     if K.shape != (Bsz, H, T, 2, 2):
@@ -1490,20 +1537,23 @@ def compile_chunk_scan_bwd_kernels(
             dtype=tc_dtype,
             batch_size=Bsz,
             heads=H,
+            bc_groups=G,
             P=P,
             D=D,
         )
     else:
-        if B_prev.shape != (Bsz, H, D) or U_prev.shape != (Bsz, H, P):
-            raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+        if B_prev.shape != (Bsz, G, D) or U_prev.shape != (Bsz, H, P):
+            raise ValueError("B_prev/U_prev must be (B,G,D)/(B,H,P).")
         B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
         U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
 
     BH = Bsz * H
+    BG = Bsz * G
     BHC = BH * n_chunks
+    BGC = BG * n_chunks
 
     d_out_operand = d_out_tc.reshape(BH, T_pad, P).permute(2, 1, 0)
-    c_operand = C_tc.reshape(BH, T_pad, D).permute(2, 1, 0)
+    c_operand = C_tc.reshape(BG, T_pad, D).permute(2, 1, 0)
     m_operand = M_f.reshape(BH, T_pad, 2).permute(2, 1, 0)
 
     d_z0 = torch.empty((BHC, P, D), device=U.device, dtype=torch.float32)
@@ -1511,15 +1561,15 @@ def compile_chunk_scan_bwd_kernels(
     d_z0_view = d_z0.reshape(Bsz, H, n_chunks, P, D)
 
     U_blk = U_tc.reshape(BH, n_chunks, L, P).reshape(BHC, L, 1, P).contiguous()
-    B_blk = B_tc.reshape(BH, n_chunks, L, D).reshape(BHC, L, 1, D).contiguous()
-    C_blk = C_tc.reshape(BH, n_chunks, L, D).reshape(BHC, L, 1, D).contiguous()
+    B_blk = B_tc.reshape(BG, n_chunks, L, D).reshape(BGC, L, 1, D).contiguous()
+    C_blk = C_tc.reshape(BG, n_chunks, L, D).reshape(BGC, L, 1, D).contiguous()
     M_blk = M_f.reshape(BH, n_chunks, L, 2).reshape(BHC, L, 2).contiguous()
     K_blk = K_f.reshape(BH, n_chunks, L, 2, 2).reshape(BHC, L, 2, 2).contiguous()
     dOut_blk = d_out_tc.reshape(BH, n_chunks, L, P).reshape(BHC, L, 1, P).contiguous()
     Z0_blk = chunk_starts_f.reshape(BH, n_chunks, P, D).reshape(BHC, P, D).contiguous()
 
     U_prev0_flat = U_prev0.reshape(BH, P).contiguous()
-    B_prev0_flat = B_prev0.reshape(BH, D).contiguous()
+    B_prev0_flat = B_prev0.reshape(BG, D).contiguous()
 
     du_runtime_artifacts = _make_du_runtime_artifacts(
         U_blk=U_blk,
@@ -1678,22 +1728,22 @@ def compile_chunk_scan_bwd_kernels(
                 _make_tensor_spec_from_tensor(m_operand),
                 _make_tensor_spec_from_tensor(d_z0_perm),
             ),
-            cfg=(L, dz0_cta_tiler),
+            cfg=(L, dz0_cta_tiler, H, G),
             cutlass_dtype=cutlass_dtype,
         )
         du_wrapper = _make_du_host_wrapper(
             spec=_make_tensor_specs_from_tensors(*du_runtime_args),
-            cfg=(L, D, P, num_threads_du),
+            cfg=(L, D, P, num_threads_du, H, G),
             cutlass_dtype=cutlass_dtype,
         )
         dcdr_wrapper = _make_dcdr_host_wrapper(
             tensor_specs=dcdr_runtime_artifacts.tensor_specs,
-            kernel_cfg=(L, D, P, num_threads_dcdr),
+            kernel_cfg=(L, D, P, num_threads_dcdr, H, G),
             cutlass_dtype=cutlass_dtype,
         )
         dlp_wrapper = _make_dlp_host_wrapper(
             spec=dlp_tensor_specs,
-            cfg=(L, D, P, num_threads_dlp),
+            cfg=(L, D, P, num_threads_dlp, H, G),
             cutlass_dtype=cutlass_dtype,
         )
         param_scan_wrapper = _make_param_host_wrapper(
@@ -1719,7 +1769,7 @@ def compile_chunk_scan_bwd_kernels(
             ),
             db=_compile_db_wrapper(
                 runtime_artifacts=db_runtime_artifacts,
-                cfg=(L, D, P, num_threads_db),
+                cfg=(L, D, P, num_threads_db, H, G),
                 cutlass_dtype=cutlass_dtype,
             ),
             dcdr=cute.compile(
@@ -1777,12 +1827,13 @@ def compile_chunk_scan_bwd_kernels(
         )
 
     outputs = ChunkScanBwdOutputs(
+        bc_groups=G,
         chunk_start_grad=d_z0_view,
         value_grad_chunk=du_runtime_artifacts.workspace.value_grad_chunk.reshape(
             Bsz, H, n_chunks, L, P
         ),
         key_grad_chunk=db_runtime_artifacts.workspace.key_grad_chunk.reshape(
-            Bsz, H, n_chunks, L, D
+            Bsz, G, n_chunks, L, D
         ),
         value_boundary_grad=du_runtime_artifacts.workspace.value_boundary_grad.reshape(
             Bsz, H, n_chunks, P
@@ -1791,7 +1842,7 @@ def compile_chunk_scan_bwd_kernels(
             Bsz, H, n_chunks, D
         ),
         logprefix_grad=d_logprefix.reshape(Bsz, H, n_chunks, L),
-        query_grad_chunk=d_c.reshape(Bsz, H, n_chunks, L, D),
+        query_grad_chunk=d_c.reshape(Bsz, G, n_chunks, L, D),
         rotation_grad=d_r.reshape(Bsz, H, n_chunks, L, 4),
         transition_grad=param_scan_runtime_artifacts.transition_view,
         tap_prev_grad=param_scan_runtime_artifacts.tap_prev_view,

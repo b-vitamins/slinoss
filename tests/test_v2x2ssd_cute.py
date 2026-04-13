@@ -34,6 +34,7 @@ def _make_scan_inputs(
     *,
     batch: int,
     heads: int,
+    bc_groups: int | None = None,
     T: int,
     N: int,
     P: int,
@@ -49,6 +50,9 @@ def _make_scan_inputs(
     torch.Tensor,
     torch.Tensor,
 ]:
+    bc_groups = heads if bc_groups is None else bc_groups
+    assert heads % bc_groups == 0
+
     radius = 0.6 + 0.35 * torch.rand((batch, heads, T), device=device)
     angle = (2.0 * math.pi) * torch.rand((batch, heads, T), device=device) - math.pi
     M = torch.view_as_real(torch.polar(radius, angle)).to(torch.float32).contiguous()
@@ -60,15 +64,21 @@ def _make_scan_inputs(
     K = torch.view_as_real(K_complex).to(torch.float32).contiguous()
 
     U = torch.randn((batch, heads, T, P), device=device, dtype=value_dtype)
-    B = torch.randn((batch, heads, T, 2 * N), device=device, dtype=value_dtype) * 0.1
-    C = torch.randn((batch, heads, T, 2 * N), device=device, dtype=value_dtype) * 0.1
+    B = (
+        torch.randn((batch, bc_groups, T, 2 * N), device=device, dtype=value_dtype)
+        * 0.1
+    )
+    C = (
+        torch.randn((batch, bc_groups, T, 2 * N), device=device, dtype=value_dtype)
+        * 0.1
+    )
     initial_states = torch.randn(
         (batch, heads, P, 2 * N), device=device, dtype=torch.float32
     )
 
     b_prev = (
-        torch.randn((batch, heads, N), device=device, dtype=torch.float32)
-        + 1j * torch.randn((batch, heads, N), device=device, dtype=torch.float32)
+        torch.randn((batch, bc_groups, N), device=device, dtype=torch.float32)
+        + 1j * torch.randn((batch, bc_groups, N), device=device, dtype=torch.float32)
     ) * 0.1
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
@@ -2167,6 +2177,87 @@ def test_v2x2ssd_cute_matches_reference_autograd_with_state() -> None:
     }
     for name, got, want in zip(grad_names, cute_grads, ref_grads, strict=True):
         torch.testing.assert_close(got, want, atol=atol_by_grad[name], rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_matches_reference_autograd_with_grouped_bc_state() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, bc_groups, T, N, P = 1, 4, 2, 33, 8, 16
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=batch,
+        heads=heads,
+        bc_groups=bc_groups,
+        T=T,
+        N=N,
+        P=P,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    ref_out = v2x2ssd(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    U_cute, M_cute, K_cute, B_cute, C_cute, initial_cute, B_prev_cute, U_prev_cute = (
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+    cute_out = v2x2ssd_cute(
+        U_cute,
+        M_cute,
+        K_cute,
+        B_cute,
+        C_cute,
+        chunk_size=chunk_size,
+        initial_states=initial_cute,
+        B_prev=B_prev_cute,
+        U_prev=U_prev_cute,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+
+    assert ref_out[2].shape == cute_out[2].shape == (batch, bc_groups, 2 * N)
+    for got, want in zip(cute_out, ref_out, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-3, rtol=0.0)
+
+    y_weight = torch.randn((batch, heads, T, P), device="cuda", dtype=torch.float32)
+    state_weight = torch.randn(
+        (batch, heads, P, 2 * N), device="cuda", dtype=torch.float32
+    )
+    b_last_weight = torch.randn(
+        (batch, bc_groups, 2 * N), device="cuda", dtype=torch.float32
+    )
+    u_last_weight = torch.randn((batch, heads, P), device="cuda", dtype=torch.float32)
+    Y_cute, final_state_cute, B_last_cute, U_last_cute = cute_out
+    loss = (
+        (Y_cute * y_weight).sum()
+        + (final_state_cute * state_weight).sum()
+        + (B_last_cute * b_last_weight).sum()
+        + (U_last_cute * u_last_weight).sum()
+    )
+    loss.backward()
+
+    assert B_cute.grad is not None
+    assert C_cute.grad is not None
+    assert B_prev_cute.grad is not None
+    assert B_cute.grad.shape == (batch, bc_groups, T, 2 * N)
+    assert C_cute.grad.shape == (batch, bc_groups, T, 2 * N)
+    assert B_prev_cute.grad.shape == (batch, bc_groups, 2 * N)
+    assert torch.isfinite(B_cute.grad).all()
+    assert torch.isfinite(C_cute.grad).all()
+    assert torch.isfinite(B_prev_cute.grad).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -61,6 +61,9 @@ class ChunkIncrementBwdBoundaryAmpere:
         chunk_size: int,
         D: int,
         P: int,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+        n_chunks: int | None = None,
         num_threads: int = 192,
     ):
         self.ab_dtype = dtype
@@ -71,6 +74,29 @@ class ChunkIncrementBwdBoundaryAmpere:
         self.D = int(D)
         self.P = int(P)
         self.num_threads = int(num_threads)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if n_chunks is None:
+                raise ValueError(
+                    "n_chunks must be specified when grouped BC is active."
+                )
+            self.n_chunks = int(n_chunks)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            if self.n_chunks <= 0:
+                raise ValueError("n_chunks must be positive.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.n_chunks = 0
+            self.heads_per_bc_group = 0
 
         self.du_prev_threads = 64
         self.db_prev_threads = self.num_threads - self.du_prev_threads
@@ -108,6 +134,18 @@ class ChunkIncrementBwdBoundaryAmpere:
             self.d_smem_stride = (
                 self._align_up(self.D, self.async_copy_elems) + self.async_copy_elems
             )
+
+    @cute.jit
+    def _batch_group_chunk_index(self, batch_head_chunk_idx: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk_idx
+        batch_head = batch_head_chunk_idx // cutlass.Int32(self.n_chunks)
+        chunk_index = batch_head_chunk_idx - batch_head * cutlass.Int32(self.n_chunks)
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        batch_group = batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+        return batch_group * cutlass.Int32(self.n_chunks) + chunk_index
 
     @staticmethod
     def _resolve_scan_threads(chunk_size: int) -> int:
@@ -483,6 +521,7 @@ class ChunkIncrementBwdBoundaryAmpere:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         batch_head_chunk, _, _ = cute.arch.block_idx()
+        batch_group_chunk = self._batch_group_chunk_index(batch_head_chunk)
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.warp_idx()
 
@@ -677,10 +716,10 @@ class ChunkIncrementBwdBoundaryAmpere:
                 while cute.elem_less(complex_pair, cutlass.Int32(stage_width // 2)):
                     d_pair_start = complex_pair * 2
                     b_prev_re = mBPrev[
-                        stage_col_start + d_pair_start + 0, batch_head_chunk
+                        stage_col_start + d_pair_start + 0, batch_group_chunk
                     ].to(cutlass.Float32)
                     b_prev_im = mBPrev[
-                        stage_col_start + d_pair_start + 1, batch_head_chunk
+                        stage_col_start + d_pair_start + 1, batch_group_chunk
                     ].to(cutlass.Float32)
                     s_decayed_boundary_key[d_pair_start + 0] = (
                         boundary_coeff_re * b_prev_re - boundary_coeff_im * b_prev_im
@@ -746,10 +785,10 @@ class ChunkIncrementBwdBoundaryAmpere:
                             ).to(mDBPrev.element_type)
 
                             b_prev_re = mBPrev[
-                                global_pair_start + 0, batch_head_chunk
+                                global_pair_start + 0, batch_group_chunk
                             ].to(cutlass.Float32)
                             b_prev_im = mBPrev[
-                                global_pair_start + 1, batch_head_chunk
+                                global_pair_start + 1, batch_group_chunk
                             ].to(cutlass.Float32)
                             d_mp0_partial_re = d_mp0_partial_re + (
                                 g0 * b_prev_re + g1 * b_prev_im
@@ -785,10 +824,10 @@ class ChunkIncrementBwdBoundaryAmpere:
             complex_pair_count = self.D // 2
             while cute.elem_less(complex_pair, complex_pair_count):
                 d_pair_start = complex_pair * 2
-                b_prev_re = mBPrev[d_pair_start + 0, batch_head_chunk].to(
+                b_prev_re = mBPrev[d_pair_start + 0, batch_group_chunk].to(
                     cutlass.Float32
                 )
-                b_prev_im = mBPrev[d_pair_start + 1, batch_head_chunk].to(
+                b_prev_im = mBPrev[d_pair_start + 1, batch_group_chunk].to(
                     cutlass.Float32
                 )
                 s_decayed_boundary_key[d_pair_start + 0] = (
@@ -848,10 +887,10 @@ class ChunkIncrementBwdBoundaryAmpere:
                         boundary_coeff_re * g1 - boundary_coeff_im * g0
                     ).to(mDBPrev.element_type)
 
-                    b_prev_re = mBPrev[d_pair_start + 0, batch_head_chunk].to(
+                    b_prev_re = mBPrev[d_pair_start + 0, batch_group_chunk].to(
                         cutlass.Float32
                     )
-                    b_prev_im = mBPrev[d_pair_start + 1, batch_head_chunk].to(
+                    b_prev_im = mBPrev[d_pair_start + 1, batch_group_chunk].to(
                         cutlass.Float32
                     )
                     d_mp0_partial_re = d_mp0_partial_re + (

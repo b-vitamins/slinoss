@@ -73,6 +73,7 @@ def _make_decode_step_fixture(
     *,
     dtype: torch.dtype,
     batch: int = 2,
+    bc_groups: int | None = None,
 ) -> tuple[
     SLinOSSMixer,
     torch.Tensor,
@@ -83,16 +84,29 @@ def _make_decode_step_fixture(
     torch.Tensor,
     torch.Tensor,
 ]:
-    mixer = SLinOSSMixer(
-        128,
-        d_state=64,
-        expand=2,
-        d_head=64,
-        d_conv=4,
-        chunk_size=32,
-        device="cuda",
-        dtype=dtype,
-    ).eval()
+    if bc_groups is None:
+        mixer = SLinOSSMixer(
+            128,
+            d_state=64,
+            expand=2,
+            d_head=64,
+            d_conv=4,
+            chunk_size=32,
+            device="cuda",
+            dtype=dtype,
+        ).eval()
+    else:
+        mixer = SLinOSSMixer(
+            128,
+            d_state=64,
+            expand=2,
+            d_head=64,
+            d_conv=4,
+            chunk_size=32,
+            device="cuda",
+            dtype=dtype,
+            bc_groups=bc_groups,
+        ).eval()
     x = torch.randn((batch, 128), device="cuda", dtype=dtype)
     state0 = mixer.init_state(batch, device="cuda", dtype=dtype)
     proj = mixer.in_proj(x)
@@ -108,7 +122,7 @@ def _make_decode_step_fixture(
     ).contiguous()
     bc_amp = bc_flat.view(
         batch,
-        mixer.n_heads,
+        mixer.bc_groups,
         mixer.scanprep.bc_param_rows,
         mixer.d_state,
     ).contiguous()
@@ -122,7 +136,7 @@ def _make_decode_step_fixture(
         dtype=torch.float32,
     )
     b_prev = torch.randn(
-        (batch, mixer.n_heads, 128),
+        (batch, mixer.bc_groups, 128),
         device="cuda",
         dtype=dtype,
     )
@@ -141,6 +155,51 @@ def _make_decode_step_fixture(
         b_prev,
         u_prev,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_decode_step_cute_accepts_grouped_bc_prev_contract(
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    (
+        mixer,
+        value_h,
+        params_h,
+        bc_h,
+        gate_h,
+        initial_states,
+        b_prev,
+        u_prev,
+    ) = _make_decode_step_fixture(dtype=dtype, batch=1, bc_groups=2)
+
+    assert mixer.bc_groups == 2
+    assert mixer.bc_groups < mixer.n_heads
+    assert tuple(bc_h.shape[:2]) == (1, mixer.bc_groups)
+    assert bc_h.shape[-1] == mixer.d_state
+    assert tuple(b_prev.shape) == (1, mixer.bc_groups, 2 * mixer.d_state)
+    assert tuple(u_prev.shape) == (1, mixer.n_heads, mixer.d_head)
+
+    with torch.no_grad():
+        y, final, b_last, u_last = mixer_decode_step_cute(
+            value_h,
+            params_h,
+            bc_h,
+            gate_h,
+            initial_states=initial_states,
+            B_prev=b_prev,
+            U_prev=u_prev,
+            **_decode_scanprep_kwargs(mixer),
+            output_dtype=dtype,
+        )
+
+    assert tuple(y.shape) == (1, mixer.d_inner)
+    assert tuple(final.shape) == tuple(initial_states.shape)
+    assert tuple(b_last.shape) == tuple(b_prev.shape)
+    assert tuple(u_last.shape) == tuple(u_prev.shape)
 
 
 def _force_reference_sequence_backends(model: NextCharLM) -> None:

@@ -35,6 +35,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d-head", type=int, default=64)
     parser.add_argument("--d-conv", type=int, default=4)
     parser.add_argument("--chunk-size", type=int, default=32)
+    parser.add_argument("--bc-groups", type=int, default=None)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
@@ -59,6 +60,7 @@ def _make_cfg(args: argparse.Namespace) -> NextCharPerfConfig:
         d_head=args.d_head,
         d_conv=args.d_conv,
         chunk_size=args.chunk_size,
+        bc_groups=args.bc_groups,
         dtype=dtype_from_str(args.dtype),
         device=args.device,
         seed=args.seed,

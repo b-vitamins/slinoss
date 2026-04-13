@@ -9,14 +9,14 @@ reductions directly into ``dlogprefix``.
 Tensor contracts:
 
 - ``U``: ``(BHC, L, 1, P)`` fp16/bf16 value input
-- ``B``: ``(BHC, L, 1, D)`` fp16/bf16 key-side packed complex input
-- ``C``: ``(BHC, L, 1, D)`` fp16/bf16 query-side packed complex input
+- ``B``: ``(BGC, L, 1, D)`` fp16/bf16 key-side packed complex input
+- ``C``: ``(BGC, L, 1, D)`` fp16/bf16 query-side packed complex input
 - ``M``: ``(BHC, L, 2)`` fp32 packed complex transitions
 - ``K``: ``(BHC, L, 2, 2)`` fp32 packed complex taps for the previous/current
   diagonal passes
 - ``dOut``: ``(BHC, L, 1, P)`` fp16/bf16 output gradient
 - ``U_prev0``: ``(BH, P)`` fp16/bf16 chunk-0 boundary value row
-- ``B_prev0``: ``(BH, D)`` fp16/bf16 chunk-0 boundary key row
+- ``B_prev0``: ``(BG, D)`` fp16/bf16 chunk-0 boundary key row
 - ``dlogprefix``: ``(BHC, L)`` fp32 scalar metadata partials
 
 The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be
@@ -109,13 +109,38 @@ class ChunkScanBwdDLPAmpere:
         dict[tuple[object, ...], ChunkScanBwdDLPSupportInfo]
     ] = {}
 
-    def __init__(self, dtype, *, chunk_size, D, P, num_threads=128):
+    def __init__(
+        self,
+        dtype,
+        *,
+        chunk_size,
+        D,
+        P,
+        num_threads=128,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+    ):
         self.ab_dtype = dtype
         self.acc_dtype = cutlass.Float32
         self.L = int(chunk_size)
         self.D = int(D)
         self.P = int(P)
         self.num_threads = int(num_threads)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.heads_per_bc_group = 0
         self.kv_tile = 32
         self.p_tile = 32
 
@@ -131,6 +156,24 @@ class ChunkScanBwdDLPAmpere:
         self.mma_inst_shape = (16, 8, 16)
         self.warp_layout_mnk = (2, 2, 1)
         self.atom_layout_mnk = self.warp_layout_mnk
+
+    @cute.jit
+    def _batch_group(self, batch_head: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        return batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+
+    @cute.jit
+    def _batch_group_chunk(self, batch_head_chunk: int, n_chunks: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk
+        batch_head = batch_head_chunk // n_chunks
+        chunk_index = batch_head_chunk - batch_head * n_chunks
+        batch_group = self._batch_group(batch_head)
+        return batch_group * n_chunks + chunk_index
 
     @property
     def D_padded(self) -> int:
@@ -867,6 +910,11 @@ class ChunkScanBwdDLPAmpere:
             boundary_state.batch_head_chunk - cutlass.Int32(1),
             boundary_state.batch_head_chunk,
         )
+        prev_batch_group_chunk = cutlass.select_(
+            boundary_state.chunk_index > cutlass.Int32(0),
+            boundary_state.batch_group_chunk - cutlass.Int32(1),
+            boundary_state.batch_group_chunk,
+        )
 
         iters_p = (self.P + self.num_threads - 1) // self.num_threads
         for it in range(iters_p):
@@ -884,8 +932,13 @@ class ChunkScanBwdDLPAmpere:
         for it in range(iters_d):
             d = tidx + cutlass.Int32(it * self.num_threads)
             if d < cutlass.Int32(self.D):
-                boundary_prev = boundary_state.m_b_prev0[boundary_state.batch_head, d]
-                chunk_prev = boundary_state.m_b[prev_batch_head_chunk, self.L - 1, 0, d]
+                boundary_prev = boundary_state.m_b_prev0[boundary_state.batch_group, d]
+                chunk_prev = boundary_state.m_b[
+                    prev_batch_group_chunk,
+                    self.L - 1,
+                    0,
+                    d,
+                ]
                 boundary_state.s_b_prev[d] = cutlass.select_(
                     boundary_state.chunk_index == cutlass.Int32(0),
                     boundary_prev,
@@ -905,7 +958,7 @@ class ChunkScanBwdDLPAmpere:
         m0 = cutlass.Int32(m_tile * self.kv_tile)
 
         g_query_tile = cute.local_tile(
-            query_state.m_query[query_state.batch_head_chunk, None, 0, None],
+            query_state.m_query[query_state.batch_group_chunk, None, 0, None],
             (self.kv_tile, self.D_padded),
             (m_tile, 0),
         )
@@ -1109,7 +1162,7 @@ class ChunkScanBwdDLPAmpere:
             pass_id == 1
         ):
             g_key = cute.local_tile(
-                key_state.m_key[key_state.batch_head_chunk, None, 0, None],
+                key_state.m_key[key_state.batch_group_chunk, None, 0, None],
                 (self.kv_tile, d_block),
                 (n_tile, d_tile),
             )
@@ -1132,13 +1185,19 @@ class ChunkScanBwdDLPAmpere:
                         if cutlass.const_expr(pass_id == 1):
                             if seq_idx < cutlass.Int32(self.L):
                                 value = key_state.m_key[
-                                    key_state.batch_head_chunk, seq_idx, 0, d
+                                    key_state.batch_group_chunk,
+                                    seq_idx,
+                                    0,
+                                    d,
                                 ]
                         else:
                             src_idx = seq_idx - cutlass.Int32(1)
                             if src_idx >= cutlass.Int32(0):
                                 value = key_state.m_key[
-                                    key_state.batch_head_chunk, src_idx, 0, d
+                                    key_state.batch_group_chunk,
+                                    src_idx,
+                                    0,
+                                    d,
                                 ]
                             else:
                                 value = key_state.s_b_prev[d]
@@ -1418,6 +1477,8 @@ class ChunkScanBwdDLPAmpere:
         *,
         batch_head_chunk,
         batch_head,
+        batch_group_chunk,
+        batch_group,
         chunk_index,
         m_u: cute.Tensor,
         m_b: cute.Tensor,
@@ -1429,6 +1490,8 @@ class ChunkScanBwdDLPAmpere:
         return SimpleNamespace(
             batch_head_chunk=batch_head_chunk,
             batch_head=batch_head,
+            batch_group_chunk=batch_group_chunk,
+            batch_group=batch_group,
             chunk_index=chunk_index,
             m_u=m_u,
             m_b=m_b,
@@ -1441,7 +1504,7 @@ class ChunkScanBwdDLPAmpere:
     def _make_query_state(
         self,
         *,
-        batch_head_chunk,
+        batch_group_chunk,
         m_query: cute.Tensor,
         coord_query: cute.Tensor,
         gmem_tiled_copy_d: cute.TiledCopy,
@@ -1451,7 +1514,7 @@ class ChunkScanBwdDLPAmpere:
         s_phase_row: cute.Tensor,
     ) -> SimpleNamespace:
         return SimpleNamespace(
-            batch_head_chunk=batch_head_chunk,
+            batch_group_chunk=batch_group_chunk,
             m_query=m_query,
             coord_query=coord_query,
             gmem_tiled_copy_d=gmem_tiled_copy_d,
@@ -1491,7 +1554,7 @@ class ChunkScanBwdDLPAmpere:
     def _make_score_state(
         self,
         *,
-        batch_head_chunk,
+        batch_group_chunk,
         m_key: cute.Tensor,
         gmem_tiled_copy_d: cute.TiledCopy,
         gmem_thr_copy_d,
@@ -1503,7 +1566,7 @@ class ChunkScanBwdDLPAmpere:
         s_query_tile: cute.Tensor,
     ) -> SimpleNamespace:
         return SimpleNamespace(
-            batch_head_chunk=batch_head_chunk,
+            batch_group_chunk=batch_group_chunk,
             m_key=m_key,
             gmem_tiled_copy_d=gmem_tiled_copy_d,
             gmem_thr_copy_d=gmem_thr_copy_d,
@@ -1656,9 +1719,9 @@ class ChunkScanBwdDLPAmpere:
         if cutlass.const_expr(
             mU.shape[1] != self.L or mB.shape[1] != self.L or mC.shape[1] != self.L
         ):
-            raise ValueError("U/B/C must have shape (BHC, L, 1, ...).")
+            raise ValueError("U must be (BHC, L, 1, P) and B/C must be (BGC, L, 1, D).")
         if cutlass.const_expr(mU.shape[2] != 1 or mB.shape[2] != 1 or mC.shape[2] != 1):
-            raise ValueError("U/B/C must have a singleton dim2 (BHC, L, 1, ...).")
+            raise ValueError("U must be (BHC, L, 1, P) and B/C must be (BGC, L, 1, D).")
         if cutlass.const_expr(mM.shape[1] != self.L or mM.shape[2] != 2):
             raise ValueError("M must be (BHC, L, 2).")
         if cutlass.const_expr(
@@ -1669,6 +1732,18 @@ class ChunkScanBwdDLPAmpere:
             raise ValueError("dOut must be (BHC, L, 1, P).")
         if cutlass.const_expr(mDLogPrefix.shape[1] != self.L):
             raise ValueError("dlogprefix must be (BHC, L).")
+        if cutlass.const_expr(mU.layout.shape[3] != self.P):
+            raise ValueError("U must be (BHC, L, 1, P).")
+        if cutlass.const_expr(mDOut.layout.shape[3] != self.P):
+            raise ValueError("dOut must be (BHC, L, 1, P).")
+        if cutlass.const_expr(
+            mB.layout.shape[3] != self.D or mC.layout.shape[3] != self.D
+        ):
+            raise ValueError("B/C must be (BGC, L, 1, D).")
+        if cutlass.const_expr(mU_prev0.shape[1] != self.P):
+            raise ValueError("U_prev0 must be (BH, P).")
+        if cutlass.const_expr(mB_prev0.shape[1] != self.D):
+            raise ValueError("B_prev0 must be (BG, D).")
 
         if cutlass.const_expr(self.P_padded % self.p_tile != 0):
             raise ValueError("P_padded must be a multiple of 32.")
@@ -1851,6 +1926,8 @@ class ChunkScanBwdDLPAmpere:
         batch_head_chunk_count = mU.shape[0]
         n_chunks = batch_head_chunk_count // batch_head_count
         batch_head = batch_head_chunk // n_chunks
+        batch_group = self._batch_group(batch_head)
+        batch_group_chunk = self._batch_group_chunk(batch_head_chunk, n_chunks)
         chunk_index = batch_head_chunk - batch_head * n_chunks
 
         d_padded = self.D_padded
@@ -1912,6 +1989,8 @@ class ChunkScanBwdDLPAmpere:
         boundary_state = self._make_boundary_state(
             batch_head_chunk=batch_head_chunk,
             batch_head=batch_head,
+            batch_group_chunk=batch_group_chunk,
+            batch_group=batch_group,
             chunk_index=chunk_index,
             m_u=mU,
             m_b=mB,
@@ -1956,12 +2035,12 @@ class ChunkScanBwdDLPAmpere:
             (mU.shape[0], self.L, mU.shape[2], self.L)
         )[batch_head_chunk, None, 0, None]
         query_coord = cute.make_identity_tensor(
-            (mU.shape[0], self.L, mU.shape[2], d_padded)
-        )[batch_head_chunk, None, 0, None]
+            (mC.shape[0], self.L, mC.shape[2], d_padded)
+        )[batch_group_chunk, None, 0, None]
         score_tile_acc_shape = thr_mma.partition_shape_C((kv_tile, kv_tile))
 
         query_state = self._make_query_state(
-            batch_head_chunk=batch_head_chunk,
+            batch_group_chunk=batch_group_chunk,
             m_query=mC,
             coord_query=query_coord,
             gmem_tiled_copy_d=gmem_tiled_copy_d,
@@ -1983,7 +2062,7 @@ class ChunkScanBwdDLPAmpere:
             s_u_prev=s_u_prev,
         )
         score_state = self._make_score_state(
-            batch_head_chunk=batch_head_chunk,
+            batch_group_chunk=batch_group_chunk,
             m_key=mB,
             gmem_tiled_copy_d=gmem_tiled_copy_d,
             gmem_thr_copy_d=gmem_thr_copy_d,

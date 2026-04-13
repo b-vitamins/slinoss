@@ -10,12 +10,13 @@ and adds the chunk-start boundary rank-1 term in the epilogue.
 Tensor contracts:
 
 - ``U``: ``(P, T_pad, BH)`` fp16/bf16 value stream
-- ``B``: ``(D, T_pad, BH)`` fp16/bf16 packed-complex key stream
+- ``B``: ``(D, T_pad, BG)`` fp16/bf16 packed-complex key stream shared across
+  contiguous head groups
 - ``M``: ``(2, T_pad, BH)`` fp32 packed-complex transitions
 - ``Kprev``: ``(2, T_pad, BH)`` fp32 packed-complex previous-pass taps
 - ``Kcurr``: ``(2, T_pad, BH)`` fp32 packed-complex current-pass taps
 - ``U_prev0``: ``(P, BH)`` fp16/bf16 chunk-0 boundary value row
-- ``B_prev0``: ``(D, BH)`` fp16/bf16 chunk-0 boundary key row
+- ``B_prev0``: ``(D, BG)`` fp16/bf16 chunk-0 boundary key row
 - ``Inc``: ``(P, D, BHC)`` fp32 output increment tiles
 - ``Mchunk``: ``(2, BHC)`` fp32 chunk-end packed-complex summaries
 
@@ -552,11 +553,7 @@ class ChunkIncrementFwdAmpere:
             == mKcurr.shape[1]
         )
         batch_head_dims_match = (
-            mU.shape[2]
-            == mB.shape[2]
-            == mM.shape[2]
-            == mKprev.shape[2]
-            == mKcurr.shape[2]
+            mU.shape[2] == mM.shape[2] == mKprev.shape[2] == mKcurr.shape[2]
         )
 
         if cutlass.const_expr(not value_stream_dtype_ok):
@@ -574,11 +571,15 @@ class ChunkIncrementFwdAmpere:
         if cutlass.const_expr(not time_dims_match):
             raise ValueError("U/B/M/Kprev/Kcurr must share the padded time dimension.")
         if cutlass.const_expr(not batch_head_dims_match):
-            raise ValueError("U/B/M/Kprev/Kcurr must share the batch-head dimension.")
-        if cutlass.const_expr(
-            not (mU_prev0.shape[1] == mB_prev0.shape[1] == mU.shape[2])
-        ):
-            raise ValueError("U_prev0/B_prev0 must match the batch-head dimension.")
+            raise ValueError("U/M/Kprev/Kcurr must share the batch-head dimension.")
+        if cutlass.const_expr(mB.shape[2] <= 0 or mU.shape[2] % mB.shape[2] != 0):
+            raise ValueError(
+                "Grouped B batch dimension must divide the batch-head count."
+            )
+        if cutlass.const_expr(mU_prev0.shape[1] != mU.shape[2]):
+            raise ValueError("U_prev0 must match the batch-head dimension.")
+        if cutlass.const_expr(mB_prev0.shape[1] != mB.shape[2]):
+            raise ValueError("B_prev0 must match the grouped B batch dimension.")
         if cutlass.const_expr(mU_prev0.shape[0] != mU.shape[0]):
             raise ValueError("U_prev0 rows must match U rows.")
         if cutlass.const_expr(mB_prev0.shape[0] != mB.shape[0]):
@@ -648,12 +649,12 @@ class ChunkIncrementFwdAmpere:
     def _validate_and_launch(
         self,
         mU: cute.Tensor,  # (P, T_pad, BH)
-        mB: cute.Tensor,  # (D, T_pad, BH)
+        mB: cute.Tensor,  # (D, T_pad, BG)
         mM: cute.Tensor,  # (2, T_pad, BH)
         mKprev: cute.Tensor,  # (2, T_pad, BH)
         mKcurr: cute.Tensor,  # (2, T_pad, BH)
         mU_prev0: cute.Tensor,  # (P, BH)
-        mB_prev0: cute.Tensor,  # (D, BH)
+        mB_prev0: cute.Tensor,  # (D, BG)
         mInc: cute.Tensor,  # (P, D, BHC) fp32
         mMchunk: cute.Tensor,  # (2, BHC) fp32
         stream: cuda.CUstream | None = None,
@@ -678,12 +679,12 @@ class ChunkIncrementFwdAmpere:
     def __call__(
         self,
         mU: cute.Tensor,  # (P, T_pad, BH)
-        mB: cute.Tensor,  # (D, T_pad, BH)
+        mB: cute.Tensor,  # (D, T_pad, BG)
         mM: cute.Tensor,  # (2, T_pad, BH)
         mKprev: cute.Tensor,  # (2, T_pad, BH)
         mKcurr: cute.Tensor,  # (2, T_pad, BH)
         mU_prev0: cute.Tensor,  # (P, BH)
-        mB_prev0: cute.Tensor,  # (D, BH)
+        mB_prev0: cute.Tensor,  # (D, BG)
         mInc: cute.Tensor,  # (P, D, BHC) fp32
         mMchunk: cute.Tensor,  # (2, BHC) fp32
     ):
@@ -695,12 +696,12 @@ class ChunkIncrementFwdAmpere:
     def call_on_stream(
         self,
         mU: cute.Tensor,  # (P, T_pad, BH)
-        mB: cute.Tensor,  # (D, T_pad, BH)
+        mB: cute.Tensor,  # (D, T_pad, BG)
         mM: cute.Tensor,  # (2, T_pad, BH)
         mKprev: cute.Tensor,  # (2, T_pad, BH)
         mKcurr: cute.Tensor,  # (2, T_pad, BH)
         mU_prev0: cute.Tensor,  # (P, BH)
-        mB_prev0: cute.Tensor,  # (D, BH)
+        mB_prev0: cute.Tensor,  # (D, BG)
         mInc: cute.Tensor,  # (P, D, BHC) fp32
         mMchunk: cute.Tensor,  # (2, BHC) fp32
         stream: cuda.CUstream,
@@ -770,10 +771,13 @@ class ChunkIncrementFwdAmpere:
         bidx, bidy, bidz = cute.arch.block_idx()
 
         batch_head_count = mU.shape[2]
+        batch_group_count = mB.shape[2]
         batch_head_chunk_count = mInc.shape[2]
         chunk_count = batch_head_chunk_count // batch_head_count
+        heads_per_group = batch_head_count // batch_group_count
 
         batch_head = bidz // chunk_count
+        batch_group = batch_head // heads_per_group
         chunk_index = bidz - batch_head * chunk_count
         chunk_start = chunk_index * self.L
 
@@ -861,7 +865,7 @@ class ChunkIncrementFwdAmpere:
             proj=(1, None, 1),
         )
         b_coord_tile = cute.local_tile(
-            b_coord_chunk[None, None, batch_head],
+            b_coord_chunk[None, None, batch_group],
             tiler=self.cta_tiler,
             coord=tiler_coord,
             proj=(None, 1, 1),
@@ -1056,7 +1060,7 @@ class ChunkIncrementFwdAmpere:
             proj=(1, None, 1),
         )
         g_b = cute.local_tile(
-            mB_off[None, None, batch_head],
+            mB_off[None, None, batch_group],
             tiler=self.cta_tiler,
             coord=tiler_coord,
             proj=(None, 1, 1),
@@ -1253,23 +1257,23 @@ class ChunkIncrementFwdAmpere:
             if cute.elem_less(global_d_pair_start + 1, mB.shape[0]):
                 if chunk_index == 0:
                     boundary_key_re = cutlass.Float32(
-                        mB_prev0[global_d_pair_start + 0, batch_head].to(
+                        mB_prev0[global_d_pair_start + 0, batch_group].to(
                             cutlass.Float32
                         )
                     )
                     boundary_key_im = cutlass.Float32(
-                        mB_prev0[global_d_pair_start + 1, batch_head].to(
+                        mB_prev0[global_d_pair_start + 1, batch_group].to(
                             cutlass.Float32
                         )
                     )
                 else:
                     boundary_key_re = cutlass.Float32(
-                        mB[global_d_pair_start + 0, chunk_start - 1, batch_head].to(
+                        mB[global_d_pair_start + 0, chunk_start - 1, batch_group].to(
                             cutlass.Float32
                         )
                     )
                     boundary_key_im = cutlass.Float32(
-                        mB[global_d_pair_start + 1, chunk_start - 1, batch_head].to(
+                        mB[global_d_pair_start + 1, chunk_start - 1, batch_group].to(
                             cutlass.Float32
                         )
                     )

@@ -59,7 +59,7 @@ class ScanState:
     All tensors use the canonical packed layout expected by ``v2x2ssd``:
 
     - ``state``: ``(batch, heads, P, 2N)``
-    - ``b_prev``: ``(batch, heads, 2N)``
+    - ``b_prev``: ``(batch, groups, 2N)``
     - ``u_prev``: ``(batch, heads, P)``
     """
 

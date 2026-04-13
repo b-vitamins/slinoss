@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from math import prod
 from pathlib import Path
 import sys
@@ -16,11 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from _common import (  # noqa: E402
-    PerfConfig,
-    dtype_from_str,
-    make_inputs,
-)
+from _common import dtype_from_str  # noqa: E402
 from _nextchar import DEFAULT_NEXTCHAR_PERF_CONFIG  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
@@ -55,6 +52,35 @@ DEFAULT_V2_N = int(DEFAULT_NEXTCHAR_PERF_CONFIG.d_state)
 DEFAULT_V2_P = int(DEFAULT_NEXTCHAR_PERF_CONFIG.d_head)
 DEFAULT_V2_CHUNK = int(DEFAULT_NEXTCHAR_PERF_CONFIG.chunk_size)
 DEFAULT_V2_DTYPE = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
+DEFAULT_V2_BC_GROUPS = int(
+    getattr(DEFAULT_NEXTCHAR_PERF_CONFIG, "resolved_bc_groups", DEFAULT_V2_HEADS)
+)
+
+
+@dataclass(frozen=True)
+class V2KernelPerfConfig:
+    batch: int = DEFAULT_V2_BATCH
+    heads: int = DEFAULT_V2_HEADS
+    T: int = DEFAULT_V2_T
+    N: int = DEFAULT_V2_N
+    P: int = DEFAULT_V2_P
+    chunk_size: int = DEFAULT_V2_CHUNK
+    bc_groups: int | None = None
+    dtype: torch.dtype = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
+    device: str = "cuda"
+    seed: int = 0
+
+    @property
+    def D(self) -> int:
+        return 2 * int(self.N)
+
+    @property
+    def resolved_bc_groups(self) -> int:
+        return int(self.heads if self.bc_groups is None else self.bc_groups)
+
+    @property
+    def torch_device(self) -> torch.device:
+        return torch.device(self.device)
 
 
 @dataclass(frozen=True)
@@ -64,12 +90,17 @@ class ScanPrepPerfConfig:
     T: int = DEFAULT_V2_T
     P: int = DEFAULT_V2_P
     N: int = DEFAULT_V2_N
+    bc_groups: int | None = None
     dtype: torch.dtype = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
     device: str = "cuda"
     seed: int = 0
     pack_warps_per_block: int = 8
     coeff_block_size_fwd: int = 256
     coeff_block_size_bwd: int = 512
+
+    @property
+    def resolved_bc_groups(self) -> int:
+        return int(self.heads if self.bc_groups is None else self.bc_groups)
 
     @property
     def torch_device(self) -> torch.device:
@@ -143,6 +174,119 @@ def _tc_input_dtype(dtype: torch.dtype) -> torch.dtype:
     raise TypeError(f"Unsupported dtype: {dtype}")
 
 
+def _validate_bc_groups(heads: int, bc_groups: int) -> tuple[int, int]:
+    resolved_heads = int(heads)
+    resolved_groups = int(bc_groups)
+    if resolved_groups < 1:
+        raise ValueError(f"bc_groups must be positive. Got {resolved_groups}.")
+    if resolved_groups > resolved_heads:
+        raise ValueError(
+            "bc_groups must not exceed the head count. "
+            f"Got bc_groups={resolved_groups}, heads={resolved_heads}."
+        )
+    if resolved_heads % resolved_groups != 0:
+        raise ValueError(
+            "bc_groups must divide the head count so contiguous group mapping is well-defined. "
+            f"Got bc_groups={resolved_groups}, heads={resolved_heads}."
+        )
+    return resolved_groups, resolved_heads // resolved_groups
+
+
+def _materialize_grouped_rows(
+    tensor: torch.Tensor,
+    *,
+    heads_per_group: int,
+) -> torch.Tensor:
+    if heads_per_group == 1:
+        return tensor.contiguous()
+    batch, groups = map(int, tensor.shape[:2])
+    tail = tuple(int(dim) for dim in tensor.shape[2:])
+    return (
+        tensor.unsqueeze(2)
+        .expand(batch, groups, heads_per_group, *tail)
+        .reshape(batch, groups * heads_per_group, *tail)
+        .contiguous()
+    )
+
+
+def _scaled_tensor_bytes(
+    tensor: torch.Tensor,
+    *,
+    bc_groups: int,
+    heads: int,
+) -> int:
+    groups = int(bc_groups)
+    resolved_heads = int(heads)
+    if groups == resolved_heads:
+        return _tensor_bytes(tensor)
+    numer = _tensor_bytes(tensor) * groups
+    if numer % resolved_heads != 0:
+        raise ValueError(
+            "Grouped byte scaling must divide evenly. "
+            f"Got bytes={_tensor_bytes(tensor)}, bc_groups={groups}, heads={resolved_heads}."
+        )
+    return numer // resolved_heads
+
+
+def _pack_complex_pairs(z: torch.Tensor, *, real_dtype: torch.dtype) -> torch.Tensor:
+    return torch.view_as_real(z).reshape(*z.shape[:-1], 2 * z.shape[-1]).to(real_dtype)
+
+
+def _build_grouped_v2_inputs(cfg: V2KernelPerfConfig) -> dict[str, torch.Tensor]:
+    device = cfg.torch_device
+    batch, heads, T, N, P = cfg.batch, cfg.heads, cfg.T, cfg.N, cfg.P
+    bc_groups, _ = _validate_bc_groups(heads, cfg.resolved_bc_groups)
+    D = 2 * N
+
+    radius = 0.6 + 0.35 * torch.rand((batch, heads, T), device=device)
+    angle = (2.0 * torch.pi) * torch.rand((batch, heads, T), device=device) - torch.pi
+    M = torch.view_as_real(torch.polar(radius, angle)).to(torch.float32).contiguous()
+
+    K_complex = (
+        torch.randn((batch, heads, T, 2), device=device, dtype=torch.float32)
+        + 1j * torch.randn((batch, heads, T, 2), device=device, dtype=torch.float32)
+    ) * 0.1
+    K = torch.view_as_real(K_complex).to(torch.float32).contiguous()
+
+    U = torch.randn((batch, heads, T, P), device=device, dtype=cfg.dtype)
+    B_grouped = (
+        torch.randn((batch, bc_groups, T, D), device=device, dtype=cfg.dtype) * 0.1
+    )
+    C_grouped = (
+        torch.randn((batch, bc_groups, T, D), device=device, dtype=cfg.dtype) * 0.1
+    )
+    initial_states = torch.randn((batch, heads, P, D), device=device, dtype=cfg.dtype)
+
+    b_prev = (
+        torch.randn((batch, bc_groups, N), device=device, dtype=torch.float32)
+        + 1j * torch.randn((batch, bc_groups, N), device=device, dtype=torch.float32)
+    ) * 0.1
+    B_prev_grouped = _pack_complex_pairs(b_prev, real_dtype=cfg.dtype)
+    U_prev = torch.randn((batch, heads, P), device=device, dtype=cfg.dtype)
+    return {
+        "U": U.contiguous(),
+        "M": M,
+        "K": K,
+        "B_grouped": B_grouped.contiguous(),
+        "C_grouped": C_grouped.contiguous(),
+        "initial_states": initial_states.contiguous(),
+        "B_prev_grouped": B_prev_grouped.contiguous(),
+        "U_prev": U_prev.contiguous(),
+    }
+
+
+def _make_scanprep_module(cfg: ScanPrepPerfConfig) -> SLinOSSScanPrep:
+    kwargs = {
+        "n_heads": cfg.heads,
+        "d_state": cfg.N,
+        "d_head": cfg.P,
+        "device": cfg.torch_device,
+    }
+    if "bc_groups" in inspect.signature(SLinOSSScanPrep).parameters:
+        kwargs["bc_groups"] = cfg.resolved_bc_groups
+    return SLinOSSScanPrep(**kwargs).to(dtype=cfg.dtype)
+
+
 def _resolve_dtype(dtype_name: str) -> torch.dtype:
     return dtype_from_str(dtype_name)
 
@@ -159,13 +303,8 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     _seed_all(cfg.seed)
     device = cfg.torch_device
     dtype = cfg.dtype
-
-    prep = SLinOSSScanPrep(
-        n_heads=cfg.heads,
-        d_state=cfg.N,
-        d_head=cfg.P,
-        device=device,
-    ).to(dtype=dtype)
+    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    prep = _make_scanprep_module(cfg)
 
     value = torch.randn(
         (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
@@ -173,12 +312,23 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     params = torch.randn(
         (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM), device=device, dtype=dtype
     )
-    bc_amp = torch.randn(
-        (cfg.batch, cfg.T, cfg.heads, prep.bc_param_rows, cfg.N),
+    bc_grouped = torch.randn(
+        (cfg.batch, cfg.T, bc_groups, prep.bc_param_rows, cfg.N),
         device=device,
         dtype=dtype,
     )
-    bc = prep._parameterize_scan_bc_rows(bc_amp)
+    prep_input_groups = int(getattr(prep, "bc_groups", cfg.heads))
+    bc_for_prep = (
+        bc_grouped
+        if prep_input_groups == bc_groups
+        else _materialize_grouped_rows(bc_grouped, heads_per_group=heads_per_group)
+    )
+    bc_rows = prep._parameterize_scan_bc_rows(bc_for_prep)
+    if int(bc_rows.shape[2]) != bc_groups:
+        raise ValueError(
+            "scanprep forward NCU runner requires grouped BC rows. "
+            f"Got bc rows with group dim {int(bc_rows.shape[2])}, expected {bc_groups}."
+        )
 
     U = torch.empty((cfg.batch, cfg.heads, cfg.T, cfg.P), device=device, dtype=dtype)
     M = torch.empty(
@@ -188,7 +338,7 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.heads, cfg.T, 2, 2), device=device, dtype=torch.float32
     )
     B = torch.empty(
-        (cfg.batch, cfg.heads, cfg.T, 2 * cfg.N), device=device, dtype=dtype
+        (cfg.batch, bc_groups, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     C = torch.empty_like(B)
     coeff_aux = torch.empty(
@@ -200,6 +350,7 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     compiled = cute.compile(
         ScanPrepFwdFused(
             h_size=cfg.heads,
+            g_size=bc_groups,
             p_size=cfg.P,
             n_size=cfg.N,
             store_coeff_aux=True,
@@ -216,7 +367,7 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             coeff_block_size=cfg.coeff_block_size_fwd,
         ),
         make_fake_tensor_arg(value),
-        make_fake_tensor_arg(bc),
+        make_fake_tensor_arg(bc_rows),
         make_fake_tensor_arg(params),
         make_fake_tensor_arg(prep.dt_bias.detach()),
         make_fake_tensor_arg(prep.gamma_bias.detach()),
@@ -235,7 +386,7 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     def launch() -> None:
         compiled(
             value,
-            bc,
+            bc_rows,
             params,
             prep.dt_bias.detach(),
             prep.gamma_bias.detach(),
@@ -250,21 +401,31 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             coeff_aux,
         )
 
-    effective_bytes = _tensor_bytes(
-        value,
-        bc,
-        params,
-        prep.dt_bias.detach(),
-        prep.gamma_bias.detach(),
-        prep.theta_mod_bias.detach(),
-        prep.theta_bias.detach(),
-        cast(torch.Tensor, prep.theta_sign).detach(),
-        U,
-        B,
-        C,
-        M,
-        K,
-        coeff_aux,
+    effective_bytes = (
+        _shape_bytes((cfg.batch, cfg.T, cfg.heads * cfg.P), dtype)
+        + _shape_bytes(
+            (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
+            dtype,
+        )
+        + _shape_bytes(
+            (cfg.batch, cfg.T, bc_groups, prep.bc_param_rows, cfg.N),
+            dtype,
+        )
+        + _tensor_bytes(
+            prep.dt_bias.detach(),
+            prep.gamma_bias.detach(),
+            prep.theta_mod_bias.detach(),
+            prep.theta_bias.detach(),
+            cast(torch.Tensor, prep.theta_sign).detach(),
+        )
+        + _shape_bytes((cfg.batch, cfg.heads, cfg.T, cfg.P), dtype)
+        + 2 * _shape_bytes((cfg.batch, bc_groups, cfg.T, 2 * cfg.N), dtype)
+        + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2), torch.float32)
+        + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2, 2), torch.float32)
+        + _shape_bytes(
+            (cfg.batch, cfg.heads, COEFF_AUX_FIELDS, cfg.T),
+            torch.float32,
+        )
     )
     return KernelRunner(
         name="scanprep_fwd",
@@ -278,13 +439,8 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     _seed_all(cfg.seed)
     device = cfg.torch_device
     dtype = cfg.dtype
-
-    prep = SLinOSSScanPrep(
-        n_heads=cfg.heads,
-        d_state=cfg.N,
-        d_head=cfg.P,
-        device=device,
-    ).to(dtype=dtype)
+    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    prep = _make_scanprep_module(cfg)
 
     value = torch.randn(
         (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
@@ -294,12 +450,23 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         device=device,
         dtype=dtype,
     )
-    bc_amp = torch.randn(
-        (cfg.batch, cfg.T, cfg.heads, prep.bc_param_rows, cfg.N),
+    bc_grouped = torch.randn(
+        (cfg.batch, cfg.T, bc_groups, prep.bc_param_rows, cfg.N),
         device=device,
         dtype=dtype,
     )
-    bc = prep._parameterize_scan_bc_rows(bc_amp)
+    prep_input_groups = int(getattr(prep, "bc_groups", cfg.heads))
+    bc_for_prep = (
+        bc_grouped
+        if prep_input_groups == bc_groups
+        else _materialize_grouped_rows(bc_grouped, heads_per_group=heads_per_group)
+    )
+    bc_rows = prep._parameterize_scan_bc_rows(bc_for_prep)
+    if int(bc_rows.shape[2]) != bc_groups:
+        raise ValueError(
+            "scanprep backward NCU runner requires grouped BC rows. "
+            f"Got bc rows with group dim {int(bc_rows.shape[2])}, expected {bc_groups}."
+        )
     dU = torch.randn((cfg.batch, cfg.heads, cfg.T, cfg.P), device=device, dtype=dtype)
     dM = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, 2), device=device, dtype=torch.float32
@@ -308,15 +475,16 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.heads, cfg.T, 2, 2), device=device, dtype=torch.float32
     )
     dB = torch.randn(
-        (cfg.batch, cfg.heads, cfg.T, 2 * cfg.N), device=device, dtype=dtype
+        (cfg.batch, bc_groups, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     dC = torch.randn_like(dB)
     with torch.no_grad():
         _, _, _, _, _, coeff_aux = scanprep_fwd_cute_with_aux(
             value,
             params_flat,
-            bc,
+            bc_rows,
             n_heads=cfg.heads,
+            bc_groups=bc_groups,
             d_state=cfg.N,
             d_head=cfg.P,
             dt_min=prep.dt_min,
@@ -339,7 +507,7 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
     )
     bc_grad = torch.empty(
-        (cfg.batch, cfg.T, cfg.heads, 4, cfg.N), device=device, dtype=dtype
+        (cfg.batch, cfg.T, bc_groups, 4, cfg.N), device=device, dtype=dtype
     )
     dparams = torch.empty(
         (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
@@ -351,6 +519,7 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     compiled = cute.compile(
         ScanPrepBwdFused(
             h_size=cfg.heads,
+            g_size=bc_groups,
             p_size=cfg.P,
             n_size=cfg.N,
             param_dim=prep.param_dim,
@@ -402,20 +571,27 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             bias_grad,
         )
 
-    effective_bytes = _tensor_bytes(
-        dU,
-        dB,
-        dC,
-        coeff_aux,
-        dM,
-        dK,
-        prep.dt_bias.detach(),
-        prep.theta_bias.detach(),
-        cast(torch.Tensor, prep.theta_sign).detach(),
-        value_grad,
-        bc_grad,
-        dparams,
-        bias_grad,
+    effective_bytes = (
+        _shape_bytes((cfg.batch, cfg.heads, cfg.T, cfg.P), dtype)
+        + 2 * _shape_bytes((cfg.batch, bc_groups, cfg.T, 2 * cfg.N), dtype)
+        + _shape_bytes(
+            (cfg.batch, cfg.heads, COEFF_AUX_FIELDS, cfg.T),
+            torch.float32,
+        )
+        + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2), torch.float32)
+        + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2, 2), torch.float32)
+        + _tensor_bytes(
+            prep.dt_bias.detach(),
+            prep.theta_bias.detach(),
+            cast(torch.Tensor, prep.theta_sign).detach(),
+        )
+        + _shape_bytes((cfg.batch, cfg.T, cfg.heads * cfg.P), dtype)
+        + _shape_bytes((cfg.batch, cfg.T, bc_groups, 4, cfg.N), dtype)
+        + _shape_bytes(
+            (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
+            dtype,
+        )
+        + _shape_bytes((cfg.heads, 4), torch.float32)
     )
     return KernelRunner(
         name="scanprep_bwd",
@@ -425,16 +601,19 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     )
 
 
-def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
+def _build_v2x2ssd_forward_runners(
+    cfg: V2KernelPerfConfig,
+) -> dict[str, KernelRunner]:
     _seed_all(cfg.seed)
-    tensors = make_inputs(cfg)
+    bc_groups, _ = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    tensors = _build_grouped_v2_inputs(cfg)
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
-    B = tensors["B"]
-    C = tensors["C"]
+    B = tensors["B_grouped"]
+    C = tensors["C_grouped"]
     initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
-    B_prev = tensors["B_prev"]
+    B_prev = tensors["B_prev_grouped"]
     U_prev = tensors["U_prev"]
 
     n_chunks = _n_chunks(cfg.T, cfg.chunk_size)
@@ -487,9 +666,11 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
     out_chunk = prepared_scan.outputs.output_chunk
 
     bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
-    bytes_bc = _shape_bytes((cfg.batch, cfg.heads, T_pad, D), tc_dtype)
+    bytes_bc = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
     bytes_m = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
     bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
+    bytes_u_prev = _shape_bytes((cfg.batch, cfg.heads, cfg.P), tc_dtype)
+    bytes_b_prev = _shape_bytes((cfg.batch, bc_groups, D), tc_dtype)
 
     return {
         "chunk_increment_fwd": KernelRunner(
@@ -499,7 +680,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 + bytes_bc
                 + bytes_m
                 + bytes_k
-                + _tensor_bytes(U_prev, B_prev, inc_chunk, chunk_multiplier_storage)
+                + bytes_u_prev
+                + bytes_b_prev
+                + _tensor_bytes(inc_chunk, chunk_multiplier_storage)
             ),
             launch=lambda prepared=prepared_increment: cast(
                 Callable[..., None], prepared.compiled
@@ -528,7 +711,9 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
                 + bytes_bc
                 + bytes_m
                 + bytes_k
-                + _tensor_bytes(chunk_starts, U_prev, B_prev, out_chunk)
+                + bytes_u_prev
+                + bytes_b_prev
+                + _tensor_bytes(chunk_starts, out_chunk)
             ),
             launch=lambda prepared=prepared_scan: cast(
                 Callable[..., None], prepared.compiled
@@ -539,15 +724,21 @@ def _build_v2x2ssd_forward_runners(cfg: PerfConfig) -> dict[str, KernelRunner]:
 
 
 def _build_v2x2ssd_chunk_increment_bwd_runners(
-    cfg: PerfConfig,
+    cfg: V2KernelPerfConfig,
 ) -> dict[str, KernelRunner]:
     _seed_all(cfg.seed)
-    tensors = make_inputs(cfg)
+    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    tensors = _build_grouped_v2_inputs(cfg)
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
-    B = tensors["B"]
-    B_prev = tensors["B_prev"]
+    B_grouped = tensors["B_grouped"]
+    B = _materialize_grouped_rows(B_grouped, heads_per_group=heads_per_group)
+    B_prev_grouped = tensors["B_prev_grouped"]
+    B_prev = _materialize_grouped_rows(
+        B_prev_grouped,
+        heads_per_group=heads_per_group,
+    )
     U_prev = tensors["U_prev"]
 
     inc, m_chunk = chunk_increment_cute(
@@ -654,11 +845,11 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
     n_chunks = _n_chunks(cfg.T, cfg.chunk_size)
     tc_dtype = _tc_input_dtype(cfg.dtype)
     bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
-    bytes_b = _shape_bytes((cfg.batch, cfg.heads, T_pad, D), tc_dtype)
+    bytes_b = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
     bytes_m = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
     bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
     bytes_d_inc = _shape_bytes(tuple(int(dim) for dim in d_inc.shape), tc_dtype)
-    bytes_prev_b = _shape_bytes((cfg.batch, cfg.heads, n_chunks, D), tc_dtype)
+    bytes_prev_b = _shape_bytes((cfg.batch, bc_groups, n_chunks, D), tc_dtype)
     bytes_prev_u = _shape_bytes((cfg.batch, cfg.heads, n_chunks, cfg.P), tc_dtype)
     bytes_kprev = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
 
@@ -674,7 +865,8 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_inc
-            + _tensor_bytes(dB, dMsum_part),
+            + bytes_b
+            + _tensor_bytes(dMsum_part),
             launch=launchers["chunk_increment_bwd_db"],
             prepare=_noop,
         ),
@@ -695,7 +887,8 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
             + bytes_prev_b
             + bytes_prev_u
             + bytes_kprev
-            + _tensor_bytes(dU_prev, dB_prev, dMp0),
+            + _tensor_bytes(dU_prev, dMp0)
+            + _shape_bytes((cfg.batch, bc_groups, D), tc_dtype),
             launch=launchers["chunk_increment_bwd_boundary"],
             prepare=_noop,
         ),
@@ -711,16 +904,23 @@ def _build_v2x2ssd_chunk_increment_bwd_runners(
 
 
 def _build_v2x2ssd_state_passing_bwd_runners(
-    cfg: PerfConfig,
+    cfg: V2KernelPerfConfig,
 ) -> dict[str, KernelRunner]:
     _seed_all(cfg.seed)
-    tensors = make_inputs(cfg)
+    _, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    tensors = _build_grouped_v2_inputs(cfg)
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
-    B = tensors["B"]
+    B = _materialize_grouped_rows(
+        tensors["B_grouped"],
+        heads_per_group=heads_per_group,
+    )
     initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
-    B_prev = tensors["B_prev"]
+    B_prev = _materialize_grouped_rows(
+        tensors["B_prev_grouped"],
+        heads_per_group=heads_per_group,
+    )
     U_prev = tensors["U_prev"]
 
     inc, m_chunk = chunk_increment_cute(
@@ -786,17 +986,27 @@ def _build_v2x2ssd_state_passing_bwd_runners(
 
 
 def _build_v2x2ssd_chunk_scan_bwd_runners(
-    cfg: PerfConfig,
+    cfg: V2KernelPerfConfig,
 ) -> dict[str, KernelRunner]:
     _seed_all(cfg.seed)
-    tensors = make_inputs(cfg)
+    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    tensors = _build_grouped_v2_inputs(cfg)
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
-    B = tensors["B"]
-    C = tensors["C"]
+    B = _materialize_grouped_rows(
+        tensors["B_grouped"],
+        heads_per_group=heads_per_group,
+    )
+    C = _materialize_grouped_rows(
+        tensors["C_grouped"],
+        heads_per_group=heads_per_group,
+    )
     initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
-    B_prev = tensors["B_prev"]
+    B_prev = _materialize_grouped_rows(
+        tensors["B_prev_grouped"],
+        heads_per_group=heads_per_group,
+    )
     U_prev = tensors["U_prev"]
 
     inc, m_chunk = chunk_increment_cute(
@@ -851,10 +1061,12 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
     D = B.shape[-1]
     tc_dtype = _tc_input_dtype(cfg.dtype)
     bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
-    bytes_b = _shape_bytes((cfg.batch, cfg.heads, T_pad, D), tc_dtype)
+    bytes_b = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
     bytes_m = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
     bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
     bytes_d_out = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
+    bytes_u_prev = _shape_bytes((cfg.batch, cfg.heads, cfg.P), tc_dtype)
+    bytes_b_prev = _shape_bytes((cfg.batch, bc_groups, D), tc_dtype)
     bytes_dphase = _shape_bytes(
         (2, cfg.chunk_size, cfg.batch * cfg.heads * _n_chunks(cfg.T, cfg.chunk_size)),
         torch.float32,
@@ -883,16 +1095,24 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
+            + bytes_u_prev
+            + bytes_b_prev
             + _tensor_bytes(
-                U_prev,
-                B_prev,
                 outputs.value_grad_chunk,
-                outputs.key_grad_chunk,
                 outputs.value_boundary_grad,
-                outputs.key_boundary_grad,
                 outputs.logprefix_grad,
                 outputs.transition_grad,
                 outputs.transition_grad,
+            )
+            + _scaled_tensor_bytes(
+                outputs.key_grad_chunk,
+                bc_groups=bc_groups,
+                heads=cfg.heads,
+            )
+            + _scaled_tensor_bytes(
+                outputs.key_boundary_grad,
+                bc_groups=bc_groups,
+                heads=cfg.heads,
             ),
             launch=launchers["chunk_scan_bwd_du"],
             prepare=_noop,
@@ -905,16 +1125,24 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
+            + bytes_u_prev
+            + bytes_b_prev
             + _tensor_bytes(
-                U_prev,
-                B_prev,
                 outputs.value_grad_chunk,
-                outputs.key_grad_chunk,
                 outputs.value_boundary_grad,
-                outputs.key_boundary_grad,
                 outputs.logprefix_grad,
                 outputs.transition_grad,
                 outputs.transition_grad,
+            )
+            + _scaled_tensor_bytes(
+                outputs.key_grad_chunk,
+                bc_groups=bc_groups,
+                heads=cfg.heads,
+            )
+            + _scaled_tensor_bytes(
+                outputs.key_boundary_grad,
+                bc_groups=bc_groups,
+                heads=cfg.heads,
             ),
             launch=launchers["chunk_scan_bwd_db"],
             prepare=_noop,
@@ -927,13 +1155,17 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
+            + bytes_u_prev
+            + bytes_b_prev
             + _tensor_bytes(
-                U_prev,
-                B_prev,
                 chunk_starts,
-                outputs.query_grad_chunk,
                 outputs.logprefix_grad,
                 outputs.rotation_grad,
+            )
+            + _scaled_tensor_bytes(
+                outputs.query_grad_chunk,
+                bc_groups=bc_groups,
+                heads=cfg.heads,
             )
             + bytes_dphase,
             launch=launchers["chunk_scan_bwd_dcdr"],
@@ -947,7 +1179,9 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
             + bytes_m
             + bytes_k
             + bytes_d_out
-            + _tensor_bytes(U_prev, B_prev, outputs.logprefix_grad),
+            + bytes_u_prev
+            + bytes_b_prev
+            + _tensor_bytes(outputs.logprefix_grad),
             launch=launchers["chunk_scan_bwd_dlp"],
             prepare=_noop,
         ),
@@ -974,17 +1208,18 @@ def _build_v2x2ssd_chunk_scan_bwd_runners(
 
 def build_kernel_runners(
     *,
-    v2_cfg: PerfConfig | None = None,
+    v2_cfg: V2KernelPerfConfig | None = None,
     scanprep_cfg: ScanPrepPerfConfig | None = None,
 ) -> list[KernelRunner]:
     if v2_cfg is None:
-        v2_cfg = PerfConfig(
+        v2_cfg = V2KernelPerfConfig(
             batch=DEFAULT_V2_BATCH,
             heads=DEFAULT_V2_HEADS,
             T=DEFAULT_V2_T,
             N=DEFAULT_V2_N,
             P=DEFAULT_V2_P,
             chunk_size=DEFAULT_V2_CHUNK,
+            bc_groups=DEFAULT_V2_BC_GROUPS,
             dtype=DEFAULT_V2_DTYPE,
             device="cuda",
             seed=0,
@@ -1009,17 +1244,18 @@ def build_kernel_runners(
 def build_kernel_runner(
     name: str,
     *,
-    v2_cfg: PerfConfig | None = None,
+    v2_cfg: V2KernelPerfConfig | None = None,
     scanprep_cfg: ScanPrepPerfConfig | None = None,
 ) -> KernelRunner:
     if v2_cfg is None:
-        v2_cfg = PerfConfig(
+        v2_cfg = V2KernelPerfConfig(
             batch=DEFAULT_V2_BATCH,
             heads=DEFAULT_V2_HEADS,
             T=DEFAULT_V2_T,
             N=DEFAULT_V2_N,
             P=DEFAULT_V2_P,
             chunk_size=DEFAULT_V2_CHUNK,
+            bc_groups=DEFAULT_V2_BC_GROUPS,
             dtype=DEFAULT_V2_DTYPE,
             device="cuda",
             seed=0,

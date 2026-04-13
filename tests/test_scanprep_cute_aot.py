@@ -17,6 +17,7 @@ def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
 
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert all(spec.bc_groups == spec.heads for spec in specs)
     assert {spec.store_coeff_aux for spec in specs} == {False, True}
     assert {spec.value_dtype_name for spec in specs} == {"float16", "bfloat16"}
     assert len(specs) == 2 * 2 * 2
@@ -27,8 +28,38 @@ def test_default_backward_aot_specs_expand_requested_arch_tags() -> None:
 
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert all(spec.bc_groups == spec.heads for spec in specs)
     assert {spec.bc_dtype_name for spec in specs} == {"float16", "bfloat16"}
     assert len(specs) == 2 * 2
+
+
+def test_scanprep_aot_record_load_defaults_bc_groups_to_heads() -> None:
+    record = {
+        "arch_tag": "sm_80",
+        "heads": 8,
+        "d_head": 64,
+        "d_state": 128,
+        "value_dtype_name": "float16",
+        "params_dtype_name": "float16",
+        "bc_dtype_name": "float16",
+        "bias_dtype_name": "float16",
+        "store_coeff_aux": False,
+        "config": scanprep_aot_mod._DEFAULT_SCANPREP_CONFIG_KWARGS,
+    }
+
+    fwd = scanprep_aot_mod._forward_spec_from_record(record)
+    assert fwd.bc_groups == fwd.heads == 8
+    assert "_g8_" in fwd.module_id
+
+    bwd = scanprep_aot_mod._backward_spec_from_record(
+        {
+            **record,
+            "value_grad_dtype_name": "float16",
+            "params_grad_dtype_name": "float16",
+        }
+    )
+    assert bwd.bc_groups == bwd.heads == 8
+    assert "_g8_" in bwd.module_id
 
 
 def test_build_default_forward_aot_package_only_exports_forward_specs(

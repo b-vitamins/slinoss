@@ -99,6 +99,7 @@ class ForwardCompileArtifacts:
 class ForwardInputInfo:
     batch_size: int
     heads: int
+    bc_groups: int
     time_steps: int
     P: int
     D: int
@@ -236,12 +237,23 @@ def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
         seen.add(ident)
 
 
+def _resolve_heads_per_group(*, heads: int, bc_groups: int, name: str) -> int:
+    if bc_groups <= 0:
+        raise ValueError(f"{name} must have a positive group dimension.")
+    if heads % bc_groups != 0:
+        raise ValueError(
+            f"{name} group dimension must divide heads. Got heads={heads}, groups={bc_groups}."
+        )
+    return heads // bc_groups
+
+
 def _get_zero_prev_tensors(
     *,
     device: torch.device,
     dtype: torch.dtype,
     batch_size: int,
     heads: int,
+    bc_groups: int,
     P: int,
     D: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -251,6 +263,7 @@ def _get_zero_prev_tensors(
         dtype,
         int(batch_size),
         int(heads),
+        int(bc_groups),
         int(P),
         int(D),
     )
@@ -259,7 +272,7 @@ def _get_zero_prev_tensors(
         note_cache_event("cute.v2x2ssd.fwd.zero_prev", hit=False)
         cached = (
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
-            torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
+            torch.zeros((batch_size, bc_groups, D), device=device, dtype=dtype),
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     else:
@@ -658,8 +671,11 @@ def _chunk_increment_tensor_specs(
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
 ]:
-    batch_size, heads, padded_time, P, D, n_chunks, _chunk_size = problem_shape
+    batch_size, heads, padded_time, P, D, n_chunks, _chunk_size, bc_groups = (
+        problem_shape
+    )
     batch_head_count = batch_size * heads
+    batch_group_count = batch_size * bc_groups
     batch_head_chunk_count = batch_head_count * n_chunks
     return (
         _make_tensor_spec(
@@ -667,7 +683,7 @@ def _chunk_increment_tensor_specs(
             stride=(1, P, padded_time * P),
         ),
         _make_tensor_spec(
-            (D, padded_time, batch_head_count),
+            (D, padded_time, batch_group_count),
             stride=(1, D, padded_time * D),
         ),
         _make_tensor_spec(
@@ -679,7 +695,7 @@ def _chunk_increment_tensor_specs(
             stride=(1, 4, padded_time * 4),
         ),
         _make_tensor_spec((P, batch_head_count), stride=(1, P)),
-        _make_tensor_spec((D, batch_head_count), stride=(1, D)),
+        _make_tensor_spec((D, batch_group_count), stride=(1, D)),
         _make_tensor_spec((P, D, batch_head_chunk_count), stride=(D, 1, P * D)),
         _make_tensor_spec((2, batch_head_chunk_count), stride=(1, 2)),
     )
@@ -694,6 +710,7 @@ def _resolve_chunk_increment_problem_shape(
 ) -> tuple[int, ...]:
     batch_size, heads, _time_steps, P = map(int, U.shape)
     D = int(B.shape[-1])
+    bc_groups = int(B.shape[1])
     resolved_chunk_size = int(chunk_size)
     n_chunks = int(padded_time) // resolved_chunk_size
     return (
@@ -704,6 +721,7 @@ def _resolve_chunk_increment_problem_shape(
         D,
         n_chunks,
         resolved_chunk_size,
+        bc_groups,
     )
 
 
@@ -890,17 +908,21 @@ def _chunk_scan_tensor_specs(
     tuple[tuple[int, ...], tuple[int, ...]],
     tuple[tuple[int, ...], tuple[int, ...]],
 ]:
-    batch_size, heads, _padded_time, P, D, n_chunks, chunk_size = problem_shape
+    batch_size, heads, _padded_time, P, D, n_chunks, chunk_size, bc_groups = (
+        problem_shape
+    )
     batch_head_count = batch_size * heads
+    batch_group_count = batch_size * bc_groups
     batch_head_chunk_count = batch_head_count * n_chunks
+    batch_group_chunk_count = batch_group_count * n_chunks
     return (
         _make_tensor_spec((batch_head_chunk_count, chunk_size, 1, P)),
-        _make_tensor_spec((batch_head_chunk_count, chunk_size, 1, D)),
+        _make_tensor_spec((batch_group_chunk_count, chunk_size, 1, D)),
         _make_tensor_spec((batch_head_chunk_count, chunk_size, 2)),
         _make_tensor_spec((batch_head_chunk_count, chunk_size, 2, 2)),
         _make_tensor_spec((batch_head_chunk_count, P, 1, D)),
         _make_tensor_spec((batch_head_count, P)),
-        _make_tensor_spec((batch_head_count, D)),
+        _make_tensor_spec((batch_group_count, D)),
         _make_tensor_spec((batch_head_chunk_count, chunk_size, 1, P)),
     )
 
@@ -1285,8 +1307,10 @@ def _validate_chunk_increment_inputs(
 
     batch_size, heads, time_steps, P = map(int, U.shape)
     D = int(B.shape[-1])
-    if B.shape != (batch_size, heads, time_steps, D):
-        raise ValueError("B must be (B,H,T,D) matching U.")
+    bc_groups = int(B.shape[1])
+    _resolve_heads_per_group(heads=heads, bc_groups=bc_groups, name="B")
+    if B.shape != (batch_size, bc_groups, time_steps, D):
+        raise ValueError("B must be (B,G,T,D) matching U on batch/time/width.")
     if M.shape != (batch_size, heads, time_steps, 2):
         raise ValueError(f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}.")
     if K.shape != (batch_size, heads, time_steps, 2, 2):
@@ -1296,9 +1320,10 @@ def _validate_chunk_increment_inputs(
     if D % 2 != 0:
         raise ValueError("B last dim must be divisible by 2.")
     if U_prev is not None and (
-        U_prev.shape != (batch_size, heads, P) or B_prev.shape != (batch_size, heads, D)
+        U_prev.shape != (batch_size, heads, P)
+        or B_prev.shape != (batch_size, bc_groups, D)
     ):
-        raise ValueError("U_prev/B_prev must be (B,H,P)/(B,H,D).")
+        raise ValueError("U_prev/B_prev must be (B,H,P)/(B,G,D).")
     return batch_size, heads, time_steps, P, D
 
 
@@ -1366,13 +1391,15 @@ def _validate_chunk_scan_inputs(
 
     batch_size, heads, time_steps, P = map(int, U.shape)
     D = int(B.shape[-1])
-    if B.shape != (batch_size, heads, time_steps, D) or C.shape != (
+    bc_groups = int(B.shape[1])
+    _resolve_heads_per_group(heads=heads, bc_groups=bc_groups, name="B/C")
+    if B.shape != (batch_size, bc_groups, time_steps, D) or C.shape != (
         batch_size,
-        heads,
+        bc_groups,
         time_steps,
         D,
     ):
-        raise ValueError("B/C must be (B,H,T,D) matching U.")
+        raise ValueError("B/C must be grouped as (B,G,T,D) and match each other.")
     if M.shape != (batch_size, heads, time_steps, 2):
         raise ValueError(f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}.")
     if K.shape != (batch_size, heads, time_steps, 2, 2):
@@ -1391,9 +1418,10 @@ def _validate_chunk_scan_inputs(
             f"chunk_starts must be (B,H,C,P,D) ={(batch_size, heads, n_chunks, P, D)}."
         )
     if B_prev is not None and (
-        B_prev.shape != (batch_size, heads, D) or U_prev.shape != (batch_size, heads, P)
+        B_prev.shape != (batch_size, bc_groups, D)
+        or U_prev.shape != (batch_size, heads, P)
     ):
-        raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+        raise ValueError("B_prev/U_prev must be (B,G,D)/(B,H,P).")
     return batch_size, heads, time_steps, P, D, n_chunks
 
 
@@ -1402,7 +1430,9 @@ def _make_chunk_scan_host_wrapper(
     problem_shape: tuple[int, ...],
     launch_cfg: tuple[int, ...],
 ):
-    batch_size, heads, padded_time, P, D, n_chunks, chunk_size = problem_shape
+    batch_size, heads, padded_time, P, D, n_chunks, chunk_size, bc_groups = (
+        problem_shape
+    )
     m_block_size, n_block_size, num_threads = launch_cfg
 
     @cute.jit
@@ -1420,7 +1450,7 @@ def _make_chunk_scan_host_wrapper(
     ):
         u_spec, b_spec, m_spec, k_spec, z0_spec, u_prev_spec, b_prev_spec, out_spec = (
             _chunk_scan_tensor_specs(
-                (batch_size, heads, padded_time, P, D, n_chunks, chunk_size)
+                (batch_size, heads, padded_time, P, D, n_chunks, chunk_size, bc_groups)
             )
         )
         mU = _make_static_tensor_spec_view(U_t, u_spec)
@@ -1470,6 +1500,7 @@ def _make_chunk_scan_runtime_artifacts(
     output_chunk: torch.Tensor,
     batch_size: int,
     heads: int,
+    bc_groups: int,
     padded_time: int,
     P: int,
     D: int,
@@ -1483,7 +1514,16 @@ def _make_chunk_scan_runtime_artifacts(
     resolved_num_threads: int,
     has_prev: bool,
 ) -> ChunkScanRuntimeArtifacts:
-    problem_shape = (batch_size, heads, padded_time, P, D, n_chunks, chunk_size)
+    problem_shape = (
+        batch_size,
+        heads,
+        padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        bc_groups,
+    )
     (
         u_spec,
         b_spec,
@@ -1557,6 +1597,7 @@ def _make_chunk_scan_compile_artifacts(
 ) -> ChunkScanCompileArtifacts:
     batch_size, heads, time_steps, P = map(int, U.shape)
     D = int(B.shape[-1])
+    bc_groups = int(B.shape[1])
     resolved_chunk_size = int(chunk_size)
     n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
     padded_time = n_chunks * resolved_chunk_size
@@ -1582,6 +1623,7 @@ def _make_chunk_scan_compile_artifacts(
         D,
         n_chunks,
         resolved_chunk_size,
+        bc_groups,
     )
     (
         u_spec,
@@ -1641,7 +1683,9 @@ def _make_chunk_increment_host_wrapper(
     problem_shape: tuple[int, ...],
     config: ChunkIncrementConfig,
 ):
-    batch_size, heads, padded_time, P, D, n_chunks, chunk_size = problem_shape
+    batch_size, heads, padded_time, P, D, n_chunks, chunk_size, bc_groups = (
+        problem_shape
+    )
 
     @cute.jit
     def _chunk_increment_host_wrapper(
@@ -1665,7 +1709,7 @@ def _make_chunk_increment_host_wrapper(
             inc_spec,
             m_chunk_spec,
         ) = _chunk_increment_tensor_specs(
-            (batch_size, heads, padded_time, P, D, n_chunks, chunk_size)
+            (batch_size, heads, padded_time, P, D, n_chunks, chunk_size, bc_groups)
         )
         mU = _make_static_tensor_spec_view(U_t, u_spec)
         mB = _make_static_tensor_spec_view(B_t, b_spec)
@@ -1767,7 +1811,9 @@ def _make_v2x2ssd_fwd_host_wrapper(
     config_bundle: ForwardConfigBundle,
     launch_cfg: tuple[int, ...],
 ):
-    batch_size, heads, padded_time, P, D, n_chunks, chunk_size = problem_shape
+    batch_size, heads, padded_time, P, D, n_chunks, chunk_size, bc_groups = (
+        problem_shape
+    )
     (
         m_block_size,
         n_block_size,
@@ -2044,21 +2090,45 @@ def _reset_chunk_scan_outputs(outputs: ChunkScanOutputs) -> None:
     outputs.output_chunk.zero_()
 
 
+def _packaged_bc_groups_identity_for_problem_shape(
+    problem_shape: tuple[int, ...],
+) -> int | None:
+    if len(problem_shape) != 8:
+        raise ValueError(
+            "v2x2ssd forward packaged identity expects an 8D problem shape. "
+            f"Got {problem_shape}."
+        )
+    heads = int(problem_shape[1])
+    bc_groups = int(problem_shape[7])
+    if bc_groups <= 0:
+        raise ValueError("bc_groups must be positive.")
+    if heads % bc_groups != 0:
+        raise ValueError(
+            "Grouped BC packaged identity requires bc_groups to divide heads. "
+            f"Got heads={heads}, bc_groups={bc_groups}."
+        )
+    return None if bc_groups == heads else bc_groups
+
+
 def _matching_packaged_chunk_increment_specs(
     *,
     device_index: int,
     problem_shape: tuple[int, ...],
     tc_dtype: torch.dtype,
 ) -> tuple[object, ...]:
+    if len(problem_shape) != 8:
+        return ()
     from slinoss.ops.v2x2ssd.cute.aot import list_packaged_chunk_increment_aot_specs
 
     hardware = current_hardware_fingerprint(device_index=device_index)
+    bc_groups_identity = _packaged_bc_groups_identity_for_problem_shape(problem_shape)
     return tuple(
         spec
         for spec in list_packaged_chunk_increment_aot_specs(arch_tag=hardware.arch_tag)
         if spec.P == int(problem_shape[3])
         and spec.D == int(problem_shape[4])
         and spec.chunk_size == int(problem_shape[6])
+        and spec.bc_groups == bc_groups_identity
         and spec.tc_dtype_name == str(tc_dtype).replace("torch.", "")
     )
 
@@ -2088,15 +2158,19 @@ def _matching_packaged_chunk_scan_specs(
     tc_dtype: torch.dtype,
     output_dtype: torch.dtype,
 ) -> tuple[object, ...]:
+    if len(problem_shape) != 8:
+        return ()
     from slinoss.ops.v2x2ssd.cute.aot import list_packaged_chunk_scan_aot_specs
 
     hardware = current_hardware_fingerprint(device_index=device_index)
+    bc_groups_identity = _packaged_bc_groups_identity_for_problem_shape(problem_shape)
     matching_specs = []
     for spec in list_packaged_chunk_scan_aot_specs(arch_tag=hardware.arch_tag):
         if (
             spec.P != int(problem_shape[3])
             or spec.D != int(problem_shape[4])
             or spec.chunk_size != int(problem_shape[6])
+            or spec.bc_groups != bc_groups_identity
             or spec.tc_dtype_name != str(tc_dtype).replace("torch.", "")
             or spec.output_dtype_name != str(output_dtype).replace("torch.", "")
         ):
@@ -2199,6 +2273,7 @@ def tune_chunk_increment_cute(
             U_prev=U_prev,
             B_prev=B_prev,
         )
+        bc_groups = int(B.shape[1])
         n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
         padded_time = n_chunks * resolved_chunk_size
         U_tc = _pad_zero_time(U, T_pad=padded_time, dtype=tc_dtype)
@@ -2213,6 +2288,7 @@ def tune_chunk_increment_cute(
                 dtype=tc_dtype,
                 batch_size=batch_size,
                 heads=heads,
+                bc_groups=bc_groups,
                 P=P,
                 D=D,
             )
@@ -2503,6 +2579,7 @@ def tune_chunk_scan_cute(
         else torch.cuda.current_device()
     )
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    bc_groups = int(B.shape[1])
     problem_shape = (
         batch_size,
         heads,
@@ -2511,6 +2588,7 @@ def tune_chunk_scan_cute(
         D,
         n_chunks,
         resolved_chunk_size,
+        bc_groups,
     )
     hardware = current_hardware_fingerprint(device_index=device_index)
     problem_key = chunk_scan_problem_key(
@@ -2560,6 +2638,7 @@ def tune_chunk_scan_cute(
                 dtype=tc_dtype,
                 batch_size=batch_size,
                 heads=heads,
+                bc_groups=bc_groups,
                 P=P,
                 D=D,
             )
@@ -2598,6 +2677,7 @@ def tune_chunk_scan_cute(
                 output_chunk=outputs.output_chunk,
                 batch_size=batch_size,
                 heads=heads,
+                bc_groups=bc_groups,
                 padded_time=padded_time,
                 P=P,
                 D=D,
@@ -2933,6 +3013,7 @@ def _make_chunk_increment_prepared_launch(
     padded_time = n_chunks * resolved_chunk_size
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    bc_groups = int(B.shape[1])
     U_tc = _pad_zero_time(U, T_pad=padded_time, dtype=tc_dtype)
     B_tc = _pad_zero_time(B, T_pad=padded_time, dtype=tc_dtype)
     M_f = _pad_m_identity(M, T_pad=padded_time)
@@ -2946,6 +3027,7 @@ def _make_chunk_increment_prepared_launch(
             dtype=tc_dtype,
             batch_size=batch_size,
             heads=heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
         )
@@ -3256,6 +3338,7 @@ def _make_chunk_scan_prepared_launch(
     padded_time = n_chunks * resolved_chunk_size
     batch_head_count = batch_size * heads
     batch_head_chunk_count = batch_head_count * n_chunks
+    bc_groups = int(B.shape[1])
     device_index = (
         int(U.device.index)
         if U.device.index is not None
@@ -3293,6 +3376,7 @@ def _make_chunk_scan_prepared_launch(
             dtype=tc_dtype,
             batch_size=batch_size,
             heads=heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
         )
@@ -3321,6 +3405,7 @@ def _make_chunk_scan_prepared_launch(
         output_chunk=out_chunk,
         batch_size=batch_size,
         heads=heads,
+        bc_groups=bc_groups,
         padded_time=padded_time,
         P=P,
         D=D,
@@ -3433,14 +3518,16 @@ def _make_forward_input_info(
 
     batch_size, heads, time_steps, P = map(int, U.shape)
     D = int(B.shape[-1])
+    bc_groups = int(B.shape[1])
     if validate_runtime_contract:
-        if B.shape != (batch_size, heads, time_steps, D) or C.shape != (
+        _resolve_heads_per_group(heads=heads, bc_groups=bc_groups, name="B/C")
+        if B.shape != (batch_size, bc_groups, time_steps, D) or C.shape != (
             batch_size,
-            heads,
+            bc_groups,
             time_steps,
             D,
         ):
-            raise ValueError("B/C must be (B,H,T,D) matching U.")
+            raise ValueError("B/C must be grouped as (B,G,T,D) and match each other.")
         if M.shape != (batch_size, heads, time_steps, 2):
             raise ValueError(
                 f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}."
@@ -3465,12 +3552,14 @@ def _make_forward_input_info(
                 U_prev
             ):
                 raise TypeError("B_prev and U_prev must be floating-point.")
-            if tuple(B_prev.shape) != (batch_size, heads, D) or tuple(U_prev.shape) != (
+            if tuple(B_prev.shape) != (batch_size, bc_groups, D) or tuple(
+                U_prev.shape
+            ) != (
                 batch_size,
                 heads,
                 P,
             ):
-                raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+                raise ValueError("B_prev/U_prev must be (B,G,D)/(B,H,P).")
             if B_prev.device != U.device or U_prev.device != U.device:
                 raise ValueError("B_prev and U_prev must be on the same device as U.")
 
@@ -3501,6 +3590,7 @@ def _make_forward_input_info(
     return ForwardInputInfo(
         batch_size=batch_size,
         heads=heads,
+        bc_groups=bc_groups,
         time_steps=time_steps,
         P=P,
         D=D,
@@ -3580,6 +3670,7 @@ def _make_forward_runtime_artifacts(
     )
     batch_size = input_info.batch_size
     heads = input_info.heads
+    bc_groups = input_info.bc_groups
     time_steps = input_info.time_steps
     P = input_info.P
     D = input_info.D
@@ -3626,7 +3717,7 @@ def _make_forward_runtime_artifacts(
     else:
         U_tc, M_f, K_f, B_tc, C_tc = prepared_inputs
         expected_u_shape = (batch_size, heads, padded_time, P)
-        expected_b_shape = (batch_size, heads, padded_time, D)
+        expected_b_shape = (batch_size, bc_groups, padded_time, D)
         expected_m_shape = (batch_size, heads, padded_time, 2)
         expected_k_shape = (batch_size, heads, padded_time, 2, 2)
         if (
@@ -3666,6 +3757,7 @@ def _make_forward_runtime_artifacts(
             dtype=tc_dtype,
             batch_size=batch_size,
             heads=heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
         )
@@ -3767,13 +3859,13 @@ def _make_forward_runtime_artifacts(
     U_scan = _guard_prev_time_base(U_tc, min_align=16)
     B_scan = _guard_prev_time_base(B_tc, min_align=16)
     chunk_increment_spec = _chunk_increment_tensor_specs(
-        (batch_size, heads, padded_time, P, D, n_chunks, resolved_chunk_size)
+        (batch_size, heads, padded_time, P, D, n_chunks, resolved_chunk_size, bc_groups)
     )
     state_passing_spec = _state_passing_tensor_specs(
         (batch_size, heads, n_chunks, P, D)
     )
     chunk_scan_spec = _chunk_scan_tensor_specs(
-        (batch_size, heads, padded_time, P, D, n_chunks, resolved_chunk_size)
+        (batch_size, heads, padded_time, P, D, n_chunks, resolved_chunk_size, bc_groups)
     )
     (
         u_increment_spec,
@@ -3834,6 +3926,7 @@ def _make_forward_runtime_artifacts(
         D,
         n_chunks,
         resolved_chunk_size,
+        bc_groups,
     )
     launch_cfg = (
         resolved_m_block,
@@ -3920,6 +4013,7 @@ def _make_forward_compile_artifacts(
     )
     batch_size = input_info.batch_size
     heads = input_info.heads
+    bc_groups = input_info.bc_groups
     P = input_info.P
     D = input_info.D
     resolved_chunk_size = input_info.chunk_size
@@ -3977,6 +4071,7 @@ def _make_forward_compile_artifacts(
         D,
         n_chunks,
         resolved_chunk_size,
+        bc_groups,
     )
     launch_cfg = (
         input_info.resolved_m_block,
@@ -4126,11 +4221,15 @@ def _get_compiled_v2x2ssd_fwd_kernel(
         note_cache_event("cute.v2x2ssd.fwd.host_compile", hit=True)
         return compiled
 
+    packaged = None
     forward_aot_spec = ForwardAOTSpec(
         arch_tag=current_hardware_fingerprint(device_index=device_index).arch_tag,
         P=int(compile_artifacts.problem_shape[3]),
         D=int(compile_artifacts.problem_shape[4]),
         chunk_size=int(compile_artifacts.problem_shape[6]),
+        bc_groups=_packaged_bc_groups_identity_for_problem_shape(
+            compile_artifacts.problem_shape
+        ),
         tc_dtype_name={
             torch.float16: "float16",
             torch.bfloat16: "bfloat16",
@@ -4173,12 +4272,15 @@ def _matching_packaged_forward_aot_specs(
     output_dtype: torch.dtype,
     has_init: bool,
 ) -> tuple[object, ...]:
+    if len(problem_shape) != 8:
+        return ()
     from slinoss.ops.v2x2ssd.cute.aot import list_packaged_forward_aot_specs
 
     hardware = current_hardware_fingerprint(device_index=device_index)
     P = int(problem_shape[3])
     D = int(problem_shape[4])
     chunk_size = int(problem_shape[6])
+    bc_groups_identity = _packaged_bc_groups_identity_for_problem_shape(problem_shape)
     tc_dtype_name = str(tc_dtype).replace("torch.", "")
     output_dtype_name = str(output_dtype).replace("torch.", "")
     return tuple(
@@ -4187,6 +4289,7 @@ def _matching_packaged_forward_aot_specs(
         if spec.P == P
         and spec.D == D
         and spec.chunk_size == chunk_size
+        and spec.bc_groups == bc_groups_identity
         and spec.tc_dtype_name == tc_dtype_name
         and spec.output_dtype_name == output_dtype_name
         and spec.has_init == has_init
@@ -4334,6 +4437,7 @@ def _resolve_forward_autotune_bundle(
             input_info.D,
             input_info.n_chunks,
             input_info.chunk_size,
+            input_info.bc_groups,
         ),
         tc_dtype=input_info.tc_dtype,
         output_dtype=output_dtype,

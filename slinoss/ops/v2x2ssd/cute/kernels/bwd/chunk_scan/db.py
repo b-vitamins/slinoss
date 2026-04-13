@@ -97,12 +97,37 @@ class ChunkScanBwdDBAmpere:
         dict[tuple[object, ...], ChunkScanBwdDBSupportInfo]
     ] = {}
 
-    def __init__(self, dtype, *, chunk_size, D, P, num_threads=128):
+    def __init__(
+        self,
+        dtype,
+        *,
+        chunk_size,
+        D,
+        P,
+        num_threads=128,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+    ):
         self.ab_dtype = dtype
         self.acc_dtype = cutlass.Float32
         self.L = int(chunk_size)
         self.D = int(D)
         self.P = int(P)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.heads_per_bc_group = 0
         self.kv_tile = 32
         if self.L % self.kv_tile != 0:
             raise ValueError("chunk_size must be a multiple of 32.")
@@ -122,6 +147,24 @@ class ChunkScanBwdDBAmpere:
         if self.D % 2 != 0:
             raise ValueError("D must be divisible by 2 (flattened 2N).")
         self.mma_inst_shape = (16, 8, 16)
+
+    @cute.jit
+    def _batch_group(self, batch_head: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        return batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+
+    @cute.jit
+    def _batch_group_chunk(self, batch_head_chunk: int, n_chunks: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk
+        batch_head = batch_head_chunk // n_chunks
+        chunk_index = batch_head_chunk - batch_head * n_chunks
+        batch_group = self._batch_group(batch_head)
+        return batch_group * n_chunks + chunk_index
 
     @property
     def num_warps(self) -> int:
@@ -553,19 +596,19 @@ class ChunkScanBwdDBAmpere:
         coord_query: cute.Tensor,
         t_query_smem: cute.Tensor,
         *,
-        batch_head_chunk: int,
+        batch_group_chunk: int,
         m_tile_index: int,
         d_stage_index: int,
         stage_width: int,
     ):
         g_query_stage = cute.local_tile(
-            m_query[batch_head_chunk, None, 0, None],
+            m_query[batch_group_chunk, None, 0, None],
             (self.kv_tile, stage_width),
             (m_tile_index, d_stage_index),
         )
         t_query_gmem = gmem_thr_copy_d.partition_S(g_query_stage)
         c_query_stage = cute.local_tile(
-            coord_query[batch_head_chunk, None, 0, None],
+            coord_query[batch_group_chunk, None, 0, None],
             (self.kv_tile, stage_width),
             (m_tile_index, d_stage_index),
         )
@@ -1173,8 +1216,8 @@ class ChunkScanBwdDBAmpere:
         s_dm_curr: cute.Tensor,
         s_dm_prev: cute.Tensor,
         *,
-        batch_head_chunk: int,
-        batch_head: int,
+        batch_group_chunk: int,
+        batch_group: int,
         chunk_index: int,
         n_tile_start: int,
         d_col_base: int,
@@ -1208,10 +1251,10 @@ class ChunkScanBwdDBAmpere:
                         )
                         gx_curr, gy_curr = conj_mul_phase(bxr_curr, bxi_curr, pr, pi)
                         br_curr = cutlass.Float32(
-                            mB[batch_head_chunk, row, 0, d + 0].to(cutlass.Float32)
+                            mB[batch_group_chunk, row, 0, d + 0].to(cutlass.Float32)
                         )
                         bi_curr = cutlass.Float32(
-                            mB[batch_head_chunk, row, 0, d + 1].to(cutlass.Float32)
+                            mB[batch_group_chunk, row, 0, d + 1].to(cutlass.Float32)
                         )
                         dmy_curr_re = (
                             dmy_curr_re + gx_curr * br_curr - gy_curr * bi_curr
@@ -1232,25 +1275,25 @@ class ChunkScanBwdDBAmpere:
                         if row > cutlass.Int32(0):
                             br_prev = cutlass.Float32(
                                 mB[
-                                    batch_head_chunk, row - cutlass.Int32(1), 0, d + 0
+                                    batch_group_chunk, row - cutlass.Int32(1), 0, d + 0
                                 ].to(cutlass.Float32)
                             )
                             bi_prev = cutlass.Float32(
                                 mB[
-                                    batch_head_chunk, row - cutlass.Int32(1), 0, d + 1
+                                    batch_group_chunk, row - cutlass.Int32(1), 0, d + 1
                                 ].to(cutlass.Float32)
                             )
                         elif chunk_index == cutlass.Int32(0):
                             br_prev = cutlass.Float32(
-                                mB_prev0[batch_head, d + 0].to(cutlass.Float32)
+                                mB_prev0[batch_group, d + 0].to(cutlass.Float32)
                             )
                             bi_prev = cutlass.Float32(
-                                mB_prev0[batch_head, d + 1].to(cutlass.Float32)
+                                mB_prev0[batch_group, d + 1].to(cutlass.Float32)
                             )
                         else:
                             br_prev = cutlass.Float32(
                                 mB[
-                                    batch_head_chunk - cutlass.Int32(1),
+                                    batch_group_chunk - cutlass.Int32(1),
                                     cutlass.Int32(self.L - 1),
                                     0,
                                     d + 0,
@@ -1258,7 +1301,7 @@ class ChunkScanBwdDBAmpere:
                             )
                             bi_prev = cutlass.Float32(
                                 mB[
-                                    batch_head_chunk - cutlass.Int32(1),
+                                    batch_group_chunk - cutlass.Int32(1),
                                     cutlass.Int32(self.L - 1),
                                     0,
                                     d + 1,
@@ -1605,7 +1648,7 @@ class ChunkScanBwdDBAmpere:
         bundle = self._make_kernel_bundle(mU.element_type)
         layouts = bundle.layouts
         copies = bundle.copies
-        grid_dim = (1, 1, cute.size(mB.shape[0]))
+        grid_dim = (1, 1, cute.size(mU.shape[0]))
         launch_kwargs = {
             "grid": grid_dim,
             "block": [self.num_threads, 1, 1],
@@ -1789,9 +1832,11 @@ class ChunkScanBwdDBAmpere:
         p_tile = 32
         num_p_tiles = p_padded // p_tile
         num_batch_heads = mU_prev0.shape[0]
-        num_batch_head_chunks = mB.shape[0]
+        num_batch_head_chunks = mU.shape[0]
         num_chunks = num_batch_head_chunks // num_batch_heads
         batch_head = batch_head_chunk // num_chunks
+        batch_group = self._batch_group(batch_head)
+        batch_group_chunk = self._batch_group_chunk(batch_head_chunk, num_chunks)
         chunk_index = batch_head_chunk - batch_head * num_chunks
         kv_tile = int(self.kv_tile)
         num_n_tiles = int(self.L // kv_tile)
@@ -1989,7 +2034,7 @@ class ChunkScanBwdDBAmpere:
                         mC,
                         coord_query,
                         t_query_smem,
-                        batch_head_chunk=batch_head_chunk,
+                        batch_group_chunk=batch_group_chunk,
                         m_tile_index=m_tile_index,
                         d_stage_index=d_stage_index,
                         stage_width=d_stage_width,
@@ -2157,8 +2202,8 @@ class ChunkScanBwdDBAmpere:
                     mB_prev0,
                     s_dm_curr,
                     s_dm_prev,
-                    batch_head_chunk=batch_head_chunk,
-                    batch_head=batch_head,
+                    batch_group_chunk=batch_group_chunk,
+                    batch_group=batch_group,
                     chunk_index=chunk_index,
                     n_tile_start=n_tile_start,
                     d_col_base=d_col_base,

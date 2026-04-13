@@ -83,6 +83,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d-head", type=int, default=default_cfg.d_head)
     parser.add_argument("--d-conv", type=int, default=default_cfg.d_conv)
     parser.add_argument("--chunk-size", type=int, default=default_cfg.chunk_size)
+    parser.add_argument("--bc-groups", type=int, default=default_cfg.bc_groups)
     parser.add_argument("--lr", type=float, default=default_cfg.lr)
     parser.add_argument("--weight-decay", type=float, default=default_cfg.weight_decay)
     parser.add_argument("--grad-clip", type=float, default=default_cfg.grad_clip)
@@ -122,6 +123,7 @@ def _make_nextchar_cfg(args: argparse.Namespace) -> NextCharPerfConfig:
         d_head=args.d_head,
         d_conv=args.d_conv,
         chunk_size=args.chunk_size,
+        bc_groups=args.bc_groups,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,

@@ -48,6 +48,7 @@ class SLinOSSMixer(nn.Module):
         d_head: int = 64,
         d_conv: int = 4,
         chunk_size: int = 64,
+        bc_groups: int | None = None,
         scanprep_backend: ScanPrepBackend | None = None,
         cconv_backend: CConv1dBackend | None = None,
         dt_min: float = 3e-2,
@@ -73,6 +74,11 @@ class SLinOSSMixer(nn.Module):
         _require(d_head > 0, f"d_head must be positive. Got {d_head}.")
         _require(d_conv > 0, f"d_conv must be positive. Got {d_conv}.")
         _require(chunk_size > 0, f"chunk_size must be positive. Got {chunk_size}.")
+        if bc_groups is not None:
+            _require(
+                bc_groups > 0,
+                f"bc_groups must be positive when provided. Got {bc_groups}.",
+            )
 
         self.d_model = int(d_model)
         self.d_state = int(d_state)
@@ -90,10 +96,23 @@ class SLinOSSMixer(nn.Module):
             f"expand * d_model = {self.d_inner} must be divisible by d_head = {self.d_head}.",
         )
         self.n_heads = int(self.d_inner // self.d_head)
+        self.bc_groups = self.n_heads if bc_groups is None else int(bc_groups)
+        _require(
+            self.bc_groups <= self.n_heads,
+            "bc_groups must not exceed the realized head count. "
+            f"Got bc_groups={self.bc_groups}, n_heads={self.n_heads}.",
+        )
+        _require(
+            self.n_heads % self.bc_groups == 0,
+            "bc_groups must divide n_heads so the contiguous head-to-group mapping "
+            f"is well-defined. Got bc_groups={self.bc_groups}, n_heads={self.n_heads}.",
+        )
+        self.heads_per_bc_group = int(self.n_heads // self.bc_groups)
 
         factory_kwargs = {"device": device, "dtype": dtype}
         self.scanprep = SLinOSSScanPrep(
             n_heads=self.n_heads,
+            bc_groups=self.bc_groups,
             d_state=self.d_state,
             d_head=self.d_head,
             backend=scanprep_backend,
@@ -119,7 +138,7 @@ class SLinOSSMixer(nn.Module):
         )
 
         self.param_proj_dim = self.n_heads * self.scanprep.param_dim
-        self.bc_proj_dim = self.n_heads * self.scanprep.bc_param_rows * self.d_state
+        self.bc_proj_dim = self.bc_groups * self.scanprep.bc_param_rows * self.d_state
         self.in_proj = nn.Linear(
             self.d_model,
             2 * self.d_inner + self.param_proj_dim + self.bc_proj_dim,
@@ -220,7 +239,7 @@ class SLinOSSMixer(nn.Module):
                     dtype=dtype,
                 ),
                 b_prev=torch.zeros(
-                    (batch_size, self.n_heads, 2 * self.d_state),
+                    (batch_size, self.bc_groups, 2 * self.d_state),
                     device=device,
                     dtype=dtype,
                 ),
@@ -289,7 +308,7 @@ class SLinOSSMixer(nn.Module):
         bc = bc_flat.view(
             batch_size,
             time_steps,
-            self.n_heads,
+            self.bc_groups,
             self.scanprep.bc_param_rows,
             self.d_state,
         )

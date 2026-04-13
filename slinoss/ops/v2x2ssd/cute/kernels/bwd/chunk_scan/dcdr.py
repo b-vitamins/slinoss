@@ -113,13 +113,38 @@ class ChunkScanBwdDCDRAmpere:
         dict[tuple[object, ...], ChunkScanBwdDCDRSupportInfo]
     ] = {}
 
-    def __init__(self, dtype, *, chunk_size, D, P, num_threads=128):
+    def __init__(
+        self,
+        dtype,
+        *,
+        chunk_size,
+        D,
+        P,
+        num_threads=128,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+    ):
         self.ab_dtype = dtype
         self.acc_dtype = cutlass.Float32
         self.L = int(chunk_size)
         self.D = int(D)
         self.P = int(P)
         self.num_threads = int(num_threads)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.heads_per_bc_group = 0
         self.kv_tile = 32
         self.p_tile = 32
 
@@ -135,6 +160,24 @@ class ChunkScanBwdDCDRAmpere:
         self.mma_inst_shape = (16, 8, 16)
         self.warp_layout_mnk = (2, 2, 1)
         self.atom_layout_mnk = self.warp_layout_mnk
+
+    @cute.jit
+    def _batch_group(self, batch_head: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        return batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+
+    @cute.jit
+    def _batch_group_chunk(self, batch_head_chunk: int, n_chunks: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk
+        batch_head = batch_head_chunk // n_chunks
+        chunk_index = batch_head_chunk - batch_head * n_chunks
+        batch_group = self._batch_group(batch_head)
+        return batch_group * n_chunks + chunk_index
 
     @property
     def D_padded(self) -> int:
@@ -738,10 +781,10 @@ class ChunkScanBwdDCDRAmpere:
     @cute.jit
     def _load_previous_boundary_rows(self, boundary_state: SimpleNamespace):
         tidx, _, _ = cute.arch.thread_idx()
-        prev_batch_head_chunk = cutlass.select_(
+        prev_batch_group_chunk = cutlass.select_(
             boundary_state.chunk_index > cutlass.Int32(0),
-            boundary_state.batch_head_chunk - cutlass.Int32(1),
-            boundary_state.batch_head_chunk,
+            boundary_state.batch_group_chunk - cutlass.Int32(1),
+            boundary_state.batch_group_chunk,
         )
 
         iters_p = (self.P + self.num_threads - 1) // self.num_threads
@@ -750,7 +793,15 @@ class ChunkScanBwdDCDRAmpere:
             if p < cutlass.Int32(self.P):
                 u_prev0 = boundary_state.m_u_prev0[boundary_state.batch_head, p]
                 u_prev_chunk = boundary_state.m_u[
-                    prev_batch_head_chunk, self.L - 1, 0, p
+                    boundary_state.batch_head_chunk
+                    - cutlass.select_(
+                        boundary_state.chunk_index > cutlass.Int32(0),
+                        cutlass.Int32(1),
+                        cutlass.Int32(0),
+                    ),
+                    self.L - 1,
+                    0,
+                    p,
                 ]
                 boundary_state.s_u_prev[p] = cutlass.select_(
                     boundary_state.chunk_index == cutlass.Int32(0),
@@ -762,9 +813,9 @@ class ChunkScanBwdDCDRAmpere:
         for it in range(iters_d):
             d = tidx + cutlass.Int32(it * self.num_threads)
             if d < cutlass.Int32(self.D):
-                b_prev0 = boundary_state.m_b_prev0[boundary_state.batch_head, d]
+                b_prev0 = boundary_state.m_b_prev0[boundary_state.batch_group, d]
                 b_prev_chunk = boundary_state.m_b[
-                    prev_batch_head_chunk, self.L - 1, 0, d
+                    prev_batch_group_chunk, self.L - 1, 0, d
                 ]
                 boundary_state.s_b_prev[d] = cutlass.select_(
                     boundary_state.chunk_index == cutlass.Int32(0),
@@ -1169,7 +1220,7 @@ class ChunkScanBwdDCDRAmpere:
         out_dtype = key_load_state.s_key_tile.element_type
         if key_load_state.pass_id == 1:
             g_key = cute.local_tile(
-                key_load_state.m_b[key_load_state.batch_head_chunk, None, 0, None],
+                key_load_state.m_b[key_load_state.batch_group_chunk, None, 0, None],
                 (self.kv_tile, d_block),
                 (key_load_state.n_tile, key_load_state.d_tile),
             )
@@ -1182,7 +1233,7 @@ class ChunkScanBwdDCDRAmpere:
                 )
             else:
                 c_key = cute.local_tile(
-                    key_load_state.coord_dc,
+                    key_load_state.coord_b,
                     (self.kv_tile, d_block),
                     (key_load_state.n_tile, key_load_state.d_tile),
                 )
@@ -1218,7 +1269,7 @@ class ChunkScanBwdDCDRAmpere:
                         )
                         if src_row >= cutlass.Int32(0):
                             value = key_load_state.m_b[
-                                key_load_state.batch_head_chunk, src_row, 0, d
+                                key_load_state.batch_group_chunk, src_row, 0, d
                             ]
                         else:
                             value = key_load_state.s_b_prev[d]
@@ -1349,10 +1400,10 @@ class ChunkScanBwdDCDRAmpere:
                     phase_im = cutlass.Float32(dc_state.s_phase_full[seq_idx, 1])
                     dc0, dc1 = conj_mul_phase(dq0, dq1, phase_re, phase_im)
                     c0 = cutlass.Float32(
-                        dc_state.m_c[dc_state.batch_head_chunk, seq_idx, 0, d0 + 0]
+                        dc_state.m_c[dc_state.batch_group_chunk, seq_idx, 0, d0 + 0]
                     )
                     c1 = cutlass.Float32(
-                        dc_state.m_c[dc_state.batch_head_chunk, seq_idx, 0, d0 + 1]
+                        dc_state.m_c[dc_state.batch_group_chunk, seq_idx, 0, d0 + 1]
                     )
                     row_dlogprefix_sum = row_dlogprefix_sum + dc0 * c0 + dc1 * c1
                     dR00_sum = dR00_sum + dq0 * c0
@@ -1728,6 +1779,8 @@ class ChunkScanBwdDCDRAmpere:
         batch_head_chunks = mU.shape[0]
         n_chunks = batch_head_chunks // batch_heads
         batch_head = bidz // n_chunks
+        batch_group = self._batch_group(batch_head)
+        batch_group_chunk = self._batch_group_chunk(bidz, n_chunks)
         chunk_index = bidz - batch_head * n_chunks
 
         d_padded = self.D_padded
@@ -1784,7 +1837,9 @@ class ChunkScanBwdDCDRAmpere:
 
         boundary_state = SimpleNamespace(
             batch_head=batch_head,
+            batch_group=batch_group,
             batch_head_chunk=bidz,
+            batch_group_chunk=batch_group_chunk,
             chunk_index=chunk_index,
             m_u=mU,
             m_b=mB,
@@ -1815,11 +1870,13 @@ class ChunkScanBwdDCDRAmpere:
         coord_scores = cute.make_identity_tensor(
             (mU.shape[0], self.L, mU.shape[2], self.L)
         )
+        coord_b = cute.make_identity_tensor(mB.layout.shape)
         coord_dc = cute.make_identity_tensor(
             (mU.shape[0], self.L, mU.shape[2], d_padded)
         )
         coord_scores_tile = coord_scores[bidz, None, 0, None]
         coord_dc_tile = coord_dc[bidz, None, 0, None]
+        coord_b_tile = coord_b[batch_group_chunk, None, 0, None]
 
         d_block = self._smem_block_size_d()
         n_d_tiles = d_padded // d_block
@@ -1947,14 +2004,14 @@ class ChunkScanBwdDCDRAmpere:
                     for pass_id in range(2):
                         key_load_state = SimpleNamespace(
                             pass_id=pass_id,
-                            batch_head_chunk=bidz,
+                            batch_group_chunk=batch_group_chunk,
                             n_tile=n_tile,
                             d_tile=d_tile,
                             row_tile_start=n0,
                             d_tile_start=d_base,
                             d_block=d_block,
                             m_b=mB,
-                            coord_dc=coord_dc_tile,
+                            coord_b=coord_b_tile,
                             gmem_tiled_copy_d_async=gmem_tiled_copy_d_async,
                             gmem_thr_copy_d_async=gmem_thr_copy_D_async,
                             t_key_smem=tKs_key_block,
@@ -2081,7 +2138,7 @@ class ChunkScanBwdDCDRAmpere:
                 self._materialize_dq_tile(dq_tile_state)
 
                 dc_state = SimpleNamespace(
-                    batch_head_chunk=bidz,
+                    batch_group_chunk=batch_group_chunk,
                     row_tile_start=m0,
                     d_tile_start=d_base,
                     d_block=d_block,

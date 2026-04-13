@@ -110,7 +110,7 @@ def _validate_decode_inputs(
     initial_states: torch.Tensor | None,
     B_prev: torch.Tensor | None,
     U_prev: torch.Tensor | None,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     if value.ndim != 3:
         raise ValueError(f"value must be (B,H,P). Got {tuple(value.shape)}.")
     if params.ndim != 3 or params.shape[-1] != SCANPREP_PARAM_DIM:
@@ -118,14 +118,23 @@ def _validate_decode_inputs(
             f"params must be (B,H,{SCANPREP_PARAM_DIM}). Got {tuple(params.shape)}."
         )
     if bc.ndim != 4 or bc.shape[-2] != 4:
-        raise ValueError(f"bc must be (B,H,4,N). Got {tuple(bc.shape)}.")
+        raise ValueError(f"bc must be (B,G,4,N). Got {tuple(bc.shape)}.")
     if gate.shape != value.shape:
         raise ValueError(f"gate must match value exactly. Got {tuple(gate.shape)}.")
     batch, heads, P = map(int, value.shape)
     if tuple(map(int, params.shape[:2])) != (batch, heads):
         raise ValueError("params leading dims must match value.")
-    if tuple(map(int, bc.shape[:2])) != (batch, heads):
-        raise ValueError("bc leading dims must match value.")
+    if int(bc.shape[0]) != batch:
+        raise ValueError("bc batch dim must match value.")
+    bc_groups = int(bc.shape[1])
+    if bc_groups < 1:
+        raise ValueError("bc must have at least one BC group.")
+    if heads % bc_groups != 0:
+        raise ValueError(
+            "bc group count must divide the head count. "
+            f"Got heads={heads}, bc_groups={bc_groups}."
+        )
+    heads_per_group = heads // bc_groups
     N = int(bc.shape[-1])
     if (B_prev is None) ^ (U_prev is None):
         raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
@@ -139,15 +148,19 @@ def _validate_decode_inputs(
             "initial_states must be "
             f"{(batch, heads, P, 2 * N)}. Got {tuple(initial_states.shape)}."
         )
-    if B_prev is not None and tuple(map(int, B_prev.shape)) != (batch, heads, 2 * N):
+    if B_prev is not None and tuple(map(int, B_prev.shape)) != (
+        batch,
+        bc_groups,
+        2 * N,
+    ):
         raise ValueError(
-            f"B_prev must be {(batch, heads, 2 * N)}. Got {tuple(B_prev.shape)}."
+            f"B_prev must be {(batch, bc_groups, 2 * N)}. Got {tuple(B_prev.shape)}."
         )
     if U_prev is not None and tuple(map(int, U_prev.shape)) != (batch, heads, P):
         raise ValueError(
             f"U_prev must be {(batch, heads, P)}. Got {tuple(U_prev.shape)}."
         )
-    return batch, heads, P, N
+    return batch, heads, bc_groups, heads_per_group, P, N
 
 
 def _require_decode_tensor_contract(
@@ -168,6 +181,45 @@ def _require_decode_tensor_contract(
     if tensor.dtype not in allowed_dtypes:
         expected = " or ".join(str(dt) for dt in allowed_dtypes)
         raise ValueError(f"{name} must use {expected}. Got {tensor.dtype}.")
+
+
+def _materialize_grouped_rows(
+    tensor: torch.Tensor,
+    *,
+    heads_per_group: int,
+) -> torch.Tensor:
+    if heads_per_group == 1:
+        return tensor if tensor.is_contiguous() else tensor.contiguous()
+    batch, groups = map(int, tensor.shape[:2])
+    tail = tuple(int(dim) for dim in tensor.shape[2:])
+    return (
+        tensor.unsqueeze(2)
+        .expand(batch, groups, heads_per_group, *tail)
+        .reshape(batch, groups * heads_per_group, *tail)
+        .contiguous()
+    )
+
+
+def _reduce_grouped_rows(
+    tensor: torch.Tensor,
+    *,
+    bc_groups: int,
+    heads_per_group: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if heads_per_group == 1:
+        reduced = tensor if tensor.is_contiguous() else tensor.contiguous()
+    else:
+        batch = int(tensor.shape[0])
+        tail = tuple(int(dim) for dim in tensor.shape[2:])
+        reduced = tensor.view(batch, bc_groups, heads_per_group, *tail)[
+            :, :, 0, ...
+        ].contiguous()
+    if out is None:
+        return reduced
+    if out is not reduced:
+        out.copy_(reduced)
+    return out
 
 
 def mixer_decode_step_cute(
@@ -200,7 +252,7 @@ def mixer_decode_step_cute(
     out_proj_weight: torch.Tensor | None = None,
     projected_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch, heads, P, N = _validate_decode_inputs(
+    batch, heads, bc_groups, heads_per_group, P, N = _validate_decode_inputs(
         value,
         params,
         bc,
@@ -227,7 +279,7 @@ def mixer_decode_step_cute(
             "out_proj_weight and projected_out must be provided together for fused projection."
         )
     state_shape = (batch, heads, P, 2 * N)
-    b_prev_shape = (batch, heads, 2 * N)
+    b_prev_shape = (batch, bc_groups, 2 * N)
     u_prev_shape = (batch, heads, P)
     state_dtype = torch.float32
     _require_decode_tensor_contract(
@@ -281,8 +333,10 @@ def mixer_decode_step_cute(
         params if params.is_contiguous() else params.contiguous(),
         min_align=_DECODE_MIN_ALIGN,
     )
+    # Keep grouped BC/B-prev at the public decode contract and materialize the
+    # current head-major kernel view in one place here.
     bc_c = _ensure_min_alignment(
-        bc if bc.is_contiguous() else bc.contiguous(),
+        _materialize_grouped_rows(bc, heads_per_group=heads_per_group),
         min_align=_DECODE_MIN_ALIGN,
     )
     gate_c = _ensure_min_alignment(
@@ -299,13 +353,19 @@ def mixer_decode_step_cute(
             min_align=_DECODE_MIN_ALIGN,
         )
     )
-    b_prev_c = (
+    b_prev_grouped = (
         B_prev
         if B_prev is not None
         else _ensure_min_alignment(
-            torch.zeros((batch, heads, 2 * N), device=value.device, dtype=value.dtype),
+            torch.zeros(
+                (batch, bc_groups, 2 * N), device=value.device, dtype=value.dtype
+            ),
             min_align=_DECODE_MIN_ALIGN,
         )
+    )
+    b_prev_c = _ensure_min_alignment(
+        _materialize_grouped_rows(b_prev_grouped, heads_per_group=heads_per_group),
+        min_align=_DECODE_MIN_ALIGN,
     )
     u_prev_c = (
         U_prev
@@ -320,7 +380,11 @@ def mixer_decode_step_cute(
     final_state = (
         final_state_out if final_state_out is not None else _aligned_empty_like(state_c)
     )
-    b_last = b_last_out if b_last_out is not None else _aligned_empty_like(b_prev_c)
+    b_last = (
+        b_last_out
+        if b_last_out is not None
+        else _aligned_empty(b_prev_shape, device=value.device, dtype=value.dtype)
+    )
     u_last = u_last_out if u_last_out is not None else _aligned_empty_like(u_prev_c)
     if out_proj_weight is None:
         out_proj = _aligned_empty((1, heads, P), device=value.device, dtype=value.dtype)
@@ -399,13 +463,22 @@ def mixer_decode_step_cute(
         )
     p_tiles = (P + tile_p - 1) // tile_p
     b_prev_aliases_output = (
-        b_last_out is not None and b_last_out.data_ptr() == b_prev_c.data_ptr()
+        heads_per_group == 1
+        and b_last_out is not None
+        and b_last_out.data_ptr() == b_prev_grouped.data_ptr()
     )
-    b_last_kernel = (
-        _aligned_empty_like(b_prev_c)
-        if b_prev_aliases_output and p_tiles > 1
-        else b_last
-    )
+    if heads_per_group == 1:
+        b_last_kernel = (
+            _aligned_empty_like(b_prev_c)
+            if b_prev_aliases_output and p_tiles > 1
+            else b_last
+        )
+    else:
+        b_last_kernel = _aligned_empty(
+            (batch, heads, 2 * N),
+            device=value.device,
+            dtype=value.dtype,
+        )
     b_last_kernel_align = _assumed_align(b_last_kernel)
 
     cache_key = (
@@ -537,8 +610,15 @@ def mixer_decode_step_cute(
         out_proj,
         projected,
     )
-    if b_last_kernel is not b_last:
+    if heads_per_group == 1 and b_last_kernel is not b_last:
         b_last.copy_(b_last_kernel)
+    if heads_per_group != 1:
+        _reduce_grouped_rows(
+            b_last_kernel,
+            bc_groups=bc_groups,
+            heads_per_group=heads_per_group,
+            out=b_last,
+        )
     if out_proj_weight is not None:
         torch.sum(projected, dim=1, out=projected_out)
     y_flat = cast(torch.Tensor, y.reshape(batch, heads * P).contiguous())

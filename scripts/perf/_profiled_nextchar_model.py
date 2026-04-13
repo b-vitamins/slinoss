@@ -42,7 +42,7 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
         return bc_flat.view(
             batch_size,
             time_steps,
-            self.n_heads,
+            self.bc_groups,
             self.scanprep.bc_param_rows,
             self.d_state,
         )
@@ -222,6 +222,7 @@ class ProfiledNextCharBlock(nn.Module):
         d_head: int,
         d_conv: int,
         chunk_size: int,
+        bc_groups: int,
     ) -> None:
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
@@ -232,6 +233,7 @@ class ProfiledNextCharBlock(nn.Module):
             d_head=d_head,
             d_conv=d_conv,
             chunk_size=chunk_size,
+            bc_groups=bc_groups,
         )
         self.norm2 = nn.RMSNorm(d_model)
         self.ff = FeedForward(d_model)
@@ -262,6 +264,7 @@ class ProfiledNextCharLM(nn.Module):
         d_head: int,
         d_conv: int,
         chunk_size: int,
+        bc_groups: int,
     ) -> None:
         super().__init__()
         self.block_size = int(block_size)
@@ -276,6 +279,7 @@ class ProfiledNextCharLM(nn.Module):
                     d_head=d_head,
                     d_conv=d_conv,
                     chunk_size=chunk_size,
+                    bc_groups=bc_groups,
                 )
                 for _ in range(n_layers)
             ]

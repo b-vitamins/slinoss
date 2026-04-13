@@ -40,6 +40,7 @@ class SLinOSSScanPrep(nn.Module):
         self,
         *,
         n_heads: int,
+        bc_groups: int | None = None,
         d_state: int,
         d_head: int,
         backend: ScanPrepBackend | None = None,
@@ -58,6 +59,19 @@ class SLinOSSScanPrep(nn.Module):
     ) -> None:
         super().__init__()
         _require(n_heads > 0, f"n_heads must be positive. Got {n_heads}.")
+        resolved_bc_groups = n_heads if bc_groups is None else int(bc_groups)
+        _require(
+            resolved_bc_groups > 0,
+            f"bc_groups must be positive. Got {resolved_bc_groups}.",
+        )
+        _require(
+            resolved_bc_groups <= n_heads,
+            f"bc_groups must be <= n_heads. Got {resolved_bc_groups}, {n_heads}.",
+        )
+        _require(
+            n_heads % resolved_bc_groups == 0,
+            f"n_heads must be divisible by bc_groups. Got {n_heads}, {resolved_bc_groups}.",
+        )
         _require(d_state > 0, f"d_state must be positive. Got {d_state}.")
         _require(d_head > 0, f"d_head must be positive. Got {d_head}.")
         _require(
@@ -84,6 +98,8 @@ class SLinOSSScanPrep(nn.Module):
         _require(bc_gain_max > 0.0, f"Require bc_gain_max > 0. Got {bc_gain_max}.")
 
         self.n_heads = int(n_heads)
+        self.bc_groups = int(resolved_bc_groups)
+        self.heads_per_bc_group = int(self.n_heads // self.bc_groups)
         self.d_state = int(d_state)
         self.d_head = int(d_head)
         self.d_inner = int(self.n_heads * self.d_head)
@@ -116,7 +132,7 @@ class SLinOSSScanPrep(nn.Module):
         )
         self.bc_complex_base = nn.Parameter(
             torch.empty(
-                (self.n_heads, 2, self.d_state),
+                (self.bc_groups, 2, self.d_state),
                 device=device,
                 dtype=torch.complex64,
             )
@@ -172,10 +188,10 @@ class SLinOSSScanPrep(nn.Module):
         return torch.linspace(
             -math.pi,
             math.pi,
-            self.n_heads * 2 * self.d_state + 1,
+            self.bc_groups * 2 * self.d_state + 1,
             device=self.dt_bias.device,
             dtype=torch.float32,
-        )[:-1].view(self.n_heads, 2, self.d_state)
+        )[:-1].view(self.bc_groups, 2, self.d_state)
 
     def reset_parameters(self) -> None:
         dt0, theta0 = self._head_init_targets()
@@ -286,11 +302,11 @@ class SLinOSSScanPrep(nn.Module):
         )
 
     def _validate_scan_bc(self, bc: torch.Tensor) -> None:
-        expected = (self.n_heads, self.bc_param_rows, self.d_state)
+        expected = (self.bc_groups, self.bc_param_rows, self.d_state)
         _require(
             bc.ndim == 5 and tuple(bc.shape[2:]) == expected,
             "bc must be "
-            f"(batch, T, heads, {self.bc_param_rows}, d_state). "
+            f"(batch, T, groups, {self.bc_param_rows}, d_state). "
             f"Got {tuple(bc.shape)}.",
         )
 
@@ -315,10 +331,10 @@ class SLinOSSScanPrep(nn.Module):
         )
         b_pairs = bc_amplitude[..., 0, :].unsqueeze(-1) * bc_complex_base[
             :, 0, :, :
-        ].view(1, 1, self.n_heads, self.d_state, 2)
+        ].view(1, 1, self.bc_groups, self.d_state, 2)
         c_pairs = bc_amplitude[..., 1, :].unsqueeze(-1) * bc_complex_base[
             :, 1, :, :
-        ].view(1, 1, self.n_heads, self.d_state, 2)
+        ].view(1, 1, self.bc_groups, self.d_state, 2)
         return (
             self._normalize_scan_bc_pairs(b_pairs).contiguous(),
             self._normalize_scan_bc_pairs(c_pairs).contiguous(),
@@ -356,7 +372,7 @@ class SLinOSSScanPrep(nn.Module):
         batch: int,
         T: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        expected = (batch, T, self.n_heads, self.d_state, 2)
+        expected = (batch, T, self.bc_groups, self.d_state, 2)
         _require(
             tuple(map(int, B_pairs.shape)) == expected,
             f"B_pairs must be {expected}. Got {tuple(B_pairs.shape)}.",
@@ -367,12 +383,12 @@ class SLinOSSScanPrep(nn.Module):
         )
         B = (
             B_pairs.permute(0, 2, 1, 3, 4)
-            .reshape(batch, self.n_heads, T, 2 * self.d_state)
+            .reshape(batch, self.bc_groups, T, 2 * self.d_state)
             .contiguous()
         )
         C = (
             C_pairs.permute(0, 2, 1, 3, 4)
-            .reshape(batch, self.n_heads, T, 2 * self.d_state)
+            .reshape(batch, self.bc_groups, T, 2 * self.d_state)
             .contiguous()
         )
         return B, C
@@ -414,6 +430,7 @@ class SLinOSSScanPrep(nn.Module):
             inputs.params,
             bc_rows,
             n_heads=self.n_heads,
+            bc_groups=self.bc_groups,
             d_state=self.d_state,
             d_head=self.d_head,
             dt_min=self.dt_min,

@@ -112,6 +112,7 @@ class NextCharBlock(nn.Module):
         d_head: int,
         d_conv: int,
         chunk_size: int,
+        bc_groups: int | None = None,
     ) -> None:
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
@@ -122,6 +123,7 @@ class NextCharBlock(nn.Module):
             d_head=d_head,
             d_conv=d_conv,
             chunk_size=chunk_size,
+            bc_groups=bc_groups,
         )
         self.norm2 = nn.RMSNorm(d_model)
         self.ff = FeedForward(d_model)
@@ -272,6 +274,7 @@ class NextCharLM(nn.Module):
         d_head: int,
         d_conv: int,
         chunk_size: int,
+        bc_groups: int | None = None,
     ) -> None:
         super().__init__()
         self.block_size = int(block_size)
@@ -286,6 +289,7 @@ class NextCharLM(nn.Module):
                     d_head=d_head,
                     d_conv=d_conv,
                     chunk_size=chunk_size,
+                    bc_groups=bc_groups,
                 )
                 for _ in range(n_layers)
             ]

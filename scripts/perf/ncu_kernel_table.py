@@ -19,14 +19,11 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from _common import (  # noqa: E402
-    PerfConfig,
-    dtype_from_str,
-    ensure_cuda,
-)
+from _common import dtype_from_str, ensure_cuda  # noqa: E402
 from _nextchar import DEFAULT_NEXTCHAR_PERF_CONFIG  # noqa: E402
 from _ncu_kernels import (  # noqa: E402
     DEFAULT_V2_BATCH,
+    DEFAULT_V2_BC_GROUPS,
     DEFAULT_V2_CHUNK,
     DEFAULT_V2_HEADS,
     DEFAULT_V2_N,
@@ -34,6 +31,7 @@ from _ncu_kernels import (  # noqa: E402
     DEFAULT_V2_T,
     KERNEL_ORDER,
     ScanPrepPerfConfig,
+    V2KernelPerfConfig,
     build_kernel_runner,
 )
 import ncu_report  # noqa: E402
@@ -91,11 +89,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--N", type=int, default=DEFAULT_V2_N)
     parser.add_argument("--P", type=int, default=DEFAULT_V2_P)
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_V2_CHUNK)
+    parser.add_argument("--bc-groups", type=int, default=DEFAULT_V2_BC_GROUPS)
     parser.add_argument("--scanprep-batch", type=int, default=DEFAULT_V2_BATCH)
     parser.add_argument("--scanprep-heads", type=int, default=DEFAULT_V2_HEADS)
     parser.add_argument("--scanprep-T", type=int, default=DEFAULT_V2_T)
     parser.add_argument("--scanprep-N", type=int, default=DEFAULT_V2_N)
     parser.add_argument("--scanprep-P", type=int, default=DEFAULT_V2_P)
+    parser.add_argument(
+        "--scanprep-bc-groups",
+        type=int,
+        default=DEFAULT_V2_BC_GROUPS,
+    )
     parser.add_argument(
         "--scanprep-dtype",
         choices=("fp16", "bf16", "fp32"),
@@ -110,14 +114,15 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _make_v2_cfg(args: argparse.Namespace) -> PerfConfig:
-    return PerfConfig(
+def _make_v2_cfg(args: argparse.Namespace) -> V2KernelPerfConfig:
+    return V2KernelPerfConfig(
         batch=args.batch,
         heads=args.heads,
         T=args.T,
         N=args.N,
         P=args.P,
         chunk_size=args.chunk_size,
+        bc_groups=args.bc_groups,
         dtype=dtype_from_str(args.dtype),
         device=args.device,
         seed=args.seed,
@@ -131,6 +136,7 @@ def _make_scanprep_cfg(args: argparse.Namespace) -> ScanPrepPerfConfig:
         T=args.scanprep_T,
         N=args.scanprep_N,
         P=args.scanprep_P,
+        bc_groups=args.scanprep_bc_groups,
         dtype=dtype_from_str(args.scanprep_dtype),
         device=args.device,
         seed=args.seed,
@@ -220,6 +226,8 @@ def _kernel_cli_args(args: argparse.Namespace, kernel_name: str) -> list[str]:
         str(int(args.P)),
         "--chunk-size",
         str(int(args.chunk_size)),
+        "--bc-groups",
+        str(int(args.bc_groups)),
         "--scanprep-batch",
         str(int(args.scanprep_batch)),
         "--scanprep-heads",
@@ -230,6 +238,8 @@ def _kernel_cli_args(args: argparse.Namespace, kernel_name: str) -> list[str]:
         str(int(args.scanprep_N)),
         "--scanprep-P",
         str(int(args.scanprep_P)),
+        "--scanprep-bc-groups",
+        str(int(args.scanprep_bc_groups)),
         "--scanprep-dtype",
         args.scanprep_dtype,
     ]
@@ -344,6 +354,7 @@ def main() -> int:
             "v2x2ssd_config": {
                 "batch": v2_cfg.batch,
                 "heads": v2_cfg.heads,
+                "bc_groups": v2_cfg.resolved_bc_groups,
                 "T": v2_cfg.T,
                 "N": v2_cfg.N,
                 "P": v2_cfg.P,
@@ -355,6 +366,7 @@ def main() -> int:
             "scanprep_config": {
                 "batch": scanprep_cfg.batch,
                 "heads": scanprep_cfg.heads,
+                "bc_groups": scanprep_cfg.resolved_bc_groups,
                 "T": scanprep_cfg.T,
                 "N": scanprep_cfg.N,
                 "P": scanprep_cfg.P,

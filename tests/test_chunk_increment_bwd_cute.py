@@ -30,6 +30,7 @@ def _make_inputs(
     *,
     batch: int,
     heads: int,
+    bc_groups: int | None = None,
     T: int,
     N: int,
     P: int,
@@ -37,6 +38,9 @@ def _make_inputs(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
+    bc_groups = heads if bc_groups is None else bc_groups
+    assert heads % bc_groups == 0
+
     radius = 0.6 + 0.35 * torch.rand((batch, heads, T), device=device)
     angle = (2.0 * math.pi) * torch.rand((batch, heads, T), device=device) - math.pi
     M = torch.view_as_real(torch.polar(radius, angle)).to(torch.float32).contiguous()
@@ -48,11 +52,14 @@ def _make_inputs(
     K = torch.view_as_real(K_complex).to(torch.float32).contiguous()
 
     U = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
-    B = torch.randn((batch, heads, T, 2 * N), device=device, dtype=torch.float32) * 0.1
+    B = (
+        torch.randn((batch, bc_groups, T, 2 * N), device=device, dtype=torch.float32)
+        * 0.1
+    )
 
     b_prev = (
-        torch.randn((batch, heads, N), device=device, dtype=torch.float32)
-        + 1j * torch.randn((batch, heads, N), device=device, dtype=torch.float32)
+        torch.randn((batch, bc_groups, N), device=device, dtype=torch.float32)
+        + 1j * torch.randn((batch, bc_groups, N), device=device, dtype=torch.float32)
     ) * 0.1
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
@@ -154,6 +161,91 @@ def test_chunk_increment_bwd_cute_matches_autograd() -> None:
     # through bf16 rather than silently narrowing to fp16. The right
     # correctness bar here is principled low-precision agreement, not bitwise
     # parity with the fp32 reference.
+    atol_by_grad = {
+        "dU": 2e-3,
+        "dM": 6e-3,
+        "dK": 1.5e-2,
+        "dB": 1e-2,
+        "dB_prev": 1e-5,
+        "dU_prev": 1e-6,
+    }
+
+    for name, got, want in (
+        ("dU", dU_cute, dU_ref),
+        ("dM", dM_cute, dM_ref),
+        ("dK", dK_cute, dK_ref),
+        ("dB", dB_cute, dB_ref),
+        ("dB_prev", dB_prev_cute, dB_prev_ref),
+        ("dU_prev", dU_prev_cute, dU_prev_ref),
+    ):
+        torch.testing.assert_close(
+            got,
+            want,
+            atol=atol_by_grad[name],
+            rtol=0.0,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_increment_bwd_cute_matches_autograd_with_grouped_b() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, bc_groups, T, N, P = 1, 4, 2, 33, 8, 16
+    U, M, K, B, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        bc_groups=bc_groups,
+        T=T,
+        N=N,
+        P=P,
+        device=torch.device("cuda"),
+    )
+    U.requires_grad_(True)
+    M.requires_grad_(True)
+    K.requires_grad_(True)
+    B.requires_grad_(True)
+    B_prev.requires_grad_(True)
+    U_prev.requires_grad_(True)
+
+    inc, m_chunk = reference_chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+    )
+    d_inc = torch.randn_like(inc)
+    d_m_chunk = torch.randn_like(m_chunk)
+    loss = (inc * d_inc).sum() + (m_chunk * d_m_chunk).sum()
+
+    dU_ref, dM_ref, dK_ref, dB_ref, dB_prev_ref, dU_prev_ref = torch.autograd.grad(
+        loss,
+        (U, M, K, B, B_prev, U_prev),
+    )
+
+    dU_cute, dM_cute, dK_cute, dB_cute, dB_prev_cute, dU_prev_cute = (
+        chunk_increment_bwd_cute(
+            U.detach(),
+            M.detach(),
+            K.detach(),
+            B.detach(),
+            d_inc=d_inc.detach(),
+            d_m_chunk=d_m_chunk.detach(),
+            chunk_size=32,
+            B_prev=B_prev.detach(),
+            U_prev=U_prev.detach(),
+            compute_dtype=torch.float32,
+        )
+    )
+
+    assert dB_cute.shape == (batch, bc_groups, T, 2 * N)
+    assert dB_prev_cute.shape == (batch, bc_groups, 2 * N)
+
     atol_by_grad = {
         "dU": 2e-3,
         "dM": 6e-3,

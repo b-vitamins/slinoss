@@ -8,14 +8,16 @@ the two complex taps in ``K``, and writes the stage output ``Out``.
 Tensor contracts:
 
 - ``U``: ``(BHC, L, 1, P)`` fp16/bf16 value input
-- ``B``: ``(BHC, L, 1, D)`` fp16/bf16 key-side packed complex input
-- ``C``: ``(BHC, L, 1, D)`` fp16/bf16 query-side packed complex input
+- ``B``: ``(BGC, L, 1, D)`` fp16/bf16 key-side packed complex input shared
+  across contiguous head groups
+- ``C``: ``(BGC, L, 1, D)`` fp16/bf16 query-side packed complex input shared
+  across contiguous head groups
 - ``M``: ``(BHC, L, 2)`` fp32 packed complex transitions
 - ``K``: ``(BHC, L, 2, 2)`` fp32 packed complex taps for the previous/current
   diagonal passes
 - ``Z0``: ``(BHC, P, 1, D)`` fp32 packed complex initial state
 - ``U_prev0``: ``(BH, P)`` fp16/bf16 chunk-0 boundary value row
-- ``B_prev0``: ``(BH, D)`` fp16/bf16 chunk-0 boundary key row
+- ``B_prev0``: ``(BG, D)`` fp16/bf16 chunk-0 boundary key row
 - ``Out``: ``(BHC, L, 1, P)`` fp16/bf16/fp32 stage output
 
 The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be
@@ -1015,7 +1017,7 @@ class ChunkScanFwdAmpere:
         s_key: cute.Tensor,
         mB_prev0: cute.Tensor,
         *,
-        batch_head: int,
+        batch_group: int,
         d_col_base: int,
         stage_width: int,
         out_dtype: type[cutlass.Numeric],
@@ -1034,9 +1036,9 @@ class ChunkScanFwdAmpere:
             breb = out_dtype(0)
             bimb = out_dtype(0)
             if cute.elem_less(g_col_re, mB_prev0.layout.shape[1]):
-                breb = mB_prev0[batch_head, g_col_re]
+                breb = mB_prev0[batch_group, g_col_re]
             if cute.elem_less(g_col_im, mB_prev0.layout.shape[1]):
-                bimb = mB_prev0[batch_head, g_col_im]
+                bimb = mB_prev0[batch_group, g_col_im]
             s_key[0, re_col] = cutlass.select_(is_chunk0, breb, bre0)
             s_key[0, im_col] = cutlass.select_(is_chunk0, bimb, bim0)
             ii = ii + self.num_threads
@@ -1114,13 +1116,13 @@ class ChunkScanFwdAmpere:
             d_col_base = d_stage_idx * d_stage_width
 
             g_query_stage = cute.local_tile(
-                offterm_state.m_query[offterm_state.batch_head_chunk, None, 0, None],
+                offterm_state.m_query[offterm_state.batch_group_chunk, None, 0, None],
                 (self.m_block_size, d_stage_width),
                 (offterm_state.m_block, d_stage_idx),
             )
             c_query_stage = cute.local_tile(
                 offterm_state.coord_query[
-                    offterm_state.batch_head_chunk, None, 0, None
+                    offterm_state.batch_group_chunk, None, 0, None
                 ],
                 (self.m_block_size, d_stage_width),
                 (offterm_state.m_block, d_stage_idx),
@@ -1377,6 +1379,35 @@ class ChunkScanFwdAmpere:
             raise TypeError("K must be Float32.")
         if cutlass.const_expr(mZ0.element_type != cutlass.Float32):
             raise TypeError("Z0 must be Float32.")
+        if cutlass.const_expr(mU.shape[1] != mB.shape[1] or mU.shape[1] != mC.shape[1]):
+            raise ValueError("U/B/C must share the chunk-local time dimension.")
+        if cutlass.const_expr(
+            not (
+                mU.shape[0]
+                == mM.shape[0]
+                == mK.shape[0]
+                == mZ0.shape[0]
+                == mOut.shape[0]
+            )
+        ):
+            raise ValueError("U/M/K/Z0/Out must share the batch-head-chunk dimension.")
+        if cutlass.const_expr(mB.shape[0] != mC.shape[0]):
+            raise ValueError(
+                "Grouped B and C must share the batch-group-chunk dimension."
+            )
+        if cutlass.const_expr(mU.shape[0] % mU_prev0.shape[0] != 0):
+            raise ValueError("U batch-head-chunk dimension must be divisible by BH.")
+        n_chunks = mU.shape[0] // mU_prev0.shape[0]
+        if cutlass.const_expr(mB.shape[0] % n_chunks != 0):
+            raise ValueError(
+                "Grouped B batch dimension must be divisible by the chunk count."
+            )
+        if cutlass.const_expr(mB_prev0.shape[0] != mB.shape[0] // n_chunks):
+            raise ValueError("B_prev0 must match the grouped B batch dimension.")
+        if cutlass.const_expr(mU_prev0.shape[0] % mB_prev0.shape[0] != 0):
+            raise ValueError(
+                "Grouped B batch dimension must divide the batch-head count."
+            )
         if cutlass.const_expr(
             mOut.element_type
             not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
@@ -1522,9 +1553,13 @@ class ChunkScanFwdAmpere:
         m_tile_start = m_block * m_block_size
 
         batch_head_count = mU_prev0.shape[0]
+        batch_group_count = mB_prev0.shape[0]
         n_chunks = mU.shape[0] // batch_head_count
+        heads_per_group = batch_head_count // batch_group_count
         batch_head = batch_head_chunk // n_chunks
         chunk_index = batch_head_chunk - batch_head * n_chunks
+        batch_group = batch_head // heads_per_group
+        batch_group_chunk = batch_group * n_chunks + chunk_index
         is_chunk0 = chunk_index == 0
 
         smem = cutlass.utils.SmemAllocator()
@@ -1666,6 +1701,7 @@ class ChunkScanFwdAmpere:
 
         offterm_state = SimpleNamespace(
             batch_head_chunk=batch_head_chunk,
+            batch_group_chunk=batch_group_chunk,
             m_block=m_block,
             m_tile_start=m_tile_start,
             gmem_tiled_copy_d=gmem_tiled_copy_d,
@@ -1754,12 +1790,12 @@ class ChunkScanFwdAmpere:
                     d_col_base = d_stage_idx * d_stage_width
 
                     g_query_stage = cute.local_tile(
-                        mC[batch_head_chunk, None, 0, None],
+                        mC[batch_group_chunk, None, 0, None],
                         (m_block_size, d_stage_width),
                         (m_block, d_stage_idx),
                     )
                     c_query_stage = cute.local_tile(
-                        coord_query[batch_head_chunk, None, 0, None],
+                        coord_query[batch_group_chunk, None, 0, None],
                         (m_block_size, d_stage_width),
                         (m_block, d_stage_idx),
                     )
@@ -1778,12 +1814,12 @@ class ChunkScanFwdAmpere:
                     )
 
                     g_key_stage = cute.local_tile(
-                        m_key_pass[batch_head_chunk, None, 0, None],
+                        m_key_pass[batch_group_chunk, None, 0, None],
                         (n_block_size, d_stage_width),
                         (n_block, d_stage_idx),
                     )
                     c_key_stage = cute.local_tile(
-                        coord_key[batch_head_chunk, None, 0, None],
+                        coord_key[batch_group_chunk, None, 0, None],
                         (n_block_size, d_stage_width),
                         (n_block, d_stage_idx),
                     )
@@ -1829,7 +1865,7 @@ class ChunkScanFwdAmpere:
                         self._inject_boundary_key_row(
                             s_key,
                             mB_prev0,
-                            batch_head=batch_head,
+                            batch_group=batch_group,
                             d_col_base=d_col_base,
                             stage_width=d_stage_width,
                             out_dtype=in_dtype,

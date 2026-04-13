@@ -44,6 +44,7 @@ class InputInfo:
     batch_size: int
     time_steps: int
     heads: int
+    groups: int
     d_head: int
     d_state: int
     device_index: int
@@ -189,16 +190,24 @@ def _make_forward_input_info(
     value: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
 ) -> InputInfo:
     batch_size, time_steps, width = map(int, value.shape)
     if width != int(n_heads * d_head):
         raise ValueError(f"value width must be {n_heads * d_head}. Got {width}.")
+    resolved_bc_groups = int(n_heads if bc_groups is None else bc_groups)
+    if resolved_bc_groups <= 0 or n_heads % resolved_bc_groups != 0:
+        raise ValueError(
+            "n_heads must be divisible by bc_groups. "
+            f"Got {n_heads}, {resolved_bc_groups}."
+        )
     return InputInfo(
         batch_size=batch_size,
         time_steps=time_steps,
         heads=int(n_heads),
+        groups=resolved_bc_groups,
         d_head=int(d_head),
         d_state=int(d_state),
         device_index=_device_cache_key(value.device),
@@ -209,14 +218,22 @@ def _make_backward_input_info(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
 ) -> InputInfo:
     batch_size, time_steps, _, _, _ = map(int, bc.shape)
+    resolved_bc_groups = int(n_heads if bc_groups is None else bc_groups)
+    if resolved_bc_groups <= 0 or n_heads % resolved_bc_groups != 0:
+        raise ValueError(
+            "n_heads must be divisible by bc_groups. "
+            f"Got {n_heads}, {resolved_bc_groups}."
+        )
     return InputInfo(
         batch_size=batch_size,
         time_steps=time_steps,
         heads=int(n_heads),
+        groups=resolved_bc_groups,
         d_head=int(d_head),
         d_state=int(d_state),
         device_index=_device_cache_key(bc.device),
@@ -241,7 +258,7 @@ def _validate_forward_operands(
     expected_bc_shape = (
         input_info.batch_size,
         input_info.time_steps,
-        input_info.heads,
+        input_info.groups,
         4,
         input_info.d_state,
     )
@@ -318,7 +335,7 @@ def _validate_backward_operands(
         name="dB",
         expected_shape=(
             input_info.batch_size,
-            input_info.heads,
+            input_info.groups,
             input_info.time_steps,
             2 * input_info.d_state,
         ),
@@ -328,7 +345,7 @@ def _validate_backward_operands(
         name="dC",
         expected_shape=(
             input_info.batch_size,
-            input_info.heads,
+            input_info.groups,
             input_info.time_steps,
             2 * input_info.d_state,
         ),
@@ -427,7 +444,7 @@ def _make_forward_outputs(
         B=torch.empty(
             (
                 input_info.batch_size,
-                input_info.heads,
+                input_info.groups,
                 input_info.time_steps,
                 2 * input_info.d_state,
             ),
@@ -437,7 +454,7 @@ def _make_forward_outputs(
         C=torch.empty(
             (
                 input_info.batch_size,
-                input_info.heads,
+                input_info.groups,
                 input_info.time_steps,
                 2 * input_info.d_state,
             ),
@@ -488,6 +505,7 @@ def _make_forward_cache_key(
     return (
         (
             input_info.heads,
+            input_info.groups,
             input_info.d_head,
             input_info.d_state,
             bool(store_coeff_aux),
@@ -505,6 +523,7 @@ def _make_forward_runtime_artifacts(
     *,
     config: ScanPrepConfig,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_bias: torch.Tensor,
@@ -517,6 +536,7 @@ def _make_forward_runtime_artifacts(
     input_info = _make_forward_input_info(
         value,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
     )
@@ -578,6 +598,7 @@ def _make_scanprep_fwd_host_wrapper(
     input_info = compile_artifacts.input_info
     return ScanPrepFwdFused(
         h_size=input_info.heads,
+        g_size=input_info.groups,
         p_size=input_info.d_head,
         n_size=input_info.d_state,
         store_coeff_aux=compile_artifacts.store_coeff_aux,
@@ -629,6 +650,7 @@ def _make_scanprep_fwd_aot_spec(
     return ForwardAOTSpec(
         arch_tag=arch_tag,
         heads=input_info.heads,
+        bc_groups=input_info.groups,
         d_head=input_info.d_head,
         d_state=input_info.d_state,
         value_dtype_name=_dtype_name(value_arg.dtype),
@@ -706,6 +728,7 @@ def _scanprep_fwd_cute_prevalidated(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -741,6 +764,7 @@ def _scanprep_fwd_cute_prevalidated(
         bc,
         config=config,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_state=d_state,
         d_head=d_head,
         dt_bias=dt_bias,
@@ -759,6 +783,7 @@ def compile_scanprep_fwd_cute(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -794,6 +819,7 @@ def compile_scanprep_fwd_cute(
         bc,
         config=config,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_state=d_state,
         d_head=d_head,
         dt_bias=dt_bias,
@@ -820,6 +846,7 @@ def scanprep_fwd_cute(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -842,6 +869,7 @@ def scanprep_fwd_cute(
         params,
         bc,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_state=d_state,
         d_head=d_head,
         dt_min=dt_min,
@@ -869,6 +897,7 @@ def scanprep_fwd_cute_with_aux(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -898,6 +927,7 @@ def scanprep_fwd_cute_with_aux(
         params,
         bc,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_state=d_state,
         d_head=d_head,
         dt_min=dt_min,
@@ -963,7 +993,7 @@ def _make_backward_outputs(
             (
                 input_info.batch_size,
                 input_info.time_steps,
-                input_info.heads,
+                input_info.groups,
                 4,
                 input_info.d_state,
             ),
@@ -1006,7 +1036,7 @@ def _make_backward_runtime_args(
             dB,
             shape=(
                 input_info.batch_size,
-                input_info.heads,
+                input_info.groups,
                 input_info.time_steps,
                 2 * input_info.d_state,
             ),
@@ -1017,7 +1047,7 @@ def _make_backward_runtime_args(
             dC,
             shape=(
                 input_info.batch_size,
-                input_info.heads,
+                input_info.groups,
                 input_info.time_steps,
                 2 * input_info.d_state,
             ),
@@ -1069,6 +1099,7 @@ def _make_backward_cache_key(
     return (
         (
             input_info.heads,
+            input_info.groups,
             input_info.d_head,
             input_info.d_state,
             SCANPREP_PARAM_DIM,
@@ -1091,6 +1122,7 @@ def _make_backward_runtime_artifacts(
     dB: torch.Tensor | None,
     dC: torch.Tensor | None,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
     value_dtype: torch.dtype,
@@ -1102,6 +1134,7 @@ def _make_backward_runtime_artifacts(
     input_info = _make_backward_input_info(
         bc,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
     )
@@ -1176,6 +1209,7 @@ def _make_scanprep_bwd_host_wrapper(
     input_info = compile_artifacts.input_info
     return ScanPrepBwdFused(
         h_size=input_info.heads,
+        g_size=input_info.groups,
         p_size=input_info.d_head,
         n_size=input_info.d_state,
         param_dim=SCANPREP_PARAM_DIM,
@@ -1226,6 +1260,7 @@ def _make_scanprep_bwd_aot_spec(
     return BackwardAOTSpec(
         arch_tag=arch_tag,
         heads=input_info.heads,
+        bc_groups=input_info.groups,
         d_head=input_info.d_head,
         d_state=input_info.d_state,
         bc_dtype_name=_dtype_name(runtime_artifacts.outputs.bc_grad.dtype),
@@ -1329,6 +1364,7 @@ def _scanprep_bwd_cute_prevalidated(
     dB: torch.Tensor | None,
     dC: torch.Tensor | None,
     n_heads: int,
+    bc_groups: int | None,
     d_head: int,
     d_state: int,
     value_dtype: torch.dtype,
@@ -1367,6 +1403,7 @@ def _scanprep_bwd_cute_prevalidated(
         dB=dB,
         dC=dC,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
         value_dtype=value_dtype,
@@ -1391,6 +1428,7 @@ def compile_scanprep_bwd_cute(
     dB: torch.Tensor | None,
     dC: torch.Tensor | None,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
     value_dtype: torch.dtype,
@@ -1429,6 +1467,7 @@ def compile_scanprep_bwd_cute(
         dB=dB,
         dC=dC,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
         value_dtype=value_dtype,
@@ -1458,6 +1497,7 @@ def scanprep_bwd_cute(
     dB: torch.Tensor | None,
     dC: torch.Tensor | None,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
     value_dtype: torch.dtype,
@@ -1492,6 +1532,7 @@ def scanprep_bwd_cute(
         dB=dB,
         dC=dC,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
         value_dtype=value_dtype,

@@ -8,8 +8,9 @@ eager/JIT runtime path:
 - curated default payload specs that match the repo's default training workload
 
 The packaged path stays specialized to the scanprep model configuration
-(``heads``, ``d_head``, ``d_state``, dtypes, and scalar parameter ranges) while
-remaining dynamic in batch/time via runtime tensor views.
+(``heads``, ``bc_groups``, ``d_head``, ``d_state``, dtypes, and scalar
+parameter ranges) while remaining dynamic in batch/time via runtime tensor
+views.
 """
 
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ _PACKAGED_FORWARD_CACHE: dict[str, object] = {}
 _PACKAGED_BACKWARD_CACHE: dict[str, object] = {}
 
 _DEFAULT_AOT_HEADS = 23
+_DEFAULT_AOT_BC_GROUPS = _DEFAULT_AOT_HEADS
 _DEFAULT_AOT_D_HEAD = 64
 _DEFAULT_AOT_D_STATE = 128
 _DEFAULT_AOT_DTYPE_NAMES = ("float16", "bfloat16")
@@ -93,6 +95,7 @@ def _config_tag(config: "ScanPrepConfig") -> str:
 class ForwardAOTSpec:
     arch_tag: str
     heads: int
+    bc_groups: int
     d_head: int
     d_state: int
     value_dtype_name: str
@@ -123,7 +126,7 @@ class ForwardAOTSpec:
         return _sanitize_stem(
             "scanprep_fwd"
             f"__arch{self.arch_tag}"
-            f"__h{self.heads}_p{self.d_head}_n{self.d_state}"
+            f"__h{self.heads}_g{self.bc_groups}_p{self.d_head}_n{self.d_state}"
             f"__val{_dtype_tag(self.value_dtype)}"
             f"__param{_dtype_tag(self.params_dtype)}"
             f"__bc{_dtype_tag(self.bc_dtype)}"
@@ -137,6 +140,7 @@ class ForwardAOTSpec:
 class BackwardAOTSpec:
     arch_tag: str
     heads: int
+    bc_groups: int
     d_head: int
     d_state: int
     bc_dtype_name: str
@@ -166,7 +170,7 @@ class BackwardAOTSpec:
         return _sanitize_stem(
             "scanprep_bwd"
             f"__arch{self.arch_tag}"
-            f"__h{self.heads}_p{self.d_head}_n{self.d_state}"
+            f"__h{self.heads}_g{self.bc_groups}_p{self.d_head}_n{self.d_state}"
             f"__bc{_dtype_tag(self.bc_dtype)}"
             f"__dval{_dtype_tag(self.value_grad_dtype)}"
             f"__dparam{_dtype_tag(self.params_grad_dtype)}"
@@ -200,6 +204,7 @@ def default_forward_aot_specs(
         ForwardAOTSpec(
             arch_tag=arch_tag,
             heads=_DEFAULT_AOT_HEADS,
+            bc_groups=_DEFAULT_AOT_BC_GROUPS,
             d_head=_DEFAULT_AOT_D_HEAD,
             d_state=_DEFAULT_AOT_D_STATE,
             value_dtype_name=dtype_name,
@@ -225,6 +230,7 @@ def default_backward_aot_specs(
         BackwardAOTSpec(
             arch_tag=arch_tag,
             heads=_DEFAULT_AOT_HEADS,
+            bc_groups=_DEFAULT_AOT_BC_GROUPS,
             d_head=_DEFAULT_AOT_D_HEAD,
             d_state=_DEFAULT_AOT_D_STATE,
             bc_dtype_name=dtype_name,
@@ -244,6 +250,7 @@ def _forward_spec_from_record(record: dict[str, Any]) -> ForwardAOTSpec:
     return ForwardAOTSpec(
         arch_tag=str(record["arch_tag"]),
         heads=int(record["heads"]),
+        bc_groups=int(record.get("bc_groups", record["heads"])),
         d_head=int(record["d_head"]),
         d_state=int(record["d_state"]),
         value_dtype_name=str(record["value_dtype_name"]),
@@ -261,6 +268,7 @@ def _backward_spec_from_record(record: dict[str, Any]) -> BackwardAOTSpec:
     return BackwardAOTSpec(
         arch_tag=str(record["arch_tag"]),
         heads=int(record["heads"]),
+        bc_groups=int(record.get("bc_groups", record["heads"])),
         d_head=int(record["d_head"]),
         d_state=int(record["d_state"]),
         bc_dtype_name=str(record["bc_dtype_name"]),
@@ -361,7 +369,7 @@ def _make_forward_runtime_artifacts_from_spec(spec: ForwardAOTSpec):
         (
             _REPRESENTATIVE_BATCH_SIZE,
             _REPRESENTATIVE_TIME_STEPS,
-            spec.heads,
+            spec.bc_groups,
             4,
             spec.d_state,
         ),
@@ -374,6 +382,7 @@ def _make_forward_runtime_artifacts_from_spec(spec: ForwardAOTSpec):
         bc,
         config=spec.config,
         n_heads=spec.heads,
+        bc_groups=spec.bc_groups,
         d_state=spec.d_state,
         d_head=spec.d_head,
         dt_bias=bias,
@@ -392,7 +401,7 @@ def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
         (
             _REPRESENTATIVE_BATCH_SIZE,
             _REPRESENTATIVE_TIME_STEPS,
-            spec.heads,
+            spec.bc_groups,
             4,
             spec.d_state,
         ),
@@ -419,7 +428,7 @@ def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
     dB = torch.empty(
         (
             _REPRESENTATIVE_BATCH_SIZE,
-            spec.heads,
+            spec.bc_groups,
             _REPRESENTATIVE_TIME_STEPS,
             2 * spec.d_state,
         ),
@@ -445,6 +454,7 @@ def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
         dB=dB,
         dC=dC,
         n_heads=spec.heads,
+        bc_groups=spec.bc_groups,
         d_head=spec.d_head,
         d_state=spec.d_state,
         value_dtype=spec.value_grad_dtype,
@@ -466,6 +476,7 @@ def infer_scanprep_fwd_aot_spec(
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -489,6 +500,7 @@ def infer_scanprep_fwd_aot_spec(
     input_info = _make_forward_input_info(
         value,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
     )
@@ -496,6 +508,7 @@ def infer_scanprep_fwd_aot_spec(
     return ForwardAOTSpec(
         arch_tag=arch_tag,
         heads=input_info.heads,
+        bc_groups=input_info.groups,
         d_head=input_info.d_head,
         d_state=input_info.d_state,
         value_dtype_name=_dtype_name(value.dtype),
@@ -528,6 +541,7 @@ def infer_scanprep_bwd_aot_spec(
     bc: torch.Tensor,
     coeff_aux: torch.Tensor,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
     value_dtype: torch.dtype,
@@ -555,6 +569,7 @@ def infer_scanprep_bwd_aot_spec(
     input_info = _make_backward_input_info(
         bc,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
     )
@@ -573,6 +588,7 @@ def infer_scanprep_bwd_aot_spec(
     return BackwardAOTSpec(
         arch_tag=arch_tag,
         heads=input_info.heads,
+        bc_groups=input_info.groups,
         d_head=input_info.d_head,
         d_state=input_info.d_state,
         bc_dtype_name=_dtype_name(bc.dtype),
@@ -652,6 +668,7 @@ def export_scanprep_fwd_cute_aot(
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -677,6 +694,7 @@ def export_scanprep_fwd_cute_aot(
         theta_bias=theta_bias,
         theta_sign=theta_sign,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_state=d_state,
         d_head=d_head,
         dt_min=dt_min,
@@ -713,6 +731,7 @@ def export_scanprep_bwd_cute_aot(
     bc: torch.Tensor,
     coeff_aux: torch.Tensor,
     n_heads: int,
+    bc_groups: int | None = None,
     d_head: int,
     d_state: int,
     value_dtype: torch.dtype,
@@ -736,6 +755,7 @@ def export_scanprep_bwd_cute_aot(
         bc=bc,
         coeff_aux=coeff_aux,
         n_heads=n_heads,
+        bc_groups=bc_groups,
         d_head=d_head,
         d_state=d_state,
         value_dtype=value_dtype,

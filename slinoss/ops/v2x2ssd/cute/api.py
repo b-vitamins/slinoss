@@ -98,6 +98,7 @@ def v2x2ssd_cute(
         empty_y, final_state, b_last, u_last = _resolve_empty_outputs(
             batch_size=batch_size,
             n_heads=n_heads,
+            bc_groups=int(B.shape[1]),
             P=P,
             D=D,
             device=U.device,

@@ -67,6 +67,8 @@ class ChunkIncrementBwdCompiledBundle:
 class ChunkIncrementBwdInputInfo:
     batch_size: int
     heads: int
+    bc_groups: int
+    heads_per_bc_group: int
     time_steps: int
     P: int
     D: int
@@ -75,6 +77,8 @@ class ChunkIncrementBwdInputInfo:
     padded_time: int
     batch_head_count: int
     batch_head_chunk_count: int
+    batch_group_count: int
+    batch_group_chunk_count: int
     device_index: int
     tc_dtype: torch.dtype
     cutlass_dtype: object
@@ -167,6 +171,7 @@ def _get_zero_prev_tensors(
     dtype: torch.dtype,
     batch_size: int,
     heads: int,
+    bc_groups: int,
     P: int,
     D: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,17 +181,36 @@ def _get_zero_prev_tensors(
         dtype,
         int(batch_size),
         int(heads),
+        int(bc_groups),
         int(P),
         int(D),
     )
     cached = _ZERO_PREV_CACHE.get(key)
     if cached is None:
         cached = (
-            torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
+            torch.zeros((batch_size, bc_groups, D), device=device, dtype=dtype),
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     return cached
+
+
+def _reduce_heads_to_bc_groups(
+    x: torch.Tensor,
+    *,
+    bc_groups: int,
+) -> torch.Tensor:
+    if x.ndim < 2:
+        raise ValueError("Expected tensor with a head axis at dim=1.")
+    batch_size, heads = map(int, x.shape[:2])
+    if heads % bc_groups != 0:
+        raise ValueError(
+            f"bc_groups must divide heads. Got heads={heads}, bc_groups={bc_groups}."
+        )
+    if heads == bc_groups:
+        return x
+    heads_per_group = heads // bc_groups
+    return x.reshape(batch_size, bc_groups, heads_per_group, *x.shape[2:]).sum(dim=2)
 
 
 def _chunk_increment_device_label(device_index: int) -> str:
@@ -341,10 +365,10 @@ def _make_tensor_from_spec(
 def _make_boundary_tensor_specs(
     problem_shape: tuple[int, ...],
 ) -> ChunkIncrementBwdBoundaryTensorSpecs:
-    L, P, D, BHC = problem_shape
+    L, P, D, BHC, BGC = problem_shape
     return ChunkIncrementBwdBoundaryTensorSpecs(
         d_inc_boundary=_make_tensor_spec((BHC, P, D), stride=(P * D, D, 1)),
-        prev_b=_make_tensor_spec((D, BHC), stride=(1, D)),
+        prev_b=_make_tensor_spec((D, BGC), stride=(1, D)),
         prev_u=_make_tensor_spec((P, BHC), stride=(1, P)),
         transition=_make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2)),
         d_mp0=_make_tensor_spec((2, BHC), stride=(BHC, 1)),
@@ -358,22 +382,23 @@ def _prepare_boundary_prev_chunks(
     U_prev0: torch.Tensor,
     B_prev0: torch.Tensor,
     batch_head_count: int,
+    batch_group_count: int,
     n_chunks: int,
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     P = int(U_tc.shape[-1])
     D = int(B_tc.shape[-1])
     U_chunks = U_tc.reshape(batch_head_count, n_chunks, chunk_size, P)
-    B_chunks = B_tc.reshape(batch_head_count, n_chunks, chunk_size, D)
+    B_chunks = B_tc.reshape(batch_group_count, n_chunks, chunk_size, D)
 
     U_prev_chunks = torch.empty(
         (batch_head_count, n_chunks, P), device=U_tc.device, dtype=U_tc.dtype
     )
     B_prev_chunks = torch.empty(
-        (batch_head_count, n_chunks, D), device=B_tc.device, dtype=B_tc.dtype
+        (batch_group_count, n_chunks, D), device=B_tc.device, dtype=B_tc.dtype
     )
     U_prev_chunks[:, 0, :] = U_prev0.reshape(batch_head_count, P)
-    B_prev_chunks[:, 0, :] = B_prev0.reshape(batch_head_count, D)
+    B_prev_chunks[:, 0, :] = B_prev0.reshape(batch_group_count, D)
     if n_chunks > 1:
         U_prev_chunks[:, 1:, :] = U_chunks[:, :-1, -1, :]
         B_prev_chunks[:, 1:, :] = B_chunks[:, :-1, -1, :]
@@ -441,11 +466,11 @@ def _make_db_host_wrapper(
     launch_cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    L, P, D, BHC = problem_shape
-    chunk_size, n_d_tiles = launch_cfg
+    L, P, D, BHC, BGC = problem_shape
+    chunk_size, n_d_tiles, heads, bc_groups, n_chunks = launch_cfg
 
     u_spec = _make_tensor_spec((L, P, BHC), stride=(P, 1, L * P))
-    b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    b_spec = _make_tensor_spec((L, D, BGC), stride=(D, 1, L * D))
     m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
     d_inc_dp_spec = _make_tensor_spec((D, P, BHC), stride=(1, D, P * D))
     d_b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
@@ -479,6 +504,9 @@ def _make_db_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         kernel(mU, mB, mM, mKprev, mKcurr, mDIncDP, mDB, mDMsumPart)
 
@@ -491,11 +519,11 @@ def _make_du_host_wrapper(
     launch_cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    L, P, D, BHC = problem_shape
-    (chunk_size,) = launch_cfg
+    L, P, D, BHC, BGC = problem_shape
+    chunk_size, heads, bc_groups, n_chunks = launch_cfg
 
     d_inc_spec = _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D))
-    b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    b_spec = _make_tensor_spec((L, D, BGC), stride=(D, 1, L * D))
     m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
     d_u_spec = _make_tensor_spec((P, L, BHC), stride=(1, P, L * P))
 
@@ -520,6 +548,9 @@ def _make_du_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         kernel(mDInc, mB, mM, mKprev, mKcurr, mDU)
 
@@ -532,8 +563,8 @@ def _make_boundary_host_wrapper(
     launch_cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    _L, P, D, _BHC = problem_shape
-    (chunk_size,) = launch_cfg
+    _L, P, D, _BHC, _BGC = problem_shape
+    chunk_size, heads, bc_groups, n_chunks = launch_cfg
 
     boundary_specs = _make_boundary_tensor_specs(problem_shape)
 
@@ -562,6 +593,9 @@ def _make_boundary_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         kernel(mDInc, mBPrev, mUPrev, mM, mKprev, mDUPrev, mDBPrev, mDMp0)
 
@@ -632,11 +666,11 @@ def _make_stage_host_wrapper(
     launch_cfg: tuple[int, ...],
     cutlass_dtype,
 ):
-    L, P, D, BHC = problem_shape
-    chunk_size, n_d_tiles = launch_cfg
+    L, P, D, BHC, BGC = problem_shape
+    chunk_size, n_d_tiles, heads, bc_groups, n_chunks = launch_cfg
 
     u_spec = _make_tensor_spec((L, P, BHC), stride=(P, 1, L * P))
-    b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    b_spec = _make_tensor_spec((L, D, BGC), stride=(D, 1, L * D))
     m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
     d_inc_spec = _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D))
     d_inc_dp_spec = _make_tensor_spec((D, P, BHC), stride=(1, D, P * D))
@@ -697,18 +731,27 @@ def _make_stage_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         k_du = ChunkIncrementBwdDUAmpere(
             cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         k_boundary = ChunkIncrementBwdBoundaryAmpere(
             cutlass_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         k_param_scan = ChunkIncrementBwdParamScanAmpere(
             chunk_size=chunk_size,
@@ -756,14 +799,19 @@ def _make_chunk_increment_bwd_input_info(
         raise ValueError("CUDA tensor required.")
 
     batch_size, heads, time_steps, P = map(int, U.shape)
+    bc_groups = int(B.shape[1])
     D = int(B.shape[-1])
     device_index = (
         int(U.device.index)
         if U.device.index is not None
         else torch.cuda.current_device()
     )
-    if B.shape != (batch_size, heads, time_steps, D):
-        raise ValueError("B must be (B,H,T,D) matching U.")
+    if heads % bc_groups != 0:
+        raise ValueError(
+            f"bc_groups must divide heads. Got heads={heads}, bc_groups={bc_groups}."
+        )
+    if B.shape != (batch_size, bc_groups, time_steps, D):
+        raise ValueError("B must be (B,G,T,D) with contiguous head-to-group mapping.")
     if M.shape != (batch_size, heads, time_steps, 2):
         raise ValueError(f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}.")
     if K.shape != (batch_size, heads, time_steps, 2, 2):
@@ -794,6 +842,8 @@ def _make_chunk_increment_bwd_input_info(
     return ChunkIncrementBwdInputInfo(
         batch_size=batch_size,
         heads=heads,
+        bc_groups=bc_groups,
+        heads_per_bc_group=heads // bc_groups,
         time_steps=time_steps,
         P=P,
         D=D,
@@ -802,6 +852,8 @@ def _make_chunk_increment_bwd_input_info(
         padded_time=padded_time,
         batch_head_count=batch_size * heads,
         batch_head_chunk_count=batch_size * heads * n_chunks,
+        batch_group_count=batch_size * bc_groups,
+        batch_group_chunk_count=batch_size * bc_groups * n_chunks,
         device_index=device_index,
         tc_dtype=tc_dtype,
         cutlass_dtype=_torch_to_cutlass_dtype(tc_dtype),
@@ -821,18 +873,19 @@ def _make_chunk_increment_bwd_prev_state(
             dtype=input_info.tc_dtype,
             batch_size=input_info.batch_size,
             heads=input_info.heads,
+            bc_groups=input_info.bc_groups,
             P=input_info.P,
             D=input_info.D,
         )
 
-    if B_prev.shape != (input_info.batch_size, input_info.heads, input_info.D):
-        raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+    if B_prev.shape != (input_info.batch_size, input_info.bc_groups, input_info.D):
+        raise ValueError("B_prev/U_prev must be (B,G,D)/(B,H,P).")
     if U_prev is None or U_prev.shape != (
         input_info.batch_size,
         input_info.heads,
         input_info.P,
     ):
-        raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+        raise ValueError("B_prev/U_prev must be (B,G,D)/(B,H,P).")
     return (
         B_prev.to(dtype=input_info.tc_dtype).contiguous(),
         U_prev.to(dtype=input_info.tc_dtype).contiguous(),
@@ -897,6 +950,7 @@ def _make_chunk_increment_bwd_prepared_inputs(
         U_prev0=u_prev0,
         B_prev0=b_prev0,
         batch_head_count=input_info.batch_head_count,
+        batch_group_count=input_info.batch_group_count,
         n_chunks=input_info.n_chunks,
         chunk_size=input_info.chunk_size,
     )
@@ -922,6 +976,9 @@ def _validate_chunk_increment_bwd_support(
         chunk_size=input_info.chunk_size,
         D=input_info.D,
         P=input_info.P,
+        heads=input_info.heads,
+        bc_groups=input_info.bc_groups,
+        n_chunks=input_info.n_chunks,
     )
     db_info = db_kernel.support_info(
         input_info.cutlass_dtype,
@@ -942,6 +999,9 @@ def _validate_chunk_increment_bwd_support(
         chunk_size=input_info.chunk_size,
         D=input_info.D,
         P=input_info.P,
+        heads=input_info.heads,
+        bc_groups=input_info.bc_groups,
+        n_chunks=input_info.n_chunks,
     )
     du_info = du_kernel.support_info(
         input_info.cutlass_dtype,
@@ -960,6 +1020,9 @@ def _validate_chunk_increment_bwd_support(
         chunk_size=input_info.chunk_size,
         D=input_info.D,
         P=input_info.P,
+        heads=input_info.heads,
+        bc_groups=input_info.bc_groups,
+        n_chunks=input_info.n_chunks,
     )
     boundary_info = boundary_kernel.support_info(device_index=input_info.device_index)
     if not boundary_info.supported:
@@ -1116,20 +1179,37 @@ def _get_compiled_chunk_increment_bwd_bundle(
         input_info.P,
         input_info.D,
         input_info.batch_head_chunk_count,
+        input_info.batch_group_chunk_count,
     )
     db_wrapper = _make_db_host_wrapper(
         problem_shape=problem_shape,
-        launch_cfg=(input_info.chunk_size, n_d_tiles),
+        launch_cfg=(
+            input_info.chunk_size,
+            n_d_tiles,
+            input_info.heads,
+            input_info.bc_groups,
+            input_info.n_chunks,
+        ),
         cutlass_dtype=input_info.cutlass_dtype,
     )
     du_wrapper = _make_du_host_wrapper(
         problem_shape=problem_shape,
-        launch_cfg=(input_info.chunk_size,),
+        launch_cfg=(
+            input_info.chunk_size,
+            input_info.heads,
+            input_info.bc_groups,
+            input_info.n_chunks,
+        ),
         cutlass_dtype=input_info.cutlass_dtype,
     )
     boundary_wrapper = _make_boundary_host_wrapper(
         problem_shape=problem_shape,
-        launch_cfg=(input_info.chunk_size,),
+        launch_cfg=(
+            input_info.chunk_size,
+            input_info.heads,
+            input_info.bc_groups,
+            input_info.n_chunks,
+        ),
         cutlass_dtype=input_info.cutlass_dtype,
     )
     param_scan_wrapper = _make_param_scan_host_wrapper(
@@ -1138,7 +1218,13 @@ def _get_compiled_chunk_increment_bwd_bundle(
     )
     stage_wrapper = _make_stage_host_wrapper(
         problem_shape=problem_shape,
-        launch_cfg=(input_info.chunk_size, n_d_tiles),
+        launch_cfg=(
+            input_info.chunk_size,
+            n_d_tiles,
+            input_info.heads,
+            input_info.bc_groups,
+            input_info.n_chunks,
+        ),
         cutlass_dtype=input_info.cutlass_dtype,
     )
     cached = ChunkIncrementBwdCompiledBundle(
@@ -1362,6 +1448,10 @@ def _make_chunk_increment_bwd_public_outputs(
 ) -> tuple[torch.Tensor, ...]:
     d_u_public = _fold_chunk_boundary_carries(outputs.d_u_chunk, outputs.d_u_prev)
     d_b_public = _fold_chunk_boundary_carries(outputs.d_b_chunk, outputs.d_b_prev)
+    d_b_grouped = _reduce_heads_to_bc_groups(d_b_public, bc_groups=B.shape[1])
+    d_b_prev_grouped = _reduce_heads_to_bc_groups(
+        outputs.d_b_prev, bc_groups=B.shape[1]
+    )
 
     if not return_prev_grads:
         return (
@@ -1377,7 +1467,7 @@ def _make_chunk_increment_bwd_public_outputs(
                 time_steps=U.shape[2],
             ),
             _public_from_chunked_output(
-                d_b_public,
+                d_b_grouped,
                 time_steps=U.shape[2],
                 dtype=B.dtype,
             ),
@@ -1395,11 +1485,11 @@ def _make_chunk_increment_bwd_public_outputs(
             time_steps=U.shape[2],
         ),
         _public_from_chunked_output(
-            d_b_public,
+            d_b_grouped,
             time_steps=U.shape[2],
             dtype=B.dtype,
         ),
-        outputs.d_b_prev[:, :, 0, :].to(dtype=B.dtype).contiguous(),
+        d_b_prev_grouped[:, :, 0, :].to(dtype=B.dtype).contiguous(),
         outputs.d_u_prev[:, :, 0, :].to(dtype=U.dtype).contiguous(),
     )
 

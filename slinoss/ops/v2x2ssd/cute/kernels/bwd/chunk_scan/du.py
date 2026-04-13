@@ -10,13 +10,13 @@ the public value-gradient outputs directly.
 Tensor contracts:
 
 - ``U``: ``(BHC, L, 1, P)`` fp16/bf16 value input
-- ``B``: ``(BHC, L, 1, D)`` fp16/bf16 key-side packed complex input
-- ``C``: ``(BHC, L, 1, D)`` fp16/bf16 query-side packed complex input
+- ``B``: ``(BGC, L, 1, D)`` fp16/bf16 key-side packed complex input
+- ``C``: ``(BGC, L, 1, D)`` fp16/bf16 query-side packed complex input
 - ``M``: ``(BHC, L, 2)`` fp32 packed complex transitions
 - ``K``: ``(BHC, L, 2, 2)`` fp32 packed complex taps
 - ``dOut``: ``(BHC, L, 1, P)`` fp16/bf16 output gradient
 - ``U_prev0``: ``(BH, P)`` fp16/bf16 chunk-0 boundary value row
-- ``B_prev0``: ``(BH, D)`` fp16/bf16 chunk-0 boundary key row
+- ``B_prev0``: ``(BG, D)`` fp16/bf16 chunk-0 boundary key row
 - ``dU``: ``(BHC, L, 1, P)`` fp16/bf16 value gradients
 - ``dU_prev``: ``(BHC, P)`` fp16/bf16 chunk-boundary value carry gradients
 
@@ -109,13 +109,38 @@ class ChunkScanBwdDUAmpere:
         dict[tuple[object, ...], ChunkScanBwdDUSupportInfo]
     ] = {}
 
-    def __init__(self, dtype, *, chunk_size, D, P, num_threads=128):
+    def __init__(
+        self,
+        dtype,
+        *,
+        chunk_size,
+        D,
+        P,
+        num_threads=128,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+    ):
         self.ab_dtype = dtype
         self.acc_dtype = cutlass.Float32
         self.L = int(chunk_size)
         self.D = int(D)
         self.P = int(P)
         self.num_threads = int(num_threads)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.heads_per_bc_group = 0
 
         self.kv_tile = 32
         self.p_tile = 32
@@ -137,6 +162,24 @@ class ChunkScanBwdDUAmpere:
             raise ValueError(
                 f"num_threads must be {expected_threads} for the 32x32 tensorop tile."
             )
+
+    @cute.jit
+    def _batch_group(self, batch_head: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        return batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+
+    @cute.jit
+    def _batch_group_chunk(self, batch_head_chunk: int, n_chunks: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk
+        batch_head = batch_head_chunk // n_chunks
+        chunk_index = batch_head_chunk - batch_head * n_chunks
+        batch_group = self._batch_group(batch_head)
+        return batch_group * n_chunks + chunk_index
 
     @property
     def D_padded(self) -> int:
@@ -778,8 +821,8 @@ class ChunkScanBwdDUAmpere:
         m_key: cute.Tensor,
         m_key_prev0: cute.Tensor,
         *,
-        batch_head_chunk: int,
-        batch_head: int,
+        batch_group_chunk: int,
+        batch_group: int,
         chunk_index: int,
         d_col_base: int,
         stage_width: int,
@@ -795,10 +838,10 @@ class ChunkScanBwdDUAmpere:
                 value = out_dtype(0)
                 if d_idx < cutlass.Int32(self.D):
                     if chunk_index == cutlass.Int32(0):
-                        value = m_key_prev0[batch_head, d_idx]
+                        value = m_key_prev0[batch_group, d_idx]
                     else:
                         value = m_key[
-                            batch_head_chunk - cutlass.Int32(1),
+                            batch_group_chunk - cutlass.Int32(1),
                             cutlass.Int32(self.L - 1),
                             0,
                             d_idx,
@@ -857,12 +900,12 @@ class ChunkScanBwdDUAmpere:
         self,
         coord_score: cute.Tensor,
         *,
-        batch_head_chunk: int,
+        batch_group_chunk: int,
         m_tile: int,
         n_tile: int,
     ):
         return cute.local_tile(
-            coord_score[batch_head_chunk, None, 0, None],
+            coord_score[batch_group_chunk, None, 0, None],
             (self.kv_tile, self.kv_tile),
             (m_tile, n_tile),
         )
@@ -918,7 +961,8 @@ class ChunkScanBwdDUAmpere:
         acc_score: cute.Tensor,
         *,
         batch_head_chunk: int,
-        batch_head: int,
+        batch_group_chunk: int,
+        batch_group: int,
         chunk_index: int,
         n_tile: int,
         m_tile: int,
@@ -930,14 +974,14 @@ class ChunkScanBwdDUAmpere:
         d_stage_width = self._d_stage_size()
 
         query_coord_stage0 = cute.local_tile(
-            coord_query[batch_head_chunk, None, 0, None],
+            coord_query[batch_group_chunk, None, 0, None],
             (self.kv_tile, d_stage_width),
             (m_tile, 0),
         )
         t_query_coord_stage0 = gmem_thr_copy_d.partition_S(query_coord_stage0)
 
         key_coord_stage0 = cute.local_tile(
-            coord_key[batch_head_chunk, None, 0, None],
+            coord_key[batch_group_chunk, None, 0, None],
             (self.kv_tile, d_stage_width),
             (n_tile, 0),
         )
@@ -955,7 +999,7 @@ class ChunkScanBwdDUAmpere:
             )
 
             g_query_stage = cute.local_tile(
-                m_query[batch_head_chunk, None, 0, None],
+                m_query[batch_group_chunk, None, 0, None],
                 (self.kv_tile, d_stage_width),
                 (m_tile, d_stage_idx),
             )
@@ -970,7 +1014,7 @@ class ChunkScanBwdDUAmpere:
             )
 
             g_key_stage = cute.local_tile(
-                m_key[batch_head_chunk, None, 0, None],
+                m_key[batch_group_chunk, None, 0, None],
                 (self.kv_tile, d_stage_width),
                 (n_tile, d_stage_idx),
             )
@@ -1013,8 +1057,8 @@ class ChunkScanBwdDUAmpere:
                         s_key,
                         m_key,
                         m_key_prev0,
-                        batch_head_chunk=batch_head_chunk,
-                        batch_head=batch_head,
+                        batch_group_chunk=batch_group_chunk,
+                        batch_group=batch_group,
                         chunk_index=chunk_index,
                         d_col_base=d_col_base,
                         stage_width=d_stage_width,
@@ -1414,7 +1458,8 @@ class ChunkScanBwdDUAmpere:
         acc_output_tiles,
         *,
         batch_head_chunk: int,
-        batch_head: int,
+        batch_group_chunk: int,
+        batch_group: int,
         chunk_index: int,
         n_tile: int,
         n_tile_start: int,
@@ -1447,7 +1492,8 @@ class ChunkScanBwdDUAmpere:
                 mma_state,
                 acc_score,
                 batch_head_chunk=batch_head_chunk,
-                batch_head=batch_head,
+                batch_group_chunk=batch_group_chunk,
+                batch_group=batch_group,
                 chunk_index=chunk_index,
                 n_tile=n_tile,
                 m_tile=m_tile,
@@ -1459,7 +1505,7 @@ class ChunkScanBwdDUAmpere:
 
             score_coord_tile = self._make_score_coord_tile(
                 coord_score,
-                batch_head_chunk=batch_head_chunk,
+                batch_group_chunk=batch_group_chunk,
                 m_tile=m_tile,
                 n_tile=n_tile,
             )
@@ -1540,11 +1586,11 @@ class ChunkScanBwdDUAmpere:
         gmem_thr_copy_d: object,
         t_query_smem: cute.Tensor,
         *,
-        batch_head_chunk: int,
+        batch_group_chunk: int,
         query_col_limit: int,
     ):
         query_coord_tile = cute.local_tile(
-            coord_query[batch_head_chunk, None, 0, None],
+            coord_query[batch_group_chunk, None, 0, None],
             (self.kv_tile, self._d_stage_size()),
             (0, 0),
         )
@@ -1694,9 +1740,9 @@ class ChunkScanBwdDUAmpere:
         if cutlass.const_expr(
             mU.shape[1] != self.L or mB.shape[1] != self.L or mC.shape[1] != self.L
         ):
-            raise ValueError("U/B/C must have shape (BHC, L, 1, ...).")
+            raise ValueError("U must be (BHC, L, 1, P) and B/C must be (BGC, L, 1, D).")
         if cutlass.const_expr(mU.shape[2] != 1 or mB.shape[2] != 1 or mC.shape[2] != 1):
-            raise ValueError("U/B/C must have a singleton dim2 (BHC, L, 1, ...).")
+            raise ValueError("U must be (BHC, L, 1, P) and B/C must be (BGC, L, 1, D).")
         if cutlass.const_expr(mM.shape[1] != self.L or mM.shape[2] != 2):
             raise ValueError("M must be (BHC, L, 2).")
         if cutlass.const_expr(
@@ -1713,7 +1759,7 @@ class ChunkScanBwdDUAmpere:
         if cutlass.const_expr(
             mB.layout.shape[3] != self.D or mC.layout.shape[3] != self.D
         ):
-            raise ValueError("B/C must be (BHC, L, 1, D).")
+            raise ValueError("B/C must be (BGC, L, 1, D).")
         if cutlass.const_expr(
             mDU.shape[1] != self.L or mDU.shape[2] != 1 or mDU.layout.shape[3] != self.P
         ):
@@ -1721,7 +1767,7 @@ class ChunkScanBwdDUAmpere:
         if cutlass.const_expr(
             mDB.shape[1] != self.L or mDB.shape[2] != 1 or mDB.layout.shape[3] != self.D
         ):
-            raise ValueError("dB must be (BHC, L, 1, D).")
+            raise ValueError("dB must be (BGC, L, 1, D).")
         if cutlass.const_expr(mDU_prev.shape[1] != self.P):
             raise ValueError("dU_prev must be (BHC, P).")
         if cutlass.const_expr(mDB_prev.shape[1] != self.D):
@@ -1738,7 +1784,7 @@ class ChunkScanBwdDUAmpere:
         if cutlass.const_expr(mU_prev0.shape[1] != self.P):
             raise ValueError("U_prev0 must be (BH, P).")
         if cutlass.const_expr(mB_prev0.shape[1] != self.D):
-            raise ValueError("B_prev0 must be (BH, D).")
+            raise ValueError("B_prev0 must be (BG, D).")
 
     # Host launch
     def _launch_main_kernel(
@@ -1962,8 +2008,11 @@ class ChunkScanBwdDUAmpere:
         in_dtype = mU.element_type
         n_tiles = self.num_kv_tiles
         batch_head_count = mU_prev0.shape[0]
-        n_chunks = mB.shape[0] // batch_head_count
+        batch_head_chunk_count = mU.shape[0]
+        n_chunks = batch_head_chunk_count // batch_head_count
         batch_head = batch_head_chunk // n_chunks
+        batch_group = self._batch_group(batch_head)
+        batch_group_chunk = self._batch_group_chunk(batch_head_chunk, n_chunks)
         chunk_index = batch_head_chunk - batch_head * n_chunks
 
         smem = cutlass.utils.SmemAllocator()
@@ -2015,7 +2064,7 @@ class ChunkScanBwdDUAmpere:
             coord_bundle.query,
             gmem_thr_copy_d,
             t_query_smem,
-            batch_head_chunk=batch_head_chunk,
+            batch_group_chunk=batch_group_chunk,
             query_col_limit=mC.layout.shape[3],
         )
 
@@ -2078,7 +2127,8 @@ class ChunkScanBwdDUAmpere:
                 acc_shape_score,
                 acc_output_curr_tiles,
                 batch_head_chunk=batch_head_chunk,
-                batch_head=batch_head,
+                batch_group_chunk=batch_group_chunk,
+                batch_group=batch_group,
                 chunk_index=chunk_index,
                 n_tile=n_tile,
                 n_tile_start=n_tile_start,
@@ -2113,7 +2163,8 @@ class ChunkScanBwdDUAmpere:
                 acc_shape_score,
                 acc_output_prev_tiles,
                 batch_head_chunk=batch_head_chunk,
-                batch_head=batch_head,
+                batch_group_chunk=batch_group_chunk,
+                batch_group=batch_group,
                 chunk_index=chunk_index,
                 n_tile=n_tile,
                 n_tile_start=n_tile_start,

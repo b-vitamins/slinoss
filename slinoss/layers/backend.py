@@ -30,7 +30,11 @@ class ScanPrepInputs:
     Shapes:
     - ``value``: ``(batch, T, heads * P)``
     - ``params``: ``(batch, T, heads * param_dim)``
-    - ``bc``: ``(batch, T, heads, 2, N)``
+    - ``bc``: ``(batch, T, groups, 2, N)``
+
+    The BC stream is grouped across contiguous head ranges. If ``H`` is the
+    value-head count and ``G`` is the BC-group count, then the grouped BC slice
+    consumed by head ``h`` is ``bc[..., h // (H // G), :, :]``.
     """
 
     value: torch.Tensor
@@ -46,7 +50,10 @@ class ScanInputs:
     - ``U``: ``(batch, heads, T, P)``
     - ``M``: ``(batch, heads, T, 2)``
     - ``K``: ``(batch, heads, T, 2, 2)``
-    - ``B, C``: ``(batch, heads, T, 2N)``
+    - ``B, C``: ``(batch, groups, T, 2N)``
+
+    The grouped BC tensors use the same contiguous head-to-group mapping as
+    ``ScanPrepInputs.bc``.
     """
 
     U: torch.Tensor
@@ -63,7 +70,7 @@ class MixerDecodeInputs:
     Shapes:
     - ``value``: ``(batch, heads, P)`` post-conv/post-activation value token
     - ``params``: ``(batch, heads, param_dim)`` flat scanprep parameter token
-    - ``bc``: ``(batch, heads, 2, N)`` raw mixer-emitted BC token
+    - ``bc``: ``(batch, groups, 2, N)`` raw mixer-emitted grouped BC token
     - ``gate``: ``(batch, heads, P)`` token-local gating vector
     """
 
@@ -80,6 +87,9 @@ if TYPE_CHECKING:
         def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs: ...
 
     class _MixerScanPrepOwner(Protocol):
+        @property
+        def bc_groups(self) -> int: ...
+
         @property
         def param_dim(self) -> int: ...
 
@@ -146,6 +156,9 @@ if TYPE_CHECKING:
         def dw_bias(self) -> torch.Tensor: ...
 
     class _MixerDecodeOwner(Protocol):
+        @property
+        def bc_groups(self) -> int: ...
+
         @property
         def d_inner(self) -> int: ...
 

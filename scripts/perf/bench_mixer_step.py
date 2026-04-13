@@ -33,6 +33,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d-head", type=int, default=64)
     parser.add_argument("--d-conv", type=int, default=4)
     parser.add_argument("--chunk-size", type=int, default=32)
+    parser.add_argument("--bc-groups", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--repeat", type=int, default=5)
@@ -51,6 +52,7 @@ def _run_case(args: argparse.Namespace, *, batch_size: int) -> dict[str, object]
         d_head=args.d_head,
         d_conv=args.d_conv,
         chunk_size=args.chunk_size,
+        bc_groups=args.bc_groups,
         device=args.device,
         dtype=dtype,
     ).eval()
@@ -102,6 +104,7 @@ def main() -> int:
         "d_head": args.d_head,
         "d_conv": args.d_conv,
         "chunk_size": args.chunk_size,
+        "bc_groups": args.bc_groups,
         "warmup": args.warmup,
         "iterations": args.iterations,
         "repeat": args.repeat,

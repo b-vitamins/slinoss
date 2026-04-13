@@ -57,6 +57,7 @@ class NextCharPerfConfig:
     d_head: int = 64
     d_conv: int = 4
     chunk_size: int = 32
+    bc_groups: int | None = None
     lr: float = 3e-4
     weight_decay: float = 0.05
     grad_clip: float = 1.0
@@ -77,9 +78,14 @@ class NextCharPerfConfig:
         return d_inner // self.d_head
 
     @property
+    def resolved_bc_groups(self) -> int:
+        return self.n_heads if self.bc_groups is None else int(self.bc_groups)
+
+    @property
     def perf_config_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["dtype"] = str(self.dtype)
+        data["bc_groups"] = self.resolved_bc_groups
         return data
 
 
@@ -112,6 +118,7 @@ def build_model(
         d_head=cfg.d_head,
         d_conv=cfg.d_conv,
         chunk_size=cfg.chunk_size,
+        bc_groups=cfg.resolved_bc_groups,
     ).to(device=cfg.torch_device, dtype=cfg.dtype)
     model.perf_trainable_params = tuple(
         p for p in model.parameters() if p.requires_grad

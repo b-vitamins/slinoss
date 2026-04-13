@@ -293,6 +293,7 @@ def estimate_lower_bound(
     d_head = int(mixer.d_head)
     d_state = int(mixer.d_state)
     n_heads = int(mixer.n_heads)
+    bc_groups = int(getattr(mixer, "bc_groups", n_heads))
     d_conv = int(mixer.d_conv)
     hidden = int(blocks[0].ff.fc1.out_features)
 
@@ -305,7 +306,7 @@ def estimate_lower_bound(
         * (
             d_inner * max(d_conv - 1, 0) * dtype_bytes
             + n_heads * d_head * (2 * d_state) * dtype_bytes
-            + n_heads * (2 * d_state) * dtype_bytes
+            + bc_groups * (2 * d_state) * dtype_bytes
             + n_heads * d_head * dtype_bytes
         )
     )

@@ -87,7 +87,21 @@ def _cuda_amp_dtype_supported(dtype: torch.dtype) -> bool:
     return dtype == torch.float16
 
 
-def _make_mixer(*, scan_backend: object | None = None) -> SLinOSSMixer:
+def _make_mixer(
+    *,
+    scan_backend: object | None = None,
+    bc_groups: int | None = None,
+) -> SLinOSSMixer:
+    if bc_groups is None:
+        return SLinOSSMixer(
+            12,
+            d_state=3,
+            expand=2,
+            d_head=6,
+            d_conv=3,
+            chunk_size=4,
+            scan_backend=scan_backend,  # type: ignore[arg-type]
+        )
     return SLinOSSMixer(
         12,
         d_state=3,
@@ -96,13 +110,15 @@ def _make_mixer(*, scan_backend: object | None = None) -> SLinOSSMixer:
         d_conv=3,
         chunk_size=4,
         scan_backend=scan_backend,  # type: ignore[arg-type]
+        bc_groups=bc_groups,
     )
 
 
-def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
+@pytest.mark.parametrize("bc_groups", [4, 2])
+def test_mixer_calls_backend_with_canonical_scan_shapes(bc_groups: int) -> None:
     torch.manual_seed(0)
     spy = SpyBackend()
-    mixer = _make_mixer(scan_backend=spy)
+    mixer = _make_mixer(scan_backend=spy, bc_groups=bc_groups)
     x = torch.randn((2, 5, 12), dtype=torch.float32)
 
     y, state = mixer(x, return_state=True)
@@ -120,13 +136,13 @@ def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
     assert spy.last_inputs.U.shape == (2, 4, 5, 6)
     assert spy.last_inputs.M.shape == (2, 4, 5, 2)
     assert spy.last_inputs.K.shape == (2, 4, 5, 2, 2)
-    assert spy.last_inputs.B.shape == (2, 4, 5, 6)
-    assert spy.last_inputs.C.shape == (2, 4, 5, 6)
+    assert spy.last_inputs.B.shape == (2, mixer.bc_groups, 5, 6)
+    assert spy.last_inputs.C.shape == (2, mixer.bc_groups, 5, 6)
     assert spy.last_inputs.B.is_contiguous()
     assert spy.last_inputs.C.is_contiguous()
     assert state.conv.shape == (2, 24, 2)
     assert state.scan.state.shape == (2, 4, 6, 6)
-    assert state.scan.b_prev.shape == (2, 4, 6)
+    assert state.scan.b_prev.shape == (2, mixer.bc_groups, 6)
     assert state.scan.u_prev.shape == (2, 4, 6)
 
 

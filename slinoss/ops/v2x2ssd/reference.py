@@ -14,13 +14,15 @@ Canonical layouts
 - ``M``: ``(batch, heads, T, 2)`` packed complex ``(re, im)``
 - ``K``: ``(batch, heads, T, 2, 2)`` with tap ``0=prev`` and ``1=curr``,
   each packed as ``(re, im)``
-- ``B, C``: ``(batch, heads, T, 2N)`` flattened interleaved complex vectors
+- ``B, C``: ``(batch, groups, T, 2N)`` flattened interleaved complex vectors
+  shared across contiguous head groups, where ``groups`` divides ``heads``
 - State ``z``: ``(batch, heads, P, 2N)``
 - Output ``Y``: ``(batch, heads, T, P)``
 
 Streaming semantics
 -------------------
-Optional ``B_prev`` / ``U_prev`` provide time-0 "previous" values:
+Optional grouped ``B_prev`` and per-head ``U_prev`` provide time-0 "previous"
+values:
 
 - ``B_prev_seq[t] = B_prev`` if ``t == 0`` else ``B[..., t-1]``
 - ``U_prev_seq[t] = U_prev`` if ``t == 0`` else ``U[..., t-1]``
@@ -121,6 +123,32 @@ def _check_reference_inputs_finite(
         _check_finite("U_prev", U_prev)
 
 
+def _resolve_heads_per_group(*, n_heads: int, bc_groups: int, name: str) -> int:
+    if bc_groups <= 0:
+        raise ValueError(f"{name} must have a positive group dimension.")
+    if n_heads % bc_groups != 0:
+        raise ValueError(
+            f"{name} group dimension must divide heads. Got heads={n_heads}, groups={bc_groups}."
+        )
+    return n_heads // bc_groups
+
+
+def _expand_grouped_heads(
+    x: torch.Tensor,
+    *,
+    n_heads: int,
+    name: str,
+) -> torch.Tensor:
+    heads_per_group = _resolve_heads_per_group(
+        n_heads=n_heads,
+        bc_groups=int(x.shape[1]),
+        name=name,
+    )
+    if heads_per_group == 1:
+        return x
+    return x.repeat_interleave(heads_per_group, dim=1).contiguous()
+
+
 def _validate_inputs(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -152,25 +180,27 @@ def _validate_inputs(
     if K.ndim != 5 or K.shape[-2:] != (2, 2):
         raise ValueError(f"K must be (batch,heads,T,2,2). Got {tuple(K.shape)}.")
     if B.ndim != 4:
-        raise ValueError(f"B must be (batch,heads,T,2N). Got {tuple(B.shape)}.")
+        raise ValueError(f"B must be (batch,groups,T,2N). Got {tuple(B.shape)}.")
     if C.ndim != 4:
-        raise ValueError(f"C must be (batch,heads,T,2N). Got {tuple(C.shape)}.")
+        raise ValueError(f"C must be (batch,groups,T,2N). Got {tuple(C.shape)}.")
 
     batch_size, n_heads, T, P = map(int, U.shape)
     if M.shape[:3] != (batch_size, n_heads, T):
         raise ValueError("Leading (batch,heads,T) dims of M must match U.")
     if K.shape[:3] != (batch_size, n_heads, T):
         raise ValueError("Leading (batch,heads,T) dims of K must match U.")
-    if B.shape[:3] != (batch_size, n_heads, T):
-        raise ValueError("Leading (batch,heads,T) dims of B must match U.")
-    if C.shape[:3] != (batch_size, n_heads, T):
-        raise ValueError("Leading (batch,heads,T) dims of C must match U.")
+    if B.shape[0] != batch_size or B.shape[2] != T:
+        raise ValueError("B must match U on batch/time dims.")
+    if C.shape[0] != batch_size or C.shape[2] != T:
+        raise ValueError("C must match U on batch/time dims.")
 
     D = int(B.shape[-1])
     if D % 2 != 0:
         raise ValueError(f"B/C 2N dim must be divisible by 2. Got {D}.")
-    if tuple(C.shape) != (batch_size, n_heads, T, D):
-        raise ValueError("C must match B exactly.")
+    bc_groups = int(B.shape[1])
+    _resolve_heads_per_group(n_heads=n_heads, bc_groups=bc_groups, name="B/C")
+    if tuple(C.shape) != (batch_size, bc_groups, T, D):
+        raise ValueError("C must match grouped B exactly.")
     N = D // 2
 
     if (B_prev is None) ^ (U_prev is None):
@@ -187,9 +217,9 @@ def _validate_inputs(
             raise ValueError("initial_states must be on the same device as inputs.")
 
     if B_prev is not None:
-        if B_prev.shape != (batch_size, n_heads, D):
+        if B_prev.shape != (batch_size, bc_groups, D):
             raise ValueError(
-                f"B_prev must be (batch,heads,2N)={(batch_size, n_heads, D)}. Got {tuple(B_prev.shape)}."
+                f"B_prev must be (batch,groups,2N)={(batch_size, bc_groups, D)}. Got {tuple(B_prev.shape)}."
             )
         if U_prev is None or U_prev.shape != (batch_size, n_heads, P):
             raise ValueError(
@@ -228,7 +258,7 @@ def _validate_chunk_increment_inputs(
     if K.ndim != 5 or K.shape[-2:] != (2, 2):
         raise ValueError(f"K must be (batch,heads,T,2,2). Got {tuple(K.shape)}.")
     if B.ndim != 4:
-        raise ValueError(f"B must be (batch,heads,T,2N). Got {tuple(B.shape)}.")
+        raise ValueError(f"B must be (batch,groups,T,2N). Got {tuple(B.shape)}.")
     if int(U.shape[2]) != int(T):
         raise ValueError(f"T={T} must match U.shape[2]={int(U.shape[2])}.")
 
@@ -237,18 +267,20 @@ def _validate_chunk_increment_inputs(
         raise ValueError("M leading dims must match U.")
     if K.shape[:3] != (batch_size, n_heads, int(T)):
         raise ValueError("K leading dims must match U.")
-    if B.shape[:3] != (batch_size, n_heads, int(T)):
-        raise ValueError("B leading dims must match U.")
+    if B.shape[0] != batch_size or B.shape[2] != int(T):
+        raise ValueError("B must match U on batch/time dims.")
 
     D = int(B.shape[-1])
     if D % 2 != 0:
         raise ValueError(f"B 2N dim must be divisible by 2. Got {D}.")
+    bc_groups = int(B.shape[1])
+    _resolve_heads_per_group(n_heads=n_heads, bc_groups=bc_groups, name="B")
     N = D // 2
 
     if B_prev is not None:
-        if tuple(B_prev.shape) != (batch_size, n_heads, D):
+        if tuple(B_prev.shape) != (batch_size, bc_groups, D):
             raise ValueError(
-                f"B_prev must be (batch,heads,2N)={(batch_size, n_heads, D)}. Got {tuple(B_prev.shape)}."
+                f"B_prev must be (batch,groups,2N)={(batch_size, bc_groups, D)}. Got {tuple(B_prev.shape)}."
             )
         if U_prev is None or tuple(U_prev.shape) != (batch_size, n_heads, P):
             raise ValueError(
@@ -551,6 +583,7 @@ def _pad_time_full(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int
 ]:
     batch_size, n_heads, T, P = map(int, U.shape)
+    bc_groups = int(B.shape[1])
     D = int(B.shape[-1])
     device = U.device
     pad = (-T) % int(chunk_size)
@@ -589,7 +622,7 @@ def _pad_time_full(
             [
                 B_f,
                 torch.zeros(
-                    (batch_size, n_heads, pad, D), device=device, dtype=real_dtype
+                    (batch_size, bc_groups, pad, D), device=device, dtype=real_dtype
                 ),
             ],
             dim=2,
@@ -598,7 +631,7 @@ def _pad_time_full(
             [
                 C_f,
                 torch.zeros(
-                    (batch_size, n_heads, pad, D), device=device, dtype=real_dtype
+                    (batch_size, bc_groups, pad, D), device=device, dtype=real_dtype
                 ),
             ],
             dim=2,
@@ -619,6 +652,7 @@ def _pad_time_partial(
     real_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     batch_size, n_heads, T, P = map(int, U.shape)
+    bc_groups = int(B.shape[1])
     D = int(B.shape[-1])
     device = U.device
     pad = (-T) % int(chunk_size)
@@ -656,7 +690,7 @@ def _pad_time_partial(
             [
                 B_f,
                 torch.zeros(
-                    (batch_size, n_heads, pad, D), device=device, dtype=real_dtype
+                    (batch_size, bc_groups, pad, D), device=device, dtype=real_dtype
                 ),
             ],
             dim=2,
@@ -671,6 +705,7 @@ def _resolve_empty_outputs(
     *,
     batch_size: int,
     n_heads: int,
+    bc_groups: int,
     P: int,
     D: int,
     device: torch.device,
@@ -689,7 +724,7 @@ def _resolve_empty_outputs(
 
     if B_prev is None:
         B_last = torch.zeros(
-            (batch_size, n_heads, D), device=device, dtype=output_dtype
+            (batch_size, bc_groups, D), device=device, dtype=output_dtype
         )
         U_last = torch.zeros(
             (batch_size, n_heads, P), device=device, dtype=output_dtype
@@ -729,11 +764,13 @@ def v2x2ssm(
     )
     device = U.device
     cplx_dtype = _complex_dtype_from_real(rdtype)
+    bc_groups = int(B.shape[1])
 
     if T == 0:
         return _resolve_empty_outputs(
             batch_size=batch_size,
             n_heads=n_heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
             device=device,
@@ -746,8 +783,15 @@ def v2x2ssm(
     U_r = U.to(dtype=rdtype)
     M_r = M.to(dtype=rdtype)
     K_r = K.to(dtype=rdtype)
-    B_r = B.to(dtype=rdtype)
-    C_r = C.to(dtype=rdtype)
+    B_r = _expand_grouped_heads(B.to(dtype=rdtype), n_heads=n_heads, name="B")
+    C_r = _expand_grouped_heads(C.to(dtype=rdtype), n_heads=n_heads, name="C")
+    B_prev_r = (
+        None
+        if B_prev is None
+        else _expand_grouped_heads(
+            B_prev.to(dtype=rdtype), n_heads=n_heads, name="B_prev"
+        )
+    )
 
     m = _to_complex_scalar(M_r, name="M").to(dtype=cplx_dtype)
     k = _to_complex_taps(K_r, name="K").to(dtype=cplx_dtype)
@@ -757,7 +801,7 @@ def v2x2ssm(
     c_conj = torch.conj(_as_complex_pairs(C_r, name="C").to(dtype=cplx_dtype))
 
     b_prev0, u_prev0 = _resolve_prev0(
-        B_prev,
+        B_prev_r,
         U_prev,
         batch_size=batch_size,
         n_heads=n_heads,
@@ -834,11 +878,13 @@ def v2x2ssd_ref(
     )
     device = U.device
     cplx_dtype = _complex_dtype_from_real(rdtype)
+    bc_groups = int(B.shape[1])
 
     if T == 0:
         return _resolve_empty_outputs(
             batch_size=batch_size,
             n_heads=n_heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
             device=device,
@@ -854,6 +900,15 @@ def v2x2ssd_ref(
     U_f, M_f, K_f, B_f, C_f, T_pad, n_chunks = _pad_time_full(
         U, M, K, B, C, chunk_size=chunk_size, real_dtype=rdtype
     )
+    B_f = _expand_grouped_heads(B_f, n_heads=n_heads, name="B")
+    C_f = _expand_grouped_heads(C_f, n_heads=n_heads, name="C")
+    B_prev_f = (
+        None
+        if B_prev is None
+        else _expand_grouped_heads(
+            B_prev.to(dtype=rdtype), n_heads=n_heads, name="B_prev"
+        )
+    )
     L = int(chunk_size)
 
     m = _to_complex_scalar(M_f, name="M").to(dtype=cplx_dtype)
@@ -863,7 +918,7 @@ def v2x2ssd_ref(
     c_conj = torch.conj(_as_complex_pairs(C_f, name="C").to(dtype=cplx_dtype))
 
     b_prev0, u_prev0 = _resolve_prev0(
-        B_prev,
+        B_prev_f,
         U_prev,
         batch_size=batch_size,
         n_heads=n_heads,
@@ -971,6 +1026,14 @@ def chunk_increment(
     U_f, M_f, K_f, B_f, _, n_chunks = _pad_time_partial(
         U, M, K, B, chunk_size=chunk_size, real_dtype=rdtype
     )
+    B_f = _expand_grouped_heads(B_f, n_heads=n_heads, name="B")
+    B_prev_f = (
+        None
+        if B_prev is None
+        else _expand_grouped_heads(
+            B_prev.to(dtype=rdtype), n_heads=n_heads, name="B_prev"
+        )
+    )
     L = int(chunk_size)
 
     m = _to_complex_scalar(M_f, name="M").to(dtype=cplx_dtype)
@@ -979,7 +1042,7 @@ def chunk_increment(
     b_t = _as_complex_pairs(B_f, name="B").to(dtype=cplx_dtype)
 
     b_prev0, u_prev0 = _resolve_prev0(
-        B_prev,
+        B_prev_f,
         U_prev,
         batch_size=batch_size,
         n_heads=n_heads,
@@ -1089,6 +1152,15 @@ def chunk_scan(
     U_f, M_f, K_f, B_f, C_f, T_pad, _ = _pad_time_full(
         U, M, K, B, C, chunk_size=chunk_size, real_dtype=rdtype
     )
+    B_f = _expand_grouped_heads(B_f, n_heads=n_heads, name="B")
+    C_f = _expand_grouped_heads(C_f, n_heads=n_heads, name="C")
+    B_prev_f = (
+        None
+        if B_prev is None
+        else _expand_grouped_heads(
+            B_prev.to(dtype=rdtype), n_heads=n_heads, name="B_prev"
+        )
+    )
     L = int(chunk_size)
 
     m = _to_complex_scalar(M_f, name="M").to(dtype=cplx_dtype)
@@ -1101,7 +1173,7 @@ def chunk_scan(
     )
 
     b_prev0, u_prev0 = _resolve_prev0(
-        B_prev,
+        B_prev_f,
         U_prev,
         batch_size=batch_size,
         n_heads=n_heads,
@@ -1221,11 +1293,13 @@ def v2x2ssd(
         default_output_dtype=U.dtype,
     )
     device = U.device
+    bc_groups = int(B.shape[1])
 
     if T == 0:
         return _resolve_empty_outputs(
             batch_size=batch_size,
             n_heads=n_heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
             device=device,

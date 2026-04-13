@@ -52,6 +52,7 @@ _PACKAGED_AOT_ARTIFACT_DIR = _PACKAGED_AOT_ROOT / "artifacts"
 _PACKAGED_FORWARD_CACHE: dict[str, object] = {}
 _PACKAGED_BACKWARD_CACHE: dict[str, object] = {}
 _PACKAGED_STAGE_CACHE: dict[str, object] = {}
+BCGroupsAOTIdentity = int | None
 
 
 def _dtype_tag(dtype: torch.dtype) -> str:
@@ -86,6 +87,62 @@ def _dtype_from_name(name: str) -> torch.dtype:
 
 def _bool_tag(flag: bool) -> str:
     return "1" if bool(flag) else "0"
+
+
+def _normalize_bc_groups_identity(
+    bc_groups: BCGroupsAOTIdentity,
+) -> BCGroupsAOTIdentity:
+    if bc_groups is None:
+        return None
+    resolved = int(bc_groups)
+    if resolved <= 0:
+        raise ValueError("bc_groups must be positive when present in AOT identity.")
+    return resolved
+
+
+def _bc_groups_identity_from_runtime(
+    *,
+    heads: int,
+    bc_groups: int,
+) -> BCGroupsAOTIdentity:
+    resolved_heads = int(heads)
+    resolved_bc_groups = int(bc_groups)
+    if resolved_bc_groups <= 0:
+        raise ValueError("bc_groups must be positive.")
+    if resolved_heads % resolved_bc_groups != 0:
+        raise ValueError(
+            "Grouped BC AOT identity requires bc_groups to divide heads. "
+            f"Got heads={resolved_heads}, bc_groups={resolved_bc_groups}."
+        )
+    if resolved_bc_groups == resolved_heads:
+        return None
+    return resolved_bc_groups
+
+
+def _bc_groups_identity_from_record(
+    record: dict[str, Any],
+) -> BCGroupsAOTIdentity:
+    return _normalize_bc_groups_identity(
+        None if record.get("bc_groups") is None else int(record["bc_groups"])
+    )
+
+
+def _bc_groups_module_tag(bc_groups: BCGroupsAOTIdentity) -> str:
+    resolved_bc_groups = _normalize_bc_groups_identity(bc_groups)
+    return "" if resolved_bc_groups is None else f"__g{resolved_bc_groups}"
+
+
+def _representative_heads_and_bc_groups(
+    bc_groups: BCGroupsAOTIdentity,
+) -> tuple[int, int]:
+    resolved_bc_groups = _normalize_bc_groups_identity(bc_groups)
+    representative_heads = max(
+        2, 2 if resolved_bc_groups is None else resolved_bc_groups
+    )
+    representative_bc_groups = (
+        representative_heads if resolved_bc_groups is None else resolved_bc_groups
+    )
+    return representative_heads, representative_bc_groups
 
 
 def _sanitize_stem(text: str) -> str:
@@ -151,6 +208,7 @@ class ChunkIncrementAOTSpec:
     P: int
     D: int
     chunk_size: int
+    bc_groups: BCGroupsAOTIdentity
     tc_dtype_name: str
     config: ChunkIncrementConfig
 
@@ -164,6 +222,7 @@ class ChunkIncrementAOTSpec:
             "chunk_increment"
             f"__arch{self.arch_tag}"
             f"__p{self.P}_d{self.D}_l{self.chunk_size}"
+            f"{_bc_groups_module_tag(self.bc_groups)}"
             f"__tc{_dtype_tag(self.tc_dtype)}"
             f"__cta{'x'.join(str(v) for v in self.config.cta_tiler)}"
             f"__stg{self.config.num_stages}"
@@ -196,6 +255,7 @@ class ChunkScanAOTSpec:
     P: int
     D: int
     chunk_size: int
+    bc_groups: BCGroupsAOTIdentity
     tc_dtype_name: str
     output_dtype_name: str
     config: ChunkScanConfig
@@ -214,6 +274,7 @@ class ChunkScanAOTSpec:
             "chunk_scan"
             f"__arch{self.arch_tag}"
             f"__p{self.P}_d{self.D}_l{self.chunk_size}"
+            f"{_bc_groups_module_tag(self.bc_groups)}"
             f"__tc{_dtype_tag(self.tc_dtype)}"
             f"__out{_dtype_tag(self.output_dtype)}"
             f"__cfg{self.config.m_block_size}x{self.config.n_block_size}x{self.config.num_threads}"
@@ -226,6 +287,7 @@ class ForwardAOTSpec:
     P: int
     D: int
     chunk_size: int
+    bc_groups: BCGroupsAOTIdentity
     tc_dtype_name: str
     output_dtype_name: str
     config_bundle: ForwardConfigBundle
@@ -245,6 +307,7 @@ class ForwardAOTSpec:
             "v2x2ssd_fwd"
             f"__arch{self.arch_tag}"
             f"__p{self.P}_d{self.D}_l{self.chunk_size}"
+            f"{_bc_groups_module_tag(self.bc_groups)}"
             f"__tc{_dtype_tag(self.tc_dtype)}"
             f"__out{_dtype_tag(self.output_dtype)}"
             f"__inc{'x'.join(str(v) for v in self.config_bundle.chunk_increment.cta_tiler)}"
@@ -291,6 +354,7 @@ class BackwardAOTSpec:
     P: int
     D: int
     chunk_size: int
+    bc_groups: BCGroupsAOTIdentity
     tc_dtype_name: str
     chunk_scan_config: ChunkScanBackwardConfig
     state_passing_config: StatePassingBackwardConfig
@@ -305,6 +369,7 @@ class BackwardAOTSpec:
             "v2x2ssd_bwd"
             f"__arch{self.arch_tag}"
             f"__p{self.P}_d{self.D}_l{self.chunk_size}"
+            f"{_bc_groups_module_tag(self.bc_groups)}"
             f"__tc{_dtype_tag(self.tc_dtype)}"
             f"__scan"
             f"{self.chunk_scan_config.num_threads_du}"
@@ -494,6 +559,7 @@ def _search_space_chunk_increment_specs(
                         P=_AOT_SEARCH_P,
                         D=_AOT_SEARCH_D,
                         chunk_size=chunk_size,
+                        bc_groups=None,
                         tc_dtype_name=_dtype_name(tc_dtype),
                         config=config,
                     )
@@ -548,6 +614,7 @@ def _search_space_chunk_scan_specs(
                             P=_AOT_SEARCH_P,
                             D=_AOT_SEARCH_D,
                             chunk_size=chunk_size,
+                            bc_groups=None,
                             tc_dtype_name=_dtype_name(tc_dtype),
                             output_dtype_name=_dtype_name(output_dtype),
                             config=config,
@@ -579,6 +646,7 @@ def _search_space_forward_specs(*, arch_tag: str = "any") -> tuple[ForwardAOTSpe
                                 P=_AOT_SEARCH_P,
                                 D=_AOT_SEARCH_D,
                                 chunk_size=chunk_size,
+                                bc_groups=None,
                                 tc_dtype_name=_dtype_name(tc_dtype),
                                 output_dtype_name=_dtype_name(output_dtype),
                                 config_bundle=config_bundle,
@@ -611,6 +679,7 @@ def default_forward_aot_specs(
             P=_AOT_SEARCH_P,
             D=_AOT_SEARCH_D,
             chunk_size=chunk_size,
+            bc_groups=None,
             tc_dtype_name=_dtype_name(tc_dtype),
             output_dtype_name=_dtype_name(tc_dtype),
             config_bundle=_default_forward_config_bundle(
@@ -639,6 +708,7 @@ def default_backward_aot_specs(
             P=_AOT_SEARCH_P,
             D=_AOT_SEARCH_D,
             chunk_size=chunk_size,
+            bc_groups=None,
             tc_dtype_name=_dtype_name(tc_dtype),
             chunk_scan_config=default_scan_config,
             state_passing_config=default_state_config,
@@ -655,6 +725,7 @@ def _chunk_increment_spec_from_record(record: dict[str, Any]) -> ChunkIncrementA
         P=int(record["P"]),
         D=int(record["D"]),
         chunk_size=int(record["chunk_size"]),
+        bc_groups=_bc_groups_identity_from_record(record),
         tc_dtype_name=str(record["tc_dtype_name"]),
         config=ChunkIncrementConfig.from_record(cast(dict[str, Any], record["config"])),
     )
@@ -676,6 +747,7 @@ def _chunk_scan_spec_from_record(record: dict[str, Any]) -> ChunkScanAOTSpec:
         P=int(record["P"]),
         D=int(record["D"]),
         chunk_size=int(record["chunk_size"]),
+        bc_groups=_bc_groups_identity_from_record(record),
         tc_dtype_name=str(record["tc_dtype_name"]),
         output_dtype_name=str(record["output_dtype_name"]),
         config=ChunkScanConfig.from_record(cast(dict[str, Any], record["config"])),
@@ -688,6 +760,7 @@ def _forward_spec_from_record(record: dict[str, Any]) -> ForwardAOTSpec:
         P=int(record["P"]),
         D=int(record["D"]),
         chunk_size=int(record["chunk_size"]),
+        bc_groups=_bc_groups_identity_from_record(record),
         tc_dtype_name=str(record["tc_dtype_name"]),
         output_dtype_name=str(record["output_dtype_name"]),
         config_bundle=ForwardConfigBundle.from_record(
@@ -703,6 +776,7 @@ def _backward_spec_from_record(record: dict[str, Any]) -> BackwardAOTSpec:
         P=int(record["P"]),
         D=int(record["D"]),
         chunk_size=int(record["chunk_size"]),
+        bc_groups=_bc_groups_identity_from_record(record),
         tc_dtype_name=str(record["tc_dtype_name"]),
         chunk_scan_config=ChunkScanBackwardConfig.from_record(
             cast(dict[str, Any], record["chunk_scan_config"])
@@ -780,7 +854,17 @@ def _aot_compile_options(arch_tag: str) -> str:
 def _representative_chunk_increment_problem_shape(
     spec: ChunkIncrementAOTSpec,
 ) -> tuple[int, ...]:
-    return (2, 2, 2 * spec.chunk_size, spec.P, spec.D, 2, spec.chunk_size)
+    heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
+    return (
+        2,
+        heads,
+        2 * spec.chunk_size,
+        spec.P,
+        spec.D,
+        2,
+        spec.chunk_size,
+        bc_groups,
+    )
 
 
 def _representative_state_passing_problem_shape(
@@ -792,17 +876,38 @@ def _representative_state_passing_problem_shape(
 def _representative_chunk_scan_problem_shape(
     spec: ChunkScanAOTSpec,
 ) -> tuple[int, ...]:
-    return (2, 2, 2 * spec.chunk_size, spec.P, spec.D, 2, spec.chunk_size)
+    heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
+    return (
+        2,
+        heads,
+        2 * spec.chunk_size,
+        spec.P,
+        spec.D,
+        2,
+        spec.chunk_size,
+        bc_groups,
+    )
 
 
 def _representative_forward_problem_shape(spec: ForwardAOTSpec) -> tuple[int, ...]:
-    return (2, 2, 2 * spec.chunk_size, spec.P, spec.D, 2, spec.chunk_size)
+    heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
+    return (
+        2,
+        heads,
+        2 * spec.chunk_size,
+        spec.P,
+        spec.D,
+        2,
+        spec.chunk_size,
+        bc_groups,
+    )
 
 
 def _representative_backward_problem_shape(spec: BackwardAOTSpec):
     from ..kernels.bwd import BackwardProblemShape, _torch_to_cutlass_dtype
     from ..kernels.bwd.chunk_increment.db import ChunkIncrementBwdDBAmpere
 
+    heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
     chunk_increment_db = ChunkIncrementBwdDBAmpere(
         _torch_to_cutlass_dtype(spec.tc_dtype),
         chunk_size=spec.chunk_size,
@@ -812,7 +917,17 @@ def _representative_backward_problem_shape(spec: BackwardAOTSpec):
     n_d_tiles = (spec.D + chunk_increment_db.bN - 1) // chunk_increment_db.bN
     return cast(
         BackwardProblemShape,
-        (2, 2, 2 * spec.chunk_size, spec.P, spec.D, 2, spec.chunk_size, n_d_tiles),
+        (
+            2,
+            heads,
+            bc_groups,
+            2 * spec.chunk_size,
+            spec.P,
+            spec.D,
+            2,
+            spec.chunk_size,
+            n_d_tiles,
+        ),
     )
 
 
@@ -833,14 +948,25 @@ def _infer_chunk_increment_aot_spec(
         compute_dtype=compute_dtype,
         has_prev=False,
     )
-    _batch_size, _heads, _padded_time, P, D, _n_chunks, resolved_chunk_size = (
-        compile_artifacts.problem_shape
-    )
+    (
+        _batch_size,
+        heads,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        resolved_chunk_size,
+        bc_groups,
+    ) = compile_artifacts.problem_shape
     return ChunkIncrementAOTSpec(
         arch_tag=arch_tag,
         P=int(P),
         D=int(D),
         chunk_size=int(resolved_chunk_size),
+        bc_groups=_bc_groups_identity_from_runtime(
+            heads=int(heads),
+            bc_groups=int(bc_groups),
+        ),
         tc_dtype_name=_dtype_name(_tc_input_dtype(U.dtype, compute_dtype)),
         config=compile_artifacts.config,
     )
@@ -905,14 +1031,25 @@ def _infer_chunk_scan_aot_spec(
         num_threads=num_threads,
         has_prev=False,
     )
-    _batch_size, _heads, _padded_time, P, D, _n_chunks, resolved_chunk_size = (
-        compile_artifacts.problem_shape
-    )
+    (
+        _batch_size,
+        heads,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        resolved_chunk_size,
+        bc_groups,
+    ) = compile_artifacts.problem_shape
     return ChunkScanAOTSpec(
         arch_tag=arch_tag,
         P=int(P),
         D=int(D),
         chunk_size=int(resolved_chunk_size),
+        bc_groups=_bc_groups_identity_from_runtime(
+            heads=int(heads),
+            bc_groups=int(bc_groups),
+        ),
         tc_dtype_name=_dtype_name(_tc_input_dtype(U.dtype, compute_dtype)),
         output_dtype_name=_dtype_name(output_dtype),
         config=compile_artifacts.config,
@@ -992,14 +1129,25 @@ def infer_v2x2ssd_fwd_aot_spec(
             )
         ),
     )
-    _batch_size, _heads, _padded_time, P, D, _n_chunks, resolved_chunk_size = (
-        compile_artifacts.problem_shape
-    )
+    (
+        _batch_size,
+        heads,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        resolved_chunk_size,
+        bc_groups,
+    ) = compile_artifacts.problem_shape
     return ForwardAOTSpec(
         arch_tag=arch_tag,
         P=int(P),
         D=int(D),
         chunk_size=int(resolved_chunk_size),
+        bc_groups=_bc_groups_identity_from_runtime(
+            heads=int(heads),
+            bc_groups=int(bc_groups),
+        ),
         tc_dtype_name=_dtype_name(_tc_input_dtype(U.dtype, compute_dtype)),
         output_dtype_name=_dtype_name(output_dtype),
         config_bundle=compile_artifacts.config_bundle,
@@ -1049,7 +1197,8 @@ def infer_v2x2ssd_bwd_aot_spec(
     )
     (
         _batch_size,
-        _heads,
+        heads,
+        bc_groups,
         _padded_time,
         P,
         D,
@@ -1062,6 +1211,10 @@ def infer_v2x2ssd_bwd_aot_spec(
         P=int(P),
         D=int(D),
         chunk_size=int(resolved_chunk_size),
+        bc_groups=_bc_groups_identity_from_runtime(
+            heads=int(heads),
+            bc_groups=int(bc_groups),
+        ),
         tc_dtype_name=_dtype_name(compile_artifacts.tc_dtype),
         chunk_scan_config=ChunkScanBackwardConfig(
             num_threads_du=int(compile_artifacts.launch_cfg[0]),
@@ -1721,18 +1874,28 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
     )
 
     problem_shape = _representative_backward_problem_shape(spec)
-    batch_size, heads, padded_time, _P, D, n_chunks, chunk_size, n_d_tiles = (
-        problem_shape
-    )
+    (
+        batch_size,
+        heads,
+        bc_groups,
+        padded_time,
+        _P,
+        D,
+        n_chunks,
+        chunk_size,
+        n_d_tiles,
+    ) = problem_shape
     input_info = BackwardInputInfo(
         batch_size=batch_size,
         heads=heads,
+        bc_groups=bc_groups,
         time_steps=padded_time,
         P=spec.P,
         D=spec.D,
         chunk_size=chunk_size,
         n_chunks=n_chunks,
         padded_time=padded_time,
+        heads_per_bc_group=heads // bc_groups,
         tc_dtype=spec.tc_dtype,
         device_index=-1,
         n_d_tiles=n_d_tiles,
@@ -1793,6 +1956,8 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         dMp0_spec,
         d_chunk_multiplier_increment_spec,
         d_param_increment_spec,
+        _dB_increment_spec,
+        _dB_prev_increment_spec,
     ) = _chunk_increment_bwd_tensor_specs(problem_shape)
     _alignments, compile_args = _masked_compile_args_from_specs(
         (
@@ -2572,6 +2737,7 @@ def export_chunk_increment_cute_aot(
             P=spec.P,
             D=spec.D,
             chunk_size=spec.chunk_size,
+            bc_groups=spec.bc_groups,
             tc_dtype_name=spec.tc_dtype_name,
             config=ChunkIncrementConfig(
                 cta_tiler=(

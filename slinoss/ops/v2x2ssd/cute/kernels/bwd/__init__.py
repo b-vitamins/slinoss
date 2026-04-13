@@ -48,7 +48,7 @@ _ZERO_FINAL_GRAD_CACHE_LIMIT = 8
 _BWD_WORKSPACE_CACHE_LIMIT = 4
 
 
-BackwardProblemShape = tuple[int, int, int, int, int, int, int, int]
+BackwardProblemShape = tuple[int, int, int, int, int, int, int, int, int]
 BackwardLaunchConfig = tuple[
     int,
     int,
@@ -110,12 +110,14 @@ class BackwardCompileArtifacts:
 class BackwardInputInfo:
     batch_size: int
     heads: int
+    bc_groups: int
     time_steps: int
     P: int
     D: int
     chunk_size: int
     n_chunks: int
     padded_time: int
+    heads_per_bc_group: int
     tc_dtype: torch.dtype
     device_index: int
     n_d_tiles: int
@@ -152,6 +154,7 @@ def _get_zero_prev_tensors(
     dtype: torch.dtype,
     batch_size: int,
     heads: int,
+    bc_groups: int,
     P: int,
     D: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -161,6 +164,7 @@ def _get_zero_prev_tensors(
         dtype,
         int(batch_size),
         int(heads),
+        int(bc_groups),
         int(P),
         int(D),
     )
@@ -169,7 +173,7 @@ def _get_zero_prev_tensors(
         note_cache_event("cute.v2x2ssd.bwd.zero_prev", hit=False)
         cached = (
             torch.zeros((batch_size, heads, P), device=device, dtype=dtype),
-            torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
+            torch.zeros((batch_size, bc_groups, D), device=device, dtype=dtype),
         )
         _cache_set(_ZERO_PREV_CACHE, key, cached, limit=_ZERO_PREV_CACHE_LIMIT)
     else:
@@ -216,6 +220,7 @@ def _get_bwd_workspace(
     tc_dtype: torch.dtype,
     batch_size: int,
     heads: int,
+    bc_groups: int,
     n_chunks: int,
     chunk_size: int,
     P: int,
@@ -228,6 +233,7 @@ def _get_bwd_workspace(
         tc_dtype,
         int(batch_size),
         int(heads),
+        int(bc_groups),
         int(n_chunks),
         int(chunk_size),
         int(P),
@@ -242,11 +248,12 @@ def _get_bwd_workspace(
     note_cache_event("cute.v2x2ssd.bwd.workspace", hit=False)
     batch_head_count = int(batch_size) * int(heads)
     batch_head_chunk_count = batch_head_count * int(n_chunks)
+    batch_group_count = int(batch_size) * int(bc_groups)
     resolved_chunk_size = int(chunk_size)
 
     cached = (
         torch.empty((batch_head_count, n_chunks, P), device=device, dtype=tc_dtype),
-        torch.empty((batch_head_count, n_chunks, D), device=device, dtype=tc_dtype),
+        torch.empty((batch_group_count, n_chunks, D), device=device, dtype=tc_dtype),
         torch.empty((batch_head_chunk_count, P, D), device=device, dtype=torch.float32),
         torch.empty((batch_size, heads, n_chunks, P, D), device=device, dtype=tc_dtype),
         torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
@@ -372,18 +379,28 @@ def _make_tensor_spec(
 def _chunk_scan_bwd_tensor_specs(
     problem_shape: BackwardProblemShape,
 ) -> tuple[TensorSpec, ...]:
-    batch_size, heads, padded_time, P, D, n_chunks, chunk_size, _n_d_tiles = (
-        problem_shape
-    )
+    (
+        batch_size,
+        heads,
+        bc_groups,
+        padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
     batch_head_count = batch_size * heads
     batch_head_chunk_count = batch_head_count * n_chunks
+    batch_group_count = batch_size * bc_groups
+    batch_group_chunk_count = batch_group_count * n_chunks
     return (
         _make_tensor_spec(
             (batch_head_chunk_count, chunk_size, 1, P),
             stride=(chunk_size * P, P, P, 1),
         ),
         _make_tensor_spec(
-            (batch_head_chunk_count, chunk_size, 1, D),
+            (batch_group_chunk_count, chunk_size, 1, D),
             stride=(chunk_size * D, D, D, 1),
         ),
         _make_tensor_spec(
@@ -396,7 +413,7 @@ def _chunk_scan_bwd_tensor_specs(
         ),
         _make_tensor_spec((batch_head_chunk_count, P, D), stride=(P * D, D, 1)),
         _make_tensor_spec((batch_head_count, P), stride=(P, 1)),
-        _make_tensor_spec((batch_head_count, D), stride=(D, 1)),
+        _make_tensor_spec((batch_group_count, D), stride=(D, 1)),
         _make_tensor_spec((batch_head_chunk_count, chunk_size), stride=(chunk_size, 1)),
         _make_tensor_spec(
             (batch_head_chunk_count, chunk_size, 2),
@@ -422,7 +439,7 @@ def _chunk_scan_bwd_tensor_specs(
             stride=(1, P, padded_time * P),
         ),
         _make_tensor_spec(
-            (D, padded_time, batch_head_count),
+            (D, padded_time, batch_group_count),
             stride=(1, D, padded_time * D),
         ),
         _make_tensor_spec(
@@ -446,9 +463,17 @@ def _chunk_scan_bwd_tensor_specs(
 def _state_passing_bwd_tensor_specs(
     problem_shape: BackwardProblemShape,
 ) -> tuple[TensorSpec, TensorSpec, TensorSpec]:
-    batch_size, heads, _padded_time, P, D, n_chunks, _chunk_size, _n_d_tiles = (
-        problem_shape
-    )
+    (
+        batch_size,
+        heads,
+        _bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        _chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
     return (
         _make_tensor_spec((batch_size, heads, n_chunks, P, D)),
         _make_tensor_spec((batch_size, heads, n_chunks, 2)),
@@ -459,11 +484,21 @@ def _state_passing_bwd_tensor_specs(
 def _chunk_increment_bwd_tensor_specs(
     problem_shape: BackwardProblemShape,
 ) -> tuple[TensorSpec, ...]:
-    batch_size, heads, _padded_time, P, D, n_chunks, chunk_size, n_d_tiles = (
-        problem_shape
-    )
+    (
+        batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        n_d_tiles,
+    ) = problem_shape
     batch_head_count = batch_size * heads
     batch_head_chunk_count = batch_head_count * n_chunks
+    batch_group_count = batch_size * bc_groups
+    batch_group_chunk_count = batch_group_count * n_chunks
     return (
         _make_tensor_spec(
             (chunk_size, P, batch_head_chunk_count), stride=(P, 1, chunk_size * P)
@@ -472,7 +507,7 @@ def _chunk_increment_bwd_tensor_specs(
             (P, chunk_size, batch_head_chunk_count), stride=(1, P, chunk_size * P)
         ),
         _make_tensor_spec(
-            (chunk_size, D, batch_head_chunk_count), stride=(D, 1, chunk_size * D)
+            (chunk_size, D, batch_group_chunk_count), stride=(D, 1, chunk_size * D)
         ),
         _make_tensor_spec(
             (2, chunk_size, batch_head_chunk_count), stride=(1, 2, chunk_size * 2)
@@ -484,11 +519,15 @@ def _chunk_increment_bwd_tensor_specs(
         _make_tensor_spec((D, P, batch_head_chunk_count), stride=(1, D, P * D)),
         _make_tensor_spec((batch_head_chunk_count, P, D), stride=(P * D, D, 1)),
         _make_tensor_spec((P, batch_head_chunk_count), stride=(1, P)),
-        _make_tensor_spec((D, batch_head_chunk_count), stride=(1, D)),
+        _make_tensor_spec((D, batch_group_count), stride=(1, D)),
         _make_tensor_spec((2, chunk_size, n_d_tiles, batch_head_chunk_count)),
         _make_tensor_spec((2, batch_head_chunk_count)),
         _make_tensor_spec((2, batch_head_chunk_count), stride=(1, 2)),
         _make_tensor_spec((2, chunk_size, batch_head_chunk_count)),
+        _make_tensor_spec(
+            (chunk_size, D, batch_head_chunk_count), stride=(D, 1, chunk_size * D)
+        ),
+        _make_tensor_spec((D, batch_head_chunk_count), stride=(1, D)),
     )
 
 
@@ -499,6 +538,24 @@ def _public_from_packed_dk(
 ) -> torch.Tensor:
     B, H, C, L, _, F = map(int, x.shape)
     return x.reshape(B, H, C * L, 2, F)[:, :, :time_steps, :, :].contiguous()
+
+
+def _reduce_heads_to_bc_groups(
+    x: torch.Tensor,
+    *,
+    bc_groups: int,
+) -> torch.Tensor:
+    if int(x.shape[1]) == int(bc_groups):
+        return x
+    batch_size, heads = map(int, x.shape[:2])
+    if heads % int(bc_groups) != 0:
+        raise ValueError(
+            "Grouped BC reduction requires bc_groups to divide heads. "
+            f"Got heads={heads}, bc_groups={bc_groups}."
+        )
+    heads_per_bc_group = heads // int(bc_groups)
+    grouped_shape = (batch_size, int(bc_groups), heads_per_bc_group, *x.shape[2:])
+    return x.reshape(grouped_shape).sum(dim=2, dtype=torch.float32)
 
 
 def _make_static_tensor_spec_view(
@@ -693,15 +750,22 @@ def _make_backward_input_info(
             raise TypeError("m_chunk and chunk_starts must be float32.")
 
     batch_size, heads, time_steps, P = map(int, U.shape)
+    bc_groups = int(B.shape[1])
     D = int(B.shape[-1])
+    if heads % bc_groups != 0:
+        raise ValueError(
+            "B/C grouped BC contract requires bc_groups to divide heads. "
+            f"Got heads={heads}, bc_groups={bc_groups}."
+        )
+    heads_per_bc_group = heads // bc_groups
     if validate_runtime_contract:
-        if B.shape != (batch_size, heads, time_steps, D) or C.shape != (
+        if B.shape != (batch_size, bc_groups, time_steps, D) or C.shape != (
             batch_size,
-            heads,
+            bc_groups,
             time_steps,
             D,
         ):
-            raise ValueError("B/C must be (B,H,T,D) matching U.")
+            raise ValueError("B/C must be (B,G,T,D) matching U and grouped BC.")
         if M.shape != (batch_size, heads, time_steps, 2):
             raise ValueError(
                 f"M must be (B,H,T,2)={(batch_size, heads, time_steps, 2)}."
@@ -713,12 +777,14 @@ def _make_backward_input_info(
         if d_out.shape != (batch_size, heads, time_steps, P):
             raise ValueError("d_out must be (B,H,T,P) matching U.")
         if B_prev is not None:
-            if tuple(B_prev.shape) != (batch_size, heads, D) or tuple(U_prev.shape) != (
+            if tuple(B_prev.shape) != (batch_size, bc_groups, D) or tuple(
+                U_prev.shape
+            ) != (
                 batch_size,
                 heads,
                 P,
             ):
-                raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+                raise ValueError("B_prev/U_prev must be (B,G,D)/(B,H,P).")
             if B_prev.device != U.device or U_prev.device != U.device:
                 raise ValueError("B_prev/U_prev must be on the same device as U.")
         if d_final_state is not None:
@@ -766,12 +832,14 @@ def _make_backward_input_info(
     return BackwardInputInfo(
         batch_size=batch_size,
         heads=heads,
+        bc_groups=bc_groups,
         time_steps=time_steps,
         P=P,
         D=D,
         chunk_size=resolved_chunk_size,
         n_chunks=n_chunks,
         padded_time=padded_time,
+        heads_per_bc_group=heads_per_bc_group,
         tc_dtype=tc_dtype,
         device_index=(U.device.index if U.device.index is not None else -1),
         n_d_tiles=n_d_tiles,
@@ -803,6 +871,7 @@ def _make_backward_problem_shape(
     return (
         input_info.batch_size,
         input_info.heads,
+        input_info.bc_groups,
         input_info.padded_time,
         input_info.P,
         input_info.D,
@@ -874,17 +943,17 @@ def _make_backward_runtime_arg_descriptors(
     *,
     tc_dtype: torch.dtype,
 ) -> tuple[tuple[torch.dtype, TensorSpec, int], ...]:
-    batch_size, heads, padded_time, P, D, n_chunks, chunk_size, n_d_tiles = (
+    batch_size, heads, bc_groups, padded_time, P, D, n_chunks, chunk_size, n_d_tiles = (
         problem_shape
     )
     batch_head_count = batch_size * heads
-    batch_head_chunk_count = batch_head_count * n_chunks
+    batch_group_count = batch_size * bc_groups
     tc_align = _compile_min_align_for_dtype(tc_dtype)
     fp32_align = _compile_min_align_for_dtype(torch.float32)
     k_pair_stride = (heads * padded_time * 4, padded_time * 4, 4, 1)
     (
         U_scan_spec,
-        B_scan_spec,
+        BC_scan_spec,
         _M_scan_spec,
         _K_scan_spec,
         _chunk_starts_scan_spec,
@@ -901,17 +970,43 @@ def _make_backward_runtime_arg_descriptors(
         _M_dz0_spec,
         d_chunk_starts_spec,
         dU_db_dummy_spec,
-        dB_du_dummy_spec,
+        dBC_scan_spec,
         dU_prev_dummy_spec,
         dB_prev_dummy_spec,
     ) = _chunk_scan_bwd_tensor_specs(problem_shape)
     chunk_starts_state_spec, chunk_multiplier_state_spec, final_state_spec = (
         _state_passing_bwd_tensor_specs(problem_shape)
     )
+    (
+        _U_increment_spec,
+        dU_increment_spec,
+        _B_increment_input_spec,
+        _M_increment_spec,
+        _K_increment_spec,
+        _d_increment_spec,
+        _d_increment_dp_spec,
+        _d_increment_boundary_spec,
+        U_prev_chunks_spec,
+        _B_prev_chunks_input_spec,
+        dM_sum_part_spec,
+        dMp0_spec,
+        _d_chunk_multiplier_increment_spec,
+        d_param_increment_spec,
+        dB_increment_spec,
+        dB_prev_increment_spec,
+    ) = _chunk_increment_bwd_tensor_specs(problem_shape)
     return (
         (tc_dtype, _make_tensor_spec((batch_size, heads, padded_time, P)), tc_align),
-        (tc_dtype, _make_tensor_spec((batch_size, heads, padded_time, D)), tc_align),
-        (tc_dtype, _make_tensor_spec((batch_size, heads, padded_time, D)), tc_align),
+        (
+            tc_dtype,
+            _make_tensor_spec((batch_size, bc_groups, padded_time, D)),
+            tc_align,
+        ),
+        (
+            tc_dtype,
+            _make_tensor_spec((batch_size, bc_groups, padded_time, D)),
+            tc_align,
+        ),
         (
             torch.float32,
             _make_tensor_spec((batch_size, heads, padded_time, 2)),
@@ -950,7 +1045,7 @@ def _make_backward_runtime_arg_descriptors(
             fp32_align,
         ),
         (tc_dtype, _make_tensor_spec((batch_size, heads, P)), tc_align),
-        (tc_dtype, _make_tensor_spec((batch_size, heads, D)), tc_align),
+        (tc_dtype, _make_tensor_spec((batch_size, bc_groups, D)), tc_align),
         (torch.float32, final_state_spec, fp32_align),
         (
             tc_dtype,
@@ -959,7 +1054,7 @@ def _make_backward_runtime_arg_descriptors(
         ),
         (
             tc_dtype,
-            _make_tensor_spec((batch_head_count, n_chunks, D)),
+            _make_tensor_spec((batch_group_count, n_chunks, D)),
             tc_align,
         ),
         (
@@ -980,12 +1075,12 @@ def _make_backward_runtime_arg_descriptors(
         ),
         (tc_dtype, U_scan_spec, tc_align),
         (tc_dtype, dU_prev_dummy_spec, tc_align),
-        (tc_dtype, B_scan_spec, tc_align),
+        (tc_dtype, dBC_scan_spec, tc_align),
         (tc_dtype, dB_prev_dummy_spec, tc_align),
-        (tc_dtype, B_scan_spec, tc_align),
+        (tc_dtype, dBC_scan_spec, tc_align),
         (tc_dtype, dU_db_dummy_spec, tc_align),
         (tc_dtype, dU_prev_dummy_spec, tc_align),
-        (tc_dtype, dB_du_dummy_spec, tc_align),
+        (tc_dtype, dBC_scan_spec, tc_align),
         (tc_dtype, dB_prev_dummy_spec, tc_align),
         (torch.float32, dlogp_scan_spec, fp32_align),
         (torch.float32, dR_scan_spec, fp32_align),
@@ -996,47 +1091,47 @@ def _make_backward_runtime_arg_descriptors(
         (torch.float32, d_param_scan_spec, fp32_align),
         (
             tc_dtype,
-            _make_tensor_spec((batch_head_chunk_count, chunk_size, D)),
+            dB_increment_spec,
             tc_align,
         ),
         (
             tc_dtype,
-            _make_tensor_spec((batch_head_chunk_count, D)),
+            dB_prev_increment_spec,
             tc_align,
         ),
         (
             tc_dtype,
-            _make_tensor_spec((batch_head_chunk_count, chunk_size, P)),
+            dU_increment_spec,
             tc_align,
         ),
         (
             tc_dtype,
-            _make_tensor_spec((batch_head_chunk_count, P)),
+            U_prev_chunks_spec,
             tc_align,
         ),
         (
             torch.float32,
-            _make_tensor_spec((2, chunk_size, n_d_tiles, batch_head_chunk_count)),
+            dM_sum_part_spec,
             fp32_align,
         ),
         (
             torch.float32,
-            _make_tensor_spec((2, batch_head_chunk_count)),
+            dMp0_spec,
             fp32_align,
         ),
         (
             torch.float32,
-            _make_tensor_spec((2, chunk_size, batch_head_chunk_count)),
+            d_param_increment_spec,
             fp32_align,
         ),
         (
             torch.float32,
-            _make_tensor_spec((2, chunk_size, batch_head_chunk_count)),
+            d_param_increment_spec,
             fp32_align,
         ),
         (
             torch.float32,
-            _make_tensor_spec((2, chunk_size, batch_head_chunk_count)),
+            d_param_increment_spec,
             fp32_align,
         ),
     )
@@ -1203,6 +1298,7 @@ def _make_backward_runtime_artifacts(
     )
     batch_size = input_info.batch_size
     heads = input_info.heads
+    bc_groups = input_info.bc_groups
     P = input_info.P
     D = input_info.D
     n_chunks = input_info.n_chunks
@@ -1210,6 +1306,7 @@ def _make_backward_runtime_artifacts(
     tc_dtype = input_info.tc_dtype
     chunk_size = input_info.chunk_size
     batch_head_count = batch_size * heads
+    batch_group_count = batch_size * bc_groups
 
     if prepared_inputs is None:
         U_tc = _prepare_time_operand(U, padded_time=padded_time, dtype=tc_dtype)
@@ -1220,7 +1317,7 @@ def _make_backward_runtime_artifacts(
     else:
         U_tc, M_f, K_f, B_tc, C_tc = prepared_inputs
         expected_u_shape = (batch_size, heads, padded_time, P)
-        expected_b_shape = (batch_size, heads, padded_time, D)
+        expected_b_shape = (batch_size, bc_groups, padded_time, D)
         expected_m_shape = (batch_size, heads, padded_time, 2)
         expected_k_shape = (batch_size, heads, padded_time, 2, 2)
         if (
@@ -1274,6 +1371,7 @@ def _make_backward_runtime_artifacts(
             dtype=tc_dtype,
             batch_size=batch_size,
             heads=heads,
+            bc_groups=bc_groups,
             P=P,
             D=D,
         )
@@ -1300,7 +1398,7 @@ def _make_backward_runtime_artifacts(
     d_final_buffer = _ensure_min_alignment(d_final_buffer, min_align=16)
 
     U_chunked = U_tc.reshape(batch_head_count, n_chunks, chunk_size, P)
-    B_chunked = B_tc.reshape(batch_head_count, n_chunks, chunk_size, D)
+    B_chunked = B_tc.reshape(batch_group_count, n_chunks, chunk_size, D)
 
     (
         U_prev_chunks,
@@ -1337,6 +1435,7 @@ def _make_backward_runtime_artifacts(
         tc_dtype=tc_dtype,
         batch_size=batch_size,
         heads=heads,
+        bc_groups=bc_groups,
         n_chunks=n_chunks,
         chunk_size=chunk_size,
         P=P,
@@ -1357,7 +1456,7 @@ def _make_backward_runtime_artifacts(
     dM_increment_storage.zero_()
 
     U_prev_chunks[:, 0, :] = U_prev_state.reshape(batch_head_count, P)
-    B_prev_chunks[:, 0, :] = B_prev_state.reshape(batch_head_count, D)
+    B_prev_chunks[:, 0, :] = B_prev_state.reshape(batch_group_count, D)
     if n_chunks > 1:
         U_prev_chunks[:, 1:, :] = U_chunked[:, :-1, -1, :]
         B_prev_chunks[:, 1:, :] = B_chunked[:, :-1, -1, :]
@@ -1487,9 +1586,17 @@ def _make_v2x2ssd_bwd_host_wrapper(
     problem_shape: BackwardProblemShape,
     launch_cfg: BackwardLaunchConfig,
 ):
-    _batch_size, _heads, _padded_time, P, D, _n_chunks, chunk_size, n_d_tiles = (
-        problem_shape
-    )
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        n_d_tiles,
+    ) = problem_shape
     (
         scan_num_threads_du,
         scan_num_threads_db,
@@ -1557,7 +1664,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
     ):
         (
             U_scan_spec,
-            B_scan_spec,
+            BC_scan_spec,
             M_scan_spec,
             K_scan_spec,
             chunk_starts_scan_spec,
@@ -1574,7 +1681,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             M_dz0_spec,
             d_chunk_starts_scan_spec,
             dU_db_dummy_spec,
-            dB_du_dummy_spec,
+            dBC_scan_spec,
             dU_prev_dummy_spec,
             dB_prev_dummy_spec,
         ) = chunk_scan_specs
@@ -1586,23 +1693,25 @@ def _make_v2x2ssd_bwd_host_wrapper(
         (
             U_increment_spec,
             dU_increment_spec,
-            B_increment_spec,
+            B_increment_input_spec,
             M_increment_spec,
             K_increment_spec,
             d_increment_spec,
             d_increment_dp_spec,
             d_increment_boundary_spec,
             U_prev_chunks_spec,
-            B_prev_chunks_spec,
+            B_prev_chunks_input_spec,
             dM_sum_part_spec,
             dMp0_spec,
             d_chunk_multiplier_increment_spec,
             d_param_increment_spec,
+            dB_increment_spec,
+            dB_prev_increment_spec,
         ) = chunk_increment_specs
 
         U_scan_view = _make_static_tensor_spec_view(U_t, U_scan_spec)
-        B_scan_view = _make_static_tensor_spec_view(B_t, B_scan_spec)
-        C_scan_view = _make_static_tensor_spec_view(C_t, B_scan_spec)
+        B_scan_view = _make_static_tensor_spec_view(B_t, BC_scan_spec)
+        C_scan_view = _make_static_tensor_spec_view(C_t, BC_scan_spec)
         M_scan_view = _make_static_tensor_spec_view(M_t, M_scan_spec)
         K_scan_view = _make_static_tensor_spec_view(K_t, K_scan_spec)
         d_out_scan_view = _make_static_tensor_spec_view(d_out_t, U_scan_spec)
@@ -1616,7 +1725,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             B_prev_state_t, B_prev_scan_spec
         )
         dU_scan_view = _make_static_tensor_spec_view(dU_scan_t, U_scan_spec)
-        dB_scan_view = _make_static_tensor_spec_view(dB_scan_t, B_scan_spec)
+        dB_scan_view = _make_static_tensor_spec_view(dB_scan_t, dBC_scan_spec)
         dU_prev_scan_view = _make_static_tensor_spec_view(
             dU_prev_scan_t, dU_prev_dummy_spec
         )
@@ -1637,7 +1746,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         dM_current_param_view = _make_static_tensor_spec_view(
             dM_current_scratch_t, d_param_scan_spec
         )
-        dC_scan_view = _make_static_tensor_spec_view(dC_scan_t, B_scan_spec)
+        dC_scan_view = _make_static_tensor_spec_view(dC_scan_t, dBC_scan_spec)
         dR_scan_view = _make_static_tensor_spec_view(dR_t, dR_scan_spec)
         dR_param_view = _make_static_tensor_spec_view(dR_t, dR_param_spec)
         dM_scan_view = _make_static_tensor_spec_view(dM_scan_t, d_param_scan_spec)
@@ -1678,7 +1787,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         )
 
         U_increment_view = _make_static_tensor_spec_view(U_t, U_increment_spec)
-        B_increment_view = _make_static_tensor_spec_view(B_t, B_increment_spec)
+        B_increment_view = _make_static_tensor_spec_view(B_t, B_increment_input_spec)
         M_increment_view = _make_static_tensor_spec_view(M_t, M_increment_spec)
         K_previous_increment_view = _make_static_tensor_spec_view(
             K_previous_t, K_increment_spec
@@ -1696,19 +1805,19 @@ def _make_v2x2ssd_bwd_host_wrapper(
             d_increment_t, d_increment_boundary_spec
         )
         B_prev_chunks_view = _make_static_tensor_spec_view(
-            B_prev_chunks_t, B_prev_chunks_spec
+            B_prev_chunks_t, B_prev_chunks_input_spec
         )
         U_prev_chunks_view = _make_static_tensor_spec_view(
             U_prev_chunks_t, U_prev_chunks_spec
         )
         dB_increment_view = _make_static_tensor_spec_view(
-            dB_increment_t, B_increment_spec
+            dB_increment_t, dB_increment_spec
         )
         dU_increment_view = _make_static_tensor_spec_view(
             dU_increment_t, dU_increment_spec
         )
         dB_prev_increment_view = _make_static_tensor_spec_view(
-            dB_prev_increment_t, B_prev_chunks_spec
+            dB_prev_increment_t, dB_prev_increment_spec
         )
         dU_prev_increment_view = _make_static_tensor_spec_view(
             dU_prev_increment_t, U_prev_chunks_spec
@@ -1736,9 +1845,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         dU_prev_db_dummy_view = _make_static_tensor_spec_view(
             dU_prev_db_dummy_t, dU_prev_dummy_spec
         )
-        dB_du_dummy_view = _make_static_tensor_spec_view(
-            dB_du_dummy_t, dB_du_dummy_spec
-        )
+        dB_du_dummy_view = _make_static_tensor_spec_view(dB_du_dummy_t, dBC_scan_spec)
         dB_prev_du_dummy_view = _make_static_tensor_spec_view(
             dB_prev_du_dummy_t, dB_prev_dummy_spec
         )
@@ -1750,6 +1857,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_db,
         )
         chunk_scan_dcdr_kernel = ChunkScanBwdDCDRAmpere(
@@ -1757,6 +1866,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_dcdr,
         )
         chunk_scan_dlp_kernel = ChunkScanBwdDLPAmpere(
@@ -1764,6 +1875,8 @@ def _make_v2x2ssd_bwd_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_dcdr,
         )
         chunk_scan_param_kernel = ChunkScanBwdParamScanAmpere(
@@ -1775,11 +1888,15 @@ def _make_v2x2ssd_bwd_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_du,
         )
         chunk_scan_dz0_kernel = ChunkScanBwdDZ0Ampere(
             tc_dtype,
             chunk_size=chunk_size,
+            heads=heads,
+            bc_groups=bc_groups,
             cta_tiler=dz0_cta_tiler,
         )
 
@@ -1801,12 +1918,18 @@ def _make_v2x2ssd_bwd_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         chunk_increment_boundary_kernel = ChunkIncrementBwdBoundaryAmpere(
             tc_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         chunk_increment_param_kernel = ChunkIncrementBwdParamScanAmpere(
             chunk_size=chunk_size,
@@ -1817,6 +1940,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
 
         chunk_scan_db_kernel(
@@ -1954,9 +2080,17 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
     problem_shape: BackwardProblemShape,
     launch_cfg: BackwardLaunchConfig,
 ):
-    _batch_size, _heads, _padded_time, P, D, _n_chunks, chunk_size, n_d_tiles = (
-        problem_shape
-    )
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        n_d_tiles,
+    ) = problem_shape
     (
         scan_num_threads_du,
         scan_num_threads_db,
@@ -2042,6 +2176,8 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_db,
         )
         chunk_scan_dcdr_kernel = ChunkScanBwdDCDRAmpere(
@@ -2049,6 +2185,8 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_dcdr,
         )
         chunk_scan_dlp_kernel = ChunkScanBwdDLPAmpere(
@@ -2056,6 +2194,8 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_dcdr,
         )
         chunk_scan_param_kernel = ChunkScanBwdParamScanAmpere(
@@ -2067,11 +2207,15 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
             num_threads=scan_num_threads_du,
         )
         chunk_scan_dz0_kernel = ChunkScanBwdDZ0Ampere(
             tc_dtype,
             chunk_size=chunk_size,
+            heads=heads,
+            bc_groups=bc_groups,
             cta_tiler=dz0_cta_tiler,
         )
 
@@ -2093,12 +2237,18 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         chunk_increment_boundary_kernel = ChunkIncrementBwdBoundaryAmpere(
             tc_dtype,
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
         chunk_increment_param_kernel = ChunkIncrementBwdParamScanAmpere(
             chunk_size=chunk_size,
@@ -2109,6 +2259,9 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             chunk_size=chunk_size,
             D=D,
             P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
         )
 
         chunk_scan_db_kernel(
@@ -2297,7 +2450,7 @@ def _make_backward_aot_runtime_args(
     chunk_increment_specs = _chunk_increment_bwd_tensor_specs(problem_shape)
     (
         U_scan_spec,
-        B_scan_spec,
+        BC_scan_spec,
         M_scan_spec,
         K_scan_spec,
         chunk_starts_scan_spec,
@@ -2314,7 +2467,7 @@ def _make_backward_aot_runtime_args(
         M_dz0_spec,
         d_chunk_starts_scan_spec,
         dU_db_dummy_spec,
-        dB_du_dummy_spec,
+        dBC_scan_spec,
         dU_prev_dummy_spec,
         dB_prev_dummy_spec,
     ) = chunk_scan_specs
@@ -2326,23 +2479,25 @@ def _make_backward_aot_runtime_args(
     (
         U_increment_spec,
         dU_increment_spec,
-        B_increment_spec,
+        B_increment_input_spec,
         M_increment_spec,
         K_increment_spec,
         d_increment_spec,
         d_increment_dp_spec,
         d_increment_boundary_spec,
         U_prev_chunks_spec,
-        B_prev_chunks_spec,
+        B_prev_chunks_input_spec,
         dM_sum_part_spec,
         dMp0_spec,
         d_chunk_multiplier_increment_spec,
         d_param_increment_spec,
+        dB_increment_spec,
+        dB_prev_increment_spec,
     ) = chunk_increment_specs
     return (
         make_runtime_tensor_spec_view(U_t, U_scan_spec),
-        make_runtime_tensor_spec_view(B_t, B_scan_spec),
-        make_runtime_tensor_spec_view(C_t, B_scan_spec),
+        make_runtime_tensor_spec_view(B_t, BC_scan_spec),
+        make_runtime_tensor_spec_view(C_t, BC_scan_spec),
         make_runtime_tensor_spec_view(M_t, M_scan_spec),
         make_runtime_tensor_spec_view(K_t, K_scan_spec),
         make_runtime_tensor_spec_view(d_out_t, U_scan_spec),
@@ -2350,7 +2505,7 @@ def _make_backward_aot_runtime_args(
         make_runtime_tensor_spec_view(U_prev_state_t, U_prev_scan_spec),
         make_runtime_tensor_spec_view(B_prev_state_t, B_prev_scan_spec),
         make_runtime_tensor_spec_view(dU_scan_t, U_scan_spec),
-        make_runtime_tensor_spec_view(dB_scan_t, B_scan_spec),
+        make_runtime_tensor_spec_view(dB_scan_t, dBC_scan_spec),
         make_runtime_tensor_spec_view(dU_prev_scan_t, dU_prev_dummy_spec),
         make_runtime_tensor_spec_view(dB_prev_scan_t, dB_prev_dummy_spec),
         make_runtime_tensor_spec_view(dlogp_t, dlogp_scan_spec),
@@ -2359,7 +2514,7 @@ def _make_backward_aot_runtime_args(
         make_runtime_tensor_spec_view(dM_current_scratch_t, dM_scan_scratch_spec),
         make_runtime_tensor_spec_view(dM_previous_scratch_t, d_param_scan_spec),
         make_runtime_tensor_spec_view(dM_current_scratch_t, d_param_scan_spec),
-        make_runtime_tensor_spec_view(dC_scan_t, B_scan_spec),
+        make_runtime_tensor_spec_view(dC_scan_t, dBC_scan_spec),
         make_runtime_tensor_spec_view(dR_t, dR_scan_spec),
         make_runtime_tensor_spec_view(dR_t, dR_param_spec),
         make_runtime_tensor_spec_view(dM_scan_t, d_param_scan_spec),
@@ -2379,18 +2534,18 @@ def _make_backward_aot_runtime_args(
             d_chunk_multiplier_t, chunk_multiplier_state_spec
         ),
         make_runtime_tensor_spec_view(U_t, U_increment_spec),
-        make_runtime_tensor_spec_view(B_t, B_increment_spec),
+        make_runtime_tensor_spec_view(B_t, B_increment_input_spec),
         make_runtime_tensor_spec_view(M_t, M_increment_spec),
         make_runtime_tensor_spec_view(K_previous_t, K_increment_spec),
         make_runtime_tensor_spec_view(K_current_t, K_increment_spec),
         make_runtime_tensor_spec_view(d_increment_t, d_increment_dp_spec),
         make_runtime_tensor_spec_view(d_increment_t, d_increment_spec),
         make_runtime_tensor_spec_view(d_increment_t, d_increment_boundary_spec),
-        make_runtime_tensor_spec_view(B_prev_chunks_t, B_prev_chunks_spec),
+        make_runtime_tensor_spec_view(B_prev_chunks_t, B_prev_chunks_input_spec),
         make_runtime_tensor_spec_view(U_prev_chunks_t, U_prev_chunks_spec),
-        make_runtime_tensor_spec_view(dB_increment_t, B_increment_spec),
+        make_runtime_tensor_spec_view(dB_increment_t, dB_increment_spec),
         make_runtime_tensor_spec_view(dU_increment_t, dU_increment_spec),
-        make_runtime_tensor_spec_view(dB_prev_increment_t, B_prev_chunks_spec),
+        make_runtime_tensor_spec_view(dB_prev_increment_t, dB_prev_increment_spec),
         make_runtime_tensor_spec_view(dU_prev_increment_t, U_prev_chunks_spec),
         make_runtime_tensor_spec_view(dM_sum_part_t, dM_sum_part_spec),
         make_runtime_tensor_spec_view(dMp0_t, dMp0_spec),
@@ -2402,7 +2557,7 @@ def _make_backward_aot_runtime_args(
         make_runtime_tensor_spec_view(dK_current_increment_t, d_param_increment_spec),
         make_runtime_tensor_spec_view(dU_db_dummy_t, dU_db_dummy_spec),
         make_runtime_tensor_spec_view(dU_prev_db_dummy_t, dU_prev_dummy_spec),
-        make_runtime_tensor_spec_view(dB_du_dummy_t, dB_du_dummy_spec),
+        make_runtime_tensor_spec_view(dB_du_dummy_t, dBC_scan_spec),
         make_runtime_tensor_spec_view(dB_prev_du_dummy_t, dB_prev_dummy_spec),
     )
 
@@ -2446,9 +2601,15 @@ def _get_compiled_v2x2ssd_bwd_kernel(
     )
     backward_aot_spec = BackwardAOTSpec(
         arch_tag=current_hardware_fingerprint(device_index=device_index).arch_tag,
-        P=int(compile_artifacts.problem_shape[3]),
-        D=int(compile_artifacts.problem_shape[4]),
-        chunk_size=int(compile_artifacts.problem_shape[6]),
+        P=int(compile_artifacts.problem_shape[4]),
+        D=int(compile_artifacts.problem_shape[5]),
+        chunk_size=int(compile_artifacts.problem_shape[7]),
+        bc_groups=(
+            None
+            if int(compile_artifacts.problem_shape[2])
+            == int(compile_artifacts.problem_shape[1])
+            else int(compile_artifacts.problem_shape[2])
+        ),
         tc_dtype_name={
             torch.float16: "float16",
             torch.bfloat16: "bfloat16",
@@ -2551,6 +2712,17 @@ def _materialize_backward_public_outputs(
     torch.Tensor,
 ]:
     outputs = runtime_artifacts.outputs
+    (
+        _batch_size,
+        _heads,
+        bc_groups,
+        _padded_time,
+        _P,
+        _D,
+        _n_chunks,
+        _chunk_size,
+        _n_d_tiles,
+    ) = runtime_artifacts.problem_shape
     outputs.dU_scan.add_(outputs.dU_increment)
     outputs.dU_prev_scan.add_(outputs.dU_prev_increment)
     outputs.dB_scan.add_(outputs.dB_increment)
@@ -2560,21 +2732,27 @@ def _materialize_backward_public_outputs(
 
     dU_public = _fold_chunk_boundary_carries(outputs.dU_scan, outputs.dU_prev_scan)
     dB_public = _fold_chunk_boundary_carries(outputs.dB_scan, outputs.dB_prev_scan)
+    dB_grouped = _reduce_heads_to_bc_groups(dB_public, bc_groups=bc_groups)
+    dC_grouped = _reduce_heads_to_bc_groups(outputs.dC_scan, bc_groups=bc_groups)
+    dB_prev_grouped = _reduce_heads_to_bc_groups(
+        outputs.dB_prev_scan,
+        bc_groups=bc_groups,
+    )
 
     return (
         _public_from_chunked(dU_public, T=time_steps, dtype=U_dtype),
         _public_from_param_scan(outputs.dM_scan, T=time_steps),
         _public_from_packed_dk(outputs.dK_scan, time_steps=time_steps),
-        _public_from_chunked(dB_public, T=time_steps, dtype=B_dtype),
-        _public_from_chunked(outputs.dC_scan, T=time_steps, dtype=C_dtype),
+        _public_from_chunked(dB_grouped, T=time_steps, dtype=B_dtype),
+        _public_from_chunked(dC_grouped, T=time_steps, dtype=C_dtype),
         _materialize_public_output(
             outputs.d_initial_state,
             outputs.d_initial_state,
             dtype=initial_state_dtype or torch.float32,
         ),
         _materialize_public_output(
-            outputs.dB_prev_scan,
-            outputs.dB_prev_scan[:, :, 0, :],
+            dB_prev_grouped,
+            dB_prev_grouped[:, :, 0, :],
             dtype=B_prev.dtype if B_prev is not None else B_dtype,
         ),
         _materialize_public_output(

@@ -73,6 +73,9 @@ if TYPE_CHECKING:
 
     class _DecodeOwner(Protocol):
         @property
+        def bc_groups(self) -> int: ...
+
+        @property
         def d_head(self) -> int: ...
 
         @property
@@ -187,7 +190,7 @@ def make_decode_inputs(
         ).contiguous(),
         bc=bc_token.view(
             batch_size,
-            mixer.n_heads,
+            mixer.bc_groups,
             mixer.scanprep.bc_param_rows,
             mixer.d_state,
         ).contiguous(),
@@ -211,7 +214,7 @@ def run_reference_decode_step(
     bc_token = inputs.bc.reshape(
         batch_size,
         1,
-        mixer.n_heads,
+        mixer.bc_groups,
         mixer.scanprep.bc_param_rows,
         mixer.d_state,
     ).contiguous()

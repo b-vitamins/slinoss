@@ -24,6 +24,7 @@ def _validate_scanprep_inputs(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int,
     d_state: int,
     d_head: int,
 ) -> None:
@@ -33,13 +34,18 @@ def _validate_scanprep_inputs(
         or bc.device.type != "cuda"
     ):
         raise ValueError("CuTe scanprep requires CUDA tensors.")
-    if n_heads <= 0 or d_state <= 0 or d_head <= 0:
+    if n_heads <= 0 or bc_groups <= 0 or d_state <= 0 or d_head <= 0:
         raise ValueError(
-            f"Invalid scanprep dimensions: n_heads={n_heads}, d_state={d_state}, d_head={d_head}."
+            "Invalid scanprep dimensions: "
+            f"n_heads={n_heads}, bc_groups={bc_groups}, d_state={d_state}, d_head={d_head}."
+        )
+    if n_heads % bc_groups != 0:
+        raise ValueError(
+            f"n_heads must be divisible by bc_groups. Got {n_heads}, {bc_groups}."
         )
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
-            "Expected value=(B,T,H*P), params=(B,T,H*2), bc=(B,T,H,4,N). "
+            "Expected value=(B,T,H*P), params=(B,T,H*2), bc=(B,T,G,4,N). "
             f"Got {tuple(value.shape)}, {tuple(params.shape)}, {tuple(bc.shape)}."
         )
     supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
@@ -74,6 +80,7 @@ def scanprep_cute(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -92,11 +99,13 @@ def scanprep_cute(
     theta_sign: torch.Tensor,
 ) -> ScanInputs:
     """CuTe scanprep contract for stateless mixer execution."""
+    resolved_bc_groups = n_heads if bc_groups is None else int(bc_groups)
     _validate_scanprep_inputs(
         value,
         params,
         bc,
         n_heads=n_heads,
+        bc_groups=resolved_bc_groups,
         d_state=d_state,
         d_head=d_head,
     )
@@ -117,6 +126,7 @@ def scanprep_cute(
                 params,
                 bc,
                 n_heads=n_heads,
+                bc_groups=resolved_bc_groups,
                 d_state=d_state,
                 d_head=d_head,
                 dt_min=dt_min,
@@ -144,6 +154,7 @@ def scanprep_cute(
             params,
             bc,
             n_heads=n_heads,
+            bc_groups=resolved_bc_groups,
             d_state=d_state,
             d_head=d_head,
             dt_min=dt_min,

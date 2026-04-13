@@ -66,6 +66,7 @@ def _scanprep_runtime_kwargs(
 
     return {
         "n_heads": prep.n_heads,
+        "bc_groups": prep.bc_groups,
         "d_state": prep.d_state,
         "d_head": prep.d_head,
         "dt_min": prep.dt_min,
@@ -92,9 +93,11 @@ def _canonical_bc(prep: SLinOSSScanPrep, bc_amp: torch.Tensor) -> torch.Tensor:
 def _make_scanprep_cuda_fixture(
     *,
     dtype: torch.dtype = torch.float16,
+    bc_groups: int | None = None,
 ) -> tuple[SLinOSSScanPrep, torch.Tensor, torch.Tensor, torch.Tensor]:
     prep = SLinOSSScanPrep(
         n_heads=2,
+        bc_groups=bc_groups,
         d_state=3,
         d_head=4,
         dt_min=1e-3,
@@ -107,7 +110,7 @@ def _make_scanprep_cuda_fixture(
     value = torch.randn((2, 5, 8), device="cuda", dtype=dtype)
     params = torch.randn((2, 5, 2 * prep.param_dim), device="cuda", dtype=dtype)
     bc_amp = torch.randn(
-        (2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state),
+        (2, 5, prep.bc_groups, prep.bc_param_rows, prep.d_state),
         device="cuda",
         dtype=dtype,
     )
@@ -757,7 +760,7 @@ def test_scanprep_real_dtype_cast_preserves_complex_bc_base() -> None:
 def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
     torch.manual_seed(0)
     prep = SLinOSSScanPrep(n_heads=2, d_state=3, d_head=4)
-    bc = torch.randn((2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state))
+    bc = torch.randn((2, 5, prep.bc_groups, prep.bc_param_rows, prep.d_state))
 
     B_pairs, C_pairs = prep._parameterize_scan_bc_pairs(bc)
     bc_rows = prep._parameterize_scan_bc_rows(bc)
@@ -771,7 +774,7 @@ def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
 def test_scanprep_parameterized_bc_pairs_have_bounded_complex_row_gain() -> None:
     torch.manual_seed(0)
     prep = SLinOSSScanPrep(n_heads=2, d_state=5, d_head=4, bc_gain_max=1.25)
-    bc = torch.randn((2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state)) * 20.0
+    bc = torch.randn((2, 5, prep.bc_groups, prep.bc_param_rows, prep.d_state)) * 20.0
 
     B_pairs, C_pairs = prep._parameterize_scan_bc_pairs(bc)
 
@@ -792,12 +795,51 @@ def test_scanprep_reference_pack_produces_contiguous_bc() -> None:
     )
     value = torch.randn((2, 5, prep.d_inner), dtype=torch.float32)
     params = torch.randn((2, 5, prep.n_heads * prep.param_dim), dtype=torch.float32)
-    bc = torch.randn((2, 5, prep.n_heads, prep.bc_param_rows, prep.d_state))
+    bc = torch.randn((2, 5, prep.bc_groups, prep.bc_param_rows, prep.d_state))
 
     out = prep(value, params, bc)
 
     assert out.B.is_contiguous()
     assert out.C.is_contiguous()
+
+
+def test_scanprep_grouped_reference_contract_and_gradients() -> None:
+    torch.manual_seed(0)
+    prep = SLinOSSScanPrep(
+        n_heads=4,
+        bc_groups=2,
+        d_state=3,
+        d_head=5,
+        backend=ReferenceScanPrepBackend(),
+    )
+    value = torch.randn((2, 6, prep.d_inner), dtype=torch.float32, requires_grad=True)
+    params = torch.randn(
+        (2, 6, prep.n_heads * prep.param_dim),
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    bc = torch.randn(
+        (2, 6, prep.bc_groups, prep.bc_param_rows, prep.d_state),
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    out = prep(value, params, bc)
+
+    assert tuple(out.U.shape) == (2, prep.n_heads, 6, prep.d_head)
+    assert tuple(out.M.shape) == (2, prep.n_heads, 6, 2)
+    assert tuple(out.K.shape) == (2, prep.n_heads, 6, 2, 2)
+    assert tuple(out.B.shape) == (2, prep.bc_groups, 6, 2 * prep.d_state)
+    assert tuple(out.C.shape) == (2, prep.bc_groups, 6, 2 * prep.d_state)
+
+    loss = out.U.sum() + out.M.sum() + out.K.sum() + out.B.sum() + out.C.sum()
+    loss.backward()
+
+    assert value.grad is not None and tuple(value.grad.shape) == tuple(value.shape)
+    assert params.grad is not None and tuple(params.grad.shape) == tuple(params.shape)
+    assert bc.grad is not None and tuple(bc.grad.shape) == tuple(bc.shape)
+    assert prep.bc_complex_base.grad is not None
+    assert tuple(prep.bc_complex_base.grad.shape) == (prep.bc_groups, 2, prep.d_state)
 
 
 def test_cute_scanprep_backend_requires_cuda() -> None:

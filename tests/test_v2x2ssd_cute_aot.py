@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, replace
 import math
 from pathlib import Path
 from typing import Any, cast
@@ -56,6 +57,7 @@ def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
     specs = cute_aot_mod.default_forward_aot_specs(("sm_80", "sm_86"))
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert all(spec.bc_groups is None for spec in specs)
     assert {spec.chunk_size for spec in specs} == set(
         cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES
     )
@@ -78,6 +80,7 @@ def test_default_backward_aot_specs_expand_requested_arch_tags() -> None:
     specs = cute_aot_mod.default_backward_aot_specs(("sm_80", "sm_86"))
     assert specs
     assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
+    assert all(spec.bc_groups is None for spec in specs)
     assert {spec.chunk_size for spec in specs} == set(
         cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES
     )
@@ -104,6 +107,74 @@ def test_search_space_forward_aot_specs_expand_beyond_default_specs() -> None:
         "bfloat16",
         "float32",
     }
+
+
+def test_v2x2ssd_aot_record_load_defaults_bc_groups_to_head_matched_identity() -> None:
+    increment_base = cute_aot_mod._search_space_chunk_increment_specs(arch_tag="sm_80")[
+        0
+    ]
+    increment = cute_aot_mod._chunk_increment_spec_from_record(
+        {
+            key: value
+            for key, value in asdict(increment_base).items()
+            if key != "bc_groups"
+        }
+    )
+    assert increment.bc_groups is None
+    assert increment.module_id == increment_base.module_id
+
+    scan_base = cute_aot_mod._search_space_chunk_scan_specs(arch_tag="sm_80")[0]
+    scan = cute_aot_mod._chunk_scan_spec_from_record(
+        {key: value for key, value in asdict(scan_base).items() if key != "bc_groups"}
+    )
+    assert scan.bc_groups is None
+    assert scan.module_id == scan_base.module_id
+
+    forward_base = cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0]
+    forward = cute_aot_mod._forward_spec_from_record(
+        {
+            key: value
+            for key, value in asdict(forward_base).items()
+            if key != "bc_groups"
+        }
+    )
+    assert forward.bc_groups is None
+    assert forward.module_id == forward_base.module_id
+
+    backward_base = cute_aot_mod.default_backward_aot_specs(("sm_80",))[0]
+    backward = cute_aot_mod._backward_spec_from_record(
+        {
+            key: value
+            for key, value in asdict(backward_base).items()
+            if key != "bc_groups"
+        }
+    )
+    assert backward.bc_groups is None
+    assert backward.module_id == backward_base.module_id
+
+
+def test_grouped_v2x2ssd_aot_module_ids_include_bc_groups_identity() -> None:
+    increment_base = cute_aot_mod._search_space_chunk_increment_specs(arch_tag="sm_80")[
+        0
+    ]
+    increment_grouped = replace(increment_base, bc_groups=1)
+    assert increment_grouped.module_id != increment_base.module_id
+    assert "g1" in increment_grouped.module_id
+
+    scan_base = cute_aot_mod._search_space_chunk_scan_specs(arch_tag="sm_80")[0]
+    scan_grouped = replace(scan_base, bc_groups=1)
+    assert scan_grouped.module_id != scan_base.module_id
+    assert "g1" in scan_grouped.module_id
+
+    forward_base = cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0]
+    forward_grouped = replace(forward_base, bc_groups=1)
+    assert forward_grouped.module_id != forward_base.module_id
+    assert "g1" in forward_grouped.module_id
+
+    backward_base = cute_aot_mod.default_backward_aot_specs(("sm_80",))[0]
+    backward_grouped = replace(backward_base, bc_groups=1)
+    assert backward_grouped.module_id != backward_base.module_id
+    assert "g1" in backward_grouped.module_id
 
 
 def test_build_default_forward_aot_package_only_exports_forward_specs(
@@ -347,6 +418,7 @@ def _make_scan_inputs(
     P: int,
     device: torch.device,
     value_dtype: torch.dtype = torch.float16,
+    bc_groups: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -357,6 +429,13 @@ def _make_scan_inputs(
     torch.Tensor,
     torch.Tensor,
 ]:
+    resolved_bc_groups = heads if bc_groups is None else int(bc_groups)
+    if resolved_bc_groups <= 0:
+        raise ValueError("bc_groups must be positive.")
+    if heads % resolved_bc_groups != 0:
+        raise ValueError(
+            f"bc_groups must divide heads. Got heads={heads}, bc_groups={resolved_bc_groups}."
+        )
     radius = 0.6 + 0.35 * torch.rand((batch, heads, T), device=device)
     angle = (2.0 * math.pi) * torch.rand((batch, heads, T), device=device) - math.pi
     M = torch.view_as_real(torch.polar(radius, angle)).to(torch.float32).contiguous()
@@ -368,15 +447,32 @@ def _make_scan_inputs(
     K = torch.view_as_real(K_complex).to(torch.float32).contiguous()
 
     U = torch.randn((batch, heads, T, P), device=device, dtype=value_dtype)
-    B = torch.randn((batch, heads, T, 2 * N), device=device, dtype=value_dtype) * 0.1
-    C = torch.randn((batch, heads, T, 2 * N), device=device, dtype=value_dtype) * 0.1
+    B = (
+        torch.randn(
+            (batch, resolved_bc_groups, T, 2 * N),
+            device=device,
+            dtype=value_dtype,
+        )
+        * 0.1
+    )
+    C = (
+        torch.randn(
+            (batch, resolved_bc_groups, T, 2 * N),
+            device=device,
+            dtype=value_dtype,
+        )
+        * 0.1
+    )
     initial_states = torch.randn(
         (batch, heads, P, 2 * N), device=device, dtype=torch.float32
     )
 
     b_prev = (
-        torch.randn((batch, heads, N), device=device, dtype=torch.float32)
-        + 1j * torch.randn((batch, heads, N), device=device, dtype=torch.float32)
+        torch.randn((batch, resolved_bc_groups, N), device=device, dtype=torch.float32)
+        + 1j
+        * torch.randn(
+            (batch, resolved_bc_groups, N), device=device, dtype=torch.float32
+        )
     ) * 0.1
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
@@ -392,6 +488,7 @@ def _make_backward_inputs(
     P: int,
     device: torch.device,
     value_dtype: torch.dtype = torch.float16,
+    bc_groups: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -408,6 +505,7 @@ def _make_backward_inputs(
     U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
         batch=batch,
         heads=heads,
+        bc_groups=bc_groups,
         T=T,
         N=N,
         P=P,
@@ -619,6 +717,71 @@ def test_v2x2ssd_fwd_cute_prefers_packaged_aot_over_jit(
 
     def _compile_should_not_run(*args, **kwargs):
         raise AssertionError("expected packaged AOT forward to bypass cute.compile")
+
+    monkeypatch.setattr(v2x2ssd_fwd_mod.cute, "compile", _compile_should_not_run)
+    out = v2x2ssd_fwd_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float16,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        return_final_state=True,
+        return_intermediates=False,
+    )
+    assert len(out) == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_fwd_grouped_packaged_aot_prefers_packaged_over_jit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=4,
+        bc_groups=1,
+        T=32,
+        N=8,
+        P=16,
+        device=device,
+    )
+    arch_tag = current_hardware_fingerprint(
+        device_index=torch.cuda.current_device()
+    ).arch_tag
+
+    cute_aot_mod.export_v2x2ssd_fwd_cute_aot(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float16,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        arch_tag=arch_tag,
+        package_root=tmp_path,
+    )
+
+    monkeypatch.setattr(cute_aot_mod, "_PACKAGED_AOT_ROOT", tmp_path)
+    cute_aot_mod.clear_packaged_forward_aot_cache()
+    v2x2ssd_fwd_mod._FWD_HOST_CACHE.clear()
+
+    def _compile_should_not_run(*args, **kwargs):
+        raise AssertionError(
+            "expected grouped packaged AOT forward to bypass cute.compile"
+        )
 
     monkeypatch.setattr(v2x2ssd_fwd_mod.cute, "compile", _compile_should_not_run)
     out = v2x2ssd_fwd_cute(

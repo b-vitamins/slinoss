@@ -15,6 +15,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         params: torch.Tensor,
         bc: torch.Tensor,
         n_heads: int,
+        bc_groups: int,
         d_state: int,
         d_head: int,
         dt_min: float,
@@ -33,6 +34,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         theta_sign: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.n_heads = int(n_heads)
+        ctx.bc_groups = int(bc_groups)
         ctx.d_state = int(d_state)
         ctx.d_head = int(d_head)
         ctx.value_dtype = value.dtype
@@ -61,6 +63,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             params_d,
             bc_d,
             n_heads=n_heads,
+            bc_groups=bc_groups,
             d_state=d_state,
             d_head=d_head,
             dt_min=dt_min,
@@ -107,6 +110,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dB=dB,
             dC=dC,
             n_heads=ctx.n_heads,
+            bc_groups=ctx.bc_groups,
             d_head=ctx.d_head,
             d_state=ctx.d_state,
             value_dtype=ctx.value_dtype,
@@ -140,6 +144,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             outputs.bias_grad[:, 0].contiguous(),
             outputs.bias_grad[:, 1].contiguous(),
             outputs.bias_grad[:, 2].contiguous(),
@@ -154,6 +159,7 @@ def scanprep_cute_training_autograd(
     bc: torch.Tensor,
     *,
     n_heads: int,
+    bc_groups: int | None = None,
     d_state: int,
     d_head: int,
     dt_min: float,
@@ -171,6 +177,7 @@ def scanprep_cute_training_autograd(
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    resolved_bc_groups = n_heads if bc_groups is None else int(bc_groups)
     return cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         _ScanPrepCuTeFn.apply(
@@ -178,6 +185,7 @@ def scanprep_cute_training_autograd(
             params,
             bc,
             int(n_heads),
+            int(resolved_bc_groups),
             int(d_state),
             int(d_head),
             float(dt_min),

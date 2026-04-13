@@ -9,7 +9,7 @@ prefix phase, and runs one tensor-core GEMM that writes ``dZ0`` directly.
 Tensor contracts:
 
 - ``dOut``: ``(P, T, BH)`` fp16/bf16 packed row/column-major operand
-- ``C``: ``(D, T, BH)`` fp16/bf16 packed complex query-side operand
+- ``C``: ``(D, T, BG)`` fp16/bf16 packed complex query-side operand
 - ``M``: ``(2, T, BH)`` fp32 packed complex transitions
 - ``dZ0``: ``(P, D, BHC)`` fp32 public chunk-start state gradient
 
@@ -115,6 +115,8 @@ class ChunkScanBwdDZ0Ampere:
         cta_tiler: tuple[int, int, int] = (64, 96, 32),  # (bM=P, bN=D, bK=time)
         atom_layout_mnk: tuple[int, int, int] = (2, 2, 1),
         num_stages: int = 2,
+        heads: int | None = None,
+        bc_groups: int | None = None,
     ):
         self.ab_dtype = dtype
         self.acc_dtype = cutlass.Float32
@@ -124,6 +126,21 @@ class ChunkScanBwdDZ0Ampere:
         self.cta_tiler = tuple(int(dim) for dim in cta_tiler)
         self.atom_layout_mnk = tuple(int(dim) for dim in atom_layout_mnk)
         self.num_stages = int(num_stages)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.heads_per_bc_group = 0
 
         if self.ab_dtype not in (cutlass.Float16, cutlass.BFloat16):
             raise TypeError("dtype must be Float16/BFloat16 for the tensor-core path.")
@@ -155,6 +172,15 @@ class ChunkScanBwdDZ0Ampere:
             raise ValueError("atom_layout_mnk K must be 1.")
         if self.bK % mma_k != 0:
             raise ValueError("bK must be divisible by the MMA instruction shape.")
+
+    @cute.jit
+    def _batch_group(self, batch_head: int):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        return batch_idx * cutlass.Int32(self.bc_groups) + group_idx
 
     @property
     def k_tile_count(self) -> int:
@@ -644,6 +670,7 @@ class ChunkScanBwdDZ0Ampere:
         batch_head = batch_head_chunk // n_chunks
         return SimpleNamespace(
             batch_head=batch_head,
+            batch_group=self._batch_group(batch_head),
             chunk_start=(batch_head_chunk - batch_head * n_chunks) * self.L,
         )
 
@@ -728,7 +755,7 @@ class ChunkScanBwdDZ0Ampere:
                 proj=(1, None, 1),
             ),
             c_coord=cute.local_tile(
-                coord_c_base[None, None, tile_info.batch_head],
+                coord_c_base[None, None, tile_info.batch_group],
                 tiler=self.cta_tiler,
                 coord=(block_m, block_n, None),
                 proj=(None, 1, 1),
@@ -752,7 +779,7 @@ class ChunkScanBwdDZ0Ampere:
             proj=(1, None, 1),
         )
         g_c = cute.local_tile(
-            g_c_base[None, None, tile_info.batch_head],
+            g_c_base[None, None, tile_info.batch_group],
             tiler=self.cta_tiler,
             coord=(block_m, block_n, None),
             proj=(None, 1, 1),
@@ -1510,7 +1537,7 @@ class ChunkScanBwdDZ0Ampere:
     def kernel(
         self,
         mDOut: cute.Tensor,  # (P, T, BH)
-        mC: cute.Tensor,  # (D, T, BH)
+        mC: cute.Tensor,  # (D, T, BG)
         mM: cute.Tensor,  # (2, T, BH)
         mDZ0: cute.Tensor,  # (P, D, BHC)
         dout_layout: cute.ComposedLayout,

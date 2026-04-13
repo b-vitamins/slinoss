@@ -10,8 +10,14 @@ from slinoss.layers import AutoScanBackend, CuteScanBackend, ScanInputs, ScanSta
 from slinoss.layers import backend as backend_mod
 
 
-def _make_inputs() -> tuple[ScanInputs, ScanState]:
-    batch, heads, T, N, P = 2, 3, 7, 4, 5
+def _make_inputs(
+    *,
+    heads: int = 3,
+    bc_groups: int | None = None,
+) -> tuple[ScanInputs, ScanState]:
+    batch, T, N, P = 2, 7, 4, 5
+    groups = heads if bc_groups is None else bc_groups
+    assert heads % groups == 0
     radius = 0.6 + 0.35 * torch.rand((batch, heads, T), dtype=torch.float32)
     angle = (2.0 * math.pi) * torch.rand(
         (batch, heads, T), dtype=torch.float32
@@ -23,11 +29,11 @@ def _make_inputs() -> tuple[ScanInputs, ScanState]:
     ) * 0.1
     K = torch.view_as_real(K_complex).contiguous()
     U = torch.randn((batch, heads, T, P), dtype=torch.float32)
-    B = torch.randn((batch, heads, T, 2 * N), dtype=torch.float32) * 0.1
-    C = torch.randn((batch, heads, T, 2 * N), dtype=torch.float32) * 0.1
+    B = torch.randn((batch, groups, T, 2 * N), dtype=torch.float32) * 0.1
+    C = torch.randn((batch, groups, T, 2 * N), dtype=torch.float32) * 0.1
     state = ScanState(
         state=torch.randn((batch, heads, P, 2 * N), dtype=torch.float32),
-        b_prev=torch.randn((batch, heads, 2 * N), dtype=torch.float32),
+        b_prev=torch.randn((batch, groups, 2 * N), dtype=torch.float32),
         u_prev=torch.randn((batch, heads, P), dtype=torch.float32),
     )
     return ScanInputs(U=U, M=M, K=K, B=B, C=C), state
@@ -87,8 +93,12 @@ def test_cute_backend_runs_stateless_training_contract(monkeypatch) -> None:
     assert torch.equal(y, torch.zeros_like(inputs.U))
 
 
-def test_cute_backend_threads_stateful_execution() -> None:
-    inputs, state = _make_inputs()
+@pytest.mark.parametrize(("heads", "bc_groups"), [(3, 3), (4, 2)])
+def test_cute_backend_threads_stateful_execution(
+    heads: int,
+    bc_groups: int,
+) -> None:
+    inputs, state = _make_inputs(heads=heads, bc_groups=bc_groups)
     calls: dict[str, object] = {}
 
     def fake_scan_op(
@@ -106,7 +116,9 @@ def test_cute_backend_threads_stateful_execution() -> None:
         output_dtype: torch.dtype | None = None,
         return_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        del U, M, K, B, C, chunk_size, compute_dtype, output_dtype
+        del U, M, K, chunk_size, compute_dtype, output_dtype
+        calls["B"] = B
+        calls["C"] = C
         calls["initial_states"] = initial_states
         calls["B_prev"] = B_prev
         calls["U_prev"] = U_prev
@@ -129,10 +141,16 @@ def test_cute_backend_threads_stateful_execution() -> None:
     finally:
         monkeypatch.undo()
 
+    assert calls["B"] is inputs.B
+    assert calls["C"] is inputs.C
     assert calls["initial_states"] is state.state
     assert calls["B_prev"] is state.b_prev
     assert calls["U_prev"] is state.u_prev
     assert calls["return_state"] is True
+    assert tuple(inputs.B.shape) == (2, bc_groups, 7, 8)
+    assert tuple(inputs.C.shape) == (2, bc_groups, 7, 8)
+    assert state.b_prev is not None
+    assert tuple(state.b_prev.shape) == (2, bc_groups, 8)
     assert torch.equal(y, torch.zeros_like(inputs.U))
     assert next_state.state is not None
     assert next_state.b_prev is not None

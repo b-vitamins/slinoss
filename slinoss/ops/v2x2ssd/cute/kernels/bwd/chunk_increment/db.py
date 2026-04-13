@@ -85,6 +85,9 @@ class ChunkIncrementBwdDBAmpere:
         chunk_size: int,
         D: int,
         P: int,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+        n_chunks: int | None = None,
         cta_tiler: tuple[int, int, int] | None = None,  # (bM=L, bN=D, bK=P)
         atom_layout_mnk: tuple[int, int, int] = (2, 2, 1),
         num_stages: int = 2,
@@ -96,6 +99,29 @@ class ChunkIncrementBwdDBAmpere:
         self.L = int(chunk_size)
         self.D = int(D)
         self.P = int(P)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if n_chunks is None:
+                raise ValueError(
+                    "n_chunks must be specified when grouped BC is active."
+                )
+            self.n_chunks = int(n_chunks)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            if self.n_chunks <= 0:
+                raise ValueError("n_chunks must be positive.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.n_chunks = 0
+            self.heads_per_bc_group = 0
         if cta_tiler is None:
             cta_tiler = (self.L, 64, _default_tc_k_tile(self.P))
         self.cta_tiler = cta_tiler
@@ -136,6 +162,21 @@ class ChunkIncrementBwdDBAmpere:
             raise ValueError(
                 "chunk_size too large for scan_threads with this CTA thread count."
             )
+
+    @cute.jit
+    def _batch_group_chunk_index(
+        self,
+        batch_head_chunk_idx: int,
+    ):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk_idx
+        batch_head = batch_head_chunk_idx // cutlass.Int32(self.n_chunks)
+        chunk_index = batch_head_chunk_idx - batch_head * cutlass.Int32(self.n_chunks)
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        batch_group = batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+        return batch_group * cutlass.Int32(self.n_chunks) + chunk_index
 
     def _suffix_coeff_layout(self):
         return cute.make_layout((self.L, 2), stride=(2, 1))
@@ -779,6 +820,7 @@ class ChunkIncrementBwdDBAmpere:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         _, block_col_idx, batch_head_chunk_idx = cute.arch.block_idx()
+        batch_group_chunk_idx = self._batch_group_chunk_index(batch_head_chunk_idx)
 
         tile_col_start = block_col_idx * self.bN
         tiler_coord = (cutlass.Int32(0), block_col_idx, None)
@@ -1219,12 +1261,12 @@ class ChunkIncrementBwdDBAmpere:
                 d_b_sum_re = cutlass.Float32(s_db_tile[time_index, d_pair_start + 0])
                 d_b_sum_im = cutlass.Float32(s_db_tile[time_index, d_pair_start + 1])
                 b_re = cutlass.Float32(
-                    mB[time_index, global_d_pair_start + 0, batch_head_chunk_idx].to(
+                    mB[time_index, global_d_pair_start + 0, batch_group_chunk_idx].to(
                         cutlass.Float32
                     )
                 )
                 b_im = cutlass.Float32(
-                    mB[time_index, global_d_pair_start + 1, batch_head_chunk_idx].to(
+                    mB[time_index, global_d_pair_start + 1, batch_group_chunk_idx].to(
                         cutlass.Float32
                     )
                 )

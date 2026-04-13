@@ -35,6 +35,7 @@ class ScanPrepFwdFused:
         self,
         *,
         h_size: int,
+        g_size: int,
         p_size: int,
         n_size: int,
         store_coeff_aux: bool,
@@ -51,9 +52,12 @@ class ScanPrepFwdFused:
         coeff_block_size: int = 256,
     ) -> None:
         self.h_size = int(h_size)
+        self.g_size = int(g_size)
         self.p_size = int(p_size)
         self.n_size = int(n_size)
         self.store_coeff_aux = bool(store_coeff_aux)
+        self._validate_group_shape()
+        self.heads_per_group = self.h_size // self.g_size
 
         self.pack_warps_per_block = int(pack_warps_per_block)
         self._validate_pack_warps_per_block()
@@ -82,6 +86,14 @@ class ScanPrepFwdFused:
     def _validate_pack_warps_per_block(self) -> None:
         if self.pack_warps_per_block <= 0:
             raise ValueError("pack_warps_per_block must be positive.")
+
+    def _validate_group_shape(self) -> None:
+        if self.g_size <= 0:
+            raise ValueError("g_size must be positive.")
+        if self.h_size % self.g_size != 0:
+            raise ValueError(
+                f"h_size must be divisible by g_size. Got {self.h_size}, {self.g_size}."
+            )
 
     def _validate_coeff_block_size(self) -> None:
         if self.coeff_block_size <= 0 or self.coeff_block_size % 32 != 0:
@@ -156,6 +168,8 @@ class ScanPrepFwdFused:
             rem = row - b * rows_per_batch_
             t = rem // self.h_size
             h = rem - t * self.h_size
+            g = h // self.heads_per_group
+            head_in_group = h - g * self.heads_per_group
 
             num_p_iters = (self.p_size + 31) // 32
             for p_iter in cutlass.range_constexpr(num_p_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
@@ -164,25 +178,26 @@ class ScanPrepFwdFused:
                     mU[b, h, t, p] = mValue[b, h, t, p]
 
             num_n_iters = (self.n_size + 31) // 32
-            for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
-                n = lane + n_iter * 32
-                if n < self.n_size:
-                    mBOut[b, h, t, 2 * n] = safe_cast_to_dtype(
-                        cutlass.Float32(mBC[b, t, h, 0, n]),
-                        mBOut.element_type,
-                    )
-                    mBOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
-                        cutlass.Float32(mBC[b, t, h, 1, n]),
-                        mBOut.element_type,
-                    )
-                    mCOut[b, h, t, 2 * n] = safe_cast_to_dtype(
-                        cutlass.Float32(mBC[b, t, h, 2, n]),
-                        mCOut.element_type,
-                    )
-                    mCOut[b, h, t, 2 * n + 1] = safe_cast_to_dtype(
-                        cutlass.Float32(mBC[b, t, h, 3, n]),
-                        mCOut.element_type,
-                    )
+            if head_in_group == 0:
+                for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
+                    n = lane + n_iter * 32
+                    if n < self.n_size:
+                        mBOut[b, g, t, 2 * n] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, g, 0, n]),
+                            mBOut.element_type,
+                        )
+                        mBOut[b, g, t, 2 * n + 1] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, g, 1, n]),
+                            mBOut.element_type,
+                        )
+                        mCOut[b, g, t, 2 * n] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, g, 2, n]),
+                            mCOut.element_type,
+                        )
+                        mCOut[b, g, t, 2 * n + 1] = safe_cast_to_dtype(
+                            cutlass.Float32(mBC[b, t, g, 3, n]),
+                            mCOut.element_type,
+                        )
 
     @cute.kernel
     def _compute_coefficients(

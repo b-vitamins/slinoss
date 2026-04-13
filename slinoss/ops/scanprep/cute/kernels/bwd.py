@@ -40,6 +40,7 @@ class ScanPrepBwdFused:
         self,
         *,
         h_size: int,
+        g_size: int,
         p_size: int,
         n_size: int,
         param_dim: int,
@@ -57,9 +58,11 @@ class ScanPrepBwdFused:
         coeff_block_size: int = 512,
     ) -> None:
         self.h_size = int(h_size)
+        self.g_size = int(g_size)
         self.p_size = int(p_size)
         self.n_size = int(n_size)
         self.param_dim = int(param_dim)
+        self._validate_group_shape()
 
         self.value_warps_per_block = int(value_warps_per_block)
         self._validate_value_warps_per_block()
@@ -103,6 +106,14 @@ class ScanPrepBwdFused:
         if self.value_warps_per_block <= 0:
             raise ValueError("value_warps_per_block must be positive.")
 
+    def _validate_group_shape(self) -> None:
+        if self.g_size <= 0:
+            raise ValueError("g_size must be positive.")
+        if self.h_size % self.g_size != 0:
+            raise ValueError(
+                f"h_size must be divisible by g_size. Got {self.h_size}, {self.g_size}."
+            )
+
     def _validate_pack_warps_per_block(self) -> None:
         if (
             self.pack_warps_per_block <= 0
@@ -132,7 +143,7 @@ class ScanPrepBwdFused:
     def _pack_grid_shape(self, *, total_bt) -> tuple[int, int, int]:
         return (
             (total_bt + self.pack_bt_tile - 1) // self.pack_bt_tile,
-            self.h_size,
+            self.g_size,
             1,
         )
 
@@ -233,13 +244,13 @@ class ScanPrepBwdFused:
         t_size_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        block_bt, h, _ = cute.arch.block_idx()
+        block_bt, g, _ = cute.arch.block_idx()
         warp = tidx // 32
         lane = tidx - warp * 32
         role = warp // self.pack_rows_per_round
         row_local = warp - role * self.pack_rows_per_round
 
-        if h < self.h_size and role < self.pack_role_warps:
+        if g < self.g_size and role < self.pack_role_warps:
             num_n_iters = (self.n_size + 31) // 32
             for round_iter in cutlass.range_constexpr(self.pack_rounds):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                 bt = (
@@ -254,14 +265,14 @@ class ScanPrepBwdFused:
                         for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                             n = lane + n_iter * 32
                             if n < self.n_size:
-                                mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
-                                mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
+                                mBCGrad[b, t, g, 0, n] = mDB[b, g, t, 2 * n]
+                                mBCGrad[b, t, g, 1, n] = mDB[b, g, t, 2 * n + 1]
                     else:
                         for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                             n = lane + n_iter * 32
                             if n < self.n_size:
-                                mBCGrad[b, t, h, 2, n] = mDC[b, h, t, 2 * n]
-                                mBCGrad[b, t, h, 3, n] = mDC[b, h, t, 2 * n + 1]
+                                mBCGrad[b, t, g, 2, n] = mDC[b, g, t, 2 * n]
+                                mBCGrad[b, t, g, 3, n] = mDC[b, g, t, 2 * n + 1]
 
     @cute.kernel
     def _accumulate_coeff_grads(
