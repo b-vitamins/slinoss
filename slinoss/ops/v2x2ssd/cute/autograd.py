@@ -12,7 +12,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _prepare_m_operand,
     _prepare_time_operand,
     _tc_input_dtype,
-    _v2x2ssd_fwd_cute_prevalidated,
+    _v2x2ssd_fwd_runtime_artifacts_prevalidated,
 )
 
 
@@ -81,25 +81,43 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         initial_states_d = None if initial_states is None else initial_states.detach()
         B_prev_d = None if B_prev is None else B_prev.detach()
         U_prev_d = None if U_prev is None else U_prev.detach()
+        runtime_artifacts = _v2x2ssd_fwd_runtime_artifacts_prevalidated(
+            U_d,
+            M_d,
+            K_d,
+            B_d,
+            C_d,
+            chunk_size=ctx.chunk_size,
+            initial_states=initial_states_d,
+            B_prev=B_prev_d,
+            U_prev=U_prev_d,
+            compute_dtype=compute_dtype,
+            output_dtype=ctx.output_dtype,
+            m_block_size=None,
+            n_block_size=64,
+            scan_num_threads=128,
+            state_num_threads=128,
+            state_vecs_per_thread=8,
+            return_final_state=ctx.return_state,
+            return_intermediates=True,
+            prepared_inputs=None,
+            validate_runtime_contract=False,
+        )
+        ctx.forward_config_bundle = runtime_artifacts.config_bundle
+
+        saved_tensors = [U_d, M_d, K_d, B_d, C_d]
+        if ctx.has_initial_states:
+            assert initial_states_d is not None
+            saved_tensors.append(initial_states_d)
+        if ctx.has_prev_state:
+            assert B_prev_d is not None
+            assert U_prev_d is not None
+            saved_tensors.extend([B_prev_d, U_prev_d])
+        ctx.save_for_backward(*saved_tensors)
 
         if ctx.return_state:
-            Y, final_state, m_chunk, chunk_starts = cast(
-                tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                _v2x2ssd_fwd_cute_prevalidated(
-                    U_d,
-                    M_d,
-                    K_d,
-                    B_d,
-                    C_d,
-                    chunk_size=ctx.chunk_size,
-                    initial_states=initial_states_d,
-                    B_prev=B_prev_d,
-                    U_prev=U_prev_d,
-                    compute_dtype=compute_dtype,
-                    output_dtype=ctx.output_dtype,
-                    return_final_state=True,
-                ),
-            )
+            Y = runtime_artifacts.outputs.output
+            final_state = cast(torch.Tensor, runtime_artifacts.outputs.final_state)
             final_state_out = cast(
                 torch.Tensor,
                 _materialize_boundary_tensor(
@@ -121,38 +139,8 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                     dtype=ctx.output_dtype,
                 ),
             )
-
-            saved_tensors = [U_d, M_d, K_d, B_d, C_d, m_chunk, chunk_starts]
-            if ctx.has_prev_state:
-                assert B_prev_d is not None
-                assert U_prev_d is not None
-                saved_tensors.extend([B_prev_d, U_prev_d])
-            ctx.save_for_backward(*saved_tensors)
             return Y, final_state_out, B_last, U_last
-        else:
-            Y, m_chunk, chunk_starts = cast(
-                tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                _v2x2ssd_fwd_cute_prevalidated(
-                    U_d,
-                    M_d,
-                    K_d,
-                    B_d,
-                    C_d,
-                    chunk_size=ctx.chunk_size,
-                    initial_states=initial_states_d,
-                    B_prev=B_prev_d,
-                    U_prev=U_prev_d,
-                    compute_dtype=compute_dtype,
-                    output_dtype=ctx.output_dtype,
-                ),
-            )
-            saved_tensors = [U_d, M_d, K_d, B_d, C_d, m_chunk, chunk_starts]
-            if ctx.has_prev_state:
-                assert B_prev_d is not None
-                assert U_prev_d is not None
-                saved_tensors.extend([B_prev_d, U_prev_d])
-            ctx.save_for_backward(*saved_tensors)
-            return Y
+        return runtime_artifacts.outputs.output
 
     @staticmethod
     def backward(  # type: ignore[override]
@@ -173,10 +161,16 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         None,
     ]:
         saved = ctx.saved_tensors
-        U, M, K, B, C, m_chunk, chunk_starts = saved[:7]
+        U, M, K, B, C = saved[:5]
+        next_index = 5
+        if ctx.has_initial_states:
+            initial_states = cast(torch.Tensor, saved[next_index])
+            next_index += 1
+        else:
+            initial_states = None
         if ctx.has_prev_state:
-            B_prev = cast(torch.Tensor, saved[7])
-            U_prev = cast(torch.Tensor, saved[8])
+            B_prev = cast(torch.Tensor, saved[next_index])
+            U_prev = cast(torch.Tensor, saved[next_index + 1])
         else:
             B_prev = None
             U_prev = None
@@ -255,15 +249,17 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                     K,
                     B,
                     C,
-                    m_chunk,
-                    chunk_starts,
+                    None,
+                    None,
                     dY_contig,
                     chunk_size=ctx.chunk_size,
                     initial_state_dtype=ctx.initial_state_dtype,
+                    initial_states=initial_states,
                     B_prev=B_prev,
                     U_prev=U_prev,
                     d_final_state=d_final_contig,
                     compute_dtype=ctx.compute_dtype,
+                    forward_config_bundle=ctx.forward_config_bundle,
                     prepared_inputs=prepared_inputs,
                 ),
             )

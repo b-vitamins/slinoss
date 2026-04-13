@@ -1194,6 +1194,199 @@ def _make_state_passing_compile_artifacts(
     )
 
 
+def _recompute_boundary_metadata_prevalidated(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    config_bundle: ForwardConfigBundle,
+    initial_states: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+    increment_workspace: torch.Tensor,
+    chunk_multiplier_workspace: torch.Tensor,
+    chunk_starts_workspace: torch.Tensor,
+    final_state_workspace: torch.Tensor,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, heads, time_steps, P, D = _validate_chunk_increment_inputs(
+        U,
+        M,
+        K,
+        B,
+        U_prev=U_prev,
+        B_prev=B_prev,
+    )
+    resolved_chunk_size = int(chunk_size)
+    if resolved_chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
+    padded_time = n_chunks * resolved_chunk_size
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+
+    if prepared_inputs is None:
+        U_tc = _prepare_time_operand(U, padded_time=padded_time, dtype=tc_dtype)
+        M_f = _prepare_m_operand(M, padded_time=padded_time)
+        K_f = _prepare_time_operand(K, padded_time=padded_time, dtype=torch.float32)
+        B_tc = _prepare_time_operand(B, padded_time=padded_time, dtype=tc_dtype)
+    else:
+        U_tc, M_f, K_f, B_tc, _ = prepared_inputs
+        expected_u_shape = (batch_size, heads, padded_time, P)
+        expected_b_shape = (batch_size, int(B.shape[1]), padded_time, D)
+        expected_m_shape = (batch_size, heads, padded_time, 2)
+        expected_k_shape = (batch_size, heads, padded_time, 2, 2)
+        if (
+            tuple(U_tc.shape) != expected_u_shape
+            or U_tc.dtype != tc_dtype
+            or not U_tc.is_contiguous()
+        ):
+            raise ValueError("prepared U_tc must match padded scan input layout.")
+        if (
+            tuple(B_tc.shape) != expected_b_shape
+            or B_tc.dtype != tc_dtype
+            or not B_tc.is_contiguous()
+        ):
+            raise ValueError("prepared B_tc must match padded scan input layout.")
+        if (
+            tuple(M_f.shape) != expected_m_shape
+            or M_f.dtype != torch.float32
+            or not M_f.is_contiguous()
+        ):
+            raise ValueError("prepared M_f must match padded scan parameter layout.")
+        if (
+            tuple(K_f.shape) != expected_k_shape
+            or K_f.dtype != torch.float32
+            or not K_f.is_contiguous()
+        ):
+            raise ValueError("prepared K_f must match padded scan parameter layout.")
+
+    if increment_workspace.shape == (batch_size * heads * n_chunks, P, D):
+        inc_chunk = increment_workspace
+    elif increment_workspace.shape == (batch_size, heads, n_chunks, P, D):
+        inc_chunk = increment_workspace.reshape(batch_size * heads * n_chunks, P, D)
+    else:
+        raise ValueError(
+            "increment_workspace must be flat (B*H*C,P,D) or public (B,H,C,P,D)."
+        )
+    if chunk_multiplier_workspace.shape == (batch_size * heads * n_chunks, 2):
+        chunk_multiplier_storage = chunk_multiplier_workspace
+    elif chunk_multiplier_workspace.shape == (batch_size, heads, n_chunks, 2):
+        chunk_multiplier_storage = chunk_multiplier_workspace.reshape(
+            batch_size * heads * n_chunks,
+            2,
+        )
+    else:
+        raise ValueError(
+            "chunk_multiplier_workspace must be flat (B*H*C,2) or public (B,H,C,2)."
+        )
+    if tuple(chunk_starts_workspace.shape) != (batch_size, heads, n_chunks, P, D):
+        raise ValueError(
+            "chunk_starts_workspace must be (B,H,C,P,D) matching the chunked state domain."
+        )
+    if tuple(final_state_workspace.shape) != (batch_size, heads, P, D):
+        raise ValueError(
+            "final_state_workspace must be (B,H,P,D) matching the boundary-state domain."
+        )
+
+    if B_prev is None:
+        U_prev_state, B_prev_state = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=batch_size,
+            heads=heads,
+            bc_groups=int(B.shape[1]),
+            P=P,
+            D=D,
+        )
+    else:
+        U_prev_state = _ensure_min_alignment(
+            U_prev.to(dtype=tc_dtype).contiguous(),
+            min_align=16,
+        )
+        B_prev_state = _ensure_min_alignment(
+            B_prev.to(dtype=tc_dtype).contiguous(),
+            min_align=16,
+        )
+
+    increment_workspace.zero_()
+    chunk_multiplier_storage.zero_()
+    final_state_workspace.zero_()
+
+    increment_runtime = _make_chunk_increment_runtime_artifacts(
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        U_tc=U_tc,
+        B_tc=B_tc,
+        M_f=M_f,
+        K_f=K_f,
+        U_prev_state=U_prev_state,
+        B_prev_state=B_prev_state,
+        inc_chunk=inc_chunk,
+        chunk_multiplier_storage=chunk_multiplier_storage,
+        chunk_size=resolved_chunk_size,
+        compute_dtype=compute_dtype,
+        has_prev=U_prev is not None,
+        config=config_bundle.chunk_increment,
+    )
+    increment_compiled = _get_compiled_chunk_increment_kernel(
+        problem_shape=increment_runtime.problem_shape,
+        config=increment_runtime.config,
+        compile_args=increment_runtime.compile_args,
+        cache_key=increment_runtime.cache_key,
+    )
+    increment_compiled(*increment_runtime.runtime_args)
+
+    increment = inc_chunk.reshape(batch_size, heads, n_chunks, P, D)
+    chunk_multiplier = chunk_multiplier_storage.reshape(batch_size, heads, n_chunks, 2)
+    if initial_states is None:
+        initial_state_arg = _get_zero_initial_state(
+            device=U.device,
+            batch_size=batch_size,
+            heads=heads,
+            P=P,
+            D=D,
+        )
+        has_init = False
+    else:
+        initial_state_arg = initial_states.to(dtype=torch.float32).contiguous()
+        has_init = True
+
+    state_runtime = _make_state_passing_runtime_artifacts(
+        increment=increment,
+        chunk_multiplier=chunk_multiplier,
+        chunk_starts=chunk_starts_workspace,
+        final_state=final_state_workspace,
+        initial_state_arg=initial_state_arg,
+        has_init=has_init,
+        num_threads=config_bundle.state_passing.num_threads,
+        vecs_per_thread=config_bundle.state_passing.vecs_per_thread,
+    )
+    state_compiled = _get_compiled_state_passing_kernel(
+        problem_shape=state_runtime.problem_shape,
+        launch_cfg=state_runtime.launch_cfg,
+        compile_args=state_runtime.compile_args,
+        cache_key=state_runtime.cache_key,
+    )
+    state_compiled(*state_runtime.runtime_args)
+    _record_tensors_on_current_stream(
+        *increment_runtime.runtime_args,
+        *state_runtime.runtime_args,
+    )
+    return chunk_multiplier, chunk_starts_workspace
+
+
 def _chunk_scan_key(
     *,
     device_index: int,
@@ -4523,6 +4716,70 @@ def _run_v2x2ssd_fwd_cute(
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 ):
+    runtime_artifacts = _v2x2ssd_fwd_runtime_artifacts_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        scan_num_threads=scan_num_threads,
+        state_num_threads=state_num_threads,
+        state_vecs_per_thread=state_vecs_per_thread,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        return_final_state=return_final_state,
+        return_intermediates=return_intermediates,
+        prepared_inputs=prepared_inputs,
+        validate_runtime_contract=validate_runtime_contract,
+        config_bundle=config_bundle,
+    )
+    output = runtime_artifacts.outputs.output
+    final_state = runtime_artifacts.outputs.final_state
+    chunk_multiplier = runtime_artifacts.outputs.chunk_multiplier
+    chunk_starts = runtime_artifacts.outputs.chunk_starts
+    if not return_final_state:
+        return output, chunk_multiplier, chunk_starts
+    assert final_state is not None
+    return output, final_state, chunk_multiplier, chunk_starts
+
+
+def _v2x2ssd_fwd_runtime_artifacts_prevalidated(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    output_dtype: torch.dtype,
+    m_block_size: int | None,
+    n_block_size: int,
+    scan_num_threads: int,
+    state_num_threads: int,
+    state_vecs_per_thread: int,
+    initial_states: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+    return_final_state: bool,
+    return_intermediates: bool,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None,
+    validate_runtime_contract: bool,
+    config_bundle: ForwardConfigBundle | None = None,
+) -> ForwardRuntimeArtifacts:
     resolved_config_bundle = config_bundle
     explicit_launch_override = (
         config_bundle is not None
@@ -4584,14 +4841,7 @@ def _run_v2x2ssd_fwd_cute(
     )
     compiled(*runtime_artifacts.runtime_args)
     _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
-    output = runtime_artifacts.outputs.output
-    final_state = runtime_artifacts.outputs.final_state
-    chunk_multiplier = runtime_artifacts.outputs.chunk_multiplier
-    chunk_starts = runtime_artifacts.outputs.chunk_starts
-    if not return_final_state:
-        return output, chunk_multiplier, chunk_starts
-    assert final_state is not None
-    return output, final_state, chunk_multiplier, chunk_starts
+    return runtime_artifacts
 
 
 def compile_v2x2ssd_fwd_cute(

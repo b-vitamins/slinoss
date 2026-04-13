@@ -6,6 +6,7 @@ import torch
 import cutlass.cute as cute
 
 from slinoss._cute_runtime import TensorSpec, make_runtime_tensor_spec_view
+from slinoss.ops.v2x2ssd.cute.tuning.types import ForwardConfigBundle
 from slinoss.perf import note_cache_event
 
 from ..fwd.common import (
@@ -714,8 +715,8 @@ def _make_backward_input_info(
     K: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    m_chunk: torch.Tensor,
-    chunk_starts: torch.Tensor,
+    m_chunk: torch.Tensor | None,
+    chunk_starts: torch.Tensor | None,
     d_out: torch.Tensor,
     *,
     chunk_size: int,
@@ -729,6 +730,7 @@ def _make_backward_input_info(
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
+    allow_missing_boundary_intermediates: bool = False,
     validate_runtime_contract: bool = True,
 ) -> BackwardInputInfo:
     if validate_runtime_contract:
@@ -746,7 +748,21 @@ def _make_backward_input_info(
             raise TypeError("M and K must be float32.")
         if d_out.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise TypeError("d_out must be float16/bfloat16/float32.")
-        if m_chunk.dtype != torch.float32 or chunk_starts.dtype != torch.float32:
+        if (m_chunk is None) != (chunk_starts is None):
+            raise ValueError(
+                "m_chunk and chunk_starts must be passed together (or both omitted)."
+            )
+        if not allow_missing_boundary_intermediates and (
+            m_chunk is None or chunk_starts is None
+        ):
+            raise ValueError(
+                "m_chunk and chunk_starts are required on the public path."
+            )
+        if (
+            m_chunk is not None
+            and chunk_starts is not None
+            and (m_chunk.dtype != torch.float32 or chunk_starts.dtype != torch.float32)
+        ):
             raise TypeError("m_chunk and chunk_starts must be float32.")
 
     batch_size, heads, time_steps, P = map(int, U.shape)
@@ -800,7 +816,7 @@ def _make_backward_input_info(
         raise ValueError("chunk_size must be positive.")
     n_chunks = (time_steps + resolved_chunk_size - 1) // resolved_chunk_size
     padded_time = n_chunks * resolved_chunk_size
-    if validate_runtime_contract:
+    if validate_runtime_contract and m_chunk is not None and chunk_starts is not None:
         if tuple(m_chunk.shape) != (batch_size, heads, n_chunks, 2):
             raise ValueError(
                 f"m_chunk must be (B,H,C,2)={(batch_size, heads, n_chunks, 2)}. "
@@ -935,6 +951,89 @@ def _make_backward_launch_cfg(
             elems_per_thread=state_config.elems_per_thread,
         ),
         input_info.dz0_cta_tiler,
+    )
+
+
+def _recompute_boundary_intermediates(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    input_info: BackwardInputInfo,
+    compute_dtype: torch.dtype | None,
+    forward_config_bundle: ForwardConfigBundle,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None,
+    initial_states: torch.Tensor | None,
+    B_prev: torch.Tensor | None,
+    U_prev: torch.Tensor | None,
+    d_chunk_starts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from ..fwd import _recompute_boundary_metadata_prevalidated
+
+    if initial_states is not None and tuple(initial_states.shape) != (
+        input_info.batch_size,
+        input_info.heads,
+        input_info.P,
+        input_info.D,
+    ):
+        raise ValueError("initial_states must be (B,H,P,D) for boundary replay.")
+
+    chunk_multiplier_storage = torch.empty(
+        (input_info.batch_size * input_info.heads * input_info.n_chunks, 2),
+        device=U.device,
+        dtype=torch.float32,
+    )
+    chunk_starts = _ensure_min_alignment(
+        torch.empty(
+            (
+                input_info.batch_size,
+                input_info.heads,
+                input_info.n_chunks,
+                input_info.P,
+                input_info.D,
+            ),
+            device=U.device,
+            dtype=torch.float32,
+        ),
+        min_align=16,
+    )
+    final_state = _ensure_min_alignment(
+        torch.empty(
+            (
+                input_info.batch_size,
+                input_info.heads,
+                input_info.P,
+                input_info.D,
+            ),
+            device=U.device,
+            dtype=torch.float32,
+        ),
+        min_align=16,
+    )
+    return _recompute_boundary_metadata_prevalidated(
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        chunk_size=input_info.chunk_size,
+        compute_dtype=compute_dtype,
+        config_bundle=forward_config_bundle,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        increment_workspace=d_chunk_starts,
+        chunk_multiplier_workspace=chunk_multiplier_storage,
+        chunk_starts_workspace=chunk_starts,
+        final_state_workspace=final_state,
+        prepared_inputs=prepared_inputs,
     )
 
 
@@ -1239,8 +1338,8 @@ def _make_backward_runtime_artifacts(
     K: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    m_chunk: torch.Tensor,
-    chunk_starts: torch.Tensor,
+    m_chunk: torch.Tensor | None,
+    chunk_starts: torch.Tensor | None,
     d_out: torch.Tensor,
     *,
     chunk_size: int,
@@ -1253,7 +1352,9 @@ def _make_backward_runtime_artifacts(
     state_pairs_per_thread: int,
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
+    initial_states: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
+    forward_config_bundle: ForwardConfigBundle | None = None,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1284,6 +1385,7 @@ def _make_backward_runtime_artifacts(
         B_prev=B_prev,
         U_prev=U_prev,
         d_final_state=d_final_state,
+        allow_missing_boundary_intermediates=m_chunk is None,
         validate_runtime_contract=validate_runtime_contract,
     )
     problem_shape = _make_backward_problem_shape(input_info)
@@ -1352,18 +1454,6 @@ def _make_backward_runtime_artifacts(
             raise ValueError("prepared K_f must match padded scan parameter layout.")
 
     d_out_tc = _prepare_time_operand(d_out, padded_time=padded_time, dtype=tc_dtype)
-    chunk_multiplier = (
-        m_chunk
-        if m_chunk.dtype == torch.float32 and m_chunk.is_contiguous()
-        else m_chunk.to(dtype=torch.float32).contiguous()
-    )
-    chunk_starts_f = (
-        chunk_starts
-        if chunk_starts.dtype == torch.float32 and chunk_starts.is_contiguous()
-        else chunk_starts.to(dtype=torch.float32).contiguous()
-    )
-    chunk_multiplier = _ensure_min_alignment(chunk_multiplier, min_align=16)
-    chunk_starts_f = _ensure_min_alignment(chunk_starts_f, min_align=16)
 
     if B_prev is None:
         U_prev_state, B_prev_state = _get_zero_prev_tensors(
@@ -1447,6 +1537,47 @@ def _make_backward_runtime_artifacts(
     dK_current_scan = dK_scan_storage[1]
     dK_previous_increment = dK_increment_storage[0]
     dK_current_increment = dK_increment_storage[1]
+
+    if (m_chunk is None) != (chunk_starts is None):
+        raise ValueError(
+            "m_chunk and chunk_starts must be passed together (or both omitted)."
+        )
+    recomputed_boundary = m_chunk is None or chunk_starts is None
+    if recomputed_boundary:
+        if forward_config_bundle is None:
+            raise ValueError(
+                "forward_config_bundle is required when boundary metadata is recomputed."
+            )
+        chunk_multiplier, chunk_starts_f = _recompute_boundary_intermediates(
+            U,
+            M,
+            K,
+            B,
+            input_info=input_info,
+            compute_dtype=compute_dtype,
+            forward_config_bundle=forward_config_bundle,
+            prepared_inputs=(U_tc, M_f, K_f, B_tc, C_tc),
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            d_chunk_starts=d_chunk_starts,
+        )
+    else:
+        chunk_multiplier = (
+            m_chunk
+            if m_chunk.dtype == torch.float32 and m_chunk.is_contiguous()
+            else m_chunk.to(dtype=torch.float32).contiguous()
+        )
+        chunk_starts_f = (
+            chunk_starts
+            if chunk_starts.dtype == torch.float32 and chunk_starts.is_contiguous()
+            else chunk_starts.to(dtype=torch.float32).contiguous()
+        )
+        chunk_multiplier = _ensure_min_alignment(chunk_multiplier, min_align=16)
+        chunk_starts_f = _ensure_min_alignment(chunk_starts_f, min_align=16)
+
+    if recomputed_boundary:
+        d_chunk_starts.zero_()
 
     # These workspaces are cached across calls. The fused backward path only
     # defines the valid scan domain, so cached accumulators must start from zero
@@ -2773,8 +2904,8 @@ def _run_v2x2ssd_bwd_cute(
     K: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    m_chunk: torch.Tensor,
-    chunk_starts: torch.Tensor,
+    m_chunk: torch.Tensor | None,
+    chunk_starts: torch.Tensor | None,
     d_out: torch.Tensor,
     *,
     chunk_size: int,
@@ -2788,7 +2919,9 @@ def _run_v2x2ssd_bwd_cute(
     initial_state_dtype: torch.dtype | None = None,
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
+    initial_states: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
+    forward_config_bundle: ForwardConfigBundle | None = None,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2827,7 +2960,9 @@ def _run_v2x2ssd_bwd_cute(
         state_pairs_per_thread=state_pairs_per_thread,
         B_prev=B_prev,
         U_prev=U_prev,
+        initial_states=initial_states,
         d_final_state=d_final_state,
+        forward_config_bundle=forward_config_bundle,
         prepared_inputs=prepared_inputs,
         validate_runtime_contract=validate_runtime_contract,
     )
@@ -2855,8 +2990,8 @@ def _v2x2ssd_bwd_cute_prevalidated(
     K: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    m_chunk: torch.Tensor,
-    chunk_starts: torch.Tensor,
+    m_chunk: torch.Tensor | None,
+    chunk_starts: torch.Tensor | None,
     d_out: torch.Tensor,
     *,
     chunk_size: int,
@@ -2870,7 +3005,9 @@ def _v2x2ssd_bwd_cute_prevalidated(
     initial_state_dtype: torch.dtype | None = None,
     B_prev: torch.Tensor | None = None,
     U_prev: torch.Tensor | None = None,
+    initial_states: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
+    forward_config_bundle: ForwardConfigBundle | None = None,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2909,7 +3046,9 @@ def _v2x2ssd_bwd_cute_prevalidated(
         initial_state_dtype=initial_state_dtype,
         B_prev=B_prev,
         U_prev=U_prev,
+        initial_states=initial_states,
         d_final_state=d_final_state,
+        forward_config_bundle=forward_config_bundle,
         prepared_inputs=prepared_inputs,
         validate_runtime_contract=False,
     )

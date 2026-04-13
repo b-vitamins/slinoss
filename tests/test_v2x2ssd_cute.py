@@ -1832,6 +1832,199 @@ def test_v2x2ssd_cute_grouped_training_backward_matches_direct_kernel_path(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_bwd_recompute_boundary_metadata_matches_saved_intermediates() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=2,
+        heads=4,
+        bc_groups=2,
+        T=65,
+        N=16,
+        P=32,
+        device=torch.device("cuda"),
+        value_dtype=torch.float32,
+    )
+    chunk_size = 32
+    prepared_inputs = _prepare_direct_backward_inputs(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    runtime_artifacts = v2x2ssd_fwd_mod._v2x2ssd_fwd_runtime_artifacts_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        m_block_size=None,
+        n_block_size=64,
+        scan_num_threads=128,
+        state_num_threads=128,
+        state_vecs_per_thread=8,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        return_final_state=True,
+        return_intermediates=True,
+        prepared_inputs=prepared_inputs,
+        validate_runtime_contract=False,
+    )
+    d_out = torch.randn_like(runtime_artifacts.outputs.output)
+    d_final = torch.randn_like(
+        cast(torch.Tensor, runtime_artifacts.outputs.final_state)
+    )
+
+    direct_grads = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        runtime_artifacts.outputs.chunk_multiplier,
+        runtime_artifacts.outputs.chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        initial_state_dtype=initial_states.dtype,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        forward_config_bundle=runtime_artifacts.config_bundle,
+        prepared_inputs=prepared_inputs,
+    )
+    recompute_grads = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        None,
+        None,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        initial_state_dtype=initial_states.dtype,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        forward_config_bundle=runtime_artifacts.config_bundle,
+        prepared_inputs=prepared_inputs,
+    )
+
+    for direct_grad, recompute_grad in zip(direct_grads, recompute_grads, strict=True):
+        assert torch.isfinite(direct_grad).all()
+        assert torch.isfinite(recompute_grad).all()
+        torch.testing.assert_close(recompute_grad, direct_grad, atol=1e-7, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_bwd_recompute_boundary_metadata_matches_saved_intermediates_without_state() -> (
+    None
+):
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=2,
+        heads=4,
+        bc_groups=2,
+        T=65,
+        N=16,
+        P=32,
+        device=torch.device("cuda"),
+        value_dtype=torch.float32,
+    )
+    chunk_size = 32
+    prepared_inputs = _prepare_direct_backward_inputs(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    runtime_artifacts = v2x2ssd_fwd_mod._v2x2ssd_fwd_runtime_artifacts_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        m_block_size=None,
+        n_block_size=64,
+        scan_num_threads=128,
+        state_num_threads=128,
+        state_vecs_per_thread=8,
+        initial_states=None,
+        B_prev=None,
+        U_prev=None,
+        return_final_state=False,
+        return_intermediates=True,
+        prepared_inputs=prepared_inputs,
+        validate_runtime_contract=False,
+    )
+    d_out = torch.randn_like(runtime_artifacts.outputs.output)
+
+    direct_grads = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        runtime_artifacts.outputs.chunk_multiplier,
+        runtime_artifacts.outputs.chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        initial_state_dtype=torch.float32,
+        B_prev=None,
+        U_prev=None,
+        initial_states=None,
+        d_final_state=None,
+        forward_config_bundle=runtime_artifacts.config_bundle,
+        prepared_inputs=prepared_inputs,
+    )
+    recompute_grads = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        None,
+        None,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        initial_state_dtype=torch.float32,
+        B_prev=None,
+        U_prev=None,
+        initial_states=None,
+        d_final_state=None,
+        forward_config_bundle=runtime_artifacts.config_bundle,
+        prepared_inputs=prepared_inputs,
+    )
+
+    for direct_grad, recompute_grad in zip(direct_grads, recompute_grads, strict=True):
+        assert torch.isfinite(direct_grad).all()
+        assert torch.isfinite(recompute_grad).all()
+        torch.testing.assert_close(recompute_grad, direct_grad, atol=1e-7, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_cute_training_backward_supports_issue_5_shape() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
