@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from slinoss.ops.gate import mixer_gate
 from slinoss.ops.mixer import split_mixer_projection
 from slinoss.ops.mixer.step import (
     MixerCudaGraphStepEngine as _MixerCudaGraphStepEngine,
@@ -202,16 +203,13 @@ class SLinOSSMixer(nn.Module):
         batch_size: int,
         time_steps: int,
     ) -> torch.Tensor:
-        gated_headspace = (
-            scan_output.to(torch.float32)
-            * F.silu(gate.to(torch.float32))
-            .view(batch_size, time_steps, self.n_heads, self.d_head)
-            .permute(0, 2, 1, 3)
-        ).to(dtype=scan_output.dtype)
-        return gated_headspace.permute(0, 2, 1, 3).reshape(
-            batch_size,
-            time_steps,
-            self.d_inner,
+        return mixer_gate(
+            scan_output,
+            gate,
+            batch_size=batch_size,
+            time_steps=time_steps,
+            n_heads=self.n_heads,
+            d_head=self.d_head,
         )
 
     def init_state(
