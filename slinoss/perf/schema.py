@@ -120,11 +120,22 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
             _expect(workload, "backend")
             _expect(workload, "config")
             _expect(workload, "tokens_per_step")
-            methodology = workload.get("methodology")
-            if methodology is not None and not isinstance(methodology, dict):
-                raise ValueError(
-                    f"Workload {case_name}/{backend_name} methodology must be a dict."
-                )
+            methodology = _expect_dict(workload, "methodology")
+            for key in (
+                "timing",
+                "deterministic_fixture",
+                "fixture_model_seed",
+                "fixture_batch_seed",
+                "batch_count",
+                "warmup_steps",
+                "steps_per_repeat",
+                "workload_repeat",
+                "warm_execution",
+                "profile_execution",
+                "memory_measurement",
+                "memory_forensics",
+            ):
+                _expect(methodology, key)
 
             warm = _expect_dict(workload, "warm")
             cold = _expect_dict(workload, "cold")
@@ -172,10 +183,94 @@ def validate_nextchar_profile_payload(payload: dict[str, Any]) -> None:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "backend")
     _expect(payload, "config")
+    methodology = _expect_dict(payload, "methodology")
+    _expect(methodology, "execution")
+    _expect(methodology, "memory_mode")
     _expect(payload, "regions")
     _expect(payload, "budget")
     tree = _expect_dict(payload, "tree")
     _validate_nextchar_budget_tree(tree, require_stage_breakdown=False)
+
+
+def validate_nextchar_memory_payload(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("Payload must be a dict.")
+    if _expect(payload, "kind") != "profile_nextchar_memory":
+        raise ValueError("Expected kind=profile_nextchar_memory.")
+    if int(_expect(payload, "schema_version")) != 1:
+        raise ValueError("Unsupported schema_version.")
+    _expect(payload, "backend")
+    _expect(payload, "config")
+    methodology = _expect_dict(payload, "methodology")
+    for key in (
+        "execution",
+        "baseline_scope",
+        "warmup_steps",
+        "top_k",
+        "memory_metric_primary",
+        "allocator_snapshot_requested",
+    ):
+        _expect(methodology, key)
+    _expect(payload, "baseline_memory")
+    _expect(payload, "step_memory")
+    _expect(payload, "regions")
+    _expect(payload, "budget")
+    tree = _expect_dict(payload, "tree")
+    _validate_nextchar_budget_tree(tree, require_stage_breakdown=False)
+
+    baseline = _expect_dict(payload, "baseline_memory")
+    _expect(baseline, "allocated_bytes")
+    _expect(baseline, "reserved_bytes")
+
+    step_memory = _expect_dict(payload, "step_memory")
+    for key in (
+        "peak_allocated_bytes",
+        "peak_reserved_bytes",
+        "end_allocated_bytes",
+        "end_reserved_bytes",
+    ):
+        _expect(step_memory, key)
+
+    top_region_exit_allocated = _expect(payload, "top_region_exit_allocated")
+    if not isinstance(top_region_exit_allocated, list):
+        raise ValueError("Expected top_region_exit_allocated to be a list.")
+    for row in top_region_exit_allocated:
+        if not isinstance(row, dict):
+            raise ValueError("Each top_region_exit_allocated row must be a dict.")
+        for key in (
+            "label",
+            "max_allocated_bytes",
+            "max_reserved_bytes",
+            "num_exits",
+        ):
+            _expect(row, key)
+
+    saved_tensors = _expect(payload, "saved_tensors_by_region")
+    if not isinstance(saved_tensors, list):
+        raise ValueError("Expected saved_tensors_by_region to be a list.")
+    for row in saved_tensors:
+        if not isinstance(row, dict):
+            raise ValueError("Each saved_tensors_by_region row must be a dict.")
+        for key in (
+            "label",
+            "unique_saved_bytes",
+            "unique_storage_count",
+            "save_event_count",
+        ):
+            _expect(row, key)
+
+    saved_summary = _expect_dict(payload, "saved_tensors_summary")
+    for key in (
+        "accounting",
+        "total_unique_saved_bytes",
+        "total_unique_storage_count",
+        "total_save_event_count",
+    ):
+        _expect(saved_summary, key)
+
+    allocator_snapshot = _expect_dict(payload, "allocator_snapshot")
+    for key in ("requested", "captured", "path", "format"):
+        _expect(allocator_snapshot, key)
 
 
 def validate_nextchar_decode_bench_payload(payload: dict[str, Any]) -> None:

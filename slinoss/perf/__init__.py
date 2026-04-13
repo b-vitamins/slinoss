@@ -2,6 +2,13 @@
 
 from .budget import build_tree, derive_nextchar_budget
 from .compare import compare_budget_trees, flatten_tree_stats, rank_budget_deltas
+from .memory import (
+    EagerMemoryForensics,
+    allocator_snapshot_metadata,
+    current_memory_stats,
+    peak_memory_stats,
+    reset_peak_memory_stats,
+)
 from .runtime import (
     PerfRecorder,
     attach_module_timer,
@@ -10,7 +17,11 @@ from .runtime import (
     note_cache_event,
     record_region,
 )
-from .schema import validate_nextchar_bench_payload, validate_nextchar_profile_payload
+from .schema import (
+    validate_nextchar_bench_payload,
+    validate_nextchar_memory_payload,
+    validate_nextchar_profile_payload,
+)
 
 __all__ = [
     "build_tree",
@@ -18,7 +29,13 @@ __all__ = [
     "compare_budget_trees",
     "flatten_tree_stats",
     "rank_budget_deltas",
+    "EagerMemoryForensics",
+    "allocator_snapshot_metadata",
+    "current_memory_stats",
+    "peak_memory_stats",
+    "reset_peak_memory_stats",
     "validate_nextchar_bench_payload",
+    "validate_nextchar_memory_payload",
     "validate_nextchar_profile_payload",
     "PerfRecorder",
     "attach_module_timer",

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Profile nextchar-style training with aligned budget labels.
-
-For eager allocator forensics, use ``profile_nextchar_memory.py``.
-"""
+"""Run eager memory forensics for one nextchar training step."""
 
 from __future__ import annotations
 
@@ -10,9 +7,6 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Any
-
-import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
@@ -29,13 +23,20 @@ from _nextchar import (  # noqa: E402
     random_batch,
     run_train_step_profiled,
 )
-from slinoss.perf import PerfRecorder  # noqa: E402
+from slinoss.perf import (  # noqa: E402
+    EagerMemoryForensics,
+    PerfRecorder,
+    allocator_snapshot_metadata,
+    current_memory_stats,
+    peak_memory_stats,
+    reset_peak_memory_stats,
+)
 from slinoss.perf.budget import (  # noqa: E402
     build_tree,
     summarize_budget_samples,
     summarize_named_samples,
 )
-from slinoss.perf.schema import validate_nextchar_profile_payload  # noqa: E402
+from slinoss.perf.schema import validate_nextchar_memory_payload  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -59,11 +60,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--device", default=default_cfg.device)
     parser.add_argument("--seed", type=int, default=default_cfg.seed)
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--active", type=int, default=4)
-    parser.add_argument("--top-k", type=int, default=30)
-    parser.add_argument("--sort-by", default="self_cuda_time_total")
-    parser.add_argument("--trace-out", type=Path, default=None)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=1,
+        help="Eager warmup steps before the measured step.",
+    )
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--allocator-snapshot-out", type=Path, default=None)
     parser.add_argument("--json-out", type=Path, default=None)
     return parser.parse_args()
 
@@ -97,72 +101,79 @@ def main() -> int:
 
     cfg = _make_cfg(args)
     model, optimizer = build_model(cfg, backend=args.backend, instrumented=True)
-    captures: list[dict[str, Any]] = []
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if torch.cuda.is_available():
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-    schedule = torch.profiler.schedule(
-        wait=0, warmup=args.warmup, active=args.active, repeat=1
+
+    for _ in range(max(0, int(args.warmup_steps))):
+        xb, yb = random_batch(cfg)
+        run_train_step_profiled(model, optimizer, xb, yb, grad_clip=cfg.grad_clip)
+
+    recorder = PerfRecorder(device=cfg.torch_device)
+    forensics = EagerMemoryForensics(device=cfg.torch_device)
+    allocator_snapshot, snapshot_ctx = allocator_snapshot_metadata(
+        device=cfg.torch_device,
+        out_path=args.allocator_snapshot_out,
     )
-    total_steps = int(args.warmup) + int(args.active)
-    with torch.profiler.profile(
-        activities=activities,
-        schedule=schedule,
-        acc_events=True,
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=False,
-    ) as prof:
-        for _ in range(total_steps):
-            xb, yb = random_batch(cfg)
-            recorder = PerfRecorder(device=cfg.torch_device)
+
+    xb, yb = random_batch(cfg)
+    baseline_memory = current_memory_stats(cfg.torch_device)
+    reset_peak_memory_stats(cfg.torch_device)
+    with snapshot_ctx:
+        with forensics.capture():
             with recorder.capture_step():
                 run_train_step_profiled(
-                    model, optimizer, xb, yb, grad_clip=cfg.grad_clip
+                    model,
+                    optimizer,
+                    xb,
+                    yb,
+                    grad_clip=cfg.grad_clip,
                 )
-            captures.append(recorder.steps[-1])
-            prof.step()
-    if args.trace_out is not None:
-        args.trace_out.parent.mkdir(parents=True, exist_ok=True)
-        prof.export_chrome_trace(str(args.trace_out))
-    active_captures = captures[-int(args.active) :]
-    region_samples = [capture["regions_ms"] for capture in active_captures]
-    summaries = summarize_named_samples(region_samples)
-    budget = summarize_budget_samples(region_samples)
-    tree = build_tree(budget)
 
-    print(
-        "note: torch-profiler CUDA Mem columns are profiler-internal; "
-        "use profile_nextchar_memory.py and step_memory.peak_allocated_bytes "
-        "for eager memory acceptance."
-    )
-    print(
-        prof.key_averages().table(
-            sort_by=args.sort_by,
-            row_limit=args.top_k,
-        )
-    )
+    capture = recorder.steps[-1]
+    region_samples = [capture["regions_ms"]]
+    step_memory = {
+        **peak_memory_stats(cfg.torch_device),
+        **{
+            f"end_{key}": value
+            for key, value in current_memory_stats(cfg.torch_device).items()
+        },
+    }
     payload = {
-        "kind": "profile_nextchar",
+        "kind": "profile_nextchar_memory",
         "schema_version": 1,
         "backend": args.backend,
         "config": cfg.perf_config_dict,
         "methodology": {
-            "execution": "eager_profiled_training_step",
-            "memory_mode": "torch_profiler_profile_memory",
+            "execution": "eager_training_step",
+            "baseline_scope": "warmed_model_plus_inputs",
+            "warmup_steps": int(args.warmup_steps),
+            "top_k": int(args.top_k),
+            "memory_metric_primary": "peak_allocated_bytes",
+            "allocator_snapshot_requested": bool(args.allocator_snapshot_out),
         },
-        "regions": summaries,
-        "budget": budget,
-        "tree": tree,
-        "trace_out": None if args.trace_out is None else str(args.trace_out),
+        "baseline_memory": baseline_memory,
+        "step_memory": step_memory,
+        "regions": summarize_named_samples(region_samples),
+        "budget": summarize_budget_samples(region_samples),
+        "tree": build_tree(summarize_budget_samples(region_samples)),
+        "cache_events": capture["cache_events"],
+        "top_region_exit_allocated": forensics.top_region_exit_allocated(
+            top_k=args.top_k
+        ),
+        "saved_tensors_by_region": forensics.saved_tensors_by_region(),
+        "saved_tensors_summary": forensics.saved_tensors_summary(),
+        "allocator_snapshot": allocator_snapshot,
     }
-    validate_nextchar_profile_payload(payload)
+    validate_nextchar_memory_payload(payload)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         print(f"json: {args.json_out}")
-    if args.trace_out is not None:
-        print(f"trace: {args.trace_out}")
+    if bool(payload["allocator_snapshot"]["captured"]):
+        print(f"allocator_snapshot: {args.allocator_snapshot_out}")
+    elif args.allocator_snapshot_out is not None:
+        print(
+            "allocator_snapshot: unavailable "
+            f"({payload['allocator_snapshot'].get('reason', 'capture_failed')})"
+        )
     return 0
 
 

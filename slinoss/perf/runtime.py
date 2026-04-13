@@ -6,7 +6,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import fields, is_dataclass
 from time import perf_counter
 import threading
-from typing import Any, Callable, Iterator, TypeAlias, TypeVar, cast
+from typing import Any, Callable, Iterator, Protocol, TypeAlias, TypeVar, cast
 
 import torch
 from torch.autograd.profiler import record_function
@@ -19,6 +19,14 @@ _IS_PROFILER_ENABLED = getattr(torch.autograd.profiler, "_is_profiler_enabled", 
 
 _ACTIVE_STEPS: list["_PerfStep"] = []
 _ACTIVE_STEPS_LOCK = threading.RLock()
+_ACTIVE_REGION_OBSERVERS: list["_RegionObserver"] = []
+_ACTIVE_REGION_OBSERVERS_LOCK = threading.RLock()
+
+
+class _RegionObserver(Protocol):
+    def region_enter(self, label: str) -> None: ...
+
+    def region_exit(self, label: str) -> None: ...
 
 
 def current_step() -> "_PerfStep | None":
@@ -26,6 +34,37 @@ def current_step() -> "_PerfStep | None":
         return _ACTIVE_STEPS[-1]
     except IndexError:
         return None
+
+
+@contextmanager
+def register_region_observer(observer: _RegionObserver) -> Iterator[None]:
+    with _ACTIVE_REGION_OBSERVERS_LOCK:
+        _ACTIVE_REGION_OBSERVERS.append(observer)
+    try:
+        yield
+    finally:
+        with _ACTIVE_REGION_OBSERVERS_LOCK:
+            for idx in range(len(_ACTIVE_REGION_OBSERVERS) - 1, -1, -1):
+                if _ACTIVE_REGION_OBSERVERS[idx] is observer:
+                    del _ACTIVE_REGION_OBSERVERS[idx]
+                    break
+            else:
+                raise RuntimeError("PerfRecorder region observer stack corrupted.")
+
+
+def _snapshot_region_observers() -> tuple[_RegionObserver, ...]:
+    with _ACTIVE_REGION_OBSERVERS_LOCK:
+        return tuple(_ACTIVE_REGION_OBSERVERS)
+
+
+def _notify_region_enter(label: str) -> None:
+    for observer in _snapshot_region_observers():
+        observer.region_enter(label)
+
+
+def _notify_region_exit(label: str) -> None:
+    for observer in _snapshot_region_observers():
+        observer.region_exit(label)
 
 
 def _profiler_enabled() -> bool:
@@ -158,16 +197,27 @@ class PerfRecorder:
 @contextmanager
 def record_region(label: str) -> Iterator[None]:
     step = current_step()
-    if step is None:
+    has_region_observers = bool(_snapshot_region_observers())
+    if step is None and not has_region_observers:
         yield
         return
 
     use_record_function = _profiler_enabled()
+    maybe_record = record_function(label) if use_record_function else nullcontext()
+
+    if step is None:
+        _notify_region_enter(label)
+        with maybe_record:
+            try:
+                yield
+            finally:
+                _notify_region_exit(label)
+        return
 
     if step.uses_cuda_events:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        maybe_record = record_function(label) if use_record_function else nullcontext()
+        _notify_region_enter(label)
         with maybe_record:
             start.record(torch.cuda.current_stream(device=step.device))
             try:
@@ -175,16 +225,18 @@ def record_region(label: str) -> Iterator[None]:
             finally:
                 end.record(torch.cuda.current_stream(device=step.device))
                 step.add_region(label, start, end)
+                _notify_region_exit(label)
         return
 
     start_t = perf_counter()
-    maybe_record = record_function(label) if use_record_function else nullcontext()
+    _notify_region_enter(label)
     with maybe_record:
         try:
             yield
         finally:
             end_t = perf_counter()
             step.add_region(label, start_t, end_t)
+            _notify_region_exit(label)
 
 
 def note_cache_event(label: str, *, hit: bool) -> None:

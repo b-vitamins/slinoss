@@ -441,7 +441,7 @@ def _run_clean_sequence(
     batches: list[tuple[torch.Tensor, torch.Tensor]],
     warmup: int,
     steps: int,
-) -> tuple[float, dict[str, int], list[float], list[dict[str, int]]]:
+) -> tuple[float, dict[str, int], list[float], list[dict[str, int]], str]:
     use_cuda_graph = (
         backend == "cute"
         and cfg.torch_device.type == "cuda"
@@ -496,7 +496,7 @@ def _run_clean_sequence(
             warm_step_ms.append(step_ms)
             warm_memory.append(step_memory)
 
-        return cold_step_ms, cold_memory, warm_step_ms, warm_memory
+        return cold_step_ms, cold_memory, warm_step_ms, warm_memory, "cuda_graph_replay"
 
     for xb, yb in batches[1 : 1 + warmup]:
         run_train_step_clean(model, optimizer, xb, yb, grad_clip=cfg.grad_clip)
@@ -513,7 +513,7 @@ def _run_clean_sequence(
         warm_step_ms.append(step_ms)
         warm_memory.append(step_memory)
 
-    return cold_step_ms, cold_memory, warm_step_ms, warm_memory
+    return cold_step_ms, cold_memory, warm_step_ms, warm_memory, "eager"
 
 
 def run_bench_step(
@@ -541,6 +541,7 @@ def run_bench_step(
     warm_step_ms: list[float] = []
     warm_memory: list[dict[str, int]] = []
     warm_repeat_step_mean_ms: list[float] = []
+    warm_execution_mode = "eager"
     repeat_count = max(1, int(repeat))
     for repeat_idx in range(repeat_count):
         (
@@ -548,6 +549,7 @@ def run_bench_step(
             repeat_cold_memory,
             repeat_warm_step_ms,
             repeat_warm_memory,
+            repeat_warm_execution_mode,
         ) = _run_clean_sequence(
             cfg,
             backend=backend,
@@ -559,6 +561,7 @@ def run_bench_step(
         if repeat_idx == 0:
             cold_step_ms = repeat_cold_ms
             cold_memory = repeat_cold_memory
+            warm_execution_mode = repeat_warm_execution_mode
         warm_step_ms.extend(repeat_warm_step_ms)
         warm_memory.extend(repeat_warm_memory)
         if repeat_warm_step_ms:
@@ -591,5 +594,6 @@ def run_bench_step(
             "batch_seed": fixture.batch_seed,
             "batch_count": len(fixture.batches),
         },
+        "warm_execution_mode": warm_execution_mode,
         "tokens_per_step": cfg.batch_size * cfg.block_size,
     }

@@ -3,6 +3,7 @@ from __future__ import annotations
 from slinoss.perf.budget import build_tree, derive_nextchar_budget
 from slinoss.perf.schema import (
     validate_nextchar_bench_payload,
+    validate_nextchar_memory_payload,
     validate_nextchar_profile_payload,
 )
 
@@ -100,12 +101,18 @@ def test_validate_nextchar_bench_payload_accepts_expected_schema() -> None:
                         "config": {"batch_size": 4},
                         "tokens_per_step": 256,
                         "methodology": {
+                            "timing": "cuda_event_per_step",
                             "deterministic_fixture": True,
                             "fixture_model_seed": 0,
                             "fixture_batch_seed": 1,
+                            "batch_count": 20,
                             "warmup_steps": 10,
                             "steps_per_repeat": 20,
                             "workload_repeat": 5,
+                            "warm_execution": "bench_loop",
+                            "profile_execution": "eager_single_post_bench_replay",
+                            "memory_measurement": "bench_path_step_peaks",
+                            "memory_forensics": "use profile_nextchar_memory.py for eager attribution",
                         },
                         "cold": {
                             "regions": {},
@@ -138,9 +145,118 @@ def test_validate_nextchar_profile_payload_accepts_expected_schema() -> None:
         "schema_version": 1,
         "backend": "cute",
         "config": {"batch_size": 4},
+        "methodology": {
+            "execution": "eager_profiled_training_step",
+            "memory_mode": "torch_profiler_profile_memory",
+        },
         "regions": {},
         "budget": {},
         "tree": _sample_tree(),
         "trace_out": None,
     }
     validate_nextchar_profile_payload(payload)
+
+
+def test_validate_nextchar_memory_payload_accepts_expected_schema() -> None:
+    payload = {
+        "kind": "profile_nextchar_memory",
+        "schema_version": 1,
+        "backend": "cute",
+        "config": {"batch_size": 4},
+        "methodology": {
+            "execution": "eager_training_step",
+            "baseline_scope": "warmed_model_plus_inputs",
+            "warmup_steps": 1,
+            "top_k": 20,
+            "memory_metric_primary": "peak_allocated_bytes",
+            "allocator_snapshot_requested": False,
+        },
+        "baseline_memory": {
+            "allocated_bytes": 1,
+            "reserved_bytes": 2,
+        },
+        "step_memory": {
+            "peak_allocated_bytes": 3,
+            "peak_reserved_bytes": 4,
+            "end_allocated_bytes": 5,
+            "end_reserved_bytes": 6,
+        },
+        "regions": {},
+        "budget": {},
+        "tree": _sample_tree(),
+        "top_region_exit_allocated": [
+            {
+                "label": "forward.head.loss",
+                "max_allocated_bytes": 7,
+                "max_reserved_bytes": 8,
+                "num_exits": 1,
+            }
+        ],
+        "saved_tensors_by_region": [
+            {
+                "label": "forward.ffn",
+                "unique_saved_bytes": 9,
+                "unique_storage_count": 1,
+                "save_event_count": 2,
+            }
+        ],
+        "saved_tensors_summary": {
+            "accounting": "unique_storage_first_save",
+            "total_unique_saved_bytes": 9,
+            "total_unique_storage_count": 1,
+            "total_save_event_count": 2,
+        },
+        "allocator_snapshot": {
+            "requested": False,
+            "captured": False,
+            "path": None,
+            "format": None,
+        },
+    }
+    validate_nextchar_memory_payload(payload)
+
+
+def test_validate_nextchar_memory_payload_requires_full_methodology() -> None:
+    payload = {
+        "kind": "profile_nextchar_memory",
+        "schema_version": 1,
+        "backend": "cute",
+        "config": {"batch_size": 4},
+        "methodology": {
+            "execution": "eager_training_step",
+        },
+        "baseline_memory": {
+            "allocated_bytes": 1,
+            "reserved_bytes": 2,
+        },
+        "step_memory": {
+            "peak_allocated_bytes": 3,
+            "peak_reserved_bytes": 4,
+            "end_allocated_bytes": 5,
+            "end_reserved_bytes": 6,
+        },
+        "regions": {},
+        "budget": {},
+        "tree": _sample_tree(),
+        "top_region_exit_allocated": [],
+        "saved_tensors_by_region": [],
+        "saved_tensors_summary": {
+            "accounting": "unique_storage_first_save",
+            "total_unique_saved_bytes": 0,
+            "total_unique_storage_count": 0,
+            "total_save_event_count": 0,
+        },
+        "allocator_snapshot": {
+            "requested": False,
+            "captured": False,
+            "path": None,
+            "format": None,
+        },
+    }
+
+    try:
+        validate_nextchar_memory_payload(payload)
+    except ValueError as exc:
+        assert "baseline_scope" in str(exc)
+    else:
+        raise AssertionError("Expected validate_nextchar_memory_payload to fail.")

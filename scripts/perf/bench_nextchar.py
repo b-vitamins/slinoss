@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark nextchar-style training with end-to-end and stage/kernel budgets."""
+"""Benchmark nextchar-style training throughput and stage budgets."""
 
 from __future__ import annotations
 
@@ -228,7 +228,10 @@ def _summarize_workload(
             "warmup_steps": int(warmup_steps),
             "steps_per_repeat": int(steps),
             "workload_repeat": int(result["repeat_count"]),
-            "profile_replay": "single_post_clean_replay",
+            "warm_execution": str(result["warm_execution_mode"]),
+            "profile_execution": "eager_single_post_bench_replay",
+            "memory_measurement": "bench_path_step_peaks",
+            "memory_forensics": "use profile_nextchar_memory.py for eager attribution",
         },
         "cold": {
             "regions": summarize_named_samples([cold["regions_ms"]]),
@@ -376,8 +379,8 @@ def main() -> int:
             print(
                 f"{case_name}/{backend}: step_mean_ms={step_mean:.6f} "
                 f"tokens_per_s={tps_mean:.2f} "
-                f"peak_allocated_mib={peak_alloc_mib:.2f} "
-                f"peak_reserved_mib={peak_res_mib:.2f}"
+                f"peak_allocated_mib_primary={peak_alloc_mib:.2f} "
+                f"peak_reserved_mib_context={peak_res_mib:.2f}"
             )
 
     if args.json_out is not None:
