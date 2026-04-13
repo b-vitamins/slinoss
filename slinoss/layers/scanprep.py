@@ -5,13 +5,13 @@ from typing import cast
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from slinoss.ops.scanprep import (
     SLinOSSScanPrepCoefficients,
     principal_angle,
     scanprep_cute,
 )
+from slinoss.ops.scanprep.parameterization import parameterize_scan_bc_pairs
 from slinoss.ops.scanprep.reference import _foh_taps_from_normalized, _pack_complex
 
 from ._validation import _require
@@ -310,34 +310,18 @@ class SLinOSSScanPrep(nn.Module):
             f"Got {tuple(bc.shape)}.",
         )
 
-    def _normalize_scan_bc_pairs(self, bc_pairs: torch.Tensor) -> torch.Tensor:
-        mag_sq = bc_pairs.square().sum(dim=-1, dtype=torch.float32)
-        row_rms = mag_sq.mean(dim=-1, keepdim=True).clamp_min(self.eps).sqrt()
-        row_rms_expanded = row_rms.unsqueeze(-1).to(dtype=bc_pairs.dtype)
-        direction = bc_pairs / row_rms_expanded
-        bounded_gain = self.bc_gain_max * torch.tanh(row_rms / self.bc_gain_max)
-        return direction * bounded_gain.unsqueeze(-1).to(dtype=bc_pairs.dtype)
-
     def _parameterize_scan_bc_pairs(
         self,
         bc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._validate_scan_bc(bc)
-
-        bc_amplitude = F.softplus(bc)
-        bc_complex_base = torch.view_as_real(self.bc_complex_base).to(
-            device=bc.device,
-            dtype=bc.dtype,
-        )
-        b_pairs = bc_amplitude[..., 0, :].unsqueeze(-1) * bc_complex_base[
-            :, 0, :, :
-        ].view(1, 1, self.bc_groups, self.d_state, 2)
-        c_pairs = bc_amplitude[..., 1, :].unsqueeze(-1) * bc_complex_base[
-            :, 1, :, :
-        ].view(1, 1, self.bc_groups, self.d_state, 2)
-        return (
-            self._normalize_scan_bc_pairs(b_pairs).contiguous(),
-            self._normalize_scan_bc_pairs(c_pairs).contiguous(),
+        return parameterize_scan_bc_pairs(
+            bc,
+            self.bc_complex_base,
+            bc_groups=self.bc_groups,
+            d_state=self.d_state,
+            eps=self.eps,
+            bc_gain_max=self.bc_gain_max,
         )
 
     def _parameterize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
@@ -424,11 +408,10 @@ class SLinOSSScanPrep(nn.Module):
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
 
     def _prepare_inputs_cute(self, inputs: ScanPrepInputs) -> ScanInputs:
-        bc_rows = self._parameterize_scan_bc_rows(inputs.bc)
         return scanprep_cute(
             inputs.value,
             inputs.params,
-            bc_rows,
+            inputs.bc,
             n_heads=self.n_heads,
             bc_groups=self.bc_groups,
             d_state=self.d_state,
@@ -442,6 +425,8 @@ class SLinOSSScanPrep(nn.Module):
             r_min=self.r_min,
             r_max=self.r_max,
             eps=self.eps,
+            bc_gain_max=self.bc_gain_max,
+            bc_complex_base=self.bc_complex_base,
             dt_bias=self.dt_bias,
             gamma_bias=self.gamma_bias,
             theta_mod_bias=self.theta_mod_bias,
