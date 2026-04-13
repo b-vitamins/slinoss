@@ -55,14 +55,14 @@ _DEFAULT_AOT_DTYPE_NAMES = ("float16", "bfloat16")
 # rather than the standalone ``SLinOSSScanPrep`` defaults, so the curated AOT
 # payload covers the default nextchar training path without extra JIT churn.
 _DEFAULT_SCANPREP_CONFIG_KWARGS = {
-    "dt_min": 1.0e-3,
+    "dt_min": 3.0e-2,
     "dt_max": 1.0e-1,
     "theta_init_min": 0.2,
     "theta_init_max": 1.0,
     "gamma_min": 2.0,
     "gamma_max": 8.0,
     "r_min": 0.9,
-    "r_max": 0.9999,
+    "r_max": 1.0,
     "eps": 1.0e-8,
 }
 _REPRESENTATIVE_BATCH_SIZE = 2

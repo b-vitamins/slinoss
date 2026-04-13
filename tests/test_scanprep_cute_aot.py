@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -8,8 +9,17 @@ import torch
 pytest.importorskip("cutlass")
 
 import slinoss._cute_aot as cute_aot_common
+from slinoss.layers.scanprep import SLinOSSScanPrep
 import slinoss.ops.scanprep.cute.aot as scanprep_aot_mod
 import slinoss.ops.scanprep.cute.kernels as scanprep_kernels_mod
+
+
+def test_scanprep_aot_defaults_match_scanprep_layer_defaults() -> None:
+    init_sig = inspect.signature(SLinOSSScanPrep.__init__)
+    expected = scanprep_aot_mod._DEFAULT_SCANPREP_CONFIG_KWARGS
+    for key in expected:
+        assert key in init_sig.parameters
+        assert expected[key] == init_sig.parameters[key].default
 
 
 def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:

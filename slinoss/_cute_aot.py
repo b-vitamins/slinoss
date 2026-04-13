@@ -185,6 +185,9 @@ def _link_shared_library(
         str(shared_library_path),
         str(object_file_path),
         *map(str, runtime_libraries),
+        # CuTe TVM-FFI modules currently carry one text relocation in generated
+        # host glue. Make the linker policy explicit to avoid noisy build logs.
+        "-Wl,-z,notext",
         f"-Wl,-rpath,{runtime_rpath}",
         "-Wl,--enable-new-dtags",
     ]
