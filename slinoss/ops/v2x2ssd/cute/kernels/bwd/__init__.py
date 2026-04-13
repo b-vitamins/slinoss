@@ -1452,6 +1452,10 @@ def _make_backward_runtime_artifacts(
     # defines the valid scan domain, so cached accumulators must start from zero
     # rather than stale previous contents.
     d_chunk_multiplier.zero_()
+    dU_scan_storage.zero_()
+    dU_prev_scan_storage.zero_()
+    dU_increment_storage.zero_()
+    dU_prev_increment_storage.zero_()
     dM_scan_storage.zero_()
     dM_increment_storage.zero_()
 

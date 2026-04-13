@@ -112,6 +112,38 @@ def _make_underaligned_contiguous_storage_offset_view(t: torch.Tensor) -> torch.
     return view
 
 
+def _prepare_direct_backward_inputs(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_chunks = (int(U.shape[2]) + int(chunk_size) - 1) // int(chunk_size)
+    padded_time = n_chunks * int(chunk_size)
+    tc_dtype = v2x2ssd_fwd_mod._tc_input_dtype(U.dtype, compute_dtype)
+    return (
+        v2x2ssd_fwd_mod._prepare_time_operand(
+            U, padded_time=padded_time, dtype=tc_dtype
+        ),
+        v2x2ssd_fwd_mod._prepare_m_operand(M, padded_time=padded_time),
+        v2x2ssd_fwd_mod._prepare_time_operand(
+            K,
+            padded_time=padded_time,
+            dtype=torch.float32,
+        ),
+        v2x2ssd_fwd_mod._prepare_time_operand(
+            B, padded_time=padded_time, dtype=tc_dtype
+        ),
+        v2x2ssd_fwd_mod._prepare_time_operand(
+            C, padded_time=padded_time, dtype=tc_dtype
+        ),
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
     pytest.importorskip("cutlass")
@@ -1651,7 +1683,8 @@ def test_v2x2ssd_cute_stateful_forward_respects_current_stream() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
+@pytest.mark.parametrize("bc_groups", [4, 2, 1])
+def test_v2x2ssd_cute_training_backward_is_repeatable(bc_groups: int) -> None:
     pytest.importorskip("cutlass")
 
     def run_once() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
@@ -1659,6 +1692,7 @@ def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
         U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
             batch=2,
             heads=4,
+            bc_groups=bc_groups,
             T=65,
             N=32,
             P=64,
@@ -1709,6 +1743,92 @@ def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
         assert torch.isfinite(grad1).all()
         assert torch.isfinite(grad2).all()
         torch.testing.assert_close(grad1, grad2, atol=1e-7, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("bc_groups", [4, 2, 1])
+def test_v2x2ssd_cute_grouped_training_backward_matches_direct_kernel_path(
+    bc_groups: int,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=2,
+        heads=4,
+        bc_groups=bc_groups,
+        T=65,
+        N=32,
+        P=64,
+        device=torch.device("cuda"),
+        value_dtype=torch.float32,
+    )
+
+    U_wrap = U.detach().clone().requires_grad_(True)
+    M_wrap = M.detach().clone().requires_grad_(True)
+    K_wrap = K.detach().clone().requires_grad_(True)
+    B_wrap = B.detach().clone().requires_grad_(True)
+    C_wrap = C.detach().clone().requires_grad_(True)
+
+    y_wrap = v2x2ssd_cute(
+        U_wrap,
+        M_wrap,
+        K_wrap,
+        B_wrap,
+        C_wrap,
+        chunk_size=64,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    d_out = torch.randn_like(y_wrap)
+    wrap_grads = torch.autograd.grad(
+        y_wrap,
+        (U_wrap, M_wrap, K_wrap, B_wrap, C_wrap),
+        grad_outputs=d_out,
+    )
+
+    Y_direct, m_chunk, chunk_starts = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        v2x2ssd_fwd_mod._v2x2ssd_fwd_cute_prevalidated(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            return_intermediates=True,
+        ),
+    )
+    torch.testing.assert_close(y_wrap.detach(), Y_direct, atol=0.0, rtol=0.0)
+
+    direct_grads = v2x2ssd_bwd_mod._v2x2ssd_bwd_cute_prevalidated(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=64,
+        compute_dtype=torch.float32,
+        prepared_inputs=_prepare_direct_backward_inputs(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            compute_dtype=torch.float32,
+        ),
+    )[:5]
+
+    for wrap_grad, direct_grad in zip(wrap_grads, direct_grads, strict=True):
+        assert torch.isfinite(wrap_grad).all()
+        assert torch.isfinite(direct_grad).all()
+        torch.testing.assert_close(wrap_grad, direct_grad, atol=1e-7, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
