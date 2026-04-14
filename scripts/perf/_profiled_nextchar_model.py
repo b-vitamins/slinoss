@@ -16,7 +16,7 @@ from slinoss.layers.backend import (
     ScanInputs,
 )
 from slinoss.layers.state import SLinOSSMixerState, ScanState
-from slinoss.ops.mixer import split_mixer_projection
+from slinoss.ops.mixer import mixer_tail, split_mixer_projection
 from slinoss.perf import call_region
 
 
@@ -68,9 +68,6 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             state=scan_state,
             return_state=return_state,
         )
-
-    def _project_output(self, gated: torch.Tensor) -> torch.Tensor:
-        return self.out_proj(self.out_norm(gated))
 
     def _profile_reference_scanprep(
         self,
@@ -193,15 +190,14 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        gated = call_region(
-            "mixer.gate",
-            self._gate,
+        out = call_region(
+            "mixer.tail",
+            mixer_tail,
             scan_y,
             gate,
-            batch_size=batch,
-            time_steps=T,
+            self.out_norm,
+            self.out_proj,
         )
-        out = call_region("mixer.out_proj", self._project_output, gated)
 
         if not return_state:
             return out

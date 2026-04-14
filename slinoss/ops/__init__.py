@@ -8,7 +8,7 @@ from .cconv1d import (
     cconv1d_load_error,
     cconv1d_reference,
 )
-from .gate import mixer_gate
+from .mixer import mixer_tail
 
 __all__ = [
     "cconv1d",
@@ -17,5 +17,5 @@ __all__ = [
     "cconv1d_cuda_supported",
     "cconv1d_is_available",
     "cconv1d_load_error",
-    "mixer_gate",
+    "mixer_tail",
 ]

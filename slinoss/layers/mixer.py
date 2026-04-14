@@ -7,8 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from slinoss.ops.gate import mixer_gate
-from slinoss.ops.mixer import split_mixer_projection
+from slinoss.ops.mixer import mixer_tail, split_mixer_projection
 from slinoss.ops.mixer.step import (
     MixerCudaGraphStepEngine as _MixerCudaGraphStepEngine,
     ensure_fast_decode_state_layout,
@@ -196,23 +195,6 @@ class SLinOSSMixer(nn.Module):
             dtype=dtype,
         )
 
-    def _gate(
-        self,
-        scan_output: torch.Tensor,
-        gate: torch.Tensor,
-        *,
-        batch_size: int,
-        time_steps: int,
-    ) -> torch.Tensor:
-        return mixer_gate(
-            scan_output,
-            gate,
-            batch_size=batch_size,
-            time_steps=time_steps,
-            n_heads=self.n_heads,
-            d_head=self.d_head,
-        )
-
     def init_state(
         self,
         batch_size: int,
@@ -334,13 +316,12 @@ class SLinOSSMixer(nn.Module):
             scan_output, scan_state = cast(tuple[torch.Tensor, ScanState], scan_result)
         else:
             scan_output = cast(torch.Tensor, scan_result)
-        gated = self._gate(
+        out = mixer_tail(
             scan_output,
             gate,
-            batch_size=batch_size,
-            time_steps=time_steps,
+            self.out_norm,
+            self.out_proj,
         )
-        out = self.out_proj(self.out_norm(gated))
         if scan_state is None:
             return out
         return out, SLinOSSMixerState(conv=conv_state, scan=scan_state)

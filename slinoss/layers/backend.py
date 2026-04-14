@@ -183,15 +183,6 @@ if TYPE_CHECKING:
         @property
         def out_norm(self) -> torch.nn.Module: ...
 
-        def _gate(
-            self,
-            scan_output: torch.Tensor,
-            gate: torch.Tensor,
-            *,
-            batch_size: int,
-            time_steps: int,
-        ) -> torch.Tensor: ...
-
 
 class ScanPrepBackend(Protocol):
     """Protocol for scan preparation backends."""

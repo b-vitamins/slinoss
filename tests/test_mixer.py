@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from slinoss.layers import (
@@ -13,11 +14,13 @@ from slinoss.layers import (
     ReferenceCConv1dBackend,
     ReferenceScanBackend,
     ReferenceScanPrepBackend,
+    RMSNorm,
     SLinOSSMixer,
     ScanInputs,
     ScanPrepInputs,
     ScanState,
 )
+from slinoss.ops.mixer import mixer_tail
 from slinoss.ops.mixer.projection import _SplitMixerProjectionFn
 
 
@@ -717,18 +720,137 @@ def test_mixer_applies_output_norm_after_gate() -> None:
         .permute(0, 2, 1, 3)
         .reshape(batch, T, mixer.d_inner)
     )
-    actual = mixer.out_norm(
-        mixer._gate(
-            scan_y,
-            gate,
-            batch_size=batch,
-            time_steps=T,
+    projected = mixer_tail(scan_y, gate, mixer.out_norm, mixer.out_proj)
+
+    torch.testing.assert_close(projected, mixer.out_proj(expected))
+
+
+def test_mixer_tail_matches_reference_forward_and_backward() -> None:
+    torch.manual_seed(0)
+    mixer = _make_mixer()
+    batch, time_steps = 2, 5
+    scan_output = torch.randn(
+        (batch, mixer.n_heads, time_steps, mixer.d_head),
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    gate = torch.randn(
+        (batch, time_steps, mixer.d_inner),
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    scan_output_ref = scan_output.detach().clone().requires_grad_(True)
+    gate_ref = gate.detach().clone().requires_grad_(True)
+
+    tail_norm = RMSNorm(mixer.d_inner, eps=mixer.out_norm.eps)
+    ref_norm = RMSNorm(mixer.d_inner, eps=mixer.out_norm.eps)
+    tail_norm.weight.data.copy_(mixer.out_norm.weight.data)
+    ref_norm.weight.data.copy_(mixer.out_norm.weight.data)
+
+    tail_proj = nn.Linear(
+        mixer.d_inner,
+        mixer.d_model,
+        bias=mixer.out_proj.bias is not None,
+    )
+    ref_proj = nn.Linear(
+        mixer.d_inner,
+        mixer.d_model,
+        bias=mixer.out_proj.bias is not None,
+    )
+    tail_proj.weight.data.copy_(mixer.out_proj.weight.data)
+    ref_proj.weight.data.copy_(mixer.out_proj.weight.data)
+    if mixer.out_proj.bias is not None:
+        assert tail_proj.bias is not None
+        assert ref_proj.bias is not None
+        tail_proj.bias.data.copy_(mixer.out_proj.bias.data)
+        ref_proj.bias.data.copy_(mixer.out_proj.bias.data)
+
+    y_tail = mixer_tail(scan_output, gate, tail_norm, tail_proj)
+    y_ref = ref_proj(
+        ref_norm(
+            (
+                scan_output_ref
+                * F.silu(gate_ref)
+                .view(batch, time_steps, mixer.n_heads, mixer.d_head)
+                .permute(0, 2, 1, 3)
+            )
+            .permute(0, 2, 1, 3)
+            .reshape(batch, time_steps, mixer.d_inner)
         )
     )
-    projected = mixer.out_proj(actual)
+    torch.testing.assert_close(y_ref, y_tail, atol=1e-6, rtol=1e-6)
 
-    torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(projected, mixer.out_proj(expected))
+    loss_ref = y_ref.to(dtype=torch.float32).pow(2).mean()
+    loss_tail = y_tail.to(dtype=torch.float32).pow(2).mean()
+    loss_ref.backward()
+    loss_tail.backward()
+
+    assert scan_output.grad is not None
+    assert gate.grad is not None
+    assert tail_norm.weight.grad is not None
+    assert tail_proj.weight.grad is not None
+    assert scan_output_ref.grad is not None
+    assert gate_ref.grad is not None
+    assert ref_norm.weight.grad is not None
+    assert ref_proj.weight.grad is not None
+    torch.testing.assert_close(
+        scan_output_ref.grad,
+        scan_output.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(gate_ref.grad, gate.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        ref_norm.weight.grad,
+        tail_norm.weight.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        ref_proj.weight.grad,
+        tail_proj.weight.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    if ref_proj.bias is not None:
+        assert tail_proj.bias is not None
+        assert ref_proj.bias.grad is not None
+        assert tail_proj.bias.grad is not None
+        torch.testing.assert_close(
+            ref_proj.bias.grad,
+            tail_proj.bias.grad,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_mixer_tail_saves_only_scan_and_gate_tensors() -> None:
+    torch.manual_seed(0)
+    mixer = _make_mixer()
+    batch, time_steps = 2, 4
+    scan_output = torch.randn(
+        (batch, mixer.n_heads, time_steps, mixer.d_head),
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    gate = torch.randn(
+        (batch, time_steps, mixer.d_inner),
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    saved: list[tuple[tuple[int, ...], torch.dtype]] = []
+
+    def pack_hook(t: torch.Tensor) -> torch.Tensor:
+        saved.append((tuple(map(int, t.shape)), t.dtype))
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda t: t):
+        mixer_tail(scan_output, gate, mixer.out_norm, mixer.out_proj)
+
+    assert saved == [
+        (tuple(map(int, scan_output.shape)), scan_output.dtype),
+        (tuple(map(int, gate.shape)), gate.dtype),
+    ]
 
 
 def test_mixer_segmented_forward_matches_single_pass() -> None:

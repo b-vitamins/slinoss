@@ -9,6 +9,7 @@ from slinoss.ops.v2x2ssd.reference import v2x2ssm
 
 from .convolution import apply_causal_depthwise_conv_step
 from .projection import split_mixer_projection
+from .tail import _mixer_gated_hidden
 
 if TYPE_CHECKING:
     from slinoss.layers.backend import MixerDecodeInputs, ScanInputs, ScanPrepInputs
@@ -95,15 +96,6 @@ if TYPE_CHECKING:
 
         @property
         def out_norm(self) -> torch.nn.Module: ...
-
-        def _gate(
-            self,
-            scan_output: torch.Tensor,
-            gate: torch.Tensor,
-            *,
-            batch_size: int,
-            time_steps: int,
-        ) -> torch.Tensor: ...
 
 
 def supports_cute_decode(
@@ -243,14 +235,9 @@ def run_reference_decode_step(
     scan_output = scan_output.to(dtype=value_token.dtype)
     b_last = b_last.to(dtype=value_token.dtype)
     u_last = u_last.to(dtype=value_token.dtype)
-    normalized_output = mixer.out_norm(
-        mixer._gate(
-            scan_output,
-            gate_token,
-            batch_size=batch_size,
-            time_steps=1,
-        )
-    )[:, 0, :]
+    normalized_output = mixer.out_norm(_mixer_gated_hidden(scan_output, gate_token))[
+        :, 0, :
+    ]
     return normalized_output.contiguous(), ScanState(
         state=final_state,
         b_prev=b_last,
