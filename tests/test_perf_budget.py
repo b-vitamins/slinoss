@@ -27,7 +27,6 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
         "forward.mixer.in_proj": 0.7,
         "forward.mixer.dw_conv": 0.8,
         "forward.mixer.bc_emit": 0.9,
-        "forward.mixer.dw_conv_activation": 0.25,
         "forward.mixer.scanprep.total": 2.25,
         "forward.mixer.scanprep.pack_u": 0.4,
         "forward.mixer.scanprep.bc_norm": 0.15,
@@ -37,7 +36,6 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
         "backward.mixer.in_proj": 1.3,
         "backward.mixer.dw_conv": 1.4,
         "backward.mixer.bc_emit": 1.5,
-        "backward.mixer.dw_conv_activation": 0.45,
         "backward.mixer.scanprep.total": 3.65,
         "backward.mixer.scanprep.pack_u": 0.5,
         "backward.mixer.scanprep.bc_norm": 0.35,
@@ -93,14 +91,14 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
     assert derived["backward.norms.total"] == pytest.approx(1.5)
     assert derived["forward.mixer.scanprep.total"] == pytest.approx(2.25)
     assert derived["backward.mixer.scanprep.total"] == pytest.approx(3.65)
-    assert derived["forward.mixer.total"] == pytest.approx(6.4)
-    assert derived["backward.mixer.total"] == pytest.approx(10.5)
+    assert derived["forward.mixer.total"] == pytest.approx(6.15)
+    assert derived["backward.mixer.total"] == pytest.approx(10.05)
     assert derived["forward.residual.total"] == pytest.approx(0.23)
     assert derived["backward.residual.total"] == pytest.approx(0.43)
     assert derived["forward.head.total"] == pytest.approx(0.6)
     assert derived["backward.head.total"] == pytest.approx(1.3)
-    assert derived["forward.other.unattributed"] == pytest.approx(-3.23)
-    assert derived["backward.other.unattributed"] == pytest.approx(-4.63)
+    assert derived["forward.other.unattributed"] == pytest.approx(-2.98)
+    assert derived["backward.other.unattributed"] == pytest.approx(-4.18)
 
     tree = build_tree(
         {

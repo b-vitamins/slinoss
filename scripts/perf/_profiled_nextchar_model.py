@@ -164,9 +164,6 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             value_raw,
             conv_state_in,
         )
-        value = call_region(
-            "mixer.dw_conv_activation", torch.nn.functional.silu, conv_out
-        )
         bc = call_region(
             "mixer.bc_emit",
             self._emit_scan_bc,
@@ -175,7 +172,7 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             time_steps=T,
         )
 
-        scan_inputs = self._profile_scanprep(value=value, params=params, bc=bc)
+        scan_inputs = self._profile_scanprep(value=conv_out, params=params, bc=bc)
         scan_state_in = None if state is None else state.scan
         scan_result = call_region(
             "v2x2ssd.total",

@@ -82,7 +82,7 @@ def _mixer_tail_forward(
     scan_output: torch.Tensor,
     gate: torch.Tensor,
     out_norm_weight: torch.Tensor,
-    out_norm_eps: float,
+    out_norm_eps: float | None,
     out_proj_weight: torch.Tensor,
     out_proj_bias: torch.Tensor | None,
 ) -> torch.Tensor:
@@ -111,7 +111,7 @@ class _MixerTailFn(torch.autograd.Function):
         scan_output: torch.Tensor,
         gate: torch.Tensor,
         out_norm_weight: torch.Tensor,
-        out_norm_eps: float,
+        out_norm_eps: float | None,
         out_proj_weight: torch.Tensor,
         out_proj_bias: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -123,13 +123,13 @@ class _MixerTailFn(torch.autograd.Function):
                 scan_output,
                 gate,
                 out_norm_weight,
-                float(out_norm_eps),
+                out_norm_eps,
                 out_proj_weight,
                 out_proj_bias,
             )
         ctx.save_for_backward(scan_output, gate)
         ctx.out_norm_weight = out_norm_weight
-        ctx.out_norm_eps = float(out_norm_eps)
+        ctx.out_norm_eps = out_norm_eps
         ctx.out_proj_weight = out_proj_weight
         ctx.out_proj_bias = out_proj_bias
         return out
@@ -237,7 +237,7 @@ def mixer_tail(
             scan_output,
             gate,
             out_norm_weight,
-            float(out_norm.eps),
+            out_norm.eps,
             out_proj_weight,
             cast(torch.Tensor | None, out_proj_bias),
         )
@@ -248,7 +248,7 @@ def mixer_tail(
             scan_output,
             gate,
             out_norm_weight,
-            float(out_norm.eps),
+            out_norm.eps,
             out_proj_weight,
             cast(torch.Tensor | None, out_proj_bias),
         ),

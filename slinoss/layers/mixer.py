@@ -5,7 +5,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from slinoss.ops.mixer import mixer_tail, split_mixer_projection
 from slinoss.ops.mixer.step import (
@@ -285,7 +284,6 @@ class SLinOSSMixer(nn.Module):
         value_output, conv_state = self.cconv_backend(
             self, value_proj, conv_input_state
         )
-        value_output = F.silu(value_output)
         bc = bc_flat.view(
             batch_size,
             time_steps,

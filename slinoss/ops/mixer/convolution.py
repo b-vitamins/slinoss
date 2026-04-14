@@ -84,7 +84,7 @@ def apply_reference_causal_depthwise_conv(
             groups=mixer.d_inner,
         )
         empty_state = x.new_empty((batch_size, mixer.d_inner, 0))
-        return output.transpose(1, 2).contiguous(), empty_state
+        return F.silu(output.transpose(1, 2).contiguous()), empty_state
 
     prefix = _validate_conv_state(
         mixer,
@@ -98,7 +98,7 @@ def apply_reference_causal_depthwise_conv(
     stacked = torch.cat((prefix, x_transposed), dim=-1)
     output = F.conv1d(stacked, weight, mixer.dw_bias, groups=mixer.d_inner)
     next_state = stacked[..., -state_len:].contiguous()
-    return output.transpose(1, 2).contiguous(), next_state
+    return F.silu(output.transpose(1, 2).contiguous()), next_state
 
 
 def apply_cuda_causal_depthwise_conv(
@@ -121,17 +121,17 @@ def apply_cuda_causal_depthwise_conv(
         x_transposed = x_transposed.contiguous()
 
     if state_len == 0:
-        if not cconv1d_cuda_supported(x_transposed, weight, activation=None):
+        if not cconv1d_cuda_supported(x_transposed, weight, activation="silu"):
             return apply_reference_causal_depthwise_conv(mixer, x, conv_state)
-        output = cconv1d_cuda(x_transposed, weight, mixer.dw_bias, activation=None)
+        output = cconv1d_cuda(x_transposed, weight, mixer.dw_bias, activation="silu")
         assert isinstance(output, torch.Tensor)
         empty_state = x.new_empty((batch_size, mixer.d_inner, 0))
         return output.transpose(1, 2).contiguous(), empty_state
 
     if conv_state is None:
-        if not cconv1d_cuda_supported(x_transposed, weight, activation=None):
+        if not cconv1d_cuda_supported(x_transposed, weight, activation="silu"):
             return apply_reference_causal_depthwise_conv(mixer, x, conv_state)
-        output = cconv1d_cuda(x_transposed, weight, mixer.dw_bias, activation=None)
+        output = cconv1d_cuda(x_transposed, weight, mixer.dw_bias, activation="silu")
         assert isinstance(output, torch.Tensor)
         next_state = _next_conv_state_from_input(x_transposed, state_len=state_len)
         return output.transpose(1, 2).contiguous(), next_state
@@ -157,7 +157,7 @@ def apply_cuda_causal_depthwise_conv(
         x_transposed,
         weight,
         initial_states=initial_state,
-        activation=None,
+        activation="silu",
     ):
         return apply_reference_causal_depthwise_conv(mixer, x, conv_state)
     output_with_state = cconv1d_cuda(
@@ -166,7 +166,7 @@ def apply_cuda_causal_depthwise_conv(
         mixer.dw_bias,
         initial_states=initial_state,
         return_final_states=True,
-        activation=None,
+        activation="silu",
     )
     assert isinstance(output_with_state, tuple)
     output, next_state = output_with_state
@@ -211,7 +211,7 @@ def apply_causal_depthwise_conv_step(
             x,
             None,
         )
-        return torch.nn.functional.silu(output_sequence[:, 0, :]), next_state
+        return output_sequence[:, 0, :], next_state
 
     initial_state = _validate_conv_state(
         mixer,
@@ -232,7 +232,7 @@ def apply_causal_depthwise_conv_step(
             x,
             initial_state.contiguous(),
         )
-        return torch.nn.functional.silu(output_sequence[:, 0, :]), next_state
+        return output_sequence[:, 0, :], next_state
 
     initial_state = initial_state.transpose(1, 2).contiguous().transpose(1, 2)
     if cconv1d_cuda_supported(
@@ -258,7 +258,7 @@ def apply_causal_depthwise_conv_step(
         x,
         initial_state.contiguous(),
     )
-    return torch.nn.functional.silu(output_sequence[:, 0, :]), next_state
+    return output_sequence[:, 0, :], next_state
 
 
 __all__ = [

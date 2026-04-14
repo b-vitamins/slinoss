@@ -233,7 +233,7 @@ class AutoScanPrepBackend:
 
 
 class CConv1dBackend(Protocol):
-    """Protocol for depthwise causal convolution backends."""
+    """Protocol for activated depthwise causal convolution backends."""
 
     def __call__(
         self,
@@ -244,7 +244,7 @@ class CConv1dBackend(Protocol):
 
 
 class ReferenceCConv1dBackend:
-    """Reference implementation of depthwise causal convolution."""
+    """Reference implementation of activated depthwise causal convolution."""
 
     def __call__(
         self,
@@ -256,7 +256,7 @@ class ReferenceCConv1dBackend:
 
 
 class CudaCConv1dBackend:
-    """CUDA implementation of depthwise causal convolution."""
+    """CUDA implementation of activated depthwise causal convolution."""
 
     def __call__(
         self,

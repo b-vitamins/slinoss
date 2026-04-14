@@ -65,8 +65,6 @@ def _validate_nextchar_budget_tree(
         "backward.mixer.in_proj.__stats__",
         "forward.mixer.dw_conv.__stats__",
         "backward.mixer.dw_conv.__stats__",
-        "forward.mixer.dw_conv_activation.__stats__",
-        "backward.mixer.dw_conv_activation.__stats__",
         "forward.mixer.bc_emit.__stats__",
         "backward.mixer.bc_emit.__stats__",
         "forward.mixer.scanprep.__stats__",
