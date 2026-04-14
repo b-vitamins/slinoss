@@ -20,6 +20,7 @@ from slinoss.layers.backend import (
     ScanInputs,
 )
 from slinoss.layers.state import SLinOSSMixerState, ScanState
+from slinoss.ops.block import block_ffn_residual
 from slinoss.ops.mixer import mixer_tail, split_mixer_projection
 from slinoss.perf import call_region
 
@@ -209,13 +210,11 @@ class ProfiledSLinOSSBlock(SLinOSSBlock):
         )
         if self.ffn is None or self.ffn_norm is None:
             return out
-        norm2 = call_region("norms.pre_ffn", self.ffn_inputs, out)
-        ff = call_region("ffn", self.ffn, norm2)
-        return call_region(
-            "residual.ffn",
-            self._residual_add,
-            out,
-            self._drop_branch(ff),
+        # Keep profiling on the same FFN execution path as production block.forward.
+        # This avoids harness drift for memory-forensics work.
+        return cast(
+            torch.Tensor,
+            call_region("ffn", block_ffn_residual, self, out),
         )
 
 

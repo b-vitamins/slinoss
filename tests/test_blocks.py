@@ -13,6 +13,7 @@ from slinoss.blocks import (
     uniform_block_schedule,
 )
 from slinoss.layers import SLinOSSMLPConfig
+from slinoss.ops.block import block_ffn_residual
 
 
 def _small_block_config(*, norm_kind: str = "rmsnorm") -> SLinOSSBlockConfig:
@@ -276,3 +277,51 @@ def test_stack_can_build_custom_blocks_and_thread_context() -> None:
 
     assert torch.equal(first.step_contexts[0], step_context)
     assert torch.equal(second.step_contexts[0], step_context + 1)
+
+
+def test_block_ffn_residual_matches_eager_value_and_grads() -> None:
+    torch.manual_seed(0)
+    block = SLinOSSBlock(_small_block_config())
+    block.train()
+    x = torch.randn(2, 4, 32, requires_grad=True)
+
+    ffn_params: list[torch.Tensor] = []
+    if block.ffn_norm is not None:
+        weight = getattr(block.ffn_norm, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            ffn_params.append(weight)
+        bias = getattr(block.ffn_norm, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            ffn_params.append(bias)
+    if block.ffn is not None:
+        ffn_params.extend(
+            [
+                block.ffn.in_proj.weight,
+                block.ffn.out_proj.weight,
+            ]
+        )
+        if block.ffn.in_proj.bias is not None:
+            ffn_params.append(block.ffn.in_proj.bias)
+        if block.ffn.out_proj.bias is not None:
+            ffn_params.append(block.ffn.out_proj.bias)
+
+    eager = block._residual_add(
+        x,
+        block._drop_branch(block.forward_ffn_branch(x)),
+    )
+    eager_loss = eager.square().mean()
+    eager_grads = torch.autograd.grad(
+        eager_loss,
+        (x, *ffn_params),
+        retain_graph=True,
+    )
+
+    remat = block_ffn_residual(block, x)
+    remat_loss = remat.square().mean()
+    remat_grads = torch.autograd.grad(remat_loss, (x, *ffn_params))
+
+    assert torch.allclose(remat, eager, atol=1.0e-5, rtol=1.0e-5)
+    for ref, got in zip(eager_grads, remat_grads, strict=True):
+        assert ref is not None
+        assert got is not None
+        assert torch.allclose(got, ref, atol=1.0e-5, rtol=1.0e-5)

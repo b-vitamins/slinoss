@@ -11,6 +11,7 @@ from torch import nn
 from slinoss.layers import RMSNorm, SLinOSSMixer
 from slinoss.layers.mlp import SLinOSSMLP
 from slinoss.layers.state import SLinOSSMixerState
+from slinoss.ops.block import block_ffn_residual
 
 from .config import NormKind, SLinOSSBlockConfig
 from .state import SLinOSSBlockState
@@ -256,10 +257,7 @@ class SLinOSSBlock(nn.Module):
             )
         out = self._residual_add(x, self._drop_branch(mixed))
         if self.ffn is not None and self.ffn_norm is not None:
-            out = self._residual_add(
-                out,
-                self._drop_branch(self.forward_ffn_branch(out, context=context)),
-            )
+            out = block_ffn_residual(self, out, context=context)
         if not return_state:
             return out
         if next_state is None:
