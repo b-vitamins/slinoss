@@ -24,6 +24,7 @@ from .backend import (
 from .scanprep import SLinOSSScanPrep
 from .mixer import SLinOSSMixer
 from .state import SLinOSSMixerState, ScanState
+from .norm import RMSNorm
 
 __all__ = [
     "CConv1dBackend",
@@ -49,4 +50,5 @@ __all__ = [
     "SLinOSSMixerState",
     "SLinOSSMixer",
     "SLinOSSScanPrep",
+    "RMSNorm",
 ]

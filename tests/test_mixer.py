@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import cast
 
 import pytest
@@ -817,10 +818,18 @@ def test_mixer_backward_supports_cuda_autocast(amp_dtype: torch.dtype) -> None:
     ).train()
     x = torch.randn((2, 8, 32), device="cuda", dtype=torch.float32, requires_grad=True)
 
-    with torch.autocast("cuda", dtype=amp_dtype):
-        loss = mixer(x).square().mean()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with torch.autocast("cuda", dtype=amp_dtype):
+            loss = mixer(x).square().mean()
+        loss.backward()
 
-    loss.backward()
+    mismatch_warnings = [
+        warning
+        for warning in caught
+        if "Mismatch dtype between input and weight" in str(warning.message)
+    ]
+    assert mismatch_warnings == []
 
     assert x.grad is not None
     assert mixer.in_proj.weight.grad is not None

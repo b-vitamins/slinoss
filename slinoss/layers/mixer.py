@@ -16,6 +16,7 @@ from slinoss.ops.mixer.step import (
     run_inplace_decode_step,
     supports_cute_decode,
 )
+from slinoss.layers.norm import RMSNorm
 
 from .backend import (
     AutoCConv1dBackend,
@@ -156,7 +157,7 @@ class SLinOSSMixer(nn.Module):
             bias=False,
             **factory_kwargs,
         )
-        self.out_norm = nn.RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
+        self.out_norm = RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
 
         self.reset_parameters()
 

@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from slinoss.layers import SLinOSSMixer
+from slinoss.layers.norm import RMSNorm
 from slinoss.layers.state import SLinOSSMixerState
 from slinoss.ops.decode import decode_linear
 
@@ -115,7 +116,7 @@ class NextCharBlock(nn.Module):
         bc_groups: int | None = None,
     ) -> None:
         super().__init__()
-        self.norm1 = nn.RMSNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
         self.mixer = SLinOSSMixer(
             d_model,
             d_state=d_state,
@@ -125,7 +126,7 @@ class NextCharBlock(nn.Module):
             chunk_size=chunk_size,
             bc_groups=bc_groups,
         )
-        self.norm2 = nn.RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
         self.ff = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -294,7 +295,7 @@ class NextCharLM(nn.Module):
                 for _ in range(n_layers)
             ]
         )
-        self.norm_f = nn.RMSNorm(d_model)
+        self.norm_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_embed.weight
         self.perf_trainable_params: tuple[torch.nn.Parameter, ...] = ()
