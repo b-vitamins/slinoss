@@ -1126,6 +1126,124 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
         )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="CUDA BF16 required",
+)
+def test_cute_scanprep_backward_bf16_bc_pack_store_cast_regression() -> None:
+    torch.manual_seed(1)
+    prep = SLinOSSScanPrep(
+        n_heads=2,
+        d_state=3,
+        d_head=4,
+        backend=CuteScanPrepBackend(),
+        device="cuda",
+    )
+
+    value = torch.randn(
+        (2, 5, 8),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    params = torch.randn(
+        (2, 5, 2 * prep.param_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    bc = torch.randn(
+        (2, 5, prep.bc_groups, prep.bc_param_rows, prep.d_state),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    out = prep(value, params, bc)
+    loss = (
+        out.U.to(dtype=torch.float32).square().mean()
+        + out.M.to(dtype=torch.float32).square().mean()
+        + out.K.to(dtype=torch.float32).square().mean()
+        + out.B.to(dtype=torch.float32).square().mean()
+        + out.C.to(dtype=torch.float32).square().mean()
+    )
+    loss.backward()
+
+    assert value.grad is not None
+    assert params.grad is not None
+    assert bc.grad is not None
+    assert value.grad.dtype == torch.bfloat16
+    assert params.grad.dtype == torch.bfloat16
+    assert bc.grad.dtype == torch.bfloat16
+    assert torch.isfinite(value.grad).all()
+    assert torch.isfinite(params.grad).all()
+    assert torch.isfinite(bc.grad).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="CUDA BF16 required",
+)
+def test_scanprep_bwd_normalizes_optional_grad_dtypes_to_contract() -> None:
+    torch.manual_seed(7)
+    prep, value, params, bc_amp = _make_scanprep_cuda_fixture(dtype=torch.bfloat16)
+    bc = _canonical_bc(prep, bc_amp)
+    runtime_kwargs = _scanprep_runtime_kwargs(prep, detach=True)
+
+    with torch.no_grad():
+        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+            value, params, bc, **runtime_kwargs
+        )
+
+    # Deliberately pass mismatched optional-grad dtypes to ensure the runtime
+    # argument boundary normalizes to the expected public-contract dtypes.
+    dU = torch.randn_like(U, dtype=torch.float32)
+    dM = torch.randn_like(M, dtype=torch.bfloat16)
+    dK = torch.randn_like(K, dtype=torch.bfloat16)
+    dB = torch.randn_like(B, dtype=torch.float32)
+    dC = torch.randn_like(C, dtype=torch.float32)
+
+    (
+        value_grad,
+        params_grad,
+        bc_grad,
+        _dt_bias_grad,
+        _gamma_bias_grad,
+        _theta_mod_bias_grad,
+        _theta_bias_grad,
+    ) = scanprep_bwd_cute(
+        bc=bc,
+        coeff_aux=coeff_aux,
+        dU=dU,
+        dM=dM,
+        dK=dK,
+        dB=dB,
+        dC=dC,
+        n_heads=prep.n_heads,
+        bc_groups=prep.bc_groups,
+        d_head=prep.d_head,
+        d_state=prep.d_state,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        dt_min=prep.dt_min,
+        dt_max=prep.dt_max,
+        theta_init_min=prep.theta_init_min,
+        theta_init_max=prep.theta_init_max,
+        gamma_min=prep.gamma_min,
+        gamma_max=prep.gamma_max,
+        r_min=prep.r_min,
+        r_max=prep.r_max,
+        eps=prep.eps,
+        dt_bias=prep.dt_bias.detach(),
+        theta_bias=prep.theta_bias.detach(),
+        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+    )
+
+    assert value_grad.dtype == value.dtype
+    assert params_grad.dtype == params.dtype
+    assert bc_grad.dtype == bc.dtype
+
+
 def test_reference_scan_backend_matches_v2x2ssd() -> None:
     torch.manual_seed(1)
     device = torch.device("cpu")

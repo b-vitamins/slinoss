@@ -958,6 +958,8 @@ def _materialize_optional_grad(
 ) -> torch.Tensor:
     if grad is None:
         return torch.zeros(shape, device=device, dtype=dtype)
+    if grad.dtype != dtype:
+        grad = grad.to(dtype=dtype)
     return contiguous_tensor(grad)
 
 

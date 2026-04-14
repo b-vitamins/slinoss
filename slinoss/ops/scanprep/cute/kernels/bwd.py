@@ -265,14 +265,22 @@ class ScanPrepBwdFused:
                         for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                             n = lane + n_iter * 32
                             if n < self.n_size:
-                                mBCGrad[b, t, g, 0, n] = mDB[b, g, t, 2 * n]
-                                mBCGrad[b, t, g, 1, n] = mDB[b, g, t, 2 * n + 1]
+                                mBCGrad[b, t, g, 0, n] = safe_cast_to_dtype(
+                                    mDB[b, g, t, 2 * n], mBCGrad.element_type
+                                )
+                                mBCGrad[b, t, g, 1, n] = safe_cast_to_dtype(
+                                    mDB[b, g, t, 2 * n + 1], mBCGrad.element_type
+                                )
                     else:
                         for n_iter in cutlass.range_constexpr(num_n_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                             n = lane + n_iter * 32
                             if n < self.n_size:
-                                mBCGrad[b, t, g, 2, n] = mDC[b, g, t, 2 * n]
-                                mBCGrad[b, t, g, 3, n] = mDC[b, g, t, 2 * n + 1]
+                                mBCGrad[b, t, g, 2, n] = safe_cast_to_dtype(
+                                    mDC[b, g, t, 2 * n], mBCGrad.element_type
+                                )
+                                mBCGrad[b, t, g, 3, n] = safe_cast_to_dtype(
+                                    mDC[b, g, t, 2 * n + 1], mBCGrad.element_type
+                                )
 
     @cute.kernel
     def _accumulate_coeff_grads(
