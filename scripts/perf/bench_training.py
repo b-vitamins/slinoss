@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark nextchar-style training throughput and stage budgets."""
+"""Benchmark block-based training throughput and stage budgets."""
 
 from __future__ import annotations
 
@@ -19,6 +19,21 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from _common import (  # noqa: E402
+    PerfConfig,
+    benchmark_instrumented,
+    build_callable,
+    dtype_from_str,
+    ensure_cuda,
+    seed_all,
+)
+from _training import (  # noqa: E402
+    DEFAULT_TRAINING_PERF_CONFIG,
+    TrainingBenchFixture,
+    TrainingPerfConfig,
+    build_bench_fixture,
+    run_bench_step,
+)
 from slinoss.perf.budget import (  # noqa: E402
     build_tree,
     summarize_budget_samples,
@@ -26,22 +41,7 @@ from slinoss.perf.budget import (  # noqa: E402
     summarize_named_samples,
     summarize_scalar_samples,
 )
-from _common import (  # noqa: E402
-    benchmark_instrumented,
-    build_callable,
-    dtype_from_str,
-    ensure_cuda,
-    seed_all,
-    PerfConfig,
-)
-from _nextchar import (  # noqa: E402
-    DEFAULT_NEXTCHAR_PERF_CONFIG,
-    NextCharBenchFixture,
-    NextCharPerfConfig,
-    build_bench_fixture,
-    run_bench_step,
-)
-from slinoss.perf.schema import validate_nextchar_bench_payload  # noqa: E402
+from slinoss.perf.schema import validate_training_bench_payload  # noqa: E402
 
 
 def _summarize_byte_samples(samples: list[float]) -> dict[str, float]:
@@ -68,26 +68,41 @@ def _bytes_to_mib(num_bytes: float) -> float:
 
 
 def _parse_args() -> argparse.Namespace:
-    default_cfg = DEFAULT_NEXTCHAR_PERF_CONFIG
+    default_cfg = DEFAULT_TRAINING_PERF_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--backend", choices=("reference", "cute", "both"), default="both"
+        "--backend",
+        choices=("cute",),
+        default="cute",
     )
     parser.add_argument("--batch-size", type=int, default=default_cfg.batch_size)
-    parser.add_argument("--block-size", type=int, default=default_cfg.block_size)
+    parser.add_argument("--seq-len", type=int, default=default_cfg.seq_len)
     parser.add_argument("--vocab-size", type=int, default=default_cfg.vocab_size)
     parser.add_argument("--d-model", type=int, default=default_cfg.d_model)
     parser.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
-    parser.add_argument("--d-state", type=int, default=default_cfg.d_state)
-    parser.add_argument("--expand", type=float, default=default_cfg.expand)
-    parser.add_argument("--d-head", type=int, default=default_cfg.d_head)
-    parser.add_argument("--d-conv", type=int, default=default_cfg.d_conv)
-    parser.add_argument("--chunk-size", type=int, default=default_cfg.chunk_size)
-    parser.add_argument("--bc-groups", type=int, default=default_cfg.bc_groups)
+    parser.add_argument("--d-state", type=int, default=default_cfg.mixer.d_state)
+    parser.add_argument("--expand", type=float, default=default_cfg.mixer.expand)
+    parser.add_argument("--d-head", type=int, default=default_cfg.mixer.d_head)
+    parser.add_argument("--d-conv", type=int, default=default_cfg.mixer.d_conv)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=default_cfg.mixer.chunk_size,
+    )
+    parser.add_argument(
+        "--bc-groups",
+        type=int,
+        default=default_cfg.mixer.bc_groups,
+    )
+    parser.add_argument(
+        "--ffn-expand",
+        type=float,
+        default=(0.0 if default_cfg.ffn is None else default_cfg.ffn.expand),
+    )
     parser.add_argument("--lr", type=float, default=default_cfg.lr)
     parser.add_argument("--weight-decay", type=float, default=default_cfg.weight_decay)
     parser.add_argument("--grad-clip", type=float, default=default_cfg.grad_clip)
-    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
     parser.add_argument("--device", default=default_cfg.device)
     parser.add_argument("--seed", type=int, default=default_cfg.seed)
     parser.add_argument("--warmup-steps", type=int, default=4)
@@ -111,19 +126,30 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _make_nextchar_cfg(args: argparse.Namespace) -> NextCharPerfConfig:
-    return NextCharPerfConfig(
+def _make_training_cfg(args: argparse.Namespace) -> TrainingPerfConfig:
+    ffn = None
+    default_ffn = DEFAULT_TRAINING_PERF_CONFIG.ffn
+    if float(args.ffn_expand) > 0.0 and default_ffn is not None:
+        ffn = replace(
+            default_ffn,
+            expand=float(args.ffn_expand),
+        )
+    return TrainingPerfConfig(
         batch_size=args.batch_size,
-        block_size=args.block_size,
+        seq_len=args.seq_len,
         vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
-        d_state=args.d_state,
-        expand=args.expand,
-        d_head=args.d_head,
-        d_conv=args.d_conv,
-        chunk_size=args.chunk_size,
-        bc_groups=args.bc_groups,
+        mixer=replace(
+            DEFAULT_TRAINING_PERF_CONFIG.mixer,
+            d_state=args.d_state,
+            expand=args.expand,
+            d_head=args.d_head,
+            d_conv=args.d_conv,
+            chunk_size=args.chunk_size,
+            bc_groups=args.bc_groups,
+        ),
+        ffn=ffn,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
@@ -133,14 +159,14 @@ def _make_nextchar_cfg(args: argparse.Namespace) -> NextCharPerfConfig:
     )
 
 
-def _make_stage_cfg(cfg: NextCharPerfConfig) -> PerfConfig:
+def _make_stage_cfg(cfg: TrainingPerfConfig) -> PerfConfig:
     return PerfConfig(
         batch=cfg.batch_size,
         heads=cfg.n_heads,
-        T=cfg.block_size,
-        N=cfg.d_state,
-        P=cfg.d_head,
-        chunk_size=cfg.chunk_size,
+        T=cfg.seq_len,
+        N=cfg.mixer.d_state,
+        P=cfg.mixer.d_head,
+        chunk_size=cfg.mixer.chunk_size,
         dtype=cfg.dtype,
         device=cfg.device,
         seed=cfg.seed,
@@ -148,10 +174,10 @@ def _make_stage_cfg(cfg: NextCharPerfConfig) -> PerfConfig:
 
 
 def _make_case_cfgs(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     suite: str,
-) -> dict[str, NextCharPerfConfig]:
+) -> dict[str, TrainingPerfConfig]:
     if suite == "single":
         return {"default": cfg}
     if suite == "training":
@@ -165,13 +191,13 @@ def _make_case_cfgs(
 
 
 def _summarize_workload(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     warmup_steps: int,
     steps: int,
     repeat: int,
-    fixture: NextCharBenchFixture,
+    fixture: TrainingBenchFixture,
 ) -> dict[str, object]:
     result = run_bench_step(
         cfg,
@@ -231,7 +257,7 @@ def _summarize_workload(
             "warm_execution": str(result["warm_execution_mode"]),
             "profile_execution": "eager_single_post_bench_replay",
             "memory_measurement": "bench_path_step_peaks",
-            "memory_forensics": "use profile_nextchar_memory.py for eager attribution",
+            "memory_forensics": "use profile_training_memory.py for eager attribution",
         },
         "cold": {
             "regions": summarize_named_samples([cold["regions_ms"]]),
@@ -263,7 +289,7 @@ def _summarize_stage_suite(
     repeat: int,
 ) -> dict[str, object]:
     rows: list[dict[str, object]] = []
-    backends = ("reference", "cute") if backend_choice == "both" else (backend_choice,)
+    backends = (backend_choice,)
     for direction in ("forward", "backward"):
         for stage in ("chunk_increment", "state_passing", "chunk_scan"):
             for backend in backends:
@@ -320,11 +346,11 @@ def main() -> int:
     ensure_cuda(args.device)
     seed_all(args.seed)
 
-    nextchar_cfg = _make_nextchar_cfg(args)
-    backends = ("reference", "cute") if args.backend == "both" else (args.backend,)
+    training_cfg = _make_training_cfg(args)
+    backends = (args.backend,)
 
     cases: dict[str, dict[str, Any]] = {}
-    for case_name, case_cfg in _make_case_cfgs(nextchar_cfg, suite=args.suite).items():
+    for case_name, case_cfg in _make_case_cfgs(training_cfg, suite=args.suite).items():
         stage_cfg = _make_stage_cfg(case_cfg)
         fixture = build_bench_fixture(
             case_cfg,
@@ -355,7 +381,7 @@ def main() -> int:
         }
 
     payload = {
-        "kind": "bench_nextchar",
+        "kind": "bench_training",
         "schema_version": 1,
         "device_name": torch.cuda.get_device_name(0)
         if torch.cuda.is_available()
@@ -363,7 +389,7 @@ def main() -> int:
         "suite": args.suite,
         "cases": cases,
     }
-    validate_nextchar_bench_payload(payload)
+    validate_training_bench_payload(payload)
 
     for case_name, case_payload in cases.items():
         for backend in backends:
@@ -373,14 +399,14 @@ def main() -> int:
             peak_alloc_mib = _bytes_to_mib(
                 float(warm["memory"]["peak_allocated_bytes"]["mean_bytes"])
             )
-            peak_res_mib = _bytes_to_mib(
+            peak_reserved_mib = _bytes_to_mib(
                 float(warm["memory"]["peak_reserved_bytes"]["mean_bytes"])
             )
             print(
                 f"{case_name}/{backend}: step_mean_ms={step_mean:.6f} "
                 f"tokens_per_s={tps_mean:.2f} "
                 f"peak_allocated_mib_primary={peak_alloc_mib:.2f} "
-                f"peak_reserved_mib_context={peak_res_mib:.2f}"
+                f"peak_reserved_mib_context={peak_reserved_mib:.2f}"
             )
 
     if args.json_out is not None:

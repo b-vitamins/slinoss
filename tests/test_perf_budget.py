@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from slinoss.perf.budget import build_tree, derive_nextchar_budget
+from slinoss.perf.budget import build_tree, derive_training_budget
 
 
-def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
+def test_derive_training_budget_builds_expected_aggregates() -> None:
     sample = {
         "step.forward_loss": 10.0,
         "step.backward": 20.0,
@@ -70,7 +70,7 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
         "backward.v2x2ssd.chunk_scan.dlp": 0.2,
         "backward.v2x2ssd.chunk_scan.param_scan": 0.7,
     }
-    derived = derive_nextchar_budget(sample)
+    derived = derive_training_budget(sample)
 
     assert derived["step.total"] == 33.5
     assert derived["forward.other.total"] == 7.0
@@ -115,3 +115,21 @@ def test_derive_nextchar_budget_builds_expected_aggregates() -> None:
     assert tree["forward"]["v2x2ssd"]["chunk_scan"]["__stats__"][
         "percent_of_parent_mean"
     ] == pytest.approx(37.5)
+
+
+def test_derive_training_budget_does_not_fabricate_v2_overhead_without_stage_labels() -> (
+    None
+):
+    sample = {
+        "step.forward_loss": 10.0,
+        "step.backward": 20.0,
+        "forward.v2x2ssd.total": 3.0,
+        "backward.v2x2ssd.total": 8.0,
+    }
+    derived = derive_training_budget(sample)
+    assert derived["forward.v2x2ssd.stage_breakdown_available"] == 0.0
+    assert derived["backward.v2x2ssd.stage_breakdown_available"] == 0.0
+    assert derived["forward.v2x2ssd.stage_sum"] == 0.0
+    assert derived["backward.v2x2ssd.stage_sum"] == 0.0
+    assert derived["forward.v2x2ssd.overhead"] == 0.0
+    assert derived["backward.v2x2ssd.overhead"] == 0.0

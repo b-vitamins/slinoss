@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run eager memory forensics for one nextchar training step."""
+"""Run eager memory forensics for one block-based training step."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 import argparse
 import json
 from pathlib import Path
@@ -16,9 +17,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
-from _nextchar import (  # noqa: E402
-    DEFAULT_NEXTCHAR_PERF_CONFIG,
-    NextCharPerfConfig,
+from _training import (  # noqa: E402
+    DEFAULT_TRAINING_PERF_CONFIG,
+    TrainingPerfConfig,
     build_model,
     random_batch,
     run_train_step_profiled,
@@ -36,28 +37,41 @@ from slinoss.perf.budget import (  # noqa: E402
     summarize_budget_samples,
     summarize_named_samples,
 )
-from slinoss.perf.schema import validate_nextchar_memory_payload  # noqa: E402
+from slinoss.perf.schema import validate_training_memory_payload  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
-    default_cfg = DEFAULT_NEXTCHAR_PERF_CONFIG
+    default_cfg = DEFAULT_TRAINING_PERF_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("reference", "cute"), default="cute")
+    parser.add_argument("--backend", choices=("cute",), default="cute")
     parser.add_argument("--batch-size", type=int, default=default_cfg.batch_size)
-    parser.add_argument("--block-size", type=int, default=default_cfg.block_size)
+    parser.add_argument("--seq-len", type=int, default=default_cfg.seq_len)
     parser.add_argument("--vocab-size", type=int, default=default_cfg.vocab_size)
     parser.add_argument("--d-model", type=int, default=default_cfg.d_model)
     parser.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
-    parser.add_argument("--d-state", type=int, default=default_cfg.d_state)
-    parser.add_argument("--expand", type=float, default=default_cfg.expand)
-    parser.add_argument("--d-head", type=int, default=default_cfg.d_head)
-    parser.add_argument("--d-conv", type=int, default=default_cfg.d_conv)
-    parser.add_argument("--chunk-size", type=int, default=default_cfg.chunk_size)
-    parser.add_argument("--bc-groups", type=int, default=default_cfg.bc_groups)
+    parser.add_argument("--d-state", type=int, default=default_cfg.mixer.d_state)
+    parser.add_argument("--expand", type=float, default=default_cfg.mixer.expand)
+    parser.add_argument("--d-head", type=int, default=default_cfg.mixer.d_head)
+    parser.add_argument("--d-conv", type=int, default=default_cfg.mixer.d_conv)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=default_cfg.mixer.chunk_size,
+    )
+    parser.add_argument(
+        "--bc-groups",
+        type=int,
+        default=default_cfg.mixer.bc_groups,
+    )
+    parser.add_argument(
+        "--ffn-expand",
+        type=float,
+        default=(0.0 if default_cfg.ffn is None else default_cfg.ffn.expand),
+    )
     parser.add_argument("--lr", type=float, default=default_cfg.lr)
     parser.add_argument("--weight-decay", type=float, default=default_cfg.weight_decay)
     parser.add_argument("--grad-clip", type=float, default=default_cfg.grad_clip)
-    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
     parser.add_argument("--device", default=default_cfg.device)
     parser.add_argument("--seed", type=int, default=default_cfg.seed)
     parser.add_argument(
@@ -72,19 +86,26 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _make_cfg(args: argparse.Namespace) -> NextCharPerfConfig:
-    return NextCharPerfConfig(
+def _make_cfg(args: argparse.Namespace) -> TrainingPerfConfig:
+    ffn = None
+    if float(args.ffn_expand) > 0.0 and DEFAULT_TRAINING_PERF_CONFIG.ffn is not None:
+        ffn = replace(DEFAULT_TRAINING_PERF_CONFIG.ffn, expand=float(args.ffn_expand))
+    return TrainingPerfConfig(
         batch_size=args.batch_size,
-        block_size=args.block_size,
+        seq_len=args.seq_len,
         vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
-        d_state=args.d_state,
-        expand=args.expand,
-        d_head=args.d_head,
-        d_conv=args.d_conv,
-        chunk_size=args.chunk_size,
-        bc_groups=args.bc_groups,
+        mixer=replace(
+            DEFAULT_TRAINING_PERF_CONFIG.mixer,
+            d_state=args.d_state,
+            expand=args.expand,
+            d_head=args.d_head,
+            d_conv=args.d_conv,
+            chunk_size=args.chunk_size,
+            bc_groups=args.bc_groups,
+        ),
+        ffn=ffn,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
@@ -129,15 +150,9 @@ def main() -> int:
 
     capture = recorder.steps[-1]
     region_samples = [capture["regions_ms"]]
-    step_memory = {
-        **peak_memory_stats(cfg.torch_device),
-        **{
-            f"end_{key}": value
-            for key, value in current_memory_stats(cfg.torch_device).items()
-        },
-    }
+    budget = summarize_budget_samples(region_samples)
     payload = {
-        "kind": "profile_nextchar_memory",
+        "kind": "profile_training_memory",
         "schema_version": 1,
         "backend": args.backend,
         "config": cfg.perf_config_dict,
@@ -150,10 +165,16 @@ def main() -> int:
             "allocator_snapshot_requested": bool(args.allocator_snapshot_out),
         },
         "baseline_memory": baseline_memory,
-        "step_memory": step_memory,
+        "step_memory": {
+            **peak_memory_stats(cfg.torch_device),
+            **{
+                f"end_{key}": value
+                for key, value in current_memory_stats(cfg.torch_device).items()
+            },
+        },
         "regions": summarize_named_samples(region_samples),
-        "budget": summarize_budget_samples(region_samples),
-        "tree": build_tree(summarize_budget_samples(region_samples)),
+        "budget": budget,
+        "tree": build_tree(budget),
         "cache_events": capture["cache_events"],
         "top_region_exit_allocated": forensics.top_region_exit_allocated(
             top_k=args.top_k
@@ -162,7 +183,7 @@ def main() -> int:
         "saved_tensors_summary": forensics.saved_tensors_summary(),
         "allocator_snapshot": allocator_snapshot,
     }
-    validate_nextchar_memory_payload(payload)
+    validate_training_memory_payload(payload)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")

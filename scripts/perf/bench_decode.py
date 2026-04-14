@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark steady-state nextchar decode on the persistent AR path."""
+"""Benchmark steady-state block-based decode on the persistent AR path."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 import argparse
 import gc
 import json
@@ -20,34 +21,48 @@ if str(PROJECT_ROOT) not in sys.path:
 import torch  # noqa: E402
 
 from _common import dtype_from_str, ensure_cuda  # noqa: E402
-from _nextchar import NextCharPerfConfig  # noqa: E402
-from _nextchar_decode import (  # noqa: E402
+from _training import DEFAULT_TRAINING_PERF_CONFIG, TrainingPerfConfig  # noqa: E402
+from _training_decode import (  # noqa: E402
     benchmark_decode_mode,
     build_decode_model,
     estimate_lower_bound,
     resolve_peak_spec,
     summary_speedup,
 )
-from slinoss.perf.schema import validate_nextchar_decode_bench_payload  # noqa: E402
+from slinoss.perf.schema import validate_decode_bench_payload  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
+    default_cfg = DEFAULT_TRAINING_PERF_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("cute", "reference"), default="cute")
+    parser.add_argument("--backend", choices=("cute",), default="cute")
     parser.add_argument("--batch-sizes", default="1,2,4,8,16")
-    parser.add_argument("--block-size", type=int, default=512)
-    parser.add_argument("--vocab-size", type=int, default=4096)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--d-state", type=int, default=64)
-    parser.add_argument("--expand", type=float, default=2.0)
-    parser.add_argument("--d-head", type=int, default=64)
-    parser.add_argument("--d-conv", type=int, default=4)
-    parser.add_argument("--chunk-size", type=int, default=32)
-    parser.add_argument("--bc-groups", type=int, default=None)
-    parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seq-len", type=int, default=default_cfg.seq_len)
+    parser.add_argument("--vocab-size", type=int, default=default_cfg.vocab_size)
+    parser.add_argument("--d-model", type=int, default=default_cfg.d_model)
+    parser.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
+    parser.add_argument("--d-state", type=int, default=default_cfg.mixer.d_state)
+    parser.add_argument("--expand", type=float, default=default_cfg.mixer.expand)
+    parser.add_argument("--d-head", type=int, default=default_cfg.mixer.d_head)
+    parser.add_argument("--d-conv", type=int, default=default_cfg.mixer.d_conv)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=default_cfg.mixer.chunk_size,
+    )
+    parser.add_argument(
+        "--bc-groups",
+        type=int,
+        default=default_cfg.mixer.bc_groups,
+    )
+    parser.add_argument(
+        "--ffn-expand",
+        type=float,
+        default=(0.0 if default_cfg.ffn is None else default_cfg.ffn.expand),
+    )
+    parser.add_argument("--dtype", choices=("fp16", "bf16"), default="bf16")
+    parser.add_argument("--device", default=default_cfg.device)
+    parser.add_argument("--seed", type=int, default=default_cfg.seed)
     parser.add_argument("--warmup-tokens", type=int, default=16)
     parser.add_argument("--active-tokens", type=int, default=256)
     parser.add_argument("--repeat", type=int, default=5)
@@ -64,19 +79,29 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _make_cfg(args: argparse.Namespace, *, batch_size: int) -> NextCharPerfConfig:
-    return NextCharPerfConfig(
+def _make_cfg(args: argparse.Namespace, *, batch_size: int) -> TrainingPerfConfig:
+    ffn = None
+    if float(args.ffn_expand) > 0.0 and DEFAULT_TRAINING_PERF_CONFIG.ffn is not None:
+        ffn = replace(
+            DEFAULT_TRAINING_PERF_CONFIG.ffn,
+            expand=float(args.ffn_expand),
+        )
+    return TrainingPerfConfig(
         batch_size=batch_size,
-        block_size=args.block_size,
+        seq_len=args.seq_len,
         vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
-        d_state=args.d_state,
-        expand=args.expand,
-        d_head=args.d_head,
-        d_conv=args.d_conv,
-        chunk_size=args.chunk_size,
-        bc_groups=args.bc_groups,
+        mixer=replace(
+            DEFAULT_TRAINING_PERF_CONFIG.mixer,
+            d_state=args.d_state,
+            expand=args.expand,
+            d_head=args.d_head,
+            d_conv=args.d_conv,
+            chunk_size=args.chunk_size,
+            bc_groups=args.bc_groups,
+        ),
+        ffn=ffn,
         dtype=dtype_from_str(args.dtype),
         device=args.device,
         seed=args.seed,
@@ -98,7 +123,6 @@ def _row(
     lower_bound: dict[str, object] | None,
 ) -> dict[str, object]:
     persistent_summary = cast(dict[str, float], persistent["summary"])
-    lower_us = None
     efficiency = None
     if lower_bound is not None:
         lower_us = float(cast(float, lower_bound["t_lower_us"]))
@@ -197,7 +221,7 @@ def main() -> int:
         )
 
     payload: dict[str, Any] = {
-        "kind": "bench_nextchar_decode",
+        "kind": "bench_decode",
         "schema_version": 1,
         "backend": args.backend,
         "device_name": (
@@ -208,7 +232,7 @@ def main() -> int:
         "peak": None if peak is None else peak.to_dict(),
         "rows": rows,
     }
-    validate_nextchar_decode_bench_payload(payload)
+    validate_decode_bench_payload(payload)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")

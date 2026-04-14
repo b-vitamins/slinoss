@@ -85,8 +85,8 @@ Model-level throughput is the primary metric. Kernel-level wins matter only
 insofar as they improve the real training/inference path through `layers/` and
 `ops/`, especially the mixer.
 
-- Treat `scripts/perf/bench_nextchar.py` as the primary workload bench.
-- Treat `scripts/perf/profile_nextchar.py` as the primary workload profiler.
+- Treat `scripts/perf/bench_training.py` as the primary workload bench.
+- Treat `scripts/perf/profile_training.py` as the primary workload profiler.
 - Treat `scripts/perf/bench_v2x2ssd.py` and `scripts/perf/profile_v2x2ssd.py`
   as stage/kernel drills to use only after the workload harness identifies the
   current hot bucket.
@@ -98,7 +98,7 @@ insofar as they improve the real training/inference path through `layers/` and
 When doing performance work, use this loop:
 
 1. Run a workload bench and save JSON:
-   `./scripts/guix-run python3 scripts/perf/bench_nextchar.py --backend both --suite training --json-out /tmp/run.json`
+   `./scripts/guix-run python3 scripts/perf/bench_training.py --backend cute --suite training --json-out /tmp/run.json`
 2. Compare against the previous run:
    `./scripts/guix-run python3 scripts/perf/compare_perf.py before.json after.json --backend cute --case default`
 3. Identify the largest actionable bucket from the workload tree.

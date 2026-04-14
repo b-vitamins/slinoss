@@ -1,6 +1,6 @@
 """Runtime performance instrumentation for SLinOSS."""
 
-from .budget import build_tree, derive_nextchar_budget
+from .budget import build_tree, derive_training_budget
 from .compare import compare_budget_trees, flatten_tree_stats, rank_budget_deltas
 from .memory import (
     EagerMemoryForensics,
@@ -18,14 +18,16 @@ from .runtime import (
     record_region,
 )
 from .schema import (
-    validate_nextchar_bench_payload,
-    validate_nextchar_memory_payload,
-    validate_nextchar_profile_payload,
+    validate_decode_bench_payload,
+    validate_decode_profile_payload,
+    validate_training_bench_payload,
+    validate_training_memory_payload,
+    validate_training_profile_payload,
 )
 
 __all__ = [
     "build_tree",
-    "derive_nextchar_budget",
+    "derive_training_budget",
     "compare_budget_trees",
     "flatten_tree_stats",
     "rank_budget_deltas",
@@ -34,9 +36,11 @@ __all__ = [
     "current_memory_stats",
     "peak_memory_stats",
     "reset_peak_memory_stats",
-    "validate_nextchar_bench_payload",
-    "validate_nextchar_memory_payload",
-    "validate_nextchar_profile_payload",
+    "validate_decode_bench_payload",
+    "validate_decode_profile_payload",
+    "validate_training_bench_payload",
+    "validate_training_memory_payload",
+    "validate_training_profile_payload",
     "PerfRecorder",
     "attach_module_timer",
     "call_region",

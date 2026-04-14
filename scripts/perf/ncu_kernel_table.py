@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from _common import dtype_from_str, ensure_cuda  # noqa: E402
-from _nextchar import DEFAULT_NEXTCHAR_PERF_CONFIG  # noqa: E402
+from _training import DEFAULT_TRAINING_PERF_CONFIG  # noqa: E402
 from _ncu_kernels import (  # noqa: E402
     DEFAULT_V2_BATCH,
     DEFAULT_V2_BC_GROUPS,
@@ -50,9 +50,9 @@ NCU_SECTIONS = (
 
 DEFAULT_DTYPE = (
     "fp16"
-    if DEFAULT_NEXTCHAR_PERF_CONFIG.dtype == torch.float16
+    if DEFAULT_TRAINING_PERF_CONFIG.dtype == torch.float16
     else "bf16"
-    if DEFAULT_NEXTCHAR_PERF_CONFIG.dtype == torch.bfloat16
+    if DEFAULT_TRAINING_PERF_CONFIG.dtype == torch.bfloat16
     else "fp32"
 )
 

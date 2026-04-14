@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Profile nextchar-style training with aligned budget labels.
+"""Profile block-based training with aligned budget labels.
 
-For eager allocator forensics, use ``profile_nextchar_memory.py``.
+For eager allocator forensics, use ``profile_training_memory.py``.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Any
+from typing import cast
 
 import torch
 
@@ -22,9 +23,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
-from _nextchar import (  # noqa: E402
-    DEFAULT_NEXTCHAR_PERF_CONFIG,
-    NextCharPerfConfig,
+from _training import (  # noqa: E402
+    DEFAULT_TRAINING_PERF_CONFIG,
+    TrainingPerfConfig,
     build_model,
     random_batch,
     run_train_step_profiled,
@@ -35,28 +36,41 @@ from slinoss.perf.budget import (  # noqa: E402
     summarize_budget_samples,
     summarize_named_samples,
 )
-from slinoss.perf.schema import validate_nextchar_profile_payload  # noqa: E402
+from slinoss.perf.schema import validate_training_profile_payload  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
-    default_cfg = DEFAULT_NEXTCHAR_PERF_CONFIG
+    default_cfg = DEFAULT_TRAINING_PERF_CONFIG
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("reference", "cute"), default="cute")
+    parser.add_argument("--backend", choices=("cute",), default="cute")
     parser.add_argument("--batch-size", type=int, default=default_cfg.batch_size)
-    parser.add_argument("--block-size", type=int, default=default_cfg.block_size)
+    parser.add_argument("--seq-len", type=int, default=default_cfg.seq_len)
     parser.add_argument("--vocab-size", type=int, default=default_cfg.vocab_size)
     parser.add_argument("--d-model", type=int, default=default_cfg.d_model)
     parser.add_argument("--n-layers", type=int, default=default_cfg.n_layers)
-    parser.add_argument("--d-state", type=int, default=default_cfg.d_state)
-    parser.add_argument("--expand", type=float, default=default_cfg.expand)
-    parser.add_argument("--d-head", type=int, default=default_cfg.d_head)
-    parser.add_argument("--d-conv", type=int, default=default_cfg.d_conv)
-    parser.add_argument("--chunk-size", type=int, default=default_cfg.chunk_size)
-    parser.add_argument("--bc-groups", type=int, default=default_cfg.bc_groups)
+    parser.add_argument("--d-state", type=int, default=default_cfg.mixer.d_state)
+    parser.add_argument("--expand", type=float, default=default_cfg.mixer.expand)
+    parser.add_argument("--d-head", type=int, default=default_cfg.mixer.d_head)
+    parser.add_argument("--d-conv", type=int, default=default_cfg.mixer.d_conv)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=default_cfg.mixer.chunk_size,
+    )
+    parser.add_argument(
+        "--bc-groups",
+        type=int,
+        default=default_cfg.mixer.bc_groups,
+    )
+    parser.add_argument(
+        "--ffn-expand",
+        type=float,
+        default=(0.0 if default_cfg.ffn is None else default_cfg.ffn.expand),
+    )
     parser.add_argument("--lr", type=float, default=default_cfg.lr)
     parser.add_argument("--weight-decay", type=float, default=default_cfg.weight_decay)
     parser.add_argument("--grad-clip", type=float, default=default_cfg.grad_clip)
-    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
     parser.add_argument("--device", default=default_cfg.device)
     parser.add_argument("--seed", type=int, default=default_cfg.seed)
     parser.add_argument("--warmup", type=int, default=2)
@@ -68,19 +82,28 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _make_cfg(args: argparse.Namespace) -> NextCharPerfConfig:
-    return NextCharPerfConfig(
+def _make_cfg(args: argparse.Namespace) -> TrainingPerfConfig:
+    ffn = None
+    if float(args.ffn_expand) > 0.0:
+        ffn = DEFAULT_TRAINING_PERF_CONFIG.ffn
+        if ffn is not None:
+            ffn = replace(ffn, expand=float(args.ffn_expand))
+    return TrainingPerfConfig(
         batch_size=args.batch_size,
-        block_size=args.block_size,
+        seq_len=args.seq_len,
         vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
-        d_state=args.d_state,
-        expand=args.expand,
-        d_head=args.d_head,
-        d_conv=args.d_conv,
-        chunk_size=args.chunk_size,
-        bc_groups=args.bc_groups,
+        mixer=replace(
+            DEFAULT_TRAINING_PERF_CONFIG.mixer,
+            d_state=args.d_state,
+            expand=args.expand,
+            d_head=args.d_head,
+            d_conv=args.d_conv,
+            chunk_size=args.chunk_size,
+            bc_groups=args.bc_groups,
+        ),
+        ffn=ffn,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
@@ -97,12 +120,15 @@ def main() -> int:
 
     cfg = _make_cfg(args)
     model, optimizer = build_model(cfg, backend=args.backend, instrumented=True)
-    captures: list[dict[str, Any]] = []
+    captures: list[dict[str, object]] = []
     activities = [torch.profiler.ProfilerActivity.CPU]
     if torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     schedule = torch.profiler.schedule(
-        wait=0, warmup=args.warmup, active=args.active, repeat=1
+        wait=0,
+        warmup=args.warmup,
+        active=args.active,
+        repeat=1,
     )
     total_steps = int(args.warmup) + int(args.active)
     with torch.profiler.profile(
@@ -118,7 +144,11 @@ def main() -> int:
             recorder = PerfRecorder(device=cfg.torch_device)
             with recorder.capture_step():
                 run_train_step_profiled(
-                    model, optimizer, xb, yb, grad_clip=cfg.grad_clip
+                    model,
+                    optimizer,
+                    xb,
+                    yb,
+                    grad_clip=cfg.grad_clip,
                 )
             captures.append(recorder.steps[-1])
             prof.step()
@@ -126,14 +156,17 @@ def main() -> int:
         args.trace_out.parent.mkdir(parents=True, exist_ok=True)
         prof.export_chrome_trace(str(args.trace_out))
     active_captures = captures[-int(args.active) :]
-    region_samples = [capture["regions_ms"] for capture in active_captures]
+    region_samples = cast(
+        list[dict[str, float]],
+        [capture["regions_ms"] for capture in active_captures],
+    )
     summaries = summarize_named_samples(region_samples)
     budget = summarize_budget_samples(region_samples)
     tree = build_tree(budget)
 
     print(
         "note: torch-profiler CUDA Mem columns are profiler-internal; "
-        "use profile_nextchar_memory.py and step_memory.peak_allocated_bytes "
+        "use profile_training_memory.py and step_memory.peak_allocated_bytes "
         "for eager memory acceptance."
     )
     print(
@@ -143,7 +176,7 @@ def main() -> int:
         )
     )
     payload = {
-        "kind": "profile_nextchar",
+        "kind": "profile_training",
         "schema_version": 1,
         "backend": args.backend,
         "config": cfg.perf_config_dict,
@@ -156,7 +189,7 @@ def main() -> int:
         "tree": tree,
         "trace_out": None if args.trace_out is None else str(args.trace_out),
     }
-    validate_nextchar_profile_payload(payload)
+    validate_training_profile_payload(payload)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")

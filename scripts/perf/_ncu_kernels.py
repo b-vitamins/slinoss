@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from _common import dtype_from_str  # noqa: E402
-from _nextchar import DEFAULT_NEXTCHAR_PERF_CONFIG  # noqa: E402
+from _training import DEFAULT_TRAINING_PERF_CONFIG  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
     COEFF_AUX_FIELDS,
@@ -45,15 +45,15 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (  # noqa: E402
 )
 
 
-DEFAULT_V2_BATCH = int(DEFAULT_NEXTCHAR_PERF_CONFIG.batch_size)
-DEFAULT_V2_HEADS = int(DEFAULT_NEXTCHAR_PERF_CONFIG.n_heads)
-DEFAULT_V2_T = int(DEFAULT_NEXTCHAR_PERF_CONFIG.block_size)
-DEFAULT_V2_N = int(DEFAULT_NEXTCHAR_PERF_CONFIG.d_state)
-DEFAULT_V2_P = int(DEFAULT_NEXTCHAR_PERF_CONFIG.d_head)
-DEFAULT_V2_CHUNK = int(DEFAULT_NEXTCHAR_PERF_CONFIG.chunk_size)
-DEFAULT_V2_DTYPE = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
+DEFAULT_V2_BATCH = int(DEFAULT_TRAINING_PERF_CONFIG.batch_size)
+DEFAULT_V2_HEADS = int(DEFAULT_TRAINING_PERF_CONFIG.n_heads)
+DEFAULT_V2_T = int(DEFAULT_TRAINING_PERF_CONFIG.seq_len)
+DEFAULT_V2_N = int(DEFAULT_TRAINING_PERF_CONFIG.mixer.d_state)
+DEFAULT_V2_P = int(DEFAULT_TRAINING_PERF_CONFIG.mixer.d_head)
+DEFAULT_V2_CHUNK = int(DEFAULT_TRAINING_PERF_CONFIG.mixer.chunk_size)
+DEFAULT_V2_DTYPE = DEFAULT_TRAINING_PERF_CONFIG.dtype
 DEFAULT_V2_BC_GROUPS = int(
-    getattr(DEFAULT_NEXTCHAR_PERF_CONFIG, "resolved_bc_groups", DEFAULT_V2_HEADS)
+    getattr(DEFAULT_TRAINING_PERF_CONFIG, "resolved_bc_groups", DEFAULT_V2_HEADS)
 )
 
 
@@ -66,7 +66,7 @@ class V2KernelPerfConfig:
     P: int = DEFAULT_V2_P
     chunk_size: int = DEFAULT_V2_CHUNK
     bc_groups: int | None = None
-    dtype: torch.dtype = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
+    dtype: torch.dtype = DEFAULT_TRAINING_PERF_CONFIG.dtype
     device: str = "cuda"
     seed: int = 0
 
@@ -91,7 +91,7 @@ class ScanPrepPerfConfig:
     P: int = DEFAULT_V2_P
     N: int = DEFAULT_V2_N
     bc_groups: int | None = None
-    dtype: torch.dtype = DEFAULT_NEXTCHAR_PERF_CONFIG.dtype
+    dtype: torch.dtype = DEFAULT_TRAINING_PERF_CONFIG.dtype
     device: str = "cuda"
     seed: int = 0
     pack_warps_per_block: int = 8

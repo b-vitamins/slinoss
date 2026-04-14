@@ -53,7 +53,7 @@ _DEFAULT_AOT_D_STATE = 128
 _DEFAULT_AOT_DTYPE_NAMES = ("float16", "bfloat16")
 # These defaults intentionally mirror the hot ``SLinOSSMixer`` constructor
 # rather than the standalone ``SLinOSSScanPrep`` defaults, so the curated AOT
-# payload covers the default nextchar training path without extra JIT churn.
+# payload covers the default block-backed training path without extra JIT churn.
 _DEFAULT_SCANPREP_CONFIG_KWARGS = {
     "dt_min": 3.0e-2,
     "dt_max": 1.0e-1,

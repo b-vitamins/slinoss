@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 import os
 import statistics
 from time import perf_counter
@@ -10,23 +10,21 @@ from typing import Any, Callable, TypeAlias, TypeVar
 import torch
 from torch.nn import functional as F
 
-from _nextchar_model import NextCharLM, configure_optim
-from _profiled_nextchar_model import ProfiledNextCharLM
-from slinoss.layers import SLinOSSMixer
-from slinoss.layers.backend import (
+from _profiled_training_model import ProfiledTrainingLM
+from _training_model import TrainingLM, configure_optim
+from slinoss.blocks import SLinOSSBlockConfig, SLinOSSMixerConfig, SLinOSSStackConfig
+from slinoss.layers import (
     AutoCConv1dBackend,
     AutoMixerDecodeBackend,
     AutoScanPrepBackend,
     CuteScanBackend,
-    ReferenceCConv1dBackend,
-    ReferenceMixerDecodeBackend,
-    ReferenceScanBackend,
-    ReferenceScanPrepBackend,
+    SLinOSSMLPConfig,
+    SLinOSSMixer,
 )
 from slinoss.perf import PerfRecorder, call_region, record_region
 
 T = TypeVar("T")
-NextCharModel: TypeAlias = NextCharLM | ProfiledNextCharLM
+TrainingModel: TypeAlias = TrainingLM | ProfiledTrainingLM
 
 
 def _cross_entropy_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -45,23 +43,78 @@ def _step_memory_stats(device: torch.device) -> dict[str, int]:
     }
 
 
+def _block_dict(block: SLinOSSBlockConfig, *, n_heads: int) -> dict[str, Any]:
+    ffn = None
+    if block.ffn is not None:
+        ffn = {
+            "kind": block.ffn.kind,
+            "hidden_dim": block.ffn.hidden_dim,
+            "expand": block.ffn.expand,
+            "multiple_of": block.ffn.multiple_of,
+            "bias": block.ffn.bias,
+        }
+    mixer = {
+        "d_state": block.mixer.d_state,
+        "expand": block.mixer.expand,
+        "d_head": block.mixer.d_head,
+        "d_conv": block.mixer.d_conv,
+        "chunk_size": block.mixer.chunk_size,
+        "bc_groups": n_heads
+        if block.mixer.bc_groups is None
+        else int(block.mixer.bc_groups),
+        "dt_min": block.mixer.dt_min,
+        "dt_max": block.mixer.dt_max,
+        "dt_init_floor": block.mixer.dt_init_floor,
+        "gamma_min": block.mixer.gamma_min,
+        "gamma_max": block.mixer.gamma_max,
+        "theta_init_min": block.mixer.theta_init_min,
+        "theta_init_max": block.mixer.theta_init_max,
+        "r_min": block.mixer.r_min,
+        "r_max": block.mixer.r_max,
+        "bc_gain_max": block.mixer.bc_gain_max,
+        "eps": block.mixer.eps,
+        "n_heads": n_heads,
+    }
+    return {
+        "d_model": block.d_model,
+        "norm_kind": block.norm_kind,
+        "norm_eps": block.norm_eps,
+        "residual_in_fp32": block.residual_in_fp32,
+        "residual_dropout": block.residual_dropout,
+        "mixer": mixer,
+        "ffn": ffn,
+    }
+
+
 @dataclass(frozen=True)
-class NextCharPerfConfig:
+class TrainingPerfConfig:
     batch_size: int = 4
-    block_size: int = 2048
+    seq_len: int = 2048
     vocab_size: int = 256
-    d_model: int = 736
-    n_layers: int = 3
-    d_state: int = 128
-    expand: float = 2.0
-    d_head: int = 64
-    d_conv: int = 4
-    chunk_size: int = 32
-    bc_groups: int | None = None
+    d_model: int = 576
+    n_layers: int = 13
+    mixer: SLinOSSMixerConfig = field(
+        default_factory=lambda: SLinOSSMixerConfig(chunk_size=64, bc_groups=1)
+    )
+    ffn: SLinOSSMLPConfig | None = field(
+        default_factory=lambda: SLinOSSMLPConfig(
+            kind="gelu",
+            expand=4.0,
+            multiple_of=1,
+            bias=True,
+        )
+    )
+    norm_kind: str = "rmsnorm"
+    norm_eps: float = 1.0e-5
+    residual_in_fp32: bool = True
+    residual_dropout: float = 0.0
+    final_norm_kind: str = "rmsnorm"
+    final_norm_eps: float = 1.0e-5
+    gradient_checkpointing: bool = False
     lr: float = 3e-4
     weight_decay: float = 0.05
     grad_clip: float = 1.0
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16
     device: str = "cuda"
     seed: int = 0
 
@@ -72,81 +125,101 @@ class NextCharPerfConfig:
     @property
     def n_heads(self) -> int:
         d_inner = SLinOSSMixer._quantize_inner_dim(
-            self.expand * self.d_model,
-            self.d_head,
+            self.mixer.expand * self.d_model,
+            self.mixer.d_head,
         )
-        return d_inner // self.d_head
+        return d_inner // self.mixer.d_head
 
     @property
     def resolved_bc_groups(self) -> int:
-        return self.n_heads if self.bc_groups is None else int(self.bc_groups)
+        return (
+            self.n_heads if self.mixer.bc_groups is None else int(self.mixer.bc_groups)
+        )
+
+    @property
+    def block_config(self) -> SLinOSSBlockConfig:
+        return SLinOSSBlockConfig(
+            d_model=self.d_model,
+            mixer=self.mixer,
+            ffn=self.ffn,
+            norm_kind=self.norm_kind,  # type: ignore[arg-type]
+            norm_eps=self.norm_eps,
+            residual_in_fp32=self.residual_in_fp32,
+            residual_dropout=self.residual_dropout,
+        )
+
+    @property
+    def stack_config(self) -> SLinOSSStackConfig:
+        return SLinOSSStackConfig.uniform(
+            self.block_config,
+            n_layers=self.n_layers,
+            final_norm_kind=self.final_norm_kind,  # type: ignore[arg-type]
+            final_norm_eps=self.final_norm_eps,
+            gradient_checkpointing=self.gradient_checkpointing,
+        )
 
     @property
     def perf_config_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["dtype"] = str(self.dtype)
-        data["bc_groups"] = self.resolved_bc_groups
-        return data
+        return {
+            "batch_size": self.batch_size,
+            "seq_len": self.seq_len,
+            "vocab_size": self.vocab_size,
+            "d_model": self.d_model,
+            "n_layers": self.n_layers,
+            "dtype": str(self.dtype),
+            "device": self.device,
+            "seed": self.seed,
+            "lr": self.lr,
+            "weight_decay": self.weight_decay,
+            "grad_clip": self.grad_clip,
+            "block": _block_dict(self.block_config, n_heads=self.n_heads),
+            "stack": {
+                "n_layers": self.n_layers,
+                "final_norm_kind": self.final_norm_kind,
+                "final_norm_eps": self.final_norm_eps,
+                "gradient_checkpointing": self.gradient_checkpointing,
+            },
+        }
 
 
 @dataclass(frozen=True)
-class NextCharBenchFixture:
+class TrainingBenchFixture:
     initial_state: dict[str, torch.Tensor]
     batches: list[tuple[torch.Tensor, torch.Tensor]]
     model_seed: int
     batch_seed: int
 
 
-# Largest training-suite shape verified to complete on the local RTX 3060 12GB.
-DEFAULT_NEXTCHAR_PERF_CONFIG = NextCharPerfConfig()
+DEFAULT_TRAINING_PERF_CONFIG = TrainingPerfConfig()
 
 
 def build_model(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     instrumented: bool = False,
-) -> tuple[NextCharModel, torch.optim.Optimizer]:
-    model_cls = ProfiledNextCharLM if instrumented else NextCharLM
+) -> tuple[TrainingModel, torch.optim.Optimizer]:
+    model_cls = ProfiledTrainingLM if instrumented else TrainingLM
     model = model_cls(
         vocab_size=cfg.vocab_size,
-        block_size=cfg.block_size,
-        d_model=cfg.d_model,
-        n_layers=cfg.n_layers,
-        d_state=cfg.d_state,
-        expand=cfg.expand,
-        d_head=cfg.d_head,
-        d_conv=cfg.d_conv,
-        chunk_size=cfg.chunk_size,
-        bc_groups=cfg.resolved_bc_groups,
+        seq_len=cfg.seq_len,
+        stack_config=cfg.stack_config,
     ).to(device=cfg.torch_device, dtype=cfg.dtype)
     model.perf_trainable_params = tuple(
-        p for p in model.parameters() if p.requires_grad
+        param for param in model.parameters() if param.requires_grad
     )
     optimizer = configure_optim(model, lr=cfg.lr, weight_decay=cfg.weight_decay)
     _configure_backend(model, backend=backend)
     return model, optimizer
 
 
-def _configure_backend(model: NextCharModel, *, backend: str) -> None:
-    if backend not in ("reference", "cute"):
+def _configure_backend(model: TrainingModel, *, backend: str) -> None:
+    if backend != "cute":
         raise ValueError(f"Unsupported backend: {backend}")
-    scan_backend = (
-        ReferenceScanBackend(compute_dtype=torch.float32)
-        if backend == "reference"
-        else CuteScanBackend(compute_dtype=torch.float32)
-    )
-    scanprep_backend = (
-        ReferenceScanPrepBackend() if backend == "reference" else AutoScanPrepBackend()
-    )
-    cconv_backend = (
-        ReferenceCConv1dBackend() if backend == "reference" else AutoCConv1dBackend()
-    )
-    decode_backend = (
-        ReferenceMixerDecodeBackend()
-        if backend == "reference"
-        else AutoMixerDecodeBackend()
-    )
+    scan_backend = CuteScanBackend(compute_dtype=torch.float32)
+    scanprep_backend = AutoScanPrepBackend()
+    cconv_backend = AutoCConv1dBackend()
+    decode_backend = AutoMixerDecodeBackend()
     for module in model.modules():
         if isinstance(module, SLinOSSMixer):
             module.scan_backend = scan_backend
@@ -155,18 +228,18 @@ def _configure_backend(model: NextCharModel, *, backend: str) -> None:
             module.decode_backend = decode_backend
 
 
-def random_batch(cfg: NextCharPerfConfig) -> tuple[torch.Tensor, torch.Tensor]:
+def random_batch(cfg: TrainingPerfConfig) -> tuple[torch.Tensor, torch.Tensor]:
     x = torch.randint(
         0,
         cfg.vocab_size,
-        (cfg.batch_size, cfg.block_size),
+        (cfg.batch_size, cfg.seq_len),
         device=cfg.torch_device,
         dtype=torch.long,
     )
     y = torch.randint(
         0,
         cfg.vocab_size,
-        (cfg.batch_size, cfg.block_size),
+        (cfg.batch_size, cfg.seq_len),
         device=cfg.torch_device,
         dtype=torch.long,
     )
@@ -188,23 +261,23 @@ def _seed_fixture_rng(seed: int) -> None:
 
 
 def build_bench_fixture(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     total_batches: int,
-) -> NextCharBenchFixture:
+) -> TrainingBenchFixture:
     devices = _rng_devices(cfg.torch_device)
     model_seed = int(cfg.seed)
     batch_seed = int(cfg.seed) + 1
     with torch.random.fork_rng(devices=devices):
         _seed_fixture_rng(model_seed)
-        model, optimizer = build_model(cfg, backend="reference", instrumented=False)
+        model, optimizer = build_model(cfg, backend="cute", instrumented=False)
         initial_state = deepcopy(model.state_dict())
         del model, optimizer
 
         _seed_fixture_rng(batch_seed)
         batches = [random_batch(cfg) for _ in range(total_batches)]
 
-    return NextCharBenchFixture(
+    return TrainingBenchFixture(
         initial_state=initial_state,
         batches=batches,
         model_seed=model_seed,
@@ -212,15 +285,17 @@ def build_bench_fixture(
     )
 
 
-def _clip_params(model: NextCharModel) -> tuple[torch.nn.Parameter, ...]:
+def _clip_params(model: TrainingModel) -> tuple[torch.nn.Parameter, ...]:
     clip_params = model.perf_trainable_params
     if not clip_params:
-        clip_params = tuple(p for p in model.parameters() if p.requires_grad)
+        clip_params = tuple(
+            param for param in model.parameters() if param.requires_grad
+        )
         model.perf_trainable_params = clip_params
     return clip_params
 
 
-def _materialized_param_grads(model: NextCharModel) -> tuple[torch.Tensor, ...]:
+def _materialized_param_grads(model: TrainingModel) -> tuple[torch.Tensor, ...]:
     return tuple(param.grad for param in model.parameters() if param.grad is not None)
 
 
@@ -233,10 +308,10 @@ def _zero_param_grads_in_place(grads: tuple[torch.Tensor, ...]) -> None:
     torch._foreach_zero_(grads)
 
 
-class _NextCharCudaGraphTrainer:
+class _TrainingCudaGraphTrainer:
     def __init__(
         self,
-        model: NextCharModel,
+        model: TrainingModel,
         optimizer: torch.optim.Optimizer,
         *,
         xb: torch.Tensor,
@@ -265,7 +340,6 @@ class _NextCharCudaGraphTrainer:
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(device=self.device))
         with torch.cuda.stream(stream):
-            # Match the captured path's persistent grad-buffer behavior during warmup.
             self.optimizer.zero_grad(set_to_none=False)
             for _ in range(3):
                 self.optimizer.zero_grad(set_to_none=False)
@@ -297,7 +371,7 @@ class _NextCharCudaGraphTrainer:
 
 
 def run_train_step_clean(
-    model: NextCharModel,
+    model: TrainingModel,
     optimizer: torch.optim.Optimizer,
     xb: torch.Tensor,
     yb: torch.Tensor,
@@ -318,7 +392,7 @@ def run_train_step_clean(
 
 
 def run_train_step_profiled(
-    model: NextCharModel,
+    model: TrainingModel,
     optimizer: torch.optim.Optimizer,
     xb: torch.Tensor,
     yb: torch.Tensor,
@@ -330,12 +404,7 @@ def run_train_step_profiled(
             optimizer.zero_grad(set_to_none=True)
         with record_region("step.forward_loss"):
             logits = model(xb)
-            loss = call_region(
-                "head.loss",
-                _cross_entropy_logits,
-                logits,
-                yb,
-            )
+            loss = call_region("head.loss", _cross_entropy_logits, logits, yb)
         with record_region("step.backward"):
             loss.backward()
         with record_region("step.clip"):
@@ -395,7 +464,7 @@ def _time_step_with_memory(
 
 
 def _run_profiled_sequence(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     initial_state: dict[str, torch.Tensor],
@@ -406,14 +475,18 @@ def _run_profiled_sequence(
     model, optimizer = build_model(cfg, backend=backend, instrumented=True)
     model.load_state_dict(initial_state)
     model.perf_trainable_params = tuple(
-        p for p in model.parameters() if p.requires_grad
+        param for param in model.parameters() if param.requires_grad
     )
 
     cold_recorder = PerfRecorder(device=cfg.torch_device)
     cold_xb, cold_yb = batches[0]
     with cold_recorder.capture_step():
         logits, loss = run_train_step_profiled(
-            model, optimizer, cold_xb, cold_yb, grad_clip=cfg.grad_clip
+            model,
+            optimizer,
+            cold_xb,
+            cold_yb,
+            grad_clip=cfg.grad_clip,
         )
     del logits, loss
     cold = cold_recorder.steps[-1]
@@ -434,7 +507,7 @@ def _run_profiled_sequence(
 
 
 def _run_clean_sequence(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     initial_state: dict[str, torch.Tensor],
@@ -450,13 +523,17 @@ def _run_clean_sequence(
     model, optimizer = build_model(cfg, backend=backend, instrumented=False)
     model.load_state_dict(initial_state)
     model.perf_trainable_params = tuple(
-        p for p in model.parameters() if p.requires_grad
+        param for param in model.parameters() if param.requires_grad
     )
 
     cold_xb, cold_yb = batches[0]
     cold_step_ms, (logits, loss), cold_memory = _time_step_with_memory(
         lambda: run_train_step_clean(
-            model, optimizer, cold_xb, cold_yb, grad_clip=cfg.grad_clip
+            model,
+            optimizer,
+            cold_xb,
+            cold_yb,
+            grad_clip=cfg.grad_clip,
         ),
         device=cfg.torch_device,
     )
@@ -471,11 +548,11 @@ def _run_clean_sequence(
         model.load_state_dict(model_state)
         optimizer.load_state_dict(optimizer_state)
         model.perf_trainable_params = tuple(
-            p for p in model.parameters() if p.requires_grad
+            param for param in model.parameters() if param.requires_grad
         )
 
         capture_xb, capture_yb = batches[1]
-        trainer = _NextCharCudaGraphTrainer(
+        trainer = _TrainingCudaGraphTrainer(
             model,
             optimizer,
             xb=capture_xb,
@@ -506,7 +583,11 @@ def _run_clean_sequence(
     for xb, yb in batches[1 + warmup : 1 + warmup + steps]:
         step_ms, _, step_memory = _time_step_with_memory(
             lambda xb=xb, yb=yb: run_train_step_clean(
-                model, optimizer, xb, yb, grad_clip=cfg.grad_clip
+                model,
+                optimizer,
+                xb,
+                yb,
+                grad_clip=cfg.grad_clip,
             ),
             device=cfg.torch_device,
         )
@@ -517,13 +598,13 @@ def _run_clean_sequence(
 
 
 def run_bench_step(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     warmup: int,
     steps: int,
     repeat: int = 1,
-    fixture: NextCharBenchFixture | None = None,
+    fixture: TrainingBenchFixture | None = None,
 ) -> dict[str, Any]:
     total_batches = 1 + int(warmup) + int(steps)
     fixture = (
@@ -595,5 +676,18 @@ def run_bench_step(
             "batch_count": len(fixture.batches),
         },
         "warm_execution_mode": warm_execution_mode,
-        "tokens_per_step": cfg.batch_size * cfg.block_size,
+        "tokens_per_step": cfg.batch_size * cfg.seq_len,
     }
+
+
+__all__ = [
+    "DEFAULT_TRAINING_PERF_CONFIG",
+    "TrainingBenchFixture",
+    "TrainingPerfConfig",
+    "build_bench_fixture",
+    "build_model",
+    "random_batch",
+    "run_bench_step",
+    "run_train_step_clean",
+    "run_train_step_profiled",
+]

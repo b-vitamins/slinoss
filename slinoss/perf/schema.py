@@ -44,7 +44,7 @@ def _validate_memory_summary(memory: dict[str, Any]) -> None:
             _expect(summary, key)
 
 
-def _validate_nextchar_budget_tree(
+def _validate_training_budget_tree(
     tree: dict[str, Any],
     *,
     require_stage_breakdown: bool,
@@ -89,11 +89,11 @@ def _validate_nextchar_budget_tree(
         _expect_path(tree, "backward.v2x2ssd.chunk_scan.__stats__")
 
 
-def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
+def validate_training_bench_payload(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dict.")
-    if _expect(payload, "kind") != "bench_nextchar":
-        raise ValueError("Expected kind=bench_nextchar.")
+    if _expect(payload, "kind") != "bench_training":
+        raise ValueError("Expected kind=bench_training.")
     if int(_expect(payload, "schema_version")) != 1:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "device_name")
@@ -109,7 +109,7 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
         workloads = _expect_dict(case_payload, "workload")
         _expect(case_payload, "stage_suite")
         for backend_name, workload in workloads.items():
-            if backend_name not in {"reference", "cute"}:
+            if backend_name not in {"cute"}:
                 raise ValueError(f"Unsupported backend key: {backend_name}")
             if not isinstance(workload, dict):
                 raise ValueError(f"Workload {case_name}/{backend_name} must be a dict.")
@@ -147,7 +147,7 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
                             f"Memory summary for {case_name}/{backend_name} must be a dict."
                         )
                     _validate_memory_summary(memory)
-                _validate_nextchar_budget_tree(
+                _validate_training_budget_tree(
                     tree,
                     require_stage_breakdown=False,
                 )
@@ -164,17 +164,17 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
                 raise ValueError(
                     f"Warm repeat_tokens_per_s for {case_name}/{backend_name} must be a dict."
                 )
-            _validate_nextchar_budget_tree(
+            _validate_training_budget_tree(
                 warm["tree"],
                 require_stage_breakdown=True,
             )
 
 
-def validate_nextchar_profile_payload(payload: dict[str, Any]) -> None:
+def validate_training_profile_payload(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dict.")
-    if _expect(payload, "kind") != "profile_nextchar":
-        raise ValueError("Expected kind=profile_nextchar.")
+    if _expect(payload, "kind") != "profile_training":
+        raise ValueError("Expected kind=profile_training.")
     if int(_expect(payload, "schema_version")) != 1:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "backend")
@@ -185,14 +185,14 @@ def validate_nextchar_profile_payload(payload: dict[str, Any]) -> None:
     _expect(payload, "regions")
     _expect(payload, "budget")
     tree = _expect_dict(payload, "tree")
-    _validate_nextchar_budget_tree(tree, require_stage_breakdown=False)
+    _validate_training_budget_tree(tree, require_stage_breakdown=False)
 
 
-def validate_nextchar_memory_payload(payload: dict[str, Any]) -> None:
+def validate_training_memory_payload(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dict.")
-    if _expect(payload, "kind") != "profile_nextchar_memory":
-        raise ValueError("Expected kind=profile_nextchar_memory.")
+    if _expect(payload, "kind") != "profile_training_memory":
+        raise ValueError("Expected kind=profile_training_memory.")
     if int(_expect(payload, "schema_version")) != 1:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "backend")
@@ -212,7 +212,7 @@ def validate_nextchar_memory_payload(payload: dict[str, Any]) -> None:
     _expect(payload, "regions")
     _expect(payload, "budget")
     tree = _expect_dict(payload, "tree")
-    _validate_nextchar_budget_tree(tree, require_stage_breakdown=False)
+    _validate_training_budget_tree(tree, require_stage_breakdown=False)
 
     baseline = _expect_dict(payload, "baseline_memory")
     _expect(baseline, "allocated_bytes")
@@ -269,11 +269,11 @@ def validate_nextchar_memory_payload(payload: dict[str, Any]) -> None:
         _expect(allocator_snapshot, key)
 
 
-def validate_nextchar_decode_bench_payload(payload: dict[str, Any]) -> None:
+def validate_decode_bench_payload(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dict.")
-    if _expect(payload, "kind") != "bench_nextchar_decode":
-        raise ValueError("Expected kind=bench_nextchar_decode.")
+    if _expect(payload, "kind") != "bench_decode":
+        raise ValueError("Expected kind=bench_decode.")
     if int(_expect(payload, "schema_version")) != 1:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "backend")
@@ -289,11 +289,11 @@ def validate_nextchar_decode_bench_payload(payload: dict[str, Any]) -> None:
         _expect_dict(_expect_dict(row, "eager"), "summary")
 
 
-def validate_nextchar_decode_profile_payload(payload: dict[str, Any]) -> None:
+def validate_decode_profile_payload(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dict.")
-    if _expect(payload, "kind") != "profile_nextchar_decode":
-        raise ValueError("Expected kind=profile_nextchar_decode.")
+    if _expect(payload, "kind") != "profile_decode":
+        raise ValueError("Expected kind=profile_decode.")
     if int(_expect(payload, "schema_version")) != 1:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "backend")

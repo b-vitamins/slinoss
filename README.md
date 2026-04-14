@@ -62,12 +62,13 @@ and 3.13.
 
 ## Example
 
-For a minimal end-to-end run, see [`examples/nextchar.py`](./examples/nextchar.py).
-It trains a small next-character model on `enwik8` using the default scan
-backend and writes all artifacts to `/tmp/nextchar` by default.
+For a minimal compositional example, see
+[`examples/blocks_lm.py`](./examples/blocks_lm.py). It shows how to build a
+causal LM shell from token embeddings, a `SLinOSSStack`, and a tied output
+head without relying on any toy model package inside SLinOSS itself.
 
 Run it with:
 
 ```bash
-python3 examples/nextchar.py
+python3 examples/blocks_lm.py
 ```

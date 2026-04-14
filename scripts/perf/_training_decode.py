@@ -13,9 +13,9 @@ PROJECT_ROOT = __import__("pathlib").Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from _nextchar import NextCharPerfConfig, build_model  # noqa: E402
-from _nextchar_model import NextCharLM  # noqa: E402
-from slinoss.models import NextCharBlock, NextCharDecodeState  # noqa: E402
+from _training import TrainingPerfConfig, build_model  # noqa: E402
+from _training_model import TrainingDecodeState, TrainingLM  # noqa: E402
+from slinoss.blocks import SLinOSSBlock  # noqa: E402
 
 DecodeMode = Literal["persistent", "eager"]
 
@@ -142,17 +142,17 @@ def resolve_peak_spec(
 
 
 def build_decode_model(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
-) -> NextCharLM:
+) -> TrainingLM:
     model, optimizer = build_model(cfg, backend=backend, instrumented=False)
     del optimizer
-    return cast(NextCharLM, model.eval())
+    return cast(TrainingLM, model.eval())
 
 
 def random_decode_tokens(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     total_tokens: int,
 ) -> torch.Tensor:
@@ -166,12 +166,12 @@ def random_decode_tokens(
 
 
 def _decode_one_mode(
-    model: NextCharLM,
+    model: TrainingLM,
     token: torch.Tensor,
-    state: NextCharDecodeState,
+    state: TrainingDecodeState,
     *,
     mode: DecodeMode,
-) -> tuple[torch.Tensor, NextCharDecodeState]:
+) -> tuple[torch.Tensor, TrainingDecodeState]:
     if mode == "persistent":
         return model.decode_one(token, state)
     if mode == "eager":
@@ -180,7 +180,7 @@ def _decode_one_mode(
 
 
 def _time_decode_tokens(
-    model: NextCharLM,
+    model: TrainingLM,
     tokens: torch.Tensor,
     *,
     mode: DecodeMode,
@@ -215,7 +215,7 @@ def _time_decode_tokens(
 
 
 def benchmark_decode_mode(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     mode: DecodeMode,
@@ -226,9 +226,9 @@ def benchmark_decode_mode(
     total_tokens = int(warmup_tokens) + int(active_tokens)
     if total_tokens <= 0:
         raise ValueError("warmup_tokens + active_tokens must be positive.")
-    if total_tokens > cfg.block_size:
+    if total_tokens > cfg.seq_len:
         raise ValueError(
-            f"Need block_size >= {total_tokens} for decode benchmark. Got {cfg.block_size}."
+            f"Need seq_len >= {total_tokens} for decode benchmark. Got {cfg.seq_len}."
         )
     model = build_decode_model(cfg, backend=backend)
     samples_us_per_token: list[float] = []
@@ -276,7 +276,7 @@ def benchmark_decode_mode(
 
 
 def estimate_lower_bound(
-    model: NextCharLM,
+    model: TrainingLM,
     *,
     batch_size: int,
     peak: PeakSpec,
@@ -284,7 +284,7 @@ def estimate_lower_bound(
     dtype_bytes = int(model.token_embed.weight.element_size())
     d_model = int(model.token_embed.embedding_dim)
     vocab_size = int(model.token_embed.num_embeddings)
-    blocks = cast(list[NextCharBlock], list(model.blocks))
+    blocks = cast(list[SLinOSSBlock], list(model.backbone.blocks))
     n_layers = len(blocks)
     if not blocks:
         raise ValueError("Model must have at least one block.")
@@ -295,11 +295,11 @@ def estimate_lower_bound(
     n_heads = int(mixer.n_heads)
     bc_groups = int(getattr(mixer, "bc_groups", n_heads))
     d_conv = int(mixer.d_conv)
-    hidden = int(blocks[0].ff.fc1.out_features)
+    hidden = 0 if blocks[0].ffn is None else int(blocks[0].ffn.hidden_dim)
 
     bytes_hbm = 0
-    bytes_hbm += batch_size * d_model * dtype_bytes  # token embedding rows
-    bytes_hbm += d_model * dtype_bytes  # single position row
+    bytes_hbm += batch_size * d_model * dtype_bytes
+    bytes_hbm += d_model * dtype_bytes
     state_bytes = (
         batch_size
         * n_layers
@@ -311,32 +311,39 @@ def estimate_lower_bound(
         )
     )
     bytes_hbm += 2 * state_bytes
-    bytes_hbm += batch_size * vocab_size * dtype_bytes  # logits write
+    bytes_hbm += batch_size * vocab_size * dtype_bytes
 
     flops_tc = 0.0
     flops_tc += 2.0 * batch_size * d_model * vocab_size
     for block in blocks:
         flops_tc += 2.0 * batch_size * d_model * block.mixer.in_proj.out_features
         flops_tc += 2.0 * batch_size * d_inner * d_model
-        flops_tc += 2.0 * batch_size * d_model * hidden
-        flops_tc += 2.0 * batch_size * hidden * d_model
+        if block.ffn is not None:
+            flops_tc += (
+                2.0
+                * batch_size
+                * d_model
+                * block.ffn.hidden_dim
+                * (2.0 if block.ffn.kind == "swiglu" else 1.0)
+            )
+            flops_tc += 2.0 * batch_size * block.ffn.hidden_dim * d_model
 
-    # Lower-bound proxy for elementwise / recurrent work. This intentionally
-    # undercounts rather than overclaims throughput.
     flops_simt = 0.0
-    flops_simt += 6.0 * batch_size * d_model  # final norm
-    for _block in blocks:
-        flops_simt += 6.0 * batch_size * d_model  # norm1
-        flops_simt += 6.0 * batch_size * d_model  # norm2
-        flops_simt += batch_size * d_inner * (2.0 * d_conv + 6.0)  # dw conv + silu
-        flops_simt += batch_size * n_heads * (40.0 * d_state)  # scanprep scalar work
-        flops_simt += (
-            batch_size * n_heads * d_head * (24.0 * d_state + 8.0)
-        )  # recurrent update + gate
-        flops_simt += 4.0 * batch_size * d_model  # residual adds
-        flops_simt += 8.0 * batch_size * hidden  # GELU
+    flops_simt += 6.0 * batch_size * d_model
+    for block in blocks:
+        flops_simt += 6.0 * batch_size * d_model
+        flops_simt += batch_size * d_inner * (2.0 * d_conv + 6.0)
+        flops_simt += batch_size * n_heads * (40.0 * d_state)
+        flops_simt += batch_size * n_heads * d_head * (24.0 * d_state + 8.0)
+        flops_simt += 2.0 * batch_size * d_model
+        if block.ffn is not None:
+            flops_simt += 6.0 * batch_size * d_model
+            flops_simt += 2.0 * batch_size * d_model
+            if block.ffn.kind == "swiglu":
+                flops_simt += 8.0 * batch_size * hidden
+            else:
+                flops_simt += 8.0 * batch_size * hidden
 
-    # The persistent decode path issues one host-visible graph replay per token.
     launches = 1
     bw_us = (bytes_hbm / peak.bandwidth_bytes_per_s) * 1.0e6
     tc_us = (
@@ -371,7 +378,7 @@ def estimate_lower_bound(
 
 
 def profile_decode_trace(
-    cfg: NextCharPerfConfig,
+    cfg: TrainingPerfConfig,
     *,
     backend: str,
     mode: DecodeMode,
@@ -382,9 +389,9 @@ def profile_decode_trace(
     top_k: int,
 ) -> dict[str, object]:
     total_tokens = int(warmup_tokens) + int(active_tokens)
-    if total_tokens > cfg.block_size:
+    if total_tokens > cfg.seq_len:
         raise ValueError(
-            f"Need block_size >= {total_tokens} for decode profile. Got {cfg.block_size}."
+            f"Need seq_len >= {total_tokens} for decode profile. Got {cfg.seq_len}."
         )
     model = build_decode_model(cfg, backend=backend)
     torch.manual_seed(int(cfg.seed))
@@ -434,3 +441,16 @@ def summary_speedup(
     fast_us = float(faster_summary["mean_us_per_token"])
     slow_us = float(slower_summary["mean_us_per_token"])
     return math.inf if fast_us <= 0.0 else slow_us / fast_us
+
+
+__all__ = [
+    "DecodeMode",
+    "LowerBoundEstimate",
+    "PeakSpec",
+    "benchmark_decode_mode",
+    "build_decode_model",
+    "estimate_lower_bound",
+    "profile_decode_trace",
+    "resolve_peak_spec",
+    "summary_speedup",
+]

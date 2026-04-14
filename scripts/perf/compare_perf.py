@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two nextchar bench payloads and rank perf deltas."""
+"""Compare two training bench payloads and rank perf deltas."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from slinoss.perf.compare import compare_budget_trees, rank_budget_deltas  # noqa: E402
-from slinoss.perf.schema import validate_nextchar_bench_payload  # noqa: E402
+from slinoss.perf.schema import validate_training_bench_payload  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("before", type=Path)
     parser.add_argument("after", type=Path)
-    parser.add_argument("--backend", choices=("reference", "cute"), default="cute")
+    parser.add_argument("--backend", choices=("cute",), default="cute")
     parser.add_argument("--case", default="default")
     parser.add_argument("--top-k", type=int, default=15)
     parser.add_argument("--json-out", type=Path, default=None)
@@ -32,7 +32,7 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_payload(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text())
-    validate_nextchar_bench_payload(payload)
+    validate_training_bench_payload(payload)
     return payload
 
 
@@ -187,7 +187,7 @@ def main() -> int:
         )
 
     payload = {
-        "kind": "compare_nextchar_perf",
+        "kind": "compare_training_perf",
         "schema_version": 1,
         "backend": args.backend,
         "case": args.case,

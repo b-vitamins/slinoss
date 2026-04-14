@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from slinoss.perf.budget import build_tree, derive_nextchar_budget
+from slinoss.perf.budget import build_tree, derive_training_budget
 from slinoss.perf.schema import (
-    validate_nextchar_bench_payload,
-    validate_nextchar_memory_payload,
-    validate_nextchar_profile_payload,
+    validate_training_bench_payload,
+    validate_training_memory_payload,
+    validate_training_profile_payload,
 )
 
 
@@ -76,15 +76,15 @@ def _sample_regions() -> dict[str, float]:
 
 
 def _sample_tree() -> dict[str, object]:
-    derived = derive_nextchar_budget(_sample_regions())
+    derived = derive_training_budget(_sample_regions())
     summaries = {label: {"mean_ms": value} for label, value in derived.items()}
     return build_tree(summaries)
 
 
-def test_validate_nextchar_bench_payload_accepts_expected_schema() -> None:
+def test_validate_training_bench_payload_accepts_expected_schema() -> None:
     tree = _sample_tree()
     payload = {
-        "kind": "bench_nextchar",
+        "kind": "bench_training",
         "schema_version": 1,
         "device_name": "Fake GPU",
         "suite": "single",
@@ -108,7 +108,7 @@ def test_validate_nextchar_bench_payload_accepts_expected_schema() -> None:
                             "warm_execution": "bench_loop",
                             "profile_execution": "eager_single_post_bench_replay",
                             "memory_measurement": "bench_path_step_peaks",
-                            "memory_forensics": "use profile_nextchar_memory.py for eager attribution",
+                            "memory_forensics": "use profile_training_memory.py for eager attribution",
                         },
                         "cold": {
                             "regions": {},
@@ -132,12 +132,12 @@ def test_validate_nextchar_bench_payload_accepts_expected_schema() -> None:
             }
         },
     }
-    validate_nextchar_bench_payload(payload)
+    validate_training_bench_payload(payload)
 
 
-def test_validate_nextchar_profile_payload_accepts_expected_schema() -> None:
+def test_validate_training_profile_payload_accepts_expected_schema() -> None:
     payload = {
-        "kind": "profile_nextchar",
+        "kind": "profile_training",
         "schema_version": 1,
         "backend": "cute",
         "config": {"batch_size": 4},
@@ -150,12 +150,12 @@ def test_validate_nextchar_profile_payload_accepts_expected_schema() -> None:
         "tree": _sample_tree(),
         "trace_out": None,
     }
-    validate_nextchar_profile_payload(payload)
+    validate_training_profile_payload(payload)
 
 
-def test_validate_nextchar_memory_payload_accepts_expected_schema() -> None:
+def test_validate_training_memory_payload_accepts_expected_schema() -> None:
     payload = {
-        "kind": "profile_nextchar_memory",
+        "kind": "profile_training_memory",
         "schema_version": 1,
         "backend": "cute",
         "config": {"batch_size": 4},
@@ -209,12 +209,12 @@ def test_validate_nextchar_memory_payload_accepts_expected_schema() -> None:
             "format": None,
         },
     }
-    validate_nextchar_memory_payload(payload)
+    validate_training_memory_payload(payload)
 
 
-def test_validate_nextchar_memory_payload_requires_full_methodology() -> None:
+def test_validate_training_memory_payload_requires_full_methodology() -> None:
     payload = {
-        "kind": "profile_nextchar_memory",
+        "kind": "profile_training_memory",
         "schema_version": 1,
         "backend": "cute",
         "config": {"batch_size": 4},
@@ -251,8 +251,8 @@ def test_validate_nextchar_memory_payload_requires_full_methodology() -> None:
     }
 
     try:
-        validate_nextchar_memory_payload(payload)
+        validate_training_memory_payload(payload)
     except ValueError as exc:
         assert "baseline_scope" in str(exc)
     else:
-        raise AssertionError("Expected validate_nextchar_memory_payload to fail.")
+        raise AssertionError("Expected validate_training_memory_payload to fail.")

@@ -23,6 +23,7 @@ from .backend import (
 )
 from .scanprep import SLinOSSScanPrep
 from .mixer import SLinOSSMixer
+from .mlp import SLinOSSMLP, SLinOSSMLPConfig, SLinOSSMLPKind
 from .state import SLinOSSMixerState, ScanState
 from .norm import RMSNorm
 
@@ -47,6 +48,9 @@ __all__ = [
     "ScanPrepBackend",
     "ScanPrepInputs",
     "ScanState",
+    "SLinOSSMLP",
+    "SLinOSSMLPConfig",
+    "SLinOSSMLPKind",
     "SLinOSSMixerState",
     "SLinOSSMixer",
     "SLinOSSScanPrep",

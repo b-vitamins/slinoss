@@ -54,15 +54,25 @@ def summarize_cache_samples(
 def summarize_budget_samples(
     samples: list[dict[str, float]],
 ) -> dict[str, dict[str, float]]:
-    derived_samples = [derive_nextchar_budget(sample) for sample in samples]
+    derived_samples = [derive_training_budget(sample) for sample in samples]
     return summarize_named_samples(derived_samples)
 
 
-def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
+def derive_training_budget(sample: dict[str, float]) -> dict[str, float]:
     sample = {label: float(value) for label, value in sample.items()}
 
     def _sum(*labels: str) -> float:
         return sum(sample.get(label, 0.0) for label in labels)
+
+    def _has_v2_stage_breakdown(direction: str) -> bool:
+        return any(
+            label in sample
+            for label in (
+                f"{direction}.v2x2ssd.chunk_increment.total",
+                f"{direction}.v2x2ssd.state_passing.total",
+                f"{direction}.v2x2ssd.chunk_scan.total",
+            )
+        )
 
     def _scanprep_total(direction: str) -> float:
         return sample.get(
@@ -224,14 +234,18 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
         + out["backward.head.total"]
     )
 
+    forward_v2_stage_breakdown = _has_v2_stage_breakdown("forward")
     out["forward.v2x2ssd.chunk_increment.total"] = sample.get(
-        "forward.v2x2ssd.chunk_increment.total", 0.0
+        "forward.v2x2ssd.chunk_increment.total",
+        0.0,
     )
     out["forward.v2x2ssd.state_passing.total"] = sample.get(
-        "forward.v2x2ssd.state_passing.total", 0.0
+        "forward.v2x2ssd.state_passing.total",
+        0.0,
     )
     out["forward.v2x2ssd.chunk_scan.total"] = sample.get(
-        "forward.v2x2ssd.chunk_scan.total", 0.0
+        "forward.v2x2ssd.chunk_scan.total",
+        0.0,
     )
     out["forward.v2x2ssd.stage_sum"] = (
         out["forward.v2x2ssd.chunk_increment.total"]
@@ -240,16 +254,25 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     )
     out["forward.v2x2ssd.overhead"] = (
         out["forward.v2x2ssd.total"] - out["forward.v2x2ssd.stage_sum"]
+        if forward_v2_stage_breakdown
+        else 0.0
+    )
+    out["forward.v2x2ssd.stage_breakdown_available"] = (
+        1.0 if forward_v2_stage_breakdown else 0.0
     )
 
+    backward_v2_stage_breakdown = _has_v2_stage_breakdown("backward")
     out["backward.v2x2ssd.chunk_increment.total"] = sample.get(
-        "backward.v2x2ssd.chunk_increment.total", 0.0
+        "backward.v2x2ssd.chunk_increment.total",
+        0.0,
     )
     out["backward.v2x2ssd.state_passing.total"] = sample.get(
-        "backward.v2x2ssd.state_passing.total", 0.0
+        "backward.v2x2ssd.state_passing.total",
+        0.0,
     )
     out["backward.v2x2ssd.chunk_scan.total"] = sample.get(
-        "backward.v2x2ssd.chunk_scan.total", 0.0
+        "backward.v2x2ssd.chunk_scan.total",
+        0.0,
     )
     out["backward.v2x2ssd.stage_sum"] = (
         out["backward.v2x2ssd.chunk_increment.total"]
@@ -258,6 +281,11 @@ def derive_nextchar_budget(sample: dict[str, float]) -> dict[str, float]:
     )
     out["backward.v2x2ssd.overhead"] = (
         out["backward.v2x2ssd.total"] - out["backward.v2x2ssd.stage_sum"]
+        if backward_v2_stage_breakdown
+        else 0.0
+    )
+    out["backward.v2x2ssd.stage_breakdown_available"] = (
+        1.0 if backward_v2_stage_breakdown else 0.0
     )
 
     out["backward.v2x2ssd.chunk_increment.kernel_sum"] = _sum(
