@@ -46,14 +46,19 @@ _PACKAGED_AOT_ROOT = Path(__file__).resolve().parent
 _PACKAGED_FORWARD_CACHE: dict[str, object] = {}
 _PACKAGED_BACKWARD_CACHE: dict[str, object] = {}
 
-_DEFAULT_AOT_HEADS = 23
-_DEFAULT_AOT_BC_GROUPS = _DEFAULT_AOT_HEADS
-_DEFAULT_AOT_D_HEAD = 64
-_DEFAULT_AOT_D_STATE = 128
-_DEFAULT_AOT_DTYPE_NAMES = ("float16", "bfloat16")
-# These defaults intentionally mirror the hot ``SLinOSSMixer`` constructor
-# rather than the standalone ``SLinOSSScanPrep`` defaults, so the curated AOT
-# payload covers the default block-backed training path without extra JIT churn.
+_DEFAULT_AOT_GEOMETRIES: tuple[tuple[int, int, int, int], ...] = (
+    # d_inner=1536, d_head=64 => heads=24; grouped BC with d_state=128
+    (24, 1, 64, 128),
+    # d_inner=2048, d_head=64 => heads=32; grouped BC with d_state=128
+    (32, 1, 64, 128),
+    # d_inner=3072, d_head=64 => heads=48; grouped BC with d_state=128
+    (48, 1, 64, 128),
+    # d_inner=4096, d_head=64 => heads=64; grouped BC with d_state=128
+    (64, 1, 64, 128),
+)
+_DEFAULT_AOT_DTYPE_NAMES = ("bfloat16",)
+# Keep the scalar scanprep parameter band aligned with the common mixer path so
+# the curated default AOT surface matches representative training workloads.
 _DEFAULT_SCANPREP_CONFIG_KWARGS = {
     "dt_min": 3.0e-2,
     "dt_max": 1.0e-1,
@@ -203,10 +208,10 @@ def default_forward_aot_specs(
     return tuple(
         ForwardAOTSpec(
             arch_tag=arch_tag,
-            heads=_DEFAULT_AOT_HEADS,
-            bc_groups=_DEFAULT_AOT_BC_GROUPS,
-            d_head=_DEFAULT_AOT_D_HEAD,
-            d_state=_DEFAULT_AOT_D_STATE,
+            heads=heads,
+            bc_groups=bc_groups,
+            d_head=d_head,
+            d_state=d_state,
             value_dtype_name=dtype_name,
             params_dtype_name=dtype_name,
             bc_dtype_name=dtype_name,
@@ -215,6 +220,7 @@ def default_forward_aot_specs(
             config=config,
         )
         for arch_tag in resolved_arch_tags
+        for heads, bc_groups, d_head, d_state in _DEFAULT_AOT_GEOMETRIES
         for dtype_name in _DEFAULT_AOT_DTYPE_NAMES
         for store_coeff_aux in (False, True)
     )
@@ -229,10 +235,10 @@ def default_backward_aot_specs(
     return tuple(
         BackwardAOTSpec(
             arch_tag=arch_tag,
-            heads=_DEFAULT_AOT_HEADS,
-            bc_groups=_DEFAULT_AOT_BC_GROUPS,
-            d_head=_DEFAULT_AOT_D_HEAD,
-            d_state=_DEFAULT_AOT_D_STATE,
+            heads=heads,
+            bc_groups=bc_groups,
+            d_head=d_head,
+            d_state=d_state,
             bc_dtype_name=dtype_name,
             value_grad_dtype_name=dtype_name,
             params_grad_dtype_name=dtype_name,
@@ -240,6 +246,7 @@ def default_backward_aot_specs(
             config=config,
         )
         for arch_tag in resolved_arch_tags
+        for heads, bc_groups, d_head, d_state in _DEFAULT_AOT_GEOMETRIES
         for dtype_name in _DEFAULT_AOT_DTYPE_NAMES
     )
 

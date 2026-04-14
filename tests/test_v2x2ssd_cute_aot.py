@@ -54,18 +54,19 @@ def test_arch_tags_from_env_drops_unsupported_forward_arches(monkeypatch) -> Non
 
 
 def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
-    specs = cute_aot_mod.default_forward_aot_specs(("sm_80", "sm_86"))
+    specs = cute_aot_mod.default_forward_aot_specs(("sm_86", "sm_89"))
     assert specs
-    assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
-    assert all(spec.bc_groups is None for spec in specs)
-    assert {spec.chunk_size for spec in specs} == set(
-        cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES
-    )
-    assert {spec.output_dtype_name for spec in specs} == {"float16", "bfloat16"}
+    assert {spec.arch_tag for spec in specs} == {"sm_86", "sm_89"}
+    assert {spec.bc_groups for spec in specs} == {1}
+    assert {spec.D for spec in specs} == {128}
+    assert {spec.chunk_size for spec in specs} == {128}
+    assert {spec.tc_dtype_name for spec in specs} == {"bfloat16"}
+    assert {spec.output_dtype_name for spec in specs} == {"bfloat16"}
     assert len(specs) == (
         2
+        * len(cute_aot_mod._DEFAULT_AOT_SHAPES)
         * len(cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES)
-        * len(cute_aot_mod._AOT_SEARCH_TC_DTYPES)
+        * len(cute_aot_mod._DEFAULT_FORWARD_AOT_TC_DTYPES)
         * 2
     )
 
@@ -77,18 +78,18 @@ def test_default_forward_aot_specs_drop_unsupported_requested_arch_tags() -> Non
 
 
 def test_default_backward_aot_specs_expand_requested_arch_tags() -> None:
-    specs = cute_aot_mod.default_backward_aot_specs(("sm_80", "sm_86"))
+    specs = cute_aot_mod.default_backward_aot_specs(("sm_86", "sm_89"))
     assert specs
-    assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
-    assert all(spec.bc_groups is None for spec in specs)
-    assert {spec.chunk_size for spec in specs} == set(
-        cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES
-    )
-    assert {spec.tc_dtype_name for spec in specs} == {"float16", "bfloat16"}
+    assert {spec.arch_tag for spec in specs} == {"sm_86", "sm_89"}
+    assert {spec.bc_groups for spec in specs} == {1}
+    assert {spec.D for spec in specs} == {128}
+    assert {spec.chunk_size for spec in specs} == {128}
+    assert {spec.tc_dtype_name for spec in specs} == {"bfloat16"}
     assert len(specs) == (
         2
+        * len(cute_aot_mod._DEFAULT_AOT_SHAPES)
         * len(cute_aot_mod._DEFAULT_FORWARD_AOT_CHUNK_SIZES)
-        * len(cute_aot_mod._AOT_SEARCH_TC_DTYPES)
+        * len(cute_aot_mod._DEFAULT_FORWARD_AOT_TC_DTYPES)
     )
 
 
@@ -141,7 +142,10 @@ def test_v2x2ssd_aot_record_load_defaults_bc_groups_to_head_matched_identity() -
     assert forward.bc_groups is None
     assert forward.module_id == forward_base.module_id
 
-    backward_base = cute_aot_mod.default_backward_aot_specs(("sm_80",))[0]
+    backward_base = replace(
+        cute_aot_mod.default_backward_aot_specs(("sm_86",))[0],
+        bc_groups=None,
+    )
     backward = cute_aot_mod._backward_spec_from_record(
         {
             key: value
@@ -171,7 +175,10 @@ def test_grouped_v2x2ssd_aot_module_ids_include_bc_groups_identity() -> None:
     assert forward_grouped.module_id != forward_base.module_id
     assert "g1" in forward_grouped.module_id
 
-    backward_base = cute_aot_mod.default_backward_aot_specs(("sm_80",))[0]
+    backward_base = replace(
+        cute_aot_mod.default_backward_aot_specs(("sm_86",))[0],
+        bc_groups=None,
+    )
     backward_grouped = replace(backward_base, bc_groups=1)
     assert backward_grouped.module_id != backward_base.module_id
     assert "g1" in backward_grouped.module_id
@@ -255,7 +262,7 @@ def test_build_default_backward_aot_package_only_exports_backward_specs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    specs = cute_aot_mod.default_backward_aot_specs(("sm_80",))[:2]
+    specs = cute_aot_mod.default_backward_aot_specs(("sm_86", "sm_89"))[:2]
     compiled_ids: list[str] = []
     exported_kinds: list[str] = []
     registered_kinds: list[str] = []

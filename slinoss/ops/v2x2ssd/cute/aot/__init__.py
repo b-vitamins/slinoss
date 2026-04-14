@@ -389,7 +389,12 @@ _AOT_SEARCH_P = 64
 _AOT_SEARCH_D = 256
 _AOT_SEARCH_CHUNK_SIZES = (32, 64, 128, 256)
 _AOT_SEARCH_TC_DTYPES = (torch.float16, torch.bfloat16)
-_DEFAULT_FORWARD_AOT_CHUNK_SIZES = (32, 64, 128)
+_DEFAULT_FORWARD_AOT_CHUNK_SIZES = (128,)
+_DEFAULT_FORWARD_AOT_TC_DTYPES = (torch.bfloat16,)
+_DEFAULT_AOT_SHAPES: tuple[tuple[int, int], ...] = (
+    # Default grouped-BC training identity point.
+    (128, 1),
+)
 _SUPPORTED_CUTE_AOT_ARCH_TAGS = frozenset(
     {
         "sm_80",
@@ -510,6 +515,7 @@ def _default_chunk_scan_config(*, chunk_size: int) -> ChunkScanConfig:
 
 def _default_forward_config_bundle(
     *,
+    D: int,
     chunk_size: int,
     tc_dtype: torch.dtype,
 ) -> ForwardConfigBundle:
@@ -518,7 +524,7 @@ def _default_forward_config_bundle(
     return ForwardConfigBundle(
         chunk_increment=_resolve_default_chunk_increment_config(
             tc_dtype=tc_dtype,
-            D=_AOT_SEARCH_D,
+            D=int(D),
             chunk_size=int(chunk_size),
         ),
         state_passing=StatePassingConfig(num_threads=128, vecs_per_thread=8),
@@ -680,20 +686,22 @@ def default_forward_aot_specs(
         ForwardAOTSpec(
             arch_tag=arch_tag,
             P=_AOT_SEARCH_P,
-            D=_AOT_SEARCH_D,
+            D=D,
             chunk_size=chunk_size,
-            bc_groups=None,
+            bc_groups=bc_groups,
             tc_dtype_name=_dtype_name(tc_dtype),
             output_dtype_name=_dtype_name(tc_dtype),
             config_bundle=_default_forward_config_bundle(
+                D=D,
                 chunk_size=chunk_size,
                 tc_dtype=tc_dtype,
             ),
             has_init=has_init,
         )
         for arch_tag in resolved_arch_tags
+        for D, bc_groups in _DEFAULT_AOT_SHAPES
         for chunk_size in _DEFAULT_FORWARD_AOT_CHUNK_SIZES
-        for tc_dtype in _AOT_SEARCH_TC_DTYPES
+        for tc_dtype in _DEFAULT_FORWARD_AOT_TC_DTYPES
         for has_init in (False, True)
     )
 
@@ -709,16 +717,17 @@ def default_backward_aot_specs(
         BackwardAOTSpec(
             arch_tag=arch_tag,
             P=_AOT_SEARCH_P,
-            D=_AOT_SEARCH_D,
+            D=D,
             chunk_size=chunk_size,
-            bc_groups=None,
+            bc_groups=bc_groups,
             tc_dtype_name=_dtype_name(tc_dtype),
             chunk_scan_config=default_scan_config,
             state_passing_config=default_state_config,
         )
         for arch_tag in resolved_arch_tags
+        for D, bc_groups in _DEFAULT_AOT_SHAPES
         for chunk_size in _DEFAULT_FORWARD_AOT_CHUNK_SIZES
-        for tc_dtype in _AOT_SEARCH_TC_DTYPES
+        for tc_dtype in _DEFAULT_FORWARD_AOT_TC_DTYPES
     )
 
 

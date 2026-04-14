@@ -23,24 +23,38 @@ def test_scanprep_aot_defaults_match_scanprep_layer_defaults() -> None:
 
 
 def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
-    specs = scanprep_aot_mod.default_forward_aot_specs(("sm_80", "sm_86"))
+    specs = scanprep_aot_mod.default_forward_aot_specs(("sm_86", "sm_89"))
 
     assert specs
-    assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
-    assert all(spec.bc_groups == spec.heads for spec in specs)
+    assert {spec.arch_tag for spec in specs} == {"sm_86", "sm_89"}
+    assert {
+        (spec.heads, spec.bc_groups, spec.d_head, spec.d_state) for spec in specs
+    } == {
+        (24, 1, 64, 128),
+        (32, 1, 64, 128),
+        (48, 1, 64, 128),
+        (64, 1, 64, 128),
+    }
     assert {spec.store_coeff_aux for spec in specs} == {False, True}
-    assert {spec.value_dtype_name for spec in specs} == {"float16", "bfloat16"}
-    assert len(specs) == 2 * 2 * 2
+    assert {spec.value_dtype_name for spec in specs} == {"bfloat16"}
+    assert len(specs) == 2 * 4 * 1 * 2
 
 
 def test_default_backward_aot_specs_expand_requested_arch_tags() -> None:
-    specs = scanprep_aot_mod.default_backward_aot_specs(("sm_80", "sm_86"))
+    specs = scanprep_aot_mod.default_backward_aot_specs(("sm_86", "sm_89"))
 
     assert specs
-    assert {spec.arch_tag for spec in specs} == {"sm_80", "sm_86"}
-    assert all(spec.bc_groups == spec.heads for spec in specs)
-    assert {spec.bc_dtype_name for spec in specs} == {"float16", "bfloat16"}
-    assert len(specs) == 2 * 2
+    assert {spec.arch_tag for spec in specs} == {"sm_86", "sm_89"}
+    assert {
+        (spec.heads, spec.bc_groups, spec.d_head, spec.d_state) for spec in specs
+    } == {
+        (24, 1, 64, 128),
+        (32, 1, 64, 128),
+        (48, 1, 64, 128),
+        (64, 1, 64, 128),
+    }
+    assert {spec.bc_dtype_name for spec in specs} == {"bfloat16"}
+    assert len(specs) == 2 * 4 * 1
 
 
 def test_scanprep_aot_record_load_defaults_bc_groups_to_heads() -> None:
@@ -76,7 +90,7 @@ def test_build_default_forward_aot_package_only_exports_forward_specs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    specs = scanprep_aot_mod.default_forward_aot_specs(("sm_80",))[:2]
+    specs = scanprep_aot_mod.default_forward_aot_specs(("sm_86",))[:2]
     compiled_ids: list[str] = []
     exported_kinds: list[str] = []
     registered_kinds: list[str] = []
@@ -136,7 +150,7 @@ def test_build_default_backward_aot_package_only_exports_backward_specs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    specs = scanprep_aot_mod.default_backward_aot_specs(("sm_80",))[:2]
+    specs = scanprep_aot_mod.default_backward_aot_specs(("sm_86",))[:2]
     compiled_ids: list[str] = []
     exported_kinds: list[str] = []
     registered_kinds: list[str] = []

@@ -154,8 +154,8 @@ jobs:
       - name: Build CUDA default CuTe AOT payload
         env:
           CUDA_HOME: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
-          TORCH_CUDA_ARCH_LIST: "7.0;8.0;8.6;8.9;9.0"
-          SLINOSS_CUTE_AOT_ARCH_TAGS: "8.0;8.6;8.9;9.0"
+          TORCH_CUDA_ARCH_LIST: "8.6;8.9"
+          SLINOSS_CUTE_AOT_ARCH_TAGS: "8.6;8.9"
         run: >
           python scripts/build_cute_aot.py
           --package-root /tmp/slinoss-cute-aot
