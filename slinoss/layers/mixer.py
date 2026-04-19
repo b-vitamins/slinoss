@@ -143,6 +143,10 @@ class SLinOSSMixer(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        self.d_skip = nn.Parameter(
+            torch.ones((self.n_heads,), device=device, dtype=torch.float32)
+        )
+        setattr(self.d_skip, "_no_weight_decay", True)
         self.dw_weight = nn.Parameter(
             torch.empty((self.d_inner, self.d_conv), **factory_kwargs)
         )
@@ -158,6 +162,7 @@ class SLinOSSMixer(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        nn.init.normal_(self.d_skip)
         nn.init.kaiming_uniform_(
             self.dw_weight.view(self.d_inner, 1, self.d_conv),
             a=math.sqrt(5.0),
@@ -317,6 +322,8 @@ class SLinOSSMixer(nn.Module):
             gate,
             self.out_norm,
             self.out_proj,
+            skip_input=scan_inputs.U,
+            d_skip=self.d_skip,
         )
         if scan_state is None:
             return out

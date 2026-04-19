@@ -97,6 +97,9 @@ if TYPE_CHECKING:
         @property
         def out_norm(self) -> torch.nn.Module: ...
 
+        @property
+        def d_skip(self) -> torch.Tensor: ...
+
 
 def supports_cute_decode(
     mixer: "_DecodeOwner",
@@ -105,6 +108,8 @@ def supports_cute_decode(
     device: torch.device,
     dtype: torch.dtype,
 ) -> bool:
+    if mixer.d_skip is not None:
+        return False
     if device.type != "cuda":
         return False
     if dtype not in (torch.float16, torch.bfloat16):
@@ -235,9 +240,14 @@ def run_reference_decode_step(
     scan_output = scan_output.to(dtype=value_token.dtype)
     b_last = b_last.to(dtype=value_token.dtype)
     u_last = u_last.to(dtype=value_token.dtype)
-    normalized_output = mixer.out_norm(_mixer_gated_hidden(scan_output, gate_token))[
-        :, 0, :
-    ]
+    normalized_output = mixer.out_norm(
+        _mixer_gated_hidden(
+            scan_output,
+            gate_token,
+            skip_input=scan_inputs.U,
+            d_skip=mixer.d_skip,
+        )
+    )[:, 0, :]
     return normalized_output.contiguous(), ScanState(
         state=final_state,
         b_prev=b_last,
@@ -250,6 +260,8 @@ def run_cute_decode_step(
     inputs,
     state: "ScanState",
 ) -> tuple[torch.Tensor, "ScanState"]:
+    if mixer.d_skip is not None:
+        return run_reference_decode_step(mixer, inputs, state)
     from slinoss.layers.state import ScanState
     from slinoss.ops.v2x2ssd.cute.step import mixer_decode_step_cute
 
