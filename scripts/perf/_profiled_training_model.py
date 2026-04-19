@@ -182,7 +182,6 @@ class ProfiledSLinOSSBlock(SLinOSSBlock):
             theta_init_max=config.mixer.theta_init_max,
             r_min=config.mixer.r_min,
             r_max=config.mixer.r_max,
-            bc_gain_max=config.mixer.bc_gain_max,
             eps=config.mixer.eps,
             device=device,
             dtype=dtype,
@@ -194,7 +193,9 @@ class ProfiledSLinOSSBlock(SLinOSSBlock):
         *,
         state: object | None = None,
         return_state: bool = False,
+        context: object | None = None,
     ) -> torch.Tensor:
+        del context
         if state is not None or return_state:
             raise ValueError(
                 "ProfiledSLinOSSBlock only supports the stateless training path."
@@ -240,7 +241,9 @@ class ProfiledSLinOSSStack(SLinOSSStack):
         *,
         state: object | None = None,
         return_state: bool = False,
+        context: object | None = None,
     ) -> torch.Tensor:
+        del context
         if state is not None or return_state:
             raise ValueError(
                 "ProfiledSLinOSSStack only supports the stateless training path."

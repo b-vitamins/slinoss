@@ -60,7 +60,6 @@ class SLinOSSMixer(nn.Module):
         theta_init_max: float = 1.0,
         r_min: float = 0.9,
         r_max: float = 1.0,
-        bc_gain_max: float = 2.0,
         eps: float = 1e-8,
         scan_backend: ScanBackend | None = None,
         decode_backend: MixerDecodeBackend | None = None,
@@ -125,7 +124,6 @@ class SLinOSSMixer(nn.Module):
             theta_init_max=theta_init_max,
             r_min=r_min,
             r_max=r_max,
-            bc_gain_max=bc_gain_max,
             eps=eps,
             device=device,
         )

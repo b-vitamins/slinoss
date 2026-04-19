@@ -787,9 +787,9 @@ def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
     torch.testing.assert_close(bc_rows[..., 3, :], C_pairs[..., 1])
 
 
-def test_scanprep_parameterized_bc_pairs_have_bounded_complex_row_gain() -> None:
+def test_scanprep_parameterized_bc_pairs_have_unit_complex_rms() -> None:
     torch.manual_seed(0)
-    prep = SLinOSSScanPrep(n_heads=2, d_state=5, d_head=4, bc_gain_max=1.25)
+    prep = SLinOSSScanPrep(n_heads=2, d_state=5, d_head=4)
     bc = torch.randn((2, 5, prep.bc_groups, prep.bc_param_rows, prep.d_state)) * 20.0
 
     B_pairs, C_pairs = prep._parameterize_scan_bc_pairs(bc)
@@ -797,8 +797,8 @@ def test_scanprep_parameterized_bc_pairs_have_bounded_complex_row_gain() -> None
     B_rms = B_pairs.square().sum(dim=-1, dtype=torch.float32).mean(dim=-1).sqrt()
     C_rms = C_pairs.square().sum(dim=-1, dtype=torch.float32).mean(dim=-1).sqrt()
 
-    assert bool((B_rms <= prep.bc_gain_max + 1e-5).all())
-    assert bool((C_rms <= prep.bc_gain_max + 1e-5).all())
+    torch.testing.assert_close(B_rms, torch.ones_like(B_rms), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(C_rms, torch.ones_like(C_rms), atol=1e-5, rtol=1e-5)
 
 
 def test_scanprep_reference_pack_produces_contiguous_bc() -> None:

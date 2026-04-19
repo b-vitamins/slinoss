@@ -33,7 +33,6 @@ def _validate_scanprep_inputs(
     bc_groups: int,
     d_state: int,
     d_head: int,
-    bc_gain_max: float,
 ) -> None:
     if (
         value.device.type != "cuda"
@@ -50,8 +49,6 @@ def _validate_scanprep_inputs(
         raise ValueError(
             f"n_heads must be divisible by bc_groups. Got {n_heads}, {bc_groups}."
         )
-    if bc_gain_max <= 0.0:
-        raise ValueError(f"bc_gain_max must be positive. Got {bc_gain_max}.")
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
             "Expected value=(B,T,H*P), params=(B,T,H*2), "
@@ -107,7 +104,6 @@ def scanprep_cute(
     r_min: float,
     r_max: float,
     eps: float,
-    bc_gain_max: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     theta_mod_bias: torch.Tensor,
@@ -124,7 +120,6 @@ def scanprep_cute(
         bc_groups=resolved_bc_groups,
         d_state=d_state,
         d_head=d_head,
-        bc_gain_max=bc_gain_max,
     )
     if _should_use_scanprep_autograd(
         value,
@@ -155,7 +150,6 @@ def scanprep_cute(
                 r_min=r_min,
                 r_max=r_max,
                 eps=eps,
-                bc_gain_max=bc_gain_max,
                 dt_bias=dt_bias,
                 gamma_bias=gamma_bias,
                 theta_mod_bias=theta_mod_bias,
@@ -171,7 +165,6 @@ def scanprep_cute(
         bc_groups=resolved_bc_groups,
         d_state=d_state,
         eps=eps,
-        bc_gain_max=bc_gain_max,
     )
     validate_scan_bc_rows(
         bc_rows,

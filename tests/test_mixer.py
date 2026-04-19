@@ -577,9 +577,10 @@ def test_mixer_cute_segmented_forward_matches_single_pass() -> None:
         assert torch.isfinite(tensor).all()
 
     y_segmented = torch.cat([y_a, y_b], dim=1)
-    # Direct token-emitted BC phase makes the segmented CuTe scan path slightly
-    # more numerically sensitive while keeping the carried scan state stable.
-    torch.testing.assert_close(y_segmented, y_full, atol=1.5e-3, rtol=0.0)
+    # Pure complex-RMS BC normalization makes the segmented CuTe scan path
+    # slightly more numerically sensitive while keeping the carried scan state
+    # stable.
+    torch.testing.assert_close(y_segmented, y_full, atol=2e-3, rtol=0.0)
     torch.testing.assert_close(
         state.scan.state, state_full.scan.state, atol=1e-3, rtol=0.0
     )

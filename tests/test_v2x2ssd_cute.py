@@ -1751,6 +1751,7 @@ def test_v2x2ssd_cute_grouped_training_backward_matches_direct_kernel_path(
     bc_groups: int,
 ) -> None:
     pytest.importorskip("cutlass")
+    torch.cuda.synchronize()
     torch.manual_seed(0)
 
     U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
@@ -1786,6 +1787,7 @@ def test_v2x2ssd_cute_grouped_training_backward_matches_direct_kernel_path(
         (U_wrap, M_wrap, K_wrap, B_wrap, C_wrap),
         grad_outputs=d_out,
     )
+    torch.cuda.synchronize()
 
     Y_direct, m_chunk, chunk_starts = cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1824,6 +1826,7 @@ def test_v2x2ssd_cute_grouped_training_backward_matches_direct_kernel_path(
             compute_dtype=torch.float32,
         ),
     )[:5]
+    torch.cuda.synchronize()
 
     for wrap_grad, direct_grad in zip(wrap_grads, direct_grads, strict=True):
         assert torch.isfinite(wrap_grad).all()

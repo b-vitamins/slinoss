@@ -71,7 +71,6 @@ def _block_dict(block: SLinOSSBlockConfig, *, n_heads: int) -> dict[str, Any]:
         "theta_init_max": block.mixer.theta_init_max,
         "r_min": block.mixer.r_min,
         "r_max": block.mixer.r_max,
-        "bc_gain_max": block.mixer.bc_gain_max,
         "eps": block.mixer.eps,
         "n_heads": n_heads,
     }

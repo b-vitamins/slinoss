@@ -46,14 +46,10 @@ def _normalize_scan_bc_pairs(
     bc_pairs: torch.Tensor,
     *,
     eps: float,
-    bc_gain_max: float,
 ) -> torch.Tensor:
     mag_sq = bc_pairs.square().sum(dim=-1, dtype=torch.float32)
     row_rms = mag_sq.mean(dim=-1, keepdim=True).clamp_min(float(eps)).sqrt()
-    row_rms_expanded = row_rms.unsqueeze(-1).to(dtype=bc_pairs.dtype)
-    direction = bc_pairs / row_rms_expanded
-    bounded_gain = float(bc_gain_max) * torch.tanh(row_rms / float(bc_gain_max))
-    return direction * bounded_gain.unsqueeze(-1).to(dtype=bc_pairs.dtype)
+    return bc_pairs / row_rms.unsqueeze(-1).to(dtype=bc_pairs.dtype)
 
 
 def _phase_rotor(phase_logits: torch.Tensor) -> torch.Tensor:
@@ -67,7 +63,6 @@ def parameterize_scan_bc_pairs(
     bc_groups: int,
     d_state: int,
     eps: float,
-    bc_gain_max: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build normalized complex B/C pairs directly from token-emitted polar fields.
 
@@ -100,14 +95,12 @@ def parameterize_scan_bc_pairs(
         _normalize_scan_bc_pairs(
             b_pairs,
             eps=float(eps),
-            bc_gain_max=float(bc_gain_max),
         )
         .to(dtype=pair_dtype)
         .contiguous(),
         _normalize_scan_bc_pairs(
             c_pairs,
             eps=float(eps),
-            bc_gain_max=float(bc_gain_max),
         )
         .to(dtype=pair_dtype)
         .contiguous(),
@@ -120,7 +113,6 @@ def parameterize_scan_bc_rows(
     bc_groups: int,
     d_state: int,
     eps: float,
-    bc_gain_max: float,
 ) -> torch.Tensor:
     """Build packed real BC rows ``(B_re, B_im, C_re, C_im)`` for CuTe scanprep."""
     b_pairs, c_pairs = parameterize_scan_bc_pairs(
@@ -128,7 +120,6 @@ def parameterize_scan_bc_rows(
         bc_groups=int(bc_groups),
         d_state=int(d_state),
         eps=float(eps),
-        bc_gain_max=float(bc_gain_max),
     )
     rows = torch.stack(
         (b_pairs[..., 0], b_pairs[..., 1], c_pairs[..., 0], c_pairs[..., 1]),

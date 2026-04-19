@@ -34,7 +34,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         gamma_max: float,
         r_min: float,
         r_max: float,
-        bc_gain_max: float,
         eps: float,
         dt_bias: torch.Tensor,
         gamma_bias: torch.Tensor,
@@ -56,7 +55,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         ctx.gamma_max = float(gamma_max)
         ctx.r_min = float(r_min)
         ctx.r_max = float(r_max)
-        ctx.bc_gain_max = float(bc_gain_max)
         ctx.eps = float(eps)
 
         value_d = value.detach()
@@ -73,7 +71,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             bc_groups=int(bc_groups),
             d_state=int(d_state),
             eps=float(eps),
-            bc_gain_max=float(bc_gain_max),
         )
         validate_scan_bc_rows(
             bc_rows,
@@ -141,7 +138,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
                 bc_groups=ctx.bc_groups,
                 d_state=ctx.d_state,
                 eps=ctx.eps,
-                bc_gain_max=ctx.bc_gain_max,
             )
             validate_scan_bc_rows(
                 bc_rows,
@@ -235,7 +231,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             None,
             None,
             None,
-            None,
             outputs.bias_grad[:, 0].contiguous(),
             outputs.bias_grad[:, 1].contiguous(),
             outputs.bias_grad[:, 2].contiguous(),
@@ -261,7 +256,6 @@ def scanprep_cute_training_autograd(
     gamma_max: float,
     r_min: float,
     r_max: float,
-    bc_gain_max: float,
     eps: float,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
@@ -293,7 +287,6 @@ def scanprep_cute_training_autograd(
             float(gamma_max),
             float(r_min),
             float(r_max),
-            float(bc_gain_max),
             float(eps),
             dt_bias,
             gamma_bias,

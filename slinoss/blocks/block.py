@@ -77,7 +77,6 @@ class SLinOSSBlock(nn.Module):
             theta_init_max=config.mixer.theta_init_max,
             r_min=config.mixer.r_min,
             r_max=config.mixer.r_max,
-            bc_gain_max=config.mixer.bc_gain_max,
             eps=config.mixer.eps,
             device=device,
             dtype=dtype,

@@ -38,7 +38,6 @@ class SLinOSSMixerConfig:
     theta_init_max: float = 1.0
     r_min: float = 0.9
     r_max: float = 1.0
-    bc_gain_max: float = 2.0
     eps: float = 1.0e-8
 
     def __post_init__(self) -> None:
@@ -73,7 +72,6 @@ class SLinOSSMixerConfig:
             "theta_init_max": self.theta_init_max,
             "r_min": self.r_min,
             "r_max": self.r_max,
-            "bc_gain_max": self.bc_gain_max,
             "eps": self.eps,
         }
 

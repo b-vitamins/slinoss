@@ -53,7 +53,6 @@ class SLinOSSScanPrep(nn.Module):
         theta_init_max: float = 1.0,
         r_min: float = 0.9,
         r_max: float = 1.0,
-        bc_gain_max: float = 2.0,
         eps: float = 1e-8,
         device: torch.device | str | None = None,
     ) -> None:
@@ -95,7 +94,6 @@ class SLinOSSScanPrep(nn.Module):
             0.0 < r_min <= r_max <= 1.0,
             f"Require 0 < r_min <= r_max <= 1. Got {r_min}, {r_max}.",
         )
-        _require(bc_gain_max > 0.0, f"Require bc_gain_max > 0. Got {bc_gain_max}.")
 
         self.n_heads = int(n_heads)
         self.bc_groups = int(resolved_bc_groups)
@@ -114,7 +112,6 @@ class SLinOSSScanPrep(nn.Module):
         self.theta_init_max = float(theta_init_max)
         self.r_min = float(r_min)
         self.r_max = float(r_max)
-        self.bc_gain_max = float(bc_gain_max)
         self.eps = float(eps)
 
         fp32 = torch.float32
@@ -277,7 +274,6 @@ class SLinOSSScanPrep(nn.Module):
             bc_groups=self.bc_groups,
             d_state=self.d_state,
             eps=self.eps,
-            bc_gain_max=self.bc_gain_max,
         )
 
     def _parameterize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
@@ -381,7 +377,6 @@ class SLinOSSScanPrep(nn.Module):
             r_min=self.r_min,
             r_max=self.r_max,
             eps=self.eps,
-            bc_gain_max=self.bc_gain_max,
             dt_bias=self.dt_bias,
             gamma_bias=self.gamma_bias,
             theta_mod_bias=self.theta_mod_bias,
