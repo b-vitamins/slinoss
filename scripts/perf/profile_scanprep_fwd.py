@@ -111,6 +111,7 @@ def main() -> int:
             dt_max=prep.dt_max,
             theta_init_min=prep.theta_init_min,
             theta_init_max=prep.theta_init_max,
+            theta_mod_scale=prep.theta_mod_scale,
             alpha_min=prep.alpha_min,
             alpha_max=prep.alpha_max,
             r_min=prep.r_min,

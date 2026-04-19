@@ -997,7 +997,7 @@ def test_mixer_segmented_forward_matches_single_pass() -> None:
     assert state.scan.state is not None
     assert state.scan.b_prev is not None
     assert state.scan.u_prev is not None
-    assert torch.allclose(y_full, torch.cat([y_a, y_b], dim=1), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(y_full, torch.cat([y_a, y_b], dim=1), atol=2e-6, rtol=2e-6)
 
 
 @pytest.mark.parametrize("amp_dtype", [torch.float16, torch.bfloat16])

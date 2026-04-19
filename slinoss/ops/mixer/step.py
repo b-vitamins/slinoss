@@ -36,6 +36,9 @@ if TYPE_CHECKING:
         def theta_init_max(self) -> float: ...
 
         @property
+        def theta_mod_scale(self) -> float: ...
+
+        @property
         def alpha_min(self) -> float: ...
 
         @property
@@ -277,6 +280,7 @@ def run_cute_decode_step(
         dt_max=mixer.scanprep.dt_max,
         theta_init_min=mixer.scanprep.theta_init_min,
         theta_init_max=mixer.scanprep.theta_init_max,
+        theta_mod_scale=mixer.scanprep.theta_mod_scale,
         alpha_min=mixer.scanprep.alpha_min,
         alpha_max=mixer.scanprep.alpha_max,
         r_min=mixer.scanprep.r_min,

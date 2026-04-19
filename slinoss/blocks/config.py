@@ -34,8 +34,9 @@ class SLinOSSMixerConfig:
     dt_init_floor: float = 5.0e-3
     alpha_min: float = 0.0
     alpha_max: float = 20.0
-    theta_init_min: float = 0.2
-    theta_init_max: float = 1.0
+    theta_init_min: float = 0.05
+    theta_init_max: float = 2.0
+    theta_mod_scale: float = 1.0
     r_min: float = 0.8
     r_max: float = 1.0
     eps: float = 1.0e-8
@@ -59,6 +60,10 @@ class SLinOSSMixerConfig:
             f"alpha_min/alpha_max must satisfy 0 <= min < max. Got "
             f"{self.alpha_min}, {self.alpha_max}.",
         )
+        _require(
+            self.theta_mod_scale >= 0.0,
+            f"theta_mod_scale must be non-negative. Got {self.theta_mod_scale}.",
+        )
 
     def build_kwargs(self) -> dict[str, object]:
         return {
@@ -75,6 +80,7 @@ class SLinOSSMixerConfig:
             "alpha_max": self.alpha_max,
             "theta_init_min": self.theta_init_min,
             "theta_init_max": self.theta_init_max,
+            "theta_mod_scale": self.theta_mod_scale,
             "r_min": self.r_min,
             "r_max": self.r_max,
             "eps": self.eps,

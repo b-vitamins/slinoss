@@ -48,6 +48,7 @@ class ScanPrepBwdFused:
         dt_max: float,
         theta_init_min: float,
         theta_init_max: float,
+        theta_mod_scale: float,
         alpha_min: float,
         alpha_max: float,
         r_min: float,
@@ -95,9 +96,9 @@ class ScanPrepBwdFused:
         self.dt_scale = float(dt_max - dt_min)
         self.theta_init_min = float(theta_init_min)
         self.theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
+        self.theta_mod_scale = float(theta_mod_scale)
         self.alpha_min = float(alpha_min)
         self.alpha_span = float(alpha_max - alpha_min)
-        self.theta_mod_scale = 0.25
         self.r_scale = float(r_max - r_min)
         self.eps = float(eps)
         self.z_thresh_sq = self._resolve_z_thresh_sq()

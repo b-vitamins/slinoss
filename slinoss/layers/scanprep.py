@@ -33,7 +33,7 @@ class SLinOSSScanPrep(nn.Module):
 
     param_dim: int = 3
     bc_param_rows: int = 4
-    theta_mod_scale: float = 0.25
+    theta_mod_scale: float
     theta_sign: torch.Tensor
 
     def __init__(
@@ -49,8 +49,9 @@ class SLinOSSScanPrep(nn.Module):
         dt_init_floor: float = 5e-3,
         alpha_min: float = 0.0,
         alpha_max: float = 20.0,
-        theta_init_min: float = 0.2,
-        theta_init_max: float = 1.0,
+        theta_init_min: float = 0.05,
+        theta_init_max: float = 2.0,
+        theta_mod_scale: float = 1.0,
         r_min: float = 0.8,
         r_max: float = 1.0,
         eps: float = 1e-8,
@@ -91,6 +92,10 @@ class SLinOSSScanPrep(nn.Module):
             f"{theta_init_min}, {theta_init_max}.",
         )
         _require(
+            theta_mod_scale >= 0.0,
+            f"Require theta_mod_scale >= 0. Got {theta_mod_scale}.",
+        )
+        _require(
             0.0 < r_min <= r_max <= 1.0,
             f"Require 0 < r_min <= r_max <= 1. Got {r_min}, {r_max}.",
         )
@@ -110,6 +115,7 @@ class SLinOSSScanPrep(nn.Module):
         self.alpha_max = float(alpha_max)
         self.theta_init_min = float(theta_init_min)
         self.theta_init_max = float(theta_init_max)
+        self.theta_mod_scale = float(theta_mod_scale)
         self.r_min = float(r_min)
         self.r_max = float(r_max)
         self.eps = float(eps)
@@ -401,6 +407,7 @@ class SLinOSSScanPrep(nn.Module):
             dt_max=self.dt_max,
             theta_init_min=self.theta_init_min,
             theta_init_max=self.theta_init_max,
+            theta_mod_scale=self.theta_mod_scale,
             alpha_min=self.alpha_min,
             alpha_max=self.alpha_max,
             r_min=self.r_min,

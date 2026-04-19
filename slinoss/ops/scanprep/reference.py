@@ -101,6 +101,7 @@ def scanprep_scan_coeffs_from_flat_params(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
+    theta_mod_scale: float,
     alpha_min: float,
     alpha_max: float,
     r_min: float,
@@ -130,7 +131,8 @@ def scanprep_scan_coeffs_from_flat_params(
     dt = dt_min + (dt_max - dt_min) * torch.sigmoid(dt_raw)
     theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
     theta_u = torch.sigmoid(
-        theta_bias.view(1, n_heads, 1) + 0.25 * torch.tanh(theta_mod_raw)
+        theta_bias.view(1, n_heads, 1)
+        + float(theta_mod_scale) * torch.tanh(theta_mod_raw)
     )
     theta_drive = theta_init_min + theta_span * theta_u
     alpha = alpha_min + (alpha_max - alpha_min) * torch.sigmoid(alpha_raw)

@@ -62,8 +62,9 @@ _DEFAULT_AOT_DTYPE_NAMES = ("bfloat16",)
 _DEFAULT_SCANPREP_CONFIG_KWARGS = {
     "dt_min": 5.0e-3,
     "dt_max": 1.0e-1,
-    "theta_init_min": 0.2,
-    "theta_init_max": 1.0,
+    "theta_init_min": 0.05,
+    "theta_init_max": 2.0,
+    "theta_mod_scale": 1.0,
     "alpha_min": 0.0,
     "alpha_max": 20.0,
     "r_min": 0.8,
@@ -90,6 +91,7 @@ def _config_tag(config: "ScanPrepConfig") -> str:
     return (
         f"dt{_float_tag(config.dt_min)}_{_float_tag(config.dt_max)}"
         f"__theta{_float_tag(config.theta_init_min)}_{_float_tag(config.theta_init_max)}"
+        f"__thetamod{_float_tag(config.theta_mod_scale)}"
         f"__alpha{_float_tag(config.alpha_min)}_{_float_tag(config.alpha_max)}"
         f"__r{_float_tag(config.r_min)}_{_float_tag(config.r_max)}"
         f"__eps{_float_tag(config.eps)}"
@@ -490,6 +492,7 @@ def infer_scanprep_fwd_aot_spec(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
+    theta_mod_scale: float,
     alpha_min: float,
     alpha_max: float,
     r_min: float,
@@ -534,6 +537,7 @@ def infer_scanprep_fwd_aot_spec(
             dt_max=dt_max,
             theta_init_min=theta_init_min,
             theta_init_max=theta_init_max,
+            theta_mod_scale=theta_mod_scale,
             alpha_min=alpha_min,
             alpha_max=alpha_max,
             r_min=r_min,
@@ -557,6 +561,7 @@ def infer_scanprep_bwd_aot_spec(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
+    theta_mod_scale: float,
     alpha_min: float,
     alpha_max: float,
     r_min: float,
@@ -611,6 +616,7 @@ def infer_scanprep_bwd_aot_spec(
             dt_max=dt_max,
             theta_init_min=theta_init_min,
             theta_init_max=theta_init_max,
+            theta_mod_scale=theta_mod_scale,
             alpha_min=alpha_min,
             alpha_max=alpha_max,
             r_min=r_min,
@@ -682,6 +688,7 @@ def export_scanprep_fwd_cute_aot(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
+    theta_mod_scale: float,
     alpha_min: float,
     alpha_max: float,
     r_min: float,
@@ -708,6 +715,7 @@ def export_scanprep_fwd_cute_aot(
         dt_max=dt_max,
         theta_init_min=theta_init_min,
         theta_init_max=theta_init_max,
+        theta_mod_scale=theta_mod_scale,
         alpha_min=alpha_min,
         alpha_max=alpha_max,
         r_min=r_min,
@@ -747,6 +755,7 @@ def export_scanprep_bwd_cute_aot(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
+    theta_mod_scale: float,
     alpha_min: float,
     alpha_max: float,
     r_min: float,
@@ -771,6 +780,7 @@ def export_scanprep_bwd_cute_aot(
         dt_max=dt_max,
         theta_init_min=theta_init_min,
         theta_init_max=theta_init_max,
+        theta_mod_scale=theta_mod_scale,
         alpha_min=alpha_min,
         alpha_max=alpha_max,
         r_min=r_min,

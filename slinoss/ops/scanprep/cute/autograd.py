@@ -30,6 +30,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         dt_max: float,
         theta_init_min: float,
         theta_init_max: float,
+        theta_mod_scale: float,
         alpha_min: float,
         alpha_max: float,
         r_min: float,
@@ -51,6 +52,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         ctx.dt_max = float(dt_max)
         ctx.theta_init_min = float(theta_init_min)
         ctx.theta_init_max = float(theta_init_max)
+        ctx.theta_mod_scale = float(theta_mod_scale)
         ctx.alpha_min = float(alpha_min)
         ctx.alpha_max = float(alpha_max)
         ctx.r_min = float(r_min)
@@ -89,6 +91,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=dt_max,
             theta_init_min=theta_init_min,
             theta_init_max=theta_init_max,
+            theta_mod_scale=theta_mod_scale,
             alpha_min=alpha_min,
             alpha_max=alpha_max,
             r_min=r_min,
@@ -164,6 +167,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=ctx.dt_max,
             theta_init_min=ctx.theta_init_min,
             theta_init_max=ctx.theta_init_max,
+            theta_mod_scale=ctx.theta_mod_scale,
             alpha_min=ctx.alpha_min,
             alpha_max=ctx.alpha_max,
             r_min=ctx.r_min,
@@ -194,6 +198,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=ctx.dt_max,
             theta_init_min=ctx.theta_init_min,
             theta_init_max=ctx.theta_init_max,
+            theta_mod_scale=ctx.theta_mod_scale,
             alpha_min=ctx.alpha_min,
             alpha_max=ctx.alpha_max,
             r_min=ctx.r_min,
@@ -231,6 +236,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             outputs.bias_grad[:, 0].contiguous(),
             outputs.bias_grad[:, 1].contiguous(),
             outputs.bias_grad[:, 2].contiguous(),
@@ -252,6 +258,7 @@ def scanprep_cute_training_autograd(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
+    theta_mod_scale: float,
     alpha_min: float,
     alpha_max: float,
     r_min: float,
@@ -283,6 +290,7 @@ def scanprep_cute_training_autograd(
             float(dt_max),
             float(theta_init_min),
             float(theta_init_max),
+            float(theta_mod_scale),
             float(alpha_min),
             float(alpha_max),
             float(r_min),
