@@ -6,7 +6,11 @@ from typing import cast
 
 import torch
 
-from slinoss.ops.scanprep.parameterization import parameterize_scan_bc_rows
+from slinoss.ops.scanprep.parameterization import (
+    parameterize_scan_bc_rows,
+    validate_scan_bc_raw,
+    validate_scan_bc_rows,
+)
 
 from .kernels import _scanprep_bwd_cute_prevalidated, _scanprep_fwd_cute_prevalidated
 
@@ -18,7 +22,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         value: torch.Tensor,
         params: torch.Tensor,
         bc: torch.Tensor,
-        bc_complex_base: torch.Tensor,
         n_heads: int,
         bc_groups: int,
         d_state: int,
@@ -59,7 +62,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         value_d = value.detach()
         params_d = params.detach()
         bc_d = bc.detach()
-        bc_complex_base_d = bc_complex_base.detach()
         dt_bias_d = dt_bias.detach()
         gamma_bias_d = gamma_bias.detach()
         theta_mod_bias_d = theta_mod_bias.detach()
@@ -68,11 +70,15 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
 
         bc_rows = parameterize_scan_bc_rows(
             bc_d,
-            bc_complex_base_d,
             bc_groups=int(bc_groups),
             d_state=int(d_state),
             eps=float(eps),
             bc_gain_max=float(bc_gain_max),
+        )
+        validate_scan_bc_rows(
+            bc_rows,
+            bc_groups=int(bc_groups),
+            d_state=int(d_state),
         )
         outputs = _scanprep_fwd_cute_prevalidated(
             value_d,
@@ -101,7 +107,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         ctx.save_for_backward(
             bc_d,
             params_d,
-            bc_complex_base_d,
             dt_bias_d,
             gamma_bias_d,
             theta_mod_bias_d,
@@ -122,7 +127,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         (
             bc,
             params,
-            bc_complex_base,
             dt_bias,
             gamma_bias,
             theta_mod_bias,
@@ -132,14 +136,17 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
 
         with torch.enable_grad():
             bc_req = bc.detach().requires_grad_(True)
-            bc_complex_base_req = bc_complex_base.detach().requires_grad_(True)
             bc_rows = parameterize_scan_bc_rows(
                 bc_req,
-                bc_complex_base_req,
                 bc_groups=ctx.bc_groups,
                 d_state=ctx.d_state,
                 eps=ctx.eps,
                 bc_gain_max=ctx.bc_gain_max,
+            )
+            validate_scan_bc_rows(
+                bc_rows,
+                bc_groups=ctx.bc_groups,
+                d_state=ctx.d_state,
             )
 
         bc_rows_detached = bc_rows.detach()
@@ -202,9 +209,9 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         )
 
         with torch.enable_grad():
-            bc_grad, bc_complex_base_grad = torch.autograd.grad(
+            (bc_grad,) = torch.autograd.grad(
                 outputs=bc_rows,
-                inputs=(bc_req, bc_complex_base_req),
+                inputs=(bc_req,),
                 grad_outputs=outputs.bc_grad,
                 create_graph=False,
                 retain_graph=False,
@@ -215,7 +222,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             outputs.value_grad,
             outputs.dparams,
             bc_grad,
-            bc_complex_base_grad,
             None,
             None,
             None,
@@ -257,7 +263,6 @@ def scanprep_cute_training_autograd(
     r_max: float,
     bc_gain_max: float,
     eps: float,
-    bc_complex_base: torch.Tensor,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     theta_mod_bias: torch.Tensor,
@@ -265,13 +270,17 @@ def scanprep_cute_training_autograd(
     theta_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     resolved_bc_groups = n_heads if bc_groups is None else int(bc_groups)
+    validate_scan_bc_raw(
+        bc,
+        bc_groups=resolved_bc_groups,
+        d_state=int(d_state),
+    )
     return cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         _ScanPrepCuTeFn.apply(
             value,
             params,
             bc,
-            bc_complex_base,
             int(n_heads),
             int(resolved_bc_groups),
             int(d_state),

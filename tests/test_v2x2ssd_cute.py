@@ -1664,18 +1664,16 @@ def test_v2x2ssd_cute_stateful_forward_respects_current_stream() -> None:
                 output_dtype=torch.bfloat16,
                 return_state=True,
             )
-            final_checksum = out_cute[1].float().sum().cpu()
+            final_probe = out_cute[1][:, :2, :4, :8].float().cpu()
 
-        expected_checksum = out_ref[1].float().sum().cpu()
+        expected_probe = out_ref[1][:, :2, :4, :8].float().cpu()
         torch.cuda.synchronize()
 
-        # The checksum is only a stream-routing sentinel here. With bf16 TC
-        # staging the corrected path accumulates enough deterministic rounding
-        # drift to move the sum by about 3.7e-2 while the synchronized
-        # elementwise state error stays around 1e-3.
-        torch.testing.assert_close(
-            final_checksum, expected_checksum, atol=5e-2, rtol=0.0
-        )
+        # The host copy is only a stream-routing sentinel here. Copy a small
+        # final-state slice instead of reducing the whole bf16 state tensor,
+        # since the full reduction accumulates enough deterministic rounding
+        # noise under long suite runs to become flaky.
+        torch.testing.assert_close(final_probe, expected_probe, atol=2e-3, rtol=0.0)
         torch.testing.assert_close(out_cute[0], out_ref[0], atol=1e-1, rtol=0.0)
         torch.testing.assert_close(out_cute[1], out_ref[1], atol=2e-3, rtol=0.0)
         torch.testing.assert_close(out_cute[2], out_ref[2], atol=1e-1, rtol=0.0)
@@ -1688,6 +1686,7 @@ def test_v2x2ssd_cute_training_backward_is_repeatable(bc_groups: int) -> None:
     pytest.importorskip("cutlass")
 
     def run_once() -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        torch.cuda.synchronize()
         torch.manual_seed(0)
         U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
             batch=2,
@@ -1717,6 +1716,7 @@ def test_v2x2ssd_cute_training_backward_is_repeatable(bc_groups: int) -> None:
         )
         loss = y.square().mean()
         loss.backward()
+        torch.cuda.synchronize()
 
         assert U.grad is not None
         assert M.grad is not None

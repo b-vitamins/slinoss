@@ -30,11 +30,12 @@ class ScanPrepInputs:
     Shapes:
     - ``value``: ``(batch, T, heads * P)``
     - ``params``: ``(batch, T, heads * param_dim)``
-    - ``bc``: ``(batch, T, groups, 2, N)``
+    - ``bc``: ``(batch, T, groups, 4, N)``
 
-    The BC stream is grouped across contiguous head ranges. If ``H`` is the
-    value-head count and ``G`` is the BC-group count, then the grouped BC slice
-    consumed by head ``h`` is ``bc[..., h // (H // G), :, :]``.
+    The BC stream carries grouped raw control rows
+    ``(B_amp, B_phase, C_amp, C_phase)`` across contiguous head ranges. If
+    ``H`` is the value-head count and ``G`` is the BC-group count, then the
+    grouped BC slice consumed by head ``h`` is ``bc[..., h // (H // G), :, :]``.
     """
 
     value: torch.Tensor
@@ -70,7 +71,7 @@ class MixerDecodeInputs:
     Shapes:
     - ``value``: ``(batch, heads, P)`` post-conv/post-activation value token
     - ``params``: ``(batch, heads, param_dim)`` flat scanprep parameter token
-    - ``bc``: ``(batch, groups, 2, N)`` raw mixer-emitted grouped BC token
+    - ``bc``: ``(batch, groups, 4, N)`` raw grouped BC control rows
     - ``gate``: ``(batch, heads, P)`` token-local gating vector
     """
 

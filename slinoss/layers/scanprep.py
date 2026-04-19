@@ -32,7 +32,7 @@ class SLinOSSScanPrep(nn.Module):
     """Converts mixer value, parameter, and BC streams into scan inputs."""
 
     param_dim: int = 2
-    bc_param_rows: int = 2
+    bc_param_rows: int = 4
     theta_mod_scale: float = 0.25
     theta_sign: torch.Tensor
 
@@ -130,14 +130,6 @@ class SLinOSSScanPrep(nn.Module):
         self.theta_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
-        self.bc_complex_base = nn.Parameter(
-            torch.empty(
-                (self.bc_groups, 2, self.d_state),
-                device=device,
-                dtype=torch.complex64,
-            )
-        )
-
         self.register_buffer(
             "theta_sign",
             torch.where(
@@ -184,15 +176,6 @@ class SLinOSSScanPrep(nn.Module):
         theta0 = torch.stack([pair[1] for pair in pairs[: self.n_heads]])
         return dt0, theta0
 
-    def _make_initial_phase_grid(self) -> torch.Tensor:
-        return torch.linspace(
-            -math.pi,
-            math.pi,
-            self.bc_groups * 2 * self.d_state + 1,
-            device=self.dt_bias.device,
-            dtype=torch.float32,
-        )[:-1].view(self.bc_groups, 2, self.d_state)
-
     def reset_parameters(self) -> None:
         dt0, theta0 = self._head_init_targets()
         dt_u0 = (dt0 - self.dt_min) / (self.dt_max - self.dt_min)
@@ -206,32 +189,6 @@ class SLinOSSScanPrep(nn.Module):
             )
             self.theta_mod_bias.zero_()
             self.theta_bias.copy_(_logit(theta_u0))
-            phase_grid = self._make_initial_phase_grid()
-            self.bc_complex_base.copy_(
-                torch.polar(torch.ones_like(phase_grid), phase_grid).to(torch.complex64)
-            )
-
-    def _apply(self, fn):  # type: ignore[override]
-        bc_complex_base = self._parameters.pop("bc_complex_base", None)
-        super()._apply(fn)
-        if bc_complex_base is None:
-            return self
-
-        probe = fn(torch.empty((), device=bc_complex_base.device, dtype=torch.float32))
-        restored = nn.Parameter(
-            bc_complex_base.detach().to(
-                device=probe.device,
-                dtype=bc_complex_base.dtype,
-            ),
-            requires_grad=bc_complex_base.requires_grad,
-        )
-        if bc_complex_base.grad is not None:
-            restored.grad = bc_complex_base.grad.detach().to(
-                device=probe.device,
-                dtype=bc_complex_base.dtype,
-            )
-        self._parameters["bc_complex_base"] = restored
-        return self
 
     def coefficients(self, params: torch.Tensor) -> SLinOSSScanPrepCoefficients:
         M, K, dt, r, theta = self._make_scan_coefficients(params, include_aux=True)
@@ -317,7 +274,6 @@ class SLinOSSScanPrep(nn.Module):
         self._validate_scan_bc(bc)
         return parameterize_scan_bc_pairs(
             bc,
-            self.bc_complex_base,
             bc_groups=self.bc_groups,
             d_state=self.d_state,
             eps=self.eps,
@@ -426,7 +382,6 @@ class SLinOSSScanPrep(nn.Module):
             r_max=self.r_max,
             eps=self.eps,
             bc_gain_max=self.bc_gain_max,
-            bc_complex_base=self.bc_complex_base,
             dt_bias=self.dt_bias,
             gamma_bias=self.gamma_bias,
             theta_mod_bias=self.theta_mod_bias,

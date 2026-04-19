@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import warnings
 from typing import Any, cast
 
 import cutlass.cute as cute
@@ -34,6 +33,7 @@ from slinoss.ops.scanprep.cute.kernels import (
     scanprep_fwd_cute,
     scanprep_fwd_cute_with_aux,
 )
+from slinoss.ops.scanprep.parameterization import PHASE_LIMIT
 from slinoss.ops.v2x2ssd import v2x2ssd
 
 
@@ -744,17 +744,33 @@ def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     assert torch.allclose(radius, out.r, atol=1e-6, rtol=1e-6)
 
 
-def test_scanprep_real_dtype_cast_preserves_complex_bc_base() -> None:
-    prep = SLinOSSScanPrep(n_heads=2, d_state=3, d_head=4)
-    before = prep.bc_complex_base.detach().clone()
+def test_scanprep_direct_polar_bc_pairs_follow_token_phase_rows() -> None:
+    prep = SLinOSSScanPrep(n_heads=1, bc_groups=1, d_state=2, d_head=4)
+    bc = torch.zeros((1, 1, prep.bc_groups, prep.bc_param_rows, prep.d_state))
+    bc[..., 0, :] = 1.0
+    bc[..., 1, :] = torch.tensor([0.75, -0.25])
+    bc[..., 2, :] = 1.0
+    bc[..., 3, :] = torch.tensor([-0.5, 0.5])
 
-    with warnings.catch_warnings(record=True) as caught:
-        prep = prep.to(dtype=torch.float16)
+    b_pairs, c_pairs = prep._parameterize_scan_bc_pairs(bc)
 
-    assert caught == []
-    assert prep.bc_complex_base.is_complex()
-    assert prep.bc_complex_base.dtype == torch.complex64
-    torch.testing.assert_close(prep.bc_complex_base, before)
+    for lane, phase_logit in enumerate((0.75, -0.25)):
+        b_direction = b_pairs[0, 0, 0, lane] / b_pairs[0, 0, 0, lane].norm()
+        b_expected_phase = PHASE_LIMIT * math.tanh(phase_logit)
+        b_expected = torch.tensor(
+            [math.cos(b_expected_phase), math.sin(b_expected_phase)],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(b_direction, b_expected, atol=1e-5, rtol=1e-5)
+
+    for lane, phase_logit in enumerate((-0.5, 0.5)):
+        c_direction = c_pairs[0, 0, 0, lane] / c_pairs[0, 0, 0, lane].norm()
+        c_expected_phase = PHASE_LIMIT * math.tanh(phase_logit)
+        c_expected = torch.tensor(
+            [math.cos(c_expected_phase), math.sin(c_expected_phase)],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(c_direction, c_expected, atol=1e-5, rtol=1e-5)
 
 
 def test_scanprep_parameterized_bc_pairs_match_row_packing() -> None:
@@ -838,8 +854,6 @@ def test_scanprep_grouped_reference_contract_and_gradients() -> None:
     assert value.grad is not None and tuple(value.grad.shape) == tuple(value.shape)
     assert params.grad is not None and tuple(params.grad.shape) == tuple(params.shape)
     assert bc.grad is not None and tuple(bc.grad.shape) == tuple(bc.shape)
-    assert prep.bc_complex_base.grad is not None
-    assert tuple(prep.bc_complex_base.grad.shape) == (prep.bc_groups, 2, prep.d_state)
 
 
 def test_cute_scanprep_backend_requires_cuda() -> None:
@@ -1111,7 +1125,6 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
         "gamma_bias",
         "theta_mod_bias",
         "theta_bias",
-        "bc_complex_base",
     )
     for name in names:
         ref_grad = getattr(ref, name).grad

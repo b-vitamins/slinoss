@@ -1,22 +1,44 @@
-"""Shared BC parameterization helpers for scanprep."""
+"""Direct token-emitted complex BC parameterization helpers for scanprep."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch.nn import functional as F
 
+RAW_BC_PARAM_ROWS = 4
+PACKED_BC_ROWS = 4
+PHASE_LIMIT = math.pi
 
-def _validate_scan_bc_raw(
+
+def validate_scan_bc_raw(
     bc: torch.Tensor,
     *,
     bc_groups: int,
     d_state: int,
 ) -> None:
-    expected_tail = (int(bc_groups), 2, int(d_state))
+    expected_tail = (int(bc_groups), RAW_BC_PARAM_ROWS, int(d_state))
     if bc.ndim != 5 or tuple(map(int, bc.shape[2:])) != expected_tail:
         raise ValueError(
             "bc must be "
-            f"(batch, T, groups, 2, d_state). Got {tuple(map(int, bc.shape))}."
+            f"(batch, T, groups, {RAW_BC_PARAM_ROWS}, d_state). "
+            f"Got {tuple(map(int, bc.shape))}."
+        )
+
+
+def validate_scan_bc_rows(
+    bc_rows: torch.Tensor,
+    *,
+    bc_groups: int,
+    d_state: int,
+) -> None:
+    expected_tail = (int(bc_groups), PACKED_BC_ROWS, int(d_state))
+    if bc_rows.ndim != 5 or tuple(map(int, bc_rows.shape[2:])) != expected_tail:
+        raise ValueError(
+            "Packed bc rows must be "
+            f"(batch, T, groups, {PACKED_BC_ROWS}, d_state). "
+            f"Got {tuple(map(int, bc_rows.shape))}."
         )
 
 
@@ -34,59 +56,66 @@ def _normalize_scan_bc_pairs(
     return direction * bounded_gain.unsqueeze(-1).to(dtype=bc_pairs.dtype)
 
 
+def _phase_rotor(phase_logits: torch.Tensor) -> torch.Tensor:
+    phase = PHASE_LIMIT * torch.tanh(phase_logits.to(torch.float32))
+    return torch.stack((torch.cos(phase), torch.sin(phase)), dim=-1)
+
+
 def parameterize_scan_bc_pairs(
     bc: torch.Tensor,
-    bc_complex_base: torch.Tensor,
     *,
     bc_groups: int,
     d_state: int,
     eps: float,
     bc_gain_max: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build normalized complex B/C pairs from raw grouped BC amplitudes."""
-    _validate_scan_bc_raw(
+    """Build normalized complex B/C pairs directly from token-emitted polar fields.
+
+    Raw grouped BC rows are interpreted as:
+    - ``bc[..., 0, :]``: B amplitude logits
+    - ``bc[..., 1, :]``: B phase logits
+    - ``bc[..., 2, :]``: C amplitude logits
+    - ``bc[..., 3, :]``: C phase logits
+    """
+    validate_scan_bc_raw(
         bc,
         bc_groups=int(bc_groups),
         d_state=int(d_state),
     )
-    if bc_complex_base.ndim != 3 or tuple(map(int, bc_complex_base.shape)) != (
-        int(bc_groups),
-        2,
-        int(d_state),
-    ):
-        raise ValueError(
-            "bc_complex_base must be "
-            f"({int(bc_groups)}, 2, {int(d_state)}). "
-            f"Got {tuple(map(int, bc_complex_base.shape))}."
-        )
 
-    bc_amplitude = F.softplus(bc)
-    complex_base = torch.view_as_real(bc_complex_base).to(
-        device=bc.device, dtype=bc.dtype
-    )
-    b_pairs = bc_amplitude[..., 0, :].unsqueeze(-1) * complex_base[:, 0, :, :].view(
-        1, 1, int(bc_groups), int(d_state), 2
-    )
-    c_pairs = bc_amplitude[..., 1, :].unsqueeze(-1) * complex_base[:, 1, :, :].view(
-        1, 1, int(bc_groups), int(d_state), 2
+    b_amp = F.softplus(bc[..., 0, :].to(torch.float32))
+    c_amp = F.softplus(bc[..., 2, :].to(torch.float32))
+    b_phase = _phase_rotor(bc[..., 1, :])
+    c_phase = _phase_rotor(bc[..., 3, :])
+
+    b_pairs = b_amp.unsqueeze(-1) * b_phase
+    c_pairs = c_amp.unsqueeze(-1) * c_phase
+
+    pair_dtype = (
+        bc.dtype
+        if bc.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        else torch.float32
     )
     return (
         _normalize_scan_bc_pairs(
             b_pairs,
             eps=float(eps),
             bc_gain_max=float(bc_gain_max),
-        ).contiguous(),
+        )
+        .to(dtype=pair_dtype)
+        .contiguous(),
         _normalize_scan_bc_pairs(
             c_pairs,
             eps=float(eps),
             bc_gain_max=float(bc_gain_max),
-        ).contiguous(),
+        )
+        .to(dtype=pair_dtype)
+        .contiguous(),
     )
 
 
 def parameterize_scan_bc_rows(
     bc: torch.Tensor,
-    bc_complex_base: torch.Tensor,
     *,
     bc_groups: int,
     d_state: int,
@@ -96,19 +125,29 @@ def parameterize_scan_bc_rows(
     """Build packed real BC rows ``(B_re, B_im, C_re, C_im)`` for CuTe scanprep."""
     b_pairs, c_pairs = parameterize_scan_bc_pairs(
         bc,
-        bc_complex_base,
         bc_groups=int(bc_groups),
         d_state=int(d_state),
         eps=float(eps),
         bc_gain_max=float(bc_gain_max),
     )
-    return torch.stack(
+    rows = torch.stack(
         (b_pairs[..., 0], b_pairs[..., 1], c_pairs[..., 0], c_pairs[..., 1]),
         dim=3,
     )
+    validate_scan_bc_rows(
+        rows,
+        bc_groups=int(bc_groups),
+        d_state=int(d_state),
+    )
+    return rows
 
 
 __all__ = [
+    "PACKED_BC_ROWS",
+    "PHASE_LIMIT",
+    "RAW_BC_PARAM_ROWS",
     "parameterize_scan_bc_pairs",
     "parameterize_scan_bc_rows",
+    "validate_scan_bc_raw",
+    "validate_scan_bc_rows",
 ]

@@ -3,7 +3,12 @@
 import torch
 
 from slinoss.layers.backend import ScanInputs
-from slinoss.ops.scanprep.parameterization import parameterize_scan_bc_rows
+from slinoss.ops.scanprep.parameterization import (
+    RAW_BC_PARAM_ROWS,
+    parameterize_scan_bc_rows,
+    validate_scan_bc_raw,
+    validate_scan_bc_rows,
+)
 
 
 def _match_scan_io_dtype(
@@ -23,7 +28,6 @@ def _validate_scanprep_inputs(
     value: torch.Tensor,
     params: torch.Tensor,
     bc: torch.Tensor,
-    bc_complex_base: torch.Tensor,
     *,
     n_heads: int,
     bc_groups: int,
@@ -50,15 +54,15 @@ def _validate_scanprep_inputs(
         raise ValueError(f"bc_gain_max must be positive. Got {bc_gain_max}.")
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
-            "Expected value=(B,T,H*P), params=(B,T,H*2), bc=(B,T,G,2,N). "
+            "Expected value=(B,T,H*P), params=(B,T,H*2), "
+            f"bc=(B,T,G,{RAW_BC_PARAM_ROWS},N). "
             f"Got {tuple(value.shape)}, {tuple(params.shape)}, {tuple(bc.shape)}."
         )
-    expected_base_shape = (bc_groups, 2, d_state)
-    if tuple(map(int, bc_complex_base.shape)) != expected_base_shape:
-        raise ValueError(
-            "Expected bc_complex_base shape "
-            f"{expected_base_shape}. Got {tuple(map(int, bc_complex_base.shape))}."
-        )
+    validate_scan_bc_raw(
+        bc,
+        bc_groups=bc_groups,
+        d_state=d_state,
+    )
     supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     if (
         value.dtype not in supported_dtypes
@@ -104,7 +108,6 @@ def scanprep_cute(
     r_max: float,
     eps: float,
     bc_gain_max: float,
-    bc_complex_base: torch.Tensor,
     dt_bias: torch.Tensor,
     gamma_bias: torch.Tensor,
     theta_mod_bias: torch.Tensor,
@@ -117,7 +120,6 @@ def scanprep_cute(
         value,
         params,
         bc,
-        bc_complex_base,
         n_heads=n_heads,
         bc_groups=resolved_bc_groups,
         d_state=d_state,
@@ -128,7 +130,6 @@ def scanprep_cute(
         value,
         params,
         bc,
-        bc_complex_base,
         dt_bias,
         gamma_bias,
         theta_mod_bias,
@@ -155,7 +156,6 @@ def scanprep_cute(
                 r_max=r_max,
                 eps=eps,
                 bc_gain_max=bc_gain_max,
-                bc_complex_base=bc_complex_base,
                 dt_bias=dt_bias,
                 gamma_bias=gamma_bias,
                 theta_mod_bias=theta_mod_bias,
@@ -168,11 +168,15 @@ def scanprep_cute(
 
     bc_rows = parameterize_scan_bc_rows(
         bc,
-        bc_complex_base,
         bc_groups=resolved_bc_groups,
         d_state=d_state,
         eps=eps,
         bc_gain_max=bc_gain_max,
+    )
+    validate_scan_bc_rows(
+        bc_rows,
+        bc_groups=resolved_bc_groups,
+        d_state=d_state,
     )
 
     return _make_scan_inputs(
