@@ -774,6 +774,26 @@ def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     assert torch.allclose(radius, out.r, atol=1e-6, rtol=1e-6)
 
 
+def test_scanprep_dt_is_token_conditioned_while_radius_and_phase_stay_fixed() -> None:
+    prep = SLinOSSScanPrep(n_heads=1, d_state=2, d_head=4)
+    params = torch.zeros((1, 2, prep.n_heads, prep.param_dim), dtype=torch.float32)
+    params[0, 0, 0, 0] = -5.0
+    params[0, 1, 0, 0] = 5.0
+
+    out = prep.coefficients(params)
+
+    dt0 = out.dt[0, 0, 0]
+    dt1 = out.dt[0, 0, 1]
+    r0 = out.r[0, 0, 0]
+    r1 = out.r[0, 0, 1]
+    theta0 = out.theta[0, 0, 0]
+    theta1 = out.theta[0, 0, 1]
+
+    assert not torch.isclose(dt0, dt1)
+    torch.testing.assert_close(r0, r1, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(theta0, theta1, atol=1e-6, rtol=1e-6)
+
+
 def test_scanprep_direct_polar_bc_pairs_follow_token_phase_rows() -> None:
     prep = SLinOSSScanPrep(n_heads=1, bc_groups=1, d_state=2, d_head=4)
     bc = torch.zeros((1, 1, prep.bc_groups, prep.bc_param_rows, prep.d_state))

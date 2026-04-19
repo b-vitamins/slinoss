@@ -515,7 +515,7 @@ class ScanPrepBwdFused:
             )
 
             dt_u = (dt - cutlass.Float32(self.dt_min)) / cutlass.Float32(self.dt_scale)
-            g_dt_bias = (
+            g_dt_raw = (
                 g_dt
                 * cutlass.Float32(self.dt_scale)
                 * dt_u
@@ -524,12 +524,13 @@ class ScanPrepBwdFused:
             g_theta_bias = g_phase_logit
 
             flat_base = warp * self.param_dim
-            sDParams[lane, flat_base + 0] = g_alpha_raw
-            sDParams[lane, flat_base + 1] = g_theta_mod_raw
+            sDParams[lane, flat_base + 0] = g_dt_raw
+            sDParams[lane, flat_base + 1] = g_alpha_raw
+            sDParams[lane, flat_base + 2] = g_theta_mod_raw
 
             bias_base = h * 4
             cute.arch.atomic_add(
-                _llvm_ptr(mBiasGrad.iterator + bias_base + 0), g_dt_bias
+                _llvm_ptr(mBiasGrad.iterator + bias_base + 0), g_dt_raw
             )
             cute.arch.atomic_add(
                 _llvm_ptr(mBiasGrad.iterator + bias_base + 1), g_alpha_raw

@@ -29,9 +29,9 @@ class SLinOSSMixerConfig:
     d_conv: int = 4
     chunk_size: int = 64
     bc_groups: int | None = None
-    dt_min: float = 3.0e-2
+    dt_min: float = 5.0e-3
     dt_max: float = 1.0e-1
-    dt_init_floor: float = 3.0e-2
+    dt_init_floor: float = 5.0e-3
     alpha_min: float = 0.0
     alpha_max: float = 20.0
     theta_init_min: float = 0.2

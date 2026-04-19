@@ -263,10 +263,11 @@ class ScanPrepFwdFused:
             b = bt // t_size_
             t = bt - b * t_size_
 
-            alpha_raw = sParams[warp, 0, lane] + cutlass.Float32(mAlphaBias[h])
-            theta_mod_raw = sParams[warp, 1, lane] + cutlass.Float32(mThetaModBias[h])
+            dt_raw = sParams[warp, 0, lane] + cutlass.Float32(mDtBias[h])
+            alpha_raw = sParams[warp, 1, lane] + cutlass.Float32(mAlphaBias[h])
+            theta_mod_raw = sParams[warp, 2, lane] + cutlass.Float32(mThetaModBias[h])
 
-            dt_u = sigmoid(cutlass.Float32(mDtBias[h]))
+            dt_u = sigmoid(dt_raw)
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
             alpha = cutlass.Float32(self.alpha_min) + cutlass.Float32(
                 self.alpha_span

@@ -26,7 +26,7 @@ class MixerDecodeStepFwd:
 
     Contract:
     - ``value`` / ``gate``: ``(B, H, P)``
-    - ``params``: ``(B, H, 2)``
+    - ``params``: ``(B, H, 3)``
     - ``bc``: ``(B, H, 4, N)``
     - ``state``: ``(B, H, P, 2N)``
     - ``b_prev``: ``(B, H, 2N)``
@@ -585,14 +585,17 @@ class MixerDecodeStepFwd:
         tap_curr_im = cutlass.Float32(0.0)
 
         if lane_idx == 0:
-            alpha_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
+            dt_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
+                mDtBias[bidh]
+            )
+            alpha_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
                 mAlphaBias[bidh]
             )
-            theta_mod_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
+            theta_mod_raw = cutlass.Float32(mParams[bidb, bidh, 2]) + cutlass.Float32(
                 mThetaModBias[bidh]
             )
 
-            dt_u = sigmoid(cutlass.Float32(mDtBias[bidh]))
+            dt_u = sigmoid(dt_raw)
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
             alpha = cutlass.Float32(self.alpha_min) + cutlass.Float32(
                 self.alpha_span

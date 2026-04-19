@@ -263,7 +263,7 @@ def test_get_compiled_scanprep_fwd_kernel_prefers_packaged_aot(
     )
     runtime_artifacts = scanprep_kernels_mod._make_forward_runtime_artifacts(
         torch.empty((2, 5, 8), dtype=torch.float16),
-        torch.empty((2, 5, 4), dtype=torch.float16),
+        torch.empty((2, 5, 6), dtype=torch.float16),
         torch.empty((2, 5, 2, 4, 3), dtype=torch.float16),
         config=config,
         n_heads=2,

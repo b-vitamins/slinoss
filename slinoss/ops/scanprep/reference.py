@@ -120,21 +120,14 @@ def scanprep_scan_coeffs_from_flat_params(
 
     p = params.view(params.shape[0], params.shape[1], n_heads, param_dim)
     p = p.permute(0, 2, 1, 3).to(torch.float32)
-    bias = torch.stack(
-        (
-            alpha_bias,
-            theta_mod_bias,
-        ),
-        dim=-1,
-    )
+    bias = torch.stack((dt_bias, alpha_bias, theta_mod_bias), dim=-1)
     p = p + bias.view(1, n_heads, 1, param_dim)
 
-    alpha_raw = p[..., 0]
-    theta_mod_raw = p[..., 1]
+    dt_raw = p[..., 0]
+    alpha_raw = p[..., 1]
+    theta_mod_raw = p[..., 2]
 
-    dt = (
-        dt_min + (dt_max - dt_min) * torch.sigmoid(dt_bias).view(1, n_heads, 1)
-    ).expand_as(alpha_raw)
+    dt = dt_min + (dt_max - dt_min) * torch.sigmoid(dt_raw)
     theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
     theta_u = torch.sigmoid(
         theta_bias.view(1, n_heads, 1) + 0.25 * torch.tanh(theta_mod_raw)

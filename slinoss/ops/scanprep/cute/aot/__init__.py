@@ -60,7 +60,7 @@ _DEFAULT_AOT_DTYPE_NAMES = ("bfloat16",)
 # Keep the scalar scanprep parameter band aligned with the common mixer path so
 # the curated default AOT surface matches representative training workloads.
 _DEFAULT_SCANPREP_CONFIG_KWARGS = {
-    "dt_min": 3.0e-2,
+    "dt_min": 5.0e-3,
     "dt_max": 1.0e-1,
     "theta_init_min": 0.2,
     "theta_init_max": 1.0,

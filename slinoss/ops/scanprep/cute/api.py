@@ -9,6 +9,7 @@ from slinoss.ops.scanprep.parameterization import (
     validate_scan_bc_raw,
     validate_scan_bc_rows,
 )
+from .common import SCANPREP_PARAM_DIM
 
 
 def _match_scan_io_dtype(
@@ -51,7 +52,7 @@ def _validate_scanprep_inputs(
         )
     if value.ndim != 3 or params.ndim != 3 or bc.ndim != 5:
         raise ValueError(
-            "Expected value=(B,T,H*P), params=(B,T,H*2), "
+            f"Expected value=(B,T,H*P), params=(B,T,H*{SCANPREP_PARAM_DIM}), "
             f"bc=(B,T,G,{RAW_BC_PARAM_ROWS},N). "
             f"Got {tuple(value.shape)}, {tuple(params.shape)}, {tuple(bc.shape)}."
         )

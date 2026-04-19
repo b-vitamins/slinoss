@@ -31,7 +31,7 @@ def _logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 class SLinOSSScanPrep(nn.Module):
     """Converts mixer value, parameter, and BC streams into scan inputs."""
 
-    param_dim: int = 2
+    param_dim: int = 3
     bc_param_rows: int = 4
     theta_mod_scale: float = 0.25
     theta_sign: torch.Tensor
@@ -44,9 +44,9 @@ class SLinOSSScanPrep(nn.Module):
         d_state: int,
         d_head: int,
         backend: ScanPrepBackend | None = None,
-        dt_min: float = 3e-2,
+        dt_min: float = 5e-3,
         dt_max: float = 1e-1,
-        dt_init_floor: float = 3e-2,
+        dt_init_floor: float = 5e-3,
         alpha_min: float = 0.0,
         alpha_max: float = 20.0,
         theta_init_min: float = 0.2,
@@ -223,7 +223,10 @@ class SLinOSSScanPrep(nn.Module):
         return SLinOSSScanPrepCoefficients(M=M, K=K, dt=dt, r=r, theta=theta)
 
     def _make_param_bias(self) -> torch.Tensor:
-        return torch.stack((self.alpha_bias, self.theta_mod_bias), dim=-1)
+        return torch.stack(
+            (self.dt_bias, self.alpha_bias, self.theta_mod_bias),
+            dim=-1,
+        )
 
     def _make_scan_coefficients(
         self,
@@ -241,13 +244,9 @@ class SLinOSSScanPrep(nn.Module):
 
         p = params.permute(0, 2, 1, 3).to(torch.float32)
         p = p + self._make_param_bias().view(1, self.n_heads, 1, self.param_dim)
-        alpha_raw, theta_mod_raw = p.unbind(dim=-1)
+        dt_raw, alpha_raw, theta_mod_raw = p.unbind(dim=-1)
 
-        dt = (
-            self.dt_min
-            + (self.dt_max - self.dt_min)
-            * torch.sigmoid(self.dt_bias).view(1, self.n_heads, 1)
-        ).expand_as(alpha_raw)
+        dt = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(dt_raw)
         theta_u = torch.sigmoid(
             self.theta_bias.view(1, self.n_heads, 1)
             + self.theta_mod_scale * torch.tanh(theta_mod_raw)
