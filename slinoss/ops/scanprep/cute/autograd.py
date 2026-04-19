@@ -30,13 +30,13 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         dt_max: float,
         theta_init_min: float,
         theta_init_max: float,
-        gamma_min: float,
-        gamma_max: float,
+        alpha_min: float,
+        alpha_max: float,
         r_min: float,
         r_max: float,
         eps: float,
         dt_bias: torch.Tensor,
-        gamma_bias: torch.Tensor,
+        alpha_bias: torch.Tensor,
         theta_mod_bias: torch.Tensor,
         theta_bias: torch.Tensor,
         theta_sign: torch.Tensor,
@@ -51,8 +51,8 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         ctx.dt_max = float(dt_max)
         ctx.theta_init_min = float(theta_init_min)
         ctx.theta_init_max = float(theta_init_max)
-        ctx.gamma_min = float(gamma_min)
-        ctx.gamma_max = float(gamma_max)
+        ctx.alpha_min = float(alpha_min)
+        ctx.alpha_max = float(alpha_max)
         ctx.r_min = float(r_min)
         ctx.r_max = float(r_max)
         ctx.eps = float(eps)
@@ -61,7 +61,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         params_d = params.detach()
         bc_d = bc.detach()
         dt_bias_d = dt_bias.detach()
-        gamma_bias_d = gamma_bias.detach()
+        alpha_bias_d = alpha_bias.detach()
         theta_mod_bias_d = theta_mod_bias.detach()
         theta_bias_d = theta_bias.detach()
         theta_sign_d = theta_sign.detach()
@@ -89,13 +89,13 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=dt_max,
             theta_init_min=theta_init_min,
             theta_init_max=theta_init_max,
-            gamma_min=gamma_min,
-            gamma_max=gamma_max,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
             r_min=r_min,
             r_max=r_max,
             eps=eps,
             dt_bias=dt_bias_d,
-            gamma_bias=gamma_bias_d,
+            alpha_bias=alpha_bias_d,
             theta_mod_bias=theta_mod_bias_d,
             theta_bias=theta_bias_d,
             theta_sign=theta_sign_d,
@@ -105,7 +105,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             bc_d,
             params_d,
             dt_bias_d,
-            gamma_bias_d,
+            alpha_bias_d,
             theta_mod_bias_d,
             theta_bias_d,
             theta_sign_d,
@@ -125,7 +125,7 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             bc,
             params,
             dt_bias,
-            gamma_bias,
+            alpha_bias,
             theta_mod_bias,
             theta_bias,
             theta_sign,
@@ -164,13 +164,13 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=ctx.dt_max,
             theta_init_min=ctx.theta_init_min,
             theta_init_max=ctx.theta_init_max,
-            gamma_min=ctx.gamma_min,
-            gamma_max=ctx.gamma_max,
+            alpha_min=ctx.alpha_min,
+            alpha_max=ctx.alpha_max,
             r_min=ctx.r_min,
             r_max=ctx.r_max,
             eps=ctx.eps,
             dt_bias=dt_bias,
-            gamma_bias=gamma_bias,
+            alpha_bias=alpha_bias,
             theta_mod_bias=theta_mod_bias,
             theta_bias=theta_bias,
             theta_sign=theta_sign,
@@ -194,8 +194,8 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             dt_max=ctx.dt_max,
             theta_init_min=ctx.theta_init_min,
             theta_init_max=ctx.theta_init_max,
-            gamma_min=ctx.gamma_min,
-            gamma_max=ctx.gamma_max,
+            alpha_min=ctx.alpha_min,
+            alpha_max=ctx.alpha_max,
             r_min=ctx.r_min,
             r_max=ctx.r_max,
             eps=ctx.eps,
@@ -252,13 +252,13 @@ def scanprep_cute_training_autograd(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
-    gamma_min: float,
-    gamma_max: float,
+    alpha_min: float,
+    alpha_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
     theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
@@ -283,13 +283,13 @@ def scanprep_cute_training_autograd(
             float(dt_max),
             float(theta_init_min),
             float(theta_init_max),
-            float(gamma_min),
-            float(gamma_max),
+            float(alpha_min),
+            float(alpha_max),
             float(r_min),
             float(r_max),
             float(eps),
             dt_bias,
-            gamma_bias,
+            alpha_bias,
             theta_mod_bias,
             theta_bias,
             theta_sign,

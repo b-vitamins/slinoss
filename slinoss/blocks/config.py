@@ -32,11 +32,11 @@ class SLinOSSMixerConfig:
     dt_min: float = 3.0e-2
     dt_max: float = 1.0e-1
     dt_init_floor: float = 3.0e-2
-    gamma_min: float = 2.0
-    gamma_max: float = 8.0
+    alpha_min: float = 0.0
+    alpha_max: float = 20.0
     theta_init_min: float = 0.2
     theta_init_max: float = 1.0
-    r_min: float = 0.9
+    r_min: float = 0.8
     r_max: float = 1.0
     eps: float = 1.0e-8
 
@@ -54,6 +54,11 @@ class SLinOSSMixerConfig:
                 self.bc_groups > 0,
                 f"bc_groups must be positive. Got {self.bc_groups}.",
             )
+        _require(
+            0.0 <= self.alpha_min < self.alpha_max,
+            f"alpha_min/alpha_max must satisfy 0 <= min < max. Got "
+            f"{self.alpha_min}, {self.alpha_max}.",
+        )
 
     def build_kwargs(self) -> dict[str, object]:
         return {
@@ -66,8 +71,8 @@ class SLinOSSMixerConfig:
             "dt_min": self.dt_min,
             "dt_max": self.dt_max,
             "dt_init_floor": self.dt_init_floor,
-            "gamma_min": self.gamma_min,
-            "gamma_max": self.gamma_max,
+            "alpha_min": self.alpha_min,
+            "alpha_max": self.alpha_max,
             "theta_init_min": self.theta_init_min,
             "theta_init_max": self.theta_init_max,
             "r_min": self.r_min,

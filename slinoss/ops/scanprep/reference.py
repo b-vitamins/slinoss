@@ -101,13 +101,13 @@ def scanprep_scan_coeffs_from_flat_params(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
-    gamma_min: float,
-    gamma_max: float,
+    alpha_min: float,
+    alpha_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
     theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
@@ -122,27 +122,27 @@ def scanprep_scan_coeffs_from_flat_params(
     p = p.permute(0, 2, 1, 3).to(torch.float32)
     bias = torch.stack(
         (
-            gamma_bias,
+            alpha_bias,
             theta_mod_bias,
         ),
         dim=-1,
     )
     p = p + bias.view(1, n_heads, 1, param_dim)
 
-    gamma_raw = p[..., 0]
+    alpha_raw = p[..., 0]
     theta_mod_raw = p[..., 1]
 
     dt = (
         dt_min + (dt_max - dt_min) * torch.sigmoid(dt_bias).view(1, n_heads, 1)
-    ).expand_as(gamma_raw)
+    ).expand_as(alpha_raw)
     theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
     theta_u = torch.sigmoid(
         theta_bias.view(1, n_heads, 1) + 0.25 * torch.tanh(theta_mod_raw)
     )
     theta_drive = theta_init_min + theta_span * theta_u
-    gamma = gamma_min + (gamma_max - gamma_min) * torch.sigmoid(gamma_raw)
+    alpha = alpha_min + (alpha_max - alpha_min) * torch.sigmoid(alpha_raw)
     theta = principal_angle(theta_sign.view(1, n_heads, 1) * theta_drive)
-    r_struct = r_min + (r_max - r_min) * torch.exp(-(gamma * dt))
+    r_struct = r_min + (r_max - r_min) * torch.exp(-alpha)
     r = r_struct
     log_r_f = torch.log(r)
     rho = torch.polar(r, theta)

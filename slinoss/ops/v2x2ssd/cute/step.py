@@ -235,13 +235,13 @@ def mixer_decode_step_cute(
     dt_max: float,
     theta_init_min: float,
     theta_init_max: float,
-    gamma_min: float,
-    gamma_max: float,
+    alpha_min: float,
+    alpha_max: float,
     r_min: float,
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
-    gamma_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
     theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
@@ -438,7 +438,7 @@ def mixer_decode_step_cute(
     b_prev_align = _assumed_align(b_prev_c)
     u_prev_align = _assumed_align(u_prev_c)
     dt_bias_align = _assumed_align(dt_bias)
-    gamma_bias_align = _assumed_align(gamma_bias)
+    alpha_bias_align = _assumed_align(alpha_bias)
     theta_mod_bias_align = _assumed_align(theta_mod_bias)
     theta_bias_align = _assumed_align(theta_bias)
     theta_sign_align = _assumed_align(theta_sign)
@@ -499,7 +499,7 @@ def mixer_decode_step_cute(
         b_prev_c.dtype,
         u_prev_c.dtype,
         dt_bias.dtype,
-        gamma_bias.dtype,
+        alpha_bias.dtype,
         theta_mod_bias.dtype,
         theta_bias.dtype,
         theta_sign.dtype,
@@ -517,7 +517,7 @@ def mixer_decode_step_cute(
         b_prev_align,
         u_prev_align,
         dt_bias_align,
-        gamma_bias_align,
+        alpha_bias_align,
         theta_mod_bias_align,
         theta_bias_align,
         theta_sign_align,
@@ -532,8 +532,8 @@ def mixer_decode_step_cute(
         float(dt_max),
         float(theta_init_min),
         float(theta_init_max),
-        float(gamma_min),
-        float(gamma_max),
+        float(alpha_min),
+        float(alpha_max),
         float(r_min),
         float(r_max),
         float(eps),
@@ -558,8 +558,8 @@ def mixer_decode_step_cute(
                 dt_max=dt_max,
                 theta_init_min=theta_init_min,
                 theta_init_max=theta_init_max,
-                gamma_min=gamma_min,
-                gamma_max=gamma_max,
+                alpha_min=alpha_min,
+                alpha_max=alpha_max,
                 r_min=r_min,
                 r_max=r_max,
                 eps=eps,
@@ -572,7 +572,7 @@ def mixer_decode_step_cute(
             _make_fake_tensor_arg(b_prev_c, align=b_prev_align, dynamic_stride=True),
             _make_fake_tensor_arg(u_prev_c, align=u_prev_align, dynamic_stride=True),
             _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
-            _make_fake_tensor_arg(gamma_bias, align=gamma_bias_align),
+            _make_fake_tensor_arg(alpha_bias, align=alpha_bias_align),
             _make_fake_tensor_arg(theta_mod_bias, align=theta_mod_bias_align),
             _make_fake_tensor_arg(theta_bias, align=theta_bias_align),
             _make_fake_tensor_arg(theta_sign, align=theta_sign_align),
@@ -599,7 +599,7 @@ def mixer_decode_step_cute(
         b_prev_c,
         u_prev_c,
         dt_bias,
-        gamma_bias,
+        alpha_bias,
         theta_mod_bias,
         theta_bias,
         theta_sign,

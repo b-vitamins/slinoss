@@ -7,7 +7,7 @@ import cutlass.cute.math as cute_math
 from ..common import (
     COEFF_AUX_DT,
     COEFF_AUX_EXP_TERM,
-    COEFF_AUX_GAMMA,
+    COEFF_AUX_ALPHA,
     COEFF_AUX_KAPPA1_IM,
     COEFF_AUX_KAPPA1_RE,
     COEFF_AUX_KAPPA2_IM,
@@ -43,8 +43,8 @@ class ScanPrepFwdFused:
         dt_max: float,
         theta_init_min: float,
         theta_init_max: float,
-        gamma_min: float,
-        gamma_max: float,
+        alpha_min: float,
+        alpha_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -75,8 +75,8 @@ class ScanPrepFwdFused:
         self.dt_scale = float(dt_max - dt_min)
         self.theta_init_min = float(theta_init_min)
         self.theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
-        self.gamma_min = float(gamma_min)
-        self.gamma_span = float(gamma_max - gamma_min)
+        self.alpha_min = float(alpha_min)
+        self.alpha_span = float(alpha_max - alpha_min)
         self.theta_mod_scale = 0.25
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
@@ -204,7 +204,7 @@ class ScanPrepFwdFused:
         self,
         mParams: cute.Tensor,
         mDtBias: cute.Tensor,
-        mGammaBias: cute.Tensor,
+        mAlphaBias: cute.Tensor,
         mThetaModBias: cute.Tensor,
         mThetaBias: cute.Tensor,
         mThetaSign: cute.Tensor,
@@ -263,14 +263,14 @@ class ScanPrepFwdFused:
             b = bt // t_size_
             t = bt - b * t_size_
 
-            gamma_raw = sParams[warp, 0, lane] + cutlass.Float32(mGammaBias[h])
+            alpha_raw = sParams[warp, 0, lane] + cutlass.Float32(mAlphaBias[h])
             theta_mod_raw = sParams[warp, 1, lane] + cutlass.Float32(mThetaModBias[h])
 
             dt_u = sigmoid(cutlass.Float32(mDtBias[h]))
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
-            gamma = cutlass.Float32(self.gamma_min) + cutlass.Float32(
-                self.gamma_span
-            ) * sigmoid(gamma_raw)
+            alpha = cutlass.Float32(self.alpha_min) + cutlass.Float32(
+                self.alpha_span
+            ) * sigmoid(alpha_raw)
             theta_tanh = cute_math.tanh(theta_mod_raw)
             theta_u = sigmoid(
                 cutlass.Float32(mThetaBias[h])
@@ -282,7 +282,7 @@ class ScanPrepFwdFused:
             )
             theta = principal_angle(cutlass.Float32(mThetaSign[h]) * theta_drive)
 
-            exp_term = cute_math.exp(-(gamma * dt))
+            exp_term = cute_math.exp(-alpha)
             r_struct = (
                 cutlass.Float32(self.r_min) + cutlass.Float32(self.r_scale) * exp_term
             )
@@ -355,7 +355,7 @@ class ScanPrepFwdFused:
             mKOut[b, h, t, 1, 1] = k_curr_im
 
             if cutlass.const_expr(self.store_coeff_aux):  # pyright: ignore[reportPrivateImportUsage]
-                mCoeffAux[b, h, COEFF_AUX_GAMMA, t] = gamma
+                mCoeffAux[b, h, COEFF_AUX_ALPHA, t] = alpha
                 mCoeffAux[b, h, COEFF_AUX_THETA_TANH, t] = theta_tanh
                 mCoeffAux[b, h, COEFF_AUX_THETA_DRIVE, t] = theta_drive
                 mCoeffAux[b, h, COEFF_AUX_DT, t] = dt
@@ -377,7 +377,7 @@ class ScanPrepFwdFused:
         bc: cute.Tensor,
         params: cute.Tensor,
         dt_bias: cute.Tensor,
-        gamma_bias: cute.Tensor,
+        alpha_bias: cute.Tensor,
         theta_mod_bias: cute.Tensor,
         theta_bias: cute.Tensor,
         theta_sign: cute.Tensor,
@@ -413,7 +413,7 @@ class ScanPrepFwdFused:
             self._compute_coefficients(
                 param_view,
                 dt_bias,
-                gamma_bias,
+                alpha_bias,
                 theta_mod_bias,
                 theta_bias,
                 theta_sign,

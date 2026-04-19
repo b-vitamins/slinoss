@@ -270,7 +270,7 @@ def test_get_compiled_scanprep_fwd_kernel_prefers_packaged_aot(
         d_state=3,
         d_head=4,
         dt_bias=torch.empty((2,), dtype=torch.float32),
-        gamma_bias=torch.empty((2,), dtype=torch.float32),
+        alpha_bias=torch.empty((2,), dtype=torch.float32),
         theta_mod_bias=torch.empty((2,), dtype=torch.float32),
         theta_bias=torch.empty((2,), dtype=torch.float32),
         theta_sign=torch.empty((2,), dtype=torch.float32),

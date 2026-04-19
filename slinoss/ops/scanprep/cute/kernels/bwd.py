@@ -6,7 +6,7 @@ import cutlass.cute as cute
 from ..common import (
     COEFF_AUX_DT,
     COEFF_AUX_EXP_TERM,
-    COEFF_AUX_GAMMA,
+    COEFF_AUX_ALPHA,
     COEFF_AUX_KAPPA1_IM,
     COEFF_AUX_KAPPA1_RE,
     COEFF_AUX_KAPPA2_IM,
@@ -48,8 +48,8 @@ class ScanPrepBwdFused:
         dt_max: float,
         theta_init_min: float,
         theta_init_max: float,
-        gamma_min: float,
-        gamma_max: float,
+        alpha_min: float,
+        alpha_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -95,8 +95,8 @@ class ScanPrepBwdFused:
         self.dt_scale = float(dt_max - dt_min)
         self.theta_init_min = float(theta_init_min)
         self.theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
-        self.gamma_min = float(gamma_min)
-        self.gamma_span = float(gamma_max - gamma_min)
+        self.alpha_min = float(alpha_min)
+        self.alpha_span = float(alpha_max - alpha_min)
         self.theta_mod_scale = 0.25
         self.r_scale = float(r_max - r_min)
         self.eps = float(eps)
@@ -318,7 +318,7 @@ class ScanPrepBwdFused:
             b = bt // t_size_
             t = bt - b * t_size_
 
-            gamma = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_GAMMA, t])
+            alpha = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_ALPHA, t])
             theta_tanh = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_THETA_TANH, t])
             theta_drive = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_THETA_DRIVE, t])
             dt = cutlass.Float32(mCoeffAux[b, h, COEFF_AUX_DT, t])
@@ -485,12 +485,10 @@ class ScanPrepBwdFused:
             g_r = g_r + g_log_r / r
 
             g_exp_term = g_r * cutlass.Float32(self.r_scale)
-            g_x = g_exp_term * exp_term
+            g_alpha = g_exp_term * (-exp_term)
 
             sign = cutlass.Float32(mThetaSign[h])
             g_theta_drive = g_theta * sign
-            g_gamma = g_x * (-dt)
-            g_dt = g_dt + g_x * (-gamma)
 
             theta_u = (
                 theta_drive - cutlass.Float32(self.theta_init_min)
@@ -506,14 +504,14 @@ class ScanPrepBwdFused:
                 * cutlass.Float32(self.theta_mod_scale)
                 * (cutlass.Float32(1.0) - theta_tanh * theta_tanh)
             )
-            gamma_sigmoid = (gamma - cutlass.Float32(self.gamma_min)) / cutlass.Float32(
-                self.gamma_span
+            alpha_sigmoid = (alpha - cutlass.Float32(self.alpha_min)) / cutlass.Float32(
+                self.alpha_span
             )
-            g_gamma_raw = (
-                g_gamma
-                * cutlass.Float32(self.gamma_span)
-                * gamma_sigmoid
-                * (cutlass.Float32(1.0) - gamma_sigmoid)
+            g_alpha_raw = (
+                g_alpha
+                * cutlass.Float32(self.alpha_span)
+                * alpha_sigmoid
+                * (cutlass.Float32(1.0) - alpha_sigmoid)
             )
 
             dt_u = (dt - cutlass.Float32(self.dt_min)) / cutlass.Float32(self.dt_scale)
@@ -526,7 +524,7 @@ class ScanPrepBwdFused:
             g_theta_bias = g_phase_logit
 
             flat_base = warp * self.param_dim
-            sDParams[lane, flat_base + 0] = g_gamma_raw
+            sDParams[lane, flat_base + 0] = g_alpha_raw
             sDParams[lane, flat_base + 1] = g_theta_mod_raw
 
             bias_base = h * 4
@@ -534,7 +532,7 @@ class ScanPrepBwdFused:
                 _llvm_ptr(mBiasGrad.iterator + bias_base + 0), g_dt_bias
             )
             cute.arch.atomic_add(
-                _llvm_ptr(mBiasGrad.iterator + bias_base + 1), g_gamma_raw
+                _llvm_ptr(mBiasGrad.iterator + bias_base + 1), g_alpha_raw
             )
             cute.arch.atomic_add(
                 _llvm_ptr(mBiasGrad.iterator + bias_base + 2), g_theta_mod_raw

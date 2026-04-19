@@ -55,8 +55,8 @@ class MixerDecodeStepFwd:
         dt_max: float,
         theta_init_min: float,
         theta_init_max: float,
-        gamma_min: float,
-        gamma_max: float,
+        alpha_min: float,
+        alpha_max: float,
         r_min: float,
         r_max: float,
         eps: float,
@@ -117,8 +117,8 @@ class MixerDecodeStepFwd:
         self.dt_scale = float(dt_max - dt_min)
         self.theta_init_min = float(theta_init_min)
         self.theta_span = float(max(theta_init_max - theta_init_min, 1.0e-6))
-        self.gamma_min = float(gamma_min)
-        self.gamma_span = float(gamma_max - gamma_min)
+        self.alpha_min = float(alpha_min)
+        self.alpha_span = float(alpha_max - alpha_min)
         self.theta_mod_scale = 0.25
         self.r_min = float(r_min)
         self.r_scale = float(r_max - r_min)
@@ -208,7 +208,7 @@ class MixerDecodeStepFwd:
         b_prev: cute.Tensor,
         u_prev: cute.Tensor,
         dt_bias: cute.Tensor,
-        gamma_bias: cute.Tensor,
+        alpha_bias: cute.Tensor,
         theta_mod_bias: cute.Tensor,
         theta_bias: cute.Tensor,
         theta_sign: cute.Tensor,
@@ -269,8 +269,8 @@ class MixerDecodeStepFwd:
         mDtBias = cute.make_tensor(
             dt_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
-        mGammaBias = cute.make_tensor(
-            gamma_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
+        mAlphaBias = cute.make_tensor(
+            alpha_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
         )
         mThetaModBias = cute.make_tensor(
             theta_mod_bias.iterator, cute.make_layout((self.heads,), stride=(1,))
@@ -429,7 +429,7 @@ class MixerDecodeStepFwd:
             mBPrev,
             mUPrev,
             mDtBias,
-            mGammaBias,
+            mAlphaBias,
             mThetaModBias,
             mThetaBias,
             mThetaSign,
@@ -461,7 +461,7 @@ class MixerDecodeStepFwd:
         mBPrev: cute.Tensor,
         mUPrev: cute.Tensor,
         mDtBias: cute.Tensor,
-        mGammaBias: cute.Tensor,
+        mAlphaBias: cute.Tensor,
         mThetaModBias: cute.Tensor,
         mThetaBias: cute.Tensor,
         mThetaSign: cute.Tensor,
@@ -585,8 +585,8 @@ class MixerDecodeStepFwd:
         tap_curr_im = cutlass.Float32(0.0)
 
         if lane_idx == 0:
-            gamma_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
-                mGammaBias[bidh]
+            alpha_raw = cutlass.Float32(mParams[bidb, bidh, 0]) + cutlass.Float32(
+                mAlphaBias[bidh]
             )
             theta_mod_raw = cutlass.Float32(mParams[bidb, bidh, 1]) + cutlass.Float32(
                 mThetaModBias[bidh]
@@ -594,9 +594,9 @@ class MixerDecodeStepFwd:
 
             dt_u = sigmoid(cutlass.Float32(mDtBias[bidh]))
             dt = cutlass.Float32(self.dt_min) + cutlass.Float32(self.dt_scale) * dt_u
-            gamma = cutlass.Float32(self.gamma_min) + cutlass.Float32(
-                self.gamma_span
-            ) * sigmoid(gamma_raw)
+            alpha = cutlass.Float32(self.alpha_min) + cutlass.Float32(
+                self.alpha_span
+            ) * sigmoid(alpha_raw)
             theta_tanh = cute_math.tanh(theta_mod_raw)
             theta_u = sigmoid(
                 cutlass.Float32(mThetaBias[bidh])
@@ -609,7 +609,7 @@ class MixerDecodeStepFwd:
             theta = principal_angle(cutlass.Float32(mThetaSign[bidh]) * theta_drive)
             r_struct = cutlass.Float32(self.r_min) + cutlass.Float32(
                 self.r_scale
-            ) * cute_math.exp(-(gamma * dt))
+            ) * cute_math.exp(-alpha)
             r = r_struct
             rho_re = r * cute_math.cos(theta)
             rho_im = r * cute_math.sin(theta)

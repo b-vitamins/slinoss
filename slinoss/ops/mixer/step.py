@@ -36,10 +36,10 @@ if TYPE_CHECKING:
         def theta_init_max(self) -> float: ...
 
         @property
-        def gamma_min(self) -> float: ...
+        def alpha_min(self) -> float: ...
 
         @property
-        def gamma_max(self) -> float: ...
+        def alpha_max(self) -> float: ...
 
         @property
         def r_min(self) -> float: ...
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         def dt_bias(self) -> torch.Tensor: ...
 
         @property
-        def gamma_bias(self) -> torch.Tensor: ...
+        def alpha_bias(self) -> torch.Tensor: ...
 
         @property
         def theta_mod_bias(self) -> torch.Tensor: ...
@@ -277,13 +277,13 @@ def run_cute_decode_step(
         dt_max=mixer.scanprep.dt_max,
         theta_init_min=mixer.scanprep.theta_init_min,
         theta_init_max=mixer.scanprep.theta_init_max,
-        gamma_min=mixer.scanprep.gamma_min,
-        gamma_max=mixer.scanprep.gamma_max,
+        alpha_min=mixer.scanprep.alpha_min,
+        alpha_max=mixer.scanprep.alpha_max,
         r_min=mixer.scanprep.r_min,
         r_max=mixer.scanprep.r_max,
         eps=mixer.scanprep.eps,
         dt_bias=mixer.scanprep.dt_bias,
-        gamma_bias=mixer.scanprep.gamma_bias,
+        alpha_bias=mixer.scanprep.alpha_bias,
         theta_mod_bias=mixer.scanprep.theta_mod_bias,
         theta_bias=mixer.scanprep.theta_bias,
         theta_sign=cast(torch.Tensor, mixer.scanprep.theta_sign),

@@ -17,7 +17,7 @@ COMPLEX_DIV_DENOM_FLOOR = 1.0e-30
 
 SCANPREP_PARAM_DIM = 2
 
-COEFF_AUX_GAMMA = 0
+COEFF_AUX_ALPHA = 0
 COEFF_AUX_THETA_TANH = 1
 COEFF_AUX_THETA_DRIVE = 2
 COEFF_AUX_DT = 3
@@ -213,7 +213,7 @@ __all__ = [
     "COEFF_AUX_THETA",
     "COEFF_AUX_THETA_DRIVE",
     "COEFF_AUX_THETA_TANH",
-    "COEFF_AUX_GAMMA",
+    "COEFF_AUX_ALPHA",
     "assumed_align",
     "contiguous_tensor",
     "complex_div",

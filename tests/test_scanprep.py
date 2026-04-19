@@ -73,13 +73,13 @@ def _scanprep_runtime_kwargs(
         "dt_max": prep.dt_max,
         "theta_init_min": prep.theta_init_min,
         "theta_init_max": prep.theta_init_max,
-        "gamma_min": prep.gamma_min,
-        "gamma_max": prep.gamma_max,
+        "alpha_min": prep.alpha_min,
+        "alpha_max": prep.alpha_max,
         "r_min": prep.r_min,
         "r_max": prep.r_max,
         "eps": prep.eps,
         "dt_bias": _maybe_detach(prep.dt_bias),
-        "gamma_bias": _maybe_detach(prep.gamma_bias),
+        "alpha_bias": _maybe_detach(prep.alpha_bias),
         "theta_mod_bias": _maybe_detach(prep.theta_mod_bias),
         "theta_bias": _maybe_detach(prep.theta_bias),
         "theta_sign": _maybe_detach(cast(torch.Tensor, prep.theta_sign)),
@@ -141,6 +141,36 @@ def test_foh_taps_match_midpoint_rule_at_identity() -> None:
     assert torch.allclose(k_curr[..., 0], half_dt, atol=1e-7, rtol=0.0)
     assert torch.equal(k_prev[..., 1], torch.zeros_like(half_dt))
     assert torch.equal(k_curr[..., 1], torch.zeros_like(half_dt))
+
+
+@pytest.mark.parametrize("r_min", (0.8, 0.7, 0.6))
+def test_scanprep_low_r_min_init_stays_finite(r_min: float) -> None:
+    prep = SLinOSSScanPrep(
+        n_heads=32,
+        bc_groups=1,
+        d_state=64,
+        d_head=64,
+        dt_min=3e-2,
+        dt_max=1e-1,
+        dt_init_floor=3e-2,
+        alpha_min=0.0,
+        alpha_max=20.0,
+        theta_init_min=0.2,
+        theta_init_max=1.0,
+        r_min=r_min,
+        r_max=1.0,
+        device="cpu",
+    )
+    assert torch.isfinite(prep.alpha_bias).all()
+
+    zeros = torch.zeros((1, 1, prep.n_heads, prep.param_dim), dtype=torch.float32)
+    coeffs = prep.coefficients(zeros)
+
+    assert torch.isfinite(coeffs.dt).all()
+    assert torch.isfinite(coeffs.r).all()
+    assert torch.isfinite(coeffs.theta).all()
+    assert torch.isfinite(coeffs.M).all()
+    assert torch.isfinite(coeffs.K).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -421,8 +451,8 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
             dt_max=prep.dt_max,
             theta_init_min=prep.theta_init_min,
             theta_init_max=prep.theta_init_max,
-            gamma_min=prep.gamma_min,
-            gamma_max=prep.gamma_max,
+            alpha_min=prep.alpha_min,
+            alpha_max=prep.alpha_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
@@ -464,8 +494,8 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
             dt_max=prep.dt_max,
             theta_init_min=prep.theta_init_min,
             theta_init_max=prep.theta_init_max,
-            gamma_min=prep.gamma_min,
-            gamma_max=prep.gamma_max,
+            alpha_min=prep.alpha_min,
+            alpha_max=prep.alpha_max,
             r_min=prep.r_min,
             r_max=prep.r_max,
             eps=prep.eps,
@@ -501,8 +531,8 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
         dt_max=prep.dt_max,
         theta_init_min=prep.theta_init_min,
         theta_init_max=prep.theta_init_max,
-        gamma_min=prep.gamma_min,
-        gamma_max=prep.gamma_max,
+        alpha_min=prep.alpha_min,
+        alpha_max=prep.alpha_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
@@ -554,8 +584,8 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
         dt_max=prep.dt_max,
         theta_init_min=prep.theta_init_min,
         theta_init_max=prep.theta_init_max,
-        gamma_min=prep.gamma_min,
-        gamma_max=prep.gamma_max,
+        alpha_min=prep.alpha_min,
+        alpha_max=prep.alpha_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
@@ -607,8 +637,8 @@ def test_compile_scanprep_bwd_cute_enables_tvm_ffi(monkeypatch) -> None:
         dt_max=prep.dt_max,
         theta_init_min=prep.theta_init_min,
         theta_init_max=prep.theta_init_max,
-        gamma_min=prep.gamma_min,
-        gamma_max=prep.gamma_max,
+        alpha_min=prep.alpha_min,
+        alpha_max=prep.alpha_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
@@ -685,8 +715,8 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
         dt_max=prep.dt_max,
         theta_init_min=prep.theta_init_min,
         theta_init_max=prep.theta_init_max,
-        gamma_min=prep.gamma_min,
-        gamma_max=prep.gamma_max,
+        alpha_min=prep.alpha_min,
+        alpha_max=prep.alpha_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
@@ -711,8 +741,8 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
         dt_max=prep.dt_max,
         theta_init_min=prep.theta_init_min,
         theta_init_max=prep.theta_init_max,
-        gamma_min=prep.gamma_min,
-        gamma_max=prep.gamma_max,
+        alpha_min=prep.alpha_min,
+        alpha_max=prep.alpha_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
@@ -1122,7 +1152,7 @@ def test_cute_scanprep_backend_matches_reference_gradients() -> None:
 
     names = (
         "dt_bias",
-        "gamma_bias",
+        "alpha_bias",
         "theta_mod_bias",
         "theta_bias",
     )
@@ -1221,7 +1251,7 @@ def test_scanprep_bwd_normalizes_optional_grad_dtypes_to_contract() -> None:
         params_grad,
         bc_grad,
         _dt_bias_grad,
-        _gamma_bias_grad,
+        _alpha_bias_grad,
         _theta_mod_bias_grad,
         _theta_bias_grad,
     ) = scanprep_bwd_cute(
@@ -1242,8 +1272,8 @@ def test_scanprep_bwd_normalizes_optional_grad_dtypes_to_contract() -> None:
         dt_max=prep.dt_max,
         theta_init_min=prep.theta_init_min,
         theta_init_max=prep.theta_init_max,
-        gamma_min=prep.gamma_min,
-        gamma_max=prep.gamma_max,
+        alpha_min=prep.alpha_min,
+        alpha_max=prep.alpha_max,
         r_min=prep.r_min,
         r_max=prep.r_max,
         eps=prep.eps,
