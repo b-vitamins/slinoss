@@ -36,7 +36,12 @@ def test_stage_cute_aot_bundle_stages_known_payload_roots(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "bundle"
-    for name, kind in (("v2x2ssd", "v2x2ssd_fwd"), ("scanprep", "scanprep_fwd")):
+    for name, kind in (
+        ("v2x2ssd", "v2x2ssd_fwd"),
+        ("scanprep", "scanprep_fwd"),
+        ("mixer", "mixer_tail_rowwise_fwd"),
+        ("block", "ffn_norm_fwd"),
+    ):
         payload_root = source_root / name
         artifact_dir = payload_root / "artifacts"
         runtime_dir = payload_root / "runtime"
@@ -51,6 +56,8 @@ def test_stage_cute_aot_bundle_stages_known_payload_roots(
     package_roots = {
         "v2x2ssd": tmp_path / "pkg-v2",
         "scanprep": tmp_path / "pkg-scanprep",
+        "mixer": tmp_path / "pkg-mixer",
+        "block": tmp_path / "pkg-block",
     }
     stage_cute_aot_bundle(source_root, package_roots)
 
@@ -60,9 +67,17 @@ def test_stage_cute_aot_bundle_stages_known_payload_roots(
     assert json.loads((package_roots["scanprep"] / "manifest.json").read_text()) == {
         "artifacts": [{"kind": "scanprep_fwd"}]
     }
+    assert json.loads((package_roots["mixer"] / "manifest.json").read_text()) == {
+        "artifacts": [{"kind": "mixer_tail_rowwise_fwd"}]
+    }
+    assert json.loads((package_roots["block"] / "manifest.json").read_text()) == {
+        "artifacts": [{"kind": "ffn_norm_fwd"}]
+    }
     assert (
         package_roots["v2x2ssd"] / "artifacts" / "payload.so"
     ).read_text() == "v2x2ssd"
     assert (
         package_roots["scanprep"] / "artifacts" / "payload.so"
     ).read_text() == "scanprep"
+    assert (package_roots["mixer"] / "artifacts" / "payload.so").read_text() == "mixer"
+    assert (package_roots["block"] / "artifacts" / "payload.so").read_text() == "block"

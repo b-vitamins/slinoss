@@ -18,7 +18,17 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from _common import dtype_from_str  # noqa: E402
 from _training import DEFAULT_TRAINING_PERF_CONFIG  # noqa: E402
-from slinoss.layers import SLinOSSScanPrep  # noqa: E402
+from slinoss.layers import SLinOSSMLPConfig, SLinOSSScanPrep  # noqa: E402
+from slinoss.ops.block.cute.activation import (  # noqa: E402
+    FfnActivationBwdFused,
+    FfnActivationFwdFused,
+)
+import slinoss.ops.block.cute.common as block_cute_common  # noqa: E402
+from slinoss.ops.block.cute.common import ActivationKind  # noqa: E402
+from slinoss.ops.block.cute.norm import (  # noqa: E402
+    FfnRmsNormBwdFused,
+    FfnRmsNormFwdFused,
+)
 from slinoss.ops.mixer.cute.bwd import MixerTailRowwiseBwdFused  # noqa: E402
 import slinoss.ops.mixer.cute.common as mixer_cute_common  # noqa: E402
 from slinoss.ops.mixer.cute.fwd import MixerTailRowwiseFwdFused  # noqa: E402
@@ -55,6 +65,13 @@ DEFAULT_V2_DTYPE = DEFAULT_TRAINING_PERF_CONFIG.dtype
 DEFAULT_V2_BC_GROUPS = int(
     getattr(DEFAULT_TRAINING_PERF_CONFIG, "resolved_bc_groups", DEFAULT_V2_HEADS)
 )
+_DEFAULT_FFN_CONFIG = DEFAULT_TRAINING_PERF_CONFIG.ffn or SLinOSSMLPConfig()
+DEFAULT_FFN_D_MODEL = int(DEFAULT_TRAINING_PERF_CONFIG.d_model)
+DEFAULT_FFN_HIDDEN_DIM = int(
+    _DEFAULT_FFN_CONFIG.resolve_hidden_dim(DEFAULT_FFN_D_MODEL)
+)
+DEFAULT_FFN_KIND = _DEFAULT_FFN_CONFIG.kind
+DEFAULT_FFN_EPS = float(DEFAULT_TRAINING_PERF_CONFIG.norm_eps)
 
 
 @dataclass(frozen=True)
@@ -129,6 +146,28 @@ class MixerTailPerfConfig:
         return torch.device(self.device)
 
 
+@dataclass(frozen=True)
+class FfnPerfConfig:
+    batch: int = DEFAULT_V2_BATCH
+    T: int = DEFAULT_V2_T
+    d_model: int = DEFAULT_FFN_D_MODEL
+    hidden_dim: int = DEFAULT_FFN_HIDDEN_DIM
+    kind: str = DEFAULT_FFN_KIND
+    dtype: torch.dtype = DEFAULT_TRAINING_PERF_CONFIG.dtype
+    device: str = "cuda"
+    seed: int = 0
+    eps: float = DEFAULT_FFN_EPS
+    warps_per_block: int = 8
+
+    @property
+    def projected_dim(self) -> int:
+        return int(self.hidden_dim if self.kind == "gelu" else 2 * self.hidden_dim)
+
+    @property
+    def torch_device(self) -> torch.device:
+        return torch.device(self.device)
+
+
 @dataclass
 class KernelRunner:
     name: str
@@ -143,6 +182,10 @@ KERNEL_ORDER = (
     "scanprep_bwd",
     "mixer_tail_rowwise_fwd",
     "mixer_tail_rowwise_bwd",
+    "ffn_norm_fwd",
+    "ffn_norm_bwd",
+    "ffn_activation_fwd",
+    "ffn_activation_bwd",
     "chunk_increment_fwd",
     "state_passing_fwd",
     "chunk_scan_fwd",
@@ -735,6 +778,178 @@ def _build_mixer_tail_rowwise_bwd_runner(cfg: MixerTailPerfConfig) -> KernelRunn
         ),
         launch=launch,
         prepare=prepare,
+    )
+
+
+def _build_ffn_norm_fwd_runner(cfg: FfnPerfConfig) -> KernelRunner:
+    _seed_all(cfg.seed)
+    device = cfg.torch_device
+    dtype = cfg.dtype
+
+    residual = torch.randn((cfg.batch, cfg.T, cfg.d_model), device=device, dtype=dtype)
+    norm_weight = torch.randn((cfg.d_model,), device=device, dtype=dtype)
+    output = torch.empty_like(residual)
+
+    compiled = cute.compile(
+        FfnRmsNormFwdFused(
+            hidden_dim=cfg.d_model,
+            eps=cfg.eps,
+            warps_per_block=cfg.warps_per_block,
+        ),
+        block_cute_common.make_fake_tensor_arg(residual),
+        block_cute_common.make_fake_tensor_arg(norm_weight),
+        block_cute_common.make_fake_tensor_arg(output),
+        options="--enable-tvm-ffi",
+    )
+
+    def launch() -> None:
+        compiled(
+            residual,
+            norm_weight,
+            output,
+        )
+
+    return KernelRunner(
+        name="ffn_norm_fwd",
+        effective_bytes=_tensor_bytes(residual, norm_weight, output),
+        launch=launch,
+        prepare=_noop,
+    )
+
+
+def _build_ffn_norm_bwd_runner(cfg: FfnPerfConfig) -> KernelRunner:
+    _seed_all(cfg.seed)
+    device = cfg.torch_device
+    dtype = cfg.dtype
+
+    residual = torch.randn((cfg.batch, cfg.T, cfg.d_model), device=device, dtype=dtype)
+    norm_weight = torch.randn((cfg.d_model,), device=device, dtype=dtype)
+    d_output = torch.randn_like(residual)
+    d_input = torch.empty_like(residual)
+    d_weight_accum = torch.zeros((cfg.d_model,), device=device, dtype=torch.float32)
+
+    compiled = cute.compile(
+        FfnRmsNormBwdFused(
+            hidden_dim=cfg.d_model,
+            eps=cfg.eps,
+            warps_per_block=cfg.warps_per_block,
+        ),
+        block_cute_common.make_fake_tensor_arg(residual),
+        block_cute_common.make_fake_tensor_arg(norm_weight),
+        block_cute_common.make_fake_tensor_arg(d_output),
+        block_cute_common.make_fake_tensor_arg(d_input),
+        block_cute_common.make_fake_tensor_arg(d_weight_accum),
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        d_weight_accum.zero_()
+
+    def launch() -> None:
+        compiled(
+            residual,
+            norm_weight,
+            d_output,
+            d_input,
+            d_weight_accum,
+        )
+
+    return KernelRunner(
+        name="ffn_norm_bwd",
+        effective_bytes=_tensor_bytes(
+            residual,
+            norm_weight,
+            d_output,
+            d_input,
+            d_weight_accum,
+        ),
+        launch=launch,
+        prepare=prepare,
+    )
+
+
+def _build_ffn_activation_fwd_runner(cfg: FfnPerfConfig) -> KernelRunner:
+    _seed_all(cfg.seed)
+    device = cfg.torch_device
+    dtype = cfg.dtype
+
+    projected = torch.randn(
+        (cfg.batch, cfg.T, cfg.projected_dim),
+        device=device,
+        dtype=dtype,
+    )
+    hidden = torch.empty(
+        (cfg.batch, cfg.T, cfg.hidden_dim),
+        device=device,
+        dtype=dtype,
+    )
+
+    compiled = cute.compile(
+        FfnActivationFwdFused(
+            hidden_dim=cfg.hidden_dim,
+            kind=cast(ActivationKind, cfg.kind),
+            warps_per_block=cfg.warps_per_block,
+        ),
+        block_cute_common.make_fake_tensor_arg(projected),
+        block_cute_common.make_fake_tensor_arg(hidden),
+        options="--enable-tvm-ffi",
+    )
+
+    def launch() -> None:
+        compiled(
+            projected,
+            hidden,
+        )
+
+    return KernelRunner(
+        name="ffn_activation_fwd",
+        effective_bytes=_tensor_bytes(projected, hidden),
+        launch=launch,
+        prepare=_noop,
+    )
+
+
+def _build_ffn_activation_bwd_runner(cfg: FfnPerfConfig) -> KernelRunner:
+    _seed_all(cfg.seed)
+    device = cfg.torch_device
+    dtype = cfg.dtype
+
+    projected = torch.randn(
+        (cfg.batch, cfg.T, cfg.projected_dim),
+        device=device,
+        dtype=dtype,
+    )
+    d_hidden = torch.randn(
+        (cfg.batch, cfg.T, cfg.hidden_dim),
+        device=device,
+        dtype=dtype,
+    )
+    d_projected = torch.empty_like(projected)
+
+    compiled = cute.compile(
+        FfnActivationBwdFused(
+            hidden_dim=cfg.hidden_dim,
+            kind=cast(ActivationKind, cfg.kind),
+            warps_per_block=cfg.warps_per_block,
+        ),
+        block_cute_common.make_fake_tensor_arg(projected),
+        block_cute_common.make_fake_tensor_arg(d_hidden),
+        block_cute_common.make_fake_tensor_arg(d_projected),
+        options="--enable-tvm-ffi",
+    )
+
+    def launch() -> None:
+        compiled(
+            projected,
+            d_hidden,
+            d_projected,
+        )
+
+    return KernelRunner(
+        name="ffn_activation_bwd",
+        effective_bytes=_tensor_bytes(projected, d_hidden, d_projected),
+        launch=launch,
+        prepare=_noop,
     )
 
 
@@ -1348,6 +1563,7 @@ def build_kernel_runners(
     v2_cfg: V2KernelPerfConfig | None = None,
     scanprep_cfg: ScanPrepPerfConfig | None = None,
     mixer_tail_cfg: MixerTailPerfConfig | None = None,
+    ffn_cfg: FfnPerfConfig | None = None,
 ) -> list[KernelRunner]:
     if v2_cfg is None:
         v2_cfg = V2KernelPerfConfig(
@@ -1374,6 +1590,14 @@ def build_kernel_runners(
             device=v2_cfg.device,
             seed=v2_cfg.seed,
         )
+    if ffn_cfg is None:
+        ffn_cfg = FfnPerfConfig(
+            batch=v2_cfg.batch,
+            T=v2_cfg.T,
+            dtype=v2_cfg.dtype,
+            device=v2_cfg.device,
+            seed=v2_cfg.seed,
+        )
 
     runners: dict[str, KernelRunner] = {}
     runners.update(
@@ -1386,6 +1610,10 @@ def build_kernel_runners(
             "mixer_tail_rowwise_bwd": _build_mixer_tail_rowwise_bwd_runner(
                 mixer_tail_cfg
             ),
+            "ffn_norm_fwd": _build_ffn_norm_fwd_runner(ffn_cfg),
+            "ffn_norm_bwd": _build_ffn_norm_bwd_runner(ffn_cfg),
+            "ffn_activation_fwd": _build_ffn_activation_fwd_runner(ffn_cfg),
+            "ffn_activation_bwd": _build_ffn_activation_bwd_runner(ffn_cfg),
         }
     )
     runners.update(_build_v2x2ssd_forward_runners(v2_cfg))
@@ -1401,6 +1629,7 @@ def build_kernel_runner(
     v2_cfg: V2KernelPerfConfig | None = None,
     scanprep_cfg: ScanPrepPerfConfig | None = None,
     mixer_tail_cfg: MixerTailPerfConfig | None = None,
+    ffn_cfg: FfnPerfConfig | None = None,
 ) -> KernelRunner:
     if v2_cfg is None:
         v2_cfg = V2KernelPerfConfig(
@@ -1427,6 +1656,14 @@ def build_kernel_runner(
             device=v2_cfg.device,
             seed=v2_cfg.seed,
         )
+    if ffn_cfg is None:
+        ffn_cfg = FfnPerfConfig(
+            batch=v2_cfg.batch,
+            T=v2_cfg.T,
+            dtype=v2_cfg.dtype,
+            device=v2_cfg.device,
+            seed=v2_cfg.seed,
+        )
 
     if name == "scanprep_fwd":
         return _build_scanprep_fwd_runner(scanprep_cfg)
@@ -1436,6 +1673,14 @@ def build_kernel_runner(
         return _build_mixer_tail_rowwise_fwd_runner(mixer_tail_cfg)
     if name == "mixer_tail_rowwise_bwd":
         return _build_mixer_tail_rowwise_bwd_runner(mixer_tail_cfg)
+    if name == "ffn_norm_fwd":
+        return _build_ffn_norm_fwd_runner(ffn_cfg)
+    if name == "ffn_norm_bwd":
+        return _build_ffn_norm_bwd_runner(ffn_cfg)
+    if name == "ffn_activation_fwd":
+        return _build_ffn_activation_fwd_runner(ffn_cfg)
+    if name == "ffn_activation_bwd":
+        return _build_ffn_activation_bwd_runner(ffn_cfg)
     if name in {
         "chunk_increment_fwd",
         "state_passing_fwd",

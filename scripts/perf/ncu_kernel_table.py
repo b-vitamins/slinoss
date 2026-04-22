@@ -29,6 +29,7 @@ from _ncu_kernels import (  # noqa: E402
     DEFAULT_V2_N,
     DEFAULT_V2_P,
     DEFAULT_V2_T,
+    FfnPerfConfig,
     KERNEL_ORDER,
     MixerTailPerfConfig,
     ScanPrepPerfConfig,
@@ -106,6 +107,21 @@ def _parse_args() -> argparse.Namespace:
         choices=("fp16", "bf16", "fp32"),
         default="fp16",
     )
+    parser.add_argument("--ffn-d-model", type=int, default=FfnPerfConfig().d_model)
+    parser.add_argument(
+        "--ffn-hidden-dim", type=int, default=FfnPerfConfig().hidden_dim
+    )
+    parser.add_argument(
+        "--ffn-kind",
+        choices=("gelu", "swiglu"),
+        default=FfnPerfConfig().kind,
+    )
+    parser.add_argument("--ffn-eps", type=float, default=FfnPerfConfig().eps)
+    parser.add_argument(
+        "--ffn-warps-per-block",
+        type=int,
+        default=FfnPerfConfig().warps_per_block,
+    )
     parser.add_argument(
         "--run-kernel",
         choices=KERNEL_ORDER,
@@ -153,6 +169,21 @@ def _make_mixer_tail_cfg(args: argparse.Namespace) -> MixerTailPerfConfig:
         dtype=dtype_from_str(args.dtype),
         device=args.device,
         seed=args.seed,
+    )
+
+
+def _make_ffn_cfg(args: argparse.Namespace) -> FfnPerfConfig:
+    return FfnPerfConfig(
+        batch=args.batch,
+        T=args.T,
+        d_model=args.ffn_d_model,
+        hidden_dim=args.ffn_hidden_dim,
+        kind=args.ffn_kind,
+        dtype=dtype_from_str(args.dtype),
+        device=args.device,
+        seed=args.seed,
+        eps=args.ffn_eps,
+        warps_per_block=args.ffn_warps_per_block,
     )
 
 
@@ -255,6 +286,16 @@ def _kernel_cli_args(args: argparse.Namespace, kernel_name: str) -> list[str]:
         str(int(args.scanprep_bc_groups)),
         "--scanprep-dtype",
         args.scanprep_dtype,
+        "--ffn-d-model",
+        str(int(args.ffn_d_model)),
+        "--ffn-hidden-dim",
+        str(int(args.ffn_hidden_dim)),
+        "--ffn-kind",
+        args.ffn_kind,
+        "--ffn-eps",
+        str(float(args.ffn_eps)),
+        "--ffn-warps-per-block",
+        str(int(args.ffn_warps_per_block)),
     ]
 
 
@@ -289,6 +330,7 @@ def main() -> int:
     v2_cfg = _make_v2_cfg(args)
     scanprep_cfg = _make_scanprep_cfg(args)
     mixer_tail_cfg = _make_mixer_tail_cfg(args)
+    ffn_cfg = _make_ffn_cfg(args)
     device = torch.device(args.device)
 
     if args.run_kernel is not None:
@@ -297,6 +339,7 @@ def main() -> int:
             v2_cfg=v2_cfg,
             scanprep_cfg=scanprep_cfg,
             mixer_tail_cfg=mixer_tail_cfg,
+            ffn_cfg=ffn_cfg,
         )
         _run_kernel_once(
             runner,
@@ -316,6 +359,7 @@ def main() -> int:
             v2_cfg=v2_cfg,
             scanprep_cfg=scanprep_cfg,
             mixer_tail_cfg=mixer_tail_cfg,
+            ffn_cfg=ffn_cfg,
         )
         bench = _benchmark_kernel(
             runner,
@@ -402,6 +446,19 @@ def main() -> int:
                 "seed": mixer_tail_cfg.seed,
                 "eps": mixer_tail_cfg.eps,
                 "warps_per_block": mixer_tail_cfg.warps_per_block,
+            },
+            "ffn_config": {
+                "batch": ffn_cfg.batch,
+                "T": ffn_cfg.T,
+                "d_model": ffn_cfg.d_model,
+                "hidden_dim": ffn_cfg.hidden_dim,
+                "projected_dim": ffn_cfg.projected_dim,
+                "kind": ffn_cfg.kind,
+                "dtype": str(ffn_cfg.dtype),
+                "device": ffn_cfg.device,
+                "seed": ffn_cfg.seed,
+                "eps": ffn_cfg.eps,
+                "warps_per_block": ffn_cfg.warps_per_block,
             },
             "rows": rows,
         }

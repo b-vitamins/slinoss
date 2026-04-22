@@ -49,3 +49,15 @@ include = ["slinoss*"]
   "artifacts/*.so",
   "runtime/*.so",
 ]
+"slinoss.ops.mixer.cute.aot" = [
+  "manifest.json",
+  "artifacts/*.json",
+  "artifacts/*.so",
+  "runtime/*.so",
+]
+"slinoss.ops.block.cute.aot" = [
+  "manifest.json",
+  "artifacts/*.json",
+  "artifacts/*.so",
+  "runtime/*.so",
+]

@@ -45,6 +45,21 @@ def _import_aot_build_helpers():
     from slinoss.ops.mixer.cute.aot import (
         default_forward_aot_specs as default_mixer_forward_aot_specs,
     )
+    from slinoss.ops.block.cute.aot import (
+        build_default_backward_aot_package as build_default_block_backward_aot_package,
+    )
+    from slinoss.ops.block.cute.aot import (
+        build_default_cute_aot_package as build_default_block_cute_aot_package,
+    )
+    from slinoss.ops.block.cute.aot import (
+        build_default_forward_aot_package as build_default_block_forward_aot_package,
+    )
+    from slinoss.ops.block.cute.aot import (
+        default_backward_aot_specs as default_block_backward_aot_specs,
+    )
+    from slinoss.ops.block.cute.aot import (
+        default_forward_aot_specs as default_block_forward_aot_specs,
+    )
     from slinoss.ops.v2x2ssd.cute.aot import (
         build_default_backward_aot_package,
         build_default_cute_aot_package,
@@ -64,6 +79,8 @@ def _import_aot_build_helpers():
         default_scanprep_backward_aot_specs,
         default_mixer_forward_aot_specs,
         default_mixer_backward_aot_specs,
+        default_block_forward_aot_specs,
+        default_block_backward_aot_specs,
         build_default_forward_aot_package,
         build_default_backward_aot_package,
         build_default_cute_aot_package,
@@ -74,6 +91,9 @@ def _import_aot_build_helpers():
         build_default_mixer_forward_aot_package,
         build_default_mixer_backward_aot_package,
         build_default_mixer_cute_aot_package,
+        build_default_block_forward_aot_package,
+        build_default_block_backward_aot_package,
+        build_default_block_cute_aot_package,
     )
 
 
@@ -82,7 +102,8 @@ def _parse_args() -> argparse.Namespace:
         description=(
             "Compile, export, and package the curated CuTe AOT payload for the "
             "full CuTe training stack. By default this builds both forward and "
-            "backward default payloads for v2x2ssd, scanprep, and mixer-tail rowwise."
+            "backward default payloads for v2x2ssd, scanprep, mixer-tail rowwise, "
+            "and block FFN rowwise."
         )
     )
     parser.add_argument(
@@ -90,8 +111,8 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("build/cute-aot"),
         help=(
-            "Bundle directory that will receive sibling v2x2ssd/, scanprep/, and mixer/ "
-            "payload trees."
+            "Bundle directory that will receive sibling v2x2ssd/, scanprep/, mixer/, "
+            "and block/ payload trees."
         ),
     )
     parser.add_argument(
@@ -146,6 +167,8 @@ def main() -> None:
         default_scanprep_backward_aot_specs,
         default_mixer_forward_aot_specs,
         default_mixer_backward_aot_specs,
+        default_block_forward_aot_specs,
+        default_block_backward_aot_specs,
         build_default_v2_forward_aot_package,
         build_default_v2_backward_aot_package,
         build_default_v2_cute_aot_package,
@@ -156,6 +179,9 @@ def main() -> None:
         build_default_mixer_forward_aot_package,
         build_default_mixer_backward_aot_package,
         build_default_mixer_cute_aot_package,
+        build_default_block_forward_aot_package,
+        build_default_block_backward_aot_package,
+        build_default_block_cute_aot_package,
     ) = _import_aot_build_helpers()
     if args.list_default_forward_specs:
         print("[v2x2ssd]")
@@ -166,6 +192,9 @@ def main() -> None:
             print(spec)
         print("[mixer]")
         for spec in default_mixer_forward_aot_specs():
+            print(spec)
+        print("[block]")
+        for spec in default_block_forward_aot_specs():
             print(spec)
         return
     if args.list_default_backward_specs:
@@ -178,6 +207,9 @@ def main() -> None:
         print("[mixer]")
         for spec in default_mixer_backward_aot_specs():
             print(spec)
+        print("[block]")
+        for spec in default_block_backward_aot_specs():
+            print(spec)
         return
     if args.list_search_space_forward_specs:
         for spec in search_space_v2_forward_aot_specs():
@@ -188,6 +220,7 @@ def main() -> None:
     v2_package_root = args.package_root / "v2x2ssd"
     scanprep_package_root = args.package_root / "scanprep"
     mixer_package_root = args.package_root / "mixer"
+    block_package_root = args.package_root / "block"
     if not args.no_clean:
         shutil.rmtree(args.package_root / "artifacts", ignore_errors=True)
         shutil.rmtree(args.package_root / "runtime", ignore_errors=True)
@@ -213,6 +246,10 @@ def main() -> None:
             package_root=mixer_package_root,
             clean=not args.no_clean,
         )
+        exported += build_default_block_forward_aot_package(
+            package_root=block_package_root,
+            clean=not args.no_clean,
+        )
     elif args.backward_only:
         exported = []
         exported += build_default_v2_backward_aot_package(
@@ -225,6 +262,10 @@ def main() -> None:
         )
         exported += build_default_mixer_backward_aot_package(
             package_root=mixer_package_root,
+            clean=not args.no_clean,
+        )
+        exported += build_default_block_backward_aot_package(
+            package_root=block_package_root,
             clean=not args.no_clean,
         )
     elif args.search_space_forward:
@@ -241,6 +282,10 @@ def main() -> None:
             package_root=mixer_package_root,
             clean=not args.no_clean,
         )
+        exported += build_default_block_forward_aot_package(
+            package_root=block_package_root,
+            clean=not args.no_clean,
+        )
         exported += build_default_v2_backward_aot_package(
             package_root=v2_package_root,
             clean=False,
@@ -251,6 +296,10 @@ def main() -> None:
         )
         exported += build_default_mixer_backward_aot_package(
             package_root=mixer_package_root,
+            clean=False,
+        )
+        exported += build_default_block_backward_aot_package(
+            package_root=block_package_root,
             clean=False,
         )
     else:
@@ -265,6 +314,10 @@ def main() -> None:
         )
         exported += build_default_mixer_cute_aot_package(
             package_root=mixer_package_root,
+            clean=not args.no_clean,
+        )
+        exported += build_default_block_cute_aot_package(
+            package_root=block_package_root,
             clean=not args.no_clean,
         )
     print("built-cute-aot", args.package_root, "count", len(exported))

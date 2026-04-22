@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import cast
+
+import pytest
 import torch
 
 from slinoss.blocks import (
@@ -325,3 +329,136 @@ def test_block_ffn_residual_matches_eager_value_and_grads() -> None:
         assert ref is not None
         assert got is not None
         assert torch.allclose(got, ref, atol=1.0e-5, rtol=1.0e-5)
+
+
+@pytest.mark.parametrize("kind", ["gelu", "swiglu"])
+def test_block_ffn_residual_cuda_cute_matches_eager_value_and_grads(
+    kind: str,
+) -> None:
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the CuTe FFN path.")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA bfloat16 support is required for the CuTe FFN path.")
+
+    torch.manual_seed(0)
+    cfg = replace(
+        _small_block_config(),
+        ffn=SLinOSSMLPConfig(
+            kind=kind,  # type: ignore[arg-type]
+            hidden_dim=48,
+            multiple_of=16,
+            bias=True,
+        ),
+    )
+    block = SLinOSSBlock(cfg, device="cuda", dtype=torch.bfloat16).train()
+    x = torch.randn((2, 4, 32), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+
+    ffn_params: list[torch.Tensor] = []
+    if block.ffn_norm is not None:
+        weight = getattr(block.ffn_norm, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            ffn_params.append(weight)
+    if block.ffn is not None:
+        ffn_params.extend(
+            [
+                block.ffn.in_proj.weight,
+                block.ffn.out_proj.weight,
+            ]
+        )
+        if block.ffn.in_proj.bias is not None:
+            ffn_params.append(block.ffn.in_proj.bias)
+        if block.ffn.out_proj.bias is not None:
+            ffn_params.append(block.ffn.out_proj.bias)
+
+    eager = block._residual_add(
+        x_ref,
+        block._drop_branch(block.forward_ffn_branch(x_ref)),
+    )
+    eager_loss = eager.square().mean()
+    eager_grads = torch.autograd.grad(
+        eager_loss,
+        (x_ref, *ffn_params),
+        retain_graph=True,
+    )
+
+    remat = block_ffn_residual(block, x)
+    remat_loss = remat.square().mean()
+    remat_grads = torch.autograd.grad(remat_loss, (x, *ffn_params))
+
+    torch.testing.assert_close(eager, remat, atol=6e-2, rtol=6e-2)
+    for ref, got in zip(eager_grads, remat_grads, strict=True):
+        assert ref is not None
+        assert got is not None
+        torch.testing.assert_close(ref, got, atol=8e-2, rtol=8e-2)
+
+
+def test_block_ffn_residual_cuda_cute_saves_only_residual_and_parameters() -> None:
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the CuTe FFN path.")
+
+    torch.manual_seed(0)
+    cfg = replace(
+        _small_block_config(),
+        ffn=SLinOSSMLPConfig(kind="gelu", hidden_dim=48, multiple_of=16, bias=True),
+    )
+    block = SLinOSSBlock(cfg, device="cuda", dtype=torch.float16).train()
+    assert block.ffn_norm is not None
+    assert block.ffn_norm.weight is not None
+    assert block.ffn is not None
+    assert block.ffn.in_proj.bias is not None
+    assert block.ffn.out_proj.bias is not None
+    norm_weight = cast(torch.Tensor, block.ffn_norm.weight)
+    in_proj_weight = cast(torch.Tensor, block.ffn.in_proj.weight)
+    in_proj_bias = cast(torch.Tensor, block.ffn.in_proj.bias)
+    out_proj_weight = cast(torch.Tensor, block.ffn.out_proj.weight)
+    out_proj_bias = cast(torch.Tensor, block.ffn.out_proj.bias)
+    x = torch.randn((2, 4, 32), device="cuda", dtype=torch.float16, requires_grad=True)
+
+    saved: list[tuple[tuple[int, ...], torch.dtype]] = []
+
+    def pack_hook(t: torch.Tensor) -> torch.Tensor:
+        saved.append((tuple(map(int, t.shape)), t.dtype))
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda t: t):
+        block_ffn_residual(block, x)
+
+    expected = [
+        (tuple(map(int, x.shape)), x.dtype),
+        (tuple(map(int, norm_weight.shape)), norm_weight.dtype),
+        (tuple(map(int, in_proj_weight.shape)), in_proj_weight.dtype),
+        (tuple(map(int, in_proj_bias.shape)), in_proj_bias.dtype),
+        (tuple(map(int, out_proj_weight.shape)), out_proj_weight.dtype),
+        (tuple(map(int, out_proj_bias.shape)), out_proj_bias.dtype),
+    ]
+    assert saved == expected
+
+
+def test_block_ffn_residual_compile_boundary_is_explicit() -> None:
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_available():
+        return
+
+    torch.manual_seed(0)
+    cfg = replace(
+        _small_block_config(),
+        ffn=SLinOSSMLPConfig(kind="gelu", hidden_dim=48, multiple_of=16, bias=True),
+    )
+    block = SLinOSSBlock(cfg, device="cuda", dtype=torch.float16).eval()
+    x = torch.randn((2, 4, 32), device="cuda", dtype=torch.float16)
+
+    explain = torch._dynamo.explain(lambda t: block_ffn_residual(block, t))
+    result = explain(x)
+
+    if len(result.break_reasons) == 0:
+        assert result.graph_count == 0
+        assert result.graph_break_count == -1
+    else:
+        assert result.graph_break_count >= len(result.break_reasons)
+        assert all(
+            "torch.compiler.disable" in break_reason.reason
+            for break_reason in result.break_reasons
+        )

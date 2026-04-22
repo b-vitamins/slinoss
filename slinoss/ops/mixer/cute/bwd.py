@@ -233,7 +233,9 @@ class MixerTailRowwiseBwdFused:
                     if p < self.p_size:
                         d = h * self.p_size + p
                         block_sum = cutlass.Float32(0.0)
-                        for source_warp in cutlass.range_constexpr(self.warps_per_block):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
+                        for source_warp in cutlass.range_constexpr(  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
+                            self.warps_per_block
+                        ):
                             block_sum = block_sum + sDNormWeightHead[source_warp, p]
                         cute.arch.atomic_add(
                             _llvm_ptr(mDNormWeight.iterator + d),
