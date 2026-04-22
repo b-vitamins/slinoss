@@ -1840,7 +1840,6 @@ class ChunkScanBwdDBAmpere:
         chunk_index = batch_head_chunk - batch_head * num_chunks
         kv_tile = int(self.kv_tile)
         num_n_tiles = int(self.L // kv_tile)
-        single_tile_cache = num_n_tiles == 1
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(shared_storage_cls)
@@ -2008,6 +2007,54 @@ class ChunkScanBwdDBAmpere:
             n_tile_start = n_tile_index * kv_tile
             num_m_tiles = num_n_tiles - n_tile_index
 
+            cached_m_tile_index = n_tile_index
+            cached_m_tile_start = n_tile_start
+            cached_score_coord_tile = cute.local_tile(
+                coord_score_tile_base,
+                (kv_tile, kv_tile),
+                (cached_m_tile_index, n_tile_index),
+            )
+            t_cached_score_coord = thr_mma.partition_C(cached_score_coord_tile)
+            t_cached_score_coord_mn = self._make_accumulator_mn_view(
+                t_cached_score_coord
+            )
+
+            acc_score_cache_curr = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
+            acc_score_cache_curr.fill(0.0)
+            self._accumulate_score_block_from_p_tiles(
+                score_pipeline,
+                acc_score_cache_curr,
+                m_tile_index=cached_m_tile_index,
+                n_tile_index=n_tile_index,
+                use_shifted_values=False,
+            )
+            self._store_causal_score_block(
+                acc_score_cache_curr,
+                t_cached_score_coord_mn,
+                s_score_cache,
+                m_tile_start=cached_m_tile_start,
+                n_tile_start=n_tile_start,
+                out_dtype=mU.element_type,
+            )
+
+            acc_score_cache_prev = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
+            acc_score_cache_prev.fill(0.0)
+            self._accumulate_score_block_from_p_tiles(
+                score_pipeline,
+                acc_score_cache_prev,
+                m_tile_index=cached_m_tile_index,
+                n_tile_index=n_tile_index,
+                use_shifted_values=True,
+            )
+            self._store_causal_score_block(
+                acc_score_cache_prev,
+                t_cached_score_coord_mn,
+                s_score_prev,
+                m_tile_start=cached_m_tile_start,
+                n_tile_start=n_tile_start,
+                out_dtype=mU.element_type,
+            )
+
             self._initialize_curr_taps_and_dm_tiles(
                 mK,
                 s_tap_curr,
@@ -2027,6 +2074,7 @@ class ChunkScanBwdDBAmpere:
                 for m_tile_offset in cutlass.range_constexpr(num_m_tiles):
                     m_tile_index = n_tile_index + m_tile_offset
                     m_tile_start = m_tile_index * kv_tile
+                    cache_score_tiles = m_tile_offset == 0
 
                     self._stage_query_tile_from_gmem(
                         gmem_tiled_copy_d,
@@ -2055,7 +2103,7 @@ class ChunkScanBwdDBAmpere:
                     t_score_coord = thr_mma.partition_C(coord_score_tile)
                     t_score_coord_mn = self._make_accumulator_mn_view(t_score_coord)
 
-                    if (not single_tile_cache) or d_stage_index == 0:
+                    if (not cache_score_tiles) or d_stage_index == 0:
                         acc_score_curr = cute.make_rmem_tensor(
                             acc_shape_blk, cutlass.Float32
                         )
@@ -2070,7 +2118,7 @@ class ChunkScanBwdDBAmpere:
                         self._store_causal_score_block(
                             acc_score_curr,
                             t_score_coord_mn,
-                            s_score_cache if single_tile_cache else s_score_block,
+                            s_score_cache if cache_score_tiles else s_score_block,
                             m_tile_start=m_tile_start,
                             n_tile_start=n_tile_start,
                             out_dtype=mU.element_type,
@@ -2083,7 +2131,7 @@ class ChunkScanBwdDBAmpere:
                         stage_width=d_stage_width,
                         out_dtype=mU.element_type,
                     )
-                    if single_tile_cache:
+                    if cache_score_tiles:
                         self._accumulate_key_grad_from_staged_score_block(
                             tiled_mma,
                             acc_dk_curr,
@@ -2110,7 +2158,7 @@ class ChunkScanBwdDBAmpere:
                             t_query_transposed,
                         )
 
-                    if (not single_tile_cache) or d_stage_index == 0:
+                    if (not cache_score_tiles) or d_stage_index == 0:
                         acc_score_prev = cute.make_rmem_tensor(
                             acc_shape_blk, cutlass.Float32
                         )
@@ -2125,12 +2173,12 @@ class ChunkScanBwdDBAmpere:
                         self._store_causal_score_block(
                             acc_score_prev,
                             t_score_coord_mn,
-                            s_score_prev if single_tile_cache else s_score_block,
+                            s_score_prev if cache_score_tiles else s_score_block,
                             m_tile_start=m_tile_start,
                             n_tile_start=n_tile_start,
                             out_dtype=mU.element_type,
                         )
-                    if single_tile_cache:
+                    if cache_score_tiles:
                         self._accumulate_key_grad_from_staged_score_block(
                             tiled_mma,
                             acc_dk_prev,
