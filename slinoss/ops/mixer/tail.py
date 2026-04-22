@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import warnings
 from contextlib import nullcontext
-from typing import cast
+from typing import Any, Callable, cast
 
 import torch
 from torch import nn
 from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
+
+_INITIALIZED_CUBLAS_DEVICES: set[int] = set()
 
 
 def _mixer_tail_dims(
@@ -135,6 +138,106 @@ def _mixer_tail_forward(
         out_norm_weight,
         out_norm_eps,
     ).to(dtype=gated.dtype)
+    _ensure_cuda_current_context(normed.device)
+    return F.linear(normed, out_proj_weight, out_proj_bias)
+
+
+def _resolved_rms_eps(eps: float | None, dtype: torch.dtype) -> float:
+    if eps is not None:
+        return float(eps)
+    return float(torch.finfo(dtype).eps)
+
+
+def _ensure_cuda_current_context(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.current_stream(device=device)
+        device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        if device_index not in _INITIALIZED_CUBLAS_DEVICES:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Attempting to run cuBLAS, but there was no current CUDA context!",
+                )
+                torch.cuda.current_blas_handle()
+            _INITIALIZED_CUBLAS_DEVICES.add(device_index)
+
+
+def _supports_cute_tail_rowwise(
+    scan_output: torch.Tensor,
+    gate: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_proj_weight: torch.Tensor,
+    *,
+    skip_input: torch.Tensor | None,
+    d_skip: torch.Tensor | None,
+) -> bool:
+    del skip_input, d_skip
+    if scan_output.device.type != "cuda":
+        return False
+    if (
+        gate.device != scan_output.device
+        or out_norm_weight.device != scan_output.device
+        or out_proj_weight.device != scan_output.device
+    ):
+        return False
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    if (
+        scan_output.dtype not in supported_dtypes
+        or gate.dtype not in supported_dtypes
+        or out_norm_weight.dtype not in supported_dtypes
+        or out_proj_weight.dtype not in supported_dtypes
+    ):
+        return False
+    try:
+        import cutlass  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _mixer_tail_rowwise_normed_cute(
+    scan_output: torch.Tensor,
+    gate: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_norm_eps: float | None,
+    *,
+    skip_input: torch.Tensor | None = None,
+    d_skip: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from .cute import _mixer_tail_rowwise_fwd_cute_prevalidated
+
+    return _mixer_tail_rowwise_fwd_cute_prevalidated(
+        scan_output,
+        gate,
+        out_norm_weight,
+        skip_input=skip_input,
+        d_skip=d_skip,
+        eps=_resolved_rms_eps(out_norm_eps, out_norm_weight.dtype),
+    )
+
+
+def _mixer_tail_forward_cute_rowwise(
+    scan_output: torch.Tensor,
+    gate: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_norm_eps: float | None,
+    out_proj_weight: torch.Tensor,
+    out_proj_bias: torch.Tensor | None,
+    *,
+    skip_input: torch.Tensor | None = None,
+    d_skip: torch.Tensor | None = None,
+) -> torch.Tensor:
+    normed = _mixer_tail_rowwise_normed_cute(
+        scan_output,
+        gate,
+        out_norm_weight,
+        out_norm_eps,
+        skip_input=skip_input,
+        d_skip=d_skip,
+    )
+    _ensure_cuda_current_context(normed.device)
     return F.linear(normed, out_proj_weight, out_proj_bias)
 
 
@@ -154,17 +257,37 @@ class _MixerTailFn(torch.autograd.Function):
         ctx.device_type = scan_output.device.type
         ctx.autocast_enabled = bool(torch.is_autocast_enabled(ctx.device_type))
         ctx.autocast_dtype = torch.get_autocast_dtype(ctx.device_type)
+        ctx.use_cute_rowwise = _supports_cute_tail_rowwise(
+            scan_output,
+            gate,
+            out_norm_weight,
+            out_proj_weight,
+            skip_input=skip_input,
+            d_skip=d_skip,
+        )
         with torch.no_grad():
-            out = _mixer_tail_forward(
-                scan_output,
-                gate,
-                out_norm_weight,
-                out_norm_eps,
-                out_proj_weight,
-                out_proj_bias,
-                skip_input=skip_input,
-                d_skip=d_skip,
-            )
+            if ctx.use_cute_rowwise:
+                out = _mixer_tail_forward_cute_rowwise(
+                    scan_output,
+                    gate,
+                    out_norm_weight,
+                    out_norm_eps,
+                    out_proj_weight,
+                    out_proj_bias,
+                    skip_input=skip_input,
+                    d_skip=d_skip,
+                )
+            else:
+                out = _mixer_tail_forward(
+                    scan_output,
+                    gate,
+                    out_norm_weight,
+                    out_norm_eps,
+                    out_proj_weight,
+                    out_proj_bias,
+                    skip_input=skip_input,
+                    d_skip=d_skip,
+                )
         if skip_input is None:
             ctx.save_for_backward(scan_output, gate)
         else:
@@ -188,6 +311,75 @@ class _MixerTailFn(torch.autograd.Function):
         else:
             scan_output, gate = ctx.saved_tensors
             skip_input = None
+        if ctx.use_cute_rowwise:
+            from .cute import _mixer_tail_rowwise_bwd_cute_prevalidated
+
+            autocast_ctx = (
+                torch.autocast(
+                    device_type=ctx.device_type,
+                    dtype=ctx.autocast_dtype,
+                    enabled=bool(ctx.autocast_enabled),
+                )
+                if ctx.device_type in {"cpu", "cuda"}
+                else nullcontext()
+            )
+            with torch.no_grad():
+                normed = _mixer_tail_rowwise_normed_cute(
+                    scan_output,
+                    gate,
+                    ctx.out_norm_weight,
+                    ctx.out_norm_eps,
+                    skip_input=skip_input,
+                    d_skip=ctx.d_skip,
+                )
+                _ensure_cuda_current_context(grad_out.device)
+                with autocast_ctx:
+                    d_normed = F.linear(grad_out, ctx.out_proj_weight.t())
+                    grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1])
+                    normed_2d = normed.reshape(-1, normed.shape[-1])
+                    if not ctx.autocast_enabled:
+                        proj_dtype = ctx.out_proj_weight.dtype
+                        if grad_out_2d.dtype != proj_dtype:
+                            grad_out_2d = grad_out_2d.to(dtype=proj_dtype)
+                        if normed_2d.dtype != proj_dtype:
+                            normed_2d = normed_2d.to(dtype=proj_dtype)
+                    d_proj_weight = grad_out_2d.transpose(0, 1) @ normed_2d
+                    if d_proj_weight.dtype != ctx.out_proj_weight.dtype:
+                        d_proj_weight = d_proj_weight.to(
+                            dtype=ctx.out_proj_weight.dtype
+                        )
+                    d_proj_bias = None
+                    if ctx.out_proj_bias is not None:
+                        d_proj_bias = grad_out.sum(dim=(0, 1))
+                        if d_proj_bias.dtype != ctx.out_proj_bias.dtype:
+                            d_proj_bias = d_proj_bias.to(dtype=ctx.out_proj_bias.dtype)
+                rowwise = _mixer_tail_rowwise_bwd_cute_prevalidated(
+                    scan_output,
+                    gate,
+                    ctx.out_norm_weight,
+                    d_normed,
+                    skip_input=skip_input,
+                    d_skip=ctx.d_skip,
+                    eps=_resolved_rms_eps(ctx.out_norm_eps, ctx.out_norm_weight.dtype),
+                )
+                d_norm_weight = rowwise.d_norm_weight_accum.to(
+                    dtype=ctx.out_norm_weight.dtype
+                )
+                d_skip_input = None if not ctx.has_skip_input else rowwise.d_skip_input
+                d_d_skip = None
+                if ctx.d_skip is not None:
+                    d_d_skip = rowwise.d_d_skip.to(dtype=ctx.d_skip.dtype)
+
+            return (
+                rowwise.d_scan_output,
+                rowwise.d_gate,
+                d_skip_input,
+                d_d_skip,
+                d_norm_weight,
+                None,
+                d_proj_weight,
+                d_proj_bias,
+            )
         scan_output_r = scan_output.detach().requires_grad_(True)
         gate_r = gate.detach().requires_grad_(True)
         skip_input_r = (
@@ -234,6 +426,7 @@ class _MixerTailFn(torch.autograd.Function):
         )
         with torch.enable_grad():
             with autocast_ctx:
+                _ensure_cuda_current_context(scan_output_r.device)
                 out = _mixer_tail_forward(
                     scan_output_r,
                     gate_r,
@@ -281,7 +474,7 @@ class _MixerTailFn(torch.autograd.Function):
         )
 
 
-def mixer_tail(
+def _mixer_tail_impl(
     scan_output: torch.Tensor,
     gate: torch.Tensor,
     out_norm: nn.RMSNorm,
@@ -299,6 +492,13 @@ def mixer_tail(
     out_proj_bias = getattr(out_proj, "bias", None)
     if out_proj_bias is not None and not isinstance(out_proj_bias, torch.Tensor):
         raise TypeError("mixer_tail requires out_proj.bias to be a tensor or None.")
+    _, n_heads, _, d_head = _mixer_tail_dims(scan_output, gate)
+    _validate_tail_parameters(
+        out_norm_weight,
+        out_proj_weight,
+        cast(torch.Tensor | None, out_proj_bias),
+        hidden_dim=int(n_heads * d_head),
+    )
 
     requires_grad = torch.is_grad_enabled() and any(
         tensor.requires_grad
@@ -315,6 +515,24 @@ def mixer_tail(
     if out_proj_bias is not None:
         requires_grad = requires_grad or out_proj_bias.requires_grad
     if not requires_grad:
+        if _supports_cute_tail_rowwise(
+            scan_output,
+            gate,
+            out_norm_weight,
+            out_proj_weight,
+            skip_input=skip_input,
+            d_skip=d_skip,
+        ):
+            return _mixer_tail_forward_cute_rowwise(
+                scan_output,
+                gate,
+                out_norm_weight,
+                out_norm.eps,
+                out_proj_weight,
+                cast(torch.Tensor | None, out_proj_bias),
+                skip_input=skip_input,
+                d_skip=d_skip,
+            )
         return _mixer_tail_forward(
             scan_output,
             gate,
@@ -339,6 +557,9 @@ def mixer_tail(
             cast(torch.Tensor | None, out_proj_bias),
         ),
     )
+
+
+mixer_tail = cast(Callable[..., Any], torch.compiler.disable(_mixer_tail_impl))
 
 
 __all__ = ["mixer_tail"]

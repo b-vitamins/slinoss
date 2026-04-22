@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark and Nsight-Compute profile the canonical scanprep/v2x2ssd kernels."""
+"""Benchmark and Nsight-Compute profile the canonical CuTe training kernels."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from _ncu_kernels import (  # noqa: E402
     DEFAULT_V2_P,
     DEFAULT_V2_T,
     KERNEL_ORDER,
+    MixerTailPerfConfig,
     ScanPrepPerfConfig,
     V2KernelPerfConfig,
     build_kernel_runner,
@@ -138,6 +139,18 @@ def _make_scanprep_cfg(args: argparse.Namespace) -> ScanPrepPerfConfig:
         P=args.scanprep_P,
         bc_groups=args.scanprep_bc_groups,
         dtype=dtype_from_str(args.scanprep_dtype),
+        device=args.device,
+        seed=args.seed,
+    )
+
+
+def _make_mixer_tail_cfg(args: argparse.Namespace) -> MixerTailPerfConfig:
+    return MixerTailPerfConfig(
+        batch=args.batch,
+        heads=args.heads,
+        T=args.T,
+        P=args.P,
+        dtype=dtype_from_str(args.dtype),
         device=args.device,
         seed=args.seed,
     )
@@ -275,6 +288,7 @@ def main() -> int:
     ensure_cuda(args.device)
     v2_cfg = _make_v2_cfg(args)
     scanprep_cfg = _make_scanprep_cfg(args)
+    mixer_tail_cfg = _make_mixer_tail_cfg(args)
     device = torch.device(args.device)
 
     if args.run_kernel is not None:
@@ -282,6 +296,7 @@ def main() -> int:
             args.run_kernel,
             v2_cfg=v2_cfg,
             scanprep_cfg=scanprep_cfg,
+            mixer_tail_cfg=mixer_tail_cfg,
         )
         _run_kernel_once(
             runner,
@@ -300,6 +315,7 @@ def main() -> int:
             kernel_name,
             v2_cfg=v2_cfg,
             scanprep_cfg=scanprep_cfg,
+            mixer_tail_cfg=mixer_tail_cfg,
         )
         bench = _benchmark_kernel(
             runner,
@@ -373,6 +389,19 @@ def main() -> int:
                 "dtype": str(scanprep_cfg.dtype),
                 "device": scanprep_cfg.device,
                 "seed": scanprep_cfg.seed,
+            },
+            "mixer_tail_config": {
+                "batch": mixer_tail_cfg.batch,
+                "heads": mixer_tail_cfg.heads,
+                "T": mixer_tail_cfg.T,
+                "P": mixer_tail_cfg.P,
+                "hidden_dim": mixer_tail_cfg.hidden_dim,
+                "dtype": str(mixer_tail_cfg.dtype),
+                "d_skip_dtype": str(mixer_tail_cfg.d_skip_dtype),
+                "device": mixer_tail_cfg.device,
+                "seed": mixer_tail_cfg.seed,
+                "eps": mixer_tail_cfg.eps,
+                "warps_per_block": mixer_tail_cfg.warps_per_block,
             },
             "rows": rows,
         }

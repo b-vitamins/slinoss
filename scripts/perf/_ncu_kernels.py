@@ -19,6 +19,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from _common import dtype_from_str  # noqa: E402
 from _training import DEFAULT_TRAINING_PERF_CONFIG  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
+from slinoss.ops.mixer.cute.bwd import MixerTailRowwiseBwdFused  # noqa: E402
+import slinoss.ops.mixer.cute.common as mixer_cute_common  # noqa: E402
+from slinoss.ops.mixer.cute.fwd import MixerTailRowwiseFwdFused  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
     SCANPREP_PARAM_DIM,
     make_fake_tensor_arg,
@@ -104,6 +107,28 @@ class ScanPrepPerfConfig:
         return torch.device(self.device)
 
 
+@dataclass(frozen=True)
+class MixerTailPerfConfig:
+    batch: int = DEFAULT_V2_BATCH
+    heads: int = DEFAULT_V2_HEADS
+    T: int = DEFAULT_V2_T
+    P: int = DEFAULT_V2_P
+    dtype: torch.dtype = DEFAULT_TRAINING_PERF_CONFIG.dtype
+    d_skip_dtype: torch.dtype = torch.float32
+    device: str = "cuda"
+    seed: int = 0
+    eps: float = 1.0e-5
+    warps_per_block: int = 8
+
+    @property
+    def hidden_dim(self) -> int:
+        return int(self.heads * self.P)
+
+    @property
+    def torch_device(self) -> torch.device:
+        return torch.device(self.device)
+
+
 @dataclass
 class KernelRunner:
     name: str
@@ -116,6 +141,8 @@ class KernelRunner:
 KERNEL_ORDER = (
     "scanprep_fwd",
     "scanprep_bwd",
+    "mixer_tail_rowwise_fwd",
+    "mixer_tail_rowwise_bwd",
     "chunk_increment_fwd",
     "state_passing_fwd",
     "chunk_scan_fwd",
@@ -541,6 +568,171 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     return KernelRunner(
         name="scanprep_bwd",
         effective_bytes=effective_bytes,
+        launch=launch,
+        prepare=prepare,
+    )
+
+
+def _build_mixer_tail_rowwise_fwd_runner(cfg: MixerTailPerfConfig) -> KernelRunner:
+    _seed_all(cfg.seed)
+    device = cfg.torch_device
+    dtype = cfg.dtype
+
+    scan_output = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=device,
+        dtype=dtype,
+    )
+    gate = torch.randn(
+        (cfg.batch, cfg.T, cfg.hidden_dim),
+        device=device,
+        dtype=dtype,
+    )
+    out_norm_weight = torch.randn(
+        (cfg.hidden_dim,),
+        device=device,
+        dtype=dtype,
+    )
+    skip_input = torch.randn_like(scan_output)
+    d_skip = torch.randn((cfg.heads,), device=device, dtype=cfg.d_skip_dtype)
+    normed = torch.empty(
+        (cfg.batch, cfg.T, cfg.hidden_dim),
+        device=device,
+        dtype=dtype,
+    )
+
+    compiled = cute.compile(
+        MixerTailRowwiseFwdFused(
+            h_size=cfg.heads,
+            p_size=cfg.P,
+            eps=cfg.eps,
+            has_skip=True,
+            storage_dtype=dtype,
+            warps_per_block=cfg.warps_per_block,
+        ),
+        mixer_cute_common.make_fake_tensor_arg(scan_output),
+        mixer_cute_common.make_fake_tensor_arg(gate),
+        mixer_cute_common.make_fake_tensor_arg(out_norm_weight),
+        mixer_cute_common.make_fake_tensor_arg(skip_input),
+        mixer_cute_common.make_fake_tensor_arg(d_skip),
+        mixer_cute_common.make_fake_tensor_arg(normed),
+        options="--enable-tvm-ffi",
+    )
+
+    def launch() -> None:
+        compiled(
+            scan_output,
+            gate,
+            out_norm_weight,
+            skip_input,
+            d_skip,
+            normed,
+        )
+
+    return KernelRunner(
+        name="mixer_tail_rowwise_fwd",
+        effective_bytes=_tensor_bytes(
+            scan_output,
+            gate,
+            out_norm_weight,
+            skip_input,
+            d_skip,
+            normed,
+        ),
+        launch=launch,
+        prepare=_noop,
+    )
+
+
+def _build_mixer_tail_rowwise_bwd_runner(cfg: MixerTailPerfConfig) -> KernelRunner:
+    _seed_all(cfg.seed)
+    device = cfg.torch_device
+    dtype = cfg.dtype
+
+    scan_output = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=device,
+        dtype=dtype,
+    )
+    gate = torch.randn(
+        (cfg.batch, cfg.T, cfg.hidden_dim),
+        device=device,
+        dtype=dtype,
+    )
+    out_norm_weight = torch.randn(
+        (cfg.hidden_dim,),
+        device=device,
+        dtype=dtype,
+    )
+    skip_input = torch.randn_like(scan_output)
+    d_skip = torch.randn((cfg.heads,), device=device, dtype=cfg.d_skip_dtype)
+    d_normed = torch.randn(
+        (cfg.batch, cfg.T, cfg.hidden_dim),
+        device=device,
+        dtype=dtype,
+    )
+    d_scan_output = torch.empty_like(scan_output)
+    d_gate = torch.empty_like(gate)
+    d_skip_input = torch.empty_like(scan_output)
+    d_d_skip = torch.zeros((cfg.heads,), device=device, dtype=torch.float32)
+    d_norm_weight = torch.zeros((cfg.hidden_dim,), device=device, dtype=torch.float32)
+
+    compiled = cute.compile(
+        MixerTailRowwiseBwdFused(
+            h_size=cfg.heads,
+            p_size=cfg.P,
+            eps=cfg.eps,
+            has_skip=True,
+            warps_per_block=cfg.warps_per_block,
+        ),
+        mixer_cute_common.make_fake_tensor_arg(scan_output),
+        mixer_cute_common.make_fake_tensor_arg(gate),
+        mixer_cute_common.make_fake_tensor_arg(out_norm_weight),
+        mixer_cute_common.make_fake_tensor_arg(skip_input),
+        mixer_cute_common.make_fake_tensor_arg(d_skip),
+        mixer_cute_common.make_fake_tensor_arg(d_normed),
+        mixer_cute_common.make_fake_tensor_arg(d_scan_output),
+        mixer_cute_common.make_fake_tensor_arg(d_gate),
+        mixer_cute_common.make_fake_tensor_arg(d_skip_input),
+        mixer_cute_common.make_fake_tensor_arg(d_d_skip),
+        mixer_cute_common.make_fake_tensor_arg(d_norm_weight),
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        d_d_skip.zero_()
+        d_norm_weight.zero_()
+
+    def launch() -> None:
+        compiled(
+            scan_output,
+            gate,
+            out_norm_weight,
+            skip_input,
+            d_skip,
+            d_normed,
+            d_scan_output,
+            d_gate,
+            d_skip_input,
+            d_d_skip,
+            d_norm_weight,
+        )
+
+    return KernelRunner(
+        name="mixer_tail_rowwise_bwd",
+        effective_bytes=_tensor_bytes(
+            scan_output,
+            gate,
+            out_norm_weight,
+            skip_input,
+            d_skip,
+            d_normed,
+            d_scan_output,
+            d_gate,
+            d_skip_input,
+            d_d_skip,
+            d_norm_weight,
+        ),
         launch=launch,
         prepare=prepare,
     )
@@ -1155,6 +1347,7 @@ def build_kernel_runners(
     *,
     v2_cfg: V2KernelPerfConfig | None = None,
     scanprep_cfg: ScanPrepPerfConfig | None = None,
+    mixer_tail_cfg: MixerTailPerfConfig | None = None,
 ) -> list[KernelRunner]:
     if v2_cfg is None:
         v2_cfg = V2KernelPerfConfig(
@@ -1171,12 +1364,28 @@ def build_kernel_runners(
         )
     if scanprep_cfg is None:
         scanprep_cfg = ScanPrepPerfConfig()
+    if mixer_tail_cfg is None:
+        mixer_tail_cfg = MixerTailPerfConfig(
+            batch=v2_cfg.batch,
+            heads=v2_cfg.heads,
+            T=v2_cfg.T,
+            P=v2_cfg.P,
+            dtype=v2_cfg.dtype,
+            device=v2_cfg.device,
+            seed=v2_cfg.seed,
+        )
 
     runners: dict[str, KernelRunner] = {}
     runners.update(
         {
             "scanprep_fwd": _build_scanprep_fwd_runner(scanprep_cfg),
             "scanprep_bwd": _build_scanprep_bwd_runner(scanprep_cfg),
+            "mixer_tail_rowwise_fwd": _build_mixer_tail_rowwise_fwd_runner(
+                mixer_tail_cfg
+            ),
+            "mixer_tail_rowwise_bwd": _build_mixer_tail_rowwise_bwd_runner(
+                mixer_tail_cfg
+            ),
         }
     )
     runners.update(_build_v2x2ssd_forward_runners(v2_cfg))
@@ -1191,6 +1400,7 @@ def build_kernel_runner(
     *,
     v2_cfg: V2KernelPerfConfig | None = None,
     scanprep_cfg: ScanPrepPerfConfig | None = None,
+    mixer_tail_cfg: MixerTailPerfConfig | None = None,
 ) -> KernelRunner:
     if v2_cfg is None:
         v2_cfg = V2KernelPerfConfig(
@@ -1207,11 +1417,25 @@ def build_kernel_runner(
         )
     if scanprep_cfg is None:
         scanprep_cfg = ScanPrepPerfConfig()
+    if mixer_tail_cfg is None:
+        mixer_tail_cfg = MixerTailPerfConfig(
+            batch=v2_cfg.batch,
+            heads=v2_cfg.heads,
+            T=v2_cfg.T,
+            P=v2_cfg.P,
+            dtype=v2_cfg.dtype,
+            device=v2_cfg.device,
+            seed=v2_cfg.seed,
+        )
 
     if name == "scanprep_fwd":
         return _build_scanprep_fwd_runner(scanprep_cfg)
     if name == "scanprep_bwd":
         return _build_scanprep_bwd_runner(scanprep_cfg)
+    if name == "mixer_tail_rowwise_fwd":
+        return _build_mixer_tail_rowwise_fwd_runner(mixer_tail_cfg)
+    if name == "mixer_tail_rowwise_bwd":
+        return _build_mixer_tail_rowwise_bwd_runner(mixer_tail_cfg)
     if name in {
         "chunk_increment_fwd",
         "state_passing_fwd",

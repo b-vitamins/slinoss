@@ -149,6 +149,8 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             gate,
             self.out_norm,
             self.out_proj,
+            skip_input=scan_inputs.U,
+            d_skip=self.d_skip,
         )
 
         if not return_state:
