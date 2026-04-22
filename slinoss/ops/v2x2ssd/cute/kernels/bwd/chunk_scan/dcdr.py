@@ -1895,10 +1895,12 @@ class ChunkScanBwdDCDRAmpere:
         tSr_score_tile_view = thr_copy_A.retile(tSr_score_tile)
         coord_dout = cute.make_identity_tensor(mDOut.layout.shape)
         coord_dout_tile = coord_dout[bidz, None, 0, None]
-        single_n_tile = cutlass.const_expr(n_tiles == 1)
 
         for m_tile in cutlass.range_constexpr(n_tiles):
             m0 = cutlass.Int32(m_tile * kv_tile)
+            use_cached_score_tiles = cutlass.const_expr(
+                (n_tiles == 1) or ((n_tiles == 2) and (m_tile == 0))
+            )
             row_state = SimpleNamespace(
                 m_tile=m_tile,
                 s_scale_full=s_scale_full,
@@ -1921,7 +1923,7 @@ class ChunkScanBwdDCDRAmpere:
             )
             self._load_dout_tiles(dout_state)
 
-            if single_n_tile:
+            if use_cached_score_tiles:
                 column_state = SimpleNamespace(
                     n_tile=0,
                     batch_head_chunk=bidz,
@@ -1987,7 +1989,7 @@ class ChunkScanBwdDCDRAmpere:
                 for n_tile in cutlass.range_constexpr(m_tile + 1):
                     n0 = cutlass.Int32(n_tile * kv_tile)
 
-                    if not single_n_tile:
+                    if not use_cached_score_tiles:
                         column_state = SimpleNamespace(
                             n_tile=n_tile,
                             batch_head_chunk=bidz,
@@ -2035,7 +2037,7 @@ class ChunkScanBwdDCDRAmpere:
                         tSr_score_pass = tSr_score_tile
                         tSs_score_pass = tSs_score_tile
                         tSr_score_pass_view = tSr_score_tile_view
-                        if single_n_tile:
+                        if use_cached_score_tiles:
                             s_score_pass = (
                                 s_score_tile if pass_id == 0 else s_score_tile_alt
                             )
