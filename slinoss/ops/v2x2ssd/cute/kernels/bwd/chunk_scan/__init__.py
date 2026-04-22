@@ -569,20 +569,23 @@ def _make_db_workspace(
     device: torch.device,
     tc_dtype: torch.dtype,
     u_block_like: torch.Tensor,
-    b_block_like: torch.Tensor,
 ) -> ChunkScanBwdDBWorkspace:
     return ChunkScanBwdDBWorkspace(
-        value_grad_scratch=torch.empty_like(u_block_like),
-        key_grad_chunk=torch.empty_like(b_block_like),
-        value_boundary_scratch=torch.empty((BHC, P), device=device, dtype=tc_dtype),
-        key_boundary_grad=torch.empty((BHC, D), device=device, dtype=tc_dtype),
-        logprefix_scratch=torch.empty((BHC, L), device=device, dtype=torch.float32),
-        transition_prev_scratch=torch.empty(
+        # The stage-host path allocates fresh workspaces per launch, but the
+        # live domain written by DB is narrower than the raw tensor extent on
+        # grouped/tail shapes. Zero-seed the stage scratch so allocator garbage
+        # cannot leak into public dB/dM/dK outputs.
+        value_grad_scratch=torch.zeros_like(u_block_like),
+        key_grad_chunk=torch.zeros((BHC, L, 1, D), device=device, dtype=tc_dtype),
+        value_boundary_scratch=torch.zeros((BHC, P), device=device, dtype=tc_dtype),
+        key_boundary_grad=torch.zeros((BHC, D), device=device, dtype=tc_dtype),
+        logprefix_scratch=torch.zeros((BHC, L), device=device, dtype=torch.float32),
+        transition_prev_scratch=torch.zeros(
             (BHC, L, 2),
             device=device,
             dtype=torch.float32,
         ),
-        transition_curr_scratch=torch.empty(
+        transition_curr_scratch=torch.zeros(
             (BHC, L, 2),
             device=device,
             dtype=torch.float32,
@@ -602,6 +605,19 @@ def _make_db_runtime_artifacts(
     B_prev0_flat: torch.Tensor,
     workspace: ChunkScanBwdDBWorkspace,
 ) -> ChunkScanBwdDBRuntimeArtifacts:
+    bhc = int(U_blk.shape[0])
+    if (
+        int(workspace.key_grad_chunk.shape[0]) != bhc
+        or int(workspace.value_grad_scratch.shape[0]) != bhc
+        or int(workspace.value_boundary_scratch.shape[0]) != bhc
+        or int(workspace.key_boundary_grad.shape[0]) != bhc
+        or int(workspace.logprefix_scratch.shape[0]) != bhc
+        or int(workspace.transition_prev_scratch.shape[0]) != bhc
+        or int(workspace.transition_curr_scratch.shape[0]) != bhc
+    ):
+        raise ValueError(
+            "DB stage workspace must use the per-head BHC leading dimension."
+        )
     runtime_args = (
         U_blk,
         B_blk,
@@ -726,19 +742,22 @@ def _allocate_du_workspace(
     D: int,
 ) -> ChunkScanBwdDUWorkspace:
     return ChunkScanBwdDUWorkspace(
-        value_grad_chunk=torch.empty_like(value_template),
-        key_grad_scratch=torch.empty_like(key_template),
-        value_boundary_grad=torch.empty(
+        # DU has the same stage-host contract issue as DB: some grouped/tail
+        # shapes only define the live scan domain. Zero-seed the stage outputs
+        # and scratch so fresh allocator contents cannot leak into dU.
+        value_grad_chunk=torch.zeros_like(value_template),
+        key_grad_scratch=torch.zeros_like(key_template),
+        value_boundary_grad=torch.zeros(
             (BHC, value_template.shape[-1]), device=device, dtype=tc_dtype
         ),
-        key_boundary_scratch=torch.empty((BHC, D), device=device, dtype=tc_dtype),
-        logprefix_scratch=torch.empty(
+        key_boundary_scratch=torch.zeros((BHC, D), device=device, dtype=tc_dtype),
+        logprefix_scratch=torch.zeros(
             (BHC, chunk_size), device=device, dtype=torch.float32
         ),
-        transition_prev_scratch=torch.empty(
+        transition_prev_scratch=torch.zeros(
             (BHC, chunk_size, 2), device=device, dtype=torch.float32
         ),
-        transition_curr_scratch=torch.empty(
+        transition_curr_scratch=torch.zeros(
             (BHC, chunk_size, 2), device=device, dtype=torch.float32
         ),
     )
@@ -923,9 +942,12 @@ def _make_param_scan_runtime_artifacts(
     transition_prev_input = d_m_prev.unsqueeze(1).contiguous()
     transition_curr_input = d_m_curr.unsqueeze(1).contiguous()
     rotation_input = d_r.unsqueeze(1).contiguous()
-    transition_output = torch.empty_like(transition_prev_input)
-    tap_prev_output = torch.empty_like(transition_prev_input)
-    tap_curr_output = torch.empty_like(transition_prev_input)
+    # The stage param-scan only materializes the valid scan domain. Seed the
+    # stage outputs with zeros so fresh allocator contents cannot leak back
+    # through the public dM/dK views on grouped/tail shapes.
+    transition_output = torch.zeros_like(transition_prev_input)
+    tap_prev_output = torch.zeros_like(transition_prev_input)
+    tap_curr_output = torch.zeros_like(transition_prev_input)
 
     param_split_count = int(logprefix_input.shape[1])
     transition_view = transition_output.reshape(
@@ -1594,7 +1616,6 @@ def compile_chunk_scan_bwd_kernels(
         device=U.device,
         tc_dtype=tc_dtype,
         u_block_like=U_blk,
-        b_block_like=B_blk,
     )
     db_runtime_artifacts = _make_db_runtime_artifacts(
         U_blk=U_blk,
@@ -1608,9 +1629,9 @@ def compile_chunk_scan_bwd_kernels(
         workspace=db_workspace,
     )
 
-    d_logprefix = torch.empty((BHC, L), device=U.device, dtype=torch.float32)
+    d_logprefix = torch.zeros((BHC, L), device=U.device, dtype=torch.float32)
     d_c = torch.empty_like(C_blk)
-    d_r = torch.empty((BHC, L, 4), device=U.device, dtype=torch.float32)
+    d_r = torch.zeros((BHC, L, 4), device=U.device, dtype=torch.float32)
 
     param_scan_runtime_artifacts = _make_param_scan_runtime_artifacts(
         d_logprefix=d_logprefix,
@@ -1833,7 +1854,7 @@ def compile_chunk_scan_bwd_kernels(
             Bsz, H, n_chunks, L, P
         ),
         key_grad_chunk=db_runtime_artifacts.workspace.key_grad_chunk.reshape(
-            Bsz, G, n_chunks, L, D
+            Bsz, H, n_chunks, L, D
         ),
         value_boundary_grad=du_runtime_artifacts.workspace.value_boundary_grad.reshape(
             Bsz, H, n_chunks, P
