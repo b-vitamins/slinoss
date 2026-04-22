@@ -97,6 +97,23 @@ class StatePassingBwdAmpere:
         self.copy_bits_initial = int(copy_bits_initial)
         self.copy_bits_final = int(copy_bits_final)
 
+    def _warp_partial_layout(self):
+        return cute.make_layout((self.num_threads // 32, 2), stride=(2, 1))
+
+    def _make_shared_storage(self):
+        warp_partial_layout = self._warp_partial_layout()
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "warp_partial": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(warp_partial_layout)],
+                8,
+            ],
+        }
+        return cute.struct(SharedStorage)
+
     def _make_layout_bundle(
         self,
         *,
@@ -248,7 +265,11 @@ class StatePassingBwdAmpere:
             grid_y=batch_head_count,
         )
 
-    def _make_kernel_invocation(self, launch_bundle: StatePassingLaunchBundle):
+    def _make_kernel_invocation(
+        self,
+        launch_bundle: StatePassingLaunchBundle,
+        shared_storage_cls: cutlass.Constexpr,
+    ):
         return self.kernel(
             launch_bundle.chunk_starts_flat,
             launch_bundle.d_chunk_starts_flat,
@@ -271,6 +292,7 @@ class StatePassingBwdAmpere:
             launch_bundle.copies.d_final_vector_copy,
             launch_bundle.copies.d_final_scalar_copy,
             launch_bundle.copies.multiplier_copy,
+            shared_storage_cls,
         )
 
     @cute.jit
@@ -466,19 +488,32 @@ class StatePassingBwdAmpere:
         batch_head_idx,
         chunk_idx,
         d_chunk_multiplier_partial: cute.Tensor,
+        s_warp_partial: cute.Tensor,
     ):
-        if cute.arch.lane_idx() == cutlass.Int32(0):
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+        if lane == cutlass.Int32(0):
+            s_warp_partial[warp, 0] = d_chunk_multiplier_partial[0]
+            s_warp_partial[warp, 1] = d_chunk_multiplier_partial[1]
+        cute.arch.barrier()
+        if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
+            total_re = cutlass.Float32(0.0)
+            total_im = cutlass.Float32(0.0)
+            for warp_idx in cutlass.range_constexpr(self.num_threads // 32):
+                total_re = total_re + s_warp_partial[warp_idx, 0]
+                total_im = total_im + s_warp_partial[warp_idx, 1]
             global_d_chunk_multiplier = d_chunk_multiplier_flat[
                 batch_head_idx, chunk_idx, None
             ]
             cute.arch.atomic_add(
                 (global_d_chunk_multiplier.iterator + 0).llvm_ptr,
-                d_chunk_multiplier_partial[0],
+                total_re,
             )
             cute.arch.atomic_add(
                 (global_d_chunk_multiplier.iterator + 1).llvm_ptr,
-                d_chunk_multiplier_partial[1],
+                total_im,
             )
+        cute.arch.barrier()
 
     @cute.jit
     def __call__(
@@ -500,10 +535,11 @@ class StatePassingBwdAmpere:
             d_chunk_multiplier=d_chunk_multiplier,
             d_initial=d_initial,
         )
-
-        self._make_kernel_invocation(launch_bundle).launch(
+        shared_storage_cls = self._make_shared_storage()
+        self._make_kernel_invocation(launch_bundle, shared_storage_cls).launch(
             grid=[launch_bundle.grid_x, launch_bundle.grid_y, 1],
             block=[self.num_threads, 1, 1],
+            smem=int(shared_storage_cls.size_in_bytes()),
         )
 
     @cute.jit
@@ -527,11 +563,12 @@ class StatePassingBwdAmpere:
             d_chunk_multiplier=d_chunk_multiplier,
             d_initial=d_initial,
         )
-
-        self._make_kernel_invocation(launch_bundle).launch(
+        shared_storage_cls = self._make_shared_storage()
+        self._make_kernel_invocation(launch_bundle, shared_storage_cls).launch(
             grid=[launch_bundle.grid_x, launch_bundle.grid_y, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
+            smem=int(shared_storage_cls.size_in_bytes()),
         )
 
     @cute.kernel
@@ -558,9 +595,13 @@ class StatePassingBwdAmpere:
         d_final_vector_copy,
         d_final_scalar_copy,
         multiplier_copy,
+        shared_storage_cls: cutlass.Constexpr,
     ):
         thread_idx, _, _ = cute.arch.thread_idx()
         block_x, batch_head_idx, _ = cute.arch.block_idx()
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(shared_storage_cls)
+        s_warp_partial = storage.warp_partial.get_tensor(self._warp_partial_layout())
 
         total_state_elems = d_increment_flat.shape[2]
         chunk_count = d_increment_flat.shape[1]
@@ -654,6 +695,7 @@ class StatePassingBwdAmpere:
                 batch_head_idx,
                 chunk_idx,
                 d_chunk_multiplier_partial,
+                s_warp_partial,
             )
 
             global_d_chunk_start = d_chunk_starts_flat[batch_head_idx, chunk_idx, None]
