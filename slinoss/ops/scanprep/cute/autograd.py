@@ -6,11 +6,7 @@ from typing import cast
 
 import torch
 
-from slinoss.ops.scanprep.parameterization import (
-    parameterize_scan_bc_rows,
-    validate_scan_bc_raw,
-    validate_scan_bc_rows,
-)
+from slinoss.ops.scanprep.parameterization import validate_scan_bc_raw
 
 from .kernels import _scanprep_bwd_cute_prevalidated, _scanprep_fwd_cute_prevalidated
 
@@ -67,22 +63,10 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
         theta_mod_bias_d = theta_mod_bias.detach()
         theta_bias_d = theta_bias.detach()
         theta_sign_d = theta_sign.detach()
-
-        bc_rows = parameterize_scan_bc_rows(
-            bc_d,
-            bc_groups=int(bc_groups),
-            d_state=int(d_state),
-            eps=float(eps),
-        )
-        validate_scan_bc_rows(
-            bc_rows,
-            bc_groups=int(bc_groups),
-            d_state=int(d_state),
-        )
         outputs = _scanprep_fwd_cute_prevalidated(
             value_d,
             params_d,
-            bc_rows,
+            bc_d,
             n_heads=n_heads,
             bc_groups=bc_groups,
             d_state=d_state,
@@ -102,7 +86,6 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             theta_mod_bias=theta_mod_bias_d,
             theta_bias=theta_bias_d,
             theta_sign=theta_sign_d,
-            store_coeff_aux=False,
         )
         ctx.save_for_backward(
             bc_d,
@@ -134,55 +117,9 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             theta_sign,
         ) = ctx.saved_tensors
 
-        with torch.enable_grad():
-            bc_req = bc.detach().requires_grad_(True)
-            bc_rows = parameterize_scan_bc_rows(
-                bc_req,
-                bc_groups=ctx.bc_groups,
-                d_state=ctx.d_state,
-                eps=ctx.eps,
-            )
-            validate_scan_bc_rows(
-                bc_rows,
-                bc_groups=ctx.bc_groups,
-                d_state=ctx.d_state,
-            )
-
-        bc_rows_detached = bc_rows.detach()
-        batch, time_steps = map(int, bc_rows_detached.shape[:2])
-        value_dummy = torch.empty(
-            (batch, time_steps, ctx.n_heads * ctx.d_head),
-            device=bc_rows_detached.device,
-            dtype=ctx.value_dtype,
-        )
-        coeff_aux = _scanprep_fwd_cute_prevalidated(
-            value_dummy,
-            params,
-            bc_rows_detached,
-            n_heads=ctx.n_heads,
-            bc_groups=ctx.bc_groups,
-            d_state=ctx.d_state,
-            d_head=ctx.d_head,
-            dt_min=ctx.dt_min,
-            dt_max=ctx.dt_max,
-            theta_init_min=ctx.theta_init_min,
-            theta_init_max=ctx.theta_init_max,
-            theta_mod_scale=ctx.theta_mod_scale,
-            alpha_min=ctx.alpha_min,
-            alpha_max=ctx.alpha_max,
-            r_min=ctx.r_min,
-            r_max=ctx.r_max,
-            eps=ctx.eps,
-            dt_bias=dt_bias,
-            alpha_bias=alpha_bias,
-            theta_mod_bias=theta_mod_bias,
-            theta_bias=theta_bias,
-            theta_sign=theta_sign,
-            store_coeff_aux=True,
-        ).coeff_aux
         outputs = _scanprep_bwd_cute_prevalidated(
-            bc=bc_rows_detached,
-            coeff_aux=coeff_aux,
+            params=params,
+            bc=bc,
             dU=dU,
             dM=dM,
             dK=dK,
@@ -205,24 +142,16 @@ class _ScanPrepCuTeFn(torch.autograd.Function):
             r_max=ctx.r_max,
             eps=ctx.eps,
             dt_bias=dt_bias,
+            alpha_bias=alpha_bias,
+            theta_mod_bias=theta_mod_bias,
             theta_bias=theta_bias,
             theta_sign=theta_sign,
         )
 
-        with torch.enable_grad():
-            (bc_grad,) = torch.autograd.grad(
-                outputs=bc_rows,
-                inputs=(bc_req,),
-                grad_outputs=outputs.bc_grad,
-                create_graph=False,
-                retain_graph=False,
-                allow_unused=False,
-            )
-
         return (
             outputs.value_grad,
             outputs.dparams,
-            bc_grad,
+            outputs.bc_grad,
             None,
             None,
             None,

@@ -21,7 +21,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import make_fake_tensor_arg  # noqa: E402
-from slinoss.ops.scanprep.cute.kernels import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 
 
@@ -78,47 +77,19 @@ def main() -> int:
         device=device,
     ).to(dtype=dtype)
 
-    value = torch.randn((batch, t_size, heads * p_size), device=device, dtype=dtype)
     params = torch.randn(
         (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
     )
-    bc_amp = torch.randn(
+    bc = torch.randn(
         (batch, t_size, heads, prep.bc_param_rows, d_state),
         device=device,
         dtype=dtype,
     )
-    bc = prep._parameterize_scan_bc_rows(bc_amp)
     dU = torch.randn((batch, heads, t_size, p_size), device=device, dtype=dtype)
     dM = torch.randn((batch, heads, t_size, 2), device=device, dtype=torch.float32)
     dK = torch.randn((batch, heads, t_size, 2, 2), device=device, dtype=torch.float32)
     dB = torch.randn((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
     dC = torch.randn_like(dB)
-
-    with torch.no_grad():
-        _, _, _, _, _, coeff_aux = scanprep_fwd_cute_with_aux(
-            value,
-            params,
-            bc,
-            n_heads=heads,
-            bc_groups=heads,
-            d_state=d_state,
-            d_head=p_size,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            theta_init_min=prep.theta_init_min,
-            theta_init_max=prep.theta_init_max,
-            theta_mod_scale=prep.theta_mod_scale,
-            alpha_min=prep.alpha_min,
-            alpha_max=prep.alpha_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            alpha_bias=prep.alpha_bias.detach(),
-            theta_mod_bias=prep.theta_mod_bias.detach(),
-            theta_bias=prep.theta_bias.detach(),
-            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
-        )
 
     value_grad = torch.empty(
         (batch, t_size, heads * p_size), device=device, dtype=dtype
@@ -155,12 +126,14 @@ def main() -> int:
         make_fake_tensor_arg(bc),
         make_fake_tensor_arg(dB),
         make_fake_tensor_arg(dC),
-        make_fake_tensor_arg(coeff_aux),
-        make_fake_tensor_arg(dM),
-        make_fake_tensor_arg(dK),
+        make_fake_tensor_arg(params),
         make_fake_tensor_arg(prep.dt_bias.detach()),
+        make_fake_tensor_arg(prep.alpha_bias.detach()),
+        make_fake_tensor_arg(prep.theta_mod_bias.detach()),
         make_fake_tensor_arg(prep.theta_bias.detach()),
         make_fake_tensor_arg(cast(torch.Tensor, prep.theta_sign).detach()),
+        make_fake_tensor_arg(dM),
+        make_fake_tensor_arg(dK),
         make_fake_tensor_arg(value_grad),
         make_fake_tensor_arg(bc_grad),
         make_fake_tensor_arg(dparams),
@@ -177,12 +150,14 @@ def main() -> int:
             bc,
             dB,
             dC,
-            coeff_aux,
-            dM,
-            dK,
+            params,
             prep.dt_bias.detach(),
+            prep.alpha_bias.detach(),
+            prep.theta_mod_bias.detach(),
             prep.theta_bias.detach(),
             cast(torch.Tensor, prep.theta_sign).detach(),
+            dM,
+            dK,
             value_grad,
             bc_grad,
             dparams,

@@ -31,7 +31,6 @@ COEFF_AUX_KAPPA1_RE = 10
 COEFF_AUX_KAPPA1_IM = 11
 COEFF_AUX_KAPPA2_RE = 12
 COEFF_AUX_KAPPA2_IM = 13
-COEFF_AUX_FIELDS = 14
 
 
 def make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -201,7 +200,6 @@ __all__ = [
     "SCANPREP_PARAM_DIM",
     "COEFF_AUX_DT",
     "COEFF_AUX_EXP_TERM",
-    "COEFF_AUX_FIELDS",
     "COEFF_AUX_KAPPA1_IM",
     "COEFF_AUX_KAPPA1_RE",
     "COEFF_AUX_KAPPA2_IM",

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import inspect
 from math import prod
 from pathlib import Path
 import sys
@@ -21,11 +20,9 @@ from _common import dtype_from_str  # noqa: E402
 from _training import DEFAULT_TRAINING_PERF_CONFIG  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
 from slinoss.ops.scanprep.cute.common import (  # noqa: E402
-    COEFF_AUX_FIELDS,
     SCANPREP_PARAM_DIM,
     make_fake_tensor_arg,
 )
-from slinoss.ops.scanprep.cute.kernels import scanprep_fwd_cute_with_aux  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.fwd import ScanPrepFwdFused  # noqa: E402
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
@@ -276,15 +273,13 @@ def _build_grouped_v2_inputs(cfg: V2KernelPerfConfig) -> dict[str, torch.Tensor]
 
 
 def _make_scanprep_module(cfg: ScanPrepPerfConfig) -> SLinOSSScanPrep:
-    kwargs = {
-        "n_heads": cfg.heads,
-        "d_state": cfg.N,
-        "d_head": cfg.P,
-        "device": cfg.torch_device,
-    }
-    if "bc_groups" in inspect.signature(SLinOSSScanPrep).parameters:
-        kwargs["bc_groups"] = cfg.resolved_bc_groups
-    return SLinOSSScanPrep(**kwargs).to(dtype=cfg.dtype)
+    return SLinOSSScanPrep(
+        n_heads=cfg.heads,
+        bc_groups=cfg.resolved_bc_groups,
+        d_state=cfg.N,
+        d_head=cfg.P,
+        device=cfg.torch_device,
+    ).to(dtype=cfg.dtype)
 
 
 def _resolve_dtype(dtype_name: str) -> torch.dtype:
@@ -303,7 +298,7 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     _seed_all(cfg.seed)
     device = cfg.torch_device
     dtype = cfg.dtype
-    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    bc_groups, _ = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
     prep = _make_scanprep_module(cfg)
 
     value = torch.randn(
@@ -317,19 +312,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         device=device,
         dtype=dtype,
     )
-    prep_input_groups = int(getattr(prep, "bc_groups", cfg.heads))
-    bc_for_prep = (
-        bc_grouped
-        if prep_input_groups == bc_groups
-        else _materialize_grouped_rows(bc_grouped, heads_per_group=heads_per_group)
-    )
-    bc_rows = prep._parameterize_scan_bc_rows(bc_for_prep)
-    if int(bc_rows.shape[2]) != bc_groups:
-        raise ValueError(
-            "scanprep forward NCU runner requires grouped BC rows. "
-            f"Got bc rows with group dim {int(bc_rows.shape[2])}, expected {bc_groups}."
-        )
-
     U = torch.empty((cfg.batch, cfg.heads, cfg.T, cfg.P), device=device, dtype=dtype)
     M = torch.empty(
         (cfg.batch, cfg.heads, cfg.T, 2), device=device, dtype=torch.float32
@@ -341,11 +323,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, bc_groups, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     C = torch.empty_like(B)
-    coeff_aux = torch.empty(
-        (cfg.batch, cfg.heads, COEFF_AUX_FIELDS, cfg.T),
-        device=device,
-        dtype=torch.float32,
-    )
 
     compiled = cute.compile(
         ScanPrepFwdFused(
@@ -353,7 +330,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             g_size=bc_groups,
             p_size=cfg.P,
             n_size=cfg.N,
-            store_coeff_aux=True,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
             theta_init_min=prep.theta_init_min,
@@ -368,7 +344,7 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             coeff_block_size=cfg.coeff_block_size_fwd,
         ),
         make_fake_tensor_arg(value),
-        make_fake_tensor_arg(bc_rows),
+        make_fake_tensor_arg(bc_grouped),
         make_fake_tensor_arg(params),
         make_fake_tensor_arg(prep.dt_bias.detach()),
         make_fake_tensor_arg(prep.alpha_bias.detach()),
@@ -380,14 +356,13 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         make_fake_tensor_arg(C),
         make_fake_tensor_arg(M),
         make_fake_tensor_arg(K),
-        make_fake_tensor_arg(coeff_aux),
         options="--enable-tvm-ffi",
     )
 
     def launch() -> None:
         compiled(
             value,
-            bc_rows,
+            bc_grouped,
             params,
             prep.dt_bias.detach(),
             prep.alpha_bias.detach(),
@@ -399,7 +374,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             C,
             M,
             K,
-            coeff_aux,
         )
 
     effective_bytes = (
@@ -423,10 +397,6 @@ def _build_scanprep_fwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         + 2 * _shape_bytes((cfg.batch, bc_groups, cfg.T, 2 * cfg.N), dtype)
         + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2), torch.float32)
         + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2, 2), torch.float32)
-        + _shape_bytes(
-            (cfg.batch, cfg.heads, COEFF_AUX_FIELDS, cfg.T),
-            torch.float32,
-        )
     )
     return KernelRunner(
         name="scanprep_fwd",
@@ -440,12 +410,9 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     _seed_all(cfg.seed)
     device = cfg.torch_device
     dtype = cfg.dtype
-    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
+    bc_groups, _ = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
     prep = _make_scanprep_module(cfg)
 
-    value = torch.randn(
-        (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
-    )
     params_flat = torch.randn(
         (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
         device=device,
@@ -456,18 +423,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         device=device,
         dtype=dtype,
     )
-    prep_input_groups = int(getattr(prep, "bc_groups", cfg.heads))
-    bc_for_prep = (
-        bc_grouped
-        if prep_input_groups == bc_groups
-        else _materialize_grouped_rows(bc_grouped, heads_per_group=heads_per_group)
-    )
-    bc_rows = prep._parameterize_scan_bc_rows(bc_for_prep)
-    if int(bc_rows.shape[2]) != bc_groups:
-        raise ValueError(
-            "scanprep backward NCU runner requires grouped BC rows. "
-            f"Got bc rows with group dim {int(bc_rows.shape[2])}, expected {bc_groups}."
-        )
     dU = torch.randn((cfg.batch, cfg.heads, cfg.T, cfg.P), device=device, dtype=dtype)
     dM = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, 2), device=device, dtype=torch.float32
@@ -479,31 +434,6 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
         (cfg.batch, bc_groups, cfg.T, 2 * cfg.N), device=device, dtype=dtype
     )
     dC = torch.randn_like(dB)
-    with torch.no_grad():
-        _, _, _, _, _, coeff_aux = scanprep_fwd_cute_with_aux(
-            value,
-            params_flat,
-            bc_rows,
-            n_heads=cfg.heads,
-            bc_groups=bc_groups,
-            d_state=cfg.N,
-            d_head=cfg.P,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            theta_init_min=prep.theta_init_min,
-            theta_init_max=prep.theta_init_max,
-            theta_mod_scale=prep.theta_mod_scale,
-            alpha_min=prep.alpha_min,
-            alpha_max=prep.alpha_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            alpha_bias=prep.alpha_bias.detach(),
-            theta_mod_bias=prep.theta_mod_bias.detach(),
-            theta_bias=prep.theta_bias.detach(),
-            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
-        )
 
     value_grad = torch.empty(
         (cfg.batch, cfg.T, cfg.heads * cfg.P), device=device, dtype=dtype
@@ -539,12 +469,15 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
             coeff_block_size=cfg.coeff_block_size_bwd,
         ),
         make_fake_tensor_arg(dU),
+        make_fake_tensor_arg(bc_grouped),
         make_fake_tensor_arg(dB),
         make_fake_tensor_arg(dC),
-        make_fake_tensor_arg(coeff_aux),
+        make_fake_tensor_arg(params_flat),
         make_fake_tensor_arg(dM),
         make_fake_tensor_arg(dK),
         make_fake_tensor_arg(prep.dt_bias.detach()),
+        make_fake_tensor_arg(prep.alpha_bias.detach()),
+        make_fake_tensor_arg(prep.theta_mod_bias.detach()),
         make_fake_tensor_arg(prep.theta_bias.detach()),
         make_fake_tensor_arg(cast(torch.Tensor, prep.theta_sign).detach()),
         make_fake_tensor_arg(value_grad),
@@ -560,14 +493,17 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
     def launch() -> None:
         compiled(
             dU,
+            bc_grouped,
             dB,
             dC,
-            coeff_aux,
-            dM,
-            dK,
+            params_flat,
             prep.dt_bias.detach(),
+            prep.alpha_bias.detach(),
+            prep.theta_mod_bias.detach(),
             prep.theta_bias.detach(),
             cast(torch.Tensor, prep.theta_sign).detach(),
+            dM,
+            dK,
             value_grad,
             bc_grad,
             dparams,
@@ -576,15 +512,21 @@ def _build_scanprep_bwd_runner(cfg: ScanPrepPerfConfig) -> KernelRunner:
 
     effective_bytes = (
         _shape_bytes((cfg.batch, cfg.heads, cfg.T, cfg.P), dtype)
-        + 2 * _shape_bytes((cfg.batch, bc_groups, cfg.T, 2 * cfg.N), dtype)
         + _shape_bytes(
-            (cfg.batch, cfg.heads, COEFF_AUX_FIELDS, cfg.T),
-            torch.float32,
+            (cfg.batch, cfg.T, cfg.heads * SCANPREP_PARAM_DIM),
+            dtype,
         )
+        + _shape_bytes(
+            (cfg.batch, cfg.T, bc_groups, prep.bc_param_rows, cfg.N),
+            dtype,
+        )
+        + 2 * _shape_bytes((cfg.batch, bc_groups, cfg.T, 2 * cfg.N), dtype)
         + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2), torch.float32)
         + _shape_bytes((cfg.batch, cfg.heads, cfg.T, 2, 2), torch.float32)
         + _tensor_bytes(
             prep.dt_bias.detach(),
+            prep.alpha_bias.detach(),
+            prep.theta_mod_bias.detach(),
             prep.theta_bias.detach(),
             cast(torch.Tensor, prep.theta_sign).detach(),
         )

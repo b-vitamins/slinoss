@@ -27,12 +27,9 @@ from slinoss.ops.scanprep.cute.kernels import (
     compile_scanprep_bwd_cute,
     compile_scanprep_fwd_cute,
     scanprep_bwd_cute,
+    scanprep_fwd_cute,
 )
 from slinoss.ops.scanprep.cute.common import assumed_align
-from slinoss.ops.scanprep.cute.kernels import (
-    scanprep_fwd_cute,
-    scanprep_fwd_cute_with_aux,
-)
 from slinoss.ops.scanprep.parameterization import PHASE_LIMIT
 from slinoss.ops.v2x2ssd import v2x2ssd
 
@@ -85,6 +82,25 @@ def _scanprep_runtime_kwargs(
         "theta_bias": _maybe_detach(prep.theta_bias),
         "theta_sign": _maybe_detach(cast(torch.Tensor, prep.theta_sign)),
     }
+
+
+def _scanprep_bwd_runtime_kwargs(
+    prep: SLinOSSScanPrep,
+    params: torch.Tensor,
+    *,
+    value_dtype: torch.dtype,
+    params_dtype: torch.dtype,
+    detach: bool = False,
+) -> dict[str, Any]:
+    kwargs = _scanprep_runtime_kwargs(prep, detach=detach)
+    kwargs.update(
+        {
+            "params": params.detach() if detach else params,
+            "value_dtype": value_dtype,
+            "params_dtype": params_dtype,
+        }
+    )
+    return kwargs
 
 
 def _canonical_bc(prep: SLinOSSScanPrep, bc_amp: torch.Tensor) -> torch.Tensor:
@@ -247,7 +263,6 @@ def test_scanprep_fwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
     bc = _canonical_bc(prep, bc_amp)
     scanprep_fwd_mod._SCANPREP_FWD_CACHE.clear()
-    scanprep_fwd_mod._SCANPREP_DUMMY_COEFF_AUX_CACHE.clear()
 
     compile_calls: list[bool] = []
     orig_compile = cute.compile
@@ -270,7 +285,6 @@ def test_scanprep_fwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
 
     assert compile_calls == []
     assert scanprep_fwd_mod._SCANPREP_FWD_CACHE == {}
-    assert scanprep_fwd_mod._SCANPREP_DUMMY_COEFF_AUX_CACHE == {}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -415,8 +429,15 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     pytest.importorskip("cutlass")
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
     bc = _canonical_bc(prep, bc_amp)
+    bwd_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        detach=True,
+    )
     with torch.no_grad():
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C = scanprep_fwd_cute(
             value,
             params,
             bc,
@@ -437,30 +458,12 @@ def test_scanprep_bwd_rejects_cold_cache_during_capture(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="backward .*cold during CUDA graph capture"):
         scanprep_bwd_cute(
             bc=bc,
-            coeff_aux=coeff_aux,
             dU=torch.randn_like(U),
             dM=torch.randn_like(M),
             dK=torch.randn_like(K),
             dB=torch.randn_like(B),
             dC=torch.randn_like(C),
-            n_heads=prep.n_heads,
-            d_head=prep.d_head,
-            d_state=prep.d_state,
-            value_dtype=value.dtype,
-            params_dtype=params.dtype,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            theta_init_min=prep.theta_init_min,
-            theta_init_max=prep.theta_init_max,
-            theta_mod_scale=prep.theta_mod_scale,
-            alpha_min=prep.alpha_min,
-            alpha_max=prep.alpha_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            theta_bias=prep.theta_bias.detach(),
-            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+            **bwd_runtime_kwargs,
         )
 
     assert compile_calls == []
@@ -472,8 +475,15 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
     pytest.importorskip("cutlass")
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
     bc = _canonical_bc(prep, bc_amp)
+    bwd_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        detach=True,
+    )
     with torch.no_grad():
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C = scanprep_fwd_cute(
             value,
             params,
             bc,
@@ -481,30 +491,12 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
         )
         scanprep_bwd_cute(
             bc=bc,
-            coeff_aux=coeff_aux,
             dU=torch.randn_like(U),
             dM=torch.randn_like(M),
             dK=torch.randn_like(K),
             dB=torch.randn_like(B),
             dC=torch.randn_like(C),
-            n_heads=prep.n_heads,
-            d_head=prep.d_head,
-            d_state=prep.d_state,
-            value_dtype=value.dtype,
-            params_dtype=params.dtype,
-            dt_min=prep.dt_min,
-            dt_max=prep.dt_max,
-            theta_init_min=prep.theta_init_min,
-            theta_init_max=prep.theta_init_max,
-            theta_mod_scale=prep.theta_mod_scale,
-            alpha_min=prep.alpha_min,
-            alpha_max=prep.alpha_max,
-            r_min=prep.r_min,
-            r_max=prep.r_max,
-            eps=prep.eps,
-            dt_bias=prep.dt_bias.detach(),
-            theta_bias=prep.theta_bias.detach(),
-            theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+            **bwd_runtime_kwargs,
         )
 
     compile_calls: list[bool] = []
@@ -519,30 +511,12 @@ def test_scanprep_bwd_cached_path_stays_capture_safe(monkeypatch) -> None:
 
     scanprep_bwd_cute(
         bc=bc,
-        coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
         dM=torch.randn_like(M),
         dK=torch.randn_like(K),
         dB=torch.randn_like(B),
         dC=torch.randn_like(C),
-        n_heads=prep.n_heads,
-        d_head=prep.d_head,
-        d_state=prep.d_state,
-        value_dtype=value.dtype,
-        params_dtype=params.dtype,
-        dt_min=prep.dt_min,
-        dt_max=prep.dt_max,
-        theta_init_min=prep.theta_init_min,
-        theta_init_max=prep.theta_init_max,
-        theta_mod_scale=prep.theta_mod_scale,
-        alpha_min=prep.alpha_min,
-        alpha_max=prep.alpha_max,
-        r_min=prep.r_min,
-        r_max=prep.r_max,
-        eps=prep.eps,
-        dt_bias=prep.dt_bias.detach(),
-        theta_bias=prep.theta_bias.detach(),
-        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+        **bwd_runtime_kwargs,
     )
 
     assert compile_calls == []
@@ -553,8 +527,15 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
     pytest.importorskip("cutlass")
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
     bc = _canonical_bc(prep, bc_amp)
+    bwd_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        detach=True,
+    )
     with torch.no_grad():
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C = scanprep_fwd_cute(
             value,
             params,
             bc,
@@ -573,30 +554,12 @@ def test_scanprep_bwd_compile_enables_tvm_ffi(monkeypatch) -> None:
 
     scanprep_bwd_cute(
         bc=bc,
-        coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
         dM=torch.randn_like(M),
         dK=torch.randn_like(K),
         dB=torch.randn_like(B),
         dC=torch.randn_like(C),
-        n_heads=prep.n_heads,
-        d_head=prep.d_head,
-        d_state=prep.d_state,
-        value_dtype=value.dtype,
-        params_dtype=params.dtype,
-        dt_min=prep.dt_min,
-        dt_max=prep.dt_max,
-        theta_init_min=prep.theta_init_min,
-        theta_init_max=prep.theta_init_max,
-        theta_mod_scale=prep.theta_mod_scale,
-        alpha_min=prep.alpha_min,
-        alpha_max=prep.alpha_max,
-        r_min=prep.r_min,
-        r_max=prep.r_max,
-        eps=prep.eps,
-        dt_bias=prep.dt_bias.detach(),
-        theta_bias=prep.theta_bias.detach(),
-        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+        **bwd_runtime_kwargs,
     )
 
     assert compile_options == ["--enable-tvm-ffi"]
@@ -607,8 +570,15 @@ def test_compile_scanprep_bwd_cute_enables_tvm_ffi(monkeypatch) -> None:
     pytest.importorskip("cutlass")
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
     bc = _canonical_bc(prep, bc_amp)
+    bwd_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        detach=True,
+    )
     with torch.no_grad():
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C = scanprep_fwd_cute(
             value,
             params,
             bc,
@@ -627,30 +597,12 @@ def test_compile_scanprep_bwd_cute_enables_tvm_ffi(monkeypatch) -> None:
 
     compiled = compile_scanprep_bwd_cute(
         bc=bc,
-        coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
         dM=torch.randn_like(M),
         dK=torch.randn_like(K),
         dB=torch.randn_like(B),
         dC=torch.randn_like(C),
-        n_heads=prep.n_heads,
-        d_head=prep.d_head,
-        d_state=prep.d_state,
-        value_dtype=value.dtype,
-        params_dtype=params.dtype,
-        dt_min=prep.dt_min,
-        dt_max=prep.dt_max,
-        theta_init_min=prep.theta_init_min,
-        theta_init_max=prep.theta_init_max,
-        theta_mod_scale=prep.theta_mod_scale,
-        alpha_min=prep.alpha_min,
-        alpha_max=prep.alpha_max,
-        r_min=prep.r_min,
-        r_max=prep.r_max,
-        eps=prep.eps,
-        dt_bias=prep.dt_bias.detach(),
-        theta_bias=prep.theta_bias.detach(),
-        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+        **bwd_runtime_kwargs,
     )
 
     assert callable(compiled)
@@ -664,8 +616,15 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
     pytest.importorskip("cutlass")
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture()
     bc = _canonical_bc(prep, bc_amp)
+    bwd_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        detach=True,
+    )
     with torch.no_grad():
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
+        U, M, K, B, C = scanprep_fwd_cute(
             value,
             params,
             bc,
@@ -686,8 +645,15 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
             dtype=bc_amp.dtype,
         ),
     )
+    bwd_alt_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params_alt,
+        value_dtype=value_alt.dtype,
+        params_dtype=params_alt.dtype,
+        detach=True,
+    )
     with torch.no_grad():
-        U_alt, M_alt, K_alt, B_alt, C_alt, coeff_aux_alt = scanprep_fwd_cute_with_aux(
+        U_alt, M_alt, K_alt, B_alt, C_alt = scanprep_fwd_cute(
             value_alt,
             params_alt,
             bc_alt,
@@ -706,57 +672,21 @@ def test_scanprep_bwd_reuses_compiled_executor_across_batch_time_shapes(
 
     scanprep_bwd_cute(
         bc=bc,
-        coeff_aux=coeff_aux,
         dU=torch.randn_like(U),
         dM=torch.randn_like(M),
         dK=torch.randn_like(K),
         dB=torch.randn_like(B),
         dC=torch.randn_like(C),
-        n_heads=prep.n_heads,
-        d_head=prep.d_head,
-        d_state=prep.d_state,
-        value_dtype=value.dtype,
-        params_dtype=params.dtype,
-        dt_min=prep.dt_min,
-        dt_max=prep.dt_max,
-        theta_init_min=prep.theta_init_min,
-        theta_init_max=prep.theta_init_max,
-        theta_mod_scale=prep.theta_mod_scale,
-        alpha_min=prep.alpha_min,
-        alpha_max=prep.alpha_max,
-        r_min=prep.r_min,
-        r_max=prep.r_max,
-        eps=prep.eps,
-        dt_bias=prep.dt_bias.detach(),
-        theta_bias=prep.theta_bias.detach(),
-        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+        **bwd_runtime_kwargs,
     )
     scanprep_bwd_cute(
         bc=bc_alt,
-        coeff_aux=coeff_aux_alt,
         dU=torch.randn_like(U_alt),
         dM=torch.randn_like(M_alt),
         dK=torch.randn_like(K_alt),
         dB=torch.randn_like(B_alt),
         dC=torch.randn_like(C_alt),
-        n_heads=prep.n_heads,
-        d_head=prep.d_head,
-        d_state=prep.d_state,
-        value_dtype=value_alt.dtype,
-        params_dtype=params_alt.dtype,
-        dt_min=prep.dt_min,
-        dt_max=prep.dt_max,
-        theta_init_min=prep.theta_init_min,
-        theta_init_max=prep.theta_init_max,
-        theta_mod_scale=prep.theta_mod_scale,
-        alpha_min=prep.alpha_min,
-        alpha_max=prep.alpha_max,
-        r_min=prep.r_min,
-        r_max=prep.r_max,
-        eps=prep.eps,
-        dt_bias=prep.dt_bias.detach(),
-        theta_bias=prep.theta_bias.detach(),
-        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+        **bwd_alt_runtime_kwargs,
     )
 
     assert compile_calls == [True]
@@ -1260,11 +1190,16 @@ def test_scanprep_bwd_normalizes_optional_grad_dtypes_to_contract() -> None:
     prep, value, params, bc_amp = _make_scanprep_cuda_fixture(dtype=torch.bfloat16)
     bc = _canonical_bc(prep, bc_amp)
     runtime_kwargs = _scanprep_runtime_kwargs(prep, detach=True)
+    bwd_runtime_kwargs = _scanprep_bwd_runtime_kwargs(
+        prep,
+        params,
+        value_dtype=value.dtype,
+        params_dtype=params.dtype,
+        detach=True,
+    )
 
     with torch.no_grad():
-        U, M, K, B, C, coeff_aux = scanprep_fwd_cute_with_aux(
-            value, params, bc, **runtime_kwargs
-        )
+        U, M, K, B, C = scanprep_fwd_cute(value, params, bc, **runtime_kwargs)
 
     # Deliberately pass mismatched optional-grad dtypes to ensure the runtime
     # argument boundary normalizes to the expected public-contract dtypes.
@@ -1284,31 +1219,12 @@ def test_scanprep_bwd_normalizes_optional_grad_dtypes_to_contract() -> None:
         _theta_bias_grad,
     ) = scanprep_bwd_cute(
         bc=bc,
-        coeff_aux=coeff_aux,
         dU=dU,
         dM=dM,
         dK=dK,
         dB=dB,
         dC=dC,
-        n_heads=prep.n_heads,
-        bc_groups=prep.bc_groups,
-        d_head=prep.d_head,
-        d_state=prep.d_state,
-        value_dtype=value.dtype,
-        params_dtype=params.dtype,
-        dt_min=prep.dt_min,
-        dt_max=prep.dt_max,
-        theta_init_min=prep.theta_init_min,
-        theta_init_max=prep.theta_init_max,
-        theta_mod_scale=prep.theta_mod_scale,
-        alpha_min=prep.alpha_min,
-        alpha_max=prep.alpha_max,
-        r_min=prep.r_min,
-        r_max=prep.r_max,
-        eps=prep.eps,
-        dt_bias=prep.dt_bias.detach(),
-        theta_bias=prep.theta_bias.detach(),
-        theta_sign=cast(torch.Tensor, prep.theta_sign).detach(),
+        **bwd_runtime_kwargs,
     )
 
     assert value_grad.dtype == value.dtype

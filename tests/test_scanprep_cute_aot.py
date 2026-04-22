@@ -35,9 +35,8 @@ def test_default_forward_aot_specs_expand_requested_arch_tags() -> None:
         (48, 1, 64, 128),
         (64, 1, 64, 128),
     }
-    assert {spec.store_coeff_aux for spec in specs} == {False, True}
     assert {spec.value_dtype_name for spec in specs} == {"bfloat16"}
-    assert len(specs) == 2 * 4 * 1 * 2
+    assert len(specs) == 2 * 4 * 1
 
 
 def test_default_backward_aot_specs_expand_requested_arch_tags() -> None:
@@ -67,7 +66,6 @@ def test_scanprep_aot_record_load_defaults_bc_groups_to_heads() -> None:
         "params_dtype_name": "float16",
         "bc_dtype_name": "float16",
         "bias_dtype_name": "float16",
-        "store_coeff_aux": False,
         "config": scanprep_aot_mod._DEFAULT_SCANPREP_CONFIG_KWARGS,
     }
 
@@ -274,7 +272,6 @@ def test_get_compiled_scanprep_fwd_kernel_prefers_packaged_aot(
         theta_mod_bias=torch.empty((2,), dtype=torch.float32),
         theta_bias=torch.empty((2,), dtype=torch.float32),
         theta_sign=torch.empty((2,), dtype=torch.float32),
-        store_coeff_aux=False,
     )
     compile_artifacts = (
         scanprep_kernels_mod._make_forward_compile_artifacts_from_runtime_artifacts(
@@ -310,7 +307,6 @@ def test_get_compiled_scanprep_fwd_kernel_prefers_packaged_aot(
 
     assert compiled is packaged
     assert captured_specs and captured_specs[0].arch_tag == "sm_80"
-    assert captured_specs[0].store_coeff_aux is False
 
 
 def test_get_compiled_scanprep_bwd_kernel_prefers_packaged_aot(
@@ -320,8 +316,8 @@ def test_get_compiled_scanprep_bwd_kernel_prefers_packaged_aot(
         **scanprep_aot_mod._DEFAULT_SCANPREP_CONFIG_KWARGS
     )
     runtime_artifacts = scanprep_kernels_mod._make_backward_runtime_artifacts(
+        torch.empty((2, 5, 6), dtype=torch.float16),
         torch.empty((2, 5, 2, 4, 3), dtype=torch.float16),
-        torch.empty((2, 2, 14, 5), dtype=torch.float32),
         config=config,
         dU=torch.empty((2, 2, 5, 4), dtype=torch.float16),
         dM=torch.empty((2, 2, 5, 2), dtype=torch.float32),
@@ -334,6 +330,8 @@ def test_get_compiled_scanprep_bwd_kernel_prefers_packaged_aot(
         value_dtype=torch.float16,
         params_dtype=torch.float16,
         dt_bias=torch.empty((2,), dtype=torch.float32),
+        alpha_bias=torch.empty((2,), dtype=torch.float32),
+        theta_mod_bias=torch.empty((2,), dtype=torch.float32),
         theta_bias=torch.empty((2,), dtype=torch.float32),
         theta_sign=torch.empty((2,), dtype=torch.float32),
     )

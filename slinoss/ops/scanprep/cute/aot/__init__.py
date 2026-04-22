@@ -36,7 +36,7 @@ from slinoss._cute_aot import (
     register_aot_artifact,
 )
 
-from ..common import COEFF_AUX_FIELDS, SCANPREP_PARAM_DIM
+from ..common import SCANPREP_PARAM_DIM
 
 if TYPE_CHECKING:
     from ..kernels import ScanPrepConfig
@@ -75,10 +75,6 @@ _REPRESENTATIVE_BATCH_SIZE = 2
 _REPRESENTATIVE_TIME_STEPS = 64
 
 
-def _bool_tag(flag: bool) -> str:
-    return "1" if bool(flag) else "0"
-
-
 def _float_tag(value: float) -> str:
     text = f"{float(value):.8g}"
     text = text.replace("+", "")
@@ -109,7 +105,6 @@ class ForwardAOTSpec:
     params_dtype_name: str
     bc_dtype_name: str
     bias_dtype_name: str
-    store_coeff_aux: bool
     config: "ScanPrepConfig"
 
     @property
@@ -138,7 +133,6 @@ class ForwardAOTSpec:
             f"__param{_dtype_tag(self.params_dtype)}"
             f"__bc{_dtype_tag(self.bc_dtype)}"
             f"__bias{_dtype_tag(self.bias_dtype)}"
-            f"__aux{_bool_tag(self.store_coeff_aux)}"
             f"__{_config_tag(self.config)}"
         )
 
@@ -218,13 +212,11 @@ def default_forward_aot_specs(
             params_dtype_name=dtype_name,
             bc_dtype_name=dtype_name,
             bias_dtype_name=dtype_name,
-            store_coeff_aux=store_coeff_aux,
             config=config,
         )
         for arch_tag in resolved_arch_tags
         for heads, bc_groups, d_head, d_state in _DEFAULT_AOT_GEOMETRIES
         for dtype_name in _DEFAULT_AOT_DTYPE_NAMES
-        for store_coeff_aux in (False, True)
     )
 
 
@@ -266,7 +258,6 @@ def _forward_spec_from_record(record: dict[str, Any]) -> ForwardAOTSpec:
         params_dtype_name=str(record["params_dtype_name"]),
         bc_dtype_name=str(record["bc_dtype_name"]),
         bias_dtype_name=str(record["bias_dtype_name"]),
-        store_coeff_aux=bool(record["store_coeff_aux"]),
         config=ScanPrepConfig(**cast(dict[str, float], record["config"])),
     )
 
@@ -399,13 +390,20 @@ def _make_forward_runtime_artifacts_from_spec(spec: ForwardAOTSpec):
         theta_mod_bias=bias.clone(),
         theta_bias=bias.clone(),
         theta_sign=bias.clone(),
-        store_coeff_aux=spec.store_coeff_aux,
     )
 
 
 def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
     from ..kernels import _make_backward_runtime_artifacts
 
+    params = torch.empty(
+        (
+            _REPRESENTATIVE_BATCH_SIZE,
+            _REPRESENTATIVE_TIME_STEPS,
+            spec.heads * SCANPREP_PARAM_DIM,
+        ),
+        dtype=spec.params_grad_dtype,
+    )
     bc = torch.empty(
         (
             _REPRESENTATIVE_BATCH_SIZE,
@@ -415,15 +413,6 @@ def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
             spec.d_state,
         ),
         dtype=spec.bc_dtype,
-    )
-    coeff_aux = torch.empty(
-        (
-            _REPRESENTATIVE_BATCH_SIZE,
-            spec.heads,
-            COEFF_AUX_FIELDS,
-            _REPRESENTATIVE_TIME_STEPS,
-        ),
-        dtype=torch.float32,
     )
     dU = torch.empty(
         (
@@ -454,8 +443,8 @@ def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
     )
     bias = torch.empty((spec.heads,), dtype=spec.bias_dtype)
     return _make_backward_runtime_artifacts(
+        params,
         bc,
-        coeff_aux,
         config=spec.config,
         dU=dU,
         dM=dM,
@@ -469,6 +458,8 @@ def _make_backward_runtime_artifacts_from_spec(spec: BackwardAOTSpec):
         value_dtype=spec.value_grad_dtype,
         params_dtype=spec.params_grad_dtype,
         dt_bias=bias,
+        alpha_bias=bias.clone(),
+        theta_mod_bias=bias.clone(),
         theta_bias=bias.clone(),
         theta_sign=bias.clone(),
     )
@@ -498,7 +489,6 @@ def infer_scanprep_fwd_aot_spec(
     r_min: float,
     r_max: float,
     eps: float,
-    store_coeff_aux: bool = False,
     arch_tag: str = "any",
 ) -> ForwardAOTSpec:
     from ..kernels import (
@@ -531,7 +521,6 @@ def infer_scanprep_fwd_aot_spec(
             theta_bias,
             theta_sign,
         ),
-        store_coeff_aux=bool(store_coeff_aux),
         config=_make_scanprep_config(
             dt_min=dt_min,
             dt_max=dt_max,
@@ -549,8 +538,8 @@ def infer_scanprep_fwd_aot_spec(
 
 def infer_scanprep_bwd_aot_spec(
     *,
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     n_heads: int,
     bc_groups: int | None = None,
     d_head: int,
@@ -568,6 +557,8 @@ def infer_scanprep_bwd_aot_spec(
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
     arch_tag: str = "any",
@@ -586,7 +577,7 @@ def infer_scanprep_bwd_aot_spec(
         d_state=d_state,
     )
     _validate_backward_operands(
-        coeff_aux,
+        params,
         input_info=input_info,
         dU=None,
         dM=None,
@@ -594,6 +585,8 @@ def infer_scanprep_bwd_aot_spec(
         dB=None,
         dC=None,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
     )
@@ -608,6 +601,8 @@ def infer_scanprep_bwd_aot_spec(
         params_grad_dtype_name=_dtype_name(params_dtype),
         bias_dtype_name=_shared_bias_dtype_name(
             dt_bias,
+            alpha_bias,
+            theta_mod_bias,
             theta_bias,
             theta_sign,
         ),
@@ -694,7 +689,6 @@ def export_scanprep_fwd_cute_aot(
     r_min: float,
     r_max: float,
     eps: float,
-    store_coeff_aux: bool = False,
     arch_tag: str = "any",
     package_root: str | Path,
 ) -> ExportedTVMFFIModule:
@@ -721,7 +715,6 @@ def export_scanprep_fwd_cute_aot(
         r_min=r_min,
         r_max=r_max,
         eps=eps,
-        store_coeff_aux=store_coeff_aux,
         arch_tag=arch_tag,
     )
     compiled = _compile_forward_aot(spec)
@@ -743,8 +736,8 @@ def export_scanprep_fwd_cute_aot(
 
 def export_scanprep_bwd_cute_aot(
     *,
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     n_heads: int,
     bc_groups: int | None = None,
     d_head: int,
@@ -762,14 +755,16 @@ def export_scanprep_bwd_cute_aot(
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
     arch_tag: str = "any",
     package_root: str | Path,
 ) -> ExportedTVMFFIModule:
     spec = infer_scanprep_bwd_aot_spec(
+        params=params,
         bc=bc,
-        coeff_aux=coeff_aux,
         n_heads=n_heads,
         bc_groups=bc_groups,
         d_head=d_head,
@@ -787,6 +782,8 @@ def export_scanprep_bwd_cute_aot(
         r_max=r_max,
         eps=eps,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
         arch_tag=arch_tag,

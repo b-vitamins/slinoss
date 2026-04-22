@@ -9,7 +9,6 @@ import torch
 from slinoss.perf import note_cache_event
 
 from ..common import (
-    COEFF_AUX_FIELDS,
     SCANPREP_PARAM_DIM,
     contiguous_tensor,
     make_fake_tensor_arg,
@@ -21,8 +20,6 @@ from .fwd import ScanPrepFwdFused
 
 _SCANPREP_FWD_CACHE: dict[tuple, object] = {}
 _SCANPREP_BWD_CACHE: dict[tuple, object] = {}
-_SCANPREP_DUMMY_COEFF_AUX_CACHE: dict[tuple, torch.Tensor] = {}
-_SCANPREP_DUMMY_CACHE_LIMIT = 8
 _TVM_FFI_COMPILE_OPTIONS = "--enable-tvm-ffi"
 
 
@@ -58,7 +55,6 @@ class ForwardOutputs:
     K: torch.Tensor
     B: torch.Tensor
     C: torch.Tensor
-    coeff_aux: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -68,7 +64,6 @@ class ForwardRuntimeArtifacts:
     outputs: ForwardOutputs
     alignments: tuple[int, ...]
     cache_key: tuple
-    store_coeff_aux: bool
 
 
 @dataclass(frozen=True)
@@ -77,7 +72,6 @@ class ForwardCompileArtifacts:
     compile_args: tuple[object, ...]
     alignments: tuple[int, ...]
     cache_key: tuple
-    store_coeff_aux: bool
 
 
 @dataclass(frozen=True)
@@ -280,7 +274,7 @@ def _validate_optional_grad(
 
 
 def _validate_backward_operands(
-    coeff_aux: torch.Tensor,
+    params: torch.Tensor,
     *,
     input_info: InputInfo,
     dU: torch.Tensor | None,
@@ -289,18 +283,19 @@ def _validate_backward_operands(
     dB: torch.Tensor | None,
     dC: torch.Tensor | None,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> None:
-    expected_coeff_aux_shape = (
+    expected_param_shape = (
         input_info.batch_size,
-        input_info.heads,
-        COEFF_AUX_FIELDS,
         input_info.time_steps,
+        input_info.heads * SCANPREP_PARAM_DIM,
     )
-    if tuple(map(int, coeff_aux.shape)) != expected_coeff_aux_shape:
+    if tuple(map(int, params.shape)) != expected_param_shape:
         raise ValueError(
-            f"coeff_aux must be {expected_coeff_aux_shape}. Got {tuple(coeff_aux.shape)}."
+            f"params must be {expected_param_shape}. Got {tuple(params.shape)}."
         )
     _validate_optional_grad(
         dU,
@@ -355,6 +350,8 @@ def _validate_backward_operands(
     )
     for name, tensor in (
         ("dt_bias", dt_bias),
+        ("alpha_bias", alpha_bias),
+        ("theta_mod_bias", theta_mod_bias),
         ("theta_bias", theta_bias),
         ("theta_sign", theta_sign),
     ):
@@ -365,64 +362,13 @@ def _validate_backward_operands(
             )
 
 
-def _get_dummy_coeff_aux(
-    *, input_info: InputInfo, device: torch.device
-) -> torch.Tensor:
-    key = (
-        device.type,
-        device.index if device.index is not None else -1,
-        input_info.batch_size,
-        input_info.heads,
-        input_info.time_steps,
-    )
-    cached = _SCANPREP_DUMMY_COEFF_AUX_CACHE.get(key)
-    if cached is not None:
-        note_cache_event("cute.scanprep.fwd.dummy_coeff_aux", hit=True)
-        return cached
-    note_cache_event("cute.scanprep.fwd.dummy_coeff_aux", hit=False)
-    if _is_cuda_graph_capturing(device):
-        _raise_cold_capture_error("forward", "dummy_coeff_aux cache")
-    cached = torch.empty(
-        (
-            input_info.batch_size,
-            input_info.heads,
-            COEFF_AUX_FIELDS,
-            input_info.time_steps,
-        ),
-        device=device,
-        dtype=torch.float32,
-    )
-    _cache_set(
-        _SCANPREP_DUMMY_COEFF_AUX_CACHE,
-        key,
-        cached,
-        limit=_SCANPREP_DUMMY_CACHE_LIMIT,
-    )
-    return cached
-
-
 def _make_forward_outputs(
     *,
     input_info: InputInfo,
     device: torch.device,
     value_dtype: torch.dtype,
     bc_dtype: torch.dtype,
-    store_coeff_aux: bool,
 ) -> ForwardOutputs:
-    coeff_aux = (
-        torch.empty(
-            (
-                input_info.batch_size,
-                input_info.heads,
-                COEFF_AUX_FIELDS,
-                input_info.time_steps,
-            ),
-            device=device,
-            dtype=torch.float32,
-        )
-        if store_coeff_aux
-        else _get_dummy_coeff_aux(input_info=input_info, device=device)
-    )
     return ForwardOutputs(
         U=torch.empty(
             (
@@ -464,7 +410,6 @@ def _make_forward_outputs(
             device=device,
             dtype=bc_dtype,
         ),
-        coeff_aux=coeff_aux,
     )
 
 
@@ -494,7 +439,6 @@ def _make_forward_runtime_args(
         outputs.C,
         outputs.M,
         outputs.K,
-        outputs.coeff_aux,
     )
 
 
@@ -503,7 +447,6 @@ def _make_forward_cache_key(
     *,
     input_info: InputInfo,
     config: ScanPrepConfig,
-    store_coeff_aux: bool,
 ) -> tuple:
     return (
         (
@@ -511,7 +454,6 @@ def _make_forward_cache_key(
             input_info.groups,
             input_info.d_head,
             input_info.d_state,
-            bool(store_coeff_aux),
         ),
         input_info.device_index,
         *_runtime_signature_key(runtime_args),
@@ -534,7 +476,6 @@ def _make_forward_runtime_artifacts(
     theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
-    store_coeff_aux: bool,
 ) -> ForwardRuntimeArtifacts:
     input_info = _make_forward_input_info(
         value,
@@ -549,7 +490,6 @@ def _make_forward_runtime_artifacts(
         device=value.device,
         value_dtype=value.dtype,
         bc_dtype=bc.dtype,
-        store_coeff_aux=bool(store_coeff_aux),
     )
     runtime_args = _make_forward_runtime_args(
         value,
@@ -572,9 +512,7 @@ def _make_forward_runtime_artifacts(
             runtime_args,
             input_info=input_info,
             config=config,
-            store_coeff_aux=bool(store_coeff_aux),
         ),
-        store_coeff_aux=bool(store_coeff_aux),
     )
 
 
@@ -589,7 +527,6 @@ def _make_forward_compile_artifacts_from_runtime_artifacts(
         ),
         alignments=runtime_artifacts.alignments,
         cache_key=runtime_artifacts.cache_key,
-        store_coeff_aux=runtime_artifacts.store_coeff_aux,
     )
 
 
@@ -604,7 +541,6 @@ def _make_scanprep_fwd_host_wrapper(
         g_size=input_info.groups,
         p_size=input_info.d_head,
         n_size=input_info.d_state,
-        store_coeff_aux=compile_artifacts.store_coeff_aux,
         dt_min=config.dt_min,
         dt_max=config.dt_max,
         theta_init_min=config.theta_init_min,
@@ -661,7 +597,6 @@ def _make_scanprep_fwd_aot_spec(
         params_dtype_name=_dtype_name(params_arg.dtype),
         bc_dtype_name=_dtype_name(bc_arg.dtype),
         bias_dtype_name=next(iter(bias_dtype_names)),
-        store_coeff_aux=runtime_artifacts.store_coeff_aux,
         config=config,
     )
 
@@ -750,7 +685,6 @@ def _scanprep_fwd_cute_prevalidated(
     theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
-    store_coeff_aux: bool,
 ) -> ForwardOutputs:
     config = _make_scanprep_config(
         dt_min=dt_min,
@@ -778,7 +712,6 @@ def _scanprep_fwd_cute_prevalidated(
         theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
-        store_coeff_aux=bool(store_coeff_aux),
     )
     return _run_scanprep_fwd_cute(runtime_artifacts, config=config)
 
@@ -807,7 +740,6 @@ def compile_scanprep_fwd_cute(
     theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
-    store_coeff_aux: bool = False,
 ) -> object:
     config = _make_scanprep_config(
         dt_min=dt_min,
@@ -835,7 +767,6 @@ def compile_scanprep_fwd_cute(
         theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
-        store_coeff_aux=bool(store_coeff_aux),
     )
     compile_artifacts = _make_forward_compile_artifacts_from_runtime_artifacts(
         runtime_artifacts
@@ -896,69 +827,8 @@ def scanprep_fwd_cute(
         theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
-        store_coeff_aux=False,
     )
     return outputs.U, outputs.M, outputs.K, outputs.B, outputs.C
-
-
-def scanprep_fwd_cute_with_aux(
-    value: torch.Tensor,
-    params: torch.Tensor,
-    bc: torch.Tensor,
-    *,
-    n_heads: int,
-    bc_groups: int | None = None,
-    d_state: int,
-    d_head: int,
-    dt_min: float,
-    dt_max: float,
-    theta_init_min: float,
-    theta_init_max: float,
-    theta_mod_scale: float,
-    alpha_min: float,
-    alpha_max: float,
-    r_min: float,
-    r_max: float,
-    eps: float,
-    dt_bias: torch.Tensor,
-    alpha_bias: torch.Tensor,
-    theta_mod_bias: torch.Tensor,
-    theta_bias: torch.Tensor,
-    theta_sign: torch.Tensor,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    outputs = _scanprep_fwd_cute_prevalidated(
-        value,
-        params,
-        bc,
-        n_heads=n_heads,
-        bc_groups=bc_groups,
-        d_state=d_state,
-        d_head=d_head,
-        dt_min=dt_min,
-        dt_max=dt_max,
-        theta_init_min=theta_init_min,
-        theta_init_max=theta_init_max,
-        theta_mod_scale=theta_mod_scale,
-        alpha_min=alpha_min,
-        alpha_max=alpha_max,
-        r_min=r_min,
-        r_max=r_max,
-        eps=eps,
-        dt_bias=dt_bias,
-        alpha_bias=alpha_bias,
-        theta_mod_bias=theta_mod_bias,
-        theta_bias=theta_bias,
-        theta_sign=theta_sign,
-        store_coeff_aux=True,
-    )
-    return outputs.U, outputs.M, outputs.K, outputs.B, outputs.C, outputs.coeff_aux
 
 
 def _materialize_optional_grad(
@@ -1019,8 +889,8 @@ def _make_backward_outputs(
 
 
 def _make_backward_runtime_args(
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     *,
     input_info: InputInfo,
     dU: torch.Tensor | None,
@@ -1031,6 +901,8 @@ def _make_backward_runtime_args(
     value_dtype: torch.dtype,
     outputs: BackwardOutputs,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
@@ -1046,6 +918,7 @@ def _make_backward_runtime_args(
             device=bc.device,
             dtype=value_dtype,
         ),
+        contiguous_tensor(bc),
         _materialize_optional_grad(
             dB,
             shape=(
@@ -1068,7 +941,12 @@ def _make_backward_runtime_args(
             device=bc.device,
             dtype=bc.dtype,
         ),
-        contiguous_tensor(coeff_aux),
+        contiguous_tensor(params),
+        dt_bias,
+        alpha_bias,
+        theta_mod_bias,
+        theta_bias,
+        theta_sign,
         _materialize_optional_grad(
             dM,
             shape=(
@@ -1092,9 +970,6 @@ def _make_backward_runtime_args(
             device=bc.device,
             dtype=torch.float32,
         ),
-        dt_bias,
-        theta_bias,
-        theta_sign,
         outputs.value_grad,
         outputs.bc_grad,
         outputs.dparams,
@@ -1106,10 +981,8 @@ def _make_backward_cache_key(
     runtime_args: tuple[torch.Tensor, ...],
     *,
     input_info: InputInfo,
-    bc: torch.Tensor,
     config: ScanPrepConfig,
 ) -> tuple:
-    bc_signature = tensor_compile_signature(contiguous_tensor(bc))
     return (
         (
             input_info.heads,
@@ -1119,15 +992,14 @@ def _make_backward_cache_key(
             SCANPREP_PARAM_DIM,
         ),
         input_info.device_index,
-        *bc_signature,
         *_runtime_signature_key(runtime_args),
         *astuple(config),
     )
 
 
 def _make_backward_runtime_artifacts(
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     *,
     config: ScanPrepConfig,
     dU: torch.Tensor | None,
@@ -1142,6 +1014,8 @@ def _make_backward_runtime_artifacts(
     value_dtype: torch.dtype,
     params_dtype: torch.dtype,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> BackwardRuntimeArtifacts:
@@ -1153,7 +1027,7 @@ def _make_backward_runtime_artifacts(
         d_state=d_state,
     )
     _validate_backward_operands(
-        coeff_aux,
+        params,
         input_info=input_info,
         dU=dU,
         dM=dM,
@@ -1161,6 +1035,8 @@ def _make_backward_runtime_artifacts(
         dB=dB,
         dC=dC,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
     )
@@ -1172,8 +1048,8 @@ def _make_backward_runtime_artifacts(
         bc_dtype=bc.dtype,
     )
     runtime_args = _make_backward_runtime_args(
+        params,
         bc,
-        coeff_aux,
         input_info=input_info,
         dU=dU,
         dM=dM,
@@ -1183,6 +1059,8 @@ def _make_backward_runtime_artifacts(
         value_dtype=value_dtype,
         outputs=outputs,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
     )
@@ -1195,7 +1073,6 @@ def _make_backward_runtime_artifacts(
         cache_key=_make_backward_cache_key(
             runtime_args,
             input_info=input_info,
-            bc=bc,
             config=config,
         ),
     )
@@ -1266,7 +1143,7 @@ def _make_scanprep_bwd_aot_spec(
     from ..aot import BackwardAOTSpec
 
     input_info = runtime_artifacts.input_info
-    bias_args = runtime_artifacts.runtime_args[6:9]
+    bias_args = runtime_artifacts.runtime_args[5:10]
     bias_dtype_names = {_dtype_name(tensor.dtype) for tensor in bias_args}
     if len(bias_dtype_names) != 1:
         raise ValueError(
@@ -1371,8 +1248,8 @@ def _run_scanprep_bwd_cute(
 
 def _scanprep_bwd_cute_prevalidated(
     *,
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     dU: torch.Tensor | None,
     dM: torch.Tensor | None,
     dK: torch.Tensor | None,
@@ -1395,6 +1272,8 @@ def _scanprep_bwd_cute_prevalidated(
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> BackwardOutputs:
@@ -1411,8 +1290,8 @@ def _scanprep_bwd_cute_prevalidated(
         eps=eps,
     )
     runtime_artifacts = _make_backward_runtime_artifacts(
+        params,
         bc,
-        coeff_aux,
         config=config,
         dU=dU,
         dM=dM,
@@ -1426,6 +1305,8 @@ def _scanprep_bwd_cute_prevalidated(
         value_dtype=value_dtype,
         params_dtype=params_dtype,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
     )
@@ -1437,8 +1318,8 @@ def _scanprep_bwd_cute_prevalidated(
 
 def compile_scanprep_bwd_cute(
     *,
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     dU: torch.Tensor | None,
     dM: torch.Tensor | None,
     dK: torch.Tensor | None,
@@ -1461,6 +1342,8 @@ def compile_scanprep_bwd_cute(
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> object:
@@ -1477,8 +1360,8 @@ def compile_scanprep_bwd_cute(
         eps=eps,
     )
     runtime_artifacts = _make_backward_runtime_artifacts(
+        params,
         bc,
-        coeff_aux,
         config=config,
         dU=dU,
         dM=dM,
@@ -1492,6 +1375,8 @@ def compile_scanprep_bwd_cute(
         value_dtype=value_dtype,
         params_dtype=params_dtype,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
     )
@@ -1508,8 +1393,8 @@ def compile_scanprep_bwd_cute(
 
 def scanprep_bwd_cute(
     *,
+    params: torch.Tensor,
     bc: torch.Tensor,
-    coeff_aux: torch.Tensor,
     dU: torch.Tensor | None,
     dM: torch.Tensor | None,
     dK: torch.Tensor | None,
@@ -1532,6 +1417,8 @@ def scanprep_bwd_cute(
     r_max: float,
     eps: float,
     dt_bias: torch.Tensor,
+    alpha_bias: torch.Tensor,
+    theta_mod_bias: torch.Tensor,
     theta_bias: torch.Tensor,
     theta_sign: torch.Tensor,
 ) -> tuple[
@@ -1544,8 +1431,8 @@ def scanprep_bwd_cute(
     torch.Tensor,
 ]:
     outputs = _scanprep_bwd_cute_prevalidated(
+        params=params,
         bc=bc,
-        coeff_aux=coeff_aux,
         dU=dU,
         dM=dM,
         dK=dK,
@@ -1568,6 +1455,8 @@ def scanprep_bwd_cute(
         r_max=r_max,
         eps=eps,
         dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
         theta_bias=theta_bias,
         theta_sign=theta_sign,
     )
@@ -1581,5 +1470,4 @@ __all__ = [
     "compile_scanprep_fwd_cute",
     "scanprep_bwd_cute",
     "scanprep_fwd_cute",
-    "scanprep_fwd_cute_with_aux",
 ]

@@ -20,10 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from slinoss.layers import SLinOSSScanPrep  # noqa: E402
-from slinoss.ops.scanprep.cute.common import (  # noqa: E402
-    COEFF_AUX_FIELDS,
-    make_fake_tensor_arg,
-)
+from slinoss.ops.scanprep.cute.common import make_fake_tensor_arg  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.fwd import ScanPrepFwdFused  # noqa: E402
 
 
@@ -82,23 +79,17 @@ def main() -> int:
     params = torch.randn(
         (batch, t_size, heads * prep.param_dim), device=device, dtype=dtype
     )
-    bc_amp = torch.randn(
+    bc = torch.randn(
         (batch, t_size, heads, prep.bc_param_rows, d_state),
         device=device,
         dtype=dtype,
     )
-    bc = prep._parameterize_scan_bc_rows(bc_amp)
 
     U = torch.empty((batch, heads, t_size, p_size), device=device, dtype=dtype)
     M = torch.empty((batch, heads, t_size, 2), device=device, dtype=torch.float32)
     K = torch.empty((batch, heads, t_size, 2, 2), device=device, dtype=torch.float32)
     B = torch.empty((batch, heads, t_size, 2 * d_state), device=device, dtype=dtype)
     C = torch.empty_like(B)
-    coeff_aux = torch.empty(
-        (batch, heads, COEFF_AUX_FIELDS, t_size),
-        device=device,
-        dtype=torch.float32,
-    )
 
     compiled = cute.compile(
         ScanPrepFwdFused(
@@ -106,7 +97,6 @@ def main() -> int:
             g_size=heads,
             p_size=p_size,
             n_size=d_state,
-            store_coeff_aux=True,
             dt_min=prep.dt_min,
             dt_max=prep.dt_max,
             theta_init_min=prep.theta_init_min,
@@ -133,7 +123,6 @@ def main() -> int:
         make_fake_tensor_arg(C),
         make_fake_tensor_arg(M),
         make_fake_tensor_arg(K),
-        make_fake_tensor_arg(coeff_aux),
         options="--enable-tvm-ffi",
     )
 
@@ -152,11 +141,10 @@ def main() -> int:
             C,
             M,
             K,
-            coeff_aux,
         )
 
     _profile_once(run, warmup=args.warmup)
-    checksum = U.sum() + M.sum() + K.sum() + B.sum() + C.sum() + coeff_aux.sum()
+    checksum = U.sum() + M.sum() + K.sum() + B.sum() + C.sum()
     print(f"B={batch} H={heads} T={t_size} P={p_size} N={d_state} dtype={args.dtype}")
     print(f"checksum={float(checksum):.6f}")
     return 0

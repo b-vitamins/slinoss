@@ -5,9 +5,7 @@ import torch
 from slinoss.layers.backend import ScanInputs
 from slinoss.ops.scanprep.parameterization import (
     RAW_BC_PARAM_ROWS,
-    parameterize_scan_bc_rows,
     validate_scan_bc_raw,
-    validate_scan_bc_rows,
 )
 from .common import SCANPREP_PARAM_DIM
 
@@ -161,45 +159,38 @@ def scanprep_cute(
             )
         )
 
-    from .kernels import scanprep_fwd_cute
+    from .kernels import _scanprep_fwd_cute_prevalidated
 
-    bc_rows = parameterize_scan_bc_rows(
+    outputs = _scanprep_fwd_cute_prevalidated(
+        value,
+        params,
         bc,
+        n_heads=n_heads,
         bc_groups=resolved_bc_groups,
         d_state=d_state,
+        d_head=d_head,
+        dt_min=dt_min,
+        dt_max=dt_max,
+        theta_init_min=theta_init_min,
+        theta_init_max=theta_init_max,
+        theta_mod_scale=theta_mod_scale,
+        alpha_min=alpha_min,
+        alpha_max=alpha_max,
+        r_min=r_min,
+        r_max=r_max,
         eps=eps,
+        dt_bias=dt_bias,
+        alpha_bias=alpha_bias,
+        theta_mod_bias=theta_mod_bias,
+        theta_bias=theta_bias,
+        theta_sign=theta_sign,
     )
-    validate_scan_bc_rows(
-        bc_rows,
-        bc_groups=resolved_bc_groups,
-        d_state=d_state,
-    )
-
     return _make_scan_inputs(
-        *scanprep_fwd_cute(
-            value,
-            params,
-            bc_rows,
-            n_heads=n_heads,
-            bc_groups=resolved_bc_groups,
-            d_state=d_state,
-            d_head=d_head,
-            dt_min=dt_min,
-            dt_max=dt_max,
-            theta_init_min=theta_init_min,
-            theta_init_max=theta_init_max,
-            theta_mod_scale=theta_mod_scale,
-            alpha_min=alpha_min,
-            alpha_max=alpha_max,
-            r_min=r_min,
-            r_max=r_max,
-            eps=eps,
-            dt_bias=dt_bias,
-            alpha_bias=alpha_bias,
-            theta_mod_bias=theta_mod_bias,
-            theta_bias=theta_bias,
-            theta_sign=theta_sign,
-        )
+        outputs.U,
+        outputs.M,
+        outputs.K,
+        outputs.B,
+        outputs.C,
     )
 
 

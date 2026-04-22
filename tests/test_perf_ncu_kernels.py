@@ -15,53 +15,6 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
     compile_args: list[tuple[object, ...]] = []
     launch_args: list[tuple[torch.Tensor, ...]] = []
 
-    def fake_scanprep_fwd_cute_with_aux(
-        value: torch.Tensor,
-        params_flat: torch.Tensor,
-        bc: torch.Tensor,
-        *,
-        n_heads: int,
-        d_state: int,
-        d_head: int,
-        **unused_kwargs: object,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        del params_flat, bc, unused_kwargs
-        batch_size, t_size, _unused_channels = map(int, value.shape)
-        u = torch.empty(
-            (batch_size, n_heads, t_size, d_head),
-            device=value.device,
-            dtype=value.dtype,
-        )
-        m = torch.empty(
-            (batch_size, n_heads, t_size, 2),
-            device=value.device,
-            dtype=torch.float32,
-        )
-        k = torch.empty(
-            (batch_size, n_heads, t_size, 2, 2),
-            device=value.device,
-            dtype=torch.float32,
-        )
-        b = torch.empty(
-            (batch_size, n_heads, t_size, 2 * d_state),
-            device=value.device,
-            dtype=value.dtype,
-        )
-        c = torch.empty_like(b)
-        coeff_aux = torch.empty(
-            (batch_size, n_heads, ncu_kernels.COEFF_AUX_FIELDS, t_size),
-            device=value.device,
-            dtype=torch.float32,
-        )
-        return u, m, k, b, c, coeff_aux
-
     def fake_compile(_kernel: object, *args: object, **_: object):
         compile_args.append(args)
 
@@ -70,11 +23,6 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
 
         return compiled
 
-    monkeypatch.setattr(
-        ncu_kernels,
-        "scanprep_fwd_cute_with_aux",
-        fake_scanprep_fwd_cute_with_aux,
-    )
     monkeypatch.setattr(
         ncu_kernels,
         "make_fake_tensor_arg",
@@ -95,12 +43,12 @@ def test_scanprep_bwd_runner_matches_fused_launcher_contract(
     runner = ncu_kernels._build_scanprep_bwd_runner(cfg)
 
     assert len(compile_args) == 1
-    assert len(compile_args[0]) == 13
+    assert len(compile_args[0]) == 16
 
     runner.prepare()
     runner.launch()
 
     assert len(launch_args) == 1
-    assert len(launch_args[0]) == 13
-    assert tuple(launch_args[0][1].shape) == (cfg.batch, cfg.heads, cfg.T, 2 * cfg.N)
+    assert len(launch_args[0]) == 16
+    assert tuple(launch_args[0][1].shape) == (cfg.batch, cfg.T, cfg.heads, 4, cfg.N)
     assert runner.effective_bytes == ncu_kernels._tensor_bytes(*launch_args[0])
