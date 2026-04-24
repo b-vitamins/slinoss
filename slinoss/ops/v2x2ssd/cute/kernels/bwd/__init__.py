@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+from cuda.bindings import driver as cuda
 import cutlass.cute as cute
 
 from slinoss._cute_runtime import TensorSpec, make_runtime_tensor_spec_view
@@ -11,6 +12,7 @@ from slinoss.perf import note_cache_event
 
 from ..fwd.common import (
     _assumed_align,
+    _compile_env_stream_placeholder,
     _ensure_min_alignment,
     _make_fake_tensor_arg,
     _make_fake_tensor_spec_arg,
@@ -32,7 +34,6 @@ from .chunk_scan import (
 )
 from .chunk_scan.db import ChunkScanBwdDBAmpere
 from .chunk_scan.dcdr import ChunkScanBwdDCDRAmpere
-from .chunk_scan.dlp import ChunkScanBwdDLPAmpere
 from .chunk_scan.du import ChunkScanBwdDUAmpere
 from .chunk_scan.dz0 import ChunkScanBwdDZ0Ampere
 from .chunk_scan.param_scan import ChunkScanBwdParamScanAmpere
@@ -606,7 +607,7 @@ def _make_tvm_ffi_compile_args(
     compile_args = tuple(
         _make_fake_tensor_arg(tensor, align=align)
         for tensor, align in zip(runtime_args, resolved_alignments, strict=True)
-    )
+    ) + (_compile_env_stream_placeholder(),)
     return resolved_alignments, compile_args
 
 
@@ -622,7 +623,7 @@ def _make_tvm_ffi_compile_args_from_specs(
             align=align,
         )
         for dtype, spec, align in tensor_specs
-    )
+    ) + (_compile_env_stream_placeholder(),)
     return alignments, compile_args
 
 
@@ -1587,6 +1588,10 @@ def _make_backward_runtime_artifacts(
     dU_prev_scan_storage.zero_()
     dU_increment_storage.zero_()
     dU_prev_increment_storage.zero_()
+    dlogp.zero_()
+    dR.zero_()
+    dM_previous_scratch.zero_()
+    dM_current_scratch.zero_()
     dM_scan_storage.zero_()
     dM_increment_storage.zero_()
 
@@ -1796,6 +1801,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         dM_increment_t: cute.Tensor,
         dK_previous_increment_t: cute.Tensor,
         dK_current_increment_t: cute.Tensor,
+        stream: cuda.CUstream,
     ):
         (
             U_scan_spec,
@@ -2005,15 +2011,6 @@ def _make_v2x2ssd_bwd_host_wrapper(
             bc_groups=bc_groups,
             num_threads=scan_num_threads_dcdr,
         )
-        chunk_scan_dlp_kernel = ChunkScanBwdDLPAmpere(
-            tc_dtype,
-            chunk_size=chunk_size,
-            D=D,
-            P=P,
-            heads=heads,
-            bc_groups=bc_groups,
-            num_threads=scan_num_threads_dcdr,
-        )
         chunk_scan_param_kernel = ChunkScanBwdParamScanAmpere(
             chunk_size=chunk_size,
             num_threads=scan_num_threads_param,
@@ -2080,7 +2077,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             n_chunks=n_chunks,
         )
 
-        chunk_scan_db_kernel(
+        chunk_scan_db_kernel.call_on_stream(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -2096,8 +2093,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dlogp_scan_view,
             dM_previous_scan_view,
             dM_current_scan_view,
+            stream,
         )
-        chunk_scan_dcdr_kernel(
+        chunk_scan_dcdr_kernel.call_on_stream(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -2110,19 +2108,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dC_scan_view,
             dlogp_scan_view,
             dR_scan_view,
+            stream,
         )
-        chunk_scan_dlp_kernel(
-            U_scan_view,
-            B_scan_view,
-            C_scan_view,
-            M_scan_view,
-            K_scan_view,
-            d_out_scan_view,
-            U_prev_scan_view,
-            B_prev_scan_view,
-            dlogp_scan_view,
-        )
-        chunk_scan_param_kernel(
+        chunk_scan_param_kernel.call_on_stream(
             M_scan_view,
             K_scan_view,
             dlogp_param_view,
@@ -2132,8 +2120,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dM_scan_view,
             dK_previous_scan_view,
             dK_current_scan_view,
+            stream,
         )
-        chunk_scan_du_kernel(
+        chunk_scan_du_kernel.call_on_stream(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -2149,15 +2138,17 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dlogp_scan_view,
             dM_previous_scan_view,
             dM_current_scan_view,
+            stream,
         )
-        chunk_scan_dz0_kernel(
+        chunk_scan_dz0_kernel.call_on_stream(
             d_out_dz0_view,
             C_dz0_view,
             M_dz0_view,
             d_chunk_starts_scan_view,
+            stream,
         )
 
-        state_passing_kernel(
+        state_passing_kernel.call_on_stream(
             chunk_starts_state_view,
             d_chunk_starts_state_view,
             d_final_state_view,
@@ -2165,9 +2156,10 @@ def _make_v2x2ssd_bwd_host_wrapper(
             d_increment_state_view,
             d_chunk_multiplier_state_view,
             d_initial_state_view,
+            stream,
         )
 
-        chunk_increment_db_kernel(
+        chunk_increment_db_kernel.call_on_stream(
             U_increment_view,
             B_increment_view,
             M_increment_view,
@@ -2176,8 +2168,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             d_increment_dp_view,
             dB_increment_view,
             dM_sum_part_view,
+            stream,
         )
-        chunk_increment_boundary_kernel(
+        chunk_increment_boundary_kernel.call_on_stream(
             d_increment_boundary_view,
             B_prev_chunks_view,
             U_prev_chunks_view,
@@ -2186,8 +2179,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dU_prev_increment_view,
             dB_prev_increment_view,
             dMp0_view,
+            stream,
         )
-        chunk_increment_param_kernel(
+        chunk_increment_param_kernel.call_on_stream(
             M_increment_view,
             K_previous_increment_view,
             K_current_increment_view,
@@ -2197,14 +2191,16 @@ def _make_v2x2ssd_bwd_host_wrapper(
             dM_increment_view,
             dK_previous_increment_view,
             dK_current_increment_view,
+            stream,
         )
-        chunk_increment_du_kernel(
+        chunk_increment_du_kernel.call_on_stream(
             d_increment_view,
             B_increment_view,
             M_increment_view,
             K_previous_increment_view,
             K_current_increment_view,
             dU_increment_view,
+            stream,
         )
 
     return _v2x2ssd_bwd_host_wrapper
@@ -2303,6 +2299,7 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
         dU_prev_db_dummy_view: cute.Tensor,
         dB_du_dummy_view: cute.Tensor,
         dB_prev_du_dummy_view: cute.Tensor,
+        stream: cuda.CUstream,
     ):
         tc_dtype = U_scan_view.element_type
 
@@ -2316,15 +2313,6 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             num_threads=scan_num_threads_db,
         )
         chunk_scan_dcdr_kernel = ChunkScanBwdDCDRAmpere(
-            tc_dtype,
-            chunk_size=chunk_size,
-            D=D,
-            P=P,
-            heads=heads,
-            bc_groups=bc_groups,
-            num_threads=scan_num_threads_dcdr,
-        )
-        chunk_scan_dlp_kernel = ChunkScanBwdDLPAmpere(
             tc_dtype,
             chunk_size=chunk_size,
             D=D,
@@ -2399,7 +2387,7 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             n_chunks=n_chunks,
         )
 
-        chunk_scan_db_kernel(
+        chunk_scan_db_kernel.call_on_stream(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -2415,8 +2403,9 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             dlogp_scan_view,
             dM_previous_scan_view,
             dM_current_scan_view,
+            stream,
         )
-        chunk_scan_dcdr_kernel(
+        chunk_scan_dcdr_kernel.call_on_stream(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -2429,19 +2418,9 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             dC_scan_view,
             dlogp_scan_view,
             dR_scan_view,
+            stream,
         )
-        chunk_scan_dlp_kernel(
-            U_scan_view,
-            B_scan_view,
-            C_scan_view,
-            M_scan_view,
-            K_scan_view,
-            d_out_scan_view,
-            U_prev_scan_view,
-            B_prev_scan_view,
-            dlogp_scan_view,
-        )
-        chunk_scan_param_kernel(
+        chunk_scan_param_kernel.call_on_stream(
             M_scan_view,
             K_scan_view,
             dlogp_param_view,
@@ -2451,8 +2430,9 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             dM_scan_view,
             dK_previous_scan_view,
             dK_current_scan_view,
+            stream,
         )
-        chunk_scan_du_kernel(
+        chunk_scan_du_kernel.call_on_stream(
             U_scan_view,
             B_scan_view,
             C_scan_view,
@@ -2468,15 +2448,17 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             dlogp_scan_view,
             dM_previous_scan_view,
             dM_current_scan_view,
+            stream,
         )
-        chunk_scan_dz0_kernel(
+        chunk_scan_dz0_kernel.call_on_stream(
             d_out_dz0_view,
             C_dz0_view,
             M_dz0_view,
             d_chunk_starts_scan_view,
+            stream,
         )
 
-        state_passing_kernel(
+        state_passing_kernel.call_on_stream(
             chunk_starts_state_view,
             d_chunk_starts_state_view,
             d_final_state_view,
@@ -2484,9 +2466,10 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             d_increment_state_view,
             d_chunk_multiplier_state_view,
             d_initial_state_view,
+            stream,
         )
 
-        chunk_increment_db_kernel(
+        chunk_increment_db_kernel.call_on_stream(
             U_increment_view,
             B_increment_view,
             M_increment_view,
@@ -2495,8 +2478,9 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             d_increment_dp_view,
             dB_increment_view,
             dM_sum_part_view,
+            stream,
         )
-        chunk_increment_boundary_kernel(
+        chunk_increment_boundary_kernel.call_on_stream(
             d_increment_boundary_view,
             B_prev_chunks_view,
             U_prev_chunks_view,
@@ -2505,8 +2489,9 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             dU_prev_increment_view,
             dB_prev_increment_view,
             dMp0_view,
+            stream,
         )
-        chunk_increment_param_kernel(
+        chunk_increment_param_kernel.call_on_stream(
             M_increment_view,
             K_previous_increment_view,
             K_current_increment_view,
@@ -2516,14 +2501,16 @@ def _make_v2x2ssd_bwd_aot_host_wrapper(
             dM_increment_view,
             dK_previous_increment_view,
             dK_current_increment_view,
+            stream,
         )
-        chunk_increment_du_kernel(
+        chunk_increment_du_kernel.call_on_stream(
             d_increment_view,
             B_increment_view,
             M_increment_view,
             K_previous_increment_view,
             K_current_increment_view,
             dU_increment_view,
+            stream,
         )
 
     return _v2x2ssd_bwd_aot_host_wrapper

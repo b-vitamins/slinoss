@@ -2320,7 +2320,6 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
             (False, False, False, False),
         ),
         (spec.tc_dtype, dB_prev_dummy_spec, tc_align, (True, False), (False, False)),
-        include_stream_placeholder=False,
     )
     host_wrapper = _make_v2x2ssd_bwd_aot_host_wrapper(
         problem_shape=problem_shape,

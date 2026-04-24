@@ -18,6 +18,10 @@ KERNEL_SCRIPTS = {
 }
 
 NUM_RE = r"([+-]?(?:\d[\d,]*)(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+KERNEL_HEADER_RE = re.compile(
+    r"^  (?P<kernel_name>\S.*?), Context \d+, Stream \d+, Device \d+, CC [\d.]+$",
+    flags=re.MULTILINE,
+)
 
 
 def _find_match(patterns: Iterable[str], text: str) -> re.Match[str] | None:
@@ -139,6 +143,41 @@ def _parse_size_kib_table(text: str, metric_name: str) -> float | None:
     if unit in ("bytes", "byte", "b"):
         return value / 1024.0
     return value
+
+
+def _duration_to_ms(value: float, unit: str) -> float:
+    unit = unit.lower()
+    if unit in ("ms", "msec", "millisecond", "milliseconds"):
+        return value
+    if unit in ("us", "usec", "microsecond", "microseconds"):
+        return value / 1000.0
+    if unit in ("ns", "nsec", "nanosecond", "nanoseconds"):
+        return value / 1_000_000.0
+    if unit in ("s", "sec", "second", "seconds"):
+        return value * 1000.0
+    return value
+
+
+def _parse_duration_ms(text: str) -> float | None:
+    pattern = rf"^\s*Duration\s+(\S+)\s+{NUM_RE}\s*$"
+    match = re.search(pattern, text, flags=re.MULTILINE)
+    if not match:
+        raw_match = _find_match(
+            [rf"gpu__time_duration\.sum\s+{NUM_RE}\s*([A-Za-z]+)?"],
+            text,
+        )
+        if not raw_match:
+            return None
+        value = _parse_float(raw_match.group(1))
+        unit = raw_match.group(2) or "ms"
+        return _duration_to_ms(value, unit)
+    return _duration_to_ms(_parse_float(match.group(2)), match.group(1))
+
+
+def _launch_label(kernel_name: str, launch_index: int) -> str:
+    if "kernel_cutlass_kernel_" in kernel_name:
+        return "main"
+    return f"launch_{launch_index}"
 
 
 def _fmt_pct(value: float | None) -> str:
@@ -362,6 +401,8 @@ def parse_ncu_summary(output: str) -> dict[str, float | None]:
         )
         else None
     )
+    duration_ms = _parse_duration_ms(output)
+    elapsed_cycles = _parse_metric_value(output, "Elapsed Cycles")
     total_dram = (
         dram_read + dram_write
         if dram_read is not None and dram_write is not None
@@ -385,7 +426,37 @@ def parse_ncu_summary(output: str) -> dict[str, float | None]:
         "smem_static_kib": smem_static_kib,
         "smem_driver_kib": smem_driver_kib,
         "smem_total_kib": smem_total_kib,
+        "duration_ms": duration_ms,
+        "elapsed_cycles": elapsed_cycles,
     }
+
+
+def parse_ncu_launch_summaries(output: str) -> list[dict[str, object]]:
+    matches = list(KERNEL_HEADER_RE.finditer(output))
+    if not matches:
+        summary: dict[str, object] = dict(parse_ncu_summary(output))
+        summary["launch_index"] = 0
+        summary["kernel_name"] = None
+        summary["kernel_label"] = "launch_0"
+        summary["duration_source"] = "ncu_replay_profiled"
+        return [summary]
+
+    launches: list[dict[str, object]] = []
+    for launch_index, match in enumerate(matches):
+        next_start = (
+            matches[launch_index + 1].start()
+            if launch_index + 1 < len(matches)
+            else len(output)
+        )
+        kernel_name = match.group("kernel_name").strip()
+        segment = output[match.start() : next_start]
+        summary = dict(parse_ncu_summary(segment))
+        summary["launch_index"] = launch_index
+        summary["kernel_name"] = kernel_name
+        summary["kernel_label"] = _launch_label(kernel_name, launch_index)
+        summary["duration_source"] = "ncu_replay_profiled"
+        launches.append(summary)
+    return launches
 
 
 def main() -> int:

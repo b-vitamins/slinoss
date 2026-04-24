@@ -313,7 +313,6 @@ def derive_training_budget(sample: dict[str, float]) -> dict[str, float]:
         "backward.v2x2ssd.chunk_scan.du",
         "backward.v2x2ssd.chunk_scan.db",
         "backward.v2x2ssd.chunk_scan.dcdr",
-        "backward.v2x2ssd.chunk_scan.dlp",
         "backward.v2x2ssd.chunk_scan.param_scan",
     )
     out["backward.v2x2ssd.chunk_scan.overhead"] = (

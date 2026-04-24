@@ -70,7 +70,6 @@ def _sample_regions() -> dict[str, float]:
         "backward.v2x2ssd.chunk_scan.du": 0.4,
         "backward.v2x2ssd.chunk_scan.db": 0.5,
         "backward.v2x2ssd.chunk_scan.dcdr": 0.3,
-        "backward.v2x2ssd.chunk_scan.dlp": 0.2,
         "backward.v2x2ssd.chunk_scan.param_scan": 0.7,
     }
 

@@ -51,6 +51,7 @@ from .common import (
 @dataclass(frozen=True)
 class ChunkScanBwdDBLayoutBundle:
     query_layout: object
+    key_layout: object
     grad_output_layout: object
     key_grad_layout: object
     value_layout: object
@@ -231,6 +232,7 @@ class ChunkScanBwdDBAmpere:
         return self._struct_size_bytes(
             [
                 (kv_tile * d_stage_width * in_bytes, 16),
+                (kv_tile * d_stage_width * in_bytes, 16),
                 (kv_tile * p_tile * in_bytes, 16),
                 (kv_tile * d_stage_width * in_bytes, 16),
                 (kv_tile * p_tile * in_bytes, 16),
@@ -240,6 +242,7 @@ class ChunkScanBwdDBAmpere:
                 (self.L * 2 * 4, 16),
                 (kv_tile * 2 * 4, 16),
                 (d_padded * 4, 8),
+                (d_stage_width * in_bytes, 16),
                 (self.L * 4, 4),
                 (self.L * 4, 4),
                 (kv_tile * 2 * 4, 16),
@@ -324,6 +327,7 @@ class ChunkScanBwdDBAmpere:
         query_layout = cute.tile_to_shape(
             d_layout_atom, (kv_tile, d_stage_width), (0, 1)
         )
+        key_layout = cute.tile_to_shape(d_layout_atom, (kv_tile, d_stage_width), (0, 1))
         key_grad_layout = cute.tile_to_shape(
             d_layout_atom, (kv_tile, d_stage_width), (0, 1)
         )
@@ -347,6 +351,7 @@ class ChunkScanBwdDBAmpere:
 
         return ChunkScanBwdDBLayoutBundle(
             query_layout=query_layout,
+            key_layout=key_layout,
             grad_output_layout=grad_output_layout,
             key_grad_layout=key_grad_layout,
             value_layout=value_layout,
@@ -426,6 +431,9 @@ class ChunkScanBwdDBAmpere:
             "query_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.query_layout)], 16
             ],
+            "key_tile": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(layouts.key_layout)], 16
+            ],
             "grad_output_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.grad_output_layout)],
                 16,
@@ -439,7 +447,7 @@ class ChunkScanBwdDBAmpere:
             "score_tile": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.score_layout)], 16
             ],
-            "score_cache": cute.struct.Align[
+            "score_diag_curr": cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.score_layout)], 16
             ],
             "phase_full": cute.struct.Align[
@@ -453,6 +461,9 @@ class ChunkScanBwdDBAmpere:
             ],
             "db_carry": cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(carry_layout)], 8
+            ],
+            "key_boundary": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, self._d_stage_size()], 16
             ],
             "row_scale": cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(row_layout)], 4
@@ -629,6 +640,41 @@ class ChunkScanBwdDBAmpere:
         cute.arch.barrier()
 
     @cute.jit
+    def _stage_key_boundary_from_gmem(
+        self,
+        s_key_boundary: cute.Tensor,
+        m_key: cute.Tensor,
+        m_key_prev0: cute.Tensor,
+        *,
+        batch_group_chunk: int,
+        batch_group: int,
+        chunk_index: int,
+        d_col_base: int,
+        stage_width: int,
+        out_dtype: type[cutlass.Numeric],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        for it in cutlass.range_constexpr(
+            (stage_width + self.num_threads - 1) // self.num_threads
+        ):
+            d_local = tidx + cutlass.Int32(it * self.num_threads)
+            boundary_value = cutlass.Float32(0.0).to(out_dtype)
+            if d_local < cutlass.Int32(stage_width):
+                d = cutlass.Int32(d_col_base) + d_local
+                if d < cutlass.Int32(self.D):
+                    if chunk_index == cutlass.Int32(0):
+                        boundary_value = m_key_prev0[batch_group, d]
+                    else:
+                        boundary_value = m_key[
+                            batch_group_chunk - cutlass.Int32(1),
+                            cutlass.Int32(self.L - 1),
+                            0,
+                            d,
+                        ]
+                s_key_boundary[d_local] = boundary_value
+        cute.arch.barrier()
+
+    @cute.jit
     def _stage_p_tile_from_gmem(
         self,
         gmem_tiled_copy_p: cute.TiledCopy,
@@ -774,6 +820,7 @@ class ChunkScanBwdDBAmpere:
         t_reg_rhs_view: cute.Tensor,
         t_reg_lhs: cute.Tensor,
         t_reg_rhs: cute.Tensor,
+        barrier_after: cutlass.Constexpr,
     ):
         cute.copy(
             smem_tiled_copy_lhs,
@@ -804,7 +851,8 @@ class ChunkScanBwdDBAmpere:
                 t_reg_rhs[None, None, k],
                 acc,
             )
-        cute.arch.barrier()
+        if cutlass.const_expr(barrier_after):
+            cute.arch.barrier()
 
     @cute.jit
     def _compute_phase_prefix_metadata(self, prefix_state: SimpleNamespace):
@@ -933,10 +981,11 @@ class ChunkScanBwdDBAmpere:
         cute.arch.barrier()
 
     @cute.jit
-    def _rotate_staged_query_tile_from_prefix(
+    def _rotate_and_scale_staged_query_tile_from_prefix(
         self,
         s_query: cute.Tensor,
         s_phase: cute.Tensor,
+        s_row_scale: cute.Tensor,
         *,
         m_tile_start: int,
         stage_width: int,
@@ -961,43 +1010,12 @@ class ChunkScanBwdDBAmpere:
                 pr = cutlass.Float32(s_phase[row, 0])
                 pi = cutlass.Float32(s_phase[row, 1])
                 yr, yi = conj_mul_phase(xr, xi, pr, pi)
-                s_query[row_local, d_local + 0] = safe_cast_to_dtype(yr, out_dtype)
-                s_query[row_local, d_local + 1] = safe_cast_to_dtype(yi, out_dtype)
-            idx = idx + self.num_threads
-        cute.arch.barrier()
-
-    @cute.jit
-    def _scale_staged_query_tile(
-        self,
-        s_query: cute.Tensor,
-        s_row_scale: cute.Tensor,
-        *,
-        m_tile_start: int,
-        stage_width: int,
-        out_dtype: type[cutlass.Numeric],
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        stage_complex = stage_width // 2
-        total_pairs = self.kv_tile * stage_complex
-        idx = tidx
-        while cute.elem_less(idx, total_pairs):
-            row_local = idx // stage_complex
-            pair_local = idx - row_local * stage_complex
-            row = cutlass.Int32(m_tile_start) + row_local
-            if row < cutlass.Int32(self.L):
-                d_local = pair_local * 2
                 scale = cutlass.Float32(s_row_scale[row])
-                xr = cutlass.Float32(
-                    s_query[row_local, d_local + 0].to(cutlass.Float32)
-                )
-                xi = cutlass.Float32(
-                    s_query[row_local, d_local + 1].to(cutlass.Float32)
-                )
                 s_query[row_local, d_local + 0] = safe_cast_to_dtype(
-                    xr * scale, out_dtype
+                    yr * scale, out_dtype
                 )
                 s_query[row_local, d_local + 1] = safe_cast_to_dtype(
-                    xi * scale, out_dtype
+                    yi * scale, out_dtype
                 )
             idx = idx + self.num_threads
         cute.arch.barrier()
@@ -1121,6 +1139,57 @@ class ChunkScanBwdDBAmpere:
                 t_reg_value_view,
                 t_reg_dout,
                 t_reg_value,
+                True,
+            )
+
+    @cute.jit
+    def _accumulate_score_block_from_p_tiles_single_stage(
+        self,
+        score_pipeline: SimpleNamespace,
+        acc_score_block: cute.Tensor,
+        *,
+        m_tile_index: int,
+        n_tile_index: int,
+        use_shifted_values: cutlass.Constexpr,
+    ):
+        for p_tile_index in cutlass.range_constexpr(score_pipeline.num_p_tiles):
+            self._stage_score_operands_for_p_tile(
+                score_pipeline,
+                m_tile_index=m_tile_index,
+                n_tile_index=n_tile_index,
+                p_tile_index=p_tile_index,
+                use_shifted_values=use_shifted_values,
+                use_stage1=False,
+            )
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            t_reg_dout = score_pipeline.thr_mma.make_fragment_A(
+                score_pipeline.thr_mma.partition_A(score_pipeline.s_dout_stage0)
+            )
+            t_smem_dout = score_pipeline.thr_copy_lhs.partition_S(
+                score_pipeline.s_dout_stage0
+            )
+            t_reg_dout_view = score_pipeline.thr_copy_lhs.retile(t_reg_dout)
+            t_reg_value = score_pipeline.thr_mma.make_fragment_B(
+                score_pipeline.thr_mma.partition_B(score_pipeline.s_value_stage0)
+            )
+            t_smem_value = score_pipeline.thr_copy_rhs.partition_S(
+                score_pipeline.s_value_stage0
+            )
+            t_reg_value_view = score_pipeline.thr_copy_rhs.retile(t_reg_value)
+            self._accumulate_from_staged_tiles(
+                score_pipeline.tiled_mma,
+                acc_score_block,
+                score_pipeline.smem_tiled_copy_lhs,
+                score_pipeline.smem_tiled_copy_rhs,
+                t_smem_dout,
+                t_reg_dout_view,
+                t_smem_value,
+                t_reg_value_view,
+                t_reg_dout,
+                t_reg_value,
+                True,
             )
 
     @cute.jit
@@ -1162,6 +1231,7 @@ class ChunkScanBwdDBAmpere:
         t_reg_query_t_view: cute.Tensor,
         t_reg_score: cute.Tensor,
         t_reg_query_t: cute.Tensor,
+        barrier_after: cutlass.Constexpr,
     ):
         self._accumulate_from_staged_tiles(
             tiled_mma,
@@ -1174,6 +1244,7 @@ class ChunkScanBwdDBAmpere:
             t_reg_query_t_view,
             t_reg_score,
             t_reg_query_t,
+            barrier_after,
         )
 
     @cute.jit
@@ -1206,27 +1277,28 @@ class ChunkScanBwdDBAmpere:
                         target_mn[r, c + 1] = safe_cast_to_dtype(bi, out_dtype)
 
     @cute.jit
-    def _accumulate_dm_for_tile_rows(
+    def _accumulate_dm_and_apply_tap_adjoint(
         self,
+        s_db_output: cute.Tensor,
         s_db_curr: cute.Tensor,
         s_db_prev: cute.Tensor,
         s_phase: cute.Tensor,
-        mB: cute.Tensor,
-        mB_prev0: cute.Tensor,
+        s_key_tile: cute.Tensor,
+        s_key_boundary: cute.Tensor,
         s_dm_curr: cute.Tensor,
         s_dm_prev: cute.Tensor,
+        s_tap_curr: cute.Tensor,
+        s_tap_prev: cute.Tensor,
+        s_db_carry: cute.Tensor,
         *,
-        batch_group_chunk: int,
-        batch_group: int,
-        chunk_index: int,
         n_tile_start: int,
         d_col_base: int,
         stage_width: int,
+        out_dtype: type[cutlass.Numeric],
     ):
         lane = cute.arch.lane_idx()
         warp = cute.arch.warp_idx()
         nvec_stage = stage_width // 2
-
         row_local = warp
         while row_local < cutlass.Int32(self.kv_tile):
             row = cutlass.Int32(n_tile_start) + row_local
@@ -1237,83 +1309,105 @@ class ChunkScanBwdDBAmpere:
                 dmy_prev_im = cutlass.Float32(0.0)
                 pr = cutlass.Float32(s_phase[row, 0])
                 pi = cutlass.Float32(s_phase[row, 1])
-
-                pair_local = lane
-                while pair_local < cutlass.Int32(nvec_stage):
-                    d_local = pair_local * 2
+                if lane < cutlass.Int32(nvec_stage):
+                    d_local = lane * 2
                     d = cutlass.Int32(d_col_base) + d_local
                     if d + cutlass.Int32(1) < cutlass.Int32(self.D):
-                        bxr_curr = cutlass.Float32(
+                        curr_re = cutlass.Float32(
                             s_db_curr[row_local, d_local + 0].to(cutlass.Float32)
                         )
-                        bxi_curr = cutlass.Float32(
+                        curr_im = cutlass.Float32(
                             s_db_curr[row_local, d_local + 1].to(cutlass.Float32)
                         )
-                        gx_curr, gy_curr = conj_mul_phase(bxr_curr, bxi_curr, pr, pi)
+                        gx_curr, gy_curr = conj_mul_phase(curr_re, curr_im, pr, pi)
                         br_curr = cutlass.Float32(
-                            mB[batch_group_chunk, row, 0, d + 0].to(cutlass.Float32)
+                            s_key_tile[row_local, d_local + 0].to(cutlass.Float32)
                         )
                         bi_curr = cutlass.Float32(
-                            mB[batch_group_chunk, row, 0, d + 1].to(cutlass.Float32)
+                            s_key_tile[row_local, d_local + 1].to(cutlass.Float32)
                         )
-                        dmy_curr_re = (
-                            dmy_curr_re + gx_curr * br_curr - gy_curr * bi_curr
-                        )
-                        dmy_curr_im = (
-                            dmy_curr_im + gx_curr * bi_curr + gy_curr * br_curr
-                        )
+                        dmy_curr_re = gx_curr * br_curr - gy_curr * bi_curr
+                        dmy_curr_im = gx_curr * bi_curr + gy_curr * br_curr
 
-                        bxr_prev = cutlass.Float32(
+                        prev_re = cutlass.Float32(
                             s_db_prev[row_local, d_local + 0].to(cutlass.Float32)
                         )
-                        bxi_prev = cutlass.Float32(
+                        prev_im = cutlass.Float32(
                             s_db_prev[row_local, d_local + 1].to(cutlass.Float32)
                         )
-                        gx_prev, gy_prev = conj_mul_phase(bxr_prev, bxi_prev, pr, pi)
+                        gx_prev, gy_prev = conj_mul_phase(prev_re, prev_im, pr, pi)
                         br_prev = cutlass.Float32(0.0)
                         bi_prev = cutlass.Float32(0.0)
-                        if row > cutlass.Int32(0):
+                        if row_local > cutlass.Int32(0):
                             br_prev = cutlass.Float32(
-                                mB[
-                                    batch_group_chunk, row - cutlass.Int32(1), 0, d + 0
+                                s_key_tile[
+                                    row_local - cutlass.Int32(1), d_local + 0
                                 ].to(cutlass.Float32)
                             )
                             bi_prev = cutlass.Float32(
-                                mB[
-                                    batch_group_chunk, row - cutlass.Int32(1), 0, d + 1
+                                s_key_tile[
+                                    row_local - cutlass.Int32(1), d_local + 1
                                 ].to(cutlass.Float32)
-                            )
-                        elif chunk_index == cutlass.Int32(0):
-                            br_prev = cutlass.Float32(
-                                mB_prev0[batch_group, d + 0].to(cutlass.Float32)
-                            )
-                            bi_prev = cutlass.Float32(
-                                mB_prev0[batch_group, d + 1].to(cutlass.Float32)
                             )
                         else:
                             br_prev = cutlass.Float32(
-                                mB[
-                                    batch_group_chunk - cutlass.Int32(1),
-                                    cutlass.Int32(self.L - 1),
-                                    0,
-                                    d + 0,
-                                ].to(cutlass.Float32)
+                                s_key_boundary[d_local + 0].to(cutlass.Float32)
                             )
                             bi_prev = cutlass.Float32(
-                                mB[
-                                    batch_group_chunk - cutlass.Int32(1),
-                                    cutlass.Int32(self.L - 1),
-                                    0,
-                                    d + 1,
-                                ].to(cutlass.Float32)
+                                s_key_boundary[d_local + 1].to(cutlass.Float32)
                             )
-                        dmy_prev_re = (
-                            dmy_prev_re + gx_prev * br_prev - gy_prev * bi_prev
+                        dmy_prev_re = gx_prev * br_prev - gy_prev * bi_prev
+                        dmy_prev_im = gx_prev * bi_prev + gy_prev * br_prev
+
+                        tap_curr_re = cutlass.Float32(s_tap_curr[row_local, 0])
+                        tap_curr_im = cutlass.Float32(s_tap_curr[row_local, 1])
+                        out_re, out_im = apply_complex_tap_adjoint(
+                            curr_re, curr_im, tap_curr_re, tap_curr_im
                         )
-                        dmy_prev_im = (
-                            dmy_prev_im + gx_prev * bi_prev + gy_prev * br_prev
+
+                        carry_re = cutlass.Float32(0.0)
+                        carry_im = cutlass.Float32(0.0)
+                        if row + cutlass.Int32(1) < cutlass.Int32(self.L):
+                            if row_local + cutlass.Int32(1) < cutlass.Int32(
+                                self.kv_tile
+                            ):
+                                row_next = row + cutlass.Int32(1)
+                                next_prev_re = cutlass.Float32(
+                                    s_db_prev[
+                                        row_local + cutlass.Int32(1), d_local + 0
+                                    ].to(cutlass.Float32)
+                                )
+                                next_prev_im = cutlass.Float32(
+                                    s_db_prev[
+                                        row_local + cutlass.Int32(1), d_local + 1
+                                    ].to(cutlass.Float32)
+                                )
+                                tap_prev_re = cutlass.Float32(s_tap_prev[row_next, 0])
+                                tap_prev_im = cutlass.Float32(s_tap_prev[row_next, 1])
+                                carry_re, carry_im = apply_complex_tap_adjoint(
+                                    next_prev_re,
+                                    next_prev_im,
+                                    tap_prev_re,
+                                    tap_prev_im,
+                                )
+                            else:
+                                carry_re = cutlass.Float32(
+                                    s_db_carry[d_col_base + d_local + 0].to(
+                                        cutlass.Float32
+                                    )
+                                )
+                                carry_im = cutlass.Float32(
+                                    s_db_carry[d_col_base + d_local + 1].to(
+                                        cutlass.Float32
+                                    )
+                                )
+
+                        s_db_output[row_local, d_local + 0] = safe_cast_to_dtype(
+                            out_re + carry_re, out_dtype
                         )
-                    pair_local = pair_local + cutlass.Int32(32)
+                        s_db_output[row_local, d_local + 1] = safe_cast_to_dtype(
+                            out_im + carry_im, out_dtype
+                        )
 
                 for offset in (16, 8, 4, 2, 1):
                     dmy_curr_re = dmy_curr_re + cute.arch.shuffle_sync_bfly(
@@ -1343,80 +1437,6 @@ class ChunkScanBwdDBAmpere:
                         s_dm_prev[row_local, 1] + dmy_prev_im
                     )
             row_local = row_local + cutlass.Int32(self.num_warps)
-        cute.arch.barrier()
-
-    @cute.jit
-    def _apply_tap_adjoint_and_add_carry(
-        self,
-        s_db_output: cute.Tensor,
-        s_db_curr: cute.Tensor,
-        s_db_prev: cute.Tensor,
-        s_tap_curr: cute.Tensor,
-        s_tap_prev: cute.Tensor,
-        s_db_carry: cute.Tensor,
-        *,
-        n_tile_start: int,
-        d_col_base: int,
-        stage_width: int,
-        out_dtype: type[cutlass.Numeric],
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        nvec_stage = stage_width // 2
-        total_pairs = self.kv_tile * nvec_stage
-        idx = tidx
-        while cute.elem_less(idx, total_pairs):
-            row_local = idx // nvec_stage
-            pair_local = idx - row_local * nvec_stage
-            row = cutlass.Int32(n_tile_start) + row_local
-            if row < cutlass.Int32(self.L):
-                d_local = pair_local * 2
-                curr_re = cutlass.Float32(
-                    s_db_curr[row_local, d_local + 0].to(cutlass.Float32)
-                )
-                curr_im = cutlass.Float32(
-                    s_db_curr[row_local, d_local + 1].to(cutlass.Float32)
-                )
-                tap_curr_re = cutlass.Float32(s_tap_curr[row_local, 0])
-                tap_curr_im = cutlass.Float32(s_tap_curr[row_local, 1])
-                out_re, out_im = apply_complex_tap_adjoint(
-                    curr_re, curr_im, tap_curr_re, tap_curr_im
-                )
-
-                carry_re = cutlass.Float32(0.0)
-                carry_im = cutlass.Float32(0.0)
-                if row + cutlass.Int32(1) < cutlass.Int32(self.L):
-                    if row_local + cutlass.Int32(1) < cutlass.Int32(self.kv_tile):
-                        row_next = row + cutlass.Int32(1)
-                        prev_re = cutlass.Float32(
-                            s_db_prev[row_local + cutlass.Int32(1), d_local + 0].to(
-                                cutlass.Float32
-                            )
-                        )
-                        prev_im = cutlass.Float32(
-                            s_db_prev[row_local + cutlass.Int32(1), d_local + 1].to(
-                                cutlass.Float32
-                            )
-                        )
-                        tap_prev_re = cutlass.Float32(s_tap_prev[row_next, 0])
-                        tap_prev_im = cutlass.Float32(s_tap_prev[row_next, 1])
-                        carry_re, carry_im = apply_complex_tap_adjoint(
-                            prev_re, prev_im, tap_prev_re, tap_prev_im
-                        )
-                    else:
-                        carry_re = cutlass.Float32(
-                            s_db_carry[d_col_base + d_local + 0].to(cutlass.Float32)
-                        )
-                        carry_im = cutlass.Float32(
-                            s_db_carry[d_col_base + d_local + 1].to(cutlass.Float32)
-                        )
-
-                s_db_output[row_local, d_local + 0] = safe_cast_to_dtype(
-                    out_re + carry_re, out_dtype
-                )
-                s_db_output[row_local, d_local + 1] = safe_cast_to_dtype(
-                    out_im + carry_im, out_dtype
-                )
-            idx = idx + self.num_threads
         cute.arch.barrier()
 
     @cute.jit
@@ -1673,6 +1693,7 @@ class ChunkScanBwdDBAmpere:
             mDMprev,
             mDMcurr,
             layouts.query_layout,
+            layouts.key_layout,
             layouts.grad_output_layout,
             layouts.key_grad_layout,
             layouts.value_layout,
@@ -1813,6 +1834,7 @@ class ChunkScanBwdDBAmpere:
         mDMprev: cute.Tensor,
         mDMcurr: cute.Tensor,
         query_layout: cute.ComposedLayout,
+        key_layout: cute.ComposedLayout,
         grad_output_layout: cute.ComposedLayout,
         key_grad_layout: cute.ComposedLayout,
         value_layout: cute.ComposedLayout,
@@ -1845,20 +1867,23 @@ class ChunkScanBwdDBAmpere:
         storage = smem.allocate(shared_storage_cls)
 
         s_query_tile = storage.query_tile.get_tensor(query_layout)
+        s_key_tile = storage.key_tile.get_tensor(key_layout)
         s_grad_output_stage0 = storage.grad_output_tile.get_tensor(grad_output_layout)
-        s_score_prev = cute.make_tensor(
-            s_grad_output_stage0.iterator.align(16), score_layout
-        )
         s_key_grad_tile = storage.key_grad_tile.get_tensor(key_grad_layout)
         s_value_stage0 = storage.value_tile.get_tensor(value_layout)
-        s_score_block = storage.score_tile.get_tensor(score_layout)
-        s_score_cache = storage.score_cache.get_tensor(score_layout)
+        s_score_temp = storage.score_tile.get_tensor(score_layout)
+        s_score_diag_curr = storage.score_diag_curr.get_tensor(score_layout)
+        s_score_diag_prev = cute.make_tensor(
+            s_grad_output_stage0.iterator.align(16), score_layout
+        )
+        s_score_offdiag_curr = s_score_temp
+        s_score_offdiag_prev = cute.make_tensor(
+            s_value_stage0.iterator.align(16), score_layout
+        )
         s_grad_output_stage1 = cute.make_tensor(
             s_key_grad_tile.iterator.align(16), grad_output_layout
         )
-        s_value_stage1 = cute.make_tensor(
-            s_score_block.iterator.align(16), value_layout
-        )
+        s_value_stage1 = cute.make_tensor(s_score_temp.iterator.align(16), value_layout)
         s_phase = storage.phase_full.get_tensor(
             cute.make_layout((self.L, 2), stride=(2, 1))
         )
@@ -1870,6 +1895,9 @@ class ChunkScanBwdDBAmpere:
         )
         s_db_carry = storage.db_carry.get_tensor(
             cute.make_layout((d_padded,), stride=(1,))
+        )
+        s_key_boundary = storage.key_boundary.get_tensor(
+            cute.make_layout((d_stage_width,), stride=(1,))
         )
         s_row_scale = storage.row_scale.get_tensor(
             cute.make_layout((self.L,), stride=(1,))
@@ -1941,26 +1969,37 @@ class ChunkScanBwdDBAmpere:
             (mU.shape[0], self.L, mU.shape[2], self.L)
         )
         coord_db = cute.make_identity_tensor(mDB.layout.shape)
+        coord_key = cute.make_identity_tensor(mB.layout.shape)
         coord_value = cute.make_identity_tensor(mU.layout.shape)
         coord_query = cute.make_identity_tensor(mC.layout.shape)
         coord_dout = cute.make_identity_tensor(mDOut.layout.shape)
         coord_score_tile_base = coord_score[batch_head_chunk, None, 0, None]
         coord_db_tile_base = coord_db[batch_head_chunk, None, 0, None]
         t_query_smem = gmem_thr_copy_d.partition_D(s_query_tile)
+        t_key_smem = gmem_thr_copy_d.partition_D(s_key_tile)
         t_grad_output_stage0_smem = gmem_thr_copy_p.partition_D(s_grad_output_stage0)
         t_grad_output_stage1_smem = gmem_thr_copy_p.partition_D(s_grad_output_stage1)
         t_value_stage0_smem = gmem_thr_copy_p.partition_D(s_value_stage0)
         t_value_stage1_smem = gmem_thr_copy_p.partition_D(s_value_stage1)
 
-        t_score_block = thr_mma.make_fragment_A(thr_mma.partition_A(s_score_block))
-        t_score_block_smem = thr_copy_lhs.partition_S(s_score_block)
-        t_score_block_view = thr_copy_lhs.retile(t_score_block)
-        t_score_cache = thr_mma.make_fragment_A(thr_mma.partition_A(s_score_cache))
-        t_score_cache_smem = thr_copy_lhs.partition_S(s_score_cache)
-        t_score_cache_view = thr_copy_lhs.retile(t_score_cache)
-        t_score_prev = thr_mma.make_fragment_A(thr_mma.partition_A(s_score_prev))
-        t_score_prev_smem = thr_copy_lhs.partition_S(s_score_prev)
-        t_score_prev_view = thr_copy_lhs.retile(t_score_prev)
+        t_score_temp = thr_mma.make_fragment_A(thr_mma.partition_A(s_score_temp))
+        t_score_temp_smem = thr_copy_lhs.partition_S(s_score_temp)
+        t_score_temp_view = thr_copy_lhs.retile(t_score_temp)
+        t_score_diag_curr = thr_mma.make_fragment_A(
+            thr_mma.partition_A(s_score_diag_curr)
+        )
+        t_score_diag_curr_smem = thr_copy_lhs.partition_S(s_score_diag_curr)
+        t_score_diag_curr_view = thr_copy_lhs.retile(t_score_diag_curr)
+        t_score_diag_prev = thr_mma.make_fragment_A(
+            thr_mma.partition_A(s_score_diag_prev)
+        )
+        t_score_diag_prev_smem = thr_copy_lhs.partition_S(s_score_diag_prev)
+        t_score_diag_prev_view = thr_copy_lhs.retile(t_score_diag_prev)
+        t_score_offdiag_prev = thr_mma.make_fragment_A(
+            thr_mma.partition_A(s_score_offdiag_prev)
+        )
+        t_score_offdiag_prev_smem = thr_copy_lhs.partition_S(s_score_offdiag_prev)
+        t_score_offdiag_prev_view = thr_copy_lhs.retile(t_score_offdiag_prev)
         s_query_transposed_layout = cute.make_layout(
             (d_stage_width, kv_tile), stride=(kv_tile, 1)
         )
@@ -2000,6 +2039,33 @@ class ChunkScanBwdDBAmpere:
             s_value_stage0=s_value_stage0,
             s_value_stage1=s_value_stage1,
         )
+        score_pipeline_no_prev_alias = SimpleNamespace(
+            batch_head_chunk=batch_head_chunk,
+            batch_head=batch_head,
+            chunk_index=chunk_index,
+            num_p_tiles=num_p_tiles,
+            tiled_mma=tiled_mma,
+            smem_tiled_copy_lhs=smem_tiled_copy_lhs,
+            smem_tiled_copy_rhs=smem_tiled_copy_rhs,
+            thr_mma=thr_mma,
+            thr_copy_lhs=thr_copy_lhs,
+            thr_copy_rhs=thr_copy_rhs,
+            gmem_tiled_copy_p=gmem_tiled_copy_p,
+            gmem_thr_copy_p=gmem_thr_copy_p,
+            m_dout=mDOut,
+            m_value=mU,
+            m_value_prev0=mU_prev0,
+            coord_dout=coord_dout,
+            coord_value=coord_value,
+            t_dout_stage0=t_grad_output_stage1_smem,
+            t_dout_stage1=t_grad_output_stage1_smem,
+            t_value_stage0=t_value_stage0_smem,
+            t_value_stage1=t_value_stage0_smem,
+            s_dout_stage0=s_grad_output_stage1,
+            s_dout_stage1=s_grad_output_stage1,
+            s_value_stage0=s_value_stage0,
+            s_value_stage1=s_value_stage0,
+        )
         self._clear_db_carry(s_db_carry)
 
         for n_tile_rev in cutlass.range_constexpr(num_n_tiles):
@@ -2019,41 +2085,94 @@ class ChunkScanBwdDBAmpere:
                 t_cached_score_coord
             )
 
-            acc_score_cache_curr = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
-            acc_score_cache_curr.fill(0.0)
+            acc_score_diag_curr = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
+            acc_score_diag_curr.fill(0.0)
             self._accumulate_score_block_from_p_tiles(
                 score_pipeline,
-                acc_score_cache_curr,
+                acc_score_diag_curr,
                 m_tile_index=cached_m_tile_index,
                 n_tile_index=n_tile_index,
                 use_shifted_values=False,
             )
             self._store_causal_score_block(
-                acc_score_cache_curr,
+                acc_score_diag_curr,
                 t_cached_score_coord_mn,
-                s_score_cache,
+                s_score_diag_curr,
                 m_tile_start=cached_m_tile_start,
                 n_tile_start=n_tile_start,
                 out_dtype=mU.element_type,
             )
 
-            acc_score_cache_prev = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
-            acc_score_cache_prev.fill(0.0)
+            acc_score_diag_prev = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
+            acc_score_diag_prev.fill(0.0)
             self._accumulate_score_block_from_p_tiles(
                 score_pipeline,
-                acc_score_cache_prev,
+                acc_score_diag_prev,
                 m_tile_index=cached_m_tile_index,
                 n_tile_index=n_tile_index,
                 use_shifted_values=True,
             )
             self._store_causal_score_block(
-                acc_score_cache_prev,
+                acc_score_diag_prev,
                 t_cached_score_coord_mn,
-                s_score_prev,
+                s_score_diag_prev,
                 m_tile_start=cached_m_tile_start,
                 n_tile_start=n_tile_start,
                 out_dtype=mU.element_type,
             )
+
+            if cutlass.const_expr(num_n_tiles == 2 and num_m_tiles > 1):
+                offdiag_m_tile_index = n_tile_index + 1
+                offdiag_m_tile_start = offdiag_m_tile_index * kv_tile
+                offdiag_score_coord_tile = cute.local_tile(
+                    coord_score_tile_base,
+                    (kv_tile, kv_tile),
+                    (offdiag_m_tile_index, n_tile_index),
+                )
+                t_offdiag_score_coord = thr_mma.partition_C(offdiag_score_coord_tile)
+                t_offdiag_score_coord_mn = self._make_accumulator_mn_view(
+                    t_offdiag_score_coord
+                )
+
+                acc_score_offdiag_curr = cute.make_rmem_tensor(
+                    acc_shape_blk, cutlass.Float32
+                )
+                acc_score_offdiag_curr.fill(0.0)
+                self._accumulate_score_block_from_p_tiles_single_stage(
+                    score_pipeline_no_prev_alias,
+                    acc_score_offdiag_curr,
+                    m_tile_index=offdiag_m_tile_index,
+                    n_tile_index=n_tile_index,
+                    use_shifted_values=False,
+                )
+                self._store_causal_score_block(
+                    acc_score_offdiag_curr,
+                    t_offdiag_score_coord_mn,
+                    s_score_offdiag_curr,
+                    m_tile_start=offdiag_m_tile_start,
+                    n_tile_start=n_tile_start,
+                    out_dtype=mU.element_type,
+                )
+
+                acc_score_offdiag_prev = cute.make_rmem_tensor(
+                    acc_shape_blk, cutlass.Float32
+                )
+                acc_score_offdiag_prev.fill(0.0)
+                self._accumulate_score_block_from_p_tiles_single_stage(
+                    score_pipeline_no_prev_alias,
+                    acc_score_offdiag_prev,
+                    m_tile_index=offdiag_m_tile_index,
+                    n_tile_index=n_tile_index,
+                    use_shifted_values=True,
+                )
+                self._store_causal_score_block(
+                    acc_score_offdiag_prev,
+                    t_offdiag_score_coord_mn,
+                    s_score_offdiag_prev,
+                    m_tile_start=offdiag_m_tile_start,
+                    n_tile_start=n_tile_start,
+                    out_dtype=mU.element_type,
+                )
 
             self._initialize_curr_taps_and_dm_tiles(
                 mK,
@@ -2066,6 +2185,28 @@ class ChunkScanBwdDBAmpere:
 
             for d_stage_index in cutlass.range_constexpr(d_stage_count):
                 d_col_base = cutlass.Int32(d_stage_index * d_stage_width)
+                self._stage_query_tile_from_gmem(
+                    gmem_tiled_copy_d,
+                    gmem_thr_copy_d,
+                    mB,
+                    coord_key,
+                    t_key_smem,
+                    batch_group_chunk=batch_group_chunk,
+                    m_tile_index=n_tile_index,
+                    d_stage_index=d_stage_index,
+                    stage_width=d_stage_width,
+                )
+                self._stage_key_boundary_from_gmem(
+                    s_key_boundary,
+                    mB,
+                    mB_prev0,
+                    batch_group_chunk=batch_group_chunk,
+                    batch_group=batch_group,
+                    chunk_index=chunk_index,
+                    d_col_base=d_col_base,
+                    stage_width=d_stage_width,
+                    out_dtype=mU.element_type,
+                )
                 acc_dk_curr = cute.make_rmem_tensor(acc_shape_tile_d, cutlass.Float32)
                 acc_dk_curr.fill(0.0)
                 acc_dk_prev = cute.make_rmem_tensor(acc_shape_tile_d, cutlass.Float32)
@@ -2074,7 +2215,11 @@ class ChunkScanBwdDBAmpere:
                 for m_tile_offset in cutlass.range_constexpr(num_m_tiles):
                     m_tile_index = n_tile_index + m_tile_offset
                     m_tile_start = m_tile_index * kv_tile
-                    cache_score_tiles = m_tile_offset == 0
+                    cache_diag_score_tiles = m_tile_offset == 0
+                    cache_offdiag_score_tiles = num_n_tiles == 2 and m_tile_offset == 1
+                    cache_score_tiles = (
+                        cache_diag_score_tiles or cache_offdiag_score_tiles
+                    )
 
                     self._stage_query_tile_from_gmem(
                         gmem_tiled_copy_d,
@@ -2087,9 +2232,10 @@ class ChunkScanBwdDBAmpere:
                         d_stage_index=d_stage_index,
                         stage_width=d_stage_width,
                     )
-                    self._rotate_staged_query_tile_from_prefix(
+                    self._rotate_and_scale_staged_query_tile_from_prefix(
                         s_query_tile,
                         s_phase,
+                        s_row_scale,
                         m_tile_start=m_tile_start,
                         stage_width=d_stage_width,
                         out_dtype=mU.element_type,
@@ -2103,13 +2249,13 @@ class ChunkScanBwdDBAmpere:
                     t_score_coord = thr_mma.partition_C(coord_score_tile)
                     t_score_coord_mn = self._make_accumulator_mn_view(t_score_coord)
 
-                    if (not cache_score_tiles) or d_stage_index == 0:
+                    if cutlass.const_expr(not cache_score_tiles):
                         acc_score_curr = cute.make_rmem_tensor(
                             acc_shape_blk, cutlass.Float32
                         )
                         acc_score_curr.fill(0.0)
-                        self._accumulate_score_block_from_p_tiles(
-                            score_pipeline,
+                        self._accumulate_score_block_from_p_tiles_single_stage(
+                            score_pipeline_no_prev_alias,
                             acc_score_curr,
                             m_tile_index=m_tile_index,
                             n_tile_index=n_tile_index,
@@ -2118,31 +2264,39 @@ class ChunkScanBwdDBAmpere:
                         self._store_causal_score_block(
                             acc_score_curr,
                             t_score_coord_mn,
-                            s_score_cache if cache_score_tiles else s_score_block,
+                            s_score_temp,
                             m_tile_start=m_tile_start,
                             n_tile_start=n_tile_start,
                             out_dtype=mU.element_type,
                         )
 
-                    self._scale_staged_query_tile(
-                        s_query_tile,
-                        s_row_scale,
-                        m_tile_start=m_tile_start,
-                        stage_width=d_stage_width,
-                        out_dtype=mU.element_type,
-                    )
-                    if cache_score_tiles:
+                    if cutlass.const_expr(cache_diag_score_tiles):
                         self._accumulate_key_grad_from_staged_score_block(
                             tiled_mma,
                             acc_dk_curr,
                             smem_tiled_copy_lhs,
                             smem_tiled_copy_query_t,
-                            t_score_cache_smem,
-                            t_score_cache_view,
+                            t_score_diag_curr_smem,
+                            t_score_diag_curr_view,
                             t_query_transposed_smem,
                             t_query_transposed_view,
-                            t_score_cache,
+                            t_score_diag_curr,
                             t_query_transposed,
+                            False,
+                        )
+                    elif cutlass.const_expr(cache_offdiag_score_tiles):
+                        self._accumulate_key_grad_from_staged_score_block(
+                            tiled_mma,
+                            acc_dk_curr,
+                            smem_tiled_copy_lhs,
+                            smem_tiled_copy_query_t,
+                            t_score_temp_smem,
+                            t_score_temp_view,
+                            t_query_transposed_smem,
+                            t_query_transposed_view,
+                            t_score_temp,
+                            t_query_transposed,
+                            False,
                         )
                     else:
                         self._accumulate_key_grad_from_staged_score_block(
@@ -2150,21 +2304,22 @@ class ChunkScanBwdDBAmpere:
                             acc_dk_curr,
                             smem_tiled_copy_lhs,
                             smem_tiled_copy_query_t,
-                            t_score_block_smem,
-                            t_score_block_view,
+                            t_score_temp_smem,
+                            t_score_temp_view,
                             t_query_transposed_smem,
                             t_query_transposed_view,
-                            t_score_block,
+                            t_score_temp,
                             t_query_transposed,
+                            True,
                         )
 
-                    if (not cache_score_tiles) or d_stage_index == 0:
+                    if cutlass.const_expr(not cache_score_tiles):
                         acc_score_prev = cute.make_rmem_tensor(
                             acc_shape_blk, cutlass.Float32
                         )
                         acc_score_prev.fill(0.0)
-                        self._accumulate_score_block_from_p_tiles(
-                            score_pipeline,
+                        self._accumulate_score_block_from_p_tiles_single_stage(
+                            score_pipeline_no_prev_alias,
                             acc_score_prev,
                             m_tile_index=m_tile_index,
                             n_tile_index=n_tile_index,
@@ -2173,23 +2328,38 @@ class ChunkScanBwdDBAmpere:
                         self._store_causal_score_block(
                             acc_score_prev,
                             t_score_coord_mn,
-                            s_score_prev if cache_score_tiles else s_score_block,
+                            s_score_temp,
                             m_tile_start=m_tile_start,
                             n_tile_start=n_tile_start,
                             out_dtype=mU.element_type,
                         )
-                    if cache_score_tiles:
+                    if cutlass.const_expr(cache_diag_score_tiles):
                         self._accumulate_key_grad_from_staged_score_block(
                             tiled_mma,
                             acc_dk_prev,
                             smem_tiled_copy_lhs,
                             smem_tiled_copy_query_t,
-                            t_score_prev_smem,
-                            t_score_prev_view,
+                            t_score_diag_prev_smem,
+                            t_score_diag_prev_view,
                             t_query_transposed_smem,
                             t_query_transposed_view,
-                            t_score_prev,
+                            t_score_diag_prev,
                             t_query_transposed,
+                            True,
+                        )
+                    elif cutlass.const_expr(cache_offdiag_score_tiles):
+                        self._accumulate_key_grad_from_staged_score_block(
+                            tiled_mma,
+                            acc_dk_prev,
+                            smem_tiled_copy_lhs,
+                            smem_tiled_copy_query_t,
+                            t_score_offdiag_prev_smem,
+                            t_score_offdiag_prev_view,
+                            t_query_transposed_smem,
+                            t_query_transposed_view,
+                            t_score_offdiag_prev,
+                            t_query_transposed,
+                            True,
                         )
                     else:
                         self._accumulate_key_grad_from_staged_score_block(
@@ -2197,12 +2367,13 @@ class ChunkScanBwdDBAmpere:
                             acc_dk_prev,
                             smem_tiled_copy_lhs,
                             smem_tiled_copy_query_t,
-                            t_score_block_smem,
-                            t_score_block_view,
+                            t_score_temp_smem,
+                            t_score_temp_view,
                             t_query_transposed_smem,
                             t_query_transposed_view,
-                            t_score_block,
+                            t_score_temp,
                             t_query_transposed,
+                            True,
                         )
 
                 coord_db_stage = cute.local_tile(
@@ -2242,26 +2413,15 @@ class ChunkScanBwdDBAmpere:
                 cute.autovec_copy(t_db_curr_reg, t_db_curr_smem)
                 cute.arch.barrier()
 
-                self._accumulate_dm_for_tile_rows(
+                self._accumulate_dm_and_apply_tap_adjoint(
+                    s_key_grad_tile,
                     s_key_grad_tile,
                     s_query_tile,
                     s_phase,
-                    mB,
-                    mB_prev0,
+                    s_key_tile,
+                    s_key_boundary,
                     s_dm_curr,
                     s_dm_prev,
-                    batch_group_chunk=batch_group_chunk,
-                    batch_group=batch_group,
-                    chunk_index=chunk_index,
-                    n_tile_start=n_tile_start,
-                    d_col_base=d_col_base,
-                    stage_width=d_stage_width,
-                )
-
-                self._apply_tap_adjoint_and_add_carry(
-                    s_key_grad_tile,
-                    s_key_grad_tile,
-                    s_query_tile,
                     s_tap_curr,
                     s_tap_prev,
                     s_db_carry,

@@ -112,7 +112,7 @@ class ChunkScanBwdDZ0Ampere:
         dtype: type[cutlass.Numeric],
         *,
         chunk_size: int,
-        cta_tiler: tuple[int, int, int] = (64, 96, 32),  # (bM=P, bN=D, bK=time)
+        cta_tiler: tuple[int, int, int] = (64, 64, 32),  # (bM=P, bN=D, bK=time)
         atom_layout_mnk: tuple[int, int, int] = (2, 2, 1),
         num_stages: int = 2,
         heads: int | None = None,
@@ -229,6 +229,11 @@ class ChunkScanBwdDZ0Ampere:
             (self._dout_smem_elems() * input_bytes, 16),
             (self._c_smem_elems() * input_bytes, 16),
         ]
+        operand_smem_bytes = self._struct_size_bytes(operand_fields)
+        output_smem_bytes = self._output_smem_bytes()
+        pad_bytes = max(0, output_smem_bytes - operand_smem_bytes)
+        pad_words = max(1, (pad_bytes + 3) // 4)
+        operand_fields.append((pad_words * 4, 16))
         return self._struct_size_bytes(operand_fields)
 
     def _output_smem_bytes(self) -> int:
@@ -328,23 +333,40 @@ class ChunkScanBwdDZ0Ampere:
         )
         return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))
 
-    def _make_output_layout(self) -> cute.Layout:
-        return cute.make_layout((self.bM, self.bN), stride=(self.bN, 1))
+    def _make_output_layout(self):
+        output_major_mode_size = 64 if self.bN % 64 == 0 else 32
+        swizzle_bits = int(
+            math.log2(output_major_mode_size * self.c_dtype.width // 128)
+        )
+        swizzle_bits = min(swizzle_bits, 3)
+        layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits, 3, 3),
+            0,
+            cute.make_layout(
+                (8, output_major_mode_size), stride=(output_major_mode_size, 1)
+            ),
+        )
+        return cute.tile_to_shape(layout_atom, (self.bM, self.bN), (0, 1))
 
     def _operand_smem_bytes_from_layouts(
         self,
         dout_layout: cute.Layout,
         c_layout: cute.Layout,
+        output_alias_pad_layout: cute.Layout | None = None,
     ) -> int:
         operand_fields = [
             (int(cute.size_in_bytes(self.ab_dtype, dout_layout)), 16),
             (int(cute.size_in_bytes(self.ab_dtype, c_layout)), 16),
         ]
+        if output_alias_pad_layout is not None:
+            operand_fields.append(
+                (int(cute.size_in_bytes(self.c_dtype, output_alias_pad_layout)), 16)
+            )
         return self._struct_size_bytes(operand_fields)
 
     def _output_smem_bytes_from_layout(
         self,
-        output_layout: cute.Layout,
+        output_layout: cute.Layout | cute.ComposedLayout,
     ) -> int:
         return self._struct_size_bytes(
             [(int(cute.size_in_bytes(self.c_dtype, output_layout)), 16)]
@@ -354,7 +376,7 @@ class ChunkScanBwdDZ0Ampere:
         self,
         dout_layout: cute.Layout,
         c_layout: cute.Layout,
-        output_layout: cute.Layout,
+        output_layout: cute.Layout | cute.ComposedLayout,
     ) -> cute.Layout:
         operand_smem_bytes = self._operand_smem_bytes_from_layouts(
             dout_layout,
@@ -362,7 +384,8 @@ class ChunkScanBwdDZ0Ampere:
         )
         output_smem_bytes = self._output_smem_bytes_from_layout(output_layout)
         pad_bytes = max(0, output_smem_bytes - operand_smem_bytes)
-        return cute.make_layout((((pad_bytes + 3) // 4),), stride=(1,))
+        pad_words = max(1, (pad_bytes + 3) // 4)
+        return cute.make_layout((pad_words,), stride=(1,))
 
     def _make_gmem_tiled_copy_input(
         self,
@@ -644,6 +667,7 @@ class ChunkScanBwdDZ0Ampere:
             operand_smem_bytes=self._operand_smem_bytes_from_layouts(
                 layouts.dout_layout,
                 layouts.c_layout,
+                layouts.output_alias_pad_layout,
             ),
             output_smem_bytes=self._output_smem_bytes_from_layout(
                 layouts.output_layout
@@ -691,7 +715,7 @@ class ChunkScanBwdDZ0Ampere:
     def _make_output_shared_tensor(
         self,
         s_dout: cute.Tensor,
-        output_layout: cute.Layout,
+        output_layout: cute.Layout | cute.ComposedLayout,
     ):
         return cute.make_tensor(
             cute.recast_ptr(s_dout.iterator, dtype=self.c_dtype),
@@ -703,7 +727,7 @@ class ChunkScanBwdDZ0Ampere:
         storage,
         dout_layout: cute.ComposedLayout,
         c_layout: cute.ComposedLayout,
-        output_layout: cute.Layout,
+        output_layout: cute.Layout | cute.ComposedLayout,
     ) -> SimpleNamespace:
         s_dout = storage.dout_tile.get_tensor(dout_layout)
         return SimpleNamespace(
@@ -1542,7 +1566,7 @@ class ChunkScanBwdDZ0Ampere:
         mDZ0: cute.Tensor,  # (P, D, BHC)
         dout_layout: cute.ComposedLayout,
         c_layout: cute.ComposedLayout,
-        output_layout: cute.Layout,
+        output_layout: cute.Layout | cute.ComposedLayout,
         gmem_tiled_copy_dout: cute.TiledCopy,
         gmem_tiled_copy_c: cute.TiledCopy,
         gmem_tiled_copy_output: cute.TiledCopy,

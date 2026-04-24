@@ -214,7 +214,7 @@ class ChunkIncrementBwdDBAmpere:
         )
         db_tile_bytes = self.bM * self.bN * (self.c_dtype.width // 8)
         pad_bytes = max(0, db_tile_bytes - operand_bytes)
-        return 2048 + self._align_up(pad_bytes, 4)
+        return max(4, self._align_up(pad_bytes, 4))
 
     def _output_alias_guard_layout(self, in_dtype: type[cutlass.Numeric]):
         return cute.make_layout(

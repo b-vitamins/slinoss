@@ -181,6 +181,44 @@ def _reference_boundary_grads(
     )
 
 
+def _reference_key_grads(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    B_prev: torch.Tensor,
+    U_prev: torch.Tensor,
+    T: int,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B_ref = B.detach().clone().requires_grad_(True)
+    B_prev_ref = B_prev.detach().clone().requires_grad_(True)
+    y_ref = ref_chunk_scan(
+        U,
+        M,
+        K,
+        B_ref,
+        C,
+        chunk_starts,
+        B_prev=B_prev_ref,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        output_dtype=torch.float32,
+        compute_dtype=torch.float32,
+    )
+    loss = (y_ref * d_out).sum()
+    dB_ref, dB_prev_ref = torch.autograd.grad(loss, (B_ref, B_prev_ref))
+    return (
+        dB_ref.to(dtype=torch.float32).contiguous(),
+        dB_prev_ref.to(dtype=torch.float32).contiguous(),
+    )
+
+
 def _reference_param_grads(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -535,6 +573,77 @@ def test_chunk_scan_bwd_matches_reference_dz0_for_realistic_stateful_shape() -> 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_matches_reference_db_for_multi_d_stage_shape() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 1, 1, 64, 64, 64
+    chunk_size = 64
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    dB_ref, dB_prev_ref = _reference_key_grads(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+    )
+    _dU, _dM, _dK, dB, _dC, _dZ0, dB_prev, _dU_prev = chunk_scan_bwd_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+    )
+
+    dB_error = (dB.to(dtype=torch.float32) - dB_ref).abs()
+    assert float(dB_error.max()) < 1.25
+    assert float(dB_error.mean()) < 0.05
+    torch.testing.assert_close(
+        dB_prev.to(dtype=torch.float32), dB_prev_ref, atol=2e-3, rtol=0.0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_scan_bwd_cute_preserves_grouped_bc_public_contract() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
@@ -761,15 +870,15 @@ def test_chunk_scan_bwd_compile_entrypoint_enables_tvm_ffi(
     finally:
         chunk_scan_bwd_mod._COMPILED_CACHE.clear()
 
-    assert compile_options == ["--enable-tvm-ffi"] * 6
+    assert compile_options == ["--enable-tvm-ffi"] * 5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_bwd_rejects_oversized_dc_or_dlp_shapes_before_launch() -> None:
+def test_chunk_scan_bwd_rejects_oversized_dcdr_shapes_before_launch() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
-    batch, heads, T, N, P = 1, 1, 65, 1024, 128
+    batch, heads, T, N, P = 1, 1, 65, 1024, 512
     chunk_size = 64
     n_chunks = (T + chunk_size - 1) // chunk_size
     device = torch.device("cuda")
@@ -791,7 +900,7 @@ def test_chunk_scan_bwd_rejects_oversized_dc_or_dlp_shapes_before_launch() -> No
 
     with pytest.raises(
         ValueError,
-        match=r"No supported chunk_scan backward (dcdr|dlp) kernel fits",
+        match=r"No supported chunk_scan backward dcdr kernel fits",
     ):
         compile_chunk_scan_bwd_kernels(
             U,

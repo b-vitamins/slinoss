@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import statistics
 import sys
+import tempfile
 from typing import Any, cast
 
 import torch
@@ -37,8 +38,10 @@ from _ncu_kernels import (  # noqa: E402
     build_kernel_runner,
 )
 import ncu_report  # noqa: E402
+import nsys_report  # noqa: E402
 
 NCU_REPORT = cast(Any, ncu_report)
+NSYS_REPORT = cast(Any, nsys_report)
 
 
 NCU_SECTIONS = (
@@ -69,6 +72,7 @@ def _parse_args() -> argparse.Namespace:
         help="Limit the report to one or more kernels.",
     )
     parser.add_argument("--ncu", default="ncu")
+    parser.add_argument("--nsys", default="nsys")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=10)
@@ -80,6 +84,21 @@ def _parse_args() -> argparse.Namespace:
         help="Warm launches to run before the profiled NCU launch.",
     )
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument(
+        "--hot-launch-timing",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help=(
+            "Use Nsight Systems for per-CUDA-launch hot timings. "
+            "'auto' profiles only logical kernels that NCU reports as multi-launch."
+        ),
+    )
+    parser.add_argument(
+        "--nsys-output-dir",
+        type=Path,
+        default=None,
+        help="Keep NSYS timing artifacts under this directory instead of a temp dir.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -319,6 +338,111 @@ def _format_kib(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.2f} KiB"
 
 
+def _format_ms(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.4f} ms"
+
+
+def _summary_float(summary: dict[str, object], key: str) -> float | None:
+    value = summary.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _representative_launch(
+    launches: list[dict[str, object]],
+) -> dict[str, object] | None:
+    for launch in launches:
+        if launch.get("kernel_label") == "main":
+            return launch
+    return launches[-1] if launches else None
+
+
+def _hot_launch_timing_requested(
+    mode: str,
+    ncu_launches: list[dict[str, object]],
+) -> bool:
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return len(ncu_launches) > 1
+
+
+def _timing_output_base(
+    *,
+    args: argparse.Namespace,
+    kernel_name: str,
+    temp_dir: tempfile.TemporaryDirectory[str] | None,
+) -> Path:
+    if args.nsys_output_dir is not None:
+        return args.nsys_output_dir / f"{kernel_name}_nsys"
+    if temp_dir is None:
+        raise RuntimeError("Temporary NSYS directory was not initialized")
+    return Path(temp_dir.name) / f"{kernel_name}_nsys"
+
+
+def _hot_duration_ms(summary: dict[str, object]) -> float | None:
+    return _summary_float(summary, "duration_ms")
+
+
+def _hot_total_ms(launches: list[dict[str, object]]) -> float | None:
+    durations = [_hot_duration_ms(launch) for launch in launches]
+    if not durations or any(duration is None for duration in durations):
+        return None
+    return float(sum(cast(float, duration) for duration in durations))
+
+
+def _event_normalized_hot_launches(
+    launches: list[dict[str, object]],
+    *,
+    event_total_ms: float,
+) -> list[dict[str, object]]:
+    hot_total_ms = _hot_total_ms(launches)
+    normalized: list[dict[str, object]] = []
+    for launch in launches:
+        normalized_launch = dict(launch)
+        duration_ms = _hot_duration_ms(launch)
+        if hot_total_ms is not None and hot_total_ms > 0.0 and duration_ms is not None:
+            fraction = duration_ms / hot_total_ms
+            normalized_launch["event_fraction"] = fraction
+            normalized_launch["event_estimate_ms"] = event_total_ms * fraction
+            normalized_launch["event_estimate_source"] = (
+                "cuda_event_total_scaled_by_nsys_trace_fraction"
+            )
+        else:
+            normalized_launch["event_fraction"] = None
+            normalized_launch["event_estimate_ms"] = None
+            normalized_launch["event_estimate_source"] = None
+        normalized.append(normalized_launch)
+    return normalized
+
+
+def _launch_by_index(
+    launches: list[dict[str, object]],
+    launch_index: int,
+) -> dict[str, object] | None:
+    for launch in launches:
+        if int(cast(int, launch["launch_index"])) == launch_index:
+            return launch
+    return None
+
+
+def _format_ncu_counter_suffix(summary: dict[str, object]) -> str:
+    return (
+        f"NCU DRAM {_format_pct(_summary_float(summary, 'dram_pct'))} "
+        f"({_format_gbs(_summary_float(summary, 'dram_total_gbs'))}), "
+        f"occ {_format_pct(_summary_float(summary, 'achieved_occupancy'))}, "
+        f"no-eligible {_format_pct(_summary_float(summary, 'no_eligible'))}, "
+        f"bank conflicts {_format_bank(_summary_float(summary, 'bank_conflicts'))}, "
+        f"regs/thread {_format_regs(_summary_float(summary, 'registers_per_thread'))}, "
+        f"smem {_format_kib(_summary_float(summary, 'smem_total_kib'))} "
+        f"(dyn {_format_kib(_summary_float(summary, 'smem_dynamic_kib'))}, "
+        f"static {_format_kib(_summary_float(summary, 'smem_static_kib'))}, "
+        f"driver {_format_kib(_summary_float(summary, 'smem_driver_kib'))})."
+    )
+
+
 def main() -> int:
     args = _parse_args()
     if args.list:
@@ -352,61 +476,142 @@ def main() -> int:
     requested = [name for name in KERNEL_ORDER if name in requested_set]
 
     rows: list[dict[str, object]] = []
-    for kernel_name in requested:
-        torch.cuda.empty_cache()
-        runner = build_kernel_runner(
-            kernel_name,
-            v2_cfg=v2_cfg,
-            scanprep_cfg=scanprep_cfg,
-            mixer_tail_cfg=mixer_tail_cfg,
-            ffn_cfg=ffn_cfg,
-        )
-        bench = _benchmark_kernel(
-            runner,
-            device=device,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            repeat=args.repeat,
-        )
-        ncu_output = NCU_REPORT.run_ncu_sections(
-            # One NCU invocation per kernel keeps the parser compact and avoids
-            # the multi-kernel wall of output the user wants to avoid.
-            NCU_SECTIONS,
-            Path(__file__).resolve(),
-            _kernel_cli_args(args, runner.name),
-            ncu=args.ncu,
-            python=args.python,
-        )
-        ncu_summary = NCU_REPORT.parse_ncu_summary(ncu_output)
-        bench_ms = float(cast(float, bench["mean_ms"]))
-        bench_gbs = _bench_gbs(runner.effective_bytes, bench_ms)
-        label = runner.name if runner.note is None else f"{runner.name} ({runner.note})"
-        print(
-            f"- {label}: {bench_ms:.4f} ms, bench {bench_gbs:.1f} GB/s; "
-            f"NCU DRAM {_format_pct(ncu_summary['dram_pct'])} "
-            f"({_format_gbs(ncu_summary['dram_total_gbs'])}), "
-            f"occ {_format_pct(ncu_summary['achieved_occupancy'])}, "
-            f"no-eligible {_format_pct(ncu_summary['no_eligible'])}, "
-            f"bank conflicts {_format_bank(ncu_summary['bank_conflicts'])}, "
-            f"regs/thread {_format_regs(ncu_summary['registers_per_thread'])}, "
-            f"smem {_format_kib(ncu_summary['smem_total_kib'])} "
-            f"(dyn {_format_kib(ncu_summary['smem_dynamic_kib'])}, "
-            f"static {_format_kib(ncu_summary['smem_static_kib'])}, "
-            f"driver {_format_kib(ncu_summary['smem_driver_kib'])})."
-        )
-        rows.append(
-            {
-                "kernel": runner.name,
-                "label": label,
-                "note": runner.note,
-                "effective_bytes": int(runner.effective_bytes),
-                "bench": bench,
-                "bench_gbs": bench_gbs,
-                "ncu": ncu_summary,
-            }
-        )
-        del runner
-        torch.cuda.empty_cache()
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    if args.nsys_output_dir is None and args.hot_launch_timing != "never":
+        temp_dir = tempfile.TemporaryDirectory(prefix="slinoss-nsys-")
+    try:
+        for kernel_name in requested:
+            torch.cuda.empty_cache()
+            runner = build_kernel_runner(
+                kernel_name,
+                v2_cfg=v2_cfg,
+                scanprep_cfg=scanprep_cfg,
+                mixer_tail_cfg=mixer_tail_cfg,
+                ffn_cfg=ffn_cfg,
+            )
+            bench = _benchmark_kernel(
+                runner,
+                device=device,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeat=args.repeat,
+            )
+            ncu_output = NCU_REPORT.run_ncu_sections(
+                # One NCU invocation per kernel keeps the parser compact and avoids
+                # the multi-kernel wall of output the user wants to avoid.
+                NCU_SECTIONS,
+                Path(__file__).resolve(),
+                _kernel_cli_args(args, runner.name),
+                ncu=args.ncu,
+                python=args.python,
+            )
+            ncu_launches = cast(
+                list[dict[str, object]],
+                NCU_REPORT.parse_ncu_launch_summaries(ncu_output),
+            )
+            hot_launches: list[dict[str, object]] = []
+            if _hot_launch_timing_requested(args.hot_launch_timing, ncu_launches):
+                hot_launches = cast(
+                    list[dict[str, object]],
+                    NSYS_REPORT.run_nsys_cuda_gpu_trace(
+                        Path(__file__).resolve(),
+                        _kernel_cli_args(args, runner.name),
+                        nsys=args.nsys,
+                        python=args.python,
+                        output_base=_timing_output_base(
+                            args=args,
+                            kernel_name=runner.name,
+                            temp_dir=temp_dir,
+                        ),
+                    ),
+                )
+            representative_launch = _representative_launch(ncu_launches)
+            ncu_summary = (
+                representative_launch
+                if representative_launch is not None
+                else cast(dict[str, object], NCU_REPORT.parse_ncu_summary(ncu_output))
+            )
+            bench_ms = float(cast(float, bench["mean_ms"]))
+            bench_gbs = _bench_gbs(runner.effective_bytes, bench_ms)
+            normalized_hot_launches = _event_normalized_hot_launches(
+                hot_launches,
+                event_total_ms=bench_ms,
+            )
+            label = (
+                runner.name if runner.note is None else f"{runner.name} ({runner.note})"
+            )
+            if len(ncu_launches) <= 1:
+                print(
+                    f"- {label}: {bench_ms:.4f} ms CUDA-event hot path, "
+                    f"bench {bench_gbs:.1f} GB/s; "
+                    f"{_format_ncu_counter_suffix(ncu_summary)}"
+                )
+            else:
+                hot_total = _hot_total_ms(hot_launches)
+                hot_suffix = (
+                    f"; NSYS trace launch-sum {_format_ms(hot_total)}, "
+                    "split normalized to CUDA-event total"
+                    if hot_launches
+                    else ""
+                )
+                print(
+                    f"- {label}: {bench_ms:.4f} ms CUDA-event hot path, "
+                    f"bench {bench_gbs:.1f} GB/s; "
+                    f"CUDA launches {len(ncu_launches)}{hot_suffix}; "
+                    "NCU counters below use profiled replay, not hot timing."
+                )
+                for launch in ncu_launches:
+                    launch_index = int(cast(int, launch["launch_index"]))
+                    launch_label = str(launch["kernel_label"])
+                    ncu_duration_ms = _summary_float(launch, "duration_ms")
+                    hot_launch = _launch_by_index(
+                        normalized_hot_launches,
+                        launch_index,
+                    )
+                    hot_duration = None
+                    event_estimate = None
+                    event_fraction = None
+                    if hot_launch is not None:
+                        hot_duration = _hot_duration_ms(hot_launch)
+                        event_estimate = _summary_float(
+                            hot_launch,
+                            "event_estimate_ms",
+                        )
+                        event_fraction = _summary_float(
+                            hot_launch,
+                            "event_fraction",
+                        )
+                    fraction_text = (
+                        "N/A"
+                        if event_fraction is None
+                        else f"{event_fraction * 100.0:.1f}%"
+                    )
+                    print(
+                        f"  - launch[{launch_index}] {launch_label}: "
+                        f"event-est {_format_ms(event_estimate)} ({fraction_text}), "
+                        f"NSYS trace {_format_ms(hot_duration)}, "
+                        f"NCU replay {_format_ms(ncu_duration_ms)}; "
+                        f"{_format_ncu_counter_suffix(launch)}"
+                    )
+            rows.append(
+                {
+                    "kernel": runner.name,
+                    "label": label,
+                    "note": runner.note,
+                    "effective_bytes": int(runner.effective_bytes),
+                    "bench": bench,
+                    "bench_gbs": bench_gbs,
+                    "ncu": ncu_summary,
+                    "ncu_launches": ncu_launches,
+                    "hot_launches": normalized_hot_launches,
+                    "hot_launch_total_ms": _hot_total_ms(hot_launches),
+                }
+            )
+            del runner
+            torch.cuda.empty_cache()
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
     if args.json_out is not None:
         payload = {

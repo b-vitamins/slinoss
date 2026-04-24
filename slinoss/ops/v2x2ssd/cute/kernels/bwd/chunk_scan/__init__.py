@@ -14,7 +14,6 @@ from ...fwd.common import _make_fake_tensor_arg
 
 from .db import ChunkScanBwdDBAmpere
 from .dcdr import ChunkScanBwdDCDRAmpere
-from .dlp import ChunkScanBwdDLPAmpere
 from .du import ChunkScanBwdDUAmpere
 from .dz0 import ChunkScanBwdDZ0Ampere
 from .param_scan import ChunkScanBwdParamScanAmpere
@@ -32,7 +31,6 @@ class ChunkScanBwdCompiledKernels:
     du: object
     db: object
     dcdr: object
-    dlp: object
     param_scan: object
 
 
@@ -42,7 +40,6 @@ class ChunkScanBwdStageLaunchers:
     du: Callable[[], None]
     db: Callable[[], None]
     dcdr: Callable[[], None]
-    dlp: Callable[[], None]
     param_scan: Callable[[], None]
 
 
@@ -385,38 +382,6 @@ def _validate_dcdr_support(
     device_label = _chunk_scan_device_label(device_index)
     raise ValueError(
         f"No supported chunk_scan backward dcdr kernel fits {device_label} for "
-        f"(chunk_size={chunk_size}, D={D}, P={P}, num_threads={num_threads}). "
-        f"The current low-SMEM variant needs {info.required_smem_bytes}B > "
-        f"{info.smem_capacity_bytes}B shared memory."
-    )
-
-
-def _validate_dlp_support(
-    *,
-    tc_dtype: torch.dtype,
-    chunk_size: int,
-    D: int,
-    P: int,
-    num_threads: int,
-    device_index: int,
-) -> None:
-    kernel = ChunkScanBwdDLPAmpere(
-        _torch_to_cutlass_dtype(tc_dtype),
-        chunk_size=chunk_size,
-        D=D,
-        P=P,
-        num_threads=num_threads,
-    )
-    info = kernel.support_info(
-        _torch_to_cutlass_dtype(tc_dtype),
-        device_index=device_index,
-    )
-    if info.supported:
-        return
-
-    device_label = _chunk_scan_device_label(device_index)
-    raise ValueError(
-        f"No supported chunk_scan backward dlp kernel fits {device_label} for "
         f"(chunk_size={chunk_size}, D={D}, P={P}, num_threads={num_threads}). "
         f"The current low-SMEM variant needs {info.required_smem_bytes}B > "
         f"{info.smem_capacity_bytes}B shared memory."
@@ -992,13 +957,9 @@ def _materialize_public_output(
 
 
 def _resolve_dz0_cta_tiler(*, D: int) -> tuple[int, int, int]:
-    # The 96-wide D tile is fine when it covers the state width cleanly, but
-    # mixed full+tail tiling perturbs the current dz0 epilogue on realistic
-    # D=2N mixer shapes. Use the same tail-safe family selection as the forward
-    # chunk-increment path.
-    if D <= 96 or D % 96 == 0:
-        return (64, 96, 32)
-    return (64, 128, 32)
+    # Keep the D tile small enough that the aliased fp32 output tile does not
+    # dominate dynamic shared memory. Output predication handles non-multiples.
+    return (64, 64, 32)
 
 
 def _compiled_key(
@@ -1333,71 +1294,6 @@ def _make_dcdr_host_wrapper(
     return _dcdr_host_wrapper
 
 
-def _make_dlp_host_wrapper(
-    *,
-    spec: tuple[tuple[int, ...], ...],
-    cfg: tuple[int, ...],
-    cutlass_dtype,
-):
-    chunk_size, D, P, num_threads, heads, bc_groups = cfg
-    (
-        u_spec,
-        b_spec,
-        c_spec,
-        m_spec,
-        k_spec,
-        d_out_spec,
-        u_prev0_spec,
-        b_prev0_spec,
-        d_logprefix_spec,
-    ) = spec
-
-    @cute.jit
-    def _dlp_host_wrapper(
-        U_ptr: cute.Tensor,
-        B_ptr: cute.Tensor,
-        C_ptr: cute.Tensor,
-        M_ptr: cute.Tensor,
-        K_ptr: cute.Tensor,
-        DOut_ptr: cute.Tensor,
-        UPrev0_ptr: cute.Tensor,
-        BPrev0_ptr: cute.Tensor,
-        DLogPrefix_ptr: cute.Tensor,
-    ):
-        mU = _make_tensor_from_spec(U_ptr, u_spec)
-        mB = _make_tensor_from_spec(B_ptr, b_spec)
-        mC = _make_tensor_from_spec(C_ptr, c_spec)
-        mM = _make_tensor_from_spec(M_ptr, m_spec)
-        mK = _make_tensor_from_spec(K_ptr, k_spec)
-        mDOut = _make_tensor_from_spec(DOut_ptr, d_out_spec)
-        mUPrev0 = _make_tensor_from_spec(UPrev0_ptr, u_prev0_spec)
-        mBPrev0 = _make_tensor_from_spec(BPrev0_ptr, b_prev0_spec)
-        mDLogPrefix = _make_tensor_from_spec(DLogPrefix_ptr, d_logprefix_spec)
-
-        kernel = ChunkScanBwdDLPAmpere(
-            cutlass_dtype,
-            chunk_size=chunk_size,
-            D=D,
-            P=P,
-            num_threads=num_threads,
-            heads=heads,
-            bc_groups=bc_groups,
-        )
-        kernel(
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mUPrev0,
-            mBPrev0,
-            mDLogPrefix,
-        )
-
-    return _dlp_host_wrapper
-
-
 def _make_param_host_wrapper(
     *,
     spec: tuple[tuple[int, ...], ...],
@@ -1498,8 +1394,7 @@ def compile_chunk_scan_bwd_kernels(
             f"={(Bsz, H, n_chunks, P, D)}. Got {tuple(chunk_starts.shape)}."
         )
     if num_threads_dcdr != 128:
-        raise ValueError("num_threads_dcdr must be 128 for dcdr/dlp kernels.")
-    num_threads_dlp = num_threads_dcdr
+        raise ValueError("num_threads_dcdr must be 128 for dcdr kernels.")
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     device_index = (
@@ -1518,14 +1413,6 @@ def compile_chunk_scan_bwd_kernels(
         D=D,
         P=P,
         num_threads=num_threads_dcdr,
-        device_index=int(device_index),
-    )
-    _validate_dlp_support(
-        tc_dtype=tc_dtype,
-        chunk_size=L,
-        D=D,
-        P=P,
-        num_threads=num_threads_dlp,
         device_index=int(device_index),
     )
     _validate_db_support(
@@ -1664,18 +1551,6 @@ def compile_chunk_scan_bwd_kernels(
         d_r=d_r,
     )
     dcdr_runtime_args = dcdr_runtime_artifacts.runtime_args
-    dlp_runtime_args = (
-        U_blk,
-        B_blk,
-        C_blk,
-        M_blk,
-        K_blk,
-        dOut_blk,
-        U_prev0_flat,
-        B_prev0_flat,
-        d_logprefix,
-    )
-    dlp_tensor_specs = _make_tensor_specs_from_tensors(*dlp_runtime_args)
     param_scan_runtime_args = param_scan_runtime_artifacts.runtime_args_for(
         M_blk, K_blk
     )
@@ -1683,14 +1558,12 @@ def compile_chunk_scan_bwd_kernels(
     du_alignments = du_runtime_artifacts.alignments
     db_alignments = db_runtime_artifacts.alignments
     dcdr_alignments = dcdr_runtime_artifacts.alignments
-    dlp_alignments = tuple(_assumed_align(tensor) for tensor in dlp_runtime_args)
     param_scan_alignments = param_scan_runtime_artifacts.alignments_for(M_blk, K_blk)
     alignments = (
         dz0_alignments
         + du_alignments
         + db_alignments
         + dcdr_alignments
-        + dlp_alignments
         + param_scan_alignments
     )
     keepalive = (
@@ -1762,18 +1635,12 @@ def compile_chunk_scan_bwd_kernels(
             kernel_cfg=(L, D, P, num_threads_dcdr, H, G),
             cutlass_dtype=cutlass_dtype,
         )
-        dlp_wrapper = _make_dlp_host_wrapper(
-            spec=dlp_tensor_specs,
-            cfg=(L, D, P, num_threads_dlp, H, G),
-            cutlass_dtype=cutlass_dtype,
-        )
         param_scan_wrapper = _make_param_host_wrapper(
             spec=param_scan_runtime_artifacts.tensor_specs_for(M_blk, K_blk),
             cfg=(L, num_threads_param),
         )
         dz0_compile_args = _make_compile_args(dz0_runtime_args, dz0_alignments)
         du_compile_args = _make_compile_args(du_runtime_args, du_alignments)
-        dlp_compile_args = _make_compile_args(dlp_runtime_args, dlp_alignments)
         param_scan_compile_args = param_scan_runtime_artifacts.compile_args_for(
             M_blk, K_blk
         )
@@ -1796,11 +1663,6 @@ def compile_chunk_scan_bwd_kernels(
             dcdr=cute.compile(
                 dcdr_wrapper,
                 *dcdr_runtime_artifacts.compile_args,
-                options="--enable-tvm-ffi",
-            ),
-            dlp=cute.compile(
-                dlp_wrapper,
-                *dlp_compile_args,
                 options="--enable-tvm-ffi",
             ),
             param_scan=cute.compile(
@@ -1827,10 +1689,6 @@ def compile_chunk_scan_bwd_kernels(
         _ = keepalive
         compiled_kernels.dcdr(*dcdr_runtime_args)
 
-    def _launch_dlp() -> None:
-        _ = keepalive
-        compiled_kernels.dlp(*dlp_runtime_args)
-
     def _launch_param_scan() -> None:
         _ = keepalive
         compiled_kernels.param_scan(*param_scan_runtime_args)
@@ -1840,11 +1698,10 @@ def compile_chunk_scan_bwd_kernels(
         _launch_du()
         _launch_db()
         _launch_dcdr()
-        _launch_dlp()
         _launch_param_scan()
         _record_tensors_on_current_stream(
             *(dz0_runtime_args + du_runtime_args + db_runtime_args),
-            *(dcdr_runtime_args + dlp_runtime_args + param_scan_runtime_args),
+            *(dcdr_runtime_args + param_scan_runtime_args),
         )
 
     outputs = ChunkScanBwdOutputs(
@@ -1874,7 +1731,6 @@ def compile_chunk_scan_bwd_kernels(
         du=_launch_du,
         db=_launch_db,
         dcdr=_launch_dcdr,
-        dlp=_launch_dlp,
         param_scan=_launch_param_scan,
     )
     return PreparedChunkScanBwdLaunch(

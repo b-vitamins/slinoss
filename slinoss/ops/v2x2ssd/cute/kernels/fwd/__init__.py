@@ -1436,11 +1436,9 @@ def _fwd_host_cache_key(
 
 
 def _resolve_chunk_increment_cta_tiler(*, D: int) -> tuple[int, int, int]:
-    # The 96-wide N tile is efficient when it covers the full state width, but
-    # mixed full+tail tiling can perturb the current epilogue path on realistic
-    # D=2N mixer shapes. Pick a tail-safe family instead of changing semantics.
-    if D <= 96 or D % 96 == 0:
-        return (64, 96, 32)
+    # The 64-wide N family keeps the epilogue on the same accumulator-coordinate
+    # path for full and tail D tiles, avoiding the bank-heavy shared f32 output
+    # staging needed by the older 96-wide family.
     return (64, 64, 32)
 
 

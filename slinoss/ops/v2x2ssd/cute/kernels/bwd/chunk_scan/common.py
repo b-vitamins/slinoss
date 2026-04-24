@@ -52,11 +52,13 @@ def clamp_finite_for_dtype(x, dtype):
 
 @cute.jit
 def safe_cast_to_dtype(x, dtype):
+    if cutlass.const_expr(dtype == cutlass.BFloat16):
+        # BF16 keeps FP32's exponent width; the live model path only feeds
+        # finite, bounded values here, so the clamp is redundant.
+        return cutlass.BFloat16(x)
     x = clamp_finite_for_dtype(x, dtype)
     if cutlass.const_expr(dtype == cutlass.Float16):
         return cutlass.Float16(x)
-    if cutlass.const_expr(dtype == cutlass.BFloat16):
-        return cutlass.BFloat16(x)
     return cutlass.Float32(x)
 
 

@@ -106,6 +106,11 @@ class ChunkIncrementFwdAmpere:
             # A single K tile has no steady-state pipeline to overlap, so one
             # shared-memory stage is sufficient and removes a dead A/B slab.
             self.num_stages = 1
+        elif self.L == 2 * self.bK and self.bN == 64:
+            # The direct-epilogue hot path has exactly two K tiles, so a third
+            # A/B slab only raises shared-memory pressure without feeding a
+            # deeper steady-state pipeline.
+            self.num_stages = min(self.num_stages, 2)
         elif self.num_stages < 2:
             raise ValueError("num_stages must be >= 2 for multi-tile kernels")
 
@@ -141,6 +146,9 @@ class ChunkIncrementFwdAmpere:
     def _warp_transition_layout(self):
         return cute.make_layout((max(1, self.scan_threads // 32), 2), stride=(2, 1))
 
+    def _use_direct_increment_epilogue(self) -> bool:
+        return self.bN == 64
+
     def _smem_capacity_bytes(self, device_index: int | None = None) -> int:
         if torch.cuda.is_available():
             if device_index is None:
@@ -173,7 +181,6 @@ class ChunkIncrementFwdAmpere:
         fields = [
             (self.bM * self.bK * self.num_stages * in_bytes, 16),
             (self.bN * self.bK * self.num_stages * in_bytes, 16),
-            (self.bM * self.bN * 4, 16),
             (self.L * 2 * 4, 4),
             (self.L * 2 * 4, 4),
             (self.bM * 4, 4),
@@ -181,6 +188,8 @@ class ChunkIncrementFwdAmpere:
             (warp_count * 2 * 4, 8),
             (warp_count * 2 * 4, 8),
         ]
+        if not self._use_direct_increment_epilogue():
+            fields.insert(2, (self.bM * self.bN * 4, 16))
         return self._struct_size_bytes(fields)
 
     def support_info(
@@ -455,50 +464,109 @@ class ChunkIncrementFwdAmpere:
         boundary_key_layout = self._boundary_key_smem_layout()
         warp_transition_layout = self._warp_transition_layout()
 
-        @cute.struct
-        class SharedStorage:
-            u_tile: cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.u_tile_layout)], 16
-            ]
-            b_tile: cute.struct.Align[
-                cute.struct.MemRange[in_dtype, cute.cosize(layouts.b_tile_layout)], 16
-            ]
-            increment_tile: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(layouts.increment_tile_layout)
-                ],
-                16,
-            ]
-            suffix_coeff_prev: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(suffix_coeff_layout)],
-                4,
-            ]
-            suffix_coeff_curr: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(suffix_coeff_layout)],
-                4,
-            ]
-            boundary_value: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(boundary_value_layout)
-                ],
-                4,
-            ]
-            boundary_key: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(boundary_key_layout)],
-                4,
-            ]
-            warp_transition_total: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(warp_transition_layout)
-                ],
-                8,
-            ]
-            warp_transition_offset: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(warp_transition_layout)
-                ],
-                8,
-            ]
+        if self._use_direct_increment_epilogue():
+
+            @cute.struct
+            class SharedStorage:
+                u_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.u_tile_layout)],
+                    16,
+                ]
+                b_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.b_tile_layout)],
+                    16,
+                ]
+                suffix_coeff_prev: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(suffix_coeff_layout)
+                    ],
+                    4,
+                ]
+                suffix_coeff_curr: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(suffix_coeff_layout)
+                    ],
+                    4,
+                ]
+                boundary_value: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(boundary_value_layout)
+                    ],
+                    4,
+                ]
+                boundary_key: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(boundary_key_layout)
+                    ],
+                    4,
+                ]
+                warp_transition_total: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(warp_transition_layout)
+                    ],
+                    8,
+                ]
+                warp_transition_offset: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(warp_transition_layout)
+                    ],
+                    8,
+                ]
+
+        else:
+
+            @cute.struct
+            class SharedStorage:
+                u_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.u_tile_layout)],
+                    16,
+                ]
+                b_tile: cute.struct.Align[
+                    cute.struct.MemRange[in_dtype, cute.cosize(layouts.b_tile_layout)],
+                    16,
+                ]
+                increment_tile: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(layouts.increment_tile_layout)
+                    ],
+                    16,
+                ]
+                suffix_coeff_prev: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(suffix_coeff_layout)
+                    ],
+                    4,
+                ]
+                suffix_coeff_curr: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(suffix_coeff_layout)
+                    ],
+                    4,
+                ]
+                boundary_value: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(boundary_value_layout)
+                    ],
+                    4,
+                ]
+                boundary_key: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(boundary_key_layout)
+                    ],
+                    4,
+                ]
+                warp_transition_total: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(warp_transition_layout)
+                    ],
+                    8,
+                ]
+                warp_transition_offset: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32, cute.cosize(warp_transition_layout)
+                    ],
+                    8,
+                ]
 
         return SharedStorage
 
@@ -795,7 +863,8 @@ class ChunkIncrementFwdAmpere:
         storage = smem.allocate(shared_storage_cls)
         s_u_tile = storage.u_tile.get_tensor(u_tile_layout)
         s_b_tile = storage.b_tile.get_tensor(b_tile_layout)
-        s_increment_tile = storage.increment_tile.get_tensor(increment_tile_layout)
+        if cutlass.const_expr(not self._use_direct_increment_epilogue()):
+            s_increment_tile = storage.increment_tile.get_tensor(increment_tile_layout)
         suffix_coeff_layout = self._suffix_coeff_layout()
         warp_transition_layout = self._warp_transition_layout()
         s_suffix_coeff_prev = storage.suffix_coeff_prev.get_tensor(suffix_coeff_layout)
@@ -815,17 +884,20 @@ class ChunkIncrementFwdAmpere:
 
         copy_slice_u = gmem_tiled_copy_u.get_slice(tidx)
         copy_slice_b = gmem_tiled_copy_b.get_slice(tidx)
-        copy_slice_increment = gmem_tiled_copy_increment.get_slice(tidx)
+        if cutlass.const_expr(not self._use_direct_increment_epilogue()):
+            copy_slice_increment = gmem_tiled_copy_increment.get_slice(tidx)
 
         t_u_copy_dst = copy_slice_u.partition_D(s_u_tile)
         t_b_copy_dst = copy_slice_b.partition_D(s_b_tile)
-        t_increment_store_smem = copy_slice_increment.partition_S(s_increment_tile)
-        t_increment_store_gmem = copy_slice_increment.partition_D(g_increment)
+        if cutlass.const_expr(not self._use_direct_increment_epilogue()):
+            t_increment_store_smem = copy_slice_increment.partition_S(s_increment_tile)
+            t_increment_store_gmem = copy_slice_increment.partition_D(g_increment)
 
         mma_slice = tiled_mma.get_slice(tidx)
         t_u_mma_smem = mma_slice.partition_A(s_u_tile)
         t_b_mma_smem = mma_slice.partition_B(s_b_tile)
-        t_increment_mma_smem = mma_slice.partition_C(s_increment_tile)
+        if cutlass.const_expr(not self._use_direct_increment_epilogue()):
+            t_increment_mma_smem = mma_slice.partition_C(s_increment_tile)
         t_increment_mma_gmem = mma_slice.partition_C(g_increment)
 
         r_u_mma = tiled_mma.make_fragment_A(t_u_mma_smem[None, None, None, 0])
@@ -1309,8 +1381,9 @@ class ChunkIncrementFwdAmpere:
             coord=tiler_coord,
             proj=(1, 1, None),
         )
-        if cutlass.const_expr(num_smem_stages == 1):
-            # Direct-store epilogue for the single-stage specialization.
+        if cutlass.const_expr(self._use_direct_increment_epilogue()):
+            # The 64-wide N family has a stable accumulator-coordinate mapping,
+            # so avoid staging the full fp32 output tile through shared memory.
             t_increment_coord = mma_slice.partition_C(increment_coord_tile)
             t_increment_coord_mn = self._make_accumulator_mn_view(t_increment_coord)
             r_increment_accum_mn = self._make_accumulator_mn_view(r_increment_accum)
