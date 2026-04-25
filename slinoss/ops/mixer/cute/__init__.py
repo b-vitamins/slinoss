@@ -5,7 +5,8 @@ This package owns the fused rowwise stage that surrounds the output projection:
 - forward: skip/add + SiLU gate + RMSNorm
 - backward: rowwise gradients for scan output, gate, skip, and norm weight
 
-Ahead-of-time export/load helpers live under :mod:`slinoss.ops.mixer.cute.aot`.
+Ahead-of-time export/load helpers are available under
+:mod:`slinoss.ops.mixer.cute.aot`.
 """
 
 from . import aot

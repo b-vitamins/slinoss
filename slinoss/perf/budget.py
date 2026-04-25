@@ -64,16 +64,6 @@ def derive_training_budget(sample: dict[str, float]) -> dict[str, float]:
     def _sum(*labels: str) -> float:
         return sum(sample.get(label, 0.0) for label in labels)
 
-    def _has_v2_stage_breakdown(direction: str) -> bool:
-        return any(
-            label in sample
-            for label in (
-                f"{direction}.v2x2ssd.chunk_increment.total",
-                f"{direction}.v2x2ssd.state_passing.total",
-                f"{direction}.v2x2ssd.chunk_scan.total",
-            )
-        )
-
     def _scanprep_total(direction: str) -> float:
         return sample.get(
             f"{direction}.mixer.scanprep.total",
@@ -232,92 +222,6 @@ def derive_training_budget(sample: dict[str, float]) -> dict[str, float]:
         + out["backward.ffn.total"]
         + out["backward.residual.total"]
         + out["backward.head.total"]
-    )
-
-    forward_v2_stage_breakdown = _has_v2_stage_breakdown("forward")
-    out["forward.v2x2ssd.chunk_increment.total"] = sample.get(
-        "forward.v2x2ssd.chunk_increment.total",
-        0.0,
-    )
-    out["forward.v2x2ssd.state_passing.total"] = sample.get(
-        "forward.v2x2ssd.state_passing.total",
-        0.0,
-    )
-    out["forward.v2x2ssd.chunk_scan.total"] = sample.get(
-        "forward.v2x2ssd.chunk_scan.total",
-        0.0,
-    )
-    out["forward.v2x2ssd.stage_sum"] = (
-        out["forward.v2x2ssd.chunk_increment.total"]
-        + out["forward.v2x2ssd.state_passing.total"]
-        + out["forward.v2x2ssd.chunk_scan.total"]
-    )
-    out["forward.v2x2ssd.overhead"] = (
-        out["forward.v2x2ssd.total"] - out["forward.v2x2ssd.stage_sum"]
-        if forward_v2_stage_breakdown
-        else 0.0
-    )
-    out["forward.v2x2ssd.stage_breakdown_available"] = (
-        1.0 if forward_v2_stage_breakdown else 0.0
-    )
-
-    backward_v2_stage_breakdown = _has_v2_stage_breakdown("backward")
-    out["backward.v2x2ssd.chunk_increment.total"] = sample.get(
-        "backward.v2x2ssd.chunk_increment.total",
-        0.0,
-    )
-    out["backward.v2x2ssd.state_passing.total"] = sample.get(
-        "backward.v2x2ssd.state_passing.total",
-        0.0,
-    )
-    out["backward.v2x2ssd.chunk_scan.total"] = sample.get(
-        "backward.v2x2ssd.chunk_scan.total",
-        0.0,
-    )
-    out["backward.v2x2ssd.stage_sum"] = (
-        out["backward.v2x2ssd.chunk_increment.total"]
-        + out["backward.v2x2ssd.state_passing.total"]
-        + out["backward.v2x2ssd.chunk_scan.total"]
-    )
-    out["backward.v2x2ssd.overhead"] = (
-        out["backward.v2x2ssd.total"] - out["backward.v2x2ssd.stage_sum"]
-        if backward_v2_stage_breakdown
-        else 0.0
-    )
-    out["backward.v2x2ssd.stage_breakdown_available"] = (
-        1.0 if backward_v2_stage_breakdown else 0.0
-    )
-
-    out["backward.v2x2ssd.chunk_increment.kernel_sum"] = _sum(
-        "backward.v2x2ssd.chunk_increment.db",
-        "backward.v2x2ssd.chunk_increment.du",
-        "backward.v2x2ssd.chunk_increment.boundary",
-        "backward.v2x2ssd.chunk_increment.param_scan",
-    )
-    out["backward.v2x2ssd.chunk_increment.overhead"] = (
-        out["backward.v2x2ssd.chunk_increment.total"]
-        - out["backward.v2x2ssd.chunk_increment.kernel_sum"]
-    )
-    out["backward.v2x2ssd.state_passing.kernel_sum"] = _sum(
-        "backward.v2x2ssd.state_passing.kernel",
-    )
-    out["backward.v2x2ssd.state_passing.overhead"] = (
-        out["backward.v2x2ssd.state_passing.total"]
-        - out["backward.v2x2ssd.state_passing.kernel_sum"]
-    )
-    out["backward.v2x2ssd.chunk_scan.dcdr"] = sample.get(
-        "backward.v2x2ssd.chunk_scan.dcdr", 0.0
-    )
-    out["backward.v2x2ssd.chunk_scan.kernel_sum"] = _sum(
-        "backward.v2x2ssd.chunk_scan.dz0",
-        "backward.v2x2ssd.chunk_scan.du",
-        "backward.v2x2ssd.chunk_scan.db",
-        "backward.v2x2ssd.chunk_scan.dcdr",
-        "backward.v2x2ssd.chunk_scan.param_scan",
-    )
-    out["backward.v2x2ssd.chunk_scan.overhead"] = (
-        out["backward.v2x2ssd.chunk_scan.total"]
-        - out["backward.v2x2ssd.chunk_scan.kernel_sum"]
     )
 
     return out

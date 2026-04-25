@@ -8,7 +8,7 @@ from torch import nn
 
 from slinoss.ops.mixer import mixer_tail, split_mixer_projection
 from slinoss.ops.mixer.step import (
-    MixerCudaGraphStepEngine as _MixerCudaGraphStepEngine,
+    MixerCudaGraphStepEngine,
     ensure_fast_decode_state_layout,
     make_decode_state_tensor,
     run_inplace_decode_step,
@@ -388,13 +388,13 @@ class SLinOSSMixer(nn.Module):
                 )
                 engine = next_state._engine
                 if (
-                    not isinstance(engine, _MixerCudaGraphStepEngine)
+                    not isinstance(engine, MixerCudaGraphStepEngine)
                     or engine.mixer is not self
                     or engine.batch_size != batch_size
                     or engine.device != token.device
                     or engine.dtype != token.dtype
                 ):
-                    engine = _MixerCudaGraphStepEngine(
+                    engine = MixerCudaGraphStepEngine(
                         self,
                         next_state,
                         batch_size=batch_size,

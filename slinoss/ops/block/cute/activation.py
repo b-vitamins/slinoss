@@ -19,13 +19,13 @@ from .common import (
     _launchable,
     _make_compile_args,
     _raise_cold_capture_error,
-    _record_tensors_on_current_stream,
     _runtime_alignments,
     _runtime_signature_key,
     _size,
     contiguous_tensor,
     gelu_tanh,
     gelu_tanh_grad,
+    launch_tvm_ffi_on_current_stream,
     safe_cast_to_dtype,
     silu,
     silu_grad,
@@ -76,7 +76,7 @@ def _grid_shape(*, total_rows: int, warps_per_block: int) -> tuple[int, int, int
 
 
 class FfnActivationFwdFused:
-    """Host wrapper for the live FFN activation forward kernel."""
+    """Host wrapper for the FFN activation forward kernel."""
 
     def __init__(
         self,
@@ -151,7 +151,7 @@ class FfnActivationFwdFused:
 
 
 class FfnActivationBwdFused:
-    """Host wrapper for the live FFN activation backward kernel."""
+    """Host wrapper for the FFN activation backward kernel."""
 
     def __init__(
         self,
@@ -462,8 +462,10 @@ def _ffn_activation_fwd_cute_prevalidated(
         compile_artifacts,
         device=projected.device,
     )
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
-    cast(Callable[..., None], compiled)(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(
+        cast(Callable[..., None], compiled),
+        *runtime_artifacts.runtime_args,
+    )
     return runtime_artifacts.output
 
 
@@ -484,8 +486,10 @@ def _ffn_activation_bwd_cute_prevalidated(
         compile_artifacts,
         device=projected.device,
     )
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
-    cast(Callable[..., None], compiled)(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(
+        cast(Callable[..., None], compiled),
+        *runtime_artifacts.runtime_args,
+    )
     return runtime_artifacts.output
 
 

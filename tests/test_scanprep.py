@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import pytest
 import torch
 
+import slinoss.ops._cute_common as cute_common_mod
 from slinoss.layers import (
     AutoScanPrepBackend,
     CuteScanPrepBackend,
@@ -218,11 +219,11 @@ def test_scanprep_fake_tensor_arg_prefers_compact_for_row_major(
         return ("tensor", args, kwargs)
 
     monkeypatch.setattr(
-        scanprep_fwd_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
+        cute_common_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
     )
-    monkeypatch.setattr(scanprep_fwd_mod.cute.runtime, "make_fake_tensor", fake_tensor)
+    monkeypatch.setattr(cute_common_mod.cute.runtime, "make_fake_tensor", fake_tensor)
 
-    result = scanprep_fwd_mod.make_fake_tensor_arg(tensor)
+    result = cute_common_mod.make_fake_tensor_arg(tensor)
 
     assert calls == ["compact"]
     assert result[0] == "compact"
@@ -243,11 +244,11 @@ def test_scanprep_fake_tensor_arg_falls_back_for_noncompact_layout(
         return ("tensor", args, kwargs)
 
     monkeypatch.setattr(
-        scanprep_bwd_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
+        cute_common_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
     )
-    monkeypatch.setattr(scanprep_bwd_mod.cute.runtime, "make_fake_tensor", fake_tensor)
+    monkeypatch.setattr(cute_common_mod.cute.runtime, "make_fake_tensor", fake_tensor)
 
-    result = scanprep_bwd_mod.make_fake_tensor_arg(
+    result = cute_common_mod.make_fake_tensor_arg(
         tensor,
         shape=(2, 3, 4),
         stride=(12, 1, 3),

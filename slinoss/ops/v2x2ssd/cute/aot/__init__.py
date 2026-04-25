@@ -4,7 +4,6 @@ This module keeps the packaged TVM-FFI surface explicit and separate from the
 eager/JIT runtime path:
 
 - compile/export helpers for combined forward and backward wrappers
-- compile/export helpers for the public forward stages
 - packaged-artifact discovery and load helpers for release-built modules
 - a small TVM-FFI export/load wrapper around CuTe runtime APIs
 
@@ -34,7 +33,6 @@ import cutlass.cute as cute
 
 from slinoss._cute_runtime import ensure_cute_runtime_env
 from slinoss.ops.v2x2ssd.cute.tuning.types import (
-    ChunkIncrementConfig,
     ChunkScanConfig,
     ForwardConfigBundle,
     StatePassingConfig,
@@ -51,7 +49,6 @@ _PACKAGED_AOT_RUNTIME_DIR = _PACKAGED_AOT_ROOT / "runtime"
 _PACKAGED_AOT_ARTIFACT_DIR = _PACKAGED_AOT_ROOT / "artifacts"
 _PACKAGED_FORWARD_CACHE: dict[str, object] = {}
 _PACKAGED_BACKWARD_CACHE: dict[str, object] = {}
-_PACKAGED_STAGE_CACHE: dict[str, object] = {}
 BCGroupsAOTIdentity = int | None
 
 
@@ -206,85 +203,6 @@ class ExportedTVMFFIModule:
 
 
 @dataclass(frozen=True)
-class ChunkIncrementAOTSpec:
-    arch_tag: str
-    P: int
-    D: int
-    chunk_size: int
-    bc_groups: BCGroupsAOTIdentity
-    tc_dtype_name: str
-    config: ChunkIncrementConfig
-
-    @property
-    def tc_dtype(self) -> torch.dtype:
-        return _dtype_from_name(self.tc_dtype_name)
-
-    @property
-    def module_id(self) -> str:
-        return _sanitize_stem(
-            "chunk_increment"
-            f"__arch{self.arch_tag}"
-            f"__p{self.P}_d{self.D}_l{self.chunk_size}"
-            f"{_bc_groups_module_tag(self.bc_groups)}"
-            f"__tc{_dtype_tag(self.tc_dtype)}"
-            f"__cta{'x'.join(str(v) for v in self.config.cta_tiler)}"
-            f"__stg{self.config.num_stages}"
-        )
-
-
-@dataclass(frozen=True)
-class StatePassingAOTSpec:
-    arch_tag: str
-    P: int
-    D: int
-    config: StatePassingConfig
-    has_init: bool
-
-    @property
-    def module_id(self) -> str:
-        return _sanitize_stem(
-            "state_passing"
-            f"__arch{self.arch_tag}"
-            f"__p{self.P}_d{self.D}"
-            f"__thr{self.config.num_threads}"
-            f"__vec{self.config.vecs_per_thread}"
-            f"__init{_bool_tag(self.has_init)}"
-        )
-
-
-@dataclass(frozen=True)
-class ChunkScanAOTSpec:
-    arch_tag: str
-    P: int
-    D: int
-    chunk_size: int
-    bc_groups: BCGroupsAOTIdentity
-    tc_dtype_name: str
-    output_dtype_name: str
-    config: ChunkScanConfig
-
-    @property
-    def tc_dtype(self) -> torch.dtype:
-        return _dtype_from_name(self.tc_dtype_name)
-
-    @property
-    def output_dtype(self) -> torch.dtype:
-        return _dtype_from_name(self.output_dtype_name)
-
-    @property
-    def module_id(self) -> str:
-        return _sanitize_stem(
-            "chunk_scan"
-            f"__arch{self.arch_tag}"
-            f"__p{self.P}_d{self.D}_l{self.chunk_size}"
-            f"{_bc_groups_module_tag(self.bc_groups)}"
-            f"__tc{_dtype_tag(self.tc_dtype)}"
-            f"__out{_dtype_tag(self.output_dtype)}"
-            f"__cfg{self.config.m_block_size}x{self.config.n_block_size}x{self.config.num_threads}"
-        )
-
-
-@dataclass(frozen=True)
 class ForwardAOTSpec:
     arch_tag: str
     P: int
@@ -379,6 +297,7 @@ class BackwardAOTSpec:
             f"x{self.chunk_scan_config.num_threads_db}"
             f"x{self.chunk_scan_config.num_threads_dcdr}"
             f"x{self.chunk_scan_config.num_threads_param}"
+            "__dbtop2"
             f"__state"
             f"{self.state_passing_config.num_threads}"
             f"x{self.state_passing_config.pairs_per_thread}"
@@ -548,90 +467,6 @@ def _default_backward_state_passing_config() -> StatePassingBackwardConfig:
     )
 
 
-def _search_space_chunk_increment_specs(
-    *, arch_tag: str = "any"
-) -> tuple[ChunkIncrementAOTSpec, ...]:
-    from ..tuning.fwd import chunk_increment_candidate_configs
-
-    specs: list[ChunkIncrementAOTSpec] = []
-    for chunk_size in _AOT_SEARCH_CHUNK_SIZES:
-        for tc_dtype in _AOT_SEARCH_TC_DTYPES:
-            for config in chunk_increment_candidate_configs(
-                P=_AOT_SEARCH_P,
-                D=_AOT_SEARCH_D,
-                chunk_size=chunk_size,
-                tc_dtype=tc_dtype,
-            ):
-                specs.append(
-                    ChunkIncrementAOTSpec(
-                        arch_tag=arch_tag,
-                        P=_AOT_SEARCH_P,
-                        D=_AOT_SEARCH_D,
-                        chunk_size=chunk_size,
-                        bc_groups=None,
-                        tc_dtype_name=_dtype_name(tc_dtype),
-                        config=config,
-                    )
-                )
-    return tuple(specs)
-
-
-def _search_space_state_passing_specs(
-    *, arch_tag: str = "any"
-) -> tuple[StatePassingAOTSpec, ...]:
-    from ..tuning.fwd import state_passing_candidate_configs
-
-    specs: list[StatePassingAOTSpec] = []
-    for has_init in (False, True):
-        for config in state_passing_candidate_configs(
-            P=_AOT_SEARCH_P,
-            D=_AOT_SEARCH_D,
-            has_init=has_init,
-        ):
-            specs.append(
-                StatePassingAOTSpec(
-                    arch_tag=arch_tag,
-                    P=_AOT_SEARCH_P,
-                    D=_AOT_SEARCH_D,
-                    config=config,
-                    has_init=has_init,
-                )
-            )
-    return tuple(specs)
-
-
-def _search_space_chunk_scan_specs(
-    *, arch_tag: str = "any"
-) -> tuple[ChunkScanAOTSpec, ...]:
-    from ..tuning.fwd import chunk_scan_candidate_configs
-
-    specs: list[ChunkScanAOTSpec] = []
-    for chunk_size in _AOT_SEARCH_CHUNK_SIZES:
-        for tc_dtype in _AOT_SEARCH_TC_DTYPES:
-            for output_dtype in _candidate_output_dtypes(tc_dtype):
-                for config in chunk_scan_candidate_configs(
-                    P=_AOT_SEARCH_P,
-                    D=_AOT_SEARCH_D,
-                    chunk_size=chunk_size,
-                    tc_dtype=tc_dtype,
-                    output_dtype=output_dtype,
-                    device_index=None,
-                ):
-                    specs.append(
-                        ChunkScanAOTSpec(
-                            arch_tag=arch_tag,
-                            P=_AOT_SEARCH_P,
-                            D=_AOT_SEARCH_D,
-                            chunk_size=chunk_size,
-                            bc_groups=None,
-                            tc_dtype_name=_dtype_name(tc_dtype),
-                            output_dtype_name=_dtype_name(output_dtype),
-                            config=config,
-                        )
-                    )
-    return tuple(specs)
-
-
 def _search_space_forward_specs(*, arch_tag: str = "any") -> tuple[ForwardAOTSpec, ...]:
     from ..tuning.fwd import forward_bundle_candidates
 
@@ -731,41 +566,6 @@ def default_backward_aot_specs(
     )
 
 
-def _chunk_increment_spec_from_record(record: dict[str, Any]) -> ChunkIncrementAOTSpec:
-    return ChunkIncrementAOTSpec(
-        arch_tag=str(record["arch_tag"]),
-        P=int(record["P"]),
-        D=int(record["D"]),
-        chunk_size=int(record["chunk_size"]),
-        bc_groups=_bc_groups_identity_from_record(record),
-        tc_dtype_name=str(record["tc_dtype_name"]),
-        config=ChunkIncrementConfig.from_record(cast(dict[str, Any], record["config"])),
-    )
-
-
-def _state_passing_spec_from_record(record: dict[str, Any]) -> StatePassingAOTSpec:
-    return StatePassingAOTSpec(
-        arch_tag=str(record["arch_tag"]),
-        P=int(record["P"]),
-        D=int(record["D"]),
-        config=StatePassingConfig.from_record(cast(dict[str, Any], record["config"])),
-        has_init=bool(record["has_init"]),
-    )
-
-
-def _chunk_scan_spec_from_record(record: dict[str, Any]) -> ChunkScanAOTSpec:
-    return ChunkScanAOTSpec(
-        arch_tag=str(record["arch_tag"]),
-        P=int(record["P"]),
-        D=int(record["D"]),
-        chunk_size=int(record["chunk_size"]),
-        bc_groups=_bc_groups_identity_from_record(record),
-        tc_dtype_name=str(record["tc_dtype_name"]),
-        output_dtype_name=str(record["output_dtype_name"]),
-        config=ChunkScanConfig.from_record(cast(dict[str, Any], record["config"])),
-    )
-
-
 def _forward_spec_from_record(record: dict[str, Any]) -> ForwardAOTSpec:
     return ForwardAOTSpec(
         arch_tag=str(record["arch_tag"]),
@@ -808,7 +608,7 @@ def _make_masked_fake_tensor_spec_arg(
     dynamic_shape_mask: tuple[bool, ...],
     dynamic_stride_mask: tuple[bool, ...],
 ):
-    from ..kernels.fwd.common import _torch_to_cutlass_dtype
+    from slinoss.ops._cute_common import torch_to_cutlass_dtype
 
     fake_shape = tuple(
         cute.sym_int32() if is_dynamic else int(dim)
@@ -819,7 +619,7 @@ def _make_masked_fake_tensor_spec_arg(
         for step, is_dynamic in zip(stride, dynamic_stride_mask, strict=True)
     )
     return cute.runtime.make_fake_tensor(
-        _torch_to_cutlass_dtype(dtype),
+        torch_to_cutlass_dtype(dtype),
         fake_shape,
         stride=fake_stride,
         assumed_align=int(align),
@@ -836,7 +636,7 @@ def _masked_compile_args_from_specs(
     ],
     include_stream_placeholder: bool = True,
 ) -> tuple[tuple[int, ...], tuple[object, ...]]:
-    from ..kernels.fwd.common import _compile_env_stream_placeholder
+    from slinoss.ops._cute_common import _compile_env_stream_placeholder
 
     ensure_cute_runtime_env()
     alignments = tuple(int(align) for _, _, align, _, _ in tensor_specs)
@@ -863,44 +663,6 @@ def _aot_compile_options(arch_tag: str) -> str:
     return " ".join(options)
 
 
-def _representative_chunk_increment_problem_shape(
-    spec: ChunkIncrementAOTSpec,
-) -> tuple[int, ...]:
-    heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
-    return (
-        2,
-        heads,
-        2 * spec.chunk_size,
-        spec.P,
-        spec.D,
-        2,
-        spec.chunk_size,
-        bc_groups,
-    )
-
-
-def _representative_state_passing_problem_shape(
-    spec: StatePassingAOTSpec,
-) -> tuple[int, ...]:
-    return (2, 2, 2, spec.P, spec.D)
-
-
-def _representative_chunk_scan_problem_shape(
-    spec: ChunkScanAOTSpec,
-) -> tuple[int, ...]:
-    heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
-    return (
-        2,
-        heads,
-        2 * spec.chunk_size,
-        spec.P,
-        spec.D,
-        2,
-        spec.chunk_size,
-        bc_groups,
-    )
-
-
 def _representative_forward_problem_shape(spec: ForwardAOTSpec) -> tuple[int, ...]:
     heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
     return (
@@ -916,17 +678,19 @@ def _representative_forward_problem_shape(spec: ForwardAOTSpec) -> tuple[int, ..
 
 
 def _representative_backward_problem_shape(spec: BackwardAOTSpec):
-    from ..kernels.bwd import BackwardProblemShape, _torch_to_cutlass_dtype
-    from ..kernels.bwd.chunk_increment.db import ChunkIncrementBwdDBAmpere
+    from slinoss.ops._cute_common import torch_to_cutlass_dtype
+
+    from ..kernels.bwd import BackwardProblemShape
+    from ..kernels.bwd.db import BwdDBIncrementAccumulatorAmpere
 
     heads, bc_groups = _representative_heads_and_bc_groups(spec.bc_groups)
-    chunk_increment_db = ChunkIncrementBwdDBAmpere(
-        _torch_to_cutlass_dtype(spec.tc_dtype),
+    db_kernel = BwdDBIncrementAccumulatorAmpere(
+        torch_to_cutlass_dtype(spec.tc_dtype),
         chunk_size=spec.chunk_size,
         D=spec.D,
         P=spec.P,
     )
-    n_d_tiles = (spec.D + chunk_increment_db.bN - 1) // chunk_increment_db.bN
+    n_d_tiles = (spec.D + db_kernel.bN - 1) // db_kernel.bN
     return cast(
         BackwardProblemShape,
         (
@@ -940,131 +704,6 @@ def _representative_backward_problem_shape(spec: BackwardAOTSpec):
             spec.chunk_size,
             n_d_tiles,
         ),
-    )
-
-
-def _infer_chunk_increment_aot_spec(
-    U: torch.Tensor,
-    B: torch.Tensor,
-    *,
-    chunk_size: int,
-    compute_dtype: torch.dtype | None,
-    arch_tag: str = "any",
-) -> ChunkIncrementAOTSpec:
-    from ..kernels.fwd import _make_chunk_increment_compile_artifacts, _tc_input_dtype
-
-    compile_artifacts = _make_chunk_increment_compile_artifacts(
-        U,
-        B,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-        has_prev=False,
-    )
-    (
-        _batch_size,
-        heads,
-        _padded_time,
-        P,
-        D,
-        _n_chunks,
-        resolved_chunk_size,
-        bc_groups,
-    ) = compile_artifacts.problem_shape
-    return ChunkIncrementAOTSpec(
-        arch_tag=arch_tag,
-        P=int(P),
-        D=int(D),
-        chunk_size=int(resolved_chunk_size),
-        bc_groups=_bc_groups_identity_from_runtime(
-            heads=int(heads),
-            bc_groups=int(bc_groups),
-        ),
-        tc_dtype_name=_dtype_name(_tc_input_dtype(U.dtype, compute_dtype)),
-        config=compile_artifacts.config,
-    )
-
-
-def _infer_state_passing_aot_spec(
-    increment: torch.Tensor,
-    chunk_multiplier: torch.Tensor,
-    *,
-    initial_states: torch.Tensor | None,
-    num_threads: int,
-    vecs_per_thread: int,
-    arch_tag: str = "any",
-) -> StatePassingAOTSpec:
-    from ..kernels.fwd import _make_state_passing_compile_artifacts
-
-    compile_artifacts = _make_state_passing_compile_artifacts(
-        increment,
-        chunk_multiplier,
-        has_init=initial_states is not None,
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-    )
-    _batch_size, _heads, _chunks, P, D = compile_artifacts.problem_shape
-    return StatePassingAOTSpec(
-        arch_tag=arch_tag,
-        P=int(P),
-        D=int(D),
-        config=compile_artifacts.config,
-        has_init=initial_states is not None,
-    )
-
-
-def _infer_chunk_scan_aot_spec(
-    U: torch.Tensor,
-    B: torch.Tensor,
-    *,
-    chunk_size: int,
-    compute_dtype: torch.dtype | None,
-    output_dtype: torch.dtype,
-    m_block_size: int | None,
-    n_block_size: int,
-    num_threads: int,
-    arch_tag: str = "any",
-) -> ChunkScanAOTSpec:
-    from ..kernels.fwd import _make_chunk_scan_compile_artifacts, _tc_input_dtype
-
-    device_index = (
-        int(U.device.index)
-        if U.device.index is not None
-        else torch.cuda.current_device()
-    )
-    compile_artifacts = _make_chunk_scan_compile_artifacts(
-        U,
-        B,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-        output_dtype=output_dtype,
-        device_index=device_index,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
-        num_threads=num_threads,
-        has_prev=False,
-    )
-    (
-        _batch_size,
-        heads,
-        _padded_time,
-        P,
-        D,
-        _n_chunks,
-        resolved_chunk_size,
-        bc_groups,
-    ) = compile_artifacts.problem_shape
-    return ChunkScanAOTSpec(
-        arch_tag=arch_tag,
-        P=int(P),
-        D=int(D),
-        chunk_size=int(resolved_chunk_size),
-        bc_groups=_bc_groups_identity_from_runtime(
-            heads=int(heads),
-            bc_groups=int(bc_groups),
-        ),
-        tc_dtype_name=_dtype_name(_tc_input_dtype(U.dtype, compute_dtype)),
-        output_dtype_name=_dtype_name(output_dtype),
-        config=compile_artifacts.config,
     )
 
 
@@ -1241,329 +880,6 @@ def infer_v2x2ssd_bwd_aot_spec(
     )
 
 
-def _compile_chunk_increment_aot(spec: ChunkIncrementAOTSpec):
-    from ..kernels.fwd import (
-        _chunk_increment_tensor_specs,
-        _compile_min_align_for_dtype,
-    )
-
-    representative_shape = _representative_chunk_increment_problem_shape(spec)
-    (
-        u_spec,
-        b_spec,
-        m_spec,
-        k_spec,
-        u_prev_spec,
-        b_prev_spec,
-        increment_spec,
-        chunk_multiplier_spec,
-    ) = _chunk_increment_tensor_specs(representative_shape)
-    tc_align = _compile_min_align_for_dtype(spec.tc_dtype)
-    fp32_align = _compile_min_align_for_dtype(torch.float32)
-    _alignments, compile_args = _masked_compile_args_from_specs(
-        (spec.tc_dtype, u_spec, tc_align, (False, True, True), (False, False, True)),
-        (spec.tc_dtype, b_spec, tc_align, (False, True, True), (False, False, True)),
-        (torch.float32, m_spec, fp32_align, (False, True, True), (False, False, True)),
-        (torch.float32, k_spec, fp32_align, (False, True, True), (False, False, True)),
-        (spec.tc_dtype, u_prev_spec, tc_align, (False, True), (False, False)),
-        (spec.tc_dtype, b_prev_spec, tc_align, (False, True), (False, False)),
-        (
-            torch.float32,
-            increment_spec,
-            fp32_align,
-            (False, False, True),
-            (False, False, False),
-        ),
-        (
-            torch.float32,
-            chunk_multiplier_spec,
-            fp32_align,
-            (False, True),
-            (False, False),
-        ),
-    )
-
-    @cute.jit
-    def _chunk_increment_aot_host_wrapper(
-        U_view: cute.Tensor,
-        B_view: cute.Tensor,
-        M_view: cute.Tensor,
-        K_prev_view: cute.Tensor,
-        U_prev_view: cute.Tensor,
-        B_prev_view: cute.Tensor,
-        increment_view: cute.Tensor,
-        chunk_multiplier_view: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        kernel = ChunkIncrementFwdAmpere(
-            cast(Any, U_view.element_type),
-            chunk_size=spec.chunk_size,
-            cta_tiler=spec.config.cta_tiler,
-            num_stages=spec.config.num_stages,
-        )
-        K_curr_view = cute.make_tensor(
-            cast(Any, K_prev_view.iterator) + 2, K_prev_view.layout
-        )
-        kernel._launch_kernel(
-            U_view,
-            B_view,
-            M_view,
-            K_prev_view,
-            K_curr_view,
-            U_prev_view,
-            B_prev_view,
-            increment_view,
-            chunk_multiplier_view,
-            stream=stream,
-        )
-
-    return cute.compile(
-        _chunk_increment_aot_host_wrapper,
-        *compile_args,
-        options=_aot_compile_options(spec.arch_tag),
-        no_jit_engine=True,
-    )
-
-
-def _compile_state_passing_aot(spec: StatePassingAOTSpec):
-    from ..kernels.fwd import (
-        _choose_copy_bits_for_linear_tiles_from_properties,
-        _compile_min_align_for_dtype,
-        _make_state_passing_cfg,
-        _state_passing_tensor_specs,
-    )
-
-    representative_shape = _representative_state_passing_problem_shape(spec)
-    (
-        increment_spec,
-        chunk_multiplier_spec,
-        chunk_starts_spec,
-        final_state_spec,
-    ) = _state_passing_tensor_specs(representative_shape)
-    fp32_align = _compile_min_align_for_dtype(torch.float32)
-    _alignments, compile_args = _masked_compile_args_from_specs(
-        (
-            torch.float32,
-            increment_spec,
-            fp32_align,
-            (True, True, True, False, False),
-            (True, True, False, False, False),
-        ),
-        (
-            torch.float32,
-            chunk_multiplier_spec,
-            fp32_align,
-            (True, True, True, False),
-            (True, True, False, False),
-        ),
-        (
-            torch.float32,
-            chunk_starts_spec,
-            fp32_align,
-            (True, True, True, False, False),
-            (True, True, False, False, False),
-        ),
-        (
-            torch.float32,
-            final_state_spec,
-            fp32_align,
-            (True, True, False, False),
-            (True, False, False, False),
-        ),
-        (
-            torch.float32,
-            final_state_spec,
-            fp32_align,
-            (True, True, False, False),
-            (True, False, False, False),
-        ),
-    )
-    state_elem_count = spec.P * spec.D
-    elems_per_thread = 2 * int(spec.config.vecs_per_thread)
-    copy_bits_in = _choose_copy_bits_for_linear_tiles_from_properties(
-        dtype=torch.float32,
-        assumed_align=fp32_align,
-        tile_stride_elems=state_elem_count,
-        elems_per_thread=elems_per_thread,
-    )
-    copy_bits_out = _choose_copy_bits_for_linear_tiles_from_properties(
-        dtype=torch.float32,
-        assumed_align=fp32_align,
-        tile_stride_elems=state_elem_count,
-        elems_per_thread=elems_per_thread,
-    )
-    copy_bits_state_in = 32
-    copy_bits_state_out = 32
-    launch_cfg = _make_state_passing_cfg(
-        num_threads=spec.config.num_threads,
-        vecs_per_thread=spec.config.vecs_per_thread,
-        copy_bits_in=copy_bits_in,
-        copy_bits_out=copy_bits_out,
-        copy_bits_state_in=copy_bits_state_in,
-        copy_bits_state_out=copy_bits_state_out,
-        has_init=spec.has_init,
-    )
-    (
-        num_threads,
-        vecs_per_thread,
-        _copy_bits_in,
-        _copy_bits_out,
-        _copy_bits_state_in,
-        _copy_bits_state_out,
-        has_init,
-    ) = launch_cfg
-    kernel = StatePassingFwdAmpere(
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-        copy_bits_in=copy_bits_in,
-        copy_bits_out=copy_bits_out,
-        copy_bits_state_in=copy_bits_state_in,
-        copy_bits_state_out=copy_bits_state_out,
-        has_init=has_init,
-    )
-
-    @cute.jit
-    def _state_passing_aot_host_wrapper(
-        increment_view: cute.Tensor,
-        chunk_multiplier_view: cute.Tensor,
-        chunk_starts_view: cute.Tensor,
-        final_state_view: cute.Tensor,
-        initial_state_view: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        kernel.call_on_stream(
-            increment_view,
-            chunk_multiplier_view,
-            chunk_starts_view,
-            final_state_view,
-            initial_state_view,
-            stream,
-        )
-
-    return cute.compile(
-        _state_passing_aot_host_wrapper,
-        *compile_args,
-        options=_aot_compile_options(spec.arch_tag),
-        no_jit_engine=True,
-    )
-
-
-def _compile_chunk_scan_aot(spec: ChunkScanAOTSpec):
-    from ..kernels.fwd import _chunk_scan_tensor_specs, _compile_min_align_for_dtype
-
-    representative_shape = _representative_chunk_scan_problem_shape(spec)
-    (
-        u_spec,
-        b_spec,
-        m_spec,
-        k_spec,
-        z0_spec,
-        u_prev_spec,
-        b_prev_spec,
-        output_spec,
-    ) = _chunk_scan_tensor_specs(representative_shape)
-    tc_align = _compile_min_align_for_dtype(spec.tc_dtype)
-    fp32_align = _compile_min_align_for_dtype(torch.float32)
-    output_align = _compile_min_align_for_dtype(spec.output_dtype)
-    _alignments, compile_args = _masked_compile_args_from_specs(
-        (
-            spec.tc_dtype,
-            u_spec,
-            tc_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (
-            spec.tc_dtype,
-            b_spec,
-            tc_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (
-            spec.tc_dtype,
-            b_spec,
-            tc_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (
-            torch.float32,
-            m_spec,
-            fp32_align,
-            (True, False, False),
-            (False, False, False),
-        ),
-        (
-            torch.float32,
-            k_spec,
-            fp32_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (
-            torch.float32,
-            z0_spec,
-            fp32_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (spec.tc_dtype, u_prev_spec, tc_align, (True, False), (False, False)),
-        (spec.tc_dtype, b_prev_spec, tc_align, (True, False), (False, False)),
-        (
-            spec.output_dtype,
-            output_spec,
-            output_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-    )
-    m_block_size = spec.config.m_block_size
-    n_block_size = spec.config.n_block_size
-    num_threads = spec.config.num_threads
-
-    @cute.jit
-    def _chunk_scan_aot_host_wrapper(
-        U_view: cute.Tensor,
-        B_view: cute.Tensor,
-        C_view: cute.Tensor,
-        M_view: cute.Tensor,
-        K_view: cute.Tensor,
-        Z0_view: cute.Tensor,
-        U_prev_view: cute.Tensor,
-        B_prev_view: cute.Tensor,
-        output_view: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        kernel = ChunkScanFwdAmpere(
-            D=spec.D,
-            P=spec.P,
-            L=spec.chunk_size,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            num_threads=num_threads,
-        )
-        kernel._launch_main_kernel(
-            U_view,
-            B_view,
-            C_view,
-            M_view,
-            K_view,
-            Z0_view,
-            U_prev_view,
-            B_prev_view,
-            output_view,
-            stream=stream,
-        )
-
-    return cute.compile(
-        _chunk_scan_aot_host_wrapper,
-        *compile_args,
-        options=_aot_compile_options(spec.arch_tag),
-        no_jit_engine=True,
-    )
-
-
 def _compile_forward_aot(spec: ForwardAOTSpec):
     from ..kernels.fwd import (
         _choose_copy_bits_for_linear_tiles_from_properties,
@@ -1575,9 +891,9 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
     )
 
     representative_shape = _representative_forward_problem_shape(spec)
-    chunk_increment_specs = _chunk_increment_tensor_specs(representative_shape)
-    state_passing_specs = _state_passing_tensor_specs((2, 2, 2, spec.P, spec.D))
-    chunk_scan_specs = _chunk_scan_tensor_specs(representative_shape)
+    increment_specs = _chunk_increment_tensor_specs(representative_shape)
+    state_specs = _state_passing_tensor_specs((2, 2, 2, spec.P, spec.D))
+    scan_specs = _chunk_scan_tensor_specs(representative_shape)
     tc_align = _compile_min_align_for_dtype(spec.tc_dtype)
     fp32_align = _compile_min_align_for_dtype(torch.float32)
     output_align = _compile_min_align_for_dtype(spec.output_dtype)
@@ -1590,13 +906,13 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
         b_prev_increment_spec,
         increment_spec,
         chunk_multiplier_spec,
-    ) = chunk_increment_specs
+    ) = increment_specs
     (
         increment_state_spec,
         chunk_multiplier_state_spec,
         chunk_starts_spec,
         final_state_spec,
-    ) = state_passing_specs
+    ) = state_specs
     (
         u_scan_spec,
         b_scan_spec,
@@ -1606,7 +922,7 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
         u_prev_scan_spec,
         b_prev_scan_spec,
         output_spec,
-    ) = chunk_scan_specs
+    ) = scan_specs
     _alignments, compile_args = _masked_compile_args_from_specs(
         (
             spec.tc_dtype,
@@ -1779,7 +1095,7 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
     state_num_threads = spec.config_bundle.state_passing.num_threads
     state_vecs_per_thread = spec.config_bundle.state_passing.vecs_per_thread
     has_init = spec.has_init
-    state_passing_kernel = StatePassingFwdAmpere(
+    state_kernel = StatePassingFwdAmpere(
         num_threads=state_num_threads,
         vecs_per_thread=state_vecs_per_thread,
         copy_bits_in=state_copy_bits_in,
@@ -1836,7 +1152,7 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
             chunk_multiplier_view,
             stream=stream,
         )
-        state_passing_kernel.call_on_stream(
+        state_kernel.call_on_stream(
             increment_state_view,
             chunk_multiplier_state_view,
             chunk_starts_view,
@@ -1876,13 +1192,13 @@ def _compile_forward_aot(spec: ForwardAOTSpec):
 def _compile_backward_aot(spec: BackwardAOTSpec):
     from ..kernels.bwd import (
         BackwardInputInfo,
-        _chunk_increment_bwd_tensor_specs,
-        _chunk_scan_bwd_tensor_specs,
+        _increment_bwd_tensor_specs,
+        _scan_bwd_tensor_specs,
         _compile_min_align_for_dtype,
         _make_backward_launch_cfg,
         _make_v2x2ssd_bwd_aot_host_wrapper,
         _resolve_dz0_cta_tiler,
-        _state_passing_bwd_tensor_specs,
+        _state_bwd_tensor_specs,
     )
 
     problem_shape = _representative_backward_problem_shape(spec)
@@ -1943,16 +1259,15 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         C_dz0_spec,
         M_dz0_spec,
         d_chunk_starts_scan_spec,
-        dU_db_dummy_spec,
-        dB_du_dummy_spec,
-        dU_prev_dummy_spec,
-        dB_prev_dummy_spec,
-    ) = _chunk_scan_bwd_tensor_specs(problem_shape)
+        dBC_scan_spec,
+        dU_prev_scan_spec,
+        dB_prev_scan_spec,
+    ) = _scan_bwd_tensor_specs(problem_shape)
     (
         chunk_starts_state_spec,
         chunk_multiplier_state_spec,
         final_state_spec,
-    ) = _state_passing_bwd_tensor_specs(problem_shape)
+    ) = _state_bwd_tensor_specs(problem_shape)
     (
         U_increment_spec,
         dU_increment_spec,
@@ -1961,7 +1276,7 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         K_increment_spec,
         d_increment_spec,
         d_increment_dp_spec,
-        d_increment_boundary_spec,
+        d_boundary_spec,
         U_prev_chunks_spec,
         B_prev_chunks_spec,
         dM_sum_part_spec,
@@ -1969,8 +1284,8 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         d_chunk_multiplier_increment_spec,
         d_param_increment_spec,
         _dB_increment_spec,
-        _dB_prev_increment_spec,
-    ) = _chunk_increment_bwd_tensor_specs(problem_shape)
+        dB_prev_boundary_spec,
+    ) = _increment_bwd_tensor_specs(problem_shape)
     _alignments, compile_args = _masked_compile_args_from_specs(
         (
             spec.tc_dtype,
@@ -2032,13 +1347,13 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         ),
         (
             spec.tc_dtype,
-            B_scan_spec,
+            dBC_scan_spec,
             tc_align,
             (True, False, False, False),
             (False, False, False, False),
         ),
-        (spec.tc_dtype, dU_prev_dummy_spec, tc_align, (True, False), (False, False)),
-        (spec.tc_dtype, dB_prev_dummy_spec, tc_align, (True, False), (False, False)),
+        (spec.tc_dtype, dU_prev_scan_spec, tc_align, (True, False), (False, False)),
+        (spec.tc_dtype, dB_prev_scan_spec, tc_align, (True, False), (False, False)),
         (torch.float32, dlogp_scan_spec, fp32_align, (True, False), (False, False)),
         (
             torch.float32,
@@ -2077,7 +1392,7 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         ),
         (
             spec.tc_dtype,
-            B_scan_spec,
+            dBC_scan_spec,
             tc_align,
             (True, False, False, False),
             (False, False, False, False),
@@ -2245,20 +1560,19 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
         ),
         (
             spec.tc_dtype,
-            d_increment_boundary_spec,
+            d_boundary_spec,
             tc_align,
             (True, False, False),
             (False, False, False),
         ),
-        (spec.tc_dtype, B_prev_chunks_spec, tc_align, (False, True), (False, False)),
-        (spec.tc_dtype, U_prev_chunks_spec, tc_align, (False, True), (False, False)),
         (
             spec.tc_dtype,
-            B_increment_spec,
+            dB_prev_boundary_spec,
             tc_align,
-            (False, False, True),
-            (False, False, False),
+            (False, True),
+            (False, False),
         ),
+        (spec.tc_dtype, U_prev_chunks_spec, tc_align, (False, True), (False, False)),
         (
             spec.tc_dtype,
             dU_increment_spec,
@@ -2304,22 +1618,6 @@ def _compile_backward_aot(spec: BackwardAOTSpec):
             (False, False, True),
             (True, True, False),
         ),
-        (
-            spec.tc_dtype,
-            dU_db_dummy_spec,
-            tc_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (spec.tc_dtype, dU_prev_dummy_spec, tc_align, (True, False), (False, False)),
-        (
-            spec.tc_dtype,
-            dB_du_dummy_spec,
-            tc_align,
-            (True, False, False, False),
-            (False, False, False, False),
-        ),
-        (spec.tc_dtype, dB_prev_dummy_spec, tc_align, (True, False), (False, False)),
     )
     host_wrapper = _make_v2x2ssd_bwd_aot_host_wrapper(
         problem_shape=problem_shape,
@@ -2501,51 +1799,6 @@ def _list_packaged_aot_records(
     )
 
 
-def list_packaged_chunk_increment_aot_specs(
-    *,
-    package_root: str | os.PathLike[str] | Path | None = None,
-    arch_tag: str | None = None,
-) -> tuple[ChunkIncrementAOTSpec, ...]:
-    return tuple(
-        _chunk_increment_spec_from_record(cast(dict[str, Any], record["spec"]))
-        for record in _list_packaged_aot_records(
-            kind="chunk_increment_fwd",
-            package_root=package_root,
-            arch_tag=arch_tag,
-        )
-    )
-
-
-def list_packaged_state_passing_aot_specs(
-    *,
-    package_root: str | os.PathLike[str] | Path | None = None,
-    arch_tag: str | None = None,
-) -> tuple[StatePassingAOTSpec, ...]:
-    return tuple(
-        _state_passing_spec_from_record(cast(dict[str, Any], record["spec"]))
-        for record in _list_packaged_aot_records(
-            kind="state_passing_fwd",
-            package_root=package_root,
-            arch_tag=arch_tag,
-        )
-    )
-
-
-def list_packaged_chunk_scan_aot_specs(
-    *,
-    package_root: str | os.PathLike[str] | Path | None = None,
-    arch_tag: str | None = None,
-) -> tuple[ChunkScanAOTSpec, ...]:
-    return tuple(
-        _chunk_scan_spec_from_record(cast(dict[str, Any], record["spec"]))
-        for record in _list_packaged_aot_records(
-            kind="chunk_scan_fwd",
-            package_root=package_root,
-            arch_tag=arch_tag,
-        )
-    )
-
-
 def list_packaged_forward_aot_specs(
     *,
     package_root: str | os.PathLike[str] | Path | None = None,
@@ -2655,209 +1908,13 @@ def try_load_packaged_v2x2ssd_bwd_function(
     )
 
 
-def _try_load_packaged_stage_function(
-    *,
-    kind: str,
-    module_id: str,
-    arch_tag: str,
-    package_root: str | os.PathLike[str] | Path | None = None,
-):
-    return _try_load_packaged_compiled_function(
-        kind=kind,
-        module_id=module_id,
-        arch_tag=arch_tag,
-        cache=_PACKAGED_STAGE_CACHE,
-        package_root=package_root,
-    )
-
-
-def try_load_packaged_chunk_increment_function(
-    spec: ChunkIncrementAOTSpec,
-    *,
-    package_root: str | os.PathLike[str] | Path | None = None,
-):
-    return _try_load_packaged_stage_function(
-        kind="chunk_increment_fwd",
-        module_id=spec.module_id,
-        arch_tag=spec.arch_tag,
-        package_root=package_root,
-    )
-
-
-def try_load_packaged_state_passing_function(
-    spec: StatePassingAOTSpec,
-    *,
-    package_root: str | os.PathLike[str] | Path | None = None,
-):
-    return _try_load_packaged_stage_function(
-        kind="state_passing_fwd",
-        module_id=spec.module_id,
-        arch_tag=spec.arch_tag,
-        package_root=package_root,
-    )
-
-
-def try_load_packaged_chunk_scan_function(
-    spec: ChunkScanAOTSpec,
-    *,
-    package_root: str | os.PathLike[str] | Path | None = None,
-):
-    return _try_load_packaged_stage_function(
-        kind="chunk_scan_fwd",
-        module_id=spec.module_id,
-        arch_tag=spec.arch_tag,
-        package_root=package_root,
-    )
-
-
 def clear_packaged_aot_cache() -> None:
     _PACKAGED_FORWARD_CACHE.clear()
     _PACKAGED_BACKWARD_CACHE.clear()
-    _PACKAGED_STAGE_CACHE.clear()
 
 
 def clear_packaged_forward_aot_cache() -> None:
     clear_packaged_aot_cache()
-
-
-def export_chunk_increment_cute_aot(
-    U: torch.Tensor,
-    M: torch.Tensor,
-    K: torch.Tensor,
-    B: torch.Tensor,
-    *,
-    U_prev: torch.Tensor | None = None,
-    B_prev: torch.Tensor | None = None,
-    chunk_size: int,
-    compute_dtype: torch.dtype | None = None,
-    cta_tiler: tuple[int, int, int] | None = None,
-    num_stages: int | None = None,
-    arch_tag: str = "any",
-    package_root: str | os.PathLike[str] | Path,
-) -> ExportedTVMFFIModule:
-    spec = _infer_chunk_increment_aot_spec(
-        U,
-        B,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-        arch_tag=arch_tag,
-    )
-    if cta_tiler is not None or num_stages is not None:
-        spec = ChunkIncrementAOTSpec(
-            arch_tag=spec.arch_tag,
-            P=spec.P,
-            D=spec.D,
-            chunk_size=spec.chunk_size,
-            bc_groups=spec.bc_groups,
-            tc_dtype_name=spec.tc_dtype_name,
-            config=ChunkIncrementConfig(
-                cta_tiler=(
-                    spec.config.cta_tiler
-                    if cta_tiler is None
-                    else cast(tuple[int, int, int], tuple(int(v) for v in cta_tiler))
-                ),
-                num_stages=spec.config.num_stages
-                if num_stages is None
-                else int(num_stages),
-            ),
-        )
-    compiled = _compile_chunk_increment_aot(spec)
-    exported = export_tvm_ffi_compiled_module(
-        compiled,
-        kind="chunk_increment_fwd",
-        module_id=spec.module_id,
-        function_name=spec.module_id,
-        package_root=package_root,
-    )
-    register_aot_artifact(
-        kind="chunk_increment_fwd",
-        spec=spec,
-        exported=exported,
-        package_root=package_root,
-    )
-    return exported
-
-
-def export_state_passing_cute_aot(
-    increment: torch.Tensor,
-    chunk_multiplier: torch.Tensor,
-    *,
-    initial_states: torch.Tensor | None,
-    num_threads: int = 128,
-    vecs_per_thread: int = 8,
-    arch_tag: str = "any",
-    package_root: str | os.PathLike[str] | Path,
-) -> ExportedTVMFFIModule:
-    spec = _infer_state_passing_aot_spec(
-        increment,
-        chunk_multiplier,
-        initial_states=initial_states,
-        num_threads=num_threads,
-        vecs_per_thread=vecs_per_thread,
-        arch_tag=arch_tag,
-    )
-    compiled = _compile_state_passing_aot(spec)
-    exported = export_tvm_ffi_compiled_module(
-        compiled,
-        kind="state_passing_fwd",
-        module_id=spec.module_id,
-        function_name=spec.module_id,
-        package_root=package_root,
-    )
-    register_aot_artifact(
-        kind="state_passing_fwd",
-        spec=spec,
-        exported=exported,
-        package_root=package_root,
-    )
-    return exported
-
-
-def export_chunk_scan_cute_aot(
-    U: torch.Tensor,
-    M: torch.Tensor,
-    K: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    chunk_starts: torch.Tensor,
-    *,
-    B_prev: torch.Tensor | None = None,
-    U_prev: torch.Tensor | None = None,
-    chunk_size: int = 64,
-    m_block_size: int | None = None,
-    n_block_size: int = 64,
-    num_threads: int = 128,
-    compute_dtype: torch.dtype | None = None,
-    output_dtype: torch.dtype = torch.float32,
-    arch_tag: str = "any",
-    package_root: str | os.PathLike[str] | Path,
-) -> ExportedTVMFFIModule:
-    spec = _infer_chunk_scan_aot_spec(
-        U,
-        B,
-        chunk_size=chunk_size,
-        compute_dtype=compute_dtype,
-        output_dtype=output_dtype,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
-        num_threads=num_threads,
-        arch_tag=arch_tag,
-    )
-    compiled = _compile_chunk_scan_aot(spec)
-    exported = export_tvm_ffi_compiled_module(
-        compiled,
-        kind="chunk_scan_fwd",
-        module_id=spec.module_id,
-        function_name=spec.module_id,
-        package_root=package_root,
-    )
-    register_aot_artifact(
-        kind="chunk_scan_fwd",
-        spec=spec,
-        exported=exported,
-        package_root=package_root,
-    )
-    return exported
 
 
 def export_v2x2ssd_fwd_cute_aot(
@@ -3036,58 +2093,6 @@ def build_forward_aot_search_space_package(
         shutil.rmtree(package_root / "runtime", ignore_errors=True)
         (package_root / "manifest.json").unlink(missing_ok=True)
     exported_modules: list[ExportedTVMFFIModule] = []
-    for arch_tag in resolved_arch_tags:
-        for spec in _search_space_chunk_increment_specs(arch_tag=arch_tag):
-            compiled = _compile_chunk_increment_aot(spec)
-            exported = export_tvm_ffi_compiled_module(
-                compiled,
-                kind="chunk_increment_fwd",
-                module_id=spec.module_id,
-                function_name=spec.module_id,
-                package_root=package_root,
-                keep_object_file=False,
-            )
-            register_aot_artifact(
-                kind="chunk_increment_fwd",
-                spec=spec,
-                exported=exported,
-                package_root=package_root,
-            )
-            exported_modules.append(exported)
-        for spec in _search_space_state_passing_specs(arch_tag=arch_tag):
-            compiled = _compile_state_passing_aot(spec)
-            exported = export_tvm_ffi_compiled_module(
-                compiled,
-                kind="state_passing_fwd",
-                module_id=spec.module_id,
-                function_name=spec.module_id,
-                package_root=package_root,
-                keep_object_file=False,
-            )
-            register_aot_artifact(
-                kind="state_passing_fwd",
-                spec=spec,
-                exported=exported,
-                package_root=package_root,
-            )
-            exported_modules.append(exported)
-        for spec in _search_space_chunk_scan_specs(arch_tag=arch_tag):
-            compiled = _compile_chunk_scan_aot(spec)
-            exported = export_tvm_ffi_compiled_module(
-                compiled,
-                kind="chunk_scan_fwd",
-                module_id=spec.module_id,
-                function_name=spec.module_id,
-                package_root=package_root,
-                keep_object_file=False,
-            )
-            register_aot_artifact(
-                kind="chunk_scan_fwd",
-                spec=spec,
-                exported=exported,
-                package_root=package_root,
-            )
-            exported_modules.append(exported)
     for spec in resolved_specs:
         compiled = _compile_forward_aot(spec)
         exported = export_tvm_ffi_compiled_module(
@@ -3202,12 +2207,9 @@ def build_default_cute_aot_package(
 
 __all__ = [
     "BackwardAOTSpec",
-    "ChunkIncrementAOTSpec",
     "ChunkScanBackwardConfig",
-    "ChunkScanAOTSpec",
     "ExportedTVMFFIModule",
     "ForwardAOTSpec",
-    "StatePassingAOTSpec",
     "StatePassingBackwardConfig",
     "build_default_backward_aot_package",
     "build_default_cute_aot_package",
@@ -3217,9 +2219,6 @@ __all__ = [
     "clear_packaged_forward_aot_cache",
     "default_backward_aot_specs",
     "default_forward_aot_specs",
-    "export_chunk_increment_cute_aot",
-    "export_chunk_scan_cute_aot",
-    "export_state_passing_cute_aot",
     "export_tvm_ffi_compiled_module",
     "export_v2x2ssd_bwd_cute_aot",
     "export_tuned_v2x2ssd_fwd_cute_aot",
@@ -3228,17 +2227,11 @@ __all__ = [
     "infer_v2x2ssd_bwd_aot_spec",
     "infer_v2x2ssd_fwd_aot_spec",
     "list_packaged_backward_aot_specs",
-    "list_packaged_chunk_increment_aot_specs",
-    "list_packaged_chunk_scan_aot_specs",
     "list_packaged_forward_aot_specs",
-    "list_packaged_state_passing_aot_specs",
     "load_tvm_ffi_function",
     "load_tvm_ffi_module",
     "register_aot_artifact",
     "search_space_forward_aot_specs",
-    "try_load_packaged_chunk_increment_function",
-    "try_load_packaged_chunk_scan_function",
-    "try_load_packaged_state_passing_function",
     "try_load_packaged_v2x2ssd_bwd_function",
     "try_load_packaged_v2x2ssd_fwd_function",
 ]

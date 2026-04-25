@@ -8,14 +8,14 @@ The public tensor contract matches ``slinoss.ops.v2x2ssd.reference`` exactly:
 - ``B, C``: ``(B, H, T, D)`` with ``D = 2N`` interleaved complex lanes
 - state: ``(B, H, P, D)``
 
-The staged forward decomposition remains:
+The public CuTe path is the combined ``v2x2ssd_cute`` operator. Its host
+boundary launches the internal forward kernels as one compiled call site, and
+the backward path rematerializes forward boundary metadata through a private
+compiled launcher.
 
-- ``chunk_increment``
-- ``state_passing``
-- ``chunk_scan``
-
-Ahead-of-time export/load helpers live under :mod:`slinoss.ops.v2x2ssd.cute.aot`.
-Autotuning helpers live under :mod:`slinoss.ops.v2x2ssd.cute.tuning`.
+Ahead-of-time export/load helpers are available under
+:mod:`slinoss.ops.v2x2ssd.cute.aot`.
+Autotuning helpers are available under :mod:`slinoss.ops.v2x2ssd.cute.tuning`.
 """
 
 from . import aot

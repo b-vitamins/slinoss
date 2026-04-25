@@ -8,22 +8,21 @@ from typing import Callable, cast
 import torch
 import cutlass.cute as cute
 
+from slinoss.ops._cute_common import (
+    _compile_env_stream_placeholder,
+    _is_cuda_graph_capturing,
+    assumed_align,
+    make_fake_tensor_arg,
+)
 from slinoss.ops.scanprep.cute.common import SCANPREP_PARAM_DIM
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.common import (
-    _assumed_align,
-    _compile_env_stream_placeholder,
     _ensure_min_alignment,
-    _make_fake_tensor_arg,
 )
 
 from .kernels.decode import MixerDecodeStepFwd
 
 _DECODE_CACHE: dict[tuple[object, ...], object] = {}
 _DECODE_MIN_ALIGN = 16
-
-
-def _is_cuda_graph_capturing(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
 
 def _raise_cold_capture_error(resource: str) -> None:
@@ -431,23 +430,23 @@ def mixer_decode_step_cute(
         )
         projected.zero_()
 
-    value_align = _assumed_align(value_c)
-    params_align = _assumed_align(params_c)
-    bc_align = _assumed_align(bc_c)
-    gate_align = _assumed_align(gate_c)
-    state_align = _assumed_align(state_c)
-    b_prev_align = _assumed_align(b_prev_c)
-    u_prev_align = _assumed_align(u_prev_c)
-    dt_bias_align = _assumed_align(dt_bias)
-    alpha_bias_align = _assumed_align(alpha_bias)
-    theta_mod_bias_align = _assumed_align(theta_mod_bias)
-    theta_bias_align = _assumed_align(theta_bias)
-    theta_sign_align = _assumed_align(theta_sign)
-    y_align = _assumed_align(y)
-    final_state_align = _assumed_align(final_state)
-    u_last_align = _assumed_align(u_last)
-    out_proj_align = _assumed_align(out_proj)
-    projected_align = _assumed_align(projected)
+    value_align = assumed_align(value_c)
+    params_align = assumed_align(params_c)
+    bc_align = assumed_align(bc_c)
+    gate_align = assumed_align(gate_c)
+    state_align = assumed_align(state_c)
+    b_prev_align = assumed_align(b_prev_c)
+    u_prev_align = assumed_align(u_prev_c)
+    dt_bias_align = assumed_align(dt_bias)
+    alpha_bias_align = assumed_align(alpha_bias)
+    theta_mod_bias_align = assumed_align(theta_mod_bias)
+    theta_bias_align = assumed_align(theta_bias)
+    theta_sign_align = assumed_align(theta_sign)
+    y_align = assumed_align(y)
+    final_state_align = assumed_align(final_state)
+    u_last_align = assumed_align(u_last)
+    out_proj_align = assumed_align(out_proj)
+    projected_align = assumed_align(projected)
 
     if fuse_outproj:
         tile_p, num_warps, vec_n = _select_fused_decode_tuning(
@@ -480,7 +479,7 @@ def mixer_decode_step_cute(
             device=value.device,
             dtype=value.dtype,
         )
-    b_last_kernel_align = _assumed_align(b_last_kernel)
+    b_last_kernel_align = assumed_align(b_last_kernel)
 
     cache_key = (
         int(heads),
@@ -567,28 +566,28 @@ def mixer_decode_step_cute(
                 r_max=r_max,
                 eps=eps,
             ),
-            _make_fake_tensor_arg(value_c, align=value_align),
-            _make_fake_tensor_arg(params_c, align=params_align),
-            _make_fake_tensor_arg(bc_c, align=bc_align),
-            _make_fake_tensor_arg(gate_c, align=gate_align),
-            _make_fake_tensor_arg(state_c, align=state_align, dynamic_stride=True),
-            _make_fake_tensor_arg(b_prev_c, align=b_prev_align, dynamic_stride=True),
-            _make_fake_tensor_arg(u_prev_c, align=u_prev_align, dynamic_stride=True),
-            _make_fake_tensor_arg(dt_bias, align=dt_bias_align),
-            _make_fake_tensor_arg(alpha_bias, align=alpha_bias_align),
-            _make_fake_tensor_arg(theta_mod_bias, align=theta_mod_bias_align),
-            _make_fake_tensor_arg(theta_bias, align=theta_bias_align),
-            _make_fake_tensor_arg(theta_sign, align=theta_sign_align),
-            _make_fake_tensor_arg(y, align=y_align),
-            _make_fake_tensor_arg(
+            make_fake_tensor_arg(value_c, align=value_align),
+            make_fake_tensor_arg(params_c, align=params_align),
+            make_fake_tensor_arg(bc_c, align=bc_align),
+            make_fake_tensor_arg(gate_c, align=gate_align),
+            make_fake_tensor_arg(state_c, align=state_align, dynamic_stride=True),
+            make_fake_tensor_arg(b_prev_c, align=b_prev_align, dynamic_stride=True),
+            make_fake_tensor_arg(u_prev_c, align=u_prev_align, dynamic_stride=True),
+            make_fake_tensor_arg(dt_bias, align=dt_bias_align),
+            make_fake_tensor_arg(alpha_bias, align=alpha_bias_align),
+            make_fake_tensor_arg(theta_mod_bias, align=theta_mod_bias_align),
+            make_fake_tensor_arg(theta_bias, align=theta_bias_align),
+            make_fake_tensor_arg(theta_sign, align=theta_sign_align),
+            make_fake_tensor_arg(y, align=y_align),
+            make_fake_tensor_arg(
                 final_state, align=final_state_align, dynamic_stride=True
             ),
-            _make_fake_tensor_arg(
+            make_fake_tensor_arg(
                 b_last_kernel, align=b_last_kernel_align, dynamic_stride=True
             ),
-            _make_fake_tensor_arg(u_last, align=u_last_align, dynamic_stride=True),
-            _make_fake_tensor_arg(out_proj, align=out_proj_align),
-            _make_fake_tensor_arg(projected, align=projected_align),
+            make_fake_tensor_arg(u_last, align=u_last_align, dynamic_stride=True),
+            make_fake_tensor_arg(out_proj, align=out_proj_align),
+            make_fake_tensor_arg(projected, align=projected_align),
             _compile_env_stream_placeholder(),
             options="--enable-tvm-ffi",
         )

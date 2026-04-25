@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile the canonical v2x2ssd kernels with PyTorch profiler."""
+"""Profile the canonical v2x2ssd logical forward/backward ops."""
 
 from __future__ import annotations
 
@@ -27,9 +27,8 @@ from _common import (  # noqa: E402
     DEFAULT_P,
     DEFAULT_T,
     DIRECTIONS,
-    STAGES,
     PerfConfig,
-    build_callable,
+    build_v2x2ssd_callable,
     dtype_from_str,
     ensure_cuda,
     format_header,
@@ -41,7 +40,6 @@ from slinoss.perf.budget import summarize_named_samples  # noqa: E402
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=STAGES, default="chunk_scan")
     parser.add_argument("--direction", choices=DIRECTIONS, default="backward")
     parser.add_argument("--backend", choices=("reference", "cute"), default="cute")
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
@@ -111,9 +109,7 @@ def main() -> int:
         device=args.device,
         seed=args.seed,
     )
-    fn = build_callable(
-        cfg, stage=args.stage, direction=args.direction, backend=args.backend
-    )
+    fn = build_v2x2ssd_callable(cfg, direction=args.direction, backend=args.backend)
 
     activities = [torch.profiler.ProfilerActivity.CPU]
     if torch.cuda.is_available():
@@ -144,9 +140,7 @@ def main() -> int:
         prof.export_chrome_trace(str(args.trace_out))
 
     print(format_header(cfg))
-    print(
-        f"profile: stage={args.stage} direction={args.direction} backend={args.backend}"
-    )
+    print(f"profile: direction={args.direction} backend={args.backend}")
     print(
         prof.key_averages().table(
             sort_by=args.sort_by,
@@ -171,7 +165,6 @@ def main() -> int:
         payload = {
             "header": format_header(cfg),
             "profile": {
-                "stage": args.stage,
                 "direction": args.direction,
                 "backend": args.backend,
             },

@@ -1,13 +1,11 @@
-"""CuTe backward ``db`` kernel for the ``v2x2ssd`` chunk-scan stage.
+"""CuTe backward ``dB`` kernels for the ``v2x2ssd`` backward pipeline.
 
-``ChunkScanBwdDBAmpere`` is the live Ampere tensor-core implementation for the
-backward key-gradient slice of the chunk-scan stage.
-
-It consumes the public stage inputs plus the stage-local upstream gradient, then
-reconstructs prefix metadata from ``M``, sweeps tiles in reverse causal order,
-forms the current and shifted score blocks from ``dY @ V``, contracts those
-score blocks against scaled/rotated ``Q``, applies the two complex taps from
-``K``, and writes ``dB`` plus the cross-chunk boundary carry ``dB_prev``.
+``BwdDBAmpere`` computes the main backward key-gradient contribution.
+``BwdDBIncrementAccumulatorAmpere`` accumulates the increment-side key-gradient
+contribution into the same public ``dB`` tile. Both kernels reconstruct the
+needed prefix metadata from ``M``, sweep tiles in reverse causal order, apply
+the packed-complex taps from ``K``, and write ``dB`` plus the cross-chunk
+boundary carry ``dB_prev``.
 
 Tensor contracts:
 
@@ -17,7 +15,7 @@ Tensor contracts:
 - ``M``: ``(BHC, L, 2)`` fp32 packed complex transitions
 - ``K``: ``(BHC, L, 2, 2)`` fp32 packed complex taps for previous/current
   backward passes
-- ``dOut``: ``(BHC, L, 1, P)`` fp16/bf16 upstream stage gradient
+- ``dOut``: ``(BHC, L, 1, P)`` fp16/bf16 upstream gradient
 - ``U_prev0``: ``(BH, P)`` fp16/bf16 chunk-0 boundary value row
 - ``B_prev0``: ``(BH, D)`` fp16/bf16 chunk-0 boundary key row
 - ``dB``: ``(BHC, L, 1, D)`` fp16/bf16 output key gradient
@@ -27,6 +25,7 @@ The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be even
 and conceptually corresponds to ``2 * N``.
 """
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar
@@ -35,11 +34,15 @@ import torch
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
 from .common import (
     LOG2_E,
     TWO_LOG2_E,
+    _default_async_copy_bits,
+    _default_tc_k_tile,
+    _next_pow2,
     apply_complex_tap_adjoint,
     clamp_nonpositive_prefix_log,
     complex_mul,
@@ -49,7 +52,7 @@ from .common import (
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDBLayoutBundle:
+class BwdDBLayoutBundle:
     query_layout: object
     key_layout: object
     grad_output_layout: object
@@ -59,23 +62,23 @@ class ChunkScanBwdDBLayoutBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDBCopyBundle:
+class BwdDBCopyBundle:
     gmem_tiled_copy_d: object
     gmem_tiled_copy_p: object
     gmem_tiled_store_d: object
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDBKernelBundle:
-    layouts: ChunkScanBwdDBLayoutBundle
-    copies: ChunkScanBwdDBCopyBundle
+class BwdDBKernelBundle:
+    layouts: BwdDBLayoutBundle
+    copies: BwdDBCopyBundle
     tiled_mma: object
     shared_storage_cls: object
     smem_bytes: int
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDBSupportInfo:
+class BwdDBSupportInfo:
     smem_capacity_bytes: int
     required_smem_bytes: int
 
@@ -84,19 +87,17 @@ class ChunkScanBwdDBSupportInfo:
         return self.required_smem_bytes <= self.smem_capacity_bytes
 
 
-class ChunkScanBwdDBAmpere:
-    """Ampere tensor-core backward kernel for the ``v2x2ssd`` ``db`` slice.
+class BwdDBAmpere:
+    """Ampere tensor-core backward kernel for the ``v2x2ssd`` ``dB`` contract.
 
-    This kernel owns the chunk-local key-gradient path. It rebuilds the prefix
+    This kernel owns the scan-side key-gradient path. It rebuilds the prefix
     metadata from raw packed ``M``, forms the current and shifted score tiles
     from ``dOut @ U``, contracts those scores against the rotated query tiles,
     applies the two complex taps from ``K``, and writes ``dB`` plus the reverse
     chunk-boundary carry ``dB_prev``.
     """
 
-    _SUPPORT_INFO_CACHE: ClassVar[
-        dict[tuple[object, ...], ChunkScanBwdDBSupportInfo]
-    ] = {}
+    _SUPPORT_INFO_CACHE: ClassVar[dict[tuple[object, ...], BwdDBSupportInfo]] = {}
 
     def __init__(
         self,
@@ -259,9 +260,9 @@ class ChunkScanBwdDBAmpere:
         in_dtype: type[cutlass.Numeric],
         *,
         device_index: int | None = None,
-    ) -> ChunkScanBwdDBSupportInfo:
+    ) -> BwdDBSupportInfo:
         if in_dtype not in (cutlass.Float16, cutlass.BFloat16):
-            return ChunkScanBwdDBSupportInfo(0, 1)
+            return BwdDBSupportInfo(0, 1)
 
         if device_index is None:
             device_key = (
@@ -282,7 +283,7 @@ class ChunkScanBwdDBAmpere:
         if cached is not None:
             return cached
 
-        info = ChunkScanBwdDBSupportInfo(
+        info = BwdDBSupportInfo(
             smem_capacity_bytes=self._smem_capacity_bytes(device_key),
             required_smem_bytes=self._compute_smem_bytes(in_dtype),
         )
@@ -312,7 +313,7 @@ class ChunkScanBwdDBAmpere:
         acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
         return cute.make_tensor(acc.iterator, acc_layout_mn)
 
-    def _make_layout_bundle(self) -> ChunkScanBwdDBLayoutBundle:
+    def _make_layout_bundle(self) -> BwdDBLayoutBundle:
         kv_tile = self.kv_tile
         d_stage_width = self._d_stage_size()
         p_tile = 32
@@ -349,7 +350,7 @@ class ChunkScanBwdDBAmpere:
         )
         score_layout = cute.tile_to_shape(score_layout_atom, (kv_tile, kv_tile), (0, 1))
 
-        return ChunkScanBwdDBLayoutBundle(
+        return BwdDBLayoutBundle(
             query_layout=query_layout,
             key_layout=key_layout,
             grad_output_layout=grad_output_layout,
@@ -358,9 +359,7 @@ class ChunkScanBwdDBAmpere:
             score_layout=score_layout,
         )
 
-    def _make_copy_bundle(
-        self, in_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanBwdDBCopyBundle:
+    def _make_copy_bundle(self, in_dtype: type[cutlass.Numeric]) -> BwdDBCopyBundle:
         universal_copy_bits = 128
         elems_per_copy = universal_copy_bits // in_dtype.width
         p_tile = 32
@@ -389,7 +388,7 @@ class ChunkScanBwdDBAmpere:
             in_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
-        return ChunkScanBwdDBCopyBundle(
+        return BwdDBCopyBundle(
             gmem_tiled_copy_d=cute.make_tiled_copy_tv(
                 atom_async_copy_in, t_d_layout, vector_layout
             ),
@@ -417,87 +416,83 @@ class ChunkScanBwdDBAmpere:
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
-        layouts: ChunkScanBwdDBLayoutBundle,
+        layouts: BwdDBLayoutBundle,
     ):
         phase_layout = cute.make_layout((self.L, 2), stride=(2, 1))
         tap_curr_layout = cute.make_layout((self.kv_tile, 2), stride=(2, 1))
         carry_layout = cute.make_layout((self.D_padded,), stride=(1,))
         row_layout = cute.make_layout((self.L,), stride=(1,))
 
+        @cute.struct
         class SharedStorage:
-            pass
-
-        SharedStorage.__annotations__ = {
-            "query_tile": cute.struct.Align[
+            query_tile: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.query_layout)], 16
-            ],
-            "key_tile": cute.struct.Align[
+            ]
+            key_tile: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.key_layout)], 16
-            ],
-            "grad_output_tile": cute.struct.Align[
+            ]
+            grad_output_tile: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.grad_output_layout)],
                 16,
-            ],
-            "key_grad_tile": cute.struct.Align[
+            ]
+            key_grad_tile: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.key_grad_layout)], 16
-            ],
-            "value_tile": cute.struct.Align[
+            ]
+            value_tile: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.value_layout)], 16
-            ],
-            "score_tile": cute.struct.Align[
+            ]
+            score_tile: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.score_layout)], 16
-            ],
-            "score_diag_curr": cute.struct.Align[
+            ]
+            score_diag_curr: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, cute.cosize(layouts.score_layout)], 16
-            ],
-            "phase_full": cute.struct.Align[
+            ]
+            phase_full: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(phase_layout)], 16
-            ],
-            "tap_prev_full": cute.struct.Align[
+            ]
+            tap_prev_full: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(phase_layout)], 16
-            ],
-            "tap_curr_tile": cute.struct.Align[
+            ]
+            tap_curr_tile: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(tap_curr_layout)], 16
-            ],
-            "db_carry": cute.struct.Align[
+            ]
+            db_carry: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(carry_layout)], 8
-            ],
-            "key_boundary": cute.struct.Align[
+            ]
+            key_boundary: cute.struct.Align[
                 cute.struct.MemRange[in_dtype, self._d_stage_size()], 16
-            ],
-            "row_scale": cute.struct.Align[
+            ]
+            row_scale: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(row_layout)], 4
-            ],
-            "inv_row_scale": cute.struct.Align[
+            ]
+            inv_row_scale: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(row_layout)], 4
-            ],
-            "dm_curr": cute.struct.Align[
+            ]
+            dm_curr: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(tap_curr_layout)], 16
-            ],
-            "dm_prev": cute.struct.Align[
+            ]
+            dm_prev: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(tap_curr_layout)], 16
-            ],
-            "warp_log_total": cute.struct.Align[
+            ]
+            warp_log_total: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.num_warps], 4
-            ],
-            "warp_log_offset": cute.struct.Align[
+            ]
+            warp_log_offset: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.num_warps], 4
-            ],
-            "warp_phase_total": cute.struct.Align[
+            ]
+            warp_phase_total: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
-            ],
-            "warp_phase_offset": cute.struct.Align[
+            ]
+            warp_phase_offset: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.num_warps * 2], 16
-            ],
-        }
-        return cute.struct(SharedStorage)
+            ]
 
-    def _make_kernel_bundle(
-        self, in_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanBwdDBKernelBundle:
+        return SharedStorage
+
+    def _make_kernel_bundle(self, in_dtype: type[cutlass.Numeric]) -> BwdDBKernelBundle:
         layouts = self._make_layout_bundle()
         shared_storage_cls = self._make_shared_storage(in_dtype, layouts)
-        return ChunkScanBwdDBKernelBundle(
+        return BwdDBKernelBundle(
             layouts=layouts,
             copies=self._make_copy_bundle(in_dtype),
             tiled_mma=self._make_tiled_mma(in_dtype),
@@ -637,7 +632,7 @@ class ChunkScanBwdDBAmpere:
         )
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _stage_key_boundary_from_gmem(
@@ -672,7 +667,7 @@ class ChunkScanBwdDBAmpere:
                             d,
                         ]
                 s_key_boundary[d_local] = boundary_value
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _stage_p_tile_from_gmem(
@@ -745,7 +740,7 @@ class ChunkScanBwdDBAmpere:
                             p,
                         ]
                 s_value[0, p_local] = boundary_value
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _stage_shifted_value_p_tile(
@@ -852,7 +847,7 @@ class ChunkScanBwdDBAmpere:
                 acc,
             )
         if cutlass.const_expr(barrier_after):
-            cute.arch.barrier()
+            pipeline.sync()
 
     @cute.jit
     def _compute_phase_prefix_metadata(self, prefix_state: SimpleNamespace):
@@ -900,7 +895,7 @@ class ChunkScanBwdDBAmpere:
             prefix_state.warp_log_total[warp] = logp
             prefix_state.warp_phase_total[warp, 0] = phase_re
             prefix_state.warp_phase_total[warp, 1] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
         if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
             running_log = cutlass.Float32(0.0)
@@ -923,7 +918,7 @@ class ChunkScanBwdDBAmpere:
                 running_log = running_log + total_log
                 running_phase_re = next_phase_re
                 running_phase_im = next_phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
         logp = logp + prefix_state.warp_log_offset[warp]
         phase_re, phase_im = complex_mul(
@@ -942,7 +937,7 @@ class ChunkScanBwdDBAmpere:
             prefix_state.s_inv_row_scale[seq_idx] = cutlass.Float32(1.0) / row_scale
             prefix_state.s_phase[seq_idx, 0] = phase_re
             prefix_state.s_phase[seq_idx, 1] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_prev_taps(
@@ -956,7 +951,7 @@ class ChunkScanBwdDBAmpere:
         if tidx < self.L:
             s_tap_prev[tidx, 0] = cutlass.Float32(mK[batch_head_chunk, tidx, 0, 0])
             s_tap_prev[tidx, 1] = cutlass.Float32(mK[batch_head_chunk, tidx, 0, 1])
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_curr_taps_and_dm_tiles(
@@ -978,7 +973,7 @@ class ChunkScanBwdDBAmpere:
             s_dm_curr[tidx, 1] = cutlass.Float32(0.0)
             s_dm_prev[tidx, 0] = cutlass.Float32(0.0)
             s_dm_prev[tidx, 1] = cutlass.Float32(0.0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _rotate_and_scale_staged_query_tile_from_prefix(
@@ -1018,7 +1013,7 @@ class ChunkScanBwdDBAmpere:
                     yi * scale, out_dtype
                 )
             idx = idx + self.num_threads
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _stage_score_operands_for_p_tile(
@@ -1099,7 +1094,7 @@ class ChunkScanBwdDBAmpere:
         )
         for p_tile_index in cutlass.range_constexpr(score_pipeline.num_p_tiles):
             cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+            pipeline.sync()
 
             if cutlass.const_expr(p_tile_index + 1 < score_pipeline.num_p_tiles):
                 self._stage_score_operands_for_p_tile(
@@ -1162,7 +1157,7 @@ class ChunkScanBwdDBAmpere:
                 use_stage1=False,
             )
             cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+            pipeline.sync()
 
             t_reg_dout = score_pipeline.thr_mma.make_fragment_A(
                 score_pipeline.thr_mma.partition_A(score_pipeline.s_dout_stage0)
@@ -1216,7 +1211,7 @@ class ChunkScanBwdDBAmpere:
                 s_score[col_local, row_local] = safe_cast_to_dtype(
                     score_value, out_dtype
                 )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _accumulate_key_grad_from_staged_score_block(
@@ -1437,7 +1432,7 @@ class ChunkScanBwdDBAmpere:
                         s_dm_prev[row_local, 1] + dmy_prev_im
                     )
             row_local = row_local + cutlass.Int32(self.num_warps)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _clear_db_carry(self, s_db_carry: cute.Tensor):
@@ -1448,7 +1443,7 @@ class ChunkScanBwdDBAmpere:
             d = tidx + cutlass.Int32(it * self.num_threads)
             if d < cutlass.Int32(self.D_padded):
                 s_db_carry[d] = cutlass.Float32(0.0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _update_db_carry_from_tile_head(
@@ -1484,7 +1479,7 @@ class ChunkScanBwdDBAmpere:
                     )
                     s_db_carry[d_col_base + d_local + 0] = cutlass.Float32(carry_re)
                     s_db_carry[d_col_base + d_local + 1] = cutlass.Float32(carry_im)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _store_dm_tile(
@@ -1505,7 +1500,7 @@ class ChunkScanBwdDBAmpere:
                 mDMcurr[batch_head_chunk, row, 1] = s_dm_curr[tidx, 1]
                 mDMprev[batch_head_chunk, row, 0] = s_dm_prev[tidx, 0]
                 mDMprev[batch_head_chunk, row, 1] = s_dm_prev[tidx, 1]
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _store_db_prev_carry(
@@ -1582,11 +1577,8 @@ class ChunkScanBwdDBAmpere:
         mDOut: cute.Tensor,
         mU_prev0: cute.Tensor,
         mB_prev0: cute.Tensor,
-        mDU: cute.Tensor,
         mDB: cute.Tensor,
-        mDU_prev: cute.Tensor,
         mDB_prev: cute.Tensor,
-        mDLogPrefix: cute.Tensor,
         mDMprev: cute.Tensor,
         mDMcurr: cute.Tensor,
     ):
@@ -1604,8 +1596,6 @@ class ChunkScanBwdDBAmpere:
             raise TypeError("M must be Float32.")
         if cutlass.const_expr(mK.element_type != cutlass.Float32):
             raise TypeError("K must be Float32.")
-        if cutlass.const_expr(mDLogPrefix.element_type != cutlass.Float32):
-            raise TypeError("dlogprefix must be Float32.")
         if cutlass.const_expr(
             mDMprev.element_type != cutlass.Float32
             or mDMcurr.element_type != cutlass.Float32
@@ -1625,16 +1615,10 @@ class ChunkScanBwdDBAmpere:
             raise ValueError("K must be (BHC, L, 2, 2).")
         if cutlass.const_expr(mDOut.shape[1] != self.L or mDOut.shape[2] != 1):
             raise ValueError("dOut must be (BHC, L, 1, P).")
-        if cutlass.const_expr(mDU.shape[1] != self.L or mDU.shape[2] != 1):
-            raise ValueError("dU must be (BHC, L, 1, P).")
         if cutlass.const_expr(mDB.shape[1] != self.L or mDB.shape[2] != 1):
             raise ValueError("dB must be (BHC, L, 1, D).")
-        if cutlass.const_expr(mDU_prev.shape[1] != self.P):
-            raise ValueError("dU_prev must be (BHC, P).")
         if cutlass.const_expr(mDB_prev.shape[1] != self.D):
             raise ValueError("dB_prev must be (BHC, D).")
-        if cutlass.const_expr(mDLogPrefix.shape[1] != self.L):
-            raise ValueError("dlogprefix must be (BHC, L).")
         if cutlass.const_expr(
             mDMprev.shape[1] != self.L
             or mDMprev.shape[2] != 2
@@ -1655,11 +1639,8 @@ class ChunkScanBwdDBAmpere:
         mDOut: cute.Tensor,
         mU_prev0: cute.Tensor,
         mB_prev0: cute.Tensor,
-        mDU: cute.Tensor,
         mDB: cute.Tensor,
-        mDU_prev: cute.Tensor,
         mDB_prev: cute.Tensor,
-        mDLogPrefix: cute.Tensor,
         mDMprev: cute.Tensor,
         mDMcurr: cute.Tensor,
         *,
@@ -1685,11 +1666,8 @@ class ChunkScanBwdDBAmpere:
             mDOut,
             mU_prev0,
             mB_prev0,
-            mDU,
             mDB,
-            mDU_prev,
             mDB_prev,
-            mDLogPrefix,
             mDMprev,
             mDMcurr,
             layouts.query_layout,
@@ -1716,11 +1694,8 @@ class ChunkScanBwdDBAmpere:
         mDOut: cute.Tensor,
         mU_prev0: cute.Tensor,
         mB_prev0: cute.Tensor,
-        mDU: cute.Tensor,
         mDB: cute.Tensor,
-        mDU_prev: cute.Tensor,
         mDB_prev: cute.Tensor,
-        mDLogPrefix: cute.Tensor,
         mDMprev: cute.Tensor,
         mDMcurr: cute.Tensor,
     ):
@@ -1733,11 +1708,8 @@ class ChunkScanBwdDBAmpere:
             mDOut,
             mU_prev0,
             mB_prev0,
-            mDU,
             mDB,
-            mDU_prev,
             mDB_prev,
-            mDLogPrefix,
             mDMprev,
             mDMcurr,
         )
@@ -1750,11 +1722,8 @@ class ChunkScanBwdDBAmpere:
             mDOut,
             mU_prev0,
             mB_prev0,
-            mDU,
             mDB,
-            mDU_prev,
             mDB_prev,
-            mDLogPrefix,
             mDMprev,
             mDMcurr,
         )
@@ -1770,11 +1739,8 @@ class ChunkScanBwdDBAmpere:
         mDOut: cute.Tensor,
         mU_prev0: cute.Tensor,
         mB_prev0: cute.Tensor,
-        mDU: cute.Tensor,
         mDB: cute.Tensor,
-        mDU_prev: cute.Tensor,
         mDB_prev: cute.Tensor,
-        mDLogPrefix: cute.Tensor,
         mDMprev: cute.Tensor,
         mDMcurr: cute.Tensor,
         stream: cuda.CUstream,
@@ -1788,11 +1754,8 @@ class ChunkScanBwdDBAmpere:
             mDOut,
             mU_prev0,
             mB_prev0,
-            mDU,
             mDB,
-            mDU_prev,
             mDB_prev,
-            mDLogPrefix,
             mDMprev,
             mDMcurr,
         )
@@ -1805,11 +1768,8 @@ class ChunkScanBwdDBAmpere:
             mDOut,
             mU_prev0,
             mB_prev0,
-            mDU,
             mDB,
-            mDU_prev,
             mDB_prev,
-            mDLogPrefix,
             mDMprev,
             mDMcurr,
             stream=stream,
@@ -1826,11 +1786,8 @@ class ChunkScanBwdDBAmpere:
         mDOut: cute.Tensor,
         mU_prev0: cute.Tensor,
         mB_prev0: cute.Tensor,
-        mDU: cute.Tensor,
         mDB: cute.Tensor,
-        mDU_prev: cute.Tensor,
         mDB_prev: cute.Tensor,
-        mDLogPrefix: cute.Tensor,
         mDMprev: cute.Tensor,
         mDMcurr: cute.Tensor,
         query_layout: cute.ComposedLayout,
@@ -2385,11 +2342,15 @@ class ChunkScanBwdDBAmpere:
                 t_db_stage_coord_mn = self._make_accumulator_mn_view(t_db_stage_coord)
 
                 t_db_prev_smem = thr_mma.partition_C(s_query_tile)
-                t_db_prev_reg = cute.make_fragment_like(t_db_prev_smem, mU.element_type)
+                t_db_prev_reg = cute.make_rmem_tensor_like(
+                    t_db_prev_smem, mU.element_type
+                )
                 t_db_prev_reg.fill(0.0)
                 t_db_prev_reg_mn = self._make_accumulator_mn_view(t_db_prev_reg)
                 t_db_curr_smem = thr_mma.partition_C(s_key_grad_tile)
-                t_db_curr_reg = cute.make_fragment_like(t_db_curr_smem, mU.element_type)
+                t_db_curr_reg = cute.make_rmem_tensor_like(
+                    t_db_curr_smem, mU.element_type
+                )
                 t_db_curr_reg.fill(0.0)
                 t_db_curr_reg_mn = self._make_accumulator_mn_view(t_db_curr_reg)
 
@@ -2411,7 +2372,7 @@ class ChunkScanBwdDBAmpere:
                 )
                 cute.autovec_copy(t_db_prev_reg, t_db_prev_smem)
                 cute.autovec_copy(t_db_curr_reg, t_db_curr_smem)
-                cute.arch.barrier()
+                pipeline.sync()
 
                 self._accumulate_dm_and_apply_tap_adjoint(
                     s_key_grad_tile,
@@ -2464,4 +2425,1303 @@ class ChunkScanBwdDBAmpere:
         )
 
 
-__all__ = ["ChunkScanBwdDBAmpere"]
+@dataclass(frozen=True)
+class _BwdDBIncrementAccumulatorLayoutBundle:
+    u_major_mode: object
+    d_inc_major_mode: object
+    u_tile_layout: object
+    d_inc_tile_layout: object
+    db_tile_layout: object
+
+
+@dataclass(frozen=True)
+class _BwdDBIncrementAccumulatorCopyBundle:
+    gmem_tiled_copy_u: object
+    gmem_tiled_copy_d_inc: object
+    ldmatrix_tiled_copy_u: object
+    ldmatrix_tiled_copy_d_inc: object
+
+
+@dataclass(frozen=True)
+class _BwdDBIncrementAccumulatorKernelBundle:
+    layouts: _BwdDBIncrementAccumulatorLayoutBundle
+    copies: _BwdDBIncrementAccumulatorCopyBundle
+    tiled_mma: object
+    smem_bytes: int
+
+
+@dataclass(frozen=True)
+class _BwdDBIncrementAccumulatorSupportInfo:
+    smem_capacity_bytes: int
+    required_smem_bytes: int
+
+    @property
+    def supported(self) -> bool:
+        return self.required_smem_bytes <= self.smem_capacity_bytes
+
+
+class _BwdDBIncrementAccumulatorBase:
+    """Shared tensor-core plumbing for increment-side ``dB`` accumulation."""
+
+    _SUPPORT_INFO_CACHE: ClassVar[
+        dict[tuple[object, ...], _BwdDBIncrementAccumulatorSupportInfo]
+    ] = {}
+
+    def __init__(
+        self,
+        dtype: type[cutlass.Numeric],
+        *,
+        chunk_size: int,
+        D: int,
+        P: int,
+        heads: int | None = None,
+        bc_groups: int | None = None,
+        n_chunks: int | None = None,
+        cta_tiler: tuple[int, int, int] | None = None,  # (bM=L, bN=D, bK=P)
+        atom_layout_mnk: tuple[int, int, int] = (2, 2, 1),
+        num_stages: int = 2,
+    ):
+        self.ab_dtype = dtype
+        self.acc_dtype = cutlass.Float32
+        self.c_dtype = cutlass.Float32
+
+        self.L = int(chunk_size)
+        self.D = int(D)
+        self.P = int(P)
+        self.has_group_geometry = heads is not None
+        if self.has_group_geometry:
+            self.heads = int(heads)
+            self.bc_groups = self.heads if bc_groups is None else int(bc_groups)
+            if n_chunks is None:
+                raise ValueError(
+                    "n_chunks must be specified when grouped BC is active."
+                )
+            self.n_chunks = int(n_chunks)
+            if self.heads <= 0 or self.bc_groups <= 0:
+                raise ValueError("heads and bc_groups must be positive.")
+            if self.heads % self.bc_groups != 0:
+                raise ValueError("bc_groups must divide heads.")
+            if self.n_chunks <= 0:
+                raise ValueError("n_chunks must be positive.")
+            self.heads_per_bc_group = self.heads // self.bc_groups
+        else:
+            if bc_groups is not None:
+                raise ValueError("bc_groups requires heads to be specified.")
+            self.heads = 0
+            self.bc_groups = 0
+            self.n_chunks = 0
+            self.heads_per_bc_group = 0
+        if cta_tiler is None:
+            cta_tiler = (self.L, 64, _default_tc_k_tile(self.P))
+        self.cta_tiler = cta_tiler
+        self.num_stages = int(num_stages)
+        self.atom_layout_mnk = atom_layout_mnk
+
+        self.bM, self.bN, self.bK = map(int, self.cta_tiler)
+        if self.bM != self.L:
+            raise ValueError("This kernel assumes bM == chunk_size (single tile in M).")
+        if self.bN % 2 != 0:
+            raise ValueError("bN must be divisible by 2; D stores pairs.")
+        if (self.bN // 2) > 32:
+            raise ValueError("bN/2 must fit within one warp for the DB epilogue.")
+        if self.bK % 16 != 0:
+            raise ValueError("bK must be divisible by 16 for tensor cores.")
+        if self.num_stages < 2:
+            raise ValueError("num_stages must be >= 2.")
+        if self.P % self.bK != 0:
+            raise ValueError("P must be divisible by bK for this kernel.")
+        if (self.P // self.bK) < (self.num_stages - 1):
+            raise ValueError("P/bK must be >= (num_stages - 1) for the cp.async pipe.")
+
+        self.mma_inst_shape = (16, 8, 16)
+        mma_m, mma_n, mma_k = self.mma_inst_shape
+        atom_m, atom_n, atom_k = self.atom_layout_mnk
+        self.num_threads = atom_m * atom_n * atom_k * 32
+        if atom_k != 1:
+            raise ValueError("atom_layout_mnk K must be 1.")
+        if self.bM % (atom_m * mma_m) != 0:
+            raise ValueError("bM must be divisible by atomM * mmaM.")
+        if self.bN % (atom_n * mma_n * 2) != 0:
+            raise ValueError("bN must be divisible by atomN * mmaN * 2.")
+        if self.bK % mma_k != 0:
+            raise ValueError("bK must be divisible by mmaK.")
+
+        self.scan_threads = _next_pow2(self.L)
+        if self.scan_threads > self.num_threads:
+            raise ValueError(
+                "chunk_size too large for scan_threads with this CTA thread count."
+            )
+
+    @cute.jit
+    def _batch_group_chunk_index(
+        self,
+        batch_head_chunk_idx: int,
+    ):
+        if cutlass.const_expr(not self.has_group_geometry):
+            return batch_head_chunk_idx
+        batch_head = batch_head_chunk_idx // cutlass.Int32(self.n_chunks)
+        chunk_index = batch_head_chunk_idx - batch_head * cutlass.Int32(self.n_chunks)
+        batch_idx = batch_head // cutlass.Int32(self.heads)
+        head_idx = batch_head - batch_idx * cutlass.Int32(self.heads)
+        group_idx = head_idx // cutlass.Int32(self.heads_per_bc_group)
+        batch_group = batch_idx * cutlass.Int32(self.bc_groups) + group_idx
+        return batch_group * cutlass.Int32(self.n_chunks) + chunk_index
+
+    def _suffix_coeff_layout(self):
+        return cute.make_layout((self.L, 2), stride=(2, 1))
+
+    def _warp_transition_layout(self):
+        return cute.make_layout((32,), stride=(1,))
+
+    def _db_tile_layout(self):
+        major_mode_size = self.bN
+        if major_mode_size >= 64:
+            if major_mode_size % 64 == 0:
+                major_mode_size = 64
+            elif major_mode_size % 32 == 0:
+                major_mode_size = 32
+            else:
+                major_mode_size = 64
+
+        swizzle_bits = int(math.log2(major_mode_size * self.c_dtype.width // 128))
+        swizzle_bits = min(swizzle_bits, 3)
+        layout_atom_outer = cute.make_layout(
+            (8, major_mode_size), stride=(major_mode_size, 1)
+        )
+        layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits, 3, 3),
+            0,
+            layout_atom_outer,
+        )
+        return cute.tile_to_shape(layout_atom, (self.bM, self.bN), (0, 1))
+
+    def _output_alias_guard_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
+        operand_bytes = (
+            (self.bM * self.bK + self.bN * self.bK)
+            * self.num_stages
+            * (in_dtype.width // 8)
+        )
+        db_tile_bytes = self.bM * self.bN * (self.c_dtype.width // 8)
+        pad_bytes = max(0, db_tile_bytes - operand_bytes)
+        return max(4, self._align_up(pad_bytes, 4))
+
+    def _output_alias_guard_layout(self, in_dtype: type[cutlass.Numeric]):
+        return cute.make_layout(
+            (self._output_alias_guard_bytes(in_dtype) // 4,), stride=(1,)
+        )
+
+    def _shared_tail_pad_layout(self):
+        return cute.make_layout((64,), stride=(1,))
+
+    def _smem_capacity_bytes(self, device_index: int | None = None) -> int:
+        if torch.cuda.is_available():
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(int(device_index))
+            capacity = int(getattr(props, "shared_memory_per_block_optin", 0))
+            if capacity > 0:
+                return capacity
+            cc = f"sm_{props.major}{props.minor}"
+            return int(utils.get_smem_capacity_in_bytes(cc))
+        return int(utils.get_smem_capacity_in_bytes("sm_80"))
+
+    @staticmethod
+    def _align_up(offset: int, align: int) -> int:
+        return ((offset + align - 1) // align) * align
+
+    @classmethod
+    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
+        offset = 0
+        max_align = 1
+        for size, align in fields:
+            offset = cls._align_up(offset, align)
+            offset += size
+            max_align = max(max_align, align)
+        return cls._align_up(offset, max_align)
+
+    def _required_smem_bytes(self, in_dtype: type[cutlass.Numeric]) -> int:
+        # Keep this accounting aligned with `_make_shared_storage`.
+        fields = [
+            (
+                self.bM * self.bK * self.num_stages * (in_dtype.width // 8),
+                16,
+            ),
+            (
+                self.bN * self.bK * self.num_stages * (in_dtype.width // 8),
+                16,
+            ),
+            (self._output_alias_guard_bytes(in_dtype), 16),
+            (self.L * 2 * 4, 4),
+            (self.L * 2 * 4, 4),
+            (32 * 4, 4),
+            (32 * 4, 4),
+            (32 * 4, 4),
+            (32 * 4, 4),
+            (64 * 4, 4),
+        ]
+        return self._struct_size_bytes(fields)
+
+    def support_info(
+        self,
+        dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
+    ) -> _BwdDBIncrementAccumulatorSupportInfo:
+        if dtype not in (cutlass.Float16, cutlass.BFloat16):
+            return _BwdDBIncrementAccumulatorSupportInfo(0, 1)
+
+        if device_index is None:
+            device_key = (
+                int(torch.cuda.current_device()) if torch.cuda.is_available() else -1
+            )
+        else:
+            device_key = int(device_index)
+        cache_key = (
+            type(self),
+            self.L,
+            self.D,
+            self.P,
+            self.cta_tiler,
+            self.num_stages,
+            dtype,
+            device_key,
+        )
+        cached = self._SUPPORT_INFO_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        info = _BwdDBIncrementAccumulatorSupportInfo(
+            smem_capacity_bytes=self._smem_capacity_bytes(device_key),
+            required_smem_bytes=self._required_smem_bytes(dtype),
+        )
+        self._SUPPORT_INFO_CACHE[cache_key] = info
+        return info
+
+    def can_implement(
+        self,
+        dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
+    ) -> bool:
+        return self.support_info(dtype, device_index=device_index).supported
+
+    def _make_operand_smem_layout(self, dtype, major_mode, copy_bits, smem_tiler):
+        major_mode_size = (
+            smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
+        )
+        if major_mode_size >= 64:
+            if major_mode_size % 64 == 0:
+                major_mode_size = 64
+            elif major_mode_size % 32 == 0:
+                major_mode_size = 32
+            else:
+                major_mode_size = 64
+
+        swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits))
+        swizzle_bits = min(swizzle_bits, 3)
+
+        layout_atom_outer = (
+            cute.make_layout((8, major_mode_size), stride=(major_mode_size, 1))
+            if major_mode == utils.LayoutEnum.ROW_MAJOR
+            else cute.make_layout((major_mode_size, 8), stride=(1, major_mode_size))
+        )
+        layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits, 3, 3),
+            0,
+            layout_atom_outer,
+        )
+        return cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))
+
+    def _make_operand_gmem_tiled_copy(
+        self, atom_copy, dtype, major_mode, copy_bits, *, tile_m: int
+    ):
+        copy_elems = copy_bits // dtype.width
+        shape_dim_1 = cute.size(self.bK) // copy_elems
+        thread_layout = cute.make_layout(
+            (self.num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
+        )
+        if major_mode != utils.LayoutEnum.ROW_MAJOR:
+            shape_dim_0 = (int(tile_m) + int(copy_elems) - 1) // int(copy_elems)
+            if shape_dim_0 > self.num_threads:
+                raise ValueError("tile_m too large for vectorized col-major copy.")
+
+            tm = None
+            for cand in range(shape_dim_0, self.num_threads + 1):
+                if self.num_threads % cand == 0:
+                    tm = cand
+                    break
+            if tm is None:
+                raise ValueError(
+                    "Internal error: failed to find divisor for col-major copy."
+                )
+            thread_layout = cute.make_layout(
+                (tm, self.num_threads // tm), stride=(1, tm)
+            )
+        value_layout = (
+            cute.make_layout((1, copy_elems))
+            if major_mode == utils.LayoutEnum.ROW_MAJOR
+            else cute.make_layout((copy_elems, 1))
+        )
+        return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
+
+    def _make_layout_bundle(
+        self,
+        mU: cute.Tensor,
+        mDIncDP: cute.Tensor,
+    ) -> _BwdDBIncrementAccumulatorLayoutBundle:
+        u_major_mode = utils.LayoutEnum.from_tensor(mU)
+        d_inc_major_mode = utils.LayoutEnum.from_tensor(mDIncDP)
+        u_copy_bits = _default_async_copy_bits(
+            dtype_width=mU.element_type.width,
+            major_mode=u_major_mode,
+            tile_m=self.bM,
+            tile_k=self.bK,
+            num_threads=self.num_threads,
+        )
+        d_inc_copy_bits = _default_async_copy_bits(
+            dtype_width=mDIncDP.element_type.width,
+            major_mode=d_inc_major_mode,
+            tile_m=self.bN,
+            tile_k=self.bK,
+            num_threads=self.num_threads,
+        )
+        u_tile_layout = self._make_operand_smem_layout(
+            mU.element_type,
+            u_major_mode,
+            u_copy_bits,
+            (self.bM, self.bK, self.num_stages),
+        )
+        d_inc_tile_layout = self._make_operand_smem_layout(
+            mDIncDP.element_type,
+            d_inc_major_mode,
+            d_inc_copy_bits,
+            (self.bN, self.bK, self.num_stages),
+        )
+        return _BwdDBIncrementAccumulatorLayoutBundle(
+            u_major_mode=u_major_mode,
+            d_inc_major_mode=d_inc_major_mode,
+            u_tile_layout=u_tile_layout,
+            d_inc_tile_layout=d_inc_tile_layout,
+            db_tile_layout=self._db_tile_layout(),
+        )
+
+    def _make_tiled_mma(self):
+        op = cute.nvgpu.warp.MmaF16BF16Op(
+            self.ab_dtype, self.acc_dtype, self.mma_inst_shape
+        )
+        permutation_mnk = (
+            self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
+            self.atom_layout_mnk[2] * self.mma_inst_shape[2],
+        )
+        atoms_layout = cute.make_layout(self.atom_layout_mnk)
+        return cute.make_tiled_mma(op, atoms_layout, permutation_mnk=permutation_mnk)
+
+    def _make_copy_bundle(
+        self,
+        layouts: _BwdDBIncrementAccumulatorLayoutBundle,
+        in_u_dtype: type[cutlass.Numeric],
+        in_d_inc_dtype: type[cutlass.Numeric],
+        tiled_mma: cute.TiledMma,
+    ) -> _BwdDBIncrementAccumulatorCopyBundle:
+        u_copy_bits = _default_async_copy_bits(
+            dtype_width=in_u_dtype.width,
+            major_mode=layouts.u_major_mode,
+            tile_m=self.bM,
+            tile_k=self.bK,
+            num_threads=self.num_threads,
+        )
+        d_inc_copy_bits = _default_async_copy_bits(
+            dtype_width=in_d_inc_dtype.width,
+            major_mode=layouts.d_inc_major_mode,
+            tile_m=self.bN,
+            tile_k=self.bK,
+            num_threads=self.num_threads,
+        )
+        atom_async_copy_u = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            in_u_dtype,
+            num_bits_per_copy=u_copy_bits,
+        )
+        atom_async_copy_d_inc = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            in_d_inc_dtype,
+            num_bits_per_copy=d_inc_copy_bits,
+        )
+        gmem_tiled_copy_u = self._make_operand_gmem_tiled_copy(
+            atom_async_copy_u,
+            in_u_dtype,
+            layouts.u_major_mode,
+            u_copy_bits,
+            tile_m=self.bM,
+        )
+        gmem_tiled_copy_d_inc = self._make_operand_gmem_tiled_copy(
+            atom_async_copy_d_inc,
+            in_d_inc_dtype,
+            layouts.d_inc_major_mode,
+            d_inc_copy_bits,
+            tile_m=self.bN,
+        )
+        ldmatrix_copy_atom_u = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                layouts.u_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+            ),
+            in_u_dtype,
+        )
+        ldmatrix_copy_atom_d_inc = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                layouts.d_inc_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+            ),
+            in_d_inc_dtype,
+        )
+        return _BwdDBIncrementAccumulatorCopyBundle(
+            gmem_tiled_copy_u=gmem_tiled_copy_u,
+            gmem_tiled_copy_d_inc=gmem_tiled_copy_d_inc,
+            ldmatrix_tiled_copy_u=cute.make_tiled_copy_A(
+                ldmatrix_copy_atom_u, tiled_mma
+            ),
+            ldmatrix_tiled_copy_d_inc=cute.make_tiled_copy_B(
+                ldmatrix_copy_atom_d_inc, tiled_mma
+            ),
+        )
+
+    def _make_shared_storage(
+        self,
+        in_u_dtype: type[cutlass.Numeric],
+        in_d_inc_dtype: type[cutlass.Numeric],
+        u_tile_layout: cute.ComposedLayout,
+        d_inc_tile_layout: cute.ComposedLayout,
+    ):
+        suffix_coeff_layout = self._suffix_coeff_layout()
+        warp_transition_layout = self._warp_transition_layout()
+        output_alias_guard_layout = self._output_alias_guard_layout(in_u_dtype)
+        shared_tail_pad_layout = self._shared_tail_pad_layout()
+
+        @cute.struct
+        class SharedStorage:
+            u_tile: cute.struct.Align[
+                cute.struct.MemRange[in_u_dtype, cute.cosize(u_tile_layout)], 16
+            ]
+            d_inc_tile: cute.struct.Align[
+                cute.struct.MemRange[in_d_inc_dtype, cute.cosize(d_inc_tile_layout)],
+                16,
+            ]
+            # Guard storage covers the accumulator aliasing envelope.
+            output_alias_guard: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(output_alias_guard_layout)
+                ],
+                16,
+            ]
+            suffix_coeff_sum: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(suffix_coeff_layout)],
+                4,
+            ]
+            suffix_coeff_prev: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(suffix_coeff_layout)],
+                4,
+            ]
+            warp_transition_re_total: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(warp_transition_layout)
+                ],
+                4,
+            ]
+            warp_transition_im_total: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(warp_transition_layout)
+                ],
+                4,
+            ]
+            warp_transition_re_offset: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(warp_transition_layout)
+                ],
+                4,
+            ]
+            warp_transition_im_offset: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(warp_transition_layout)
+                ],
+                4,
+            ]
+            shared_tail_pad: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(shared_tail_pad_layout)
+                ],
+                4,
+            ]
+
+        return SharedStorage
+
+    def _make_kernel_bundle(
+        self,
+        mU: cute.Tensor,
+        mDIncDP: cute.Tensor,
+    ) -> _BwdDBIncrementAccumulatorKernelBundle:
+        layouts = self._make_layout_bundle(mU, mDIncDP)
+        tiled_mma = self._make_tiled_mma()
+        copies = self._make_copy_bundle(
+            layouts,
+            mU.element_type,
+            mDIncDP.element_type,
+            tiled_mma,
+        )
+        shared_storage_cls = self._make_shared_storage(
+            mU.element_type,
+            mDIncDP.element_type,
+            layouts.u_tile_layout,
+            layouts.d_inc_tile_layout,
+        )
+        return _BwdDBIncrementAccumulatorKernelBundle(
+            layouts=layouts,
+            copies=copies,
+            tiled_mma=tiled_mma,
+            smem_bytes=int(shared_storage_cls.size_in_bytes()),
+        )
+
+    @cute.jit
+    def _make_copy_tile_row_predicate(
+        self,
+        partitioned_dst: cute.Tensor,
+        partitioned_coord: cute.Tensor,
+        row_limit: int,
+    ):
+        pred = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    partitioned_dst.shape[0][1],
+                    cute.size(partitioned_dst, mode=[1]),
+                    cute.size(partitioned_dst, mode=[2]),
+                ),
+                stride=(cute.size(partitioned_dst, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in cutlass.range_constexpr(pred.shape[0]):
+            for row in cutlass.range_constexpr(pred.shape[1]):
+                pred[rest_v, row, 0] = cute.elem_less(
+                    partitioned_coord[(0, rest_v), row, 0, 0][0], row_limit
+                )
+        return pred
+
+    @cute.jit
+    def _validate_and_launch(
+        self,
+        mU: cute.Tensor,  # (L, P, BHC)
+        mB: cute.Tensor,  # (L, D, BHC)
+        mM: cute.Tensor,  # (2, L, BHC)
+        mKprev: cute.Tensor,  # (2, L, BHC)
+        mKcurr: cute.Tensor,  # (2, L, BHC)
+        mDIncDP: cute.Tensor,  # (D, P, BHC)
+        mDB: cute.Tensor,  # (L, D, BHC)
+        mDMsumPart: cute.Tensor,  # (2, L, n_d_tiles, BHC)
+        stream: cuda.CUstream | None = None,
+    ):
+        self._validate_operands(mU, mB, mM, mKprev, mKcurr, mDIncDP, mDB, mDMsumPart)
+        self._launch_kernel(
+            mU,
+            mB,
+            mM,
+            mKprev,
+            mKcurr,
+            mDIncDP,
+            mDB,
+            mDMsumPart,
+            stream=stream,
+        )
+
+
+class BwdDBIncrementAccumulatorAmpere(_BwdDBIncrementAccumulatorBase):
+    """Ampere increment accumulator for the backward ``dB`` accumulation path."""
+
+    @cute.jit
+    def _validate_operands(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mM: cute.Tensor,
+        mKprev: cute.Tensor,
+        mKcurr: cute.Tensor,
+        mDIncDP: cute.Tensor,
+        mDBTotal: cute.Tensor,
+        mDMsumPart: cute.Tensor,
+    ):
+        value_stream_dtype_ok = (
+            mU.element_type
+            == mB.element_type
+            == mDIncDP.element_type
+            == mDBTotal.element_type
+        )
+        coeff_dtype_ok = (
+            mM.element_type
+            == mKprev.element_type
+            == mKcurr.element_type
+            == mDMsumPart.element_type
+            == cutlass.Float32
+        )
+        chunk_dims_match = (
+            mU.shape[0]
+            == mB.shape[0]
+            == mM.shape[1]
+            == mKprev.shape[1]
+            == mKcurr.shape[1]
+            == mDBTotal.shape[1]
+        )
+        if cutlass.const_expr(not value_stream_dtype_ok):
+            raise TypeError("U/B/DIncDP/DBTotal must share element type.")
+        if cutlass.const_expr(
+            mU.element_type not in (cutlass.Float16, cutlass.BFloat16)
+        ):
+            raise TypeError("U/B/DIncDP/DBTotal must be Float16 or BFloat16.")
+        if cutlass.const_expr(not coeff_dtype_ok):
+            raise TypeError("M/Kprev/Kcurr/DMsumPart must be Float32.")
+        if cutlass.const_expr(not chunk_dims_match):
+            raise ValueError(
+                "U/B/M/Kprev/Kcurr/DBTotal must share the chunk time dimension."
+            )
+        if cutlass.const_expr(mB.shape[1] % 2 != 0):
+            raise ValueError("B/DBTotal D dimension must be even.")
+        if cutlass.const_expr(mDIncDP.shape[0] != mB.shape[1]):
+            raise ValueError("DIncDP rows must match the D dimension of B.")
+        if cutlass.const_expr(mDIncDP.shape[1] != mU.shape[1]):
+            raise ValueError("DIncDP columns must match the P dimension of U.")
+        if cutlass.const_expr(mDBTotal.shape[2] != 1):
+            raise ValueError("DBTotal must have singleton scan dimension 2.")
+        if cutlass.const_expr(mDBTotal.shape[3] != mB.shape[1]):
+            raise ValueError("DBTotal D dimension must match B.")
+        if cutlass.const_expr(
+            not (mM.shape[0] == mKprev.shape[0] == mKcurr.shape[0] == 2)
+        ):
+            raise ValueError(
+                "M/Kprev/Kcurr must have leading packed-complex dimension 2."
+            )
+        if cutlass.const_expr(mDMsumPart.shape[0] != 2):
+            raise ValueError("DMsumPart must have leading packed-complex dimension 2.")
+        if cutlass.const_expr(mDMsumPart.shape[1] != mU.shape[0]):
+            raise ValueError("DMsumPart time dimension must match U rows.")
+
+    def _launch_kernel(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mM: cute.Tensor,
+        mKprev: cute.Tensor,
+        mKcurr: cute.Tensor,
+        mDIncDP: cute.Tensor,
+        mDBTotal: cute.Tensor,
+        mDMsumPart: cute.Tensor,
+        *,
+        stream: cuda.CUstream | None = None,
+    ):
+        bundle = self._make_kernel_bundle(mU, mDIncDP)
+        grid_dim = cute.ceil_div(
+            (mDBTotal.shape[1], mDBTotal.shape[3], mDBTotal.shape[0]),
+            (self.bM, self.bN, 1),
+        )
+        launch_kwargs = {
+            "grid": (
+                cute.size(grid_dim[0]),
+                cute.size(grid_dim[1]),
+                cute.size(grid_dim[2]),
+            ),
+            "block": [self.num_threads, 1, 1],
+            "smem": bundle.smem_bytes,
+        }
+        if stream is not None:
+            launch_kwargs["stream"] = stream
+
+        self.kernel(
+            mU,
+            mB,
+            mM,
+            mKprev,
+            mKcurr,
+            mDIncDP,
+            mDBTotal,
+            mDMsumPart,
+            bundle.layouts.u_tile_layout,
+            bundle.layouts.d_inc_tile_layout,
+            bundle.layouts.db_tile_layout,
+            bundle.copies.gmem_tiled_copy_u,
+            bundle.copies.gmem_tiled_copy_d_inc,
+            bundle.copies.ldmatrix_tiled_copy_u,
+            bundle.copies.ldmatrix_tiled_copy_d_inc,
+            bundle.tiled_mma,
+        ).launch(**launch_kwargs)
+
+    @cute.jit
+    def __call__(
+        self,
+        mU: cute.Tensor,  # (L, P, BHC)
+        mB: cute.Tensor,  # (L, D, BGC)
+        mM: cute.Tensor,  # (2, L, BHC)
+        mKprev: cute.Tensor,  # (2, L, BHC)
+        mKcurr: cute.Tensor,  # (2, L, BHC)
+        mDIncDP: cute.Tensor,  # (D, P, BHC)
+        mDBTotal: cute.Tensor,  # (BHC, L, 1, D)
+        mDMsumPart: cute.Tensor,  # (2, L, n_d_tiles, BHC)
+    ):
+        self._validate_and_launch(
+            mU, mB, mM, mKprev, mKcurr, mDIncDP, mDBTotal, mDMsumPart
+        )
+
+    @cute.jit
+    def call_on_stream(
+        self,
+        mU: cute.Tensor,  # (L, P, BHC)
+        mB: cute.Tensor,  # (L, D, BGC)
+        mM: cute.Tensor,  # (2, L, BHC)
+        mKprev: cute.Tensor,  # (2, L, BHC)
+        mKcurr: cute.Tensor,  # (2, L, BHC)
+        mDIncDP: cute.Tensor,  # (D, P, BHC)
+        mDBTotal: cute.Tensor,  # (BHC, L, 1, D)
+        mDMsumPart: cute.Tensor,  # (2, L, n_d_tiles, BHC)
+        stream: cuda.CUstream,
+    ):
+        self._validate_and_launch(
+            mU,
+            mB,
+            mM,
+            mKprev,
+            mKcurr,
+            mDIncDP,
+            mDBTotal,
+            mDMsumPart,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mU: cute.Tensor,
+        mB: cute.Tensor,
+        mM: cute.Tensor,
+        mKprev: cute.Tensor,
+        mKcurr: cute.Tensor,
+        mDIncDP: cute.Tensor,
+        mDBTotal: cute.Tensor,
+        mDMsumPart: cute.Tensor,
+        u_tile_layout: cute.ComposedLayout,
+        d_inc_tile_layout: cute.ComposedLayout,
+        db_tile_layout: cute.ComposedLayout,
+        gmem_tiled_copy_u: cute.TiledCopy,
+        gmem_tiled_copy_d_inc: cute.TiledCopy,
+        ldmatrix_tiled_copy_u: cute.TiledCopy,
+        ldmatrix_tiled_copy_d_inc: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        _, block_col_idx, batch_head_chunk_idx = cute.arch.block_idx()
+        batch_group_chunk_idx = self._batch_group_chunk_index(batch_head_chunk_idx)
+
+        tile_col_start = block_col_idx * self.bN
+        tiler_coord = (cutlass.Int32(0), block_col_idx, None)
+
+        g_u = cute.local_tile(
+            mU[None, None, batch_head_chunk_idx],
+            tiler=self.cta_tiler,
+            coord=tiler_coord,
+            proj=(1, None, 1),
+        )
+        g_d_inc = cute.local_tile(
+            mDIncDP[None, None, batch_head_chunk_idx],
+            tiler=self.cta_tiler,
+            coord=tiler_coord,
+            proj=(None, 1, 1),
+        )
+        g_u = cute.make_tensor(g_u.iterator.align(16), g_u.layout)
+        g_d_inc = cute.make_tensor(g_d_inc.iterator.align(16), g_d_inc.layout)
+
+        smem = cutlass.utils.SmemAllocator()
+        shared_storage_cls = self._make_shared_storage(
+            mU.element_type,
+            mDIncDP.element_type,
+            u_tile_layout,
+            d_inc_tile_layout,
+        )
+        storage = smem.allocate(shared_storage_cls)
+        suffix_coeff_layout = self._suffix_coeff_layout()
+        warp_transition_layout = self._warp_transition_layout()
+        s_u_tile = storage.u_tile.get_tensor(u_tile_layout)
+        s_d_inc_tile = storage.d_inc_tile.get_tensor(d_inc_tile_layout)
+        s_db_tile = cute.make_tensor(
+            cute.recast_ptr(s_u_tile.iterator, dtype=cutlass.Float32),
+            db_tile_layout,
+        )
+        s_suffix_coeff_sum = storage.suffix_coeff_sum.get_tensor(suffix_coeff_layout)
+        s_suffix_coeff_prev = storage.suffix_coeff_prev.get_tensor(suffix_coeff_layout)
+        s_warp_transition_re_total = storage.warp_transition_re_total.get_tensor(
+            warp_transition_layout
+        )
+        s_warp_transition_im_total = storage.warp_transition_im_total.get_tensor(
+            warp_transition_layout
+        )
+        s_warp_transition_re_offset = storage.warp_transition_re_offset.get_tensor(
+            warp_transition_layout
+        )
+        s_warp_transition_im_offset = storage.warp_transition_im_offset.get_tensor(
+            warp_transition_layout
+        )
+
+        copy_slice_u = gmem_tiled_copy_u.get_slice(tidx)
+        copy_slice_d_inc = gmem_tiled_copy_d_inc.get_slice(tidx)
+        t_u_gmem = copy_slice_u.partition_S(g_u)
+        t_d_inc_gmem = copy_slice_d_inc.partition_S(g_d_inc)
+        t_u_copy_dst = copy_slice_u.partition_D(s_u_tile)
+        t_d_inc_copy_dst = copy_slice_d_inc.partition_D(s_d_inc_tile)
+
+        mma_slice = tiled_mma.get_slice(tidx)
+        t_u_mma_smem = mma_slice.partition_A(s_u_tile)
+        t_d_inc_mma_smem = mma_slice.partition_B(s_d_inc_tile)
+        t_db_mma_smem = mma_slice.partition_C(s_db_tile)
+
+        r_u_mma = tiled_mma.make_fragment_A(t_u_mma_smem[None, None, None, 0])
+        r_d_inc_mma = tiled_mma.make_fragment_B(t_d_inc_mma_smem[None, None, None, 0])
+        r_db_accum = tiled_mma.make_fragment_C(t_db_mma_smem)
+        r_db_accum.fill(0.0)
+
+        ldmatrix_slice_u = ldmatrix_tiled_copy_u.get_slice(tidx)
+        ldmatrix_slice_d_inc = ldmatrix_tiled_copy_d_inc.get_slice(tidx)
+        t_u_ldmatrix_smem = ldmatrix_slice_u.partition_S(s_u_tile)
+        r_u_ldmatrix = ldmatrix_slice_u.retile(r_u_mma)
+        t_d_inc_ldmatrix_smem = ldmatrix_slice_d_inc.partition_S(s_d_inc_tile)
+        r_d_inc_ldmatrix = ldmatrix_slice_d_inc.retile(r_d_inc_mma)
+
+        u_coord_identity = cute.make_identity_tensor(mU.layout.shape)
+        d_inc_coord_identity = cute.make_identity_tensor(mDIncDP.layout.shape)
+        u_coord_tile = cute.local_tile(
+            u_coord_identity[None, None, batch_head_chunk_idx],
+            tiler=self.cta_tiler,
+            coord=tiler_coord,
+            proj=(1, None, 1),
+        )
+        d_inc_coord_tile = cute.local_tile(
+            d_inc_coord_identity[None, None, batch_head_chunk_idx],
+            tiler=self.cta_tiler,
+            coord=tiler_coord,
+            proj=(None, 1, 1),
+        )
+        t_u_coord = copy_slice_u.partition_S(u_coord_tile)
+        t_d_inc_coord = copy_slice_d_inc.partition_S(d_inc_coord_tile)
+
+        u_row_predicate = self._make_copy_tile_row_predicate(
+            t_u_copy_dst,
+            t_u_coord,
+            mU.shape[0],
+        )
+        d_inc_row_predicate = self._make_copy_tile_row_predicate(
+            t_d_inc_copy_dst,
+            t_d_inc_coord,
+            mDIncDP.shape[0],
+        )
+
+        t_u_copy_dst.fill(0)
+        t_d_inc_copy_dst.fill(0)
+        pipeline.sync()
+
+        k_tile_count = self.P // self.bK
+        num_smem_stages = cute.size(t_u_copy_dst, mode=[3])
+        k_tile_index = cutlass.Int32(0)
+
+        for kk in cutlass.range_constexpr(u_row_predicate.shape[2]):
+            cute.copy(
+                gmem_tiled_copy_u,
+                t_u_gmem[None, None, kk, k_tile_index],
+                t_u_copy_dst[None, None, kk, 0],
+                pred=u_row_predicate[None, None, kk],
+            )
+        for kk in cutlass.range_constexpr(d_inc_row_predicate.shape[2]):
+            cute.copy(
+                gmem_tiled_copy_d_inc,
+                t_d_inc_gmem[None, None, kk, k_tile_index],
+                t_d_inc_copy_dst[None, None, kk, 0],
+                pred=d_inc_row_predicate[None, None, kk],
+            )
+        k_tile_index = k_tile_index + 1
+        cute.arch.cp_async_commit_group()
+
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.warp_idx()
+
+        reverse_time_index = cutlass.Int32(self.L - 1) - tidx
+        transition_step_re = cutlass.Float32(0.0)
+        transition_step_im = cutlass.Float32(0.0)
+        prev_tap_re = cutlass.Float32(0.0)
+        prev_tap_im = cutlass.Float32(0.0)
+        curr_tap_re = cutlass.Float32(0.0)
+        curr_tap_im = cutlass.Float32(0.0)
+
+        if tidx < cutlass.Int32(self.L):
+            transition_step_re = cutlass.Float32(
+                mM[0, reverse_time_index, batch_head_chunk_idx].to(cutlass.Float32)
+            )
+            transition_step_im = cutlass.Float32(
+                mM[1, reverse_time_index, batch_head_chunk_idx].to(cutlass.Float32)
+            )
+            prev_tap_re = cutlass.Float32(
+                mKprev[0, reverse_time_index, batch_head_chunk_idx].to(cutlass.Float32)
+            )
+            prev_tap_im = cutlass.Float32(
+                mKprev[1, reverse_time_index, batch_head_chunk_idx].to(cutlass.Float32)
+            )
+            curr_tap_re = cutlass.Float32(
+                mKcurr[0, reverse_time_index, batch_head_chunk_idx].to(cutlass.Float32)
+            )
+            curr_tap_im = cutlass.Float32(
+                mKcurr[1, reverse_time_index, batch_head_chunk_idx].to(cutlass.Float32)
+            )
+
+        scan_threads = cutlass.Int32(self.scan_threads)
+        scan_warp_count = cutlass.Int32(self.scan_threads // 32)
+        in_scan = tidx < scan_threads
+        suffix_transition_re = cutlass.select_(
+            in_scan, transition_step_re, cutlass.Float32(1.0)
+        )
+        suffix_transition_im = cutlass.select_(
+            in_scan, transition_step_im, cutlass.Float32(0.0)
+        )
+
+        if warp_idx < scan_warp_count:
+            for offset in (1, 2, 4, 8, 16):
+                prior_re = cute.arch.shuffle_sync_up(
+                    suffix_transition_re, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                prior_im = cute.arch.shuffle_sync_up(
+                    suffix_transition_im, offset=offset, mask=-1, mask_and_clamp=0
+                )
+                should_update = lane_idx >= cutlass.Int32(offset)
+                next_re = (
+                    prior_re * suffix_transition_re - prior_im * suffix_transition_im
+                )
+                next_im = (
+                    prior_re * suffix_transition_im + prior_im * suffix_transition_re
+                )
+                suffix_transition_re = cutlass.select_(
+                    should_update, next_re, suffix_transition_re
+                )
+                suffix_transition_im = cutlass.select_(
+                    should_update, next_im, suffix_transition_im
+                )
+
+            if lane_idx == cutlass.Int32(31):
+                s_warp_transition_re_total[warp_idx] = suffix_transition_re
+                s_warp_transition_im_total[warp_idx] = suffix_transition_im
+
+        pipeline.sync()
+
+        if cutlass.const_expr(self.scan_threads > 32):
+            if warp_idx == cutlass.Int32(0):
+                warp_lane = lane_idx
+                has_scan_warp = warp_lane < scan_warp_count
+                warp_transition_re = cutlass.select_(
+                    has_scan_warp,
+                    s_warp_transition_re_total[warp_lane],
+                    cutlass.Float32(1.0),
+                )
+                warp_transition_im = cutlass.select_(
+                    has_scan_warp,
+                    s_warp_transition_im_total[warp_lane],
+                    cutlass.Float32(0.0),
+                )
+
+                for offset in (1, 2, 4, 8, 16):
+                    prior_re = cute.arch.shuffle_sync_up(
+                        warp_transition_re, offset=offset, mask=-1, mask_and_clamp=0
+                    )
+                    prior_im = cute.arch.shuffle_sync_up(
+                        warp_transition_im, offset=offset, mask=-1, mask_and_clamp=0
+                    )
+                    should_update = lane_idx >= cutlass.Int32(offset)
+                    next_re = (
+                        prior_re * warp_transition_re - prior_im * warp_transition_im
+                    )
+                    next_im = (
+                        prior_re * warp_transition_im + prior_im * warp_transition_re
+                    )
+                    warp_transition_re = cutlass.select_(
+                        should_update, next_re, warp_transition_re
+                    )
+                    warp_transition_im = cutlass.select_(
+                        should_update, next_im, warp_transition_im
+                    )
+
+                warp_offset_re = cute.arch.shuffle_sync_up(
+                    warp_transition_re, offset=1, mask=-1, mask_and_clamp=0
+                )
+                warp_offset_im = cute.arch.shuffle_sync_up(
+                    warp_transition_im, offset=1, mask=-1, mask_and_clamp=0
+                )
+                is_first_lane = lane_idx == cutlass.Int32(0)
+                warp_offset_re = cutlass.select_(
+                    is_first_lane, cutlass.Float32(1.0), warp_offset_re
+                )
+                warp_offset_im = cutlass.select_(
+                    is_first_lane, cutlass.Float32(0.0), warp_offset_im
+                )
+
+                if has_scan_warp:
+                    s_warp_transition_re_offset[warp_lane] = warp_offset_re
+                    s_warp_transition_im_offset[warp_lane] = warp_offset_im
+
+            pipeline.sync()
+
+            if warp_idx < scan_warp_count:
+                warp_offset_re = s_warp_transition_re_offset[warp_idx]
+                warp_offset_im = s_warp_transition_im_offset[warp_idx]
+                next_re = (
+                    warp_offset_re * suffix_transition_re
+                    - warp_offset_im * suffix_transition_im
+                )
+                next_im = (
+                    warp_offset_re * suffix_transition_im
+                    + warp_offset_im * suffix_transition_re
+                )
+                suffix_transition_re, suffix_transition_im = next_re, next_im
+
+        if warp_idx < scan_warp_count and lane_idx == cutlass.Int32(31):
+            s_warp_transition_re_total[warp_idx] = suffix_transition_re
+            s_warp_transition_im_total[warp_idx] = suffix_transition_im
+
+        pipeline.sync()
+
+        suffix_prefix_re = cutlass.Float32(1.0)
+        suffix_prefix_im = cutlass.Float32(0.0)
+        if tidx < cutlass.Int32(self.L):
+            prior_transition_re = cute.arch.shuffle_sync_up(
+                suffix_transition_re, offset=1, mask=-1, mask_and_clamp=0
+            )
+            prior_transition_im = cute.arch.shuffle_sync_up(
+                suffix_transition_im, offset=1, mask=-1, mask_and_clamp=0
+            )
+            if tidx == cutlass.Int32(0):
+                suffix_prefix_re = cutlass.Float32(1.0)
+                suffix_prefix_im = cutlass.Float32(0.0)
+            else:
+                if lane_idx == cutlass.Int32(0):
+                    suffix_prefix_re = s_warp_transition_re_total[warp_idx - 1]
+                    suffix_prefix_im = s_warp_transition_im_total[warp_idx - 1]
+                else:
+                    suffix_prefix_re = prior_transition_re
+                    suffix_prefix_im = prior_transition_im
+
+            prev_coeff_re = (
+                suffix_prefix_re * prev_tap_re - suffix_prefix_im * prev_tap_im
+            )
+            prev_coeff_im = (
+                suffix_prefix_re * prev_tap_im + suffix_prefix_im * prev_tap_re
+            )
+            sum_coeff_re = (
+                suffix_prefix_re * curr_tap_re - suffix_prefix_im * curr_tap_im
+            )
+            sum_coeff_im = (
+                suffix_prefix_re * curr_tap_im + suffix_prefix_im * curr_tap_re
+            )
+            s_suffix_coeff_prev[reverse_time_index, 0] = prev_coeff_re
+            s_suffix_coeff_prev[reverse_time_index, 1] = prev_coeff_im
+            s_suffix_coeff_sum[reverse_time_index, 0] = sum_coeff_re
+            s_suffix_coeff_sum[reverse_time_index, 1] = sum_coeff_im
+
+        pipeline.sync()
+
+        if tidx < cutlass.Int32(self.L):
+            if reverse_time_index < cutlass.Int32(self.L - 1):
+                s_suffix_coeff_sum[reverse_time_index, 0] = (
+                    s_suffix_coeff_sum[reverse_time_index, 0]
+                    + s_suffix_coeff_prev[reverse_time_index + 1, 0]
+                )
+                s_suffix_coeff_sum[reverse_time_index, 1] = (
+                    s_suffix_coeff_sum[reverse_time_index, 1]
+                    + s_suffix_coeff_prev[reverse_time_index + 1, 1]
+                )
+
+        pipeline.sync()
+
+        for k_tile in range(1, num_smem_stages - 1):
+            cute.copy(
+                gmem_tiled_copy_u,
+                t_u_gmem[None, None, None, k_tile_index],
+                t_u_copy_dst[None, None, None, k_tile],
+                pred=u_row_predicate,
+            )
+            cute.copy(
+                gmem_tiled_copy_d_inc,
+                t_d_inc_gmem[None, None, None, k_tile_index],
+                t_d_inc_copy_dst[None, None, None, k_tile],
+                pred=d_inc_row_predicate,
+            )
+            k_tile_index = k_tile_index + 1
+            cute.arch.cp_async_commit_group()
+
+        smem_pipe_read = cutlass.Int32(0)
+        smem_pipe_write = cutlass.Int32(num_smem_stages - 1)
+        mma_k_block_count = cute.size(r_u_mma, mode=[2])
+
+        for kt in range(k_tile_count):
+            cute.arch.cp_async_wait_group(num_smem_stages - 2)
+            pipeline.sync()
+
+            next_tile = kt + (num_smem_stages - 1)
+            if next_tile < k_tile_count:
+                cute.copy(
+                    gmem_tiled_copy_u,
+                    t_u_gmem[None, None, None, k_tile_index],
+                    t_u_copy_dst[None, None, None, smem_pipe_write],
+                    pred=u_row_predicate,
+                )
+                cute.copy(
+                    gmem_tiled_copy_d_inc,
+                    t_d_inc_gmem[None, None, None, k_tile_index],
+                    t_d_inc_copy_dst[None, None, None, smem_pipe_write],
+                    pred=d_inc_row_predicate,
+                )
+                k_tile_index = k_tile_index + 1
+                cute.arch.cp_async_commit_group()
+
+            t_u_ldmatrix_stage = t_u_ldmatrix_smem[None, None, None, smem_pipe_read]
+            t_d_inc_ldmatrix_stage = t_d_inc_ldmatrix_smem[
+                None, None, None, smem_pipe_read
+            ]
+            cute.copy(
+                ldmatrix_tiled_copy_u,
+                t_u_ldmatrix_stage[None, None, 0],
+                r_u_ldmatrix[None, None, 0],
+            )
+            cute.copy(
+                ldmatrix_tiled_copy_d_inc,
+                t_d_inc_ldmatrix_stage[None, None, 0],
+                r_d_inc_ldmatrix[None, None, 0],
+            )
+            for kb in cutlass.range(mma_k_block_count, unroll_full=True):
+                kb_next = (kb + 1) % mma_k_block_count
+                cute.copy(
+                    ldmatrix_tiled_copy_u,
+                    t_u_ldmatrix_stage[None, None, kb_next],
+                    r_u_ldmatrix[None, None, kb_next],
+                )
+                cute.copy(
+                    ldmatrix_tiled_copy_d_inc,
+                    t_d_inc_ldmatrix_stage[None, None, kb_next],
+                    r_d_inc_ldmatrix[None, None, kb_next],
+                )
+                cute.gemm(
+                    tiled_mma,
+                    r_db_accum,
+                    r_u_mma[None, None, kb],
+                    r_d_inc_mma[None, None, kb],
+                    r_db_accum,
+                )
+
+            smem_pipe_write = smem_pipe_read
+            smem_pipe_read = smem_pipe_read + 1
+            if smem_pipe_read == num_smem_stages:
+                smem_pipe_read = 0
+
+        cute.arch.cp_async_wait_group(0)
+        pipeline.sync()
+
+        cute.autovec_copy(r_db_accum, t_db_mma_smem)
+        pipeline.sync()
+
+        warp_count = cutlass.Int32(self.num_threads // 32)
+        complex_pair_count = cutlass.Int32(self.bN // 2)
+        time_index = warp_idx
+        while cute.elem_less(time_index, cutlass.Int32(self.L)):
+            d_pair_start = lane_idx * cutlass.Int32(2)
+            global_d_pair_start = tile_col_start + d_pair_start
+
+            d_b_sum_re = cutlass.Float32(0.0)
+            d_b_sum_im = cutlass.Float32(0.0)
+            b_re = cutlass.Float32(0.0)
+            b_im = cutlass.Float32(0.0)
+            if cute.elem_less(lane_idx, complex_pair_count) and cute.elem_less(
+                global_d_pair_start + 1, self.D
+            ):
+                d_b_sum_re = cutlass.Float32(s_db_tile[time_index, d_pair_start + 0])
+                d_b_sum_im = cutlass.Float32(s_db_tile[time_index, d_pair_start + 1])
+                b_re = cutlass.Float32(
+                    mB[time_index, global_d_pair_start + 0, batch_group_chunk_idx].to(
+                        cutlass.Float32
+                    )
+                )
+                b_im = cutlass.Float32(
+                    mB[time_index, global_d_pair_start + 1, batch_group_chunk_idx].to(
+                        cutlass.Float32
+                    )
+                )
+
+                db_coeff_re = s_suffix_coeff_sum[time_index, 0]
+                db_coeff_im = s_suffix_coeff_sum[time_index, 1]
+                rotated_db_re = db_coeff_re * d_b_sum_re + db_coeff_im * d_b_sum_im
+                rotated_db_im = db_coeff_re * d_b_sum_im - db_coeff_im * d_b_sum_re
+                increment_re = cutlass.Float32(
+                    rotated_db_re.to(mDBTotal.element_type).to(cutlass.Float32)
+                )
+                increment_im = cutlass.Float32(
+                    rotated_db_im.to(mDBTotal.element_type).to(cutlass.Float32)
+                )
+                total_re = (
+                    cutlass.Float32(
+                        mDBTotal[
+                            batch_head_chunk_idx,
+                            time_index,
+                            0,
+                            global_d_pair_start + 0,
+                        ].to(cutlass.Float32)
+                    )
+                    + increment_re
+                )
+                total_im = (
+                    cutlass.Float32(
+                        mDBTotal[
+                            batch_head_chunk_idx,
+                            time_index,
+                            0,
+                            global_d_pair_start + 1,
+                        ].to(cutlass.Float32)
+                    )
+                    + increment_im
+                )
+                mDBTotal[
+                    batch_head_chunk_idx,
+                    time_index,
+                    0,
+                    global_d_pair_start + 0,
+                ] = total_re.to(mDBTotal.element_type)
+                mDBTotal[
+                    batch_head_chunk_idx,
+                    time_index,
+                    0,
+                    global_d_pair_start + 1,
+                ] = total_im.to(mDBTotal.element_type)
+
+            d_msum_partial_re = d_b_sum_re * b_re + d_b_sum_im * b_im
+            d_msum_partial_im = d_b_sum_im * b_re - d_b_sum_re * b_im
+
+            for offset in (16, 8, 4, 2, 1):
+                d_msum_partial_re = d_msum_partial_re + cute.arch.shuffle_sync_bfly(
+                    d_msum_partial_re, offset=offset, mask=-1, mask_and_clamp=31
+                )
+                d_msum_partial_im = d_msum_partial_im + cute.arch.shuffle_sync_bfly(
+                    d_msum_partial_im, offset=offset, mask=-1, mask_and_clamp=31
+                )
+
+            if lane_idx == cutlass.Int32(0):
+                mDMsumPart[0, time_index, block_col_idx, batch_head_chunk_idx] = (
+                    d_msum_partial_re
+                )
+                mDMsumPart[1, time_index, block_col_idx, batch_head_chunk_idx] = (
+                    d_msum_partial_im
+                )
+
+            time_index = time_index + warp_count
+
+
+__all__ = [
+    "BwdDBAmpere",
+    "BwdDBIncrementAccumulatorAmpere",
+]

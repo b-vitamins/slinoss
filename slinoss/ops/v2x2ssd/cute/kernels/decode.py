@@ -10,6 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cute_math
+import cutlass.pipeline as pipeline
 
 from slinoss.ops.scanprep.cute.common import (
     SCANPREP_PARAM_DIM,
@@ -573,7 +574,7 @@ class MixerDecodeStepFwd:
             if lane_idx < num_loads_value:
                 cute.copy(gmem_tiled_copy_value, tPgGate, tPsGate)
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         # ------------------------------------------------------------------
         # Parameter transform
@@ -701,7 +702,7 @@ class MixerDecodeStepFwd:
             bc2 = cutlass.Float32(mBC[bidb, bidh, 2, tidx])
             bc3 = cutlass.Float32(mBC[bidb, bidh, 3, tidx])
 
-        cute.arch.barrier()
+        pipeline.sync()
 
         if tidx < self.n_size:
             n = tidx
@@ -738,14 +739,14 @@ class MixerDecodeStepFwd:
                 mBLast[bidb, bidh, 2 * n] = b_re_v.to(mBLast.element_type)
                 mBLast[bidb, bidh, 2 * n + 1] = b_im_v.to(mBLast.element_type)
 
-        cute.arch.barrier()
+        pipeline.sync()
 
         # ------------------------------------------------------------------
         # Register-resident recurrence update + writeback
         # ------------------------------------------------------------------
         if self.use_state_cp_async:
             cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_threads()
+            pipeline.sync()
 
         worker = tidx // self.tile_p
         p_local = tidx - worker * self.tile_p
@@ -789,7 +790,7 @@ class MixerDecodeStepFwd:
 
             acc_partial[worker, p_local] = acc
 
-        cute.arch.barrier()
+        pipeline.sync()
 
         # ------------------------------------------------------------------
         # Output contraction / writeback
@@ -809,7 +810,7 @@ class MixerDecodeStepFwd:
                 gY[p] = y.to(mY.element_type)
                 gULast[p] = u_curr.to(mULast.element_type)
 
-        cute.arch.barrier()
+        pipeline.sync()
 
         if self.fuse_outproj:
             for out_iter in cutlass.range_constexpr(self.out_proj_iters):

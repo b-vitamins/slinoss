@@ -55,22 +55,6 @@ def _sample_regions() -> dict[str, float]:
         "forward.head.loss": 0.2,
         "backward.head.logits": 0.6,
         "backward.head.loss": 0.7,
-        "forward.v2x2ssd.chunk_increment.total": 1.0,
-        "forward.v2x2ssd.state_passing.total": 0.5,
-        "forward.v2x2ssd.chunk_scan.total": 1.25,
-        "backward.v2x2ssd.chunk_increment.total": 2.0,
-        "backward.v2x2ssd.state_passing.total": 1.0,
-        "backward.v2x2ssd.chunk_scan.total": 3.0,
-        "backward.v2x2ssd.chunk_increment.db": 0.4,
-        "backward.v2x2ssd.chunk_increment.du": 0.5,
-        "backward.v2x2ssd.chunk_increment.boundary": 0.3,
-        "backward.v2x2ssd.chunk_increment.param_scan": 0.2,
-        "backward.v2x2ssd.state_passing.kernel": 0.6,
-        "backward.v2x2ssd.chunk_scan.dz0": 0.3,
-        "backward.v2x2ssd.chunk_scan.du": 0.4,
-        "backward.v2x2ssd.chunk_scan.db": 0.5,
-        "backward.v2x2ssd.chunk_scan.dcdr": 0.3,
-        "backward.v2x2ssd.chunk_scan.param_scan": 0.7,
     }
 
 
@@ -84,7 +68,7 @@ def test_validate_training_bench_payload_accepts_expected_schema() -> None:
     tree = _sample_tree()
     payload = {
         "kind": "bench_training",
-        "schema_version": 1,
+        "schema_version": 2,
         "device_name": "Fake GPU",
         "suite": "single",
         "cases": {
@@ -127,7 +111,7 @@ def test_validate_training_bench_payload_accepts_expected_schema() -> None:
                         },
                     }
                 },
-                "stage_suite": {"rows": [], "config": {}},
+                "v2x2ssd_suite": {"rows": [], "config": {}},
             }
         },
     }

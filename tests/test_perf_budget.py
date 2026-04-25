@@ -52,38 +52,12 @@ def test_derive_training_budget_builds_expected_aggregates() -> None:
         "forward.head.loss": 0.2,
         "backward.head.logits": 0.6,
         "backward.head.loss": 0.7,
-        "forward.v2x2ssd.chunk_increment.total": 1.0,
-        "forward.v2x2ssd.state_passing.total": 0.5,
-        "forward.v2x2ssd.chunk_scan.total": 1.25,
-        "backward.v2x2ssd.chunk_increment.total": 2.0,
-        "backward.v2x2ssd.state_passing.total": 1.0,
-        "backward.v2x2ssd.chunk_scan.total": 3.0,
-        "backward.v2x2ssd.chunk_increment.db": 0.4,
-        "backward.v2x2ssd.chunk_increment.du": 0.5,
-        "backward.v2x2ssd.chunk_increment.boundary": 0.3,
-        "backward.v2x2ssd.chunk_increment.param_scan": 0.2,
-        "backward.v2x2ssd.state_passing.kernel": 0.6,
-        "backward.v2x2ssd.chunk_scan.dz0": 0.3,
-        "backward.v2x2ssd.chunk_scan.du": 0.4,
-        "backward.v2x2ssd.chunk_scan.db": 0.5,
-        "backward.v2x2ssd.chunk_scan.dcdr": 0.3,
-        "backward.v2x2ssd.chunk_scan.param_scan": 0.7,
     }
     derived = derive_training_budget(sample)
 
     assert derived["step.total"] == 33.5
     assert derived["forward.other.total"] == 7.0
     assert derived["backward.other.total"] == 12.0
-    assert derived["forward.v2x2ssd.stage_sum"] == pytest.approx(2.75)
-    assert derived["forward.v2x2ssd.overhead"] == pytest.approx(0.25)
-    assert derived["backward.v2x2ssd.stage_sum"] == pytest.approx(6.0)
-    assert derived["backward.v2x2ssd.overhead"] == pytest.approx(2.0)
-    assert derived["backward.v2x2ssd.chunk_increment.kernel_sum"] == pytest.approx(1.4)
-    assert derived["backward.v2x2ssd.chunk_increment.overhead"] == pytest.approx(0.6)
-    assert derived["backward.v2x2ssd.state_passing.kernel_sum"] == pytest.approx(0.6)
-    assert derived["backward.v2x2ssd.state_passing.overhead"] == pytest.approx(0.4)
-    assert derived["backward.v2x2ssd.chunk_scan.kernel_sum"] == pytest.approx(2.2)
-    assert derived["backward.v2x2ssd.chunk_scan.overhead"] == pytest.approx(0.8)
     assert derived["forward.embed.total"] == 1.5
     assert derived["backward.embed.total"] == 1.0
     assert derived["forward.norms.total"] == pytest.approx(0.6)
@@ -104,21 +78,19 @@ def test_derive_training_budget_builds_expected_aggregates() -> None:
             "step.total": {"mean_ms": 33.5},
             "forward.total": {"mean_ms": 10.0},
             "forward.v2x2ssd.total": {"mean_ms": 4.0},
-            "forward.v2x2ssd.chunk_scan.total": {"mean_ms": 1.5},
+            "forward.mixer.scanprep.total": {"mean_ms": 1.5},
         }
     )
     assert "step" in tree
     assert "forward" in tree
     assert tree["forward"]["__stats__"]["mean_ms"] == 10.0
     assert tree["forward"]["v2x2ssd"]["__stats__"]["mean_ms"] == 4.0
-    assert tree["forward"]["v2x2ssd"]["chunk_scan"]["__stats__"][
+    assert tree["forward"]["mixer"]["scanprep"]["__stats__"][
         "percent_of_parent_mean"
-    ] == pytest.approx(37.5)
+    ] == pytest.approx(15.0)
 
 
-def test_derive_training_budget_does_not_fabricate_v2_overhead_without_stage_labels() -> (
-    None
-):
+def test_derive_training_budget_does_not_fabricate_v2_component_labels() -> None:
     sample = {
         "step.forward_loss": 10.0,
         "step.backward": 20.0,
@@ -126,9 +98,6 @@ def test_derive_training_budget_does_not_fabricate_v2_overhead_without_stage_lab
         "backward.v2x2ssd.total": 8.0,
     }
     derived = derive_training_budget(sample)
-    assert derived["forward.v2x2ssd.stage_breakdown_available"] == 0.0
-    assert derived["backward.v2x2ssd.stage_breakdown_available"] == 0.0
-    assert derived["forward.v2x2ssd.stage_sum"] == 0.0
-    assert derived["backward.v2x2ssd.stage_sum"] == 0.0
-    assert derived["forward.v2x2ssd.overhead"] == 0.0
-    assert derived["backward.v2x2ssd.overhead"] == 0.0
+    assert derived["forward.v2x2ssd.total"] == 3.0
+    assert derived["backward.v2x2ssd.total"] == 8.0
+    assert set(derived) >= {"forward.v2x2ssd.total", "backward.v2x2ssd.total"}

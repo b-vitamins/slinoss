@@ -1,8 +1,7 @@
-"""CuTe backward kernel for the ``v2x2ssd`` chunk-scan ``dZ0`` stage.
+"""CuTe backward ``dZ0`` kernel for ``v2x2ssd``.
 
-``ChunkScanBwdDZ0Ampere`` is the live Ampere tensor-core implementation used by
-the backward path to accumulate the public chunk-start state gradient ``dZ0``.
-It reconstructs prefix magnitude/phase metadata from the raw packed-complex
+``BwdDZ0Ampere`` accumulates the chunk-start state gradient ``dZ0``. It
+reconstructs prefix magnitude/phase metadata from the raw packed-complex
 transitions ``M``, scales ``dOut`` tile-by-tile, rotates ``C`` by the conjugate
 prefix phase, and runs one tensor-core GEMM that writes ``dZ0`` directly.
 
@@ -25,6 +24,7 @@ from typing import ClassVar
 import torch
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
 from .common import (
@@ -38,7 +38,7 @@ from .common import (
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDZ0SupportInfo:
+class BwdDZ0SupportInfo:
     smem_capacity_bytes: int
     prefix_smem_bytes: int
     operand_smem_bytes: int
@@ -57,7 +57,7 @@ class ChunkScanBwdDZ0SupportInfo:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDZ0LayoutBundle:
+class BwdDZ0LayoutBundle:
     dout_major_mode: object
     c_major_mode: object
     dz0_major_mode: object
@@ -68,7 +68,7 @@ class ChunkScanBwdDZ0LayoutBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDZ0CopyBundle:
+class BwdDZ0CopyBundle:
     gmem_tiled_copy_dout: object
     gmem_tiled_copy_c: object
     gmem_tiled_copy_output: object
@@ -77,9 +77,9 @@ class ChunkScanBwdDZ0CopyBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDZ0KernelBundle:
-    layouts: ChunkScanBwdDZ0LayoutBundle
-    copies: ChunkScanBwdDZ0CopyBundle
+class BwdDZ0KernelBundle:
+    layouts: BwdDZ0LayoutBundle
+    copies: BwdDZ0CopyBundle
     tiled_mma: object
     shared_storage_cls: object
     prefix_smem_bytes: int
@@ -94,7 +94,7 @@ class ChunkScanBwdDZ0KernelBundle:
         )
 
 
-class ChunkScanBwdDZ0Ampere:
+class BwdDZ0Ampere:
     """Ampere tensor-core backward kernel for the ``v2x2ssd`` ``dZ0`` slice.
 
     This kernel owns the public chunk-start state gradient. It reconstructs the
@@ -103,9 +103,7 @@ class ChunkScanBwdDZ0Ampere:
     runs one tensor-core GEMM that writes ``dZ0`` directly.
     """
 
-    _SUPPORT_INFO_CACHE: ClassVar[
-        dict[tuple[object, ...], ChunkScanBwdDZ0SupportInfo]
-    ] = {}
+    _SUPPORT_INFO_CACHE: ClassVar[dict[tuple[object, ...], BwdDZ0SupportInfo]] = {}
 
     def __init__(
         self,
@@ -149,7 +147,7 @@ class ChunkScanBwdDZ0Ampere:
         if self.L % self.bK != 0:
             raise ValueError("chunk_size must be divisible by bK for this kernel.")
         if self.bN % 2 != 0:
-            raise ValueError("bN (D tile) must be divisible by 2 because D = 2N.")
+            raise ValueError("bN (D tile) must be divisible by 2; D = 2N.")
         if self.num_stages < 2:
             raise ValueError("num_stages must be >= 2.")
         if (self.num_stages - 1) > self.k_tile_count:
@@ -258,7 +256,7 @@ class ChunkScanBwdDZ0Ampere:
         self,
         *,
         device_index: int | None = None,
-    ) -> ChunkScanBwdDZ0SupportInfo:
+    ) -> BwdDZ0SupportInfo:
         if device_index is None:
             device_key = (
                 int(torch.cuda.current_device()) if torch.cuda.is_available() else -1
@@ -279,7 +277,7 @@ class ChunkScanBwdDZ0Ampere:
         if cached is not None:
             return cached
 
-        info = ChunkScanBwdDZ0SupportInfo(
+        info = BwdDZ0SupportInfo(
             smem_capacity_bytes=self._smem_capacity_bytes(device_index=device_key),
             prefix_smem_bytes=self._prefix_smem_bytes(),
             operand_smem_bytes=self._operand_smem_bytes(self.ab_dtype),
@@ -485,7 +483,7 @@ class ChunkScanBwdDZ0Ampere:
         mDOut: cute.Tensor,
         mC: cute.Tensor,
         mDZ0: cute.Tensor,
-    ) -> ChunkScanBwdDZ0LayoutBundle:
+    ) -> BwdDZ0LayoutBundle:
         copy_bits = 128
         dout_major_mode = utils.LayoutEnum.from_tensor(mDOut)
         c_major_mode = utils.LayoutEnum.from_tensor(mC)
@@ -503,7 +501,7 @@ class ChunkScanBwdDZ0Ampere:
             (self.bN, self.bK, self.num_stages),
         )
         output_layout = self._make_output_layout()
-        return ChunkScanBwdDZ0LayoutBundle(
+        return BwdDZ0LayoutBundle(
             dout_major_mode=dout_major_mode,
             c_major_mode=c_major_mode,
             dz0_major_mode=dz0_major_mode,
@@ -536,9 +534,9 @@ class ChunkScanBwdDZ0Ampere:
 
     def _make_copy_bundle(
         self,
-        layouts: ChunkScanBwdDZ0LayoutBundle,
+        layouts: BwdDZ0LayoutBundle,
         tiled_mma: cute.TiledMma,
-    ) -> ChunkScanBwdDZ0CopyBundle:
+    ) -> BwdDZ0CopyBundle:
         copy_bits = 128
         atom_async_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(
@@ -566,7 +564,7 @@ class ChunkScanBwdDZ0Ampere:
             ),
             self.ab_dtype,
         )
-        return ChunkScanBwdDZ0CopyBundle(
+        return BwdDZ0CopyBundle(
             gmem_tiled_copy_dout=self._make_gmem_tiled_copy_input(
                 atom_async_copy,
                 self.ab_dtype,
@@ -596,7 +594,7 @@ class ChunkScanBwdDZ0Ampere:
 
     def _make_shared_storage(
         self,
-        layouts: ChunkScanBwdDZ0LayoutBundle,
+        layouts: BwdDZ0LayoutBundle,
     ):
         @cute.struct
         class SharedStorage:
@@ -636,8 +634,7 @@ class ChunkScanBwdDZ0Ampere:
                 cute.struct.MemRange[self.ab_dtype, cute.cosize(layouts.c_layout)],
                 16,
             ]
-            # Extend the staged operand slab when the aliased fp32 output tile
-            # is larger than the staged fp16/bf16 input footprint.
+            # Extend the operand slab to cover the aliased fp32 output tile.
             output_alias_pad: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32,
@@ -653,12 +650,12 @@ class ChunkScanBwdDZ0Ampere:
         mDOut: cute.Tensor,
         mC: cute.Tensor,
         mDZ0: cute.Tensor,
-    ) -> ChunkScanBwdDZ0KernelBundle:
+    ) -> BwdDZ0KernelBundle:
         layouts = self._make_layout_bundle(mDOut, mC, mDZ0)
         tiled_mma = self._make_tiled_mma()
         copies = self._make_copy_bundle(layouts, tiled_mma)
         shared_storage_cls = self._make_shared_storage(layouts)
-        bundle = ChunkScanBwdDZ0KernelBundle(
+        bundle = BwdDZ0KernelBundle(
             layouts=layouts,
             copies=copies,
             tiled_mma=tiled_mma,
@@ -1020,7 +1017,7 @@ class ChunkScanBwdDZ0Ampere:
                 t_reg_c[None, None, k_block],
                 acc_output,
             )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _make_input_copy_row_predicate(
@@ -1070,7 +1067,7 @@ class ChunkScanBwdDZ0Ampere:
     def _zero_staged_input_tiles(self, input_state: SimpleNamespace):
         input_state.t_dout_smem.fill(0)
         input_state.t_c_smem.fill(0)
-        cute.arch.sync_threads()
+        pipeline.sync()
 
     @cute.jit
     def _prefetch_input_tile_pair(
@@ -1182,7 +1179,7 @@ class ChunkScanBwdDZ0Ampere:
             prefix_state.warp_prefix_log_total[warp] = logp
             prefix_state.warp_prefix_phase_total[warp, 0] = phase_re
             prefix_state.warp_prefix_phase_total[warp, 1] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
         if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
             running_log = cutlass.Float32(0.0)
@@ -1207,7 +1204,7 @@ class ChunkScanBwdDZ0Ampere:
                 running_log = running_log + total_log
                 running_phase_re = next_running_phase_re
                 running_phase_im = next_running_phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _apply_warp_prefix_offset(
@@ -1254,7 +1251,7 @@ class ChunkScanBwdDZ0Ampere:
             )
             prefix_state.prefix_phase_re[tidx] = phase_re
             prefix_state.prefix_phase_im[tidx] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _compute_phase_prefix_metadata(self, prefix_state: SimpleNamespace):
@@ -1364,7 +1361,7 @@ class ChunkScanBwdDZ0Ampere:
             smem_pipe_write = (k_tile + (self.num_stages - 1)) % self.num_stages
 
             cute.arch.cp_async_wait_group(self.num_stages - 2)
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             k_tile_offset = k_tile * self.bK
             self._scale_staged_dout_tile_from_prefix(
@@ -1382,7 +1379,7 @@ class ChunkScanBwdDZ0Ampere:
                 smem_pipe_read=smem_pipe_read,
                 out_dtype=c_dtype,
             )
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             self._accumulate_from_staged_tiles(
                 mma_state.tiled_mma,
@@ -1407,7 +1404,7 @@ class ChunkScanBwdDZ0Ampere:
                 cute.arch.cp_async_commit_group()
 
         cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+        pipeline.sync()
 
     # Epilogue helpers
     @cute.jit
@@ -1460,7 +1457,7 @@ class ChunkScanBwdDZ0Ampere:
         gmem_tiled_copy_output: cute.TiledCopy,
     ):
         cute.autovec_copy(acc_output, t_output_smem_mma)
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         r_output = cute.make_rmem_tensor_like(t_output_smem_epilogue, self.c_dtype)
         cute.autovec_copy(t_output_smem_epilogue, r_output)
@@ -1651,4 +1648,4 @@ class ChunkScanBwdDZ0Ampere:
         )
 
 
-__all__ = ["ChunkScanBwdDZ0Ampere"]
+__all__ = ["BwdDZ0Ampere"]

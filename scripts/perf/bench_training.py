@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark block-based training throughput and stage budgets."""
+"""Benchmark block-based training throughput and logical op budgets."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from _common import (  # noqa: E402
     PerfConfig,
     benchmark_instrumented,
-    build_callable,
+    build_v2x2ssd_callable,
     dtype_from_str,
     ensure_cuda,
     seed_all,
@@ -113,9 +113,9 @@ def _parse_args() -> argparse.Namespace:
         default=3,
         help="Independent clean end-to-end repeats per backend/case.",
     )
-    parser.add_argument("--stage-warmup", type=int, default=2)
-    parser.add_argument("--stage-iterations", type=int, default=8)
-    parser.add_argument("--stage-repeat", type=int, default=3)
+    parser.add_argument("--v2-warmup", type=int, default=2)
+    parser.add_argument("--v2-iterations", type=int, default=8)
+    parser.add_argument("--v2-repeat", type=int, default=3)
     parser.add_argument(
         "--suite",
         choices=("single", "training"),
@@ -159,7 +159,7 @@ def _make_training_cfg(args: argparse.Namespace) -> TrainingPerfConfig:
     )
 
 
-def _make_stage_cfg(cfg: TrainingPerfConfig) -> PerfConfig:
+def _make_v2_cfg(cfg: TrainingPerfConfig) -> PerfConfig:
     return PerfConfig(
         batch=cfg.batch_size,
         heads=cfg.n_heads,
@@ -280,8 +280,8 @@ def _summarize_workload(
     }
 
 
-def _summarize_stage_suite(
-    stage_cfg: PerfConfig,
+def _summarize_v2x2ssd_suite(
+    v2_cfg: PerfConfig,
     *,
     backend_choice: str,
     warmup: int,
@@ -291,51 +291,48 @@ def _summarize_stage_suite(
     rows: list[dict[str, object]] = []
     backends = (backend_choice,)
     for direction in ("forward", "backward"):
-        for stage in ("chunk_increment", "state_passing", "chunk_scan"):
-            for backend in backends:
-                fn = build_callable(
-                    stage_cfg,
-                    stage=stage,
-                    direction=direction,
-                    backend=backend,
-                )
-                stats = benchmark_instrumented(
-                    fn,
-                    device=stage_cfg.torch_device,
-                    warmup=warmup,
-                    iterations=iterations,
-                    repeat=repeat,
-                )
-                rows.append(
-                    {
-                        "direction": direction,
-                        "stage": stage,
-                        "backend": backend,
-                        "summary": {
-                            key: value
-                            for key, value in stats.items()
-                            if key
-                            not in {
-                                "samples_ms",
-                                "region_samples",
-                                "region_summaries",
-                                "cache_events",
-                            }
-                        },
-                        "regions": stats["region_summaries"],
-                        "cache_events": stats["cache_events"],
-                    }
-                )
+        for backend in backends:
+            fn = build_v2x2ssd_callable(
+                v2_cfg,
+                direction=direction,
+                backend=backend,
+            )
+            stats = benchmark_instrumented(
+                fn,
+                device=v2_cfg.torch_device,
+                warmup=warmup,
+                iterations=iterations,
+                repeat=repeat,
+            )
+            rows.append(
+                {
+                    "direction": direction,
+                    "backend": backend,
+                    "summary": {
+                        key: value
+                        for key, value in stats.items()
+                        if key
+                        not in {
+                            "samples_ms",
+                            "region_samples",
+                            "region_summaries",
+                            "cache_events",
+                        }
+                    },
+                    "regions": stats["region_summaries"],
+                    "cache_events": stats["cache_events"],
+                }
+            )
     return {
         "config": {
-            "batch": stage_cfg.batch,
-            "heads": stage_cfg.heads,
-            "T": stage_cfg.T,
-            "N": stage_cfg.N,
-            "P": stage_cfg.P,
-            "chunk_size": stage_cfg.chunk_size,
-            "dtype": str(stage_cfg.dtype),
-            "device": stage_cfg.device,
+            "batch": v2_cfg.batch,
+            "heads": v2_cfg.heads,
+            "T": v2_cfg.T,
+            "N": v2_cfg.N,
+            "P": v2_cfg.P,
+            "chunk_size": v2_cfg.chunk_size,
+            "dtype": str(v2_cfg.dtype),
+            "device": v2_cfg.device,
         },
         "rows": rows,
     }
@@ -351,7 +348,7 @@ def main() -> int:
 
     cases: dict[str, dict[str, Any]] = {}
     for case_name, case_cfg in _make_case_cfgs(training_cfg, suite=args.suite).items():
-        stage_cfg = _make_stage_cfg(case_cfg)
+        v2_cfg = _make_v2_cfg(case_cfg)
         fixture = build_bench_fixture(
             case_cfg,
             total_batches=1 + int(args.warmup_steps) + int(args.steps),
@@ -367,22 +364,22 @@ def main() -> int:
             )
             for backend in backends
         }
-        stage_suite = _summarize_stage_suite(
-            stage_cfg,
+        v2x2ssd_suite = _summarize_v2x2ssd_suite(
+            v2_cfg,
             backend_choice=args.backend,
-            warmup=args.stage_warmup,
-            iterations=args.stage_iterations,
-            repeat=args.stage_repeat,
+            warmup=args.v2_warmup,
+            iterations=args.v2_iterations,
+            repeat=args.v2_repeat,
         )
         cases[case_name] = {
             "config": case_cfg.perf_config_dict,
             "workload": workload,
-            "stage_suite": stage_suite,
+            "v2x2ssd_suite": v2x2ssd_suite,
         }
 
     payload = {
         "kind": "bench_training",
-        "schema_version": 1,
+        "schema_version": 2,
         "device_name": torch.cuda.get_device_name(0)
         if torch.cuda.is_available()
         else "cpu",

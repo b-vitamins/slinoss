@@ -6,6 +6,29 @@ import pytest
 import torch
 
 
+def test_ncu_kernel_registry_names_actual_v2x2ssd_bwd_launches() -> None:
+    pytest.importorskip("cutlass")
+    ncu_kernels = importlib.import_module("scripts.perf._ncu_kernels")
+
+    expected = (
+        "bwd_db",
+        "bwd_dcdr",
+        "bwd_param_scan",
+        "bwd_du",
+        "bwd_dz0",
+        "bwd_state_passing",
+        "bwd_db_increment_accumulator",
+        "bwd_boundary",
+        "bwd_param_increment_accumulator",
+        "bwd_du_increment_accumulator",
+    )
+    assert ncu_kernels.KERNEL_GROUPS["v2x2ssd_bwd_launches"] == expected
+    assert all(name in ncu_kernels.KERNEL_ORDER for name in expected)
+    assert ncu_kernels.KERNEL_ORDER.index(
+        "v2x2ssd_bwd"
+    ) < ncu_kernels.KERNEL_ORDER.index(expected[0])
+
+
 def test_scanprep_bwd_runner_matches_fused_launcher_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

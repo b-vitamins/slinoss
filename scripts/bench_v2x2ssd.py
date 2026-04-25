@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark the staged v2x2ssd forward path.
+"""Benchmark the v2x2ssd forward path.
 
 This is a development benchmark, not an experiment harness. It compares the
-reference and CuTe forward paths, or any individual forward stage, on the
-canonical v2x2ssd contract.
+reference and CuTe forward paths on the canonical v2x2ssd contract.
 """
 
 from __future__ import annotations
@@ -28,26 +27,10 @@ def _load_ops() -> dict[str, Callable]:
         sys.path.insert(0, str(project_root))
 
     from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
-    from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
-        chunk_increment_cute,
-        chunk_scan_cute,
-        state_passing_cute,
-    )
-    from slinoss.ops.v2x2ssd.reference import (
-        chunk_increment as ref_chunk_increment,
-    )
-    from slinoss.ops.v2x2ssd.reference import chunk_scan as ref_chunk_scan
-    from slinoss.ops.v2x2ssd.reference import state_passing as ref_state_passing
 
     return {
         "v2x2ssd": v2x2ssd,
         "v2x2ssd_cute": v2x2ssd_cute,
-        "chunk_increment_cute": chunk_increment_cute,
-        "chunk_scan_cute": chunk_scan_cute,
-        "state_passing_cute": state_passing_cute,
-        "ref_chunk_increment": ref_chunk_increment,
-        "ref_chunk_scan": ref_chunk_scan,
-        "ref_state_passing": ref_state_passing,
     }
 
 
@@ -164,7 +147,7 @@ def _make_inputs(
     }
 
 
-def _build_stage_callable(args: argparse.Namespace, backend: str):
+def _build_callable(args: argparse.Namespace, backend: str):
     ops = _load_ops()
     inputs = _make_inputs(args, torch.device(args.device))
     U = inputs["U"]
@@ -177,152 +160,35 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
     U_prev = inputs["U_prev"]
     chunk_size = args.chunk_size
 
-    if args.stage == "full":
-        if backend == "reference":
-            fn = partial(
-                ops["v2x2ssd"],
-                U,
-                M,
-                K,
-                B,
-                C,
-                chunk_size=chunk_size,
-                initial_states=initial_states,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                compute_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
-        else:
-            fn = partial(
-                ops["v2x2ssd_cute"],
-                U,
-                M,
-                K,
-                B,
-                C,
-                chunk_size=chunk_size,
-                initial_states=initial_states,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                compute_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
-        fn()
-        return fn
-
-    if args.stage == "chunk_increment":
-        if backend == "reference":
-            fn = partial(
-                ops["ref_chunk_increment"],
-                U,
-                M,
-                K,
-                B,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                T=args.T,
-                chunk_size=chunk_size,
-                compute_dtype=torch.float32,
-            )
-        else:
-            fn = partial(
-                ops["chunk_increment_cute"],
-                U,
-                M,
-                K,
-                B,
-                chunk_size=chunk_size,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                compute_dtype=torch.float32,
-            )
-        fn()
-        return fn
-
-    inc_ref, m_ref = ops["ref_chunk_increment"](
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=args.T,
-        chunk_size=chunk_size,
-        compute_dtype=torch.float32,
-    )
-    inc_cute, m_cute = ops["chunk_increment_cute"](
-        U,
-        M,
-        K,
-        B,
-        chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=torch.float32,
-    )
-
-    if args.stage == "state_passing":
-        if backend == "reference":
-            fn = partial(
-                ops["ref_state_passing"],
-                inc_ref,
-                m_ref,
-                initial_states=initial_states,
-                compute_dtype=torch.float32,
-            )
-        else:
-            fn = partial(
-                ops["state_passing_cute"],
-                inc_cute,
-                m_cute,
-                initial_states=initial_states.to(dtype=torch.float32).contiguous(),
-            )
-        fn()
-        return fn
-
-    starts_ref, _ = ops["ref_state_passing"](
-        inc_ref,
-        m_ref,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
-    )
-    starts_cute, _ = ops["state_passing_cute"](
-        inc_cute,
-        m_cute,
-        initial_states=initial_states.to(dtype=torch.float32).contiguous(),
-    )
-
     if backend == "reference":
         fn = partial(
-            ops["ref_chunk_scan"],
+            ops["v2x2ssd"],
             U,
             M,
             K,
             B,
             C,
-            starts_ref,
+            chunk_size=chunk_size,
+            initial_states=initial_states,
             B_prev=B_prev,
             U_prev=U_prev,
-            T=args.T,
-            chunk_size=chunk_size,
-            output_dtype=torch.float32,
             compute_dtype=torch.float32,
+            output_dtype=torch.float32,
         )
     else:
         fn = partial(
-            ops["chunk_scan_cute"],
+            ops["v2x2ssd_cute"],
             U,
             M,
             K,
             B,
             C,
-            starts_cute,
             chunk_size=chunk_size,
+            initial_states=initial_states,
             B_prev=B_prev,
             U_prev=U_prev,
-            output_dtype=torch.float32,
             compute_dtype=torch.float32,
+            output_dtype=torch.float32,
         )
     fn()
     return fn
@@ -330,11 +196,6 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stage",
-        choices=("full", "chunk_increment", "state_passing", "chunk_scan"),
-        default="full",
-    )
     parser.add_argument(
         "--backend",
         choices=("reference", "cute", "both"),
@@ -362,7 +223,7 @@ def main() -> int:
     backends = ("reference", "cute") if args.backend == "both" else (args.backend,)
     rows: list[dict[str, float | str | list[float]]] = []
     for backend in backends:
-        fn = _build_stage_callable(args, backend)
+        fn = _build_callable(args, backend)
         stats = _benchmark(
             fn,
             warmup=args.warmup,
@@ -371,7 +232,6 @@ def main() -> int:
         )
         row = {
             "backend": backend,
-            "stage": args.stage,
             "batch": args.batch,
             "heads": args.heads,
             "T": args.T,
@@ -382,15 +242,14 @@ def main() -> int:
         }
         rows.append(row)
 
-    print("| backend | stage | mean_ms | median_ms | stdev_ms |")
-    print("| --- | --- | ---: | ---: | ---: |")
+    print("| backend | mean_ms | median_ms | stdev_ms |")
+    print("| --- | ---: | ---: | ---: |")
     for row in rows:
         mean_ms = cast(float, row["mean_ms"])
         median_ms = cast(float, row["median_ms"])
         stdev_ms = cast(float, row["stdev_ms"])
         print(
-            f"| {row['backend']} | {row['stage']} | "
-            f"{mean_ms:.6f} | {median_ms:.6f} | {stdev_ms:.6f} |"
+            f"| {row['backend']} | {mean_ms:.6f} | {median_ms:.6f} | {stdev_ms:.6f} |"
         )
     if len(rows) == 2:
         speedup = cast(float, rows[0]["mean_ms"]) / cast(float, rows[1]["mean_ms"])

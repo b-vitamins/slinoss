@@ -1,7 +1,7 @@
-"""CuTe backward boundary kernel for the ``v2x2ssd`` chunk-increment stage.
+"""CuTe backward boundary-correction kernel for ``v2x2ssd``.
 
-``ChunkIncrementBwdBoundaryAmpere`` computes the per-chunk boundary gradients
-for the rank-1 boundary correction:
+``BwdBoundaryAmpere`` computes the per-chunk boundary gradients for the
+rank-1 boundary correction:
 
 ``d_inc += U_prev outer (Mp0 * B_prev)``
 
@@ -13,7 +13,7 @@ Tensor contracts:
 - ``M``: ``(2, L, BHC)`` fp32 packed-complex transitions
 - ``Kprev``: ``(2, L, BHC)`` fp32 packed-complex previous-pass taps
 - ``DUPrev``: ``(P, BHC)`` fp16/bf16 output boundary-value gradients
-- ``DBPrev``: ``(D, BHC)`` fp16/bf16 output boundary-key gradients
+- ``DBPrev``: ``(D, BHC)`` fp16/bf16 in/out boundary-key gradients
 - ``DMp0``: ``(2, BHC)`` fp32 packed-complex output chunk-boundary summaries
 
 The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be
@@ -28,17 +28,18 @@ from cuda.bindings import driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
 
 @dataclass(frozen=True)
-class ChunkIncrementBwdBoundaryKernelBundle:
+class BwdBoundaryKernelBundle:
     async_copy_atom: object
     smem_bytes: int
 
 
 @dataclass(frozen=True)
-class ChunkIncrementBwdBoundarySupportInfo:
+class BwdBoundarySupportInfo:
     smem_capacity_bytes: int
     required_smem_bytes: int
 
@@ -47,12 +48,10 @@ class ChunkIncrementBwdBoundarySupportInfo:
         return self.required_smem_bytes <= self.smem_capacity_bytes
 
 
-class ChunkIncrementBwdBoundaryAmpere:
-    """Ampere backward boundary kernel for the ``v2x2ssd`` chunk-increment stage."""
+class BwdBoundaryAmpere:
+    """Ampere backward boundary-correction kernel for ``v2x2ssd``."""
 
-    _SUPPORT_INFO_CACHE: ClassVar[
-        dict[tuple[object, ...], ChunkIncrementBwdBoundarySupportInfo]
-    ] = {}
+    _SUPPORT_INFO_CACHE: ClassVar[dict[tuple[object, ...], BwdBoundarySupportInfo]] = {}
 
     def __init__(
         self,
@@ -241,7 +240,7 @@ class ChunkIncrementBwdBoundaryAmpere:
         self,
         *,
         device_index: int | None = None,
-    ) -> ChunkIncrementBwdBoundarySupportInfo:
+    ) -> BwdBoundarySupportInfo:
         device_key = (
             int(torch.cuda.current_device())
             if device_index is None and torch.cuda.is_available()
@@ -260,7 +259,7 @@ class ChunkIncrementBwdBoundaryAmpere:
         if cached is not None:
             return cached
 
-        info = ChunkIncrementBwdBoundarySupportInfo(
+        info = BwdBoundarySupportInfo(
             smem_capacity_bytes=self._smem_capacity_bytes(device_key),
             required_smem_bytes=self._required_smem_bytes(self.ab_dtype),
         )
@@ -287,51 +286,49 @@ class ChunkIncrementBwdBoundaryAmpere:
         decayed_boundary_key_layout = self._decayed_boundary_key_smem_layout()
         staged_dinc_layout = self._staged_dinc_smem_layout()
 
+        @cute.struct
         class SharedStorage:
-            pass
-
-        SharedStorage.__annotations__ = {
-            "mp0": cute.struct.Align[
+            mp0: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(mp0_layout)],
                 8,
-            ],
-            "scan_warp_transition": cute.struct.Align[
+            ]
+            scan_warp_transition: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(scan_warp_transition_layout)
                 ],
                 8,
-            ],
-            "db_prev_partial_sum": cute.struct.Align[
+            ]
+            db_prev_partial_sum: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(db_prev_partial_sum_layout)
                 ],
                 8,
-            ],
-            "boundary_value": cute.struct.Align[
+            ]
+            boundary_value: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(boundary_value_layout)
                 ],
                 4,
-            ],
-            "decayed_boundary_key": cute.struct.Align[
+            ]
+            decayed_boundary_key: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Float32, cute.cosize(decayed_boundary_key_layout)
                 ],
                 4,
-            ],
-            "staged_dinc": cute.struct.Align[
+            ]
+            staged_dinc: cute.struct.Align[
                 cute.struct.MemRange[dinc_dtype, cute.cosize(staged_dinc_layout)],
                 16,
-            ],
-        }
-        return cute.struct(SharedStorage)
+            ]
+
+        return SharedStorage
 
     def _make_kernel_bundle(
         self,
         mDInc: cute.Tensor,
-    ) -> ChunkIncrementBwdBoundaryKernelBundle:
+    ) -> BwdBoundaryKernelBundle:
         shared_storage_cls = self._make_shared_storage(mDInc.element_type)
-        return ChunkIncrementBwdBoundaryKernelBundle(
+        return BwdBoundaryKernelBundle(
             async_copy_atom=self._make_async_dinc_copy_atom(mDInc.element_type),
             smem_bytes=int(shared_storage_cls.size_in_bytes()),
         )
@@ -387,7 +384,7 @@ class ChunkIncrementBwdBoundaryAmpere:
         if cutlass.const_expr(mM.shape[1] != mKprev.shape[1]):
             raise ValueError("M and Kprev must share the chunk time dimension.")
         if cutlass.const_expr(mBPrev.shape[0] % 2 != 0):
-            raise ValueError("BPrev D dimension must be even because D stores pairs.")
+            raise ValueError("BPrev D dimension must be even; D stores pairs.")
 
     def _launch_kernel(
         self,
@@ -619,7 +616,7 @@ class ChunkIncrementBwdBoundaryAmpere:
                 boundary_row = boundary_row + self.num_threads
             cute.arch.cp_async_commit_group()
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         if tidx == 0:
             suffix_after_step0_re = cutlass.Float32(1.0)
@@ -670,7 +667,7 @@ class ChunkIncrementBwdBoundaryAmpere:
                 + suffix_after_step0_im * prev_tap_re
             )
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         boundary_coeff_re = s_mp0[0]
         boundary_coeff_im = s_mp0[1]
@@ -730,7 +727,7 @@ class ChunkIncrementBwdBoundaryAmpere:
                     complex_pair = complex_pair + self.num_threads
 
                 cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
+                pipeline.sync()
 
                 # dU_prev workers: each thread owns at most one boundary row.
                 if cute.elem_less(
@@ -777,11 +774,21 @@ class ChunkIncrementBwdBoundaryAmpere:
 
                         if half_selector == cutlass.Int32(0):
                             global_pair_start = stage_col_start + d_pair_start
+                            current_db0 = mDBPrev[
+                                global_pair_start + 0, batch_head_chunk
+                            ].to(cutlass.Float32)
+                            current_db1 = mDBPrev[
+                                global_pair_start + 1, batch_head_chunk
+                            ].to(cutlass.Float32)
                             mDBPrev[global_pair_start + 0, batch_head_chunk] = (
-                                boundary_coeff_re * g0 + boundary_coeff_im * g1
+                                current_db0
+                                + boundary_coeff_re * g0
+                                + boundary_coeff_im * g1
                             ).to(mDBPrev.element_type)
                             mDBPrev[global_pair_start + 1, batch_head_chunk] = (
-                                boundary_coeff_re * g1 - boundary_coeff_im * g0
+                                current_db1
+                                + boundary_coeff_re * g1
+                                - boundary_coeff_im * g0
                             ).to(mDBPrev.element_type)
 
                             b_prev_re = mBPrev[
@@ -797,14 +804,15 @@ class ChunkIncrementBwdBoundaryAmpere:
                                 b_prev_re * g1 - b_prev_im * g0
                             )
 
-                cute.arch.sync_threads()
+                pipeline.sync()
 
             if cute.elem_less(
                 tidx, cutlass.Int32(self.du_prev_threads)
             ) and cute.elem_less(du_boundary_row, self.P):
-                mDUPrev[du_boundary_row, batch_head_chunk] = du_prev_accum.to(
-                    mDUPrev.element_type
-                )
+                current = mDUPrev[du_boundary_row, batch_head_chunk].to(cutlass.Float32)
+                mDUPrev[du_boundary_row, batch_head_chunk] = (
+                    current + du_prev_accum
+                ).to(mDUPrev.element_type)
 
             if not cute.elem_less(tidx, cutlass.Int32(self.du_prev_threads)):
                 for offset in (16, 8, 4, 2, 1):
@@ -839,7 +847,7 @@ class ChunkIncrementBwdBoundaryAmpere:
                 complex_pair = complex_pair + self.num_threads
 
             cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             du_prev_accum = cutlass.Float32(0.0)
             if cute.elem_less(tidx, cutlass.Int32(self.du_prev_threads)):
@@ -856,9 +864,12 @@ class ChunkIncrementBwdBoundaryAmpere:
                             * s_decayed_boundary_key[boundary_col]
                         )
                         boundary_col = boundary_col + 1
-                    mDUPrev[boundary_row, batch_head_chunk] = du_prev_accum.to(
-                        mDUPrev.element_type
+                    current = mDUPrev[boundary_row, batch_head_chunk].to(
+                        cutlass.Float32
                     )
+                    mDUPrev[boundary_row, batch_head_chunk] = (
+                        current + du_prev_accum
+                    ).to(mDUPrev.element_type)
                     boundary_row = boundary_row + self.du_prev_threads
 
             d_mp0_partial_re = cutlass.Float32(0.0)
@@ -880,11 +891,17 @@ class ChunkIncrementBwdBoundaryAmpere:
                             boundary_row, d_pair_start + 1
                         ].to(cutlass.Float32)
 
+                    current_db0 = mDBPrev[d_pair_start + 0, batch_head_chunk].to(
+                        cutlass.Float32
+                    )
+                    current_db1 = mDBPrev[d_pair_start + 1, batch_head_chunk].to(
+                        cutlass.Float32
+                    )
                     mDBPrev[d_pair_start + 0, batch_head_chunk] = (
-                        boundary_coeff_re * g0 + boundary_coeff_im * g1
+                        current_db0 + boundary_coeff_re * g0 + boundary_coeff_im * g1
                     ).to(mDBPrev.element_type)
                     mDBPrev[d_pair_start + 1, batch_head_chunk] = (
-                        boundary_coeff_re * g1 - boundary_coeff_im * g0
+                        current_db1 + boundary_coeff_re * g1 - boundary_coeff_im * g0
                     ).to(mDBPrev.element_type)
 
                     b_prev_re = mBPrev[d_pair_start + 0, batch_group_chunk].to(
@@ -913,7 +930,7 @@ class ChunkIncrementBwdBoundaryAmpere:
                     s_db_prev_partial_sum[db_prev_warp, 0] = d_mp0_partial_re
                     s_db_prev_partial_sum[db_prev_warp, 1] = d_mp0_partial_im
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         if tidx == 0:
             d_mp0_re = cutlass.Float32(0.0)
@@ -923,3 +940,6 @@ class ChunkIncrementBwdBoundaryAmpere:
                 d_mp0_im = d_mp0_im + s_db_prev_partial_sum[db_prev_warp, 1]
             mDMp0[0, batch_head_chunk] = d_mp0_re
             mDMp0[1, batch_head_chunk] = d_mp0_im
+
+
+__all__ = ["BwdBoundaryAmpere"]

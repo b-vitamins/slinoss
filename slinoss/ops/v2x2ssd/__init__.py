@@ -18,9 +18,9 @@ from .reference import (
 
 def _v2x2ssd_cute_impl(*args: Any, **kwargs: Any):
     """Compiler boundary for the CuTe scan JIT/runtime path."""
-    from .cute import v2x2ssd_cute as _v2x2ssd_cute
+    from . import cute
 
-    return _v2x2ssd_cute(*args, **kwargs)
+    return cute.v2x2ssd_cute(*args, **kwargs)
 
 
 v2x2ssd_cute = cast(

@@ -6,13 +6,19 @@ from typing import Callable, cast
 import cutlass.cute as cute
 import torch
 
+from slinoss._cute_runtime import launch_tvm_ffi_on_current_stream
+from slinoss.ops._cute_common import (
+    _device_cache_key,
+    _is_cuda_graph_capturing,
+    _make_compile_args,
+    _runtime_alignments,
+    _runtime_signature_key,
+)
 from slinoss.perf import note_cache_event
 
 from ..common import (
     SCANPREP_PARAM_DIM,
     contiguous_tensor,
-    make_fake_tensor_arg,
-    tensor_compile_signature,
 )
 from .bwd import ScanPrepBwdFused
 from .fwd import ScanPrepFwdFused
@@ -107,28 +113,11 @@ def _cache_set(cache: dict, key: tuple, value, *, limit: int) -> None:
     cache[key] = value
 
 
-def _record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
-    if not torch.cuda.is_available():
-        return
-    stream = torch.cuda.current_stream()
-    for tensor in tensors:
-        if tensor is not None and tensor.device.type == "cuda":
-            tensor.record_stream(stream)
-
-
-def _is_cuda_graph_capturing(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-
-
 def _raise_cold_capture_error(direction: str, resource: str) -> None:
     raise RuntimeError(
         f"CuTe scanprep {direction} {resource} is cold during CUDA graph capture. "
         f"Warm the same scanprep {direction} spec once outside capture before graph capture."
     )
-
-
-def _device_cache_key(device: torch.device) -> int:
-    return 0 if device.index is None else int(device.index)
 
 
 def _make_scanprep_config(
@@ -155,31 +144,6 @@ def _make_scanprep_config(
         r_min=float(r_min),
         r_max=float(r_max),
         eps=float(eps),
-    )
-
-
-def _runtime_alignments(runtime_args: tuple[torch.Tensor, ...]) -> tuple[int, ...]:
-    return tuple(tensor_compile_signature(tensor)[1] for tensor in runtime_args)
-
-
-def _runtime_signature_key(
-    runtime_args: tuple[torch.Tensor, ...],
-) -> tuple[object, ...]:
-    return tuple(
-        component
-        for tensor in runtime_args
-        for component in tensor_compile_signature(tensor)
-    )
-
-
-def _make_compile_args(
-    runtime_args: tuple[torch.Tensor, ...],
-    *,
-    alignments: tuple[int, ...],
-) -> tuple[object, ...]:
-    return tuple(
-        make_fake_tensor_arg(tensor, align=align)
-        for tensor, align in zip(runtime_args, alignments, strict=True)
     )
 
 
@@ -656,8 +620,7 @@ def _run_scanprep_fwd_cute(
             config=config,
         ),
     )
-    compiled(*runtime_artifacts.runtime_args)
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(compiled, *runtime_artifacts.runtime_args)
     return runtime_artifacts.outputs
 
 
@@ -1241,8 +1204,7 @@ def _run_scanprep_bwd_cute(
             config=config,
         ),
     )
-    compiled(*runtime_artifacts.runtime_args)
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(compiled, *runtime_artifacts.runtime_args)
     return runtime_artifacts.outputs
 
 

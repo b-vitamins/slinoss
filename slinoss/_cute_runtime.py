@@ -1,18 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 from pathlib import Path
-from typing import Iterable, TypeAlias
-from importlib import import_module
+from typing import TypeAlias, TypeVar
 
 import torch
 
 
 TensorSpec: TypeAlias = tuple[tuple[int, ...], tuple[int, ...]]
-
-
-def _cute_module():
-    return import_module("cutlass.cute")
+_T = TypeVar("_T")
+_CACHED_TENSOR_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def _default_cute_cache_dir() -> Path:
@@ -29,16 +27,6 @@ def ensure_cute_runtime_env() -> None:
     Path(cache_dir).expanduser().mkdir(parents=True, exist_ok=True)
 
 
-def _compact_stride_order(stride: tuple[int, ...]) -> tuple[int, ...]:
-    return tuple(
-        mode
-        for mode, _ in sorted(
-            enumerate(int(step) for step in stride),
-            key=lambda item: (-item[1], item[0]),
-        )
-    )
-
-
 def make_runtime_tensor_spec_view(
     tensor: torch.Tensor,
     spec: TensorSpec,
@@ -47,89 +35,74 @@ def make_runtime_tensor_spec_view(
     return torch.as_strided(tensor, size=shape, stride=stride)
 
 
-def _spec_stride_order(spec: TensorSpec) -> tuple[int, ...]:
-    _shape, stride = spec
-    return _compact_stride_order(tuple(int(step) for step in stride))
+def record_tensors_on_current_stream(*tensors: torch.Tensor | None) -> None:
+    if not torch.cuda.is_available():
+        return
+    streams: dict[torch.device, torch.cuda.Stream] = {}
+    seen: set[int] = set()
+    for tensor in tensors:
+        if tensor is None or tensor.device.type != "cuda":
+            continue
+        ident = id(tensor)
+        if ident in seen:
+            continue
+        stream = streams.get(tensor.device)
+        if stream is None:
+            stream = torch.cuda.current_stream(device=tensor.device)
+            streams[tensor.device] = stream
+        tensor.record_stream(stream)
+        seen.add(ident)
 
 
-def _deduce_leading_dim(tensor: torch.Tensor) -> int | None:
-    stride_one_modes = [i for i, step in enumerate(tensor.stride()) if int(step) == 1]
-    if len(stride_one_modes) == 1:
-        return int(stride_one_modes[0])
-    return None
+def _is_current_stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
-def to_cute_static_tensor(
-    tensor: torch.Tensor,
-    *,
-    align: int,
-):
-    ensure_cute_runtime_env()
-    cute = _cute_module()
-    return cute.runtime.from_dlpack(
-        tensor,
-        assumed_align=int(align),
-        use_32bit_stride=True,
-        enable_tvm_ffi=True,
+def prepare_cached_tensors_on_current_stream(
+    *tensors: torch.Tensor | None,
+) -> None:
+    if not torch.cuda.is_available():
+        return
+    streams: dict[torch.device, torch.cuda.Stream] = {}
+    seen: set[int] = set()
+    for tensor in tensors:
+        if tensor is None or tensor.device.type != "cuda":
+            continue
+        ident = id(tensor)
+        if ident in seen:
+            continue
+        stream = streams.get(tensor.device)
+        if stream is None:
+            stream = torch.cuda.current_stream(device=tensor.device)
+            streams[tensor.device] = stream
+        previous_stream = _CACHED_TENSOR_STREAMS.get(ident)
+        if _is_current_stream_capturing():
+            _CACHED_TENSOR_STREAMS[ident] = stream
+            seen.add(ident)
+            continue
+        if previous_stream is not None and previous_stream != stream:
+            stream.wait_stream(previous_stream)
+        tensor.record_stream(stream)
+        _CACHED_TENSOR_STREAMS[ident] = stream
+        seen.add(ident)
+
+
+def launch_tvm_ffi_on_current_stream(
+    compiled: Callable[..., _T],
+    *runtime_args: object,
+) -> _T:
+    tensor_args = tuple(arg for arg in runtime_args if isinstance(arg, torch.Tensor))
+    result = compiled(*runtime_args)
+    record_tensors_on_current_stream(
+        *tensor_args,
     )
-
-
-def to_cute_layout_dynamic_tensor(
-    tensor: torch.Tensor,
-    *,
-    align: int,
-):
-    cute_tensor = to_cute_static_tensor(tensor, align=align)
-    leading_dim = _deduce_leading_dim(tensor)
-    if leading_dim is None:
-        return cute_tensor.mark_layout_dynamic()
-    return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
-
-
-def to_cute_compact_dynamic_tensor(
-    tensor: torch.Tensor,
-    *,
-    align: int,
-    dynamic_modes: Iterable[int],
-    stride_order: tuple[int, ...] | None = None,
-):
-    cute_tensor = to_cute_static_tensor(tensor, align=align)
-    if stride_order is None:
-        stride_order = _compact_stride_order(
-            tuple(int(step) for step in tensor.stride())
-        )
-    for mode in dynamic_modes:
-        cute_tensor = cute_tensor.mark_compact_shape_dynamic(
-            mode=int(mode),
-            stride_order=stride_order,
-        )
-    return cute_tensor
-
-
-def to_cute_runtime_tensor_view(
-    tensor: torch.Tensor,
-    spec: TensorSpec,
-    *,
-    align: int,
-    dynamic_modes: Iterable[int],
-    compact: bool = True,
-):
-    runtime_view = make_runtime_tensor_spec_view(tensor, spec)
-    if not compact:
-        return to_cute_layout_dynamic_tensor(runtime_view, align=align)
-    return to_cute_compact_dynamic_tensor(
-        runtime_view,
-        align=align,
-        dynamic_modes=dynamic_modes,
-        stride_order=_spec_stride_order(spec),
-    )
+    return result
 
 
 __all__ = [
     "ensure_cute_runtime_env",
+    "launch_tvm_ffi_on_current_stream",
     "make_runtime_tensor_spec_view",
-    "to_cute_runtime_tensor_view",
-    "to_cute_compact_dynamic_tensor",
-    "to_cute_layout_dynamic_tensor",
-    "to_cute_static_tensor",
+    "prepare_cached_tensors_on_current_stream",
+    "record_tensors_on_current_stream",
 ]

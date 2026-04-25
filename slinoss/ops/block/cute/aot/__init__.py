@@ -35,9 +35,13 @@ from slinoss._cute_aot import (
 )
 
 from ..activation import FfnActivationBwdFused, FfnActivationFwdFused
-from ..common import ActivationKind, make_fake_tensor_arg, validate_activation_operands
+from ..common import (
+    ActivationKind,
+    make_fake_tensor_arg,
+    validate_activation_operands,
+    validate_norm_operands,
+)
 from ..norm import FfnRmsNormBwdFused, FfnRmsNormFwdFused
-from ..common import validate_norm_operands
 
 _PACKAGED_AOT_ROOT = Path(__file__).resolve().parent
 _PACKAGED_NORM_FORWARD_CACHE: dict[str, object] = {}

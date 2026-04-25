@@ -10,6 +10,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cute_math
+import cutlass.pipeline as pipeline
 
 from slinoss.perf import note_cache_event
 
@@ -21,11 +22,11 @@ from .common import (
     _make_compile_args,
     _make_layout,
     _raise_cold_capture_error,
-    _record_tensors_on_current_stream,
     _runtime_alignments,
     _runtime_signature_key,
     _size,
     contiguous_tensor,
+    launch_tvm_ffi_on_current_stream,
     safe_cast_to_dtype,
     validate_norm_operands,
     warp_reduce_sum,
@@ -82,7 +83,7 @@ def _grid_shape(*, total_rows: int, warps_per_block: int) -> tuple[int, int, int
 
 
 class FfnRmsNormFwdFused:
-    """Host wrapper for the live FFN RMSNorm forward kernel."""
+    """Host wrapper for the FFN RMSNorm forward kernel."""
 
     def __init__(
         self,
@@ -170,7 +171,7 @@ class FfnRmsNormFwdFused:
 
 
 class FfnRmsNormBwdFused:
-    """Host wrapper for the live FFN RMSNorm backward kernel."""
+    """Host wrapper for the FFN RMSNorm backward kernel."""
 
     def __init__(
         self,
@@ -259,7 +260,7 @@ class FfnRmsNormBwdFused:
                 d = lane + d_iter * 32
                 if d < self.hidden_dim:
                     sDWeight[warp, d] = cutlass.Float32(0.0)
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         if warp == 0:
             for d_iter in cutlass.range_constexpr(num_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
@@ -580,8 +581,10 @@ def _ffn_rmsnorm_fwd_cute_prevalidated(
         device=residual.device,
         eps=eps,
     )
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
-    cast(Callable[..., None], compiled)(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(
+        cast(Callable[..., None], compiled),
+        *runtime_artifacts.runtime_args,
+    )
     return runtime_artifacts.output
 
 
@@ -605,8 +608,10 @@ def _ffn_rmsnorm_bwd_cute_prevalidated(
         device=residual.device,
         eps=eps,
     )
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
-    cast(Callable[..., None], compiled)(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(
+        cast(Callable[..., None], compiled),
+        *runtime_artifacts.runtime_args,
+    )
     if runtime_artifacts.outputs.d_weight.dtype == torch.float32:
         runtime_artifacts.outputs.d_weight.copy_(runtime_artifacts.d_weight_accum)
     else:

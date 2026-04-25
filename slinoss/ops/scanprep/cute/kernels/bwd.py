@@ -1,10 +1,11 @@
-"""CuTe backward kernels for the live ``scanprep`` backend."""
+"""CuTe backward kernels for the ``scanprep`` backend."""
 
 import math
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cute_math
+import cutlass.pipeline as pipeline
 
 from ..common import (
     SCANPREP_PARAM_DIM,
@@ -465,7 +466,7 @@ class _CoeffGradFused:
                                 mParams[load_b, load_t, load_h, param_idx]
                             )
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         if bt < total_bt_ and h < self.h_size:
             b = bt // t_size_
@@ -751,7 +752,7 @@ class _CoeffGradFused:
                 _llvm_ptr(mBiasGrad.iterator + bias_base + 3), bias_theta_sum
             )
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         num_store_t_iters = (
             self.coeff_t_tile + self.coeff_head_tile - 1
@@ -821,7 +822,7 @@ class _CoeffGradFused:
 
 
 class ScanPrepBwdFused:
-    """Host wrapper that launches the live raw-BC backward phases."""
+    """Host wrapper that launches the scanprep backward phases."""
 
     def __init__(
         self,

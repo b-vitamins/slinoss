@@ -111,26 +111,6 @@ def test_search_space_forward_aot_specs_expand_beyond_default_specs() -> None:
 
 
 def test_v2x2ssd_aot_record_load_defaults_bc_groups_to_head_matched_identity() -> None:
-    increment_base = cute_aot_mod._search_space_chunk_increment_specs(arch_tag="sm_80")[
-        0
-    ]
-    increment = cute_aot_mod._chunk_increment_spec_from_record(
-        {
-            key: value
-            for key, value in asdict(increment_base).items()
-            if key != "bc_groups"
-        }
-    )
-    assert increment.bc_groups is None
-    assert increment.module_id == increment_base.module_id
-
-    scan_base = cute_aot_mod._search_space_chunk_scan_specs(arch_tag="sm_80")[0]
-    scan = cute_aot_mod._chunk_scan_spec_from_record(
-        {key: value for key, value in asdict(scan_base).items() if key != "bc_groups"}
-    )
-    assert scan.bc_groups is None
-    assert scan.module_id == scan_base.module_id
-
     forward_base = cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0]
     forward = cute_aot_mod._forward_spec_from_record(
         {
@@ -158,18 +138,6 @@ def test_v2x2ssd_aot_record_load_defaults_bc_groups_to_head_matched_identity() -
 
 
 def test_grouped_v2x2ssd_aot_module_ids_include_bc_groups_identity() -> None:
-    increment_base = cute_aot_mod._search_space_chunk_increment_specs(arch_tag="sm_80")[
-        0
-    ]
-    increment_grouped = replace(increment_base, bc_groups=1)
-    assert increment_grouped.module_id != increment_base.module_id
-    assert "g1" in increment_grouped.module_id
-
-    scan_base = cute_aot_mod._search_space_chunk_scan_specs(arch_tag="sm_80")[0]
-    scan_grouped = replace(scan_base, bc_groups=1)
-    assert scan_grouped.module_id != scan_base.module_id
-    assert "g1" in scan_grouped.module_id
-
     forward_base = cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0]
     forward_grouped = replace(forward_base, bc_groups=1)
     assert forward_grouped.module_id != forward_base.module_id
@@ -193,24 +161,6 @@ def test_build_default_forward_aot_package_only_exports_forward_specs(
     exported_kinds: list[str] = []
     registered_kinds: list[str] = []
 
-    def _stage_compile_should_not_run(spec: object):
-        raise AssertionError(f"unexpected stage compile for {spec!r}")
-
-    monkeypatch.setattr(
-        cute_aot_mod,
-        "_compile_chunk_increment_aot",
-        _stage_compile_should_not_run,
-    )
-    monkeypatch.setattr(
-        cute_aot_mod,
-        "_compile_state_passing_aot",
-        _stage_compile_should_not_run,
-    )
-    monkeypatch.setattr(
-        cute_aot_mod,
-        "_compile_chunk_scan_aot",
-        _stage_compile_should_not_run,
-    )
     monkeypatch.setattr(
         cute_aot_mod,
         "_compile_forward_aot",
@@ -366,18 +316,6 @@ def test_build_default_cute_aot_package_builds_forward_then_backward(
 @pytest.mark.parametrize(
     ("helper_name", "spec"),
     [
-        (
-            "_compile_chunk_increment_aot",
-            cute_aot_mod._search_space_chunk_increment_specs(arch_tag="sm_80")[0],
-        ),
-        (
-            "_compile_state_passing_aot",
-            cute_aot_mod._search_space_state_passing_specs(arch_tag="sm_80")[0],
-        ),
-        (
-            "_compile_chunk_scan_aot",
-            cute_aot_mod._search_space_chunk_scan_specs(arch_tag="sm_80")[0],
-        ),
         (
             "_compile_forward_aot",
             cute_aot_mod._search_space_forward_specs(arch_tag="sm_80")[0],
@@ -991,72 +929,3 @@ def test_v2x2ssd_bwd_cute_prefers_packaged_aot_over_jit(
         d_final_state=d_final_state,
     )
     assert len(grads) == 8
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_stage_aot_export_helpers_emit_artifacts(tmp_path: Path) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
-        batch=1,
-        heads=1,
-        T=32,
-        N=8,
-        P=16,
-        device=device,
-    )
-
-    stage_root = tmp_path / "stages"
-    exported_increment = cute_aot_mod.export_chunk_increment_cute_aot(
-        U,
-        M,
-        K,
-        B,
-        U_prev=U_prev,
-        B_prev=B_prev,
-        chunk_size=32,
-        compute_dtype=torch.float32,
-        package_root=stage_root,
-    )
-    increment, chunk_multiplier = v2x2ssd_fwd_mod.chunk_increment_cute(
-        U,
-        M,
-        K,
-        B,
-        U_prev=U_prev,
-        B_prev=B_prev,
-        chunk_size=32,
-        compute_dtype=torch.float32,
-    )
-    exported_state = cute_aot_mod.export_state_passing_cute_aot(
-        increment,
-        chunk_multiplier,
-        initial_states=initial_states,
-        package_root=stage_root,
-    )
-    chunk_starts, _final_state = v2x2ssd_fwd_mod.state_passing_cute(
-        increment,
-        chunk_multiplier,
-        initial_states=initial_states,
-    )
-    exported_scan = cute_aot_mod.export_chunk_scan_cute_aot(
-        U,
-        M,
-        K,
-        B,
-        C,
-        chunk_starts,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        chunk_size=32,
-        compute_dtype=torch.float32,
-        output_dtype=torch.float16,
-        package_root=stage_root,
-    )
-
-    for exported in (exported_increment, exported_state, exported_scan):
-        assert exported.object_file is not None
-        assert exported.object_file.is_file()
-        assert exported.shared_library.is_file()
-        assert exported.metadata_file.is_file()

@@ -146,18 +146,25 @@ Do not reintroduce verbose taxonomies like `everything_else.mixer_non_scan.*`.
 - Include last-batch or reduced-batch cases when using the `training` suite so
   cache/dispatch behavior is exercised under realistic shape variation.
 
-### NCU Table Harness
+### CuTe Kernel Profiling Harness
 
-Use `scripts/perf/ncu_kernel_table.py` for compact, machine-readable kernel NCU
-snapshots instead of raw multi-thousand-line NCU dumps.
+Use `scripts/perf/profile_cute_kernels.py` for compact, machine-readable CuTe
+kernel profiling snapshots instead of raw multi-thousand-line NCU dumps. The
+harness reports CUDA-event hot-path timing, effective bandwidth, NCU counters,
+and optional NSYS per-launch timing for multi-launch logical kernels.
 
-- Full scanprep + v2x2ssd table (all kernels):
-  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --json-out /tmp/ncu_kernel_table.json`
+- Full CuTe kernel profile:
+  - `./scripts/guix-run python3 scripts/perf/profile_cute_kernels.py --json-out /tmp/cute_kernel_profile.json`
 - Single-kernel probe:
-  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --kernel chunk_scan_bwd_dcdr --json-out /tmp/ncu_dcdr.json`
+  - `./scripts/guix-run python3 scripts/perf/profile_cute_kernels.py --kernel bwd_dcdr --json-out /tmp/cute_kernel_bwd_dcdr.json`
+- Group probe:
+  - `./scripts/guix-run python3 scripts/perf/profile_cute_kernels.py --group v2x2ssd_bwd_launches --json-out /tmp/cute_kernel_v2_bwd.json`
 - List supported kernel keys:
-  - `./scripts/guix-run python3 scripts/perf/ncu_kernel_table.py --list`
+  - `./scripts/guix-run python3 scripts/perf/profile_cute_kernels.py --list`
+- List supported kernel groups:
+  - `./scripts/guix-run python3 scripts/perf/profile_cute_kernels.py --list-groups`
 
-The table output is the default reporting surface and includes bench wall-time,
-effective GB/s, NCU DRAM throughput, occupancy, scheduler no-eligible, bank
-conflicts, registers/thread, and shared-memory-per-block breakdown.
+The profile output is the default reporting surface and includes bench
+wall-time, effective GB/s, NCU DRAM throughput, occupancy, scheduler
+no-eligible, bank conflicts, registers/thread, and shared-memory-per-block
+breakdown.

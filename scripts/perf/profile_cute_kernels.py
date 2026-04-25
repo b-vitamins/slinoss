@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Benchmark and Nsight-Compute profile the canonical CuTe training kernels."""
+"""Benchmark and profile the canonical CuTe training kernels."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+import signal
 import statistics
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from _ncu_kernels import (  # noqa: E402
     DEFAULT_V2_P,
     DEFAULT_V2_T,
     FfnPerfConfig,
+    KERNEL_GROUPS,
     KERNEL_ORDER,
     MixerTailPerfConfig,
     ScanPrepPerfConfig,
@@ -66,10 +68,21 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="List supported kernels.")
     parser.add_argument(
+        "--list-groups",
+        action="store_true",
+        help="List supported kernel groups.",
+    )
+    parser.add_argument(
         "--kernel",
         action="append",
         choices=KERNEL_ORDER,
         help="Limit the report to one or more kernels.",
+    )
+    parser.add_argument(
+        "--group",
+        action="append",
+        choices=tuple(KERNEL_GROUPS),
+        help="Limit the report to one or more named kernel groups.",
     )
     parser.add_argument("--ncu", default="ncu")
     parser.add_argument("--nsys", default="nsys")
@@ -444,10 +457,15 @@ def _format_ncu_counter_suffix(summary: dict[str, object]) -> str:
 
 
 def main() -> int:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     args = _parse_args()
     if args.list:
         for name in KERNEL_ORDER:
             print(name)
+        return 0
+    if args.list_groups:
+        for group_name, kernel_names in KERNEL_GROUPS.items():
+            print(f"{group_name}: {', '.join(kernel_names)}")
         return 0
 
     ensure_cuda(args.device)
@@ -472,7 +490,11 @@ def main() -> int:
         )
         return 0
 
-    requested_set = set(args.kernel or KERNEL_ORDER)
+    requested_set: set[str] = set(cast(list[str], args.kernel or []))
+    for group_name in cast(list[str], args.group or []):
+        requested_set.update(KERNEL_GROUPS[group_name])
+    if not requested_set:
+        requested_set.update(KERNEL_ORDER)
     requested = [name for name in KERNEL_ORDER if name in requested_set]
 
     rows: list[dict[str, object]] = []
@@ -615,7 +637,19 @@ def main() -> int:
 
     if args.json_out is not None:
         payload = {
+            "kind": "cute_kernel_profile",
+            "schema_version": 1,
             "device_name": torch.cuda.get_device_name(0),
+            "requested_kernels": requested,
+            "methodology": {
+                "timing": "cuda_event_hot_path",
+                "ncu_sections": NCU_SECTIONS,
+                "hot_launch_timing": args.hot_launch_timing,
+                "profile_warmup": int(args.profile_warmup),
+                "warmup": int(args.warmup),
+                "iterations": int(args.iterations),
+                "repeat": int(args.repeat),
+            },
             "v2x2ssd_config": {
                 "batch": v2_cfg.batch,
                 "heads": v2_cfg.heads,

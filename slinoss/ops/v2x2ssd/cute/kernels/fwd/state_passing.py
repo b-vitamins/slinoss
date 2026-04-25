@@ -1,4 +1,4 @@
-"""CuTe forward kernel for the v2x2ssd state-passing stage.
+"""CuTe forward state-passing kernel for ``v2x2ssd``.
 
 Inputs:
 - ``inc``: ``(B, H, C, P, D)`` float32 chunk-local state increments

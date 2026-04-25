@@ -46,8 +46,6 @@ def _validate_memory_summary(memory: dict[str, Any]) -> None:
 
 def _validate_training_budget_tree(
     tree: dict[str, Any],
-    *,
-    require_stage_breakdown: bool,
 ) -> None:
     for path in (
         "step.__stats__",
@@ -83,10 +81,6 @@ def _validate_training_budget_tree(
         "backward.head.__stats__",
     ):
         _expect_path(tree, path)
-    if require_stage_breakdown:
-        _expect_path(tree, "backward.v2x2ssd.chunk_increment.__stats__")
-        _expect_path(tree, "backward.v2x2ssd.state_passing.__stats__")
-        _expect_path(tree, "backward.v2x2ssd.chunk_scan.__stats__")
 
 
 def validate_training_bench_payload(payload: dict[str, Any]) -> None:
@@ -94,7 +88,7 @@ def validate_training_bench_payload(payload: dict[str, Any]) -> None:
         raise ValueError("Payload must be a dict.")
     if _expect(payload, "kind") != "bench_training":
         raise ValueError("Expected kind=bench_training.")
-    if int(_expect(payload, "schema_version")) != 1:
+    if int(_expect(payload, "schema_version")) != 2:
         raise ValueError("Unsupported schema_version.")
     _expect(payload, "device_name")
 
@@ -107,7 +101,7 @@ def validate_training_bench_payload(payload: dict[str, Any]) -> None:
             raise ValueError(f"Case {case_name} must be a dict.")
         _expect(case_payload, "config")
         workloads = _expect_dict(case_payload, "workload")
-        _expect(case_payload, "stage_suite")
+        _expect(case_payload, "v2x2ssd_suite")
         for backend_name, workload in workloads.items():
             if backend_name not in {"cute"}:
                 raise ValueError(f"Unsupported backend key: {backend_name}")
@@ -149,7 +143,6 @@ def validate_training_bench_payload(payload: dict[str, Any]) -> None:
                     _validate_memory_summary(memory)
                 _validate_training_budget_tree(
                     tree,
-                    require_stage_breakdown=False,
                 )
 
             _expect_dict(warm, "step")
@@ -166,7 +159,6 @@ def validate_training_bench_payload(payload: dict[str, Any]) -> None:
                 )
             _validate_training_budget_tree(
                 warm["tree"],
-                require_stage_breakdown=True,
             )
 
 
@@ -185,7 +177,7 @@ def validate_training_profile_payload(payload: dict[str, Any]) -> None:
     _expect(payload, "regions")
     _expect(payload, "budget")
     tree = _expect_dict(payload, "tree")
-    _validate_training_budget_tree(tree, require_stage_breakdown=False)
+    _validate_training_budget_tree(tree)
 
 
 def validate_training_memory_payload(payload: dict[str, Any]) -> None:
@@ -212,7 +204,7 @@ def validate_training_memory_payload(payload: dict[str, Any]) -> None:
     _expect(payload, "regions")
     _expect(payload, "budget")
     tree = _expect_dict(payload, "tree")
-    _validate_training_budget_tree(tree, require_stage_breakdown=False)
+    _validate_training_budget_tree(tree)
 
     baseline = _expect_dict(payload, "baseline_memory")
     _expect(baseline, "allocated_bytes")

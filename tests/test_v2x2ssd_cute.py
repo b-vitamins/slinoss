@@ -5,20 +5,17 @@ from typing import cast
 import pytest
 import torch
 
+import slinoss.ops._cute_common as cute_common_mod
 import slinoss.ops.v2x2ssd.cute.kernels.bwd as v2x2ssd_bwd_mod
 import slinoss.ops.v2x2ssd.cute.kernels.fwd as v2x2ssd_fwd_mod
 import slinoss.ops.v2x2ssd.cute.kernels.fwd.common as v2x2ssd_fwd_common_mod
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _resolve_chunk_scan_launch_cfg,
-    compile_chunk_scan_cute,
-    compile_state_passing_cute,
     compile_v2x2ssd_fwd_cute,
-    chunk_scan_cute,
-    state_passing_cute,
     v2x2ssd_fwd_cute,
 )
-from slinoss.ops.v2x2ssd.reference import chunk_increment, chunk_scan, state_passing
+from slinoss.ops.v2x2ssd.reference import chunk_increment, state_passing
 
 
 def _pack_complex_pairs(z: torch.Tensor, *, real_dtype: torch.dtype) -> torch.Tensor:
@@ -178,186 +175,6 @@ def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_wrapper_reuses_cached_executor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
-        batch=2,
-        heads=2,
-        T=64,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-    )
-    chunk_size = 32
-
-    inc_ref, m_ref = chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=chunk_size,
-        compute_dtype=torch.float32,
-    )
-    starts_ref, _ = state_passing(
-        inc_ref,
-        m_ref,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
-    )
-
-    compile_calls = 0
-    real_compile = v2x2ssd_fwd_mod.cute.compile
-
-    def _counting_compile(*args, **kwargs):
-        nonlocal compile_calls
-        compile_calls += 1
-        return real_compile(*args, **kwargs)
-
-    monkeypatch.setattr(v2x2ssd_fwd_mod.cute, "compile", _counting_compile)
-    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-    try:
-        out_view_a = chunk_scan_cute(
-            U,
-            M,
-            K,
-            B,
-            C,
-            starts_ref,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            chunk_size=chunk_size,
-            compute_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-        out_view_b = chunk_scan_cute(
-            U,
-            M,
-            K,
-            B,
-            C,
-            starts_ref,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            chunk_size=chunk_size,
-            compute_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-        assert compile_calls == 1
-    finally:
-        v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-
-    assert out_view_a.shape == out_view_b.shape == (2, 2, 64, 16)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_wrapper_reuses_cache_for_same_padded_spec(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    chunk_size = 32
-
-    inputs_a = _make_scan_inputs(
-        batch=2,
-        heads=2,
-        T=33,
-        N=8,
-        P=16,
-        device=device,
-    )
-    inputs_b = _make_scan_inputs(
-        batch=2,
-        heads=2,
-        T=60,
-        N=8,
-        P=16,
-        device=device,
-    )
-
-    def _make_chunk_starts(
-        U: torch.Tensor,
-        M: torch.Tensor,
-        K: torch.Tensor,
-        B: torch.Tensor,
-        initial_states: torch.Tensor,
-        B_prev: torch.Tensor,
-        U_prev: torch.Tensor,
-    ) -> torch.Tensor:
-        inc_ref, m_ref = chunk_increment(
-            U,
-            M,
-            K,
-            B,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            T=U.shape[2],
-            chunk_size=chunk_size,
-            compute_dtype=torch.float32,
-        )
-        starts_ref, _ = state_passing(
-            inc_ref,
-            m_ref,
-            initial_states=initial_states,
-            compute_dtype=torch.float32,
-        )
-        return starts_ref
-
-    U_a, M_a, K_a, B_a, C_a, initial_a, B_prev_a, U_prev_a = inputs_a
-    U_b, M_b, K_b, B_b, C_b, initial_b, B_prev_b, U_prev_b = inputs_b
-    starts_a = _make_chunk_starts(U_a, M_a, K_a, B_a, initial_a, B_prev_a, U_prev_a)
-    starts_b = _make_chunk_starts(U_b, M_b, K_b, B_b, initial_b, B_prev_b, U_prev_b)
-
-    compile_calls = 0
-    real_compile = v2x2ssd_fwd_mod.cute.compile
-
-    def _counting_compile(*args, **kwargs):
-        nonlocal compile_calls
-        compile_calls += 1
-        return real_compile(*args, **kwargs)
-
-    monkeypatch.setattr(v2x2ssd_fwd_mod.cute, "compile", _counting_compile)
-    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-    try:
-        chunk_scan_cute(
-            U_a,
-            M_a,
-            K_a,
-            B_a,
-            C_a,
-            starts_a,
-            B_prev=B_prev_a,
-            U_prev=U_prev_a,
-            chunk_size=chunk_size,
-            compute_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-        chunk_scan_cute(
-            U_b,
-            M_b,
-            K_b,
-            B_b,
-            C_b,
-            starts_b,
-            B_prev=B_prev_b,
-            U_prev=U_prev_b,
-            chunk_size=chunk_size,
-            compute_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-        assert compile_calls == 1
-    finally:
-        v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_fwd_reuses_compiled_host_wrapper_for_aliased_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -383,9 +200,6 @@ def test_v2x2ssd_fwd_reuses_compiled_host_wrapper_for_aliased_inputs(
         return real_compile(*args, **kwargs)
 
     monkeypatch.setattr(v2x2ssd_fwd_mod.cute, "compile", _counting_compile)
-    v2x2ssd_fwd_mod._CHUNK_INCREMENT_CACHE.clear()
-    v2x2ssd_fwd_mod._STATE_PASSING_CACHE.clear()
-    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
     v2x2ssd_fwd_mod._FWD_HOST_CACHE.clear()
 
     try:
@@ -419,14 +233,116 @@ def test_v2x2ssd_fwd_reuses_compiled_host_wrapper_for_aliased_inputs(
         )
         assert compile_calls == 1
     finally:
-        v2x2ssd_fwd_mod._CHUNK_INCREMENT_CACHE.clear()
-        v2x2ssd_fwd_mod._STATE_PASSING_CACHE.clear()
-        v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
         v2x2ssd_fwd_mod._FWD_HOST_CACHE.clear()
 
     torch.testing.assert_close(out_a, out_b, atol=2e-3, rtol=0.0)
     torch.testing.assert_close(m_chunk_a, m_chunk_b, atol=2e-3, rtol=0.0)
     torch.testing.assert_close(chunk_starts_a, chunk_starts_b, atol=2e-3, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_fwd_rejects_cold_caches_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    device = torch.device("cuda")
+    v2x2ssd_fwd_mod._ZERO_PREV_CACHE.clear()
+    v2x2ssd_fwd_mod._ZERO_INITIAL_STATE_CACHE.clear()
+    v2x2ssd_fwd_mod._DUMMY_FINAL_STATE_CACHE.clear()
+    v2x2ssd_fwd_mod._FWD_WORKSPACE_CACHE.clear()
+    v2x2ssd_fwd_mod._FWD_NO_GRAD_INTERMEDIATE_CACHE.clear()
+    v2x2ssd_fwd_mod._FWD_HOST_CACHE.clear()
+    try:
+        with pytest.raises(RuntimeError, match="zero-prev cache .*cold"):
+            v2x2ssd_fwd_mod._get_zero_prev_tensors(
+                device=device,
+                dtype=torch.float16,
+                batch_size=1,
+                heads=1,
+                bc_groups=1,
+                P=16,
+                D=16,
+            )
+        with pytest.raises(RuntimeError, match="zero-initial-state cache .*cold"):
+            v2x2ssd_fwd_mod._get_zero_initial_state(
+                device=device,
+                batch_size=1,
+                heads=1,
+                P=16,
+                D=16,
+            )
+        with pytest.raises(RuntimeError, match="dummy-final-state cache .*cold"):
+            v2x2ssd_fwd_mod._get_dummy_final_state(
+                device=device,
+                batch_size=1,
+                heads=1,
+                P=16,
+                D=16,
+            )
+        with pytest.raises(RuntimeError, match="workspace cache .*cold"):
+            v2x2ssd_fwd_mod._get_fwd_workspace(
+                device=device,
+                batch_size=1,
+                heads=1,
+                n_chunks=1,
+                P=16,
+                D=16,
+            )
+        with pytest.raises(RuntimeError, match="no-grad-intermediate cache .*cold"):
+            v2x2ssd_fwd_mod._get_no_grad_intermediates(
+                device=device,
+                batch_size=1,
+                heads=1,
+                n_chunks=1,
+                P=16,
+                D=16,
+            )
+        compile_artifacts = v2x2ssd_fwd_mod.ForwardCompileArtifacts(
+            problem_shape=(1, 1, 32, 16, 16, 1, 32, 1),
+            launch_cfg=(64, 64, 32, 64, 32, 32, 128, 8, True),
+            config_bundle=v2x2ssd_fwd_mod.ForwardConfigBundle(
+                chunk_increment=v2x2ssd_fwd_mod.ChunkIncrementConfig(
+                    cta_tiler=(64, 64, 32),
+                    num_stages=2,
+                ),
+                state_passing=v2x2ssd_fwd_mod.StatePassingConfig(
+                    num_threads=128,
+                    vecs_per_thread=8,
+                ),
+                chunk_scan=v2x2ssd_fwd_mod.ChunkScanConfig(
+                    m_block_size=64,
+                    n_block_size=64,
+                    num_threads=128,
+                ),
+            ),
+            compile_args=(),
+            alignments=(),
+        )
+        U = torch.empty((1, 1, 32, 16), device=device, dtype=torch.float16)
+        M = torch.empty((1, 1, 32, 2), device=device, dtype=torch.float32)
+        K = torch.empty((1, 1, 32, 2, 2), device=device, dtype=torch.float32)
+        B = torch.empty((1, 1, 32, 16), device=device, dtype=torch.float16)
+        C = torch.empty((1, 1, 32, 16), device=device, dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="host launcher cache .*cold"):
+            v2x2ssd_fwd_mod._get_compiled_v2x2ssd_fwd_kernel(
+                U=U,
+                M=M,
+                K=K,
+                B=B,
+                C=C,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+                compile_artifacts=compile_artifacts,
+            )
+    finally:
+        v2x2ssd_fwd_mod._ZERO_PREV_CACHE.clear()
+        v2x2ssd_fwd_mod._ZERO_INITIAL_STATE_CACHE.clear()
+        v2x2ssd_fwd_mod._DUMMY_FINAL_STATE_CACHE.clear()
+        v2x2ssd_fwd_mod._FWD_WORKSPACE_CACHE.clear()
+        v2x2ssd_fwd_mod._FWD_NO_GRAD_INTERMEDIATE_CACHE.clear()
+        v2x2ssd_fwd_mod._FWD_HOST_CACHE.clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -576,114 +492,6 @@ def test_compile_v2x2ssd_fwd_cute_avoids_runtime_launch_artifacts(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_state_passing_cute_avoids_runtime_launch_artifacts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    batch, heads, chunks, N, P = 2, 2, 16, 8, 16
-    D = 2 * N
-    increment = torch.randn(
-        (batch, heads, chunks, P, D), device="cuda", dtype=torch.float32
-    )
-    radius = 0.6 + 0.35 * torch.rand((batch, heads, chunks), device="cuda")
-    angle = (2.0 * math.pi) * torch.rand(
-        (batch, heads, chunks), device="cuda"
-    ) - math.pi
-    chunk_multiplier = torch.view_as_real(torch.polar(radius, angle)).to(torch.float32)
-    initial_states = torch.randn(
-        (batch, heads, P, D), device="cuda", dtype=torch.float32
-    )
-
-    def _unexpected_make_state_passing_runtime_artifacts(*args, **kwargs):
-        raise AssertionError(
-            "compile_state_passing_cute should not build runtime launch artifacts"
-        )
-
-    monkeypatch.setattr(
-        v2x2ssd_fwd_mod,
-        "_make_state_passing_runtime_artifacts",
-        _unexpected_make_state_passing_runtime_artifacts,
-    )
-    v2x2ssd_fwd_mod._STATE_PASSING_CACHE.clear()
-    try:
-        compiled = compile_state_passing_cute(
-            increment,
-            chunk_multiplier,
-            initial_states=initial_states,
-        )
-        assert compiled is not None
-    finally:
-        v2x2ssd_fwd_mod._STATE_PASSING_CACHE.clear()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_chunk_scan_cute_avoids_runtime_launch_artifacts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
-        batch=1,
-        heads=2,
-        T=64,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-    )
-    chunk_size = 32
-
-    increment, chunk_multiplier = chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=chunk_size,
-        compute_dtype=torch.float32,
-    )
-    chunk_starts, _ = state_passing(
-        increment,
-        chunk_multiplier,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
-    )
-
-    def _unexpected_make_chunk_scan_runtime_artifacts(*args, **kwargs):
-        raise AssertionError(
-            "compile_chunk_scan_cute should not build runtime launch artifacts"
-        )
-
-    monkeypatch.setattr(
-        v2x2ssd_fwd_mod,
-        "_make_chunk_scan_runtime_artifacts",
-        _unexpected_make_chunk_scan_runtime_artifacts,
-    )
-    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-    try:
-        compiled = compile_chunk_scan_cute(
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_starts,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            chunk_size=chunk_size,
-            compute_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-        assert compiled is not None
-    finally:
-        v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -728,7 +536,7 @@ def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
     monkeypatch.setattr(v2x2ssd_bwd_mod.cute, "compile", _recording_compile)
     v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
     try:
-        v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+        v2x2ssd_bwd_mod._compile_v2x2ssd_bwd_cute(
             U,
             M,
             K,
@@ -747,7 +555,7 @@ def test_v2x2ssd_bwd_compile_enables_tvm_ffi(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_v2x2ssd_bwd_cute_reuses_cached_executor(
+def test_private_compile_v2x2ssd_bwd_cute_reuses_cached_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("cutlass")
@@ -792,7 +600,7 @@ def test_compile_v2x2ssd_bwd_cute_reuses_cached_executor(
     monkeypatch.setattr(v2x2ssd_bwd_mod.cute, "compile", _counting_compile)
     v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
     try:
-        compiled_a = v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+        compiled_a = v2x2ssd_bwd_mod._compile_v2x2ssd_bwd_cute(
             U,
             M,
             K,
@@ -804,7 +612,7 @@ def test_compile_v2x2ssd_bwd_cute_reuses_cached_executor(
             chunk_size=chunk_size,
             compute_dtype=torch.float32,
         )
-        compiled_b = v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+        compiled_b = v2x2ssd_bwd_mod._compile_v2x2ssd_bwd_cute(
             U,
             M,
             K,
@@ -823,7 +631,7 @@ def test_compile_v2x2ssd_bwd_cute_reuses_cached_executor(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_v2x2ssd_bwd_cute_reuses_cache_for_same_padded_spec(
+def test_private_compile_v2x2ssd_bwd_cute_reuses_cache_for_same_padded_spec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("cutlass")
@@ -868,7 +676,7 @@ def test_compile_v2x2ssd_bwd_cute_reuses_cache_for_same_padded_spec(
             compute_dtype=torch.float32,
         )
         d_out = torch.randn_like(U)
-        return v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+        return v2x2ssd_bwd_mod._compile_v2x2ssd_bwd_cute(
             U,
             M,
             K,
@@ -901,7 +709,7 @@ def test_compile_v2x2ssd_bwd_cute_reuses_cache_for_same_padded_spec(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compile_v2x2ssd_bwd_cute_avoids_runtime_artifacts(
+def test_private_compile_v2x2ssd_bwd_cute_avoids_runtime_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("cutlass")
@@ -936,7 +744,7 @@ def test_compile_v2x2ssd_bwd_cute_avoids_runtime_artifacts(
     d_out = torch.randn_like(U)
 
     def _unexpected_make_backward_runtime_artifacts(*args, **kwargs):
-        raise AssertionError("compile_v2x2ssd_bwd_cute should not build runtime args")
+        raise AssertionError("_compile_v2x2ssd_bwd_cute should not build runtime args")
 
     monkeypatch.setattr(
         v2x2ssd_bwd_mod,
@@ -945,7 +753,7 @@ def test_compile_v2x2ssd_bwd_cute_avoids_runtime_artifacts(
     )
     v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
     try:
-        compiled = v2x2ssd_bwd_mod.compile_v2x2ssd_bwd_cute(
+        compiled = v2x2ssd_bwd_mod._compile_v2x2ssd_bwd_cute(
             U,
             M,
             K,
@@ -959,6 +767,68 @@ def test_compile_v2x2ssd_bwd_cute_avoids_runtime_artifacts(
         )
         assert compiled is not None
     finally:
+        v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_bwd_rejects_cold_caches_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    device = torch.device("cuda")
+    v2x2ssd_bwd_mod._ZERO_PREV_CACHE.clear()
+    v2x2ssd_bwd_mod._ZERO_FINAL_GRAD_CACHE.clear()
+    v2x2ssd_bwd_mod._BWD_WORKSPACE_CACHE.clear()
+    v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
+    try:
+        with pytest.raises(RuntimeError, match="zero-prev cache .*cold"):
+            v2x2ssd_bwd_mod._get_zero_prev_tensors(
+                device=device,
+                dtype=torch.float16,
+                batch_size=1,
+                heads=1,
+                bc_groups=1,
+                P=16,
+                D=16,
+            )
+        with pytest.raises(RuntimeError, match="zero-final-gradient cache .*cold"):
+            v2x2ssd_bwd_mod._get_zero_final_grad(
+                device=device,
+                batch_size=1,
+                heads=1,
+                P=16,
+                D=16,
+            )
+        with pytest.raises(RuntimeError, match="workspace cache .*cold"):
+            v2x2ssd_bwd_mod._get_bwd_workspace(
+                device=device,
+                tc_dtype=torch.float16,
+                batch_size=1,
+                heads=1,
+                bc_groups=1,
+                n_chunks=1,
+                chunk_size=32,
+                P=16,
+                D=16,
+                n_d_tiles=1,
+            )
+        compile_artifacts = v2x2ssd_bwd_mod.BackwardCompileArtifacts(
+            problem_shape=(1, 1, 1, 32, 16, 16, 1, 32, 1),
+            launch_cfg=(128, 128, 128, 32, 128, 8, 32, 32, 32, 32, 32, (64, 64, 32)),
+            compile_args=(),
+            alignments=(),
+            device_index=torch.cuda.current_device(),
+            tc_dtype=torch.float16,
+            cache_key=("cold-capture-test",),
+        )
+        with pytest.raises(RuntimeError, match="host launcher cache .*cold"):
+            v2x2ssd_bwd_mod._get_compiled_v2x2ssd_bwd_kernel(compile_artifacts)
+    finally:
+        v2x2ssd_bwd_mod._ZERO_PREV_CACHE.clear()
+        v2x2ssd_bwd_mod._ZERO_FINAL_GRAD_CACHE.clear()
+        v2x2ssd_bwd_mod._BWD_WORKSPACE_CACHE.clear()
         v2x2ssd_bwd_mod._BWD_HOST_CACHE.clear()
 
 
@@ -977,13 +847,11 @@ def test_v2x2ssd_fake_tensor_arg_prefers_compact_for_row_major(
         return ("tensor", args, kwargs)
 
     monkeypatch.setattr(
-        v2x2ssd_fwd_common_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
+        cute_common_mod.cute.runtime, "make_fake_compact_tensor", fake_compact
     )
-    monkeypatch.setattr(
-        v2x2ssd_fwd_common_mod.cute.runtime, "make_fake_tensor", fake_tensor
-    )
+    monkeypatch.setattr(cute_common_mod.cute.runtime, "make_fake_tensor", fake_tensor)
 
-    result = v2x2ssd_fwd_common_mod._make_fake_tensor_arg(tensor)
+    result = cute_common_mod.make_fake_tensor_arg(tensor)
 
     assert calls == ["compact"]
     assert result[0] == "compact"
@@ -1006,223 +874,6 @@ def test_tc_input_dtype_preserves_outer_contract() -> None:
     )
     with pytest.raises(TypeError):
         v2x2ssd_fwd_common_mod._tc_input_dtype(torch.float16, torch.float64)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_state_passing_cute_matches_reference_stage() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    batch, heads, chunks, N, P = 2, 2, 16, 8, 16
-    D = 2 * N
-    inc = torch.randn((batch, heads, chunks, P, D), device="cuda", dtype=torch.float32)
-    radius = 0.6 + 0.35 * torch.rand((batch, heads, chunks), device="cuda")
-    angle = (2.0 * math.pi) * torch.rand(
-        (batch, heads, chunks), device="cuda"
-    ) - math.pi
-    m_chunk = (
-        torch.view_as_real(torch.polar(radius, angle)).to(torch.float32).contiguous()
-    )
-    initial_states = torch.randn(
-        (batch, heads, P, D), device="cuda", dtype=torch.float32
-    )
-
-    starts_ref, final_ref = state_passing(
-        inc,
-        m_chunk,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
-    )
-    starts_cute, final_cute = state_passing_cute(
-        inc,
-        m_chunk,
-        initial_states=initial_states,
-    )
-
-    assert starts_cute.dtype == torch.float32
-    assert final_cute.dtype == torch.float32
-    torch.testing.assert_close(starts_cute, starts_ref, atol=4e-3, rtol=0.0)
-    torch.testing.assert_close(final_cute, final_ref, atol=2e-3, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_state_passing_cute_issue_9_shape_final_state_is_repeatable() -> None:
-    pytest.importorskip("cutlass")
-
-    for _ in range(12):
-        torch.manual_seed(0)
-        U, M, K, B, _C, initial_states, B_prev, U_prev = _make_scan_inputs(
-            batch=1,
-            heads=16,
-            T=128,
-            N=128,
-            P=64,
-            device=torch.device("cuda"),
-            value_dtype=torch.bfloat16,
-        )
-        inc_ref, m_ref = chunk_increment(
-            U,
-            M,
-            K,
-            B,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            T=U.shape[2],
-            chunk_size=128,
-            compute_dtype=torch.float32,
-        )
-        starts_ref, final_ref = state_passing(
-            inc_ref,
-            m_ref,
-            initial_states=initial_states,
-            compute_dtype=torch.float32,
-        )
-        starts_cute, final_cute = state_passing_cute(
-            inc_ref,
-            m_ref,
-            initial_states=initial_states,
-        )
-
-        torch.testing.assert_close(starts_cute, starts_ref, atol=1e-1, rtol=0.0)
-        torch.testing.assert_close(final_cute, final_ref, atol=1e-1, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_cute_matches_reference_stage() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
-        batch=2,
-        heads=2,
-        T=64,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-    )
-    chunk_size = 32
-
-    inc_ref, m_ref = chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=chunk_size,
-        compute_dtype=torch.float32,
-    )
-    starts_ref, _ = state_passing(
-        inc_ref,
-        m_ref,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
-    )
-
-    y_ref = chunk_scan(
-        U,
-        M,
-        K,
-        B,
-        C,
-        starts_ref,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
-        compute_dtype=torch.float32,
-    )
-    y_cute = chunk_scan_cute(
-        U,
-        M,
-        K,
-        B,
-        C,
-        starts_ref,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
-        compute_dtype=torch.float32,
-    )
-
-    torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_cute_is_repeatable_for_issue_9_shape() -> None:
-    pytest.importorskip("cutlass")
-
-    for output_dtype, atol in (
-        (torch.bfloat16, 5e-2),
-        # With the bf16-preserving TC path, the direct stage comparison now
-        # measures true bf16 operand staging rather than the old hidden fp16
-        # narrowing. On the issue-9 shape that raises the float32-output gap to
-        # about 1.22e-2 against the full-fp32 reference, so keep the tolerance
-        # just above that measured ceiling.
-        (torch.float32, 1.5e-2),
-    ):
-        for _ in range(8):
-            torch.manual_seed(0)
-            U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
-                batch=1,
-                heads=16,
-                T=128,
-                N=128,
-                P=64,
-                device=torch.device("cuda"),
-                value_dtype=torch.bfloat16,
-            )
-
-            inc_ref, m_ref = chunk_increment(
-                U,
-                M,
-                K,
-                B,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                T=U.shape[2],
-                chunk_size=128,
-                compute_dtype=torch.float32,
-            )
-            starts_ref, _ = state_passing(
-                inc_ref,
-                m_ref,
-                initial_states=initial_states,
-                compute_dtype=torch.float32,
-            )
-
-            y_ref = chunk_scan(
-                U,
-                M,
-                K,
-                B,
-                C,
-                starts_ref,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                T=U.shape[2],
-                chunk_size=128,
-                output_dtype=output_dtype,
-                compute_dtype=torch.float32,
-            )
-            y_cute = chunk_scan_cute(
-                U,
-                M,
-                K,
-                B,
-                C,
-                starts_ref,
-                B_prev=B_prev,
-                U_prev=U_prev,
-                chunk_size=128,
-                output_dtype=output_dtype,
-                compute_dtype=torch.float32,
-            )
-
-            torch.testing.assert_close(y_cute, y_ref, atol=atol, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -2068,71 +1719,6 @@ def test_v2x2ssd_cute_training_backward_supports_issue_5_shape() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_cute_matches_reference_stage_issue_3_shape() -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
-        batch=2,
-        heads=4,
-        T=65,
-        N=256,
-        P=64,
-        device=torch.device("cuda"),
-        value_dtype=torch.float16,
-    )
-    chunk_size = 64
-
-    inc_ref, m_ref = chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=None,
-        U_prev=None,
-        T=U.shape[2],
-        chunk_size=chunk_size,
-        compute_dtype=torch.float32,
-    )
-    starts_ref, _ = state_passing(
-        inc_ref,
-        m_ref,
-        initial_states=None,
-        compute_dtype=torch.float32,
-    )
-
-    y_ref = chunk_scan(
-        U,
-        M,
-        K,
-        B,
-        C,
-        starts_ref,
-        B_prev=None,
-        U_prev=None,
-        T=U.shape[2],
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
-        compute_dtype=torch.float32,
-    )
-    y_cute = chunk_scan_cute(
-        U,
-        M,
-        K,
-        B,
-        C,
-        starts_ref,
-        B_prev=None,
-        U_prev=None,
-        chunk_size=chunk_size,
-        output_dtype=torch.float32,
-        compute_dtype=torch.float32,
-    )
-
-    torch.testing.assert_close(y_cute, y_ref, atol=1e-3, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_cute_matches_reference_forward_training_only() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
@@ -2223,97 +1809,6 @@ def test_v2x2ssd_cute_accepts_underaligned_contiguous_activations(
         output_dtype=torch.float32,
     )
 
-    torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_scan_cute_normalizes_underaligned_chunk_starts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
-        batch=1,
-        heads=2,
-        T=64,
-        N=8,
-        P=16,
-        device=torch.device("cuda"),
-        value_dtype=torch.bfloat16,
-    )
-    inc_ref, m_ref = chunk_increment(
-        U,
-        M,
-        K,
-        B,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=32,
-        compute_dtype=torch.float32,
-    )
-    starts_ref, _ = state_passing(
-        inc_ref,
-        m_ref,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
-    )
-    starts_bad = _make_underaligned_contiguous_storage_offset_view(starts_ref)
-    v2x2ssd_fwd_mod._CHUNK_SCAN_CACHE.clear()
-
-    observed_align_mod_16: list[int] = []
-    orig_ensure_min_alignment = v2x2ssd_fwd_mod._ensure_min_alignment
-
-    def wrapped_ensure_min_alignment(
-        tensor: torch.Tensor,
-        *,
-        min_align: int,
-    ) -> torch.Tensor:
-        aligned = orig_ensure_min_alignment(tensor, min_align=min_align)
-        if (
-            tuple(tensor.shape) == tuple(starts_bad.shape)
-            and tensor.dtype == torch.float32
-        ):
-            observed_align_mod_16.append(aligned.data_ptr() % 16)
-        return aligned
-
-    monkeypatch.setattr(
-        v2x2ssd_fwd_mod,
-        "_ensure_min_alignment",
-        wrapped_ensure_min_alignment,
-    )
-
-    y_ref = chunk_scan(
-        U,
-        M,
-        K,
-        B,
-        C,
-        starts_ref,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        T=U.shape[2],
-        chunk_size=32,
-        output_dtype=torch.bfloat16,
-        compute_dtype=torch.float32,
-    )
-    y_cute = chunk_scan_cute(
-        U,
-        M,
-        K,
-        B,
-        C,
-        starts_bad,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        chunk_size=32,
-        output_dtype=torch.bfloat16,
-        compute_dtype=torch.float32,
-    )
-
-    assert observed_align_mod_16
-    assert observed_align_mod_16[-1] == 0
     torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
 
 
@@ -2760,8 +2255,8 @@ def test_v2x2ssd_cute_segmented_training_ignores_stale_dm_workspace(
 
     def _poisoned_get_bwd_workspace(*args, **kwargs):
         workspace = list(orig_get_bwd_workspace(*args, **kwargs))
-        workspace[19].fill_(123.0)  # dM_scan
-        workspace[27].fill_(123.0)  # dM_inc
+        workspace[15].fill_(123.0)  # dM_scan_storage
+        workspace[18].fill_(123.0)  # dM_sum_part
         return tuple(workspace)
 
     monkeypatch.setattr(

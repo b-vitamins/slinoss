@@ -1,11 +1,9 @@
-"""CuTe backward fused ``dcdr`` kernel for the ``v2x2ssd`` chunk-scan stage.
+"""CuTe backward fused ``dC``/``dR`` kernel for ``v2x2ssd``.
 
-``ChunkScanBwdDCDRAmpere`` is the live Ampere tensor-core implementation used
-by the backward ``dcdr`` slice. It reconstructs per-row magnitude and phase
-metadata from ``M``, accumulates causal score tiles from ``dOut`` and shifted
-``U`` rows, projects those scores into ``dC`` through the tapped key path, and
-folds the packed ``dlogprefix`` reduction into the same traversal that writes
-``dR``.
+``BwdDCDRAmpere`` reconstructs per-row magnitude and phase metadata from
+``M``, accumulates causal score tiles from ``dOut`` and shifted ``U`` rows,
+projects those scores into ``dC`` through the tapped key path, and folds the
+packed ``dlogprefix`` reduction into the same traversal that writes ``dR``.
 
 Tensor contracts:
 
@@ -35,6 +33,7 @@ import torch
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
 from .common import (
@@ -49,7 +48,7 @@ from .common import (
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCDRLayoutBundle:
+class BwdDCDRLayoutBundle:
     u_prev_layout: object
     b_prev_layout: object
     grad_output_layout: object
@@ -75,16 +74,16 @@ class ChunkScanBwdDCDRLayoutBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCDRCopyBundle:
+class BwdDCDRCopyBundle:
     gmem_tiled_copy_d_async: object
     gmem_tiled_copy_p: object
     gmem_tiled_store_d: object
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCDRKernelBundle:
-    layouts: ChunkScanBwdDCDRLayoutBundle
-    copies: ChunkScanBwdDCDRCopyBundle
+class BwdDCDRKernelBundle:
+    layouts: BwdDCDRLayoutBundle
+    copies: BwdDCDRCopyBundle
     tiled_mma: object
     shared_storage_cls: object
     smem_bytes: int
@@ -95,7 +94,7 @@ class ChunkScanBwdDCDRKernelBundle:
 
 
 @dataclass(frozen=True)
-class ChunkScanBwdDCDRSupportInfo:
+class BwdDCDRSupportInfo:
     smem_capacity_bytes: int
     required_smem_bytes: int
 
@@ -104,7 +103,7 @@ class ChunkScanBwdDCDRSupportInfo:
         return self.required_smem_bytes <= self.smem_capacity_bytes
 
 
-class ChunkScanBwdDCDRAmpere:
+class BwdDCDRAmpere:
     """Ampere tensor-core backward kernel for the ``v2x2ssd`` ``dcdr`` slice.
 
     This kernel owns the query-gradient and rotation-metadata path. It rebuilds
@@ -114,9 +113,7 @@ class ChunkScanBwdDCDRAmpere:
     ``dR`` without a separate log-prefix launch.
     """
 
-    _SUPPORT_INFO_CACHE: ClassVar[
-        dict[tuple[object, ...], ChunkScanBwdDCDRSupportInfo]
-    ] = {}
+    _SUPPORT_INFO_CACHE: ClassVar[dict[tuple[object, ...], BwdDCDRSupportInfo]] = {}
 
     def __init__(
         self,
@@ -252,7 +249,7 @@ class ChunkScanBwdDCDRAmpere:
             return int(utils.get_smem_capacity_in_bytes(cc))
         return int(utils.get_smem_capacity_in_bytes("sm_80"))
 
-    def _make_layout_bundle(self) -> ChunkScanBwdDCDRLayoutBundle:
+    def _make_layout_bundle(self) -> BwdDCDRLayoutBundle:
         kv_tile = self.kv_tile
         p_tile = self.p_tile
         n_tiles = self.num_kv_tiles
@@ -298,7 +295,7 @@ class ChunkScanBwdDCDRAmpere:
             s_score_layout_atom, (kv_tile, kv_tile), (0, 1)
         )
 
-        return ChunkScanBwdDCDRLayoutBundle(
+        return BwdDCDRLayoutBundle(
             u_prev_layout=cute.make_layout((self.P,), stride=(1,)),
             b_prev_layout=cute.make_layout((self.D,), stride=(1,)),
             grad_output_layout=grad_output_layout,
@@ -363,9 +360,9 @@ class ChunkScanBwdDCDRAmpere:
         in_dtype: type[cutlass.Numeric],
         *,
         device_index: int | None = None,
-    ) -> ChunkScanBwdDCDRSupportInfo:
+    ) -> BwdDCDRSupportInfo:
         if in_dtype not in (cutlass.Float16, cutlass.BFloat16):
-            return ChunkScanBwdDCDRSupportInfo(0, 1)
+            return BwdDCDRSupportInfo(0, 1)
 
         if device_index is None:
             device_key = (
@@ -386,16 +383,14 @@ class ChunkScanBwdDCDRAmpere:
         if cached is not None:
             return cached
 
-        info = ChunkScanBwdDCDRSupportInfo(
+        info = BwdDCDRSupportInfo(
             smem_capacity_bytes=self._smem_capacity_bytes(device_key),
             required_smem_bytes=self._compute_smem_bytes(in_dtype),
         )
         self._SUPPORT_INFO_CACHE[cache_key] = info
         return info
 
-    def _make_copy_bundle(
-        self, in_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanBwdDCDRCopyBundle:
+    def _make_copy_bundle(self, in_dtype: type[cutlass.Numeric]) -> BwdDCDRCopyBundle:
         universal_copy_bits = 128
         async_elems_in = universal_copy_bits // in_dtype.width
         smem_k_block_size_d = self._smem_block_size_d()
@@ -423,7 +418,7 @@ class ChunkScanBwdDCDRAmpere:
             in_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
-        return ChunkScanBwdDCDRCopyBundle(
+        return BwdDCDRCopyBundle(
             gmem_tiled_copy_d_async=cute.make_tiled_copy_tv(
                 atom_async_copy_in, t_d_layout, v_in_layout
             ),
@@ -447,10 +442,10 @@ class ChunkScanBwdDCDRAmpere:
 
     def _make_kernel_bundle(
         self, in_dtype: type[cutlass.Numeric]
-    ) -> ChunkScanBwdDCDRKernelBundle:
+    ) -> BwdDCDRKernelBundle:
         layouts = self._make_layout_bundle()
         shared_storage_cls = self._make_shared_storage(in_dtype, layouts)
-        return ChunkScanBwdDCDRKernelBundle(
+        return BwdDCDRKernelBundle(
             layouts=layouts,
             copies=self._make_copy_bundle(in_dtype),
             tiled_mma=self._make_tiled_mma(in_dtype),
@@ -461,7 +456,7 @@ class ChunkScanBwdDCDRAmpere:
     def _make_shared_storage(
         self,
         in_dtype: type[cutlass.Numeric],
-        layouts: ChunkScanBwdDCDRLayoutBundle,
+        layouts: BwdDCDRLayoutBundle,
     ):
         @cute.struct
         class SharedStorage:
@@ -636,7 +631,7 @@ class ChunkScanBwdDCDRAmpere:
                 t_reg_rhs[None, None, k],
                 acc,
             )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _make_copy_column_predicate(
@@ -780,7 +775,7 @@ class ChunkScanBwdDCDRAmpere:
                     prefix_state.s_tile_end_log[tile] = logp
                     prefix_state.s_tile_end_phase[tile, 0] = phase_re
                     prefix_state.s_tile_end_phase[tile, 1] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
         if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
             offset_log = cutlass.Float32(0.0)
@@ -804,7 +799,7 @@ class ChunkScanBwdDCDRAmpere:
                     offset_phase_re,
                     offset_phase_im,
                 )
-        cute.arch.barrier()
+        pipeline.sync()
 
         for tile in cutlass.range_constexpr(n_tiles):
             if warp == cutlass.Int32(tile % num_warps) and lane < cutlass.Int32(
@@ -837,7 +832,7 @@ class ChunkScanBwdDCDRAmpere:
                 prefix_state.s_inv_scale_full[seq_idx] = one / scale
                 prefix_state.s_phase_full[seq_idx, 0] = phase_re
                 prefix_state.s_phase_full[seq_idx, 1] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_full_tap_metadata(self, tap_state: SimpleNamespace):
@@ -863,7 +858,7 @@ class ChunkScanBwdDCDRAmpere:
                 tap_state.s_tap_full[seq_idx, 3] = cutlass.Float32(
                     tap_state.m_tap[tap_state.batch_head_chunk, seq_idx, 1, 1]
                 )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_previous_boundary_rows(self, boundary_state: SimpleNamespace):
@@ -909,7 +904,7 @@ class ChunkScanBwdDCDRAmpere:
                     b_prev0,
                     b_prev_chunk,
                 )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_row_outputs(self, row_state: SimpleNamespace):
@@ -929,7 +924,7 @@ class ChunkScanBwdDCDRAmpere:
             row = tidx // cutlass.Int32(4)
             col = tidx - row * cutlass.Int32(4)
             row_state.s_row_dr[row, col] = cutlass.Float32(0.0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_dlogprefix_accumulator(self, logprefix_state: SimpleNamespace):
@@ -939,7 +934,7 @@ class ChunkScanBwdDCDRAmpere:
             idx = tidx + cutlass.Int32(it * self.num_threads)
             if idx < cutlass.Int32(self.L):
                 logprefix_state.s_dlogprefix_accum[idx] = cutlass.Float32(0.0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _store_dlogprefix_accumulator(self, logprefix_state: SimpleNamespace):
@@ -952,7 +947,7 @@ class ChunkScanBwdDCDRAmpere:
                     logprefix_state.m_dlogprefix[logprefix_state.batch_head_chunk, idx]
                     + logprefix_state.s_dlogprefix_accum[idx]
                 )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_dout_tiles(self, dout_state: SimpleNamespace):
@@ -991,7 +986,7 @@ class ChunkScanBwdDCDRAmpere:
                 )
             cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_column_metadata(self, column_state: SimpleNamespace):
@@ -1020,7 +1015,7 @@ class ChunkScanBwdDCDRAmpere:
             column_state.s_tap_curr[lane, 1] = cutlass.Float32(
                 column_state.s_tap_full[seq_idx, 3]
             )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _stage_shifted_value_tile(self, value_state: SimpleNamespace):
@@ -1114,7 +1109,7 @@ class ChunkScanBwdDCDRAmpere:
                 s_value_tile=s_value_pass_tile,
             )
             self._stage_shifted_value_tile(value_state)
-            cute.arch.barrier()
+            pipeline.sync()
             tSr_value_tile = score_state.thr_mma.make_fragment_B(
                 score_state.thr_mma.partition_B(s_value_pass_tile)
             )
@@ -1137,7 +1132,7 @@ class ChunkScanBwdDCDRAmpere:
     def _materialize_score_tile(self, score_state: SimpleNamespace):
         acc_scores_mn = self._make_accumulator_mn_view(score_state.acc_scores)
         tCs_score_tile = score_state.thr_mma.partition_C(score_state.s_score_tile)
-        tCr_score_tile = cute.make_fragment_like(
+        tCr_score_tile = cute.make_rmem_tensor_like(
             tCs_score_tile, score_state.s_score_tile.element_type
         )
         t_coord_scores_mn = self._make_accumulator_mn_view(score_state.t_coord_scores)
@@ -1154,7 +1149,7 @@ class ChunkScanBwdDCDRAmpere:
         )
         self._apply_score_scales_and_mask(scaled_score_state)
         cute.autovec_copy(tCr_score_tile, tCs_score_tile)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _accumulate_offterm_from_conjugated_z0(self, offterm_state: SimpleNamespace):
@@ -1215,7 +1210,7 @@ class ChunkScanBwdDCDRAmpere:
                 acc_dq_offterm_mn[r, c] = offterm_scaled
 
         tCs_dq_tile = dq_state.thr_mma.partition_C(dq_state.s_dq_tile)
-        tCr_dq_tile = cute.make_fragment_like(
+        tCr_dq_tile = cute.make_rmem_tensor_like(
             tCs_dq_tile, dq_state.s_dq_tile.element_type
         )
         acc_dq_values = dq_state.acc_dq_total.load()
@@ -1224,7 +1219,7 @@ class ChunkScanBwdDCDRAmpere:
                 acc_dq_values[i], dq_state.s_dq_tile.element_type
             )
         cute.autovec_copy(tCr_dq_tile, tCs_dq_tile)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_boundary_aware_key_tile(self, key_load_state: SimpleNamespace):
@@ -1339,7 +1334,7 @@ class ChunkScanBwdDCDRAmpere:
                         if d < cutlass.Int32(self.D):
                             value = key_load_state.s_b_prev[d]
                         key_load_state.s_key_tile[0, idx] = value
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _apply_tap_phase_to_staged_keys(self, key_state: SimpleNamespace):
@@ -1390,7 +1385,7 @@ class ChunkScanBwdDCDRAmpere:
                     out1 = safe_cast_to_dtype(out_im, out_dtype)
                 key_state.s_key_tile[row_local, d0_local + 0] = out0
                 key_state.s_key_tile[row_local, d0_local + 1] = out1
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_conjugated_z0_stage(self, z0_state: SimpleNamespace):
@@ -1427,7 +1422,7 @@ class ChunkScanBwdDCDRAmpere:
                 )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+            pipeline.sync()
 
             total_z0_pairs_fast = cutlass.Int32(self.p_tile * d_block // 2)
             iters_z0_pairs_fast = (
@@ -1442,7 +1437,7 @@ class ChunkScanBwdDCDRAmpere:
                     d0_local = pair_idx * cutlass.Int32(2)
                     out1 = z0_state.s_z0_tile[p_local, d0_local + 1]
                     z0_state.s_z0_tile[p_local, d0_local + 1] = -out1
-            cute.arch.barrier()
+            pipeline.sync()
             return
 
         total_z0_pairs = cutlass.Int32(self.p_tile * d_block // 2)
@@ -1477,7 +1472,7 @@ class ChunkScanBwdDCDRAmpere:
                         out1 = -z0_state.m_z0[z0_state.batch_head_chunk, p, d0 + 1]
                 z0_state.s_z0_tile[p_local, d0_local + 0] = out0
                 z0_state.s_z0_tile[p_local, d0_local + 1] = out1
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_c_tile(self, c_state: SimpleNamespace):
@@ -1511,7 +1506,7 @@ class ChunkScanBwdDCDRAmpere:
             )
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _rotate_c_tile_in_place(self, c_state: SimpleNamespace):
@@ -1547,7 +1542,7 @@ class ChunkScanBwdDCDRAmpere:
                     out1 = safe_cast_to_dtype(c1, out_dtype)
                 c_state.s_c_tile[row_local, d0_local + 0] = out0
                 c_state.s_c_tile[row_local, d0_local + 1] = out1
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _accumulate_dlogprefix_from_score_partial(
@@ -1567,7 +1562,7 @@ class ChunkScanBwdDCDRAmpere:
         t_scaled_dscore_smem = prefix_state.thr_mma.partition_C(
             prefix_state.s_score_tile
         )
-        scaled_dscore = cute.make_fragment_like(
+        scaled_dscore = cute.make_rmem_tensor_like(
             t_scaled_dscore_smem, prefix_state.s_score_tile.element_type
         )
         cute.autovec_copy(t_scaled_dscore_smem, scaled_dscore)
@@ -1621,7 +1616,7 @@ class ChunkScanBwdDCDRAmpere:
             prefix_state.s_col_accum[warp, lane, 1] = col_acc1
             prefix_state.s_col_accum[warp, lane, 2] = col_acc2
             prefix_state.s_col_accum[warp, lane, 3] = col_acc3
-        cute.arch.barrier()
+        pipeline.sync()
 
         if warp == cutlass.Int32(0) and lane < cutlass.Int32(8):
             src_lane = cutlass.select_(
@@ -1680,7 +1675,7 @@ class ChunkScanBwdDCDRAmpere:
                     prefix_state.s_dlogprefix_accum[col3]
                     - cutlass.Float32(2.0) * col_sum3
                 )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _accumulate_row_outputs_from_dc(self, dc_state: SimpleNamespace):
@@ -1717,8 +1712,7 @@ class ChunkScanBwdDCDRAmpere:
                     dc0, dc1 = conj_mul_phase(dq0, dq1, phase_re, phase_im)
                     c_rot0 = cutlass.Float32(dc_state.s_c_tile[row_local, d0_local + 0])
                     c_rot1 = cutlass.Float32(dc_state.s_c_tile[row_local, d0_local + 1])
-                    # s_c_tile holds conj(C) * phase here. This keeps the
-                    # second C global load out of the row-output path.
+                    # s_c_tile holds conj(C) * phase for row-output reuse.
                     c0, c1 = conj_mul_phase(c_rot0, c_rot1, phase_re, phase_im)
                     row_dlogprefix_sum = (
                         row_dlogprefix_sum + dq0 * c_rot0 + dq1 * c_rot1
@@ -1765,7 +1759,7 @@ class ChunkScanBwdDCDRAmpere:
                     dc_state.s_row_dr[row_local, 3] + dR11_sum
                 )
             row_local = row_local + cutlass.Int32(self.num_warps)
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _store_dc_tile(self, dc_store_state: SimpleNamespace):
@@ -2123,9 +2117,7 @@ class ChunkScanBwdDCDRAmpere:
         s_key_tile = storage.key_tile.get_tensor(key_layout)
         s_score_tile = cute.local_tile(s_value_tile, (kv_tile, kv_tile), (0, 0))
         s_c_stage = storage.query_tile.get_tensor(query_layout)
-        # `Z0` is only consumed after the causal `n_tile` sweep, so it can reuse
-        # the same 32xd_padded slab as `s_key_tile` instead of reserving a third
-        # full-D tile.
+        # `Z0` shares the 32xd_padded key slab after the causal `n_tile` sweep.
         s_z0_tile = cute.make_tensor(s_key_tile.iterator, z0_layout)
         s_u_prev = storage.u_prev_row.get_tensor(u_prev_layout)
         s_b_prev = storage.b_prev_row.get_tensor(b_prev_layout)
@@ -2516,7 +2508,7 @@ class ChunkScanBwdDCDRAmpere:
                 )
                 self._store_dc_tile(dc_store_state)
 
-            cute.arch.barrier()
+            pipeline.sync()
             row_store_state = SimpleNamespace(
                 batch_head_chunk=bidz,
                 m_tile=m_tile,
@@ -2535,4 +2527,4 @@ class ChunkScanBwdDCDRAmpere:
         self._store_dlogprefix_accumulator(logprefix_store_state)
 
 
-__all__ = ["ChunkScanBwdDCDRAmpere"]
+__all__ = ["BwdDCDRAmpere"]

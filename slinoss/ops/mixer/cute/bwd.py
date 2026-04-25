@@ -10,6 +10,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cute_math
+import cutlass.pipeline as pipeline
 
 from slinoss.perf import note_cache_event
 
@@ -18,16 +19,16 @@ from .common import (
     _is_cuda_graph_capturing,
     _launchable,
     _llvm_ptr,
-    _make_layout,
     _make_compile_args,
+    _make_layout,
     _raise_cold_capture_error,
-    _record_tensors_on_current_stream,
     _runtime_alignments,
     _runtime_signature_key,
     _size,
     contiguous_tensor,
     dummy_d_skip,
     dummy_skip_input,
+    launch_tvm_ffi_on_current_stream,
     safe_cast_to_dtype,
     silu,
     silu_grad,
@@ -70,7 +71,7 @@ def _grid_shape(*, total_rows: int, warps_per_block: int) -> tuple[int, int, int
 
 
 class MixerTailRowwiseBwdFused:
-    """Host wrapper launching the live fused tail rowwise backward kernel."""
+    """Host wrapper launching the fused tail rowwise backward kernel."""
 
     def __init__(
         self,
@@ -226,7 +227,7 @@ class MixerTailRowwiseBwdFused:
                     p = lane + p_iter * 32
                     if p < self.p_size:
                         sDNormWeightHead[warp, p] = cutlass.Float32(0.0)
-            cute.arch.sync_threads()
+            pipeline.sync()
             if warp == 0:
                 for p_iter in cutlass.range_constexpr(num_p_iters):  # pyright: ignore[reportGeneralTypeIssues, reportPrivateImportUsage]
                     p = lane + p_iter * 32
@@ -241,7 +242,7 @@ class MixerTailRowwiseBwdFused:
                             _llvm_ptr(mDNormWeight.iterator + d),
                             block_sum,
                         )
-            cute.arch.sync_threads()
+            pipeline.sync()
             h = h + 1
 
     @cute.jit
@@ -535,8 +536,7 @@ def _run_backward_kernel(
             eps=eps,
         ),
     )
-    compiled(*runtime_artifacts.runtime_args)
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(compiled, *runtime_artifacts.runtime_args)
     return runtime_artifacts.outputs
 
 

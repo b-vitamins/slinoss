@@ -82,7 +82,7 @@ class MixerDecodeInputs:
 
 
 if TYPE_CHECKING:
-    from slinoss.ops.mixer.step import _DecodeOwner as _MixerDecodeOwner
+    from slinoss.ops.mixer.step import _DecodeOwner
 
     class _ScanPrepOwner(Protocol):
         def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs: ...
@@ -222,7 +222,7 @@ class MixerDecodeBackend(Protocol):
 
     def supports(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         *,
         batch_size: int,
         device: torch.device,
@@ -231,7 +231,7 @@ class MixerDecodeBackend(Protocol):
 
     def __call__(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         inputs: MixerDecodeInputs,
         state: ScanState,
     ) -> tuple[torch.Tensor, ScanState]: ...
@@ -445,7 +445,7 @@ class ReferenceMixerDecodeBackend:
 
     def supports(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         *,
         batch_size: int,
         device: torch.device,
@@ -456,7 +456,7 @@ class ReferenceMixerDecodeBackend:
 
     def __call__(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         inputs: MixerDecodeInputs,
         state: ScanState,
     ) -> tuple[torch.Tensor, ScanState]:
@@ -468,7 +468,7 @@ class CuteMixerDecodeBackend:
 
     def supports(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         *,
         batch_size: int,
         device: torch.device,
@@ -483,7 +483,7 @@ class CuteMixerDecodeBackend:
 
     def __call__(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         inputs: MixerDecodeInputs,
         state: ScanState,
     ) -> tuple[torch.Tensor, ScanState]:
@@ -499,7 +499,7 @@ class AutoMixerDecodeBackend:
 
     def supports(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         *,
         batch_size: int,
         device: torch.device,
@@ -514,7 +514,7 @@ class AutoMixerDecodeBackend:
 
     def __call__(
         self,
-        owner: "_MixerDecodeOwner",
+        owner: "_DecodeOwner",
         inputs: MixerDecodeInputs,
         state: ScanState,
     ) -> tuple[torch.Tensor, ScanState]:

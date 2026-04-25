@@ -1,10 +1,11 @@
-"""CuTe forward kernels for the live ``scanprep`` backend."""
+"""CuTe forward kernels for the ``scanprep`` backend."""
 
 import math
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cute_math
+import cutlass.pipeline as pipeline
 
 from ..common import (
     SCANPREP_PARAM_DIM,
@@ -342,7 +343,7 @@ class _CoeffForwardFused:
                                 mParams[load_b, load_t, load_h, param_idx]
                             )
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         bt = block_x * self.coeff_t_tile + lane
         h = h_base + warp
@@ -474,7 +475,7 @@ class _CoeffForwardFused:
 
 
 class ScanPrepFwdFused:
-    """Host wrapper that launches the live raw-BC forward phases."""
+    """Host wrapper that launches the scanprep forward phases."""
 
     def __init__(
         self,

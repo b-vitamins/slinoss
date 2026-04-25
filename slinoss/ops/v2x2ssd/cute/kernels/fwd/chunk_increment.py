@@ -1,11 +1,11 @@
-"""CuTe forward kernel for the ``v2x2ssd`` chunk-increment stage.
+"""CuTe forward chunk-increment kernel for ``v2x2ssd``.
 
 ``ChunkIncrementFwdAmpere`` computes one chunk-local increment tile and the
-chunk-end transition summary used by the later forward stages. The kernel runs
-a reverse-time suffix scan over the complex transition stream ``M``, applies
-the two complex taps carried by ``Kprev``/``Kcurr`` to the packed-complex
-``B`` stream, accumulates the interior contribution with one tensor-core GEMM,
-and adds the chunk-start boundary rank-1 term in the epilogue.
+chunk-end transition summary used by the internal forward kernels. The kernel
+runs a reverse-time suffix scan over the complex transition stream ``M``,
+applies the two complex taps carried by ``Kprev``/``Kcurr`` to the
+packed-complex ``B`` stream, accumulates the interior contribution with one
+tensor-core GEMM, and adds the chunk-start boundary rank-1 term in the epilogue.
 
 Tensor contracts:
 
@@ -32,6 +32,7 @@ import torch
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
 
@@ -1023,7 +1024,7 @@ class ChunkIncrementFwdAmpere:
                 s_warp_transition_total[warp_idx, 0] = suffix_transition_re
                 s_warp_transition_total[warp_idx, 1] = suffix_transition_im
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         if cutlass.const_expr(self.scan_threads > 32):
             # Per the Hopper diagnosis for the LM calibration crash, the
@@ -1051,7 +1052,7 @@ class ChunkIncrementFwdAmpere:
                     running_transition_re = next_running_transition_re
                     running_transition_im = next_running_transition_im
 
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             if warp_idx < scan_warp_count:
                 warp_offset_re = s_warp_transition_offset[warp_idx, 0]
@@ -1070,7 +1071,7 @@ class ChunkIncrementFwdAmpere:
             s_warp_transition_total[warp_idx, 0] = suffix_transition_re
             s_warp_transition_total[warp_idx, 1] = suffix_transition_im
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         # Convert the inclusive suffix products into per-step tap coefficients.
         suffix_prefix_re = cutlass.Float32(1.0)
@@ -1116,7 +1117,7 @@ class ChunkIncrementFwdAmpere:
                 mMchunk[0, bidz] = suffix_transition_re.to(cutlass.Float32)
                 mMchunk[1, bidz] = suffix_transition_im.to(cutlass.Float32)
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         # Pipelined tensor-core mainloop over the chunk-local time tiles.
         num_smem_stages = cute.size(t_u_copy_dst, mode=[3])
@@ -1145,7 +1146,7 @@ class ChunkIncrementFwdAmpere:
 
         t_u_copy_dst.fill(0)
         t_b_copy_dst.fill(0)
-        cute.arch.sync_threads()
+        pipeline.sync()
         k_tile_index = cutlass.Int32(0)
 
         for kk in cutlass.range_constexpr(u_row_predicate.shape[2]):
@@ -1199,7 +1200,7 @@ class ChunkIncrementFwdAmpere:
                 cute.arch.cp_async_wait_group(0)
             else:
                 cute.arch.cp_async_wait_group(num_smem_stages - 2)
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             k_tile_offset = kt * self.bK
 
@@ -1234,7 +1235,7 @@ class ChunkIncrementFwdAmpere:
                         mB.element_type
                     )
 
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             if cutlass.const_expr(num_smem_stages > 1):
                 next_tile = kt + (num_smem_stages - 1)
@@ -1293,7 +1294,7 @@ class ChunkIncrementFwdAmpere:
                 smem_pipe_read = 0
 
         cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         # Boundary correction and epilogue store.
         tile_row_start = bidx * self.bM
@@ -1363,7 +1364,7 @@ class ChunkIncrementFwdAmpere:
             s_boundary_key[d_pair_start + 1] = rotated_boundary_im
             complex_pair = complex_pair + self.num_threads
 
-        cute.arch.sync_threads()
+        pipeline.sync()
 
         ceil_tile_rows, ceil_tile_cols, _ = cute.ceil_div(
             mInc.shape, (self.bM, self.bN, 1)
@@ -1408,7 +1409,7 @@ class ChunkIncrementFwdAmpere:
             t_increment_coord = copy_slice_increment.partition_S(increment_coord_tile)
 
             cute.autovec_copy(r_increment_accum, t_increment_mma_smem)
-            cute.arch.sync_threads()
+            pipeline.sync()
 
             total_elems = self.bM * self.bN
             idx = tidx
@@ -1421,9 +1422,9 @@ class ChunkIncrementFwdAmpere:
                 )
                 idx = idx + self.num_threads
 
-            cute.arch.sync_threads()
+            pipeline.sync()
 
-            r_increment_store = cute.make_fragment_like(t_increment_store_smem)
+            r_increment_store = cute.make_rmem_tensor_like(t_increment_store_smem)
             cute.autovec_copy(t_increment_store_smem, r_increment_store)
 
             increment_store_predicate = cute.make_rmem_tensor(

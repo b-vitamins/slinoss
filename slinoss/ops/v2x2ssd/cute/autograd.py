@@ -6,6 +6,8 @@ from typing import cast
 
 import torch
 
+from slinoss.ops._cute_common import _is_cuda_graph_capturing
+
 from .common import _materialize_boundary_tensor
 from slinoss.ops.v2x2ssd.cute.kernels.bwd import _v2x2ssd_bwd_cute_prevalidated
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
@@ -19,7 +21,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
 def _clone_if_capturing(x: torch.Tensor | None) -> torch.Tensor | None:
     if x is None:
         return None
-    if x.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+    if _is_cuda_graph_capturing(x.device):
         return x.clone()
     return x
 

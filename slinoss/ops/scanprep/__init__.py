@@ -16,9 +16,9 @@ from .reference import (
 
 def scanprep_cute(*args: Any, **kwargs: Any):
     """Compiler boundary for the CuTe scanprep JIT/runtime path."""
-    from .cute import scanprep_cute as _scanprep_cute
+    from . import cute
 
-    return _scanprep_cute(*args, **kwargs)
+    return cute.scanprep_cute(*args, **kwargs)
 
 
 scanprep_cute = cast(Callable[..., Any], torch.compiler.disable(scanprep_cute))

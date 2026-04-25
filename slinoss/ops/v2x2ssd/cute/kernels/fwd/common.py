@@ -3,20 +3,11 @@
 from __future__ import annotations
 
 import torch
-import cutlass
-import cutlass.cute as cute
 
+from slinoss.ops._cute_common import (
+    assumed_align,
+)
 from ...common import _tc_input_dtype
-
-
-def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
-    if dt == torch.float16:
-        return cutlass.Float16
-    if dt == torch.bfloat16:
-        return cutlass.BFloat16
-    if dt == torch.float32:
-        return cutlass.Float32
-    raise TypeError(f"Unsupported dtype: {dt}")
 
 
 def _elem_bits(dt: torch.dtype) -> int:
@@ -25,17 +16,6 @@ def _elem_bits(dt: torch.dtype) -> int:
     if dt in (torch.float16, torch.bfloat16):
         return 16
     raise TypeError(f"Unsupported dtype: {dt}")
-
-
-def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
-    if not shape:
-        return ()
-    stride = [1] * len(shape)
-    running = 1
-    for i in range(len(shape) - 1, -1, -1):
-        stride[i] = running
-        running *= int(shape[i])
-    return tuple(stride)
 
 
 def _choose_copy_bits_for_linear_tiles(
@@ -66,21 +46,6 @@ def _choose_copy_bits_for_linear_tiles(
     return best
 
 
-def _assumed_align(
-    t: torch.Tensor,
-    candidates_bytes: tuple[int, ...] = (16, 8, 4),
-) -> int:
-    """Return the widest safe assumed alignment for a tensor view."""
-    elem_align = max(1, t.element_size())
-    ptr = int(t.data_ptr())
-    for align in candidates_bytes:
-        if align < elem_align:
-            continue
-        if (ptr % align) == 0:
-            return align
-    return elem_align
-
-
 def _ensure_min_alignment(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
     """Materialize a fresh contiguous buffer when the current view is under-aligned.
 
@@ -88,10 +53,10 @@ def _ensure_min_alignment(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
     activations. Arbitrary contiguous views can legally be only 2-byte aligned,
     so the launcher must normalize them before they cross the JIT boundary.
     """
-    if _assumed_align(t) >= int(min_align):
+    if assumed_align(t) >= int(min_align):
         return t
     aligned = t.clone(memory_format=torch.contiguous_format)
-    if _assumed_align(aligned) < int(min_align):
+    if assumed_align(aligned) < int(min_align):
         raise RuntimeError(
             f"Failed to materialize a buffer with assumed_align >= {min_align}."
         )
@@ -130,73 +95,11 @@ def _guard_prev_time_base(t: torch.Tensor, *, min_align: int) -> torch.Tensor:
         stride=tuple(int(step) for step in base.stride()),
         storage_offset=guard_elems,
     )
-    if _assumed_align(guarded) < int(min_align):
+    if assumed_align(guarded) < int(min_align):
         raise RuntimeError(
             f"Failed to materialize a guarded tensor with assumed_align >= {min_align}."
         )
     return guarded
-
-
-def _make_fake_tensor_arg(
-    tensor: torch.Tensor,
-    *,
-    shape: tuple[int, ...] | None = None,
-    stride: tuple[int, ...] | None = None,
-    align: int | None = None,
-    dynamic_stride: bool = False,
-):
-    return _make_fake_tensor_spec_arg(
-        dtype=tensor.dtype,
-        shape=tuple(int(dim) for dim in (shape if shape is not None else tensor.shape)),
-        stride=tuple(
-            int(step) for step in (stride if stride is not None else tensor.stride())
-        ),
-        align=int(align if align is not None else _assumed_align(tensor)),
-        dynamic_stride=dynamic_stride,
-    )
-
-
-def _make_fake_tensor_spec_arg(
-    *,
-    dtype: torch.dtype,
-    shape: tuple[int, ...],
-    stride: tuple[int, ...],
-    align: int,
-    dynamic_stride: bool = False,
-):
-    fake_shape = tuple(int(dim) for dim in shape)
-    fake_stride = tuple(int(step) for step in stride)
-    assumed = int(align)
-    row_major_stride = tuple(reversed(range(len(fake_shape))))
-    if not dynamic_stride and fake_stride == tuple(_make_row_major_stride(fake_shape)):
-        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
-        return cute.runtime.make_fake_compact_tensor(
-            _torch_to_cutlass_dtype(dtype),
-            dynamic_shape,
-            stride_order=row_major_stride,
-            assumed_align=assumed,
-        )
-    if dynamic_stride:
-        dynamic_shape = tuple(cute.sym_int32() for _ in fake_shape)
-        dynamic_fake_stride = tuple(
-            0 if step == 0 else cute.sym_int32() for step in fake_stride
-        )
-        return cute.runtime.make_fake_tensor(
-            _torch_to_cutlass_dtype(dtype),
-            dynamic_shape,
-            stride=dynamic_fake_stride,
-            assumed_align=assumed,
-        )
-    return cute.runtime.make_fake_tensor(
-        _torch_to_cutlass_dtype(dtype),
-        fake_shape,
-        stride=fake_stride,
-        assumed_align=assumed,
-    )
-
-
-def _compile_env_stream_placeholder():
-    return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
 
 def _pad_zero_time(
@@ -228,16 +131,11 @@ def _pad_m_identity(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
 
 
 __all__ = [
-    "_compile_env_stream_placeholder",
-    "_assumed_align",
     "_choose_copy_bits_for_linear_tiles",
     "_elem_bits",
     "_ensure_min_alignment",
     "_guard_prev_time_base",
-    "_make_fake_tensor_arg",
-    "_make_fake_tensor_spec_arg",
     "_pad_m_identity",
     "_pad_zero_time",
     "_tc_input_dtype",
-    "_torch_to_cutlass_dtype",
 ]

@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from typing import Callable, cast
 
+from cuda.bindings import driver as cuda  # pyright: ignore[reportAttributeAccessIssue]
+import cutlass
 import cutlass.cute as cute
 import torch
 
@@ -38,21 +40,39 @@ from slinoss.ops.scanprep.cute.common import (  # noqa: E402
 )
 from slinoss.ops.scanprep.cute.kernels.bwd import ScanPrepBwdFused  # noqa: E402
 from slinoss.ops.scanprep.cute.kernels.fwd import ScanPrepFwdFused  # noqa: E402
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
-    compile_chunk_increment_bwd_kernels,
+from slinoss.ops.v2x2ssd.cute.kernels.bwd import (  # noqa: E402
+    BackwardProblemShape,
+    _increment_bwd_tensor_specs,
+    _scan_bwd_tensor_specs,
+    _state_bwd_tensor_specs,
+    _get_compiled_v2x2ssd_bwd_kernel,
+    _make_backward_compile_artifacts_from_runtime_artifacts,
+    _make_backward_runtime_artifacts,
+    _make_static_tensor_spec_view,
+    _make_tvm_ffi_runtime_and_compile_args_from_specs,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (  # noqa: E402
-    compile_chunk_scan_bwd_kernels,
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.common import _TileConfig  # noqa: E402
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.boundary import (  # noqa: E402
+    BwdBoundaryAmpere,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.dcdr import BwdDCDRAmpere  # noqa: E402
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.db import (  # noqa: E402
+    BwdDBAmpere,
+    BwdDBIncrementAccumulatorAmpere,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.du import (  # noqa: E402
+    BwdDUAmpere,
+    BwdDUIncrementAccumulatorAmpere,
+)
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.dz0 import BwdDZ0Ampere  # noqa: E402
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.param import (  # noqa: E402
+    BwdParamIncrementAccumulatorAmpere,
+    BwdParamScanAmpere,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (  # noqa: E402
-    compile_state_passing_bwd_kernel,
+    BwdStatePassingAmpere,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.fwd import (  # noqa: E402
-    _make_chunk_increment_prepared_launch,
-    _make_chunk_scan_prepared_launch,
-    _make_state_passing_prepared_launch,
-    chunk_increment_cute,
-)
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import v2x2ssd_fwd_cute  # noqa: E402
 
 
 DEFAULT_V2_BATCH = int(DEFAULT_TRAINING_PERF_CONFIG.batch_size)
@@ -186,34 +206,60 @@ KERNEL_ORDER = (
     "ffn_norm_bwd",
     "ffn_activation_fwd",
     "ffn_activation_bwd",
-    "chunk_increment_fwd",
-    "state_passing_fwd",
-    "chunk_scan_fwd",
-    "chunk_increment_bwd_boundary",
-    "chunk_increment_bwd_db",
-    "chunk_increment_bwd_du",
-    "chunk_increment_bwd_param",
-    "chunk_scan_bwd_dz0",
-    "chunk_scan_bwd_du",
-    "chunk_scan_bwd_db",
-    "chunk_scan_bwd_dcdr",
-    "chunk_scan_bwd_param",
-    "state_passing_bwd",
+    "v2x2ssd_fwd",
+    "v2x2ssd_bwd",
+    "bwd_db",
+    "bwd_dcdr",
+    "bwd_param_scan",
+    "bwd_du",
+    "bwd_dz0",
+    "bwd_state_passing",
+    "bwd_db_increment_accumulator",
+    "bwd_boundary",
+    "bwd_param_increment_accumulator",
+    "bwd_du_increment_accumulator",
 )
+
+
+KERNEL_GROUPS = {
+    "all": KERNEL_ORDER,
+    "scanprep": ("scanprep_fwd", "scanprep_bwd"),
+    "mixer_tail": ("mixer_tail_rowwise_fwd", "mixer_tail_rowwise_bwd"),
+    "ffn": (
+        "ffn_norm_fwd",
+        "ffn_norm_bwd",
+        "ffn_activation_fwd",
+        "ffn_activation_bwd",
+    ),
+    "v2x2ssd": (
+        "v2x2ssd_fwd",
+        "v2x2ssd_bwd",
+    ),
+    "v2x2ssd_bwd_launches": (
+        "bwd_db",
+        "bwd_dcdr",
+        "bwd_param_scan",
+        "bwd_du",
+        "bwd_dz0",
+        "bwd_state_passing",
+        "bwd_db_increment_accumulator",
+        "bwd_boundary",
+        "bwd_param_increment_accumulator",
+        "bwd_du_increment_accumulator",
+    ),
+}
 
 
 def list_kernel_names() -> tuple[str, ...]:
     return KERNEL_ORDER
 
 
+def list_kernel_groups() -> dict[str, tuple[str, ...]]:
+    return {name: tuple(kernels) for name, kernels in KERNEL_GROUPS.items()}
+
+
 def _noop() -> None:
     return None
-
-
-def _closure_vars(fn: Callable[..., object]) -> dict[str, object]:
-    names = fn.__code__.co_freevars
-    cells = fn.__closure__ or ()
-    return {name: cell.cell_contents for name, cell in zip(names, cells, strict=False)}
 
 
 def _seed_all(seed: int) -> None:
@@ -952,9 +998,7 @@ def _build_ffn_activation_bwd_runner(cfg: FfnPerfConfig) -> KernelRunner:
     )
 
 
-def _build_v2x2ssd_forward_runners(
-    cfg: V2KernelPerfConfig,
-) -> dict[str, KernelRunner]:
+def _build_v2x2ssd_forward_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
     _seed_all(cfg.seed)
     bc_groups, _ = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
     tensors = _build_grouped_v2_inputs(cfg)
@@ -967,54 +1011,9 @@ def _build_v2x2ssd_forward_runners(
     B_prev = tensors["B_prev_grouped"]
     U_prev = tensors["U_prev"]
 
-    n_chunks = _n_chunks(cfg.T, cfg.chunk_size)
     T_pad = _t_pad(cfg.T, cfg.chunk_size)
     D = B.shape[-1]
     tc_dtype = _tc_input_dtype(cfg.dtype)
-
-    prepared_increment = _make_chunk_increment_prepared_launch(
-        U,
-        M,
-        K,
-        B,
-        U_prev=U_prev,
-        B_prev=B_prev,
-        chunk_size=cfg.chunk_size,
-        compute_dtype=torch.float32,
-    )
-    cast(Callable[..., None], prepared_increment.compiled)(
-        *prepared_increment.runtime_args
-    )
-    inc_chunk = prepared_increment.outputs.increment_chunk
-    chunk_multiplier_storage = prepared_increment.outputs.chunk_multiplier_storage
-    increment = inc_chunk.reshape(cfg.batch, cfg.heads, n_chunks, cfg.P, D)
-    chunk_multiplier = chunk_multiplier_storage.reshape(
-        cfg.batch, cfg.heads, n_chunks, 2
-    )
-
-    prepared_state = _make_state_passing_prepared_launch(
-        increment,
-        chunk_multiplier,
-        initial_states=initial_states,
-    )
-    cast(Callable[..., None], prepared_state.compiled)(*prepared_state.runtime_args)
-    chunk_starts = prepared_state.outputs.chunk_starts
-    final_state = prepared_state.outputs.final_state
-
-    prepared_scan = _make_chunk_scan_prepared_launch(
-        U,
-        M,
-        K,
-        B,
-        C,
-        chunk_starts,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        chunk_size=cfg.chunk_size,
-        compute_dtype=torch.float32,
-        output_dtype=torch.float32,
-    )
-    out_chunk = prepared_scan.outputs.output_chunk
 
     bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
     bytes_bc = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
@@ -1022,523 +1021,1929 @@ def _build_v2x2ssd_forward_runners(
     bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
     bytes_u_prev = _shape_bytes((cfg.batch, cfg.heads, cfg.P), tc_dtype)
     bytes_b_prev = _shape_bytes((cfg.batch, bc_groups, D), tc_dtype)
+    bytes_state = _shape_bytes((cfg.batch, cfg.heads, cfg.P, D), torch.float32)
+    bytes_output = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), torch.float32)
 
-    return {
-        "chunk_increment_fwd": KernelRunner(
-            name="chunk_increment_fwd",
-            effective_bytes=(
-                bytes_u
-                + bytes_bc
-                + bytes_m
-                + bytes_k
-                + bytes_u_prev
-                + bytes_b_prev
-                + _tensor_bytes(inc_chunk, chunk_multiplier_storage)
-            ),
-            launch=lambda prepared=prepared_increment: cast(
-                Callable[..., None], prepared.compiled
-            )(*prepared.runtime_args),
-            prepare=_noop,
-        ),
-        "state_passing_fwd": KernelRunner(
-            name="state_passing_fwd",
-            effective_bytes=_tensor_bytes(
-                increment,
-                chunk_multiplier,
-                initial_states,
-                chunk_starts,
-                final_state,
-            ),
-            launch=lambda prepared=prepared_state: cast(
-                Callable[..., None], prepared.compiled
-            )(*prepared.runtime_args),
-            prepare=_noop,
-        ),
-        "chunk_scan_fwd": KernelRunner(
-            name="chunk_scan_fwd",
-            effective_bytes=(
-                bytes_u
-                + bytes_bc
-                + bytes_bc
-                + bytes_m
-                + bytes_k
-                + bytes_u_prev
-                + bytes_b_prev
-                + _tensor_bytes(chunk_starts, out_chunk)
-            ),
-            launch=lambda prepared=prepared_scan: cast(
-                Callable[..., None], prepared.compiled
-            )(*prepared.runtime_args),
-            prepare=_noop,
-        ),
-    }
-
-
-def _build_v2x2ssd_chunk_increment_bwd_runners(
-    cfg: V2KernelPerfConfig,
-) -> dict[str, KernelRunner]:
-    _seed_all(cfg.seed)
-    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
-    tensors = _build_grouped_v2_inputs(cfg)
-    U = tensors["U"]
-    M = tensors["M"]
-    K = tensors["K"]
-    B_grouped = tensors["B_grouped"]
-    B = _materialize_grouped_rows(B_grouped, heads_per_group=heads_per_group)
-    B_prev_grouped = tensors["B_prev_grouped"]
-    B_prev = _materialize_grouped_rows(
-        B_prev_grouped,
-        heads_per_group=heads_per_group,
-    )
-    U_prev = tensors["U_prev"]
-
-    inc, m_chunk = chunk_increment_cute(
-        U,
-        M,
-        K,
-        B,
-        chunk_size=cfg.chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=torch.float32,
-    )
-    d_inc = torch.randn_like(inc)
-    d_m_chunk = torch.randn_like(m_chunk)
-    (
-        _compiled_db,
-        _compiled_du,
-        _compiled_boundary,
-        _compiled_param,
-        dB,
-        dU,
-        dB_prev,
-        dU_prev,
-        dMsum_part,
-        dMp0,
-        dM,
-        dKprev,
-        dKcurr,
-        launch,
-    ) = compile_chunk_increment_bwd_kernels(
-        U,
-        M,
-        K,
-        B,
-        d_inc=d_inc,
-        d_m_chunk=d_m_chunk,
-        chunk_size=cfg.chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=torch.float32,
-        return_launchers=True,
-    )
-    launch_vars = _closure_vars(launch)
-    stage_args = launch_vars.get("stage_runtime_args", launch_vars.get("stage_args"))
-    if not isinstance(stage_args, tuple):
-        raise RuntimeError(
-            "chunk_increment_bwd launcher closure did not expose stage runtime args."
+    def launch() -> None:
+        v2x2ssd_fwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=cfg.chunk_size,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            return_final_state=True,
+            return_intermediates=True,
         )
 
-    db_args = (
-        stage_args[0],
-        stage_args[1],
-        stage_args[2],
-        stage_args[3],
-        stage_args[4],
-        stage_args[5],
-        stage_args[8],
-        stage_args[12],
-    )
-    du_args = (
-        stage_args[5],
-        stage_args[1],
-        stage_args[2],
-        stage_args[3],
-        stage_args[4],
-        stage_args[9],
-    )
-    boundary_args = (
-        stage_args[5],
-        stage_args[6],
-        stage_args[7],
-        stage_args[2],
-        stage_args[3],
-        stage_args[11],
-        stage_args[10],
-        stage_args[13],
-    )
-    param_args = (
-        stage_args[2],
-        stage_args[3],
-        stage_args[4],
-        stage_args[12],
-        stage_args[13],
-        stage_args[14],
-        stage_args[15],
-        stage_args[16],
-        stage_args[17],
-    )
+    launch()
 
-    launchers: dict[str, Callable[[], None]] = {
-        "chunk_increment_bwd_db": lambda compiled=_compiled_db, args=db_args: compiled(
-            *args
-        ),
-        "chunk_increment_bwd_du": lambda compiled=_compiled_du, args=du_args: compiled(
-            *args
-        ),
-        "chunk_increment_bwd_boundary": lambda compiled=_compiled_boundary,
-        args=boundary_args: compiled(*args),
-        "chunk_increment_bwd_param": lambda compiled=_compiled_param,
-        args=param_args: compiled(*args),
-    }
-    T_pad = _t_pad(cfg.T, cfg.chunk_size)
-    D = B.shape[-1]
-    n_chunks = _n_chunks(cfg.T, cfg.chunk_size)
-    tc_dtype = _tc_input_dtype(cfg.dtype)
-    bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
-    bytes_b = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
-    bytes_m = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
-    bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
-    bytes_d_inc = _shape_bytes(tuple(int(dim) for dim in d_inc.shape), tc_dtype)
-    bytes_prev_b = _shape_bytes((cfg.batch, bc_groups, n_chunks, D), tc_dtype)
-    bytes_prev_u = _shape_bytes((cfg.batch, cfg.heads, n_chunks, cfg.P), tc_dtype)
-    bytes_kprev = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
-
-    def prepare_param() -> None:
-        launchers["chunk_increment_bwd_db"]()
-        launchers["chunk_increment_bwd_boundary"]()
-
-    return {
-        "chunk_increment_bwd_db": KernelRunner(
-            name="chunk_increment_bwd_db",
-            effective_bytes=bytes_u
-            + bytes_b
+    return KernelRunner(
+        name="v2x2ssd_fwd",
+        effective_bytes=(
+            bytes_u
+            + bytes_bc
+            + bytes_bc
             + bytes_m
             + bytes_k
-            + bytes_d_inc
-            + bytes_b
-            + _tensor_bytes(dMsum_part),
-            launch=launchers["chunk_increment_bwd_db"],
-            prepare=_noop,
+            + bytes_u_prev
+            + bytes_b_prev
+            + bytes_state
+            + bytes_output
         ),
-        "chunk_increment_bwd_du": KernelRunner(
-            name="chunk_increment_bwd_du",
-            effective_bytes=bytes_b
-            + bytes_m
-            + bytes_k
-            + bytes_d_inc
-            + _tensor_bytes(dU),
-            launch=launchers["chunk_increment_bwd_du"],
-            prepare=_noop,
-        ),
-        "chunk_increment_bwd_boundary": KernelRunner(
-            name="chunk_increment_bwd_boundary",
-            effective_bytes=bytes_d_inc
-            + bytes_m
-            + bytes_prev_b
-            + bytes_prev_u
-            + bytes_kprev
-            + _tensor_bytes(dU_prev, dMp0)
-            + _shape_bytes((cfg.batch, bc_groups, D), tc_dtype),
-            launch=launchers["chunk_increment_bwd_boundary"],
-            prepare=_noop,
-        ),
-        "chunk_increment_bwd_param": KernelRunner(
-            name="chunk_increment_bwd_param",
-            effective_bytes=bytes_m
-            + bytes_k
-            + _tensor_bytes(dMsum_part, dMp0, d_m_chunk, dM, dKprev, dKcurr),
-            launch=launchers["chunk_increment_bwd_param"],
-            prepare=prepare_param,
-        ),
-    }
+        launch=launch,
+        prepare=_noop,
+    )
 
 
-def _build_v2x2ssd_state_passing_bwd_runners(
+def _compute_forward_intermediates_for_bwd(
     cfg: V2KernelPerfConfig,
-) -> dict[str, KernelRunner]:
+    *,
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    initial_states: torch.Tensor,
+    B_prev: torch.Tensor,
+    U_prev: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _output, m_chunk, chunk_starts = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        v2x2ssd_fwd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=cfg.chunk_size,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            return_final_state=False,
+            return_intermediates=True,
+        ),
+    )
+    return m_chunk, chunk_starts
+
+
+def _build_v2x2ssd_bwd_runtime_artifacts(cfg: V2KernelPerfConfig):
     _seed_all(cfg.seed)
-    _, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
     tensors = _build_grouped_v2_inputs(cfg)
     U = tensors["U"]
     M = tensors["M"]
     K = tensors["K"]
-    B = _materialize_grouped_rows(
-        tensors["B_grouped"],
-        heads_per_group=heads_per_group,
-    )
+    B = tensors["B_grouped"]
+    C = tensors["C_grouped"]
     initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
-    B_prev = _materialize_grouped_rows(
-        tensors["B_prev_grouped"],
-        heads_per_group=heads_per_group,
-    )
+    B_prev = tensors["B_prev_grouped"]
     U_prev = tensors["U_prev"]
-
-    inc, m_chunk = chunk_increment_cute(
-        U,
-        M,
-        K,
-        B,
-        chunk_size=cfg.chunk_size,
+    m_chunk, chunk_starts = _compute_forward_intermediates_for_bwd(
+        cfg,
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        C=C,
+        initial_states=initial_states,
         B_prev=B_prev,
         U_prev=U_prev,
-        compute_dtype=torch.float32,
     )
-    prepared_state = _make_state_passing_prepared_launch(
-        inc,
-        m_chunk,
-        initial_states=initial_states,
-    )
-    cast(Callable[..., None], prepared_state.compiled)(*prepared_state.runtime_args)
-    chunk_starts = prepared_state.outputs.chunk_starts
-
-    d_chunk_starts = torch.randn_like(chunk_starts)
-    d_final = torch.randn_like(initial_states)
-    (
-        _compiled,
-        d_inc,
-        d_m_chunk,
-        d_initial,
-        launch,
-    ) = compile_state_passing_bwd_kernel(
-        chunk_starts,
-        m_chunk,
-        d_chunk_starts=d_chunk_starts,
-        d_final=d_final,
-        return_launcher=True,
-    )
-    launch_vars = _closure_vars(launch)
-    compiled = cast(Callable[..., None], launch_vars.get("compiled"))
-    dynamic_args = launch_vars.get("runtime_args", launch_vars.get("dynamic_args"))
-    if not isinstance(dynamic_args, tuple):
-        raise RuntimeError(
-            "state_passing_bwd launcher closure did not expose runtime args."
-        )
-
-    def prepare() -> None:
-        d_m_chunk.zero_()
-
-    return {
-        "state_passing_bwd": KernelRunner(
-            name="state_passing_bwd",
-            effective_bytes=_tensor_bytes(
-                chunk_starts,
-                d_chunk_starts,
-                d_final,
-                m_chunk,
-                d_inc,
-                d_m_chunk,
-                d_initial,
-            ),
-            launch=lambda compiled=compiled, args=dynamic_args: compiled(*args),
-            prepare=prepare,
-        ),
-    }
-
-
-def _build_v2x2ssd_chunk_scan_bwd_runners(
-    cfg: V2KernelPerfConfig,
-) -> dict[str, KernelRunner]:
-    _seed_all(cfg.seed)
-    bc_groups, heads_per_group = _validate_bc_groups(cfg.heads, cfg.resolved_bc_groups)
-    tensors = _build_grouped_v2_inputs(cfg)
-    U = tensors["U"]
-    M = tensors["M"]
-    K = tensors["K"]
-    B = _materialize_grouped_rows(
-        tensors["B_grouped"],
-        heads_per_group=heads_per_group,
-    )
-    C = _materialize_grouped_rows(
-        tensors["C_grouped"],
-        heads_per_group=heads_per_group,
-    )
-    initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
-    B_prev = _materialize_grouped_rows(
-        tensors["B_prev_grouped"],
-        heads_per_group=heads_per_group,
-    )
-    U_prev = tensors["U_prev"]
-
-    inc, m_chunk = chunk_increment_cute(
-        U,
-        M,
-        K,
-        B,
-        chunk_size=cfg.chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=torch.float32,
-    )
-    prepared_state = _make_state_passing_prepared_launch(
-        inc,
-        m_chunk,
-        initial_states=initial_states,
-    )
-    cast(Callable[..., None], prepared_state.compiled)(*prepared_state.runtime_args)
-    chunk_starts = prepared_state.outputs.chunk_starts
     d_out = torch.randn(
         (cfg.batch, cfg.heads, cfg.T, cfg.P),
         device=cfg.torch_device,
         dtype=torch.float32,
     )
-    prepared = compile_chunk_scan_bwd_kernels(
+    d_final = torch.randn_like(initial_states)
+    return _make_backward_runtime_artifacts(
         U,
         M,
         K,
         B,
         C,
+        m_chunk,
         chunk_starts,
         d_out,
         chunk_size=cfg.chunk_size,
+        compute_dtype=torch.float32,
+        scan_num_threads_du=128,
+        scan_num_threads_db=128,
+        scan_num_threads_dcdr=128,
+        scan_num_threads_param=32,
+        state_num_threads=128,
+        state_pairs_per_thread=8,
         B_prev=B_prev,
         U_prev=U_prev,
-        compute_dtype=torch.float32,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        validate_runtime_contract=True,
     )
-    outputs = prepared.outputs
-    launchers: dict[str, Callable[[], None]] = {
-        "chunk_scan_bwd_dz0": cast(Callable[[], None], prepared.launchers.dz0),
-        "chunk_scan_bwd_du": cast(Callable[[], None], prepared.launchers.du),
-        "chunk_scan_bwd_db": cast(Callable[[], None], prepared.launchers.db),
-        "chunk_scan_bwd_dcdr": cast(Callable[[], None], prepared.launchers.dcdr),
-        "chunk_scan_bwd_param": cast(
-            Callable[[], None],
-            prepared.launchers.param_scan,
+
+
+def _reset_v2x2ssd_bwd_runtime_artifacts(runtime_artifacts) -> None:
+    for tensor in runtime_artifacts.runtime_args[15:]:
+        tensor.zero_()
+
+
+def _build_v2x2ssd_backward_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    compile_artifacts = _make_backward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    compiled = cast(
+        Callable[..., None],
+        _get_compiled_v2x2ssd_bwd_kernel(compile_artifacts),
+    )
+
+    def launch() -> None:
+        compiled(*runtime_artifacts.runtime_args)
+
+    _reset_v2x2ssd_bwd_runtime_artifacts(runtime_artifacts)
+    launch()
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="v2x2ssd_bwd",
+        effective_bytes=_tensor_bytes(*runtime_artifacts.runtime_args),
+        launch=launch,
+        prepare=lambda: _reset_v2x2ssd_bwd_runtime_artifacts(runtime_artifacts),
+    )
+
+
+def _compile_full_v2x2ssd_bwd(runtime_artifacts) -> Callable[..., None]:
+    compile_artifacts = _make_backward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    return cast(
+        Callable[..., None],
+        _get_compiled_v2x2ssd_bwd_kernel(compile_artifacts),
+    )
+
+
+def _prime_v2x2ssd_bwd_dependencies(
+    runtime_artifacts,
+    *,
+    device: torch.device,
+) -> None:
+    _reset_v2x2ssd_bwd_runtime_artifacts(runtime_artifacts)
+    _compile_full_v2x2ssd_bwd(runtime_artifacts)(*runtime_artifacts.runtime_args)
+    torch.cuda.synchronize(device)
+
+
+def _make_bwd_db_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    scan_num_threads_db = int(launch_cfg[1])
+    scan_specs = _scan_bwd_tensor_specs(problem_shape)
+    U_scan_spec = scan_specs[0]
+    BC_scan_spec = scan_specs[1]
+    M_scan_spec = scan_specs[2]
+    K_scan_spec = scan_specs[3]
+    U_prev_scan_spec = scan_specs[5]
+    B_prev_scan_spec = scan_specs[6]
+    dM_scan_scratch_spec = scan_specs[8]
+    dBC_scan_spec = scan_specs[17]
+    dB_prev_scan_spec = scan_specs[19]
+
+    @cute.jit
+    def _bwd_db_host_wrapper(
+        U_t: cute.Tensor,
+        B_t: cute.Tensor,
+        C_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_t: cute.Tensor,
+        d_out_t: cute.Tensor,
+        U_prev_t: cute.Tensor,
+        B_prev_t: cute.Tensor,
+        dB_t: cute.Tensor,
+        dB_prev_t: cute.Tensor,
+        dM_previous_t: cute.Tensor,
+        dM_current_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        U_view = _make_static_tensor_spec_view(U_t, U_scan_spec)
+        B_view = _make_static_tensor_spec_view(B_t, BC_scan_spec)
+        C_view = _make_static_tensor_spec_view(C_t, BC_scan_spec)
+        M_view = _make_static_tensor_spec_view(M_t, M_scan_spec)
+        K_view = _make_static_tensor_spec_view(K_t, K_scan_spec)
+        d_out_view = _make_static_tensor_spec_view(d_out_t, U_scan_spec)
+        U_prev_view = _make_static_tensor_spec_view(U_prev_t, U_prev_scan_spec)
+        B_prev_view = _make_static_tensor_spec_view(B_prev_t, B_prev_scan_spec)
+        dB_view = _make_static_tensor_spec_view(dB_t, dBC_scan_spec)
+        dB_prev_view = _make_static_tensor_spec_view(dB_prev_t, dB_prev_scan_spec)
+        dM_previous_view = _make_static_tensor_spec_view(
+            dM_previous_t, dM_scan_scratch_spec
+        )
+        dM_current_view = _make_static_tensor_spec_view(
+            dM_current_t, dM_scan_scratch_spec
+        )
+        dtype = cast(type[cutlass.Numeric], U_view.element_type)
+        kernel = BwdDBAmpere(
+            dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            num_threads=scan_num_threads_db,
+        )
+        kernel.call_on_stream(
+            U_view,
+            B_view,
+            C_view,
+            M_view,
+            K_view,
+            d_out_view,
+            U_prev_view,
+            B_prev_view,
+            dB_view,
+            dB_prev_view,
+            dM_previous_view,
+            dM_current_view,
+            stream,
+        )
+
+    return _bwd_db_host_wrapper
+
+
+def _build_v2x2ssd_bwd_db_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    scan_specs = _scan_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    db_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[0],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[1],
+                runtime_artifacts.tc_dtype,
+                scan_specs[1],
+            ),
+            (
+                runtime_artifacts.runtime_args[2],
+                runtime_artifacts.tc_dtype,
+                scan_specs[1],
+            ),
+            (runtime_artifacts.runtime_args[3], torch.float32, scan_specs[2]),
+            (runtime_artifacts.runtime_args[4], torch.float32, scan_specs[3]),
+            (
+                runtime_artifacts.runtime_args[7],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[10],
+                runtime_artifacts.tc_dtype,
+                scan_specs[5],
+            ),
+            (
+                runtime_artifacts.runtime_args[11],
+                runtime_artifacts.tc_dtype,
+                scan_specs[6],
+            ),
+            (
+                runtime_artifacts.runtime_args[21],
+                runtime_artifacts.tc_dtype,
+                scan_specs[17],
+            ),
+            (
+                runtime_artifacts.runtime_args[22],
+                runtime_artifacts.tc_dtype,
+                scan_specs[19],
+            ),
+            (runtime_artifacts.runtime_args[26], torch.float32, scan_specs[8]),
+            (runtime_artifacts.runtime_args[27], torch.float32, scan_specs[8]),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_db_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+            launch_cfg=runtime_artifacts.launch_cfg,
         ),
-    }
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dB_scan.zero_()
+        runtime_artifacts.outputs.dB_prev_scan.zero_()
+        runtime_artifacts.runtime_args[26].zero_()
+        runtime_artifacts.runtime_args[27].zero_()
+
+    prepare()
+    compiled(*db_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="bwd_db",
+        effective_bytes=_tensor_bytes(*db_args),
+        launch=lambda compiled=compiled, args=db_args: compiled(*args),
+        prepare=prepare,
+        note="top-level v2x2ssd backward DB launch",
+    )
+
+
+def _make_bwd_dcdr_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    scan_num_threads_dcdr = int(launch_cfg[2])
+    scan_specs = _scan_bwd_tensor_specs(problem_shape)
+    U_scan_spec = scan_specs[0]
+    BC_scan_spec = scan_specs[1]
+    M_scan_spec = scan_specs[2]
+    K_scan_spec = scan_specs[3]
+    chunk_starts_scan_spec = scan_specs[4]
+    U_prev_scan_spec = scan_specs[5]
+    B_prev_scan_spec = scan_specs[6]
+    dlogp_scan_spec = scan_specs[7]
+    dR_scan_spec = scan_specs[9]
+    dBC_scan_spec = scan_specs[17]
+
+    @cute.jit
+    def _bwd_dcdr_host_wrapper(
+        U_t: cute.Tensor,
+        B_t: cute.Tensor,
+        C_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_t: cute.Tensor,
+        d_out_t: cute.Tensor,
+        U_prev_t: cute.Tensor,
+        B_prev_t: cute.Tensor,
+        chunk_starts_t: cute.Tensor,
+        dC_t: cute.Tensor,
+        dlogp_t: cute.Tensor,
+        dR_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        U_view = _make_static_tensor_spec_view(U_t, U_scan_spec)
+        B_view = _make_static_tensor_spec_view(B_t, BC_scan_spec)
+        C_view = _make_static_tensor_spec_view(C_t, BC_scan_spec)
+        M_view = _make_static_tensor_spec_view(M_t, M_scan_spec)
+        K_view = _make_static_tensor_spec_view(K_t, K_scan_spec)
+        d_out_view = _make_static_tensor_spec_view(d_out_t, U_scan_spec)
+        U_prev_view = _make_static_tensor_spec_view(U_prev_t, U_prev_scan_spec)
+        B_prev_view = _make_static_tensor_spec_view(B_prev_t, B_prev_scan_spec)
+        chunk_starts_view = _make_static_tensor_spec_view(
+            chunk_starts_t, chunk_starts_scan_spec
+        )
+        dC_view = _make_static_tensor_spec_view(dC_t, dBC_scan_spec)
+        dlogp_view = _make_static_tensor_spec_view(dlogp_t, dlogp_scan_spec)
+        dR_view = _make_static_tensor_spec_view(dR_t, dR_scan_spec)
+        dtype = cast(type[cutlass.Numeric], U_view.element_type)
+        kernel = BwdDCDRAmpere(
+            dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            num_threads=scan_num_threads_dcdr,
+        )
+        kernel.call_on_stream(
+            U_view,
+            B_view,
+            C_view,
+            M_view,
+            K_view,
+            d_out_view,
+            U_prev_view,
+            B_prev_view,
+            chunk_starts_view,
+            dC_view,
+            dlogp_view,
+            dR_view,
+            stream,
+        )
+
+    return _bwd_dcdr_host_wrapper
+
+
+def _build_v2x2ssd_bwd_dcdr_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    scan_specs = _scan_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    dcdr_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[0],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[1],
+                runtime_artifacts.tc_dtype,
+                scan_specs[1],
+            ),
+            (
+                runtime_artifacts.runtime_args[2],
+                runtime_artifacts.tc_dtype,
+                scan_specs[1],
+            ),
+            (runtime_artifacts.runtime_args[3], torch.float32, scan_specs[2]),
+            (runtime_artifacts.runtime_args[4], torch.float32, scan_specs[3]),
+            (
+                runtime_artifacts.runtime_args[7],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[10],
+                runtime_artifacts.tc_dtype,
+                scan_specs[5],
+            ),
+            (
+                runtime_artifacts.runtime_args[11],
+                runtime_artifacts.tc_dtype,
+                scan_specs[6],
+            ),
+            (runtime_artifacts.runtime_args[9], torch.float32, scan_specs[4]),
+            (
+                runtime_artifacts.runtime_args[23],
+                runtime_artifacts.tc_dtype,
+                scan_specs[17],
+            ),
+            (runtime_artifacts.runtime_args[24], torch.float32, scan_specs[7]),
+            (runtime_artifacts.runtime_args[25], torch.float32, scan_specs[9]),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_dcdr_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+            launch_cfg=runtime_artifacts.launch_cfg,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dC_scan.zero_()
+        runtime_artifacts.runtime_args[24].zero_()
+        runtime_artifacts.runtime_args[25].zero_()
+
+    prepare()
+    compiled(*dcdr_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="bwd_dcdr",
+        effective_bytes=_tensor_bytes(*dcdr_args),
+        launch=lambda compiled=compiled, args=dcdr_args: compiled(*args),
+        prepare=prepare,
+        note="top-level v2x2ssd backward DCDR launch",
+    )
+
+
+def _make_bwd_param_scan_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg,
+):
+    (
+        _batch_size,
+        _heads,
+        _bc_groups,
+        _padded_time,
+        _P,
+        _D,
+        _n_chunks,
+        chunk_size,
+        _,
+    ) = problem_shape
+    scan_num_threads_param = int(launch_cfg[3])
+    scan_specs = _scan_bwd_tensor_specs(problem_shape)
+    M_scan_spec = scan_specs[2]
+    K_scan_spec = scan_specs[3]
+    dlogp_param_spec = scan_specs[11]
+    dR_param_spec = scan_specs[12]
+    d_param_scan_spec = scan_specs[10]
+
+    @cute.jit
+    def _bwd_param_scan_host_wrapper(
+        M_t: cute.Tensor,
+        K_t: cute.Tensor,
+        dlogp_t: cute.Tensor,
+        dM_previous_t: cute.Tensor,
+        dM_current_t: cute.Tensor,
+        dR_t: cute.Tensor,
+        dM_t: cute.Tensor,
+        dK_previous_t: cute.Tensor,
+        dK_current_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        M_view = _make_static_tensor_spec_view(M_t, M_scan_spec)
+        K_view = _make_static_tensor_spec_view(K_t, K_scan_spec)
+        dlogp_view = _make_static_tensor_spec_view(dlogp_t, dlogp_param_spec)
+        dM_previous_view = _make_static_tensor_spec_view(
+            dM_previous_t, d_param_scan_spec
+        )
+        dM_current_view = _make_static_tensor_spec_view(dM_current_t, d_param_scan_spec)
+        dR_view = _make_static_tensor_spec_view(dR_t, dR_param_spec)
+        dM_view = _make_static_tensor_spec_view(dM_t, d_param_scan_spec)
+        dK_previous_view = _make_static_tensor_spec_view(
+            dK_previous_t, d_param_scan_spec
+        )
+        dK_current_view = _make_static_tensor_spec_view(dK_current_t, d_param_scan_spec)
+        kernel = BwdParamScanAmpere(
+            chunk_size=chunk_size,
+            num_threads=scan_num_threads_param,
+        )
+        kernel.call_on_stream(
+            M_view,
+            K_view,
+            dlogp_view,
+            dM_previous_view,
+            dM_current_view,
+            dR_view,
+            dM_view,
+            dK_previous_view,
+            dK_current_view,
+            stream,
+        )
+
+    return _bwd_param_scan_host_wrapper
+
+
+def _build_v2x2ssd_bwd_param_scan_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    _prime_v2x2ssd_bwd_dependencies(runtime_artifacts, device=cfg.torch_device)
+    scan_specs = _scan_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    param_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (runtime_artifacts.runtime_args[3], torch.float32, scan_specs[2]),
+            (runtime_artifacts.runtime_args[4], torch.float32, scan_specs[3]),
+            (runtime_artifacts.runtime_args[24], torch.float32, scan_specs[11]),
+            (runtime_artifacts.runtime_args[26], torch.float32, scan_specs[10]),
+            (runtime_artifacts.runtime_args[27], torch.float32, scan_specs[10]),
+            (runtime_artifacts.runtime_args[25], torch.float32, scan_specs[12]),
+            (runtime_artifacts.runtime_args[28], torch.float32, scan_specs[10]),
+            (runtime_artifacts.runtime_args[29], torch.float32, scan_specs[10]),
+            (runtime_artifacts.runtime_args[30], torch.float32, scan_specs[10]),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_param_scan_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+            launch_cfg=runtime_artifacts.launch_cfg,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dM_scan.zero_()
+        runtime_artifacts.outputs.dK_scan.zero_()
+
+    prepare()
+    compiled(*param_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="bwd_param_scan",
+        effective_bytes=_tensor_bytes(*param_args),
+        launch=lambda compiled=compiled, args=param_args: compiled(*args),
+        prepare=prepare,
+        note="top-level v2x2ssd backward parameter scan launch",
+    )
+
+
+def _make_bwd_du_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        _n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    scan_num_threads_du = int(launch_cfg[0])
+    scan_specs = _scan_bwd_tensor_specs(problem_shape)
+    U_scan_spec = scan_specs[0]
+    BC_scan_spec = scan_specs[1]
+    M_scan_spec = scan_specs[2]
+    K_scan_spec = scan_specs[3]
+    U_prev_scan_spec = scan_specs[5]
+    B_prev_scan_spec = scan_specs[6]
+    dU_prev_scan_spec = scan_specs[18]
+
+    @cute.jit
+    def _bwd_du_host_wrapper(
+        U_t: cute.Tensor,
+        B_t: cute.Tensor,
+        C_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_t: cute.Tensor,
+        d_out_t: cute.Tensor,
+        U_prev_t: cute.Tensor,
+        B_prev_t: cute.Tensor,
+        dU_t: cute.Tensor,
+        dU_prev_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        U_view = _make_static_tensor_spec_view(U_t, U_scan_spec)
+        B_view = _make_static_tensor_spec_view(B_t, BC_scan_spec)
+        C_view = _make_static_tensor_spec_view(C_t, BC_scan_spec)
+        M_view = _make_static_tensor_spec_view(M_t, M_scan_spec)
+        K_view = _make_static_tensor_spec_view(K_t, K_scan_spec)
+        d_out_view = _make_static_tensor_spec_view(d_out_t, U_scan_spec)
+        U_prev_view = _make_static_tensor_spec_view(U_prev_t, U_prev_scan_spec)
+        B_prev_view = _make_static_tensor_spec_view(B_prev_t, B_prev_scan_spec)
+        dU_view = _make_static_tensor_spec_view(dU_t, U_scan_spec)
+        dU_prev_view = _make_static_tensor_spec_view(dU_prev_t, dU_prev_scan_spec)
+        dtype = cast(type[cutlass.Numeric], U_view.element_type)
+        kernel = BwdDUAmpere(
+            dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            num_threads=scan_num_threads_du,
+        )
+        kernel.call_on_stream(
+            U_view,
+            B_view,
+            C_view,
+            M_view,
+            K_view,
+            d_out_view,
+            U_prev_view,
+            B_prev_view,
+            dU_view,
+            dU_prev_view,
+            stream,
+        )
+
+    return _bwd_du_host_wrapper
+
+
+def _build_v2x2ssd_bwd_du_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    scan_specs = _scan_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    du_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[0],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[1],
+                runtime_artifacts.tc_dtype,
+                scan_specs[1],
+            ),
+            (
+                runtime_artifacts.runtime_args[2],
+                runtime_artifacts.tc_dtype,
+                scan_specs[1],
+            ),
+            (runtime_artifacts.runtime_args[3], torch.float32, scan_specs[2]),
+            (runtime_artifacts.runtime_args[4], torch.float32, scan_specs[3]),
+            (
+                runtime_artifacts.runtime_args[7],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[10],
+                runtime_artifacts.tc_dtype,
+                scan_specs[5],
+            ),
+            (
+                runtime_artifacts.runtime_args[11],
+                runtime_artifacts.tc_dtype,
+                scan_specs[6],
+            ),
+            (
+                runtime_artifacts.runtime_args[19],
+                runtime_artifacts.tc_dtype,
+                scan_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[20],
+                runtime_artifacts.tc_dtype,
+                scan_specs[18],
+            ),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_du_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+            launch_cfg=runtime_artifacts.launch_cfg,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dU_scan.zero_()
+        runtime_artifacts.outputs.dU_prev_scan.zero_()
+
+    prepare()
+    compiled(*du_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="bwd_du",
+        effective_bytes=_tensor_bytes(*du_args),
+        launch=lambda compiled=compiled, args=du_args: compiled(*args),
+        prepare=prepare,
+        note="top-level v2x2ssd backward DU launch",
+    )
+
+
+def _make_bwd_dz0_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        _P,
+        _D,
+        _n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    dz0_cta_tiler = launch_cfg[11]
+    scan_specs = _scan_bwd_tensor_specs(problem_shape)
+    d_out_dz0_spec = scan_specs[13]
+    C_dz0_spec = scan_specs[14]
+    M_dz0_spec = scan_specs[15]
+    d_chunk_starts_scan_spec = scan_specs[16]
+
+    @cute.jit
+    def _bwd_dz0_host_wrapper(
+        d_out_t: cute.Tensor,
+        C_t: cute.Tensor,
+        M_t: cute.Tensor,
+        d_chunk_starts_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        d_out_view = _make_static_tensor_spec_view(d_out_t, d_out_dz0_spec)
+        C_view = _make_static_tensor_spec_view(C_t, C_dz0_spec)
+        M_view = _make_static_tensor_spec_view(M_t, M_dz0_spec)
+        d_chunk_starts_view = _make_static_tensor_spec_view(
+            d_chunk_starts_t, d_chunk_starts_scan_spec
+        )
+        dtype = cast(type[cutlass.Numeric], C_view.element_type)
+        kernel = BwdDZ0Ampere(
+            dtype,
+            chunk_size=chunk_size,
+            heads=heads,
+            bc_groups=bc_groups,
+            cta_tiler=dz0_cta_tiler,
+        )
+        kernel.call_on_stream(
+            d_out_view,
+            C_view,
+            M_view,
+            d_chunk_starts_view,
+            stream,
+        )
+
+    return _bwd_dz0_host_wrapper
+
+
+def _build_v2x2ssd_bwd_dz0_runner(cfg: V2KernelPerfConfig) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    scan_specs = _scan_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    dz0_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[7],
+                runtime_artifacts.tc_dtype,
+                scan_specs[13],
+            ),
+            (
+                runtime_artifacts.runtime_args[2],
+                runtime_artifacts.tc_dtype,
+                scan_specs[14],
+            ),
+            (runtime_artifacts.runtime_args[3], torch.float32, scan_specs[15]),
+            (runtime_artifacts.runtime_args[15], torch.float32, scan_specs[16]),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_dz0_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+            launch_cfg=runtime_artifacts.launch_cfg,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.runtime_args[15].zero_()
+
+    prepare()
+    compiled(*dz0_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="bwd_dz0",
+        effective_bytes=_tensor_bytes(*dz0_args),
+        launch=lambda compiled=compiled, args=dz0_args: compiled(*args),
+        prepare=prepare,
+        note="top-level v2x2ssd backward DZ0 launch",
+    )
+
+
+def _make_bwd_state_passing_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+    launch_cfg,
+):
+    (
+        _batch_size,
+        _heads,
+        _bc_groups,
+        _padded_time,
+        _P,
+        _D,
+        _n_chunks,
+        _chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    (
+        _scan_num_threads_du,
+        _scan_num_threads_db,
+        _scan_num_threads_dcdr,
+        _scan_num_threads_param,
+        state_num_threads,
+        state_pairs_per_thread,
+        state_copy_bits_starts,
+        state_copy_bits_dstarts,
+        state_copy_bits_dinc,
+        state_copy_bits_initial,
+        state_copy_bits_final,
+        _dz0_cta_tiler,
+    ) = launch_cfg
+    state_specs = _state_bwd_tensor_specs(problem_shape)
+    chunk_starts_state_spec = state_specs[0]
+    chunk_multiplier_state_spec = state_specs[1]
+    final_state_spec = state_specs[2]
+
+    @cute.jit
+    def _bwd_state_passing_host_wrapper(
+        chunk_starts_t: cute.Tensor,
+        d_chunk_starts_t: cute.Tensor,
+        d_final_state_t: cute.Tensor,
+        chunk_multiplier_t: cute.Tensor,
+        d_increment_t: cute.Tensor,
+        d_chunk_multiplier_t: cute.Tensor,
+        d_initial_state_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        chunk_starts_view = _make_static_tensor_spec_view(
+            chunk_starts_t, chunk_starts_state_spec
+        )
+        d_chunk_starts_view = _make_static_tensor_spec_view(
+            d_chunk_starts_t, chunk_starts_state_spec
+        )
+        d_final_state_view = _make_static_tensor_spec_view(
+            d_final_state_t, final_state_spec
+        )
+        chunk_multiplier_view = _make_static_tensor_spec_view(
+            chunk_multiplier_t, chunk_multiplier_state_spec
+        )
+        d_increment_view = _make_static_tensor_spec_view(
+            d_increment_t, chunk_starts_state_spec
+        )
+        d_chunk_multiplier_view = _make_static_tensor_spec_view(
+            d_chunk_multiplier_t, chunk_multiplier_state_spec
+        )
+        d_initial_state_view = _make_static_tensor_spec_view(
+            d_initial_state_t, final_state_spec
+        )
+        kernel = BwdStatePassingAmpere(
+            _TileConfig(
+                num_threads=state_num_threads,
+                pairs_per_thread=state_pairs_per_thread,
+            ),
+            copy_bits_starts=state_copy_bits_starts,
+            copy_bits_dstarts=state_copy_bits_dstarts,
+            copy_bits_dinc=state_copy_bits_dinc,
+            copy_bits_initial=state_copy_bits_initial,
+            copy_bits_final=state_copy_bits_final,
+        )
+        kernel.call_on_stream(
+            chunk_starts_view,
+            d_chunk_starts_view,
+            d_final_state_view,
+            chunk_multiplier_view,
+            d_increment_view,
+            d_chunk_multiplier_view,
+            d_initial_state_view,
+            stream,
+        )
+
+    return _bwd_state_passing_host_wrapper
+
+
+def _build_v2x2ssd_bwd_state_passing_runner(
+    cfg: V2KernelPerfConfig,
+) -> KernelRunner:
+    runtime_artifacts = _build_v2x2ssd_bwd_runtime_artifacts(cfg)
+    _prime_v2x2ssd_bwd_dependencies(runtime_artifacts, device=cfg.torch_device)
+    state_specs = _state_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    state_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (runtime_artifacts.runtime_args[9], torch.float32, state_specs[0]),
+            (runtime_artifacts.runtime_args[15], torch.float32, state_specs[0]),
+            (runtime_artifacts.runtime_args[12], torch.float32, state_specs[2]),
+            (runtime_artifacts.runtime_args[8], torch.float32, state_specs[1]),
+            (
+                runtime_artifacts.runtime_args[16],
+                runtime_artifacts.tc_dtype,
+                state_specs[0],
+            ),
+            (runtime_artifacts.runtime_args[18], torch.float32, state_specs[1]),
+            (runtime_artifacts.runtime_args[17], torch.float32, state_specs[2]),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_state_passing_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+            launch_cfg=runtime_artifacts.launch_cfg,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.runtime_args[16].zero_()
+        runtime_artifacts.outputs.d_chunk_multiplier.zero_()
+        runtime_artifacts.outputs.d_initial_state.zero_()
+
+    prepare()
+    compiled(*state_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    return KernelRunner(
+        name="bwd_state_passing",
+        effective_bytes=_tensor_bytes(*state_args),
+        launch=lambda compiled=compiled, args=state_args: compiled(*args),
+        prepare=prepare,
+        note="top-level v2x2ssd backward state passing launch",
+    )
+
+
+def _make_bwd_boundary_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    increment_specs = _increment_bwd_tensor_specs(problem_shape)
+    M_increment_spec = increment_specs[3]
+    K_increment_spec = increment_specs[4]
+    d_boundary_spec = increment_specs[7]
+    U_prev_chunks_spec = increment_specs[8]
+    B_prev_chunks_spec = increment_specs[9]
+    dMp0_spec = increment_specs[11]
+    dB_prev_boundary_spec = increment_specs[15]
+
+    @cute.jit
+    def _bwd_boundary_host_wrapper(
+        d_increment_t: cute.Tensor,
+        B_prev_chunks_t: cute.Tensor,
+        U_prev_chunks_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_previous_t: cute.Tensor,
+        dU_prev_scan_t: cute.Tensor,
+        dB_prev_scan_t: cute.Tensor,
+        dMp0_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        d_boundary_view = _make_static_tensor_spec_view(
+            d_increment_t,
+            d_boundary_spec,
+        )
+        B_prev_chunks_view = _make_static_tensor_spec_view(
+            B_prev_chunks_t,
+            B_prev_chunks_spec,
+        )
+        U_prev_chunks_view = _make_static_tensor_spec_view(
+            U_prev_chunks_t,
+            U_prev_chunks_spec,
+        )
+        M_increment_view = _make_static_tensor_spec_view(M_t, M_increment_spec)
+        K_previous_increment_view = _make_static_tensor_spec_view(
+            K_previous_t,
+            K_increment_spec,
+        )
+        dU_prev_increment_view = _make_static_tensor_spec_view(
+            dU_prev_scan_t,
+            U_prev_chunks_spec,
+        )
+        dB_prev_boundary_view = _make_static_tensor_spec_view(
+            dB_prev_scan_t,
+            dB_prev_boundary_spec,
+        )
+        dMp0_view = _make_static_tensor_spec_view(dMp0_t, dMp0_spec)
+        dtype = cast(type[cutlass.Numeric], d_boundary_view.element_type)
+        kernel = BwdBoundaryAmpere(
+            dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
+        )
+        kernel.call_on_stream(
+            d_boundary_view,
+            B_prev_chunks_view,
+            U_prev_chunks_view,
+            M_increment_view,
+            K_previous_increment_view,
+            dU_prev_increment_view,
+            dB_prev_boundary_view,
+            dMp0_view,
+            stream,
+        )
+
+    return _bwd_boundary_host_wrapper
+
+
+def _build_v2x2ssd_bwd_boundary_runner(
+    cfg: V2KernelPerfConfig,
+) -> KernelRunner:
+    _seed_all(cfg.seed)
+    bc_groups, _heads_per_group = _validate_bc_groups(
+        cfg.heads,
+        cfg.resolved_bc_groups,
+    )
+    tensors = _build_grouped_v2_inputs(cfg)
+    U = tensors["U"]
+    M = tensors["M"]
+    K = tensors["K"]
+    B = tensors["B_grouped"]
+    C = tensors["C_grouped"]
+    initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
+    B_prev = tensors["B_prev_grouped"]
+    U_prev = tensors["U_prev"]
+
+    m_chunk, chunk_starts = _compute_forward_intermediates_for_bwd(
+        cfg,
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        C=C,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+    )
+    d_out = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=cfg.torch_device,
+        dtype=torch.float32,
+    )
+    d_final = torch.randn_like(initial_states)
+    runtime_artifacts = _make_backward_runtime_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=cfg.chunk_size,
+        compute_dtype=torch.float32,
+        scan_num_threads_du=128,
+        scan_num_threads_db=128,
+        scan_num_threads_dcdr=128,
+        scan_num_threads_param=32,
+        state_num_threads=128,
+        state_pairs_per_thread=8,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        validate_runtime_contract=True,
+    )
+    compile_artifacts = _make_backward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    full_bwd = cast(
+        Callable[..., None],
+        _get_compiled_v2x2ssd_bwd_kernel(compile_artifacts),
+    )
+    full_bwd(*runtime_artifacts.runtime_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    increment_specs = _increment_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    boundary_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[16],
+                runtime_artifacts.tc_dtype,
+                increment_specs[7],
+            ),
+            (
+                runtime_artifacts.runtime_args[14],
+                runtime_artifacts.tc_dtype,
+                increment_specs[9],
+            ),
+            (
+                runtime_artifacts.runtime_args[13],
+                runtime_artifacts.tc_dtype,
+                increment_specs[8],
+            ),
+            (
+                runtime_artifacts.runtime_args[3],
+                torch.float32,
+                increment_specs[3],
+            ),
+            (
+                runtime_artifacts.runtime_args[5],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[20],
+                runtime_artifacts.tc_dtype,
+                increment_specs[8],
+            ),
+            (
+                runtime_artifacts.runtime_args[22],
+                runtime_artifacts.tc_dtype,
+                increment_specs[15],
+            ),
+            (
+                runtime_artifacts.runtime_args[33],
+                torch.float32,
+                increment_specs[11],
+            ),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_boundary_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    d_mp0 = runtime_artifacts.runtime_args[33]
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dU_prev_scan.zero_()
+        runtime_artifacts.outputs.dB_prev_scan.zero_()
+        d_mp0.zero_()
+
+    return KernelRunner(
+        name="bwd_boundary",
+        effective_bytes=_tensor_bytes(runtime_artifacts.runtime_args[16])
+        + _tensor_bytes(runtime_artifacts.runtime_args[14])
+        + _tensor_bytes(runtime_artifacts.runtime_args[13])
+        + _tensor_bytes(runtime_artifacts.runtime_args[3])
+        + _tensor_bytes(runtime_artifacts.runtime_args[5])
+        + 2 * _tensor_bytes(runtime_artifacts.outputs.dU_prev_scan)
+        + 2 * _tensor_bytes(runtime_artifacts.outputs.dB_prev_scan)
+        + _tensor_bytes(d_mp0),
+        launch=lambda compiled=compiled, args=boundary_args: compiled(*args),
+        prepare=prepare,
+        note="top-level bwd boundary accumulator",
+    )
+
+
+def _make_bwd_db_increment_accumulator_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    scan_specs = _scan_bwd_tensor_specs(problem_shape)
+    increment_specs = _increment_bwd_tensor_specs(problem_shape)
+    dBC_scan_spec = scan_specs[17]
+    U_increment_spec = increment_specs[0]
+    B_increment_spec = increment_specs[2]
+    M_increment_spec = increment_specs[3]
+    K_increment_spec = increment_specs[4]
+    d_increment_dp_spec = increment_specs[6]
+    dM_sum_part_spec = increment_specs[10]
+
+    @cute.jit
+    def _bwd_db_increment_accumulator_host_wrapper(
+        U_t: cute.Tensor,
+        B_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_previous_t: cute.Tensor,
+        K_current_t: cute.Tensor,
+        d_increment_t: cute.Tensor,
+        dB_scan_t: cute.Tensor,
+        dM_sum_part_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        U_increment_view = _make_static_tensor_spec_view(U_t, U_increment_spec)
+        B_increment_view = _make_static_tensor_spec_view(B_t, B_increment_spec)
+        M_increment_view = _make_static_tensor_spec_view(M_t, M_increment_spec)
+        K_previous_increment_view = _make_static_tensor_spec_view(
+            K_previous_t,
+            K_increment_spec,
+        )
+        K_current_increment_view = _make_static_tensor_spec_view(
+            K_current_t,
+            K_increment_spec,
+        )
+        d_increment_dp_view = _make_static_tensor_spec_view(
+            d_increment_t,
+            d_increment_dp_spec,
+        )
+        dB_scan_view = _make_static_tensor_spec_view(dB_scan_t, dBC_scan_spec)
+        dM_sum_part_view = _make_static_tensor_spec_view(
+            dM_sum_part_t,
+            dM_sum_part_spec,
+        )
+        dtype = cast(type[cutlass.Numeric], U_increment_view.element_type)
+        kernel = BwdDBIncrementAccumulatorAmpere(
+            dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
+        )
+        kernel.call_on_stream(
+            U_increment_view,
+            B_increment_view,
+            M_increment_view,
+            K_previous_increment_view,
+            K_current_increment_view,
+            d_increment_dp_view,
+            dB_scan_view,
+            dM_sum_part_view,
+            stream,
+        )
+
+    return _bwd_db_increment_accumulator_host_wrapper
+
+
+def _build_v2x2ssd_bwd_db_increment_accumulator_runner(
+    cfg: V2KernelPerfConfig,
+) -> KernelRunner:
+    _seed_all(cfg.seed)
+    bc_groups, _heads_per_group = _validate_bc_groups(
+        cfg.heads,
+        cfg.resolved_bc_groups,
+    )
+    tensors = _build_grouped_v2_inputs(cfg)
+    U = tensors["U"]
+    M = tensors["M"]
+    K = tensors["K"]
+    B = tensors["B_grouped"]
+    C = tensors["C_grouped"]
+    initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
+    B_prev = tensors["B_prev_grouped"]
+    U_prev = tensors["U_prev"]
+
+    m_chunk, chunk_starts = _compute_forward_intermediates_for_bwd(
+        cfg,
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        C=C,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+    )
+    d_out = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=cfg.torch_device,
+        dtype=torch.float32,
+    )
+    d_final = torch.randn_like(initial_states)
+    runtime_artifacts = _make_backward_runtime_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=cfg.chunk_size,
+        compute_dtype=torch.float32,
+        scan_num_threads_du=128,
+        scan_num_threads_db=128,
+        scan_num_threads_dcdr=128,
+        scan_num_threads_param=32,
+        state_num_threads=128,
+        state_pairs_per_thread=8,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        validate_runtime_contract=True,
+    )
+    compile_artifacts = _make_backward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    full_bwd = cast(
+        Callable[..., None],
+        _get_compiled_v2x2ssd_bwd_kernel(compile_artifacts),
+    )
+    full_bwd(*runtime_artifacts.runtime_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    scan_specs = _scan_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    increment_specs = _increment_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    accumulator_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[0],
+                runtime_artifacts.tc_dtype,
+                increment_specs[0],
+            ),
+            (
+                runtime_artifacts.runtime_args[1],
+                runtime_artifacts.tc_dtype,
+                increment_specs[2],
+            ),
+            (
+                runtime_artifacts.runtime_args[3],
+                torch.float32,
+                increment_specs[3],
+            ),
+            (
+                runtime_artifacts.runtime_args[5],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[6],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[16],
+                runtime_artifacts.tc_dtype,
+                increment_specs[6],
+            ),
+            (
+                runtime_artifacts.runtime_args[21],
+                runtime_artifacts.tc_dtype,
+                scan_specs[17],
+            ),
+            (
+                runtime_artifacts.runtime_args[32],
+                torch.float32,
+                increment_specs[10],
+            ),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_db_increment_accumulator_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    d_msum_part = runtime_artifacts.runtime_args[32]
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dB_scan.zero_()
+        d_msum_part.zero_()
 
     T_pad = _t_pad(cfg.T, cfg.chunk_size)
+    n_chunks = _n_chunks(cfg.T, cfg.chunk_size)
     D = B.shape[-1]
     tc_dtype = _tc_input_dtype(cfg.dtype)
     bytes_u = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
     bytes_b = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
     bytes_m = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
     bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
-    bytes_d_out = _shape_bytes((cfg.batch, cfg.heads, T_pad, cfg.P), tc_dtype)
-    bytes_u_prev = _shape_bytes((cfg.batch, cfg.heads, cfg.P), tc_dtype)
-    bytes_b_prev = _shape_bytes((cfg.batch, bc_groups, D), tc_dtype)
-    bytes_dphase = _shape_bytes(
-        (2, cfg.chunk_size, cfg.batch * cfg.heads * _n_chunks(cfg.T, cfg.chunk_size)),
+    bytes_d_inc = _shape_bytes(
+        (cfg.batch, cfg.heads, n_chunks, cfg.P, D),
         torch.float32,
     )
 
-    def prepare_param() -> None:
-        launchers["chunk_scan_bwd_db"]()
-        launchers["chunk_scan_bwd_dcdr"]()
+    return KernelRunner(
+        name="bwd_db_increment_accumulator",
+        effective_bytes=bytes_u
+        + bytes_b
+        + bytes_m
+        + bytes_k
+        + bytes_d_inc
+        + 2 * _tensor_bytes(runtime_artifacts.outputs.dB_scan)
+        + _tensor_bytes(d_msum_part),
+        launch=lambda compiled=compiled, args=accumulator_args: compiled(*args),
+        prepare=prepare,
+        note="top-level bwd DB increment accumulator",
+    )
 
-    return {
-        "chunk_scan_bwd_dz0": KernelRunner(
-            name="chunk_scan_bwd_dz0",
-            effective_bytes=bytes_d_out
-            + bytes_b
-            + bytes_m
-            + _tensor_bytes(outputs.chunk_start_grad),
-            launch=launchers["chunk_scan_bwd_dz0"],
-            prepare=_noop,
-        ),
-        "chunk_scan_bwd_du": KernelRunner(
-            name="chunk_scan_bwd_du",
-            effective_bytes=bytes_u
-            + bytes_b
-            + bytes_b
-            + bytes_m
-            + bytes_k
-            + bytes_d_out
-            + bytes_u_prev
-            + bytes_b_prev
-            + _tensor_bytes(
-                outputs.value_grad_chunk,
-                outputs.value_boundary_grad,
-                outputs.logprefix_grad,
-                outputs.transition_grad,
-                outputs.transition_grad,
-            )
-            + _scaled_tensor_bytes(
-                outputs.key_grad_chunk,
-                bc_groups=bc_groups,
-                heads=cfg.heads,
-            )
-            + _scaled_tensor_bytes(
-                outputs.key_boundary_grad,
-                bc_groups=bc_groups,
-                heads=cfg.heads,
+
+def _make_bwd_du_increment_accumulator_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+):
+    (
+        _batch_size,
+        heads,
+        bc_groups,
+        _padded_time,
+        P,
+        D,
+        n_chunks,
+        chunk_size,
+        _n_d_tiles,
+    ) = problem_shape
+    increment_specs = _increment_bwd_tensor_specs(problem_shape)
+    dU_increment_spec = increment_specs[1]
+    B_increment_spec = increment_specs[2]
+    M_increment_spec = increment_specs[3]
+    K_increment_spec = increment_specs[4]
+    d_increment_spec = increment_specs[5]
+
+    @cute.jit
+    def _bwd_du_increment_accumulator_host_wrapper(
+        d_increment_t: cute.Tensor,
+        B_t: cute.Tensor,
+        M_t: cute.Tensor,
+        K_previous_t: cute.Tensor,
+        K_current_t: cute.Tensor,
+        dU_scan_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        d_increment_view = _make_static_tensor_spec_view(
+            d_increment_t,
+            d_increment_spec,
+        )
+        B_increment_view = _make_static_tensor_spec_view(B_t, B_increment_spec)
+        M_increment_view = _make_static_tensor_spec_view(M_t, M_increment_spec)
+        K_previous_increment_view = _make_static_tensor_spec_view(
+            K_previous_t,
+            K_increment_spec,
+        )
+        K_current_increment_view = _make_static_tensor_spec_view(
+            K_current_t,
+            K_increment_spec,
+        )
+        dU_increment_view = _make_static_tensor_spec_view(
+            dU_scan_t,
+            dU_increment_spec,
+        )
+        dtype = cast(type[cutlass.Numeric], B_increment_view.element_type)
+        kernel = BwdDUIncrementAccumulatorAmpere(
+            dtype,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+            heads=heads,
+            bc_groups=bc_groups,
+            n_chunks=n_chunks,
+        )
+        kernel.call_on_stream(
+            d_increment_view,
+            B_increment_view,
+            M_increment_view,
+            K_previous_increment_view,
+            K_current_increment_view,
+            dU_increment_view,
+            stream,
+        )
+
+    return _bwd_du_increment_accumulator_host_wrapper
+
+
+def _build_v2x2ssd_bwd_du_increment_accumulator_runner(
+    cfg: V2KernelPerfConfig,
+) -> KernelRunner:
+    _seed_all(cfg.seed)
+    bc_groups, _heads_per_group = _validate_bc_groups(
+        cfg.heads,
+        cfg.resolved_bc_groups,
+    )
+    tensors = _build_grouped_v2_inputs(cfg)
+    U = tensors["U"]
+    M = tensors["M"]
+    K = tensors["K"]
+    B = tensors["B_grouped"]
+    C = tensors["C_grouped"]
+    initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
+    B_prev = tensors["B_prev_grouped"]
+    U_prev = tensors["U_prev"]
+
+    m_chunk, chunk_starts = _compute_forward_intermediates_for_bwd(
+        cfg,
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        C=C,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+    )
+    d_out = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=cfg.torch_device,
+        dtype=torch.float32,
+    )
+    d_final = torch.randn_like(initial_states)
+    runtime_artifacts = _make_backward_runtime_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=cfg.chunk_size,
+        compute_dtype=torch.float32,
+        scan_num_threads_du=128,
+        scan_num_threads_db=128,
+        scan_num_threads_dcdr=128,
+        scan_num_threads_param=32,
+        state_num_threads=128,
+        state_pairs_per_thread=8,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        validate_runtime_contract=True,
+    )
+    compile_artifacts = _make_backward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    full_bwd = cast(
+        Callable[..., None],
+        _get_compiled_v2x2ssd_bwd_kernel(compile_artifacts),
+    )
+    full_bwd(*runtime_artifacts.runtime_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    increment_specs = _increment_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    accumulator_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[16],
+                runtime_artifacts.tc_dtype,
+                increment_specs[5],
             ),
-            launch=launchers["chunk_scan_bwd_du"],
-            prepare=_noop,
-        ),
-        "chunk_scan_bwd_db": KernelRunner(
-            name="chunk_scan_bwd_db",
-            effective_bytes=bytes_u
-            + bytes_b
-            + bytes_b
-            + bytes_m
-            + bytes_k
-            + bytes_d_out
-            + bytes_u_prev
-            + bytes_b_prev
-            + _tensor_bytes(
-                outputs.value_grad_chunk,
-                outputs.value_boundary_grad,
-                outputs.logprefix_grad,
-                outputs.transition_grad,
-                outputs.transition_grad,
-            )
-            + _scaled_tensor_bytes(
-                outputs.key_grad_chunk,
-                bc_groups=bc_groups,
-                heads=cfg.heads,
-            )
-            + _scaled_tensor_bytes(
-                outputs.key_boundary_grad,
-                bc_groups=bc_groups,
-                heads=cfg.heads,
+            (
+                runtime_artifacts.runtime_args[1],
+                runtime_artifacts.tc_dtype,
+                increment_specs[2],
             ),
-            launch=launchers["chunk_scan_bwd_db"],
-            prepare=_noop,
-        ),
-        "chunk_scan_bwd_dcdr": KernelRunner(
-            name="chunk_scan_bwd_dcdr",
-            effective_bytes=bytes_u
-            + bytes_b
-            + bytes_b
-            + bytes_m
-            + bytes_k
-            + bytes_d_out
-            + bytes_u_prev
-            + bytes_b_prev
-            + _tensor_bytes(
-                chunk_starts,
-                outputs.logprefix_grad,
-                outputs.rotation_grad,
-            )
-            + _scaled_tensor_bytes(
-                outputs.query_grad_chunk,
-                bc_groups=bc_groups,
-                heads=cfg.heads,
-            )
-            + bytes_dphase,
-            launch=launchers["chunk_scan_bwd_dcdr"],
-            prepare=_noop,
-        ),
-        "chunk_scan_bwd_param": KernelRunner(
-            name="chunk_scan_bwd_param",
-            effective_bytes=bytes_m
-            + bytes_k
-            + bytes_dphase
-            + _tensor_bytes(
-                outputs.logprefix_grad,
-                outputs.rotation_grad,
-                outputs.transition_grad,
-                outputs.transition_grad,
-                outputs.transition_grad,
-                outputs.tap_prev_grad,
-                outputs.tap_curr_grad,
+            (
+                runtime_artifacts.runtime_args[3],
+                torch.float32,
+                increment_specs[3],
             ),
-            launch=launchers["chunk_scan_bwd_param"],
-            prepare=prepare_param,
-            note="integrated stage in chunk_scan_bwd",
+            (
+                runtime_artifacts.runtime_args[5],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[6],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[19],
+                runtime_artifacts.tc_dtype,
+                increment_specs[1],
+            ),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_du_increment_accumulator_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
         ),
-    }
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dU_scan.zero_()
+
+    T_pad = _t_pad(cfg.T, cfg.chunk_size)
+    n_chunks = _n_chunks(cfg.T, cfg.chunk_size)
+    D = B.shape[-1]
+    tc_dtype = _tc_input_dtype(cfg.dtype)
+    bytes_b = _shape_bytes((cfg.batch, bc_groups, T_pad, D), tc_dtype)
+    bytes_m = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2), torch.float32)
+    bytes_k = _shape_bytes((cfg.batch, cfg.heads, T_pad, 2, 2), torch.float32)
+    bytes_d_inc = _shape_bytes(
+        (cfg.batch, cfg.heads, n_chunks, cfg.P, D),
+        torch.float32,
+    )
+
+    return KernelRunner(
+        name="bwd_du_increment_accumulator",
+        effective_bytes=bytes_d_inc
+        + bytes_b
+        + bytes_m
+        + bytes_k
+        + 2 * _tensor_bytes(runtime_artifacts.outputs.dU_scan),
+        launch=lambda compiled=compiled, args=accumulator_args: compiled(*args),
+        prepare=prepare,
+        note="top-level bwd DU increment accumulator",
+    )
+
+
+def _make_bwd_param_increment_accumulator_host_wrapper(
+    *,
+    problem_shape: BackwardProblemShape,
+):
+    (
+        _batch_size,
+        _heads,
+        _bc_groups,
+        _padded_time,
+        _P,
+        _D,
+        _n_chunks,
+        chunk_size,
+        n_d_tiles,
+    ) = problem_shape
+    increment_specs = _increment_bwd_tensor_specs(problem_shape)
+    M_increment_spec = increment_specs[3]
+    K_increment_spec = increment_specs[4]
+    dM_sum_part_spec = increment_specs[10]
+    dMp0_spec = increment_specs[11]
+    d_chunk_multiplier_increment_spec = increment_specs[12]
+    d_param_increment_spec = increment_specs[13]
+
+    @cute.jit
+    def _bwd_param_increment_accumulator_host_wrapper(
+        M_t: cute.Tensor,
+        K_previous_t: cute.Tensor,
+        K_current_t: cute.Tensor,
+        dM_sum_part_t: cute.Tensor,
+        dMp0_t: cute.Tensor,
+        d_chunk_multiplier_t: cute.Tensor,
+        dM_scan_t: cute.Tensor,
+        dK_previous_scan_t: cute.Tensor,
+        dK_current_scan_t: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        M_increment_view = _make_static_tensor_spec_view(M_t, M_increment_spec)
+        K_previous_increment_view = _make_static_tensor_spec_view(
+            K_previous_t,
+            K_increment_spec,
+        )
+        K_current_increment_view = _make_static_tensor_spec_view(
+            K_current_t,
+            K_increment_spec,
+        )
+        dM_sum_part_view = _make_static_tensor_spec_view(
+            dM_sum_part_t,
+            dM_sum_part_spec,
+        )
+        dMp0_view = _make_static_tensor_spec_view(dMp0_t, dMp0_spec)
+        d_chunk_multiplier_increment_view = _make_static_tensor_spec_view(
+            d_chunk_multiplier_t,
+            d_chunk_multiplier_increment_spec,
+        )
+        dM_increment_view = _make_static_tensor_spec_view(
+            dM_scan_t,
+            d_param_increment_spec,
+        )
+        dK_previous_increment_view = _make_static_tensor_spec_view(
+            dK_previous_scan_t,
+            d_param_increment_spec,
+        )
+        dK_current_increment_view = _make_static_tensor_spec_view(
+            dK_current_scan_t,
+            d_param_increment_spec,
+        )
+        kernel = BwdParamIncrementAccumulatorAmpere(
+            chunk_size=chunk_size,
+            n_d_tiles=n_d_tiles,
+        )
+        kernel.call_on_stream(
+            M_increment_view,
+            K_previous_increment_view,
+            K_current_increment_view,
+            dM_sum_part_view,
+            dMp0_view,
+            d_chunk_multiplier_increment_view,
+            dM_increment_view,
+            dK_previous_increment_view,
+            dK_current_increment_view,
+            stream,
+        )
+
+    return _bwd_param_increment_accumulator_host_wrapper
+
+
+def _build_v2x2ssd_bwd_param_increment_accumulator_runner(
+    cfg: V2KernelPerfConfig,
+) -> KernelRunner:
+    _seed_all(cfg.seed)
+    tensors = _build_grouped_v2_inputs(cfg)
+    U = tensors["U"]
+    M = tensors["M"]
+    K = tensors["K"]
+    B = tensors["B_grouped"]
+    C = tensors["C_grouped"]
+    initial_states = tensors["initial_states"].to(dtype=torch.float32).contiguous()
+    B_prev = tensors["B_prev_grouped"]
+    U_prev = tensors["U_prev"]
+
+    m_chunk, chunk_starts = _compute_forward_intermediates_for_bwd(
+        cfg,
+        U=U,
+        M=M,
+        K=K,
+        B=B,
+        C=C,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+    )
+    d_out = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=cfg.torch_device,
+        dtype=torch.float32,
+    )
+    d_final = torch.randn_like(initial_states)
+    runtime_artifacts = _make_backward_runtime_artifacts(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=cfg.chunk_size,
+        compute_dtype=torch.float32,
+        scan_num_threads_du=128,
+        scan_num_threads_db=128,
+        scan_num_threads_dcdr=128,
+        scan_num_threads_param=32,
+        state_num_threads=128,
+        state_pairs_per_thread=8,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        initial_states=initial_states,
+        d_final_state=d_final,
+        validate_runtime_contract=True,
+    )
+    compile_artifacts = _make_backward_compile_artifacts_from_runtime_artifacts(
+        runtime_artifacts
+    )
+    full_bwd = cast(
+        Callable[..., None],
+        _get_compiled_v2x2ssd_bwd_kernel(compile_artifacts),
+    )
+    full_bwd(*runtime_artifacts.runtime_args)
+    torch.cuda.synchronize(cfg.torch_device)
+
+    increment_specs = _increment_bwd_tensor_specs(runtime_artifacts.problem_shape)
+    accumulator_args, _alignments, compile_args = (
+        _make_tvm_ffi_runtime_and_compile_args_from_specs(
+            (
+                runtime_artifacts.runtime_args[3],
+                torch.float32,
+                increment_specs[3],
+            ),
+            (
+                runtime_artifacts.runtime_args[5],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[6],
+                torch.float32,
+                increment_specs[4],
+            ),
+            (
+                runtime_artifacts.runtime_args[32],
+                torch.float32,
+                increment_specs[10],
+            ),
+            (
+                runtime_artifacts.runtime_args[33],
+                torch.float32,
+                increment_specs[11],
+            ),
+            (
+                runtime_artifacts.runtime_args[18],
+                torch.float32,
+                increment_specs[12],
+            ),
+            (
+                runtime_artifacts.runtime_args[28],
+                torch.float32,
+                increment_specs[13],
+            ),
+            (
+                runtime_artifacts.runtime_args[29],
+                torch.float32,
+                increment_specs[13],
+            ),
+            (
+                runtime_artifacts.runtime_args[30],
+                torch.float32,
+                increment_specs[13],
+            ),
+        )
+    )
+    compiled = cute.compile(
+        _make_bwd_param_increment_accumulator_host_wrapper(
+            problem_shape=runtime_artifacts.problem_shape,
+        ),
+        *compile_args,
+        options="--enable-tvm-ffi",
+    )
+
+    def prepare() -> None:
+        runtime_artifacts.outputs.dM_scan.zero_()
+        runtime_artifacts.outputs.dK_scan.zero_()
+
+    bytes_m = _tensor_bytes(M)
+    bytes_k = _tensor_bytes(K)
+    bytes_d_msum = _tensor_bytes(runtime_artifacts.runtime_args[32])
+    bytes_d_mp0 = _tensor_bytes(runtime_artifacts.runtime_args[33])
+    bytes_d_chunk_multiplier = _tensor_bytes(runtime_artifacts.runtime_args[18])
+
+    return KernelRunner(
+        name="bwd_param_increment_accumulator",
+        effective_bytes=bytes_m
+        + bytes_k
+        + bytes_d_msum
+        + bytes_d_mp0
+        + bytes_d_chunk_multiplier
+        + 2 * _tensor_bytes(runtime_artifacts.outputs.dM_scan)
+        + 2 * _tensor_bytes(runtime_artifacts.outputs.dK_scan),
+        launch=lambda compiled=compiled, args=accumulator_args: compiled(*args),
+        prepare=prepare,
+        note="top-level bwd parameter increment accumulator",
+    )
 
 
 def build_kernel_runners(
@@ -1599,10 +3004,24 @@ def build_kernel_runners(
             "ffn_activation_bwd": _build_ffn_activation_bwd_runner(ffn_cfg),
         }
     )
-    runners.update(_build_v2x2ssd_forward_runners(v2_cfg))
-    runners.update(_build_v2x2ssd_chunk_increment_bwd_runners(v2_cfg))
-    runners.update(_build_v2x2ssd_chunk_scan_bwd_runners(v2_cfg))
-    runners.update(_build_v2x2ssd_state_passing_bwd_runners(v2_cfg))
+    runners["v2x2ssd_fwd"] = _build_v2x2ssd_forward_runner(v2_cfg)
+    runners["v2x2ssd_bwd"] = _build_v2x2ssd_backward_runner(v2_cfg)
+    runners["bwd_db"] = _build_v2x2ssd_bwd_db_runner(v2_cfg)
+    runners["bwd_dcdr"] = _build_v2x2ssd_bwd_dcdr_runner(v2_cfg)
+    runners["bwd_param_scan"] = _build_v2x2ssd_bwd_param_scan_runner(v2_cfg)
+    runners["bwd_du"] = _build_v2x2ssd_bwd_du_runner(v2_cfg)
+    runners["bwd_dz0"] = _build_v2x2ssd_bwd_dz0_runner(v2_cfg)
+    runners["bwd_state_passing"] = _build_v2x2ssd_bwd_state_passing_runner(v2_cfg)
+    runners["bwd_db_increment_accumulator"] = (
+        _build_v2x2ssd_bwd_db_increment_accumulator_runner(v2_cfg)
+    )
+    runners["bwd_boundary"] = _build_v2x2ssd_bwd_boundary_runner(v2_cfg)
+    runners["bwd_param_increment_accumulator"] = (
+        _build_v2x2ssd_bwd_param_increment_accumulator_runner(v2_cfg)
+    )
+    runners["bwd_du_increment_accumulator"] = (
+        _build_v2x2ssd_bwd_du_increment_accumulator_runner(v2_cfg)
+    )
     return [runners[name] for name in KERNEL_ORDER]
 
 
@@ -1664,27 +3083,28 @@ def build_kernel_runner(
         return _build_ffn_activation_fwd_runner(ffn_cfg)
     if name == "ffn_activation_bwd":
         return _build_ffn_activation_bwd_runner(ffn_cfg)
-    if name in {
-        "chunk_increment_fwd",
-        "state_passing_fwd",
-        "chunk_scan_fwd",
-    }:
-        return _build_v2x2ssd_forward_runners(v2_cfg)[name]
-    if name in {
-        "chunk_increment_bwd_boundary",
-        "chunk_increment_bwd_db",
-        "chunk_increment_bwd_du",
-        "chunk_increment_bwd_param",
-    }:
-        return _build_v2x2ssd_chunk_increment_bwd_runners(v2_cfg)[name]
-    if name in {
-        "chunk_scan_bwd_dz0",
-        "chunk_scan_bwd_du",
-        "chunk_scan_bwd_db",
-        "chunk_scan_bwd_dcdr",
-        "chunk_scan_bwd_param",
-    }:
-        return _build_v2x2ssd_chunk_scan_bwd_runners(v2_cfg)[name]
-    if name in {"state_passing_bwd"}:
-        return _build_v2x2ssd_state_passing_bwd_runners(v2_cfg)[name]
+    if name == "v2x2ssd_fwd":
+        return _build_v2x2ssd_forward_runner(v2_cfg)
+    if name == "v2x2ssd_bwd":
+        return _build_v2x2ssd_backward_runner(v2_cfg)
+    if name == "bwd_db":
+        return _build_v2x2ssd_bwd_db_runner(v2_cfg)
+    if name == "bwd_dcdr":
+        return _build_v2x2ssd_bwd_dcdr_runner(v2_cfg)
+    if name == "bwd_param_scan":
+        return _build_v2x2ssd_bwd_param_scan_runner(v2_cfg)
+    if name == "bwd_du":
+        return _build_v2x2ssd_bwd_du_runner(v2_cfg)
+    if name == "bwd_dz0":
+        return _build_v2x2ssd_bwd_dz0_runner(v2_cfg)
+    if name == "bwd_state_passing":
+        return _build_v2x2ssd_bwd_state_passing_runner(v2_cfg)
+    if name == "bwd_db_increment_accumulator":
+        return _build_v2x2ssd_bwd_db_increment_accumulator_runner(v2_cfg)
+    if name == "bwd_boundary":
+        return _build_v2x2ssd_bwd_boundary_runner(v2_cfg)
+    if name == "bwd_param_increment_accumulator":
+        return _build_v2x2ssd_bwd_param_increment_accumulator_runner(v2_cfg)
+    if name == "bwd_du_increment_accumulator":
+        return _build_v2x2ssd_bwd_du_increment_accumulator_runner(v2_cfg)
     raise KeyError(f"Unknown kernel runner: {name}")

@@ -1,9 +1,9 @@
-"""CuTe forward kernel for the ``v2x2ssd`` chunk-scan stage.
+"""CuTe forward chunk-scan kernel for ``v2x2ssd``.
 
-``ChunkScanFwdAmpere`` is the live Ampere tensor-core implementation used by
+``ChunkScanFwdAmpere`` is the Ampere tensor-core implementation used by
 the forward path. It reconstructs prefix magnitude/phase metadata from ``M``,
 accumulates the off-term from ``Z0``, runs the two diagonal scan passes using
-the two complex taps in ``K``, and writes the stage output ``Out``.
+the two complex taps in ``K``, and writes the output tile ``Out``.
 
 Tensor contracts:
 
@@ -18,7 +18,7 @@ Tensor contracts:
 - ``Z0``: ``(BHC, P, 1, D)`` fp32 packed complex initial state
 - ``U_prev0``: ``(BH, P)`` fp16/bf16 chunk-0 boundary value row
 - ``B_prev0``: ``(BG, D)`` fp16/bf16 chunk-0 boundary key row
-- ``Out``: ``(BHC, L, 1, P)`` fp16/bf16/fp32 stage output
+- ``Out``: ``(BHC, L, 1, P)`` fp16/bf16/fp32 output tile
 
 The trailing ``D`` dimension stores packed complex pairs, so ``D`` must be
 even and conceptually corresponds to ``2 * N``.
@@ -32,6 +32,7 @@ import torch
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
 LOG2_E = 1.4426950408889634
@@ -414,7 +415,7 @@ class ChunkScanFwdAmpere:
             )
         # All warps must finish consuming the staged shared tiles before the
         # caller can repopulate the same storage for the next slice.
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _make_copy_column_predicate(
@@ -533,7 +534,7 @@ class ChunkScanFwdAmpere:
             )
         # The V tile aliases the main shared staging buffer in the fast path,
         # so do not let later stages overwrite it until every warp is done.
-        cute.arch.barrier()
+        pipeline.sync()
 
     def _make_accumulator_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
@@ -823,7 +824,7 @@ class ChunkScanFwdAmpere:
             prefix_state.warp_log_total[warp] = logp
             prefix_state.warp_phase_total[warp, 0] = phase_re
             prefix_state.warp_phase_total[warp, 1] = phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
         # Per the Hopper diagnosis for Issue #9, the inter-warp shuffle-based
         # exclusive scan in this block can trigger the H100 illegal-address fault
@@ -853,7 +854,7 @@ class ChunkScanFwdAmpere:
                 running_phase_re = next_running_phase_re
                 running_phase_im = next_running_phase_im
 
-        cute.arch.barrier()
+        pipeline.sync()
 
         warp_log_offset = prefix_state.warp_log_offset[warp]
         warp_phase_re_offset = prefix_state.warp_phase_offset[warp, 0]
@@ -872,7 +873,7 @@ class ChunkScanFwdAmpere:
             prefix_state.s_phase_re[seq_idx] = phase_re
             prefix_state.s_phase_im[seq_idx] = phase_im
 
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_query_scales_from_prefix(
@@ -931,7 +932,7 @@ class ChunkScanFwdAmpere:
                 s_query[rr, re_col] = qre.to(out_dtype)
                 s_query[rr, im_col] = qim.to(out_dtype)
             idx = idx + self.num_threads
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _load_conjugated_z0_stage(
@@ -978,7 +979,7 @@ class ChunkScanFwdAmpere:
             s_z[rr, cc0 + 2] = f2.to(out_dtype)
             s_z[rr, cc0 + 3] = (-f3).to(out_dtype)
             idx = idx + self.num_threads
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _initialize_tap_phase_from_prefix(
@@ -1009,7 +1010,7 @@ class ChunkScanFwdAmpere:
                 tap_phase_im = tap_im * phase_re - tap_re * phase_im
             s_tap_phase_re[tidx] = tap_phase_re
             s_tap_phase_im[tidx] = tap_phase_im
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _inject_boundary_key_row(
@@ -1042,7 +1043,7 @@ class ChunkScanFwdAmpere:
             s_key[0, re_col] = cutlass.select_(is_chunk0, breb, bre0)
             s_key[0, im_col] = cutlass.select_(is_chunk0, bimb, bim0)
             ii = ii + self.num_threads
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _apply_tap_phase_to_staged_keys(
@@ -1079,7 +1080,7 @@ class ChunkScanFwdAmpere:
             s_key[rr, re_col] = kre.to(out_dtype)
             s_key[rr, im_col] = (-kim).to(out_dtype)
             ii = ii + self.num_threads
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _inject_boundary_value_row(
@@ -1101,7 +1102,7 @@ class ChunkScanFwdAmpere:
                 boundary = mU_prev0[batch_head, ii]
             s_value[0, ii] = cutlass.select_(is_chunk0, boundary, old)
             ii = ii + self.num_threads
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def _accumulate_offterm_from_rotated_z0(
@@ -1144,7 +1145,7 @@ class ChunkScanFwdAmpere:
             )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+            pipeline.sync()
 
             self._rotate_staged_query_tile_from_prefix(
                 offterm_state.s_query,
@@ -1292,7 +1293,7 @@ class ChunkScanFwdAmpere:
         t_acc_reg_output = smem_thr_copy_output.retile(r_output)
         t_acc_smem_output = smem_thr_copy_output.partition_D(s_output)
         cute.copy(smem_copy_atom_output, t_acc_reg_output, t_acc_smem_output)
-        cute.arch.barrier()
+        pipeline.sync()
 
         gmem_thr_copy_output = gmem_tiled_copy_output.get_slice(tidx)
         t_smem_output = gmem_thr_copy_output.partition_S(s_output)
@@ -1849,7 +1850,7 @@ class ChunkScanFwdAmpere:
 
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
-                    cute.arch.barrier()
+                    pipeline.sync()
 
                     self._rotate_staged_query_tile_from_prefix(
                         s_query,
@@ -1951,7 +1952,7 @@ class ChunkScanFwdAmpere:
                         t_value_smem[None, vi, None].fill(0)
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
-                cute.arch.barrier()
+                pipeline.sync()
 
                 if is_prev_boundary_block:
                     self._inject_boundary_value_row(

@@ -1,4 +1,4 @@
-"""CuTe backward kernel for the fused ``v2x2ssd`` state-passing stage.
+"""CuTe backward state-passing kernel for ``v2x2ssd``.
 
 Inputs:
 - ``chunk_starts``: ``(B, H, C, P, D)`` float32 state before each forward chunk
@@ -21,12 +21,13 @@ from dataclasses import dataclass
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 
 from .common import _TileConfig
 
 
 @dataclass(frozen=True)
-class StatePassingLayoutBundle:
+class BwdStatePassingLayoutBundle:
     chunk_state_layout: object
     chunk_multiplier_layout: object
     state_layout: object
@@ -35,7 +36,7 @@ class StatePassingLayoutBundle:
 
 
 @dataclass(frozen=True)
-class StatePassingCopyBundle:
+class BwdStatePassingCopyBundle:
     chunk_start_vector_copy: object
     chunk_start_scalar_copy: object
     d_chunk_start_vector_copy: object
@@ -50,7 +51,7 @@ class StatePassingCopyBundle:
 
 
 @dataclass(frozen=True)
-class StatePassingLaunchBundle:
+class BwdStatePassingLaunchBundle:
     chunk_starts_flat: object
     d_chunk_starts_flat: object
     d_final_flat: object
@@ -59,13 +60,13 @@ class StatePassingLaunchBundle:
     d_chunk_multiplier_flat: object
     d_initial_flat: object
     state_tile_coord_tensor: object
-    layouts: StatePassingLayoutBundle
-    copies: StatePassingCopyBundle
+    layouts: BwdStatePassingLayoutBundle
+    copies: BwdStatePassingCopyBundle
     grid_x: object
     grid_y: object
 
 
-class StatePassingBwdAmpere:
+class BwdStatePassingAmpere:
     """Ampere backward state-passing kernel with fp32 state math."""
 
     def __init__(
@@ -103,16 +104,14 @@ class StatePassingBwdAmpere:
     def _make_shared_storage(self):
         warp_partial_layout = self._warp_partial_layout()
 
+        @cute.struct
         class SharedStorage:
-            pass
-
-        SharedStorage.__annotations__ = {
-            "warp_partial": cute.struct.Align[
+            warp_partial: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(warp_partial_layout)],
                 8,
-            ],
-        }
-        return cute.struct(SharedStorage)
+            ]
+
+        return SharedStorage
 
     def _make_layout_bundle(
         self,
@@ -120,7 +119,7 @@ class StatePassingBwdAmpere:
         batch_head_count: int,
         chunk_count: int,
         state_elem_count: int,
-    ) -> StatePassingLayoutBundle:
+    ) -> BwdStatePassingLayoutBundle:
         chunk_state_layout = cute.make_layout(
             (batch_head_count, chunk_count, state_elem_count),
             stride=(chunk_count * state_elem_count, state_elem_count, 1),
@@ -137,7 +136,7 @@ class StatePassingBwdAmpere:
             (self.num_threads, self.state_elems_per_thread),
             stride=(self.state_elems_per_thread, 1),
         )
-        return StatePassingLayoutBundle(
+        return BwdStatePassingLayoutBundle(
             chunk_state_layout=chunk_state_layout,
             chunk_multiplier_layout=chunk_multiplier_layout,
             state_layout=state_layout,
@@ -162,8 +161,8 @@ class StatePassingBwdAmpere:
         d_initial_dtype: type[cutlass.Numeric],
         d_final_dtype: type[cutlass.Numeric],
         multiplier_dtype: type[cutlass.Numeric],
-    ) -> StatePassingCopyBundle:
-        return StatePassingCopyBundle(
+    ) -> BwdStatePassingCopyBundle:
+        return BwdStatePassingCopyBundle(
             chunk_start_vector_copy=self._make_copy_atom(
                 chunk_start_dtype, self.copy_bits_starts
             ),
@@ -209,7 +208,7 @@ class StatePassingBwdAmpere:
         d_increment: cute.Tensor,
         d_chunk_multiplier: cute.Tensor,
         d_initial: cute.Tensor,
-    ) -> StatePassingLaunchBundle:
+    ) -> BwdStatePassingLaunchBundle:
         batch_size, head_count, chunk_count, state_rows, state_width = d_increment.shape
         batch_head_count = batch_size * head_count
         state_elem_count = state_rows * state_width
@@ -250,7 +249,7 @@ class StatePassingBwdAmpere:
             state_identity, tiler=layouts.state_tile_layout
         )
 
-        return StatePassingLaunchBundle(
+        return BwdStatePassingLaunchBundle(
             chunk_starts_flat=chunk_starts_flat,
             d_chunk_starts_flat=d_chunk_starts_flat,
             d_final_flat=d_final_flat,
@@ -267,7 +266,7 @@ class StatePassingBwdAmpere:
 
     def _make_kernel_invocation(
         self,
-        launch_bundle: StatePassingLaunchBundle,
+        launch_bundle: BwdStatePassingLaunchBundle,
         shared_storage_cls: cutlass.Constexpr,
     ):
         return self.kernel(
@@ -495,7 +494,7 @@ class StatePassingBwdAmpere:
         if lane == cutlass.Int32(0):
             s_warp_partial[warp, 0] = d_chunk_multiplier_partial[0]
             s_warp_partial[warp, 1] = d_chunk_multiplier_partial[1]
-        cute.arch.barrier()
+        pipeline.sync()
         if warp == cutlass.Int32(0) and lane == cutlass.Int32(0):
             total_re = cutlass.Float32(0.0)
             total_im = cutlass.Float32(0.0)
@@ -513,7 +512,7 @@ class StatePassingBwdAmpere:
                 (global_d_chunk_multiplier.iterator + 1).llvm_ptr,
                 total_im,
             )
-        cute.arch.barrier()
+        pipeline.sync()
 
     @cute.jit
     def __call__(

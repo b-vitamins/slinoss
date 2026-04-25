@@ -17,16 +17,16 @@ from .common import (
     TailRowwiseInputInfo,
     _is_cuda_graph_capturing,
     _launchable,
-    _make_layout,
     _make_compile_args,
+    _make_layout,
     _raise_cold_capture_error,
-    _record_tensors_on_current_stream,
     _runtime_alignments,
     _runtime_signature_key,
     _size,
     contiguous_tensor,
     dummy_d_skip,
     dummy_skip_input,
+    launch_tvm_ffi_on_current_stream,
     safe_cast_to_dtype,
     silu,
     torch_to_cutlass_dtype,
@@ -62,7 +62,7 @@ def _grid_shape(*, total_rows: int, warps_per_block: int) -> tuple[int, int, int
 
 
 class MixerTailRowwiseFwdFused:
-    """Host wrapper launching the live fused tail rowwise forward kernel."""
+    """Host wrapper launching the fused tail rowwise forward kernel."""
 
     def __init__(
         self,
@@ -391,8 +391,7 @@ def _run_forward_kernel(
             eps=eps,
         ),
     )
-    compiled(*runtime_artifacts.runtime_args)
-    _record_tensors_on_current_stream(*runtime_artifacts.runtime_args)
+    launch_tvm_ffi_on_current_stream(compiled, *runtime_artifacts.runtime_args)
     return runtime_artifacts.output
 
 

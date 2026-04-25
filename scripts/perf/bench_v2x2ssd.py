@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the canonical v2x2ssd kernels and report CuTe/reference speedups."""
+"""Benchmark the canonical v2x2ssd logical forward/backward ops."""
 
 from __future__ import annotations
 
@@ -24,10 +24,9 @@ from _common import (  # noqa: E402
     DEFAULT_P,
     DEFAULT_T,
     DIRECTIONS,
-    STAGES,
     PerfConfig,
     benchmark_instrumented,
-    build_callable,
+    build_v2x2ssd_callable,
     dtype_from_str,
     ensure_cuda,
     format_header,
@@ -37,12 +36,6 @@ from _common import (  # noqa: E402
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stage",
-        choices=("all", *STAGES),
-        default="all",
-        help="Kernel stage to benchmark.",
-    )
     parser.add_argument(
         "--direction",
         choices=("both", *DIRECTIONS),
@@ -91,7 +84,6 @@ def main() -> int:
         device=args.device,
         seed=args.seed,
     )
-    stages = STAGES if args.stage == "all" else (args.stage,)
     directions = DIRECTIONS if args.direction == "both" else (args.direction,)
     backends = ("reference", "cute") if args.backend == "both" else (args.backend,)
 
@@ -99,111 +91,103 @@ def main() -> int:
     region_rows: list[dict[str, Any]] = []
     cache_rows: list[dict[str, Any]] = []
     for direction in directions:
-        for stage in stages:
-            by_backend: dict[str, dict[str, Any]] = {}
-            for backend in backends:
-                fn = build_callable(
-                    cfg, stage=stage, direction=direction, backend=backend
-                )
-                stats = benchmark_instrumented(
-                    fn,
-                    device=cfg.torch_device,
-                    warmup=args.warmup,
-                    iterations=args.iterations,
-                    repeat=args.repeat,
-                )
-                by_backend[backend] = stats
+        by_backend: dict[str, dict[str, Any]] = {}
+        for backend in backends:
+            fn = build_v2x2ssd_callable(cfg, direction=direction, backend=backend)
+            stats = benchmark_instrumented(
+                fn,
+                device=cfg.torch_device,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeat=args.repeat,
+            )
+            by_backend[backend] = stats
 
-            ref_mean = (
-                float(by_backend["reference"]["mean_ms"])
-                if "reference" in by_backend
-                else None
-            )
-            cute_mean = (
-                float(by_backend["cute"]["mean_ms"]) if "cute" in by_backend else None
-            )
-            speedup = (
-                ref_mean / cute_mean
-                if ref_mean is not None and cute_mean is not None and cute_mean > 0.0
-                else None
-            )
+        ref_mean = (
+            float(by_backend["reference"]["mean_ms"])
+            if "reference" in by_backend
+            else None
+        )
+        cute_mean = (
+            float(by_backend["cute"]["mean_ms"]) if "cute" in by_backend else None
+        )
+        speedup = (
+            ref_mean / cute_mean
+            if ref_mean is not None and cute_mean is not None and cute_mean > 0.0
+            else None
+        )
 
-            for backend in backends:
-                backend_stats = by_backend[backend]
-                rows.append(
-                    {
-                        "direction": direction,
-                        "stage": stage,
-                        "backend": backend,
-                        "mean_ms": float(backend_stats["mean_ms"]),
-                        "median_ms": float(backend_stats["median_ms"]),
-                        "stdev_ms": float(backend_stats["stdev_ms"]),
-                        "speedup_vs_reference": speedup if backend == "cute" else 1.0,
-                        "samples_ms": backend_stats["samples_ms"],
-                    }
-                )
-                region_summaries = backend_stats.get("region_summaries", {})
-                if isinstance(region_summaries, dict):
-                    for region, region_stats in sorted(region_summaries.items()):
-                        if not isinstance(region_stats, dict):
-                            continue
-                        region_rows.append(
-                            {
-                                "direction": direction,
-                                "stage": stage,
-                                "backend": backend,
-                                "region": region,
-                                "mean_ms": float(region_stats["mean_ms"]),
-                                "median_ms": float(region_stats["median_ms"]),
-                                "stdev_ms": float(region_stats["stdev_ms"]),
-                            }
-                        )
-                cache_events = backend_stats.get("cache_events", {})
-                if isinstance(cache_events, dict):
-                    for cache_label, counts in sorted(cache_events.items()):
-                        if not isinstance(counts, dict):
-                            continue
-                        cache_rows.append(
-                            {
-                                "direction": direction,
-                                "stage": stage,
-                                "backend": backend,
-                                "cache": cache_label,
-                                "hits": int(counts.get("hits", 0)),
-                                "misses": int(counts.get("misses", 0)),
-                            }
-                        )
+        for backend in backends:
+            backend_stats = by_backend[backend]
+            rows.append(
+                {
+                    "direction": direction,
+                    "backend": backend,
+                    "mean_ms": float(backend_stats["mean_ms"]),
+                    "median_ms": float(backend_stats["median_ms"]),
+                    "stdev_ms": float(backend_stats["stdev_ms"]),
+                    "speedup_vs_reference": speedup if backend == "cute" else 1.0,
+                    "samples_ms": backend_stats["samples_ms"],
+                }
+            )
+            region_summaries = backend_stats.get("region_summaries", {})
+            if isinstance(region_summaries, dict):
+                for region, region_stats in sorted(region_summaries.items()):
+                    if not isinstance(region_stats, dict):
+                        continue
+                    region_rows.append(
+                        {
+                            "direction": direction,
+                            "backend": backend,
+                            "region": region,
+                            "mean_ms": float(region_stats["mean_ms"]),
+                            "median_ms": float(region_stats["median_ms"]),
+                            "stdev_ms": float(region_stats["stdev_ms"]),
+                        }
+                    )
+            cache_events = backend_stats.get("cache_events", {})
+            if isinstance(cache_events, dict):
+                for cache_label, counts in sorted(cache_events.items()):
+                    if not isinstance(counts, dict):
+                        continue
+                    cache_rows.append(
+                        {
+                            "direction": direction,
+                            "backend": backend,
+                            "cache": cache_label,
+                            "hits": int(counts.get("hits", 0)),
+                            "misses": int(counts.get("misses", 0)),
+                        }
+                    )
 
     print(format_header(cfg))
-    print("| direction | stage | backend | mean_ms | median_ms | stdev_ms | vs_ref |")
-    print("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+    print("| direction | backend | mean_ms | median_ms | stdev_ms | vs_ref |")
+    print("| --- | --- | ---: | ---: | ---: | ---: |")
     for row in rows:
         vs_ref = row["speedup_vs_reference"]
         vs_ref_str = "-" if vs_ref is None else f"{float(vs_ref):.3f}x"
         print(
-            f"| {row['direction']} | {row['stage']} | {row['backend']} | "
+            f"| {row['direction']} | {row['backend']} | "
             f"{float(row['mean_ms']):.6f} | {float(row['median_ms']):.6f} | "
             f"{float(row['stdev_ms']):.6f} | {vs_ref_str} |"
         )
     if region_rows:
         print()
-        print(
-            "| direction | stage | backend | region | mean_ms | median_ms | stdev_ms |"
-        )
-        print("| --- | --- | --- | --- | ---: | ---: | ---: |")
+        print("| direction | backend | region | mean_ms | median_ms | stdev_ms |")
+        print("| --- | --- | --- | ---: | ---: | ---: |")
         for row in region_rows:
             print(
-                f"| {row['direction']} | {row['stage']} | {row['backend']} | "
+                f"| {row['direction']} | {row['backend']} | "
                 f"{row['region']} | {float(row['mean_ms']):.6f} | "
                 f"{float(row['median_ms']):.6f} | {float(row['stdev_ms']):.6f} |"
             )
     if cache_rows:
         print()
-        print("| direction | stage | backend | cache | hits | misses |")
-        print("| --- | --- | --- | --- | ---: | ---: |")
+        print("| direction | backend | cache | hits | misses |")
+        print("| --- | --- | --- | ---: | ---: |")
         for row in cache_rows:
             print(
-                f"| {row['direction']} | {row['stage']} | {row['backend']} | "
+                f"| {row['direction']} | {row['backend']} | "
                 f"{row['cache']} | {int(row['hits'])} | {int(row['misses'])} |"
             )
 
