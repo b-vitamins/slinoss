@@ -28,7 +28,7 @@ from typing import Annotated, Any, Final
 from slinoss.perf.budget import BucketDelta, BudgetReport
 from slinoss.perf.ceiling import Ceilings, ClassVerdict
 from slinoss.perf.device import DeviceInfo
-from slinoss.perf.dispersion import GrowthRow, RepeatRow
+from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
 from slinoss.perf.memory import MemoryPeaks, SavedStorages
 from slinoss.perf.ncu import KernelCounters
 from slinoss.perf.nsys import NsysTrace
@@ -190,6 +190,7 @@ class Report:
         deltas: Bucket-level comparison against a prior report.
         growth: Dispersion against the sample count.
         scatter: Run-to-run median scatter against the reported floor.
+        comparisons: Paired A/B verdicts, each from one loop.
         notes: Free-form lines appended verbatim.
     """
 
@@ -207,6 +208,7 @@ class Report:
     deltas: tuple[BucketDelta, ...] = ()
     growth: tuple[GrowthRow, ...] = ()
     scatter: RepeatRow | None = None
+    comparisons: tuple[PairedRow, ...] = ()
     notes: tuple[str, ...] = ()
 
 
@@ -387,6 +389,8 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
         lines += _section("dispersion against sample count", report.growth)
     if report.scatter is not None:
         lines += _section("run-to-run median scatter", [report.scatter])
+    if report.comparisons:
+        lines += _section("paired comparisons", report.comparisons)
     if report.notes:
         lines += ["## notes", "", *[f"- {note}" for note in report.notes], ""]
     return "\n".join(lines).rstrip() + "\n"

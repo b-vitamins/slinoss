@@ -36,6 +36,14 @@ launching one small kernel per iteration spends most of its wall enqueueing, and
 20 percent coverage is the honest reading. So the share is reported and not
 enforced. Above 100 percent it is impossible, since the wall brackets every event
 it is compared against, and that is enforced.
+
+Comparing two implementations takes one loop, not two. :func:`measure_paired`
+runs both arms inside every iteration and swaps which goes first on alternate
+iterations, so each arm runs first exactly half the time and the verdict comes
+off the per-iteration differences. Two separate loops cannot do this: their
+medians scatter further than either loop's own floor, measured on this fleet at
+0.234% against a 0.211% budget on a whole step and 21.250% against 10.198% on
+the smallest shape. See :func:`slinoss.perf.dispersion.paired`.
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ import torch
 from torch import Tensor
 
 from slinoss.perf.device import ClockPolicy, clock_policy, device_ordinal
+from slinoss.perf.dispersion import PairedRow, paired
 from slinoss.perf.units import (
     INVARIANT,
     MEDIAN,
@@ -71,6 +80,7 @@ from slinoss.perf.units import (
 __all__ = [
     "MAX_TIMER_COVERAGE_PCT",
     "UNATTRIBUTED",
+    "PairedMeasurement",
     "RegionRecorder",
     "RegionTiming",
     "Throughput",
@@ -79,6 +89,7 @@ __all__ = [
     "active_recorder",
     "call_region",
     "measure",
+    "measure_paired",
     "on_device",
     "parent_of",
     "region",
@@ -651,6 +662,101 @@ def measure(
         regions=regions,
         root_sum_duration_us=Microseconds(sum(roots)),
         timer_coverage_pct=coverage,
+    )
+
+
+@dataclass(frozen=True)
+class PairedMeasurement:
+    """One loop that measured two arms against each other.
+
+    Attributes:
+        timed: The loop. Its two root regions are the arms, and its total covers
+            both of them plus whatever sits between.
+        comparison: The verdict on the per-iteration differences.
+    """
+
+    timed: Timed
+    comparison: PairedRow
+
+
+def measure_paired(
+    a_label: str,
+    a: Callable[[], object],
+    b_label: str,
+    b: Callable[[], object],
+    *,
+    label: str,
+    iters: int,
+    warmup: int,
+    device: torch.device,
+    clocks: ClockPolicy | None = None,
+) -> PairedMeasurement:
+    """Measure two arms in one loop and judge the difference.
+
+    Each iteration runs both arms, in an order that swaps every iteration, so
+    each arm runs first exactly half the time and neither pays the whole of
+    whatever the first position costs. Every sample is still one real call.
+
+    Args:
+        a_label: Region label for the baseline arm.
+        a: The baseline callable. Takes no arguments.
+        b_label: Region label for the arm under test.
+        b: The callable under test. Takes no arguments.
+        label: What is being compared.
+        iters: Timed iterations. Even, so the order swap balances. Each iteration
+            yields one sample per arm.
+        warmup: Untimed iterations first. Its parity does not matter: the swap
+            balances over the timed iterations however many precede them.
+        device: Device to time on.
+        clocks: Clock policy to stamp. Probed if omitted on a CUDA device.
+
+    Returns:
+        The loop and the verdict.
+
+    Raises:
+        ValueError: If the two labels are equal, which would sum both arms into
+            one region and compare it against itself, or if ``iters`` is odd,
+            which leaves one iteration's order unbalanced by any other.
+        TimerError: As :func:`measure`.
+    """
+    if a_label == b_label:
+        raise ValueError(
+            f"measure_paired needs two distinct labels; both arms are {a_label!r}, "
+            f"so the recorder would sum them into one region"
+        )
+    if iters % 2 != 0:
+        raise ValueError(
+            f"measure_paired needs an even iters so each arm runs first exactly "
+            f"half the time, got {iters}"
+        )
+    arms = ((a_label, a), (b_label, b))
+    index = 0
+
+    def body() -> None:
+        nonlocal index
+        order = arms if index % 2 == 0 else arms[::-1]
+        index += 1
+        for name, fn in order:
+            with region(name):
+                fn()
+
+    timed = measure(
+        body,
+        label=label,
+        iters=iters,
+        warmup=warmup,
+        device=device,
+        clocks=clocks,
+    )
+    return PairedMeasurement(
+        timed=timed,
+        comparison=paired(
+            label,
+            a_label,
+            timed.region(a_label).spread.samples_duration_us,
+            b_label,
+            timed.region(b_label).spread.samples_duration_us,
+        ),
     )
 
 

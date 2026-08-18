@@ -5,13 +5,18 @@ inputs and a failure names the statistic rather than the clock. The outlier seri
 is the point of the module: one 400 us stall pins the full range at every prefix
 while the confidence interval on the median closes by two orders of magnitude over
 the same samples.
+
+The paired series is the point of :func:`slinoss.perf.dispersion.paired`: an arm
+drifting by 62 percent of its own median still resolves a 0.69 percent difference
+against the other arm, because the drift is common to the pair and cancels out of
+the difference.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from slinoss.perf.dispersion import growth, repeats
+from slinoss.perf.dispersion import growth, paired, repeats
 from slinoss.perf.units import (
     CONFIDENCE_PCT,
     MIN_RESOLVING_SAMPLES,
@@ -197,3 +202,99 @@ def test_the_floor_cannot_hold_below_nominal_coverage() -> None:
 def test_repeats_rejects_fewer_than_two_runs(count: int) -> None:
     with pytest.raises(ValueError, match="repeats needs at least two runs"):
         repeats("step", [run_wide()] * count)
+
+
+# ---------------------------------------------------------------------------
+# paired
+# ---------------------------------------------------------------------------
+
+
+def drifting() -> list[Microseconds]:
+    """Ten samples climbing from 100 to 190 us. Median 145, range 90."""
+    return us(*(100.0 + 10.0 * i for i in range(10)))
+
+
+def test_pairing_resolves_a_delta_far_below_either_arm_own_floor() -> None:
+    slow = drifting()
+    fast = us(*(v + 1.0 for v in slow))
+    row = paired("scan", "reference", slow, "cute", fast)
+    assert row.label == "scan"
+    assert row.a_label == "reference"
+    assert row.b_label == "cute"
+    assert row.sample_count == 10
+    assert row.a_median_duration_us == 145.0
+    assert row.b_median_duration_us == 146.0
+    assert row.delta_median_duration_us == 1.0
+    assert row.delta_pct == pytest.approx(100.0 / 145.0)
+    assert row.speedup_ratio == pytest.approx(145.0 / 146.0)
+    assert row.resolves
+    # Neither arm alone can see this. Each drifts across 62 percent of its own
+    # median and carries a 24 percent floor, against a difference of 0.69 percent.
+    # The drift is shared by the pair, so it leaves the difference untouched.
+    own = Spread.of(slow)
+    assert own.spread_pct == pytest.approx(100.0 * 90.0 / 145.0)
+    assert own.resolution_pct == pytest.approx(100.0 * 35.0 / 145.0)
+    assert not own.resolves(row.delta_pct)
+
+
+def test_the_interval_is_two_of_the_differences_and_carries_their_unit() -> None:
+    row = paired("scan", "a", drifting(), "b", us(*(v + 1.0 for v in drifting())))
+    # Rank two of ten, the tightest interval reaching nominal coverage.
+    assert row.coverage_pct == 97.8515625
+    assert row.delta_low_duration_us == 1.0
+    assert row.delta_high_duration_us == 1.0
+
+
+def test_an_interval_straddling_zero_resolves_nothing() -> None:
+    flat = us(*([100.0] * 8))
+    alternating = us(105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0)
+    row = paired("scan", "a", flat, "b", alternating)
+    assert row.a_median_duration_us == 100.0
+    assert row.b_median_duration_us == 100.0
+    assert row.delta_median_duration_us == 0.0
+    assert row.speedup_ratio == 1.0
+    # The two arms swing 10 us against each other in both directions, so the
+    # interval covers zero and the median inside it means nothing.
+    assert row.delta_low_duration_us == -5.0
+    assert row.delta_high_duration_us == 5.0
+    assert not row.resolves
+
+
+def test_a_consistent_difference_below_nominal_coverage_resolves_nothing() -> None:
+    count = MIN_RESOLVING_SAMPLES - 1
+    row = paired("scan", "a", us(*([100.0] * count)), "b", us(*([50.0] * count)))
+    # Every pair agrees that the second arm is half the cost, and the interval is
+    # one point wide. Too few pairs to bound a median at nominal coverage, so the
+    # verdict refuses; the figures still print.
+    assert row.delta_median_duration_us == -50.0
+    assert row.delta_pct == -50.0
+    assert row.speedup_ratio == 2.0
+    assert row.coverage_pct < CONFIDENCE_PCT
+    assert not row.resolves
+
+
+@pytest.mark.parametrize("arm", ["a", "b"])
+def test_paired_rejects_an_empty_arm(arm: str) -> None:
+    empty: list[Microseconds] = []
+    one = us(100.0)
+    with pytest.raises(ValueError, match="at least one sample in each arm"):
+        paired(
+            "scan", "a", empty if arm == "a" else one, "b", one if arm == "a" else empty
+        )
+
+
+def test_paired_rejects_arms_of_different_lengths() -> None:
+    # Unequal counts mean the two arms did not run in the same iterations, so
+    # element i of one is not the partner of element i of the other.
+    with pytest.raises(ValueError, match="these are not pairs"):
+        paired("scan", "a", us(100.0, 100.0, 100.0), "b", us(90.0, 90.0, 90.0, 90.0))
+
+
+@pytest.mark.parametrize("arm", ["a", "b"])
+def test_paired_rejects_a_zero_median(arm: str) -> None:
+    zero = us(0.0, 0.0)
+    one = us(100.0, 100.0)
+    with pytest.raises(ValueError, match="nonzero median in each arm"):
+        paired(
+            "scan", "a", zero if arm == "a" else one, "b", one if arm == "a" else zero
+        )

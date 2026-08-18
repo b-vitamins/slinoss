@@ -35,6 +35,7 @@ from slinoss.perf.units import (
     Spread,
     aggregate,
     gbs_from_bytes_us,
+    median_ci,
     mib_from_bytes,
     ms_from_us,
     pct_of,
@@ -654,6 +655,43 @@ def test_min_resolving_samples_is_derived_from_the_confidence() -> None:
     # coverage at this count and misses it at one sample fewer.
     assert units_mod._sign_coverage_pct(MIN_RESOLVING_SAMPLES, 1) >= CONFIDENCE_PCT
     assert units_mod._sign_coverage_pct(MIN_RESOLVING_SAMPLES - 1, 1) < CONFIDENCE_PCT
+
+
+def test_median_ci_returns_two_of_the_samples() -> None:
+    # Rank 2 of ten, so the bounds are the second and the ninth in order. They are
+    # samples, not derived quantities, so they carry the unit and need no scale.
+    low, high, coverage = median_ci(
+        us(104.0, 92.0, 96.0, 100.0, 108.0, 100.0, 99.0, 101.0, 100.0, 100.0)
+    )
+    assert (low, high) == (96.0, 104.0)
+    assert coverage == units_mod._sign_coverage_pct(10, 2)
+
+
+def test_median_ci_widens_to_the_whole_range_below_nominal_coverage() -> None:
+    # Five samples admit no interval at the nominal coverage, so the widest one
+    # they have is returned with the coverage it really has.
+    low, high, coverage = median_ci(us(30.0, 10.0, 40.0, 100.0, 20.0))
+    assert (low, high) == (10.0, 100.0)
+    assert coverage == 93.75
+    assert coverage < CONFIDENCE_PCT
+
+
+def test_median_ci_is_the_one_definition_behind_a_spread() -> None:
+    samples = stalled(20)
+    low, high, coverage = median_ci(samples)
+    s = Spread.of(samples)
+    assert s.resolution_pct == pct_of(0.5 * (high - low), s.median_duration_us)
+    assert s.coverage_pct == coverage
+
+
+def test_median_ci_takes_samples_in_any_order() -> None:
+    assert median_ci(us(3.0, 1.0, 2.0)) == median_ci(us(1.0, 2.0, 3.0))
+
+
+def test_median_ci_rejects_an_empty_sample_list() -> None:
+    empty: list[Microseconds] = []
+    with pytest.raises(ValueError, match="median_ci needs at least one sample"):
+        median_ci(empty)
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import itertools
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 import pytest
@@ -27,6 +27,7 @@ from slinoss.perf.timing import (
     active_recorder,
     call_region,
     measure,
+    measure_paired,
     on_device,
     parent_of,
     region,
@@ -174,6 +175,104 @@ def test_measure_refuses_events_that_outlast_the_loop_around_them(
 
     with pytest.raises(TimerError, match=r"do not fit in the interval"):
         measure(body, label="step", iters=3, warmup=0, device=CPU)
+
+
+def two_arms(
+    slow_s: float,
+) -> tuple[list[str], Callable[[], None], Callable[[], None]]:
+    """Two sleeping arms and the call order they record.
+
+    Args:
+        slow_s: Sleep for the second arm. The first sleeps ``SLEEP_S``.
+
+    Returns:
+        The order list, the fast arm, and the slow arm.
+    """
+    order: list[str] = []
+
+    def fast() -> None:
+        order.append("fast")
+        time.sleep(SLEEP_S)
+
+    def slow() -> None:
+        order.append("slow")
+        time.sleep(slow_s)
+
+    return order, fast, slow
+
+
+def test_measure_paired_runs_both_arms_every_iteration_and_swaps_the_order() -> None:
+    order, fast, slow = two_arms(SLEEP_S)
+    out = measure_paired(
+        "fast", fast, "slow", slow, label="scan", iters=4, warmup=0, device=CPU
+    )
+    # Each arm goes first in exactly half the iterations, so neither pays the
+    # whole of whatever the first position costs.
+    assert order == ["fast", "slow", "slow", "fast"] * 2
+    assert [t.label for t in out.timed.regions] == ["fast", "slow"]
+    assert [t.spread.sample_count for t in out.timed.regions] == [4, 4]
+    assert out.comparison.sample_count == 4
+    assert out.comparison.label == "scan"
+    assert out.comparison.a_label == "fast"
+    assert out.comparison.b_label == "slow"
+    # Both arms are roots of the tree, so the one loop owns both of them.
+    assert [t.parent for t in out.timed.regions] == ["", ""]
+
+
+def test_measure_paired_warmup_parity_leaves_the_swap_balanced() -> None:
+    order, fast, slow = two_arms(SLEEP_S)
+    measure_paired(
+        "fast", fast, "slow", slow, label="scan", iters=4, warmup=1, device=CPU
+    )
+    warm, timed = order[:2], order[2:]
+    # An odd warmup hands the first timed iteration to the other arm. Over an even
+    # iteration count each arm still leads half of them, so the parity of the
+    # warmup does not enter the result.
+    assert warm == ["fast", "slow"]
+    assert timed[::2].count("fast") == timed[::2].count("slow") == 2
+
+
+def test_measure_paired_resolves_a_difference_between_the_arms() -> None:
+    order, fast, slow = two_arms(10.0 * SLEEP_S)
+    out = measure_paired(
+        "fast", fast, "slow", slow, label="scan", iters=6, warmup=0, device=CPU
+    )
+    assert len(order) == 12
+    row = out.comparison
+    assert row.delta_median_duration_us > 0.0
+    assert row.speedup_ratio < 1.0
+    assert row.delta_low_duration_us > 0.0
+    assert row.resolves
+
+
+def test_measure_paired_rejects_one_label_for_both_arms() -> None:
+    with pytest.raises(ValueError, match="two distinct labels"):
+        measure_paired(
+            "arm",
+            lambda: None,
+            "arm",
+            lambda: None,
+            label="scan",
+            iters=2,
+            warmup=0,
+            device=CPU,
+        )
+
+
+@pytest.mark.parametrize("iters", [1, 3])
+def test_measure_paired_rejects_an_odd_iteration_count(iters: int) -> None:
+    # An odd count leaves one iteration whose order no other iteration balances.
+    with pytest.raises(ValueError, match="even iters"):
+        measure_paired(
+            "fast",
+            lambda: None,
+            "slow",
+            lambda: None,
+            label="scan",
+            iters=iters,
+            warmup=0,
+            device=CPU,
+        )
 
 
 def test_on_device_yields_without_selecting_a_device_off_cuda() -> None:

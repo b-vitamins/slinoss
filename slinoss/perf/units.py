@@ -77,6 +77,7 @@ __all__ = [
     "TokensPerSecond",
     "aggregate",
     "gbs_from_bytes_us",
+    "median_ci",
     "mib_from_bytes",
     "ms_from_us",
     "pct_of",
@@ -496,6 +497,35 @@ misses the nominal coverage, so no delta resolves at any size.
 """
 
 
+F = TypeVar("F", bound=float)
+
+
+def median_ci(samples: Sequence[F]) -> tuple[F, F, Percent]:
+    """Confidence interval on the median, read off the order statistics.
+
+    The interval is two of the samples, so it carries their unit and needs no
+    scale, no variance, and no distribution. The one below is the bound a delta
+    is judged against; see :attr:`Spread.resolution_pct`.
+
+    Args:
+        samples: At least one sample. Order does not matter.
+
+    Returns:
+        The lower bound, the upper bound, and the exact coverage of that interval.
+        The rank is the tightest one still reaching :data:`CONFIDENCE_PCT`, or 1
+        when no rank reaches it, and the returned coverage is what it says.
+
+    Raises:
+        ValueError: If ``samples`` is empty.
+    """
+    if not samples:
+        raise ValueError("median_ci needs at least one sample")
+    ordered = sorted(samples)
+    count = len(ordered)
+    rank = _median_ci_rank(count)
+    return ordered[rank - 1], ordered[count - rank], _sign_coverage_pct(count, rank)
+
+
 @dataclass(frozen=True)
 class Spread(PerfRecord):
     """A timed quantity with the dispersion that bounds what it can resolve.
@@ -574,8 +604,8 @@ class Spread(PerfRecord):
         mid = Microseconds(median(ordered))
         low = ordered[0]
         high = ordered[-1]
-        rank = _median_ci_rank(len(ordered))
-        width = ordered[len(ordered) - rank] - ordered[rank - 1]
+        ci_low, ci_high, coverage = median_ci(ordered)
+        width = ci_high - ci_low
         # Identical samples have zero spread whatever the median is, including a
         # median that rounds to zero. Only a nonzero span needs a denominator.
         return cls(
@@ -584,7 +614,7 @@ class Spread(PerfRecord):
             max_duration_us=high,
             spread_pct=Percent(0.0) if high == low else pct_of(high - low, mid),
             resolution_pct=Percent(0.0) if width == 0.0 else pct_of(0.5 * width, mid),
-            coverage_pct=_sign_coverage_pct(len(ordered), rank),
+            coverage_pct=coverage,
             sample_count=Count(len(ordered)),
             samples_duration_us=tuple(samples),
         )

@@ -55,7 +55,14 @@ from slinoss.perf.device import (
     contention,
     device_info,
 )
-from slinoss.perf.dispersion import GrowthRow, RepeatRow, growth, repeats
+from slinoss.perf.dispersion import (
+    GrowthRow,
+    PairedRow,
+    RepeatRow,
+    growth,
+    paired,
+    repeats,
+)
 from slinoss.perf.memory import (
     MemoryPeaks,
     RegionSaved,
@@ -88,6 +95,7 @@ from slinoss.perf.report import (
 )
 from slinoss.perf.timing import (
     MAX_TIMER_COVERAGE_PCT,
+    PairedMeasurement,
     RegionRecorder,
     RegionTiming,
     Throughput,
@@ -96,6 +104,7 @@ from slinoss.perf.timing import (
     active_recorder,
     call_region,
     measure,
+    measure_paired,
     on_device,
     region,
 )
@@ -166,6 +175,8 @@ __all__ = [
     "NcuTable",
     "NsysKernel",
     "NsysTrace",
+    "PairedMeasurement",
+    "PairedRow",
     "Percent",
     "PerfRecord",
     "Ratio",
@@ -202,8 +213,10 @@ __all__ = [
     "kernel_counters",
     "markdown",
     "measure",
+    "measure_paired",
     "memory_peaks",
     "on_device",
+    "paired",
     "peak_window",
     "profiler_window",
     "rank",

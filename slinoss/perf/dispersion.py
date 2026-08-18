@@ -16,12 +16,23 @@ independent measurements of identical work. Two medians are distinguishable only
 when they lie further apart than the sum of their two half-widths, so a floor
 under half that scatter is not a floor, and this is the only check that can say
 so.
+
+A within-run half-width does not bound a between-run difference, and on this
+fleet it does not: repeated identical work scatters further than twice the floor
+at several shapes. Both statistics above are within-run, so neither licenses a
+delta taken from two separate runs, whatever the iteration count.
+:func:`paired` is the way out. It compares two implementations inside one run,
+alternating which goes first, and judges the per-iteration difference rather than
+the difference of two medians. Whatever drifts between runs is common to both
+arms of a pair and cancels; what is left is the difference, and its interval
+comes off the same order statistics with no scale and no distribution assumed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from statistics import median
 from typing import Annotated
 
 from slinoss.perf.units import (
@@ -32,13 +43,19 @@ from slinoss.perf.units import (
     Microseconds,
     Percent,
     PerfRecord,
+    Ratio,
     Spread,
+    median_ci,
+    pct_of,
+    ratio_of,
 )
 
 __all__ = [
     "GrowthRow",
+    "PairedRow",
     "RepeatRow",
     "growth",
+    "paired",
     "repeats",
 ]
 
@@ -105,6 +122,117 @@ class RepeatRow(PerfRecord):
     coverage_pct: Annotated[Percent, MEDIAN]
     spread_pct: Annotated[Percent, MEDIAN]
     floor_holds: bool
+
+
+@dataclass(frozen=True)
+class PairedRow(PerfRecord):
+    """Two implementations measured against each other inside one run.
+
+    The samples are paired by iteration, so the statistic is the median of the
+    per-iteration differences and not the difference of two medians. A clock
+    excursion, a cache eviction, or another tenant arriving hits both arms of a
+    pair and cancels out of the difference. Nothing between runs enters at all.
+
+    The interval on that median is two of the differences themselves, so the
+    verdict is a comparison against zero in the unit the differences are measured
+    in. A speedup is claimed only when the whole interval sits on one side of
+    zero.
+
+    Attributes:
+        label: What was compared.
+        a_label: The baseline arm.
+        b_label: The arm under test.
+        sample_count: Pairs. One per iteration.
+        a_median_duration_us: Median of the baseline arm.
+        b_median_duration_us: Median of the arm under test.
+        delta_median_duration_us: Median of ``b - a`` over the pairs. Negative
+            means the arm under test is faster.
+        delta_low_duration_us: Lower bound of the interval on that median.
+        delta_high_duration_us: Upper bound of the interval on that median.
+        coverage_pct: Exact coverage of that interval. Short of
+            :data:`slinoss.perf.units.CONFIDENCE_PCT` nothing resolves, however
+            far the interval sits from zero.
+        delta_pct: The median difference over the baseline median.
+        speedup_ratio: Baseline median over the median under test. Above one means
+            faster.
+        resolves: True only if the interval reaches nominal coverage and excludes
+            zero. This is the only field that licenses a claim.
+    """
+
+    label: str
+    a_label: str
+    b_label: str
+    sample_count: Annotated[Count, SUM]
+    a_median_duration_us: Annotated[Microseconds, MEDIAN]
+    b_median_duration_us: Annotated[Microseconds, MEDIAN]
+    delta_median_duration_us: Annotated[Microseconds, MEDIAN]
+    delta_low_duration_us: Annotated[Microseconds, MEDIAN]
+    delta_high_duration_us: Annotated[Microseconds, MEDIAN]
+    coverage_pct: Annotated[Percent, MEDIAN]
+    delta_pct: Annotated[Percent, MEDIAN]
+    speedup_ratio: Annotated[Ratio, MEDIAN]
+    resolves: bool
+
+
+def paired(
+    label: str,
+    a_label: str,
+    a_samples: Sequence[Microseconds],
+    b_label: str,
+    b_samples: Sequence[Microseconds],
+) -> PairedRow:
+    """Judge two arms measured in the same iterations.
+
+    Args:
+        label: What was compared.
+        a_label: The baseline arm.
+        a_samples: Its per-iteration durations, in measurement order.
+        b_label: The arm under test.
+        b_samples: Its per-iteration durations, in the same order.
+
+    Returns:
+        The comparison. ``resolves`` is the verdict.
+
+    Raises:
+        ValueError: If either arm is empty, if the two arms carry different sample
+            counts, which means they were not measured in the same iterations, or
+            if either median is zero, which leaves the ratio and the percentage
+            undefined.
+    """
+    if not a_samples or not b_samples:
+        raise ValueError("paired needs at least one sample in each arm")
+    if len(a_samples) != len(b_samples):
+        raise ValueError(
+            f"paired needs one sample per arm per iteration, got {len(a_samples)} "
+            f"for {a_label!r} and {len(b_samples)} for {b_label!r}; these are not "
+            f"pairs"
+        )
+    a_median = Microseconds(median(a_samples))
+    b_median = Microseconds(median(b_samples))
+    if a_median == 0.0 or b_median == 0.0:
+        raise ValueError(
+            f"paired needs a nonzero median in each arm, got {a_median} for "
+            f"{a_label!r} and {b_median} for {b_label!r}"
+        )
+    deltas = [Microseconds(b - a) for a, b in zip(a_samples, b_samples)]
+    low, high, coverage = median_ci(deltas)
+    return PairedRow(
+        label=label,
+        a_label=a_label,
+        b_label=b_label,
+        sample_count=Count(len(deltas)),
+        a_median_duration_us=a_median,
+        b_median_duration_us=b_median,
+        delta_median_duration_us=Microseconds(median(deltas)),
+        delta_low_duration_us=low,
+        delta_high_duration_us=high,
+        coverage_pct=coverage,
+        delta_pct=pct_of(median(deltas), a_median),
+        speedup_ratio=ratio_of(a_median, b_median),
+        # An interval straddling zero is consistent with no difference at all, so
+        # the sign of the median it contains licenses nothing.
+        resolves=coverage >= CONFIDENCE_PCT and (low > 0.0 or high < 0.0),
+    )
 
 
 def growth(samples: Sequence[Microseconds], stride: int) -> tuple[GrowthRow, ...]:

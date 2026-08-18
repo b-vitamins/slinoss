@@ -30,7 +30,14 @@ from slinoss.perf.ceiling import (
     TensorCeiling,
 )
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
-from slinoss.perf.dispersion import GrowthRow, RepeatRow, growth, repeats
+from slinoss.perf.dispersion import (
+    GrowthRow,
+    PairedRow,
+    RepeatRow,
+    growth,
+    paired,
+    repeats,
+)
 from slinoss.perf.memory import MemoryPeaks, RegionSaved, SavedStorages
 from slinoss.perf.ncu import KernelCounters
 from slinoss.perf.nsys import NsysKernel, NsysTrace
@@ -108,6 +115,12 @@ def _growth() -> tuple[GrowthRow, ...]:
 def _scatter() -> RepeatRow:
     """Two independent runs of identical work, one microsecond apart."""
     return repeats("step", (Spread.of(_us(99.0, 100.0, 101.0)), _spread(101.0)))
+
+
+def _comparison() -> PairedRow:
+    """Six pairs, the arm under test faster by 10 us in every one of them."""
+    base = _us(100.0, 104.0, 96.0, 300.0, 101.0, 99.0)
+    return paired("scan", "reference", base, "cute", _us(*(v - 10.0 for v in base)))
 
 
 def _device() -> DeviceInfo:
@@ -334,6 +347,7 @@ def _report(
         ),
         growth=_growth(),
         scatter=_scatter(),
+        comparisons=(_comparison(),),
         notes=("clocks unlocked; the resolution floor bounds every claim",),
     )
 
@@ -494,6 +508,7 @@ def test_markdown_renders_every_present_section() -> None:
         "## bucket deltas",
         "## dispersion against sample count",
         "## run-to-run median scatter",
+        "## paired comparisons",
         "## notes",
     ):
         assert title in text
@@ -539,6 +554,14 @@ def test_markdown_renders_the_dispersion_sections() -> None:
     assert "floor_pct" in scatter
     assert "coverage_pct" in scatter
     assert "floor_holds" in scatter
+    # The paired section is the only one whose verdict survives a comparison
+    # between two runs, so it carries the interval it was judged on.
+    pair = _header_under(text, "paired comparisons")
+    assert "delta_median_duration_us" in pair
+    assert "delta_low_duration_us" in pair
+    assert "delta_high_duration_us" in pair
+    assert "coverage_pct" in pair
+    assert "resolves" in pair
 
 
 def test_markdown_omits_the_dispersion_sections_when_unset() -> None:
@@ -549,6 +572,7 @@ def test_markdown_omits_the_dispersion_sections_when_unset() -> None:
     assert "## bucket deltas" not in text
     assert "## dispersion against sample count" not in text
     assert "## run-to-run median scatter" not in text
+    assert "## paired comparisons" not in text
     assert "scatter_pct" not in text
     assert "resolves" not in text
 
@@ -571,6 +595,7 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "## bucket deltas",
         "## dispersion against sample count",
         "## run-to-run median scatter",
+        "## paired comparisons",
         "## notes",
     ):
         assert title not in text
