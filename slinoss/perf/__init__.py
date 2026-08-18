@@ -1,1 +1,211 @@
-"""Instrumentation: budget taxonomy, region timers, memory forensics."""
+"""Instrumentation: budget taxonomy, region timers, memory forensics.
+
+Layering, innermost first:
+
+- :mod:`slinoss.perf.units` -- unit-carrying field types and the record schema
+  that rejects a misnamed field at class definition time.
+- :mod:`slinoss.perf.device` -- queried device identity and clock state.
+- :mod:`slinoss.perf.timing` -- region timers and the median-of-N loop.
+- :mod:`slinoss.perf.budget` -- the closed tree over the measured total.
+- :mod:`slinoss.perf.dispersion` -- which dispersion statistic bounds a delta.
+- :mod:`slinoss.perf.memory` -- what autograd holds, and allocator peaks.
+- :mod:`slinoss.perf.ceiling` -- measured DRAM and tensor ceilings, and the
+  three kernel class verdicts.
+- :mod:`slinoss.perf.capture` -- the window an external profiler attaches to.
+- :mod:`slinoss.perf.ncu`, :mod:`slinoss.perf.nsys` -- the two profiler drivers.
+- :mod:`slinoss.perf.report` -- emission, gated by the three-way cross-check.
+"""
+
+from __future__ import annotations
+
+from slinoss.perf.budget import (
+    STEP_BUCKETS,
+    UNATTRIBUTED,
+    BucketDelta,
+    BucketTiming,
+    BudgetReport,
+    assert_closed,
+    assert_nonzero,
+    budget,
+    compare,
+    rank,
+)
+from slinoss.perf.capture import profiler_window
+from slinoss.perf.ceiling import (
+    CLASS_FLOOR_PCT,
+    DRAM_BOUND,
+    SERIAL_TINY,
+    TENSOR_BOUND,
+    Ceilings,
+    ClassVerdict,
+    DramCeiling,
+    TensorCeiling,
+    ceilings,
+    dram_ceiling,
+    dram_verdict,
+    serial_verdict,
+    tensor_ceiling,
+    tensor_verdict,
+)
+from slinoss.perf.device import ClockPolicy, DeviceInfo, clock_policy, device_info
+from slinoss.perf.dispersion import GrowthRow, RepeatRow, growth, repeats
+from slinoss.perf.memory import (
+    MemoryPeaks,
+    RegionSaved,
+    SavedStorages,
+    SavedTensorProbe,
+    memory_peaks,
+    peak_window,
+    reset_memory_peaks,
+    saved_storage_bytes,
+)
+from slinoss.perf.ncu import (
+    NCU_TABLES,
+    REQUIRED_METRICS,
+    KernelCounters,
+    NcuPass,
+    NcuTable,
+    kernel_counters,
+    run_ncu,
+)
+from slinoss.perf.nsys import NsysKernel, NsysTrace, run_nsys
+from slinoss.perf.report import (
+    TOLERANCE_PCT,
+    Agreement,
+    AgreementError,
+    Report,
+    agreement,
+    json_text,
+    markdown,
+    write_report,
+)
+from slinoss.perf.timing import (
+    MAX_TIMER_COVERAGE_PCT,
+    RegionRecorder,
+    RegionTiming,
+    Throughput,
+    Timed,
+    TimerError,
+    active_recorder,
+    call_region,
+    measure,
+    on_device,
+    region,
+)
+from slinoss.perf.units import (
+    CONFIDENCE_PCT,
+    INVARIANT,
+    MEDIAN,
+    MIN_RESOLVING_SAMPLES,
+    MODELLED,
+    SUM,
+    Bytes,
+    Count,
+    GBPerSecond,
+    Mebibytes,
+    Megahertz,
+    Microseconds,
+    Milliseconds,
+    Nanoseconds,
+    Percent,
+    PerfRecord,
+    Ratio,
+    Spread,
+    TFlopsPerSecond,
+    TokensPerSecond,
+    aggregate,
+)
+
+__all__ = [
+    "CLASS_FLOOR_PCT",
+    "CONFIDENCE_PCT",
+    "DRAM_BOUND",
+    "INVARIANT",
+    "MAX_TIMER_COVERAGE_PCT",
+    "MEDIAN",
+    "MIN_RESOLVING_SAMPLES",
+    "MODELLED",
+    "NCU_TABLES",
+    "REQUIRED_METRICS",
+    "SERIAL_TINY",
+    "STEP_BUCKETS",
+    "SUM",
+    "TENSOR_BOUND",
+    "TOLERANCE_PCT",
+    "UNATTRIBUTED",
+    "Agreement",
+    "AgreementError",
+    "BucketDelta",
+    "BucketTiming",
+    "BudgetReport",
+    "Bytes",
+    "Ceilings",
+    "ClassVerdict",
+    "ClockPolicy",
+    "Count",
+    "DeviceInfo",
+    "DramCeiling",
+    "GBPerSecond",
+    "GrowthRow",
+    "KernelCounters",
+    "Mebibytes",
+    "Megahertz",
+    "MemoryPeaks",
+    "Microseconds",
+    "Milliseconds",
+    "Nanoseconds",
+    "NcuPass",
+    "NcuTable",
+    "NsysKernel",
+    "NsysTrace",
+    "Percent",
+    "PerfRecord",
+    "Ratio",
+    "RegionRecorder",
+    "RegionSaved",
+    "RegionTiming",
+    "RepeatRow",
+    "Report",
+    "SavedStorages",
+    "SavedTensorProbe",
+    "Spread",
+    "TFlopsPerSecond",
+    "TensorCeiling",
+    "Throughput",
+    "Timed",
+    "TimerError",
+    "TokensPerSecond",
+    "active_recorder",
+    "aggregate",
+    "agreement",
+    "assert_closed",
+    "assert_nonzero",
+    "budget",
+    "call_region",
+    "ceilings",
+    "clock_policy",
+    "compare",
+    "device_info",
+    "dram_ceiling",
+    "dram_verdict",
+    "growth",
+    "json_text",
+    "kernel_counters",
+    "markdown",
+    "measure",
+    "memory_peaks",
+    "on_device",
+    "peak_window",
+    "profiler_window",
+    "rank",
+    "region",
+    "repeats",
+    "reset_memory_peaks",
+    "run_ncu",
+    "run_nsys",
+    "saved_storage_bytes",
+    "serial_verdict",
+    "tensor_ceiling",
+    "tensor_verdict",
+    "write_report",
+]

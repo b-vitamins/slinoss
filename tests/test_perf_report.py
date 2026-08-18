@@ -1,0 +1,730 @@
+"""Report emission, serialization, and the cross-check that gates both.
+
+Every record is built from literal samples, so nothing here needs a profiler, a
+trace file, or a GPU. The point of the file is the refusal path: a report whose
+clocks disagree must not reach a file, because a stale report that survives a
+failed run is indistinguishable from a fresh pass.
+
+``_row`` and ``_table`` are imported directly. ``_row``'s non-dataclass early
+return is unreachable from :func:`markdown`, which only ever hands it dataclasses,
+and ``_table``'s one-shape rule is enforced at every call site so no report can
+reach it with a mixture.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated
+
+import pytest
+
+from slinoss.perf.budget import BucketDelta, BucketTiming, BudgetReport
+from slinoss.perf.ceiling import (
+    DRAM_BOUND,
+    SERIAL_TINY,
+    Ceilings,
+    ClassVerdict,
+    DramCeiling,
+    TensorCeiling,
+)
+from slinoss.perf.device import ClockPolicy, DeviceInfo
+from slinoss.perf.dispersion import GrowthRow, RepeatRow, growth, repeats
+from slinoss.perf.memory import MemoryPeaks, RegionSaved, SavedStorages
+from slinoss.perf.ncu import KernelCounters
+from slinoss.perf.nsys import NsysKernel, NsysTrace
+from slinoss.perf.report import (
+    TOLERANCE_PCT,
+    Agreement,
+    AgreementError,
+    Report,
+    _row,
+    _table,
+    agreement,
+    json_text,
+    markdown,
+    payload,
+    write_report,
+)
+from slinoss.perf.timing import Throughput
+from slinoss.perf.units import (
+    MODELLED,
+    SUM,
+    Bytes,
+    Count,
+    GBPerSecond,
+    Megahertz,
+    Microseconds,
+    Percent,
+    PerfRecord,
+    Ratio,
+    Spread,
+    TFlopsPerSecond,
+)
+
+CAPTURE_ITERS = 3
+"""Iterations the fabricated capture window contains. Both profiler sums cover
+all three, so a per-iteration figure is a third of them."""
+
+
+# ---------------------------------------------------------------------------
+# Record builders. Literal samples only.
+# ---------------------------------------------------------------------------
+
+
+def _us(*values: float) -> list[Microseconds]:
+    """Microsecond samples from raw floats."""
+    return [Microseconds(v) for v in values]
+
+
+def _header_under(text: str, title: str) -> str:
+    """The header row of the table under one markdown section."""
+    return text.split(f"## {title}\n\n")[1].splitlines()[0]
+
+
+def _spread(median_us: float) -> Spread:
+    """Three samples one percent either side of ``median_us``.
+
+    The middle sample is the median exactly, so every figure derived from it is
+    exact: the range is 2 percent and the floor is 1 percent of the median.
+    """
+    half = median_us / 100.0
+    return Spread.of(
+        [
+            Microseconds(median_us - half),
+            Microseconds(median_us),
+            Microseconds(median_us + half),
+        ]
+    )
+
+
+def _growth() -> tuple[GrowthRow, ...]:
+    """Two prefixes of one run, the second long enough to resolve anything."""
+    return growth(_us(100.0, 104.0, 96.0, 300.0, 101.0, 99.0), 3)
+
+
+def _scatter() -> RepeatRow:
+    """Two independent runs of identical work, one microsecond apart."""
+    return repeats("step", (Spread.of(_us(99.0, 100.0, 101.0)), _spread(101.0)))
+
+
+def _device() -> DeviceInfo:
+    return DeviceInfo(
+        name="Test Part",
+        capability="8.6",
+        sm_count=Count(84),
+        warp_thread_count=Count(32),
+        max_threads_per_sm_count=Count(1536),
+        regs_per_sm_count=Count(65536),
+        smem_per_block_bytes=Bytes(49152),
+        smem_optin_per_block_bytes=Bytes(101376),
+        smem_per_sm_bytes=Bytes(102400),
+        l2_bytes=Bytes(6291456),
+        total_memory_bytes=Bytes(51041271808),
+        clocks=ClockPolicy(
+            locked=False,
+            sm_clock_mhz=Megahertz(1740.0),
+            max_sm_clock_mhz=Megahertz(1800.0),
+            detail="fabricated",
+        ),
+    )
+
+
+def _counters(kernel: str = "scan", duration_us: float = 3030.0) -> KernelCounters:
+    return KernelCounters(
+        kernel=kernel,
+        launch_count=Count(CAPTURE_ITERS),
+        duration_us=Microseconds(duration_us),
+        pass_duration_spread_pct=Percent(0.4),
+        dram_read_bytes=Bytes(1 << 24),
+        dram_write_bytes=Bytes(1 << 23),
+        dram_pct=Percent(88.0),
+        achieved_gbs=GBPerSecond(760.0),
+        global_load_bytes=Bytes(1 << 25),
+        global_store_bytes=Bytes(1 << 24),
+        global_load_sector_count=Count(1 << 20),
+        global_store_sector_count=Count(1 << 19),
+        bytes_per_sector_ratio=Ratio(32.0),
+        wavefront_count=Count(4096),
+        shared_load_conflict_count=Count(0),
+        shared_store_conflict_count=Count(0),
+        conflict_per_wavefront_ratio=Ratio(0.0),
+        register_per_thread_count=Count(96),
+        static_smem_bytes=Bytes(0),
+        dynamic_smem_bytes=Bytes(65536),
+        theoretical_occupancy_pct=Percent(50.0),
+        achieved_occupancy_pct=Percent(46.0),
+        tensor_pipe_pct=Percent(12.0),
+        inst_count=Count(1 << 22),
+        active_thread_per_warp_ratio=Ratio(32.0),
+        block_count=Count(168),
+        thread_per_block_count=Count(256),
+        wave_per_sm_ratio=Ratio(2.0),
+    )
+
+
+def _trace(
+    *,
+    kernel_sum_us: float = 3000.0,
+    memcpy_us: float = 0.0,
+    memset_us: float = 0.0,
+    with_kernels: bool = True,
+) -> NsysTrace:
+    kernels = (
+        NsysKernel(
+            kernel="scan",
+            launch_count=Count(CAPTURE_ITERS),
+            duration_us=Microseconds(kernel_sum_us),
+            duration=_spread(kernel_sum_us / CAPTURE_ITERS),
+            share_pct=Percent(100.0),
+        ),
+    )
+    return NsysTrace(
+        label="step",
+        report_path="fabricated.nsys-rep",
+        kernel_sum_duration_us=Microseconds(kernel_sum_us),
+        memcpy_sum_duration_us=Microseconds(memcpy_us),
+        memset_sum_duration_us=Microseconds(memset_us),
+        memcpy_count=Count(1 if memcpy_us else 0),
+        memset_count=Count(1 if memset_us else 0),
+        kernels=kernels if with_kernels else (),
+    )
+
+
+def _agreement(
+    *,
+    event_us: float = 1200.0,
+    kernel_sum_us: float = 3000.0,
+    ncu_us: float = 3030.0,
+    memcpy_us: float = 0.0,
+    memset_us: float = 0.0,
+    tolerance_pct: Percent = TOLERANCE_PCT,
+) -> Agreement:
+    return agreement(
+        "step",
+        event=_spread(event_us),
+        trace=_trace(
+            kernel_sum_us=kernel_sum_us, memcpy_us=memcpy_us, memset_us=memset_us
+        ),
+        kernels=(_counters(duration_us=ncu_us),),
+        capture_iters=CAPTURE_ITERS,
+        tolerance_pct=tolerance_pct,
+    )
+
+
+def _budget() -> BudgetReport:
+    return BudgetReport(
+        label="step",
+        clocks="unlocked",
+        total=_spread(1200.0),
+        buckets=(
+            BucketTiming(
+                label="forward",
+                parent="",
+                derived=False,
+                median_duration_us=Microseconds(800.0),
+                spread_pct=Percent(1.5),
+                resolution_pct=Percent(0.75),
+                coverage_pct=Percent(95.7),
+                sample_count=Count(30),
+                share_of_parent_pct=Percent(100.0),
+                share_of_total_pct=Percent(66.667),
+            ),
+        ),
+    )
+
+
+def _ceilings() -> Ceilings:
+    return Ceilings(
+        device=_device(),
+        dram=DramCeiling(
+            label="device-to-device copy, 512 MiB per buffer",
+            moved_bytes=Bytes(1073741824),
+            duration=_spread(1400.0),
+            achieved_gbs=GBPerSecond(767.0),
+        ),
+        tensor=TensorCeiling(
+            label="8192x8192x8192 torch.bfloat16 gemm",
+            flop_count=Count(1099511627776),
+            duration=_spread(4200.0),
+            achieved_tflops=TFlopsPerSecond(261.8),
+        ),
+    )
+
+
+def _saved(*, with_regions: bool = True) -> SavedStorages:
+    regions = (
+        RegionSaved(
+            label="forward.scan",
+            storage_count=Count(2),
+            save_event_count=Count(3),
+            saved_bytes=Bytes(2097152),
+        ),
+    )
+    return SavedStorages(
+        label="step",
+        storage_count=Count(2),
+        save_event_count=Count(3),
+        saved_bytes=Bytes(2097152),
+        input_bytes=Bytes(1048576),
+        derived_bytes=Bytes(1048576),
+        regions=regions if with_regions else (),
+    )
+
+
+def _report(
+    *,
+    title: str = "full",
+    check: Agreement | None = None,
+    everything: bool = True,
+    with_regions: bool = True,
+) -> Report:
+    if not everything:
+        return Report(title=title, device=_device(), agreement=check)
+    return Report(
+        title=title,
+        device=_device(),
+        agreement=check,
+        budget=_budget(),
+        throughput=(Throughput.of("prefill", Count(4096), _spread(1200.0)),),
+        ceilings=_ceilings(),
+        kernels=(_counters(),),
+        trace=_trace(),
+        saved=_saved(with_regions=with_regions),
+        peaks=MemoryPeaks(
+            label="step",
+            peak_allocated_bytes=Bytes(268435456),
+            peak_reserved_bytes=Bytes(335544320),
+        ),
+        verdicts=(
+            ClassVerdict(
+                kernel="scan",
+                declared=DRAM_BOUND,
+                achieved_pct=Percent(90.0),
+                required_pct=Percent(85.0),
+                passed=True,
+            ),
+            ClassVerdict(
+                kernel="norm",
+                declared=SERIAL_TINY,
+                achieved_pct=Percent(1.2),
+                required_pct=Percent(2.0),
+                passed=True,
+            ),
+        ),
+        deltas=(
+            BucketDelta(
+                label="forward.scan",
+                before_duration_us=Microseconds(900.0),
+                after_duration_us=Microseconds(800.0),
+                delta_pct=Percent(-11.111),
+                speedup_ratio=Ratio(1.125),
+                floor_pct=Percent(3.0),
+                resolved=True,
+            ),
+        ),
+        growth=_growth(),
+        scatter=_scatter(),
+        notes=("clocks unlocked; the resolution floor bounds every claim",),
+    )
+
+
+@dataclass(frozen=True)
+class _Modelled(PerfRecord):
+    """A modelled field, since no shipped record carries one.
+
+    Attributes:
+        label: What is modelled.
+        est_traffic_bytes: Analytic byte count.
+    """
+
+    label: str
+    est_traffic_bytes: Annotated[Bytes, MODELLED, SUM]
+
+
+# ---------------------------------------------------------------------------
+# agreement
+# ---------------------------------------------------------------------------
+
+
+def test_agreement_passes_when_both_checks_hold() -> None:
+    check = _agreement()
+    assert check.agrees
+    assert check.detail == "ncu and nsys agree; event wall covers the device sum"
+    assert check.tolerance_pct == 5.0
+    assert check.capture_iter_count == CAPTURE_ITERS
+
+
+def test_agreement_divides_both_profiler_sums_by_the_capture_iters() -> None:
+    # Both sums cover three iterations; all three reported figures are per
+    # iteration, so they are directly comparable.
+    check = _agreement(kernel_sum_us=3000.0, ncu_us=3030.0, memcpy_us=300.0)
+    assert check.nsys_kernel_sum_duration_us == 1000.0
+    assert check.nsys_device_sum_duration_us == 1100.0
+    assert check.ncu_kernel_sum_duration_us == 1010.0
+    assert check.event_duration_us == 1200.0
+
+
+def test_agreement_device_sum_includes_copies_and_fills() -> None:
+    check = _agreement(kernel_sum_us=3000.0, memcpy_us=300.0, memset_us=150.0)
+    assert check.nsys_device_sum_duration_us == 1150.0
+
+
+def test_agreement_reports_the_gap_as_the_wall_over_the_device_sum() -> None:
+    check = _agreement(event_us=1200.0, kernel_sum_us=3000.0, ncu_us=3000.0)
+    assert check.kernel_delta_pct == 0.0
+    assert check.gap_pct == pytest.approx(100.0 * 200.0 / 1200.0)
+
+
+def test_agreement_fails_on_a_kernel_sum_disagreement() -> None:
+    check = _agreement(kernel_sum_us=3000.0, ncu_us=3300.0)
+    assert not check.agrees
+    assert check.kernel_delta_pct == pytest.approx(10.0)
+    # The detail names both sums, so the failure is diagnosable from the message.
+    assert "1100.000" in check.detail
+    assert "1000.000" in check.detail
+    assert "10.00%" in check.detail
+
+
+def test_agreement_fails_when_the_wall_is_below_the_device_sum() -> None:
+    check = _agreement(event_us=900.0, kernel_sum_us=3000.0, ncu_us=3000.0)
+    assert not check.agrees
+    assert check.gap_pct < 0.0
+    assert "event wall 900.000 us is below the nsys device sum 1000.000 us" in (
+        check.detail
+    )
+
+
+def test_agreement_tolerates_a_small_negative_gap() -> None:
+    # 2% short of the device sum, inside the 5% bar: a timeline this close is
+    # clock skew, not an impossible ordering.
+    check = _agreement(event_us=1000.0, kernel_sum_us=3060.0, ncu_us=3060.0)
+    assert check.gap_pct == pytest.approx(-2.0)
+    assert check.agrees
+
+
+def test_agreement_honours_a_custom_tolerance() -> None:
+    check = _agreement(ncu_us=3300.0, tolerance_pct=Percent(20.0))
+    assert check.agrees
+    assert check.tolerance_pct == 20.0
+
+
+@pytest.mark.parametrize("iters", [0, -1])
+def test_agreement_rejects_a_non_positive_capture_iters(iters: int) -> None:
+    with pytest.raises(ValueError, match="capture_iters must be positive"):
+        agreement(
+            "step",
+            event=_spread(1200.0),
+            trace=_trace(),
+            kernels=(_counters(),),
+            capture_iters=iters,
+        )
+
+
+def test_agreement_rejects_an_empty_kernel_list() -> None:
+    with pytest.raises(ValueError, match="at least one NCU kernel"):
+        agreement(
+            "step",
+            event=_spread(1200.0),
+            trace=_trace(),
+            kernels=(),
+            capture_iters=CAPTURE_ITERS,
+        )
+
+
+# ---------------------------------------------------------------------------
+# markdown
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_refuses_a_failing_check() -> None:
+    report = _report(check=_agreement(ncu_us=3300.0))
+    with pytest.raises(AgreementError, match=r"clocks disagree beyond 5\.0%"):
+        markdown(report)
+
+
+def test_markdown_refuses_a_missing_check_when_required() -> None:
+    with pytest.raises(AgreementError, match="no CUDA-event / NSYS / NCU cross-check"):
+        markdown(_report(check=None))
+
+
+def test_markdown_says_the_cross_check_did_not_run() -> None:
+    text = markdown(_report(check=None), require_agreement=False)
+    assert "- cross-check: not run" in text
+    assert "## cross-check" not in text
+
+
+def test_markdown_header_carries_the_device_evidence() -> None:
+    text = markdown(_report(check=_agreement()))
+    assert text.startswith("# full\n")
+    assert "- device: Test Part, capability 8.6, 84 SM" in text
+    assert "- clocks: unlocked" in text
+    assert "- smem opt-in per block: 101,376 bytes" in text
+
+
+def test_markdown_renders_every_present_section() -> None:
+    text = markdown(_report(check=_agreement()))
+    for title in (
+        "## cross-check",
+        "## budget",
+        "## throughput",
+        "## measured dram ceiling",
+        "## measured tensor ceiling",
+        "## class verdicts",
+        "## kernel counters",
+        "## gpu trace",
+        "## saved tensors",
+        "## memory peaks",
+        "## bucket deltas",
+        "## dispersion against sample count",
+        "## run-to-run median scatter",
+        "## notes",
+    ):
+        assert title in text
+    assert "- total_duration_us: 1,200.000" in text
+    assert "- kernel_sum_duration_us: 3,000.000" in text
+    assert "over 0 copies" in text
+    assert "over 0 fills" in text
+    assert "- clocks unlocked; the resolution floor bounds every claim" in text
+    # Both ceilings print in full. One shared table would take its headers from
+    # the DRAM row and drop every tensor field.
+    for field in ("moved_bytes", "achieved_gbs", "flop_count", "achieved_tflops"):
+        assert field in text
+
+
+def test_markdown_budget_header_carries_the_floor_beside_the_range() -> None:
+    text = markdown(_report(check=_agreement()))
+    header = text.split("## budget\n\n")[1].split("\n\n")[0].splitlines()
+    # The floor sits between the range and the count it was derived from, so a
+    # reader cannot take the range for the bound. Its coverage follows it: three
+    # samples put the median's interval at 75 percent, well under nominal, and the
+    # floor is worth nothing without that figure beside it.
+    assert header == [
+        "- total_duration_us: 1,200.000",
+        "- spread_pct: 2.000",
+        "- resolution_pct: 1.000",
+        "- coverage_pct: 75.000",
+        "- sample_count: 3",
+    ]
+
+
+def test_markdown_renders_the_dispersion_sections() -> None:
+    text = markdown(_report(check=_agreement()))
+    rows = _header_under(text, "dispersion against sample count")
+    assert "sample_count" in rows
+    assert "spread_pct" in rows
+    assert "resolution_pct" in rows
+    # Every floor prints beside the coverage of the interval it came from, in both
+    # sections. A floor alone reads as though its interval reached nominal.
+    assert "coverage_pct" in rows
+    assert "resolves" in rows
+    scatter = _header_under(text, "run-to-run median scatter")
+    assert "scatter_pct" in scatter
+    assert "floor_pct" in scatter
+    assert "coverage_pct" in scatter
+    assert "floor_holds" in scatter
+
+
+def test_markdown_omits_the_dispersion_sections_when_unset() -> None:
+    text = markdown(
+        Report(title="no dispersion", device=_device(), budget=_budget()),
+        require_agreement=False,
+    )
+    assert "## bucket deltas" not in text
+    assert "## dispersion against sample count" not in text
+    assert "## run-to-run median scatter" not in text
+    assert "scatter_pct" not in text
+    assert "resolves" not in text
+
+
+def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
+    text = markdown(
+        _report(title="minimal", check=None, everything=False), require_agreement=False
+    )
+    for title in (
+        "## cross-check",
+        "## budget",
+        "## throughput",
+        "## measured dram ceiling",
+        "## measured tensor ceiling",
+        "## class verdicts",
+        "## kernel counters",
+        "## gpu trace",
+        "## saved tensors",
+        "## memory peaks",
+        "## bucket deltas",
+        "## dispersion against sample count",
+        "## run-to-run median scatter",
+        "## notes",
+    ):
+        assert title not in text
+    for field in (
+        "total_duration_us",
+        "kernel_sum_duration_us",
+        "peak_allocated_bytes",
+        "achieved_gbs",
+        "saved_bytes",
+        "resolution_pct",
+        "coverage_pct",
+        "scatter_pct",
+    ):
+        assert field not in text
+    assert "0.000" not in text
+
+
+def test_markdown_formats_by_type() -> None:
+    text = markdown(_report(check=_agreement()))
+    assert "| yes |" in text  # bool
+    assert "1,073,741,824" in text  # int, grouped
+    assert "1,200.000" in text  # float, three places
+    assert "| scan |" in text  # str, verbatim
+
+
+def test_markdown_dots_into_a_nested_record_and_skips_tuple_fields() -> None:
+    text = markdown(_report(check=_agreement()))
+    # NsysKernel.duration is a nested Spread, so the leaf keeps its own suffix.
+    assert "duration.median_duration_us" in text
+    # SavedStorages.regions is a table of its own, never a column.
+    header = _header_under(text, "saved tensors")
+    assert "derived_bytes" in header
+    assert "regions" not in header
+    # Spread.samples_duration_us is a tuple, so it reaches the JSON and no row.
+    assert "samples_duration_us" not in text
+
+
+def test_markdown_prints_none_for_an_empty_table() -> None:
+    text = markdown(_report(check=_agreement(), with_regions=False))
+    assert "(none)" in text
+
+
+def test_markdown_ends_with_exactly_one_newline() -> None:
+    text = markdown(_report(check=_agreement()))
+    assert text.endswith("\n")
+    assert not text.endswith("\n\n")
+
+
+# ---------------------------------------------------------------------------
+# _row
+# ---------------------------------------------------------------------------
+
+
+def test_row_of_a_non_record_is_empty() -> None:
+    assert _row("not a record") == {}
+    assert _row(Agreement) == {}
+
+
+# ---------------------------------------------------------------------------
+# _table
+# ---------------------------------------------------------------------------
+
+
+def test_table_rejects_two_record_shapes() -> None:
+    with pytest.raises(ValueError, match="one table takes one record shape"):
+        _table([_ceilings().dram, _ceilings().tensor])
+
+
+# ---------------------------------------------------------------------------
+# payload and json_text
+# ---------------------------------------------------------------------------
+
+
+def test_payload_keeps_unit_suffixes_verbatim() -> None:
+    data = payload(_report(check=_agreement()))
+    assert "nsys_kernel_sum_duration_us" in data["agreement"]
+    assert "peak_allocated_bytes" in data["peaks"]
+
+
+def test_payload_keeps_the_est_prefix() -> None:
+    data = payload(_Modelled(label="dram traffic", est_traffic_bytes=Bytes(1024)))
+    assert data == {"label": "dram traffic", "est_traffic_bytes": 1024}
+
+
+def test_payload_nests_records_and_lists_tuples() -> None:
+    data = payload(_report(check=_agreement()))
+    assert data["device"]["clocks"]["sm_clock_mhz"] == 1740.0
+    assert data["ceilings"]["dram"]["duration"]["median_duration_us"] == 1400.0
+    assert isinstance(data["kernels"], list)
+    assert isinstance(data["notes"], list)
+    assert data["notes"] == ["clocks unlocked; the resolution floor bounds every claim"]
+
+
+def test_payload_maps_keys_to_strings() -> None:
+    assert payload({1: (2, 3)}) == {"1": [2, 3]}
+
+
+def test_payload_passes_scalars_and_types_through() -> None:
+    assert payload(3.5) == 3.5
+    assert payload(None) is None
+    assert payload("text") == "text"
+    assert payload(Agreement) is Agreement
+
+
+def test_json_text_round_trips() -> None:
+    report = _report(check=_agreement())
+    assert json.loads(json_text(report)) == payload(report)
+
+
+def test_json_text_keeps_field_order() -> None:
+    keys = list(json.loads(json_text(_report(check=_agreement()))))
+    assert keys[:3] == ["title", "device", "agreement"]
+
+
+# ---------------------------------------------------------------------------
+# write_report
+# ---------------------------------------------------------------------------
+
+
+def test_write_report_writes_markdown_and_json(tmp_path: Path) -> None:
+    md, js = write_report(_report(check=_agreement()), tmp_path / "run")
+    assert (md, js) == (tmp_path / "run.md", tmp_path / "run.json")
+    assert md.read_text().startswith("# full\n")
+    assert json.loads(js.read_text())["title"] == "full"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["run.json", "run.md"]
+
+
+def test_write_report_appends_the_suffix_to_the_whole_name(tmp_path: Path) -> None:
+    md, js = write_report(_report(check=_agreement()), tmp_path / "run.1")
+    assert (md, js) == (tmp_path / "run.1.md", tmp_path / "run.1.json")
+
+
+def test_two_bases_differing_after_a_dot_do_not_collide(tmp_path: Path) -> None:
+    # Substituting the last suffix would send both of these to run.md and lose the
+    # first report to the second.
+    write_report(_report(title="first", check=_agreement()), tmp_path / "run.1")
+    write_report(_report(title="second", check=_agreement()), tmp_path / "run.2")
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "run.1.json",
+        "run.1.md",
+        "run.2.json",
+        "run.2.md",
+    ]
+    assert (tmp_path / "run.1.md").read_text().startswith("# first\n")
+    assert (tmp_path / "run.2.md").read_text().startswith("# second\n")
+
+
+def test_write_report_creates_the_parent_directory(tmp_path: Path) -> None:
+    md, js = write_report(_report(check=_agreement()), tmp_path / "a" / "b" / "run")
+    assert md.exists()
+    assert js.exists()
+
+
+def test_write_report_accepts_a_single_clock_measurement(tmp_path: Path) -> None:
+    md, _js = write_report(
+        _report(check=None), tmp_path / "run", require_agreement=False
+    )
+    assert "- cross-check: not run" in md.read_text()
+
+
+def test_a_refused_report_leaves_no_file(tmp_path: Path) -> None:
+    # The load-bearing rule: a stale report must never be mistaken for a fresh
+    # pass, so the refusal happens before anything is written or created.
+    with pytest.raises(AgreementError):
+        write_report(_report(check=_agreement(ncu_us=3300.0)), tmp_path / "a" / "run")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_missing_check_leaves_no_file(tmp_path: Path) -> None:
+    with pytest.raises(AgreementError):
+        write_report(_report(check=None), tmp_path / "run")
+    assert list(tmp_path.iterdir()) == []
