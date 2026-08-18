@@ -91,6 +91,7 @@ from slinoss.perf.report import (
     agreement,
     json_text,
     markdown,
+    rate_table,
     write_report,
 )
 from slinoss.perf.timing import (
@@ -220,6 +221,7 @@ __all__ = [
     "peak_window",
     "profiler_window",
     "rank",
+    "rate_table",
     "region",
     "repeats",
     "reset_memory_peaks",

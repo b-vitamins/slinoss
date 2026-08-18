@@ -273,6 +273,36 @@ def test_a_consistent_difference_below_nominal_coverage_resolves_nothing() -> No
     assert not row.resolves
 
 
+def test_the_verdict_names_the_faster_arm_and_the_interval() -> None:
+    slow = drifting()
+    row = paired("scan", "reference", slow, "cute", us(*(v - 10.0 for v in slow)))
+    line = row.verdict()
+    assert line.startswith("scan: cute beats reference by 10.000 us")
+    assert "speedup_ratio 1.074" in line
+    assert "[-10.000, -10.000] us at 97.852% coverage over 10 pairs" in line
+    assert "excludes zero" in line
+
+
+def test_the_verdict_names_the_baseline_when_the_baseline_is_faster() -> None:
+    fast = drifting()
+    row = paired("scan", "reference", fast, "cute", us(*(v + 10.0 for v in fast)))
+    assert row.verdict().startswith("scan: reference beats cute by 10.000 us")
+
+
+def test_the_verdict_of_an_unresolved_comparison_claims_nothing() -> None:
+    flat = us(*([100.0] * 8))
+    alternating = us(105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0)
+    line = paired("scan", "a", flat, "b", alternating).verdict()
+    # No arm is named as faster and no ratio is printed, so the line cannot be
+    # quoted as a result.
+    assert line == (
+        "scan: no difference measured between a and b; the interval "
+        "[-5.000, 5.000] us at 99.219% coverage over 8 pairs does not exclude zero"
+    )
+    assert "beats" not in line
+    assert "speedup" not in line
+
+
 @pytest.mark.parametrize("arm", ["a", "b"])
 def test_paired_rejects_an_empty_arm(arm: str) -> None:
     empty: list[Microseconds] = []

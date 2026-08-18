@@ -16,6 +16,14 @@ Requires ``mamba-ssm``. Absent, the script exits with a message naming the
 package instead of a traceback.
 
     python3 scripts/bench/bench_mamba.py --shape standard --mode both
+
+``--against-so3ssd`` runs both operators inside one loop and judges the
+per-iteration difference. Two separate runs cannot be subtracted: their medians
+scatter further than either run's own floor. This is the only comparison against
+the floor that resolves anything.
+
+    python3 scripts/bench/bench_mamba.py --shape standard --mode step \\
+        --groups heads --against-so3ssd
 """
 
 from __future__ import annotations
@@ -30,15 +38,19 @@ from torch import Tensor
 
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.device import device_info, device_ordinal
+from slinoss.perf.dispersion import PairedRow
 from slinoss.perf.memory import (
     SavedStorages,
     SavedTensorProbe,
     memory_peaks,
     reset_memory_peaks,
 )
-from slinoss.perf.report import Report, write_report
-from slinoss.perf.timing import Throughput, measure, region
+from slinoss.perf.report import Report, rate_table, write_report
+from slinoss.perf.timing import Throughput, measure, measure_paired, region
 from slinoss.perf.workload import SHAPES, OpShape, shape_by_name
+from slinoss.perf.workload import forward_only as so3ssd_forward_only
+from slinoss.perf.workload import make_inputs as so3ssd_inputs
+from slinoss.perf.workload import step as so3ssd_step
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 MODES = ("forward", "step")
@@ -129,8 +141,21 @@ def runner(
     chunk: int,
     *,
     grads: bool,
+    prefix: str = "mamba",
 ) -> Callable[[], None]:
-    """Build the timed callable for one mode."""
+    """Build the timed callable for one mode.
+
+    Args:
+        scan: ``mamba_chunk_scan_combined``.
+        inputs: Its inputs.
+        chunk: Chunk length.
+        grads: Whether to run the backward.
+        prefix: Region label prefix. Two arms measured in one loop need two
+            prefixes; see :func:`slinoss.perf.workload.forward_only`.
+
+    Returns:
+        The callable.
+    """
 
     def forward() -> Tensor:
         return scan(inputs.x, inputs.dt, inputs.A, inputs.B, inputs.C, chunk)
@@ -138,15 +163,15 @@ def runner(
     if not grads:
 
         def run_forward() -> None:
-            with torch.no_grad(), region("mamba.forward"):
+            with torch.no_grad(), region(f"{prefix}.forward"):
                 forward()
 
         return run_forward
 
     def run_step() -> None:
-        with region("mamba.forward"):
+        with region(f"{prefix}.forward"):
             y = forward()
-        with region("mamba.backward"):
+        with region(f"{prefix}.backward"):
             torch.autograd.grad(y, inputs.differentiable, inputs.dy)
 
     return run_step
@@ -172,6 +197,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--against-so3ssd",
+        action="store_true",
+        help=(
+            "Measure the SO(3) operator against Mamba2 inside one loop and judge "
+            "the per-iteration difference. Needs an even --iters."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        default=None,
+        help="SO(3) backend for the comparison arm. Default is the fastest one.",
+    )
     parser.add_argument("--out", type=Path, default=Path("out/bench-mamba"))
     return parser.parse_args(argv)
 
@@ -216,6 +254,119 @@ def _saved(
     return probe.report(f"mamba {shape.name}", inputs.differentiable)
 
 
+def compare_so3ssd(
+    scan: Callable[..., Any],
+    shape: OpShape,
+    groups: int,
+    mode: str,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[Report, PairedRow]:
+    """Measure the SO(3) operator against Mamba2 in one loop at one configuration.
+
+    Mamba2 is the baseline arm, so ``speedup_ratio`` above one means the SO(3)
+    operator is the faster of the two.
+
+    Args:
+        scan: ``mamba_chunk_scan_combined``.
+        shape: The problem size. Both arms carry the same state size per head.
+        groups: Mamba2 group count.
+        mode: ``forward`` or ``step``.
+        args: Parsed command line.
+        device: Device to time on.
+
+    Returns:
+        The report and the verdict on the per-iteration differences.
+    """
+    dtype = DTYPES[args.dtype]
+    grads = mode == "step"
+    a_label = f"mamba-g{groups}"
+    b_label = f"so3ssd-{args.backend or 'auto'}"
+    mamba = make_inputs(shape, groups, device, dtype=dtype, requires_grad=grads)
+    ours = so3ssd_inputs(shape, device, dtype=dtype, requires_grad=grads)
+    label = f"mamba g{groups} vs so3ssd {shape.name} {mode} paired"
+    reset_memory_peaks(device)
+    out = measure_paired(
+        a_label,
+        runner(scan, mamba, shape.chunk, grads=grads, prefix=a_label),
+        b_label,
+        (
+            so3ssd_step(ours, shape.chunk, backend=args.backend, prefix=b_label)
+            if grads
+            else so3ssd_forward_only(
+                ours, shape.chunk, backend=args.backend, prefix=b_label
+            )
+        ),
+        label=label,
+        iters=args.iters,
+        warmup=args.warmup,
+        device=device,
+    )
+    tree = budget(out.timed)
+    assert_closed(tree)
+    report = Report(
+        title=f"bench: {label}",
+        device=device_info(device_ordinal(device)),
+        budget=tree,
+        throughput=tuple(
+            Throughput.of(name, shape.token_count, out.timed.region(name).spread)
+            for name in (a_label, b_label)
+        ),
+        comparisons=(out.comparison,),
+        peaks=memory_peaks(label, device),
+        notes=(
+            shape.describe(),
+            f"mamba2 ngroups={groups} headdim={shape.rows} dstate={shape.d_state}",
+            f"mode={mode} dtype={args.dtype}",
+            f"arm a={a_label} b={b_label}, one loop, order swapped each iteration",
+            # The two operators take different tensors, so the arms cannot share
+            # inputs the way two backends of one operator do. The peak is the sum of
+            # both arms' live tensors and belongs to neither.
+            "each arm holds its own inputs; the memory peak covers both",
+            f"iters={args.iters} warmup={args.warmup}",
+            f"timer={out.timed.timer} clocks={out.timed.clocks}",
+        ),
+    )
+    return report, out.comparison
+
+
+def _run_comparisons(
+    scan: Callable[..., Any],
+    shapes: Sequence[OpShape],
+    modes: Sequence[str],
+    wanted: Sequence[str],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> int:
+    """Run every paired comparison against Mamba2 and print the verdicts.
+
+    Returns:
+        Process exit status.
+    """
+    rates: list[tuple[str, Throughput]] = []
+    verdicts: list[PairedRow] = []
+    for shape in shapes:
+        for groups in group_counts(shape, wanted):
+            for mode in modes:
+                report, row = compare_so3ssd(scan, shape, groups, mode, args, device)
+                base = args.out.with_name(
+                    f"{args.out.name}-{shape.name}-g{groups}-{mode}-paired"
+                )
+                md, _ = write_report(report, base, require_agreement=False)
+                rates += [
+                    (f"{shape.name}/g{groups}/{mode}/{rate.label}", rate)
+                    for rate in report.throughput
+                ]
+                verdicts.append(row)
+                print(f"wrote {md}")
+    print()
+    print(rate_table(rates, width=52))
+    print()
+    for row in verdicts:
+        print(row.verdict())
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the bench.
 
@@ -234,6 +385,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     shapes = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]
     modes = MODES if args.mode == "both" else (args.mode,)
     wanted = args.groups or ["heads", "one"]
+    if args.against_so3ssd:
+        return _run_comparisons(scan, shapes, modes, wanted, args, device)
     info = device_info(device_ordinal(device))
     rows: list[tuple[str, Throughput]] = []
     for shape in shapes:
@@ -282,16 +435,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rows.append((f"{shape.name}/g{groups}/{mode}", rate))
                 print(f"wrote {md}")
     print()
-    print(
-        f"{'config':<28} {'duration_us':>14} {'spread_pct':>11} "
-        f"{'resolution_pct':>15} {'coverage_pct':>13} {'tps':>14}"
-    )
-    for name, rate in rows:
-        print(
-            f"{name:<28} {rate.duration_us:>14,.3f} {rate.spread_pct:>11,.3f} "
-            f"{rate.resolution_pct:>15,.3f} {rate.coverage_pct:>13,.3f} "
-            f"{rate.throughput_tps:>14,.0f}"
-        )
+    print(rate_table(rows, width=28))
     return 0
 
 

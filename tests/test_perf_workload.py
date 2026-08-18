@@ -12,7 +12,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from slinoss.perf.timing import measure
+from slinoss.perf.budget import assert_closed, budget
+from slinoss.perf.timing import measure, measure_paired
 from slinoss.perf.workload import (
     SHAPES,
     W_MAX,
@@ -192,3 +193,43 @@ def test_step_rejects_a_wrt_that_takes_no_gradient() -> None:
     inputs = make_inputs(SMALL, CPU, requires_grad=True)
     with pytest.raises(ValueError, match="at least one input requiring grad"):
         step(inputs, SMALL.chunk, wrt=(inputs.dy,))
+
+
+def test_two_prefixes_keep_two_arms_apart_in_one_loop() -> None:
+    inputs = make_inputs(SMALL, CPU, dtype=torch.float32, requires_grad=True)
+    out = measure_paired(
+        "arm-a",
+        step(inputs, SMALL.chunk, prefix="arm-a"),
+        "arm-b",
+        step(inputs, SMALL.chunk, prefix="arm-b"),
+        label="paired",
+        iters=2,
+        warmup=0,
+        device=CPU,
+    )
+    # The default prefix in both arms would sum the two forwards into one region
+    # and one backward into another, and the tree would describe neither arm.
+    assert {t.label for t in out.timed.regions} == {
+        "arm-a",
+        "arm-a.forward",
+        "arm-a.backward",
+        "arm-b",
+        "arm-b.forward",
+        "arm-b.backward",
+    }
+    assert out.timed.region("arm-a.forward").parent == "arm-a"
+    assert out.comparison.sample_count == 2
+    # Each arm's children sit under it, so the budget closes over both arms.
+    assert_closed(budget(out.timed))
+
+
+def test_forward_only_takes_a_prefix_too() -> None:
+    inputs = make_inputs(SMALL, CPU, dtype=torch.float32, requires_grad=False)
+    timed = measure(
+        forward_only(inputs, SMALL.chunk, prefix="arm-b"),
+        label="op",
+        iters=1,
+        warmup=0,
+        device=CPU,
+    )
+    assert [t.label for t in timed.regions] == ["arm-b.forward"]

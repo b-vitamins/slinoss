@@ -193,7 +193,7 @@ def make_inputs(
 
 
 def forward_only(
-    inputs: OpInputs, chunk: int, *, backend: str | None = None
+    inputs: OpInputs, chunk: int, *, backend: str | None = None, prefix: str = "op"
 ) -> Callable[[], None]:
     """A callable that runs the forward under ``no_grad``.
 
@@ -201,13 +201,16 @@ def forward_only(
         inputs: Operator inputs.
         chunk: Chunk length.
         backend: Backend name, or None for the fastest registered one.
+        prefix: Region label prefix. Two arms measured in one loop need two
+            prefixes, or the recorder sums their regions into one and the inner
+            tree describes neither.
 
     Returns:
         The callable, timed by :func:`slinoss.perf.timing.measure`.
     """
 
     def run() -> None:
-        with torch.no_grad(), region("op.forward"):
+        with torch.no_grad(), region(f"{prefix}.forward"):
             so3ssd(
                 inputs.U,
                 inputs.trans,
@@ -227,6 +230,7 @@ def step(
     *,
     backend: str | None = None,
     wrt: Sequence[Tensor] | None = None,
+    prefix: str = "op",
 ) -> Callable[[], None]:
     """A callable that runs the forward and the backward.
 
@@ -235,6 +239,7 @@ def step(
         chunk: Chunk length.
         backend: Backend name, or None for the fastest registered one.
         wrt: Tensors to differentiate with respect to. Defaults to all five.
+        prefix: Region label prefix. See :func:`forward_only`.
 
     Returns:
         The callable, timed by :func:`slinoss.perf.timing.measure`.
@@ -248,7 +253,7 @@ def step(
         raise ValueError("step needs at least one input requiring grad")
 
     def run() -> None:
-        with region("op.forward"):
+        with region(f"{prefix}.forward"):
             y = so3ssd(
                 inputs.U,
                 inputs.trans,
@@ -258,7 +263,7 @@ def step(
                 chunk,
                 backend=backend,
             ).y
-        with region("op.backward"):
+        with region(f"{prefix}.backward"):
             torch.autograd.grad(y, targets, inputs.dy)
 
     return run

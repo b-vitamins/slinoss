@@ -52,6 +52,7 @@ from slinoss.perf.report import (
     json_text,
     markdown,
     payload,
+    rate_table,
     write_report,
 )
 from slinoss.perf.timing import Throughput
@@ -708,6 +709,47 @@ def test_json_text_round_trips() -> None:
 def test_json_text_keeps_field_order() -> None:
     keys = list(json.loads(json_text(_report(check=_agreement()))))
     assert keys[:3] == ["title", "device", "agreement"]
+
+
+# ---------------------------------------------------------------------------
+# rate_table
+# ---------------------------------------------------------------------------
+
+
+def test_rate_table_prints_every_rate_beside_its_dispersion() -> None:
+    rows = [
+        (
+            "standard/step/mamba-g12",
+            Throughput.of("mamba-g12", Count(8192), _spread(1200.0)),
+        ),
+        (
+            "standard/step/so3ssd-auto",
+            Throughput.of("so3ssd-auto", Count(8192), _spread(1000.0)),
+        ),
+    ]
+    header, *body = rate_table(rows, width=30).splitlines()
+    assert header.split() == [
+        "config",
+        "duration_us",
+        "spread_pct",
+        "resolution_pct",
+        "coverage_pct",
+        "tps",
+    ]
+    assert [line.split()[0] for line in body] == [name for name, _ in rows]
+    # Every rate carries the four dispersion columns, so no driver can print a
+    # throughput figure without what says whether a difference in it is real.
+    assert body[0].split()[1:] == [
+        "1,200.000",
+        "2.000",
+        "1.000",
+        "75.000",
+        "6,826,667",
+    ]
+
+
+def test_rate_table_of_no_rates_is_the_header_alone() -> None:
+    assert rate_table([], width=8).splitlines()[0].startswith("config  ")
 
 
 # ---------------------------------------------------------------------------

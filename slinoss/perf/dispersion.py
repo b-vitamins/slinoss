@@ -173,6 +173,37 @@ class PairedRow(PerfRecord):
     speedup_ratio: Annotated[Ratio, MEDIAN]
     resolves: bool
 
+    def verdict(self) -> str:
+        """One line stating what these pairs license, for stdout.
+
+        One definition, so a claim and a refusal read the same way in every driver
+        and neither can be phrased more strongly than the other. Both carry the
+        interval, its coverage, and the pair count.
+
+        Returns:
+            The sentence.
+        """
+        interval = (
+            f"[{self.delta_low_duration_us:,.3f}, {self.delta_high_duration_us:,.3f}]"
+            f" us at {self.coverage_pct:,.3f}% coverage over {self.sample_count} pairs"
+        )
+        if not self.resolves:
+            return (
+                f"{self.label}: no difference measured between {self.a_label} and "
+                f"{self.b_label}; the interval {interval} does not exclude zero"
+            )
+        faster, slower = (
+            (self.b_label, self.a_label)
+            if self.delta_median_duration_us < 0.0
+            else (self.a_label, self.b_label)
+        )
+        return (
+            f"{self.label}: {faster} beats {slower} by "
+            f"{abs(self.delta_median_duration_us):,.3f} us "
+            f"({abs(self.delta_pct):,.3f}%, speedup_ratio "
+            f"{self.speedup_ratio:,.3f}); the interval {interval} excludes zero"
+        )
+
 
 def paired(
     label: str,

@@ -53,6 +53,7 @@ __all__ = [
     "json_text",
     "markdown",
     "payload",
+    "rate_table",
     "write_report",
 ]
 
@@ -394,6 +395,37 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
     if report.notes:
         lines += ["## notes", "", *[f"- {note}" for note in report.notes], ""]
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Stdout
+# ---------------------------------------------------------------------------
+
+
+def rate_table(rows: Sequence[tuple[str, Throughput]], width: int) -> str:
+    """Render measured rates as a fixed-width table for stdout.
+
+    One definition, so no driver can print a rate without the dispersion that says
+    whether a difference in it is real.
+
+    Args:
+        rows: Config name and its rate, in run order.
+        width: Column width for the config name.
+
+    Returns:
+        The table, header first, without a trailing newline.
+    """
+    lines = [
+        f"{'config':<{width}} {'duration_us':>14} {'spread_pct':>11} "
+        f"{'resolution_pct':>15} {'coverage_pct':>13} {'tps':>14}"
+    ]
+    lines += [
+        f"{name:<{width}} {rate.duration_us:>14,.3f} {rate.spread_pct:>11,.3f} "
+        f"{rate.resolution_pct:>15,.3f} {rate.coverage_pct:>13,.3f} "
+        f"{rate.throughput_tps:>14,.0f}"
+        for name, rate in rows
+    ]
+    return "\n".join(lines)
 
 
 def write_report(

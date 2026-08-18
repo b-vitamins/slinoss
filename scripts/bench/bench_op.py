@@ -10,12 +10,25 @@ per-kernel picture and the three-way agreement come from
 ``scripts/perf/profile_op.py``.
 
     python3 scripts/bench/bench_op.py --shape standard --mode both
+
+Two backends are compared in one loop, not in two runs. Run-to-run medians on a
+shared host scatter further than either run's own floor, so a difference of two
+separately measured medians resolves nothing; ``--against`` pairs the two arms
+inside every iteration instead and judges the per-iteration difference. Both arms
+read the same input tensors.
+
+    python3 scripts/bench/bench_op.py --shape standard --mode step \\
+        --backend reference --against cute
+
+``--against same`` runs the identical backend in both arms. That is the null test
+of the comparison itself: a verdict of ``resolves`` there is a broken harness, not
+a speedup.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import torch
@@ -23,14 +36,15 @@ import torch
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.ceiling import Ceilings, ceilings
 from slinoss.perf.device import device_info, device_ordinal
+from slinoss.perf.dispersion import PairedRow
 from slinoss.perf.memory import (
     SavedStorages,
     SavedTensorProbe,
     memory_peaks,
     reset_memory_peaks,
 )
-from slinoss.perf.report import Report, write_report
-from slinoss.perf.timing import Throughput, measure
+from slinoss.perf.report import Report, rate_table, write_report
+from slinoss.perf.timing import Throughput, measure, measure_paired
 from slinoss.perf.workload import (
     SHAPES,
     OpShape,
@@ -42,6 +56,8 @@ from slinoss.perf.workload import (
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 MODES = ("forward", "step")
+SAME = "same"
+"""``--against`` value that puts the same backend in both arms. The null test."""
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -59,6 +75,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--backend", default=None)
+    parser.add_argument(
+        "--against",
+        default=None,
+        help=(
+            f"Second backend, measured against --backend inside one loop. "
+            f"{SAME!r} runs --backend in both arms, which is the null test of the "
+            f"comparison itself. Needs an even --iters."
+        ),
+    )
     parser.add_argument("--out", type=Path, default=Path("out/bench-op"))
     parser.add_argument(
         "--no-ceilings",
@@ -140,11 +165,144 @@ def bench(
     return report, rate
 
 
+def arm_labels(a: str | None, b: str | None) -> tuple[str, str]:
+    """Region prefixes for two backends measured in one loop.
+
+    Args:
+        a: Baseline backend name, or None for the fastest registered one.
+        b: Backend name for the arm under test.
+
+    Returns:
+        The two labels, in arm order. Equal backends get a side suffix, because
+        :func:`slinoss.perf.timing.measure_paired` refuses one label for both arms
+        and the null test still has to be runnable.
+    """
+    labels = [f"so3ssd-{name or 'auto'}" for name in (a, b)]
+    if labels[0] == labels[1]:
+        return f"{labels[0]}-a", f"{labels[1]}-b"
+    return labels[0], labels[1]
+
+
+def compare_backends(
+    shape: OpShape,
+    mode: str,
+    args: argparse.Namespace,
+    device: torch.device,
+    limits: Ceilings | None,
+) -> tuple[Report, PairedRow]:
+    """Measure two backends against each other in one loop at one shape and mode.
+
+    Args:
+        shape: The problem size.
+        mode: ``forward`` or ``step``.
+        args: Parsed command line. ``--backend`` is the baseline arm and
+            ``--against`` the arm under test.
+        device: Device to time on.
+        limits: Measured ceilings, or None.
+
+    Returns:
+        The report and the verdict on the per-iteration differences.
+    """
+    dtype = DTYPES[args.dtype]
+    grads = mode == "step"
+    against = args.backend if args.against == SAME else args.against
+    a_label, b_label = arm_labels(args.backend, against)
+    # One input set for both arms. Two would differ in address and in cache
+    # residency, and that difference would be attributed to the backend.
+    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
+
+    def arm(backend: str | None, prefix: str) -> Callable[[], None]:
+        if grads:
+            return step(inputs, shape.chunk, backend=backend, prefix=prefix)
+        return forward_only(inputs, shape.chunk, backend=backend, prefix=prefix)
+
+    label = f"so3ssd {shape.name} {mode} paired"
+    reset_memory_peaks(device)
+    out = measure_paired(
+        a_label,
+        arm(args.backend, a_label),
+        b_label,
+        arm(against, b_label),
+        label=label,
+        iters=args.iters,
+        warmup=args.warmup,
+        device=device,
+    )
+    peaks = memory_peaks(label, device)
+    tree = budget(out.timed)
+    assert_closed(tree)
+    report = Report(
+        title=f"bench: {label}",
+        device=device_info(device_ordinal(device)),
+        budget=tree,
+        throughput=tuple(
+            Throughput.of(name, shape.token_count, out.timed.region(name).spread)
+            for name in (a_label, b_label)
+        ),
+        comparisons=(out.comparison,),
+        ceilings=limits,
+        peaks=peaks,
+        notes=(
+            shape.describe(),
+            f"mode={mode} dtype={args.dtype}",
+            f"arm a={a_label} b={b_label}, one loop, order swapped each iteration",
+            f"iters={args.iters} warmup={args.warmup}",
+            f"timer={out.timed.timer} clocks={out.timed.clocks}",
+        ),
+    )
+    return report, out.comparison
+
+
+def _run_comparisons(
+    shapes: Sequence[OpShape],
+    modes: Sequence[str],
+    args: argparse.Namespace,
+    device: torch.device,
+    limits: Ceilings | None,
+) -> int:
+    """Run every paired comparison and print the verdicts.
+
+    Returns:
+        Process exit status. Nonzero when both arms held the same backend and a
+        verdict still resolved a difference: that is the comparison measuring the
+        arm order or the loop rather than the backend.
+    """
+    null_test = args.against in (SAME, args.backend)
+    rates: list[tuple[str, Throughput]] = []
+    verdicts: list[PairedRow] = []
+    for shape in shapes:
+        for mode in modes:
+            report, row = compare_backends(shape, mode, args, device, limits)
+            base = args.out.with_name(f"{args.out.name}-{shape.name}-{mode}-paired")
+            md, _ = write_report(report, base, require_agreement=False)
+            rates += [
+                (f"{shape.name}/{mode}/{rate.label}", rate)
+                for rate in report.throughput
+            ]
+            verdicts.append(row)
+            print(f"wrote {md}")
+    print()
+    print(rate_table(rates, width=48))
+    print()
+    for row in verdicts:
+        print(row.verdict())
+    if null_test:
+        broken = [row.label for row in verdicts if row.resolves]
+        if broken:
+            print(
+                f"both arms ran the same backend and {broken} still resolve a "
+                f"difference; the comparison is measuring the arm order or the loop, "
+                f"not the backend"
+            )
+            return 1
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the bench.
 
     Returns:
-        Process exit status.
+        Process exit status. Nonzero when a null comparison resolves a difference.
 
     Raises:
         RuntimeError: If the requested device is CUDA and CUDA is unavailable.
@@ -156,6 +314,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     shapes = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]
     modes = MODES if args.mode == "both" else (args.mode,)
     limits = None if args.no_ceilings else ceilings(device)
+    if args.against is not None:
+        return _run_comparisons(shapes, modes, args, device, limits)
     rows: list[tuple[str, Throughput]] = []
     for shape in shapes:
         for mode in modes:
@@ -165,16 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows.append((f"{shape.name}/{mode}", rate))
             print(f"wrote {md}")
     print()
-    print(
-        f"{'config':<20} {'duration_us':>14} {'spread_pct':>11} "
-        f"{'resolution_pct':>15} {'coverage_pct':>13} {'tps':>14}"
-    )
-    for name, rate in rows:
-        print(
-            f"{name:<20} {rate.duration_us:>14,.3f} {rate.spread_pct:>11,.3f} "
-            f"{rate.resolution_pct:>15,.3f} {rate.coverage_pct:>13,.3f} "
-            f"{rate.throughput_tps:>14,.0f}"
-        )
+    print(rate_table(rows, width=20))
     return 0
 
 
