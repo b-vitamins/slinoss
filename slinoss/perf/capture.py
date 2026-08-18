@@ -29,7 +29,14 @@ def profiler_window(device: torch.device) -> Iterator[None]:
 
     Yields:
         None.
+
+    Raises:
+        ValueError: If the device is not CUDA. Both edges synchronize a CUDA
+            device and the counters come from one, so there is no window to open
+            anywhere else. Checked on entry, before the caller's body runs.
     """
+    if device.type != "cuda":
+        raise ValueError(f"the capture window needs a cuda device, got {device}")
     with on_device(device):
         torch.cuda.synchronize(device)
         torch.cuda.profiler.start()

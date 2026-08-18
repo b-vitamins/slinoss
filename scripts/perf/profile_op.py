@@ -23,7 +23,7 @@ import torch
 
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.ceiling import ceilings
-from slinoss.perf.device import device_info, device_ordinal
+from slinoss.perf.device import device_info, device_ordinal, require_cuda
 from slinoss.perf.ncu import NCU_TABLES, NcuPass, kernel_counters, run_ncu
 from slinoss.perf.nsys import run_nsys
 from slinoss.perf.report import Report, agreement, write_report
@@ -56,7 +56,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--event-iters", type=int, default=30)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="CUDA device, cuda or cuda:N. There is no host path: every "
+        "report names the part the numbers came from.",
+    )
     parser.add_argument("--backend", default=None)
     parser.add_argument("--ncu", default="ncu")
     parser.add_argument("--nsys", default="nsys")
@@ -106,14 +111,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status.
 
     Raises:
-        RuntimeError: If CUDA is unavailable.
+        RuntimeError: If the requested device is not a usable CUDA device.
         ValueError: If NCU returned a table with a metric absent, which means the
             metric name is wrong for this driver version.
     """
     args = parse_args(argv)
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("profile_op needs CUDA")
+    device = require_cuda(args.device)
     shape = shape_by_name(args.shape)
     grads = args.mode == "step"
     inputs = make_inputs(shape, device, dtype=DTYPES[args.dtype], requires_grad=grads)

@@ -19,6 +19,7 @@ from collections.abc import Sequence
 import torch
 
 from slinoss.perf.capture import profiler_window
+from slinoss.perf.device import require_cuda
 from slinoss.perf.timing import on_device
 from slinoss.perf.workload import (
     SHAPES,
@@ -46,7 +47,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="CUDA device, cuda or cuda:N. There is no host path: every "
+        "report names the part the numbers came from.",
+    )
     parser.add_argument("--backend", default=None)
     return parser.parse_args(argv)
 
@@ -58,15 +64,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status.
 
     Raises:
-        RuntimeError: If the requested device is CUDA and CUDA is unavailable.
-        ValueError: If ``--iters`` is not positive.
+        RuntimeError: If the requested device is not a usable CUDA device.
+        ValueError: If ``--iters`` is not positive or ``--warmup`` is negative.
     """
     args = parse_args(argv)
     if args.iters <= 0:
         raise ValueError(f"--iters must be positive, got {args.iters}")
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda needs CUDA")
+    # `range(-1)` is empty, so a negative warmup would run none and profile the
+    # first call, which is the one thing the window exists to exclude. The bench
+    # path rejects the same value in `measure`; both paths reject it or the same
+    # flag over the same workload means two different things.
+    if args.warmup < 0:
+        raise ValueError(f"--warmup must not be negative, got {args.warmup}")
+    device = require_cuda(args.device)
     shape = shape_by_name(args.shape)
     grads = args.mode == "step"
     inputs = make_inputs(shape, device, dtype=DTYPES[args.dtype], requires_grad=grads)

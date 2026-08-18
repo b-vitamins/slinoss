@@ -20,7 +20,7 @@ from pathlib import Path
 
 import torch
 
-from slinoss.perf.device import device_info, device_ordinal
+from slinoss.perf.device import device_info, device_ordinal, require_cuda
 from slinoss.perf.dispersion import growth, repeats
 from slinoss.perf.report import Report, write_report
 from slinoss.perf.timing import measure
@@ -41,7 +41,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=5, help="Prefix stride.")
     parser.add_argument("--repeat", type=int, default=5, help="Independent runs.")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="CUDA device, cuda or cuda:N. There is no host path: every "
+        "report names the part the numbers came from.",
+    )
     parser.add_argument("--backend", default=None)
     parser.add_argument("--out", type=Path, default=Path("out/dispersion"))
     return parser.parse_args(argv)
@@ -54,12 +59,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status. Nonzero if the floor did not cover the scatter.
 
     Raises:
-        RuntimeError: If the requested device is CUDA and CUDA is unavailable.
+        RuntimeError: If the requested device is not a usable CUDA device.
+        ValueError: If ``--repeat`` is below two or ``--stride`` is not positive.
     """
     args = parse_args(argv)
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda needs CUDA")
+    device = require_cuda(args.device)
+    # `repeats` and `growth` reject both of these, but only once every run has
+    # been measured. Scatter needs two medians to have a range at all, and a
+    # zero stride names no prefix.
+    if args.repeat < 2:
+        raise ValueError(f"--repeat needs at least two runs, got {args.repeat}")
+    if args.stride <= 0:
+        raise ValueError(f"--stride must be positive, got {args.stride}")
     shape = shape_by_name(args.shape)
     dtype = DTYPES[args.dtype]
     grads = args.mode == "step"

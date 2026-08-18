@@ -37,7 +37,7 @@ import torch
 from torch import Tensor
 
 from slinoss.perf.budget import assert_closed, budget
-from slinoss.perf.device import device_info, device_ordinal
+from slinoss.perf.device import device_info, device_ordinal, require_cuda
 from slinoss.perf.dispersion import PairedRow
 from slinoss.perf.memory import (
     SavedStorages,
@@ -69,7 +69,7 @@ def load_scan() -> Callable[..., Any]:
         from mamba_ssm.ops.triton.ssd_combined import (  # type: ignore[import-not-found]
             mamba_chunk_scan_combined,
         )
-    except ImportError as exc:  # pragma: no cover - environment dependent
+    except ImportError as exc:
         raise SystemExit(f"bench_mamba needs mamba-ssm: {exc}") from exc
     return mamba_chunk_scan_combined
 
@@ -196,7 +196,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="CUDA device, cuda or cuda:N. There is no host path: every "
+        "report names the part the numbers came from.",
+    )
     parser.add_argument(
         "--against-so3ssd",
         action="store_true",
@@ -374,12 +379,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status.
 
     Raises:
-        RuntimeError: If the requested device is CUDA and CUDA is unavailable.
+        RuntimeError: If the requested device is not a usable CUDA device.
     """
     args = parse_args(argv)
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda needs CUDA")
+    device = require_cuda(args.device)
     scan = load_scan()
     dtype = DTYPES[args.dtype]
     shapes = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]

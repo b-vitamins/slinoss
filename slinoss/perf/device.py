@@ -46,6 +46,7 @@ __all__ = [
     "contention",
     "device_info",
     "device_ordinal",
+    "require_cuda",
     "smi_query",
 ]
 
@@ -58,6 +59,34 @@ ComputeAppsQuery = Callable[[int], "str | None"]
 Empty means the device has none. None means the probe did not run, which is a
 different fact and is reported as one.
 """
+
+
+def require_cuda(spec: str) -> torch.device:
+    """Resolve a device string for a measurement driver, or refuse.
+
+    One implementation for every driver. Each of them writes a report that names
+    the part the numbers came from, divides by a measured ceiling, or reads a
+    hardware counter, and none of those exists off CUDA. Refusing here costs a
+    string comparison; refusing later costs the allocation and the warmup, and
+    reports whichever probe reached for the ordinal first rather than the reason.
+
+    Args:
+        spec: Device string as given on the command line, ``cuda`` or ``cuda:N``.
+
+    Returns:
+        The device.
+
+    Raises:
+        RuntimeError: If the string is not a CUDA device, or if CUDA is
+            unavailable.
+    """
+    device = torch.device(spec)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{spec!r} is not a usable cuda device; the measurement drivers report "
+            f"per-kernel counters against measured ceilings and have no host path"
+        )
+    return device
 
 
 def device_ordinal(device: torch.device) -> int:
@@ -401,8 +430,14 @@ def device_info(
         The device record.
 
     Raises:
+        ValueError: If the index is negative. :func:`device_ordinal` yields ``-1``
+            for a device that has no ordinal, so this is a CPU device arriving
+            where a part is being named. Checked first, or the failure reports the
+            absence of CUDA on a host that has it.
         RuntimeError: If CUDA is unavailable.
     """
+    if index < 0:
+        raise ValueError(f"device_info needs a cuda ordinal, got {index}")
     if not torch.cuda.is_available():
         raise RuntimeError("device_info needs CUDA")
     props = torch.cuda.get_device_properties(index)

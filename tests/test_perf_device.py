@@ -42,6 +42,8 @@ from slinoss.perf.device import (
     compute_apps_query,
     contention,
     device_info,
+    device_ordinal,
+    require_cuda,
     smi_query,
 )
 from slinoss.perf.units import (
@@ -475,6 +477,41 @@ def test_device_info_refuses_without_cuda(monkeypatch: pytest.MonkeyPatch) -> No
         device_info()
 
 
+@pytest.mark.parametrize("spec", ["cpu", "meta"])
+def test_require_cuda_refuses_a_device_no_counter_exists_on(spec: str) -> None:
+    # One guard for all five drivers. The alternative is each of them permitting a
+    # host device and then failing in whichever probe reaches for the ordinal
+    # first, after the inputs are allocated and the warmup has run.
+    with pytest.raises(RuntimeError, match="is not a usable cuda device"):
+        require_cuda(spec)
+
+
+def test_require_cuda_refuses_cuda_on_a_host_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="is not a usable cuda device"):
+        require_cuda("cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+@pytest.mark.parametrize("spec", ["cuda", "cuda:0"])
+def test_require_cuda_resolves_an_ordinal_a_report_can_name(spec: str) -> None:
+    device = require_cuda(spec)
+    assert device.type == "cuda"
+    assert device_ordinal(device) == 0
+
+
+@pytest.mark.parametrize("index", [-1, -2])
+def test_device_info_refuses_an_ordinal_no_device_carries(index: int) -> None:
+    # `device_ordinal` returns -1 for a CPU device, so a driver that permits
+    # `--device cpu` arrives here with -1. Without this the call reaches
+    # `get_device_properties(-1)` and fails on the ordinal rather than on the
+    # reason, or reports the absence of CUDA on a host that has it.
+    with pytest.raises(ValueError, match="device_info needs a cuda ordinal"):
+        device_info(index)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
 def test_device_info_reads_the_part_it_runs_on() -> None:
     info = device_info(0)
@@ -606,6 +643,19 @@ def test_a_verdict_at_exactly_the_bar_passes() -> None:
 # ---------------------------------------------------------------------------
 # capture
 # ---------------------------------------------------------------------------
+
+
+def test_the_capture_window_rejects_a_device_it_cannot_drain() -> None:
+    # Without this the window fails inside `torch.cuda.device` with a message
+    # about an unexpected device type, after the caller has already allocated the
+    # inputs and run the whole warmup. The requirement belongs to the window, so
+    # the window states it.
+    # The guard raises on entry, so the body never runs.
+    with (
+        pytest.raises(ValueError, match="capture window needs a cuda device"),
+        profiler_window(torch.device("cpu")),
+    ):
+        raise AssertionError("the window opened on a cpu device")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")

@@ -105,7 +105,7 @@ markers = [
 filterwarnings = ["error::RuntimeWarning"]
 
 [tool.coverage.run]
-source = ["slinoss"]
+source = ["slinoss", "scripts"]
 branch = true
 omit = ["slinoss/_aot/*"]
 
@@ -114,4 +114,7 @@ exclude_also = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
     "@overload",
+    # A driver's process entry point. It runs only when the module is a program,
+    # which no test does; `main` itself is tested directly.
+    "if __name__ == .__main__.:",
 ]
