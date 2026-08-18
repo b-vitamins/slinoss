@@ -7,7 +7,7 @@ chunk-start state does not exercise chunk composition, so neither is built here.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict
 
 import pytest
 import torch
@@ -16,6 +16,18 @@ from torch import Tensor
 from slinoss.ops.scanprep import scanprep_ref
 
 W_MAX = 3.0
+
+
+class ScanKwargs(TypedDict):
+    """The optional operands, keyed by parameter name.
+
+    Typed rather than ``dict[str, Tensor | None]`` so that ``**inp.kw()`` checks
+    against the callee's own parameters instead of every keyword it accepts.
+    """
+
+    z0: Tensor | None
+    b_prev: Tensor | None
+    u_prev: Tensor | None
 
 
 class ScanInputs(NamedTuple):
@@ -34,7 +46,7 @@ class ScanInputs(NamedTuple):
         """Positional operands, in signature order."""
         return (self.U, self.trans, self.K, self.B, self.C)
 
-    def kw(self) -> dict[str, Tensor | None]:
+    def kw(self) -> ScanKwargs:
         """Keyword operands, in signature order."""
         return {"z0": self.z0, "b_prev": self.b_prev, "u_prev": self.u_prev}
 

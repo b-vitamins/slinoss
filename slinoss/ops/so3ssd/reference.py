@@ -62,17 +62,26 @@ from slinoss._precision import (
 from slinoss.config import HEAD_MULTIPLE, LANE_MULTIPLE
 
 __all__ = [
+    "ChunkedForward",
     "SO3SSDResult",
+    "TapGrads",
     "TransformTable",
+    "as_lanes",
+    "chunk_pad",
+    "chunked_forward",
     "quat_conj",
     "quat_exp",
+    "quat_exp_vjp",
     "quat_mul",
     "quat_prefix_scan",
+    "quat_prefix_scan_vjp",
     "rot_matrix",
+    "rot_matrix_vjp",
     "skew",
     "so3ssd_ref",
     "so3ssm",
     "tap_matrix",
+    "tap_matrix_vjp",
     "transform_table",
 ]
 
@@ -103,8 +112,14 @@ def _series_coeffs(offset: int) -> tuple[float, ...]:
     )
 
 
+def _deriv_coeffs(coeffs: tuple[float, ...]) -> tuple[float, ...]:
+    return tuple(k * coeffs[k] for k in range(1, len(coeffs)))
+
+
 _COS_HALF: tuple[float, ...] = _series_coeffs(0)
 _SINC_HALF: tuple[float, ...] = _series_coeffs(1)
+_COS_HALF_D: tuple[float, ...] = _deriv_coeffs(_COS_HALF)
+_SINC_HALF_D: tuple[float, ...] = _deriv_coeffs(_SINC_HALF)
 
 
 def _horner(s: Tensor, coeffs: tuple[float, ...]) -> Tensor:
@@ -125,6 +140,27 @@ def quat_exp(w: Tensor) -> Tensor:
     """
     s = (w * w).sum(-1, keepdim=True)
     return torch.cat([_horner(s, _COS_HALF), 0.5 * _horner(s, _SINC_HALF) * w], dim=-1)
+
+
+def quat_exp_vjp(dq: Tensor, w: Tensor) -> Tensor:
+    """Adjoint of :func:`quat_exp`.
+
+    Differentiating in ``s = |w|^2`` keeps the chain rule polynomial too: the
+    inner derivative is ``2*w``, so nothing here divides by ``|w|``.
+
+    Args:
+        dq: Cotangent of the quaternion, shape ``(...,4)``.
+        w: Rotation vectors the primal was evaluated at, shape ``(...,3)``.
+
+    Returns:
+        Cotangent of ``w``, shape ``(...,3)``.
+    """
+    s = (w * w).sum(-1, keepdim=True)
+    dq_s, dq_v = dq[..., :1], dq[..., 1:]
+    ds = dq_s * _horner(s, _COS_HALF_D) + 0.5 * _horner(s, _SINC_HALF_D) * (
+        dq_v * w
+    ).sum(-1, keepdim=True)
+    return 0.5 * _horner(s, _SINC_HALF) * dq_v + 2.0 * w * ds
 
 
 def quat_mul(a: Tensor, b: Tensor) -> Tensor:
@@ -178,6 +214,37 @@ def quat_prefix_scan(q: Tensor) -> Tensor:
         )
         step *= 2
     return out / out.norm(dim=-1, keepdim=True)
+
+
+def quat_prefix_scan_vjp(dQ: Tensor, qprefix: Tensor) -> Tensor:
+    """Adjoint of :func:`quat_prefix_scan`, in closed form.
+
+    ``Q_l = q_l (*) Q_{l-1}`` and right multiplication is its own adjoint under
+    conjugation, so
+
+        dq_l = Q_l (*) S_l (*) conj(Q_{l-1}),
+        S_l  = sum_{m >= l} conj(Q_m) (*) p_m.
+
+    ``S`` is a reverse cumulative sum of four numbers per token, not a
+    non-commutative scan, so the adjoint costs one suffix sum and two products.
+    ``p_m`` is ``dQ_m`` with its radial component removed, which is the adjoint of
+    the renormalization the forward applies once per chunk; the prefix is unit to
+    rounding, so the divide by its norm is the identity.
+
+    Args:
+        dQ: Cotangent of the prefix, shape ``(...,L,4)``.
+        qprefix: The prefix the primal returned, shape ``(...,L,4)``. The
+            per-token quaternions are not needed: the closed form recovers each
+            from a neighbouring pair of prefixes.
+
+    Returns:
+        Cotangent of the per-token quaternions, shape ``(...,L,4)``.
+    """
+    proj = dQ - (dQ * qprefix).sum(-1, keepdim=True) * qprefix
+    suffix = quat_mul(quat_conj(qprefix), proj).flip(-2).cumsum(-2).flip(-2)
+    ident = _pad(torch.ones_like(qprefix[..., :1, :1]), (0, 3))
+    shifted = torch.cat([ident, qprefix[..., :-1, :]], dim=-2)
+    return quat_mul(quat_mul(qprefix, suffix), quat_conj(shifted))
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +303,54 @@ def rot_matrix(q: Tensor) -> Tensor:
     )
 
 
+def _sym_asym(dM: Tensor) -> tuple[tuple[Tensor, Tensor, Tensor], Tensor, Tensor]:
+    """Off-diagonal symmetric parts, the axial vector, and the diagonal.
+
+    Every 3x3 adjoint here contracts ``dM`` against a matrix that is either
+    symmetric or antisymmetric, so both halves are formed once.
+
+    Args:
+        dM: Cotangent matrices, shape ``(...,3,3)``.
+
+    Returns:
+        ``((s01, s02, s12), axial, diag)`` where ``s_ij = dM_ij + dM_ji``,
+        ``axial`` is the vector ``v`` with ``<dM, skew(v)> = <axial, v>``, shape
+        ``(...,3)``, and ``diag`` holds the three diagonal entries, shape
+        ``(...,3)``.
+    """
+    d00, d01, d02, d10, d11, d12, d20, d21, d22 = dM.flatten(-2, -1).unbind(-1)
+    axial = torch.stack([d21 - d12, d02 - d20, d10 - d01], dim=-1)
+    diag = torch.stack([d00, d11, d22], dim=-1)
+    return (d01 + d10, d02 + d20, d12 + d21), axial, diag
+
+
+def rot_matrix_vjp(dR: Tensor, q: Tensor) -> Tensor:
+    """Adjoint of :func:`rot_matrix`.
+
+    Args:
+        dR: Cotangent of the rotation matrix, shape ``(...,3,3)``.
+        q: Scalar-first unit quaternions the primal was evaluated at, shape
+            ``(...,4)``.
+
+    Returns:
+        Cotangent of ``q``, shape ``(...,4)``. Includes the radial component;
+        callers that renormalized must project it out.
+    """
+    qw, qx, qy, qz = q.unbind(-1)
+    (s01, s02, s12), axial, diag = _sym_asym(dR)
+    a0, a1, a2 = axial.unbind(-1)
+    d00, d11, d22 = diag.unbind(-1)
+    return torch.stack(
+        [
+            2.0 * (qx * a0 + qy * a1 + qz * a2),
+            2.0 * (qy * s01 + qz * s02 + qw * a0) - 4.0 * qx * (d11 + d22),
+            2.0 * (qx * s01 + qz * s12 + qw * a1) - 4.0 * qy * (d00 + d22),
+            2.0 * (qx * s02 + qy * s12 + qw * a2) - 4.0 * qz * (d00 + d11),
+        ],
+        dim=-1,
+    )
+
+
 def tap_matrix(tap: Tensor, w: Tensor) -> Tensor:
     """Tap operator as an explicit matrix.
 
@@ -256,6 +371,56 @@ def tap_matrix(tap: Tensor, w: Tensor) -> Tensor:
     kr, par, imag = (component[..., None, None] for component in tap.unbind(-1))
     eye = torch.eye(3, dtype=w.dtype, device=w.device)
     return kr * eye + par * (w[..., :, None] * w[..., None, :]) + imag * skew(w)
+
+
+class TapGrads(NamedTuple):
+    """Adjoints of :func:`tap_matrix`.
+
+    Attributes:
+        tap: Cotangent of ``(kr, g, h)``, shape ``(...,3)``.
+        w: Cotangent of the rotation vector, shape ``(...,3)``.
+    """
+
+    tap: Tensor
+    w: Tensor
+
+
+def tap_matrix_vjp(dK: Tensor, tap: Tensor, w: Tensor) -> TapGrads:
+    """Adjoint of :func:`tap_matrix`.
+
+    The three basis matrices are the identity, ``w w^T``, and ``skew(w)``, so each
+    tap cotangent is one Frobenius inner product: the trace, the quadratic form,
+    and the axial contraction.
+
+    Args:
+        dK: Cotangent of the tap matrix, shape ``(...,3,3)``.
+        tap: ``(kr, g, h)`` the primal was evaluated at, shape ``(...,3)``.
+        w: Rotation vectors the primal was evaluated at, shape ``(...,3)``.
+
+    Returns:
+        A :class:`TapGrads`.
+    """
+    (s01, s02, s12), axial, diag = _sym_asym(dK)
+    wx, wy, wz = w.unbind(-1)
+    _, par, imag = tap.unbind(-1)
+    d00, d11, d22 = diag.unbind(-1)
+    symw = torch.stack(
+        [
+            2.0 * d00 * wx + s01 * wy + s02 * wz,
+            s01 * wx + 2.0 * d11 * wy + s12 * wz,
+            s02 * wx + s12 * wy + 2.0 * d22 * wz,
+        ],
+        dim=-1,
+    )
+    dtap = torch.stack(
+        [
+            diag.sum(-1),
+            0.5 * (w * symw).sum(-1),
+            (w * axial).sum(-1),
+        ],
+        dim=-1,
+    )
+    return TapGrads(tap=dtap, w=par[..., None] * symw + imag[..., None] * axial)
 
 
 class TransformTable(NamedTuple):
@@ -338,12 +503,37 @@ class _Shapes(NamedTuple):
     lanes: int
 
 
-def _lanes(t: Tensor) -> Tensor:
-    """``(...,3N) -> (...,N,3)``.
+def as_lanes(t: Tensor) -> Tensor:
+    """Split the trailing ``3N`` into ``N`` 3-vectors: ``(...,3N) -> (...,N,3)``.
 
     Lane-major: element ``3n+i`` is component ``i`` of 3-vector ``n``.
+
+    Args:
+        t: Tensor whose last axis is ``3N``.
+
+    Returns:
+        A view with shape ``(...,N,3)``.
     """
     return t.unflatten(-1, (-1, 3))
+
+
+def chunk_pad(t: Tensor, length: int) -> Tensor:
+    """``(B,H,T,...) -> (B,H,ceil(T/L),L,...)``, zero-padding a ragged tail.
+
+    A zero-padded token is an exact no-op: ``w = 0`` and ``ls = 0`` give the
+    identity transition while a zero tap kills the forcing.
+
+    Args:
+        t: Time-major tensor, shape ``(B,H,T,...)``.
+        length: Chunk length ``L``.
+
+    Returns:
+        The chunked tensor, shape ``(B,H,ceil(T/L),L,...)``.
+    """
+    tail = (-t.shape[2]) % length
+    if tail:
+        t = _pad(t, (0, 0) * (t.ndim - 3) + (0, tail))
+    return t.unflatten(2, (-1, length))
 
 
 def _check_inputs(
@@ -464,8 +654,8 @@ def so3ssm(
         kprev = tap_matrix(_promote(K[..., 0, :3], dtype), w)
         kcurr = tap_matrix(_promote(K[..., 1, :3], dtype), w)
         u = _promote(U, dtype)
-        blane = _lanes(_promote(B, dtype))
-        clane = _lanes(_promote(C, dtype))
+        blane = as_lanes(_promote(B, dtype))
+        clane = as_lanes(_promote(C, dtype))
 
         state = (
             torch.zeros(
@@ -478,14 +668,14 @@ def so3ssm(
                 device=device,
             )
             if z0 is None
-            else _lanes(_promote(z0, dtype))
+            else as_lanes(_promote(z0, dtype))
         )
         bp = (
             torch.zeros(
                 shapes.bsz, shapes.heads, shapes.lanes, 3, dtype=dtype, device=device
             )
             if b_prev is None
-            else _lanes(_promote(b_prev, dtype))
+            else as_lanes(_promote(b_prev, dtype))
         )
         up = (
             torch.zeros(
@@ -521,7 +711,72 @@ def so3ssm(
     )
 
 
-def so3ssd_ref(
+class ChunkedForward(NamedTuple):
+    """Every chunk-local intermediate of the chunked factorization.
+
+    Produced by :func:`chunked_forward`. The backward rematerializes this from the
+    saved inputs, so it is the single definition of what the two passes share.
+    Nothing here crosses a kernel boundary on the fast path.
+
+    Time is chunked: an axis pair ``(C,L)`` replaces ``T``, with the ragged tail
+    zero-padded. ``d`` denotes the flattened ``3N``.
+
+    Attributes:
+        length: Chunk length ``L``.
+        seqlen: Unpadded ``T``, for slicing the tail off the output.
+        w: Rotation vectors, ``(B,H,C,L,3)``.
+        lprefix: Chunk-local log-scale prefix ``lp``, ``(B,H,C,L)``.
+        tap: Tap parameters, ``(B,H,C,L,2,3)``.
+        u: ``U`` chunked, ``(B,H,C,L,P)``.
+        ushift: ``u_{t-1}`` chunked, ``(B,H,C,L,P)``.
+        b: ``B`` chunked, ``(B,H,C,L,3N)``.
+        bshift: ``b_{t-1}`` chunked, ``(B,H,C,L,3N)``.
+        c: ``C`` chunked, ``(B,H,C,L,3N)``.
+        quat: Per-token quaternion ``q_t``, ``(B,H,C,L,4)``.
+        qprefix: Chunk-local quaternion prefix ``Q_t``, ``(B,H,C,L,4)``.
+        table: The per-token 3x3 transforms.
+        crot: ``R(Q_t)^T c_t``, ``(B,H,C,L,N,3)``.
+        bnow: ``R(Q_t)^T Kcurr_t b_t``, ``(B,H,C,L,N,3)``.
+        bprv: ``R(Q_t)^T Kprev_t b_{t-1}``, ``(B,H,C,L,N,3)``.
+        score_now: ``<crot_t, bnow_r>``, ``(B,H,C,L,L)``. Unmasked.
+        score_prv: ``<crot_t, bprv_r>``, ``(B,H,C,L,L)``. Unmasked.
+        dmask: ``exp(2*(lp_t - lp_r)) * [r <= t]``, ``(B,H,C,L,L)``.
+        wgt: ``exp(2*(lp_{L-1} - lp_r))``, ``(B,H,C,L,1)``.
+        inc_local: Chunk increment before the frame change, ``(B,H,C,P,3N)``.
+        zstart: State entering each chunk, ``(B,H,C,P,N,3)``.
+        state: State after the last token, ``(B,H,P,N,3)``.
+        y: Output in the pinned dtype, tail already sliced, ``(B,H,T,P)``.
+        y_off: The ``zstart`` half of ``y``, still chunked, ``(B,H,C,L,P)``.
+    """
+
+    length: int
+    seqlen: int
+    w: Tensor
+    lprefix: Tensor
+    tap: Tensor
+    u: Tensor
+    ushift: Tensor
+    b: Tensor
+    bshift: Tensor
+    c: Tensor
+    quat: Tensor
+    qprefix: Tensor
+    table: TransformTable
+    crot: Tensor
+    bnow: Tensor
+    bprv: Tensor
+    score_now: Tensor
+    score_prv: Tensor
+    dmask: Tensor
+    wgt: Tensor
+    inc_local: Tensor
+    zstart: Tensor
+    state: Tensor
+    y: Tensor
+    y_off: Tensor
+
+
+def chunked_forward(
     U: Tensor,
     trans: Tensor,
     K: Tensor,
@@ -532,13 +787,11 @@ def so3ssd_ref(
     z0: Tensor | None = None,
     b_prev: Tensor | None = None,
     u_prev: Tensor | None = None,
-) -> SO3SSDResult:
-    """Chunked reference. Defines the shape the CUDA kernels implement.
+) -> ChunkedForward:
+    """Evaluate the chunked factorization and keep every intermediate.
 
     Vectorized over ``T``. The only Python loop is over chunks, which is the
-    inter-chunk recurrence the ``state_passing`` kernel owns. A ragged tail is
-    zero-padded, and a zero-padded token is an exact no-op: ``w = 0`` and
-    ``ls = 0`` give the identity transition while a zero tap kills the forcing.
+    inter-chunk recurrence the ``state_passing`` kernel owns.
 
     Args:
         U: Input weights, shape ``(B,H,T,P)``.
@@ -552,7 +805,7 @@ def so3ssd_ref(
         u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
 
     Returns:
-        A :class:`SO3SSDResult`.
+        A :class:`ChunkedForward`.
 
     Raises:
         ValueError: On a shape, contiguity, device, or pairing violation, or a
@@ -565,8 +818,6 @@ def so3ssd_ref(
     dtype = pinned_dtype(U, trans, K, B, C)
     device = U.device
     length = chunk_size
-    tail = (-shapes.seqlen) % length
-    n_chunks = (shapes.seqlen + tail) // length
 
     with autocast_disabled(device.type):
         u = _promote(U, dtype)
@@ -594,24 +845,26 @@ def so3ssd_ref(
         bshift = torch.cat([bhead, bvec[:, :, :-1]], dim=2)
         ushift = torch.cat([uhead, u[:, :, :-1]], dim=2)
 
-        def chunked(t: Tensor) -> Tensor:
-            if tail:
-                t = _pad(t, (0, 0, 0, tail))
-            return t.unflatten(2, (n_chunks, length))
+        w = chunk_pad(_promote(trans[..., :3], dtype), length)
+        lprefix = torch.cumsum(
+            chunk_pad(_promote(trans[..., 3:], dtype), length)[..., 0], dim=-1
+        )
+        tap = chunk_pad(_promote(K[..., :3].flatten(-2, -1), dtype), length).unflatten(
+            -1, (2, 3)
+        )
+        u_c = chunk_pad(u, length)
+        ushift_c = chunk_pad(ushift, length)
+        b_c = chunk_pad(bvec, length)
+        bshift_c = chunk_pad(bshift, length)
+        c_c = chunk_pad(cvec, length)
+        n_chunks = int(w.shape[2])
 
-        w = chunked(_promote(trans[..., :3], dtype))
-        lprefix = torch.cumsum(chunked(_promote(trans[..., 3:], dtype))[..., 0], dim=-1)
-        tap = chunked(_promote(K[..., :3].flatten(-2, -1), dtype)).unflatten(-1, (2, 3))
-        u_c = chunked(u)
-        ushift_c = chunked(ushift)
-        b_c = chunked(bvec)
-        bshift_c = chunked(bshift)
-        c_c = chunked(cvec)
-
-        table = transform_table(w, tap, quat_prefix_scan(quat_exp(w)))
-        crot = torch.einsum("bhclij,bhclnj->bhclni", table.ac, _lanes(c_c))
-        bnow = torch.einsum("bhclij,bhclnj->bhclni", table.an, _lanes(b_c))
-        bprv = torch.einsum("bhclij,bhclnj->bhclni", table.ap, _lanes(bshift_c))
+        quat = quat_exp(w)
+        qprefix = quat_prefix_scan(quat)
+        table = transform_table(w, tap, qprefix)
+        crot = torch.einsum("bhclij,bhclnj->bhclni", table.ac, as_lanes(c_c))
+        bnow = torch.einsum("bhclij,bhclnj->bhclni", table.an, as_lanes(b_c))
+        bprv = torch.einsum("bhclij,bhclnj->bhclni", table.ap, as_lanes(bshift_c))
         crot_f = crot.flatten(-2, -1)
         bnow_f = bnow.flatten(-2, -1)
         bprv_f = bprv.flatten(-2, -1)
@@ -624,9 +877,9 @@ def so3ssd_ref(
                 ~causal, -float("inf")
             )
         )
-        y_diag = ((crot_f @ bnow_f.transpose(-1, -2)) * dmask) @ u_c + (
-            (crot_f @ bprv_f.transpose(-1, -2)) * dmask
-        ) @ ushift_c
+        score_now = crot_f @ bnow_f.transpose(-1, -2)
+        score_prv = crot_f @ bprv_f.transpose(-1, -2)
+        y_diag = (score_now * dmask) @ u_c + (score_prv * dmask) @ ushift_c
 
         # I6: fold the increment weight into u, size P, not into brot, size 3N.
         wgt = torch.exp(2.0 * (lprefix[..., -1:] - lprefix))[..., None]
@@ -634,7 +887,7 @@ def so3ssd_ref(
             "bhclp,bhcld->bhcpd", u_c * wgt, bnow_f
         ) + torch.einsum("bhclp,bhcld->bhcpd", ushift_c * wgt, bprv_f)
         chunk_rot = table.rot[..., -1, :, :]
-        inc = torch.einsum("bhcij,bhcpnj->bhcpni", chunk_rot, _lanes(inc_local))
+        inc = torch.einsum("bhcij,bhcpnj->bhcpni", chunk_rot, as_lanes(inc_local))
         chunk_scale = torch.exp(2.0 * lprefix[..., -1])
 
         state = (
@@ -648,7 +901,7 @@ def so3ssd_ref(
                 device=device,
             )
             if z0 is None
-            else _lanes(_promote(z0, dtype))
+            else as_lanes(_promote(z0, dtype))
         )
         starts = []
         for c in range(n_chunks):
@@ -665,9 +918,78 @@ def so3ssd_ref(
         )
         y = (y_diag + y_off).flatten(2, 3)[:, :, : shapes.seqlen]
 
+    return ChunkedForward(
+        length=length,
+        seqlen=shapes.seqlen,
+        w=w,
+        lprefix=lprefix,
+        tap=tap,
+        u=u_c,
+        ushift=ushift_c,
+        b=b_c,
+        bshift=bshift_c,
+        c=c_c,
+        quat=quat,
+        qprefix=qprefix,
+        table=table,
+        crot=crot,
+        bnow=bnow,
+        bprv=bprv,
+        score_now=score_now,
+        score_prv=score_prv,
+        dmask=dmask,
+        wgt=wgt,
+        inc_local=inc_local,
+        zstart=zstart,
+        state=state,
+        y=y,
+        y_off=y_off,
+    )
+
+
+def so3ssd_ref(
+    U: Tensor,
+    trans: Tensor,
+    K: Tensor,
+    B: Tensor,
+    C: Tensor,
+    chunk_size: int,
+    *,
+    z0: Tensor | None = None,
+    b_prev: Tensor | None = None,
+    u_prev: Tensor | None = None,
+) -> SO3SSDResult:
+    """Chunked reference. Defines the shape the CUDA kernels implement.
+
+    A thin projection of :func:`chunked_forward` onto the operator's return
+    contract. A ragged tail is zero-padded, and a zero-padded token is an exact
+    no-op.
+
+    Args:
+        U: Input weights, shape ``(B,H,T,P)``.
+        trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
+        K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
+        B: Input vectors, shape ``(B,H,T,3N)``.
+        C: Output vectors, shape ``(B,H,T,3N)``.
+        chunk_size: Chunk length ``L``.
+        z0: Initial state, shape ``(B,H,P,3N)``, pinned. Zero if omitted.
+        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,H,3N)``.
+        u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
+
+    Returns:
+        A :class:`SO3SSDResult`.
+
+    Raises:
+        ValueError: On a shape, contiguity, device, or pairing violation, or a
+            non-positive ``chunk_size``.
+        TypeError: On an unsupported dtype, or a low-precision pinned tensor.
+    """
+    fw = chunked_forward(
+        U, trans, K, B, C, chunk_size, z0=z0, b_prev=b_prev, u_prev=u_prev
+    )
     return SO3SSDResult(
-        y=y.to(U.dtype).contiguous(),
-        state=state.flatten(-2, -1).contiguous(),
+        y=fw.y.to(U.dtype).contiguous(),
+        state=fw.state.flatten(-2, -1).contiguous(),
         b_last=B[:, :, -1].contiguous(),
         u_last=U[:, :, -1].contiguous(),
     )
