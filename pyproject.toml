@@ -1,0 +1,117 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slinoss"
+version = "0.1.0"
+description = "Oscillatory state-space sequence mixer with an SO(3) rotation operator"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "einops>=0.7",
+]
+
+[project.optional-dependencies]
+# The CUDA path needs the CuTe DSL. Declared here so an import failure is a
+# dependency error and not a mystery. Kept optional so the reference path
+# installs on a machine with no GPU.
+cuda = [
+    "nvidia-cutlass-dsl>=4.4",
+    "cuda-python>=12.4",
+]
+# Profiling and benchmarking drivers under scripts/.
+perf = [
+    "nvtx>=0.2",
+    "cupti-python",
+    "ncu-report",
+    "nsight-python",
+]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "ruff>=0.9",
+    "pyright>=1.1.390",
+]
+
+[tool.setuptools.packages.find]
+# Explicit include so every kernel subpackage lands in the wheel. A missing
+# __init__.py silently drops a whole kernel tree from an installed
+# distribution while leaving the source tree working; enumerate instead.
+where = ["."]
+include = ["slinoss*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+slinoss = ["py.typed"]
+
+# --------------------------------------------------------------------------
+# Lint
+# --------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+extend-exclude = ["slinoss/_aot"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",   # line length is enforced by the formatter
+    "B905",   # zip strict= is noise on fixed-length CuTe tuples
+]
+
+[tool.ruff.lint.per-file-ignores]
+# CuTe tests gate on a module-level importorskip before importing kernels.
+# That is deliberate: without it the import raises at collection time and the
+# whole file errors instead of skipping.
+"tests/**" = ["E402"]
+"scripts/**" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["slinoss"]
+
+# --------------------------------------------------------------------------
+# Types
+# --------------------------------------------------------------------------
+
+[tool.pyright]
+include = ["slinoss", "tests", "scripts", "examples"]
+exclude = ["slinoss/_aot", "**/__pycache__"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingImports = "error"
+reportMissingTypeStubs = "none"
+reportPrivateImportUsage = "none"
+reportUnusedExpression = "error"
+reportUnnecessaryComparison = "error"
+reportUnnecessaryIsInstance = "error"
+
+# --------------------------------------------------------------------------
+# Test
+# --------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "cuda: requires a CUDA device",
+    "cute: requires the CuTe DSL and a CUDA device",
+    "slow: takes more than a few seconds",
+    "perf: measures time or memory; excluded from correctness runs",
+]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.coverage.run]
+source = ["slinoss"]
+branch = true
+omit = ["slinoss/_aot/*"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]

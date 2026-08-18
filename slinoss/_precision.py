@@ -1,0 +1,111 @@
+"""Float32-pinning policy.
+
+The rotation state is float32 or wider everywhere, including under autocast:
+``trans``, ``K``, the per-step quaternions, both chunk-local prefixes, the 3x3
+transform table, and the recurrent state ``z``. Only ``U``, ``B``, ``C``, ``Y``,
+the score matrix, and GEMM operands may be low precision.
+
+Rotation error enters the rotation matrix squared and the chunk-local prefixes
+accumulate over the whole chunk, so a low-precision transition is a correctness
+defect rather than a speed/accuracy trade.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from collections.abc import Iterator
+
+import torch
+from torch import Tensor
+
+LOW_PRECISION_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16, torch.float16)
+"""Admitted for ``U``, ``B``, ``C``, ``Y`` and GEMM operands only."""
+
+WIDE_DTYPES: tuple[torch.dtype, ...] = (torch.float32, torch.float64)
+"""Admitted anywhere. float64 exists so the reference is the fp64 oracle."""
+
+SUPPORTED_DTYPES: tuple[torch.dtype, ...] = LOW_PRECISION_DTYPES + WIDE_DTYPES
+
+PINNED_TENSORS: tuple[str, ...] = ("trans", "K", "q", "Q", "lp", "table", "z")
+"""Names that must never carry a dtype from :data:`LOW_PRECISION_DTYPES`."""
+
+
+def check_supported(tensor: Tensor, name: str) -> None:
+    """Reject a dtype the operator does not implement.
+
+    Args:
+        tensor: Tensor to check.
+        name: Name used in the error message.
+
+    Raises:
+        TypeError: If ``tensor.dtype`` is not in :data:`SUPPORTED_DTYPES`.
+    """
+    if tensor.dtype not in SUPPORTED_DTYPES:
+        raise TypeError(
+            f"{name} has dtype {tensor.dtype}; supported: {SUPPORTED_DTYPES}"
+        )
+
+
+def check_pinned(tensor: Tensor, name: str) -> None:
+    """Reject a low-precision dtype on a pinned tensor.
+
+    Args:
+        tensor: Tensor to check.
+        name: Name used in the error message. Expected to be in
+            :data:`PINNED_TENSORS`.
+
+    Raises:
+        TypeError: If ``tensor.dtype`` is in :data:`LOW_PRECISION_DTYPES`.
+    """
+    check_supported(tensor, name)
+    if tensor.dtype in LOW_PRECISION_DTYPES:
+        raise TypeError(
+            f"{name} is float32-pinned and cannot be {tensor.dtype}; "
+            f"pinned tensors: {PINNED_TENSORS}"
+        )
+
+
+def pinned_dtype(*tensors: Tensor) -> torch.dtype:
+    """Resolve the dtype the pinned math runs in.
+
+    float64 whenever any operand is float64, so a float64 call is an fp64
+    oracle end to end. float32 otherwise, including when every operand is
+    bfloat16 or float16.
+
+    Args:
+        *tensors: Operands of the call.
+
+    Returns:
+        ``torch.float64`` or ``torch.float32``.
+
+    Raises:
+        ValueError: If no tensors are given.
+    """
+    if not tensors:
+        raise ValueError("pinned_dtype needs at least one tensor")
+    if any(t.dtype is torch.float64 for t in tensors):
+        return torch.float64
+    return torch.float32
+
+
+def device_type_of(tensor: Tensor) -> str:
+    """Return the autocast device-type string for ``tensor``."""
+    return tensor.device.type
+
+
+@contextlib.contextmanager
+def autocast_disabled(device_type: str) -> Iterator[None]:
+    """Run pinned math outside autocast.
+
+    Autocast rewrites matmul operands to the autocast dtype. Every contraction
+    over a pinned tensor is wrapped in this so the rewrite cannot reach the
+    transition.
+
+    Args:
+        device_type: Device type string, e.g. ``"cuda"`` or ``"cpu"``.
+
+    Yields:
+        None.
+    """
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        yield

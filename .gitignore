@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.a
+
+build/
+dist/
+*.egg-info/
+_skbuild/
+
+.venv/
+venv/
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.hypothesis/
+
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated AOT payloads and JIT caches.
+slinoss/_aot/
+.cutlass_cache/
+.cute_cache/
+
+# Local measurement and profiling artifacts.
+reports/
+out/
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+# Local planning and status scratch.
+goal.md
+.goal/
