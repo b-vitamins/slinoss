@@ -19,6 +19,14 @@ scale of one.
 the profiled kernel, which is not the clock the benchmark ran at, so the
 resulting per-kernel durations do not compose into the measured step time.
 
+``--cache-control none`` is not optional either, for two reasons. The default
+flushes L1 and L2 before every replay, so every kernel is profiled cold while the
+benchmark runs warm: measured on this fleet at 2,096,864 ns against 1,764,928 ns
+over the same 816 launches, 18.8% of the total. And a cold cache inflates DRAM
+traffic, which inflates achieved bandwidth, which lets a cache-resident kernel
+pass a DRAM-bound bar it has no business passing. Warm is both the execution the
+step time came from and the conservative side of the class verdict.
+
 One NCU pass per table. Counters from different passes describe different
 executions, so they do not share a row without a stated disagreement:
 ``pass_duration_spread_pct`` carries the duration disagreement between passes,
@@ -270,6 +278,8 @@ def ncu_command(
         ncu,
         "--csv",
         "--clock-control",
+        "none",
+        "--cache-control",
         "none",
         "--profile-from-start",
         "off",

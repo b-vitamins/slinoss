@@ -187,14 +187,18 @@ def test_required_metrics_is_the_deduplicated_union_in_table_order() -> None:
 
 
 def test_ncu_command_flags_in_order() -> None:
-    # --clock-control none is not optional: clock locking is denied on the
-    # verification fleet, so the profiled clock must be the benchmark's clock.
+    # Neither control flag is optional. Clock locking is denied on the
+    # verification fleet, so the profiled clock must be the benchmark's clock;
+    # and the default cache control profiles every kernel cold while the
+    # benchmark runs warm, which inflates both the duration and the DRAM traffic.
     # The target follows --metrics directly; ncu parses a bare "--" as an empty
     # long option and exits on it.
     assert ncu_command(DRAM, TARGET) == [
         "ncu",
         "--csv",
         "--clock-control",
+        "none",
+        "--cache-control",
         "none",
         "--profile-from-start",
         "off",
