@@ -334,6 +334,7 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
         f"- device: {device.name}, capability {device.capability}, "
         f"{device.sm_count} SM",
         f"- clocks: {device.clocks.stamp}",
+        f"- sharing: {device.sharing.stamp}",
         f"- smem opt-in per block: {device.smem_optin_per_block_bytes:,} bytes",
         f"- cross-check: {'not run' if check is None else check.detail}",
         "",

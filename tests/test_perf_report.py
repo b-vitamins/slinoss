@@ -29,7 +29,7 @@ from slinoss.perf.ceiling import (
     DramCeiling,
     TensorCeiling,
 )
-from slinoss.perf.device import ClockPolicy, DeviceInfo
+from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, RepeatRow, growth, repeats
 from slinoss.perf.memory import MemoryPeaks, RegionSaved, SavedStorages
 from slinoss.perf.ncu import KernelCounters
@@ -54,6 +54,7 @@ from slinoss.perf.units import (
     Bytes,
     Count,
     GBPerSecond,
+    Mebibytes,
     Megahertz,
     Microseconds,
     Percent,
@@ -126,6 +127,13 @@ def _device() -> DeviceInfo:
             locked=False,
             sm_clock_mhz=Megahertz(1740.0),
             max_sm_clock_mhz=Megahertz(1800.0),
+            detail="fabricated",
+        ),
+        sharing=Contention(
+            probed=True,
+            foreign_process_count=Count(1),
+            foreign_memory_mib=Mebibytes(36918.0),
+            utilization_pct=Percent(100.0),
             detail="fabricated",
         ),
     )
@@ -460,6 +468,13 @@ def test_markdown_header_carries_the_device_evidence() -> None:
     assert text.startswith("# full\n")
     assert "- device: Test Part, capability 8.6, 84 SM" in text
     assert "- clocks: unlocked" in text
+    # A competitor on the device moves a median further than any change under
+    # test, so the header states it beside the clock stamp rather than leaving it
+    # in the JSON for nobody to read.
+    assert (
+        "- sharing: shared with 1 process holding 36,918 MiB at 100% utilization"
+        in text
+    )
     assert "- smem opt-in per block: 101,376 bytes" in text
 
 

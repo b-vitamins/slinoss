@@ -47,7 +47,14 @@ from slinoss.perf.ceiling import (
     tensor_ceiling,
     tensor_verdict,
 )
-from slinoss.perf.device import ClockPolicy, DeviceInfo, clock_policy, device_info
+from slinoss.perf.device import (
+    ClockPolicy,
+    Contention,
+    DeviceInfo,
+    clock_policy,
+    contention,
+    device_info,
+)
 from slinoss.perf.dispersion import GrowthRow, RepeatRow, growth, repeats
 from slinoss.perf.memory import (
     MemoryPeaks,
@@ -142,6 +149,7 @@ __all__ = [
     "Ceilings",
     "ClassVerdict",
     "ClockPolicy",
+    "Contention",
     "Count",
     "DeviceInfo",
     "DramCeiling",
@@ -185,6 +193,7 @@ __all__ = [
     "ceilings",
     "clock_policy",
     "compare",
+    "contention",
     "device_info",
     "dram_ceiling",
     "dram_verdict",

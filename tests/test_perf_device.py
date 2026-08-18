@@ -1,14 +1,16 @@
 """Queried device state, measured ceilings, and the profiler capture window.
 
-The clock probe is driven through an injected :data:`slinoss.perf.device.SmiQuery`
-and ``smi_query`` through a monkeypatched ``subprocess.run``, so every parse
-branch runs without ``nvidia-smi``. The two ceilings need a GPU to measure but
-their refusal on a CPU device does not, and the verdicts are pure arithmetic over
-hand-built ceilings.
+The clock and sharing probes are driven through an injected
+:data:`slinoss.perf.device.SmiQuery` and
+:data:`slinoss.perf.device.ComputeAppsQuery`, and the two readers behind them
+through a monkeypatched ``subprocess.run``, so every parse branch runs without
+``nvidia-smi``. The two ceilings need a GPU to measure but their refusal on a CPU
+device does not, and the verdicts are pure arithmetic over hand-built ceilings.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Sequence
 
@@ -32,9 +34,13 @@ from slinoss.perf.ceiling import (
 )
 from slinoss.perf.device import (
     ClockPolicy,
+    ComputeAppsQuery,
+    Contention,
     DeviceInfo,
     SmiQuery,
     clock_policy,
+    compute_apps_query,
+    contention,
     device_info,
     smi_query,
 )
@@ -42,6 +48,7 @@ from slinoss.perf.units import (
     Bytes,
     Count,
     GBPerSecond,
+    Mebibytes,
     Megahertz,
     Microseconds,
     Percent,
@@ -65,6 +72,16 @@ def _returning(line: str | None) -> SmiQuery:
     def query(fields: Sequence[str], index: int) -> str | None:
         del fields, index
         return line
+
+    return query
+
+
+def _apps(text: str | None) -> ComputeAppsQuery:
+    """An injected compute-process reader that always answers with one block."""
+
+    def query(index: int) -> str | None:
+        del index
+        return text
 
     return query
 
@@ -100,6 +117,13 @@ def _device(sm_count: int = 84) -> DeviceInfo:
             locked=False,
             sm_clock_mhz=Megahertz(1740.0),
             max_sm_clock_mhz=Megahertz(1800.0),
+            detail="fabricated",
+        ),
+        sharing=Contention(
+            probed=True,
+            foreign_process_count=Count(0),
+            foreign_memory_mib=Mebibytes(0.0),
+            utilization_pct=Percent(0.0),
             detail="fabricated",
         ),
     )
@@ -274,6 +298,166 @@ def test_smi_query_returns_none_on_empty_stdout(
 
 
 # ---------------------------------------------------------------------------
+# compute_apps_query and contention
+#
+# A shared device is the measurement condition that moved a median by 2.33x on
+# this fleet, so it is stamped the way the clock state is. A probe that fails
+# reports shared, never exclusive.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_apps_query_builds_the_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[list[str], int]] = []
+
+    def fake_run(
+        cmd: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, int)
+        seen.append((list(cmd), timeout))
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        return subprocess.CompletedProcess(list(cmd), 0, "17, 28\n99, 36918\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert compute_apps_query(1) == "17, 28\n99, 36918"
+    assert seen == [
+        (
+            [
+                "nvidia-smi",
+                "--id=1",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            20,
+        )
+    ]
+
+
+def test_compute_apps_query_reads_an_idle_device_as_an_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A device with no compute process prints nothing. That is not a failed probe,
+    # and conflating the two would report an exclusive device as unknown.
+    def fake_run(
+        cmd: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(list(cmd), 0, "\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert compute_apps_query(0) == ""
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["nonzero", "missing", "timeout"],
+)
+def test_compute_apps_query_returns_none_on_a_failed_probe(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    def fake_run(
+        cmd: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        if failure == "missing":
+            raise OSError("no such file")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(cmd=["nvidia-smi"], timeout=20)
+        return subprocess.CompletedProcess(list(cmd), 9, "", "no devices")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert compute_apps_query(0) is None
+
+
+def test_contention_reports_a_device_holding_only_this_process() -> None:
+    got = contention(
+        0, apps=_apps("4321, 512"), query=_returning("0, 512"), own_pid=4321
+    )
+    assert got.exclusive
+    assert got.foreign_process_count == 0
+    assert got.foreign_memory_mib == 0.0
+    assert got.utilization_pct == 0.0
+    assert got.stamp == "exclusive"
+    assert "own pid 4321" in got.detail
+
+
+def test_contention_counts_every_other_process_on_the_device() -> None:
+    got = contention(
+        0,
+        apps=_apps("4321, 512\n3823071, 36918\n3270062, 28"),
+        query=_returning("100, 37458"),
+        own_pid=4321,
+    )
+    assert not got.exclusive
+    assert got.foreign_process_count == 2
+    assert got.foreign_memory_mib == 36946.0
+    assert got.utilization_pct == 100.0
+    assert got.stamp == (
+        "shared with 2 processes holding 36,946 MiB at 100% utilization"
+    )
+
+
+def test_contention_names_one_other_process_in_the_singular() -> None:
+    got = contention(0, apps=_apps("99, 28"), query=_returning("0, 44"), own_pid=4321)
+    assert got.stamp == "shared with 1 process holding 28 MiB at 0% utilization"
+
+
+def test_contention_reports_a_failed_apps_probe_as_shared() -> None:
+    # Unknown is not exclusive. Claiming an exclusive device off a probe that did
+    # not run is the one direction that turns a contended median into a clean one.
+    got = contention(0, apps=_apps(None), query=_returning("0, 44"), own_pid=4321)
+    assert not got.exclusive
+    assert got.foreign_process_count == 0
+    assert got.detail == "nvidia-smi unavailable"
+    assert got.stamp == "sharing unknown"
+
+
+def test_contention_reports_an_unparsed_apps_line_as_shared() -> None:
+    got = contention(0, apps=_apps("4321"), query=_returning("0, 44"), own_pid=4321)
+    assert not got.exclusive
+    assert got.detail.startswith("unparsed nvidia-smi output:")
+    assert got.stamp == "sharing unknown"
+
+
+def test_contention_reports_a_failed_utilization_probe_as_shared() -> None:
+    # An idle device whose utilization did not read is still not a device this
+    # measurement had to itself, because half the probe is missing.
+    got = contention(0, apps=_apps(""), query=_returning(None), own_pid=4321)
+    assert not got.exclusive
+    assert got.detail == "nvidia-smi unavailable"
+
+
+@pytest.mark.parametrize("line", ["0", "0, 44, extra"])
+def test_contention_reports_an_unparsed_utilization_line_as_shared(line: str) -> None:
+    got = contention(0, apps=_apps(""), query=_returning(line), own_pid=4321)
+    assert not got.exclusive
+    assert got.detail.startswith("unparsed nvidia-smi output:")
+    assert got.stamp == "sharing unknown"
+
+
+def test_contention_reads_a_non_numeric_field_as_zero() -> None:
+    # A probe that answers [N/A] is a fact to report, not an exception to raise.
+    got = contention(
+        0,
+        apps=_apps("99, [N/A]"),
+        query=_returning("[N/A], [N/A]"),
+        own_pid=4321,
+    )
+    assert not got.exclusive
+    assert got.foreign_process_count == 1
+    assert got.foreign_memory_mib == 0.0
+    assert got.utilization_pct == 0.0
+
+
+def test_contention_defaults_to_this_process_id() -> None:
+    # The measuring process holds a context on the device it measures, so without
+    # this exclusion every report would read as shared with itself.
+    got = contention(0, apps=_apps(f"{os.getpid()}, 512"), query=_returning("0, 512"))
+    assert got.exclusive
+
+
+# ---------------------------------------------------------------------------
 # DeviceInfo
 # ---------------------------------------------------------------------------
 
@@ -301,6 +485,11 @@ def test_device_info_reads_the_part_it_runs_on() -> None:
     assert info.smem_optin_per_block_bytes >= info.smem_per_block_bytes
     assert info.total_memory_bytes > 0
     assert info.block_floor_count == 2 * info.sm_count
+    # This process holds a context on the device, so the probe ran and excluded
+    # it. Whether anything else is there is the host's business, not a property
+    # the test can assert.
+    assert info.sharing.detail != "nvidia-smi unavailable"
+    assert info.sharing.foreign_memory_mib >= 0.0
 
 
 # ---------------------------------------------------------------------------
