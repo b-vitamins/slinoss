@@ -235,7 +235,7 @@ def causal_conv1d_bwd_native(
     dx = torch.empty_like(x)
     dinitial_state = None if initial_state is None else torch.empty_like(initial_state)
     parts = int(module.bwd_parts(dims.seqlen))
-    dweight_parts = x.new_empty((parts, dims.channels, dims.width), dtype=torch.float32)
+    dweight_parts = x.new_empty((parts, dims.width, dims.channels), dtype=torch.float32)
     dbias_parts = (
         None
         if bias is None
@@ -254,9 +254,12 @@ def causal_conv1d_bwd_native(
         dbias_parts,
         activation,
     )
+    # The partials are tap-major so the kernel's stores coalesce; the transpose
+    # back to the weight's own (D,W) is over D*W elements and does not scale with
+    # the sequence.
     return ConvGrads(
         dx=dx,
-        dweight=dweight_parts.sum(0).to(weight.dtype),
+        dweight=dweight_parts.sum(0).t().contiguous().to(weight.dtype),
         dbias=None if dbias_parts is None else dbias_parts.sum(0).to(x.dtype),
         dinitial_state=dinitial_state,
     )

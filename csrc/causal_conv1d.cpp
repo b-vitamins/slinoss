@@ -92,7 +92,7 @@ void bwd(const std::optional<at::Tensor> &dy,
   expect_optional(dfinal_state, "dfinal_state", window, dtype, device);
   expect_optional(dinitial_state, "dinitial_state", window, dtype, device);
   const int64_t parts = slinoss::causal_conv1d_bwd_parts(d.seqlen);
-  expect(dweight_parts, "dweight_parts", {parts, d.channels, d.width},
+  expect(dweight_parts, "dweight_parts", {parts, d.width, d.channels},
          at::kFloat, device);
   expect_optional(dbias_parts, "dbias_parts", {parts, d.channels}, at::kFloat,
                   device);

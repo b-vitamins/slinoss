@@ -25,17 +25,19 @@ constexpr int kTileT = 32;
 // Timesteps one backward block walks. Smaller than the forward tile because the
 // backward folds batch into the block's serial loop, so the time tile is the
 // only axis that supplies it blocks: the grid holds D*ceil(T/kBwdTileT) threads
-// whatever the batch is, where the forward gets a factor of B on top. The
-// backward pays a wider re-read for it, W-1 timesteps of x and dy per block
-// instead of W-1 of x. Halving it again is not free: the partial count is
-// ceil(T/kBwdTileT), so it doubles the partials the host has to sum.
-constexpr int kBwdTileT = 8;
+// whatever the batch is, where the forward gets a factor of B on top. Against
+// that, the tile is what amortizes the backward's overhang: a block walks
+// kBwdTileT + kWidth - 1 steps and loads both x and dy at each, so the loads per
+// owned timestep are (kWidth-1 + 2*(kBwdTileT+kWidth-1)) / kBwdTileT, and the
+// partial count is ceil(T/kBwdTileT), which is also what the host sums.
+constexpr int kBwdTileT = 16;
 
-// Batch entries one backward thread walks at once. The walk over time is serial
-// and each step depends on the one before it, so this is the axis that supplies
-// the thread independent loads to overlap: bytes in flight per thread scale with
-// it, and the window registers do too.
-constexpr int kBwdStreams = 2;
+// Timesteps one forward thread loads before it consumes any of them. The window
+// carries a serial dependence across time but the loads do not, so this is the
+// forward's bytes-in-flight-per-thread knob. It divides kTileT, so a full tile is
+// a whole number of groups and only the ragged tail tile needs the predicate.
+constexpr int kFwdPrefetch = 8;
+static_assert(kTileT % kFwdPrefetch == 0, "the prefetch group must divide kTileT");
 
 // Channels per block. A warp reads 32 consecutive channels at a fixed timestep,
 // which is one coalesced transaction because the layout is channels-last. Two
@@ -68,13 +70,14 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
 //   dx             (B,T,D)   contiguous, same dtype as x, written in full
 //   dinitial_state (B,W-1,D) contiguous, same dtype as x, written in full,
 //                            or nullopt
-//   dweight_parts  (P,D,W)   contiguous float32, written in full
+//   dweight_parts  (P,W,D)   contiguous float32, written in full
 //   dbias_parts    (P,D)     contiguous float32, written in full, or nullopt
 //
 // P is causal_conv1d_bwd_parts(T). The parameter gradients are per-lag float32
 // accumulators reduced along time inside the block and stored, never
 // accumulated, so no output needs zeroing before the launch. The caller sums
-// the P slices.
+// the P slices. Both partial buffers are channel-minor, so a warp's store is one
+// coalesced transaction; the caller transposes the summed tap block once.
 void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dfinal_state,
                        const at::Tensor &x, const at::Tensor &weight,
