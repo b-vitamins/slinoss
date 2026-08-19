@@ -201,8 +201,8 @@ NCU_TABLES: Final[tuple[NcuTable, ...]] = (
         "global",
         (
             _DURATION,
-            "l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum",
-            "l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum",
+            "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+            "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
             "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
             "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
         ),
@@ -611,12 +611,18 @@ class KernelCounters(PerfRecord):
         dram_pct: NCU's own DRAM throughput as a percentage of peak sustained.
             Trusted over the reconstructed rate beside it.
         achieved_gbs: ``(read + write)`` over ``duration_us``.
-        global_load_bytes: Bytes requested from global by load instructions.
-        global_store_bytes: Bytes requested from global by store instructions.
+        global_load_request_count: Requests the LSU sent to L1TEX for loads. One
+            per warp instruction that is not replayed.
+        global_store_request_count: The same for stores.
         global_load_sector_count: L1 sectors touched by loads.
         global_store_sector_count: L1 sectors touched by stores.
-        bytes_per_sector_ratio: Global bytes over global sectors. 32 is a fully
-            coalesced access; below that the access pattern is wasting sectors.
+        sector_per_load_request_ratio: Sectors over requests on the load side.
+            Read against the instruction's own bytes per lane, not a constant:
+            a warp asking four bytes each wants four sectors, and sixteen bytes
+            each wants sixteen. Above that, the access is scattered and pays for
+            sectors it does not use; below it, the request is under-filled and
+            the kernel is leaving in-flight bytes on the table.
+        sector_per_store_request_ratio: The same for stores.
         wavefront_count: Shared-memory wavefronts, load plus store. The
             denominator without which a conflict count means nothing.
         shared_load_conflict_count: Bank conflicts on shared loads.
@@ -678,11 +684,12 @@ class KernelCounters(PerfRecord):
     dram_write_bytes: Annotated[Bytes, SUM]
     dram_pct: Annotated[Percent, MEDIAN]
     achieved_gbs: Annotated[GBPerSecond, MEDIAN]
-    global_load_bytes: Annotated[Bytes, SUM]
-    global_store_bytes: Annotated[Bytes, SUM]
+    global_load_request_count: Annotated[Count, SUM]
+    global_store_request_count: Annotated[Count, SUM]
     global_load_sector_count: Annotated[Count, SUM]
     global_store_sector_count: Annotated[Count, SUM]
-    bytes_per_sector_ratio: Annotated[Ratio, MEDIAN]
+    sector_per_load_request_ratio: Annotated[Ratio, MEDIAN]
+    sector_per_store_request_ratio: Annotated[Ratio, MEDIAN]
     wavefront_count: Annotated[Count, SUM]
     shared_load_conflict_count: Annotated[Count, SUM]
     shared_store_conflict_count: Annotated[Count, SUM]
@@ -820,11 +827,10 @@ def kernel_counters(
             )
         read = Bytes(round(values["dram__bytes_read.sum"]))
         write = Bytes(round(values["dram__bytes_write.sum"]))
-        load_bytes = round(values["l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum"])
-        store_bytes = round(values["l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum"])
+        load_reqs = round(values["l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum"])
+        store_reqs = round(values["l1tex__t_requests_pipe_lsu_mem_global_op_st.sum"])
         load_sectors = round(values["l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"])
         store_sectors = round(values["l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"])
-        sectors = load_sectors + store_sectors
         wavefronts = round(
             values["l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum"]
             + values["l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum"]
@@ -851,12 +857,15 @@ def kernel_counters(
                     values["dram__throughput.avg.pct_of_peak_sustained_elapsed"]
                 ),
                 achieved_gbs=gbs_from_bytes_us(Bytes(read + write), duration_us),
-                global_load_bytes=Bytes(load_bytes),
-                global_store_bytes=Bytes(store_bytes),
+                global_load_request_count=Count(load_reqs),
+                global_store_request_count=Count(store_reqs),
                 global_load_sector_count=Count(load_sectors),
                 global_store_sector_count=Count(store_sectors),
-                bytes_per_sector_ratio=Ratio(
-                    0.0 if sectors == 0 else (load_bytes + store_bytes) / sectors
+                sector_per_load_request_ratio=Ratio(
+                    0.0 if load_reqs == 0 else load_sectors / load_reqs
+                ),
+                sector_per_store_request_ratio=Ratio(
+                    0.0 if store_reqs == 0 else store_sectors / store_reqs
                 ),
                 wavefront_count=Count(wavefronts),
                 shared_load_conflict_count=Count(load_conflicts),

@@ -40,6 +40,17 @@ a transposed score tile is not.
   on a DRAM-bound kernel. The achieved fraction cannot see that loss, since it
   divides measured bytes by measured time and both rise together, so the width of
   the tensor the band is cut from carries the requirement.
+- A warp's global access is charged per request, not per sector. Lanes covering
+  consecutive elements of one row fill the request; lanes strided by the warp
+  width leave the last segment carrying `width mod 32` lanes and that fraction of
+  the request's bytes. At a 48-element row the strided map averaged 48 bytes a
+  request against 64, and packing the columns cut 15% off a kernel whose DRAM
+  traffic did not move. L1 sector count rose in the same change, so sectors are
+  not the quantity to minimize. Sectors per request is, read against the
+  instruction's own bytes per lane. Bytes over sectors is not a coalescing
+  measure at all: NCU's global byte counters are sector-granular by
+  construction, so that quotient is exactly 32 for every kernel and can never
+  fire.
 - No `torch.zeros` or `aten::fill_` on a hot path. Accumulators initialize
   inside kernels.
 - No gradient tensor doubles as scratch. No tensor whose name and contents

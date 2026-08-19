@@ -360,8 +360,8 @@ COUNTERS: Final[dict[str, Fixture]] = {
             "%",
             ("62.5", "70", "81.25"),
         ),
-        "l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum": ("Mbyte", ("1.25",)),
-        "l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum": ("Kbyte", ("512",)),
+        "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum": ("request", ("10,240",)),
+        "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum": ("request", ("2,048",)),
         "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum": ("sector", ("40,960",)),
         "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum": ("sector", ("16,384",)),
         "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum": ("", ("8,192",)),
@@ -400,8 +400,8 @@ COUNTERS: Final[dict[str, Fixture]] = {
         "dram__bytes_read.sum": ("Kbyte", ("96",)),
         "dram__bytes_write.sum": ("Kbyte", ("32",)),
         "dram__throughput.avg.pct_of_peak_sustained_elapsed": ("%", ("12.5", "25")),
-        "l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum": ("byte", ("0",)),
-        "l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum": ("byte", ("0",)),
+        "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum": ("request", ("0",)),
+        "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum": ("request", ("0",)),
         "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum": ("sector", ("0",)),
         "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum": ("sector", ("0",)),
         "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum": ("", ("0",)),
@@ -501,8 +501,8 @@ def test_counters_merge_every_table() -> None:
     assert chunk.duration_us == pytest.approx(536.64)
     assert chunk.dram_read_bytes == 7_500_000
     assert chunk.dram_write_bytes == 1_920_000
-    assert chunk.global_load_bytes == 3_750_000
-    assert chunk.global_store_bytes == 1_536_000
+    assert chunk.global_load_request_count == 30_720
+    assert chunk.global_store_request_count == 6_144
     assert chunk.global_load_sector_count == 122_880
     assert chunk.global_store_sector_count == 49_152
     assert chunk.wavefront_count == 36_864
@@ -523,7 +523,11 @@ def test_counters_merge_every_table() -> None:
     assert chunk.thread_per_block_count == 256
     assert chunk.wave_per_sm_ratio == 6.4
     assert chunk.achieved_gbs == pytest.approx(9_420_000 / 536_640)
-    assert chunk.bytes_per_sector_ratio == pytest.approx(5_286_000 / 172_032)
+    # Distinct on purpose: the load side asks four sectors per request, which is
+    # one full request of four bytes a lane, and the store side asks eight, which
+    # is the scattered access this ratio exists to name.
+    assert chunk.sector_per_load_request_ratio == pytest.approx(4.0)
+    assert chunk.sector_per_store_request_ratio == pytest.approx(8.0)
     assert chunk.conflict_per_wavefront_ratio == pytest.approx(384 / 36_864)
     assert chunk.smem_bytes == 48_000 + 32_768
     # Longest first, so the row that owns the step heads the table.
@@ -547,7 +551,8 @@ def test_counters_take_an_even_median_and_guard_a_zero_denominator() -> None:
     # ratios are guarded rather than dividing by that zero.
     assert cpasync.global_load_sector_count == 0
     assert cpasync.global_store_sector_count == 0
-    assert cpasync.bytes_per_sector_ratio == 0.0
+    assert cpasync.sector_per_load_request_ratio == 0.0
+    assert cpasync.sector_per_store_request_ratio == 0.0
     assert cpasync.wavefront_count == 0
     assert cpasync.conflict_per_wavefront_ratio == 0.0
 
