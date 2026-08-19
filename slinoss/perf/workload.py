@@ -5,10 +5,12 @@ so the benchmarked path is the shipped path: :func:`slinoss.ops.so3ssd.so3ssd` a
 :func:`slinoss.ops.conv.causal_conv1d`, with no variant reachable from a script
 and not from the public API.
 
-Two shape vocabularies, because the two operators have two. The scan is indexed by
-``(B,H,T,P,N,L)`` and the causal conv1d by ``(B,T,D,W)``; ``D`` is the scan's
-``H*P``, so the conv shape of each name is the conv the mixer runs at the
-same-named scan shape.
+Four shape vocabularies, because the four operators have four. The scan is indexed
+by ``(B,H,T,P,N,L)``, the causal conv1d by ``(B,T,D,W)``, the parameter frontier by
+``(B,T,H,3N,G)`` and the block by ``(B,T,d_model,d_ffn)``. One name denotes one
+layer measured in four places: the conv's ``D`` is the scan's ``H*P``, and the
+frontier and the block hold the scan shape itself and read their widths off the
+:class:`slinoss.config.SLinOSSConfig` it implies, so neither can drift from it.
 
 ``trans`` and ``K`` are produced by the real parameter maps and then detached, so
 the numerical invariants hold on the benchmarked tensors -- ``ls <= 0`` and
@@ -35,30 +37,52 @@ from typing import Final, NamedTuple
 import torch
 from torch import Tensor
 
+from slinoss._guard import ALIGN_BYTES
+from slinoss.config import SLinOSSConfig
+from slinoss.ops.block import rmsnorm_residual, swiglu
 from slinoss.ops.conv import causal_conv1d, conv_state_shape
+from slinoss.ops.scanprep import scanprep
 from slinoss.ops.scanprep.reference import PARAM_COLS, pack_params, scanprep_ref
 from slinoss.ops.so3ssd import so3ssd
 from slinoss.perf.timing import region
 from slinoss.perf.units import Count
 
 __all__ = [
+    "BLOCK",
+    "BLOCK_SHAPES",
     "CONV",
     "CONV_SHAPES",
     "OPS",
+    "PREP_SHAPES",
+    "PROJ_ALIGN",
+    "SCANPREP",
     "SHAPES",
     "SHAPE_NAMES",
     "SO3SSD",
     "W_MAX",
+    "BlockInputs",
+    "BlockShape",
     "ConvInputs",
     "ConvShape",
     "OpInputs",
     "OpShape",
+    "PrepInputs",
+    "PrepShape",
+    "block_forward_only",
+    "block_shape_by_name",
+    "block_step",
     "conv_forward_only",
     "conv_shape_by_name",
     "conv_step",
     "forward_only",
+    "layer_config",
+    "make_block_inputs",
     "make_conv_inputs",
     "make_inputs",
+    "make_prep_inputs",
+    "prep_forward_only",
+    "prep_shape_by_name",
+    "prep_step",
     "shape_by_name",
     "step",
 ]
@@ -66,9 +90,19 @@ __all__ = [
 W_MAX: Final = 3.0
 """Rotation-vector bound used by every benchmark. Below pi, as I2 requires."""
 
+PROJ_ALIGN: Final = ALIGN_BYTES // 2
+"""Element multiple every band offset and the projection width clear.
+
+Elements, not bytes: ``ALIGN_BYTES`` at the narrowest supported width. A multiple
+of this is a multiple of the element count at every wider dtype too, so one number
+serves all of them.
+"""
+
 SO3SSD: Final = "so3ssd"
 CONV: Final = "conv"
-OPS: Final[tuple[str, ...]] = (SO3SSD, CONV)
+SCANPREP: Final = "scanprep"
+BLOCK: Final = "block"
+OPS: Final[tuple[str, ...]] = (SO3SSD, CONV, SCANPREP, BLOCK)
 """Benchmarkable operators. The whole registry every driver dispatches on."""
 
 
@@ -512,5 +546,526 @@ def conv_step(
             ).y
         with region(f"{prefix}.backward"):
             torch.autograd.grad(y, targets, inputs.dy)
+
+    return run
+
+
+def layer_config(shape: OpShape, *, groups: int = 1) -> SLinOSSConfig:
+    """The layer whose scan runs at ``shape``.
+
+    ``d_inner`` is ``H*P``, so at the default expansion the residual stream is half
+    of it and the FFN hidden is four times the stream. Every width the frontier and
+    the block are measured at is read off the returned config, so a driver restates
+    none of them and none can drift from the scan shape.
+
+    Args:
+        shape: The scan shape.
+        groups: ``G``, groups sharing one ``B``/``C`` pair.
+
+    Returns:
+        The config.
+
+    Raises:
+        ValueError: If ``H*P`` is odd, so no integer ``d_model`` expands to it, or
+            if any shape invariant of :class:`slinoss.config.SLinOSSConfig` fails.
+    """
+    inner = shape.heads * shape.rows
+    if inner % 2 != 0:
+        raise ValueError(f"H*P must be even to halve, got {inner}")
+    return SLinOSSConfig(
+        d_model=inner // 2,
+        d_state=shape.d_state,
+        expand=2.0,
+        d_head=shape.rows,
+        n_groups=groups,
+        chunk_size=shape.chunk,
+    )
+
+
+@dataclass(frozen=True)
+class PrepShape:
+    """One benchmarked parameter-frontier size.
+
+    Attributes:
+        scan: The scan this frontier feeds. ``B``, ``T``, ``H`` and ``3N`` are read
+            off it.
+        groups: ``G``, groups sharing one ``B``/``C`` pair. Divides ``H``.
+    """
+
+    scan: OpShape
+    groups: int
+
+    @property
+    def name(self) -> str:
+        """Shape name. The scan's, because it is the same layer."""
+        return self.scan.name
+
+    @property
+    def params_width(self) -> int:
+        """Parameter-band width, ``10*H``."""
+        return PARAM_COLS * self.scan.heads
+
+    @property
+    def bc_width(self) -> int:
+        """``B``/``C`` band width, ``2*G*3N``."""
+        return 2 * self.groups * self.scan.d_state
+
+    @property
+    def bc_offset(self) -> int:
+        """First column of the ``B``/``C`` band, ``2*d_inner``. The value and gate
+        bands precede it."""
+        return 2 * layer_config(self.scan, groups=self.groups).d_inner
+
+    @property
+    def params_offset(self) -> int:
+        """First column of the parameter band. Last of the four."""
+        return self.bc_offset + self.bc_width
+
+    @property
+    def proj_width(self) -> int:
+        """Fused-projection width: the four bands, padded up to :data:`PROJ_ALIGN`.
+
+        The row pitch of a band is the whole projection width, so the width has to
+        clear the alignment the kernels require of a pitched operand even though
+        the sum of the bands need not: ``10*H`` is a multiple of 8 only for ``H`` a
+        multiple of 4. Padding the projection costs a few columns of its GEMM and
+        keeps every ``H`` reachable.
+        """
+        total = self.params_offset + self.params_width
+        return -(-total // PROJ_ALIGN) * PROJ_ALIGN
+
+    @property
+    def token_count(self) -> Count:
+        """Tokens per call, ``B*T``."""
+        return Count(self.scan.bsz * self.scan.seq)
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        return (
+            f"{self.name}: B={self.scan.bsz} T={self.scan.seq} H={self.scan.heads} "
+            f"3N={self.scan.d_state} G={self.groups} W={self.proj_width}"
+        )
+
+
+PREP_SHAPES: Final[tuple[PrepShape, ...]] = tuple(
+    PrepShape(shape, groups=4 if shape.name == "wide" else 1) for shape in SHAPES
+)
+"""The standard frontier sizes, one per entry of :data:`SHAPES` and the same names.
+
+``G`` is 1 at every name but ``wide``, which is the config default and therefore
+the headline case. ``wide`` takes ``G = 4`` against ``H = 12``, so three heads share
+a pair: neither ``G = 1`` nor ``G = H`` exercises the general ``h // (H//G)``
+address, and the ``B``/``C`` band's share of the projection is a function of ``G``.
+"""
+
+
+def prep_shape_by_name(name: str) -> PrepShape:
+    """Look up a standard frontier shape.
+
+    Args:
+        name: Shape name.
+
+    Returns:
+        The shape.
+
+    Raises:
+        KeyError: If the name is not one of :data:`PREP_SHAPES`.
+    """
+    for shape in PREP_SHAPES:
+        if shape.name == name:
+            return shape
+    raise KeyError(f"no prep shape {name!r}; have {[s.name for s in PREP_SHAPES]}")
+
+
+class PrepInputs(NamedTuple):
+    """Parameter-frontier inputs at one shape.
+
+    ``params`` and ``bc`` are detached slices of ``proj``, so each is a leaf with
+    the row pitch the fused projection gives it. Slicing a leaf instead would put
+    a pullback into a zeroed ``(B,T,W)`` buffer inside the backward measurement,
+    which is the projection's cost and not the frontier's.
+
+    Attributes:
+        proj: ``(B,T,W)`` projection output, contiguous. Held only to keep the two
+            slices alive and to name the pitch; not differentiated.
+        params: ``(B,T,10H)`` pitched slice, activation dtype.
+        bc: ``(B,T,2*G*3N)`` pitched slice, same dtype.
+        param_bias: ``(H,10)``, float32.
+        dtrans: ``(B,H,T,4)`` float32 cotangent seed.
+        dK: ``(B,H,T,2,4)`` float32 cotangent seed.
+        dB: ``(B,G,T,3N)`` cotangent seed, activation dtype.
+        dC: ``(B,G,T,3N)`` cotangent seed, activation dtype.
+    """
+
+    proj: Tensor
+    params: Tensor
+    bc: Tensor
+    param_bias: Tensor
+    dtrans: Tensor
+    dK: Tensor
+    dB: Tensor
+    dC: Tensor
+
+    @property
+    def differentiable(self) -> tuple[Tensor, ...]:
+        """The three tensors gradients are taken with respect to."""
+        return (self.params, self.bc, self.param_bias)
+
+    @property
+    def cotangents(self) -> tuple[Tensor, ...]:
+        """The four output-gradient seeds, in output order."""
+        return (self.dtrans, self.dK, self.dB, self.dC)
+
+
+def make_prep_inputs(
+    shape: PrepShape,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    requires_grad: bool = True,
+    seed: int = 0,
+) -> PrepInputs:
+    """Build parameter-frontier inputs at one shape.
+
+    Args:
+        shape: The problem size.
+        device: Where to allocate.
+        dtype: Dtype of the projection. ``param_bias`` is float32 regardless, as
+            I4 requires.
+        requires_grad: Whether the three differentiable inputs carry gradients.
+        seed: Generator seed, so two runs benchmark the same numbers.
+
+    Returns:
+        The inputs.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    scan = shape.scan
+    lead = (scan.bsz, scan.heads, scan.seq)
+
+    def randn(*size: int, dt: torch.dtype = dtype) -> Tensor:
+        return torch.randn(*size, dtype=dt, device=device, generator=gen)
+
+    with torch.no_grad():
+        proj = randn(scan.bsz, scan.seq, shape.proj_width)
+    # Each band by offset and width, not to the end: the padding that squares the
+    # projection width with the alignment sits past the last band.
+    bc_columns = slice(shape.bc_offset, shape.bc_offset + shape.bc_width)
+    param_columns = slice(shape.params_offset, shape.params_offset + shape.params_width)
+    return PrepInputs(
+        proj=proj,
+        params=proj[..., param_columns].detach().requires_grad_(requires_grad),
+        bc=proj[..., bc_columns].detach().requires_grad_(requires_grad),
+        param_bias=torch.zeros(
+            scan.heads, PARAM_COLS, dtype=torch.float32, device=device
+        ).requires_grad_(requires_grad),
+        dtrans=randn(*lead, 4, dt=torch.float32),
+        dK=randn(*lead, 2, 4, dt=torch.float32),
+        dB=randn(scan.bsz, shape.groups, scan.seq, scan.d_state),
+        dC=randn(scan.bsz, shape.groups, scan.seq, scan.d_state),
+    )
+
+
+def prep_forward_only(
+    inputs: PrepInputs,
+    shape: PrepShape,
+    *,
+    backend: str | None = None,
+    prefix: str = "prep",
+) -> Callable[[], None]:
+    """A callable that runs the frontier forward under ``no_grad``.
+
+    Args:
+        inputs: Frontier inputs.
+        shape: The problem size, for ``H`` and ``3N``.
+        backend: Backend name, or None for the fastest registered one.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+    """
+
+    def run() -> None:
+        with torch.no_grad(), region(f"{prefix}.forward"):
+            scanprep(
+                inputs.params,
+                inputs.bc,
+                inputs.param_bias,
+                heads=shape.scan.heads,
+                state_dim=shape.scan.d_state,
+                w_max=W_MAX,
+                backend=backend,
+            )
+
+    return run
+
+
+def prep_step(
+    inputs: PrepInputs,
+    shape: PrepShape,
+    *,
+    backend: str | None = None,
+    wrt: Sequence[Tensor] | None = None,
+    prefix: str = "prep",
+) -> Callable[[], None]:
+    """A callable that runs the frontier forward and backward.
+
+    Args:
+        inputs: Frontier inputs. The three differentiable ones must require grad.
+        shape: The problem size, for ``H`` and ``3N``.
+        backend: Backend name, or None for the fastest registered one.
+        wrt: Tensors to differentiate with respect to. Defaults to all three.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+
+    Raises:
+        ValueError: If no input requires grad, which would time a forward and
+            call it a step.
+    """
+    targets = tuple(inputs.differentiable if wrt is None else wrt)
+    if not any(t.requires_grad for t in targets):
+        raise ValueError("prep step needs at least one input requiring grad")
+
+    def run() -> None:
+        with region(f"{prefix}.forward"):
+            out = scanprep(
+                inputs.params,
+                inputs.bc,
+                inputs.param_bias,
+                heads=shape.scan.heads,
+                state_dim=shape.scan.d_state,
+                w_max=W_MAX,
+                backend=backend,
+            )
+        with region(f"{prefix}.backward"):
+            torch.autograd.grad(tuple(out), targets, inputs.cotangents)
+
+    return run
+
+
+@dataclass(frozen=True)
+class BlockShape:
+    """One benchmarked block size.
+
+    Two kernels, so two widths: the fused residual add and norm run on the
+    residual stream and the activation on the FFN hidden. Both are read off
+    :func:`layer_config`.
+
+    Attributes:
+        scan: The scan of the block this measures.
+    """
+
+    scan: OpShape
+
+    @property
+    def name(self) -> str:
+        """Shape name. The scan's, because it is the same layer."""
+        return self.scan.name
+
+    @property
+    def width(self) -> int:
+        """Residual-stream width, ``d_model``."""
+        return layer_config(self.scan).d_model
+
+    @property
+    def hidden(self) -> int:
+        """FFN hidden width, ``d_ffn``. The activation's row length."""
+        return layer_config(self.scan).d_ffn
+
+    @property
+    def eps(self) -> float:
+        """Norm epsilon."""
+        return layer_config(self.scan).norm_eps
+
+    @property
+    def token_count(self) -> Count:
+        """Tokens per call, ``B*T``."""
+        return Count(self.scan.bsz * self.scan.seq)
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        return (
+            f"{self.name}: B={self.scan.bsz} T={self.scan.seq} "
+            f"d_model={self.width} d_ffn={self.hidden}"
+        )
+
+
+BLOCK_SHAPES: Final[tuple[BlockShape, ...]] = tuple(BlockShape(s) for s in SHAPES)
+"""The standard block sizes, one per entry of :data:`SHAPES` and the same names."""
+
+
+def block_shape_by_name(name: str) -> BlockShape:
+    """Look up a standard block shape.
+
+    Args:
+        name: Shape name.
+
+    Returns:
+        The shape.
+
+    Raises:
+        KeyError: If the name is not one of :data:`BLOCK_SHAPES`.
+    """
+    for shape in BLOCK_SHAPES:
+        if shape.name == name:
+            return shape
+    raise KeyError(f"no block shape {name!r}; have {[s.name for s in BLOCK_SHAPES]}")
+
+
+class BlockInputs(NamedTuple):
+    """Block norm and activation inputs at one shape.
+
+    The incoming residual, the norm weight, and the residual output's cotangent
+    are float32 and the rest are the activation dtype: that is every block of a
+    stack but the first, where the stream has already been widened once and is
+    never narrowed again.
+
+    Attributes:
+        x: ``(B,T,d_model)`` branch output.
+        residual: ``(B,T,d_model)`` incoming stream, float32.
+        weight: ``(d_model,)`` norm weight, float32.
+        gate: ``(B,T,d_ffn)`` activation gate.
+        up: ``(B,T,d_ffn)`` activation value.
+        dnormed: ``(B,T,d_model)`` cotangent seed of the normed output.
+        dresidual: ``(B,T,d_model)`` float32 cotangent seed of the stream output.
+        dout: ``(B,T,d_ffn)`` cotangent seed of the activation output.
+    """
+
+    x: Tensor
+    residual: Tensor
+    weight: Tensor
+    gate: Tensor
+    up: Tensor
+    dnormed: Tensor
+    dresidual: Tensor
+    dout: Tensor
+
+    @property
+    def differentiable(self) -> tuple[Tensor, ...]:
+        """The five tensors gradients are taken with respect to."""
+        return (self.x, self.residual, self.weight, self.gate, self.up)
+
+
+def make_block_inputs(
+    shape: BlockShape,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    requires_grad: bool = True,
+    seed: int = 0,
+) -> BlockInputs:
+    """Build block inputs at one shape.
+
+    Args:
+        shape: The problem size.
+        device: Where to allocate.
+        dtype: Dtype of the branch output and the activation operands.
+        requires_grad: Whether the five differentiable inputs carry gradients.
+        seed: Generator seed, so two runs benchmark the same numbers.
+
+    Returns:
+        The inputs.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    stream = (shape.scan.bsz, shape.scan.seq, shape.width)
+    ffn = (shape.scan.bsz, shape.scan.seq, shape.hidden)
+
+    def randn(*size: int, dt: torch.dtype = dtype) -> Tensor:
+        return torch.randn(*size, dtype=dt, device=device, generator=gen)
+
+    return BlockInputs(
+        x=randn(*stream).requires_grad_(requires_grad),
+        residual=randn(*stream, dt=torch.float32).requires_grad_(requires_grad),
+        weight=randn(shape.width, dt=torch.float32).requires_grad_(requires_grad),
+        gate=randn(*ffn).requires_grad_(requires_grad),
+        up=randn(*ffn).requires_grad_(requires_grad),
+        dnormed=randn(*stream),
+        dresidual=randn(*stream, dt=torch.float32),
+        dout=randn(*ffn),
+    )
+
+
+def block_forward_only(
+    inputs: BlockInputs,
+    shape: BlockShape,
+    *,
+    backend: str | None = None,
+    prefix: str = "block",
+) -> Callable[[], None]:
+    """A callable that runs both block kernels forward under ``no_grad``.
+
+    Args:
+        inputs: Block inputs.
+        shape: The problem size, for the norm epsilon.
+        backend: Backend name, or None for the fastest registered one.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+    """
+
+    def run() -> None:
+        with torch.no_grad(), region(f"{prefix}.forward"):
+            rmsnorm_residual(
+                inputs.x,
+                inputs.residual,
+                inputs.weight,
+                eps=shape.eps,
+                backend=backend,
+            )
+            swiglu(inputs.gate, inputs.up, backend=backend)
+
+    return run
+
+
+def block_step(
+    inputs: BlockInputs,
+    shape: BlockShape,
+    *,
+    backend: str | None = None,
+    wrt: Sequence[Tensor] | None = None,
+    prefix: str = "block",
+) -> Callable[[], None]:
+    """A callable that runs both block kernels forward and backward.
+
+    Both norm outputs carry a cotangent: the normed one feeds the projection and
+    the stream one feeds the next block, so a stack seeds both and a measurement
+    that dropped either would skip an arc of the pullback.
+
+    Args:
+        inputs: Block inputs. The five differentiable ones must require grad.
+        shape: The problem size, for the norm epsilon.
+        backend: Backend name, or None for the fastest registered one.
+        wrt: Tensors to differentiate with respect to. Defaults to all five.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+
+    Raises:
+        ValueError: If no input requires grad, which would time a forward and
+            call it a step.
+    """
+    targets = tuple(inputs.differentiable if wrt is None else wrt)
+    if not any(t.requires_grad for t in targets):
+        raise ValueError("block step needs at least one input requiring grad")
+
+    def run() -> None:
+        with region(f"{prefix}.forward"):
+            normed, stream = rmsnorm_residual(
+                inputs.x,
+                inputs.residual,
+                inputs.weight,
+                eps=shape.eps,
+                backend=backend,
+            )
+            out = swiglu(inputs.gate, inputs.up, backend=backend)
+        with region(f"{prefix}.backward"):
+            torch.autograd.grad(
+                (normed, stream, out),
+                targets,
+                (inputs.dnormed, inputs.dresidual, inputs.dout),
+            )
 
     return run

@@ -37,17 +37,29 @@ from slinoss.perf.nsys import run_nsys
 from slinoss.perf.report import Report, agreement, write_report
 from slinoss.perf.timing import Throughput, measure
 from slinoss.perf.workload import (
+    BLOCK,
     CONV,
     OPS,
+    SCANPREP,
     SHAPE_NAMES,
+    BlockShape,
     ConvShape,
     OpShape,
+    PrepShape,
+    block_forward_only,
+    block_shape_by_name,
+    block_step,
     conv_forward_only,
     conv_shape_by_name,
     conv_step,
     forward_only,
+    make_block_inputs,
     make_conv_inputs,
     make_inputs,
+    make_prep_inputs,
+    prep_forward_only,
+    prep_shape_by_name,
+    prep_step,
     shape_by_name,
     step,
 )
@@ -127,7 +139,7 @@ def target_argv(args: argparse.Namespace) -> list[str]:
 
 def build_workload(
     args: argparse.Namespace, device: torch.device
-) -> tuple[OpShape | ConvShape, Callable[[], None]]:
+) -> tuple[OpShape | ConvShape | PrepShape | BlockShape, Callable[[], None]]:
     """Resolve the shape and build the event-bench runner for ``--op``.
 
     The same dispatch runs in :mod:`scripts.perf.profile_target`, so the event
@@ -151,6 +163,22 @@ def build_workload(
             else conv_forward_only(conv, backend=args.backend)
         )
         return conv_shape, runner
+    if args.op == SCANPREP:
+        prep_shape = prep_shape_by_name(args.shape)
+        prep = make_prep_inputs(prep_shape, device, dtype=dtype, requires_grad=grads)
+        return prep_shape, (
+            prep_step(prep, prep_shape, backend=args.backend)
+            if grads
+            else prep_forward_only(prep, prep_shape, backend=args.backend)
+        )
+    if args.op == BLOCK:
+        block_shape = block_shape_by_name(args.shape)
+        block = make_block_inputs(block_shape, device, dtype=dtype, requires_grad=grads)
+        return block_shape, (
+            block_step(block, block_shape, backend=args.backend)
+            if grads
+            else block_forward_only(block, block_shape, backend=args.backend)
+        )
     shape = shape_by_name(args.shape)
     inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
     return shape, (

@@ -27,15 +27,25 @@ from slinoss.perf.capture import profiler_window
 from slinoss.perf.device import require_cuda
 from slinoss.perf.timing import on_device
 from slinoss.perf.workload import (
+    BLOCK,
     CONV,
     OPS,
+    SCANPREP,
     SHAPE_NAMES,
+    block_forward_only,
+    block_shape_by_name,
+    block_step,
     conv_forward_only,
     conv_shape_by_name,
     conv_step,
     forward_only,
+    make_block_inputs,
     make_conv_inputs,
     make_inputs,
+    make_prep_inputs,
+    prep_forward_only,
+    prep_shape_by_name,
+    prep_step,
     shape_by_name,
     step,
 )
@@ -77,8 +87,8 @@ def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[],
         device: Device to allocate on.
 
     Returns:
-        The workload callable, region-labelled ``op.*`` for the scan and
-        ``conv.*`` for the conv.
+        The workload callable, region-labelled ``op.*`` for the scan, ``conv.*``
+        for the conv, ``prep.*`` for the frontier and ``block.*`` for the block.
     """
     grads = args.mode == "step"
     dtype = DTYPES[args.dtype]
@@ -89,6 +99,18 @@ def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[],
         if grads:
             return conv_step(conv, backend=args.backend)
         return conv_forward_only(conv, backend=args.backend)
+    if args.op == SCANPREP:
+        prep_shape = prep_shape_by_name(args.shape)
+        prep = make_prep_inputs(prep_shape, device, dtype=dtype, requires_grad=grads)
+        if grads:
+            return prep_step(prep, prep_shape, backend=args.backend)
+        return prep_forward_only(prep, prep_shape, backend=args.backend)
+    if args.op == BLOCK:
+        block_shape = block_shape_by_name(args.shape)
+        block = make_block_inputs(block_shape, device, dtype=dtype, requires_grad=grads)
+        if grads:
+            return block_step(block, block_shape, backend=args.backend)
+        return block_forward_only(block, block_shape, backend=args.backend)
     shape = shape_by_name(args.shape)
     inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
     if grads:
