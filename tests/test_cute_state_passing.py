@@ -23,10 +23,8 @@ if not torch.cuda.is_available():
 
 from slinoss.config import HEAD_MULTIPLE, LANE_MULTIPLE
 from slinoss.ops.so3ssd import ChunkedForward, as_lanes, chunked_forward
-from slinoss.ops.so3ssd.cute.fwd.state_passing import (
-    THREADS,
-    state_passing_forward,
-)
+from slinoss.ops.so3ssd.cute.common import THREADS
+from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
@@ -38,15 +36,20 @@ pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 LS_BIAS = -4.0
 
 # (bsz, heads, seqlen, chunk, rows, lanes, with_state). P and N are at and above
-# their legal minima, so the vector count P*N runs from one block per (b,h) to
-# four, and the chunk count from one to seven.
+# their legal minima, so the vector count P*N runs from two blocks per (b,h) to
+# eight, and the chunk count from one to seven.
+#
+# A single chunk carries an initial state, and a zero initial state comes with
+# several chunks. The two together would be vacuous: with one chunk and no state,
+# `zstart` is the zero the kernel just wrote and the transition is never applied,
+# so the recorded relative error is exactly zero whatever the matrix does.
 SHAPES = [
-    pytest.param(2, 3, 256, 64, 8, 16, True, id="four-chunks"),
-    pytest.param(2, 3, 200, 64, 8, 16, True, id="ragged-tail"),
-    pytest.param(1, 1, 64, 64, 8, 16, False, id="single-chunk-zero-start"),
-    pytest.param(1, 2, 384, 128, 8, 32, True, id="L128-two-tiles"),
-    pytest.param(2, 2, 100, 16, 16, 16, False, id="seven-chunks-zero-start"),
-    pytest.param(1, 1, 128, 64, 16, 32, True, id="four-tiles"),
+    pytest.param(2, 3, 256, 64, 16, 16, True, id="four-chunks"),
+    pytest.param(2, 3, 200, 64, 16, 16, True, id="ragged-tail"),
+    pytest.param(1, 1, 64, 64, 16, 16, True, id="single-chunk"),
+    pytest.param(1, 2, 384, 128, 16, 32, True, id="L128-four-tiles"),
+    pytest.param(2, 2, 100, 16, 32, 16, False, id="seven-chunks-zero-start"),
+    pytest.param(1, 1, 128, 64, 32, 32, True, id="eight-tiles"),
 ]
 
 
@@ -130,6 +133,9 @@ def test_state_passing_matches_reference(
     # increment and of the packed transition, not a per-chunk growth term.
     assert_max_rel(out.zstart, ref.zstart.flatten(-2, -1), 4e-6, f"{tag}.zstart")
     assert_max_rel(out.state, ref.state.flatten(-2, -1), 4e-6, f"{tag}.state")
+    # A comparison that only ever sees zeros passes whatever the transition does.
+    # Every parameter must move at least one state through the matrix.
+    assert torch.count_nonzero(out.zstart) > 0
 
 
 def test_zero_start_is_not_read() -> None:
@@ -139,7 +145,7 @@ def test_zero_start_is_not_read() -> None:
     buffer, which is uninitialized. Running the same increments twice must give
     the same answer, or that buffer is being read.
     """
-    inp = _make(2, 2, 192, 8, 16, False)
+    inp = _make(2, 2, 192, 16, 16, False)
     inc, ctrans = _pack(chunked_forward(*inp.args(), 64, **inp.kw()))
     first = state_passing_forward(inc.clone(), ctrans)
     second = state_passing_forward(inc.clone(), ctrans)
@@ -150,7 +156,7 @@ def test_zero_start_is_not_read() -> None:
 
 
 def _inputs(
-    chunks: int = 3, rows: int = 8, lanes: int = 16
+    chunks: int = 3, rows: int = 16, lanes: int = 16
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A legally shaped operand pair, for the rejection tests to perturb."""
     return (
@@ -183,8 +189,9 @@ def test_rejects_wrong_rank() -> None:
 def test_rejects_mismatched_ctrans() -> None:
     """One transition per chunk, no broadcasting."""
     inc, ctrans = _inputs()
+    # Contiguous, so this reaches the shape check rather than the layout check.
     with pytest.raises(ValueError, match="ctrans shape"):
-        state_passing_forward(inc, ctrans[:, :, :-1])
+        state_passing_forward(inc, ctrans[:, :, :-1].contiguous())
 
 
 def test_rejects_unlaunchable_shape() -> None:
@@ -202,7 +209,7 @@ def test_rejects_unlaunchable_shape() -> None:
 def test_rejects_low_precision_z0() -> None:
     """The initial state is pinned by I4 as well."""
     inc, ctrans = _inputs()
-    z0 = torch.empty(2, 2, 8, 48, device="cuda", dtype=torch.float32)
+    z0 = torch.empty(2, 2, 16, 48, device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="float32 z0"):
         state_passing_forward(inc, ctrans, z0.bfloat16())
 
@@ -210,12 +217,55 @@ def test_rejects_low_precision_z0() -> None:
 def test_rejects_mismatched_z0() -> None:
     """The initial state carries no chunk axis and must match ``(P,3N)``."""
     inc, ctrans = _inputs()
-    z0 = torch.empty(2, 2, 16, 48, device="cuda", dtype=torch.float32)
+    z0 = torch.empty(2, 2, 32, 48, device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="z0 shape"):
         state_passing_forward(inc, ctrans, z0)
 
 
-def test_block_width_matches_the_shape_multiples() -> None:
-    """The exact launch depends on this identity, so it is asserted, not assumed."""
-    assert THREADS == HEAD_MULTIPLE * LANE_MULTIPLE
+@pytest.mark.parametrize("operand", ["inc", "ctrans", "z0"])
+def test_rejects_a_non_contiguous_operand(operand: str) -> None:
+    """No repacking is done, so a strided operand is refused rather than fixed.
+
+    The three cases fail three different ways without the check: ``inc`` and
+    ``z0`` reach an internal ``view`` and raise ``RuntimeError``, while
+    ``ctrans`` is not reshaped at all and would be read at the wrong stride and
+    return a wrong answer with no error.
+    """
+    inc, ctrans = _inputs()
+    z0 = torch.empty(2, 2, 16, 48, device="cuda", dtype=torch.float32)
+    wide = {
+        "inc": torch.empty(2, 2, 3, 16, 96, device="cuda", dtype=torch.float32),
+        "ctrans": torch.empty(2, 2, 3, 8, device="cuda", dtype=torch.float32),
+        "z0": torch.empty(2, 2, 16, 96, device="cuda", dtype=torch.float32),
+    }[operand]
+    sliced = wide[..., : (4 if operand == "ctrans" else 48)]
+    args = {"inc": inc, "ctrans": ctrans, "z0": z0}
+    args[operand] = sliced
+    with pytest.raises(ValueError, match="contiguous"):
+        state_passing_forward(args["inc"], args["ctrans"], args["z0"])
+
+
+@pytest.mark.parametrize("operand", ["inc", "ctrans", "z0"])
+def test_rejects_a_host_operand(operand: str) -> None:
+    """A host tensor must be refused before the launch, not during it.
+
+    Launching against a host pointer raises inside CUDA and leaves the context
+    unusable for the rest of the process, so every later launch fails too. The
+    check has to be on the host side of the call.
+    """
+    inc, ctrans = _inputs()
+    z0 = torch.empty(2, 2, 16, 48, device="cuda", dtype=torch.float32)
+    args = {"inc": inc, "ctrans": ctrans, "z0": z0}
+    args[operand] = args[operand].cpu()
+    with pytest.raises(ValueError, match="cuda"):
+        state_passing_forward(args["inc"], args["ctrans"], args["z0"])
+
+
+def test_block_width_divides_the_shape_multiples() -> None:
+    """The exact launch depends on this, so it is asserted, not assumed.
+
+    ``P*N`` is a multiple of ``HEAD_MULTIPLE * LANE_MULTIPLE``. That product
+    being a multiple of the block width is what makes every launch exact.
+    """
+    assert (HEAD_MULTIPLE * LANE_MULTIPLE) % THREADS == 0
     assert THREADS % 32 == 0

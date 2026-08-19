@@ -14,26 +14,27 @@ forward or backward, recomputes them from ``trans``.
 Structure. Lane ``l`` of warp 0 owns ``seg = ceil(L/32)`` consecutive tokens and
 runs them serially, then the lane totals are combined by a shuffle scan of
 ``ceil(log2(min(32, L)))`` rounds and folded back as an exclusive lane offset.
-Sequential depth is ``L/32 + log2(32)`` rather than ``L``.
+Sequential depth is ``seg + ceil(log2(min(32, L)))`` rather than ``L``.
 
-The lane predicate is a select, not a branch. The tail predicate exists only when
-``L`` is not a multiple of the warp width, and it is resolved at compile time.
-The one dynamic branch is warp-uniform, so average active threads per warp stays
-at 32.00.
+The lane predicate is a select, not a branch. One dynamic branch remains, the
+store predicate, and it exists only when ``L`` is not a multiple of the warp
+width; below the warp width it is not warp-uniform, because the idle lanes are
+exactly the ones the predicate excludes. Measured on the probe kernel,
+``smsp__thread_inst_executed_per_inst_executed.ratio`` is 22.10 at ``L = 16``,
+30.66 at 32, and 31.19 to 31.54 from 64 up. Only warp 0 runs this at all, so at
+the default block width the cost is bounded by a quarter of one warp's issue
+slots over the scan.
 """
 
 import cutlass
 import cutlass.cute as cute
 
+from slinoss._cute import Scalar, scale, select, shuffle_up
 from slinoss.ops.so3ssd.cute.common import (
-    LOG2_E,
     Quat,
-    Scalar,
     quat_exp,
     quat_mul,
     quat_normalize,
-    select,
-    shuffle_up,
 )
 
 __all__ = ["chunk_prefixes", "quat_prefix_endpoint"]
@@ -207,10 +208,10 @@ def quat_prefix_endpoint(squat: cute.Tensor, slp: cute.Tensor, chunk: int) -> Qu
         ``(qw, qx, qy, qz)`` scaled by ``exp(lp_{L-1})``.
     """
     last = chunk - 1
-    scale = cute.exp2(slp[last] * LOG2_E)
+    factor = scale(slp[last])
     return (
-        squat[0, last] * scale,
-        squat[1, last] * scale,
-        squat[2, last] * scale,
-        squat[3, last] * scale,
+        squat[0, last] * factor,
+        squat[1, last] * factor,
+        squat[2, last] * factor,
+        squat[3, last] * factor,
     )

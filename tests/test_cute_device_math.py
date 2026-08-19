@@ -26,11 +26,21 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from slinoss._cute import (
+    Tile,
+    assert_smem_fits,
+    cute_dtype,
+    smem_bytes,
+    smem_capacity,
+)
+from slinoss.config import MAX_CHUNK, MIN_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.common import (
-    table_layout,
-    tap_layout,
-    trans_layout,
+    THREADS,
+    table_tile,
+    tap_tile,
+    trans_tile,
+    vec_tile,
 )
 from slinoss.ops.so3ssd.cute.prefix import (
     chunk_prefixes,
@@ -41,7 +51,17 @@ from tests.conftest import assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-THREADS = 128
+
+def _lp_tile(chunk: int) -> Tile:
+    """The scalar log-prefix tile. Dense, one entry per token."""
+    return Tile((chunk,), (1,))
+
+
+# scanprep maps the raw log scale through a negative softplus, so a negative bias
+# is a weak decay. Without it the prefix at the end of a 128-token chunk reaches
+# exp(lp) near 2e-45, the packed chunk endpoint underflows to zero, and the
+# assertion on it is skipped as subnormal rather than checked.
+LS_BIAS = -4.0
 
 
 @cute.kernel
@@ -60,11 +80,11 @@ def _probe_kernel(
     cidx, bidx, hidx = cute.arch.block_idx()
 
     smem = cutlass.utils.SmemAllocator()
-    strans = smem.allocate_tensor(cutlass.Float32, trans_layout(chunk), 16)
-    stap = smem.allocate_tensor(cutlass.Float32, tap_layout(chunk), 16)
-    slp = smem.allocate_tensor(cutlass.Float32, cute.make_layout(chunk), 16)
-    squat = smem.allocate_tensor(cutlass.Float32, trans_layout(chunk), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_layout(chunk), 16)
+    strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
+    stap = smem.allocate_tensor(cutlass.Float32, tap_tile(chunk).layout(), 16)
+    slp = smem.allocate_tensor(cutlass.Float32, _lp_tile(chunk).layout(), 16)
+    squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
+    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk).layout(), 16)
 
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), cutlass.Int32(seqlen) - t0)
@@ -161,9 +181,10 @@ def _run_probe(
 SHAPES = [
     pytest.param(2, 3, 256, 64, id="exact-4-chunks"),
     pytest.param(2, 3, 200, 64, id="ragged-tail"),
-    pytest.param(1, 1, 128, 128, id="single-chunk-seg4"),
+    pytest.param(1, 1, 128, MAX_CHUNK, id="single-chunk-seg4"),
+    pytest.param(1, 2, 384, MAX_CHUNK, id="three-chunks-seg4"),
     pytest.param(2, 2, 96, 48, id="chunk-not-warp-multiple"),
-    pytest.param(1, 2, 48, 16, id="chunk-under-warp"),
+    pytest.param(1, 2, 48, MIN_CHUNK, id="chunk-under-warp"),
     pytest.param(2, 2, 64, 32, id="chunk-one-per-lane"),
 ]
 
@@ -175,11 +196,12 @@ def test_prefixes_and_table(bsz: int, heads: int, seqlen: int, chunk: int) -> No
         bsz=bsz,
         heads=heads,
         seqlen=seqlen,
-        rows=8,
+        rows=16,
         lanes=16,
         dtype=torch.float32,
         device="cuda",
         w_scale=2.0,
+        ls_bias=LS_BIAS,
     )
     lp, quat, table, end = _run_probe(inp.trans, inp.K, chunk)
     ref = chunked_forward(
@@ -192,20 +214,29 @@ def test_prefixes_and_table(bsz: int, heads: int, seqlen: int, chunk: int) -> No
     )
 
     tag = f"cute-device[{bsz}x{heads}x{seqlen}/L{chunk}]"
-    # float32 Hillis-Steele over at most 128 tokens. The quaternion prefix is the
-    # deepest chain and sets the bound; the table inherits it squared through the
-    # rotation matrix, which is why the bound is not tighter.
+    # float32 Hillis-Steele over at most MAX_CHUNK tokens. The quaternion prefix is
+    # the deepest chain and sets the bound; the table inherits it squared through
+    # the rotation matrix, which is why the bound is not tighter.
     assert_max_rel(lp, ref.lprefix, 2e-6, f"{tag}.lprefix")
-    assert_max_rel(quat, ref.qprefix.movedim(-1, -2), 4e-6, f"{tag}.qprefix")
+    assert_max_rel(quat, ref.qprefix.movedim(-1, -2), 2e-6, f"{tag}.qprefix")
     assert_max_rel(
-        table[:, :, :, 0], ref.table.ac.flatten(-2, -1), 8e-6, f"{tag}.table.ac"
+        table[:, :, :, 0], ref.table.ac.flatten(-2, -1), 4e-6, f"{tag}.table.ac"
     )
     assert_max_rel(
-        table[:, :, :, 1], ref.table.ap.flatten(-2, -1), 8e-6, f"{tag}.table.ap"
+        table[:, :, :, 1], ref.table.ap.flatten(-2, -1), 4e-6, f"{tag}.table.ap"
     )
     assert_max_rel(
-        table[:, :, :, 2], ref.table.an.flatten(-2, -1), 8e-6, f"{tag}.table.an"
+        table[:, :, :, 2], ref.table.an.flatten(-2, -1), 4e-6, f"{tag}.table.an"
     )
+
+    # I5 is a property of the prefix, not of its distance from the reference: a
+    # comparison against float64 sees drift only after the rotation matrix has
+    # squared it, and by then it is inside the bound above. The norm is what the
+    # projection controls, so the norm is what is asserted. Measured 1.8e-07 with
+    # the projection and 2.0e-06 without it at L=128, so this bound separates the
+    # two by a factor of five in the direction that matters.
+    drift = (quat.double().square().sum(dim=-2).sqrt() - 1.0).abs().max()
+    assert float(drift) < 5e-7, f"{tag}: quaternion prefix norm drifted {drift:.3e}"
 
     # The packed chunk endpoint must reproduce the full chunk transition, scale
     # included, through the degree-two homogeneity of `rot_hom`.
@@ -260,11 +291,12 @@ def test_padded_tail_is_identity() -> None:
         bsz=1,
         heads=1,
         seqlen=seqlen,
-        rows=8,
+        rows=16,
         lanes=16,
         dtype=torch.float32,
         device="cuda",
         w_scale=2.0,
+        ls_bias=LS_BIAS,
     )
     lp, quat, table, _ = _run_probe(inp.trans, inp.K, chunk)
     tail = seqlen - chunk
@@ -282,3 +314,54 @@ def test_padded_tail_is_identity() -> None:
         "cute-device.pad.qprefix",
     )
     assert torch.count_nonzero(table[0, 0, 1, 1:, tail:]) == 0
+
+
+def _probe_smem_bytes(chunk: int) -> int:
+    """Bytes the probe's shared-memory tiles add up to.
+
+    The same five tiles :func:`_probe_kernel` allocates, in the same order.
+    """
+    return smem_bytes(
+        [
+            (trans_tile(chunk), 4),
+            (tap_tile(chunk), 4),
+            (_lp_tile(chunk), 4),
+            (trans_tile(chunk), 4),
+            (table_tile(chunk), 4),
+        ]
+    )
+
+
+@pytest.mark.parametrize("chunk", [MIN_CHUNK, 32, 64, MAX_CHUNK])
+def test_shared_memory_budget_fits_the_queried_capacity(chunk: int) -> None:
+    """The budget is computed from the layouts, not from a guard constant.
+
+    The 48 KiB default is not the ceiling; the opt-in capacity is queried from the
+    device's own architecture. At ``MAX_CHUNK`` the probe's tiles are the widest
+    the tree stages, so this is the binding case.
+    """
+    nbytes = _probe_smem_bytes(chunk)
+    assert assert_smem_fits(f"probe[L{chunk}]", nbytes) == nbytes
+    assert nbytes <= smem_capacity()
+    # A carveout of at least 64 KiB is what makes three of these resident per SM.
+    assert smem_capacity() >= 64 * 1024
+
+
+def test_shared_memory_budget_over_capacity_is_refused() -> None:
+    """No slop constant: either the layouts fit or the layouts change."""
+    with pytest.raises(ValueError, match="shared memory"):
+        assert_smem_fits("oversized", smem_capacity() + 1)
+
+
+def test_vector_tile_covers_width_times_chunk() -> None:
+    """The per-token vector tile is dense: one entry per component per token."""
+    assert smem_bytes([(vec_tile(64, 3), 4)]) == 4 * 3 * 64
+    assert smem_bytes([(vec_tile(128, 48), 2)]) == 2 * 48 * 128
+
+
+def test_dtype_map_rejects_a_dtype_with_no_kernel_path() -> None:
+    """float64 has no tensor-core path, so it is refused rather than downcast."""
+    assert cute_dtype(torch.bfloat16) is cutlass.BFloat16
+    assert cute_dtype(torch.float32) is cutlass.Float32
+    with pytest.raises(TypeError, match="no CuTe kernel path"):
+        cute_dtype(torch.float64)

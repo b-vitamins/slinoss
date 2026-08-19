@@ -22,8 +22,11 @@ store pattern is a bank permutation. Every read during application is a
 broadcast. Neither needs a swizzle.
 
 Staging is transposed on the way in: global ``(L, 4)`` and ``(L, 8)`` become
-shared ``(4, L)`` and ``(8, L)``. One thread owns one token, so a component read
-is unit stride across the warp and no bank conflict is reachable.
+shared ``(4, L)`` and ``(8, L)``. One thread owns one token here and in the build,
+so a component access is unit stride across the warp. The prefix scan reads the
+same tiles at a block stride instead; both shared-memory bank-conflict counters
+are measured zero at every legal chunk size, which is the constraint
+``MAX_CHUNK`` is set by.
 
 A ragged tail is staged as the identity transition and a zero tap, which is what
 :func:`slinoss.ops.so3ssd.reference.chunk_pad` does: ``quat_exp(0)`` is the
@@ -34,11 +37,11 @@ nothing and need no separate code path.
 import cutlass
 import cutlass.cute as cute
 
+from slinoss._cute import select
 from slinoss.ops.so3ssd.cute.common import (
     mat3_mul,
     mat3_transpose,
     rot_hom,
-    select,
     tap_matrix,
 )
 
@@ -65,8 +68,10 @@ def stage_chunk(
         strans: ``(4, L)`` float32 shared tile, written.
         stap: ``(8, L)`` float32 shared tile, written. Component ``4*tap + j``.
         t0: First token of the chunk.
-        valid: Tokens of the chunk that exist. Tokens at or past this index are
-            staged as zeros.
+        valid: Tokens of the chunk that exist, at least one. Tokens at or past
+            this index are staged as zeros. The clamp below reads ``valid - 1``,
+            so zero would read the token before the chunk; a chunk with no valid
+            token is not launched.
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.

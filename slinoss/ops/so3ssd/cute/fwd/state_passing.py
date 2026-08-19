@@ -14,20 +14,29 @@ serial over chunks. Nothing is shared between threads, so the kernel holds no
 shared memory and no barrier.
 
 ``P`` is a multiple of ``HEAD_MULTIPLE`` and ``N`` of ``LANE_MULTIPLE``, so
-``P*N`` is a multiple of their product, which is the block width. The launch is
-therefore exact: no tail tile, no bounds predicate, no padding path.
+``P*N`` is a multiple of their product and therefore of the block width. The
+launch is exact: no tail tile, no bounds predicate, no padding path.
 
 ``zstart`` is written in place over ``inc``. Each thread reads ``inc_c`` into
 registers before storing ``zstart_c``, so the alias is safe, and the operator
 carries one ``(B,H,C,P,3N)`` buffer instead of two.
 
-``M_c`` is rebuilt by every thread on every chunk rather than staged once. That is
-twenty redundant FMA per thread-step against a kernel whose arithmetic intensity
-is under 0.1 flop/byte, so it buys a dynamic chunk count -- no recompile per
-sequence length -- for under 3% of the kernel's own DRAM floor.
+``M_c`` is rebuilt by every thread on every chunk rather than staged once. That
+buys a dynamic chunk count, so no recompile per sequence length. Measured cost:
+``sm__throughput`` is 2.10% of peak against ``dram__throughput`` at 10.68%, so the
+redundant arithmetic is not what bounds the kernel.
 
-DRAM-bound. Traffic is one read and one write of ``inc`` plus four floats per
-chunk transition.
+SERIAL-tiny, not DRAM-bound. The chunk recurrence is the one provably serial step
+in the operator: chunk ``c+1`` cannot start before ``c`` finishes, so the kernel is
+latency bound on that chain and cannot reach a bandwidth fraction. Measured at
+10.68% of peak DRAM and 2.10% of peak SM, which is neither of the other two
+classes. Held instead to the serial budget: under 2% of step time, asserted from
+the committed step-time artifact rather than from this docstring.
+
+The grid is ``(P*N/threads, B, H)``. That is under twice the SM count only when
+``B*H`` is small; the kernel is exempt from the block-count rule as the documented
+serial step, and widening it is not available, because the parallelism is exactly
+``B*H*P*N`` independent 3-vectors and no more.
 """
 
 from typing import NamedTuple
@@ -36,22 +45,15 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss.config import HEAD_MULTIPLE, LANE_MULTIPLE
-from slinoss.ops.so3ssd.cute.common import dev_tensor, mat3_matvec, rot_hom
+from slinoss._cute import dev_tensor
+from slinoss.ops.so3ssd.cute.common import THREADS, mat3_matvec, rot_hom
 
 __all__ = [
-    "THREADS",
     "StatePassing",
     "state_passing_forward",
     "state_passing_fwd",
     "state_passing_fwd_kernel",
 ]
-
-# One 3-vector per thread. The width is the product of the two shape multiples,
-# which is what makes every launch exact; changing it reintroduces a tail tile.
-# Four warps, three float32 of live state, no shared memory: occupancy is capped
-# by nothing.
-THREADS = HEAD_MULTIPLE * LANE_MULTIPLE
 
 
 @cute.kernel
@@ -159,6 +161,27 @@ class StatePassing(NamedTuple):
     state: torch.Tensor
 
 
+def _check_operand(name: str, tensor: torch.Tensor) -> None:
+    """Reject a device or layout the kernel cannot read.
+
+    Both checks are on the host side of the launch. A host pointer handed to a
+    kernel raises inside CUDA and leaves the context unusable for the rest of the
+    process, and a strided operand is either silently misread or fails later in an
+    internal reshape.
+
+    Args:
+        name: Operand name, for the message.
+        tensor: The operand.
+
+    Raises:
+        ValueError: If the tensor is not on a cuda device or is not contiguous.
+    """
+    if tensor.device.type != "cuda":
+        raise ValueError(f"{name} must be on a cuda device, got {tensor.device}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous; no repacking is done")
+
+
 def state_passing_forward(
     inc: torch.Tensor,
     ctrans: torch.Tensor,
@@ -177,9 +200,11 @@ def state_passing_forward(
         A :class:`StatePassing`. ``zstart`` is a view of ``inc``.
 
     Raises:
-        ValueError: On a dtype, rank, or shape mismatch, or on a ``(P, 3N)`` pair
-            the exact launch cannot cover.
+        ValueError: On a dtype, device, layout, rank, or shape mismatch, or on a
+            ``(P, 3N)`` pair the exact launch cannot cover.
     """
+    _check_operand("inc", inc)
+    _check_operand("ctrans", ctrans)
     if inc.dtype is not torch.float32 or ctrans.dtype is not torch.float32:
         raise ValueError("state_passing needs float32 inc and ctrans (I4)")
     if inc.ndim != 5 or ctrans.ndim != 4:
@@ -196,6 +221,7 @@ def state_passing_forward(
     if z0 is None:
         start = state
     else:
+        _check_operand("z0", z0)
         if z0.dtype is not torch.float32:
             raise ValueError("state_passing needs a float32 z0 (I4)")
         if tuple(z0.shape) != (bsz, heads, rows, dim):
