@@ -5,6 +5,10 @@ trace file, or a GPU. The point of the file is the refusal path: a report whose
 clocks disagree must not reach a file, because a stale report that survives a
 failed run is indistinguishable from a fresh pass.
 
+:mod:`slinoss.perf.declared` is covered here as well: it is the only producer of
+the verdict record this module renders, and both take the same fabricated
+counters and ceilings.
+
 ``_row`` and ``_table`` are imported directly. ``_row``'s non-dataclass early
 return is unreachable from :func:`markdown`, which only ever hands it dataclasses,
 and ``_table``'s one-shape rule is enforced at every call site so no report can
@@ -14,7 +18,7 @@ reach it with a mixture.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Annotated
 
@@ -24,11 +28,13 @@ from slinoss.perf.budget import BucketDelta, BucketTiming, BudgetReport
 from slinoss.perf.ceiling import (
     DRAM_BOUND,
     SERIAL_TINY,
+    TENSOR_BOUND,
     Ceilings,
     ClassVerdict,
     DramCeiling,
     TensorCeiling,
 )
+from slinoss.perf.declared import DECLARED, class_audit, declared_class
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.dispersion import (
     GrowthRow,
@@ -75,6 +81,18 @@ from slinoss.perf.units import (
 CAPTURE_ITERS = 3
 """Iterations the fabricated capture window contains. Both profiler sums cover
 all three, so a per-iteration figure is a third of them."""
+
+CUTE_SCAN = "kernel_cutlass_chunk_scan_fwd_kernel_bf16_0"
+CUTE_STATE = "kernel_cutlass_state_passing_fwd_kernel_bf16_0"
+CONV_FWD = "void slinoss::(anonymous namespace)::conv1d_fwd_kernel<c10::BFloat16>"
+FOREIGN = "void at::native::vectorized_elementwise_kernel<4>"
+"""Kernel symbols in the mangled form NCU reports them, one per declaration arc:
+two CuTe DSL kernels, the compiled extension, and a kernel from torch that this
+repo does not compile.
+
+No entry of :data:`DECLARED` declares SERIAL-tiny, so the test that exercises that
+arc patches one in. Binding the arc to whichever kernel currently declares the
+class would make an unrelated reclassification break a test about the audit."""
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +201,30 @@ def _counters(kernel: str = "scan", duration_us: float = 3030.0) -> KernelCounte
         block_count=Count(168),
         thread_per_block_count=Count(256),
         wave_per_sm_ratio=Ratio(2.0),
+        issue_active_pct=Percent(8.5),
+        dominant_stall="long_scoreboard",
+        dominant_stall_pct=Percent(74.0),
+        stall_barrier_pct=Percent(0.5),
+        stall_branch_resolving_pct=Percent(0.25),
+        stall_dispatch_stall_pct=Percent(0.1),
+        stall_drain_pct=Percent(0.05),
+        stall_imc_miss_pct=Percent(0.2),
+        stall_lg_throttle_pct=Percent(0.3),
+        stall_long_scoreboard_pct=Percent(74.0),
+        stall_math_pipe_throttle_pct=Percent(1.0),
+        stall_membar_pct=Percent(0.05),
+        stall_mio_throttle_pct=Percent(2.5),
+        stall_misc_pct=Percent(0.4),
+        stall_no_instruction_pct=Percent(1.25),
+        stall_not_selected_pct=Percent(3.0),
+        stall_short_scoreboard_pct=Percent(4.5),
+        stall_sleeping_pct=Percent(0.0),
+        stall_tex_throttle_pct=Percent(0.0),
+        stall_wait_pct=Percent(5.5),
+        sm_pct=Percent(15.0),
+        memory_pct=Percent(41.0),
+        l1tex_pct=Percent(28.0),
+        l2_pct=Percent(24.0),
     )
 
 
@@ -482,6 +524,8 @@ def test_markdown_renders_every_present_section() -> None:
         "## measured tensor ceiling",
         "## class verdicts",
         "## kernel counters",
+        "## warp stalls",
+        "## speed of light",
         "## gpu trace",
         "## saved tensors",
         "## memory peaks",
@@ -559,6 +603,8 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "## measured tensor ceiling",
         "## class verdicts",
         "## kernel counters",
+        "## warp stalls",
+        "## speed of light",
         "## gpu trace",
         "## saved tensors",
         "## memory peaks",
@@ -600,6 +646,33 @@ def test_markdown_formats_a_cell_by_type_and_dots_into_a_nested_record() -> None
     assert "samples_duration_us" not in text
 
 
+def test_the_counters_print_as_three_tables_and_no_field_is_dropped() -> None:
+    """Every counter field lands in exactly one per-kernel table.
+
+    A stall percentage, a bandwidth, and a unit utilization answer three
+    questions, and one table of every field is fifty columns wide. The split is by
+    column, so the union of the three headers is the whole record and only the two
+    that identify a row repeat.
+    """
+    text = markdown(_report(check=_agreement()))
+    counters = _header_under(text, "kernel counters").strip("| ").split(" | ")
+    stalls = _header_under(text, "warp stalls").strip("| ").split(" | ")
+    sol = _header_under(text, "speed of light").strip("| ").split(" | ")
+    assert set(counters) | set(stalls) | set(sol) == {
+        f.name for f in fields(KernelCounters)
+    }
+    identity = {"kernel", "duration_us"}
+    assert set(counters) & set(stalls) == identity
+    assert set(counters) & set(sol) == identity
+    assert set(stalls) & set(sol) == identity
+    # The distinction the split exists for: the issue rate and the dominant stall
+    # sit together, away from the DRAM figures they contradict.
+    assert "issue_active_pct" in stalls
+    assert "stall_long_scoreboard_pct" in stalls
+    assert "dram_pct" in counters
+    assert "memory_pct" in sol
+
+
 def test_markdown_prints_none_for_an_empty_table() -> None:
     text = markdown(_report(check=_agreement(), with_regions=False))
     assert "(none)" in text
@@ -623,6 +696,13 @@ def test_row_of_a_non_record_is_empty() -> None:
 def test_table_rejects_two_record_shapes() -> None:
     with pytest.raises(ValueError, match="one table takes one record shape"):
         _table([_ceilings().dram, _ceilings().tensor])
+
+
+def test_table_rejects_a_column_the_records_do_not_have() -> None:
+    # A projection that silently dropped an unknown column would print a table
+    # missing whichever field was renamed under it.
+    with pytest.raises(KeyError, match="dram_gbs"):
+        _table([_counters()], ("kernel", "dram_gbs"))
 
 
 # ---------------------------------------------------------------------------
@@ -757,3 +837,96 @@ def test_a_refused_report_leaves_no_file(tmp_path: Path) -> None:
     with pytest.raises(AgreementError):
         write_report(_report(check=None), tmp_path / "b" / "run")
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# declared
+#
+# The class audit, beside the verdict record it is the only producer of.
+# ---------------------------------------------------------------------------
+
+
+def test_declared_class_reads_the_table_through_a_mangled_symbol() -> None:
+    # Neither toolchain emits the source name: the DSL appends a traced signature
+    # and the extension wraps the name in a namespace and template arguments.
+    assert declared_class(CUTE_SCAN) == DRAM_BOUND
+    assert declared_class(CONV_FWD) == DRAM_BOUND
+    assert declared_class(CUTE_STATE) == DRAM_BOUND
+    # A kernel from torch, cuBLAS, or the driver is not this repo's to declare.
+    assert declared_class(FOREIGN) is None
+
+
+def test_declared_class_refuses_a_symbol_it_cannot_place() -> None:
+    with pytest.raises(ValueError, match="declares no class"):
+        declared_class("kernel_cutlass_brand_new_fwd_kernel_0")
+    with pytest.raises(ValueError, match="one symbol, one class"):
+        declared_class("kernel_cutlass_conv1d_fwd_kernel_conv1d_bwd_kernel_0")
+
+
+def test_class_audit_judges_each_kernel_against_the_class_it_declares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each declaration picks its own comparison, and a failure still emits.
+
+    DRAM-bound is judged against the measured copy ceiling and SERIAL-tiny against
+    its share of the step, which is an upper bound rather than a floor. A failing
+    verdict is returned, not raised: the report exists to show it.
+
+    The SERIAL-tiny declaration is patched in because no kernel currently carries
+    one. The arc under test is the audit's choice of comparison, not the table.
+    """
+    monkeypatch.setitem(DECLARED, "state_passing_fwd_kernel", SERIAL_TINY)
+    audit = class_audit(
+        (
+            _counters(kernel=CUTE_SCAN, duration_us=3030.0),
+            _counters(kernel=CUTE_STATE, duration_us=30.0),
+            _counters(kernel=FOREIGN, duration_us=10.0),
+        ),
+        limits=_ceilings(),
+        step_duration_us=Microseconds(1200.0),
+        capture_iters=CAPTURE_ITERS,
+    )
+    # Unjudged rather than dropped: a kernel absent from both lists is invisible.
+    assert audit.unjudged == (FOREIGN,)
+    dram, serial = audit.verdicts
+    assert (dram.kernel, dram.declared) == (CUTE_SCAN, DRAM_BOUND)
+    # 760 GB/s of the measured 767 GB/s ceiling, against an 85% floor.
+    assert dram.achieved_pct == pytest.approx(100.0 * 760.0 / 767.0)
+    assert dram.required_pct == 85.0
+    assert dram.passed
+    assert (serial.kernel, serial.declared) == (CUTE_STATE, SERIAL_TINY)
+    # 30 us over three capture iterations is 10 us against a 1,200 us step.
+    assert serial.achieved_pct == pytest.approx(100.0 * 10.0 / 1200.0)
+    assert serial.passed
+    over = class_audit(
+        (_counters(kernel=CUTE_STATE, duration_us=300.0),),
+        limits=_ceilings(),
+        step_duration_us=Microseconds(1200.0),
+        capture_iters=CAPTURE_ITERS,
+    )
+    assert over.verdicts[0].achieved_pct == pytest.approx(100.0 * 100.0 / 1200.0)
+    assert not over.verdicts[0].passed
+
+
+def test_class_audit_refuses_a_judgement_it_cannot_make(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counters = (_counters(kernel=CUTE_SCAN),)
+    limits = _ceilings()
+    with pytest.raises(ValueError, match="capture_iters must be positive"):
+        class_audit(
+            counters,
+            limits=limits,
+            step_duration_us=Microseconds(1200.0),
+            capture_iters=0,
+        )
+    # No table collects a flop count, so a TENSOR-bound declaration says so rather
+    # than judging a tensor kernel by the bandwidth it was never held to.
+    monkeypatch.setitem(DECLARED, "chunk_scan_fwd_kernel", TENSOR_BOUND)
+    with pytest.raises(ValueError, match="needs a flop count"):
+        class_audit(
+            counters,
+            limits=limits,
+            step_duration_us=Microseconds(1200.0),
+            capture_iters=CAPTURE_ITERS,
+        )

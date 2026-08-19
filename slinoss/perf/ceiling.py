@@ -14,6 +14,22 @@ Two ceilings, matching the two kernel classes:
 A kernel may read slightly above the copy ceiling if its read/write mix is
 friendlier than a copy's. That is a fact about the probe, not a licence to invent
 a higher number, and it is left visible rather than clamped.
+
+Both ceilings are taken from the fastest sample, not the median. A ceiling is a
+property of the hardware, so the estimator wanted is the sample least perturbed
+by anything else on the device, and that is the fastest one. The median is the
+wrong estimator here and fails in the one direction that matters: it absorbs
+foreign load into the denominator, which inflates every ratio built on it and
+turns a slow kernel into a passing one. Taking the minimum inverts that. Foreign
+load then depresses the kernel numerator while leaving the denominator right, so
+a contended capture reports a kernel as slower than it is and a verdict fails
+conservatively rather than passing spuriously.
+
+The dispersion is still reported beside every ceiling, because it is what says
+how much foreign load the probe saw. ``spread_pct`` is not a trust bar on the
+minimum: intermittent load raises it while leaving a clean fastest sample, and
+uniform load lowers it while corrupting every sample. Contention is read from
+``device.sharing``, which is a direct probe, not inferred from dispersion.
 """
 
 from __future__ import annotations
@@ -85,7 +101,7 @@ class DramCeiling(PerfRecord):
         label: Probe description.
         moved_bytes: Bytes crossing DRAM per iteration, read plus write.
         duration: Per-iteration dispersion of the copy.
-        achieved_gbs: ``moved_bytes`` over the median duration.
+        achieved_gbs: ``moved_bytes`` over the fastest duration.
     """
 
     label: str
@@ -102,7 +118,7 @@ class TensorCeiling(PerfRecord):
         label: Probe description, including the operand dtype.
         flop_count: Floating-point operations per iteration, ``2*M*N*K``.
         duration: Per-iteration dispersion of the GEMM.
-        achieved_tflops: ``flop_count`` over the median duration.
+        achieved_tflops: ``flop_count`` over the fastest duration.
     """
 
     label: str
@@ -175,7 +191,7 @@ def dram_ceiling(
         label=f"device-to-device copy, {size // _MIB} MiB per buffer",
         moved_bytes=moved,
         duration=timed.total,
-        achieved_gbs=gbs_from_bytes_us(moved, timed.total.median_duration_us),
+        achieved_gbs=gbs_from_bytes_us(moved, timed.total.min_duration_us),
     )
 
 
@@ -219,7 +235,7 @@ def tensor_ceiling(
         label=f"{dim}x{dim}x{dim} {dtype} gemm",
         flop_count=flop,
         duration=timed.total,
-        achieved_tflops=tflops_from_flop_us(flop, timed.total.median_duration_us),
+        achieved_tflops=tflops_from_flop_us(flop, timed.total.min_duration_us),
     )
 
 

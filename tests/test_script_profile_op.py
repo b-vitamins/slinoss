@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from scripts.perf import profile_op
-from slinoss.perf.ceiling import Ceilings, DramCeiling, TensorCeiling
+from slinoss.perf.ceiling import DRAM_BOUND, Ceilings, DramCeiling, TensorCeiling
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.ncu import NCU_TABLES, KernelCounters, NcuPass, NcuTable
 from slinoss.perf.nsys import NsysKernel, NsysTrace
@@ -57,6 +57,15 @@ TABLE_NAMES = tuple(table.name for table in NCU_TABLES)
 FAKE_SUM_US = 2.0
 """Fabricated profiler total, in microseconds. Far below any real CPU wall, so
 the event-covers-device check has room on every host."""
+
+OWNED = "kernel_cutlass_chunk_scan_fwd_kernel_bf16_Ampere_0"
+"""A profiled kernel under the symbol NCU reports. The declaration table matches
+the function name inside the mangled symbol, so the fabricated name carries the
+mangling rather than the bare table key."""
+
+FOREIGN = "void at::native::vectorized_elementwise_kernel<4, ...>(int, ...)"
+"""A kernel this repo does not compile. It gets no verdict, and the report says
+which kernels were left unjudged rather than omitting them."""
 
 
 def spread(median_us: float) -> Spread:
@@ -135,10 +144,12 @@ def trace_record(*, kernel_sum_us: float = FAKE_SUM_US) -> NsysTrace:
     )
 
 
-def counter_record(*, duration_us: float = FAKE_SUM_US) -> KernelCounters:
+def counter_record(
+    *, duration_us: float = FAKE_SUM_US, kernel: str = OWNED
+) -> KernelCounters:
     """Merged counters for one kernel, summing to ``duration_us``."""
     return KernelCounters(
-        kernel="scan",
+        kernel=kernel,
         launch_count=Count(1),
         duration_us=Microseconds(duration_us),
         pass_duration_spread_pct=Percent(0.4),
@@ -166,6 +177,30 @@ def counter_record(*, duration_us: float = FAKE_SUM_US) -> KernelCounters:
         block_count=Count(336),
         thread_per_block_count=Count(256),
         wave_per_sm_ratio=Ratio(4.0),
+        issue_active_pct=Percent(12.0),
+        dominant_stall="long_scoreboard",
+        dominant_stall_pct=Percent(61.0),
+        stall_barrier_pct=Percent(1.0),
+        stall_branch_resolving_pct=Percent(0.5),
+        stall_dispatch_stall_pct=Percent(0.2),
+        stall_drain_pct=Percent(0.1),
+        stall_imc_miss_pct=Percent(0.3),
+        stall_lg_throttle_pct=Percent(0.4),
+        stall_long_scoreboard_pct=Percent(61.0),
+        stall_math_pipe_throttle_pct=Percent(2.0),
+        stall_membar_pct=Percent(0.1),
+        stall_mio_throttle_pct=Percent(3.0),
+        stall_misc_pct=Percent(0.6),
+        stall_no_instruction_pct=Percent(1.5),
+        stall_not_selected_pct=Percent(4.0),
+        stall_short_scoreboard_pct=Percent(5.0),
+        stall_sleeping_pct=Percent(0.0),
+        stall_tex_throttle_pct=Percent(0.0),
+        stall_wait_pct=Percent(7.0),
+        sm_pct=Percent(18.0),
+        memory_pct=Percent(44.0),
+        l1tex_pct=Percent(31.0),
+        l2_pct=Percent(27.0),
     )
 
 
@@ -384,6 +419,41 @@ def test_main_cross_checks_three_clocks_and_writes_both_files(
     printed = capsys.readouterr().out.splitlines()
     assert printed[: len(NCU_TABLES)] == [f"ncu {n}: 0 launches" for n in TABLE_NAMES]
     assert printed[-2:] == [f"wrote {md}", f"wrote {js}"]
+
+
+def test_every_profiled_kernel_this_repo_compiles_lands_a_class_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The taxonomy reaches the report, and an unjudged kernel is named.
+
+    What is pinned is the wiring, not the arithmetic: the comparison against each
+    ceiling belongs to :mod:`slinoss.perf.ceiling` and is tested there. A verdict
+    that is computed and never emitted leaves the class rule unchecked by the
+    tooling that exists to check it, which is what this closes.
+    """
+    patch_externals(monkeypatch)
+    half = FAKE_SUM_US / 2
+
+    def two_kernels(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
+        return (
+            counter_record(duration_us=half),
+            counter_record(duration_us=half, kernel=FOREIGN),
+        )
+
+    monkeypatch.setattr(profile_op, "kernel_counters", two_kernels)
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 0
+    doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
+    # One verdict, for the one kernel this repo owns.
+    assert [v["kernel"] for v in doc["verdicts"]] == [OWNED]
+    one = doc["verdicts"][0]
+    assert one["declared"] == DRAM_BOUND
+    assert one["required_pct"] == 85.0
+    # 760 GB/s against the fabricated 767 GB/s copy ceiling.
+    assert one["achieved_pct"] == pytest.approx(99.087, abs=5e-4)
+    assert one["passed"] is True
+    text = (tmp_path / "prof-tiny-forward.md").read_text()
+    assert "## class verdicts" in text
+    assert f"unjudged kernels, not compiled by this repo: {FOREIGN}" in text
 
 
 def test_the_cross_check_divides_by_the_capture_iters_and_uses_the_event_total(

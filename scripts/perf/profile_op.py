@@ -6,7 +6,7 @@ Runs three clocks over the same workload and refuses to emit if they disagree:
 2. NSYS over ``scripts/perf/profile_target.py``, giving the launch stream.
 3. NCU over the same target, one pass per counter table, giving the counters.
 
-NCU is slow: it replays every kernel once per pass, six passes deep. Keep
+NCU is slow: it replays every kernel once per pass, eight passes deep. Keep
 ``--iters`` small; the wall comes from the event bench, not from the profiler.
 
     python3 scripts/perf/profile_op.py --shape standard --mode step
@@ -30,6 +30,7 @@ import torch
 
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.ceiling import ceilings
+from slinoss.perf.declared import ClassAudit, class_audit
 from slinoss.perf.device import device_info, device_ordinal, require_cuda
 from slinoss.perf.ncu import NCU_TABLES, NcuPass, kernel_counters, run_ncu
 from slinoss.perf.nsys import run_nsys
@@ -168,7 +169,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     Raises:
         RuntimeError: If the requested device is not a usable CUDA device.
         ValueError: If NCU returned a table with a metric absent, which means the
-            metric name is wrong for this driver version.
+            metric name is wrong for this driver version, or if a profiled kernel
+            this repo compiles declares no class.
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
@@ -233,6 +235,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the ncu tables together"
         )
 
+    audit: ClassAudit | None = None
+    if kernels:
+        audit = class_audit(
+            kernels,
+            limits=limits,
+            step_duration_us=timed.total.median_duration_us,
+            capture_iters=args.iters,
+        )
+        if audit.unjudged:
+            notes.append(
+                "unjudged kernels, not compiled by this repo: "
+                + ", ".join(audit.unjudged)
+            )
+
     report = Report(
         title=f"profile: {label}",
         device=device_info(device_ordinal(device)),
@@ -241,6 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         throughput=(Throughput.of(label, shape.token_count, timed.total),),
         ceilings=limits,
         kernels=kernels,
+        verdicts=() if audit is None else audit.verdicts,
         trace=trace,
         notes=tuple(notes),
     )

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Mapping, Sequence
+from statistics import median
 from typing import Final
 
 import pytest
@@ -17,6 +18,9 @@ import pytest
 from slinoss.perf.ncu import (
     NCU_TABLES,
     REQUIRED_METRICS,
+    SOL_FIELDS,
+    STALL_FIELDS,
+    STALL_REASONS,
     NcuPass,
     NcuTable,
     kernel_counters,
@@ -24,9 +28,20 @@ from slinoss.perf.ncu import (
     ncu_command,
     parse_ncu_csv,
     run_ncu,
+    stall_field,
+    stall_metric,
 )
 
 DURATION: Final = "gpu__time_duration.sum"
+ISSUE: Final = "smsp__issue_active.avg.pct_of_peak_sustained_active"
+
+SOL_METRICS: Final[tuple[tuple[str, str], ...]] = (
+    ("sm_pct", "sm__throughput.avg.pct_of_peak_sustained_elapsed"),
+    ("memory_pct", "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"),
+    ("l1tex_pct", "l1tex__throughput.avg.pct_of_peak_sustained_active"),
+    ("l2_pct", "lts__throughput.avg.pct_of_peak_sustained_active"),
+)
+"""Speed-of-light field paired with the metric it reads."""
 
 TARGET: Final[tuple[str, ...]] = (
     "python3",
@@ -310,6 +325,29 @@ def test_parse_ncu_csv_rejects_output_it_cannot_read() -> None:
 
 Fixture = dict[str, tuple[str, tuple[str, ...]]]
 
+
+def stall_fixture(**by_reason: tuple[str, ...]) -> Fixture:
+    """Warp-stall entries for one kernel, one per member of :data:`STALL_REASONS`.
+
+    Args:
+        by_reason: Per-launch display values, keyed by stall reason. A reason not
+            named reads zero, which is what NCU prints for a stall a kernel never
+            hits.
+
+    Returns:
+        The entries, keyed by metric name.
+    """
+    return {
+        stall_metric(reason): ("%", by_reason.get(reason, ("0",)))
+        for reason in STALL_REASONS
+    }
+
+
+def sol_fixture(*values: tuple[str, ...]) -> Fixture:
+    """Speed-of-light entries, one per pair of :data:`SOL_METRICS` in order."""
+    return {metric: ("%", v) for (_field, metric), v in zip(SOL_METRICS, values)}
+
+
 COUNTERS: Final[dict[str, Fixture]] = {
     CHUNK: {
         DURATION: ("usecond", ("41.28", "82.56", "412.8")),
@@ -341,6 +379,18 @@ COUNTERS: Final[dict[str, Fixture]] = {
         ),
         "sm__inst_executed.sum": ("inst", ("1,048,576",)),
         "smsp__thread_inst_executed_per_inst_executed.ratio": ("", ("32",)),
+        ISSUE: ("%", ("3.5",)),
+        # The dominant reason varies per launch, so its field is a median and not
+        # a sum of the three.
+        **stall_fixture(
+            long_scoreboard=("48", "52", "60"),
+            wait=("9",),
+            short_scoreboard=("6",),
+            mio_throttle=("4",),
+            not_selected=("2",),
+            no_instruction=("1.5",),
+        ),
+        **sol_fixture(("18.5",), ("44.25",), ("31",), ("27.5",)),
     },
     CPASYNC: {
         DURATION: ("usecond", ("3.2", "4.8")),
@@ -369,6 +419,16 @@ COUNTERS: Final[dict[str, Fixture]] = {
         ),
         "sm__inst_executed.sum": ("inst", ("65,536",)),
         "smsp__thread_inst_executed_per_inst_executed.ratio": ("", ("31.75",)),
+        ISSUE: ("%", ("21.5",)),
+        # A different dominant reason, so the derivation is a per-kernel maximum
+        # and not the family's first entry or the other kernel's answer.
+        **stall_fixture(
+            wait=("70", "74"),
+            long_scoreboard=("5",),
+            barrier=("8",),
+            drain=("3",),
+        ),
+        **sol_fixture(("6.75",), ("11.5",), ("4",), ("9.25",)),
     },
 }
 
@@ -492,6 +552,51 @@ def test_counters_take_an_even_median_and_guard_a_zero_denominator() -> None:
     assert cpasync.conflict_per_wavefront_ratio == 0.0
 
 
+def fixture_median(kernel: str, metric: str) -> float:
+    """The value a per-launch fixture entry must merge to.
+
+    A fixture entry shorter than the launch count repeats, so the median is taken
+    over the launches rather than over the entry.
+    """
+    launches = len(COUNTERS[kernel][DURATION][1])
+    _unit, values = COUNTERS[kernel][metric]
+    return median(float(values[i % len(values)]) for i in range(launches))
+
+
+def test_the_stall_and_sol_tables_reach_fields_and_merge_by_median() -> None:
+    """Every stall and speed-of-light metric lands in a field, reduced by median.
+
+    Both families are percentages NCU has already normalized, per warp-active
+    cycle or per unit peak, so a sum over three launches would report 300% of a
+    whole that is per launch. One test over the whole family rather than one per
+    metric: the reduction is a property of the normalization, not of the reason.
+    """
+    chunk, cpasync = kernel_counters(full_passes())
+    # Field totality: the reasons plus the issue rate and the derived pair.
+    assert len(STALL_FIELDS) == len(STALL_REASONS) + 3
+    assert len(SOL_FIELDS) == len(SOL_METRICS)
+    for reason in STALL_REASONS:
+        metric = stall_metric(reason)
+        want = fixture_median(CHUNK, metric)
+        assert getattr(chunk, stall_field(reason)) == pytest.approx(want), reason
+    # median(48, 52, 60), not their sum and not the largest launch.
+    assert chunk.stall_long_scoreboard_pct == 52.0
+    assert chunk.issue_active_pct == 3.5
+    assert chunk.dominant_stall == "long_scoreboard"
+    assert chunk.dominant_stall_pct == 52.0
+    for field, metric in SOL_METRICS:
+        want = fixture_median(CHUNK, metric)
+        assert getattr(chunk, field) == pytest.approx(want), field
+    assert chunk.memory_pct == 44.25
+    # A second kernel, so the maximum is taken per kernel: median(70, 74) beats
+    # the first kernel's dominant reason, which reads 5 here.
+    assert cpasync.dominant_stall == "wait"
+    assert cpasync.dominant_stall_pct == 72.0
+    assert cpasync.stall_long_scoreboard_pct == 5.0
+    assert cpasync.issue_active_pct == 21.5
+    assert cpasync.l2_pct == 9.25
+
+
 def test_spread_reports_a_pass_disagreement() -> None:
     for one in kernel_counters(full_passes()):
         assert one.pass_duration_spread_pct == 0.0
@@ -500,16 +605,16 @@ def test_spread_reports_a_pass_disagreement() -> None:
         for index, table in enumerate(NCU_TABLES)
     ]
     chunk = kernel_counters(passes)[0]
-    # Five passes summed 536640 ns; one summed 650000 ns. The median is the base.
+    # Seven passes summed 536640 ns; one summed 650000 ns. The median is the base.
     assert chunk.pass_duration_spread_pct == pytest.approx(
         100.0 * (650_000.0 - 536_640.0) / 536_640.0
     )
 
 
 def test_duration_does_not_depend_on_pass_order() -> None:
-    # Six passes, one of them disagreeing. The duration is the median over the
+    # Eight passes, one of them disagreeing. The duration is the median over the
     # passes, which is the statistic pass_duration_spread_pct is a spread of, so
-    # the same six passes give the same answer in either order.
+    # the same eight passes give the same answer in either order.
     disagree = ncu_pass(NCU_TABLES[1], durations={CHUNK: ("50", "100", "500")})
     rest = [ncu_pass(t) for t in NCU_TABLES if t.name != NCU_TABLES[1].name]
     first = kernel_counters([*rest, disagree])[0]
@@ -532,7 +637,7 @@ def test_counters_need_every_required_metric() -> None:
     # Filling an absent counter with a zero would report a broken label as a
     # free operation, so one table on its own is an error.
     with pytest.raises(
-        ValueError, match=r"missing 19 metrics, first 'dram__bytes_read\.sum'"
+        ValueError, match=r"missing 41 metrics, first 'dram__bytes_read\.sum'"
     ):
         kernel_counters([ncu_pass(NCU_TABLES[0])])
 

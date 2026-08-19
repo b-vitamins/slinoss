@@ -56,6 +56,8 @@ from slinoss.perf.units import (
     Percent,
     Spread,
     TFlopsPerSecond,
+    gbs_from_bytes_us,
+    tflops_from_flop_us,
 )
 
 CPU = torch.device("cpu")
@@ -503,6 +505,12 @@ def test_the_ceilings_refuse_a_cpu_device() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
 def test_dram_ceiling_measures_a_copy() -> None:
+    """The copy ceiling, taken from the fastest sample rather than the median.
+
+    The estimator is pinned because reverting it is silent and harmful: a median
+    absorbs foreign load into the denominator, which inflates every ratio built on
+    the ceiling and turns a slow kernel into a passing one.
+    """
     ceiling = dram_ceiling(
         torch.device("cuda"), requested_bytes=64 << 20, iters=3, warmup=1
     )
@@ -510,15 +518,30 @@ def test_dram_ceiling_measures_a_copy() -> None:
     assert ceiling.achieved_gbs > 0.0
     assert ceiling.duration.sample_count == 3
     assert "per buffer" in ceiling.label
+    assert ceiling.achieved_gbs == pytest.approx(
+        gbs_from_bytes_us(ceiling.moved_bytes, ceiling.duration.min_duration_us)
+    )
+    # Strict whenever any sample was slower than the fastest, which is the only
+    # case where the two estimators differ at all.
+    assert ceiling.achieved_gbs >= gbs_from_bytes_us(
+        ceiling.moved_bytes, ceiling.duration.median_duration_us
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
 def test_tensor_ceiling_measures_a_gemm() -> None:
+    """The GEMM ceiling, taken from the fastest sample. Same estimator, same why."""
     ceiling = tensor_ceiling(torch.device("cuda"), dim=1024, iters=3, warmup=1)
     assert ceiling.flop_count == 2 * 1024**3
     assert ceiling.achieved_tflops > 0.0
     assert ceiling.duration.sample_count == 3
     assert "bfloat16" in ceiling.label
+    assert ceiling.achieved_tflops == pytest.approx(
+        tflops_from_flop_us(ceiling.flop_count, ceiling.duration.min_duration_us)
+    )
+    assert ceiling.achieved_tflops >= tflops_from_flop_us(
+        ceiling.flop_count, ceiling.duration.median_duration_us
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")

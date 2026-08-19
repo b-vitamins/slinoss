@@ -30,7 +30,7 @@ from slinoss.perf.ceiling import Ceilings, ClassVerdict
 from slinoss.perf.device import DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
 from slinoss.perf.memory import MemoryPeaks, SavedStorages
-from slinoss.perf.ncu import KernelCounters
+from slinoss.perf.ncu import SOL_FIELDS, STALL_FIELDS, KernelCounters
 from slinoss.perf.nsys import NsysTrace
 from slinoss.perf.timing import Throughput
 from slinoss.perf.units import (
@@ -278,11 +278,29 @@ def _row(record: object, prefix: str = "") -> dict[str, str]:
     return out
 
 
-def _table(records: Sequence[object]) -> list[str]:
+def _table(
+    records: Sequence[object], columns: Sequence[str] | None = None
+) -> list[str]:
+    """Render one record shape as a markdown table.
+
+    Args:
+        records: The rows.
+        columns: Flattened field names to keep, in order. None keeps every field.
+            A name absent from a row raises rather than printing a blank column.
+
+    Returns:
+        The table lines, blank-terminated.
+
+    Raises:
+        KeyError: If a requested column is not a field of the records.
+        ValueError: If two records flatten to different field sets.
+    """
     rows = [_row(r) for r in records]
     rows = [r for r in rows if r]
     if not rows:
         return ["(none)", ""]
+    if columns is not None:
+        rows = [{name: row[name] for name in columns} for row in rows]
     headers = list(rows[0])
     other = next((r for r in rows[1:] if list(r) != headers), None)
     if other is not None:
@@ -300,8 +318,25 @@ def _table(records: Sequence[object]) -> list[str]:
     return lines
 
 
-def _section(title: str, records: Sequence[object]) -> list[str]:
-    return [f"## {title}", "", *_table(records)]
+def _section(
+    title: str, records: Sequence[object], columns: Sequence[str] | None = None
+) -> list[str]:
+    return [f"## {title}", "", *_table(records, columns)]
+
+
+_IDENTITY: Final[tuple[str, ...]] = ("kernel", "duration_us")
+"""Columns every per-kernel table repeats, so each one is readable alone."""
+
+_STALL_COLUMNS: Final[tuple[str, ...]] = (*_IDENTITY, *STALL_FIELDS)
+_SOL_COLUMNS: Final[tuple[str, ...]] = (*_IDENTITY, *SOL_FIELDS)
+_COUNTER_COLUMNS: Final[tuple[str, ...]] = tuple(
+    field.name
+    for field in fields(KernelCounters)
+    if field.name not in set(STALL_FIELDS + SOL_FIELDS)
+)
+"""The counter fields left after the stall and speed-of-light families are split
+off into tables of their own. One table of every field is fifty columns wide, and
+the two families answer questions of their own."""
 
 
 def markdown(report: Report, *, require_agreement: bool = True) -> str:
@@ -364,7 +399,9 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
     if report.verdicts:
         lines += _section("class verdicts", report.verdicts)
     if report.kernels:
-        lines += _section("kernel counters", report.kernels)
+        lines += _section("kernel counters", report.kernels, _COUNTER_COLUMNS)
+        lines += _section("warp stalls", report.kernels, _STALL_COLUMNS)
+        lines += _section("speed of light", report.kernels, _SOL_COLUMNS)
     if report.trace is not None:
         lines += [
             "## gpu trace",

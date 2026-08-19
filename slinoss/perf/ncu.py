@@ -31,6 +31,14 @@ One NCU pass per table. Counters from different passes describe different
 executions, so they do not share a row without a stated disagreement:
 ``pass_duration_spread_pct`` carries the duration disagreement between passes,
 which is the replay-stability signal for everything else in the record.
+
+The ``stall`` and ``sol`` tables answer two different questions and are two
+tables for that reason. ``stall`` is the scheduler's view: how often it issued,
+and every reason it did not, as percentages of warp-active cycles. ``sol`` is the
+unit view: each engine against its own peak. A kernel far below the DRAM ceiling
+whose dominant stall is ``long_scoreboard`` while ``issue_active_pct`` sits in
+single digits is memory-latency bound with too few loads in flight, which no
+counter in the other six tables distinguishes from a bandwidth bound.
 """
 
 from __future__ import annotations
@@ -62,6 +70,9 @@ from slinoss.perf.units import (
 __all__ = [
     "NCU_TABLES",
     "REQUIRED_METRICS",
+    "SOL_FIELDS",
+    "STALL_FIELDS",
+    "STALL_REASONS",
     "KernelCounters",
     "NcuInvocation",
     "NcuPass",
@@ -71,6 +82,8 @@ __all__ = [
     "ncu_command",
     "parse_ncu_csv",
     "run_ncu",
+    "stall_field",
+    "stall_metric",
 ]
 
 
@@ -88,6 +101,69 @@ class NcuTable:
 
 
 _DURATION: Final = "gpu__time_duration.sum"
+
+_STALL_PREFIX: Final = "smsp__warp_issue_stalled_"
+_STALL_SUFFIX: Final = "_per_warp_active.pct"
+
+_ISSUE_ACTIVE: Final = "smsp__issue_active.avg.pct_of_peak_sustained_active"
+
+_SM_SOL: Final = "sm__throughput.avg.pct_of_peak_sustained_elapsed"
+_MEMORY_SOL: Final = "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
+_L1TEX_SOL: Final = "l1tex__throughput.avg.pct_of_peak_sustained_active"
+_L2_SOL: Final = "lts__throughput.avg.pct_of_peak_sustained_active"
+
+STALL_REASONS: Final[tuple[str, ...]] = (
+    "barrier",
+    "branch_resolving",
+    "dispatch_stall",
+    "drain",
+    "imc_miss",
+    "lg_throttle",
+    "long_scoreboard",
+    "math_pipe_throttle",
+    "membar",
+    "mio_throttle",
+    "misc",
+    "no_instruction",
+    "not_selected",
+    "short_scoreboard",
+    "sleeping",
+    "tex_throttle",
+    "wait",
+)
+"""Every warp-issue stall reason, in NCU's own spelling.
+
+The family also carries ``selected``, which is not a stall; the issue rate it
+describes is ``issue_active_pct``. The two sub-breakdowns ``long_scoreboard`` and
+``mio_throttle`` expose per pipe are absent, because they double-count their
+parent. The reasons do not partition warp-active cycles -- measured on this fleet
+they sum to 87 to 93 percent -- so no total is derived from them.
+"""
+
+
+def stall_metric(reason: str) -> str:
+    """NCU metric name carrying one stall reason.
+
+    Args:
+        reason: A member of :data:`STALL_REASONS`.
+
+    Returns:
+        The metric name, requested verbatim.
+    """
+    return f"{_STALL_PREFIX}{reason}{_STALL_SUFFIX}"
+
+
+def stall_field(reason: str) -> str:
+    """:class:`KernelCounters` field carrying one stall reason.
+
+    Args:
+        reason: A member of :data:`STALL_REASONS`.
+
+    Returns:
+        The field name.
+    """
+    return f"stall_{reason}_pct"
+
 
 NCU_TABLES: Final[tuple[NcuTable, ...]] = (
     NcuTable(
@@ -148,14 +224,41 @@ NCU_TABLES: Final[tuple[NcuTable, ...]] = (
             "smsp__thread_inst_executed_per_inst_executed.ratio",
         ),
     ),
+    NcuTable(
+        "stall",
+        (
+            _DURATION,
+            _ISSUE_ACTIVE,
+            *(stall_metric(reason) for reason in STALL_REASONS),
+        ),
+    ),
+    NcuTable("sol", (_DURATION, _SM_SOL, _MEMORY_SOL, _L1TEX_SOL, _L2_SOL)),
 )
 """The tables. Each is one NCU pass; every pass re-reads the duration so the
-passes can be checked against each other."""
+passes can be checked against each other. ``dram__throughput`` is the DRAM row of
+the speed-of-light breakdown and stays in the ``dram`` table beside the byte
+counters it explains, so ``sol`` does not request it twice."""
 
 REQUIRED_METRICS: Final[tuple[str, ...]] = tuple(
     dict.fromkeys(metric for table in NCU_TABLES for metric in table.metrics)
 )
 """Every metric :func:`kernel_counters` needs, in table order."""
+
+STALL_FIELDS: Final[tuple[str, ...]] = (
+    "issue_active_pct",
+    "dominant_stall",
+    "dominant_stall_pct",
+    *(stall_field(reason) for reason in STALL_REASONS),
+)
+""":class:`KernelCounters` fields the ``stall`` table fills, in print order."""
+
+SOL_FIELDS: Final[tuple[str, ...]] = (
+    "sm_pct",
+    "memory_pct",
+    "l1tex_pct",
+    "l2_pct",
+)
+""":class:`KernelCounters` fields the ``sol`` table fills, in print order."""
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +566,11 @@ class KernelCounters(PerfRecord):
     kernel row answers is what share of the step it owns. Rates are formed from
     those sums, so the numerator and the denominator cover the same launches.
 
+    Every field from the ``stall`` and the ``sol`` table is a percentage NCU has
+    already normalized -- per warp-active cycle for a stall reason, per unit peak
+    for a throughput -- so each takes the median across launches. Adding one over
+    three launches would report 300 percent of a whole that is per launch.
+
     Attributes:
         kernel: Demangled kernel name.
         launch_count: Launches profiled.
@@ -501,6 +609,37 @@ class KernelCounters(PerfRecord):
         thread_per_block_count: Threads per block.
         wave_per_sm_ratio: Waves per multiprocessor. Below one, the grid does not
             fill the device.
+        issue_active_pct: Issue slots used, as a percentage of peak sustained. Low
+            beside a high stall reason is a latency bound; a bandwidth bound
+            reaches the DRAM ceiling instead.
+        dominant_stall: The reason in :data:`STALL_REASONS` holding the largest
+            share. Ties break in declaration order.
+        dominant_stall_pct: That reason's share of warp-active cycles.
+        stall_barrier_pct: Waiting at a CTA barrier.
+        stall_branch_resolving_pct: Waiting for a branch target to resolve.
+        stall_dispatch_stall_pct: Waiting for a busy dispatch port.
+        stall_drain_pct: Waiting for outstanding memory to drain after an exit.
+        stall_imc_miss_pct: Waiting on an immediate-constant cache miss.
+        stall_lg_throttle_pct: Local and global instruction queue full.
+        stall_long_scoreboard_pct: Waiting on an L1TEX scoreboard dependency,
+            chiefly a global load. The memory-latency signal.
+        stall_math_pipe_throttle_pct: Math pipe oversubscribed.
+        stall_membar_pct: Waiting at a memory barrier.
+        stall_mio_throttle_pct: MIO instruction queue full, chiefly shared memory.
+        stall_misc_pct: Everything not otherwise attributed.
+        stall_no_instruction_pct: Waiting on an instruction fetch.
+        stall_not_selected_pct: Eligible, and another warp was issued instead.
+        stall_short_scoreboard_pct: Waiting on an MIO scoreboard dependency,
+            chiefly shared memory.
+        stall_sleeping_pct: Warp asleep.
+        stall_tex_throttle_pct: Texture and L1 request queue full.
+        stall_wait_pct: Waiting on a fixed-latency execution dependency.
+        sm_pct: SM throughput against peak sustained. NCU's Compute SOL row.
+        memory_pct: Memory-pipeline throughput against peak sustained, the
+            maximum over the memory subsystem. NCU's Memory SOL row. At or above
+            ``dram_pct`` by construction.
+        l1tex_pct: L1TEX throughput against peak sustained.
+        l2_pct: L2 throughput against peak sustained.
     """
 
     kernel: str
@@ -531,6 +670,30 @@ class KernelCounters(PerfRecord):
     block_count: Annotated[Count, INVARIANT]
     thread_per_block_count: Annotated[Count, INVARIANT]
     wave_per_sm_ratio: Annotated[Ratio, MEDIAN]
+    issue_active_pct: Annotated[Percent, MEDIAN]
+    dominant_stall: str
+    dominant_stall_pct: Annotated[Percent, MEDIAN]
+    stall_barrier_pct: Annotated[Percent, MEDIAN]
+    stall_branch_resolving_pct: Annotated[Percent, MEDIAN]
+    stall_dispatch_stall_pct: Annotated[Percent, MEDIAN]
+    stall_drain_pct: Annotated[Percent, MEDIAN]
+    stall_imc_miss_pct: Annotated[Percent, MEDIAN]
+    stall_lg_throttle_pct: Annotated[Percent, MEDIAN]
+    stall_long_scoreboard_pct: Annotated[Percent, MEDIAN]
+    stall_math_pipe_throttle_pct: Annotated[Percent, MEDIAN]
+    stall_membar_pct: Annotated[Percent, MEDIAN]
+    stall_mio_throttle_pct: Annotated[Percent, MEDIAN]
+    stall_misc_pct: Annotated[Percent, MEDIAN]
+    stall_no_instruction_pct: Annotated[Percent, MEDIAN]
+    stall_not_selected_pct: Annotated[Percent, MEDIAN]
+    stall_short_scoreboard_pct: Annotated[Percent, MEDIAN]
+    stall_sleeping_pct: Annotated[Percent, MEDIAN]
+    stall_tex_throttle_pct: Annotated[Percent, MEDIAN]
+    stall_wait_pct: Annotated[Percent, MEDIAN]
+    sm_pct: Annotated[Percent, MEDIAN]
+    memory_pct: Annotated[Percent, MEDIAN]
+    l1tex_pct: Annotated[Percent, MEDIAN]
+    l2_pct: Annotated[Percent, MEDIAN]
 
     @property
     def smem_bytes(self) -> Bytes:
@@ -644,6 +807,10 @@ def kernel_counters(
         store_conflicts = round(
             values["l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum"]
         )
+        stalls = {
+            reason: Percent(values[stall_metric(reason)]) for reason in STALL_REASONS
+        }
+        dominant = max(STALL_REASONS, key=lambda reason: stalls[reason])
         out.append(
             KernelCounters(
                 kernel=kernel,
@@ -698,6 +865,30 @@ def kernel_counters(
                 block_count=Count(round(values["launch__grid_size"])),
                 thread_per_block_count=Count(round(values["launch__block_size"])),
                 wave_per_sm_ratio=Ratio(values["launch__waves_per_multiprocessor"]),
+                issue_active_pct=Percent(values[_ISSUE_ACTIVE]),
+                dominant_stall=dominant,
+                dominant_stall_pct=stalls[dominant],
+                stall_barrier_pct=stalls["barrier"],
+                stall_branch_resolving_pct=stalls["branch_resolving"],
+                stall_dispatch_stall_pct=stalls["dispatch_stall"],
+                stall_drain_pct=stalls["drain"],
+                stall_imc_miss_pct=stalls["imc_miss"],
+                stall_lg_throttle_pct=stalls["lg_throttle"],
+                stall_long_scoreboard_pct=stalls["long_scoreboard"],
+                stall_math_pipe_throttle_pct=stalls["math_pipe_throttle"],
+                stall_membar_pct=stalls["membar"],
+                stall_mio_throttle_pct=stalls["mio_throttle"],
+                stall_misc_pct=stalls["misc"],
+                stall_no_instruction_pct=stalls["no_instruction"],
+                stall_not_selected_pct=stalls["not_selected"],
+                stall_short_scoreboard_pct=stalls["short_scoreboard"],
+                stall_sleeping_pct=stalls["sleeping"],
+                stall_tex_throttle_pct=stalls["tex_throttle"],
+                stall_wait_pct=stalls["wait"],
+                sm_pct=Percent(values[_SM_SOL]),
+                memory_pct=Percent(values[_MEMORY_SOL]),
+                l1tex_pct=Percent(values[_L1TEX_SOL]),
+                l2_pct=Percent(values[_L2_SOL]),
             )
         )
     return tuple(sorted(out, key=lambda k: k.duration_us, reverse=True))
