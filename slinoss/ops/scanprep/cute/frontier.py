@@ -16,8 +16,11 @@ tile it would be staged in. Bank conflicts are unreachable rather than avoided.
 
 That read is a ten-column gather per thread, not a coalesced row. It costs L1
 requests, not DRAM traffic: a block reads every head of its own token rows, so
-every sector it touches is fully consumed, and the parameter slice is a few
-percent of the bytes either direction moves.
+every sector it touches is fully consumed, and the ten loads of one column re-read
+the sectors the other nine touch. At one group and the minimum state width the
+parameter slice is a fifth of the bytes the forward moves and, with ``dparams``, a
+third of the backward's; at four groups and twice the state, a sixteenth and a
+ninth.
 
 ``bc`` is a separate phase over its own flat item space. A run of consecutive
 source columns inside one ``(half, group)`` segment maps to a run of consecutive
@@ -46,10 +49,10 @@ and the parameter rows are widened on load so both maps and the bias reduction
 run in float32. Gradients are narrowed back to the input width once, on the store
 to ``dparams``.
 
-DRAM-bound. Per token the forward moves ``i*(10*H + 4*G*3N) + 48`` bytes at
+DRAM-bound. Per token the forward moves ``i*(10*H + 4*G*3N) + 48*H`` bytes at
 activation itemsize ``i``: the parameter row in, ``bc`` in, ``B`` and ``C`` out,
-and 48 bytes of packed float32. The backward moves
-``i*(20*H + 4*G*3N) + 48 + 40*H/TILE_TOKENS`` bytes: both float32 cotangents and
+and 48 bytes of packed float32 per head. The backward moves
+``i*(20*H + 4*G*3N) + 48*H + 40*H/TILE_TOKENS`` bytes: both float32 cotangents and
 ``dB``, ``dC``, and the parameter row in, ``dparams`` and ``dbc`` out, and the
 partial bias row. The per-head bias is ``40*H`` bytes for the whole launch and is
 read once per block out of cache. No measured bandwidth is claimed here.
