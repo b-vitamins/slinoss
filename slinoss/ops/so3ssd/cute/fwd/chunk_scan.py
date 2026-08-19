@@ -94,7 +94,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
-    MMA_TILE_M,
+    MMA_PAIR,
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
@@ -145,8 +145,8 @@ accumulators, both GEMMs' fragments, and one staging group.
 
 Two, because the score fragment is one of those groups. Measured on sm_86 at the
 standard shape, asking for three caps the thread at 168 registers and the body
-spills 491,520 load and 245,760 store sectors per launch, for 111.2 us; asking for
-two leaves 255 registers, no spill at all, and 105.0 us. The bound's function here
+spills 491,520 load and 245,760 store sectors per launch, for 114.8 us; asking for
+two leaves 255 registers, no spill at all, and 104.4 us. The bound's function here
 is to stop the allocator targeting a residency this body does not fit in, not to
 make two blocks resident: at 255 registers one is. Before the score moved into
 registers the ordering was the other way round, 107.0 us at three against 118.7 at
@@ -373,13 +373,14 @@ def chunk_scan_fwd_kernel(
     # are built once: the retile is a layout, so nothing here is per-slice work.
     sfrag = cute.make_fragment_like(sacc, elem)
     fa_score = mma_areg(sfrag)
-    # The slice loop's form follows the chunk length, because the two costs it
-    # trades scale differently. Unrolled, the slice base is a trace-time constant and
-    # every score-epilogue index folds into an immediate, which is worth
-    # ``cute.size(sacc)`` addresses a slice; dynamic, the body is emitted once and
-    # ptxas schedules it without carrying every slice's live set at once. At one M
-    # tile the schedule wins and at two the folding does.
-    for s in cutlass.range(slices, unroll_full=chunk > MMA_TILE_M):
+    # The slice body is emitted once, never unrolled. Unrolling folds every
+    # score-epilogue index into an immediate, but ptxas then schedules all
+    # ``2 * slices`` copies against one register file: at ``L`` 128 that is 257
+    # registers of demand against the architectural 255, and the two integer
+    # addresses it evicts cost 73,728 local load and 49,152 local store sectors a
+    # launch. Measured on sm_86, dropping the unroll at ``L`` 128 removes the spill
+    # and the kernel runs 212.1 us against 242.0 us unrolled.
+    for s in cutlass.range(slices):
         nbase = s * nblk
         for tap in cutlass.range_constexpr(2):
             cute.arch.sync_threads()
@@ -438,13 +439,30 @@ def chunk_scan_fwd_kernel(
                 False,
             )
 
-    # mma_store takes the logical row count at compile time; here it is
-    # min(L, T - t0), so the store is predicated by hand on the same coordinates.
+    # mma_store's predicated path, inlined because both of its bounds are dynamic
+    # here: the row count is min(L, T - t0) and the destination row is offset by t0.
+    # Its invariants and its alignment restatement carry over unchanged. Without the
+    # pair the store moved four sectors per payload sector, since a scalar subscript
+    # never reaches cute.autovec_copy and at two bytes an element the quad of lanes
+    # covering four columns touched 8 useful bytes of a 32-byte sector.
     out = gy.element_type
-    for i in cutlass.range_constexpr(cute.size(acc)):
+    dst = gy[bidx, hidx, None, None]
+    flat = cute.make_tensor(
+        dst.iterator.align(MMA_PAIR * (out.width // 8)),
+        cute.make_layout((seqlen * rows,), stride=(1,)),
+    )
+    vy = cute.zipped_divide(flat, (MMA_PAIR,))
+    fy = cute.make_fragment((MMA_PAIR,), out)
+    for p in cutlass.range_constexpr(cute.size(acc) // MMA_PAIR):
+        i = p * MMA_PAIR
         m, n = ycrd[i]
+        # Filled before the predicate: a value produced inside a dynamic branch is
+        # not readable after it. The fill is free on the rows the predicate drops.
+        # ``rows`` and ``n`` are both even, so the flat index of the pair is exact.
+        for j in cutlass.range_constexpr(MMA_PAIR):
+            fy[j] = narrow(acc[i + j], out)
         if m < valid:
-            gy[bidx, hidx, t0 + m, n] = narrow(acc[i], out)
+            cute.autovec_copy(fy, vy[(None, ((t0 + m) * rows + n) // MMA_PAIR)])
 
 
 @cute.jit
