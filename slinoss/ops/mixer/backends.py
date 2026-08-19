@@ -1,0 +1,121 @@
+"""Backend registry for the fused mixer tail.
+
+The lookup itself is :class:`slinoss._registry.Registry`, which every operator
+shares. This module holds only what is the tail's own: the two call signatures and
+which implementations exist.
+
+The CuTe backend registers only when the DSL imports and a CUDA device is visible.
+Importing the DSL on a host without one raises, and an operator that cannot be
+imported on a CPU host is not an operator, so the import is guarded and a tree with
+no DSL resolves to the reference everywhere.
+"""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+import torch
+from torch import Tensor
+
+from slinoss._precision import KERNEL_DTYPES, SUPPORTED_DTYPES
+from slinoss._registry import Backend, Registry
+from slinoss.ops.mixer.reference import (
+    MixerTailGrads,
+    mixer_tail_bwd_ref,
+    mixer_tail_ref,
+)
+
+__all__ = [
+    "Backend",
+    "MixerBackend",
+    "MixerBackward",
+    "MixerForward",
+    "get",
+    "names",
+    "register",
+    "resolve",
+]
+
+REFERENCE = "reference"
+CUTE = "cute"
+
+
+class MixerForward(Protocol):
+    """Forward signature every backend implements."""
+
+    def __call__(
+        self,
+        y: Tensor,
+        u: Tensor,
+        gate: Tensor,
+        d_skip: Tensor,
+        weight: Tensor,
+        /,
+        *,
+        eps: float,
+    ) -> Tensor: ...
+
+
+class MixerBackward(Protocol):
+    """Backward signature every backend implements.
+
+    The five operands and nothing else: the norm scale, the gate, and the pre-norm
+    value are all recomputed, so no forward intermediate crosses the boundary.
+    """
+
+    def __call__(
+        self,
+        dout: Tensor,
+        y: Tensor,
+        u: Tensor,
+        gate: Tensor,
+        d_skip: Tensor,
+        weight: Tensor,
+        /,
+        *,
+        eps: float,
+    ) -> MixerTailGrads: ...
+
+
+MixerBackend = Backend[MixerForward, MixerBackward]
+
+_REGISTRY: Registry[MixerForward, MixerBackward] = Registry("mixer_tail")
+
+register = _REGISTRY.register
+names = _REGISTRY.names
+get = _REGISTRY.get
+resolve = _REGISTRY.resolve
+
+register(
+    Backend(
+        name=REFERENCE,
+        forward=mixer_tail_ref,
+        backward=mixer_tail_bwd_ref,
+        device_types=("cpu", "cuda"),
+        dtypes=SUPPORTED_DTYPES,
+        priority=0,
+    )
+)
+
+
+def _register_cute() -> None:
+    """Register the CuTe backend if this host can run it."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        from slinoss.ops.mixer.cute.tail import mixer_tail_backward, mixer_tail_forward
+    except ImportError:
+        return
+    register(
+        Backend(
+            name=CUTE,
+            forward=mixer_tail_forward,
+            backward=mixer_tail_backward,
+            device_types=("cuda",),
+            dtypes=KERNEL_DTYPES,
+            priority=10,
+        )
+    )
+
+
+_register_cute()

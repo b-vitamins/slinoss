@@ -13,9 +13,11 @@ import torch
 from torch.autograd import gradcheck
 from torch.nn.functional import silu
 
-from slinoss.ops.mixer import mixer_tail_ref
+from slinoss.ops.mixer import mixer_tail, mixer_tail_bwd_ref, mixer_tail_ref
 
 EPS = 1e-5
+
+NAMES = ("y", "u", "gate", "d_skip", "weight")
 
 SHAPES = [
     pytest.param(2, 3, 5, 8, id="small"),
@@ -245,3 +247,32 @@ def test_rejects_unsupported_dtype(name: str) -> None:
             tensors["weight"],
             eps=EPS,
         )
+
+
+def test_reference_backward_matches_autograd_through_the_public_operator() -> None:
+    """The dispatched reference path is the same gradient autograd produces.
+
+    :func:`mixer_tail` routes the backward through the registry rather than
+    through autograd's own graph, so the two are only equal if the backend and
+    the interface agree about the saved set and the argument order. The forward
+    is the reference in both arms, so any difference is dispatch.
+    """
+    operands = _operands(2, 3, 5, 8)
+    dout = _operands(2, 3, 5, 8, seed=7)[0]
+
+    leaves = tuple(t.detach().clone().requires_grad_(True) for t in operands)
+    mixer_tail(*leaves, eps=EPS, backend="reference").mul(dout).sum().backward()
+
+    direct = tuple(t.detach().clone().requires_grad_(True) for t in operands)
+    mixer_tail_ref(*direct, eps=EPS).mul(dout).sum().backward()
+
+    for got, want, name in zip(leaves, direct, NAMES, strict=True):
+        assert got.grad is not None and want.grad is not None
+        torch.testing.assert_close(got.grad, want.grad, msg=f"d{name}")
+
+
+def test_reference_backward_rejects_a_mismatched_cotangent() -> None:
+    """The cotangent shape is the output shape; a broadcastable one is a bug."""
+    y, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
+    with pytest.raises(ValueError, match="dout must be"):
+        mixer_tail_bwd_ref(y[:, :, :-1], y, u, gate, d_skip, weight, eps=EPS)

@@ -23,11 +23,10 @@ if not torch.cuda.is_available():
 from collections.abc import Callable
 
 from slinoss._cute import assert_smem_fits, smem_bytes, smem_capacity
-from slinoss.ops.mixer import mixer_tail_ref
+from slinoss.ops.mixer import mixer_tail, mixer_tail_ref
 from slinoss.ops.mixer.cute import (
     ROWS,
     THREADS,
-    mixer_tail,
     mixer_tail_backward,
     mixer_tail_forward,
 )
@@ -317,7 +316,7 @@ def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     fast = _leaves(ops, double=False)
     oracle = _leaves(ops, double=True)
 
-    got = mixer_tail(*fast, eps=EPS)
+    got = mixer_tail(*fast, eps=EPS, backend="cute")
     (got * dout).sum().backward()
 
     want = mixer_tail_ref(*oracle, eps=EPS)

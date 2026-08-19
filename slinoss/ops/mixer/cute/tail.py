@@ -52,7 +52,7 @@ tile partials and reads them back once.
 """
 
 import functools
-from typing import Any, NamedTuple, cast
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -75,6 +75,7 @@ from slinoss._cute import (
 )
 from slinoss._guard import Named, check_layout
 from slinoss._precision import KERNEL_DTYPES
+from slinoss.ops.mixer.reference import MixerTailGrads
 
 __all__ = [
     "ROWS",
@@ -84,9 +85,6 @@ __all__ = [
     "SLOT_WEIGHT",
     "THREADS",
     "WARPS",
-    "MixerTailFunction",
-    "MixerTailGrads",
-    "mixer_tail",
     "mixer_tail_backward",
     "mixer_tail_bwd",
     "mixer_tail_bwd_kernel",
@@ -623,24 +621,6 @@ def _check_operands(
 # ---------------------------------------------------------------------------
 
 
-class MixerTailGrads(NamedTuple):
-    """Gradients of the fused tail.
-
-    Attributes:
-        dy: ``(B,H,T,P)``, operand dtype.
-        du: ``(B,H,T,P)``, operand dtype.
-        dgate: ``(B,H,T,P)``, operand dtype.
-        dd_skip: ``(H,P)``, parameter dtype.
-        dweight: ``(H,P)``, parameter dtype.
-    """
-
-    dy: Tensor
-    du: Tensor
-    dgate: Tensor
-    dd_skip: Tensor
-    dweight: Tensor
-
-
 def mixer_tail_forward(
     y: Tensor,
     u: Tensor,
@@ -778,74 +758,3 @@ def mixer_tail_backward(
         dd_skip=totals[SLOT_DSKIP].to(d_skip.dtype),
         dweight=totals[SLOT_WEIGHT].to(weight.dtype),
     )
-
-
-class MixerTailFunction(torch.autograd.Function):
-    """Differentiable fused tail.
-
-    Saves the five operands. The backward recomputes the gate, the pre-norm
-    value, and the norm scale from them, so no forward intermediate crosses the
-    boundary. All five gradients are produced whatever the leaves require: a
-    variant per subset of ``needs_input_grad`` would be a second entry point
-    into the same kernel.
-    """
-
-    @staticmethod
-    def forward(  # type: ignore[override]
-        ctx: Any,
-        y: Tensor,
-        u: Tensor,
-        gate: Tensor,
-        d_skip: Tensor,
-        weight: Tensor,
-        eps: float,
-    ) -> Tensor:
-        out = mixer_tail_forward(y, u, gate, d_skip, weight, eps=eps)
-        ctx.save_for_backward(y, u, gate, d_skip, weight)
-        ctx.eps = eps
-        return out
-
-    @staticmethod
-    def backward(  # type: ignore[override]
-        ctx: Any,
-        dout: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, None]:
-        y, u, gate, d_skip, weight = ctx.saved_tensors
-        grads = mixer_tail_backward(dout, y, u, gate, d_skip, weight, eps=ctx.eps)
-        return (
-            grads.dy,
-            grads.du,
-            grads.dgate,
-            grads.dd_skip,
-            grads.dweight,
-            None,
-        )
-
-
-def mixer_tail(
-    y: Tensor,
-    u: Tensor,
-    gate: Tensor,
-    d_skip: Tensor,
-    weight: Tensor,
-    *,
-    eps: float,
-) -> Tensor:
-    """Fused tail with an analytic backward. The public fast path.
-
-    Args:
-        y: Scan output, ``(B,H,T,P)``.
-        u: Scan input, ``(B,H,T,P)``.
-        gate: Gate, ``(B,H,T,P)``.
-        d_skip: Per-row skip scale, ``(H,P)``.
-        weight: Per-row norm scale, ``(H,P)``.
-        eps: Added to the mean square before the reciprocal square root.
-
-    Returns:
-        ``(B,H,T,P)`` in the dtype of ``y``.
-
-    Raises:
-        ValueError: On a shape, layout, device, or epsilon violation.
-        TypeError: On an unsupported or mixed dtype.
-    """
-    return cast("Tensor", MixerTailFunction.apply(y, u, gate, d_skip, weight, eps))

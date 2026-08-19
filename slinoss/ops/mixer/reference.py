@@ -25,13 +25,15 @@ of ``y``.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from torch import Tensor
 from torch.nn.functional import silu
 
 from slinoss._precision import autocast_disabled, check_supported, pinned_dtype
 
-__all__ = ["mixer_tail_ref"]
+__all__ = ["MixerTailGrads", "mixer_tail_bwd_ref", "mixer_tail_ref"]
 
 
 def mixer_tail_ref(
@@ -91,3 +93,66 @@ def mixer_tail_ref(
         x = x * silu(gate.to(dtype))
         scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
         return (x * scale * weight.to(dtype)[:, None, :]).to(y.dtype)
+
+
+class MixerTailGrads(NamedTuple):
+    """Gradients of the fused tail.
+
+    Attributes:
+        dy: ``(B,H,T,P)``, dtype of ``y``.
+        du: ``(B,H,T,P)``, dtype of ``u``.
+        dgate: ``(B,H,T,P)``, dtype of ``gate``.
+        dd_skip: ``(H,P)``, dtype of ``d_skip``.
+        dweight: ``(H,P)``, dtype of ``weight``.
+    """
+
+    dy: Tensor
+    du: Tensor
+    dgate: Tensor
+    dd_skip: Tensor
+    dweight: Tensor
+
+
+def mixer_tail_bwd_ref(
+    dout: Tensor,
+    y: Tensor,
+    u: Tensor,
+    gate: Tensor,
+    d_skip: Tensor,
+    weight: Tensor,
+    /,
+    *,
+    eps: float,
+) -> MixerTailGrads:
+    """Pullback of :func:`mixer_tail_ref`, by autograd through it.
+
+    Autograd through the forward rather than a written-out VJP. A hand-derived
+    pullback shares its algebra with the forward it was derived from, so an algebra
+    error passes silently. In float64 this is the gradient authority the kernel is
+    measured against.
+
+    Args:
+        dout: Cotangent of the output, shape ``(B,H,T,P)``.
+        y: The forward's scan output, shape ``(B,H,T,P)``.
+        u: The forward's scan input, shape ``(B,H,T,P)``.
+        gate: The forward's gate, shape ``(B,H,T,P)``.
+        d_skip: The forward's skip scale, shape ``(H,P)``.
+        weight: The forward's norm scale, shape ``(H,P)``.
+        eps: The forward's epsilon.
+
+    Returns:
+        A :class:`MixerTailGrads`.
+
+    Raises:
+        ValueError: On a rank or shape mismatch, or a non-positive ``eps``.
+        TypeError: On an unsupported dtype.
+    """
+    if tuple(dout.shape) != tuple(y.shape):
+        raise ValueError(f"dout must be {tuple(y.shape)}, got {tuple(dout.shape)}")
+
+    leaves = tuple(
+        tensor.detach().requires_grad_(True) for tensor in (y, u, gate, d_skip, weight)
+    )
+    with torch.enable_grad():
+        out = mixer_tail_ref(*leaves, eps=eps)
+    return MixerTailGrads(*torch.autograd.grad(out, leaves, dout))
