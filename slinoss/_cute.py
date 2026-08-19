@@ -37,6 +37,7 @@ __all__ = [
     "Scalar",
     "Tile",
     "assert_smem_fits",
+    "block_reduce_add",
     "cute_dtype",
     "decay",
     "dev_tensor",
@@ -45,7 +46,9 @@ __all__ = [
     "jit_launch",
     "narrow",
     "select",
+    "shuffle_down",
     "shuffle_up",
+    "shuffle_xor",
     "sigmoid",
     "silu",
     "silu_grad",
@@ -344,6 +347,98 @@ def shuffle_up(value: Scalar, offset: int) -> Scalar:
         Lane ``l - offset``'s value, or the lane's own below ``offset``.
     """
     return cute.arch.shuffle_sync_up(value, offset, mask_and_clamp=0)
+
+
+def shuffle_down(value: Scalar, offset: int) -> Scalar:
+    """``shfl.sync.down`` across a full warp: lane ``l`` reads lane ``l + offset``.
+
+    Lanes within ``offset`` of the top keep their own value, which is the identity
+    the suffix scans here rely on.
+
+    The clamp is the mirror of :func:`shuffle_up`'s: an upper bound on the source
+    lane rather than a lower one, so the full-warp value is the top lane index and
+    not zero. The two directions therefore take opposite constants, and zero here
+    is the identity permutation rather than a shorter reach.
+
+    Args:
+        value: The value to shift.
+        offset: Lane distance. Compile-time in every caller.
+
+    Returns:
+        Lane ``l + offset``'s value, or the lane's own within ``offset`` of the top.
+    """
+    return cute.arch.shuffle_sync_down(
+        value, offset, mask_and_clamp=cute.arch.WARP_SIZE - 1
+    )
+
+
+def shuffle_xor(value: Scalar, mask: int) -> Scalar:
+    """``shfl.sync.bfly`` across a full warp: lane ``l`` reads lane ``l ^ mask``.
+
+    Every lane both sends and receives, so a butterfly of ``log2(32)`` rounds
+    leaves the total in all 32 lanes with no separate broadcast. The clamp is the
+    top lane index, as for :func:`shuffle_down`; zero there confines the exchange
+    to lanes below ``mask`` and leaves the rest reading themselves.
+
+    Args:
+        value: The value to exchange.
+        mask: Lane bit to flip. Compile-time in every caller.
+
+    Returns:
+        Lane ``l ^ mask``'s value.
+    """
+    return cute.arch.shuffle_sync_bfly(
+        value, mask, mask_and_clamp=cute.arch.WARP_SIZE - 1
+    )
+
+
+def block_reduce_add(
+    value: Scalar, sred: cute.Tensor, tid: cutlass.Int32, threads: int
+) -> Scalar:
+    """Sum one float32 over a whole block, result in every thread.
+
+    A butterfly inside each warp, one word per warp through shared memory, then
+    every thread sums those words. The butterfly leaves the warp total in all 32
+    lanes and the final pass is a broadcast read, so no thread is a designated
+    reducer and no second barrier is needed to publish the answer.
+
+    The store is unpredicated. All 32 lanes of a warp hold bitwise-identical
+    values after the butterfly and write one address, which the ISA resolves to a
+    single write by an unspecified lane with no bank conflict, so which lane wins
+    cannot change the result. Predicating it on lane zero would add a branch and a
+    divergent instruction for no effect.
+
+    Entered by every thread of the block. One barrier, ordering the warp writes
+    against the reads. Reusing ``sred`` for a second reduction needs a barrier
+    from the caller first, on the same principle as
+    :func:`slinoss.ops.so3ssd.cute.prefix.chunk_prefixes`: only the caller knows
+    what else is live in shared memory. A caller reducing several values at once
+    should widen ``sred`` to one word per warp per value, which pays one barrier
+    for all of them.
+
+    Args:
+        value: The thread's contribution.
+        sred: ``(threads // 32,)`` float32 scratch, or one such row of a wider
+            tile.
+        tid: Thread index within the block.
+        threads: Block width, a multiple of the warp width. Compile-time.
+
+    Returns:
+        The block sum, bitwise identical in every thread.
+    """
+    reach = 1
+    while reach < cute.arch.WARP_SIZE:
+        value = value + shuffle_xor(value, reach)
+        reach *= 2
+    sred[tid // cute.arch.WARP_SIZE] = value
+    cute.arch.sync_threads()
+    # Plain Python loops, not cutlass.range_constexpr: this is an undecorated
+    # helper, so the DSL's preprocessor never rewrites its body, and both bounds
+    # are compile-time anyway, which is what unrolls them during the trace.
+    total = cutlass.Float32(0.0)
+    for warp in range(threads // cute.arch.WARP_SIZE):
+        total = total + sred[warp]
+    return total
 
 
 def decay(log_diff: Scalar) -> Scalar:
