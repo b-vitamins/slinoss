@@ -1,4 +1,4 @@
-"""Backend registry for the bounded parameter maps.
+"""Backend registry for the scan's parameter frontier.
 
 The lookup itself is :class:`slinoss._registry.Registry`, which every operator
 shares. This module holds only what is scanprep's own: the two call signatures and
@@ -42,15 +42,21 @@ CUTE = "cute"
 
 
 class ScanPrepForward(Protocol):
-    """Forward signature every backend implements."""
+    """Forward signature every backend implements.
+
+    ``heads`` and ``state_dim`` are keyword-only because they are shape metadata,
+    not operands. ``G`` is absent: it is read off ``bc``.
+    """
 
     def __call__(
         self,
-        w_raw: Tensor,
-        ls_raw: Tensor,
-        tap_raw: Tensor,
+        params: Tensor,
+        bc: Tensor,
+        param_bias: Tensor,
         /,
         *,
+        heads: int,
+        state_dim: int,
         w_max: float,
     ) -> ScanParams: ...
 
@@ -58,18 +64,23 @@ class ScanPrepForward(Protocol):
 class ScanPrepBackward(Protocol):
     """Backward signature every backend implements.
 
-    ``tap_raw`` is absent: the tap map is the identity, so its pullback reads only
-    ``dK`` and the forward saves it for nobody.
+    ``bc`` is absent: the permute is linear, so its pullback reads only ``dB`` and
+    ``dC``. ``param_bias`` is present because the maps' Jacobians are evaluated at
+    ``params + param_bias``.
     """
 
     def __call__(
         self,
         dtrans: Tensor,
         dK: Tensor,
-        w_raw: Tensor,
-        ls_raw: Tensor,
+        dB: Tensor,
+        dC: Tensor,
+        params: Tensor,
+        param_bias: Tensor,
         /,
         *,
+        heads: int,
+        state_dim: int,
         w_max: float,
     ) -> ScanGrads: ...
 
@@ -101,7 +112,10 @@ def _register_cute() -> None:
     if not torch.cuda.is_available():
         return
     try:
-        from slinoss.ops.scanprep.cute.maps import scanprep_backward, scanprep_forward
+        from slinoss.ops.scanprep.cute.frontier import (
+            scanprep_backward,
+            scanprep_forward,
+        )
     except ImportError:
         return
     register(

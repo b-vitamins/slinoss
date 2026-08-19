@@ -1,74 +1,36 @@
-"""Bounded parameter maps. CuTe DSL forward and backward.
+"""Bounded parameter maps: the device-side implementation, and the only one.
 
     w  = w_max * raw * rsqrt(1 + |raw|^2)
     ls = -softplus(raw)
     K  = tap, unchanged
 
-One kernel and one launch per direction. The forward writes both packed layouts
-directly, ``(B,H,T,4)`` and ``(B,H,T,2,4)``, and writes lane 3 of each tap as a
-hard zero, so the packing costs no concatenation, no ``zeros_like``, and no
-``aten::fill_``. Output buffers are ``torch.empty``: every element is written.
+Both maps and both pullbacks live here as plain Python functions over
+:data:`slinoss._cute.Scalar`, so a call from inside a ``@cute.kernel`` is inlined
+at trace time. The kernels in :mod:`slinoss.ops.scanprep.cute.frontier` are the
+only callers. A second copy of either map would diverge from this one, and the
+divergence is a correctness bug.
 
-``trans`` and ``K`` are float32 at every input width, including under autocast
-(I4). Low-precision inputs are widened on load, so both maps are evaluated in
-float32; the gradients are narrowed back to the input width on store.
+Nothing here emits dynamic control flow. ``rsqrt`` acts on ``1 + |raw|^2 >= 1``
+and ``softplus`` is evaluated through an identity whose exponential argument is
+never positive, so I1 and I2 are produced without a clamp, an epsilon, or a
+validity pass, and no function here contributes divergence.
 
-Parallel decomposition. One thread per token over the flattened ``B*H*T`` axis,
-which is the only axis in the problem. Nothing is shared between tokens, so
-neither kernel holds shared memory or a barrier. ``T`` is arbitrary, so the grid
-is ``ceil(B*H*T / THREADS)`` blocks and the token index carries a bounds
-predicate; the predicate is warp-uniform except in the last warp of the last
-block.
-
-Invariants. I1 and I2 are produced here rather than asserted here. ``rsqrt`` acts
-on ``1 + |raw|^2 >= 1`` and ``softplus`` is evaluated through an identity whose
-exponential argument is never positive, so no clamp, epsilon, or validity pass
-exists on this path.
-
-DRAM-bound. Per token the forward moves ten input elements in and twelve float32
-out: 88 B at float32, 68 B at bfloat16. The backward moves twelve float32
-cotangents and four input elements in, ten input elements out: 104 B at float32,
-76 B at bfloat16.
+Every quantity is float32 (I4), whatever width the raw parameters were stored at.
 """
 
-import math
 from typing import Any
 
 import cutlass
 import cutlass.cute as cute
-import torch
-from torch import Tensor
 
-from slinoss._cute import (
-    LOG2_E,
-    Scalar,
-    dev_tensor,
-    f32,
-    narrow,
-    select,
-    widen,
-)
-from slinoss._guard import Named, check_layout
-from slinoss._precision import KERNEL_DTYPES
-from slinoss.ops.scanprep.reference import ScanGrads, ScanParams
+from slinoss._cute import LOG2_E, Scalar, f32, select
 
 __all__ = [
-    "THREADS",
-    "scanprep_backward",
-    "scanprep_bwd",
-    "scanprep_bwd_kernel",
-    "scanprep_forward",
-    "scanprep_fwd",
-    "scanprep_fwd_kernel",
+    "log_scale",
+    "log_scale_grad",
+    "rotvec",
+    "rotvec_grad",
 ]
-
-# One token per thread, eight warps. Live state is under a dozen float32 and
-# there is no shared memory, so occupancy is capped by nothing.
-THREADS = 256
-
-# ---------------------------------------------------------------------------
-# Device math
-# ---------------------------------------------------------------------------
 
 
 def _softplus_parts(raw: Scalar) -> tuple[Any, Scalar]:
@@ -82,7 +44,7 @@ def _softplus_parts(raw: Scalar) -> tuple[Any, Scalar]:
     return positive, f32(cute.exp2(select(positive, -raw, raw) * LOG2_E))
 
 
-def _log_scale(raw: Scalar) -> Scalar:
+def log_scale(raw: Scalar) -> Scalar:
     """``-softplus(raw) <= 0`` (I1).
 
     Evaluated as ``min(-raw, 0) - log1p(exp(-|raw|))``. Both terms are bounded by
@@ -93,384 +55,85 @@ def _log_scale(raw: Scalar) -> Scalar:
     below float32 epsilon, which is an absolute error of at most ``2^-24`` on a
     quantity whose magnitude is ``|raw|``, and it drops nothing at all wherever
     ``e`` is normal against one.
+
+    Args:
+        raw: Unconstrained log-scale, float32.
+
+    Returns:
+        The log-scale, non-positive.
     """
     positive, small = _softplus_parts(raw)
     return select(positive, -raw, cutlass.Float32(0.0)) - f32(cute.log(small + 1.0))
 
 
-def _log_scale_grad(raw: Scalar) -> Scalar:
+def log_scale_grad(raw: Scalar) -> Scalar:
     """``d(-softplus)/draw = -sigmoid(raw)``.
 
     ``sigmoid(raw)`` is ``1 / (1 + e)`` where ``raw > 0`` and ``e / (1 + e)``
     elsewhere, with ``e = exp(-|raw|)`` in ``(0, 1]``: one select, and no
     intermediate exceeds one, so no input magnitude overflows.
+
+    Args:
+        raw: Unconstrained log-scale, float32.
+
+    Returns:
+        The derivative of :func:`log_scale`.
     """
     positive, small = _softplus_parts(raw)
     return -select(positive, cutlass.Float32(1.0), small) / (small + 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Forward
-# ---------------------------------------------------------------------------
+def rotvec(
+    rx: Scalar, ry: Scalar, rz: Scalar, w_max: Scalar
+) -> tuple[Scalar, Scalar, Scalar]:
+    """Map an unconstrained vector into the closed ball of radius ``w_max`` (I2).
 
-
-@cute.kernel
-def scanprep_fwd_kernel(
-    gw: cute.Tensor,
-    gls: cute.Tensor,
-    gtap: cute.Tensor,
-    gtrans: cute.Tensor,
-    gpack: cute.Tensor,
-    tokens: cutlass.Int32,
-    w_max: cutlass.Float32,
-    threads: cutlass.Constexpr,
-) -> None:
-    """Apply both maps and write the packed layouts.
+    ``1 + |raw|^2 >= 1``, so the rsqrt is regular over the whole domain and needs
+    no guard. An overflowing ``|raw|^2`` gives ``rsqrt(inf) == 0``, which collapses
+    the result to the centre of the ball: finite, and still inside it.
 
     Args:
-        gw: ``(B*H*T, 3)`` unconstrained rotation vectors, input dtype.
-        gls: ``(B*H*T,)`` unconstrained log-scales, input dtype.
-        gtap: ``(B*H*T, 6)`` unconstrained taps, ``3*tap + j``, input dtype.
-        gtrans: ``(B*H*T, 4)`` float32, written with ``(w_x, w_y, w_z, ls)``.
-        gpack: ``(B*H*T, 8)`` float32, written with ``(kr, g, h, 0)`` per tap at
-            component ``4*tap + j``.
-        tokens: ``B*H*T``. Dynamic.
-        w_max: Rotation-vector bound. Dynamic, so one compiled variant covers
-            every bound.
-        threads: Block width. Compile-time.
-
-    Invariants:
-        Every input dtype is one dtype, so one widening type serves all three
-        reads. ``tokens`` is arbitrary, so the last block is predicated.
-    """
-    tile, _, _ = cute.arch.block_idx()
-    tid, _, _ = cute.arch.thread_idx()
-    token = tile * threads + tid
-
-    if token < tokens:
-        src = gw.element_type
-        rx = widen(gw[token, 0], src)
-        ry = widen(gw[token, 1], src)
-        rz = widen(gw[token, 2], src)
-        # 1 + |raw|^2 >= 1, so the rsqrt is regular over the whole domain and the
-        # product lands in the closed ball of radius w_max (I2).
-        scale = w_max * f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
-        gtrans[token, 0] = rx * scale
-        gtrans[token, 1] = ry * scale
-        gtrans[token, 2] = rz * scale
-        gtrans[token, 3] = _log_scale(widen(gls[token], src))
-
-        zero = cutlass.Float32(0.0)
-        for tap in cutlass.range_constexpr(2):
-            for j in cutlass.range_constexpr(3):
-                gpack[token, 4 * tap + j] = widen(gtap[token, 3 * tap + j], src)
-            gpack[token, 4 * tap + 3] = zero
-
-
-@cute.jit
-def scanprep_fwd(
-    gw: cute.Tensor,
-    gls: cute.Tensor,
-    gtap: cute.Tensor,
-    gtrans: cute.Tensor,
-    gpack: cute.Tensor,
-    tokens: cutlass.Int32,
-    tiles: cutlass.Int32,
-    w_max: cutlass.Float32,
-    threads: cutlass.Constexpr,
-) -> None:
-    """Launch :func:`scanprep_fwd_kernel`.
-
-    Only ``threads`` is compile-time, so one compiled variant per input dtype
-    covers every batch, head, token count, and bound.
-    """
-    scanprep_fwd_kernel(gw, gls, gtap, gtrans, gpack, tokens, w_max, threads).launch(
-        grid=(tiles, 1, 1), block=(threads, 1, 1)
-    )
-
-
-# ---------------------------------------------------------------------------
-# Backward
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def scanprep_bwd_kernel(
-    gdtrans: cute.Tensor,
-    gdpack: cute.Tensor,
-    gw: cute.Tensor,
-    gls: cute.Tensor,
-    gdw: cute.Tensor,
-    gdls: cute.Tensor,
-    gdtap: cute.Tensor,
-    tokens: cutlass.Int32,
-    w_max: cutlass.Float32,
-    threads: cutlass.Constexpr,
-) -> None:
-    """Pull the cotangents of both maps back to the unconstrained parameters.
-
-    Args:
-        gdtrans: ``(B*H*T, 4)`` float32 cotangent of ``trans``.
-        gdpack: ``(B*H*T, 8)`` float32 cotangent of ``K``. Component
-            ``4*tap + 3`` is the cotangent of a constant and is not read.
-        gw: ``(B*H*T, 3)`` unconstrained rotation vectors, input dtype.
-        gls: ``(B*H*T,)`` unconstrained log-scales, input dtype.
-        gdw: ``(B*H*T, 3)`` written, input dtype.
-        gdls: ``(B*H*T,)`` written, input dtype.
-        gdtap: ``(B*H*T, 6)`` written, ``3*tap + j``, input dtype.
-        tokens: ``B*H*T``. Dynamic.
-        w_max: Rotation-vector bound. Dynamic.
-        threads: Block width. Compile-time.
-
-    Invariants:
-        The rotation-vector map is recomputed from ``gw`` rather than read back
-        from ``trans``: the pullback needs ``raw``, not ``w``.
-    """
-    tile, _, _ = cute.arch.block_idx()
-    tid, _, _ = cute.arch.thread_idx()
-    token = tile * threads + tid
-
-    if token < tokens:
-        src = gw.element_type
-        dst = gdw.element_type
-        rx = widen(gw[token, 0], src)
-        ry = widen(gw[token, 1], src)
-        rz = widen(gw[token, 2], src)
-        gx = gdtrans[token, 0]
-        gy = gdtrans[token, 1]
-        gz = gdtrans[token, 2]
-
-        inv = f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
-        scale = w_max * inv
-        # The map is a radial rescaling, so its Jacobian is the scale times a
-        # rank-one correction along raw; inv*inv is 1/(1 + |raw|^2).
-        pull = inv * inv * (gx * rx + gy * ry + gz * rz)
-        gdw[token, 0] = narrow(scale * (gx - pull * rx), dst)
-        gdw[token, 1] = narrow(scale * (gy - pull * ry), dst)
-        gdw[token, 2] = narrow(scale * (gz - pull * rz), dst)
-
-        raw_ls = widen(gls[token], src)
-        gdls[token] = narrow(_log_scale_grad(raw_ls) * gdtrans[token, 3], dst)
-
-        for tap in cutlass.range_constexpr(2):
-            for j in cutlass.range_constexpr(3):
-                gdtap[token, 3 * tap + j] = narrow(gdpack[token, 4 * tap + j], dst)
-
-
-@cute.jit
-def scanprep_bwd(
-    gdtrans: cute.Tensor,
-    gdpack: cute.Tensor,
-    gw: cute.Tensor,
-    gls: cute.Tensor,
-    gdw: cute.Tensor,
-    gdls: cute.Tensor,
-    gdtap: cute.Tensor,
-    tokens: cutlass.Int32,
-    tiles: cutlass.Int32,
-    w_max: cutlass.Float32,
-    threads: cutlass.Constexpr,
-) -> None:
-    """Launch :func:`scanprep_bwd_kernel`."""
-    scanprep_bwd_kernel(
-        gdtrans, gdpack, gw, gls, gdw, gdls, gdtap, tokens, w_max, threads
-    ).launch(grid=(tiles, 1, 1), block=(threads, 1, 1))
-
-
-# ---------------------------------------------------------------------------
-# Host validation
-# ---------------------------------------------------------------------------
-
-
-def _check_w_max(w_max: float) -> None:
-    """Raises:
-    ValueError: If ``w_max`` is outside ``(0, pi)``, which I2 requires.
-    """
-    if not 0.0 < w_max < math.pi:
-        raise ValueError(f"w_max must lie in (0, pi), got {w_max}")
-
-
-def _check_dtypes(named: Named) -> None:
-    """Raises:
-    TypeError: If an operand dtype has no kernel path, or if the operands do
-        not share one dtype. One dtype per call keeps a single widening type
-        inside the kernel.
-    """
-    for tensor, name in named:
-        if tensor.dtype not in KERNEL_DTYPES:
-            raise TypeError(
-                f"{name} has dtype {tensor.dtype}; kernel dtypes: {KERNEL_DTYPES}"
-            )
-    head, head_name = named[0]
-    for tensor, name in named[1:]:
-        if tensor.dtype is not head.dtype:
-            raise TypeError(
-                f"{name} is {tensor.dtype} and {head_name} is {head.dtype}; "
-                "one dtype per call"
-            )
-
-
-def _check_pinned(named: Named) -> None:
-    """Raises:
-    ValueError: If a cotangent of ``trans`` or ``K`` is not float32. Both are
-        float32-pinned (I4), so their cotangents are too.
-    """
-    for tensor, name in named:
-        if tensor.dtype is not torch.float32:
-            raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
-
-
-def _lead(w_raw: Tensor) -> tuple[int, int, int]:
-    """The ``(B, H, T)`` prefix of a rotation-vector operand.
-
-    Raises:
-        ValueError: If ``w_raw`` is not ``(B,H,T,3)``, or if it holds no token.
-            A zero-token call has no launchable grid, so it is refused rather
-            than special-cased.
-    """
-    if w_raw.ndim != 4 or w_raw.shape[-1] != 3:
-        raise ValueError(f"w_raw must be (B,H,T,3), got {tuple(w_raw.shape)}")
-    lead = (int(w_raw.shape[0]), int(w_raw.shape[1]), int(w_raw.shape[2]))
-    if lead[0] * lead[1] * lead[2] == 0:
-        raise ValueError(f"w_raw must hold at least one token, got {lead}")
-    return lead
-
-
-def _check_raw_shapes(w_raw: Tensor, ls_raw: Tensor) -> tuple[int, int, int]:
-    """The ``(B, H, T)`` prefix shared by the two unconstrained operands.
-
-    Raises:
-        ValueError: On a rank or shape mismatch.
-    """
-    lead = _lead(w_raw)
-    if tuple(ls_raw.shape) != lead:
-        raise ValueError(f"ls_raw must be {lead}, got {tuple(ls_raw.shape)}")
-    return lead
-
-
-# ---------------------------------------------------------------------------
-# Host wrappers
-# ---------------------------------------------------------------------------
-
-
-def _flat(tensor: Tensor, *shape: int) -> cute.Tensor:
-    """View an operand in its flattened token form and wrap it for a launch.
-
-    The view aliases the same storage, so nothing is copied.
-    :func:`slinoss._cute.dev_tensor` handles the detach the DLPack export needs.
-    """
-    return dev_tensor(tensor.view(*shape))
-
-
-def scanprep_forward(
-    w_raw: Tensor,
-    ls_raw: Tensor,
-    tap_raw: Tensor,
-    *,
-    w_max: float,
-) -> ScanParams:
-    """Apply the bounded maps and pack, in one launch.
-
-    Args:
-        w_raw: Unconstrained rotation vectors, ``(B,H,T,3)``, contiguous CUDA,
-            one of :data:`slinoss._precision.KERNEL_DTYPES`.
-        ls_raw: Unconstrained log-scales, ``(B,H,T)``, same dtype.
-        tap_raw: Unconstrained taps ``(kr, g, h)``, ``(B,H,T,2,3)``, same dtype.
-        w_max: Rotation-vector norm bound, in ``(0, pi)``.
+        rx: First component of the unconstrained vector, float32.
+        ry: Second component.
+        rz: Third component.
+        w_max: Radius bound. Checked against ``(0, pi)`` on the host.
 
     Returns:
-        A :class:`slinoss.ops.scanprep.ScanParams`. ``trans`` and ``K`` are
-        float32 whatever the input dtype (I4), and lane 3 of each tap of ``K``
-        is zero.
-
-    Raises:
-        ValueError: On a shape mismatch, a zero-token operand, a non-CUDA or
-            non-contiguous operand, or a ``w_max`` outside ``(0, pi)``.
-        TypeError: On a dtype with no kernel path, or on operands that do not
-            share one dtype.
+        ``(w_x, w_y, w_z)`` with ``|w| <= w_max``.
     """
-    _check_w_max(w_max)
-    lead = _check_raw_shapes(w_raw, ls_raw)
-    if tuple(tap_raw.shape) != (*lead, 2, 3):
-        raise ValueError(f"tap_raw must be {(*lead, 2, 3)}, got {tuple(tap_raw.shape)}")
-    named = ((w_raw, "w_raw"), (ls_raw, "ls_raw"), (tap_raw, "tap_raw"))
-    _check_dtypes(named)
-    check_layout(named)
-
-    tokens = lead[0] * lead[1] * lead[2]
-    trans = torch.empty(*lead, 4, dtype=torch.float32, device=w_raw.device)
-    packed = torch.empty(*lead, 2, 4, dtype=torch.float32, device=w_raw.device)
-    scanprep_fwd(
-        _flat(w_raw, tokens, 3),
-        _flat(ls_raw, tokens),
-        _flat(tap_raw, tokens, 6),
-        _flat(trans, tokens, 4),
-        _flat(packed, tokens, 8),
-        tokens,
-        (tokens + THREADS - 1) // THREADS,
-        float(w_max),
-        THREADS,
-    )
-    return ScanParams(trans=trans, K=packed)
+    scale = w_max * f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
+    return rx * scale, ry * scale, rz * scale
 
 
-def scanprep_backward(
-    dtrans: Tensor,
-    dK: Tensor,
-    w_raw: Tensor,
-    ls_raw: Tensor,
-    *,
-    w_max: float,
-) -> ScanGrads:
-    """Pull the cotangents of ``trans`` and ``K`` back to the raw parameters.
+def rotvec_grad(
+    rx: Scalar,
+    ry: Scalar,
+    rz: Scalar,
+    gx: Scalar,
+    gy: Scalar,
+    gz: Scalar,
+    w_max: Scalar,
+) -> tuple[Scalar, Scalar, Scalar]:
+    """Pullback of :func:`rotvec`, evaluated at the raw vector.
 
-    ``tap_raw`` is not read: the tap map is the identity, so its pullback is a
-    narrowing of ``dK``. The cotangent of lane 3 is the cotangent of a constant
-    and is discarded.
+    The map is a radial rescaling, so its Jacobian is the scale times a rank-one
+    correction along ``raw``; ``inv * inv`` is ``1 / (1 + |raw|^2)``. The raw
+    vector is the argument rather than ``w``: the pullback is a function of
+    ``raw``, and recovering ``raw`` from ``w`` would invert a saturating map.
 
     Args:
-        dtrans: Cotangent of ``trans``, ``(B,H,T,4)`` float32, contiguous CUDA.
-        dK: Cotangent of ``K``, ``(B,H,T,2,4)`` float32, contiguous CUDA.
-        w_raw: The forward's rotation-vector operand, ``(B,H,T,3)``.
-        ls_raw: The forward's log-scale operand, ``(B,H,T)``, same dtype.
-        w_max: The bound the forward was called with, in ``(0, pi)``.
+        rx: First component of the unconstrained vector, float32.
+        ry: Second component.
+        rz: Third component.
+        gx: First component of the cotangent of ``w``.
+        gy: Second component.
+        gz: Third component.
+        w_max: The bound the forward used.
 
     Returns:
-        A :class:`ScanGrads` in the dtype of ``w_raw``.
-
-    Raises:
-        ValueError: On a shape mismatch, a zero-token operand, a non-float32
-            cotangent, a non-CUDA or non-contiguous operand, or a ``w_max``
-            outside ``(0, pi)``.
-        TypeError: On a dtype with no kernel path, or on raw operands that do
-            not share one dtype.
+        The cotangent of the unconstrained vector.
     """
-    _check_w_max(w_max)
-    lead = _check_raw_shapes(w_raw, ls_raw)
-    if tuple(dtrans.shape) != (*lead, 4):
-        raise ValueError(f"dtrans must be {(*lead, 4)}, got {tuple(dtrans.shape)}")
-    if tuple(dK.shape) != (*lead, 2, 4):
-        raise ValueError(f"dK must be {(*lead, 2, 4)}, got {tuple(dK.shape)}")
-    raws = ((w_raw, "w_raw"), (ls_raw, "ls_raw"))
-    _check_dtypes(raws)
-    _check_pinned(((dtrans, "dtrans"), (dK, "dK")))
-    check_layout(((dtrans, "dtrans"), (dK, "dK"), *raws))
-
-    tokens = lead[0] * lead[1] * lead[2]
-    dw_raw = torch.empty_like(w_raw)
-    dls_raw = torch.empty_like(ls_raw)
-    dtap_raw = torch.empty(*lead, 2, 3, dtype=w_raw.dtype, device=w_raw.device)
-    scanprep_bwd(
-        _flat(dtrans, tokens, 4),
-        _flat(dK, tokens, 8),
-        _flat(w_raw, tokens, 3),
-        _flat(ls_raw, tokens),
-        _flat(dw_raw, tokens, 3),
-        _flat(dls_raw, tokens),
-        _flat(dtap_raw, tokens, 6),
-        tokens,
-        (tokens + THREADS - 1) // THREADS,
-        float(w_max),
-        THREADS,
-    )
-    return ScanGrads(dw_raw=dw_raw, dls_raw=dls_raw, dtap_raw=dtap_raw)
+    inv = f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
+    scale = w_max * inv
+    pull = inv * inv * (gx * rx + gy * ry + gz * rz)
+    return scale * (gx - pull * rx), scale * (gy - pull * ry), scale * (gz - pull * rz)

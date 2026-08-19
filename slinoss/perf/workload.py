@@ -36,7 +36,7 @@ import torch
 from torch import Tensor
 
 from slinoss.ops.conv import causal_conv1d, conv_state_shape
-from slinoss.ops.scanprep.reference import scanprep_ref
+from slinoss.ops.scanprep.reference import PARAM_COLS, pack_params, scanprep_ref
 from slinoss.ops.so3ssd import so3ssd
 from slinoss.perf.timing import region
 from slinoss.perf.units import Count
@@ -198,9 +198,23 @@ def make_inputs(
 
     with torch.no_grad():
         params = scanprep_ref(
-            randn(*lead, 3, dt=torch.float32),
-            randn(*lead, dt=torch.float32),
-            randn(*lead, 2, 3, dt=torch.float32),
+            pack_params(
+                randn(*lead, 3, dt=torch.float32),
+                randn(*lead, dt=torch.float32),
+                randn(*lead, 2, 3, dt=torch.float32),
+            ),
+            # trans and K do not depend on bc, and B and C are drawn below, so bc
+            # is the narrowest legal placeholder: one group, outputs discarded.
+            torch.zeros(
+                shape.bsz,
+                shape.seq,
+                2 * shape.d_state,
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.zeros(shape.heads, PARAM_COLS, dtype=torch.float32, device=device),
+            heads=shape.heads,
+            state_dim=shape.d_state,
             w_max=W_MAX,
         )
     trans = params.trans.detach().requires_grad_(requires_grad)

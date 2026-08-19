@@ -10,9 +10,13 @@ import pytest
 import torch
 from torch import Tensor
 
+from slinoss.config import STATE_MULTIPLE
 from slinoss.ops.scanprep import (
+    PARAM_COLS,
+    ScanParams,
     bounded_logscale,
     bounded_rotvec,
+    pack_params,
     scanprep,
     scanprep_bwd_ref,
     scanprep_ref,
@@ -20,6 +24,7 @@ from slinoss.ops.scanprep import (
 
 Triple = tuple[Tensor, Tensor, Tensor]
 Mutator = Callable[[Tensor, Tensor, Tensor], Triple]
+Quad = tuple[Tensor, Tensor, Tensor, Tensor]
 
 EXTREME_RAWS: tuple[float, ...] = (
     -1e8,
@@ -189,7 +194,7 @@ def test_rotvec_rejects_illegal_bound(w_max: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Packing
+# Column packing
 # ---------------------------------------------------------------------------
 
 
@@ -199,7 +204,7 @@ def _raw_triple(
     seqlen: int = 5,
     dtype: torch.dtype = torch.float64,
     seed: int = 0,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> Triple:
     gen = torch.Generator().manual_seed(seed)
 
     def rnd(*shape: int) -> Tensor:
@@ -212,66 +217,17 @@ def _raw_triple(
     )
 
 
-def test_pack_shapes_and_contents() -> None:
+def test_pack_params_lays_out_the_projection_column_order() -> None:
+    """The column order is the operator's contract with the projection, and every
+    kernel indexes it by hand, so it is asserted rather than assumed."""
     w_raw, ls_raw, tap_raw = _raw_triple()
-    params = scanprep_ref(w_raw, ls_raw, tap_raw, w_max=W_MAX)
-    assert params.trans.shape == (2, 3, 5, 4)
-    assert params.K.shape == (2, 3, 5, 2, 4)
-    assert params.trans.is_contiguous()
-    assert params.K.is_contiguous()
-    assert torch.equal(params.trans[..., :3], bounded_rotvec(w_raw, W_MAX))
-    assert torch.equal(params.trans[..., 3], bounded_logscale(ls_raw))
-    assert torch.equal(params.K[..., :3], tap_raw)
-
-
-def test_pack_lane_three_is_a_hard_zero() -> None:
-    params = scanprep_ref(*_raw_triple(), w_max=W_MAX)
-    assert torch.equal(params.K[..., 3], torch.zeros_like(params.K[..., 3]))
-
-
-def test_pack_invariants_hold_on_the_packed_tensors() -> None:
-    w_raw, ls_raw, tap_raw = _raw_triple(seqlen=64, seed=1)
-    params = scanprep_ref(w_raw * 1e6, ls_raw * 1e6, tap_raw, w_max=W_MAX)
-    assert bool((params.trans[..., 3] <= 0.0).all())
-    assert bool(
-        (params.trans[..., :3].norm(dim=-1) <= _ball_bound(torch.float64)).all()
-    )
-    assert bool(torch.isfinite(params.trans).all())
-    assert bool(torch.isfinite(params.K).all())
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_pack_promotes_low_precision_to_float32(dtype: torch.dtype) -> None:
-    params = scanprep_ref(*_raw_triple(dtype=dtype), w_max=W_MAX)
-    assert params.trans.dtype is torch.float32
-    assert params.K.dtype is torch.float32
-
-
-def test_pack_keeps_float64() -> None:
-    params = scanprep_ref(*_raw_triple(), w_max=W_MAX)
-    assert params.trans.dtype is torch.float64
-    assert params.K.dtype is torch.float64
-
-
-def test_pack_gradcheck() -> None:
-    w_raw, ls_raw, tap_raw = _raw_triple(bsz=1, heads=1, seqlen=3, seed=2)
-    leaves = tuple(
-        t.detach().clone().requires_grad_() for t in (w_raw, ls_raw, tap_raw)
-    )
-
-    def fn(w: Tensor, ls: Tensor, tap: Tensor) -> tuple[Tensor, Tensor]:
-        params = scanprep_ref(w, ls, tap, w_max=W_MAX)
-        return params.trans, params.K
-
-    assert torch.autograd.gradcheck(fn, leaves)
-
-
-def test_pack_runs_under_autocast() -> None:
-    w_raw, ls_raw, tap_raw = _raw_triple(dtype=torch.float32)
-    with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
-        params = scanprep_ref(w_raw, ls_raw, tap_raw, w_max=W_MAX)
-    assert params.trans.dtype is torch.float32
-    assert params.K.dtype is torch.float32
+    row = pack_params(w_raw, ls_raw, tap_raw)
+    assert row.shape == (2, 5, 3 * PARAM_COLS)
+    assert row.is_contiguous()
+    head_major = row.unflatten(-1, (3, PARAM_COLS)).permute(0, 2, 1, 3)
+    assert torch.equal(head_major[..., 0:3], w_raw)
+    assert torch.equal(head_major[..., 3], ls_raw)
+    assert torch.equal(head_major[..., 4:].unflatten(-1, (2, 3)), tap_raw)
 
 
 @pytest.mark.parametrize(
@@ -284,64 +240,352 @@ def test_pack_runs_under_autocast() -> None:
         (lambda w, ls, tap: (w, ls, tap[..., :1, :]), "tap_raw must be"),
     ],
 )
-def test_pack_rejects_shape_mismatch(mutate: Mutator, match: str) -> None:
+def test_pack_params_rejects_shape_mismatch(mutate: Mutator, match: str) -> None:
     with pytest.raises(ValueError, match=match):
-        scanprep_ref(*mutate(*_raw_triple()), w_max=W_MAX)
+        pack_params(*mutate(*_raw_triple()))
 
 
-def test_pack_rejects_illegal_w_max() -> None:
+# ---------------------------------------------------------------------------
+# The frontier: maps, packing, and the B/C permute
+# ---------------------------------------------------------------------------
+
+
+def _operands(
+    *,
+    bsz: int = 2,
+    heads: int = 3,
+    seqlen: int = 5,
+    groups: int = 1,
+    state_dim: int = STATE_MULTIPLE,
+    dtype: torch.dtype = torch.float64,
+    bias: float = 0.0,
+    strided: bool = False,
+    seed: int = 0,
+) -> Triple:
+    """``(params, bc, param_bias)``.
+
+    Both operands are cut out of one wider row, which is the shipped layout: the
+    mixer runs one projection GEMM and hands out views. ``strided`` keeps them as
+    views; otherwise they are compacted. The two hold the same values, so an output
+    difference between them is a layout bug.
+    """
+    gen = torch.Generator().manual_seed(seed)
+
+    def rnd(*shape: int) -> Tensor:
+        return torch.randn(*shape, generator=gen, dtype=torch.float64).to(dtype)
+
+    pwidth = heads * PARAM_COLS
+    bwidth = 2 * groups * state_dim
+    row = rnd(bsz, seqlen, 7 + pwidth + bwidth + 5)
+    params = row[..., 7 : 7 + pwidth]
+    bc = row[..., 7 + pwidth : 7 + pwidth + bwidth]
+    if not strided:
+        params, bc = params.contiguous(), bc.contiguous()
+    pinned = dtype if dtype in (torch.float32, torch.float64) else torch.float32
+    return params, bc, rnd(heads, PARAM_COLS).to(pinned) * bias
+
+
+def _apply(
+    params: Tensor,
+    bc: Tensor,
+    param_bias: Tensor,
+    *,
+    heads: int = 3,
+    state_dim: int = STATE_MULTIPLE,
+) -> ScanParams:
+    """:func:`scanprep_ref` at the default bound."""
+    return scanprep_ref(
+        params, bc, param_bias, heads=heads, state_dim=state_dim, w_max=W_MAX
+    )
+
+
+def _head_major(params: Tensor, param_bias: Tensor, heads: int) -> Tensor:
+    """The biased parameter rows as ``(B,H,T,PARAM_COLS)``."""
+    rows = params.unflatten(-1, (heads, PARAM_COLS)) + param_bias
+    return rows.permute(0, 2, 1, 3)
+
+
+def test_frontier_shapes_dtypes_and_contiguity() -> None:
+    params, bc, pb = _operands(groups=3)
+    out = scanprep(params, bc, pb, heads=3, state_dim=STATE_MULTIPLE, w_max=W_MAX)
+    assert isinstance(out, ScanParams)
+    assert out.trans.shape == (2, 3, 5, 4)
+    assert out.K.shape == (2, 3, 5, 2, 4)
+    assert out.B.shape == (2, 3, 5, STATE_MULTIPLE)
+    assert out.C.shape == out.B.shape
+    assert all(t.is_contiguous() for t in out)
+
+
+def test_frontier_applies_the_bounded_maps_to_the_biased_row() -> None:
+    """The maps are the ones asserted above, applied after the bias. A frontier
+    that biased after the map, or dropped the bias, would still have every shape
+    and dtype right."""
+    params, bc, pb = _operands(bias=1.0, seed=1)
+    rows = _head_major(params, pb, heads=3)
+    out = _apply(params, bc, pb)
+    assert torch.equal(out.trans[..., :3], bounded_rotvec(rows[..., 0:3], W_MAX))
+    assert torch.equal(out.trans[..., 3], bounded_logscale(rows[..., 3]))
+    assert torch.equal(out.K[..., :3], rows[..., 4:].unflatten(-1, (2, 3)))
+
+
+def test_frontier_lane_three_is_a_hard_zero() -> None:
+    params, bc, pb = _operands(bias=1.0)
+    out = _apply(params, bc, pb)
+    assert torch.equal(out.K[..., 3], torch.zeros_like(out.K[..., 3]))
+
+
+@pytest.mark.parametrize(("groups", "state_dim"), [(1, STATE_MULTIPLE), (3, 96)])
+def test_frontier_permutes_bc_group_major(groups: int, state_dim: int) -> None:
+    """``bc`` is all of ``B`` then all of ``C``, each group-major. Swept at
+    ``G = 1`` and ``G = H``; the state width does not interact with the grouping,
+    so it moves once alongside it rather than crossing it."""
+    params, bc, pb = _operands(groups=groups, state_dim=state_dim, seed=2)
+    out = _apply(params, bc, pb, state_dim=state_dim)
+    half = groups * state_dim
+    for g in range(groups):
+        lo = g * state_dim
+        assert torch.equal(out.B[:, g], bc[..., lo : lo + state_dim])
+        assert torch.equal(out.C[:, g], bc[..., half + lo : half + lo + state_dim])
+
+
+def test_frontier_reads_a_projection_slice_without_repacking_it() -> None:
+    """Bitwise equality against the compact operands. The shipped operands are
+    views of one projection output, so an implementation that only handled
+    contiguous input would pass every other test in this file."""
+    params, bc, pb = _operands(groups=3, bias=1.0, strided=True, seed=3)
+    assert params.stride(-1) == 1 and not params.is_contiguous()
+    assert bc.stride(-1) == 1 and not bc.is_contiguous()
+    strided = _apply(params, bc, pb)
+    compact = _apply(params.contiguous(), bc.contiguous(), pb)
+    for got, want in zip(strided, compact, strict=True):
+        assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_frontier_pins_the_transition_to_float32(dtype: torch.dtype) -> None:
+    params, bc, pb = _operands(dtype=dtype)
+    out = _apply(params, bc, pb)
+    assert out.trans.dtype is torch.float32
+    assert out.K.dtype is torch.float32
+    assert out.B.dtype is dtype
+    assert out.C.dtype is dtype
+
+
+def test_frontier_keeps_float64() -> None:
+    params, bc, pb = _operands()
+    out = _apply(params, bc, pb)
+    assert out.trans.dtype is torch.float64
+    assert out.K.dtype is torch.float64
+
+
+def test_frontier_runs_under_autocast() -> None:
+    """I4 against autocast: no ``custom_fwd``, so the transition stays float32 even
+    when the surrounding region is bfloat16."""
+    params, bc, pb = _operands(dtype=torch.float32)
+    with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
+        out = _apply(params, bc, pb)
+    assert out.trans.dtype is torch.float32
+    assert out.K.dtype is torch.float32
+
+
+def test_frontier_invariants_hold_on_the_packed_tensors() -> None:
+    params, bc, pb = _operands(seqlen=64, bias=1e6, seed=4)
+    out = _apply(params * 1e6, bc, pb)
+    assert bool((out.trans[..., 3] <= 0.0).all())
+    assert bool((out.trans[..., :3].norm(dim=-1) <= _ball_bound(torch.float64)).all())
+    assert bool(torch.isfinite(out.trans).all())
+    assert bool(torch.isfinite(out.K).all())
+
+
+def test_frontier_gradcheck() -> None:
+    """float64 gradcheck on all three inputs, ``param_bias`` included."""
+    params, bc, pb = _operands(bsz=1, heads=1, seqlen=3, seed=5)
+    leaves = tuple(t.detach().clone().requires_grad_() for t in (params, bc, pb))
+
+    def fn(p: Tensor, b: Tensor, pbias: Tensor) -> tuple[Tensor, ...]:
+        return tuple(_apply(p, b, pbias, heads=1))
+
+    assert torch.autograd.gradcheck(fn, leaves)
+
+
+def _stride_two(bsz: int, seqlen: int, width: int) -> Tensor:
+    """A ``(B,T,width)`` view whose trailing stride is two."""
+    row = torch.randn(bsz, seqlen, 2 * width, dtype=torch.float64)
+    return row[..., ::2]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error", "match"),
+    [
+        (lambda p, b, pb: (p, b, pb, 0), ValueError, "heads must be positive"),
+        (lambda p, b, pb: (p[..., :-1], b, pb, 3), ValueError, "params must be"),
+        (lambda p, b, pb: (p[:, :-1], b, pb, 3), ValueError, "bc must be"),
+        (lambda p, b, pb: (p, b[..., None], pb, 3), ValueError, "bc must be"),
+        (lambda p, b, pb: (p, b, pb[:-1], 3), ValueError, "param_bias must be"),
+        (lambda p, b, pb: (p, b[..., :-1], pb, 3), ValueError, r"2\*G\*"),
+        (
+            lambda p, b, pb: (_stride_two(2, 5, 3 * PARAM_COLS), b, pb, 3),
+            ValueError,
+            "params must have unit stride",
+        ),
+        (
+            lambda p, b, pb: (p, _stride_two(2, 5, 2 * STATE_MULTIPLE), pb, 3),
+            ValueError,
+            "bc must have unit stride",
+        ),
+        (lambda p, b, pb: (p.to(torch.int64), b, pb, 3), TypeError, "supported"),
+        (
+            lambda p, b, pb: (p, b.to(torch.float32), pb, 3),
+            TypeError,
+            "one activation dtype per call",
+        ),
+        (
+            lambda p, b, pb: (p, b, pb.to(torch.bfloat16), 3),
+            TypeError,
+            "float32-pinned",
+        ),
+    ],
+)
+def test_frontier_rejects_a_broken_operand_set(
+    mutate: Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor, Tensor, int]],
+    error: type[Exception],
+    match: str,
+) -> None:
+    """Every raise in the operand contract. A frontier that trusted its operands
+    would mis-index a projection whose columns moved, silently."""
+    params, bc, pb, heads = mutate(*_operands(seed=6))
+    with pytest.raises(error, match=match):
+        scanprep_ref(params, bc, pb, heads=heads, state_dim=STATE_MULTIPLE, w_max=W_MAX)
+
+
+def test_frontier_rejects_a_grouping_the_head_count_cannot_hold() -> None:
+    """``G`` comes off ``bc``, so a caller cannot claim one grouping and hand over
+    another; a group must still hold a whole number of heads."""
+    params, bc, pb = _operands(heads=3, groups=2, seed=7)
+    with pytest.raises(ValueError, match="does not divide heads"):
+        _apply(params, bc, pb)
+
+
+@pytest.mark.parametrize("state_dim", [0, 1, STATE_MULTIPLE - 1, STATE_MULTIPLE + 1])
+def test_frontier_rejects_an_illegal_state_width(state_dim: int) -> None:
+    """``3N`` with ``N`` a multiple of 16 is what makes every downstream
+    contraction MMA-k friendly with no padding."""
+    params, bc, pb = _operands()
+    with pytest.raises(ValueError, match="state_dim is 3N"):
+        _apply(params, bc, pb, state_dim=state_dim)
+
+
+def test_frontier_rejects_illegal_w_max() -> None:
+    params, bc, pb = _operands()
     with pytest.raises(ValueError, match=r"w_max must lie in \(0, pi\)"):
-        scanprep_ref(*_raw_triple(), w_max=math.pi)
+        scanprep_ref(params, bc, pb, heads=3, state_dim=STATE_MULTIPLE, w_max=math.pi)
 
 
-@pytest.mark.parametrize("index", [0, 1, 2])
-def test_pack_rejects_unsupported_dtype(index: int) -> None:
-    raws = list(_raw_triple())
-    raws[index] = raws[index].to(torch.int64)
-    with pytest.raises(TypeError, match="supported"):
-        scanprep_ref(*raws, w_max=W_MAX)
+# ---------------------------------------------------------------------------
+# The reference pullback
+# ---------------------------------------------------------------------------
+
+
+def _cotangents(
+    bsz: int = 2,
+    heads: int = 3,
+    seqlen: int = 5,
+    groups: int = 3,
+    state_dim: int = STATE_MULTIPLE,
+    seed: int = 11,
+) -> Quad:
+    """``(dtrans, dK, dB, dC)`` at the packed layouts."""
+    gen = torch.Generator().manual_seed(seed)
+
+    def rnd(*shape: int) -> Tensor:
+        return torch.randn(*shape, generator=gen, dtype=torch.float64)
+
+    return (
+        rnd(bsz, heads, seqlen, 4),
+        rnd(bsz, heads, seqlen, 2, 4),
+        rnd(bsz, groups, seqlen, state_dim),
+        rnd(bsz, groups, seqlen, state_dim),
+    )
 
 
 def test_reference_backward_matches_autograd_through_the_public_operator() -> None:
     """The dispatched reference path is the same gradient autograd produces.
 
     :func:`scanprep` routes the backward through the registry rather than through
-    autograd's own graph, and the registry's backward signature omits ``tap_raw``
-    because the tap map is the identity. The two arms are only equal if that
-    omission is sound and the saved set is right.
+    autograd's own graph, and the registry's backward signature omits ``bc``
+    because the permute is linear. The two arms are equal only if that omission is
+    sound and the saved set is right.
     """
-    raws = _raw_triple(bsz=2, heads=3, seqlen=5, seed=3)
-    dtrans = torch.randn(2, 3, 5, 4, dtype=torch.float64)
-    dK = torch.randn(2, 3, 5, 2, 4, dtype=torch.float64)
+    params, bc, pb = _operands(groups=3, bias=1.0, seed=8)
+    cots = _cotangents()
 
-    leaves = tuple(t.detach().clone().requires_grad_(True) for t in raws)
-    got = scanprep(*leaves, w_max=W_MAX, backend="reference")
-    (got.trans * dtrans).sum().add((got.K * dK).sum()).backward()
+    leaves = tuple(t.detach().clone().requires_grad_(True) for t in (params, bc, pb))
+    out = scanprep(*leaves, heads=3, state_dim=STATE_MULTIPLE, w_max=W_MAX)
+    total = out.trans.new_zeros(())
+    for value, cot in zip(out, cots, strict=True):
+        total = total + (value * cot).sum()
+    total.backward()
 
-    direct = tuple(t.detach().clone().requires_grad_(True) for t in raws)
-    want = scanprep_ref(*direct, w_max=W_MAX)
-    (want.trans * dtrans).sum().add((want.K * dK).sum()).backward()
+    got = scanprep_bwd_ref(
+        *cots, params, pb, heads=3, state_dim=STATE_MULTIPLE, w_max=W_MAX
+    )
+    names = ("dparams", "dbc", "dparam_bias")
+    want = (got.dparams, got.dbc, got.dparam_bias)
+    for leaf, ref, name in zip(leaves, want, names, strict=True):
+        assert leaf.grad is not None
+        torch.testing.assert_close(leaf.grad, ref, msg=name)
 
-    names = ("dw_raw", "dls_raw", "dtap_raw")
-    for leaf, ref, name in zip(leaves, direct, names, strict=True):
-        assert leaf.grad is not None and ref.grad is not None
-        torch.testing.assert_close(leaf.grad, ref.grad, msg=name)
+
+def test_reference_backward_ignores_the_cotangent_of_the_padding_lane() -> None:
+    """Lane 3 of each tap is a constant zero, so its cotangent is the cotangent of
+    nothing. A pullback that read it would leak into ``dparams``."""
+    params, _, pb = _operands(bias=1.0, seed=9)
+    dtrans, dK, dB, dC = _cotangents(groups=1)
+    loud = dK.clone()
+    loud[..., 3] = 1e6
+    quiet = scanprep_bwd_ref(
+        dtrans, dK, dB, dC, params, pb, heads=3, state_dim=STATE_MULTIPLE, w_max=W_MAX
+    )
+    got = scanprep_bwd_ref(
+        dtrans, loud, dB, dC, params, pb, heads=3, state_dim=STATE_MULTIPLE, w_max=W_MAX
+    )
+    assert torch.equal(got.dparams, quiet.dparams)
+    assert torch.equal(got.dparam_bias, quiet.dparam_bias)
+    assert float(quiet.dparams.abs().max()) > 0.0
 
 
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda dtrans, dK: (dtrans[..., :3], dK), "dtrans must be"),
-        (lambda dtrans, dK: (dtrans, dK[..., :3]), "dK must be"),
+        (lambda d, k, b, c: (d[..., :3], k, b, c), "dtrans must be"),
+        (lambda d, k, b, c: (d, k[..., :3], b, c), "dK must be"),
+        (lambda d, k, b, c: (d, k, b[..., :-1], c), "dB must be"),
+        (lambda d, k, b, c: (d, k, b, c[..., :-1]), "dC must be"),
+        (
+            lambda d, k, b, c: (
+                d,
+                k,
+                b.expand(2, 2, 5, STATE_MULTIPLE),
+                c.expand(2, 2, 5, STATE_MULTIPLE),
+            ),
+            "with G dividing heads",
+        ),
     ],
 )
 def test_reference_backward_rejects_a_mismatched_cotangent(
-    mutate: Callable[[Tensor, Tensor], tuple[Tensor, Tensor]],
+    mutate: Callable[[Tensor, Tensor, Tensor, Tensor], Quad],
     match: str,
 ) -> None:
-    """Both cotangents are the packed layouts; a narrower one is a bug."""
-    w_raw, ls_raw, _ = _raw_triple(bsz=1, heads=1, seqlen=2)
-    dtrans = torch.zeros(1, 1, 2, 4, dtype=torch.float64)
-    dK = torch.zeros(1, 1, 2, 2, 4, dtype=torch.float64)
+    """Each cotangent is one of the four packed layouts. A narrower one, or a
+    grouping the head count cannot hold, is a bug in the caller."""
+    params, _, pb = _operands(groups=1)
+    cots = _cotangents(groups=1)
     with pytest.raises(ValueError, match=match):
-        scanprep_bwd_ref(*mutate(dtrans, dK), w_raw, ls_raw, w_max=W_MAX)
+        scanprep_bwd_ref(
+            *mutate(*cots),
+            params,
+            pb,
+            heads=3,
+            state_dim=STATE_MULTIPLE,
+            w_max=W_MAX,
+        )
