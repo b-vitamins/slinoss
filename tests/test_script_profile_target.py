@@ -10,6 +10,11 @@ any device a report cannot name, so every test names a CUDA one.
 Ordering is the point. A warmup call inside the window puts first-call
 compilation and allocator growth into a counter, and the only evidence of that
 is the position of a runner call relative to the window's ``enter``.
+
+The operator axis does not interact with the warmup, iteration, or device axes:
+``--op`` selects which factory is built, and the window and the guards run over
+whichever one that is. So it is swept once, against the workload it selects, and
+not crossed with the rest.
 """
 
 from __future__ import annotations
@@ -23,7 +28,14 @@ import pytest
 import torch
 
 from scripts.perf import profile_target
-from slinoss.perf.workload import SHAPES, OpInputs, shape_by_name
+from slinoss.perf.workload import (
+    OPS,
+    SHAPES,
+    ConvInputs,
+    OpInputs,
+    conv_shape_by_name,
+    shape_by_name,
+)
 
 pytestmark = [
     pytest.mark.cuda,
@@ -32,6 +44,9 @@ pytestmark = [
 
 SMALL: Final = shape_by_name("tiny")
 """The smallest standard shape the driver accepts: B=1 H=1 T=256 P=16 N=16 L=64."""
+
+SMALL_CONV: Final = conv_shape_by_name("tiny")
+"""The same name under the conv shape table: B=1 T=256 D=16 W=4."""
 
 
 def argv(*extra: str) -> list[str]:
@@ -67,8 +82,10 @@ class Trace:
         events: ``run`` per runner call, ``enter`` and ``exit`` per capture
             window, in call order. A warmup call and a measured call differ only
             in their position relative to ``enter``.
-        factories: ``step`` or ``forward`` per runner built.
-        chunks: Chunk length handed to each factory.
+        factories: One name per runner built, out of ``step``, ``forward``,
+            ``conv-step``, and ``conv-forward``.
+        chunks: Chunk length handed to each factory, or None for the conv, which
+            has no chunk.
         backends: Backend name handed to each factory.
         inputs: Operator inputs handed to each factory.
         devices: Device each window opened on.
@@ -76,9 +93,9 @@ class Trace:
 
     events: list[str] = field(default_factory=list)
     factories: list[str] = field(default_factory=list)
-    chunks: list[int] = field(default_factory=list)
+    chunks: list[int | None] = field(default_factory=list)
     backends: list[str | None] = field(default_factory=list)
-    inputs: list[OpInputs] = field(default_factory=list)
+    inputs: list[OpInputs | ConvInputs] = field(default_factory=list)
     devices: list[torch.device] = field(default_factory=list)
 
 
@@ -86,9 +103,9 @@ class Trace:
 def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
     """Count runner calls and window edges instead of running either.
 
-    All three names are patched in the driver's namespace, which is where it
-    imported them and therefore where it looks them up. The stub runner does no
-    work, so the counts are the driver's control flow and nothing else.
+    Every name is patched in the driver's namespace, which is where it imported
+    them and therefore where it looks them up. The stub runner does no work, so
+    the counts are the driver's control flow and nothing else.
 
     Args:
         monkeypatch: Patcher, undone after the test.
@@ -100,7 +117,10 @@ def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
 
     def factory(name: str) -> Callable[..., Callable[[], None]]:
         def make(
-            inputs: OpInputs, chunk: int, *, backend: str | None = None
+            inputs: OpInputs | ConvInputs,
+            chunk: int | None = None,
+            *,
+            backend: str | None = None,
         ) -> Callable[[], None]:
             out.factories.append(name)
             out.chunks.append(chunk)
@@ -125,6 +145,8 @@ def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
 
     monkeypatch.setattr(profile_target, "step", factory("step"))
     monkeypatch.setattr(profile_target, "forward_only", factory("forward"))
+    monkeypatch.setattr(profile_target, "conv_step", factory("conv-step"))
+    monkeypatch.setattr(profile_target, "conv_forward_only", factory("conv-forward"))
     monkeypatch.setattr(profile_target, "profiler_window", window)
     return out
 
@@ -136,6 +158,9 @@ def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
 
 def test_parse_args_defaults_to_a_step_on_the_standard_shape_on_cuda() -> None:
     got = profile_target.parse_args([])
+    # The scan is the first entry of the registry and the default, so the command
+    # that profiled the scan before the conv existed still profiles the scan.
+    assert got.op == OPS[0] == "so3ssd"
     assert got.shape == "standard"
     assert got.mode == "step"
     assert got.iters == 3
@@ -158,6 +183,9 @@ def test_every_choice_the_driver_offers_selects_something() -> None:
     assert profile_target.DTYPES["bf16"] is torch.bfloat16
     assert profile_target.DTYPES["fp16"] is torch.float16
     assert profile_target.DTYPES["fp32"] is torch.float32
+    assert OPS == ("so3ssd", "conv")
+    for op in OPS:
+        assert profile_target.parse_args(["--op", op]).op == op
     for shape in SHAPES:
         assert profile_target.parse_args(["--shape", shape.name]).shape == shape.name
     for mode in profile_target.MODES:
@@ -167,6 +195,7 @@ def test_every_choice_the_driver_offers_selects_something() -> None:
     # Argparse exits 2 rather than raising, so a mistyped shape stops the run
     # instead of silently profiling the default one.
     for flags in (
+        ["--op", "mamba"],
         ["--shape", "huge"],
         ["--mode", "train"],
         ["--dtype", "fp8"],
@@ -242,6 +271,7 @@ def test_the_shape_the_device_and_the_backend_reach_the_runner(trace: Trace) -> 
     assert trace.devices == [torch.device("cuda")]
     assert trace.chunks == [SMALL.chunk]
     inputs = trace.inputs[0]
+    assert isinstance(inputs, OpInputs)
     lead = (SMALL.bsz, SMALL.heads, SMALL.seq)
     assert tuple(inputs.U.shape) == (*lead, SMALL.rows)
     assert tuple(inputs.B.shape) == (*lead, SMALL.d_state)
@@ -256,8 +286,43 @@ def test_the_requested_dtype_reaches_the_inputs(trace: Trace) -> None:
     ):
         assert profile_target.main(argv("--dtype", name)) == 0
         inputs = trace.inputs[index]
+        assert isinstance(inputs, OpInputs)
         assert inputs.U.dtype == dtype
         assert inputs.B.dtype == dtype
         # I4: trans and K are float32 whatever U, B, and C are.
         assert inputs.trans.dtype == torch.float32
         assert inputs.K.dtype == torch.float32
+
+
+def test_the_conv_operator_builds_the_conv_workload_at_the_named_shape(
+    trace: Trace,
+) -> None:
+    assert profile_target.main(argv("--op", "conv", "--mode", "step")) == 0
+    # Only the conv factory, so nothing allocates a scan input set the profiler
+    # would count as the conv's memory traffic.
+    assert trace.factories == ["conv-step"]
+    # The conv has no chunk. A driver that passed the scan shape's chunk to it
+    # would be reading the wrong shape table.
+    assert trace.chunks == [None]
+    assert trace.devices == [torch.device("cuda")]
+    inputs = trace.inputs[0]
+    assert isinstance(inputs, ConvInputs)
+    assert tuple(inputs.x.shape) == (
+        SMALL_CONV.bsz,
+        SMALL_CONV.seq,
+        SMALL_CONV.channels,
+    )
+    assert tuple(inputs.weight.shape) == (SMALL_CONV.channels, SMALL_CONV.width)
+    assert tuple(inputs.initial_state.shape) == SMALL_CONV.state_shape
+    assert {t.dtype for t in inputs} == {torch.float32}
+    assert all(t.requires_grad for t in inputs.differentiable)
+    # The output-gradient seed is preallocated and takes no gradient, so the
+    # backward inside the window allocates nothing of its own.
+    assert not inputs.dy.requires_grad
+    # Forward mode drops the graph, and a named backend reaches the factory.
+    assert profile_target.main(argv("--op", "conv", "--backend", "reference")) == 0
+    assert trace.factories[1] == "conv-step"
+    assert trace.backends == [None, "reference"]
+    assert profile_target.main(argv("--op", "conv", "--mode", "forward")) == 0
+    assert trace.factories[2] == "conv-forward"
+    assert not any(t.requires_grad for t in trace.inputs[2].differentiable)

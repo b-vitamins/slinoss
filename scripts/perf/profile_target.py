@@ -5,16 +5,21 @@ window opens, so nothing but the measured iterations reaches a counter. The
 window is :func:`slinoss.perf.capture.profiler_window`, which is what
 ``--capture-range=cudaProfilerApi`` and ``--profile-from-start off`` key on.
 
+``--op`` selects the operator. It is the whole registry the profiler drivers
+dispatch on: one target process per operator would be one warmup policy and one
+capture window per operator, and they would drift.
+
 Run it through ``scripts/perf/profile_op.py``; it is invoked directly only to
 check that the target itself works.
 
     python3 scripts/perf/profile_target.py --shape standard --mode step --iters 3
+    python3 scripts/perf/profile_target.py --op conv --shape standard --mode step
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -22,8 +27,14 @@ from slinoss.perf.capture import profiler_window
 from slinoss.perf.device import require_cuda
 from slinoss.perf.timing import on_device
 from slinoss.perf.workload import (
-    SHAPES,
+    CONV,
+    OPS,
+    SHAPE_NAMES,
+    conv_forward_only,
+    conv_shape_by_name,
+    conv_step,
     forward_only,
+    make_conv_inputs,
     make_inputs,
     shape_by_name,
     step,
@@ -36,7 +47,8 @@ MODES = ("forward", "step")
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shape", choices=[s.name for s in SHAPES], default="standard")
+    parser.add_argument("--op", choices=OPS, default=OPS[0])
+    parser.add_argument("--shape", choices=SHAPE_NAMES, default="standard")
     parser.add_argument("--mode", choices=MODES, default="step")
     parser.add_argument(
         "--iters",
@@ -55,6 +67,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--backend", default=None)
     return parser.parse_args(argv)
+
+
+def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[], None]:
+    """Allocate the inputs and return the callable the window wraps.
+
+    Args:
+        args: Parsed command line.
+        device: Device to allocate on.
+
+    Returns:
+        The workload callable, region-labelled ``op.*`` for the scan and
+        ``conv.*`` for the conv.
+    """
+    grads = args.mode == "step"
+    dtype = DTYPES[args.dtype]
+    if args.op == CONV:
+        conv = make_conv_inputs(
+            conv_shape_by_name(args.shape), device, dtype=dtype, requires_grad=grads
+        )
+        if grads:
+            return conv_step(conv, backend=args.backend)
+        return conv_forward_only(conv, backend=args.backend)
+    shape = shape_by_name(args.shape)
+    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
+    if grads:
+        return step(inputs, shape.chunk, backend=args.backend)
+    return forward_only(inputs, shape.chunk, backend=args.backend)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -77,14 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.warmup < 0:
         raise ValueError(f"--warmup must not be negative, got {args.warmup}")
     device = require_cuda(args.device)
-    shape = shape_by_name(args.shape)
-    grads = args.mode == "step"
-    inputs = make_inputs(shape, device, dtype=DTYPES[args.dtype], requires_grad=grads)
-    runner = (
-        step(inputs, shape.chunk, backend=args.backend)
-        if grads
-        else forward_only(inputs, shape.chunk, backend=args.backend)
-    )
+    runner = build_runner(args, device)
     with on_device(device):
         for _ in range(args.warmup):
             runner()

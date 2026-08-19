@@ -1,4 +1,4 @@
-"""Per-kernel profile of the SO(3) scan, cross-checked three ways.
+"""Per-kernel profile of one operator, cross-checked three ways.
 
 Runs three clocks over the same workload and refuses to emit if they disagree:
 
@@ -10,13 +10,20 @@ NCU is slow: it replays every kernel once per pass, six passes deep. Keep
 ``--iters`` small; the wall comes from the event bench, not from the profiler.
 
     python3 scripts/perf/profile_op.py --shape standard --mode step
+
+``--op`` picks the operator, out of :data:`slinoss.perf.workload.OPS`. The report
+base is named from ``--out``, the shape, and the mode, so a second operator at one
+shape and mode needs its own ``--out`` or it overwrites the first.
+
+    python3 scripts/perf/profile_op.py --op conv --shape standard --mode step \\
+        --out out/profile-conv
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import torch
@@ -29,8 +36,16 @@ from slinoss.perf.nsys import run_nsys
 from slinoss.perf.report import Report, agreement, write_report
 from slinoss.perf.timing import Throughput, measure
 from slinoss.perf.workload import (
-    SHAPES,
+    CONV,
+    OPS,
+    SHAPE_NAMES,
+    ConvShape,
+    OpShape,
+    conv_forward_only,
+    conv_shape_by_name,
+    conv_step,
     forward_only,
+    make_conv_inputs,
     make_inputs,
     shape_by_name,
     step,
@@ -44,7 +59,8 @@ TARGET = Path(__file__).with_name("profile_target.py")
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shape", choices=[s.name for s in SHAPES], default="standard")
+    parser.add_argument("--op", choices=OPS, default=OPS[0])
+    parser.add_argument("--shape", choices=SHAPE_NAMES, default="standard")
     parser.add_argument("--mode", choices=MODES, default="step")
     parser.add_argument(
         "--iters",
@@ -99,9 +115,48 @@ def target_argv(args: argparse.Namespace) -> list[str]:
         "--device",
         args.device,
     ]
+    # An operator and a backend are named only when one is asked for, so the
+    # quoted command is what a reader would have to type and no more.
+    if args.op != OPS[0]:
+        argv += ["--op", args.op]
     if args.backend is not None:
         argv += ["--backend", args.backend]
     return argv
+
+
+def build_workload(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[OpShape | ConvShape, Callable[[], None]]:
+    """Resolve the shape and build the event-bench runner for ``--op``.
+
+    The same dispatch runs in :mod:`scripts.perf.profile_target`, so the event
+    wall and the profiled window cover one workload.
+
+    Args:
+        args: Parsed command line.
+        device: Device to allocate on.
+
+    Returns:
+        The shape record and the workload callable.
+    """
+    grads = args.mode == "step"
+    dtype = DTYPES[args.dtype]
+    if args.op == CONV:
+        conv_shape = conv_shape_by_name(args.shape)
+        conv = make_conv_inputs(conv_shape, device, dtype=dtype, requires_grad=grads)
+        runner = (
+            conv_step(conv, backend=args.backend)
+            if grads
+            else conv_forward_only(conv, backend=args.backend)
+        )
+        return conv_shape, runner
+    shape = shape_by_name(args.shape)
+    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
+    return shape, (
+        step(inputs, shape.chunk, backend=args.backend)
+        if grads
+        else forward_only(inputs, shape.chunk, backend=args.backend)
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -117,15 +172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
-    shape = shape_by_name(args.shape)
-    grads = args.mode == "step"
-    inputs = make_inputs(shape, device, dtype=DTYPES[args.dtype], requires_grad=grads)
-    runner = (
-        step(inputs, shape.chunk, backend=args.backend)
-        if grads
-        else forward_only(inputs, shape.chunk, backend=args.backend)
-    )
-    label = f"so3ssd {shape.name} {args.mode}"
+    shape, runner = build_workload(args, device)
+    label = f"{args.op} {shape.name} {args.mode}"
     timed = measure(
         runner,
         label=label,
@@ -136,7 +184,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     tree = budget(timed)
     assert_closed(tree)
     limits = ceilings(device)
-    del inputs, runner
+    # The inputs live in the runner's closure and the profilers need the memory
+    # for a second process at the same shape.
+    del runner
 
     argv_target = target_argv(args)
     notes = [

@@ -11,6 +11,11 @@ workload, the timer, the budget tree, the cross-check, and the emission are real
 The fabricated profiler sums are deliberately tiny against the measured wall, so
 the timeline check passes on any part and the test turns on the wiring rather than
 on the clock.
+
+The operator axis does not interact with the skip flags, the cross-check, or the
+refusal paths: ``--op`` selects which workload the three clocks run over, and they
+run over whichever one that is. So it is swept once, against the report it names
+and the argv it forwards, and not crossed with the rest.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from slinoss.perf.units import (
     Spread,
     TFlopsPerSecond,
 )
+from slinoss.perf.workload import OPS, conv_shape_by_name
 
 pytestmark = [
     pytest.mark.cuda,
@@ -255,6 +261,9 @@ def argv_for(out: Path, *extra: str) -> list[str]:
 
 def test_the_defaults_are_the_ones_the_report_stamps() -> None:
     args = profile_op.parse_args([])
+    # The scan is the first entry of the registry and the default, so the command
+    # that profiled the scan before the conv existed still profiles the scan.
+    assert args.op == OPS[0] == "so3ssd"
     assert args.shape == "standard"
     assert args.mode == "step"
     assert args.iters == 3
@@ -281,6 +290,7 @@ def test_parse_args_rejects_a_value_outside_its_table() -> None:
     # argparse exits 2 rather than raising, so a typo in a sweep script stops the
     # run instead of silently profiling the default shape.
     for flag, value in (
+        ("--op", "mamba"),
         ("--shape", "enormous"),
         ("--mode", "backward"),
         ("--dtype", "fp8"),
@@ -288,6 +298,8 @@ def test_parse_args_rejects_a_value_outside_its_table() -> None:
         with pytest.raises(SystemExit) as exc:
             profile_op.parse_args([flag, value])
         assert exc.value.code == 2
+    for op in OPS:
+        assert profile_op.parse_args(["--op", op]).op == op
 
 
 # ---------------------------------------------------------------------------
@@ -319,12 +331,16 @@ def test_the_target_argv_carries_every_argument_the_target_needs() -> None:
     # module's location rather than from the working directory.
     assert profile_op.TARGET.name == "profile_target.py"
     assert profile_op.TARGET.parent == Path(profile_op.__file__).parent
-    # A backend is named only when one is asked for; absent means the fastest
-    # registered one, which is the profiled path.
+    # An operator and a backend are named only when one is asked for; a default
+    # operator and an absent backend are what the target already does, so the
+    # quoted command stays what a reader would have to type.
     auto = profile_op.target_argv(profile_op.parse_args([]))
     named = profile_op.target_argv(profile_op.parse_args(["--backend", "cute"]))
+    assert "--op" not in auto
     assert "--backend" not in auto
     assert named[-2:] == ["--backend", "cute"]
+    conv = profile_op.target_argv(profile_op.parse_args(["--op", "conv"]))
+    assert conv[-2:] == ["--op", "conv"]
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +474,29 @@ def test_step_mode_measures_the_backward_too(
     assert "profile: so3ssd tiny step" in text
     assert "| op.backward | op |" in text
     assert "mode=step dtype=bf16 backend=auto" in text
+
+
+def test_the_conv_operator_profiles_the_conv_and_names_it_in_the_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen = patch_externals(monkeypatch)
+    out = tmp_path / "prof"
+    argv = argv_for(out, "--op", "conv")
+    argv[argv.index("forward")] = "step"
+    assert profile_op.main(argv) == 0
+    doc = json.loads((tmp_path / "prof-tiny-step.json").read_text())
+    # The title carries the operator, because the report base does not: one --out
+    # at one shape and one mode is one file whichever operator produced it.
+    assert doc["title"] == "profile: conv tiny step"
+    assert doc["throughput"][0]["label"] == "conv tiny step"
+    tiny = conv_shape_by_name("tiny")
+    assert doc["throughput"][0]["token_count"] == tiny.token_count
+    text = (tmp_path / "prof-tiny-step.md").read_text()
+    assert "| conv.backward | conv |" in text
+    assert tiny.describe() in text
+    # The event bench and the profiled window ran one workload, so the forwarded
+    # argv names the operator the event wall measured.
+    assert seen.nsys_argv[0][-2:] == ["--op", "conv"]
 
 
 def test_the_notes_quote_the_command_the_profilers_ran(
