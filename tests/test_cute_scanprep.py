@@ -55,10 +55,11 @@ DTYPES = [torch.float32, torch.bfloat16]
 # widths, so the bound is float32 rounding of the map and nothing else.
 FWD_TOL = 1e-6
 
-# The gradients are stored at the input width. bfloat16 keeps 8 mantissa bits, so
-# a stored gradient carries up to 2^-9 = 2.0e-3 of relative rounding; the bound
-# is that with a factor of two of margin. float32 storage leaves only the
-# arithmetic.
+# The gradients are stored at the input width. bfloat16 keeps 8 significand bits,
+# so a stored gradient carries up to a half-ulp, 2^-8 = 3.9e-3, of relative
+# rounding; the bound is that, rounded up. Storage dominates, so there is no
+# margin to spend on the arithmetic and none is needed: the arithmetic is float32.
+# float32 storage leaves only the arithmetic.
 BWD_TOL = {torch.float32: 1e-6, torch.bfloat16: 4e-3}
 
 # The exact map lands in the closed ball of radius w_max; the computed vector is
