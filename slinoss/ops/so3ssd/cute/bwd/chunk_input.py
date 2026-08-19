@@ -86,10 +86,11 @@ The class is not yet met. Measured on an A6000 at ``standard``: 350.8 us per
 launch, 160.3 MB of device traffic against the 90.70 MB above, 457.0 GB/s, which is
 67.0% of a measured 681.3 GB/s copy and 68.0% of the copy's time law at the same
 traffic, against a bar of 85%. The kernel is at the 255-register architectural cap
-and spills 73.1 MB per launch each way, which is the whole of the gap between the
-model and the measurement, and the spill holds occupancy at two blocks of four
-warps, 16.7%, where ``long_scoreboard`` takes 37.4% of warp-active cycles at a
-21.8% issue rate: memory latency with too few warps, not bandwidth. The live
+and spills 73.1 MB per launch each way. The model and the measurement differ by
+69.6 MB, which the store side alone covers; the load side does not reach device
+memory in full. The spill holds occupancy at two blocks of four warps, 16.7%, where
+``long_scoreboard`` takes 37.4% of warp-active cycles at a 21.8% issue rate: memory
+latency with too few warps, not bandwidth. The live
 fragment set does not fit 255 registers at four warps and one 64-row M tile, so the
 fix is a wider block, which is
 :data:`slinoss.ops.so3ssd.cute.common.WARPS` and

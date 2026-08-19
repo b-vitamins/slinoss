@@ -72,6 +72,9 @@ a transposed score tile is not.
 - The DSL emits no phi node for a dynamic `if`, so a value produced inside a
   dynamic branch cannot be read after it. A trace-time `const_expr` branch is
   plain Python and has no such limit.
+- `cutlass.range_constexpr` is rewritten only as the iterable of a `for`
+  statement. In a comprehension or a generator expression it reaches the runtime
+  stub and raises. Use a plain `range` there; both unroll at trace time.
 - Compile once. Every launch goes through the executor cache in
   `slinoss/_cute.py`; a `@cute.jit` function called directly retraces on every
   call.
