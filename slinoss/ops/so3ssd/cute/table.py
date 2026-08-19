@@ -18,6 +18,13 @@ slots for the chunk increment, three for the chunk scan. Slot order puts the tap
 first so the increment's table is a prefix of the scan's and the slot indices are
 the same constants in both.
 
+One slot is the other direction. A kernel that reads out but does not force needs
+``Ac`` and nothing else, so at ``mats == 1`` the build computes strictly less: no
+tap matrix, no 3x3 product, and no read of ``stap`` or ``strans`` at all, which
+also frees the caller of staging ``K``. Its sole slot is ``TABLE_AC_SOLE``, a
+distinct constant, because at one slot the order is no longer a prefix of the
+three-slot order.
+
 Cost. Building one token is one quaternion exponential, one rotation matrix, two
 tap matrices, and two 3x3 products: order 120 FMA. Applying it is ``9*N`` FMA per
 tap. The build amortizes from ``N = 16``, which is the smallest legal lane count.
@@ -49,10 +56,19 @@ correctness bug. Arithmetic intensity is near 1.5 flop/byte, so the transform is
 memory bound and never gets a kernel of its own; the rotated tensors do not reach
 global memory.
 
-The two stagings that need no table are here for the same reason: more than one
-kernel needs each. :func:`stage_shifted` lays a ``(T, P)`` tensor into a tile one
-row behind, so the two taps read one staging pass through two views; and
-:func:`stage_state` narrows a chunk-start state into an operand tile.
+The backward transforms by ``A^T`` rather than ``A``. That is the same nine FMAs
+over a permuted index triple, so it is the ``transposed`` flag of
+:func:`stage_rotated` rather than a second helper: the flag selects which table
+entry feeds each output component during the trace, and ptxas sees one
+straight-line matvec either way.
+
+The stagings that need no table are here for the same reason: more than one kernel
+needs each. :func:`stage_shifted` lays a ``(T, P)`` tensor into a tile one row
+behind, so the two taps read one staging pass through two views;
+:func:`stage_state` narrows a chunk-start state into an operand tile; and
+:func:`stage_matrix` transforms a ``(P, 3N)`` tensor by one matrix that holds for
+the whole chunk, keeping the float32 result beside the narrowed operand when the
+consumer needs both widths.
 """
 
 import cutlass
@@ -61,8 +77,10 @@ import cutlass.cute as cute
 from slinoss._cute import narrow, select, widen
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
+    TABLE_AC_SOLE,
     TABLE_AN,
     TABLE_AP,
+    Mat3,
     Vec3,
     mat3_matvec,
     mat3_mul,
@@ -75,6 +93,7 @@ __all__ = [
     "PREFETCH",
     "build_table",
     "stage_chunk",
+    "stage_matrix",
     "stage_pad",
     "stage_rotated",
     "stage_shifted",
@@ -147,21 +166,24 @@ def build_table(
 
     Args:
         strans: ``(4, L)`` float32 staged transition parameters.
-        stap: ``(8, L)`` float32 staged tap parameters.
+        stap: ``(8, L)`` float32 staged tap parameters. Unread at ``mats == 1``,
+            which is the point of that slot count, so a caller there may pass any
+            tile of the right dtype.
         squat: ``(4, L)`` float32 quaternion prefix, already renormalized.
         stable: ``(mats, L, 9)`` float32, written. Slots are
             :data:`slinoss.ops.so3ssd.cute.common.TABLE_AP`, ``TABLE_AN``, and,
-            when ``mats`` is three, ``TABLE_AC``.
+            when ``mats`` is three, ``TABLE_AC``. At ``mats == 1`` the sole slot is
+            ``TABLE_AC_SOLE``.
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
-        mats: Slots to write, 2 or 3. Compile-time, and must match the ``mats``
-            the tile was allocated at.
+        mats: Slots to write, 1, 2 or 3. Compile-time, and must match the ``mats``
+            the tile was allocated at. One writes ``Ac`` alone and computes neither
+            tap matrix, so it also reads neither ``stap`` nor ``strans``.
     """
     for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
         token = tid + step * threads
         if token < chunk:
-            wvec = (strans[0, token], strans[1, token], strans[2, token])
             ac = mat3_transpose(
                 rot_hom(
                     (
@@ -172,18 +194,25 @@ def build_table(
                     )
                 )
             )
-            ap = mat3_mul(
-                ac, tap_matrix((stap[0, token], stap[1, token], stap[2, token]), wvec)
-            )
-            an = mat3_mul(
-                ac, tap_matrix((stap[4, token], stap[5, token], stap[6, token]), wvec)
-            )
-            for entry in cutlass.range_constexpr(9):
-                stable[TABLE_AP, token, entry] = ap[entry]
-                stable[TABLE_AN, token, entry] = an[entry]
-            if cutlass.const_expr(mats == 3):
+            if cutlass.const_expr(mats == 1):
                 for entry in cutlass.range_constexpr(9):
-                    stable[TABLE_AC, token, entry] = ac[entry]
+                    stable[TABLE_AC_SOLE, token, entry] = ac[entry]
+            else:
+                wvec = (strans[0, token], strans[1, token], strans[2, token])
+                ap = mat3_mul(
+                    ac,
+                    tap_matrix((stap[0, token], stap[1, token], stap[2, token]), wvec),
+                )
+                an = mat3_mul(
+                    ac,
+                    tap_matrix((stap[4, token], stap[5, token], stap[6, token]), wvec),
+                )
+                for entry in cutlass.range_constexpr(9):
+                    stable[TABLE_AP, token, entry] = ap[entry]
+                    stable[TABLE_AN, token, entry] = an[entry]
+                if cutlass.const_expr(mats == 3):
+                    for entry in cutlass.range_constexpr(9):
+                        stable[TABLE_AC, token, entry] = ac[entry]
 
 
 @cute.jit
@@ -365,6 +394,95 @@ def stage_state(
 
 
 @cute.jit
+def stage_matrix(
+    gv: cute.Tensor,
+    dst: cute.Tensor,
+    sfp32: cute.Tensor,
+    mat: Mat3,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    cidx: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+    keep_fp32: cutlass.Constexpr,
+) -> None:
+    """Transform a ``(P, 3N)`` tensor by one 3x3 matrix into an operand tile.
+
+    One matrix for the whole chunk, not a per-token table, so the caller reads the
+    nine entries once as a broadcast and hands them over in registers. Every one of
+    the ``N`` lanes takes the same matrix, so the stride loop owns one 3-vector per
+    thread per step: three coalesced global reads, nine FMA, three shared-memory
+    stores.
+
+    ``keep_fp32`` adds the float32 copy for a consumer that needs the untruncated
+    result as well as the operand. That is one extra shared-memory store per
+    component against a second pass over the ``(P, 3N)`` global read.
+
+    The pass runs in groups of :data:`PREFETCH` steps, loads first, for the reason
+    given in :func:`stage_rotated`.
+
+    Args:
+        gv: ``(B,H,C,P,3N)`` float32 source. Read at ``[bidx, hidx, cidx]``.
+        dst: Operand-dtype tile of at least ``rows`` rows, written over ``3N``
+            columns. The rest of the pitch is outside every view.
+        sfp32: Float32 tile of the same extents, written only when ``keep_fp32``.
+            Untouched otherwise, so a caller that needs one width passes any tile.
+        mat: The 3x3, row-major, entry ``3*r + c``. Float32 by I4.
+        bidx: Batch index.
+        hidx: Head index.
+        cidx: Chunk index.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        rows: Rows to fill, ``P``. Compile-time.
+        lanes: ``N``. Compile-time.
+        keep_fp32: Whether to write ``sfp32``. Compile-time.
+    """
+    src = gv.element_type
+    elem = dst.element_type
+    total = rows * lanes
+    steps = -(-total // threads)
+    exact = total % threads == 0
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        span = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(span):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            p = i // lanes
+            n = i - p * lanes
+            held.append(
+                (
+                    p,
+                    n,
+                    (
+                        widen(gv[bidx, hidx, cidx, p, 3 * n], src),
+                        widen(gv[bidx, hidx, cidx, p, 3 * n + 1], src),
+                        widen(gv[bidx, hidx, cidx, p, 3 * n + 2], src),
+                    ),
+                )
+            )
+
+        for step in cutlass.range_constexpr(span):
+            p, n, got = held[step]
+            out = mat3_matvec(mat, got)
+            if cutlass.const_expr(exact):
+                for j in cutlass.range_constexpr(3):
+                    dst[p, 3 * n + j] = narrow(out[j], elem)
+                    if cutlass.const_expr(keep_fp32):
+                        sfp32[p, 3 * n + j] = out[j]
+            else:
+                if tid + (group * PREFETCH + step) * threads < total:
+                    for j in cutlass.range_constexpr(3):
+                        dst[p, 3 * n + j] = narrow(out[j], elem)
+                        if cutlass.const_expr(keep_fp32):
+                            sfp32[p, 3 * n + j] = out[j]
+
+
+@cute.jit
 def _store_rotated(
     dst: cute.Tensor,
     stable: cute.Tensor,
@@ -375,6 +493,7 @@ def _store_rotated(
     vec: Vec3,
     slot: cutlass.Constexpr,
     scaled: cutlass.Constexpr,
+    transposed: cutlass.Constexpr = False,
 ) -> None:
     """Transform one 3-vector by one table slot and store it.
 
@@ -391,21 +510,24 @@ def _store_rotated(
             row carries no token.
         slot: Table slot. Compile-time.
         scaled: Whether to multiply by ``sscale[token]``. Compile-time.
+        transposed: Apply the slot's transpose. Compile-time: the nine reads are
+            the same nine and the permutation happens during the trace, so the
+            emitted matvec is unchanged.
     """
-    out = mat3_matvec(
-        (
-            stable[slot, token, 0],
-            stable[slot, token, 1],
-            stable[slot, token, 2],
-            stable[slot, token, 3],
-            stable[slot, token, 4],
-            stable[slot, token, 5],
-            stable[slot, token, 6],
-            stable[slot, token, 7],
-            stable[slot, token, 8],
-        ),
-        vec,
+    mat = (
+        stable[slot, token, 0],
+        stable[slot, token, 1],
+        stable[slot, token, 2],
+        stable[slot, token, 3],
+        stable[slot, token, 4],
+        stable[slot, token, 5],
+        stable[slot, token, 6],
+        stable[slot, token, 7],
+        stable[slot, token, 8],
     )
+    if cutlass.const_expr(transposed):
+        mat = mat3_transpose(mat)
+    out = mat3_matvec(mat, vec)
     elem = dst.element_type
     if cutlass.const_expr(scaled):
         weight = sscale[token]
@@ -435,13 +557,15 @@ def stage_rotated(
     lanes: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
     scaled: cutlass.Constexpr,
+    transposed: cutlass.Constexpr = False,
 ) -> None:
     """Transform a run of tokens by one table slot into a shared operand tile.
 
     Row ``r`` holds ``A_slot[lbase + r] v[t0 + lbase + r - back]``, optionally
-    scaled. ``back`` is 0 for the current tap and the readout, 1 for the previous
-    tap: the matrix is indexed at the token it acts on while the previous tap's
-    vector comes from the token before it.
+    scaled, with ``A_slot`` transposed when ``transposed``, which is what every
+    rowwise transform on the backward path applies. ``back`` is 0 for the current
+    tap and the readout, 1 for the previous tap: the matrix is indexed at the token
+    it acts on while the previous tap's vector comes from the token before it.
 
     One thread owns one 3-vector: three coalesced global reads, nine FMA, three
     shared-memory stores.
@@ -482,6 +606,8 @@ def stage_rotated(
         lanes: ``N``. Compile-time.
         has_prev: Whether ``gvprev`` was supplied. Compile-time.
         scaled: Whether to apply ``sscale``. Compile-time.
+        transposed: Apply the slot's transpose rather than the slot. Compile-time,
+            and free: it permutes an index triple during the trace.
     """
     src = gv.element_type
     zero = cutlass.Float32(0.0)
@@ -536,7 +662,11 @@ def stage_rotated(
                 select(keep, got[2], zero),
             )
             if cutlass.const_expr(exact):
-                _store_rotated(dst, stable, sscale, r, tsafe, n, vec, slot, scaled)
+                _store_rotated(
+                    dst, stable, sscale, r, tsafe, n, vec, slot, scaled, transposed
+                )
             else:
                 if tid + (group * PREFETCH + step) * threads < total:
-                    _store_rotated(dst, stable, sscale, r, tsafe, n, vec, slot, scaled)
+                    _store_rotated(
+                        dst, stable, sscale, r, tsafe, n, vec, slot, scaled, transposed
+                    )

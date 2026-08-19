@@ -50,6 +50,7 @@ __all__ = [
     "SINC_HALF",
     "SINC_HALF_D",
     "TABLE_AC",
+    "TABLE_AC_SOLE",
     "TABLE_AN",
     "TABLE_AP",
     "THREADS",
@@ -151,6 +152,14 @@ TABLE_AN: int = 1
 TABLE_AC: int = 2
 """``Ac = R(Q_t)^T``, applied to ``c_t``."""
 
+TABLE_AC_SOLE: int = 0
+"""``Ac`` when it is the only slot, at ``mats == 1``.
+
+A second name rather than a silent reuse of :data:`TABLE_AC`, because at one slot
+the order stops being a prefix of the three-slot order and an index that means two
+things at two slot counts is how a wrong matrix gets read.
+"""
+
 
 def table_tile(chunk: int, mats: int = 3) -> Tile:
     """3x3 transform table: ``(mats, L, 9)``, nine entries innermost.
@@ -160,14 +169,16 @@ def table_tile(chunk: int, mats: int = 3) -> Tile:
 
     The two tap matrices come first so a kernel that forces but does not read out
     -- the chunk increment -- takes a prefix of the table and the slot indices
-    stay the same constants in both kernels.
+    stay the same constants in both kernels. One slot is the other end: a kernel
+    that reads out but does not force holds ``Ac`` alone, at
+    :data:`TABLE_AC_SOLE`, and computes neither tap matrix.
 
     Args:
         chunk: ``L``.
-        mats: Slots to allocate, 2 or 3. Two omits ``Ac``.
+        mats: Slots to allocate, 1, 2 or 3. Two omits ``Ac``; one is ``Ac`` only.
     """
-    if mats not in (2, 3):
-        raise ValueError(f"table needs 2 or 3 matrices, got {mats}")
+    if mats not in (1, 2, 3):
+        raise ValueError(f"table needs 1, 2 or 3 matrices, got {mats}")
     return Tile((mats, chunk, 9), (9 * chunk, 9, 1))
 
 

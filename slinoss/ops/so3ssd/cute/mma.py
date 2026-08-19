@@ -48,6 +48,7 @@ __all__ = [
     "MMA_TILE_M",
     "MMA_TILE_N",
     "SMEM_SEGMENT",
+    "fp32_tile",
     "make_mma",
     "mma_acc",
     "mma_coords",
@@ -126,6 +127,24 @@ def operand_tile(rows: int, width: int) -> Tile:
             outside every view.
     """
     pitch = smem_pitch(width)
+    return Tile((rows, pitch), (pitch, 1))
+
+
+def fp32_tile(rows: int, width: int) -> Tile:
+    """Row-major float32 tile, ``(rows, smem_pitch(width, 4))``.
+
+    The float32 sibling of :func:`operand_tile`, for a quantity that I4 pins to
+    float32 and that therefore never becomes a GEMM operand. It exists because the
+    pitch depends on the element size: taking the operand pitch for a four-byte
+    element halves the segment count, and at ``3N = 48`` that lands on an even
+    number of segments, which is the two-way conflict the odd rule exists to avoid.
+
+    Args:
+        rows: Rows to allocate.
+        width: Elements per row that carry data. The rest of the pitch is padding
+            outside every view.
+    """
+    pitch = smem_pitch(width, 4)
     return Tile((rows, pitch), (pitch, 1))
 
 

@@ -37,6 +37,7 @@ from slinoss.config import MAX_CHUNK, MIN_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
+    TABLE_AC_SOLE,
     TABLE_AN,
     TABLE_AP,
     THREADS,
@@ -332,12 +333,15 @@ def test_padded_tail_is_identity() -> None:
     assert torch.count_nonzero(table[0, 0, 1, TABLE_AN, tail:]) == 0
 
 
-def test_two_slot_table_matches_the_three_slot_taps() -> None:
-    """``mats=2`` writes the same two tap matrices and allocates one slot less.
+def test_reduced_slot_tables_match_the_three_slot_matrices() -> None:
+    """``mats=2`` and ``mats=1`` write the same matrices at fewer slots.
 
-    ``Ac`` is an intermediate of both taps either way, so dropping its slot must
-    not change them. Asserted bitwise: the arithmetic is identical, so anything
-    but equality means the slot indices moved.
+    ``Ac`` is an intermediate of both taps and the taps are not intermediates of
+    ``Ac``, so neither reduction may change what it keeps. Asserted bitwise: the
+    arithmetic is identical in each case, so anything but equality means a slot
+    index moved. ``mats=1`` is the case where the constant changes, from
+    ``TABLE_AC`` to ``TABLE_AC_SOLE``, and reading the old one there would land on
+    a slot that does not exist.
     """
     inp = make_inputs(
         bsz=2,
@@ -352,16 +356,20 @@ def test_two_slot_table_matches_the_three_slot_taps() -> None:
     )
     full = _run_probe(inp.trans, inp.K, 64, mats=3)[2]
     taps = _run_probe(inp.trans, inp.K, 64, mats=2)[2]
+    sole = _run_probe(inp.trans, inp.K, 64, mats=1)[2]
     assert tuple(taps.shape[3:]) == (2, 64, 9)
+    assert tuple(sole.shape[3:]) == (1, 64, 9)
     assert torch.equal(taps[:, :, :, TABLE_AP], full[:, :, :, TABLE_AP])
     assert torch.equal(taps[:, :, :, TABLE_AN], full[:, :, :, TABLE_AN])
+    assert torch.equal(sole[:, :, :, TABLE_AC_SOLE], full[:, :, :, TABLE_AC])
     assert table_tile(64, 2).words == table_tile(64, 3).words - 9 * 64
+    assert table_tile(64, 1).words == table_tile(64, 3).words - 18 * 64
 
 
 def test_table_rejects_a_slot_count_with_no_consumer() -> None:
-    """Two slots and three are the only shapes any kernel reads."""
-    for mats in (0, 1, 4):
-        with pytest.raises(ValueError, match="2 or 3 matrices"):
+    """One, two and three slots are the only shapes any kernel reads."""
+    for mats in (0, 4):
+        with pytest.raises(ValueError, match="1, 2 or 3 matrices"):
             table_tile(64, mats)
 
 
