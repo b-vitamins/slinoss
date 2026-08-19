@@ -19,10 +19,8 @@ of :data:`OWNED_MARKERS` and matching no key raises; a symbol carrying neither
 marker came from torch, cuBLAS, or the driver, so it is reported as unjudged
 rather than judged against a class this repo did not declare.
 
-Two drivers judge that table. :func:`class_audit` scores a DRAM-bound kernel
-against the single-point copy ceiling. :func:`floor_audit` scores it against the
-copy's time law at the kernel's own traffic and fails a register spill outright.
-Both are here because the first has consumers this module does not own.
+:func:`floor_audit` judges that table: a DRAM-bound kernel against the copy's time
+law at the kernel's own traffic, and a register spill as a failure outright.
 """
 
 from __future__ import annotations
@@ -35,11 +33,9 @@ from slinoss.perf.ceiling import (
     DRAM_BOUND,
     SERIAL_TINY,
     TENSOR_BOUND,
-    Ceilings,
     ClassVerdict,
     DramTimeFloor,
     dram_floor_verdict,
-    dram_verdict,
     serial_verdict,
 )
 from slinoss.perf.ncu import KernelCounters, SpillCounters
@@ -49,9 +45,7 @@ __all__ = [
     "DECLARED",
     "OWNED_MARKERS",
     "SPILL_FREE_CLASSES",
-    "ClassAudit",
     "FloorAudit",
-    "class_audit",
     "declared_class",
     "floor_audit",
 ]
@@ -134,68 +128,6 @@ def declared_class(kernel: str) -> str | None:
     return DECLARED[hits[0]]
 
 
-@dataclass(frozen=True)
-class ClassAudit:
-    """The class check over one profiled capture window.
-
-    Attributes:
-        verdicts: One verdict per profiled kernel this repo compiles, in the
-            order profiled.
-        unjudged: Symbols of profiled kernels this repo does not compile.
-    """
-
-    verdicts: tuple[ClassVerdict, ...]
-    unjudged: tuple[str, ...]
-
-
-def class_audit(
-    kernels: Sequence[KernelCounters],
-    *,
-    limits: Ceilings,
-    step_duration_us: Microseconds,
-    capture_iters: int,
-) -> ClassAudit:
-    """Judge every profiled kernel against the class it declares.
-
-    Args:
-        kernels: Merged NCU counters for one capture window.
-        limits: Ceilings measured on the same device at the same clocks, so
-            numerator and denominator drift together.
-        step_duration_us: Measured per-iteration wall. The SERIAL-tiny divisor.
-        capture_iters: Iterations the capture window contained. Divides a counter
-            sum onto the same per-iteration footing as ``step_duration_us``.
-
-    Returns:
-        The audit.
-
-    Raises:
-        ValueError: If ``capture_iters`` is not positive, or if a declared class
-            cannot be judged from the collected counters.
-    """
-    if capture_iters <= 0:
-        raise ValueError(f"capture_iters must be positive, got {capture_iters}")
-    verdicts: list[ClassVerdict] = []
-    unjudged: list[str] = []
-    for one in kernels:
-        declared = declared_class(one.kernel)
-        if declared is None:
-            unjudged.append(one.kernel)
-        elif declared == DRAM_BOUND:
-            verdicts.append(dram_verdict(one.kernel, one.achieved_gbs, limits.dram))
-        elif declared == SERIAL_TINY:
-            per_iter = Microseconds(one.duration_us / capture_iters)
-            verdicts.append(
-                serial_verdict(one.kernel, pct_of(per_iter, step_duration_us))
-            )
-        else:
-            raise ValueError(
-                f"kernel {one.kernel!r} declares {declared}, which the collected "
-                f"counters cannot judge: {TENSOR_BOUND} needs a flop count and no "
-                f"table in NCU_TABLES collects one"
-            )
-    return ClassAudit(verdicts=tuple(verdicts), unjudged=tuple(unjudged))
-
-
 SPILL_FREE_CLASSES: Final[frozenset[str]] = frozenset((DRAM_BOUND, TENSOR_BOUND))
 """Classes a register spill fails outright.
 
@@ -239,9 +171,6 @@ def floor_audit(
     capture_iters: int,
 ) -> FloorAudit:
     """Judge every profiled kernel against its class, at the floor and for spills.
-
-    Two departures from :func:`class_audit`, which is left in place beside this and
-    unchanged.
 
     A DRAM-bound kernel is scored against the time floor at its own measured
     traffic rather than against the rate of the largest copy the device can run;

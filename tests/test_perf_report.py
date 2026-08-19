@@ -28,13 +28,12 @@ from slinoss.perf.budget import BucketDelta, BucketTiming, BudgetReport
 from slinoss.perf.ceiling import (
     DRAM_BOUND,
     SERIAL_TINY,
-    TENSOR_BOUND,
     Ceilings,
     ClassVerdict,
     DramCeiling,
     TensorCeiling,
 )
-from slinoss.perf.declared import DECLARED, class_audit, declared_class
+from slinoss.perf.declared import declared_class
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.dispersion import (
     GrowthRow,
@@ -878,73 +877,3 @@ def test_declared_class_refuses_a_symbol_it_cannot_place() -> None:
         declared_class("kernel_cutlass_brand_new_fwd_kernel_0")
     with pytest.raises(ValueError, match="one symbol, one class"):
         declared_class("kernel_cutlass_conv1d_fwd_kernel_conv1d_bwd_kernel_0")
-
-
-def test_class_audit_judges_each_kernel_against_the_class_it_declares(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Each declaration picks its own comparison, and a failure still emits.
-
-    DRAM-bound is judged against the measured copy ceiling and SERIAL-tiny against
-    its share of the step, which is an upper bound rather than a floor. A failing
-    verdict is returned, not raised: the report exists to show it.
-
-    The SERIAL-tiny declaration is patched onto a DRAM-bound kernel rather than
-    read off the one real SERIAL-tiny entry: the arc under test is the audit's
-    choice of comparison, so it must not move when the table does.
-    """
-    monkeypatch.setitem(DECLARED, "state_passing_fwd_kernel", SERIAL_TINY)
-    audit = class_audit(
-        (
-            _counters(kernel=CUTE_SCAN, duration_us=3030.0),
-            _counters(kernel=CUTE_STATE, duration_us=30.0),
-            _counters(kernel=FOREIGN, duration_us=10.0),
-        ),
-        limits=_ceilings(),
-        step_duration_us=Microseconds(1200.0),
-        capture_iters=CAPTURE_ITERS,
-    )
-    # Unjudged rather than dropped: a kernel absent from both lists is invisible.
-    assert audit.unjudged == (FOREIGN,)
-    dram, serial = audit.verdicts
-    assert (dram.kernel, dram.declared) == (CUTE_SCAN, DRAM_BOUND)
-    # 760 GB/s of the measured 767 GB/s ceiling, against an 85% floor.
-    assert dram.achieved_pct == pytest.approx(100.0 * 760.0 / 767.0)
-    assert dram.required_pct == 85.0
-    assert dram.passed
-    assert (serial.kernel, serial.declared) == (CUTE_STATE, SERIAL_TINY)
-    # 30 us over three capture iterations is 10 us against a 1,200 us step.
-    assert serial.achieved_pct == pytest.approx(100.0 * 10.0 / 1200.0)
-    assert serial.passed
-    over = class_audit(
-        (_counters(kernel=CUTE_STATE, duration_us=300.0),),
-        limits=_ceilings(),
-        step_duration_us=Microseconds(1200.0),
-        capture_iters=CAPTURE_ITERS,
-    )
-    assert over.verdicts[0].achieved_pct == pytest.approx(100.0 * 100.0 / 1200.0)
-    assert not over.verdicts[0].passed
-
-
-def test_class_audit_refuses_a_judgement_it_cannot_make(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    counters = (_counters(kernel=CUTE_SCAN),)
-    limits = _ceilings()
-    with pytest.raises(ValueError, match="capture_iters must be positive"):
-        class_audit(
-            counters,
-            limits=limits,
-            step_duration_us=Microseconds(1200.0),
-            capture_iters=0,
-        )
-    # No table collects a flop count, so a TENSOR-bound declaration says so rather
-    # than judging a tensor kernel by the bandwidth it was never held to.
-    monkeypatch.setitem(DECLARED, "chunk_scan_fwd_kernel", TENSOR_BOUND)
-    with pytest.raises(ValueError, match="needs a flop count"):
-        class_audit(
-            counters,
-            limits=limits,
-            step_duration_us=Microseconds(1200.0),
-            capture_iters=CAPTURE_ITERS,
-        )

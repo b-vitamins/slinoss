@@ -1,4 +1,4 @@
-"""The measured time floor and the spill rule.
+"""The measured time floor, the spill rule, and the arcs the audit chooses between.
 
 The fit is pure arithmetic and is driven from synthetic samples carrying an exact
 timing law, so the test states what the estimator must recover rather than what
@@ -17,13 +17,15 @@ import torch
 from slinoss.perf.ceiling import (
     CLASS_FLOOR_PCT,
     DRAM_BOUND,
+    SERIAL_TINY,
+    TENSOR_BOUND,
     CopySample,
     DramTimeFloor,
     dram_ceiling,
     dram_floor_verdict,
     dram_time_floor,
 )
-from slinoss.perf.declared import FloorAudit, floor_audit
+from slinoss.perf.declared import DECLARED, FloorAudit, floor_audit
 from slinoss.perf.ncu import KernelCounters, SpillCounters
 from slinoss.perf.units import (
     Bytes,
@@ -303,14 +305,28 @@ def counters(kernel: str = OWNED) -> KernelCounters:
     )
 
 
-def audit_one(spill: SpillCounters) -> FloorAudit:
-    """Audit one DRAM-bound kernel against the synthetic floor."""
+def audit_one(
+    spill: SpillCounters | None,
+    *,
+    step_duration_us: float = 5000.0,
+    capture_iters: int = 3,
+) -> FloorAudit:
+    """Audit one kernel against the synthetic floor.
+
+    Args:
+        spill: The kernel's spill record, or None to run the audit without one.
+        step_duration_us: Measured per-iteration wall, the SERIAL-tiny divisor.
+        capture_iters: Iterations the capture window contained.
+
+    Returns:
+        The audit.
+    """
     return floor_audit(
         (counters(),),
         floor=synthetic_floor(*SWEEP),
-        spills=(spill,),
-        step_duration_us=Microseconds(5000.0),
-        capture_iters=3,
+        spills=() if spill is None else (spill,),
+        step_duration_us=Microseconds(step_duration_us),
+        capture_iters=capture_iters,
     )
 
 
@@ -363,3 +379,45 @@ def test_the_audit_leaves_a_foreign_kernel_unjudged() -> None:
     assert audit.unjudged == (foreign,)
     assert audit.verdicts == ()
     assert audit.spilled == ()
+
+
+def test_a_serial_tiny_declaration_is_judged_by_its_share_of_the_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The audit's other arc: an upper bound on step share, and no spill record.
+
+    The declaration is patched onto a DRAM-bound kernel rather than read off the one
+    real SERIAL-tiny entry, so the arc under test does not move when the table does.
+    Both directions come off one record: 250 us over three capture iterations is
+    83.3 us, under the 2% bar of a 5,000 us step and over it at 2,000 us.
+
+    No spill record is supplied. SERIAL-tiny is absent from SPILL_FREE_CLASSES,
+    because its bar is a share of the step and a spill can only worsen it; a
+    spilling SERIAL-tiny kernel is worth fixing, not a corrupted verdict.
+    """
+    monkeypatch.setitem(DECLARED, "chunk_scan_fwd_kernel", SERIAL_TINY)
+    under = audit_one(None)
+    one = under.verdicts[0]
+    assert (one.kernel, one.declared) == (OWNED, SERIAL_TINY)
+    assert one.achieved_pct == pytest.approx(100.0 * (WINDOW_US / 3) / 5000.0)
+    assert one.required_pct == CLASS_FLOOR_PCT[SERIAL_TINY]
+    assert one.passed
+    assert under.spilled == ()
+    over = audit_one(None, step_duration_us=2000.0)
+    assert over.verdicts[0].achieved_pct == pytest.approx(
+        100.0 * (WINDOW_US / 3) / 2000.0
+    )
+    assert not over.verdicts[0].passed
+
+
+def test_the_audit_refuses_a_judgement_the_counters_cannot_make(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two refusals, each louder than a verdict resting on nothing."""
+    with pytest.raises(ValueError, match="capture_iters must be positive"):
+        audit_one(spill_record(0), capture_iters=0)
+    # No table collects a flop count, so a TENSOR-bound declaration says so rather
+    # than judging a tensor kernel by a bandwidth it was never held to.
+    monkeypatch.setitem(DECLARED, "chunk_scan_fwd_kernel", TENSOR_BOUND)
+    with pytest.raises(ValueError, match="needs a flop count"):
+        audit_one(spill_record(0))

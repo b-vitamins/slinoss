@@ -93,7 +93,6 @@ __all__ = [
     "dram_ceiling",
     "dram_floor_verdict",
     "dram_time_floor",
-    "dram_verdict",
     "serial_verdict",
     "tensor_ceiling",
     "tensor_verdict",
@@ -551,30 +550,6 @@ class ClassVerdict(PerfRecord):
     achieved_pct: Annotated[Percent, MEDIAN]
     required_pct: Annotated[Percent, MEDIAN]
     passed: bool
-
-
-def dram_verdict(
-    kernel: str, achieved_gbs: GBPerSecond, ceiling: DramCeiling
-) -> ClassVerdict:
-    """Judge a DRAM-bound kernel against the measured copy ceiling.
-
-    Args:
-        kernel: Kernel name.
-        achieved_gbs: Kernel bytes over kernel duration, both measured.
-        ceiling: The copy ceiling.
-
-    Returns:
-        The verdict.
-    """
-    share = pct_of(achieved_gbs, ceiling.achieved_gbs)
-    floor = CLASS_FLOOR_PCT[DRAM_BOUND]
-    return ClassVerdict(
-        kernel=kernel,
-        declared=DRAM_BOUND,
-        achieved_pct=share,
-        required_pct=floor,
-        passed=share >= floor,
-    )
 
 
 def dram_floor_verdict(

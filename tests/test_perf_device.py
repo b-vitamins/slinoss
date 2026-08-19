@@ -23,11 +23,9 @@ from slinoss.perf.ceiling import (
     DRAM_BOUND,
     SERIAL_TINY,
     TENSOR_BOUND,
-    DramCeiling,
     TensorCeiling,
     ceilings,
     dram_ceiling,
-    dram_verdict,
     serial_verdict,
     tensor_ceiling,
     tensor_verdict,
@@ -49,7 +47,6 @@ from slinoss.perf.device import (
 from slinoss.perf.units import (
     Bytes,
     Count,
-    GBPerSecond,
     Mebibytes,
     Megahertz,
     Microseconds,
@@ -158,15 +155,6 @@ def _device(sm_count: int = 84) -> DeviceInfo:
             utilization_pct=Percent(0.0),
             detail="fabricated",
         ),
-    )
-
-
-def _dram(achieved_gbs: float) -> DramCeiling:
-    return DramCeiling(
-        label="device-to-device copy, 512 MiB per buffer",
-        moved_bytes=Bytes(1073741824),
-        duration=_spread(1400.0),
-        achieved_gbs=GBPerSecond(achieved_gbs),
     )
 
 
@@ -564,19 +552,6 @@ def test_class_floor_pct_holds_the_declared_bars() -> None:
     assert len(CLASS_FLOOR_PCT) == 3
 
 
-def test_dram_verdict_divides_by_the_measured_ceiling() -> None:
-    verdict = dram_verdict("scan", GBPerSecond(720.0), _dram(800.0))
-    assert verdict.kernel == "scan"
-    assert verdict.declared == DRAM_BOUND
-    assert verdict.achieved_pct == 90.0
-    assert verdict.required_pct == 85.0
-    assert verdict.passed
-    assert dram_verdict("scan", GBPerSecond(600.0), _dram(800.0)).achieved_pct == 75.0
-    assert not dram_verdict("scan", GBPerSecond(600.0), _dram(800.0)).passed
-    # Exactly at the bar passes.
-    assert dram_verdict("scan", GBPerSecond(680.0), _dram(800.0)).passed
-
-
 def test_tensor_verdict_divides_by_the_measured_ceiling() -> None:
     verdict = tensor_verdict("gemm", TFlopsPerSecond(240.0), _tensor(300.0))
     assert verdict.declared == TENSOR_BOUND
@@ -601,12 +576,11 @@ def test_serial_verdict_bounds_the_share_of_the_step() -> None:
     assert serial_verdict("norm", Percent(2.0)).passed
 
 
-def test_serial_is_an_upper_bound_and_the_other_two_are_floors() -> None:
-    # All three achieve 1% of their bar's quantity: the serial kernel passes
-    # because its bar is a ceiling on step share, the other two fail.
+def test_serial_is_an_upper_bound_and_the_tensor_bar_is_a_floor() -> None:
+    # Both achieve 1% of their bar's quantity: the serial kernel passes because its
+    # bar is a ceiling on step share, the tensor kernel fails. The DRAM direction is
+    # the same comparison against the time floor; see tests/test_perf_ceiling.py.
     assert serial_verdict("norm", Percent(1.0)).passed
-    assert dram_verdict("scan", GBPerSecond(8.0), _dram(800.0)).achieved_pct == 1.0
-    assert not dram_verdict("scan", GBPerSecond(8.0), _dram(800.0)).passed
     assert not tensor_verdict("gemm", TFlopsPerSecond(3.0), _tensor(300.0)).passed
 
 
