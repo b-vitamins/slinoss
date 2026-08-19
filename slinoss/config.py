@@ -50,6 +50,11 @@ class SLinOSSConfig:
         d_state: Per-head state width ``3N``. Multiple of 48.
         expand: Inner width multiplier. ``d_inner = round(expand * d_model)``.
         d_head: Rows per head, ``P``. Multiple of 16.
+        n_groups: Groups sharing one ``B``/``C`` pair, ``G``. Divides ``n_heads``.
+            Head ``h`` reads group ``h // (n_heads // n_groups)``. At ``n_groups
+            == n_heads`` every head carries its own pair; at 1 all heads share
+            one. Only ``B`` and ``C`` are shared, never ``U``, the transition, the
+            taps, or the state.
         chunk_size: Scan chunk length ``L``. Power of two in [16, 128]; the
             quaternion prefix scan is a shuffle scan over ``log2(L)`` steps.
         d_conv: Causal depthwise convolution width.
@@ -68,6 +73,7 @@ class SLinOSSConfig:
     d_state: int
     expand: float = 2.0
     d_head: int = 64
+    n_groups: int = 1
     chunk_size: int = 64
     d_conv: int = 4
     w_max: float = 3.0
@@ -96,6 +102,13 @@ class SLinOSSConfig:
         if self.d_inner % self.d_head != 0:
             raise ValueError(
                 f"d_inner {self.d_inner} is not divisible by d_head {self.d_head}"
+            )
+        if self.n_groups < 1:
+            raise ValueError(f"n_groups must be positive, got {self.n_groups}")
+        if self.n_heads % self.n_groups != 0:
+            raise ValueError(
+                f"n_groups {self.n_groups} does not divide n_heads {self.n_heads}; "
+                f"a group holds a whole number of heads"
             )
         if not MIN_CHUNK <= self.chunk_size <= MAX_CHUNK:
             raise ValueError(
@@ -133,6 +146,11 @@ class SLinOSSConfig:
     def n_heads(self) -> int:
         """Heads per layer, ``H``."""
         return self.d_inner // self.d_head
+
+    @property
+    def heads_per_group(self) -> int:
+        """Heads sharing one ``B``/``C`` pair, ``H // G``."""
+        return self.n_heads // self.n_groups
 
     @property
     def n_lanes(self) -> int:

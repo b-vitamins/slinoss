@@ -28,6 +28,7 @@ from slinoss.ops.so3ssd.reference import (
     as_lanes,
     chunk_pad,
     chunked_forward,
+    from_heads,
     quat_exp_vjp,
     quat_prefix_scan_vjp,
     rot_matrix_vjp,
@@ -50,10 +51,11 @@ class SO3SSDGrads(NamedTuple):
         dtrans: Shape ``(B,H,T,4)``, dtype of ``trans``.
         dK: Shape ``(B,H,T,2,4)``, dtype of ``K``. Lane 3 is exactly zero: the
             forward never reads it.
-        dB: Shape ``(B,H,T,3N)``, dtype of ``B``.
-        dC: Shape ``(B,H,T,3N)``, dtype of ``C``.
+        dB: Shape ``(B,G,T,3N)``, dtype of ``B``. Summed over the heads of each
+            group.
+        dC: Shape ``(B,G,T,3N)``, dtype of ``C``. Summed like ``dB``.
         dz0: Shape ``(B,H,P,3N)`` or ``None``.
-        db_prev: Shape ``(B,H,3N)`` or ``None``.
+        db_prev: Shape ``(B,G,3N)`` or ``None``.
         du_prev: Shape ``(B,H,P)`` or ``None``.
     """
 
@@ -98,16 +100,16 @@ def so3ssd_bwd_ref(
     Args:
         dy: Cotangent of ``y``, shape ``(B,H,T,P)``. ``None`` is zero.
         dstate: Cotangent of ``state``, shape ``(B,H,P,3N)``. ``None`` is zero.
-        db_last: Cotangent of ``b_last``, shape ``(B,H,3N)``. ``None`` is zero.
+        db_last: Cotangent of ``b_last``, shape ``(B,G,3N)``. ``None`` is zero.
         du_last: Cotangent of ``u_last``, shape ``(B,H,P)``. ``None`` is zero.
         U: Input weights, shape ``(B,H,T,P)``.
         trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
         K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
-        B: Input vectors, shape ``(B,H,T,3N)``.
-        C: Output vectors, shape ``(B,H,T,3N)``.
+        B: Input vectors, shape ``(B,G,T,3N)``.
+        C: Output vectors, shape ``(B,G,T,3N)``.
         chunk_size: Chunk length ``L``. Must match the forward.
         z0: Initial state, shape ``(B,H,P,3N)``, pinned.
-        b_prev: ``b_{-1}``, shape ``(B,H,3N)``.
+        b_prev: ``b_{-1}``, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}``, shape ``(B,H,P)``.
 
     Returns:
@@ -263,8 +265,6 @@ def so3ssd_bwd_ref(
         dB_t = dB_t + _pad(dbshift_t[:, :, 1:], (0, 0, 0, 1))
         if du_last is not None:
             dU_t = dU_t + _pad(du_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
-        if db_last is not None:
-            dB_t = dB_t + _pad(db_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
 
         dtrans_t = torch.cat(
             [_unchunk(dw, seqlen), _unchunk(dls, seqlen)[..., None]], dim=-1
@@ -272,17 +272,30 @@ def so3ssd_bwd_ref(
         # Lane 3 of K is a hard zero in the forward, so it is a hard zero here.
         dK_t = _pad(_unchunk(dtap, seqlen), (0, 1))
 
+        # B and C are read by every head of their group, so their cotangents are
+        # summed back over those heads. Identity when G == H.
+        groups = int(B.shape[1])
+        dB_g = from_heads(dB_t, groups)
+        # b_last is a slice of the grouped B, not a per-head read of it, so its
+        # cotangent lands after the group reduction. Added before it, one group's
+        # cotangent would be counted once per head of that group.
+        if db_last is not None:
+            dB_g = dB_g + _pad(db_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
         return SO3SSDGrads(
             dU=dU_t.to(U.dtype).contiguous(),
             dtrans=dtrans_t.to(trans.dtype).contiguous(),
             dK=dK_t.to(K.dtype).contiguous(),
-            dB=dB_t.to(B.dtype).contiguous(),
-            dC=_unchunk(dc_n.flatten(-2, -1), seqlen).to(C.dtype).contiguous(),
+            dB=dB_g.to(B.dtype).contiguous(),
+            dC=from_heads(_unchunk(dc_n.flatten(-2, -1), seqlen), groups)
+            .to(C.dtype)
+            .contiguous(),
             dz0=None if z0 is None else acc.flatten(-2, -1).to(z0.dtype).contiguous(),
             db_prev=(
                 None
                 if b_prev is None
-                else dbshift_t[:, :, 0].to(b_prev.dtype).contiguous()
+                else from_heads(dbshift_t[:, :, 0], groups)
+                .to(b_prev.dtype)
+                .contiguous()
             ),
             du_prev=(
                 None

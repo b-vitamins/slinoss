@@ -344,7 +344,7 @@ BAD_INPUTS: tuple[Case, ...] = (
         {},
         lambda i: i._replace(B=i.B[..., 0]),
         ValueError,
-        r"B must be \(B,H,T,3N\)",
+        r"B must be \(B,G,T,3N\)",
     ),
     ("empty_time", {"seqlen": 0}, lambda i: i, ValueError, "T must be at least 1"),
     (

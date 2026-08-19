@@ -126,11 +126,12 @@ def so3ssd(
         trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
         K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned. Tap index 0
             is previous and 1 is current; lane 3 is ignored.
-        B: Input vectors, shape ``(B,H,T,3N)``.
-        C: Output vectors, shape ``(B,H,T,3N)``.
+        B: Input vectors, shape ``(B,G,T,3N)``. Grouped: ``G`` divides ``H`` and
+            head ``h`` reads group ``h // (H // G)``.
+        C: Output vectors, shape ``(B,G,T,3N)``. Grouped like ``B``.
         chunk_size: Chunk length ``L``.
         z0: Initial state, shape ``(B,H,P,3N)``, pinned. Zero if omitted.
-        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,H,3N)``.
+        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
         backend: Backend name, or ``None`` to select the fastest registered
             backend for the device.

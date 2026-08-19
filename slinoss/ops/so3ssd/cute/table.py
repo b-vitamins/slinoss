@@ -423,7 +423,7 @@ def stage_rotated(
     stable: cute.Tensor,
     sscale: cute.Tensor,
     bidx: cutlass.Int32,
-    hidx: cutlass.Int32,
+    gidx: cutlass.Int32,
     t0: cutlass.Int32,
     lbase: cutlass.Int32,
     valid: cutlass.Int32,
@@ -461,14 +461,16 @@ def stage_rotated(
     output is the same three selects and makes the nine FMA exact.
 
     Args:
-        gv: ``(B,H,T,3N)`` operand-dtype source.
-        gvprev: ``(B,H,3N)`` streaming ``v_{-1}``. Read only when ``has_prev`` and
+        gv: ``(B,G,T,3N)`` operand-dtype source.
+        gvprev: ``(B,G,3N)`` streaming ``v_{-1}``. Read only when ``has_prev`` and
             ``back`` is 1.
         dst: Operand-dtype tile of at least ``span`` rows, written.
         stable: ``(mats, L, 9)`` float32 transform table.
         sscale: ``(L,)`` float32 per-token scale. Read only when ``scaled``.
         bidx: Batch index.
-        hidx: Head index.
+        gidx: Group index, ``h // (H // G)``. The transform table is per head and
+            the vector is per group, so the two indices are distinct and only the
+            caller knows the head.
         t0: First token of the chunk.
         lbase: First chunk-local token of the run.
         valid: Tokens of the chunk that exist.
@@ -510,16 +512,16 @@ def stage_rotated(
             gbase = t0 + tsafe - back
             gsafe = cutlass.max(gbase, 0)
             got = (
-                widen(gv[bidx, hidx, gsafe, 3 * n], src),
-                widen(gv[bidx, hidx, gsafe, 3 * n + 1], src),
-                widen(gv[bidx, hidx, gsafe, 3 * n + 2], src),
+                widen(gv[bidx, gidx, gsafe, 3 * n], src),
+                widen(gv[bidx, gidx, gsafe, 3 * n + 1], src),
+                widen(gv[bidx, gidx, gsafe, 3 * n + 2], src),
             )
             if cutlass.const_expr(carry):
                 at_start = gbase < 0
                 got = (
-                    select(at_start, widen(gvprev[bidx, hidx, 3 * n], src), got[0]),
-                    select(at_start, widen(gvprev[bidx, hidx, 3 * n + 1], src), got[1]),
-                    select(at_start, widen(gvprev[bidx, hidx, 3 * n + 2], src), got[2]),
+                    select(at_start, widen(gvprev[bidx, gidx, 3 * n], src), got[0]),
+                    select(at_start, widen(gvprev[bidx, gidx, 3 * n + 1], src), got[1]),
+                    select(at_start, widen(gvprev[bidx, gidx, 3 * n + 2], src), got[2]),
                 )
             keep = lbase + r < valid
             if cutlass.const_expr(back == 1 and not has_prev):

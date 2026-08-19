@@ -61,6 +61,7 @@ def make_inputs(
     *,
     bsz: int = 2,
     heads: int = 2,
+    groups: int | None = None,
     seqlen: int = 40,
     rows: int = 16,
     lanes: int = 16,
@@ -81,6 +82,8 @@ def make_inputs(
     Args:
         bsz: Batch.
         heads: Heads.
+        groups: Groups sharing one ``B``/``C`` pair. Defaults to ``heads``, which
+            is the ungrouped case. Must divide ``heads``.
         seqlen: Tokens.
         rows: ``P``.
         lanes: ``N``. ``3N`` is the state width.
@@ -108,6 +111,10 @@ def make_inputs(
     def rnd(*shape: int) -> Tensor:
         return torch.randn(*shape, generator=gen, dtype=dtype, device=device)
 
+    # At the default the vector operands keep the shapes they had before there was
+    # a group axis, so the generator draws the same element counts in the same
+    # order and no ungrouped case moves.
+    bc_heads = heads if groups is None else groups
     state_dim = 3 * lanes
     params = scanprep_ref(
         rnd(bsz, heads, seqlen, 3) * w_scale,
@@ -126,10 +133,10 @@ def make_inputs(
         U=leaf(rnd(bsz, heads, seqlen, rows), u_dtype),
         trans=leaf(params.trans),
         K=leaf(params.K),
-        B=leaf(rnd(bsz, heads, seqlen, state_dim), bc_dtype),
-        C=leaf(rnd(bsz, heads, seqlen, state_dim), bc_dtype),
+        B=leaf(rnd(bsz, bc_heads, seqlen, state_dim), bc_dtype),
+        C=leaf(rnd(bsz, bc_heads, seqlen, state_dim), bc_dtype),
         z0=leaf(rnd(bsz, heads, rows, state_dim)) if with_state else None,
-        b_prev=leaf(rnd(bsz, heads, state_dim), bc_dtype) if streaming else None,
+        b_prev=leaf(rnd(bsz, bc_heads, state_dim), bc_dtype) if streaming else None,
         u_prev=leaf(rnd(bsz, heads, rows), u_dtype) if streaming else None,
     )
 

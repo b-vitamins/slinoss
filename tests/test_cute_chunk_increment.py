@@ -221,7 +221,19 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     ),
     (lambda a: a.update(trans=a["trans"][..., :3].contiguous()), ValueError, "trans"),
     (lambda a: a.update(K=a["K"][..., :1, :].contiguous()), ValueError, "K must be"),
-    (lambda a: a.update(B=a["B"][:, :1].contiguous()), ValueError, r"B must be \(B,H"),
+    (
+        lambda a: a.update(B=a["B"][:, :, 0].contiguous()),
+        ValueError,
+        r"B must be \(B,G,T,3N\)",
+    ),
+    # A head count is no longer a shape violation: any G dividing H is legal. What
+    # is left to refuse is a G that does not divide, which would send some head past
+    # the end of B.
+    (
+        lambda a: a.update(B=a["B"][:, :1].repeat(1, 3, 1, 1)),
+        ValueError,
+        "does not divide H=2",
+    ),
     (lambda a: a.update(u_prev=a["u_prev"][:1].contiguous()), ValueError, "u_prev"),
     (
         lambda a: a.update(b_prev=a["b_prev"][..., :3].contiguous()),

@@ -53,11 +53,13 @@ def so3ssd_fwd_cute(
         trans: ``(w_x, w_y, w_z, ls)`` per token, ``(B,H,T,4)`` float32, contiguous.
         K: Per-tap ``(kr, g, h, 0)``, ``(B,H,T,2,4)`` float32, contiguous. Tap index
             0 is previous and 1 is current; lane 3 is a hard zero.
-        B: Input vectors, ``(B,H,T,3N)``, the dtype of ``U``, contiguous.
-        C: Output vectors, ``(B,H,T,3N)``, the dtype of ``U``, contiguous.
+        B: Input vectors, ``(B,G,T,3N)``, the dtype of ``U``, contiguous. ``G``
+            divides ``H``; head ``h`` reads group ``h // (H // G)``.
+        C: Output vectors, ``(B,G,T,3N)``, the dtype of ``U``, contiguous. Grouped
+            like ``B``.
         chunk_size: Chunk length ``L``. A multiple of 16.
         z0: Initial state, ``(B,H,P,3N)`` float32, contiguous. Zero if omitted.
-        b_prev: ``b_{-1}`` for a streaming split, ``(B,H,3N)``, the dtype of ``U``.
+        b_prev: ``b_{-1}`` for a streaming split, ``(B,G,3N)``, the dtype of ``U``.
             Supplied with ``u_prev`` or not at all.
         u_prev: ``u_{-1}`` for a streaming split, ``(B,H,P)``, the dtype of ``U``.
 

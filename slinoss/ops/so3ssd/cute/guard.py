@@ -80,21 +80,27 @@ def check_pinned(named: Named) -> None:
 
 def check_shapes(
     U: Tensor, trans: Tensor, K: Tensor, *vectors: tuple[Tensor, str]
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     """Check the per-token operands against ``U``.
+
+    ``G`` is read off the first vector rather than passed in. It is a property of
+    the operands, so a caller cannot claim one grouping and hand over another, and
+    ``G == H`` needs no separate signature.
 
     Args:
         U: ``(B,H,T,P)``. Sets the leading shape.
         trans: ``(B,H,T,4)``.
         K: ``(B,H,T,2,4)``.
-        vectors: ``(tensor, name)`` pairs, each ``(B,H,T,3N)``. The first one sets
-            ``3N``.
+        vectors: ``(tensor, name)`` pairs, each ``(B,G,T,3N)``. The first one sets
+            ``G`` and ``3N``.
 
     Returns:
-        ``(B, H, T, P, 3N)``.
+        ``(B, H, G, T, P, 3N)``.
 
     Raises:
-        ValueError: On a rank or shape mismatch.
+        ValueError: On a rank or shape mismatch, or a ``G`` that does not divide
+            ``H``. A group holds a whole number of heads: with a remainder some
+            head would index past the group axis.
     """
     if U.ndim != 4:
         raise ValueError(f"U must be (B,H,T,P), got {tuple(U.shape)}")
@@ -105,17 +111,24 @@ def check_shapes(
     if tuple(K.shape) != (*lead, 2, 4):
         raise ValueError(f"K must be {(*lead, 2, 4)}, got {tuple(K.shape)}")
     head, head_name = vectors[0]
-    if head.ndim != 4 or tuple(head.shape[:3]) != lead:
+    if head.ndim != 4 or int(head.shape[0]) != bsz or int(head.shape[2]) != seqlen:
         raise ValueError(
-            f"{head_name} must be (B,H,T,3N) with {lead}, got {tuple(head.shape)}"
+            f"{head_name} must be (B,G,T,3N) with B={bsz} and T={seqlen}, "
+            f"got {tuple(head.shape)}"
         )
+    groups = int(head.shape[1])
+    if groups < 1 or heads % groups != 0:
+        raise ValueError(
+            f"{head_name} carries G={groups}, which does not divide H={heads}"
+        )
+    glead = (bsz, groups, seqlen)
     dim = int(head.shape[3])
     for tensor, name in vectors[1:]:
-        if tuple(tensor.shape) != (*lead, dim):
+        if tuple(tensor.shape) != (*glead, dim):
             raise ValueError(
-                f"{name} must be {(*lead, dim)}, got {tuple(tensor.shape)}"
+                f"{name} must be {(*glead, dim)}, got {tuple(tensor.shape)}"
             )
-    return bsz, heads, seqlen, rows, dim
+    return bsz, heads, groups, seqlen, rows, dim
 
 
 def check_extents(chunk_size: int, dim: int, slice_size: int) -> None:
@@ -147,14 +160,16 @@ def check_rows(rows: int) -> None:
 def check_stream(
     u_prev: Tensor | None,
     b_prev: Tensor | None,
-    shape: tuple[int, int, int, int],
+    shape: tuple[int, int, int, int, int],
 ) -> bool:
     """Check the streaming carry-in pair.
 
+    ``b_prev`` is a time slice of ``B``, so it is grouped exactly as ``B`` is.
+
     Args:
         u_prev: ``(B,H,P)`` or ``None``.
-        b_prev: ``(B,H,3N)`` or ``None``.
-        shape: ``(B, H, P, 3N)``.
+        b_prev: ``(B,G,3N)`` or ``None``.
+        shape: ``(B, H, G, P, 3N)``.
 
     Returns:
         Whether the pair was supplied.
@@ -168,13 +183,13 @@ def check_stream(
         raise ValueError("u_prev and b_prev are supplied together or not at all")
     if u_prev is None or b_prev is None:
         return False
-    bsz, heads, rows, dim = shape
+    bsz, heads, groups, rows, dim = shape
     if tuple(u_prev.shape) != (bsz, heads, rows):
         raise ValueError(
             f"u_prev must be {(bsz, heads, rows)}, got {tuple(u_prev.shape)}"
         )
-    if tuple(b_prev.shape) != (bsz, heads, dim):
+    if tuple(b_prev.shape) != (bsz, groups, dim):
         raise ValueError(
-            f"b_prev must be {(bsz, heads, dim)}, got {tuple(b_prev.shape)}"
+            f"b_prev must be {(bsz, groups, dim)}, got {tuple(b_prev.shape)}"
         )
     return True

@@ -200,6 +200,7 @@ def chunk_scan_fwd_kernel(
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
 ) -> None:
     """Write one chunk of the output.
@@ -210,11 +211,11 @@ def chunk_scan_fwd_kernel(
         gu: ``(B,H,T,P)`` operand-dtype input weights.
         gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
         gtap: ``(B,H,T,2,4)`` float32 per-tap ``(kr, g, h, 0)``.
-        gb: ``(B,H,T,3N)`` operand-dtype input vectors.
-        gc: ``(B,H,T,3N)`` operand-dtype readout vectors.
+        gb: ``(B,G,T,3N)`` operand-dtype input vectors.
+        gc: ``(B,G,T,3N)`` operand-dtype readout vectors.
         gz: ``(B,H,C,P,3N)`` float32 chunk-start states.
         guprev: ``(B,H,P)`` streaming ``u_{-1}``, or a placeholder.
-        gbprev: ``(B,H,3N)`` streaming ``b_{-1}``, or a placeholder.
+        gbprev: ``(B,G,3N)`` streaming ``b_{-1}``, or a placeholder.
         gy: ``(B,H,T,P)`` operand-dtype output, written.
         seqlen: ``T``. Dynamic.
         tiled_mma: From :func:`make_mma`.
@@ -222,16 +223,24 @@ def chunk_scan_fwd_kernel(
         chunk: ``L``. Compile-time.
         rows: ``P``. Compile-time.
         dim: ``3N``. Compile-time.
+        per_group: ``H // G``, heads sharing one ``b`` and ``c``. Compile-time.
         has_prev: Whether the streaming carry-in was supplied. Compile-time.
 
     Invariants:
         ``chunk`` is a multiple of :data:`MMA_TILE_K` and of ``nblock(chunk)``, and
         ``dim`` and ``rows`` are multiples of :data:`MMA_TILE_N`. ``L`` is the one
         padded mode: M is rounded up in shared memory, the rounded rows are zeroed
-        by the staging predicate, and the store drops them.
+        by the staging predicate, and the store drops them. ``per_group`` divides
+        ``H``.
     """
     tid, _, _ = cute.arch.thread_idx()
     cidx, bidx, hidx = cute.arch.block_idx()
+
+    # gb and gc are grouped; the state, the weights, the table, and the output are
+    # per head. The branch is trace-time, so the ungrouped shape emits no divide.
+    gidx = hidx
+    if cutlass.const_expr(per_group != 1):
+        gidx = hidx // per_group
 
     nblk = nblock(chunk)
     slices = chunk // nblk
@@ -291,7 +300,7 @@ def chunk_scan_fwd_kernel(
         stable,
         slp,
         bidx,
-        hidx,
+        gidx,
         t0,
         0,
         valid,
@@ -353,7 +362,7 @@ def chunk_scan_fwd_kernel(
                 stable,
                 slp,
                 bidx,
-                hidx,
+                gidx,
                 t0,
                 nbase,
                 valid,
@@ -432,12 +441,14 @@ def chunk_scan_fwd(
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`chunk_scan_fwd_kernel`.
 
-    ``L``, ``P``, and ``3N`` are compile-time because the accumulator partition
-    shapes are. Batch, head, chunk count, and sequence length are dynamic.
+    ``L``, ``P``, ``3N``, and ``H // G`` are compile-time because the accumulator
+    partition shapes are and because the group index folds away at ``G == H``.
+    Batch, head, chunk count, and sequence length are dynamic.
     """
     chunk_scan_fwd_kernel(
         gu,
@@ -455,6 +466,7 @@ def chunk_scan_fwd(
         chunk,
         rows,
         dim,
+        per_group,
         has_prev,
     ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
 
@@ -478,15 +490,16 @@ def chunk_scan_forward(
             :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous.
         trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
         K: ``(B,H,T,2,4)`` float32, contiguous. Per-tap ``(kr, g, h, 0)``.
-        B: ``(B,H,T,3N)``, the dtype of ``U``, contiguous.
-        C: ``(B,H,T,3N)``, the dtype of ``U``, contiguous.
+        B: ``(B,G,T,3N)``, the dtype of ``U``, contiguous. ``G`` divides ``H``;
+            head ``h`` reads group ``h // (H // G)``.
+        C: ``(B,G,T,3N)``, the dtype of ``U``, contiguous. Grouped like ``B``.
         zstart: ``(B,H,C,P,3N)`` float32, contiguous. Every chunk's start state, as
             :func:`slinoss.ops.so3ssd.cute.fwd.state_passing.state_passing_forward`
             writes it; chunk 0 holds ``z0`` or zero, so no chunk is a special case.
         chunk_size: ``L``. A multiple of 16.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, the dtype of ``U``. Paired with
             ``b_prev``.
-        b_prev: ``(B,H,3N)`` streaming ``b_{-1}``, the dtype of ``U``.
+        b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, the dtype of ``U``.
 
     Returns:
         ``(B,H,T,P)`` output in the dtype of ``U``, contiguous.
@@ -503,10 +516,12 @@ def chunk_scan_forward(
     check_layout((*activations, *pinned))
     dtype = check_operands(activations)
     check_pinned(pinned)
-    bsz, heads, seqlen, rows, dim = check_shapes(U, trans, K, (B, "B"), (C, "C"))
+    bsz, heads, groups, seqlen, rows, dim = check_shapes(
+        U, trans, K, (B, "B"), (C, "C")
+    )
     check_extents(chunk_size, dim, nblock(chunk_size))
     check_rows(rows)
-    has_prev = check_stream(u_prev, b_prev, (bsz, heads, rows, dim))
+    has_prev = check_stream(u_prev, b_prev, (bsz, heads, groups, rows, dim))
 
     chunks = -(-seqlen // chunk_size)
     want = (bsz, heads, chunks, rows, dim)
@@ -541,6 +556,14 @@ def chunk_scan_forward(
             bsz,
             heads,
         ),
-        (cute_dtype(dtype), THREADS, chunk_size, rows, dim, has_prev),
+        (
+            cute_dtype(dtype),
+            THREADS,
+            chunk_size,
+            rows,
+            dim,
+            heads // groups,
+            has_prev,
+        ),
     )
     return Y

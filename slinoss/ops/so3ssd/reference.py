@@ -69,6 +69,7 @@ __all__ = [
     "as_lanes",
     "chunk_pad",
     "chunked_forward",
+    "from_heads",
     "quat_conj",
     "quat_exp",
     "quat_exp_vjp",
@@ -83,6 +84,7 @@ __all__ = [
     "so3ssm",
     "tap_matrix",
     "tap_matrix_vjp",
+    "to_heads",
     "transform_table",
 ]
 
@@ -493,14 +495,14 @@ class SO3SSDResult(NamedTuple):
     Attributes:
         y: Output, shape ``(B,H,T,P)``, dtype of ``U``.
         state: State after the last token, shape ``(B,H,P,3N)``, pinned dtype.
-        b_last: ``b`` at the last token, shape ``(B,H,3N)``, contiguous. Feeds
+        b_last: ``b`` at the last token, shape ``(B,G,3N)``, contiguous. Feeds
             ``b_prev`` of the next call in a streaming split.
         u_last: ``u`` at the last token, shape ``(B,H,P)``, contiguous. Feeds
             ``u_prev``.
 
     ``b_last`` and ``u_last`` are contiguous because they are fed straight back
     in and the operator repacks nothing. A time slice of ``B`` is strided over
-    heads, so it is copied here rather than at every call site.
+    groups, so it is copied here rather than at every call site.
     """
 
     y: Tensor
@@ -512,10 +514,67 @@ class SO3SSDResult(NamedTuple):
 class _Shapes(NamedTuple):
     bsz: int
     heads: int
+    groups: int
     seqlen: int
     rows: int
     state_dim: int
     lanes: int
+
+
+def to_heads(t: Tensor, heads: int) -> Tensor:
+    """Broadcast a grouped tensor onto heads: ``(B,G,...) -> (B,H,...)``.
+
+    Head ``h`` reads group ``h // (H // G)``, so the group axis expands to
+    ``(G, H // G)`` and flattens in that order. Identity when ``G == H``.
+
+    Autograd through this is the group reduction: the pullback sums the cotangent
+    over the ``H // G`` heads of each group. That is why the reference broadcasts
+    rather than indexing per head, and why the reference gradient of a grouped
+    ``B`` or ``C`` needs no hand-written cross-head sum.
+
+    Args:
+        t: Grouped tensor, shape ``(B,G,...)``.
+        heads: ``H``. Must be a multiple of ``G``.
+
+    Returns:
+        Shape ``(B,H,...)``.
+
+    Raises:
+        ValueError: If ``G`` does not divide ``heads``.
+    """
+    groups = int(t.shape[1])
+    if heads % groups != 0:
+        raise ValueError(f"G={groups} does not divide H={heads}")
+    if groups == heads:
+        return t
+    per = heads // groups
+    return (
+        t.unsqueeze(2).expand(int(t.shape[0]), groups, per, *t.shape[2:]).flatten(1, 2)
+    )
+
+
+def from_heads(t: Tensor, groups: int) -> Tensor:
+    """Adjoint of :func:`to_heads`: ``(B,H,...) -> (B,G,...)`` by summation.
+
+    A grouped input is read by ``H // G`` heads, so its cotangent is the sum of
+    what each of those heads contributed. Identity when ``G == H``.
+
+    Args:
+        t: Per-head cotangent, shape ``(B,H,...)``.
+        groups: ``G``. Must divide ``H``.
+
+    Returns:
+        Shape ``(B,G,...)``.
+
+    Raises:
+        ValueError: If ``groups`` does not divide ``H``.
+    """
+    heads = int(t.shape[1])
+    if groups < 1 or heads % groups != 0:
+        raise ValueError(f"G={groups} does not divide H={heads}")
+    if groups == heads:
+        return t
+    return t.unflatten(1, (groups, heads // groups)).sum(2)
 
 
 def as_lanes(t: Tensor) -> Tensor:
@@ -564,22 +623,27 @@ def _check_inputs(
     if U.ndim != 4:
         raise ValueError(f"U must be (B,H,T,P), got shape {tuple(U.shape)}")
     if B.ndim != 4:
-        raise ValueError(f"B must be (B,H,T,3N), got shape {tuple(B.shape)}")
+        raise ValueError(f"B must be (B,G,T,3N), got shape {tuple(B.shape)}")
     bsz, heads, seqlen, rows = (int(d) for d in U.shape)
+    groups = int(B.shape[1])
     state_dim = int(B.shape[-1])
     if seqlen < 1:
         raise ValueError("T must be at least 1")
+    if groups < 1 or heads % groups != 0:
+        raise ValueError(
+            f"B and C carry G groups with G dividing H; got G={groups}, H={heads}"
+        )
 
     named: list[tuple[str, Tensor, tuple[int, ...]]] = [
         ("trans", trans, (bsz, heads, seqlen, 4)),
         ("K", K, (bsz, heads, seqlen, 2, 4)),
-        ("B", B, (bsz, heads, seqlen, state_dim)),
-        ("C", C, (bsz, heads, seqlen, state_dim)),
+        ("B", B, (bsz, groups, seqlen, state_dim)),
+        ("C", C, (bsz, groups, seqlen, state_dim)),
     ]
     if z0 is not None:
         named.append(("z", z0, (bsz, heads, rows, state_dim)))
     if b_prev is not None:
-        named.append(("b_prev", b_prev, (bsz, heads, state_dim)))
+        named.append(("b_prev", b_prev, (bsz, groups, state_dim)))
     if u_prev is not None:
         named.append(("u_prev", u_prev, (bsz, heads, rows)))
 
@@ -617,7 +681,7 @@ def _check_inputs(
     if u_prev is not None:
         check_supported(u_prev, "u_prev")
 
-    return _Shapes(bsz, heads, seqlen, rows, state_dim, state_dim // 3)
+    return _Shapes(bsz, heads, groups, seqlen, rows, state_dim, state_dim // 3)
 
 
 def _promote(t: Tensor, dtype: torch.dtype) -> Tensor:
@@ -645,10 +709,11 @@ def so3ssm(
         trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
         K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned. Tap index 0
             is previous and 1 is current; lane 3 is ignored.
-        B: Input vectors, shape ``(B,H,T,3N)``.
-        C: Output vectors, shape ``(B,H,T,3N)``.
+        B: Input vectors, shape ``(B,G,T,3N)``. Grouped: head ``h`` reads group
+            ``h // (H // G)``.
+        C: Output vectors, shape ``(B,G,T,3N)``. Grouped like ``B``.
         z0: Initial state, shape ``(B,H,P,3N)``, pinned. Zero if omitted.
-        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,H,3N)``.
+        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
 
     Returns:
@@ -669,8 +734,10 @@ def so3ssm(
         kprev = tap_matrix(_promote(K[..., 0, :3], dtype), w)
         kcurr = tap_matrix(_promote(K[..., 1, :3], dtype), w)
         u = _promote(U, dtype)
-        blane = as_lanes(_promote(B, dtype))
-        clane = as_lanes(_promote(C, dtype))
+        # B and C are grouped, everything else is per head. Broadcast once here so
+        # the recurrence below is written per head throughout.
+        blane = as_lanes(to_heads(_promote(B, dtype), shapes.heads))
+        clane = as_lanes(to_heads(_promote(C, dtype), shapes.heads))
 
         state = (
             torch.zeros(
@@ -690,7 +757,7 @@ def so3ssm(
                 shapes.bsz, shapes.heads, shapes.lanes, 3, dtype=dtype, device=device
             )
             if b_prev is None
-            else as_lanes(_promote(b_prev, dtype))
+            else as_lanes(to_heads(_promote(b_prev, dtype), shapes.heads))
         )
         up = (
             torch.zeros(
@@ -812,11 +879,12 @@ def chunked_forward(
         U: Input weights, shape ``(B,H,T,P)``.
         trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
         K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
-        B: Input vectors, shape ``(B,H,T,3N)``.
-        C: Output vectors, shape ``(B,H,T,3N)``.
+        B: Input vectors, shape ``(B,G,T,3N)``. Grouped: head ``h`` reads group
+            ``h // (H // G)``.
+        C: Output vectors, shape ``(B,G,T,3N)``. Grouped like ``B``.
         chunk_size: Chunk length ``L``.
         z0: Initial state, shape ``(B,H,P,3N)``, pinned. Zero if omitted.
-        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,H,3N)``.
+        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
 
     Returns:
@@ -836,8 +904,10 @@ def chunked_forward(
 
     with autocast_disabled(device.type):
         u = _promote(U, dtype)
-        bvec = _promote(B, dtype)
-        cvec = _promote(C, dtype)
+        # B and C are grouped, everything else is per head. Broadcast once here so
+        # the factorization below is written per head throughout.
+        bvec = to_heads(_promote(B, dtype), shapes.heads)
+        cvec = to_heads(_promote(C, dtype), shapes.heads)
         bhead = (
             torch.zeros(
                 shapes.bsz,
@@ -848,7 +918,7 @@ def chunked_forward(
                 device=device,
             )
             if b_prev is None
-            else _promote(b_prev, dtype)[:, :, None]
+            else to_heads(_promote(b_prev, dtype), shapes.heads)[:, :, None]
         )
         uhead = (
             torch.zeros(
@@ -984,11 +1054,12 @@ def so3ssd_ref(
         U: Input weights, shape ``(B,H,T,P)``.
         trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
         K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
-        B: Input vectors, shape ``(B,H,T,3N)``.
-        C: Output vectors, shape ``(B,H,T,3N)``.
+        B: Input vectors, shape ``(B,G,T,3N)``. Grouped: head ``h`` reads group
+            ``h // (H // G)``.
+        C: Output vectors, shape ``(B,G,T,3N)``. Grouped like ``B``.
         chunk_size: Chunk length ``L``.
         z0: Initial state, shape ``(B,H,P,3N)``, pinned. Zero if omitted.
-        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,H,3N)``.
+        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
 
     Returns:

@@ -205,6 +205,7 @@ def chunk_increment_fwd_kernel(
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
 ) -> None:
     """Accumulate one chunk's local increment and emit its transition.
@@ -215,9 +216,9 @@ def chunk_increment_fwd_kernel(
         gu: ``(B,H,T,P)`` operand-dtype input weights.
         gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
         gtap: ``(B,H,T,2,4)`` float32 per-tap ``(kr, g, h, 0)``.
-        gb: ``(B,H,T,3N)`` operand-dtype input vectors.
+        gb: ``(B,G,T,3N)`` operand-dtype input vectors.
         guprev: ``(B,H,P)`` streaming ``u_{-1}``, or a placeholder.
-        gbprev: ``(B,H,3N)`` streaming ``b_{-1}``, or a placeholder.
+        gbprev: ``(B,G,3N)`` streaming ``b_{-1}``, or a placeholder.
         ginc: ``(B,H,C,P,3N)`` float32, written with the chunk-local increment.
         gcquat: ``(B,H,C,4)`` float32, written with the unit chunk rotation.
         gcscale: ``(B,H,C)`` float32, written with ``exp(2*lp_{L-1})``.
@@ -227,15 +228,24 @@ def chunk_increment_fwd_kernel(
         chunk: ``L``. Compile-time.
         rows: ``P``. Compile-time.
         dim: ``3N``. Compile-time.
+        per_group: ``H // G``, heads sharing one ``b``. Compile-time.
         has_prev: Whether the streaming carry-in was supplied. Compile-time.
 
     Invariants:
         ``chunk`` is a multiple of :data:`MMA_TILE_K` and of ``kblock(chunk)``,
         and ``dim`` is a multiple of :data:`MMA_TILE_N`. ``rows`` is free: M is
         rounded up in shared memory, zero-filled, and the store is predicated.
+        ``per_group`` divides ``H``.
     """
     tid, _, _ = cute.arch.thread_idx()
     cidx, bidx, hidx = cute.arch.block_idx()
+
+    # Only gb and gbprev are grouped; everything else this block reads is per head.
+    # The branch is trace-time, so the ungrouped shape emits no divide at all rather
+    # than an identity one for ptxas to fold.
+    gidx = hidx
+    if cutlass.const_expr(per_group != 1):
+        gidx = hidx // per_group
 
     kblk = kblock(chunk)
     slices = chunk // kblk
@@ -331,7 +341,7 @@ def chunk_increment_fwd_kernel(
             stable,
             swgt,
             bidx,
-            hidx,
+            gidx,
             t0,
             lbase,
             valid,
@@ -354,7 +364,7 @@ def chunk_increment_fwd_kernel(
             stable,
             swgt,
             bidx,
-            hidx,
+            gidx,
             t0,
             lbase,
             valid,
@@ -395,12 +405,14 @@ def chunk_increment_fwd(
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`chunk_increment_fwd_kernel`.
 
-    ``P`` and ``3N`` are compile-time because the accumulator's partition shape
-    is. Batch, head, chunk count, and sequence length are dynamic.
+    ``P``, ``3N``, and ``H // G`` are compile-time because the accumulator's
+    partition shape is and because the group index folds away at ``G == H``. Batch,
+    head, chunk count, and sequence length are dynamic.
     """
     chunk_increment_fwd_kernel(
         gu,
@@ -418,6 +430,7 @@ def chunk_increment_fwd(
         chunk,
         rows,
         dim,
+        per_group,
         has_prev,
     ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
 
@@ -455,11 +468,12 @@ def chunk_increment_forward(
             :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous.
         trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
         K: ``(B,H,T,2,4)`` float32, contiguous. Per-tap ``(kr, g, h, 0)``.
-        B: ``(B,H,T,3N)``, the dtype of ``U``, contiguous.
+        B: ``(B,G,T,3N)``, the dtype of ``U``, contiguous. ``G`` divides ``H``;
+            head ``h`` reads group ``h // (H // G)``.
         chunk_size: ``L``. A multiple of 16.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, the dtype of ``U``. Paired with
             ``b_prev``.
-        b_prev: ``(B,H,3N)`` streaming ``b_{-1}``, the dtype of ``U``.
+        b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, the dtype of ``U``.
 
     Returns:
         A :class:`ChunkIncrement`.
@@ -476,9 +490,9 @@ def chunk_increment_forward(
     check_layout((*activations, *pinned))
     dtype = check_operands(activations)
     check_pinned(pinned)
-    bsz, heads, seqlen, rows, dim = check_shapes(U, trans, K, (B, "B"))
+    bsz, heads, groups, seqlen, rows, dim = check_shapes(U, trans, K, (B, "B"))
     check_extents(chunk_size, dim, kblock(chunk_size))
-    has_prev = check_stream(u_prev, b_prev, (bsz, heads, rows, dim))
+    has_prev = check_stream(u_prev, b_prev, (bsz, heads, groups, rows, dim))
 
     assert_smem_fits(
         f"chunk_increment[L{chunk_size}/P{rows}/3N{dim}]",
@@ -512,6 +526,14 @@ def chunk_increment_forward(
             bsz,
             heads,
         ),
-        (cute_dtype(dtype), THREADS, chunk_size, rows, dim, has_prev),
+        (
+            cute_dtype(dtype),
+            THREADS,
+            chunk_size,
+            rows,
+            dim,
+            heads // groups,
+            has_prev,
+        ),
     )
     return ChunkIncrement(inc=inc, cquat=cquat, cscale=cscale)

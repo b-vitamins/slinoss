@@ -22,6 +22,7 @@ if not torch.cuda.is_available():
 
 from slinoss._cute import executor_count
 from slinoss.ops.so3ssd import SO3SSDResult, resolve, so3ssd, so3ssd_ref
+from slinoss.ops.so3ssd.reference import to_heads
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
@@ -59,12 +60,14 @@ def _make(
     streaming: bool,
     dtype: torch.dtype,
     *,
+    groups: int | None = None,
     requires_grad: bool = False,
 ) -> ScanInputs:
     """One operand set: float32 pinned tensors, ``dtype`` activations."""
     return make_inputs(
         bsz=bsz,
         heads=heads,
+        groups=groups,
         seqlen=seqlen,
         rows=rows,
         lanes=lanes,
@@ -154,6 +157,42 @@ def test_every_field_matches_the_reference(
     # because both are slices of the caller's own tensors.
     assert torch.equal(out.b_last, inp.B[:, :, -1])
     assert torch.equal(out.u_last, inp.U[:, :, -1])
+
+
+def test_a_grouped_call_matches_the_broadcast_ungrouped_call() -> None:
+    """``G < H`` against the same call on ``B`` and ``C`` broadcast to ``H``.
+
+    All three kernels compute the group index from the same compile-time ``H // G``,
+    so the composition is where it is checked once rather than three times. Compared
+    against the ungrouped path, which the case above already holds to float64, and
+    compared bitwise: the two runs issue the same instructions on the same values in
+    the same order, and the only difference is the address each block reads ``b`` and
+    ``c`` from. A tolerance here would admit a wrong group.
+
+    ``G`` does not interact with the shape axes, so one shape is enough. It carries a
+    ragged tail and a streaming carry, which is what makes ``b_prev`` grouped too.
+    """
+    heads, groups, chunk = 4, 2, 64
+    inp = _make(2, heads, 200, 48, 16, True, torch.bfloat16, groups=groups)
+    assert tuple(inp.B.shape[:2]) == (2, groups)
+    # Materialized: at G = 1 the broadcast is a stride-0 view, and the operator
+    # refuses a non-contiguous operand rather than repacking it.
+    wide = inp._replace(
+        B=to_heads(inp.B, heads).contiguous(),
+        C=to_heads(inp.C, heads).contiguous(),
+        b_prev=None if inp.b_prev is None else to_heads(inp.b_prev, heads).contiguous(),
+    )
+    got = so3ssd(*inp.args(), chunk, **inp.kw(), backend="cute")
+    want = so3ssd(*wide.args(), chunk, **wide.kw(), backend="cute")
+    torch.cuda.synchronize()
+
+    assert torch.equal(got.y, want.y)
+    assert torch.equal(got.state, want.state)
+    assert torch.equal(got.u_last, want.u_last)
+    # b_last is a time slice of the grouped B, so it stays grouped.
+    assert torch.equal(to_heads(got.b_last, heads), want.b_last)
+    # A comparison of two all-zero outputs passes whatever the group index does.
+    assert torch.count_nonzero(got.y) > 0
 
 
 def test_the_streaming_split_reproduces_the_whole_sequence() -> None:
