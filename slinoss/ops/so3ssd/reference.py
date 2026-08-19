@@ -77,6 +77,7 @@ __all__ = [
     "quat_prefix_scan_vjp",
     "rot_matrix",
     "rot_matrix_vjp",
+    "series_coeffs",
     "skew",
     "so3ssd_ref",
     "so3ssm",
@@ -105,10 +106,24 @@ __all__ = [
 _SERIES_TERMS = 14
 
 
-def _series_coeffs(offset: int) -> tuple[float, ...]:
+def series_coeffs(offset: int, terms: int = _SERIES_TERMS) -> tuple[float, ...]:
+    """Coefficients of one half-angle series in ``s = |w|^2``.
+
+    Term ``k`` is ``(-1)^k / (4^k (2k + offset)!)``. ``offset = 0`` gives
+    ``cos(|w|/2)``, ``offset = 1`` gives ``sinc(|w|/2)``.
+
+    The device path evaluates the same series at a shorter truncation, so it
+    takes its coefficients from here rather than deriving them again.
+
+    Args:
+        offset: ``0`` for the scalar part, ``1`` for the vector part.
+        terms: How many terms to return. Defaults to the float64 truncation.
+
+    Returns:
+        Coefficients in ascending powers of ``s``.
+    """
     return tuple(
-        (-1.0) ** k / (4.0**k * math.factorial(2 * k + offset))
-        for k in range(_SERIES_TERMS)
+        (-1.0) ** k / (4.0**k * math.factorial(2 * k + offset)) for k in range(terms)
     )
 
 
@@ -116,8 +131,8 @@ def _deriv_coeffs(coeffs: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(k * coeffs[k] for k in range(1, len(coeffs)))
 
 
-_COS_HALF: tuple[float, ...] = _series_coeffs(0)
-_SINC_HALF: tuple[float, ...] = _series_coeffs(1)
+_COS_HALF: tuple[float, ...] = series_coeffs(0)
+_SINC_HALF: tuple[float, ...] = series_coeffs(1)
 _COS_HALF_D: tuple[float, ...] = _deriv_coeffs(_COS_HALF)
 _SINC_HALF_D: tuple[float, ...] = _deriv_coeffs(_SINC_HALF)
 
