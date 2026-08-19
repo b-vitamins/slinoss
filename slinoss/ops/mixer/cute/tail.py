@@ -8,6 +8,16 @@ One kernel and one launch per direction. The skip, the gate, and the norm are on
 pass over the operands: every element is read once and every intermediate stays in
 registers.
 
+Layout. ``y`` and ``u`` are head-major, ``(B,H,T,P)``, and ``gate`` and the output
+are token-major, ``(B,T,H*P)``, with head ``h`` at columns ``h*P`` through
+``(h+1)*P``. So the tail is where the two orders meet, and the conversion is a
+store address rather than a pass: one head at one token is a contiguous run of
+``P`` in both orders, so the warp's segment is one coalesced run either way and the
+only difference is which base it counts from. ``gate`` and the output cotangent are
+column bands of a projection, so both are pitched rather than contiguous; the
+kernels index them through a dynamic layout, which costs nothing, and the band's
+offset and pitch carry the alignment the producer padded them to.
+
 Parallel decomposition. The reduction runs over ``P`` and never crosses the head
 axis, so one ``(b, h, t)`` triple is one independent problem of length ``P``. One
 warp owns one triple: lane ``l`` holds columns ``l``, ``l + 32``, ... and the sum
@@ -73,9 +83,9 @@ from slinoss._cute import (
     smem_bytes,
     widen,
 )
-from slinoss._guard import Named, check_layout
+from slinoss._guard import Named, check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
-from slinoss.ops.mixer.reference import MixerTailGrads
+from slinoss.ops.mixer.reference import MixerTailGrads, tail_shape
 
 __all__ = [
     "ROWS",
@@ -199,10 +209,10 @@ def mixer_tail_fwd_kernel(
     Args:
         gy: ``(B,H,T,P)`` scan output, operand dtype.
         gu: ``(B,H,T,P)`` scan input, operand dtype.
-        ggate: ``(B,H,T,P)`` gate, operand dtype.
+        ggate: ``(B,T,H*P)`` gate, operand dtype, pitched.
         gdskip: ``(H,P)`` skip scale, parameter dtype.
         gweight: ``(H,P)`` norm scale, parameter dtype.
-        gout: ``(B,H,T,P)`` written, operand dtype.
+        gout: ``(B,T,H*P)`` written, operand dtype.
         tokens: ``B*T``. Dynamic.
         seqlen: ``T``, the divisor that splits a flat row index. Dynamic.
         rows: ``P``. Dynamic.
@@ -226,6 +236,8 @@ def mixer_tail_fwd_kernel(
     dst = gout.element_type
     zero = cutlass.Float32(0.0)
     cols = _columns(lane, rows, segments, exact)
+    # This head's band of the token-major operands. Uniform across the block.
+    band = head * rows
 
     for step in cutlass.range_constexpr(ROWS_PER_WARP):
         token = tile * ROWS + step * WARPS + warp
@@ -237,7 +249,7 @@ def mixer_tail_fwd_kernel(
             sumsq = zero
             for j in cutlass.range_constexpr(segments):
                 col, pos, masked = cols[j]
-                gate = widen(ggate[bidx, head, tidx, pos], src)
+                gate = widen(ggate[bidx, tidx, band + pos], src)
                 value = (
                     widen(gy[bidx, head, tidx, pos], src)
                     + widen(gdskip[head, pos], par)
@@ -256,9 +268,9 @@ def mixer_tail_fwd_kernel(
                 out = narrow(held[j] * scale * widen(gweight[head, pos], par), dst)
                 if cutlass.const_expr(masked):
                     if col < rows:
-                        gout[bidx, head, tidx, col] = out
+                        gout[bidx, tidx, band + col] = out
                 else:
-                    gout[bidx, head, tidx, col] = out
+                    gout[bidx, tidx, band + col] = out
 
 
 @cute.jit
@@ -330,15 +342,15 @@ def mixer_tail_bwd_kernel(
     parameters.
 
     Args:
-        gdout: ``(B,H,T,P)`` cotangent of the output, operand dtype.
+        gdout: ``(B,T,H*P)`` cotangent of the output, operand dtype, pitched.
         gy: ``(B,H,T,P)`` scan output, operand dtype.
         gu: ``(B,H,T,P)`` scan input, operand dtype.
-        ggate: ``(B,H,T,P)`` gate, operand dtype.
+        ggate: ``(B,T,H*P)`` gate, operand dtype, pitched.
         gdskip: ``(H,P)`` skip scale, parameter dtype.
         gweight: ``(H,P)`` norm scale, parameter dtype.
         gdy: ``(B,H,T,P)`` written, operand dtype.
         gdu: ``(B,H,T,P)`` written, operand dtype.
-        gdgate: ``(B,H,T,P)`` written, operand dtype.
+        gdgate: ``(B,T,H*P)`` written, operand dtype.
         gpartial: ``(SLOTS,tiles,H,P)`` float32, written with this block's
             contribution to both parameter gradients. Every element is written:
             a block whose rows are all out of range stores its zero
@@ -367,6 +379,8 @@ def mixer_tail_bwd_kernel(
     dst = gdy.element_type
     zero = cutlass.Float32(0.0)
     cols = _columns(lane, rows, segments, exact)
+    # This head's band of the token-major operands. Uniform across the block.
+    band = head * rows
 
     acc_skip: list[Scalar] = [zero] * segments
     acc_weight: list[Scalar] = [zero] * segments
@@ -382,13 +396,13 @@ def mixer_tail_bwd_kernel(
             dot = zero
             for j in cutlass.range_constexpr(segments):
                 col, pos, masked = cols[j]
-                gate = widen(ggate[bidx, head, tidx, pos], src)
+                gate = widen(ggate[bidx, tidx, band + pos], src)
                 sig = sigmoid(gate)
                 act = silu(gate, sig)
                 skip = widen(gdskip[head, pos], par)
                 uval = widen(gu[bidx, head, tidx, pos], src)
                 pre = widen(gy[bidx, head, tidx, pos], src) + skip * uval
-                dout = widen(gdout[bidx, head, tidx, pos], src)
+                dout = widen(gdout[bidx, tidx, band + pos], src)
                 value = pre * act
                 cot = dout * widen(gweight[head, pos], par)
                 if cutlass.const_expr(masked):
@@ -422,11 +436,11 @@ def mixer_tail_bwd_kernel(
                     if col < rows:
                         gdy[bidx, head, tidx, col] = dy
                         gdu[bidx, head, tidx, col] = du
-                        gdgate[bidx, head, tidx, col] = dgate
+                        gdgate[bidx, tidx, band + col] = dgate
                 else:
                     gdy[bidx, head, tidx, col] = dy
                     gdu[bidx, head, tidx, col] = du
-                    gdgate[bidx, head, tidx, col] = dgate
+                    gdgate[bidx, tidx, band + col] = dgate
 
     for j in cutlass.range_constexpr(segments):
         col, _, _ = cols[j]
@@ -563,24 +577,15 @@ def _check_shapes(
 ) -> tuple[int, int, int, int]:
     """The ``(B, H, T, P)`` shape the five operands agree on.
 
+    Delegated to the reference so the two paths refuse the same shapes under the
+    same wording. Only the emptiness check is this path's own: an empty operand has
+    no launchable grid, and the reference has no grid to launch.
+
     Raises:
-        ValueError: On a rank or shape mismatch, or on an empty operand. An
-            empty operand has no launchable grid, so it is refused rather than
-            special-cased.
+        ValueError: On a rank or shape mismatch, or on an empty operand.
     """
-    if y.ndim != 4:
-        raise ValueError(f"y must be (B,H,T,P), got {tuple(y.shape)}")
-    bsz, heads, seqlen, rows = (int(d) for d in y.shape)
-    shape = (bsz, heads, seqlen, rows)
-    for name, tensor in (("u", u), ("gate", gate)):
-        if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
-    for name, tensor in (("d_skip", d_skip), ("weight", weight)):
-        if tuple(tensor.shape) != (heads, rows):
-            raise ValueError(
-                f"{name} must be {(heads, rows)}, got {tuple(tensor.shape)}"
-            )
-    if bsz * heads * seqlen * rows == 0:
+    shape = tail_shape(y, u, gate, d_skip, weight)
+    if shape[0] * shape[1] * shape[2] * shape[3] == 0:
         raise ValueError(f"y must hold at least one element, got {shape}")
     return shape
 
@@ -600,8 +605,9 @@ def _check_operands(
 
     Raises:
         ValueError: On a shape mismatch, an empty operand, a non-positive
-            ``eps``, a non-CUDA or non-contiguous operand, or a ``P`` whose
-            partial tile exceeds the shared-memory capacity.
+            ``eps``, a non-CUDA operand, a head-major operand that is not
+            contiguous, a ``gate`` that is not pitched, or a ``P`` whose partial
+            tile exceeds the shared-memory capacity.
         TypeError: On a dtype with no kernel path, or on a group that does not
             share one dtype.
     """
@@ -609,9 +615,8 @@ def _check_operands(
     _check_eps(eps)
     _check_dtypes(((y, "y"), (u, "u"), (gate, "gate")))
     _check_dtypes(((d_skip, "d_skip"), (weight, "weight")))
-    check_layout(
-        ((y, "y"), (u, "u"), (gate, "gate"), (d_skip, "d_skip"), (weight, "weight"))
-    )
+    check_layout(((y, "y"), (u, "u"), (d_skip, "d_skip"), (weight, "weight")))
+    check_pitched(((gate, "gate"),))
     _budget(_segments(shape[3]))
     return shape
 
@@ -636,23 +641,24 @@ def mixer_tail_forward(
         y: Scan output, ``(B,H,T,P)``, contiguous CUDA, one of
             :data:`slinoss._precision.KERNEL_DTYPES`.
         u: Scan input, ``(B,H,T,P)``, same dtype.
-        gate: Gate, ``(B,H,T,P)``, same dtype.
+        gate: Gate, ``(B,T,H*P)``, same dtype, pitched.
         d_skip: Per-row skip scale, ``(H,P)``, one of :data:`slinoss._precision.KERNEL_DTYPES`.
         weight: Per-row norm scale, ``(H,P)``, same dtype as ``d_skip``.
         eps: Added to the mean square before the reciprocal square root.
 
     Returns:
-        ``(B,H,T,P)`` in the dtype of ``y``.
+        ``(B,T,H*P)``, contiguous, in the dtype of ``y``.
 
     Raises:
         ValueError: On a shape mismatch, an empty operand, a non-positive
-            ``eps``, a non-CUDA or non-contiguous operand, or a ``P`` whose
-            partial tile exceeds the shared-memory capacity.
+            ``eps``, a non-CUDA operand, a head-major operand that is not
+            contiguous, a ``gate`` that is not pitched, or a ``P`` whose partial
+            tile exceeds the shared-memory capacity.
         TypeError: On a dtype with no kernel path, or on a group that does not
             share one dtype.
     """
     bsz, heads, seqlen, rows = _check_operands(y, u, gate, d_skip, weight, eps)
-    out = torch.empty_like(y)
+    out = torch.empty(bsz, seqlen, heads * rows, dtype=y.dtype, device=y.device)
     tokens = bsz * seqlen
     mixer_tail_fwd(
         dev_tensor(y),
@@ -692,11 +698,11 @@ def mixer_tail_backward(
     reduction over that buffer and reads no operand a second time.
 
     Args:
-        dout: Cotangent of the output, ``(B,H,T,P)``, contiguous CUDA, dtype of
+        dout: Cotangent of the output, ``(B,T,H*P)``, CUDA, pitched, dtype of
             ``y``.
         y: The forward's scan output, ``(B,H,T,P)``.
         u: The forward's scan input, ``(B,H,T,P)``.
-        gate: The forward's gate, ``(B,H,T,P)``.
+        gate: The forward's gate, ``(B,T,H*P)``, pitched.
         d_skip: The forward's skip scale, ``(H,P)``.
         weight: The forward's norm scale, ``(H,P)``.
         eps: The epsilon the forward was called with.
@@ -706,22 +712,24 @@ def mixer_tail_backward(
 
     Raises:
         ValueError: On a shape mismatch, an empty operand, a non-positive
-            ``eps``, a non-CUDA or non-contiguous operand, or a ``P`` whose
-            partial tile exceeds the shared-memory capacity.
+            ``eps``, a non-CUDA operand, a head-major operand that is not
+            contiguous, a ``gate`` or ``dout`` that is not pitched, or a ``P``
+            whose partial tile exceeds the shared-memory capacity.
         TypeError: On a dtype with no kernel path, or on a group that does not
             share one dtype.
     """
     bsz, heads, seqlen, rows = _check_operands(y, u, gate, d_skip, weight, eps)
-    if tuple(dout.shape) != (bsz, heads, seqlen, rows):
+    width = heads * rows
+    if tuple(dout.shape) != (bsz, seqlen, width):
         raise ValueError(
-            f"dout must be {(bsz, heads, seqlen, rows)}, got {tuple(dout.shape)}"
+            f"dout must be {(bsz, seqlen, width)}, got {tuple(dout.shape)}"
         )
     _check_dtypes(((y, "y"), (dout, "dout")))
-    check_layout(((dout, "dout"),))
+    check_pitched(((dout, "dout"),))
 
     dy = torch.empty_like(y)
     du = torch.empty_like(y)
-    dgate = torch.empty_like(y)
+    dgate = torch.empty(bsz, seqlen, width, dtype=y.dtype, device=y.device)
     tokens = bsz * seqlen
     tiles = (tokens + ROWS - 1) // ROWS
     # Every element is written by the kernel, so the accumulator is initialized

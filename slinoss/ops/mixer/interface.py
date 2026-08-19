@@ -79,9 +79,9 @@ def mixer_tail(
     """Skip, gate, and per-head RMS norm. The public operator.
 
     Args:
-        y: Scan output, ``(B,H,T,P)``.
-        u: Scan input, ``(B,H,T,P)``.
-        gate: Gate, ``(B,H,T,P)``.
+        y: Scan output, ``(B,H,T,P)``, head-major.
+        u: Scan input, ``(B,H,T,P)``, head-major.
+        gate: Gate, ``(B,T,H*P)``, token-major.
         d_skip: Per-row skip scale, ``(H,P)``.
         weight: Per-row norm scale, ``(H,P)``.
         eps: Added to the mean square before the reciprocal square root.
@@ -89,7 +89,7 @@ def mixer_tail(
             for the device and dtype.
 
     Returns:
-        ``(B,H,T,P)`` in the dtype of ``y``.
+        ``(B,T,H*P)``, token-major, in the dtype of ``y``.
 
     Raises:
         ValueError: On a shape, layout, device, or epsilon violation, or an unusable

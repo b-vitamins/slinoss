@@ -10,6 +10,11 @@ dtypes: the generator consumes a different number of raw words per element at
 each width, so the same seed at two dtypes is two different problems. The cast to
 bfloat16 is exact on the way back up, so the kernel and the oracle see identical
 values at every width.
+
+``gate``, the output, and the output's cotangent are token-major, ``(B,T,H*P)``,
+because in the block they are column bands of one projection. The parity sweep
+builds them contiguous, which is the ``H*P == W`` case; one test builds a real
+band of a wider buffer, which is the case the mixer hands over.
 """
 
 import pytest
@@ -106,7 +111,7 @@ def _operands(
     param = dtype if param_dtype is None else param_dtype
     y = rnd(bsz, heads, seqlen, rows)
     u = rnd(bsz, heads, seqlen, rows)
-    gate = rnd(bsz, heads, seqlen, rows) * 3.0
+    gate = rnd(bsz, seqlen, heads * rows) * 3.0
     d_skip = rnd(heads, rows) * 0.5
     weight = 1.0 + 0.25 * rnd(heads, rows)
     return (
@@ -121,11 +126,28 @@ def _operands(
 def _cotangent(
     bsz: int, heads: int, seqlen: int, rows: int, dtype: torch.dtype, *, seed: int
 ) -> Tensor:
-    """Cotangent of the output, in the dtype the output carries."""
+    """Cotangent of the output, token-major, in the dtype the output carries."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     return torch.randn(
-        bsz, heads, seqlen, rows, generator=gen, dtype=torch.float32, device="cuda"
+        bsz, seqlen, heads * rows, generator=gen, dtype=torch.float32, device="cuda"
     ).to(dtype)
+
+
+def _band(source: Tensor, pad: int) -> Tensor:
+    """``source`` copied into a wider buffer and handed back as a column band.
+
+    ``pad`` columns on each side, so the band is neither at the start of a row nor
+    at the end of one and the pitch exceeds the width in both directions.
+    """
+    wide = torch.empty(
+        *source.shape[:-1],
+        int(source.shape[-1]) + 2 * pad,
+        dtype=source.dtype,
+        device=source.device,
+    )
+    band = wide[..., pad : pad + int(source.shape[-1])]
+    band.copy_(source)
+    return band
 
 
 def _leaves(ops: Operands, *, double: bool) -> Operands:
@@ -186,7 +208,7 @@ def test_forward_matches_reference(
     got = mixer_tail_forward(*ops, eps=EPS)
     torch.cuda.synchronize()
 
-    assert got.shape == (bsz, heads, seqlen, rows)
+    assert got.shape == (bsz, seqlen, heads * rows)
     assert got.dtype is dtype
     assert got.is_contiguous()
     assert_max_rel(
@@ -305,6 +327,32 @@ def test_every_output_element_is_written() -> None:
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+def test_pitched_band_matches_the_contiguous_call(dtype: torch.dtype) -> None:
+    """``gate`` and ``dout`` as column bands of a wider buffer.
+
+    In the block both are slices of one projection output, so a band is the layout
+    the tail actually runs on. The result must be bit-identical to the contiguous
+    call: the pitch changes a load address and nothing else, so a tolerance here
+    would admit a kernel that had quietly repacked.
+    """
+    ops = _operands(2, 3, 40, 64, dtype, seed=19)
+    dout = _cotangent(2, 3, 40, 64, dtype, seed=20)
+    # Eight columns of padding: 32 B at float32 and 16 B at bfloat16, so the band
+    # starts and steps on the 16 B boundary at both widths.
+    banded: Operands = (ops[0], ops[1], _band(ops[2], 8), ops[3], ops[4])
+
+    got = mixer_tail_forward(*banded, eps=EPS)
+    want = mixer_tail_forward(*ops, eps=EPS)
+    got_grads = mixer_tail_backward(_band(dout, 8), *banded, eps=EPS)
+    want_grads = mixer_tail_backward(dout, *ops, eps=EPS)
+    torch.cuda.synchronize()
+
+    assert torch.equal(got, want)
+    for got_grad, want_grad, name in zip(got_grads, want_grads, NAMES, strict=True):
+        assert torch.equal(got_grad, want_grad), name
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
 def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     """The fast forward, backpropagated through, against the float64 reference.
 
@@ -366,6 +414,11 @@ FwdMutator = Callable[[Operands], Operands]
             ValueError,
             r"y must be contiguous",
         ),
+        (
+            lambda o: (*o[:2], _band(o[2], 1), *o[3:]),
+            ValueError,
+            r"gate must start and step on a multiple of",
+        ),
     ],
 )
 def test_forward_rejects(
@@ -374,7 +427,9 @@ def test_forward_rejects(
     """Each guard on the forward's operands, triggered.
 
     ``bsz == heads`` so that a transpose of the leading pair keeps the shape and
-    loses only the layout.
+    loses only the layout. The last row is the one guard the head-major operands
+    do not share: ``gate`` is allowed a pitch but not an unaligned one, which is a
+    producer that handed out a band without padding the column offset.
     """
     with pytest.raises(error, match=match):
         mixer_tail_forward(*mutate(_operands(2, 2, 8, 64, seed=3)), eps=EPS)
@@ -389,9 +444,9 @@ BwdMutator = Callable[[Tensor, Operands], tuple[Tensor, Operands]]
         (lambda d, o: (d[..., :-16], o), ValueError, r"dout must be"),
         (lambda d, o: (d.bfloat16(), o), TypeError, r"dout is"),
         (
-            lambda d, o: (d.transpose(0, 1), o),
+            lambda d, o: (_band(d, 1), o),
             ValueError,
-            r"dout must be contiguous",
+            r"dout must start and step on a multiple of",
         ),
         (
             lambda d, o: (d, (o[0], o[1][..., :-16], *o[2:])),

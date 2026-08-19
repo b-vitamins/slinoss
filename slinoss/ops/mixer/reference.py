@@ -18,6 +18,14 @@ each element once. A reduction over ``d_inner`` would couple every head at every
 token and force either a second pass or a cross-head barrier. Parameter count is
 unchanged: ``weight`` is ``(H,P)``, which is ``d_inner`` scalars.
 
+Layout. ``y`` and ``u`` arrive head-major, ``(B,H,T,P)``, which is what the scan
+and the convolution write. ``gate`` and the output are token-major, ``(B,T,H*P)``,
+which is what the two projections around the tail read and write; head ``h``
+occupies columns ``h*P`` through ``(h+1)*P``, so one head at one token is a
+contiguous run of ``P`` either way. The tail is therefore the only place the two
+orders meet, and it converts between them as part of a pass it already makes. A
+standalone transpose would be a second pass over the largest tensor in the block.
+
 Precision. The sum of squares accumulates in float32, or float64 when any operand
 is float64 so a float64 call is an oracle end to end. The output carries the dtype
 of ``y``.
@@ -33,7 +41,81 @@ from torch.nn.functional import silu
 
 from slinoss._precision import autocast_disabled, check_supported, pinned_dtype
 
-__all__ = ["MixerTailGrads", "mixer_tail_bwd_ref", "mixer_tail_ref"]
+__all__ = [
+    "MixerTailGrads",
+    "as_head_major",
+    "as_token_major",
+    "mixer_tail_bwd_ref",
+    "mixer_tail_ref",
+    "tail_shape",
+]
+
+
+def as_head_major(t: Tensor, heads: int) -> Tensor:
+    """``(B,T,H*P) -> (B,H,T,P)``.
+
+    A view whatever ``t``'s pitch is, because the split of the trailing axis needs
+    only its unit stride.
+
+    Args:
+        t: Token-major tensor, ``(B,T,H*P)``.
+        heads: ``H``.
+
+    Returns:
+        The head-major view.
+    """
+    return t.unflatten(-1, (heads, -1)).permute(0, 2, 1, 3)
+
+
+def as_token_major(t: Tensor) -> Tensor:
+    """``(B,H,T,P) -> (B,T,H*P)``.
+
+    The flatten crosses a permuted pair, so this copies. The kernel does it in
+    store addresses instead.
+
+    Args:
+        t: Head-major tensor, ``(B,H,T,P)``.
+
+    Returns:
+        The token-major tensor.
+    """
+    return t.permute(0, 2, 1, 3).flatten(-2, -1)
+
+
+def tail_shape(
+    y: Tensor, u: Tensor, gate: Tensor, d_skip: Tensor, weight: Tensor
+) -> tuple[int, int, int, int]:
+    """The ``(B,H,T,P)`` the five operands agree on.
+
+    Args:
+        y: Scan output, ``(B,H,T,P)``.
+        u: Scan input, ``(B,H,T,P)``.
+        gate: Gate, ``(B,T,H*P)``.
+        d_skip: Skip scale, ``(H,P)``.
+        weight: Norm scale, ``(H,P)``.
+
+    Returns:
+        ``(B, H, T, P)``.
+
+    Raises:
+        ValueError: On a rank or shape mismatch.
+    """
+    if y.ndim != 4:
+        raise ValueError(f"y must be (B,H,T,P), got {tuple(y.shape)}")
+    bsz, heads, seqlen, rows = (int(d) for d in y.shape)
+    if tuple(u.shape) != (bsz, heads, seqlen, rows):
+        raise ValueError(
+            f"u must be {(bsz, heads, seqlen, rows)}, got {tuple(u.shape)}"
+        )
+    flat = (bsz, seqlen, heads * rows)
+    if tuple(gate.shape) != flat:
+        raise ValueError(f"gate must be {flat}, got {tuple(gate.shape)}")
+    for name, tensor in (("d_skip", d_skip), ("weight", weight)):
+        if tuple(tensor.shape) != (heads, rows):
+            raise ValueError(
+                f"{name} must be {(heads, rows)}, got {tuple(tensor.shape)}"
+            )
+    return bsz, heads, seqlen, rows
 
 
 def mixer_tail_ref(
@@ -50,7 +132,7 @@ def mixer_tail_ref(
     Args:
         y: Scan output, shape ``(B,H,T,P)``.
         u: Scan input, shape ``(B,H,T,P)``. Source of the skip term.
-        gate: Gate, shape ``(B,H,T,P)``.
+        gate: Gate, shape ``(B,T,H*P)``, token-major.
         d_skip: Per-row skip scale, shape ``(H,P)``.
         weight: Per-row norm scale, shape ``(H,P)``.
         eps: Added to the mean square before the reciprocal square root. The
@@ -59,22 +141,13 @@ def mixer_tail_ref(
             division by zero.
 
     Returns:
-        Shape ``(B,H,T,P)``, dtype of ``y``.
+        Shape ``(B,T,H*P)``, token-major, dtype of ``y``.
 
     Raises:
         ValueError: On a rank or shape mismatch, or a non-positive ``eps``.
         TypeError: On an unsupported dtype.
     """
-    if y.ndim != 4:
-        raise ValueError(f"y must be (B,H,T,P), got {tuple(y.shape)}")
-    shape = tuple(int(d) for d in y.shape)
-    for name, tensor in (("u", u), ("gate", gate)):
-        if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
-    rows = (shape[1], shape[3])
-    for name, tensor in (("d_skip", d_skip), ("weight", weight)):
-        if tuple(tensor.shape) != rows:
-            raise ValueError(f"{name} must be {rows}, got {tuple(tensor.shape)}")
+    _, heads, _, _ = tail_shape(y, u, gate, d_skip, weight)
     if eps <= 0.0:
         raise ValueError(f"eps must be positive, got {eps}")
     for name, tensor in (
@@ -90,9 +163,10 @@ def mixer_tail_ref(
     with autocast_disabled(y.device.type):
         # (H,P) broadcasts against (B,H,T,P) once the token axis is inserted.
         x = y.to(dtype) + d_skip.to(dtype)[:, None, :] * u.to(dtype)
-        x = x * silu(gate.to(dtype))
+        x = x * silu(as_head_major(gate.to(dtype), heads))
         scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
-        return (x * scale * weight.to(dtype)[:, None, :]).to(y.dtype)
+        out = x * scale * weight.to(dtype)[:, None, :]
+        return as_token_major(out).to(y.dtype)
 
 
 class MixerTailGrads(NamedTuple):
@@ -101,7 +175,7 @@ class MixerTailGrads(NamedTuple):
     Attributes:
         dy: ``(B,H,T,P)``, dtype of ``y``.
         du: ``(B,H,T,P)``, dtype of ``u``.
-        dgate: ``(B,H,T,P)``, dtype of ``gate``.
+        dgate: ``(B,T,H*P)``, dtype of ``gate``.
         dd_skip: ``(H,P)``, dtype of ``d_skip``.
         dweight: ``(H,P)``, dtype of ``weight``.
     """
@@ -132,10 +206,10 @@ def mixer_tail_bwd_ref(
     measured against.
 
     Args:
-        dout: Cotangent of the output, shape ``(B,H,T,P)``.
+        dout: Cotangent of the output, shape ``(B,T,H*P)``.
         y: The forward's scan output, shape ``(B,H,T,P)``.
         u: The forward's scan input, shape ``(B,H,T,P)``.
-        gate: The forward's gate, shape ``(B,H,T,P)``.
+        gate: The forward's gate, shape ``(B,T,H*P)``.
         d_skip: The forward's skip scale, shape ``(H,P)``.
         weight: The forward's norm scale, shape ``(H,P)``.
         eps: The forward's epsilon.
@@ -147,8 +221,10 @@ def mixer_tail_bwd_ref(
         ValueError: On a rank or shape mismatch, or a non-positive ``eps``.
         TypeError: On an unsupported dtype.
     """
-    if tuple(dout.shape) != tuple(y.shape):
-        raise ValueError(f"dout must be {tuple(y.shape)}, got {tuple(dout.shape)}")
+    bsz, heads, seqlen, rows = tail_shape(y, u, gate, d_skip, weight)
+    want = (bsz, seqlen, heads * rows)
+    if tuple(dout.shape) != want:
+        raise ValueError(f"dout must be {want}, got {tuple(dout.shape)}")
 
     leaves = tuple(
         tensor.detach().requires_grad_(True) for tensor in (y, u, gate, d_skip, weight)

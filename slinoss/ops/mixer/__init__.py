@@ -13,8 +13,11 @@ from slinoss.ops.mixer.backends import (
 from slinoss.ops.mixer.interface import MixerTailFunction, mixer_tail
 from slinoss.ops.mixer.reference import (
     MixerTailGrads,
+    as_head_major,
+    as_token_major,
     mixer_tail_bwd_ref,
     mixer_tail_ref,
+    tail_shape,
 )
 
 __all__ = [
@@ -24,6 +27,8 @@ __all__ = [
     "MixerForward",
     "MixerTailFunction",
     "MixerTailGrads",
+    "as_head_major",
+    "as_token_major",
     "get",
     "mixer_tail",
     "mixer_tail_bwd_ref",
@@ -31,4 +36,5 @@ __all__ = [
     "names",
     "register",
     "resolve",
+    "tail_shape",
 ]

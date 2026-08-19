@@ -4,16 +4,27 @@ The reference is the authority, so it cannot be checked against a faster path.
 It is checked against properties that pin it uniquely instead: scale invariance
 of the norm, the two limits of the gate, exactness of the skip, and float64
 autograd.
+
+The tail is also the boundary between the head-major side and the token-major
+side, so the two conversions are written out here rather than imported from the
+reference. Importing them would compare the reference against itself.
 """
 
 import math
 
 import pytest
 import torch
+from torch import Tensor
 from torch.autograd import gradcheck
 from torch.nn.functional import silu
 
-from slinoss.ops.mixer import mixer_tail, mixer_tail_bwd_ref, mixer_tail_ref
+from slinoss.ops.mixer import (
+    as_head_major,
+    as_token_major,
+    mixer_tail,
+    mixer_tail_bwd_ref,
+    mixer_tail_ref,
+)
 
 EPS = 1e-5
 
@@ -26,6 +37,16 @@ SHAPES = [
 ]
 
 
+def _head_major(t: Tensor, heads: int) -> Tensor:
+    """``(B,T,H*P) -> (B,H,T,P)``."""
+    return t.unflatten(-1, (heads, -1)).permute(0, 2, 1, 3)
+
+
+def _token_major(t: Tensor) -> Tensor:
+    """``(B,H,T,P) -> (B,T,H*P)``."""
+    return t.permute(0, 2, 1, 3).flatten(-2, -1)
+
+
 def _operands(
     bsz: int,
     heads: int,
@@ -35,7 +56,11 @@ def _operands(
     dtype: torch.dtype = torch.float64,
     seed: int = 0,
 ) -> tuple[torch.Tensor, ...]:
-    """Five operands of the tail. One generator call per tensor, one dtype."""
+    """Five operands of the tail. One generator call per tensor, one dtype.
+
+    ``gate`` is token-major, ``(B,T,H*P)``, like the projection column band it is
+    a slice of. Everything else is head-major.
+    """
     gen = torch.Generator().manual_seed(seed)
 
     def rnd(*shape: int) -> torch.Tensor:
@@ -44,7 +69,7 @@ def _operands(
     return (
         rnd(bsz, heads, seqlen, rows),
         rnd(bsz, heads, seqlen, rows),
-        rnd(bsz, heads, seqlen, rows),
+        rnd(bsz, seqlen, heads * rows),
         rnd(heads, rows),
         rnd(heads, rows),
     )
@@ -54,26 +79,31 @@ def _operands(
 def test_matches_the_written_composition(
     bsz: int, heads: int, seqlen: int, rows: int
 ) -> None:
-    """The output is the skip, the gate, and the per-head norm, in that order."""
+    """The output is the skip, the gate, and the per-head norm, in that order.
+
+    The expectation is written head-major and converted at the end, which also
+    pins the output order: head ``h`` lands at columns ``h*P`` through
+    ``(h+1)*P``.
+    """
     y, u, gate, d_skip, weight = _operands(bsz, heads, seqlen, rows)
     got = mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS)
 
     x = y + d_skip[:, None, :] * u
-    x = x * silu(gate)
+    x = x * silu(_head_major(gate, heads))
     want = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS) * weight[:, None, :]
-    assert torch.allclose(got, want, rtol=0.0, atol=1e-15)
+    assert torch.allclose(got, _token_major(want), rtol=0.0, atol=1e-15)
 
 
 def test_reduction_does_not_cross_the_head_axis() -> None:
-    """Perturbing one head leaves every other head bit-identical.
+    """Perturbing one head leaves every other head's column band bit-identical.
 
     This is the property the fused kernel's rowwise structure depends on. A
     reduction over ``d_inner`` would fail it.
     """
     y, u, gate, d_skip, weight = _operands(2, 3, 4, 8)
-    base = mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS)
+    base = _head_major(mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS), 3)
     y[:, 1] += 1.0
-    bumped = mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS)
+    bumped = _head_major(mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS), 3)
     assert torch.equal(base[:, 0], bumped[:, 0])
     assert torch.equal(base[:, 2], bumped[:, 2])
     assert not torch.equal(base[:, 1], bumped[:, 1])
@@ -86,8 +116,8 @@ def test_norm_is_scale_invariant_up_to_eps() -> None:
     applied to ``y`` and ``u`` together with ``d_skip`` left alone and the gate
     frozen at a constant, which makes the pre-norm value exactly proportional.
     """
-    y, u, _, d_skip, weight = _operands(2, 2, 3, 8)
-    gate = torch.full_like(y, 4.0)
+    y, u, shaped, d_skip, weight = _operands(2, 2, 3, 8)
+    gate = torch.full_like(shaped, 4.0)
     small = mixer_tail_ref(y, u, gate, d_skip, weight, eps=1e-30)
     large = mixer_tail_ref(8.0 * y, 8.0 * u, gate, d_skip, weight, eps=1e-30)
     assert torch.allclose(small, large, rtol=1e-12, atol=1e-12)
@@ -100,8 +130,10 @@ def test_closed_gate_kills_the_row() -> None:
     gated value is an exact zero rather than a small one, and the norm cannot
     resurrect it.
     """
-    y, u, _, d_skip, weight = _operands(2, 2, 3, 8)
-    dead = mixer_tail_ref(y, u, torch.full_like(y, -800.0), d_skip, weight, eps=EPS)
+    y, u, shaped, d_skip, weight = _operands(2, 2, 3, 8)
+    dead = mixer_tail_ref(
+        y, u, torch.full_like(shaped, -800.0), d_skip, weight, eps=EPS
+    )
     assert torch.equal(dead, torch.zeros_like(dead))
 
 
@@ -110,11 +142,11 @@ def test_skip_is_the_only_path_when_y_is_zero() -> None:
     _, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
     y = torch.zeros_like(u)
     got = mixer_tail_ref(y, u, gate, d_skip, weight, eps=1e-30)
-    x = d_skip[:, None, :] * u * silu(gate)
+    x = d_skip[:, None, :] * u * silu(_head_major(gate, 2))
     want = (
         x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-30) * weight[:, None, :]
     )
-    assert torch.allclose(got, want, rtol=1e-12, atol=1e-12)
+    assert torch.allclose(got, _token_major(want), rtol=1e-12, atol=1e-12)
 
 
 def test_zero_row_is_finite() -> None:
@@ -168,7 +200,7 @@ def test_reduction_is_wider_than_the_operands(dtype: torch.dtype) -> None:
     )
 
     narrow = (y.to(dtype) + d_skip.to(dtype)[:, None, :] * u.to(dtype)) * silu(
-        gate.to(dtype)
+        _head_major(gate.to(dtype), 2)
     )
     narrow = (
         narrow
@@ -176,7 +208,24 @@ def test_reduction_is_wider_than_the_operands(dtype: torch.dtype) -> None:
         * weight.to(dtype)[:, None, :]
     )
 
-    assert (got.float() - oracle).abs().max() < (narrow.float() - oracle).abs().max()
+    assert (got.float() - oracle).abs().max() < (
+        _token_major(narrow).float() - oracle
+    ).abs().max()
+
+
+def test_layout_helpers_are_mutual_inverses_and_the_forward_one_is_a_view() -> None:
+    """``as_head_major`` and ``as_token_major`` agree with the written reshape.
+
+    Both are public, because the mixer's projection has to hand out column bands
+    under the same convention the tail reads them under. ``as_head_major`` must be
+    a view: it is applied to a band of the projection output on the hot path, and
+    a copy there is a second pass over the largest tensor in the block.
+    """
+    gate = _operands(2, 3, 5, 8)[2]
+    head_major = as_head_major(gate, 3)
+    assert torch.equal(head_major, _head_major(gate, 3))
+    assert head_major.untyped_storage().data_ptr() == gate.untyped_storage().data_ptr()
+    assert torch.equal(as_token_major(head_major), gate)
 
 
 def test_float64_in_float64_out() -> None:
@@ -258,7 +307,8 @@ def test_reference_backward_matches_autograd_through_the_public_operator() -> No
     is the reference in both arms, so any difference is dispatch.
     """
     operands = _operands(2, 3, 5, 8)
-    dout = _operands(2, 3, 5, 8, seed=7)[0]
+    # Index 2 is the gate, which carries the output's shape.
+    dout = _operands(2, 3, 5, 8, seed=7)[2]
 
     leaves = tuple(t.detach().clone().requires_grad_(True) for t in operands)
     mixer_tail(*leaves, eps=EPS, backend="reference").mul(dout).sum().backward()
@@ -275,4 +325,4 @@ def test_reference_backward_rejects_a_mismatched_cotangent() -> None:
     """The cotangent shape is the output shape; a broadcastable one is a bug."""
     y, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
     with pytest.raises(ValueError, match="dout must be"):
-        mixer_tail_bwd_ref(y[:, :, :-1], y, u, gate, d_skip, weight, eps=EPS)
+        mixer_tail_bwd_ref(gate[:, :, :-1], y, u, gate, d_skip, weight, eps=EPS)
