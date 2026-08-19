@@ -22,26 +22,44 @@ shared memory and no barrier.
 ``P*N`` is a multiple of their product and therefore of the block width. The
 launch is exact: no tail tile, no bounds predicate, no padding path.
 
-``zstart`` is written in place over ``inc``. Each thread reads ``inc_c`` into
-registers before storing ``zstart_c``, so the alias is safe, and the operator
-carries one ``(B,H,C,P,3N)`` buffer instead of two.
+``zstart`` is written in place over ``inc``. The launch is a bijection from threads
+onto 3-vectors, so only the thread that owns a 3-vector ever touches its three
+elements and the alias is entirely intra-thread. The operator carries one
+``(B,H,C,P,3N)`` buffer instead of two.
+
+The chunk loop is a one-deep software pipeline: chunk ``c+1`` is fetched, then
+chunk ``c`` is stored, then chunk ``c`` is transformed. That order is required
+rather than incidental. A load of ``ginc`` may alias the store that overwrites it,
+so no compiler will lift the fetch above a preceding store to the same tensor, and
+a fetch emitted after the store is pinned behind an aliasing write: one full round
+trip per chunk with nothing to overlap it. Fetching first hides that round trip
+behind the previous chunk's rotation. The prefetch index is clamped to the last
+chunk rather than branched, so the tail re-reads one chunk whose value is never
+consumed; a value carried out of a dynamic branch has no phi node here.
+
+Depth one is the whole gain. Depth two and depth three were measured at the
+standard shape and moved the kernel by 0.08%, inside the run-to-run spread, while
+raising the register count from 48 to 62.
 
 ``R(Q_c)`` is rebuilt by every thread on every chunk rather than staged once. That
 buys a dynamic chunk count, so no recompile per sequence length. Measured cost:
-``sm__throughput`` is 2.10% of peak against ``dram__throughput`` at 10.68%, so the
+``sm__throughput`` is 13.63% of peak against ``dram__throughput`` at 84.23%, so the
 redundant arithmetic is not what bounds the kernel.
 
-SERIAL-tiny, not DRAM-bound. The chunk recurrence is the one provably serial step
-in the operator: chunk ``c+1`` cannot start before ``c`` finishes, so the kernel is
-latency bound on that chain and cannot reach a bandwidth fraction. Measured at
-10.68% of peak DRAM and 2.10% of peak SM, which is neither of the other two
-classes. Held instead to the serial budget: under 2% of step time, asserted from
-the committed step-time artifact rather than from this docstring.
+DRAM-bound at the standard shape: 603.728 GB/s against a measured achievable
+680.452 GB/s, which is 88.7% of ceiling. The recurrence is still the one serial
+step in the operator, but the serial chain is the rotation, not the fetch, so the
+kernel reaches a bandwidth fraction rather than a latency floor.
+``long_scoreboard`` remains the dominant stall reason at 88.90%; at 84.23% of peak
+DRAM throughput that is warps waiting on a saturated bus, not on an idle one. The
+class is asserted for shapes whose grid covers the device; a shape with too few
+blocks to fill it is SERIAL-tiny instead, and which shapes fall on which side is
+not yet measured.
 
 The grid is ``(P*N/threads, B, H)``. That is under twice the SM count only when
-``B*H`` is small; the kernel is exempt from the block-count rule as the documented
-serial step, and widening it is not available, because the parallelism is exactly
-``B*H*P*N`` independent 3-vectors and no more.
+``B*H`` is small, and widening it is not available, because the parallelism is
+exactly ``B*H*P*N`` independent 3-vectors and no more. Achieved occupancy is
+therefore capped by the launch, not by the register count.
 """
 
 from typing import NamedTuple
@@ -107,29 +125,45 @@ def state_passing_fwd_kernel(
         )
     sx, sy, sz = state
 
+    last = chunks - 1
+    incx = ginc[bidx, hidx, 0, base]
+    incy = ginc[bidx, hidx, 0, base + 1]
+    incz = ginc[bidx, hidx, 0, base + 2]
+    qw = gcquat[bidx, hidx, 0, 0]
+    qx = gcquat[bidx, hidx, 0, 1]
+    qy = gcquat[bidx, hidx, 0, 2]
+    qz = gcquat[bidx, hidx, 0, 3]
+    decayed = gcscale[bidx, hidx, 0]
+
     for c in cutlass.range(chunks):
-        incx = ginc[bidx, hidx, c, base]
-        incy = ginc[bidx, hidx, c, base + 1]
-        incz = ginc[bidx, hidx, c, base + 2]
+        # The fetch precedes the store because the store aliases it. Reversed,
+        # the load is pinned behind an aliasing write and the pipeline collapses
+        # to one round trip per chunk. The index is clamped, not branched: no phi
+        # node out of a dynamic branch, and the tail re-read is never consumed.
+        nxt = cutlass.min(c + 1, last)
+        pincx = ginc[bidx, hidx, nxt, base]
+        pincy = ginc[bidx, hidx, nxt, base + 1]
+        pincz = ginc[bidx, hidx, nxt, base + 2]
+        pqw = gcquat[bidx, hidx, nxt, 0]
+        pqx = gcquat[bidx, hidx, nxt, 1]
+        pqy = gcquat[bidx, hidx, nxt, 2]
+        pqz = gcquat[bidx, hidx, nxt, 3]
+        pdecayed = gcscale[bidx, hidx, nxt]
+
         ginc[bidx, hidx, c, base] = sx
         ginc[bidx, hidx, c, base + 1] = sy
         ginc[bidx, hidx, c, base + 2] = sz
         # The scale multiplies the state alone, then the sum is rotated once. The
         # local increment is already in the chunk-local frame, so it shares the
         # rotation rather than needing its own.
-        decayed = gcscale[bidx, hidx, c]
-        moved = mat3_matvec(
-            rot_hom(
-                (
-                    gcquat[bidx, hidx, c, 0],
-                    gcquat[bidx, hidx, c, 1],
-                    gcquat[bidx, hidx, c, 2],
-                    gcquat[bidx, hidx, c, 3],
-                )
-            ),
+        sx, sy, sz = mat3_matvec(
+            rot_hom((qw, qx, qy, qz)),
             (decayed * sx + incx, decayed * sy + incy, decayed * sz + incz),
         )
-        sx, sy, sz = moved
+
+        incx, incy, incz = pincx, pincy, pincz
+        qw, qx, qy, qz = pqw, pqx, pqy, pqz
+        decayed = pdecayed
 
     gstate[bidx, hidx, base] = sx
     gstate[bidx, hidx, base + 1] = sy
