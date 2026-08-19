@@ -49,7 +49,7 @@ flop/byte against a ridge point of 165: memory bound by a factor of seven, which
 is why the padded M mode costs nothing measurable. Measured DRAM traffic on sm_86
 is 37.4 MB per launch, so there is no redundant traffic to remove and the achieved
 fraction is set by how much of the pipe the resident blocks keep busy, which is
-what :data:`KBLOCK_MAX` bounds.
+what :func:`kblock` sizes the slice for.
 
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so both tap matrices are zero past ``valid`` and every
@@ -75,6 +75,7 @@ from slinoss._cute import (
     decay,
     jit_launch,
     smem_bytes,
+    smem_capacity,
 )
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AN,
@@ -96,6 +97,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
+    MMA_TILE_K,
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
@@ -116,6 +118,7 @@ from slinoss.ops.so3ssd.cute.table import (
 
 __all__ = [
     "KBLOCK_MAX",
+    "TARGET_BLOCKS",
     "ChunkIncrement",
     "chunk_increment_forward",
     "chunk_increment_fwd",
@@ -127,31 +130,23 @@ __all__ = [
 ]
 
 KBLOCK_MAX: int = 32
-"""Longest K slice. The two operand tiles are the only per-slice allocations, so
-this constant sets the block's shared total, and that total sets how many blocks
-an SM holds.
+"""Longest K slice, whatever the budget allows.
 
 At 32 the ``standard`` shape allocates 17,552 B and sm_86 holds four blocks where
 64 held three: 33.33% theoretical occupancy against 25.00%, and 62.6 us per launch
 against 67.2, which is what carries the kernel past the 85% DRAM-bound gate there.
-Four blocks need at most 25,344 B of the 101,376 B carveout and at most 128
-registers per thread, against 17,552 B and 114 measured, so a further shared tile
-or a register spill is what would cost the next residency step, not this constant.
+Past 32 the wider slice buys nothing back: the staging pass it saves is shared
+loads, and the residency it costs is the whole gain above.
 
 Every legal chunk length is a power of two, so this divides it exactly: one slice
 at 16 and 32, two at 64, four at 128."""
 
+TARGET_BLOCKS: int = 4
+"""Resident blocks per SM :func:`kblock` sizes the slice for.
 
-def kblock(chunk: int) -> int:
-    """K extent of one slice.
-
-    Args:
-        chunk: ``L``.
-
-    Returns:
-        ``min(L, KBLOCK_MAX)``.
-    """
-    return min(chunk, KBLOCK_MAX)
+Four, because the register file is what stops the next step: ``N`` blocks of
+:data:`THREADS` threads cap each thread at ``65536 / (N * THREADS)``, so four
+allows 128 against the 114 this body measures, and five allows 102 and spills."""
 
 
 def input_tile(kblk: int, rows: int) -> Tile:
@@ -178,7 +173,41 @@ def forced_tile(kblk: int, dim: int) -> Tile:
     return operand_tile(kblk, dim)
 
 
-def increment_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
+def kblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
+    """K extent of one slice.
+
+    The widest slice at or below :data:`KBLOCK_MAX` whose block fits
+    :data:`TARGET_BLOCKS` times in the device's shared-memory carveout. The two
+    operand tiles are the only per-slice allocations, so the slice width is the one
+    lever on the block's total, and that total is what sets residency.
+
+    Halving it costs one more pass over the same shared staging and one more ``u``
+    overlap row per slice. At ``long`` that trade is 26,768 B and three blocks
+    against 22,672 B and four, for 0.8% more global traffic.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        dim: ``3N``.
+        itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+
+    Returns:
+        A power-of-two divisor of ``chunk``, at or above :data:`MMA_TILE_K` and at
+        or below :data:`KBLOCK_MAX`. The floor binds before the budget does when no
+        legal slice fits, and :func:`chunk_increment_forward` raises there.
+    """
+    budget = smem_capacity() // TARGET_BLOCKS
+    kblk = min(chunk, KBLOCK_MAX)
+    while kblk > MMA_TILE_K:
+        if increment_smem_bytes(chunk, rows, dim, itemsize, kblk=kblk) <= budget:
+            break
+        kblk //= 2
+    return kblk
+
+
+def increment_smem_bytes(
+    chunk: int, rows: int, dim: int, itemsize: int = 2, *, kblk: int | None = None
+) -> int:
     """Shared memory the kernel allocates, in bytes.
 
     The same tiles :func:`chunk_increment_fwd_kernel` allocates, in the same
@@ -189,8 +218,11 @@ def increment_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> 
         rows: ``P``.
         dim: ``3N``.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+        kblk: K extent of the slice. Defaults to :func:`kblock`, which passes it
+            explicitly to ask what a candidate would cost.
     """
-    kblk = kblock(chunk)
+    if kblk is None:
+        kblk = kblock(chunk, rows, dim, itemsize)
     return smem_bytes(
         [
             (trans_tile(chunk), 4),
@@ -256,7 +288,7 @@ def chunk_increment_fwd_kernel(
         has_prev: Whether the streaming carry-in was supplied. Compile-time.
 
     Invariants:
-        ``chunk`` is a multiple of :data:`MMA_TILE_K` and of ``kblock(chunk)``,
+        ``chunk`` is a multiple of :data:`MMA_TILE_K` and of :func:`kblock`,
         and ``dim`` is a multiple of :data:`MMA_TILE_N`. ``rows`` is free: M is
         rounded up in shared memory, zero-filled, and the store is predicated.
         ``per_group`` divides ``H``.
@@ -271,7 +303,7 @@ def chunk_increment_fwd_kernel(
     if cutlass.const_expr(per_group != 1):
         gidx = hidx // per_group
 
-    kblk = kblock(chunk)
+    kblk = kblock(chunk, rows, dim, gu.element_type.width // 8)
     slices = chunk // kblk
     lanes = dim // 3
     mpad = mma_rows(rows)
@@ -555,7 +587,7 @@ def chunk_increment_forward(
     dtype = check_operands(activations)
     check_pinned(pinned)
     bsz, heads, groups, seqlen, rows, dim = check_shapes(U, trans, K, (B, "B"))
-    check_extents(chunk_size, dim, kblock(chunk_size))
+    check_extents(chunk_size, dim, kblock(chunk_size, rows, dim, U.element_size()))
     has_prev = check_stream(u_prev, b_prev, (bsz, heads, groups, rows, dim))
 
     assert_smem_fits(

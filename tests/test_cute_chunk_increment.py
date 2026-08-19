@@ -26,8 +26,10 @@ from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import (
     KBLOCK_MAX,
+    TARGET_BLOCKS,
     chunk_increment_forward,
     increment_smem_bytes,
+    kblock,
 )
 from tests.conftest import (
     ScanInputs,
@@ -49,8 +51,8 @@ LS_BIAS = -4.0
 # One case per distinct path through this kernel:
 #
 # - the K slice count, which is the only loop whose trip count changes what is
-#   staged. One slice at ``L == KBLOCK_MAX`` and four at ``MAX_CHUNK``, written
-#   against the constant so the two trip counts stay covered if it is retuned;
+#   staged. One slice at ``L == KBLOCK_MAX`` against several at ``MAX_CHUNK``,
+#   written against the constants so both stay covered if the slice is retuned;
 # - a ragged tail, where the pad tap must zero the operand rather than the
 #   predicate skipping a store;
 # - the streaming split, which is the only way the previous tap reaches a token
@@ -183,16 +185,33 @@ def test_previous_tap_reads_across_the_chunk_boundary() -> None:
 def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     """The budget is computed from the layouts, not from a guard constant.
 
-    The widest legal tiles are the binding case: ``MAX_CHUNK`` doubles every
-    per-token tile and is the only shape that can overflow the carveout.
+    Residency is what keeps the DRAM pipe fed, and shared memory is what bounds it:
+    measured on sm_86, one resident block per SM less costs the increment 5 us of 62
+    at the standard shape. So the budget is held to :data:`TARGET_BLOCKS`, not to
+    the capacity, at every shape and not only at the widest.
     """
-    nbytes = increment_smem_bytes(MAX_CHUNK, 64, 96)
-    assert nbytes <= smem_capacity()
-    # Residency is what keeps the DRAM pipe fed, and shared memory is what bounds
-    # it: measured on sm_86, one resident block per SM less costs the increment 5 us
-    # of 62 at the standard shape. Three at the widest shape is what the tiles buy.
-    assert 3 * nbytes <= smem_capacity()
-    assert increment_smem_bytes(64, 16, 48) < nbytes
+    for chunk in (KBLOCK_MAX, MAX_CHUNK):
+        for rows, dim in ((16, 48), (48, 48), (64, 96)):
+            nbytes = increment_smem_bytes(chunk, rows, dim)
+            assert TARGET_BLOCKS * nbytes <= smem_capacity(), (chunk, rows, dim)
+    assert increment_smem_bytes(64, 16, 48) < increment_smem_bytes(MAX_CHUNK, 64, 96)
+
+
+def test_slice_narrows_only_when_the_widest_one_would_cost_a_block() -> None:
+    """``kblock`` trades slice width for residency, and only when it has to.
+
+    Both directions matter. A search that always returned :data:`KBLOCK_MAX` would
+    pass every budget assertion above at the shapes where it happens to fit, and one
+    that always narrowed would pay the extra staging pass for nothing.
+    """
+    budget = smem_capacity() // TARGET_BLOCKS
+    wide = increment_smem_bytes(MAX_CHUNK, 64, 96, kblk=min(MAX_CHUNK, KBLOCK_MAX))
+    assert wide > budget
+    assert kblock(MAX_CHUNK, 64, 96) < KBLOCK_MAX
+
+    narrow_shape = increment_smem_bytes(64, 16, 48, kblk=KBLOCK_MAX)
+    assert narrow_shape <= budget
+    assert kblock(64, 16, 48) == KBLOCK_MAX
 
 
 def test_reads_a_band_of_the_fused_projection() -> None:
