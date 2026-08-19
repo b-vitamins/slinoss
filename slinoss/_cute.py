@@ -102,12 +102,14 @@ def cute_dtype(dtype: torch.dtype) -> type:
 
 
 def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
-    """Wrap a contiguous torch tensor for a kernel launch.
+    """Wrap a torch tensor for a kernel launch.
 
     Only the trailing mode is declared contiguous; every other stride stays
-    dynamic, so one compiled kernel serves every batch, head, and chunk count.
-    Every tensor contract in this repo is time-major and contiguous, so the
-    16-byte alignment claim holds for any allocation torch returns.
+    dynamic, so one compiled kernel serves every batch, head, and chunk count, and
+    a band of the mixer's fused projection needs no kernel change to read at its
+    own pitch. The 16-byte alignment claim is what a caller owes:
+    :func:`slinoss._guard.check_pitched` is the rule, and it is checked on the
+    host for every operand that arrives pitched.
 
     The detach is not optional. ``from_dlpack`` refuses a tensor that requires
     grad, and inside a :class:`torch.autograd.Function` the saved operands still
@@ -121,7 +123,8 @@ def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
     directly.
 
     Args:
-        tensor: A contiguous CUDA tensor.
+        tensor: A CUDA tensor with unit stride on its trailing axis, aligned to 16
+            bytes at its base and on every other stride.
 
     Returns:
         The CuTe view of it, valid for as long as ``tensor`` is.

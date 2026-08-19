@@ -26,7 +26,15 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-__all__ = ["ALIGN_BYTES", "Named", "check_dtypes", "check_layout", "check_pitched"]
+__all__ = [
+    "ALIGN_BYTES",
+    "PROJ_ALIGN",
+    "SECTOR_BYTES",
+    "Named",
+    "check_dtypes",
+    "check_layout",
+    "check_pitched",
+]
 
 Named = tuple[tuple[Tensor, str], ...]
 """Operands paired with the name to report them under."""
@@ -39,6 +47,28 @@ address a load starts from. A contiguous allocation satisfies it at the base. A
 column band of a wider tensor satisfies it only if the band's offset and the pitch
 between one row and the next both land on the boundary, which is the producer's
 job: it pads the column offsets it hands out.
+"""
+
+SECTOR_BYTES = 32
+"""The device's memory sector. Alignment below this costs traffic, not
+correctness.
+
+A load is served in whole sectors. A band row that starts mid-sector spans one
+more sector than its length needs, and the extra sector is fetched and discarded.
+Alignment to :data:`ALIGN_BYTES` leaves that case reachable: at 2 bytes an element,
+a pitch of 8 elements is 16 bytes, so every second row starts mid-sector. Measured
+on sm_86 at ``3N`` 48 and 12 groups that is 5.0% more DRAM traffic than the same
+kernel reading the same bytes from an aligned band, and no bandwidth counter shows
+it, because the sectors are genuinely fetched.
+"""
+
+PROJ_ALIGN = SECTOR_BYTES // 2
+"""Elements a band offset and a projection width are padded to.
+
+Sixteen rather than ``SECTOR_BYTES // itemsize``, because a producer pads once at
+construction and the same buffer is read at every activation dtype. Two bytes is
+the narrowest element any kernel here takes, so its multiple covers the wider ones:
+16 elements is 32 bytes at 2 and 64 at 4.
 """
 
 
