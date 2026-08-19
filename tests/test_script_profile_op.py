@@ -78,16 +78,19 @@ The spill pass is not optional, because the spill rule fails a kernel whatever i
 percentage and a pass never run must not read as clean."""
 
 TABLE_NAMES = tuple(table.name for table in PASS_TABLES)
-FAKE_SUM_US = 2.0
+FAKE_SUM_US = 12.0
 """Fabricated profiler total, in microseconds. Far below any real CPU wall, so
 the event-covers-device check has room on every host."""
 
-FLOOR_READ_BYTES = 1 << 20
-FLOOR_WRITE_BYTES = 1 << 19
+FLOOR_READ_BYTES = 6 << 20
+FLOOR_WRITE_BYTES = 2 << 20
 FLOOR_MOVED_BYTES = FLOOR_READ_BYTES + FLOOR_WRITE_BYTES
 """DRAM traffic the fabricated kernel moves, read plus write. Over
-:data:`FAKE_SUM_US` this is 786.432 GB/s, so the record is one rate rather than a
-duration and a byte count that contradict each other."""
+:data:`FAKE_SUM_US` this is 699.05 GB/s, so the record is one rate rather than a
+duration and a byte count that contradict each other.
+
+Above the fabricated L2 as well, which is what makes the kernel judgeable at all: a
+launch whose traffic fits in cache gets no bandwidth verdict."""
 
 FLOOR_FIXED_US = 0.16
 """Fabricated size-independent term of the time law. Nonzero, because the verdict
@@ -237,22 +240,27 @@ def trace_record(*, kernel_sum_us: float = FAKE_SUM_US) -> NsysTrace:
 
 
 def counter_record(
-    *, duration_us: float = FAKE_SUM_US, kernel: str = OWNED
+    *,
+    duration_us: float = FAKE_SUM_US,
+    kernel: str = OWNED,
+    read_bytes: int = FLOOR_READ_BYTES,
+    write_bytes: int = FLOOR_WRITE_BYTES,
 ) -> KernelCounters:
     """Merged counters for one kernel, summing to ``duration_us``.
 
     The traffic and the duration are one rate, so the DRAM verdict reads off a
-    record that does not contradict itself.
+    record that does not contradict itself. The traffic is a parameter because the
+    audit decides on it: below L2 there is no verdict to read.
     """
     return KernelCounters(
         kernel=kernel,
         launch_count=Count(1),
         duration_us=Microseconds(duration_us),
         pass_duration_spread_pct=Percent(0.4),
-        dram_read_bytes=Bytes(FLOOR_READ_BYTES),
-        dram_write_bytes=Bytes(FLOOR_WRITE_BYTES),
+        dram_read_bytes=Bytes(read_bytes),
+        dram_write_bytes=Bytes(write_bytes),
         dram_pct=Percent(83.0),
-        achieved_gbs=GBPerSecond(FLOOR_MOVED_BYTES / (1e3 * duration_us)),
+        achieved_gbs=GBPerSecond((read_bytes + write_bytes) / (1e3 * duration_us)),
         global_load_request_count=Count(1 << 18),
         global_store_request_count=Count(1 << 17),
         global_load_sector_count=Count(1 << 20),
@@ -573,7 +581,7 @@ def test_every_profiled_kernel_this_repo_compiles_lands_a_class_verdict(
     assert one["declared"] == DRAM_BOUND
     assert one["required_pct"] == 85.0
     # The floor at the kernel's own traffic, not the rate of the largest copy the
-    # device can run: the copy ceiling would have scored the same record 102.5%.
+    # device can run: the copy ceiling would have scored the same record 91.1%.
     assert one["achieved_pct"] == pytest.approx(FLOOR_ACHIEVED_PCT, abs=5e-4)
     assert one["passed"] is True
     text = (tmp_path / "prof-tiny-forward.md").read_text()
@@ -601,6 +609,34 @@ def test_a_spill_fails_a_dram_bound_kernel_whatever_percentage_it_reached(
     assert one["passed"] is False
     text = (tmp_path / "prof-tiny-forward.md").read_text()
     assert f"failed by the spill rule, whatever the percentage: {OWNED}" in text
+
+
+def test_a_kernel_whose_traffic_stays_inside_l2_gets_no_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """What the smallest shape reads, where the DRAM counters describe the cache.
+
+    A percentage here would divide by a floor extrapolated below every swept
+    footprint, off traffic that reports what L2 did not already hold rather than what
+    the kernel did. The counters are still emitted; only the verdict is withheld, and
+    the report names the kernel it was withheld for.
+    """
+    patch_externals(monkeypatch)
+
+    def inside_l2(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
+        return (counter_record(read_bytes=0, write_bytes=1 << 10),)
+
+    monkeypatch.setattr(profile_op, "kernel_counters", inside_l2)
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 0
+    doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
+    assert doc["verdicts"] == []
+    text = (tmp_path / "prof-tiny-forward.md").read_text()
+    assert "## class verdicts" not in text
+    assert "## kernel counters" in text
+    assert (
+        "no dram verdict, per-launch traffic within L2 so the counters describe "
+        f"the cache: {OWNED}" in text
+    )
 
 
 def test_naming_a_kernel_narrows_every_pass_and_drops_the_cross_check(
@@ -756,5 +792,5 @@ def test_the_notes_quote_the_command_the_profilers_ran(
     # floor extrapolated far below its sweep is worth no more than its residual,
     # and a reader cannot see that from the percentage alone.
     assert (
-        "dram floor: c=0.160 us B=983.04 GB/s max residual=0.00% l2=6291456 B" in text
+        "dram floor: c=0.160 us B=806.60 GB/s max residual=0.00% l2=6291456 B" in text
     )

@@ -359,6 +359,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "failed by the spill rule, whatever the percentage: "
                 + ", ".join(audit.spilled)
             )
+        if audit.cached:
+            notes.append(
+                "no dram verdict, per-launch traffic within L2 so the counters "
+                "describe the cache: " + ", ".join(audit.cached)
+            )
 
     report = Report(
         title=f"profile: {label}",

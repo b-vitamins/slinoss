@@ -130,6 +130,12 @@ the kernel's traffic comes from the fit, with the fixed term charged once per
 launch. The fit's residual is reported beside the verdict, because the
 extrapolation to a small footprint is only worth that residual.
 
+Below L2 there is no verdict. Measured traffic under the cache size is not a lower
+bound on the work a launch did, so the same kernel scores anywhere depending on
+what L2 already held, and the fit is extrapolated there as well. The kernel is
+named as unjudged rather than passed or failed. This is the reading at the smallest
+shape, where DRAM reads are zero.
+
 A register spill fails a `DRAM-bound` or `TENSOR-bound` kernel outright, whatever
 the percentage says. Both classes hold a counted quantity against a duration, and
 a spill moves both: at three blocks per SM `chunk_scan_fwd_kernel` scored 2.7

@@ -20,7 +20,9 @@ marker came from torch, cuBLAS, or the driver, so it is reported as unjudged
 rather than judged against a class this repo did not declare.
 
 :func:`floor_audit` judges that table: a DRAM-bound kernel against the copy's time
-law at the kernel's own traffic, and a register spill as a failure outright.
+law at the kernel's own traffic, and a register spill as a failure outright. A
+kernel whose traffic stays inside L2 gets no bandwidth verdict at all, because
+there the counters describe the cache.
 """
 
 from __future__ import annotations
@@ -150,16 +152,21 @@ class FloorAudit:
     """The class check against the measured time floor, with the spill rule.
 
     Attributes:
-        verdicts: One verdict per profiled kernel this repo compiles, in the order
-            profiled. A verdict failed by the spill rule carries the percentage it
-            achieved and ``passed`` False.
+        verdicts: One verdict per profiled kernel this repo compiles and can judge,
+            in the order profiled. A verdict failed by the spill rule carries the
+            percentage it achieved and ``passed`` False.
         unjudged: Symbols of profiled kernels this repo does not compile.
-        spilled: Kernels the spill rule failed, whatever their percentage.
+        spilled: Kernels the spill rule failed, whatever their percentage. A cached
+            kernel appears here too: it has no verdict to fail, and a spill is a
+            defect at any footprint.
+        cached: DRAM-bound kernels left without a verdict because their per-launch
+            traffic did not exceed L2.
     """
 
     verdicts: tuple[ClassVerdict, ...]
     unjudged: tuple[str, ...]
     spilled: tuple[str, ...]
+    cached: tuple[str, ...]
 
 
 def floor_audit(
@@ -180,6 +187,13 @@ def floor_audit(
     A kernel in :data:`SPILL_FREE_CLASSES` that touched local memory fails,
     whatever its percentage. The percentage is still reported, because the
     achieved figure is what says how far the spill moved the kernel.
+
+    A DRAM-bound kernel whose per-launch traffic did not exceed L2 gets no verdict.
+    Measured traffic under the cache size is not a lower bound on the work: it says
+    the launch could have been served without reaching DRAM, so the same kernel
+    reads high or low with the cache state rather than with its own quality. The
+    fitted law is also extrapolated there, every swept footprint being above L2.
+    This is the case at the smallest shape, where DRAM reads are literally zero.
 
     Args:
         kernels: Merged NCU counters for one capture window.
@@ -207,6 +221,7 @@ def floor_audit(
     verdicts: list[ClassVerdict] = []
     unjudged: list[str] = []
     spilled: list[str] = []
+    cached: list[str] = []
     for one in kernels:
         declared = declared_class(one.kernel)
         if declared is None:
@@ -217,10 +232,21 @@ def floor_audit(
                 f"kernel {one.kernel!r} declares {declared} and carries no spill "
                 f"record; run SPILL_TABLE over the same window"
             )
+        # Recorded before the cached exit, so a kernel with no verdict still reports
+        # the spill.
+        failed_by_spill = (
+            declared in SPILL_FREE_CLASSES and by_kernel[one.kernel].spilled
+        )
+        if failed_by_spill:
+            spilled.append(one.kernel)
         if declared == DRAM_BOUND:
+            traffic = Bytes(one.dram_read_bytes + one.dram_write_bytes)
+            if one.launch_count > 0 and traffic // one.launch_count <= floor.l2_bytes:
+                cached.append(one.kernel)
+                continue
             verdict = dram_floor_verdict(
                 one.kernel,
-                moved_bytes=Bytes(one.dram_read_bytes + one.dram_write_bytes),
+                moved_bytes=traffic,
                 launch_count=one.launch_count,
                 duration_us=one.duration_us,
                 floor=floor,
@@ -234,10 +260,12 @@ def floor_audit(
                 f"counters cannot judge: {TENSOR_BOUND} needs a flop count and no "
                 f"table in NCU_TABLES collects one"
             )
-        if declared in SPILL_FREE_CLASSES and by_kernel[one.kernel].spilled:
-            spilled.append(one.kernel)
+        if failed_by_spill:
             verdict = replace(verdict, passed=False)
         verdicts.append(verdict)
     return FloorAudit(
-        verdicts=tuple(verdicts), unjudged=tuple(unjudged), spilled=tuple(spilled)
+        verdicts=tuple(verdicts),
+        unjudged=tuple(unjudged),
+        spilled=tuple(spilled),
+        cached=tuple(cached),
     )

@@ -349,6 +349,48 @@ def test_a_spill_fails_the_class_whatever_the_percentage_says() -> None:
     assert spill_record(245_760).spill_sector_count == 3 * 245_760
 
 
+def audit_traffic(traffic: int, *, sectors: int = 0) -> FloorAudit:
+    """Audit one DRAM-bound kernel whose three launches moved ``traffic`` bytes."""
+    one = replace(
+        counters(),
+        dram_read_bytes=Bytes(0),
+        dram_write_bytes=Bytes(traffic),
+        achieved_gbs=gbs_from_bytes_us(Bytes(traffic), WINDOW_US),
+    )
+    return floor_audit(
+        (one,),
+        floor=synthetic_floor(*SWEEP),
+        spills=(spill_record(sectors),),
+        step_duration_us=Microseconds(5000.0),
+        capture_iters=3,
+    )
+
+
+def test_a_kernel_inside_l2_gets_no_bandwidth_verdict() -> None:
+    """What the smallest shape reads, where DRAM reads are literally zero.
+
+    Traffic under the cache size is not a lower bound on the work, so the same
+    kernel scores anywhere depending on what L2 already held. Withholding the
+    verdict is the only honest reading; the previous one divided by a floor
+    extrapolated below every swept footprint, and at zero bytes it had none at all.
+
+    The boundary is asserted in both directions, because at-or-below is a choice: a
+    launch whose whole traffic equals the cache size could have been served without
+    reaching DRAM.
+    """
+    inside = audit_traffic(3 * L2_BYTES)
+    assert inside.cached == (OWNED,)
+    assert inside.verdicts == ()
+    assert inside.spilled == ()
+    assert audit_traffic(3 * (L2_BYTES + 1)).cached == ()
+    assert len(audit_traffic(3 * (L2_BYTES + 1)).verdicts) == 1
+    # The spill rule does not go quiet with the verdict. There is nothing left to
+    # fail, so the record is what carries the defect.
+    spilling = audit_traffic(3 * L2_BYTES, sectors=245_760)
+    assert (spilling.cached, spilling.spilled) == ((OWNED,), (OWNED,))
+    assert spilling.verdicts == ()
+
+
 def test_the_audit_refuses_a_kernel_with_no_spill_record() -> None:
     """A pass that was never run must not read as a clean kernel.
 
