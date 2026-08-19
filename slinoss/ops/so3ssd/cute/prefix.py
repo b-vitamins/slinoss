@@ -29,7 +29,7 @@ slots over the scan.
 import cutlass
 import cutlass.cute as cute
 
-from slinoss._cute import Scalar, scale, select, shuffle_up
+from slinoss._cute import Scalar, decay, select, shuffle_up
 from slinoss.ops.so3ssd.cute.common import (
     Quat,
     quat_exp,
@@ -37,7 +37,7 @@ from slinoss.ops.so3ssd.cute.common import (
     quat_normalize,
 )
 
-__all__ = ["chunk_prefixes", "quat_prefix_endpoint"]
+__all__ = ["chunk_endpoint", "chunk_prefixes"]
 
 
 def _scan_offsets(active: int) -> tuple[int, ...]:
@@ -189,29 +189,35 @@ def chunk_prefixes(
                     squat[3, idx] = total_q[3]
 
 
-def quat_prefix_endpoint(squat: cute.Tensor, slp: cute.Tensor, chunk: int) -> Quat:
-    """The chunk transition, packed as one scaled quaternion.
+def chunk_endpoint(
+    squat: cute.Tensor, slp: cute.Tensor, chunk: int
+) -> tuple[Quat, Scalar]:
+    """The chunk transition as a unit rotation and a separate scale.
 
-    ``exp(lp_{L-1}) * Q_{L-1}``. :func:`slinoss.ops.so3ssd.cute.common.rot_hom`
-    is homogeneous of degree two, so its matrix for this argument is exactly
-    ``exp(2*lp_{L-1}) * R(Q_{L-1})``: the chunk-level scale rides inside the four
-    floats instead of travelling beside them. ``lp_{L-1} <= 0`` by I1, so the
-    factor lies in ``(0, 1]``, underflow degrades to zero, and no overflow is
-    ever multiplied by an underflow (I3).
+    ``(Q_{L-1}, exp(2*lp_{L-1}))``. The two travel separately rather than as one
+    scaled quaternion: the rotation stays unit, so the renormalization of I5 is
+    what the consumer receives, and the scale keeps its own exponent instead of
+    riding at half range inside four floats that then square. A scale small
+    enough to underflow the packed form is a transition that is already zero to
+    float32, but recovering the rotation from the packed form would need an
+    ``rsqrt`` of that zero and a guard the invariants forbid.
+
+    This is also the reference's own factorization of the chunk step, so the
+    kernel and the authority agree term by term rather than up to an identity.
+
+    ``lp_{L-1} <= 0`` by I1, so the scale lies in ``(0, 1]``, underflow degrades
+    to zero, and no overflow is ever multiplied by an underflow (I3).
 
     Args:
-        squat: ``(4, L)`` float32 quaternion prefix.
+        squat: ``(4, L)`` float32 quaternion prefix, already renormalized.
         slp: ``(L,)`` float32 log-scale prefix.
         chunk: ``L``. Compile-time.
 
     Returns:
-        ``(qw, qx, qy, qz)`` scaled by ``exp(lp_{L-1})``.
+        ``((qw, qx, qy, qz), exp(2*lp_{L-1}))``.
     """
     last = chunk - 1
-    factor = scale(slp[last])
     return (
-        squat[0, last] * factor,
-        squat[1, last] * factor,
-        squat[2, last] * factor,
-        squat[3, last] * factor,
+        (squat[0, last], squat[1, last], squat[2, last], squat[3, last]),
+        decay(slp[last]),
     )

@@ -36,11 +36,12 @@ __all__ = [
     "decay",
     "dev_tensor",
     "f32",
-    "scale",
+    "narrow",
     "select",
     "shuffle_up",
     "smem_bytes",
     "smem_capacity",
+    "widen",
 ]
 
 # exp(x) == exp2(x * LOG2_E), exp(2*x) == exp2(x * TWO_LOG2_E). One multiply
@@ -213,6 +214,36 @@ def f32(value: object) -> Scalar:
     return cutlass.Float32(value)
 
 
+def widen(value: object, src: object) -> Scalar:
+    """Read a tensor element as float32. Identity when the tensor is float32.
+
+    ``.to()`` on a value already at the target width still emits a conversion in
+    the DSL's IR, so the identity case is taken in Python rather than on the
+    device.
+
+    Args:
+        value: An element read from a tensor.
+        src: The tensor's element type, a compile-time ``cutlass`` numeric type.
+
+    Returns:
+        The value at float32.
+    """
+    return value if src is cutlass.Float32 else value.to(cutlass.Float32)  # type: ignore[attr-defined]
+
+
+def narrow(value: Scalar, dst: object) -> object:
+    """Write a float32 result at a tensor's width. Identity when that is float32.
+
+    Args:
+        value: A float32 scalar.
+        dst: The destination tensor's element type, compile-time.
+
+    Returns:
+        The value at the destination width.
+    """
+    return value if dst is cutlass.Float32 else value.to(dst)
+
+
 def select(cond: cutlass.Boolean, if_true: Scalar, if_false: Scalar) -> Scalar:
     """Branchless float32 select.
 
@@ -267,20 +298,3 @@ def decay(log_diff: Scalar) -> Scalar:
         The decay factor.
     """
     return f32(cute.exp2(log_diff * TWO_LOG2_E))
-
-
-def scale(log_prefix: Scalar) -> Scalar:
-    """``exp(log_prefix)``.
-
-    The half-exponent form. A chunk transition travels as ``exp(lp) * Q`` and the
-    rotation matrix of a quaternion is homogeneous of degree two, so the packed
-    value needs half the exponent range the transition itself spans. That is the
-    only reason this exists beside :func:`decay`.
-
-    Args:
-        log_prefix: A log-scale prefix. Non-positive by I1.
-
-    Returns:
-        A factor in ``(0, 1]``.
-    """
-    return f32(cute.exp2(log_prefix * LOG2_E))

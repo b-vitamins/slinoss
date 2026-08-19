@@ -46,6 +46,9 @@ __all__ = [
     "COS_HALF",
     "FP32_SERIES_TERMS",
     "SINC_HALF",
+    "TABLE_AC",
+    "TABLE_AN",
+    "TABLE_AP",
     "THREADS",
     "WARPS",
     "mat3_matvec",
@@ -113,13 +116,33 @@ def vec_tile(chunk: int, width: int) -> Tile:
     return Tile((width, chunk), (chunk, 1))
 
 
-def table_tile(chunk: int) -> Tile:
-    """3x3 transform table: ``(3, L, 9)``, nine entries innermost.
+TABLE_AP: int = 0
+"""``Ap = R(Q_t)^T Kprev_t``, applied to ``b_{t-1}``."""
 
-    Matrix ``0`` is ``Ac = R(Q_t)^T``, ``1`` is ``Ap = R(Q_t)^T Kprev_t``, ``2``
-    is ``An = R(Q_t)^T Kcurr_t``. Entry ``3*r + c`` is row ``r`` column ``c``.
+TABLE_AN: int = 1
+"""``An = R(Q_t)^T Kcurr_t``, applied to ``b_t``."""
+
+TABLE_AC: int = 2
+"""``Ac = R(Q_t)^T``, applied to ``c_t``."""
+
+
+def table_tile(chunk: int, mats: int = 3) -> Tile:
+    """3x3 transform table: ``(mats, L, 9)``, nine entries innermost.
+
+    Slot order is :data:`TABLE_AP`, :data:`TABLE_AN`, :data:`TABLE_AC`. Entry
+    ``3*r + c`` of a slot is row ``r`` column ``c``.
+
+    The two tap matrices come first so a kernel that forces but does not read out
+    -- the chunk increment -- takes a prefix of the table and the slot indices
+    stay the same constants in both kernels.
+
+    Args:
+        chunk: ``L``.
+        mats: Slots to allocate, 2 or 3. Two omits ``Ac``.
     """
-    return Tile((3, chunk, 9), (9 * chunk, 9, 1))
+    if mats not in (2, 3):
+        raise ValueError(f"table needs 2 or 3 matrices, got {mats}")
+    return Tile((mats, chunk, 9), (9 * chunk, 9, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -206,10 +229,11 @@ def rot_hom(q: Quat) -> Mat3:
     """Rotation matrix of a quaternion, homogeneous of degree two.
 
     ``R(q) = (qw^2 - v.v) I + 2 v v^T + 2 qw skew(v)`` with ``v = (qx,qy,qz)``.
-    For a unit quaternion this is the usual rotation matrix. Degree-two
-    homogeneity makes it also the whole transition of a scaled quaternion:
-    ``rot_hom(exp(lp) * Q) == exp(2*lp) * R(Q)`` exactly, which is how a chunk
-    transition travels as four floats instead of four floats and a scale.
+    For a unit quaternion this is the usual rotation matrix.
+
+    The homogeneous form is used rather than the unit-norm one because it costs
+    nothing: the diagonal carries ``qw^2 - v.v`` either way, and hardcoding it to
+    one would need the norm to be exact, which after a prefix product it is not.
 
     Args:
         q: A quaternion, not necessarily unit.

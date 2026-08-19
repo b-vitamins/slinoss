@@ -39,7 +39,15 @@ import cutlass.cute as cute
 import torch
 from torch import Tensor
 
-from slinoss._cute import LOG2_E, Scalar, dev_tensor, f32, select
+from slinoss._cute import (
+    LOG2_E,
+    Scalar,
+    dev_tensor,
+    f32,
+    narrow,
+    select,
+    widen,
+)
 from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.ops.scanprep.reference import ScanParams
 
@@ -69,16 +77,6 @@ oracle and runs in torch."""
 # ---------------------------------------------------------------------------
 # Device math
 # ---------------------------------------------------------------------------
-
-
-def _widen(value: Any, src: Any) -> Scalar:
-    """Read an input element as float32. Identity when the input is float32."""
-    return value if src is cutlass.Float32 else value.to(cutlass.Float32)
-
-
-def _narrow(value: Scalar, dst: Any) -> Any:
-    """Write a float32 result at the input width. Identity when that is float32."""
-    return value if dst is cutlass.Float32 else value.to(dst)
 
 
 def _softplus_parts(raw: Scalar) -> tuple[Any, Scalar]:
@@ -159,21 +157,21 @@ def scanprep_fwd_kernel(
 
     if token < tokens:
         src = gw.element_type
-        rx = _widen(gw[token, 0], src)
-        ry = _widen(gw[token, 1], src)
-        rz = _widen(gw[token, 2], src)
+        rx = widen(gw[token, 0], src)
+        ry = widen(gw[token, 1], src)
+        rz = widen(gw[token, 2], src)
         # 1 + |raw|^2 >= 1, so the rsqrt is regular over the whole domain and the
         # product lands in the closed ball of radius w_max (I2).
         scale = w_max * f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
         gtrans[token, 0] = rx * scale
         gtrans[token, 1] = ry * scale
         gtrans[token, 2] = rz * scale
-        gtrans[token, 3] = _log_scale(_widen(gls[token], src))
+        gtrans[token, 3] = _log_scale(widen(gls[token], src))
 
         zero = cutlass.Float32(0.0)
         for tap in cutlass.range_constexpr(2):
             for j in cutlass.range_constexpr(3):
-                gpack[token, 4 * tap + j] = _widen(gtap[token, 3 * tap + j], src)
+                gpack[token, 4 * tap + j] = widen(gtap[token, 3 * tap + j], src)
             gpack[token, 4 * tap + 3] = zero
 
 
@@ -243,9 +241,9 @@ def scanprep_bwd_kernel(
     if token < tokens:
         src = gw.element_type
         dst = gdw.element_type
-        rx = _widen(gw[token, 0], src)
-        ry = _widen(gw[token, 1], src)
-        rz = _widen(gw[token, 2], src)
+        rx = widen(gw[token, 0], src)
+        ry = widen(gw[token, 1], src)
+        rz = widen(gw[token, 2], src)
         gx = gdtrans[token, 0]
         gy = gdtrans[token, 1]
         gz = gdtrans[token, 2]
@@ -255,16 +253,16 @@ def scanprep_bwd_kernel(
         # The map is a radial rescaling, so its Jacobian is the scale times a
         # rank-one correction along raw; inv*inv is 1/(1 + |raw|^2).
         pull = inv * inv * (gx * rx + gy * ry + gz * rz)
-        gdw[token, 0] = _narrow(scale * (gx - pull * rx), dst)
-        gdw[token, 1] = _narrow(scale * (gy - pull * ry), dst)
-        gdw[token, 2] = _narrow(scale * (gz - pull * rz), dst)
+        gdw[token, 0] = narrow(scale * (gx - pull * rx), dst)
+        gdw[token, 1] = narrow(scale * (gy - pull * ry), dst)
+        gdw[token, 2] = narrow(scale * (gz - pull * rz), dst)
 
-        raw_ls = _widen(gls[token], src)
-        gdls[token] = _narrow(_log_scale_grad(raw_ls) * gdtrans[token, 3], dst)
+        raw_ls = widen(gls[token], src)
+        gdls[token] = narrow(_log_scale_grad(raw_ls) * gdtrans[token, 3], dst)
 
         for tap in cutlass.range_constexpr(2):
             for j in cutlass.range_constexpr(3):
-                gdtap[token, 3 * tap + j] = _narrow(gdpack[token, 4 * tap + j], dst)
+                gdtap[token, 3 * tap + j] = narrow(gdpack[token, 4 * tap + j], dst)
 
 
 @cute.jit

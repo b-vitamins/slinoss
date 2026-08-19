@@ -4,7 +4,7 @@ One probe kernel stages a chunk, runs both chunk-local prefixes, and composes th
 3x3 table, then writes every intermediate out. That covers, in one launch, the
 quaternion exponential series, the composition order, the warp prefix scans, the
 renormalization, the homogeneous rotation matrix, the tap chart, the 3x3 product
-and transpose, the ragged-tail staging, and the packed chunk endpoint.
+and transpose, the ragged-tail staging, and the chunk endpoint.
 
 The probe exists because these quantities never reach global memory on the shipped
 path. Comparing them requires a kernel written for the comparison; the alternative
@@ -36,6 +36,9 @@ from slinoss._cute import (
 from slinoss.config import MAX_CHUNK, MIN_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.common import (
+    TABLE_AC,
+    TABLE_AN,
+    TABLE_AP,
     THREADS,
     table_tile,
     tap_tile,
@@ -43,8 +46,8 @@ from slinoss.ops.so3ssd.cute.common import (
     vec_tile,
 )
 from slinoss.ops.so3ssd.cute.prefix import (
+    chunk_endpoint,
     chunk_prefixes,
-    quat_prefix_endpoint,
 )
 from slinoss.ops.so3ssd.cute.table import build_table, stage_chunk
 from tests.conftest import assert_max_rel, make_inputs
@@ -59,8 +62,8 @@ def _lp_tile(chunk: int) -> Tile:
 
 # scanprep maps the raw log scale through a negative softplus, so a negative bias
 # is a weak decay. Without it the prefix at the end of a 128-token chunk reaches
-# exp(lp) near 2e-45, the packed chunk endpoint underflows to zero, and the
-# assertion on it is skipped as subnormal rather than checked.
+# exp(2*lp) near 4e-90, the chunk decay underflows to zero, and the assertion on
+# it is skipped as subnormal rather than checked.
 LS_BIAS = -4.0
 
 
@@ -72,9 +75,11 @@ def _probe_kernel(
     oquat: cute.Tensor,
     otable: cute.Tensor,
     oend: cute.Tensor,
+    oscale: cute.Tensor,
     seqlen: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
+    mats: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     cidx, bidx, hidx = cute.arch.block_idx()
@@ -84,7 +89,7 @@ def _probe_kernel(
     stap = smem.allocate_tensor(cutlass.Float32, tap_tile(chunk).layout(), 16)
     slp = smem.allocate_tensor(cutlass.Float32, _lp_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk).layout(), 16)
+    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, mats).layout(), 16)
 
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), cutlass.Int32(seqlen) - t0)
@@ -102,7 +107,7 @@ def _probe_kernel(
     cute.arch.sync_threads()
     chunk_prefixes(strans, slp, squat, tid, chunk)
     cute.arch.sync_threads()
-    build_table(strans, stap, squat, stable, tid, threads, chunk)
+    build_table(strans, stap, squat, stable, tid, threads, chunk, mats)
     cute.arch.sync_threads()
 
     for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
@@ -111,16 +116,17 @@ def _probe_kernel(
             olp[bidx, hidx, cidx, token] = slp[token]
             for j in cutlass.range_constexpr(4):
                 oquat[bidx, hidx, cidx, j, token] = squat[j, token]
-            for mat in cutlass.range_constexpr(3):
+            for mat in cutlass.range_constexpr(mats):
                 for entry in cutlass.range_constexpr(9):
                     otable[bidx, hidx, cidx, mat, token, entry] = stable[
                         mat, token, entry
                     ]
 
     if tid == 0:
-        endpoint = quat_prefix_endpoint(squat, slp, chunk)
+        quat, cscale = chunk_endpoint(squat, slp, chunk)
         for j in cutlass.range_constexpr(4):
-            oend[bidx, hidx, cidx, j] = endpoint[j]
+            oend[bidx, hidx, cidx, j] = quat[j]
+        oscale[bidx, hidx, cidx] = cscale
 
 
 @cute.jit
@@ -131,15 +137,17 @@ def _probe_launch(
     oquat: cute.Tensor,
     otable: cute.Tensor,
     oend: cute.Tensor,
+    oscale: cute.Tensor,
     seqlen: cutlass.Constexpr,
     chunks: cutlass.Constexpr,
     bsz: cutlass.Constexpr,
     heads: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
+    mats: cutlass.Constexpr,
 ) -> None:
     _probe_kernel(
-        gtrans, gtap, olp, oquat, otable, oend, seqlen, threads, chunk
+        gtrans, gtap, olp, oquat, otable, oend, oscale, seqlen, threads, chunk, mats
     ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
 
 
@@ -150,16 +158,17 @@ def _dev(tensor: torch.Tensor) -> cute.Tensor:
 
 
 def _run_probe(
-    trans: torch.Tensor, tap: torch.Tensor, chunk: int
+    trans: torch.Tensor, tap: torch.Tensor, chunk: int, mats: int = 3
 ) -> tuple[torch.Tensor, ...]:
-    """Launch the probe and return ``(lp, quat, table, endpoint)``."""
+    """Launch the probe and return ``(lp, quat, table, cquat, cscale)``."""
     bsz, heads, seqlen, _ = trans.shape
     chunks = (seqlen + chunk - 1) // chunk
     opts = {"device": trans.device, "dtype": torch.float32}
     olp = torch.empty(bsz, heads, chunks, chunk, **opts)
     oquat = torch.empty(bsz, heads, chunks, 4, chunk, **opts)
-    otable = torch.empty(bsz, heads, chunks, 3, chunk, 9, **opts)
+    otable = torch.empty(bsz, heads, chunks, mats, chunk, 9, **opts)
     oend = torch.empty(bsz, heads, chunks, 4, **opts)
+    oscale = torch.empty(bsz, heads, chunks, **opts)
     _probe_launch(
         _dev(trans),
         _dev(tap),
@@ -167,25 +176,30 @@ def _run_probe(
         _dev(oquat),
         _dev(otable),
         _dev(oend),
+        _dev(oscale),
         seqlen,
         chunks,
         bsz,
         heads,
         THREADS,
         chunk,
+        mats,
     )
     torch.cuda.synchronize()
-    return olp, oquat, otable, oend
+    return olp, oquat, otable, oend, oscale
 
 
+# The scan structure is set by two things and nothing else: the segment count
+# ``ceil(L/32)``, which is the serial depth, and whether ``L`` is a warp multiple,
+# which selects the clamp branch. One case per reachable pair, plus the ragged
+# tail, which is a staging path rather than a scan path.
 SHAPES = [
-    pytest.param(2, 3, 256, 64, id="exact-4-chunks"),
+    pytest.param(2, 3, 256, 64, id="two-segments-exact"),
     pytest.param(2, 3, 200, 64, id="ragged-tail"),
-    pytest.param(1, 1, 128, MAX_CHUNK, id="single-chunk-seg4"),
-    pytest.param(1, 2, 384, MAX_CHUNK, id="three-chunks-seg4"),
-    pytest.param(2, 2, 96, 48, id="chunk-not-warp-multiple"),
-    pytest.param(1, 2, 48, MIN_CHUNK, id="chunk-under-warp"),
-    pytest.param(2, 2, 64, 32, id="chunk-one-per-lane"),
+    pytest.param(1, 2, 384, MAX_CHUNK, id="four-segments-exact"),
+    pytest.param(2, 2, 96, 48, id="two-segments-inexact"),
+    pytest.param(1, 2, 48, MIN_CHUNK, id="one-segment-under-warp"),
+    pytest.param(2, 2, 64, 32, id="one-segment-exact"),
 ]
 
 
@@ -203,7 +217,7 @@ def test_prefixes_and_table(bsz: int, heads: int, seqlen: int, chunk: int) -> No
         w_scale=2.0,
         ls_bias=LS_BIAS,
     )
-    lp, quat, table, end = _run_probe(inp.trans, inp.K, chunk)
+    lp, quat, table, end, cscale = _run_probe(inp.trans, inp.K, chunk)
     ref = chunked_forward(
         inp.U.double(),
         inp.trans.double(),
@@ -220,13 +234,22 @@ def test_prefixes_and_table(bsz: int, heads: int, seqlen: int, chunk: int) -> No
     assert_max_rel(lp, ref.lprefix, 2e-6, f"{tag}.lprefix")
     assert_max_rel(quat, ref.qprefix.movedim(-1, -2), 2e-6, f"{tag}.qprefix")
     assert_max_rel(
-        table[:, :, :, 0], ref.table.ac.flatten(-2, -1), 4e-6, f"{tag}.table.ac"
+        table[:, :, :, TABLE_AP],
+        ref.table.ap.flatten(-2, -1),
+        4e-6,
+        f"{tag}.table.ap",
     )
     assert_max_rel(
-        table[:, :, :, 1], ref.table.ap.flatten(-2, -1), 4e-6, f"{tag}.table.ap"
+        table[:, :, :, TABLE_AN],
+        ref.table.an.flatten(-2, -1),
+        4e-6,
+        f"{tag}.table.an",
     )
     assert_max_rel(
-        table[:, :, :, 2], ref.table.an.flatten(-2, -1), 4e-6, f"{tag}.table.an"
+        table[:, :, :, TABLE_AC],
+        ref.table.ac.flatten(-2, -1),
+        4e-6,
+        f"{tag}.table.ac",
     )
 
     # I5 is a property of the prefix, not of its distance from the reference: a
@@ -238,37 +261,29 @@ def test_prefixes_and_table(bsz: int, heads: int, seqlen: int, chunk: int) -> No
     drift = (quat.double().square().sum(dim=-2).sqrt() - 1.0).abs().max()
     assert float(drift) < 5e-7, f"{tag}: quaternion prefix norm drifted {drift:.3e}"
 
-    # The packed chunk endpoint must reproduce the full chunk transition, scale
-    # included, through the degree-two homogeneity of `rot_hom`.
-    #
-    # Packing the scale inside the quaternion halves the exponent it has to
-    # carry: the stored value is exp(lp) and the transition it produces is
-    # exp(2*lp). Whatever underflows in the packed form therefore corresponds to
-    # a transition that is already exactly zero in float32, so the two regimes
-    # are asserted separately. Direction and magnitude are checked together where
-    # the magnitude is normal, and gracefulness is checked where it is not.
-    scale = torch.exp(ref.lprefix[..., -1])
-    want_end = ref.qprefix[..., -1, :] * scale[..., None]
-    assert torch.isfinite(end).all()
-    normal = scale > 1e-30
+    # The chunk endpoint is the last token's prefix, split into a unit rotation
+    # and its own decay. The rotation carries the prefix bound directly, with no
+    # scale mixed into it, which is the point of not packing the two together.
+    assert_max_rel(end, ref.qprefix[..., -1, :], 2e-6, f"{tag}.cquat")
+
+    # The decay carries the absolute error of a float32 log prefix, and exp
+    # turns that into a relative error that grows with the prefix magnitude,
+    # because exp(2*(lp + e)) is exp(2*lp)*(1 + 2*e). Underflow is graceful by
+    # I1, so the regime where the decay is subnormal is checked for boundedness
+    # rather than for agreement.
+    want_scale = torch.exp(2.0 * ref.lprefix[..., -1])
+    assert torch.isfinite(cscale).all()
+    assert bool((cscale >= 0.0).all()), "a chunk decay went negative (I1)"
+    assert bool((cscale <= 1.0).all()), "a chunk decay exceeded one (I1)"
+    normal = want_scale > 1e-30
     if bool(normal.any()):
-        # Dividing by the reference scale puts both sides at unit magnitude, so
-        # one relative bound is meaningful. The direction carries the prefix
-        # bound; the scale carries the absolute error of a float32 log prefix,
-        # which grows with the prefix magnitude, because exp(lp + e) is
-        # exp(lp)*(1 + e).
         reach = float(ref.lprefix[..., -1].abs().max())
-        bound = 4e-6 + 2.0 * reach * float(torch.finfo(torch.float32).eps)
-        assert_max_rel(
-            end[normal].double() / scale[normal][:, None],
-            ref.qprefix[..., -1, :][normal],
-            bound,
-            f"{tag}.endpoint",
-        )
+        bound = 4e-6 + 4.0 * reach * float(torch.finfo(torch.float32).eps)
+        assert_max_rel(cscale[normal], want_scale[normal], bound, f"{tag}.cscale")
     if bool((~normal).any()):
         floor = torch.finfo(torch.float32).smallest_normal
         assert bool(
-            (end[~normal].abs().double() <= 4.0 * want_end[~normal].abs() + floor).all()
+            (cscale[~normal].double() <= 4.0 * want_scale[~normal] + floor).all()
         )
 
 
@@ -298,7 +313,7 @@ def test_padded_tail_is_identity() -> None:
         w_scale=2.0,
         ls_bias=LS_BIAS,
     )
-    lp, quat, table, _ = _run_probe(inp.trans, inp.K, chunk)
+    lp, quat, table, _, _ = _run_probe(inp.trans, inp.K, chunk)
     tail = seqlen - chunk
 
     assert_max_rel(
@@ -313,10 +328,44 @@ def test_padded_tail_is_identity() -> None:
         4e-6,
         "cute-device.pad.qprefix",
     )
-    assert torch.count_nonzero(table[0, 0, 1, 1:, tail:]) == 0
+    assert torch.count_nonzero(table[0, 0, 1, TABLE_AP, tail:]) == 0
+    assert torch.count_nonzero(table[0, 0, 1, TABLE_AN, tail:]) == 0
 
 
-def _probe_smem_bytes(chunk: int) -> int:
+def test_two_slot_table_matches_the_three_slot_taps() -> None:
+    """``mats=2`` writes the same two tap matrices and allocates one slot less.
+
+    ``Ac`` is an intermediate of both taps either way, so dropping its slot must
+    not change them. Asserted bitwise: the arithmetic is identical, so anything
+    but equality means the slot indices moved.
+    """
+    inp = make_inputs(
+        bsz=2,
+        heads=2,
+        seqlen=192,
+        rows=16,
+        lanes=16,
+        dtype=torch.float32,
+        device="cuda",
+        w_scale=2.0,
+        ls_bias=LS_BIAS,
+    )
+    full = _run_probe(inp.trans, inp.K, 64, mats=3)[2]
+    taps = _run_probe(inp.trans, inp.K, 64, mats=2)[2]
+    assert tuple(taps.shape[3:]) == (2, 64, 9)
+    assert torch.equal(taps[:, :, :, TABLE_AP], full[:, :, :, TABLE_AP])
+    assert torch.equal(taps[:, :, :, TABLE_AN], full[:, :, :, TABLE_AN])
+    assert table_tile(64, 2).words == table_tile(64, 3).words - 9 * 64
+
+
+def test_table_rejects_a_slot_count_with_no_consumer() -> None:
+    """Two slots and three are the only shapes any kernel reads."""
+    for mats in (0, 1, 4):
+        with pytest.raises(ValueError, match="2 or 3 matrices"):
+            table_tile(64, mats)
+
+
+def _probe_smem_bytes(chunk: int, mats: int = 3) -> int:
     """Bytes the probe's shared-memory tiles add up to.
 
     The same five tiles :func:`_probe_kernel` allocates, in the same order.
@@ -327,7 +376,7 @@ def _probe_smem_bytes(chunk: int) -> int:
             (tap_tile(chunk), 4),
             (_lp_tile(chunk), 4),
             (trans_tile(chunk), 4),
-            (table_tile(chunk), 4),
+            (table_tile(chunk, mats), 4),
         ]
     )
 

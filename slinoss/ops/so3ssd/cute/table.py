@@ -2,9 +2,9 @@
 
 The chunked factorization needs three matrices per token:
 
-    Ac_t = R(Q_t)^T                 applied to c_t
     Ap_t = R(Q_t)^T Kprev_t         applied to b_{t-1}
     An_t = R(Q_t)^T Kcurr_t         applied to b_t
+    Ac_t = R(Q_t)^T                 applied to c_t
 
 Each is built once per token, in shared memory, by one thread. Every vector
 transform afterwards is a nine-FMA 3x3 matvec whose matrix operand is a broadcast
@@ -12,13 +12,19 @@ shared-memory read. Applying the rotation and the tap as two separate per-lane
 passes would cost more arithmetic and two more passes over the ``3N`` data, so
 they are composed here instead.
 
+``Ac`` is an intermediate of both tap matrices, so a kernel that needs only the
+taps still builds it and merely does not store it. ``mats`` selects that: two
+slots for the chunk increment, three for the chunk scan. Slot order puts the taps
+first so the increment's table is a prefix of the scan's and the slot indices are
+the same constants in both.
+
 Cost. Building one token is one quaternion exponential, one rotation matrix, two
 tap matrices, and two 3x3 products: order 120 FMA. Applying it is ``9*N`` FMA per
 tap. The build amortizes from ``N = 16``, which is the smallest legal lane count.
 
-Table storage is ``(3, L, 9)`` float32, nine entries innermost. The build stores
-nine words at a nine-word stride, and nine is coprime with the 32 banks, so the
-store pattern is a bank permutation. Every read during application is a
+Table storage is ``(mats, L, 9)`` float32, nine entries innermost. The build
+stores nine words at a nine-word stride, and nine is coprime with the 32 banks,
+so the store pattern is a bank permutation. Every read during application is a
 broadcast. Neither needs a swizzle.
 
 Staging is transposed on the way in: global ``(L, 4)`` and ``(L, 8)`` become
@@ -39,6 +45,9 @@ import cutlass.cute as cute
 
 from slinoss._cute import select
 from slinoss.ops.so3ssd.cute.common import (
+    TABLE_AC,
+    TABLE_AN,
+    TABLE_AP,
     mat3_mul,
     mat3_transpose,
     rot_hom,
@@ -100,18 +109,22 @@ def build_table(
     tid: cutlass.Int32,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
+    mats: cutlass.Constexpr = 3,
 ) -> None:
-    """Compose the ``(3, L, 9)`` transform table in shared memory.
+    """Compose the ``(mats, L, 9)`` transform table in shared memory.
 
     Args:
         strans: ``(4, L)`` float32 staged transition parameters.
         stap: ``(8, L)`` float32 staged tap parameters.
         squat: ``(4, L)`` float32 quaternion prefix, already renormalized.
-        stable: ``(3, L, 9)`` float32, written. Matrix ``0`` is ``Ac``, ``1`` is
-            ``Ap``, ``2`` is ``An``.
+        stable: ``(mats, L, 9)`` float32, written. Slots are
+            :data:`slinoss.ops.so3ssd.cute.common.TABLE_AP`, ``TABLE_AN``, and,
+            when ``mats`` is three, ``TABLE_AC``.
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
+        mats: Slots to write, 2 or 3. Compile-time, and must match the ``mats``
+            the tile was allocated at.
     """
     for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
         token = tid + step * threads
@@ -134,6 +147,8 @@ def build_table(
                 ac, tap_matrix((stap[4, token], stap[5, token], stap[6, token]), wvec)
             )
             for entry in cutlass.range_constexpr(9):
-                stable[0, token, entry] = ac[entry]
-                stable[1, token, entry] = ap[entry]
-                stable[2, token, entry] = an[entry]
+                stable[TABLE_AP, token, entry] = ap[entry]
+                stable[TABLE_AN, token, entry] = an[entry]
+            if cutlass.const_expr(mats == 3):
+                for entry in cutlass.range_constexpr(9):
+                    stable[TABLE_AC, token, entry] = ac[entry]

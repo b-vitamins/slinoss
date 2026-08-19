@@ -1,13 +1,18 @@
 """Inter-chunk state recurrence.
 
-The only serial step in the operator. One chunk transition is four float32:
-``exp(lp_{L-1}) * Q_{L-1}``, packed by
-:func:`slinoss.ops.so3ssd.cute.prefix.quat_prefix_endpoint`. Because
-:func:`slinoss.ops.so3ssd.cute.common.rot_hom` is homogeneous of degree two, the
-matrix it builds from those four floats is exactly ``exp(2*lp_{L-1}) R(Q_{L-1})``,
-so the scale needs no separate tensor and no separate multiply.
+The only serial step in the operator.
 
-    zstart_c = s_c,    s_{c+1} = M_c s_c + inc_c,    M_c = rot_hom(ctrans_c)
+    zstart_c = s_c,    s_{c+1} = R(Q_c) (a_c s_c + inc_c)
+
+with ``a_c = exp(2*lp_{L-1})`` and ``Q_c`` the unit quaternion prefix at the end
+of chunk ``c``, both from
+:func:`slinoss.ops.so3ssd.cute.prefix.chunk_endpoint`. ``inc_c`` arrives in the
+chunk-local frame, so the rotation that carries it into the global frame is the
+same one the recurrence applies to the state and is factored out of both. That is
+why the producing kernel emits a raw local increment: rotating a ``(P,3N)``
+accumulator in place needs three neighbouring N columns per lane, which the MMA's
+C fragment does not give one thread, so it would cost either a cross-thread
+shuffle or a float32 round trip through shared memory.
 
 Parallel over every independent 3-vector: ``B*H*P*N`` of them, one per thread,
 serial over chunks. Nothing is shared between threads, so the kernel holds no
@@ -21,7 +26,7 @@ launch is exact: no tail tile, no bounds predicate, no padding path.
 registers before storing ``zstart_c``, so the alias is safe, and the operator
 carries one ``(B,H,C,P,3N)`` buffer instead of two.
 
-``M_c`` is rebuilt by every thread on every chunk rather than staged once. That
+``R(Q_c)`` is rebuilt by every thread on every chunk rather than staged once. That
 buys a dynamic chunk count, so no recompile per sequence length. Measured cost:
 ``sm__throughput`` is 2.10% of peak against ``dram__throughput`` at 10.68%, so the
 redundant arithmetic is not what bounds the kernel.
@@ -59,7 +64,8 @@ __all__ = [
 @cute.kernel
 def state_passing_fwd_kernel(
     ginc: cute.Tensor,
-    gctrans: cute.Tensor,
+    gcquat: cute.Tensor,
+    gcscale: cute.Tensor,
     gz0: cute.Tensor,
     gstate: cute.Tensor,
     chunks: cutlass.Int32,
@@ -69,9 +75,10 @@ def state_passing_fwd_kernel(
     """Run the chunk recurrence and overwrite ``inc`` with ``zstart``.
 
     Args:
-        ginc: ``(B,H,C,3*P*N)`` float32. Read as the chunk increments, written as
-            the chunk-start states.
-        gctrans: ``(B,H,C,4)`` float32 packed chunk transitions.
+        ginc: ``(B,H,C,3*P*N)`` float32. Read as the chunk-local increments,
+            written as the chunk-start states.
+        gcquat: ``(B,H,C,4)`` float32 unit chunk rotations.
+        gcscale: ``(B,H,C)`` float32 chunk decays, ``exp(2*lp_{L-1})``.
         gz0: ``(B,H,3*P*N)`` float32 initial state. Read only when ``has_z0``;
             the zero-start variant is handed ``gstate`` here so the signature has
             one form.
@@ -82,8 +89,9 @@ def state_passing_fwd_kernel(
         has_z0: Whether an initial state is supplied. Compile-time.
 
     Invariants:
-        Every ``|M_c|`` is at most one (I1), so the recurrence cannot grow.
-        ``grid.x * threads == P*N`` exactly, so no thread is out of range.
+        ``|R(Q_c)| == 1`` and ``a_c`` lies in ``(0, 1]`` by I1, so the recurrence
+        cannot grow. ``grid.x * threads == P*N`` exactly, so no thread is out of
+        range.
     """
     tid, _, _ = cute.arch.thread_idx()
     tile, bidx, hidx = cute.arch.block_idx()
@@ -105,20 +113,22 @@ def state_passing_fwd_kernel(
         ginc[bidx, hidx, c, base] = sx
         ginc[bidx, hidx, c, base + 1] = sy
         ginc[bidx, hidx, c, base + 2] = sz
+        # The scale multiplies the state alone, then the sum is rotated once. The
+        # local increment is already in the chunk-local frame, so it shares the
+        # rotation rather than needing its own.
+        decayed = gcscale[bidx, hidx, c]
         moved = mat3_matvec(
             rot_hom(
                 (
-                    gctrans[bidx, hidx, c, 0],
-                    gctrans[bidx, hidx, c, 1],
-                    gctrans[bidx, hidx, c, 2],
-                    gctrans[bidx, hidx, c, 3],
+                    gcquat[bidx, hidx, c, 0],
+                    gcquat[bidx, hidx, c, 1],
+                    gcquat[bidx, hidx, c, 2],
+                    gcquat[bidx, hidx, c, 3],
                 )
             ),
-            (sx, sy, sz),
+            (decayed * sx + incx, decayed * sy + incy, decayed * sz + incz),
         )
-        sx = moved[0] + incx
-        sy = moved[1] + incy
-        sz = moved[2] + incz
+        sx, sy, sz = moved
 
     gstate[bidx, hidx, base] = sx
     gstate[bidx, hidx, base + 1] = sy
@@ -128,7 +138,8 @@ def state_passing_fwd_kernel(
 @cute.jit
 def state_passing_fwd(
     ginc: cute.Tensor,
-    gctrans: cute.Tensor,
+    gcquat: cute.Tensor,
+    gcscale: cute.Tensor,
     gz0: cute.Tensor,
     gstate: cute.Tensor,
     chunks: cutlass.Int32,
@@ -144,7 +155,7 @@ def state_passing_fwd(
     covers every batch, head, row, lane, and chunk count.
     """
     state_passing_fwd_kernel(
-        ginc, gctrans, gz0, gstate, chunks, threads, has_z0
+        ginc, gcquat, gcscale, gz0, gstate, chunks, threads, has_z0
     ).launch(grid=(tiles, bsz, heads), block=(threads, 1, 1))
 
 
@@ -162,9 +173,9 @@ class StatePassing(NamedTuple):
 
 
 def _check_operand(name: str, tensor: torch.Tensor) -> None:
-    """Reject a device or layout the kernel cannot read.
+    """Reject a device, dtype, or layout the kernel cannot read.
 
-    Both checks are on the host side of the launch. A host pointer handed to a
+    Every check is on the host side of the launch. A host pointer handed to a
     kernel raises inside CUDA and leaves the context unusable for the rest of the
     process, and a strided operand is either silently misread or fails later in an
     internal reshape.
@@ -174,26 +185,32 @@ def _check_operand(name: str, tensor: torch.Tensor) -> None:
         tensor: The operand.
 
     Raises:
-        ValueError: If the tensor is not on a cuda device or is not contiguous.
+        ValueError: If the tensor is not on a cuda device, is not float32, or is
+            not contiguous.
     """
     if tensor.device.type != "cuda":
         raise ValueError(f"{name} must be on a cuda device, got {tensor.device}")
+    if tensor.dtype is not torch.float32:
+        raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous; no repacking is done")
 
 
 def state_passing_forward(
     inc: torch.Tensor,
-    ctrans: torch.Tensor,
+    cquat: torch.Tensor,
+    cscale: torch.Tensor,
     z0: torch.Tensor | None = None,
 ) -> StatePassing:
     """Run the inter-chunk recurrence in place over ``inc``.
 
     Args:
-        inc: ``(B,H,C,P,3N)`` float32, contiguous. Consumed: on return this
-            buffer holds ``zstart``.
-        ctrans: ``(B,H,C,4)`` float32, contiguous. Packed chunk transitions
-            ``exp(lp_{L-1}) * Q_{L-1}``.
+        inc: ``(B,H,C,P,3N)`` float32, contiguous. The chunk-local increments.
+            Consumed: on return this buffer holds ``zstart``.
+        cquat: ``(B,H,C,4)`` float32, contiguous. Unit chunk rotations
+            ``Q_{L-1}``, scalar-first.
+        cscale: ``(B,H,C)`` float32, contiguous. Chunk decays
+            ``exp(2*lp_{L-1})``.
         z0: ``(B,H,P,3N)`` float32, contiguous. Zero state if omitted.
 
     Returns:
@@ -204,14 +221,18 @@ def state_passing_forward(
             ``(P, 3N)`` pair the exact launch cannot cover.
     """
     _check_operand("inc", inc)
-    _check_operand("ctrans", ctrans)
-    if inc.dtype is not torch.float32 or ctrans.dtype is not torch.float32:
-        raise ValueError("state_passing needs float32 inc and ctrans (I4)")
-    if inc.ndim != 5 or ctrans.ndim != 4:
-        raise ValueError(f"expected (B,H,C,P,3N) and (B,H,C,4), got {tuple(inc.shape)}")
+    _check_operand("cquat", cquat)
+    _check_operand("cscale", cscale)
+    if inc.ndim != 5 or cquat.ndim != 4 or cscale.ndim != 3:
+        raise ValueError(
+            "expected (B,H,C,P,3N), (B,H,C,4) and (B,H,C), got "
+            f"{tuple(inc.shape)}, {tuple(cquat.shape)}, {tuple(cscale.shape)}"
+        )
     bsz, heads, chunks, rows, dim = inc.shape
-    if tuple(ctrans.shape) != (bsz, heads, chunks, 4):
-        raise ValueError(f"ctrans shape {tuple(ctrans.shape)} does not match inc")
+    if tuple(cquat.shape) != (bsz, heads, chunks, 4):
+        raise ValueError(f"cquat shape {tuple(cquat.shape)} does not match inc")
+    if tuple(cscale.shape) != (bsz, heads, chunks):
+        raise ValueError(f"cscale shape {tuple(cscale.shape)} does not match inc")
     if dim % 3 != 0 or (rows * dim // 3) % THREADS != 0:
         raise ValueError(
             f"P*N must be a multiple of {THREADS} and 3N of 3, got P={rows} 3N={dim}"
@@ -222,8 +243,6 @@ def state_passing_forward(
         start = state
     else:
         _check_operand("z0", z0)
-        if z0.dtype is not torch.float32:
-            raise ValueError("state_passing needs a float32 z0 (I4)")
         if tuple(z0.shape) != (bsz, heads, rows, dim):
             raise ValueError(f"z0 shape {tuple(z0.shape)} does not match inc")
         start = z0
@@ -234,7 +253,8 @@ def state_passing_forward(
     tiles = rows * dim // 3 // THREADS
     state_passing_fwd(
         dev_tensor(inc.view(bsz, heads, chunks, rows * dim)),
-        dev_tensor(ctrans),
+        dev_tensor(cquat),
+        dev_tensor(cscale),
         dev_tensor(start.view(bsz, heads, rows * dim)),
         dev_tensor(state.view(bsz, heads, rows * dim)),
         chunks,
