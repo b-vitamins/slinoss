@@ -39,11 +39,13 @@ from slinoss.perf.timing import Throughput, measure
 from slinoss.perf.workload import (
     BLOCK,
     CONV,
+    MIXER,
     OPS,
     SCANPREP,
     SHAPE_NAMES,
     BlockShape,
     ConvShape,
+    MixerShape,
     OpShape,
     PrepShape,
     block_forward_only,
@@ -56,7 +58,11 @@ from slinoss.perf.workload import (
     make_block_inputs,
     make_conv_inputs,
     make_inputs,
+    make_mixer_inputs,
     make_prep_inputs,
+    mixer_forward_only,
+    mixer_shape_by_name,
+    mixer_step,
     prep_forward_only,
     prep_shape_by_name,
     prep_step,
@@ -151,7 +157,9 @@ def target_argv(args: argparse.Namespace) -> list[str]:
 
 def build_workload(
     args: argparse.Namespace, device: torch.device
-) -> tuple[OpShape | ConvShape | PrepShape | BlockShape, Callable[[], None]]:
+) -> tuple[
+    OpShape | ConvShape | PrepShape | BlockShape | MixerShape, Callable[[], None]
+]:
     """Resolve the shape and build the event-bench runner for ``--op``.
 
     The same dispatch runs in :mod:`scripts.perf.profile_target`, so the event
@@ -196,6 +204,14 @@ def build_workload(
             block_step(block, block_shape, backend=args.backend)
             if grads
             else block_forward_only(block, block_shape, backend=args.backend)
+        )
+    if args.op == MIXER:
+        mixer_shape = mixer_shape_by_name(args.shape)
+        mixer = make_mixer_inputs(mixer_shape, device, dtype=dtype, requires_grad=grads)
+        return mixer_shape, (
+            mixer_step(mixer, mixer_shape, backend=args.backend)
+            if grads
+            else mixer_forward_only(mixer, mixer_shape, backend=args.backend)
         )
     shape = shape_by_name(args.shape)
     inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)

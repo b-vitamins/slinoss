@@ -1,7 +1,7 @@
 """The benchmarked workloads: shapes, inputs, and the timed callables.
 
 Every test runs on the CPU reference at a shape small enough to be cheap, because
-what is under test is the workload definition and not the operator. The four
+what is under test is the workload definition and not the operator. The five
 standard size tables are checked against the shape constraints they have to
 satisfy, since a bench that runs at an illegal shape reports a number for a
 configuration the operator does not support.
@@ -13,18 +13,20 @@ import pytest
 import torch
 
 from slinoss import _C
+from slinoss._guard import PROJ_ALIGN
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.timing import measure, measure_paired
 from slinoss.perf.workload import (
     BLOCK_SHAPES,
     CONV_SHAPES,
+    MIXER_SHAPES,
     PREP_SHAPES,
-    PROJ_ALIGN,
     SHAPE_NAMES,
     SHAPES,
     W_MAX,
     BlockShape,
     ConvShape,
+    MixerShape,
     OpShape,
     PrepShape,
     block_forward_only,
@@ -38,7 +40,11 @@ from slinoss.perf.workload import (
     make_block_inputs,
     make_conv_inputs,
     make_inputs,
+    make_mixer_inputs,
     make_prep_inputs,
+    mixer_forward_only,
+    mixer_shape_by_name,
+    mixer_step,
     prep_forward_only,
     prep_shape_by_name,
     prep_step,
@@ -73,6 +79,10 @@ SMALL_PREP = PrepShape(SMALL_LAYER, groups=1)
 """``H = 1``, so ``10*H`` is 10 and the projection width takes the padding path."""
 
 SMALL_BLOCK = BlockShape(SMALL_LAYER)
+
+SMALL_MIXER = MixerShape(SMALL_PREP)
+"""The tail of the layer :data:`SMALL_PREP` feeds: a 16-wide gate band of a
+144-wide projection, so the band is pitched and not the whole row."""
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +601,11 @@ def test_make_block_inputs_widens_the_residual_stream_and_the_weight() -> None:
     assert tuple(got.dnormed.shape) == stream
     assert tuple(got.dresidual.shape) == stream
     assert tuple(got.dout.shape) == ffn
+    # The plain norm's own input, not a second read of x: a second read would come
+    # out of L2 and understate that kernel's DRAM traffic.
+    assert tuple(got.prehead.shape) == stream
+    assert tuple(got.dprehead.shape) == stream
+    assert got.prehead.data_ptr() != got.x.data_ptr()
     for t in got:
         assert t.is_contiguous()
     # Every block of a stack but the first: the stream has been widened once and is
@@ -599,12 +614,23 @@ def test_make_block_inputs_widens_the_residual_stream_and_the_weight() -> None:
     assert got.residual.dtype == torch.float32
     assert got.weight.dtype == torch.float32
     assert got.dresidual.dtype == torch.float32
-    assert {got.x.dtype, got.gate.dtype, got.up.dtype, got.dnormed.dtype} == {
-        torch.bfloat16
-    }
-    assert got.differentiable == (got.x, got.residual, got.weight, got.gate, got.up)
+    assert {
+        got.x.dtype,
+        got.gate.dtype,
+        got.up.dtype,
+        got.dnormed.dtype,
+        got.prehead.dtype,
+    } == {torch.bfloat16}
+    # Two arms over one weight, so the shared parameter appears once.
+    assert got.fused == (got.x, got.residual, got.weight, got.gate, got.up)
+    assert got.plain == (got.prehead, got.weight)
+    assert got.differentiable == (*got.fused, got.prehead)
     assert all(t.requires_grad for t in got.differentiable)
-    assert not (got.dnormed.requires_grad or got.dout.requires_grad)
+    assert not (
+        got.dnormed.requires_grad
+        or got.dout.requires_grad
+        or got.dprehead.requires_grad
+    )
     plain = make_block_inputs(SMALL_BLOCK, CPU, requires_grad=False)
     assert not any(t.requires_grad for t in plain.differentiable)
     # Two runs of a bench must compare the same numbers.
@@ -634,12 +660,22 @@ def test_the_block_runners_record_their_own_regions() -> None:
         warmup=1,
         device=CPU,
     )
-    assert [t.label for t in forward.regions] == ["block.forward"]
+    # The plain norm is a third arm one level down, so the two fused kernels keep
+    # the bucket they had before it existed and its cost is a separate row.
+    assert [t.label for t in forward.regions] == [
+        "block.forward",
+        "block.rmsnorm.forward",
+    ]
     assert all(t.requires_grad for t in inputs.differentiable)
     timed = measure(
         block_step(inputs, SMALL_BLOCK), label="block", iters=2, warmup=1, device=CPU
     )
-    assert [t.label for t in timed.regions] == ["block.forward", "block.backward"]
+    assert [t.label for t in timed.regions] == [
+        "block.forward",
+        "block.backward",
+        "block.rmsnorm.forward",
+        "block.rmsnorm.backward",
+    ]
     assert timed.region("block.backward").spread.sample_count == 2
     # torch.autograd.grad, so nothing accumulates into a .grad buffer.
     assert all(t.grad is None for t in inputs.differentiable)
@@ -650,7 +686,25 @@ def test_the_block_runners_record_their_own_regions() -> None:
         warmup=0,
         device=CPU,
     )
-    assert [t.label for t in prefixed.regions] == ["arm-b.forward", "arm-b.backward"]
+    assert [t.label for t in prefixed.regions] == [
+        "arm-b.forward",
+        "arm-b.backward",
+        "arm-b.rmsnorm.forward",
+        "arm-b.rmsnorm.backward",
+    ]
+    # A subset naming one arm measures that arm alone, which is how the plain norm
+    # is profiled without the fused two in the capture.
+    alone = measure(
+        block_step(inputs, SMALL_BLOCK, wrt=(inputs.prehead,)),
+        label="block",
+        iters=1,
+        warmup=0,
+        device=CPU,
+    )
+    assert [t.label for t in alone.regions] == [
+        "block.rmsnorm.forward",
+        "block.rmsnorm.backward",
+    ]
 
 
 def test_block_step_rejects_inputs_that_take_no_gradient() -> None:
@@ -662,3 +716,134 @@ def test_block_step_rejects_inputs_that_take_no_gradient() -> None:
     grads = make_block_inputs(SMALL_BLOCK, CPU, requires_grad=True)
     with pytest.raises(ValueError, match="at least one input requiring grad"):
         block_step(grads, SMALL_BLOCK, wrt=(grads.dout,))
+
+
+# ---------------------------------------------------------------------------
+# MixerShape and MIXER_SHAPES
+# ---------------------------------------------------------------------------
+
+
+def test_mixer_shapes_take_their_pitch_from_the_frontier_projection() -> None:
+    assert tuple(s.name for s in MIXER_SHAPES) == SHAPE_NAMES
+    for shape in MIXER_SHAPES:
+        config = layer_config(shape.scan)
+        assert shape.width == config.d_inner == shape.scan.heads * shape.scan.rows
+        assert shape.eps == config.norm_eps
+        # The value band precedes the gate and is the same width, and the bands the
+        # frontier reads follow it, so the gate is interior and its pitch is wider
+        # than it is.
+        assert shape.gate_offset == shape.width
+        assert shape.proj_width == shape.prep.proj_width
+        assert shape.proj_width > shape.gate_offset + shape.width
+        # The kernels index the band through a dynamic layout, so both its offset
+        # and its pitch have to clear the alignment a pitched operand is held to.
+        assert shape.gate_offset % PROJ_ALIGN == 0
+        assert shape.proj_width % PROJ_ALIGN == 0
+    assert SMALL_MIXER.width == 16
+    assert SMALL_MIXER.proj_width == 144
+    assert SMALL_MIXER.token_count == 8
+    assert SMALL_MIXER.describe() == "small: B=1 H=1 T=8 P=16 d_inner=16 W=144"
+    with pytest.raises(KeyError, match="no mixer shape 'huge'"):
+        mixer_shape_by_name("huge")
+
+
+# ---------------------------------------------------------------------------
+# make_mixer_inputs
+# ---------------------------------------------------------------------------
+
+
+def test_make_mixer_inputs_keeps_the_projection_pitch_on_both_bands() -> None:
+    got = make_mixer_inputs(SMALL_MIXER, CPU, dtype=torch.float32)
+    scan = SMALL_MIXER.scan
+    lead = (scan.bsz, scan.heads, scan.seq)
+    token = (scan.bsz, scan.seq, SMALL_MIXER.width)
+    assert tuple(got.proj.shape) == (scan.bsz, scan.seq, SMALL_MIXER.proj_width)
+    assert tuple(got.y.shape) == (*lead, scan.rows)
+    assert tuple(got.u.shape) == (*lead, scan.rows)
+    assert tuple(got.gate.shape) == token
+    assert tuple(got.dout.shape) == token
+    assert tuple(got.d_skip.shape) == (scan.heads, scan.rows)
+    assert tuple(got.weight.shape) == (scan.heads, scan.rows)
+    # The gate and the output cotangent are bands of a wider projection: the row
+    # pitch is the whole projection and only the trailing axis is unit stride.
+    # Repacking either into a contiguous buffer would measure a layout the mixer
+    # never hands over.
+    pitch = SMALL_MIXER.proj_width
+    for band in got.bands:
+        assert band.stride() == (scan.seq * pitch, pitch, 1)
+        assert not band.is_contiguous()
+    # Head-major and contiguous, which is what the scan and the conv write.
+    assert got.y.is_contiguous()
+    assert got.u.is_contiguous()
+    # Leaves, so the backward measures the tail and not a pullback into a zeroed
+    # projection buffer.
+    assert got.differentiable == (got.y, got.u, got.gate, got.d_skip, got.weight)
+    assert all(t.requires_grad and t.is_leaf for t in got.differentiable)
+    assert not (got.proj.requires_grad or got.dout.requires_grad)
+    plain = make_mixer_inputs(SMALL_MIXER, CPU, requires_grad=False)
+    assert not any(t.requires_grad for t in plain.differentiable)
+    # Operand width and parameter width are independent in the kernel, so a builder
+    # that could not express float32 parameters against a low-precision activation
+    # would leave that call unmeasured.
+    mixed = make_mixer_inputs(
+        SMALL_MIXER, CPU, dtype=torch.bfloat16, param_dtype=torch.float32
+    )
+    assert {mixed.y.dtype, mixed.u.dtype, mixed.gate.dtype, mixed.dout.dtype} == {
+        torch.bfloat16
+    }
+    assert {mixed.d_skip.dtype, mixed.weight.dtype} == {torch.float32}
+    # Two runs of a bench must compare the same numbers.
+    assert torch.equal(
+        make_mixer_inputs(SMALL_MIXER, CPU, seed=7).proj,
+        make_mixer_inputs(SMALL_MIXER, CPU, seed=7).proj,
+    )
+    assert not torch.equal(
+        make_mixer_inputs(SMALL_MIXER, CPU, seed=7).proj,
+        make_mixer_inputs(SMALL_MIXER, CPU, seed=8).proj,
+    )
+
+
+# ---------------------------------------------------------------------------
+# mixer_forward_only and mixer_step
+# ---------------------------------------------------------------------------
+
+
+def test_the_mixer_runners_record_their_own_regions() -> None:
+    inputs = make_mixer_inputs(
+        SMALL_MIXER, CPU, dtype=torch.float32, requires_grad=True
+    )
+    forward = measure(
+        mixer_forward_only(inputs, SMALL_MIXER),
+        label="mixer",
+        iters=2,
+        warmup=1,
+        device=CPU,
+    )
+    assert [t.label for t in forward.regions] == ["mixer.forward"]
+    assert all(t.requires_grad for t in inputs.differentiable)
+    timed = measure(
+        mixer_step(inputs, SMALL_MIXER), label="mixer", iters=2, warmup=1, device=CPU
+    )
+    assert [t.label for t in timed.regions] == ["mixer.forward", "mixer.backward"]
+    assert timed.region("mixer.backward").spread.sample_count == 2
+    # torch.autograd.grad, so nothing accumulates into a .grad buffer.
+    assert all(t.grad is None for t in inputs.differentiable)
+    prefixed = measure(
+        mixer_step(inputs, SMALL_MIXER, prefix="arm-b"),
+        label="mixer",
+        iters=1,
+        warmup=0,
+        device=CPU,
+    )
+    assert [t.label for t in prefixed.regions] == ["arm-b.forward", "arm-b.backward"]
+
+
+def test_mixer_step_rejects_inputs_that_take_no_gradient() -> None:
+    # Otherwise it would time a forward under grad mode and report it as a step.
+    with pytest.raises(ValueError, match="at least one input requiring grad"):
+        mixer_step(
+            make_mixer_inputs(SMALL_MIXER, CPU, requires_grad=False), SMALL_MIXER
+        )
+    grads = make_mixer_inputs(SMALL_MIXER, CPU, requires_grad=True)
+    with pytest.raises(ValueError, match="at least one input requiring grad"):
+        mixer_step(grads, SMALL_MIXER, wrt=(grads.dout,))

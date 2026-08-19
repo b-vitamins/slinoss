@@ -29,6 +29,7 @@ from slinoss.perf.timing import on_device
 from slinoss.perf.workload import (
     BLOCK,
     CONV,
+    MIXER,
     OPS,
     SCANPREP,
     SHAPE_NAMES,
@@ -42,7 +43,11 @@ from slinoss.perf.workload import (
     make_block_inputs,
     make_conv_inputs,
     make_inputs,
+    make_mixer_inputs,
     make_prep_inputs,
+    mixer_forward_only,
+    mixer_shape_by_name,
+    mixer_step,
     prep_forward_only,
     prep_shape_by_name,
     prep_step,
@@ -96,7 +101,8 @@ def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[],
 
     Returns:
         The workload callable, region-labelled ``op.*`` for the scan, ``conv.*``
-        for the conv, ``prep.*`` for the frontier and ``block.*`` for the block.
+        for the conv, ``prep.*`` for the frontier, ``block.*`` for the block and
+        ``mixer.*`` for the fused tail.
     """
     grads = args.mode == "step"
     dtype = DTYPES[args.dtype]
@@ -123,6 +129,12 @@ def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[],
         if grads:
             return block_step(block, block_shape, backend=args.backend)
         return block_forward_only(block, block_shape, backend=args.backend)
+    if args.op == MIXER:
+        mixer_shape = mixer_shape_by_name(args.shape)
+        mixer = make_mixer_inputs(mixer_shape, device, dtype=dtype, requires_grad=grads)
+        if grads:
+            return mixer_step(mixer, mixer_shape, backend=args.backend)
+        return mixer_forward_only(mixer, mixer_shape, backend=args.backend)
     shape = shape_by_name(args.shape)
     inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
     if grads:
