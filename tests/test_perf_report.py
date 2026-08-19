@@ -18,6 +18,7 @@ reach it with a mixture.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Annotated
@@ -33,7 +34,7 @@ from slinoss.perf.ceiling import (
     DramCeiling,
     TensorCeiling,
 )
-from slinoss.perf.declared import declared_class
+from slinoss.perf.declared import DECLARED, declared_class
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.dispersion import (
     GrowthRow,
@@ -877,3 +878,29 @@ def test_declared_class_refuses_a_symbol_it_cannot_place() -> None:
         declared_class("kernel_cutlass_brand_new_fwd_kernel_0")
     with pytest.raises(ValueError, match="one symbol, one class"):
         declared_class("kernel_cutlass_conv1d_fwd_kernel_conv1d_bwd_kernel_0")
+
+
+def test_the_table_names_every_kernel_in_the_tree_and_nothing_else() -> None:
+    """The table against the source, in both directions.
+
+    An undeclared kernel raises only once something profiles it, and a
+    declaration that outlived its kernel never raises at all: it reads as
+    coverage of a symbol no run can produce. Both are decidable from the source,
+    which is where the declaration itself lives.
+
+    Read rather than imported. Importing the kernel modules drags in the CuTe DSL
+    and the compiled extension, which is what keeps this module runnable without
+    either.
+    """
+    root = Path(__file__).resolve().parents[1]
+    compiled = {
+        found.group(1)
+        for path in (root / "slinoss").rglob("*.py")
+        for found in re.finditer(r"@cute\.kernel\s+def\s+(\w+)", path.read_text())
+    } | {
+        found.group(1)
+        for path in (root / "csrc").rglob("*.c*")
+        for found in re.finditer(r"__global__\s+void\s+(\w+)", path.read_text())
+    }
+    assert compiled
+    assert set(DECLARED) == compiled
