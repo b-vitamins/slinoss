@@ -29,7 +29,12 @@ from slinoss.ops.so3ssd.cute.fwd.chunk_increment import (
     chunk_increment_forward,
     increment_smem_bytes,
 )
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import (
+    ScanInputs,
+    assert_max_rel,
+    make_inputs,
+    projection_band,
+)
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -190,6 +195,39 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert increment_smem_bytes(64, 16, 48) < nbytes
 
 
+def test_reads_a_band_of_the_fused_projection() -> None:
+    """``B`` ships pitched, and the kernel indexes the band rather than a copy of it.
+
+    One projection GEMM feeds every consumer, so ``B`` is a column band of its output
+    and never a buffer of its own. Recovering contiguity would be the staging copy
+    the layout contract exists to refuse. Nothing about the arithmetic changes, so
+    the two layouts must agree bit for bit rather than within a tolerance.
+
+    ``b_last`` is asserted beside the increment because it is read at ``T-1``, which
+    is the one token whose address the pitch places furthest from the base.
+    """
+    inp = make_inputs(
+        bsz=2,
+        heads=4,
+        groups=2,
+        seqlen=128,
+        rows=16,
+        lanes=16,
+        dtype=torch.float32,
+        device="cuda",
+        w_scale=2.0,
+        ls_bias=LS_BIAS,
+        streaming=False,
+        u_dtype=torch.bfloat16,
+        bc_dtype=torch.bfloat16,
+    )
+    want = chunk_increment_forward(inp.U, inp.trans, inp.K, inp.B, 64)
+    got = chunk_increment_forward(inp.U, inp.trans, inp.K, projection_band(inp.B), 64)
+    torch.cuda.synchronize()
+    assert torch.equal(got.inc, want.inc)
+    assert torch.equal(got.b_last, want.b_last)
+
+
 def _ok() -> dict[str, torch.Tensor]:
     """A legal operand set for the rejection table to perturb."""
     inp = _make(2, 2, 128, 16, 16, True, torch.bfloat16)
@@ -204,18 +242,26 @@ def _ok() -> dict[str, torch.Tensor]:
     }
 
 
-def _strided(tensor: torch.Tensor) -> torch.Tensor:
-    """A view of ``tensor``'s shape whose last axis is strided."""
+def _lane_strided(tensor: torch.Tensor) -> torch.Tensor:
+    """A view of ``tensor``'s shape whose trailing axis steps by two.
+
+    A doubled pitch is legal for a band, so the refusal a band operand still owes is
+    the one the tile layout cannot absorb: a trailing axis that is not unit stride.
+    """
     shape = (*tensor.shape[:-1], 2 * int(tensor.shape[-1]))
     wide = torch.empty(shape, device=tensor.device, dtype=tensor.dtype)
-    return wide[..., : tensor.shape[-1]]
+    return wide[..., ::2]
 
 
 Operands = dict[str, torch.Tensor]
 
 REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     (lambda a: a.update(U=a["U"].cpu()), ValueError, "U must be on a CUDA device"),
-    (lambda a: a.update(B=_strided(a["B"])), ValueError, "B must be contiguous"),
+    (
+        lambda a: a.update(B=_lane_strided(a["B"])),
+        ValueError,
+        "B must have unit stride on its trailing axis",
+    ),
     (lambda a: a.update(U=a["U"].float()), TypeError, "U has dtype"),
     (lambda a: a.update(B=a["B"].half()), TypeError, "one dtype per call"),
     (lambda a: a.update(trans=a["trans"].bfloat16()), ValueError, "trans must be"),
@@ -298,7 +344,10 @@ def test_rejects_an_unpaired_stream() -> None:
     ("chunk", "lanes", "match"),
     [
         (24, 16, "multiple of 16"),
-        (64, 15, "3N must be"),
+        # Eight lanes rather than any illegal count: ``3N`` is also the pitch of a
+        # contiguous ``B``, and the band alignment rule is checked first, so an odd
+        # lane count is refused for its pitch and never reaches the extent check.
+        (64, 8, "3N must be"),
     ],
 )
 def test_rejects_an_extent_the_atom_cannot_cover(

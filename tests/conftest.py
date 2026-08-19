@@ -152,6 +152,31 @@ def make_inputs(
     )
 
 
+def projection_band(bc: Tensor) -> Tensor:
+    """A ``(B,G,T,3N)`` vector operand laid out as a band of a wider tensor.
+
+    The mixer projects value, gate, ``B``, ``C`` and the parameters in one GEMM, so a
+    vector operand reaches a kernel as a column band of that output: unit stride
+    along ``3N``, and a token stride equal to the projection width. The group axis
+    therefore strides less than the axis before it, which a band cut out of a
+    head-major buffer would not reproduce. Two groups of padding sit ahead of the band
+    and one behind, so neither the offset nor the pitch is the one a dedicated buffer
+    would have.
+
+    Args:
+        bc: ``(B,G,T,3N)``, any dtype, on any device.
+
+    Returns:
+        A view holding the same values, same shape and dtype, with
+        ``stride(-2) > shape[-1]``.
+    """
+    bsz, groups, seqlen, dim = bc.shape
+    wide = torch.empty(bsz, seqlen, groups + 3, dim, dtype=bc.dtype, device=bc.device)
+    band = wide[:, :, 2 : 2 + groups]
+    band.copy_(bc.permute(0, 2, 1, 3))
+    return band.permute(0, 2, 1, 3)
+
+
 def max_err(a: Tensor, b: Tensor) -> float:
     """Maximum absolute difference, computed in float64."""
     return float((a.detach().double() - b.detach().double()).abs().max())

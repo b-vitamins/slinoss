@@ -26,7 +26,12 @@ from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_scan import chunk_scan_forward, scan_smem_bytes
 from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import (
+    ScanInputs,
+    assert_max_rel,
+    make_inputs,
+    projection_band,
+)
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -197,6 +202,45 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     nbytes = scan_smem_bytes(MAX_CHUNK, 64, 96)
     assert nbytes <= smem_capacity()
     assert scan_smem_bytes(64, 48, 48) < nbytes
+
+
+def test_reads_bands_of_the_fused_projection() -> None:
+    """``B`` and ``C`` both ship pitched, and both are indexed rather than copied.
+
+    One projection GEMM feeds every consumer, so neither vector operand is a buffer
+    of its own. Recovering contiguity would be the staging copy the layout contract
+    exists to refuse. One test covers both because both reach the same rotate-and-
+    stage path, so a break at either operand fails it. Nothing about the arithmetic
+    changes, so the two layouts must agree bit for bit rather than to a tolerance.
+    """
+    inp = make_inputs(
+        bsz=2,
+        heads=4,
+        groups=2,
+        seqlen=128,
+        rows=16,
+        lanes=16,
+        dtype=torch.float32,
+        device="cuda",
+        w_scale=2.0,
+        ls_bias=LS_BIAS,
+        streaming=False,
+        u_dtype=torch.bfloat16,
+        bc_dtype=torch.bfloat16,
+    )
+    zstart = _reference(inp, 64).zstart.flatten(-2, -1).float().contiguous()
+    want = chunk_scan_forward(inp.U, inp.trans, inp.K, inp.B, inp.C, zstart, 64)
+    got = chunk_scan_forward(
+        inp.U,
+        inp.trans,
+        inp.K,
+        projection_band(inp.B),
+        projection_band(inp.C),
+        zstart,
+        64,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)
 
 
 Operands = dict[str, torch.Tensor]

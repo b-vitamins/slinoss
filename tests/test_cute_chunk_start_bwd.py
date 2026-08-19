@@ -27,7 +27,12 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
     chunk_start_backward,
     start_smem_bytes,
 )
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import (
+    ScanInputs,
+    assert_max_rel,
+    make_inputs,
+    projection_band,
+)
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -173,23 +178,6 @@ def test_grouped_readout_reads_its_own_group(groups: int) -> None:
     assert_max_rel(got, want, BOUNDS[torch.bfloat16], f"cute-chunk-start[G{groups}]")
 
 
-def _projection_band(C: torch.Tensor) -> torch.Tensor:
-    """``C`` as the mixer hands it over: one column band of a wider tensor.
-
-    The fused projection is token-major, so the view the kernel receives strides by
-    the projection width from one token to the next and by ``3N`` from one group to
-    the next. The group axis therefore strides less than the axis before it, which a
-    band cut out of a head-major buffer would not reproduce. Two bands sit ahead of
-    it and one behind, so neither the offset nor the pitch is the one a dedicated
-    buffer would have.
-    """
-    bsz, groups, seqlen, dim = C.shape
-    wide = torch.empty(bsz, seqlen, groups + 3, dim, dtype=C.dtype, device=C.device)
-    band = wide[:, :, 2 : 2 + groups]
-    band.copy_(C.permute(0, 2, 1, 3))
-    return band.permute(0, 2, 1, 3)
-
-
 def test_reads_a_band_of_the_fused_projection() -> None:
     """``C`` ships pitched, and the kernel indexes the band rather than a copy of it.
 
@@ -201,7 +189,7 @@ def test_reads_a_band_of_the_fused_projection() -> None:
     inp = _make(2, 4, 128, 16, 16, torch.bfloat16, groups=2)
     dy = _cotangent(inp, torch.bfloat16)
     want = chunk_start_backward(dy, inp.trans, inp.C, 64)
-    got = chunk_start_backward(dy, inp.trans, _projection_band(inp.C), 64)
+    got = chunk_start_backward(dy, inp.trans, projection_band(inp.C), 64)
     torch.cuda.synchronize()
     assert torch.equal(got, want)
 

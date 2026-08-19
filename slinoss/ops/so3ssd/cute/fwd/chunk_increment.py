@@ -91,6 +91,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_layout,
     check_operands,
     check_pinned,
+    check_pitched,
     check_shapes,
     check_stream,
 )
@@ -523,8 +524,10 @@ def chunk_increment_forward(
             :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous.
         trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
         K: ``(B,H,T,2,4)`` float32, contiguous. Per-tap ``(kr, g, h, 0)``.
-        B: ``(B,G,T,3N)``, the dtype of ``U``, contiguous. ``G`` divides ``H``;
-            head ``h`` reads group ``h // (H // G)``.
+        B: ``(B,G,T,3N)``, the dtype of ``U``, pitched. One column band of the
+            mixer's fused projection, so the token stride is the projection width
+            rather than ``3N``; a contiguous buffer is the case where the two
+            agree. ``G`` divides ``H``; head ``h`` reads group ``h // (H // G)``.
         chunk_size: ``L``. A multiple of :func:`kblock` of itself, which every
             power of two satisfies and 48 does not.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, the dtype of ``U``. Paired with
@@ -538,12 +541,17 @@ def chunk_increment_forward(
         ValueError: On a layout, rank, shape, extent, or pairing violation.
         TypeError: On an activation dtype with no tensor-core path.
     """
+    # ``B`` is a band and the rest is not, so the layout rule splits while the dtype
+    # group stays whole: one call is what makes a mixed-dtype pair reachable.
     activations: Named = ((U, "U"), (B, "B"))
+    dense: Named = ((U, "U"),)
     if u_prev is not None and b_prev is not None:
         activations = (*activations, (u_prev, "u_prev"), (b_prev, "b_prev"))
+        dense = (*dense, (u_prev, "u_prev"), (b_prev, "b_prev"))
 
     pinned: Named = ((trans, "trans"), (K, "K"))
-    check_layout((*activations, *pinned))
+    check_layout((*dense, *pinned))
+    check_pitched(((B, "B"),))
     dtype = check_operands(activations)
     check_pinned(pinned)
     bsz, heads, groups, seqlen, rows, dim = check_shapes(U, trans, K, (B, "B"))

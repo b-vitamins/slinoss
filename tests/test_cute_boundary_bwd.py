@@ -42,7 +42,7 @@ from torch import Tensor
 
 from slinoss.ops.so3ssd.cute.bwd.boundary import BoundaryStream, boundary_backward
 from slinoss.ops.so3ssd.cute.common import THREADS
-from tests.conftest import assert_max_rel
+from tests.conftest import assert_max_rel, projection_band
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -297,22 +297,6 @@ def test_the_wide_case_is_wider_than_the_block() -> None:
     assert 3 * WIDE.lanes > THREADS
 
 
-def _projection_band(t: Tensor) -> Tensor:
-    """``t`` as the mixer hands it over: one column band of a token-major buffer.
-
-    The projection strides by its own width from one token to the next and by
-    ``3N`` from one group to the next, so the group axis strides less than the axis
-    before it, which a band cut from a group-major buffer would not reproduce. Two
-    bands sit ahead of this one and one behind, so neither the offset nor the pitch
-    is the one a dedicated buffer would have.
-    """
-    bsz, groups, seqlen, dim = (int(d) for d in t.shape)
-    wide = torch.empty(bsz, seqlen, groups + 3, dim, dtype=t.dtype, device=t.device)
-    band = wide[:, :, 2 : 2 + groups]
-    band.copy_(t.permute(0, 2, 1, 3))
-    return band.permute(0, 2, 1, 3)
-
-
 def test_writes_a_band_of_the_fused_projection_gradient() -> None:
     """``dB`` ships pitched, and the kernel writes the band rather than a copy.
 
@@ -325,7 +309,7 @@ def test_writes_a_band_of_the_fused_projection_gradient() -> None:
     """
     want = _build(SPLIT)
     got = _build(SPLIT)
-    got.dB = _projection_band(got.dB)
+    got.dB = projection_band(got.dB)
     want.run()
     got.run()
     torch.cuda.synchronize()
