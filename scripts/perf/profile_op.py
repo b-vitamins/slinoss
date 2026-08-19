@@ -6,8 +6,14 @@ Runs three clocks over the same workload and refuses to emit if they disagree:
 2. NSYS over ``scripts/perf/profile_target.py``, giving the launch stream.
 3. NCU over the same target, one pass per counter table, giving the counters.
 
-NCU is slow: it replays every kernel once per pass, eight passes deep. Keep
+NCU is slow: it replays every kernel once per pass, nine passes deep. Keep
 ``--iters`` small; the wall comes from the event bench, not from the profiler.
+
+A DRAM-bound kernel is scored against a time floor measured in this process at
+the kernel's own traffic, not against the rate of the largest copy the device can
+run. The ninth pass is the local-memory one, and it is not optional: the spill
+rule fails a kernel whatever its percentage, so a pass that was never run must
+not read as clean.
 
     python3 scripts/perf/profile_op.py --shape standard --mode step
 
@@ -29,10 +35,18 @@ from pathlib import Path
 import torch
 
 from slinoss.perf.budget import assert_closed, budget
-from slinoss.perf.ceiling import ceilings
-from slinoss.perf.declared import ClassAudit, class_audit
+from slinoss.perf.ceiling import ceilings, dram_time_floor
+from slinoss.perf.declared import FloorAudit, floor_audit
 from slinoss.perf.device import device_info, device_ordinal, require_cuda
-from slinoss.perf.ncu import NCU_TABLES, NcuPass, kernel_counters, run_ncu
+from slinoss.perf.ncu import (
+    NCU_TABLES,
+    SPILL_TABLE,
+    NcuPass,
+    SpillCounters,
+    kernel_counters,
+    run_ncu,
+    spill_counters,
+)
 from slinoss.perf.nsys import run_nsys
 from slinoss.perf.report import Report, agreement, write_report
 from slinoss.perf.timing import Throughput, measure
@@ -107,6 +121,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "layout. Ignored by every other operator.",
     )
     parser.add_argument("--ncu", default="ncu")
+    parser.add_argument(
+        "--kernel",
+        default=None,
+        help="NCU kernel-name regex. Narrows every pass to the matching "
+        "kernels, which is what makes a per-kernel question answerable without "
+        "replaying the whole step. The cross-check and the class audit then "
+        "cover only what was profiled, and the report says so.",
+    )
     parser.add_argument("--nsys", default="nsys")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--out", type=Path, default=Path("out/profile-op"))
@@ -248,6 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     tree = budget(timed)
     assert_closed(tree)
     limits = ceilings(device)
+    floor = dram_time_floor(device)
     # The inputs live in the runner's closure and the profilers need the memory
     # for a second process at the same shape.
     del runner
@@ -260,6 +283,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"event iters={args.event_iters} capture iters={args.iters}",
         f"timer={timed.timer} clocks={timed.clocks}",
         "target: " + " ".join(argv_target),
+        f"dram floor: c={floor.fixed_duration_us:.3f} us "
+        f"B={floor.asymptotic_gbs:.2f} GB/s "
+        f"max residual={floor.max_residual_pct:.2f}% "
+        f"l2={floor.l2_bytes} B",
     ]
 
     trace = None
@@ -270,21 +297,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         notes.append(f"nsys report: {trace.report_path}")
 
     passes: list[NcuPass] = []
+    spills: tuple[SpillCounters, ...] = ()
+    narrow = () if args.kernel is None else ("--kernel-name", f"regex:{args.kernel}")
+    if narrow:
+        notes.append(
+            f"ncu narrowed to kernels matching {args.kernel!r}; the cross-check "
+            f"and the class audit cover only those"
+        )
     if not args.skip_ncu:
-        for table in NCU_TABLES:
-            one = run_ncu(table, argv_target, ncu=args.ncu)
+        for table in (*NCU_TABLES, SPILL_TABLE):
+            one = run_ncu(table, argv_target, ncu=args.ncu, extra=narrow)
             if one.missing_metrics:
                 raise ValueError(
                     f"ncu table {table.name!r} returned no value for "
                     f"{list(one.missing_metrics)}; the metric names are wrong for "
                     f"this driver"
                 )
-            passes.append(one)
             print(f"ncu {table.name}: {len(one.invocations)} launches")
+            # The spill pass feeds the spill rule, not the counter merge: its
+            # duration column exists only to key the records to kernels.
+            if table is SPILL_TABLE:
+                spills = spill_counters(one)
+            else:
+                passes.append(one)
 
     kernels = kernel_counters(passes) if passes else ()
     check = None
-    if trace is not None and kernels:
+    # A narrowed capture holds a subset of the launches the trace holds, so the
+    # three clocks cannot be made to agree and asking them to would fail on the
+    # narrowing rather than on a disagreement.
+    if trace is not None and kernels and not narrow:
         check = agreement(
             label,
             event=timed.total,
@@ -298,11 +340,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the ncu tables together"
         )
 
-    audit: ClassAudit | None = None
+    audit: FloorAudit | None = None
     if kernels:
-        audit = class_audit(
+        audit = floor_audit(
             kernels,
-            limits=limits,
+            floor=floor,
+            spills=spills,
             step_duration_us=timed.total.median_duration_us,
             capture_iters=args.iters,
         )
@@ -310,6 +353,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             notes.append(
                 "unjudged kernels, not compiled by this repo: "
                 + ", ".join(audit.unjudged)
+            )
+        if audit.spilled:
+            notes.append(
+                "failed by the spill rule, whatever the percentage: "
+                + ", ".join(audit.spilled)
             )
 
     report = Report(

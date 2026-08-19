@@ -12,6 +12,11 @@ The fabricated profiler sums are deliberately tiny against the measured wall, so
 the timeline check passes on any part and the test turns on the wiring rather than
 on the clock.
 
+The time floor is fabricated too, and backwards: its fitted law puts the one owned
+kernel at a known share of the floor, so a driver scoring against the copy ceiling
+instead would land on a different number. The spill record beside it is what turns
+that verdict from passing to failed.
+
 The operator axis does not interact with the skip flags, the cross-check, or the
 refusal paths: ``--op`` selects which workload the three clocks run over, and they
 run over whichever one that is. So it is swept once, against the report it names
@@ -29,9 +34,23 @@ import pytest
 import torch
 
 from scripts.perf import profile_op
-from slinoss.perf.ceiling import DRAM_BOUND, Ceilings, DramCeiling, TensorCeiling
+from slinoss.perf.ceiling import (
+    DRAM_BOUND,
+    Ceilings,
+    CopySample,
+    DramCeiling,
+    DramTimeFloor,
+    TensorCeiling,
+)
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
-from slinoss.perf.ncu import NCU_TABLES, KernelCounters, NcuPass, NcuTable
+from slinoss.perf.ncu import (
+    NCU_TABLES,
+    SPILL_TABLE,
+    KernelCounters,
+    NcuPass,
+    NcuTable,
+    SpillCounters,
+)
 from slinoss.perf.nsys import NsysKernel, NsysTrace
 from slinoss.perf.report import AgreementError
 from slinoss.perf.units import (
@@ -53,10 +72,30 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device"),
 ]
 
-TABLE_NAMES = tuple(table.name for table in NCU_TABLES)
+PASS_TABLES = (*NCU_TABLES, SPILL_TABLE)
+"""Every pass the driver runs, in order: the counter tables, then the spill table.
+The spill pass is not optional, because the spill rule fails a kernel whatever its
+percentage and a pass never run must not read as clean."""
+
+TABLE_NAMES = tuple(table.name for table in PASS_TABLES)
 FAKE_SUM_US = 2.0
 """Fabricated profiler total, in microseconds. Far below any real CPU wall, so
 the event-covers-device check has room on every host."""
+
+FLOOR_READ_BYTES = 1 << 20
+FLOOR_WRITE_BYTES = 1 << 19
+FLOOR_MOVED_BYTES = FLOOR_READ_BYTES + FLOOR_WRITE_BYTES
+"""DRAM traffic the fabricated kernel moves, read plus write. Over
+:data:`FAKE_SUM_US` this is 786.432 GB/s, so the record is one rate rather than a
+duration and a byte count that contradict each other."""
+
+FLOOR_FIXED_US = 0.16
+"""Fabricated size-independent term of the time law. Nonzero, because the verdict
+charges it once per launch and a zero would hide that it is charged at all."""
+
+FLOOR_ACHIEVED_PCT = 88.0
+"""Share of the floor the owned kernel reaches, by construction. Above the 85%
+bar, so the spill rule is the only thing that can fail the default fixture."""
 
 OWNED = "kernel_cutlass_chunk_scan_fwd_kernel_bf16_Ampere_0"
 """A profiled kernel under the symbol NCU reports. The declaration table matches
@@ -122,6 +161,59 @@ def ceiling_records() -> Ceilings:
     )
 
 
+def floor_record() -> DramTimeFloor:
+    """A fitted time law, fabricated backwards from the kernel it judges.
+
+    The two samples lie exactly on ``t = c + bytes/B`` for the ``c`` and ``B`` that
+    put the floor for :data:`FLOOR_MOVED_BYTES` at :data:`FLOOR_ACHIEVED_PCT` of
+    :data:`FAKE_SUM_US`, so the fit recovers those terms and the residual is zero.
+    The arithmetic of the verdict itself belongs to
+    :func:`slinoss.perf.ceiling.dram_floor_verdict`; a known percentage here is
+    what shows the driver judging against the floor rather than against the copy
+    ceiling, which scores the same kernel differently.
+
+    Returns:
+        The fitted floor.
+    """
+    target_us = FAKE_SUM_US * FLOOR_ACHIEVED_PCT / 100.0
+    slope = (target_us - FLOOR_FIXED_US) / FLOOR_MOVED_BYTES
+    l2 = device_record().l2_bytes
+    samples: list[CopySample] = []
+    # Both footprints are several L2 sizes per buffer, which is what the real sweep
+    # requires of them; a copy that fits in L2 measures the cache, not DRAM.
+    for multiple in (2.0, 4.0):
+        moved = int(2 * multiple * l2)
+        duration_us = FLOOR_FIXED_US + slope * moved
+        samples.append(
+            CopySample(
+                moved_bytes=Bytes(moved),
+                duration=spread(duration_us),
+                achieved_gbs=GBPerSecond(moved / (1e3 * duration_us)),
+                l2_multiple_ratio=Ratio(multiple),
+            )
+        )
+    return DramTimeFloor.of("fabricated sweep", samples, l2_bytes=l2)
+
+
+def spill_record(*, kernel: str = OWNED, sector_count: int = 0) -> SpillCounters:
+    """Local-memory traffic for one kernel. Zero sectors is a clean kernel.
+
+    Args:
+        kernel: Symbol the record is keyed to.
+        sector_count: Sectors on each side, load and store.
+
+    Returns:
+        The record.
+    """
+    return SpillCounters(
+        kernel=kernel,
+        launch_count=Count(1),
+        duration_us=Microseconds(FAKE_SUM_US),
+        local_load_sector_count=Count(sector_count),
+        local_store_sector_count=Count(sector_count),
+    )
+
+
 def trace_record(*, kernel_sum_us: float = FAKE_SUM_US) -> NsysTrace:
     """A launch stream whose sums are ``kernel_sum_us`` in total."""
     return NsysTrace(
@@ -147,16 +239,20 @@ def trace_record(*, kernel_sum_us: float = FAKE_SUM_US) -> NsysTrace:
 def counter_record(
     *, duration_us: float = FAKE_SUM_US, kernel: str = OWNED
 ) -> KernelCounters:
-    """Merged counters for one kernel, summing to ``duration_us``."""
+    """Merged counters for one kernel, summing to ``duration_us``.
+
+    The traffic and the duration are one rate, so the DRAM verdict reads off a
+    record that does not contradict itself.
+    """
     return KernelCounters(
         kernel=kernel,
         launch_count=Count(1),
         duration_us=Microseconds(duration_us),
         pass_duration_spread_pct=Percent(0.4),
-        dram_read_bytes=Bytes(1 << 24),
-        dram_write_bytes=Bytes(1 << 23),
-        dram_pct=Percent(88.0),
-        achieved_gbs=GBPerSecond(760.0),
+        dram_read_bytes=Bytes(FLOOR_READ_BYTES),
+        dram_write_bytes=Bytes(FLOOR_WRITE_BYTES),
+        dram_pct=Percent(83.0),
+        achieved_gbs=GBPerSecond(FLOOR_MOVED_BYTES / (1e3 * duration_us)),
         global_load_request_count=Count(1 << 18),
         global_store_request_count=Count(1 << 17),
         global_load_sector_count=Count(1 << 20),
@@ -214,6 +310,7 @@ class Recorder:
         self.ncu_argv: list[list[str]] = []
         self.ncu_tables: list[str] = []
         self.ncu_binary: list[str] = []
+        self.ncu_extra: list[tuple[str, ...]] = []
         self.nsys_binary: list[str] = []
 
 
@@ -223,8 +320,9 @@ def patch_externals(
     kernel_sum_us: float = FAKE_SUM_US,
     ncu_sum_us: float = FAKE_SUM_US,
     missing_metrics: Sequence[str] = (),
+    spill_sector_count: int = 0,
 ) -> Recorder:
-    """Replace the two profiler drivers and the two CUDA-only device queries.
+    """Replace the two profiler drivers and the three device measurements.
 
     Args:
         monkeypatch: Patch scope.
@@ -232,6 +330,8 @@ def patch_externals(
         ncu_sum_us: NCU kernel total for the whole capture window. Equal to
             ``kernel_sum_us`` means the two profilers agree exactly.
         missing_metrics: Metrics every NCU pass reports as absent.
+        spill_sector_count: Local-memory sectors the profiled kernel touched, on
+            each side. Nonzero is a spill, which the spill rule fails.
 
     Returns:
         The recorder holding what each fake was called with.
@@ -246,10 +346,13 @@ def patch_externals(
         seen.nsys_binary.append(nsys)
         return trace_record(kernel_sum_us=kernel_sum_us)
 
-    def fake_ncu(table: NcuTable, argv: Sequence[str], *, ncu: str) -> NcuPass:
+    def fake_ncu(
+        table: NcuTable, argv: Sequence[str], *, ncu: str, extra: Sequence[str] = ()
+    ) -> NcuPass:
         seen.ncu_argv.append(list(argv))
         seen.ncu_tables.append(table.name)
         seen.ncu_binary.append(ncu)
+        seen.ncu_extra.append(tuple(extra))
         return NcuPass(
             table=table.name,
             command=(ncu, *argv),
@@ -258,13 +361,24 @@ def patch_externals(
         )
 
     def fake_counters(passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
-        assert len(passes) == len(NCU_TABLES)
+        # The spill pass feeds the spill rule instead of the merge, so what reaches
+        # the merge is the counter tables and no more: a spill duration folded in
+        # here would double one kernel's time against the other two clocks.
+        assert [one.table for one in passes] == [one.name for one in NCU_TABLES]
         return (counter_record(duration_us=ncu_sum_us),)
+
+    def fake_spills(one: NcuPass) -> tuple[SpillCounters, ...]:
+        # Keyed off the local-memory pass and no other. A record read from a
+        # counter table would report every spilling kernel as clean.
+        assert one.table == SPILL_TABLE.name
+        return (spill_record(sector_count=spill_sector_count),)
 
     monkeypatch.setattr(profile_op, "run_nsys", fake_nsys)
     monkeypatch.setattr(profile_op, "run_ncu", fake_ncu)
     monkeypatch.setattr(profile_op, "kernel_counters", fake_counters)
+    monkeypatch.setattr(profile_op, "spill_counters", fake_spills)
     monkeypatch.setattr(profile_op, "ceilings", lambda _device: ceiling_records())
+    monkeypatch.setattr(profile_op, "dram_time_floor", lambda _device: floor_record())
     monkeypatch.setattr(profile_op, "device_info", lambda _ordinal: device_record())
     return seen
 
@@ -308,6 +422,7 @@ def test_the_defaults_are_the_ones_the_report_stamps() -> None:
     assert args.dtype == "bf16"
     assert args.device == "cuda"
     assert args.backend is None
+    assert args.kernel is None
     assert args.ncu == "ncu"
     assert args.nsys == "nsys"
     assert args.python == sys.executable
@@ -418,15 +533,16 @@ def test_main_cross_checks_three_clocks_and_writes_both_files(
     assert "## cross-check" in text
     assert "ncu and nsys agree" in text
 
-    # One NSYS run and one NCU run per counter table, all on the same argv.
+    # One NSYS run and one NCU run per pass, all on the same argv and unnarrowed.
     assert len(seen.nsys_argv) == 1
     assert tuple(seen.ncu_tables) == TABLE_NAMES
-    assert seen.ncu_argv == [seen.nsys_argv[0]] * len(NCU_TABLES)
+    assert seen.ncu_argv == [seen.nsys_argv[0]] * len(TABLE_NAMES)
     assert seen.nsys_binary == ["nsys"]
-    assert seen.ncu_binary == ["ncu"] * len(NCU_TABLES)
+    assert seen.ncu_binary == ["ncu"] * len(TABLE_NAMES)
+    assert seen.ncu_extra == [()] * len(TABLE_NAMES)
 
     printed = capsys.readouterr().out.splitlines()
-    assert printed[: len(NCU_TABLES)] == [f"ncu {n}: 0 launches" for n in TABLE_NAMES]
+    assert printed[: len(TABLE_NAMES)] == [f"ncu {n}: 0 launches" for n in TABLE_NAMES]
     assert printed[-2:] == [f"wrote {md}", f"wrote {js}"]
 
 
@@ -435,19 +551,18 @@ def test_every_profiled_kernel_this_repo_compiles_lands_a_class_verdict(
 ) -> None:
     """The taxonomy reaches the report, and an unjudged kernel is named.
 
-    What is pinned is the wiring, not the arithmetic: the comparison against each
-    ceiling belongs to :mod:`slinoss.perf.ceiling` and is tested there. A verdict
+    What is pinned is the wiring, not the arithmetic: the comparison against the
+    floor belongs to :mod:`slinoss.perf.ceiling` and is tested there. A verdict
     that is computed and never emitted leaves the class rule unchecked by the
     tooling that exists to check it, which is what this closes.
     """
-    patch_externals(monkeypatch)
-    half = FAKE_SUM_US / 2
+    # Both kernels at the fabricated duration, and the trace told the window held
+    # both, so the owned kernel's verdict is the same arithmetic as one kernel
+    # alone and the three clocks still agree.
+    patch_externals(monkeypatch, kernel_sum_us=2 * FAKE_SUM_US)
 
     def two_kernels(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
-        return (
-            counter_record(duration_us=half),
-            counter_record(duration_us=half, kernel=FOREIGN),
-        )
+        return (counter_record(), counter_record(kernel=FOREIGN))
 
     monkeypatch.setattr(profile_op, "kernel_counters", two_kernels)
     assert profile_op.main(argv_for(tmp_path / "prof")) == 0
@@ -457,12 +572,60 @@ def test_every_profiled_kernel_this_repo_compiles_lands_a_class_verdict(
     one = doc["verdicts"][0]
     assert one["declared"] == DRAM_BOUND
     assert one["required_pct"] == 85.0
-    # 760 GB/s against the fabricated 767 GB/s copy ceiling.
-    assert one["achieved_pct"] == pytest.approx(99.087, abs=5e-4)
+    # The floor at the kernel's own traffic, not the rate of the largest copy the
+    # device can run: the copy ceiling would have scored the same record 102.5%.
+    assert one["achieved_pct"] == pytest.approx(FLOOR_ACHIEVED_PCT, abs=5e-4)
     assert one["passed"] is True
     text = (tmp_path / "prof-tiny-forward.md").read_text()
     assert "## class verdicts" in text
     assert f"unjudged kernels, not compiled by this repo: {FOREIGN}" in text
+    assert "spill rule" not in text
+
+
+def test_a_spill_fails_a_dram_bound_kernel_whatever_percentage_it_reached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The spill pass reaches the rule, and the report names what it failed.
+
+    A spill moves the counted bytes as well as the duration, so the percentage
+    stops ordering two configurations of one kernel by speed. The verdict therefore
+    keeps the figure it reached and fails anyway.
+    """
+    patch_externals(monkeypatch, spill_sector_count=1)
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 0
+    doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
+    one = doc["verdicts"][0]
+    assert one["kernel"] == OWNED
+    assert one["achieved_pct"] == pytest.approx(FLOOR_ACHIEVED_PCT, abs=5e-4)
+    assert one["required_pct"] == 85.0
+    assert one["passed"] is False
+    text = (tmp_path / "prof-tiny-forward.md").read_text()
+    assert f"failed by the spill rule, whatever the percentage: {OWNED}" in text
+
+
+def test_naming_a_kernel_narrows_every_pass_and_drops_the_cross_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--kernel`` is what makes a per-kernel question answerable.
+
+    A narrowed capture holds a subset of the launches the trace holds, so the three
+    clocks cannot be made to agree; asking them to would fail on the narrowing.
+    """
+    seen = patch_externals(monkeypatch)
+    argv = argv_for(tmp_path / "prof", "--kernel", "chunk_scan_fwd")
+    assert profile_op.main(argv) == 0
+    # Every pass, not just the counter tables: a spill question asked of one kernel
+    # is the reason the flag exists.
+    narrow = ("--kernel-name", "regex:chunk_scan_fwd")
+    assert tuple(seen.ncu_tables) == TABLE_NAMES
+    assert seen.ncu_extra == [narrow] * len(TABLE_NAMES)
+    text = (tmp_path / "prof-tiny-forward.md").read_text()
+    assert "## cross-check" not in text
+    assert "cross-check skipped" in text
+    assert "ncu narrowed to kernels matching 'chunk_scan_fwd'" in text
+    # The counters and the verdicts still land; they cover what was profiled.
+    assert "## kernel counters" in text
+    assert "## class verdicts" in text
 
 
 def test_the_cross_check_divides_by_the_capture_iters_and_uses_the_event_total(
@@ -589,3 +752,9 @@ def test_the_notes_quote_the_command_the_profilers_ran(
     assert "--backend reference" in text
     assert "event iters=2 capture iters=2" in text
     assert "nsys report: fabricated.nsys-rep" in text
+    # Both fitted terms and the residual travel with the verdicts they scored: a
+    # floor extrapolated far below its sweep is worth no more than its residual,
+    # and a reader cannot see that from the percentage alone.
+    assert (
+        "dram floor: c=0.160 us B=983.04 GB/s max residual=0.00% l2=6291456 B" in text
+    )
