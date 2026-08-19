@@ -68,13 +68,15 @@ behind, so the two taps read one staging pass through two views;
 :func:`stage_state` narrows a chunk-start state into an operand tile; and
 :func:`stage_matrix` transforms a ``(P, 3N)`` tensor by one matrix that holds for
 the whole chunk, keeping the float32 result beside the narrowed operand when the
-consumer needs both widths.
+consumer needs both widths; and :func:`stage_weighted` scales a ``(T, P)`` tensor
+by the chunk-local decay on its way in, which every backward operand that carries
+the weight rather than its partner needs.
 """
 
 import cutlass
 import cutlass.cute as cute
 
-from slinoss._cute import narrow, select, widen
+from slinoss._cute import decay, narrow, select, widen
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
     TABLE_AC_SOLE,
@@ -98,6 +100,8 @@ __all__ = [
     "stage_rotated",
     "stage_shifted",
     "stage_state",
+    "stage_trans",
+    "stage_weighted",
 ]
 
 PREFETCH: int = 4
@@ -106,6 +110,46 @@ PREFETCH: int = 4
 Bounds the load phase at ``3 * PREFETCH`` live float32 registers while keeping
 ``3 * PREFETCH`` loads outstanding per thread, which is what covers one global
 latency. One is the serial form: load, transform, store, wait, repeat."""
+
+
+@cute.jit
+def stage_trans(
+    gtrans: cute.Tensor,
+    strans: cute.Tensor,
+    t0: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+) -> None:
+    """Stage one chunk of ``trans`` into shared memory, transposed.
+
+    The transition half of :func:`stage_chunk`, for a kernel that reads no tap.
+    Staging ``K`` to reach the same tile would add its whole extent to a pass that
+    has no tap matrix to build.
+
+    Args:
+        gtrans: ``(T, 4)`` float32 view of ``trans`` for one ``(b, h)``.
+        strans: ``(4, L)`` float32 shared tile, written.
+        t0: First token of the chunk.
+        valid: Tokens of the chunk that exist, at least one. Tokens at or past
+            this index are staged as zeros, which is the identity transition. The
+            clamp below reads ``valid - 1``, so zero would read the token before
+            the chunk; a chunk with no valid token is not launched.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+    """
+    zero = cutlass.Float32(0.0)
+    for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
+        token = tid + step * threads
+        if token < chunk:
+            inside = token < valid
+            # The clamp keeps the read in bounds when the chunk overhangs the
+            # sequence; the select then replaces it with the pad value.
+            pos = t0 + cutlass.min(token, valid - 1)
+            for j in cutlass.range_constexpr(4):
+                strans[j, token] = select(inside, gtrans[pos, j], zero)
 
 
 @cute.jit
@@ -122,6 +166,10 @@ def stage_chunk(
 ) -> None:
     """Stage one chunk of ``trans`` and ``K`` into shared memory, transposed.
 
+    The transition half is :func:`stage_trans`; only the tap half is here. Both
+    loops are unrolled straight-line code over the same token index, so the two
+    groups of loads issue together.
+
     Args:
         gtrans: ``(T, 4)`` float32 view of ``trans`` for one ``(b, h)``.
         gtap: ``(T, 2, 4)`` float32 view of ``K`` for one ``(b, h)``.
@@ -129,26 +177,93 @@ def stage_chunk(
         stap: ``(8, L)`` float32 shared tile, written. Component ``4*tap + j``.
         t0: First token of the chunk.
         valid: Tokens of the chunk that exist, at least one. Tokens at or past
-            this index are staged as zeros. The clamp below reads ``valid - 1``,
-            so zero would read the token before the chunk; a chunk with no valid
-            token is not launched.
+            this index are staged as zeros.
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
     """
+    stage_trans(gtrans, strans, t0, valid, tid, threads, chunk)
     zero = cutlass.Float32(0.0)
     for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
         token = tid + step * threads
         if token < chunk:
             inside = token < valid
-            # The clamp keeps the read in bounds when the chunk overhangs the
-            # sequence; the select then replaces it with the pad value.
             pos = t0 + cutlass.min(token, valid - 1)
-            for j in cutlass.range_constexpr(4):
-                strans[j, token] = select(inside, gtrans[pos, j], zero)
             for tap in cutlass.range_constexpr(2):
                 for j in cutlass.range_constexpr(4):
                     stap[4 * tap + j, token] = select(inside, gtap[pos, tap, j], zero)
+
+
+@cute.jit
+def stage_weighted(
+    gsrc: cute.Tensor,
+    sdst: cute.Tensor,
+    slp: cute.Tensor,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    t0: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+) -> None:
+    """Stage one chunk of a ``(T, P)`` tensor scaled by the chunk-local decay.
+
+    Row ``r`` holds ``exp(2*lp_r) * gsrc[t0+r]``. Rows at or past ``valid`` are
+    zeroed; a zero row contributes nothing to a contraction, so no consumer needs a
+    predicate. Columns at or past ``width`` are the caller's business, through
+    :func:`stage_pad`.
+
+    The pass runs in groups of :data:`PREFETCH` steps, loads first, on a clamped
+    index with a select afterwards, for the reason given in :func:`stage_rotated`.
+
+    Args:
+        gsrc: ``(B,H,T,P)`` operand-dtype source.
+        sdst: Operand-dtype tile of at least ``chunk`` rows, written over ``width``
+            columns.
+        slp: ``(L,)`` float32 chunk-local log-scale prefix.
+        bidx: Batch index.
+        hidx: Head index.
+        t0: First token of the chunk.
+        valid: Tokens of the chunk that exist.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        width: Columns that carry data, ``P``. Compile-time.
+    """
+    src = gsrc.element_type
+    zero = cutlass.Float32(0.0)
+    total = chunk * width
+    steps = -(-total // threads)
+    exact = total % threads == 0
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        count = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // width
+            p = i - r * width
+            # One clamp bounds the read; the select below drops the pad rows. r is
+            # below the chunk by construction, so slp needs no clamp of its own.
+            token = cutlass.min(r, valid - 1)
+            got = widen(gsrc[bidx, hidx, t0 + token, p], src)
+            held.append((r, p, r < valid, got))
+
+        for step in cutlass.range_constexpr(count):
+            r, p, keep, got = held[step]
+            # I3: the weight is one exponential of the prefix, never a ratio of two.
+            # Zeroing the float32 input rather than the product keeps the pad rows
+            # exactly zero whatever the prefix holds there.
+            out = narrow(select(keep, got, zero) * decay(slp[r]), src)
+            if cutlass.const_expr(exact):
+                sdst[r, p] = out
+            else:
+                if tid + (group * PREFETCH + step) * threads < total:
+                    sdst[r, p] = out
 
 
 @cute.jit

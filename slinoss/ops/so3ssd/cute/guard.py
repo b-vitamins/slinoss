@@ -73,20 +73,28 @@ def check_pinned(named: Named) -> None:
 
 
 def check_shapes(
-    U: Tensor, trans: Tensor, K: Tensor, *vectors: tuple[Tensor, str]
+    rowwise: Tensor,
+    trans: Tensor,
+    K: Tensor | None,
+    *vectors: tuple[Tensor, str],
+    label: str = "U",
 ) -> tuple[int, int, int, int, int, int]:
-    """Check the per-token operands against ``U``.
+    """Check the per-token operands against the ``(B,H,T,P)`` one.
 
     ``G`` is read off the first vector rather than passed in. It is a property of
     the operands, so a caller cannot claim one grouping and hand over another, and
     ``G == H`` needs no separate signature.
 
     Args:
-        U: ``(B,H,T,P)``. Sets the leading shape.
+        rowwise: ``(B,H,T,P)``. Sets the leading shape. ``U`` on a forward path and
+            its cotangent on a backward one.
         trans: ``(B,H,T,4)``.
-        K: ``(B,H,T,2,4)``.
+        K: ``(B,H,T,2,4)``, or None for a kernel that reads no tap. A kernel with
+            no tap matrix to build does not take ``K``, so there is nothing to
+            check.
         vectors: ``(tensor, name)`` pairs, each ``(B,G,T,3N)``. The first one sets
             ``G`` and ``3N``.
+        label: Name of ``rowwise`` in a rejection.
 
     Returns:
         ``(B, H, G, T, P, 3N)``.
@@ -96,13 +104,13 @@ def check_shapes(
             ``H``. A group holds a whole number of heads: with a remainder some
             head would index past the group axis.
     """
-    if U.ndim != 4:
-        raise ValueError(f"U must be (B,H,T,P), got {tuple(U.shape)}")
-    bsz, heads, seqlen, rows = (int(d) for d in U.shape)
+    if rowwise.ndim != 4:
+        raise ValueError(f"{label} must be (B,H,T,P), got {tuple(rowwise.shape)}")
+    bsz, heads, seqlen, rows = (int(d) for d in rowwise.shape)
     lead = (bsz, heads, seqlen)
     if tuple(trans.shape) != (*lead, 4):
         raise ValueError(f"trans must be {(*lead, 4)}, got {tuple(trans.shape)}")
-    if tuple(K.shape) != (*lead, 2, 4):
+    if K is not None and tuple(K.shape) != (*lead, 2, 4):
         raise ValueError(f"K must be {(*lead, 2, 4)}, got {tuple(K.shape)}")
     head, head_name = vectors[0]
     if head.ndim != 4 or int(head.shape[0]) != bsz or int(head.shape[2]) != seqlen:
