@@ -101,10 +101,18 @@ kernel that wants a different layout is rewritten.
 Contiguous, except `B` and `C`. Those two are column bands of the mixer's fused
 projection, so their token stride is the projection width and not `3N`. The
 requirement on them is pitched instead: unit stride on the trailing axis,
-non-overlapping rows, and a base address and pitch both aligned to 16 bytes. A
+non-overlapping rows, and a base address and pitch that both land on a boundary. A
 contiguous buffer meets that rule at a pitch equal to its row width, so the two
 layouts are one contract and a standalone caller needs no change. `3N` is a
 multiple of 48, so the shape constraint already carries the alignment.
+
+The boundary is a 32-byte sector where the pitch exceeds the row width and 16
+bytes where it does not. A band row starting mid-sector fetches one sector it
+discards, and no bandwidth counter attributes it; a contiguous row shares its last
+sector with the next row and wastes nothing. The producer pads to the stricter of
+the two. Band order in the projection is value, gate, `B`, `C`, parameters, then
+padding: the three activation widths are sector multiples already, so putting the
+one free width last keeps every offset on a sector with no padding between bands.
 
 | tensor  | shape         | dtype           |
 |---------|---------------|-----------------|
