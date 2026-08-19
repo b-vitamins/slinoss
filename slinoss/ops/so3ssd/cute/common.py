@@ -59,6 +59,7 @@ __all__ = [
     "quat_mul",
     "quat_normalize",
     "rot_hom",
+    "scalar_tile",
     "table_tile",
     "tap_matrix",
     "tap_tile",
@@ -114,6 +115,11 @@ def tap_tile(chunk: int) -> Tile:
 def vec_tile(chunk: int, width: int) -> Tile:
     """Per-token vector tile: ``(width, L)``, component-major."""
     return Tile((width, chunk), (chunk, 1))
+
+
+def scalar_tile(chunk: int) -> Tile:
+    """One float32 per token: ``(L,)``, dense."""
+    return Tile((chunk,), (1,))
 
 
 TABLE_AP: int = 0

@@ -37,17 +37,12 @@ transition is emitted alongside the increment, as a unit quaternion and a separa
 decay, because this kernel already has both chunk-local prefixes in shared memory
 and the recurrence would otherwise recompute them.
 
-Staging. ``u`` is staged once per K slice into a tile of ``kblk + 1`` rows: row
-``r`` holds token ``t0 + s*kblk + r - 1``, so the current tap reads rows ``1..``
-and the previous tap reads rows ``0..`` off the same tile through two views that
-differ by one row of pitch. The shift is global, not per chunk, so row 0 of the
-first slice of a chunk crosses the chunk boundary and, at the first chunk, reaches
-the streaming ``u_prev``. Re-reading ``u`` from global for the second tap would add
-its whole extent to a forward pass that moves about 131 MB.
+Staging. ``u`` is staged once per K slice by :func:`stage_shifted` and read by both
+taps through two views one row of pitch apart. Re-reading it from global for the
+second tap would add its whole extent to a forward pass that moves about 131 MB.
 
-``b`` is transformed on the way in and restaged between the two taps, so the
-rotated forcing never reaches global memory. One thread owns one 3-vector: three
-coalesced global reads, nine FMA, three shared-memory stores.
+``b`` is transformed on the way in by :func:`stage_rotated` and restaged between
+the two taps, so the rotated forcing never reaches global memory.
 
 DRAM-bound. Analytic traffic at ``standard`` is about 42.4 MB against 906 MFLOP,
 so 24 flop/byte against a ridge point of 165: memory bound by a factor of seven,
@@ -71,37 +66,46 @@ from slinoss._cute import (
     cute_dtype,
     decay,
     dev_tensor,
-    narrow,
     smem_bytes,
-    widen,
 )
-from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AN,
     TABLE_AP,
     THREADS,
-    mat3_matvec,
+    scalar_tile,
     table_tile,
     tap_tile,
     trans_tile,
 )
+from slinoss.ops.so3ssd.cute.guard import (
+    Named,
+    check_extents,
+    check_layout,
+    check_operands,
+    check_pinned,
+    check_shapes,
+    check_stream,
+)
 from slinoss.ops.so3ssd.cute.mma import (
-    MMA_TILE_K,
-    MMA_TILE_N,
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
     mma_gemm,
     mma_rows,
     mma_store,
+    operand_tile,
     smem_pitch,
 )
 from slinoss.ops.so3ssd.cute.prefix import chunk_endpoint, chunk_prefixes
-from slinoss.ops.so3ssd.cute.table import build_table, stage_chunk
+from slinoss.ops.so3ssd.cute.table import (
+    build_table,
+    stage_chunk,
+    stage_rotated,
+    stage_shifted,
+)
 
 __all__ = [
     "KBLOCK_MAX",
-    "OPERAND_DTYPES",
     "ChunkIncrement",
     "chunk_increment_forward",
     "chunk_increment_fwd",
@@ -110,7 +114,6 @@ __all__ = [
     "increment_smem_bytes",
     "input_tile",
     "kblock",
-    "scalar_tile",
 ]
 
 KBLOCK_MAX: int = 64
@@ -118,11 +121,6 @@ KBLOCK_MAX: int = 64
 capping their K extent keeps ``MAX_CHUNK`` resident two blocks per SM instead of
 one. Every legal chunk length is a power of two, so this divides it exactly and
 the slice count is one or two."""
-
-OPERAND_DTYPES: tuple[torch.dtype, ...] = LOW_PRECISION_DTYPES
-"""Activation dtypes with a tensor-core path. The atom is 16-bit times 16-bit into
-float32, so a float32 activation resolves to the reference backend rather than
-being downcast behind the caller."""
 
 
 def kblock(chunk: int) -> int:
@@ -137,22 +135,18 @@ def kblock(chunk: int) -> int:
     return min(chunk, KBLOCK_MAX)
 
 
-def scalar_tile(chunk: int) -> Tile:
-    """One float32 per token. Dense."""
-    return Tile((chunk,), (1,))
-
-
 def input_tile(kblk: int, rows: int) -> Tile:
     """``u`` staging tile, ``(kblk + 1, pitch)``.
 
     The extra row is the token before the slice, which the previous tap reads.
+    ``P`` is the M mode of this kernel's output, so the row width is the rounded
+    extent rather than ``P`` itself.
 
     Args:
         kblk: K extent of the slice.
         rows: ``P``.
     """
-    lda = smem_pitch(mma_rows(rows))
-    return Tile((kblk + 1, lda), (lda, 1))
+    return operand_tile(kblk + 1, mma_rows(rows))
 
 
 def forced_tile(kblk: int, dim: int) -> Tile:
@@ -162,8 +156,7 @@ def forced_tile(kblk: int, dim: int) -> Tile:
         kblk: K extent of the slice.
         dim: ``3N``.
     """
-    ldb = smem_pitch(dim)
-    return Tile((kblk, ldb), (ldb, 1))
+    return operand_tile(kblk, dim)
 
 
 def increment_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
@@ -191,214 +184,6 @@ def increment_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> 
             (forced_tile(kblk, dim), itemsize),
         ]
     )
-
-
-@cute.jit
-def _store_forced(
-    sb: cute.Tensor,
-    stable: cute.Tensor,
-    swgt: cute.Tensor,
-    row: cutlass.Int32,
-    token: cutlass.Int32,
-    lane: cutlass.Int32,
-    vec: tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32],
-    slot: cutlass.Constexpr,
-) -> None:
-    """Transform one 3-vector by a tap matrix, scale it, and store it.
-
-    Args:
-        sb: ``(kblk, pitch)`` operand-dtype tile, written at
-            ``[row, 3*lane .. 3*lane+2]``.
-        stable: ``(2, L, 9)`` float32 transform table.
-        swgt: ``(L,)`` float32 chunk weights.
-        row: Row of the operand tile.
-        token: Chunk-local token index, indexing ``stable`` and ``swgt``.
-        lane: Which of the ``N`` 3-vectors.
-        vec: The 3-vector, already widened to float32.
-        slot: :data:`TABLE_AP` or :data:`TABLE_AN`. Compile-time.
-    """
-    out = mat3_matvec(
-        (
-            stable[slot, token, 0],
-            stable[slot, token, 1],
-            stable[slot, token, 2],
-            stable[slot, token, 3],
-            stable[slot, token, 4],
-            stable[slot, token, 5],
-            stable[slot, token, 6],
-            stable[slot, token, 7],
-            stable[slot, token, 8],
-        ),
-        vec,
-    )
-    dst = sb.element_type
-    weight = swgt[token]
-    sb[row, 3 * lane] = narrow(weight * out[0], dst)
-    sb[row, 3 * lane + 1] = narrow(weight * out[1], dst)
-    sb[row, 3 * lane + 2] = narrow(weight * out[2], dst)
-
-
-@cute.jit
-def _stage_input(
-    gu: cute.Tensor,
-    guprev: cute.Tensor,
-    su: cute.Tensor,
-    bidx: cutlass.Int32,
-    hidx: cutlass.Int32,
-    t0: cutlass.Int32,
-    lbase: cutlass.Int32,
-    valid: cutlass.Int32,
-    tid: cutlass.Int32,
-    threads: cutlass.Constexpr,
-    kblk: cutlass.Constexpr,
-    lda: cutlass.Constexpr,
-    rows: cutlass.Constexpr,
-    has_prev: cutlass.Constexpr,
-) -> None:
-    """Stage ``u`` for one K slice, one row behind.
-
-    Row ``r`` holds token ``t0 + lbase + r - 1``, so one tile serves both taps.
-    Columns past ``P`` and rows past the sequence are zeroed; a zero there
-    multiplies a forcing row that is itself zero, so no store is skipped.
-
-    Every store is inside a divergent branch and every ``(r, p)`` pair is owned by
-    exactly one thread on exactly one branch. Two guarded stores to the same
-    address would race, because the thread that owns the address in the flat loop
-    is not the one that owns it in an overlay pass.
-
-    Args:
-        gu: ``(B,H,T,P)`` operand-dtype input weights.
-        guprev: ``(B,H,P)`` streaming ``u_{-1}``. Read only when ``has_prev``.
-        su: From :func:`input_tile`, written.
-        bidx: Batch index.
-        hidx: Head index.
-        t0: First token of the chunk.
-        lbase: First chunk-local token of the slice.
-        valid: Tokens of the chunk that exist.
-        tid: Thread index within the block.
-        threads: Block width. Compile-time.
-        kblk: K extent of the slice. Compile-time.
-        lda: Row pitch of ``su``. Compile-time.
-        rows: ``P``. Compile-time.
-        has_prev: Whether ``guprev`` was supplied. Compile-time.
-    """
-    zero = su.element_type(0.0)
-    for i in cutlass.range(tid, (kblk + 1) * lda, threads):
-        r = i // lda
-        p = i - r * lda
-        # The predicate keeps the read in bounds on its own: token < valid
-        # implies t0 + token < seqlen, so no clamp is needed under a divergent
-        # branch, where an inactive lane issues no load.
-        token = lbase + r - 1
-        g = t0 + token
-        if (p < rows) & (g >= 0) & (token < valid):
-            su[r, p] = gu[bidx, hidx, g, p]
-        else:
-            if cutlass.const_expr(has_prev):
-                if (p < rows) & (g < 0):
-                    su[r, p] = guprev[bidx, hidx, p]
-                else:
-                    su[r, p] = zero
-            else:
-                su[r, p] = zero
-
-
-@cute.jit
-def _stage_forced(
-    gb: cute.Tensor,
-    gbprev: cute.Tensor,
-    sb: cute.Tensor,
-    stable: cute.Tensor,
-    swgt: cute.Tensor,
-    bidx: cutlass.Int32,
-    hidx: cutlass.Int32,
-    t0: cutlass.Int32,
-    lbase: cutlass.Int32,
-    valid: cutlass.Int32,
-    tid: cutlass.Int32,
-    slot: cutlass.Constexpr,
-    back: cutlass.Constexpr,
-    threads: cutlass.Constexpr,
-    kblk: cutlass.Constexpr,
-    lanes: cutlass.Constexpr,
-    has_prev: cutlass.Constexpr,
-) -> None:
-    """Transform and stage one tap's forcing for one K slice.
-
-    Row ``r`` holds ``A_slot[lbase + r] b[t0 + lbase + r - back]``, scaled by the
-    chunk weight. ``back`` is 0 for the current tap and 1 for the previous one:
-    both matrices are indexed at the token they act on, while the previous tap's
-    vector comes from the token before it.
-
-    Args:
-        gb: ``(B,H,T,3N)`` operand-dtype input vectors.
-        gbprev: ``(B,H,3N)`` streaming ``b_{-1}``. Read only when ``has_prev``
-            and ``back`` is 1.
-        sb: From :func:`forced_tile`, written.
-        stable: ``(2, L, 9)`` float32 transform table.
-        swgt: ``(L,)`` float32 chunk weights.
-        bidx: Batch index.
-        hidx: Head index.
-        t0: First token of the chunk.
-        lbase: First chunk-local token of the slice.
-        valid: Tokens of the chunk that exist.
-        tid: Thread index within the block.
-        slot: :data:`TABLE_AP` or :data:`TABLE_AN`. Compile-time.
-        back: Token offset of the vector, 0 or 1. Compile-time.
-        threads: Block width. Compile-time.
-        kblk: K extent of the slice. Compile-time.
-        lanes: ``N``. Compile-time.
-        has_prev: Whether ``gbprev`` was supplied. Compile-time.
-    """
-    src = gb.element_type
-    zero = sb.element_type(0.0)
-    for i in cutlass.range(tid, kblk * lanes, threads):
-        r = i // lanes
-        n = i - r * lanes
-        token = lbase + r
-        g = t0 + token - back
-        if (token < valid) & (g >= 0):
-            _store_forced(
-                sb,
-                stable,
-                swgt,
-                r,
-                token,
-                n,
-                (
-                    widen(gb[bidx, hidx, g, 3 * n], src),
-                    widen(gb[bidx, hidx, g, 3 * n + 1], src),
-                    widen(gb[bidx, hidx, g, 3 * n + 2], src),
-                ),
-                slot,
-            )
-        else:
-            # g < 0 is reachable only for the previous tap at the first token of
-            # the first chunk, which is exactly the streaming carry-in.
-            if cutlass.const_expr(has_prev and back == 1):
-                if token < valid:
-                    _store_forced(
-                        sb,
-                        stable,
-                        swgt,
-                        r,
-                        token,
-                        n,
-                        (
-                            widen(gbprev[bidx, hidx, 3 * n], src),
-                            widen(gbprev[bidx, hidx, 3 * n + 1], src),
-                            widen(gbprev[bidx, hidx, 3 * n + 2], src),
-                        ),
-                        slot,
-                    )
-                else:
-                    sb[r, 3 * n] = zero
-                    sb[r, 3 * n + 1] = zero
-                    sb[r, 3 * n + 2] = zero
-            else:
-                sb[r, 3 * n] = zero
-                sb[r, 3 * n + 1] = zero
-                sb[r, 3 * n + 2] = zero
 
 
 @cute.kernel
@@ -526,7 +311,7 @@ def chunk_increment_fwd_kernel(
     for s in cutlass.range_constexpr(slices):
         lbase = s * kblk
         cute.arch.sync_threads()
-        _stage_input(
+        stage_shifted(
             gu,
             guprev,
             su,
@@ -542,7 +327,7 @@ def chunk_increment_fwd_kernel(
             rows,
             has_prev,
         )
-        _stage_forced(
+        stage_rotated(
             gb,
             gbprev,
             sb,
@@ -560,11 +345,12 @@ def chunk_increment_fwd_kernel(
             kblk,
             lanes,
             has_prev,
+            True,
         )
         cute.arch.sync_threads()
         mma_gemm(tiled_mma, tid, acc, va_now, vb, False, False)
         cute.arch.sync_threads()
-        _stage_forced(
+        stage_rotated(
             gb,
             gbprev,
             sb,
@@ -582,6 +368,7 @@ def chunk_increment_fwd_kernel(
             kblk,
             lanes,
             has_prev,
+            True,
         )
         cute.arch.sync_threads()
         mma_gemm(tiled_mma, tid, acc, va_prv, vb, False, False)
@@ -654,92 +441,6 @@ class ChunkIncrement(NamedTuple):
     cscale: Tensor
 
 
-def _check_layout(named: tuple[tuple[Tensor, str], ...]) -> None:
-    """Raises:
-    ValueError: If any operand is off CUDA or not contiguous. The tensor
-        contract is time-major and contiguous, so a repack here would be the
-        staging copy the kernel exists to avoid.
-    """
-    for tensor, name in named:
-        if tensor.device.type != "cuda":
-            raise ValueError(f"{name} must be on a CUDA device, got {tensor.device}")
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-
-
-def _check_operands(named: tuple[tuple[Tensor, str], ...]) -> torch.dtype:
-    """Raises:
-    TypeError: If an activation dtype has no tensor-core path, or if the
-        activations do not share one dtype.
-
-    Returns:
-        The shared activation dtype.
-    """
-    for tensor, name in named:
-        if tensor.dtype not in OPERAND_DTYPES:
-            raise TypeError(
-                f"{name} has dtype {tensor.dtype}; "
-                f"tensor-core operand dtypes: {OPERAND_DTYPES}"
-            )
-    head, head_name = named[0]
-    for tensor, name in named[1:]:
-        if tensor.dtype is not head.dtype:
-            raise TypeError(
-                f"{name} is {tensor.dtype} and {head_name} is {head.dtype}; "
-                "one activation dtype per call"
-            )
-    return head.dtype
-
-
-def _check_pinned(named: tuple[tuple[Tensor, str], ...]) -> None:
-    """Raises:
-    ValueError: If a float32-pinned operand is not float32 (I4).
-    """
-    for tensor, name in named:
-        if tensor.dtype is not torch.float32:
-            raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
-
-
-def _check_shapes(
-    U: Tensor, trans: Tensor, K: Tensor, B: Tensor
-) -> tuple[int, int, int, int, int]:
-    """Raises:
-    ValueError: On a rank or shape mismatch.
-
-    Returns:
-        ``(B, H, T, P, 3N)``.
-    """
-    if U.ndim != 4:
-        raise ValueError(f"U must be (B,H,T,P), got {tuple(U.shape)}")
-    bsz, heads, seqlen, rows = (int(d) for d in U.shape)
-    lead = (bsz, heads, seqlen)
-    if tuple(trans.shape) != (*lead, 4):
-        raise ValueError(f"trans must be {(*lead, 4)}, got {tuple(trans.shape)}")
-    if tuple(K.shape) != (*lead, 2, 4):
-        raise ValueError(f"K must be {(*lead, 2, 4)}, got {tuple(K.shape)}")
-    if B.ndim != 4 or tuple(B.shape[:3]) != lead:
-        raise ValueError(f"B must be (B,H,T,3N) with {lead}, got {tuple(B.shape)}")
-    return bsz, heads, seqlen, rows, int(B.shape[3])
-
-
-def _check_extents(chunk_size: int, dim: int) -> None:
-    """Raises:
-    ValueError: If ``L`` or ``3N`` is an extent the atom cannot cover. The fix
-        for any of these is the shape, never a padding path.
-    """
-    if chunk_size < MMA_TILE_K or chunk_size % MMA_TILE_K != 0:
-        raise ValueError(
-            f"chunk_size must be a positive multiple of {MMA_TILE_K}, got {chunk_size}"
-        )
-    if chunk_size % kblock(chunk_size) != 0:
-        raise ValueError(
-            f"chunk_size {chunk_size} is not a multiple of its K slice "
-            f"{kblock(chunk_size)}"
-        )
-    if dim % 3 != 0 or dim % MMA_TILE_N != 0:
-        raise ValueError(f"3N must be a multiple of 3 and of {MMA_TILE_N}, got {dim}")
-
-
 def chunk_increment_forward(
     U: Tensor,
     trans: Tensor,
@@ -753,7 +454,8 @@ def chunk_increment_forward(
     """Accumulate every chunk's local increment and its transition.
 
     Args:
-        U: ``(B,H,T,P)``, one of :data:`OPERAND_DTYPES`, contiguous.
+        U: ``(B,H,T,P)``, one of
+            :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous.
         trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
         K: ``(B,H,T,2,4)`` float32, contiguous. Per-tap ``(kr, g, h, 0)``.
         B: ``(B,H,T,3N)``, the dtype of ``U``, contiguous.
@@ -769,30 +471,17 @@ def chunk_increment_forward(
         ValueError: On a layout, rank, shape, extent, or pairing violation.
         TypeError: On an activation dtype with no tensor-core path.
     """
-    activations: tuple[tuple[Tensor, str], ...] = ((U, "U"), (B, "B"))
-    if (u_prev is None) != (b_prev is None):
-        raise ValueError("u_prev and b_prev are supplied together or not at all")
-    has_prev = u_prev is not None and b_prev is not None
-    if has_prev:
-        assert u_prev is not None and b_prev is not None
+    activations: Named = ((U, "U"), (B, "B"))
+    if u_prev is not None and b_prev is not None:
         activations = (*activations, (u_prev, "u_prev"), (b_prev, "b_prev"))
 
-    pinned: tuple[tuple[Tensor, str], ...] = ((trans, "trans"), (K, "K"))
-    _check_layout((*activations, *pinned))
-    dtype = _check_operands(activations)
-    _check_pinned(pinned)
-    bsz, heads, seqlen, rows, dim = _check_shapes(U, trans, K, B)
-    _check_extents(chunk_size, dim)
-    if has_prev:
-        assert u_prev is not None and b_prev is not None
-        if tuple(u_prev.shape) != (bsz, heads, rows):
-            raise ValueError(
-                f"u_prev must be {(bsz, heads, rows)}, got {tuple(u_prev.shape)}"
-            )
-        if tuple(b_prev.shape) != (bsz, heads, dim):
-            raise ValueError(
-                f"b_prev must be {(bsz, heads, dim)}, got {tuple(b_prev.shape)}"
-            )
+    pinned: Named = ((trans, "trans"), (K, "K"))
+    check_layout((*activations, *pinned))
+    dtype = check_operands(activations)
+    check_pinned(pinned)
+    bsz, heads, seqlen, rows, dim = check_shapes(U, trans, K, (B, "B"))
+    check_extents(chunk_size, dim, kblock(chunk_size))
+    has_prev = check_stream(u_prev, b_prev, (bsz, heads, rows, dim))
 
     assert_smem_fits(
         f"chunk_increment[L{chunk_size}/P{rows}/3N{dim}]",

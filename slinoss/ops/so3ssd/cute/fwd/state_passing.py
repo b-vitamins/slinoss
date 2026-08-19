@@ -52,6 +52,7 @@ import torch
 
 from slinoss._cute import dev_tensor
 from slinoss.ops.so3ssd.cute.common import THREADS, mat3_matvec, rot_hom
+from slinoss.ops.so3ssd.cute.guard import Named, check_layout, check_pinned
 
 __all__ = [
     "StatePassing",
@@ -172,30 +173,6 @@ class StatePassing(NamedTuple):
     state: torch.Tensor
 
 
-def _check_operand(name: str, tensor: torch.Tensor) -> None:
-    """Reject a device, dtype, or layout the kernel cannot read.
-
-    Every check is on the host side of the launch. A host pointer handed to a
-    kernel raises inside CUDA and leaves the context unusable for the rest of the
-    process, and a strided operand is either silently misread or fails later in an
-    internal reshape.
-
-    Args:
-        name: Operand name, for the message.
-        tensor: The operand.
-
-    Raises:
-        ValueError: If the tensor is not on a cuda device, is not float32, or is
-            not contiguous.
-    """
-    if tensor.device.type != "cuda":
-        raise ValueError(f"{name} must be on a cuda device, got {tensor.device}")
-    if tensor.dtype is not torch.float32:
-        raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous; no repacking is done")
-
-
 def state_passing_forward(
     inc: torch.Tensor,
     cquat: torch.Tensor,
@@ -220,9 +197,11 @@ def state_passing_forward(
         ValueError: On a dtype, device, layout, rank, or shape mismatch, or on a
             ``(P, 3N)`` pair the exact launch cannot cover.
     """
-    _check_operand("inc", inc)
-    _check_operand("cquat", cquat)
-    _check_operand("cscale", cscale)
+    pinned: Named = ((inc, "inc"), (cquat, "cquat"), (cscale, "cscale"))
+    if z0 is not None:
+        pinned = (*pinned, (z0, "z0"))
+    check_layout(pinned)
+    check_pinned(pinned)
     if inc.ndim != 5 or cquat.ndim != 4 or cscale.ndim != 3:
         raise ValueError(
             "expected (B,H,C,P,3N), (B,H,C,4) and (B,H,C), got "
@@ -242,7 +221,6 @@ def state_passing_forward(
     if z0 is None:
         start = state
     else:
-        _check_operand("z0", z0)
         if tuple(z0.shape) != (bsz, heads, rows, dim):
             raise ValueError(f"z0 shape {tuple(z0.shape)} does not match inc")
         start = z0

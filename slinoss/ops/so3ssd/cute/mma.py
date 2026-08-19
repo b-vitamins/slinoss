@@ -39,6 +39,7 @@ which is every transposed operand above.
 import cutlass
 import cutlass.cute as cute
 
+from slinoss._cute import Tile
 from slinoss.ops.so3ssd.cute.common import WARPS
 
 __all__ = [
@@ -53,6 +54,7 @@ __all__ = [
     "mma_gemm",
     "mma_rows",
     "mma_store",
+    "operand_tile",
     "smem_pitch",
 ]
 
@@ -108,6 +110,23 @@ def smem_pitch(width: int, itemsize: int = 2) -> int:
     unit = SMEM_SEGMENT // itemsize
     segments = -(-width // unit)
     return unit * (segments | 1)
+
+
+def operand_tile(rows: int, width: int) -> Tile:
+    """Row-major tile for one GEMM operand, ``(rows, smem_pitch(width))``.
+
+    Every operand tile in the tree comes from here, so the pitch rule lives in one
+    place. Whether the tile's rows are the M mode or the N mode is decided by the
+    view built over it, not by the tile.
+
+    Args:
+        rows: Rows to allocate. Already rounded by :func:`mma_rows` when the tile's
+            rows are the M mode of the output.
+        width: Elements per row that carry data. The rest of the pitch is padding
+            outside every view.
+    """
+    pitch = smem_pitch(width)
+    return Tile((rows, pitch), (pitch, 1))
 
 
 @cute.jit

@@ -262,7 +262,7 @@ def test_rejects_a_host_operand(operand: str) -> None:
     z0 = torch.empty(2, 2, 16, 48, device="cuda", dtype=torch.float32)
     args = {"inc": inc, "cquat": cquat, "cscale": cscale, "z0": z0}
     args[operand] = args[operand].cpu()
-    with pytest.raises(ValueError, match="cuda"):
+    with pytest.raises(ValueError, match="CUDA device"):
         state_passing_forward(args["inc"], args["cquat"], args["cscale"], args["z0"])
 
 
