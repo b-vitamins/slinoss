@@ -28,6 +28,7 @@ if not torch.cuda.is_available():
 from collections.abc import Callable
 
 from slinoss._cute import assert_smem_fits, smem_bytes, smem_capacity
+from slinoss._guard import SECTOR_BYTES
 from slinoss.ops.mixer import mixer_tail, mixer_tail_ref
 from slinoss.ops.mixer.cute import (
     ROWS,
@@ -337,13 +338,14 @@ def test_pitched_band_matches_the_contiguous_call(dtype: torch.dtype) -> None:
     """
     ops = _operands(2, 3, 40, 64, dtype, seed=19)
     dout = _cotangent(2, 3, 40, 64, dtype, seed=20)
-    # Eight columns of padding: 32 B at float32 and 16 B at bfloat16, so the band
-    # starts and steps on the 16 B boundary at both widths.
-    banded: Operands = (ops[0], ops[1], _band(ops[2], 8), ops[3], ops[4])
+    # One sector of padding, in columns rather than a literal: a band offset that is
+    # only a vector width lands mid-sector at bfloat16, which is a refusal.
+    pad = SECTOR_BYTES // torch.empty(0, dtype=dtype).element_size()
+    banded: Operands = (ops[0], ops[1], _band(ops[2], pad), ops[3], ops[4])
 
     got = mixer_tail_forward(*banded, eps=EPS)
     want = mixer_tail_forward(*ops, eps=EPS)
-    got_grads = mixer_tail_backward(_band(dout, 8), *banded, eps=EPS)
+    got_grads = mixer_tail_backward(_band(dout, pad), *banded, eps=EPS)
     want_grads = mixer_tail_backward(dout, *ops, eps=EPS)
     torch.cuda.synchronize()
 

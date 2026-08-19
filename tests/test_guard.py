@@ -18,7 +18,7 @@ from torch import Tensor
 if not torch.cuda.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
 
-from slinoss._guard import ALIGN_BYTES, check_pitched
+from slinoss._guard import ALIGN_BYTES, SECTOR_BYTES, check_pitched
 
 pytestmark = [pytest.mark.cuda]
 
@@ -35,14 +35,34 @@ def _band(pad: int, dtype: torch.dtype = torch.float32) -> Tensor:
 def test_accepts_a_contiguous_tensor_and_an_aligned_band(dtype: torch.dtype) -> None:
     """The ``pitch == width`` case and a real band of a wider buffer.
 
-    The alignment multiple is :data:`slinoss._guard.ALIGN_BYTES` in elements, so it
-    is twice as many columns at bfloat16 as at float32; the padding is read from
-    the dtype rather than written down, which is the arithmetic the producer has to
-    do when it hands a band out.
+    The multiple is a boundary in elements, so it is twice as many columns at
+    bfloat16 as at float32; the padding is read from the dtype rather than written
+    down, which is the arithmetic the producer has to do when it hands a band out.
     """
-    multiple = ALIGN_BYTES // torch.empty(0, dtype=dtype).element_size()
+    itemsize = torch.empty(0, dtype=dtype).element_size()
     check_pitched(((torch.empty(2, 4, WIDTH, dtype=dtype, device="cuda"), "t"),))
-    check_pitched(((_band(multiple, dtype), "t"),))
+    check_pitched(((_band(SECTOR_BYTES // itemsize, dtype), "t"),))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_holds_a_band_to_the_sector_and_a_contiguous_row_to_the_vector(
+    dtype: torch.dtype,
+) -> None:
+    """One offset, legal contiguous and illegal as a band.
+
+    A row that starts one vector width into a sector is packed against the previous
+    row when the operand is contiguous and overhangs into an unread sector when it
+    is a band, so the same arithmetic has to be accepted in one case and refused in
+    the other. The two boundaries differ by a factor of two, which is why one vector
+    width is what separates them.
+    """
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    vector = ALIGN_BYTES // itemsize
+    check_pitched(
+        ((torch.empty(2, 4, WIDTH + vector, dtype=dtype, device="cuda"), "t"),)
+    )
+    with pytest.raises(ValueError, match="must start and step on a multiple of"):
+        check_pitched(((_band(vector, dtype), "t"),))
 
 
 @pytest.mark.parametrize(
@@ -58,7 +78,7 @@ def test_accepts_a_contiguous_tensor_and_an_aligned_band(dtype: torch.dtype) -> 
             lambda: torch.empty(2, 1, WIDTH, device="cuda").expand(2, 4, WIDTH),
             r"t rows overlap",
         ),
-        (lambda: _band(1), r"t must start and step on a multiple of 4 elements"),
+        (lambda: _band(1), r"t must start and step on a multiple of 8 elements"),
     ],
 )
 def test_rejects(make: Callable[[], Tensor], match: str) -> None:

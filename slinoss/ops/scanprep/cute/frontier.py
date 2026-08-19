@@ -32,9 +32,9 @@ Operand layout. ``params`` and ``bc`` are slices of one projection output: the
 trailing axis has unit stride and the row stride is the full projection width,
 taken from the operand at runtime. Nothing here repacks either one. The
 precondition beyond unit trailing stride is that the base address and the row
-pitch both land on a multiple of ``ALIGN_BYTES // itemsize`` elements, which the
-producer gets by padding its column offsets and its projection width; it is
-checked on the host so no alignment branch reaches the kernel.
+pitch both land on a sector, which the producer gets by padding its column offsets
+and its projection width; it is checked on the host so no alignment branch reaches
+the kernel.
 
 The backward is the same decomposition. One thread recovers its own biased
 parameter row, applies both Jacobians, stores its ten gradient columns, and then

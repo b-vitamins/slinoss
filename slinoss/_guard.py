@@ -55,11 +55,16 @@ correctness.
 
 A load is served in whole sectors. A band row that starts mid-sector spans one
 more sector than its length needs, and the extra sector is fetched and discarded.
-Alignment to :data:`ALIGN_BYTES` leaves that case reachable: at 2 bytes an element,
-a pitch of 8 elements is 16 bytes, so every second row starts mid-sector. Measured
-on sm_86 at ``3N`` 48 and 12 groups that is 5.0% more DRAM traffic than the same
-kernel reading the same bytes from an aligned band, and no bandwidth counter shows
-it, because the sectors are genuinely fetched.
+:data:`ALIGN_BYTES` alone leaves that reachable: at 2 bytes an element, a pitch of
+8 elements is 16 bytes, so every second row starts mid-sector. Measured on sm_86 at
+``3N`` 48 and 12 groups that is 5.0% more DRAM traffic than the same kernel reading
+the same bytes from an aligned band, and no bandwidth counter shows it, because the
+sectors are genuinely fetched. :func:`check_pitched` therefore holds a strict band
+to this boundary rather than to :data:`ALIGN_BYTES`.
+
+Only a strict band. Rows of a contiguous operand run into each other, so a row
+whose length is not a sector multiple shares its last sector with the next row
+instead of overhanging into an unread one.
 """
 
 PROJ_ALIGN = SECTOR_BYTES // 2
@@ -98,6 +103,14 @@ def check_pitched(named: Named) -> None:
     what a slice of one fused projection output is, so demanding contiguity would
     force either a projection per consumer or a staging copy.
 
+    The alignment a pitch is held to depends on whether the operand is a strict
+    band. A contiguous operand owes :data:`ALIGN_BYTES`, the vector width the CuTe
+    views claim. An operand whose pitch exceeds its row width owes
+    :data:`SECTOR_BYTES`, because its rows share no sector with each other and an
+    overhanging one is traffic nobody reads. Both are refused rather than absorbed:
+    the second costs bandwidth no counter attributes, and the producer that pads the
+    column offsets is the one place the arithmetic belongs.
+
     Args:
         named: ``(tensor, name)`` pairs. Order is the reporting order: an operand
             that violates two conditions is reported under the first.
@@ -105,7 +118,7 @@ def check_pitched(named: Named) -> None:
     Raises:
         ValueError: If any operand is off CUDA, has no row axis, has a strided
             trailing axis, has rows that overlap, or starts or steps on an address
-            :data:`ALIGN_BYTES` does not cover.
+            its boundary does not cover.
     """
     for tensor, name in named:
         if tensor.device.type != "cuda":
@@ -124,11 +137,17 @@ def check_pitched(named: Named) -> None:
             raise ValueError(
                 f"{name} rows overlap: pitch {pitch} is below the row width {width}"
             )
-        multiple = ALIGN_BYTES // tensor.element_size()
-        if tensor.data_ptr() % ALIGN_BYTES != 0 or pitch % multiple != 0:
+        # A strict band's rows are far enough apart to share no sector, so a row
+        # that starts mid-sector fetches one sector it discards, and the discard is
+        # invisible to every bandwidth counter. Rows of a contiguous operand run
+        # into each other, so there is no overhang to waste and the vector width is
+        # the whole rule. See :data:`SECTOR_BYTES`.
+        boundary = SECTOR_BYTES if pitch > width else ALIGN_BYTES
+        multiple = boundary // tensor.element_size()
+        if tensor.data_ptr() % boundary != 0 or pitch % multiple != 0:
             raise ValueError(
                 f"{name} must start and step on a multiple of {multiple} elements; "
-                f"got byte offset {tensor.data_ptr() % ALIGN_BYTES} and pitch {pitch}"
+                f"got byte offset {tensor.data_ptr() % boundary} and pitch {pitch}"
             )
 
 
