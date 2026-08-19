@@ -5,7 +5,8 @@
 // the compulsory count for the forward and 14% for the backward, so there are few
 // bytes left to recover and the class is not in question. SERIAL-tiny is not the
 // escape either: the two are 29% and 56% of the conv step against that class's 2%
-// ceiling.
+// ceiling. The reduction that closes the backward is a third kernel and declares
+// SERIAL-tiny; its own block is at the end of this comment.
 //
 // Achieved fraction of the measured copy ceiling, on an RTX A6000 with clocks
 // unlocked and the device contended, two runs per shape:
@@ -88,6 +89,45 @@
 // by single-digit percent at P = 48 and P = 16 and not at all at P = 64. Removing
 // that would take a thread mapping over (t, p) inside one head rather than over
 // channels, which is a different decomposition, not a store index.
+//
+// Partial reduction. Class: SERIAL-tiny. conv1d_reduce_parts_kernel reads the
+// stack the backward leaves, (W+1)*S*D floats with S = ceil(T/kBwdTileT), and
+// writes D*(W+1) elements: 1.475 MB read at the standard shape against the 29.8 MB
+// the backward moves. Its kernel time there is 2.42 us with the bias slice and
+// 2.17 us without, against the 359 us step scripts/bench/bench_conv.py reports at
+// that shape, so 0.67% of the step against that class's 2% ceiling. Measured on an
+// RTX A6000, clocks unlocked, device shared at 9% utilization, ten launches under
+// nsys.
+//
+// A bandwidth is the wrong bar for it. The stack is 5.898 MB at the long shape, the
+// largest of the five, against a 6 MB L2 the backward has just written it into:
+// back-to-back launches on that stack run 4.76 us each, 1239 GB/s, 1.8x the
+// measured DRAM ceiling, so a resident stack is served from L2 and no DRAM figure
+// describes the kernel.
+//
+// One launch writes both parameter gradients. The grid is (channel tiles, W + 1)
+// and the last slice of the second axis is the bias, so an absent bias is one slice
+// fewer rather than a second launch. A block sums its slice over S with kReduceRows
+// threads striding it, combines the rows in ascending row order through shared
+// memory, and casts in the store, which transposes to the weight's own (D,W). Fixed
+// order and no float atomic, so two runs agree bitwise. The order is not ATen's,
+// whose .sum(0) carries four mod-4 accumulators, so the result differs from the
+// expression it replaces in the last bits; matching those would cap the S axis at
+// four threads and pin the kernel to an ATen internal no contract holds fixed.
+//
+// That expression is five launches with a bias and three without, 13.5 us of kernel
+// time and 43.4 us of wall against one launch, 2.42 us, and 3.32 us. What a step
+// sees of that depends on the caller. A paired step driving the backends directly
+// reads 9.664 us, interval [-14.400, -5.120] us over 40 pairs, because there the
+// launches queue behind the backward kernel and only their kernel time is exposed.
+// Through autograd, whose engine leaves host gaps between them, bench_conv reads
+// 419 and 430 us before against 357 and 359 us after, unpaired medians at 17% to
+// 72% spread that resolve nothing on their own.
+//
+// Shared memory is rows[kReduceRows][kReduceChannels] floats, and the block is
+// kReduceChannels wide, so a warp's store covers two rows, 32 consecutive floats,
+// 32 distinct banks. The combine reads one row across kReduceChannels lanes, 16
+// distinct banks. Neither conflicts.
 
 #include "causal_conv1d.h"
 
@@ -385,6 +425,70 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
   }
 }
 
+// Reduce the backward's per-time-tile partials into the parameter gradients.
+//
+// blockIdx.y selects the slice: tap k at k < width, the bias at k == width. Both
+// are a stack of `parts` rows of `channels` floats and differ only in the row
+// stride, so one instantiation covers the taps and the bias, and the launch count
+// is one whether or not a bias is present.
+//
+// The block is (kReduceChannels, kReduceRows). Threads split the slice stack
+// along rows, each holding one accumulator, and the per-row partials meet in
+// shared memory. Every reduction here is over a compile-time count in a
+// compile-time order, so the sum does not depend on how the blocks were
+// scheduled.
+template <typename output_t>
+__global__ void
+conv1d_reduce_parts_kernel(const float *__restrict__ dweight_parts,
+                           const float *__restrict__ dbias_parts,
+                           output_t *__restrict__ dweight,
+                           output_t *__restrict__ dbias, int parts, int channels,
+                           int width) {
+  const int channel = blockIdx.x * kReduceChannels + threadIdx.x;
+  const bool bias_slice = static_cast<int>(blockIdx.y) == width;
+  const long stride = bias_slice ? channels : static_cast<long>(width) * channels;
+  const float *src =
+      bias_slice ? dbias_parts
+                 : dweight_parts + static_cast<long>(blockIdx.y) * channels;
+
+  // Four in flight per thread, which is the whole stack at the standard shape:
+  // the reduction is one add per four bytes and has no arithmetic to hide a load
+  // behind, so loads in flight is the only lever it has.
+  float acc = 0.0f;
+  if (channel < channels) {
+#pragma unroll 4
+    for (int i = threadIdx.y; i < parts; i += kReduceRows) {
+      acc += src[static_cast<long>(i) * stride + channel];
+    }
+  }
+
+  // A warp spans two rows of the tile and 16 consecutive floats of each, so its
+  // 32 addresses are 32 consecutive floats: conflict-free without a pad.
+  __shared__ float rows[kReduceRows][kReduceChannels];
+  rows[threadIdx.y][threadIdx.x] = acc;
+  __syncthreads();
+  if (threadIdx.y != 0 || channel >= channels) {
+    return;
+  }
+  // Ascending rather than a tree: one order, fixed here, is what makes the
+  // result reproducible.
+  float total = rows[0][threadIdx.x];
+#pragma unroll
+  for (int r = 1; r < kReduceRows; ++r) {
+    total += rows[r][threadIdx.x];
+  }
+  if (bias_slice) {
+    dbias[channel] = static_cast<output_t>(total);
+  } else {
+    // The weight's own layout, reached by the store index. Consecutive channels
+    // land width elements apart, which is the one uncoalesced access in the
+    // kernel and covers D*W elements: it does not scale with the sequence, where
+    // every load above does.
+    dweight[static_cast<long>(channel) * width + blockIdx.y] =
+        static_cast<output_t>(total);
+  }
+}
+
 int block_width(int channels) {
   const int warps = (channels + 31) / 32 * 32;
   return warps < kMaxChannelsPerBlock ? warps : kMaxChannelsPerBlock;
@@ -566,6 +670,26 @@ void launch_bwd(const std::optional<at::Tensor> &dy,
   });
 }
 
+// No width dispatch: the reduction holds no register array of width, so width is
+// an argument and one instantiation per dtype covers every tap count.
+template <typename output_t>
+void launch_reduce_parts(const at::Tensor &dweight_parts,
+                         const std::optional<at::Tensor> &dbias_parts,
+                         const at::Tensor &dweight,
+                         const std::optional<at::Tensor> &dbias) {
+  const int parts = static_cast<int>(dweight_parts.size(0));
+  const int width = static_cast<int>(dweight_parts.size(1));
+  const int channels = static_cast<int>(dweight_parts.size(2));
+  const dim3 block(kReduceChannels, kReduceRows);
+  const dim3 grid((channels + kReduceChannels - 1) / kReduceChannels,
+                  width + (dbias.has_value() ? 1 : 0));
+  conv1d_reduce_parts_kernel<output_t>
+      <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          dweight_parts.const_data_ptr<float>(), data_or_null<float>(dbias_parts),
+          dweight.data_ptr<output_t>(), mutable_or_null<output_t>(dbias), parts,
+          channels, width);
+}
+
 } // namespace
 
 int64_t causal_conv1d_bwd_parts(int64_t seqlen) {
@@ -628,6 +752,27 @@ void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
   default:
     TORCH_CHECK(false, "causal_conv1d_bwd: unsupported dtype ",
                 x.scalar_type());
+  }
+}
+
+void causal_conv1d_reduce_parts(const at::Tensor &dweight_parts,
+                                const std::optional<at::Tensor> &dbias_parts,
+                                const at::Tensor &dweight,
+                                const std::optional<at::Tensor> &dbias) {
+  const at::cuda::CUDAGuard guard(dweight_parts.device());
+  switch (dweight.scalar_type()) {
+  case at::ScalarType::BFloat16:
+    launch_reduce_parts<at::BFloat16>(dweight_parts, dbias_parts, dweight, dbias);
+    break;
+  case at::ScalarType::Half:
+    launch_reduce_parts<at::Half>(dweight_parts, dbias_parts, dweight, dbias);
+    break;
+  case at::ScalarType::Float:
+    launch_reduce_parts<float>(dweight_parts, dbias_parts, dweight, dbias);
+    break;
+  default:
+    TORCH_CHECK(false, "causal_conv1d_reduce_parts: unsupported dtype ",
+                dweight.scalar_type());
   }
 }
 

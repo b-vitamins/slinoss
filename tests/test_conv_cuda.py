@@ -348,6 +348,10 @@ def _check_backward(
     )
     assert_max_rel(got.dx, want.dx, DX_BOUND, "conv/native/dx")
     assert_max_rel(got.dweight, want.dweight, DPARAM_BOUND, "conv/native/dweight")
+    # Present exactly when the forward carried a bias. The reduction reaches dbias
+    # through one slice of its grid, so an absent bias is one fewer slice rather
+    # than an output that is allocated and left unwritten.
+    assert (got.dbias is None) == (not with_bias)
     if got.dbias is not None:
         assert want.dbias is not None
         assert_max_rel(got.dbias, want.dbias, DPARAM_BOUND, "conv/native/dbias")
@@ -680,6 +684,121 @@ def test_more_than_one_partial_is_reduced() -> None:
         got.dweight, want.dweight, DPARAM_BOUND, "conv/native/dweight/multi-tile"
     )
     assert_max_rel(got.dbias, want.dbias, DPARAM_BOUND, "conv/native/dbias/multi-tile")
+
+
+def _bwd_partials(
+    bsz: int,
+    seqlen: int,
+    channels: int,
+    width: int,
+    dtype: torch.dtype,
+    *,
+    with_bias: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    """The backward kernel's parameter-gradient partials.
+
+    Taken from the backward kernel rather than from ``randn``: the reduction's
+    operand is that kernel's output, and a fabricated stack would not carry its
+    layout or its magnitudes.
+
+    Args:
+        bsz: Batch.
+        seqlen: Tokens. Long enough that the stack holds more than one slice.
+        channels: Channels.
+        width: Tap count.
+        dtype: Storage dtype of the call.
+        with_bias: Build a bias, which is what makes the bias partials exist.
+
+    Returns:
+        ``(dweight_parts, dbias_parts)``, float32, shapes ``(S,W,D)`` and
+        ``(S,D)``. The second is None when the call carries no bias.
+    """
+    module = _C.extension()
+    x, weight, bias, state = cuda_call(
+        bsz, seqlen, channels, width, bias=with_bias, dtype=dtype
+    )
+    dy, dstate = cotangents(bsz, seqlen, channels, width, seed=41)
+    assert state is not None
+    parts = int(module.bwd_parts(seqlen))
+    assert parts > 1
+    dweight_parts = x.new_empty((parts, width, channels), dtype=torch.float32)
+    dbias_parts = (
+        None if bias is None else x.new_empty((parts, channels), dtype=torch.float32)
+    )
+    module.bwd(
+        dy.to(dtype),
+        dstate.to(dtype),
+        x,
+        weight,
+        bias,
+        state,
+        torch.empty_like(x),
+        torch.empty_like(state),
+        dweight_parts,
+        dbias_parts,
+        True,
+    )
+    return dweight_parts, dbias_parts
+
+
+def _reduced(
+    dweight_parts: Tensor, dbias_parts: Tensor | None, dtype: torch.dtype
+) -> tuple[Tensor, Tensor | None]:
+    """One ``bwd_reduce`` over a partial stack, into fresh outputs."""
+    channels = int(dweight_parts.shape[2])
+    width = int(dweight_parts.shape[1])
+    dweight = dweight_parts.new_empty((channels, width), dtype=dtype)
+    dbias = (
+        None
+        if dbias_parts is None
+        else dweight_parts.new_empty((channels,), dtype=dtype)
+    )
+    _C.extension().bwd_reduce(dweight_parts, dbias_parts, dweight, dbias)
+    return dweight, dbias
+
+
+@pytest.mark.parametrize(("dtype", "bound"), PARITY_DTYPES)
+def test_the_partial_reduction_matches_the_torch_tail(
+    dtype: torch.dtype, bound: float
+) -> None:
+    """The reduction against the torch expression it replaces, at each dtype.
+
+    The expression is ``parts.sum(0).t().contiguous().to(dtype)`` for the taps and
+    ``parts.sum(0).to(dtype)`` for the bias: a reduction, a transpose copy, and a
+    cast, which the kernel does in one launch and one store. Dtype is the axis
+    swept because the store is where the layout and the narrowing happen and the
+    kernel is one instantiation per output dtype; shape reaches only the grid, and
+    the sweep above already carries it.
+
+    The two sums differ in order, so the bound is the same one-ulp ceiling the
+    forward parity test is held to and for the same reason.
+    """
+    bsz, seqlen, channels, width = 2, 200, 33, 4
+    dweight_parts, dbias_parts = _bwd_partials(bsz, seqlen, channels, width, dtype)
+    assert dbias_parts is not None
+    want_dweight = dweight_parts.sum(0).t().contiguous().to(dtype)
+    want_dbias = dbias_parts.sum(0).to(dtype)
+    dweight, dbias = _reduced(dweight_parts, dbias_parts, dtype)
+    assert dbias is not None
+    assert dweight.shape == (channels, width) and dweight.is_contiguous()
+    assert_max_rel(dweight, want_dweight, bound, f"conv/native/reduce/dweight/{dtype}")
+    assert_max_rel(dbias, want_dbias, bound, f"conv/native/reduce/dbias/{dtype}")
+
+
+def test_the_partial_reduction_is_reproducible() -> None:
+    """Bitwise across two runs on one partial stack.
+
+    What this pins is the reduction order. The stack is split across the block's
+    rows, so a float atomic into the output or a combine that followed the
+    scheduler rather than the row index would agree here only by luck. float32
+    outputs, because a narrower store would round the differing bits away.
+    """
+    dweight_parts, dbias_parts = _bwd_partials(2, 200, 33, 4, torch.float32)
+    first = _reduced(dweight_parts, dbias_parts, torch.float32)
+    second = _reduced(dweight_parts, dbias_parts, torch.float32)
+    for have, again in zip(first, second):
+        assert have is not None and again is not None
+        assert_bitwise(have, again)
 
 
 def test_native_backend_is_registered_and_preferred() -> None:

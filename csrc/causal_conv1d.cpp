@@ -124,6 +124,30 @@ void bwd(const std::optional<at::Tensor> &dy,
                              dy_rows, activation);
 }
 
+void bwd_reduce(const at::Tensor &dweight_parts,
+                const std::optional<at::Tensor> &dbias_parts,
+                const at::Tensor &dweight,
+                const std::optional<at::Tensor> &dbias) {
+  TORCH_CHECK(dweight_parts.is_cuda(), "dweight_parts must be on a CUDA device");
+  TORCH_CHECK(dweight_parts.dim() == 3, "dweight_parts must be (S,W,D)");
+  const int64_t parts = dweight_parts.size(0);
+  const int64_t width = dweight_parts.size(1);
+  const int64_t channels = dweight_parts.size(2);
+  const at::Device device = dweight_parts.device();
+  const at::ScalarType dtype = dweight.scalar_type();
+  expect(dweight_parts, "dweight_parts", {parts, width, channels}, at::kFloat,
+         device);
+  expect(dweight, "dweight", {channels, width}, dtype, device);
+  expect_optional(dbias_parts, "dbias_parts", {parts, channels}, at::kFloat,
+                  device);
+  expect_optional(dbias, "dbias", {channels}, dtype, device);
+  // Paired, because the bias slice of the grid is what writes dbias: a dbias
+  // without its partials would be left unwritten rather than reduced.
+  TORCH_CHECK(dbias.has_value() == dbias_parts.has_value(),
+              "dbias and dbias_parts must be present together");
+  slinoss::causal_conv1d_reduce_parts(dweight_parts, dbias_parts, dweight, dbias);
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -143,4 +167,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "parameter-gradient partials.");
   m.def("bwd_parts", &slinoss::causal_conv1d_bwd_parts, py::arg("seqlen"),
         "Number of partial slices the backward writes for a sequence length.");
+  m.def("bwd_reduce", &bwd_reduce, py::arg("dweight_parts"),
+        py::arg("dbias_parts"), py::arg("dweight"), py::arg("dbias"),
+        "Reduce the parameter-gradient partials into dweight, in the weight's "
+        "layout and dtype, and dbias, in one launch.");
 }

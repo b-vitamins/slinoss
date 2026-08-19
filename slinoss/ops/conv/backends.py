@@ -210,8 +210,9 @@ def causal_conv1d_bwd_native(
     """Pullback of :func:`causal_conv1d_fwd_native` on the CUDA kernel.
 
     The parameter gradients arrive as one float32 partial per time tile and are
-    summed here. The kernel writes every partial with a plain store, so nothing
-    is zeroed before the launch.
+    reduced by a second launch that writes the weight's own layout and dtype
+    directly. Both kernels write every element of every output they are given, so
+    nothing is zeroed before either launch.
 
     A head-major cotangent moves the kernel's ``dy`` load address and nothing else.
     ``dx`` is token-major because ``x`` is.
@@ -274,13 +275,18 @@ def causal_conv1d_bwd_native(
         dbias_parts,
         activation,
     )
-    # The partials are tap-major so the kernel's stores coalesce; the transpose
-    # back to the weight's own (D,W) is over D*W elements and does not scale with
-    # the sequence.
+    # One launch for both parameter gradients. The partials stay tap-major so the
+    # backward's stores coalesce, and the reduction transposes to the weight's
+    # (D,W) and narrows to its dtype in its own store; the torch expression it
+    # replaces is five launches, a reduction and a transpose copy and a cast per
+    # gradient. csrc/causal_conv1d_kernel.cu holds the measurement.
+    dweight = weight.new_empty((dims.channels, dims.width))
+    dbias = None if bias is None else x.new_empty((dims.channels,))
+    module.bwd_reduce(dweight_parts, dbias_parts, dweight, dbias)
     return ConvGrads(
         dx=dx,
-        dweight=dweight_parts.sum(0).t().contiguous().to(weight.dtype),
-        dbias=None if dbias_parts is None else dbias_parts.sum(0).to(x.dtype),
+        dweight=dweight,
+        dbias=dbias,
         dinitial_state=dinitial_state,
     )
 

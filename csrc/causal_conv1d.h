@@ -46,6 +46,16 @@ static_assert(kTileT % kFwdPrefetch == 0, "the prefetch group must divide kTileT
 // in the last block of a row, and it splits the tail wave finer.
 constexpr int kMaxChannelsPerBlock = 64;
 
+// Channels one partial-reduction block covers, and partial slices one of its
+// threads walks. The product is the block, 512 threads, and the split is what
+// supplies the grid its blocks: the grid is ceil(D/kReduceChannels) * (W+1), so
+// at D = 576 and W = 4 a 32-channel block would leave 90 blocks, under twice the
+// SM count of every part this runs on, while 16 leaves 180. A 16-lane run of
+// float32 is 64 B, two whole sectors, so narrowing the block costs the load
+// nothing.
+constexpr int kReduceChannels = 16;
+constexpr int kReduceRows = 32;
+
 // y = act(conv(x)), with the activation in the kernel epilogue.
 //
 //   x             (B,T,D)   contiguous, bf16/fp16/fp32
@@ -85,9 +95,10 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
 //
 // S is causal_conv1d_bwd_parts(T). The parameter gradients are per-lag float32
 // accumulators reduced along time inside the block and stored, never
-// accumulated, so no output needs zeroing before the launch. The caller sums
-// the S slices. Both partial buffers are channel-minor, so a warp's store is one
-// coalesced transaction; the caller transposes the summed tap block once.
+// accumulated, so no output needs zeroing before the launch. Both partial
+// buffers are channel-minor, so a warp's store is one coalesced transaction;
+// causal_conv1d_reduce_parts sums the S slices and transposes the tap block on
+// the way out.
 void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dfinal_state,
                        const at::Tensor &x, const at::Tensor &weight,
@@ -101,5 +112,32 @@ void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
 
 // Number of time-tile partials the backward writes for a sequence length.
 int64_t causal_conv1d_bwd_parts(int64_t seqlen);
+
+// Reduce the backward's partials into the parameter gradients.
+//
+//   dweight_parts (S,W,D) contiguous float32
+//   dbias_parts   (S,D)   contiguous float32, or nullopt
+//   dweight       (D,W)   contiguous, bf16/fp16/fp32, written in full
+//   dbias         (D,)    contiguous, same dtype as dweight, written in full,
+//                         or nullopt
+//
+// One launch covers both gradients: the grid's second axis holds the W tap slices
+// and, when a bias is present, the bias as one more slice. Each slice is a stack
+// of S rows of D floats and differs only in its row stride, so the taps and the
+// bias are one kernel and an absent bias is one fewer slice rather than a second
+// launch that is skipped.
+//
+// The transpose from the partials' tap-major (W,D) to the weight's own (D,W) is
+// the store index and the narrowing to the weight's dtype is the store, so
+// neither is a pass over anything.
+//
+// The reduction order is fixed at compile time: thread r sums slice rows r,
+// r + kReduceRows, ... ascending, and the combine across the block's rows runs
+// ascending too. No atomics reach either output, so two runs on identical
+// partials agree bitwise.
+void causal_conv1d_reduce_parts(const at::Tensor &dweight_parts,
+                                const std::optional<at::Tensor> &dbias_parts,
+                                const at::Tensor &dweight,
+                                const std::optional<at::Tensor> &dbias);
 
 } // namespace slinoss
