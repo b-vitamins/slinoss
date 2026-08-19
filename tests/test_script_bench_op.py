@@ -62,6 +62,10 @@ PAIRS = 8
 """Pairs behind a pinned verdict. Eight reaches nominal coverage, so the verdict
 turns on whether the interval excludes zero and not on the pair count."""
 
+MEASURE_PAIRED = bench_op.measure_paired
+"""The unpatched paired loop, held so a second pin in one test wraps the real one
+rather than the previous stub."""
+
 
 def _argv(out: Path, *extra: str) -> list[str]:
     """The cheapest legal run: fp32, two iterations, no warmup.
@@ -221,7 +225,7 @@ def _pin_comparison(
         a_us: Every baseline sample.
         b_us: Every sample from the arm under test.
     """
-    real = bench_op.measure_paired
+    real = MEASURE_PAIRED
 
     def patched(
         a_label: str,
@@ -278,38 +282,28 @@ def test_parse_args_defaults_to_every_shape_in_both_modes_with_no_comparison() -
     assert args.against is None
     assert args.out == Path("out/bench-op")
     assert args.no_ceilings is False
-
-
-def test_parse_args_collects_a_repeated_shape_in_command_line_order() -> None:
+    # --shape appends, so a repeated flag is a list in command-line order.
     assert parse_args(["--shape", "standard", "--shape", "tiny"]).shape == [
         "standard",
         "tiny",
     ]
+    # The registry rejects an unknown backend, so a choices list on either name
+    # would have to be kept in step with it and would reject 'same' as well.
+    named = parse_args(["--backend", "reference", "--against", "same"])
+    assert (named.backend, named.against) == ("reference", "same")
 
 
-def test_parse_args_rejects_a_shape_that_is_not_a_standard_size() -> None:
-    with pytest.raises(SystemExit) as caught:
-        parse_args(["--shape", "huge"])
-    assert caught.value.code == 2
-
-
-def test_parse_args_rejects_a_mode_that_is_neither_direction_nor_both() -> None:
-    with pytest.raises(SystemExit) as caught:
-        parse_args(["--mode", "backward"])
-    assert caught.value.code == 2
-
-
-def test_parse_args_rejects_a_dtype_with_no_torch_mapping() -> None:
-    with pytest.raises(SystemExit) as caught:
-        parse_args(["--dtype", "fp8"])
-    assert caught.value.code == 2
-
-
-def test_parse_args_leaves_the_two_backend_names_unconstrained() -> None:
-    # The registry rejects an unknown backend, so a choices list here would have to
-    # be kept in step with it and would reject 'same' as well.
-    args = parse_args(["--backend", "reference", "--against", "same"])
-    assert (args.backend, args.against) == ("reference", "same")
+def test_parse_args_rejects_a_value_outside_its_table() -> None:
+    # argparse exits 2 rather than raising, so a typo in a sweep script stops the
+    # run instead of silently benching the default configuration.
+    for flag, value in (
+        ("--shape", "huge"),
+        ("--mode", "backward"),
+        ("--dtype", "fp8"),
+    ):
+        with pytest.raises(SystemExit) as caught:
+            parse_args([flag, value])
+        assert caught.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -317,15 +311,10 @@ def test_parse_args_leaves_the_two_backend_names_unconstrained() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_arm_labels_name_each_backend_in_arm_order() -> None:
+def test_arm_labels_name_each_backend_and_separate_the_two_null_arms() -> None:
     assert arm_labels("reference", "cute") == ("so3ssd-reference", "so3ssd-cute")
-
-
-def test_arm_labels_call_an_unselected_backend_auto() -> None:
+    # An unselected backend is the fastest registered one, named auto.
     assert arm_labels(None, "cute") == ("so3ssd-auto", "so3ssd-cute")
-
-
-def test_arm_labels_add_a_side_suffix_when_both_arms_hold_one_backend() -> None:
     # measure_paired refuses one label for both arms, and the null test still has
     # to be runnable.
     assert arm_labels("reference", "reference") == (
@@ -391,22 +380,15 @@ def test_bench_measures_a_step_and_probes_what_autograd_holds(
 # ---------------------------------------------------------------------------
 
 
-def test_compare_backends_builds_one_input_set_for_both_arms(
+def test_compare_backends_reports_one_rate_per_arm_from_one_input_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pinned_device: DeviceInfo
 ) -> None:
-    # Two sets would differ in address and in cache residency, and that difference
-    # would be attributed to the backend.
     built = _count_input_sets(monkeypatch)
     args = parse_args(_argv(tmp_path / "bench", "--against", "reference"))
-    compare_backends(TINY, "step", args, CUDA, None)
-    assert len(built) == 1
-
-
-def test_compare_backends_reports_one_rate_per_arm_and_one_comparison(
-    tmp_path: Path, pinned_device: DeviceInfo
-) -> None:
-    args = parse_args(_argv(tmp_path / "bench", "--against", "reference"))
     report, row = compare_backends(TINY, "step", args, CUDA, None)
+    # Two input sets would differ in address and in cache residency, and that
+    # difference would be attributed to the backend.
+    assert len(built) == 1
     assert report.title == "bench: so3ssd tiny step paired"
     assert [r.label for r in report.throughput] == ["so3ssd-auto", "so3ssd-reference"]
     assert [r.token_count for r in report.throughput] == [256, 256]
@@ -455,16 +437,16 @@ def test_compare_backends_puts_the_named_backend_in_both_arms_of_a_null_test(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", ["cpu", "cuda"])
 def test_main_refuses_a_device_no_report_can_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spec: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Both arcs of the shared guard: a host device, and a CUDA device on a host
     # without CUDA. Every report names the part its numbers came from, and off
     # CUDA there is no such part.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="is not a usable cuda device"):
-        main(["--device", spec, "--out", str(tmp_path / "bench")])
+    for spec in ("cpu", "cuda"):
+        with pytest.raises(RuntimeError, match="is not a usable cuda device"):
+            main(["--device", spec, "--out", str(tmp_path / "bench")])
 
 
 def test_main_prints_one_rate_row_per_configuration_and_writes_both_reports(
@@ -507,26 +489,21 @@ def test_main_measures_the_ceilings_unless_told_not_to(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pinned_device: DeviceInfo
 ) -> None:
     seen = _pin_ceilings(monkeypatch)
-    code = main(_argv(tmp_path / "bench", "--shape", "tiny", "--mode", "forward"))
-    assert code == 0
+    measured = tmp_path / "measured" / "bench"
+    assert main(_argv(measured, "--shape", "tiny", "--mode", "forward")) == 0
     assert seen == [CUDA]
-    text = (tmp_path / "bench-tiny-forward.md").read_text()
+    text = (tmp_path / "measured" / "bench-tiny-forward.md").read_text()
     assert "## measured dram ceiling" in text
     assert "## measured tensor ceiling" in text
-
-
-def test_main_skips_the_ceilings_on_request(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pinned_device: DeviceInfo
-) -> None:
-    seen = _pin_ceilings(monkeypatch)
-    code = main(
-        _argv(
-            tmp_path / "bench", "--shape", "tiny", "--mode", "forward", "--no-ceilings"
-        )
-    )
-    assert code == 0
+    # Two 512 MiB buffers and an 8192-cube GEMM per run, so a sweep can decline
+    # them. Declining has to drop the section as well as the probe: a ceiling
+    # heading over no measurement is a claim about the part that was never made.
+    seen.clear()
+    skipped = tmp_path / "skipped" / "bench"
+    argv = _argv(skipped, "--shape", "tiny", "--mode", "forward", "--no-ceilings")
+    assert main(argv) == 0
     assert seen == []
-    assert "ceiling" not in (tmp_path / "bench-tiny-forward.md").read_text()
+    assert "ceiling" not in (tmp_path / "skipped" / "bench-tiny-forward.md").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -566,28 +543,22 @@ def test_main_compares_two_backends_in_one_loop_and_claims_nothing_of_its_own(
     assert (tmp_path / "bench-tiny-forward-paired.json").is_file()
 
 
-def test_main_returns_one_when_a_null_comparison_resolves_a_difference(
+def test_the_exit_status_says_whether_a_null_comparison_resolved_anything(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     pinned_device: DeviceInfo,
 ) -> None:
-    _pin_comparison(monkeypatch, a_us=110.0, b_us=100.0)
-    code = main(
-        _argv(
-            tmp_path / "bench",
-            "--shape",
-            "tiny",
-            "--mode",
-            "forward",
-            "--no-ceilings",
-            "--against",
-            "same",
+    def run(base: str, *extra: str) -> int:
+        argv = _argv(
+            tmp_path / base, "--shape", "tiny", "--mode", "forward", "--no-ceilings"
         )
-    )
+        return main([*argv, *extra])
+
     # One backend in both arms and a resolved difference: the comparison measured
     # the arm order or the loop.
-    assert code == 1
+    _pin_comparison(monkeypatch, a_us=110.0, b_us=100.0)
+    assert run("resolved", "--against", "same") == 1
     lines = capsys.readouterr().out.splitlines()
     assert lines[6] == (
         "so3ssd tiny forward paired: so3ssd-auto-b beats so3ssd-auto-a by "
@@ -600,59 +571,22 @@ def test_main_returns_one_when_a_null_comparison_resolves_a_difference(
         "loop, not the backend"
     )
 
-
-def test_main_returns_zero_when_a_null_comparison_resolves_nothing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    pinned_device: DeviceInfo,
-) -> None:
+    # Equal samples resolve nothing, so the harness is intact and the driver says
+    # nothing further.
     _pin_comparison(monkeypatch, a_us=100.0, b_us=100.0)
-    code = main(
-        _argv(
-            tmp_path / "bench",
-            "--shape",
-            "tiny",
-            "--mode",
-            "forward",
-            "--no-ceilings",
-            "--against",
-            "same",
-        )
-    )
-    assert code == 0
+    assert run("null", "--against", "same") == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[6] == (
         "so3ssd tiny forward paired: no difference measured between so3ssd-auto-a "
         "and so3ssd-auto-b; the interval [0.000, 0.000] us at 99.219% coverage "
         "over 8 pairs does not exclude zero"
     )
-    # The harness is intact, so the driver says nothing further.
     assert len(lines) == 7
 
-
-def test_main_treats_an_against_equal_to_the_backend_as_the_same_null_test(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    pinned_device: DeviceInfo,
-) -> None:
+    # Naming the same backend twice is the same null test as 'same', so it holds
+    # the same exit status.
     _pin_comparison(monkeypatch, a_us=110.0, b_us=100.0)
-    code = main(
-        _argv(
-            tmp_path / "bench",
-            "--shape",
-            "tiny",
-            "--mode",
-            "forward",
-            "--no-ceilings",
-            "--backend",
-            "reference",
-            "--against",
-            "reference",
-        )
-    )
-    assert code == 1
+    assert run("named", "--backend", "reference", "--against", "reference") == 1
     assert (
         capsys.readouterr()
         .out.splitlines()[-1]

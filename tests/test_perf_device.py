@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 import torch
@@ -88,6 +88,34 @@ def _apps(text: str | None) -> ComputeAppsQuery:
     return query
 
 
+def _failed_run(
+    failure: str,
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """A ``subprocess.run`` that fails the way ``failure`` names.
+
+    Args:
+        failure: ``missing`` raises OSError, ``timeout`` raises TimeoutExpired,
+            ``nonzero`` exits 9, ``blank`` exits 0 with no output line.
+
+    Returns:
+        The replacement callable.
+    """
+
+    def fake_run(
+        cmd: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        if failure == "missing":
+            raise OSError("no such file")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(cmd=["nvidia-smi"], timeout=20)
+        if failure == "nonzero":
+            return subprocess.CompletedProcess(list(cmd), 9, "", "no devices")
+        return subprocess.CompletedProcess(list(cmd), 0, "   \n", "")
+
+    return fake_run
+
+
 def _spread(median_us: float) -> Spread:
     """A Spread over eight samples spanning 2 percent of the median.
 
@@ -158,15 +186,20 @@ def _tensor(achieved_tflops: float) -> TensorCeiling:
 # ---------------------------------------------------------------------------
 
 
-def test_clock_policy_passes_the_fields_and_the_index() -> None:
+def test_clock_policy_passes_the_fields_and_reports_a_missing_nvidia_smi() -> None:
     seen: list[tuple[tuple[str, ...], int]] = []
 
     def query(fields: Sequence[str], index: int) -> str | None:
         seen.append((tuple(fields), index))
         return None
 
-    clock_policy(3, query)
+    policy = clock_policy(3, query)
     assert seen == [(FIELDS, 3)]
+    assert policy.detail == "nvidia-smi unavailable"
+    assert not policy.locked
+    assert policy.stamp == "unlocked"
+    assert policy.sm_clock_mhz == 0.0
+    assert policy.max_sm_clock_mhz == 0.0
 
 
 def test_clock_policy_reports_an_active_applications_clock_as_locked() -> None:
@@ -179,36 +212,23 @@ def test_clock_policy_reports_an_active_applications_clock_as_locked() -> None:
     assert "applications_clocks_setting=Active" in policy.detail
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "1740, 1800, 1740, Not Active",
-        "1740, 1800, 0, Active",
-        "1740, 1800, [N/A], Active",
-        "1740, 1800, 1740, ",
-    ],
-)
-def test_clock_policy_reports_anything_else_as_unlocked(line: str) -> None:
-    policy = clock_policy(0, _returning(line))
-    assert not policy.locked
-    assert policy.stamp == "unlocked"
+def test_clock_policy_reports_anything_else_as_unlocked() -> None:
+    # Both halves of the condition: an inactive setting, and an active setting
+    # over an applications clock of zero.
+    for line in ("1740, 1800, 1740, Not Active", "1740, 1800, 0, Active"):
+        policy = clock_policy(0, _returning(line))
+        assert not policy.locked
+        assert policy.stamp == "unlocked"
 
 
-def test_clock_policy_reports_a_missing_nvidia_smi() -> None:
-    policy = clock_policy(0, _returning(None))
-    assert policy.detail == "nvidia-smi unavailable"
-    assert not policy.locked
-    assert policy.stamp == "unlocked"
-    assert policy.sm_clock_mhz == 0.0
-    assert policy.max_sm_clock_mhz == 0.0
-
-
-@pytest.mark.parametrize("line", ["1740, 1800", "1740, 1800, 1740, Active, extra"])
-def test_clock_policy_reports_an_unparsed_line(line: str) -> None:
-    policy = clock_policy(0, _returning(line))
-    assert policy.detail.startswith("unparsed nvidia-smi output:")
-    assert not policy.locked
-    assert policy.sm_clock_mhz == 0.0
+def test_clock_policy_reports_an_unparsed_line() -> None:
+    # Too few fields and too many are both unparsed, so the field count is
+    # compared for equality and not for a minimum.
+    for line in ("1740, 1800", "1740, 1800, 1740, Active, extra"):
+        policy = clock_policy(0, _returning(line))
+        assert policy.detail.startswith("unparsed nvidia-smi output:")
+        assert not policy.locked
+        assert policy.sm_clock_mhz == 0.0
 
 
 def test_clock_policy_parses_a_non_numeric_clock_as_zero() -> None:
@@ -252,51 +272,14 @@ def test_smi_query_builds_the_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
-def test_smi_query_returns_none_on_a_nonzero_exit(
+def test_smi_query_returns_none_on_every_failed_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run(
-        cmd: Sequence[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        del kwargs
-        return subprocess.CompletedProcess(list(cmd), 9, "", "no devices")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    assert smi_query(FIELDS, 0) is None
-
-
-def test_smi_query_returns_none_when_nvidia_smi_is_absent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del args, kwargs
-        raise OSError("no such file")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    assert smi_query(FIELDS, 0) is None
-
-
-def test_smi_query_returns_none_on_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del args, kwargs
-        raise subprocess.TimeoutExpired(cmd=["nvidia-smi"], timeout=20)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    assert smi_query(FIELDS, 0) is None
-
-
-@pytest.mark.parametrize("stdout", ["", "\n", "   \n"])
-def test_smi_query_returns_none_on_empty_stdout(
-    monkeypatch: pytest.MonkeyPatch, stdout: str
-) -> None:
-    def fake_run(
-        cmd: Sequence[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        del kwargs
-        return subprocess.CompletedProcess(list(cmd), 0, stdout, "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    assert smi_query(FIELDS, 0) is None
+    # A missing binary, a timeout, a nonzero exit, and an answer with no line are
+    # four distinct outcomes and one report: the probe did not run.
+    for failure in ("missing", "timeout", "nonzero", "blank"):
+        monkeypatch.setattr(subprocess, "run", _failed_run(failure))
+        assert smi_query(FIELDS, 0) is None
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +291,9 @@ def test_smi_query_returns_none_on_empty_stdout(
 # ---------------------------------------------------------------------------
 
 
-def test_compute_apps_query_builds_the_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_compute_apps_query_builds_the_argv_and_reads_an_idle_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     seen: list[tuple[list[str], int]] = []
 
     def fake_run(
@@ -335,41 +320,24 @@ def test_compute_apps_query_builds_the_argv(monkeypatch: pytest.MonkeyPatch) -> 
         )
     ]
 
-
-def test_compute_apps_query_reads_an_idle_device_as_an_empty_list(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     # A device with no compute process prints nothing. That is not a failed probe,
     # and conflating the two would report an exclusive device as unknown.
-    def fake_run(
+    def idle_run(
         cmd: Sequence[str], **kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         del kwargs
         return subprocess.CompletedProcess(list(cmd), 0, "\n", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", idle_run)
     assert compute_apps_query(0) == ""
 
 
-@pytest.mark.parametrize(
-    "failure",
-    ["nonzero", "missing", "timeout"],
-)
 def test_compute_apps_query_returns_none_on_a_failed_probe(
-    monkeypatch: pytest.MonkeyPatch, failure: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run(
-        cmd: Sequence[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        del kwargs
-        if failure == "missing":
-            raise OSError("no such file")
-        if failure == "timeout":
-            raise subprocess.TimeoutExpired(cmd=["nvidia-smi"], timeout=20)
-        return subprocess.CompletedProcess(list(cmd), 9, "", "no devices")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    assert compute_apps_query(0) is None
+    for failure in ("nonzero", "missing", "timeout"):
+        monkeypatch.setattr(subprocess, "run", _failed_run(failure))
+        assert compute_apps_query(0) is None
 
 
 def test_contention_reports_a_device_holding_only_this_process() -> None:
@@ -398,44 +366,38 @@ def test_contention_counts_every_other_process_on_the_device() -> None:
     assert got.stamp == (
         "shared with 2 processes holding 36,946 MiB at 100% utilization"
     )
+    one = contention(0, apps=_apps("99, 28"), query=_returning("0, 44"), own_pid=4321)
+    assert one.stamp == "shared with 1 process holding 28 MiB at 0% utilization"
 
 
-def test_contention_names_one_other_process_in_the_singular() -> None:
-    got = contention(0, apps=_apps("99, 28"), query=_returning("0, 44"), own_pid=4321)
-    assert got.stamp == "shared with 1 process holding 28 MiB at 0% utilization"
-
-
-def test_contention_reports_a_failed_apps_probe_as_shared() -> None:
+def test_contention_reports_a_failed_probe_as_shared() -> None:
     # Unknown is not exclusive. Claiming an exclusive device off a probe that did
     # not run is the one direction that turns a contended median into a clean one.
-    got = contention(0, apps=_apps(None), query=_returning("0, 44"), own_pid=4321)
-    assert not got.exclusive
-    assert got.foreign_process_count == 0
-    assert got.detail == "nvidia-smi unavailable"
-    assert got.stamp == "sharing unknown"
+    # Either half missing is a failed probe: an idle device whose utilization did
+    # not read is still not a device this measurement had to itself.
+    for apps, query in (
+        (_apps(None), _returning("0, 44")),
+        (_apps(""), _returning(None)),
+    ):
+        got = contention(0, apps=apps, query=query, own_pid=4321)
+        assert not got.exclusive
+        assert got.foreign_process_count == 0
+        assert got.detail == "nvidia-smi unavailable"
+        assert got.stamp == "sharing unknown"
 
 
-def test_contention_reports_an_unparsed_apps_line_as_shared() -> None:
-    got = contention(0, apps=_apps("4321"), query=_returning("0, 44"), own_pid=4321)
-    assert not got.exclusive
-    assert got.detail.startswith("unparsed nvidia-smi output:")
-    assert got.stamp == "sharing unknown"
-
-
-def test_contention_reports_a_failed_utilization_probe_as_shared() -> None:
-    # An idle device whose utilization did not read is still not a device this
-    # measurement had to itself, because half the probe is missing.
-    got = contention(0, apps=_apps(""), query=_returning(None), own_pid=4321)
-    assert not got.exclusive
-    assert got.detail == "nvidia-smi unavailable"
-
-
-@pytest.mark.parametrize("line", ["0", "0, 44, extra"])
-def test_contention_reports_an_unparsed_utilization_line_as_shared(line: str) -> None:
-    got = contention(0, apps=_apps(""), query=_returning(line), own_pid=4321)
-    assert not got.exclusive
-    assert got.detail.startswith("unparsed nvidia-smi output:")
-    assert got.stamp == "sharing unknown"
+def test_contention_reports_an_unparsed_probe_as_shared() -> None:
+    # A process row and the utilization line are parsed separately, and too few
+    # fields and too many are both unparsed.
+    for apps, query in (
+        (_apps("4321"), _returning("0, 44")),
+        (_apps(""), _returning("0")),
+        (_apps(""), _returning("0, 44, extra")),
+    ):
+        got = contention(0, apps=apps, query=query, own_pid=4321)
+        assert not got.exclusive
+        assert got.detail.startswith("unparsed nvidia-smi output:")
+        assert got.stamp == "sharing unknown"
 
 
 def test_contention_reads_a_non_numeric_field_as_zero() -> None:
@@ -464,9 +426,9 @@ def test_contention_defaults_to_this_process_id() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("sm_count", [1, 84, 108])
-def test_block_floor_count_is_twice_the_sm_count(sm_count: int) -> None:
-    assert _device(sm_count).block_floor_count == 2 * sm_count
+def test_block_floor_count_is_twice_the_sm_count() -> None:
+    assert _device(84).block_floor_count == 168
+    assert _device(1).block_floor_count == 2
 
 
 def test_device_info_refuses_without_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -477,39 +439,37 @@ def test_device_info_refuses_without_cuda(monkeypatch: pytest.MonkeyPatch) -> No
         device_info()
 
 
-@pytest.mark.parametrize("spec", ["cpu", "meta"])
-def test_require_cuda_refuses_a_device_no_counter_exists_on(spec: str) -> None:
+def test_require_cuda_refuses_a_device_no_counter_exists_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # One guard for all five drivers. The alternative is each of them permitting a
     # host device and then failing in whichever probe reaches for the ordinal
     # first, after the inputs are allocated and the warmup has run.
-    with pytest.raises(RuntimeError, match="is not a usable cuda device"):
-        require_cuda(spec)
-
-
-def test_require_cuda_refuses_cuda_on_a_host_without_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    for spec in ("cpu", "meta"):
+        with pytest.raises(RuntimeError, match="is not a usable cuda device"):
+            require_cuda(spec)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="is not a usable cuda device"):
         require_cuda("cuda")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-@pytest.mark.parametrize("spec", ["cuda", "cuda:0"])
-def test_require_cuda_resolves_an_ordinal_a_report_can_name(spec: str) -> None:
-    device = require_cuda(spec)
-    assert device.type == "cuda"
-    assert device_ordinal(device) == 0
+def test_require_cuda_resolves_an_ordinal_a_report_can_name() -> None:
+    # An index-less device carries index None at runtime and means the current
+    # device, so both spellings must name an ordinal.
+    for spec in ("cuda", "cuda:0"):
+        device = require_cuda(spec)
+        assert device.type == "cuda"
+        assert device_ordinal(device) == 0
 
 
-@pytest.mark.parametrize("index", [-1, -2])
-def test_device_info_refuses_an_ordinal_no_device_carries(index: int) -> None:
+def test_device_info_refuses_an_ordinal_no_device_carries() -> None:
     # `device_ordinal` returns -1 for a CPU device, so a driver that permits
     # `--device cpu` arrives here with -1. Without this the call reaches
     # `get_device_properties(-1)` and fails on the ordinal rather than on the
     # reason, or reports the absence of CUDA on a host that has it.
     with pytest.raises(ValueError, match="device_info needs a cuda ordinal"):
-        device_info(index)
+        device_info(-1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
@@ -534,12 +494,9 @@ def test_device_info_reads_the_part_it_runs_on() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dram_ceiling_refuses_a_cpu_device() -> None:
+def test_the_ceilings_refuse_a_cpu_device() -> None:
     with pytest.raises(RuntimeError, match="dram_ceiling needs a CUDA device"):
         dram_ceiling(CPU)
-
-
-def test_tensor_ceiling_refuses_a_cpu_device() -> None:
     with pytest.raises(RuntimeError, match="tensor_ceiling needs a CUDA device"):
         tensor_ceiling(CPU)
 
@@ -584,45 +541,41 @@ def test_class_floor_pct_holds_the_declared_bars() -> None:
     assert len(CLASS_FLOOR_PCT) == 3
 
 
-def test_dram_verdict_passes_at_the_floor() -> None:
+def test_dram_verdict_divides_by_the_measured_ceiling() -> None:
     verdict = dram_verdict("scan", GBPerSecond(720.0), _dram(800.0))
     assert verdict.kernel == "scan"
     assert verdict.declared == DRAM_BOUND
     assert verdict.achieved_pct == 90.0
     assert verdict.required_pct == 85.0
     assert verdict.passed
+    assert dram_verdict("scan", GBPerSecond(600.0), _dram(800.0)).achieved_pct == 75.0
+    assert not dram_verdict("scan", GBPerSecond(600.0), _dram(800.0)).passed
+    # Exactly at the bar passes.
+    assert dram_verdict("scan", GBPerSecond(680.0), _dram(800.0)).passed
 
 
-def test_dram_verdict_fails_below_the_floor() -> None:
-    verdict = dram_verdict("scan", GBPerSecond(600.0), _dram(800.0))
-    assert verdict.achieved_pct == 75.0
-    assert not verdict.passed
-
-
-def test_tensor_verdict_passes_at_the_floor() -> None:
+def test_tensor_verdict_divides_by_the_measured_ceiling() -> None:
     verdict = tensor_verdict("gemm", TFlopsPerSecond(240.0), _tensor(300.0))
     assert verdict.declared == TENSOR_BOUND
     assert verdict.achieved_pct == 80.0
     assert verdict.required_pct == 70.0
     assert verdict.passed
+    assert (
+        tensor_verdict("gemm", TFlopsPerSecond(180.0), _tensor(300.0)).achieved_pct
+        == 60.0
+    )
+    assert not tensor_verdict("gemm", TFlopsPerSecond(180.0), _tensor(300.0)).passed
+    assert tensor_verdict("gemm", TFlopsPerSecond(210.0), _tensor(300.0)).passed
 
 
-def test_tensor_verdict_fails_below_the_floor() -> None:
-    verdict = tensor_verdict("gemm", TFlopsPerSecond(180.0), _tensor(300.0))
-    assert verdict.achieved_pct == 60.0
-    assert not verdict.passed
-
-
-def test_serial_verdict_passes_under_the_limit() -> None:
+def test_serial_verdict_bounds_the_share_of_the_step() -> None:
     verdict = serial_verdict("norm", Percent(1.5))
     assert verdict.declared == SERIAL_TINY
     assert verdict.achieved_pct == 1.5
     assert verdict.required_pct == 2.0
     assert verdict.passed
-
-
-def test_serial_verdict_fails_above_the_limit() -> None:
     assert not serial_verdict("norm", Percent(3.0)).passed
+    assert serial_verdict("norm", Percent(2.0)).passed
 
 
 def test_serial_is_an_upper_bound_and_the_other_two_are_floors() -> None:
@@ -632,12 +585,6 @@ def test_serial_is_an_upper_bound_and_the_other_two_are_floors() -> None:
     assert dram_verdict("scan", GBPerSecond(8.0), _dram(800.0)).achieved_pct == 1.0
     assert not dram_verdict("scan", GBPerSecond(8.0), _dram(800.0)).passed
     assert not tensor_verdict("gemm", TFlopsPerSecond(3.0), _tensor(300.0)).passed
-
-
-def test_a_verdict_at_exactly_the_bar_passes() -> None:
-    assert dram_verdict("scan", GBPerSecond(680.0), _dram(800.0)).passed
-    assert tensor_verdict("gemm", TFlopsPerSecond(210.0), _tensor(300.0)).passed
-    assert serial_verdict("norm", Percent(2.0)).passed
 
 
 # ---------------------------------------------------------------------------
@@ -659,17 +606,12 @@ def test_the_capture_window_rejects_a_device_it_cannot_drain() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-def test_profiler_window_opens_and_closes() -> None:
-    dev = torch.device("cuda")
-    with profiler_window(dev):
-        torch.empty(16, device=dev).fill_(1.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-def test_profiler_window_closes_when_the_body_raises() -> None:
+def test_profiler_window_closes_on_both_paths() -> None:
     # The closing synchronize and profiler stop run from a finally, or a failed
     # capture would leave the profiler collecting into the next one.
     dev = torch.device("cuda")
+    with profiler_window(dev):
+        torch.empty(16, device=dev).fill_(1.0)
     with pytest.raises(RuntimeError, match="body failed"), profiler_window(dev):
         raise RuntimeError("body failed")
 

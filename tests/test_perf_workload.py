@@ -51,20 +51,14 @@ def test_standard_shapes_satisfy_the_operator_constraints() -> None:
         assert shape.d_state % 48 == 0
         assert shape.chunk > 0
         assert shape.seq > 0
-
-
-def test_standard_shapes_are_distinct_and_cover_the_ragged_tail() -> None:
     names = [s.name for s in SHAPES]
     assert len(set(names)) == len(names)
+    assert shape_by_name("tiny").name == "tiny"
     ragged = shape_by_name("ragged")
     # A sequence length that is not a multiple of the chunk, so a tail-handling
     # regression shows up in the bench and not only in the tests.
     assert ragged.seq % ragged.chunk != 0
     assert all(s.seq % s.chunk == 0 for s in SHAPES if s.name != "ragged")
-
-
-def test_shape_by_name_rejects_an_unknown_name() -> None:
-    assert shape_by_name("tiny").name == "tiny"
     with pytest.raises(KeyError, match="no shape 'huge'"):
         shape_by_name("huge")
 
@@ -85,17 +79,14 @@ def test_make_inputs_matches_the_tensor_contract() -> None:
     assert tuple(got.dy.shape) == (*lead, SMALL.rows)
     for t in got:
         assert t.is_contiguous()
-
-
-def test_make_inputs_pins_the_transition_under_a_low_precision_dtype() -> None:
     # I4: trans and K are float32 whatever U, B, C, and Y are.
-    got = make_inputs(SMALL, CPU, dtype=torch.bfloat16)
-    assert got.U.dtype == torch.bfloat16
-    assert got.B.dtype == torch.bfloat16
-    assert got.C.dtype == torch.bfloat16
-    assert got.dy.dtype == torch.bfloat16
-    assert got.trans.dtype == torch.float32
-    assert got.K.dtype == torch.float32
+    low = make_inputs(SMALL, CPU, dtype=torch.bfloat16)
+    assert low.U.dtype == torch.bfloat16
+    assert low.B.dtype == torch.bfloat16
+    assert low.C.dtype == torch.bfloat16
+    assert low.dy.dtype == torch.bfloat16
+    assert low.trans.dtype == torch.float32
+    assert low.K.dtype == torch.float32
 
 
 def test_make_inputs_holds_the_numerical_invariants() -> None:
@@ -119,11 +110,8 @@ def test_make_inputs_carries_gradients_on_the_five_differentiable_inputs() -> No
     # The output-gradient seed is preallocated and is not a graph input, so the
     # backward measurement contains no allocation of its own.
     assert not got.dy.requires_grad
-
-
-def test_make_inputs_takes_no_gradients_when_asked_not_to() -> None:
-    got = make_inputs(SMALL, CPU, requires_grad=False)
-    assert not any(t.requires_grad for t in got.differentiable)
+    plain = make_inputs(SMALL, CPU, requires_grad=False)
+    assert not any(t.requires_grad for t in plain.differentiable)
 
 
 def test_make_inputs_is_reproducible_from_the_seed() -> None:
@@ -156,6 +144,15 @@ def test_forward_only_records_one_region_and_builds_no_graph() -> None:
     # Under no_grad the inputs still require grad and the output does not, so a
     # forward-only bench cannot be paying for a graph it never uses.
     assert all(t.requires_grad for t in inputs.differentiable)
+    # A prefix renames the region, so one loop can hold two arms.
+    prefixed = measure(
+        forward_only(inputs, SMALL.chunk, prefix="arm-b"),
+        label="op",
+        iters=1,
+        warmup=0,
+        device=CPU,
+    )
+    assert [t.label for t in prefixed.regions] == ["arm-b.forward"]
 
 
 def test_step_records_the_forward_and_the_backward() -> None:
@@ -168,31 +165,26 @@ def test_step_records_the_forward_and_the_backward() -> None:
     # torch.autograd.grad, so nothing accumulates into a .grad buffer and no
     # aten::fill_ can contaminate the backward bucket.
     assert all(t.grad is None for t in inputs.differentiable)
-
-
-def test_step_differentiates_a_named_subset() -> None:
-    inputs = make_inputs(SMALL, CPU, dtype=torch.float32, requires_grad=True)
-    timed = measure(
+    # A named subset is differentiated the same way, through the same regions.
+    subset = measure(
         step(inputs, SMALL.chunk, wrt=(inputs.U,)),
         label="op",
         iters=1,
         warmup=0,
         device=CPU,
     )
-    assert timed.region("op.backward").spread.sample_count == 1
+    assert [t.label for t in subset.regions] == ["op.forward", "op.backward"]
+    assert subset.region("op.backward").spread.sample_count == 1
 
 
 def test_step_rejects_inputs_that_take_no_gradient() -> None:
     # Otherwise it would time a forward under grad mode and report it as a step.
-    inputs = make_inputs(SMALL, CPU, requires_grad=False)
     with pytest.raises(ValueError, match="at least one input requiring grad"):
-        step(inputs, SMALL.chunk)
-
-
-def test_step_rejects_a_wrt_that_takes_no_gradient() -> None:
-    inputs = make_inputs(SMALL, CPU, requires_grad=True)
+        step(make_inputs(SMALL, CPU, requires_grad=False), SMALL.chunk)
+    # A wrt naming only the output-gradient seed is the same defect.
+    grads = make_inputs(SMALL, CPU, requires_grad=True)
     with pytest.raises(ValueError, match="at least one input requiring grad"):
-        step(inputs, SMALL.chunk, wrt=(inputs.dy,))
+        step(grads, SMALL.chunk, wrt=(grads.dy,))
 
 
 def test_two_prefixes_keep_two_arms_apart_in_one_loop() -> None:
@@ -221,15 +213,3 @@ def test_two_prefixes_keep_two_arms_apart_in_one_loop() -> None:
     assert out.comparison.sample_count == 2
     # Each arm's children sit under it, so the budget closes over both arms.
     assert_closed(budget(out.timed))
-
-
-def test_forward_only_takes_a_prefix_too() -> None:
-    inputs = make_inputs(SMALL, CPU, dtype=torch.float32, requires_grad=False)
-    timed = measure(
-        forward_only(inputs, SMALL.chunk, prefix="arm-b"),
-        label="op",
-        iters=1,
-        warmup=0,
-        device=CPU,
-    )
-    assert [t.label for t in timed.regions] == ["arm-b.forward"]

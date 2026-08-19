@@ -77,22 +77,16 @@ def timed_literal() -> Timed:
     )
 
 
-@pytest.mark.parametrize(
-    ("label", "parent"),
-    [
-        ("forward.mixer.in_proj", "forward.mixer"),
-        ("forward.mixer", "forward"),
-        ("x", ""),
-    ],
-)
-def test_parent_of(label: str, parent: str) -> None:
-    assert parent_of(label) == parent
+def test_region_and_call_region_outside_a_measurement_do_nothing() -> None:
+    x = torch.randn(WIDTH)
 
+    def negate(t: Tensor) -> Tensor:
+        return -t
 
-def test_region_outside_a_measurement_records_nothing() -> None:
     assert active_recorder() is None
     with region("orphan"):
         pass
+    assert torch.equal(call_region("orphan", negate, x), -x)
     assert active_recorder() is None
 
 
@@ -102,7 +96,11 @@ def test_measure_on_cpu_records_sibling_regions() -> None:
     assert timed.clocks == "host clock"
     assert timed.total.sample_count == 3
     assert [t.label for t in timed.regions] == ["step.first", "step.second"]
+    # The dotted path is the whole of the structure; nothing infers parentage from
+    # call nesting.
     assert [t.parent for t in timed.regions] == ["step", "step"]
+    assert parent_of("forward.mixer.in_proj") == "forward.mixer"
+    assert parent_of("x") == ""
     for t in timed.regions:
         assert t.spread.sample_count == 3
         # Two equal sleeps in one call, so neither region owns the whole total
@@ -110,50 +108,38 @@ def test_measure_on_cpu_records_sibling_regions() -> None:
         assert 10.0 < t.share_pct < 90.0
     # A sum over regions is not the total, and no region here is a root.
     assert timed.root_sum_duration_us == 0.0
+    # The iteration intervals tile the loop, so the only wall outside them is the
+    # per-iteration boundary. Nothing here asserts a lower bound, because a loop
+    # whose body is cheaper than its own boundary reads low and is right.
+    assert 0.0 < timed.timer_coverage_pct <= MAX_TIMER_COVERAGE_PCT
+    # Warmup calls run with no recorder active, so they reach neither count.
+    warmed = measure(siblings, label="step", iters=2, warmup=3, device=CPU)
+    assert warmed.total.sample_count == 2
+    assert [t.spread.sample_count for t in warmed.regions] == [2, 2]
 
 
-@pytest.mark.parametrize(
-    ("iters", "warmup", "match"),
-    [
+def test_measure_rejects_bad_counts() -> None:
+    for iters, warmup, match in (
         (0, 0, "iters must be positive"),
         (-1, 0, "iters must be positive"),
         (1, -1, "warmup must not be negative"),
-    ],
-)
-def test_measure_rejects_bad_counts(iters: int, warmup: int, match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        measure(lambda: None, label="step", iters=iters, warmup=warmup, device=CPU)
+    ):
+        with pytest.raises(ValueError, match=match):
+            measure(lambda: None, label="step", iters=iters, warmup=warmup, device=CPU)
 
 
-@pytest.mark.parametrize(
-    ("locked", "stamp"), [(True, "locked at 1410 MHz"), (False, "unlocked")]
-)
-def test_measure_stamps_the_given_clock_policy(locked: bool, stamp: str) -> None:
-    policy = ClockPolicy(
-        locked=locked,
-        sm_clock_mhz=Megahertz(1410.0),
-        max_sm_clock_mhz=Megahertz(1710.0),
-        detail="supplied by the test",
-    )
-    timed = measure(
-        siblings, label="step", iters=1, warmup=0, device=CPU, clocks=policy
-    )
-    assert timed.clocks == stamp
-
-
-def test_warmup_calls_record_nothing() -> None:
-    timed = measure(siblings, label="step", iters=2, warmup=3, device=CPU)
-    assert timed.total.sample_count == 2
-    assert [t.spread.sample_count for t in timed.regions] == [2, 2]
-
-
-def test_timer_coverage_is_the_share_of_the_loop_wall_the_events_cover() -> None:
-    # The iteration intervals tile the loop, so the only wall outside them is the
-    # per-iteration boundary. On the host path the body is the whole cost and the
-    # coverage is near the ceiling; nothing here asserts a lower bound, because a
-    # loop whose body is cheaper than its own boundary reads low and is right.
-    timed = measure(siblings, label="step", iters=3, warmup=0, device=CPU)
-    assert 0.0 < timed.timer_coverage_pct <= MAX_TIMER_COVERAGE_PCT
+def test_measure_stamps_the_given_clock_policy() -> None:
+    for locked, stamp in ((True, "locked at 1410 MHz"), (False, "unlocked")):
+        policy = ClockPolicy(
+            locked=locked,
+            sm_clock_mhz=Megahertz(1410.0),
+            max_sm_clock_mhz=Megahertz(1710.0),
+            detail="supplied by the test",
+        )
+        timed = measure(
+            siblings, label="step", iters=1, warmup=0, device=CPU, clocks=policy
+        )
+        assert timed.clocks == stamp
 
 
 def test_measure_refuses_events_that_outlast_the_loop_around_them(
@@ -217,19 +203,16 @@ def test_measure_paired_runs_both_arms_every_iteration_and_swaps_the_order() -> 
     assert out.comparison.b_label == "slow"
     # Both arms are roots of the tree, so the one loop owns both of them.
     assert [t.parent for t in out.timed.regions] == ["", ""]
-
-
-def test_measure_paired_warmup_parity_leaves_the_swap_balanced() -> None:
+    # An odd warmup hands the first timed iteration to the other arm. Over an even
+    # iteration count each arm still leads half of them, so the parity of the
+    # warmup does not enter the result.
     order, fast, slow = two_arms(SLEEP_S)
     measure_paired(
         "fast", fast, "slow", slow, label="scan", iters=4, warmup=1, device=CPU
     )
-    warm, timed = order[:2], order[2:]
-    # An odd warmup hands the first timed iteration to the other arm. Over an even
-    # iteration count each arm still leads half of them, so the parity of the
-    # warmup does not enter the result.
+    warm, body = order[:2], order[2:]
     assert warm == ["fast", "slow"]
-    assert timed[::2].count("fast") == timed[::2].count("slow") == 2
+    assert body[::2].count("fast") == body[::2].count("slow") == 2
 
 
 def test_measure_paired_resolves_a_difference_between_the_arms() -> None:
@@ -245,7 +228,9 @@ def test_measure_paired_resolves_a_difference_between_the_arms() -> None:
     assert row.resolves
 
 
-def test_measure_paired_rejects_one_label_for_both_arms() -> None:
+def test_measure_paired_rejects_a_comparison_it_cannot_balance() -> None:
+    # One label for both arms sums them into one region and compares it against
+    # itself; an odd count leaves one iteration whose order no other balances.
     with pytest.raises(ValueError, match="two distinct labels"):
         measure_paired(
             "arm",
@@ -257,22 +242,18 @@ def test_measure_paired_rejects_one_label_for_both_arms() -> None:
             warmup=0,
             device=CPU,
         )
-
-
-@pytest.mark.parametrize("iters", [1, 3])
-def test_measure_paired_rejects_an_odd_iteration_count(iters: int) -> None:
-    # An odd count leaves one iteration whose order no other iteration balances.
-    with pytest.raises(ValueError, match="even iters"):
-        measure_paired(
-            "fast",
-            lambda: None,
-            "slow",
-            lambda: None,
-            label="scan",
-            iters=iters,
-            warmup=0,
-            device=CPU,
-        )
+    for iters in (1, 3):
+        with pytest.raises(ValueError, match="even iters"):
+            measure_paired(
+                "fast",
+                lambda: None,
+                "slow",
+                lambda: None,
+                label="scan",
+                iters=iters,
+                warmup=0,
+                device=CPU,
+            )
 
 
 def test_on_device_yields_without_selecting_a_device_off_cuda() -> None:
@@ -284,20 +265,17 @@ def test_on_device_yields_without_selecting_a_device_off_cuda() -> None:
     assert calls == ["body"]
 
 
-def test_timed_region_lookup() -> None:
+def test_timed_looks_up_a_region_and_resolves_against_the_total() -> None:
     timed = measure(siblings, label="step", iters=1, warmup=0, device=CPU)
     assert timed.region("step.second").label == "step.second"
     with pytest.raises(KeyError, match="no region 'absent'"):
         timed.region("absent")
-
-
-def test_resolves_delegates_to_the_total_spread() -> None:
-    timed = timed_literal()
+    literal = timed_literal()
     # The floor is the resolution, half the range the samples cover.
-    assert timed.total.resolution_pct == 5.0
-    assert timed.resolves(Percent(6.0))
-    assert not timed.resolves(Percent(4.0))
-    assert timed.resolves(Percent(-6.0)) == timed.total.resolves(Percent(-6.0))
+    assert literal.total.resolution_pct == 5.0
+    assert literal.resolves(Percent(6.0))
+    assert not literal.resolves(Percent(4.0))
+    assert literal.resolves(Percent(-6.0)) == literal.total.resolves(Percent(-6.0))
 
 
 def test_current_label_is_the_innermost_open_region() -> None:
@@ -313,23 +291,19 @@ def test_current_label_is_the_innermost_open_region() -> None:
     assert list(recorder.samples()) == ["outer.inner", "outer"]
 
 
-def test_region_rejects_an_empty_label() -> None:
+def test_region_rejects_a_label_the_budget_tree_cannot_represent() -> None:
     recorder = RegionRecorder(CPU)
     with pytest.raises(ValueError, match="must not be empty"), recorder.region(""):
         pass
-
-
-@pytest.mark.parametrize("label", ["unattributed", "step.unattributed"])
-def test_region_rejects_the_reserved_segment(label: str) -> None:
     # The budget tree generates a remainder leaf of this name under every measured
-    # parent, so a measured region of that name would be overwritten by one.
-    recorder = RegionRecorder(CPU)
-    with pytest.raises(ValueError, match="reserved segment"), recorder.region(label):
-        pass
-
-
-def test_region_accepts_a_label_that_merely_contains_the_reserved_word() -> None:
-    recorder = RegionRecorder(CPU)
+    # parent, so a measured region of that name would be overwritten by one. The
+    # rejected unit is the segment, so a label that merely contains the word stands.
+    for label in ("unattributed", "step.unattributed"):
+        with (
+            pytest.raises(ValueError, match="reserved segment"),
+            recorder.region(label),
+        ):
+            pass
     with recorder.region(f"step.{UNATTRIBUTED}_scan"):
         time.sleep(SLEEP_S)
     assert list(recorder.samples()) == [f"step.{UNATTRIBUTED}_scan"]
@@ -380,12 +354,15 @@ def test_region_samples_are_kept_in_measurement_order() -> None:
 
 def test_call_region_records_forward_and_backward() -> None:
     x = torch.randn(WIDTH, requires_grad=True)
+    bias = torch.full((WIDTH,), 3.0)
+    got: list[Tensor] = []
 
-    def fn(t: Tensor) -> tuple[Tensor, Tensor]:
-        return t * 2.0, t.sin()
+    def fn(t: Tensor, *, offset: Tensor) -> tuple[Tensor, Tensor]:
+        return t * 2.0 + offset, t.sin()
 
     def body() -> None:
-        first, second = call_region("mixer", fn, x)
+        first, second = call_region("mixer", fn, x, offset=bias)
+        got.append(first)
         (first.sum() + second.sum()).backward()
 
     timed = measure(body, label="step", iters=2, warmup=1, device=CPU)
@@ -395,6 +372,8 @@ def test_call_region_records_forward_and_backward() -> None:
     assert timed.region("backward.mixer").spread.sample_count == 2
     assert timed.region("forward.mixer").spread.sample_count == 2
     assert timed.region("backward.mixer").parent == "backward"
+    # Keyword arguments pass through untouched and are not hooked.
+    assert torch.allclose(got[-1], x.detach() * 2.0 + 3.0)
 
 
 def test_call_region_rejects_a_grad_output_with_no_grad_input() -> None:
@@ -431,63 +410,31 @@ def test_call_region_records_no_backward_when_the_alias_is_unused() -> None:
         timed.region("backward.dropped")
 
 
-def test_call_region_hooks_outputs_inside_the_standard_containers() -> None:
+def test_call_region_walks_the_containers_a_callable_returns() -> None:
     # A mixer returns a named tuple and a head often returns a mapping. Both are
     # walked, so the enter boundary fires and the backward interval is recorded
-    # rather than the label going absent.
+    # rather than the label going absent. A return with no tensor in it has no
+    # gradient path at all, so its forward is timed and no backward is recorded.
     x = torch.randn(WIDTH, requires_grad=True)
 
-    def fn(t: Tensor) -> dict[str, list[Tensor]]:
+    def mapped(t: Tensor) -> dict[str, list[Tensor]]:
         return {"out": [t * 2.0], "aux": [t.sin()]}
 
+    def scalar(t: Tensor) -> float:
+        return float(t.detach().sum())
+
     def body() -> None:
-        got = call_region("mapped", fn, x)
+        got = call_region("mapped", mapped, x)
+        assert isinstance(call_region("scalar", scalar, x), float)
         (got["out"][0].sum() + got["aux"][0].sum()).backward()
 
     timed = measure(body, label="step", iters=2, warmup=0, device=CPU)
     assert timed.region("backward.mapped").spread.sample_count == 2
-
-
-def test_call_region_records_no_backward_for_a_non_tensor_return() -> None:
-    # A callable that reduces to a Python scalar has no gradient path through the
-    # region, so there is nothing to hook and no backward interval to record. The
-    # forward is still timed.
-    x = torch.randn(WIDTH, requires_grad=True)
-
-    def fn(t: Tensor) -> float:
-        return float(t.detach().sum())
-
-    def body() -> None:
-        assert isinstance(call_region("scalar", fn, x), float)
-
-    timed = measure(body, label="step", iters=2, warmup=0, device=CPU)
-    assert [t.label for t in timed.regions] == ["forward.scalar"]
-
-
-def test_call_region_outside_a_measurement_calls_through() -> None:
-    x = torch.randn(WIDTH)
-
-    def negate(t: Tensor) -> Tensor:
-        return -t
-
-    assert active_recorder() is None
-    assert torch.equal(call_region("orphan", negate, x), -x)
-
-
-def test_call_region_passes_kwargs_through() -> None:
-    x = torch.ones(WIDTH)
-    bias = torch.full((WIDTH,), 3.0)
-    got: list[Tensor] = []
-
-    def fn(t: Tensor, *, offset: Tensor) -> Tensor:
-        return t + offset
-
-    def body() -> None:
-        got.append(call_region("bias", fn, x, offset=bias))
-
-    timed = measure(body, label="step", iters=1, warmup=0, device=CPU)
-    assert torch.equal(got[0], torch.full((WIDTH,), 4.0))
-    assert timed.region("forward.bias").spread.sample_count == 1
+    assert [t.label for t in timed.regions] == [
+        "forward.mapped",
+        "forward.scalar",
+        "backward.mapped",
+    ]
 
 
 def test_throughput_is_taken_from_the_spread() -> None:

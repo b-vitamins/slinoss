@@ -91,14 +91,13 @@ def test_growth_rows_are_rising_prefixes_of_one_run() -> None:
     assert tuple(r.min_duration_us for r in rows) == (98.0, 97.0, 97.0, 97.0)
     assert tuple(r.max_duration_us for r in rows) == (400.0, 400.0, 400.0, 400.0)
     assert tuple(r.median_duration_us for r in rows) == (100.5, 100.0, 100.0, 100.0)
-
-
-def test_growth_ends_on_the_whole_list_without_duplicating_it() -> None:
-    twelve = outlier_series()[:12]
-    assert tuple(r.sample_count for r in growth(twelve, 6)) == (6, 12)
-    fourteen = outlier_series()[:14]
-    assert tuple(r.sample_count for r in growth(fourteen, 6)) == (6, 12, 14)
-    # A stride past the end still reports the whole list, once.
+    # The whole list is the last row once, whether or not the stride divides it.
+    assert tuple(r.sample_count for r in growth(outlier_series()[:12], 6)) == (6, 12)
+    assert tuple(r.sample_count for r in growth(outlier_series()[:14], 6)) == (
+        6,
+        12,
+        14,
+    )
     assert tuple(r.sample_count for r in growth(outlier_series()[:5], 50)) == (5,)
 
 
@@ -131,16 +130,13 @@ def test_resolves_gates_on_the_sample_count_and_not_on_the_floor() -> None:
     assert not rows[3].resolves
 
 
-def test_growth_rejects_an_empty_sample_list() -> None:
+def test_growth_rejects_arguments_that_define_no_prefix() -> None:
     empty: list[Microseconds] = []
     with pytest.raises(ValueError, match="growth needs at least one sample"):
         growth(empty, 4)
-
-
-@pytest.mark.parametrize("stride", [0, -1])
-def test_growth_rejects_a_non_positive_stride(stride: int) -> None:
-    with pytest.raises(ValueError, match="stride must be positive"):
-        growth(outlier_series(), stride)
+    for stride in (0, -1):
+        with pytest.raises(ValueError, match="stride must be positive"):
+            growth(outlier_series(), stride)
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +155,6 @@ def test_repeats_reduces_across_runs_by_the_worst_case() -> None:
     assert row.spread_pct == 202.0
     # The smallest coverage, from the six-sample run.
     assert row.coverage_pct == 96.875
-
-
-def test_repeats_scatters_the_per_run_medians_and_not_their_samples() -> None:
-    row = repeats("step", (run_wide(), run_tailed(), run_at(104.0)))
     # Medians 100, 100, and 104. The 300 us stall inside one run moves that run's
     # range and nothing else, so it stays out of the scatter entirely.
     assert row.median_duration_us == 100.0
@@ -171,20 +163,19 @@ def test_repeats_scatters_the_per_run_medians_and_not_their_samples() -> None:
     assert row.scatter_pct == 4.0
 
 
-@pytest.mark.parametrize(
-    ("median_us", "scatter_pct", "holds"),
-    [(107.0, 7.0, True), (108.0, 8.0, True), (109.0, 9.0, False)],
-)
-def test_the_floor_holds_up_to_twice_the_scatter_and_no_further(
-    median_us: float, scatter_pct: float, holds: bool
-) -> None:
+def test_the_floor_holds_up_to_twice_the_scatter_and_no_further() -> None:
     # The floor is 4 percent in all three, and the scatter is a gap between two
     # medians that each carry a half-width, so the budget is 8. The boundary is
     # exact: a scatter equal to twice the floor holds and anything wider does not.
-    row = repeats("step", (run_wide(), run_tailed(), run_at(median_us)))
-    assert row.floor_pct == 4.0
-    assert row.scatter_pct == scatter_pct
-    assert row.floor_holds is holds
+    for median_us, scatter_pct, holds in (
+        (107.0, 7.0, True),
+        (108.0, 8.0, True),
+        (109.0, 9.0, False),
+    ):
+        row = repeats("step", (run_wide(), run_tailed(), run_at(median_us)))
+        assert row.floor_pct == 4.0
+        assert row.scatter_pct == scatter_pct
+        assert row.floor_holds is holds
 
 
 def test_the_floor_cannot_hold_below_nominal_coverage() -> None:
@@ -198,10 +189,10 @@ def test_the_floor_cannot_hold_below_nominal_coverage() -> None:
     assert not row.floor_holds
 
 
-@pytest.mark.parametrize("count", [0, 1])
-def test_repeats_rejects_fewer_than_two_runs(count: int) -> None:
-    with pytest.raises(ValueError, match="repeats needs at least two runs"):
-        repeats("step", [run_wide()] * count)
+def test_repeats_rejects_fewer_than_two_runs() -> None:
+    for count in (0, 1):
+        with pytest.raises(ValueError, match="repeats needs at least two runs"):
+            repeats("step", [run_wide()] * count)
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +226,8 @@ def test_pairing_resolves_a_delta_far_below_either_arm_own_floor() -> None:
     assert own.spread_pct == pytest.approx(100.0 * 90.0 / 145.0)
     assert own.resolution_pct == pytest.approx(100.0 * 35.0 / 145.0)
     assert not own.resolves(row.delta_pct)
-
-
-def test_the_interval_is_two_of_the_differences_and_carries_their_unit() -> None:
-    row = paired("scan", "a", drifting(), "b", us(*(v + 1.0 for v in drifting())))
-    # Rank two of ten, the tightest interval reaching nominal coverage.
+    # The interval is two of the differences themselves, at rank two of ten: the
+    # tightest interval reaching nominal coverage.
     assert row.coverage_pct == 97.8515625
     assert row.delta_low_duration_us == 1.0
     assert row.delta_high_duration_us == 1.0
@@ -258,6 +246,15 @@ def test_an_interval_straddling_zero_resolves_nothing() -> None:
     assert row.delta_low_duration_us == -5.0
     assert row.delta_high_duration_us == 5.0
     assert not row.resolves
+    # The verdict names no arm and prints no ratio, so it cannot be quoted as a
+    # result.
+    line = row.verdict()
+    assert line == (
+        "scan: no difference measured between a and b; the interval "
+        "[-5.000, 5.000] us at 99.219% coverage over 8 pairs does not exclude zero"
+    )
+    assert "beats" not in line
+    assert "speedup" not in line
 
 
 def test_a_consistent_difference_below_nominal_coverage_resolves_nothing() -> None:
@@ -273,58 +270,34 @@ def test_a_consistent_difference_below_nominal_coverage_resolves_nothing() -> No
     assert not row.resolves
 
 
-def test_the_verdict_names_the_faster_arm_and_the_interval() -> None:
+def test_the_verdict_names_whichever_arm_is_faster() -> None:
     slow = drifting()
-    row = paired("scan", "reference", slow, "cute", us(*(v - 10.0 for v in slow)))
-    line = row.verdict()
+    line = paired(
+        "scan", "reference", slow, "cute", us(*(v - 10.0 for v in slow))
+    ).verdict()
     assert line.startswith("scan: cute beats reference by 10.000 us")
     assert "speedup_ratio 1.074" in line
     assert "[-10.000, -10.000] us at 97.852% coverage over 10 pairs" in line
     assert "excludes zero" in line
+    # The baseline is named the same way when the baseline wins, so neither
+    # direction reads more strongly than the other.
+    other = paired("scan", "reference", slow, "cute", us(*(v + 10.0 for v in slow)))
+    assert other.verdict().startswith("scan: reference beats cute by 10.000 us")
 
 
-def test_the_verdict_names_the_baseline_when_the_baseline_is_faster() -> None:
-    fast = drifting()
-    row = paired("scan", "reference", fast, "cute", us(*(v + 10.0 for v in fast)))
-    assert row.verdict().startswith("scan: reference beats cute by 10.000 us")
-
-
-def test_the_verdict_of_an_unresolved_comparison_claims_nothing() -> None:
-    flat = us(*([100.0] * 8))
-    alternating = us(105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0)
-    line = paired("scan", "a", flat, "b", alternating).verdict()
-    # No arm is named as faster and no ratio is printed, so the line cannot be
-    # quoted as a result.
-    assert line == (
-        "scan: no difference measured between a and b; the interval "
-        "[-5.000, 5.000] us at 99.219% coverage over 8 pairs does not exclude zero"
-    )
-    assert "beats" not in line
-    assert "speedup" not in line
-
-
-@pytest.mark.parametrize("arm", ["a", "b"])
-def test_paired_rejects_an_empty_arm(arm: str) -> None:
+def test_paired_rejects_samples_it_cannot_pair() -> None:
     empty: list[Microseconds] = []
     one = us(100.0)
-    with pytest.raises(ValueError, match="at least one sample in each arm"):
-        paired(
-            "scan", "a", empty if arm == "a" else one, "b", one if arm == "a" else empty
-        )
-
-
-def test_paired_rejects_arms_of_different_lengths() -> None:
+    for a, b in ((empty, one), (one, empty)):
+        with pytest.raises(ValueError, match="at least one sample in each arm"):
+            paired("scan", "a", a, "b", b)
     # Unequal counts mean the two arms did not run in the same iterations, so
     # element i of one is not the partner of element i of the other.
     with pytest.raises(ValueError, match="these are not pairs"):
         paired("scan", "a", us(100.0, 100.0, 100.0), "b", us(90.0, 90.0, 90.0, 90.0))
-
-
-@pytest.mark.parametrize("arm", ["a", "b"])
-def test_paired_rejects_a_zero_median(arm: str) -> None:
+    # A zero median leaves the ratio and the percentage undefined.
     zero = us(0.0, 0.0)
-    one = us(100.0, 100.0)
-    with pytest.raises(ValueError, match="nonzero median in each arm"):
-        paired(
-            "scan", "a", zero if arm == "a" else one, "b", one if arm == "a" else zero
-        )
+    hundred = us(100.0, 100.0)
+    for a, b in ((zero, hundred), (hundred, zero)):
+        with pytest.raises(ValueError, match="nonzero median in each arm"):
+            paired("scan", "a", a, "b", b)

@@ -220,21 +220,18 @@ def repeats_stub(row: RepeatRow) -> Callable[[str, Sequence[Spread]], RepeatRow]
 # ---------------------------------------------------------------------------
 
 
-def test_parse_args_defaults_to_the_standard_study() -> None:
-    args = parse_args([])
-    assert args.shape == "standard"
-    assert args.mode == "step"
-    assert args.iters == 30
-    assert args.warmup == 10
-    assert args.stride == 5
-    assert args.repeat == 5
-    assert args.dtype == "bf16"
-    assert args.device == "cuda"
-    assert args.backend is None
-    assert args.out == Path("out/dispersion")
-
-
-def test_parse_args_takes_every_field_from_the_command_line() -> None:
+def test_parse_args_defaults_the_study_and_takes_every_flag() -> None:
+    default = parse_args([])
+    assert default.shape == "standard"
+    assert default.mode == "step"
+    assert default.iters == 30
+    assert default.warmup == 10
+    assert default.stride == 5
+    assert default.repeat == 5
+    assert default.dtype == "bf16"
+    assert default.device == "cuda"
+    assert default.backend is None
+    assert default.out == Path("out/dispersion")
     args = parse_args(
         [
             "--shape",
@@ -271,16 +268,13 @@ def test_parse_args_takes_every_field_from_the_command_line() -> None:
     assert args.out == Path("here/there")
 
 
-def test_every_standard_shape_and_dtype_is_selectable() -> None:
+def test_every_choice_the_driver_offers_selects_something() -> None:
     for shape in SHAPES:
         assert parse_args(["--shape", shape.name]).shape == shape.name
     for name in DTYPES:
         assert parse_args(["--dtype", name]).dtype == name
     for name in MODES:
         assert parse_args(["--mode", name]).mode == name
-
-
-def test_the_dtype_table_maps_every_choice_to_a_torch_dtype() -> None:
     # The choices are the table's keys, sorted, so a name the driver offers can
     # never miss a dtype to select.
     assert sorted(DTYPES) == ["bf16", "fp16", "fp32"]
@@ -288,13 +282,10 @@ def test_the_dtype_table_maps_every_choice_to_a_torch_dtype() -> None:
     assert DTYPES["fp16"] == torch.float16
     assert DTYPES["fp32"] == torch.float32
     assert MODES == ("forward", "step")
-
-
-@pytest.mark.parametrize("flag", ["--shape", "--mode", "--dtype"])
-def test_parse_args_rejects_a_value_outside_its_choices(flag: str) -> None:
-    with pytest.raises(SystemExit) as caught:
-        parse_args([flag, "nonesuch"])
-    assert caught.value.code == 2
+    for flag in ("--shape", "--mode", "--dtype"):
+        with pytest.raises(SystemExit) as caught:
+            parse_args([flag, "nonesuch"])
+        assert caught.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -302,27 +293,19 @@ def test_parse_args_rejects_a_value_outside_its_choices(flag: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", ["cpu", "cuda"])
 def test_main_refuses_a_device_no_report_can_name(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spec: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Both arcs of the shared guard: a host device, and a CUDA device on a host
     # without CUDA. Forced, so the refusal is reached on a GPU host too.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="is not a usable cuda device"):
-        main(["--device", spec, "--out", str(tmp_path / "dispersion")])
+    for spec in ("cpu", "cuda"):
+        with pytest.raises(RuntimeError, match="is not a usable cuda device"):
+            main(["--device", spec, "--out", str(tmp_path / "dispersion")])
 
 
-@pytest.mark.parametrize(
-    ("flag", "value", "message"),
-    [
-        ("--repeat", "1", "--repeat needs at least two runs, got 1"),
-        ("--stride", "0", "--stride must be positive, got 0"),
-        ("--stride", "-1", "--stride must be positive, got -1"),
-    ],
-)
 def test_main_refuses_a_study_shape_no_statistic_accepts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, flag: str, value: str, message: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Both statistics reject these, but only after every run has been measured.
     # A stub on either would hide the guard, so neither is patched: the refusal
@@ -332,8 +315,13 @@ def test_main_refuses_a_study_shape_no_statistic_accepts(
         raise AssertionError("the study ran before its shape was checked")
 
     monkeypatch.setattr(dispersion, "measure", unreachable)
-    with pytest.raises(ValueError, match=message):
-        main(argv(tmp_path / "dispersion", flag, value))
+    for flag, value, message in (
+        ("--repeat", "1", "--repeat needs at least two runs, got 1"),
+        ("--stride", "0", "--stride must be positive, got 0"),
+        ("--stride", "-1", "--stride must be positive, got -1"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            main(argv(tmp_path / "dispersion", flag, value))
 
 
 # ---------------------------------------------------------------------------
@@ -351,11 +339,6 @@ def test_main_writes_the_markdown_and_the_json_and_says_where(
     assert (tmp_path / "nested" / "dispersion.json").exists()
     assert capsys.readouterr().out.splitlines()[0] == f"wrote {md}"
     assert md.read_text().splitlines()[0] == "# dispersion: so3ssd tiny step"
-
-
-def test_the_notes_state_the_shape_the_settings_and_the_timer(tmp_path: Path) -> None:
-    base = tmp_path / "dispersion"
-    main(argv(base))
     assert notes_of(base) == [
         "- tiny: B=1 H=1 T=256 P=16 N=16 3N=48 L=64",
         "- mode=step dtype=fp32 backend=default",
@@ -368,40 +351,17 @@ def test_the_notes_state_the_shape_the_settings_and_the_timer(tmp_path: Path) ->
     ]
 
 
-def test_the_notes_name_the_backend_when_one_is_requested(tmp_path: Path) -> None:
+def test_the_mode_and_the_backend_reach_the_title_and_the_notes(tmp_path: Path) -> None:
     base = tmp_path / "dispersion"
-    main(argv(base, "--backend", "reference"))
-    assert "- mode=step dtype=fp32 backend=reference" in notes_of(base)
-
-
-def test_the_forward_mode_measures_a_forward_and_titles_it_so(tmp_path: Path) -> None:
-    base = tmp_path / "dispersion"
-    main(argv(base, "--mode", "forward"))
+    main(argv(base, "--mode", "forward", "--backend", "reference"))
     text = base.with_name("dispersion.md").read_text()
     assert text.splitlines()[0] == "# dispersion: so3ssd tiny forward"
-    assert "- mode=forward dtype=fp32 backend=default" in notes_of(base)
+    assert "- mode=forward dtype=fp32 backend=reference" in notes_of(base)
 
 
 # ---------------------------------------------------------------------------
 # main: the printed table
 # ---------------------------------------------------------------------------
-
-
-def test_the_growth_table_header_names_its_six_columns(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    main(argv(tmp_path / "dispersion"))
-    lines = capsys.readouterr().out.splitlines()
-    assert lines[1] == ""
-    assert lines[2] == HEADER
-    assert lines[2].split() == [
-        "sample_count",
-        "median_us",
-        "spread_pct",
-        "resolution_pct",
-        "coverage_pct",
-        "resolves",
-    ]
 
 
 def test_each_growth_row_prints_its_prefix_under_the_header(
@@ -414,6 +374,16 @@ def test_each_growth_row_prints_its_prefix_under_the_header(
     monkeypatch.setattr(dispersion, "growth", growth_stub(rows))
     main(argv(tmp_path / "dispersion"))
     lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == ""
+    assert lines[2] == HEADER
+    assert lines[2].split() == [
+        "sample_count",
+        "median_us",
+        "spread_pct",
+        "resolution_pct",
+        "coverage_pct",
+        "resolves",
+    ]
     assert lines[3].split() == ["3", "1,234.500", "8.100", "0.250", "96.875", "no"]
     assert lines[4].split() == ["6", "1,234.500", "8.100", "0.250", "96.875", "yes"]
     # Every field is right-aligned in its own column, so a row is exactly as wide as
@@ -426,25 +396,17 @@ def test_the_scatter_line_states_the_scatter_the_floor_and_the_budget(
 ) -> None:
     row = repeat_row(scatter_pct=3.0, floor_holds=True)
     monkeypatch.setattr(dispersion, "repeats", repeats_stub(row))
-    main(argv(tmp_path / "dispersion"))
+    main(argv(tmp_path / "dispersion", "--repeat", "3"))
     lines = capsys.readouterr().out.splitlines()
-    # Two per-run medians follow it, one for each run.
-    assert lines[-3] == (
+    # One per-run median line follows it, for each of the three runs.
+    assert lines[-4] == (
         "2 runs of 8 samples: median-to-median scatter 3.000%, floor 2.000% at "
         "96.875% coverage, budget 4.000%, widest range 5.000%"
     )
-
-
-def test_every_run_prints_its_own_median(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    row = repeat_row(scatter_pct=3.0, floor_holds=True)
-    monkeypatch.setattr(dispersion, "repeats", repeats_stub(row))
-    main(argv(tmp_path / "dispersion", "--repeat", "3"))
-    lines = capsys.readouterr().out.splitlines()[-3:]
-    # The medians are measured, so the assertion is on the labels and the unit.
-    assert [line.split(":")[0] for line in lines] == ["  run 0", "  run 1", "  run 2"]
-    assert all(line.endswith(" us") for line in lines)
+    # Those medians are measured, so the assertion is on the labels and the unit.
+    runs = lines[-3:]
+    assert [line.split(":")[0] for line in runs] == ["  run 0", "  run 1", "  run 2"]
+    assert all(line.endswith(" us") for line in runs)
 
 
 # ---------------------------------------------------------------------------
@@ -452,22 +414,17 @@ def test_every_run_prints_its_own_median(
 # ---------------------------------------------------------------------------
 
 
-def test_a_floor_below_the_observed_scatter_fails_the_study(
+def test_the_exit_code_follows_the_floor_verdict(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    row = repeat_row(scatter_pct=9.0, floor_holds=False)
-    monkeypatch.setattr(dispersion, "repeats", repeats_stub(row))
-    assert main(argv(tmp_path / "dispersion")) == 1
+    failing = repeat_row(scatter_pct=9.0, floor_holds=False)
+    monkeypatch.setattr(dispersion, "repeats", repeats_stub(failing))
+    assert main(argv(tmp_path / "failing")) == 1
     assert capsys.readouterr().out.splitlines()[-1] == (
         "floor 2.000% at 96.875% coverage does not cover the observed scatter "
         "9.000%; no delta measured against it is a result"
     )
-
-
-def test_a_floor_covering_the_observed_scatter_passes_the_study(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    row = repeat_row(scatter_pct=3.0, floor_holds=True)
-    monkeypatch.setattr(dispersion, "repeats", repeats_stub(row))
-    assert main(argv(tmp_path / "dispersion")) == 0
+    holding = repeat_row(scatter_pct=3.0, floor_holds=True)
+    monkeypatch.setattr(dispersion, "repeats", repeats_stub(holding))
+    assert main(argv(tmp_path / "holding")) == 0
     assert "does not cover" not in capsys.readouterr().out

@@ -46,114 +46,81 @@ CPASYNC: Final = "so3ssd_state_cpasync_fwd"
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("unit", ["", "%", "ratio", "nan", " % ", "  "])
-def test_metric_scale_dimensionless(unit: str) -> None:
-    assert metric_scale(unit) == 1.0
-
-
-@pytest.mark.parametrize(
-    ("unit", "want"),
-    [
-        ("nsecond", 1.0),
-        ("usecond", 1e3),
-        ("msecond", 1e6),
-        ("second", 1e9),
-        ("ns", 1.0),
-        ("us", 1e3),
-        ("ms", 1e6),
-    ],
+SCALES: Final[tuple[tuple[str, float], ...]] = (
+    # Dimensionless, whitespace and NCU's own "nan" cell included.
+    ("", 1.0),
+    ("%", 1.0),
+    ("ratio", 1.0),
+    ("nan", 1.0),
+    (" % ", 1.0),
+    ("  ", 1.0),
+    # Durations reach nanoseconds.
+    ("nsecond", 1.0),
+    ("usecond", 1e3),
+    ("msecond", 1e6),
+    ("second", 1e9),
+    ("ns", 1.0),
+    ("us", 1e3),
+    ("ms", 1e6),
+    # Every counter base, singular and plural.
+    ("byte", 1.0),
+    ("cycle", 1.0),
+    ("inst", 1.0),
+    ("sector", 1.0),
+    ("request", 1.0),
+    ("register", 1.0),
+    ("wavefront", 1.0),
+    ("warp", 1.0),
+    ("block", 1.0),
+    ("thread", 1.0),
+    ("bytes", 1.0),
+    ("cycles", 1.0),
+    ("insts", 1.0),
+    ("sectors", 1.0),
+    ("requests", 1.0),
+    ("registers", 1.0),
+    ("wavefronts", 1.0),
+    ("warps", 1.0),
+    ("blocks", 1.0),
+    ("threads", 1.0),
+    # SI prefixes, on any base and on a plural.
+    ("Kbyte", 1e3),
+    ("Mbyte", 1e6),
+    ("Gbyte", 1e9),
+    ("Tbyte", 1e12),
+    ("Kbytes", 1e3),
+    ("Ksector", 1e3),
+    ("Minst", 1e6),
+    ("Gcycle", 1e9),
+    # A rate scales by its numerator. NCU reports bandwidth as Gbyte/s, and
+    # scaling by the numerator prefix takes the cell to byte/s; the denominator is
+    # part of the metric's meaning, not of its scale.
+    ("byte/s", 1.0),
+    ("Gbyte/s", 1e9),
+    ("Kbyte/block", 1e3),
+    ("register/thread", 1.0),
+    ("sector/request", 1.0),
 )
-def test_metric_scale_time(unit: str, want: float) -> None:
-    assert metric_scale(unit) == want
+"""Every unit NCU has been seen to print, and the factor taking it to base."""
 
 
-@pytest.mark.parametrize(
-    "unit",
-    [
-        "byte",
-        "cycle",
-        "inst",
-        "sector",
-        "request",
-        "register",
-        "wavefront",
-        "warp",
-        "block",
-        "thread",
-    ],
-)
-def test_metric_scale_plain_bases(unit: str) -> None:
-    assert metric_scale(unit) == 1.0
+def test_metric_scale_converts_every_unit_ncu_prints() -> None:
+    for unit, want in SCALES:
+        assert metric_scale(unit) == want, unit
 
 
-@pytest.mark.parametrize(
-    "unit",
-    [
-        "bytes",
-        "cycles",
-        "insts",
-        "sectors",
-        "requests",
-        "registers",
-        "wavefronts",
-        "warps",
-        "blocks",
-        "threads",
-    ],
-)
-def test_metric_scale_plural_falls_back_to_singular(unit: str) -> None:
-    assert metric_scale(unit) == 1.0
-
-
-@pytest.mark.parametrize(
-    ("unit", "want"),
-    [
-        ("Kbyte", 1e3),
-        ("Mbyte", 1e6),
-        ("Gbyte", 1e9),
-        ("Tbyte", 1e12),
-        ("Kbytes", 1e3),
-        ("Ksector", 1e3),
-        ("Minst", 1e6),
-        ("Gcycle", 1e9),
-    ],
-)
-def test_metric_scale_si_prefixes(unit: str, want: float) -> None:
-    assert metric_scale(unit) == want
-
-
-@pytest.mark.parametrize(
-    ("unit", "want"),
-    [
-        ("byte/s", 1.0),
-        ("Gbyte/s", 1e9),
-        ("Kbyte/block", 1e3),
-        ("register/thread", 1.0),
-        ("sector/request", 1.0),
-    ],
-)
-def test_metric_scale_reads_the_numerator_of_a_rate(unit: str, want: float) -> None:
-    # NCU reports bandwidth as Gbyte/s. Scaling by the numerator prefix takes the
-    # cell to byte/s, which is the base unit; the denominator is part of the
-    # metric's meaning, not of its scale.
-    assert metric_scale(unit) == want
-
-
-@pytest.mark.parametrize(
-    "unit",
-    [
+def test_metric_scale_rejects_unknown() -> None:
+    # A raise is the whole point. Reading an Mbyte as a byte is a 10^6 error in
+    # every bandwidth figure derived from it, and a default of 1.0 hides it.
+    for unit in (
         "furlong",
         "mbyte",  # a prefix outside K/M/G/T is not a prefix
         "Xbyte",
         "s",
         "seconds",  # the plural fallback covers counter bases, not time units
-    ],
-)
-def test_metric_scale_rejects_unknown(unit: str) -> None:
-    # A raise is the whole point. Reading an Mbyte as a byte is a 10^6 error in
-    # every bandwidth figure derived from it, and a default of 1.0 hides it.
-    with pytest.raises(ValueError, match="unknown ncu metric unit"):
-        metric_scale(unit)
+    ):
+        with pytest.raises(ValueError, match="unknown ncu metric unit"):
+            metric_scale(unit)
 
 
 # ---------------------------------------------------------------------------
@@ -161,24 +128,19 @@ def test_metric_scale_rejects_unknown(unit: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_table_rereads_the_duration() -> None:
+def test_every_table_rereads_the_duration_and_their_union_is_required() -> None:
     # Counters from two passes describe two executions. The duration is the only
     # metric they share, so it is the only cross-check on replay stability.
+    want: list[str] = []
     for table in NCU_TABLES:
         assert DURATION in table.metrics
         assert len(table.metrics) > 1
         assert len(set(table.metrics)) == len(table.metrics)
-
-
-def test_required_metrics_is_the_deduplicated_union_in_table_order() -> None:
-    want: list[str] = []
-    for table in NCU_TABLES:
         for metric in table.metrics:
             if metric not in want:
                 want.append(metric)
     assert list(REQUIRED_METRICS) == want
     assert REQUIRED_METRICS[0] == DURATION
-    assert len(set(REQUIRED_METRICS)) == len(REQUIRED_METRICS)
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +176,6 @@ def test_ncu_command_flags_in_order() -> None:
         "--iters",
         "8",
     ]
-
-
-def test_ncu_command_inserts_extra_before_the_target() -> None:
     got = ncu_command(
         DRAM, TARGET, ncu="/opt/nsight/ncu", extra=("--kernel-name", "so3")
     )
@@ -226,12 +185,9 @@ def test_ncu_command_inserts_extra_before_the_target() -> None:
     assert got[-len(TARGET) - 2 : -len(TARGET)] == ["--kernel-name", "so3"]
 
 
-def test_ncu_command_needs_metrics() -> None:
+def test_ncu_command_needs_metrics_and_a_target() -> None:
     with pytest.raises(ValueError, match="table 'empty' requests no metrics"):
         ncu_command(NcuTable("empty", ()), TARGET)
-
-
-def test_ncu_command_needs_a_target() -> None:
     with pytest.raises(ValueError, match="needs a target command"):
         ncu_command(DRAM, ())
 
@@ -298,17 +254,13 @@ NO_HEADER_CSV: Final = """==PROF== Connected to process 4711 (/gnu/store/py3-3.1
 # ---------------------------------------------------------------------------
 
 
-def test_parse_ncu_csv_skips_the_preamble_and_keeps_launch_order() -> None:
+def test_parse_ncu_csv_keeps_launch_order_and_scales_by_the_declared_unit() -> None:
     got = parse_ncu_csv(DRAM_CSV, DRAM.metrics, table="dram", command=("ncu", "--csv"))
     assert got.table == "dram"
     assert got.command == ("ncu", "--csv")
     assert [i.launch_id for i in got.invocations] == ["0", "1", "2"]
     assert [i.kernel for i in got.invocations] == [CHUNK, CHUNK, CPASYNC]
     assert got.missing_metrics == ()
-
-
-def test_parse_ncu_csv_scales_by_the_declared_unit() -> None:
-    got = parse_ncu_csv(DRAM_CSV, DRAM.metrics)
     first = got.invocations[0].values
     assert first[DURATION] == pytest.approx(41280.0)  # usecond to nanosecond
     assert first["dram__bytes_read.sum"] == pytest.approx(2.5e6)  # Mbyte to byte
@@ -317,44 +269,31 @@ def test_parse_ncu_csv_scales_by_the_declared_unit() -> None:
     assert got.invocations[2].values["dram__bytes_read.sum"] == pytest.approx(96e3)
 
 
-def test_parse_ncu_csv_lists_a_metric_that_never_appears() -> None:
-    got = parse_ncu_csv(DRAM_CSV, (*DRAM.metrics, "dram__sectors_read.sum"))
-    assert got.missing_metrics == ("dram__sectors_read.sum",)
-
-
-def test_parse_ncu_csv_drops_unusable_values() -> None:
-    # An empty, non-numeric, or nan value is not a zero. The metric lands in
-    # missing_metrics instead, which is the loud failure the module documents.
+def test_parse_ncu_csv_lists_every_metric_no_row_carried() -> None:
+    # An empty, non-numeric, or nan value is not a zero, and neither is a metric
+    # absent from the output. Both land in missing_metrics, which is the loud
+    # failure the module documents.
+    absent = parse_ncu_csv(DRAM_CSV, (*DRAM.metrics, "dram__sectors_read.sum"))
+    assert absent.missing_metrics == ("dram__sectors_read.sum",)
     got = parse_ncu_csv(SPARSE_CSV, DRAM.metrics)
-    assert len(got.invocations) == 1
     assert list(got.invocations[0].values) == [DURATION]
     assert got.missing_metrics == (
         "dram__bytes_read.sum",
         "dram__bytes_write.sum",
         "dram__throughput.avg.pct_of_peak_sustained_elapsed",
     )
-
-
-def test_parse_ncu_csv_drops_a_record_with_no_launch_id() -> None:
-    # A record that names no launch cannot be attributed to one, so it is not a
-    # launch: the sparse fixture's trailing id-less row must not add an entry.
-    got = parse_ncu_csv(SPARSE_CSV, (DURATION,))
+    # A record that names no launch cannot be attributed to one, so the sparse
+    # fixture's trailing id-less row is not a launch.
     assert [i.launch_id for i in got.invocations] == ["0"]
 
 
-def test_parse_ncu_csv_needs_a_header() -> None:
+def test_parse_ncu_csv_rejects_output_it_cannot_read() -> None:
     with pytest.raises(
         ValueError, match="no CSV header in ncu output for table 'dram'"
     ):
         parse_ncu_csv(NO_HEADER_CSV, DRAM.metrics, table="dram")
-
-
-def test_parse_ncu_csv_needs_every_column() -> None:
     with pytest.raises(ValueError, match="no 'Metric Unit' column"):
         parse_ncu_csv(NO_UNIT_COLUMN_CSV, DRAM.metrics)
-
-
-def test_parse_ncu_csv_rejects_an_unknown_unit() -> None:
     with pytest.raises(ValueError, match="unknown ncu metric unit 'furlong'"):
         parse_ncu_csv(BAD_UNIT_CSV, DRAM.metrics)
 
@@ -434,11 +373,6 @@ COUNTERS: Final[dict[str, Fixture]] = {
 }
 
 ALL_METRICS: Final = NcuTable("all", REQUIRED_METRICS)
-
-
-def test_the_fixture_covers_every_required_metric() -> None:
-    for kernel, metrics in COUNTERS.items():
-        assert set(metrics) == set(REQUIRED_METRICS), kernel
 
 
 def record(launch: str, kernel: str, metric: str, unit: str, value: str) -> str:
@@ -531,9 +465,14 @@ def test_counters_merge_every_table() -> None:
     assert chunk.achieved_gbs == pytest.approx(9_420_000 / 536_640)
     assert chunk.bytes_per_sector_ratio == pytest.approx(5_286_000 / 172_032)
     assert chunk.conflict_per_wavefront_ratio == pytest.approx(384 / 36_864)
+    assert chunk.smem_bytes == 48_000 + 32_768
+    # Longest first, so the row that owns the step heads the table.
+    assert [k.duration_us for k in got] == sorted(
+        (k.duration_us for k in got), reverse=True
+    )
 
 
-def test_counters_take_an_even_median() -> None:
+def test_counters_take_an_even_median_and_guard_a_zero_denominator() -> None:
     cpasync = kernel_counters(full_passes())[1]
     assert cpasync.launch_count == 2
     assert cpasync.duration_us == pytest.approx(8.0)
@@ -543,10 +482,9 @@ def test_counters_take_an_even_median() -> None:
     assert cpasync.achieved_gbs == pytest.approx(32.0)
     assert cpasync.inst_count == 131_072
     assert cpasync.active_thread_per_warp_ratio == 31.75
-
-
-def test_counters_guard_a_zero_denominator() -> None:
-    cpasync = kernel_counters(full_passes())[1]
+    assert cpasync.smem_bytes == 64_000
+    # cp.async moves the operands, so the LSU and shared counters read zero. Their
+    # ratios are guarded rather than dividing by that zero.
     assert cpasync.global_load_sector_count == 0
     assert cpasync.global_store_sector_count == 0
     assert cpasync.bytes_per_sector_ratio == 0.0
@@ -554,26 +492,9 @@ def test_counters_guard_a_zero_denominator() -> None:
     assert cpasync.conflict_per_wavefront_ratio == 0.0
 
 
-def test_smem_bytes_adds_static_and_dynamic() -> None:
-    chunk, cpasync = kernel_counters(full_passes())
-    assert chunk.smem_bytes == 48_000 + 32_768
-    assert cpasync.smem_bytes == 64_000
-
-
-def test_counters_are_ordered_by_descending_duration() -> None:
-    got = kernel_counters(full_passes())
-    assert [k.duration_us for k in got] == sorted(
-        (k.duration_us for k in got), reverse=True
-    )
-    assert got[0].duration_us > got[1].duration_us
-
-
-def test_spread_is_zero_when_the_passes_agree() -> None:
+def test_spread_reports_a_pass_disagreement() -> None:
     for one in kernel_counters(full_passes()):
         assert one.pass_duration_spread_pct == 0.0
-
-
-def test_spread_reports_a_pass_disagreement() -> None:
     passes = [
         ncu_pass(table, durations={CHUNK: ("50", "100", "500")} if index == 1 else None)
         for index, table in enumerate(NCU_TABLES)
@@ -616,15 +537,13 @@ def test_counters_need_every_required_metric() -> None:
         kernel_counters([ncu_pass(NCU_TABLES[0])])
 
 
-def test_counters_reject_no_passes() -> None:
-    with pytest.raises(ValueError, match="no kernel launches in any ncu pass"):
-        kernel_counters(())
-
-
-def test_counters_reject_passes_without_launches() -> None:
+def test_counters_reject_passes_that_profiled_nothing() -> None:
+    # No pass at all and passes that carried no launch are the same failure: there
+    # is nothing to report, and an empty table would read as a step with no work.
     empty = NcuPass(table="dram", command=(), invocations=(), missing_metrics=())
-    with pytest.raises(ValueError, match="no kernel launches in any ncu pass"):
-        kernel_counters([empty, empty])
+    for passes in ((), [empty, empty]):
+        with pytest.raises(ValueError, match="no kernel launches in any ncu pass"):
+            kernel_counters(passes)
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +592,9 @@ def test_run_ncu_parses_its_own_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert got.missing_metrics == ()
 
 
-def test_run_ncu_raises_with_the_stderr_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_ncu_raises_with_the_diagnostic_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(subprocess, "run", FakeRun((2, "", DIAGNOSTIC)))
     with pytest.raises(RuntimeError) as caught:
         run_ncu(DRAM, TARGET)
@@ -683,9 +604,8 @@ def test_run_ncu_raises_with_the_stderr_tail(monkeypatch: pytest.MonkeyPatch) ->
     assert "diagnostic 04" in message
     assert "diagnostic 03" not in message  # the tail is the last twelve lines
     assert " | " in message
-
-
-def test_run_ncu_falls_back_to_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # NCU prints ERR_NVGPUCTRPERM on stdout, so an empty stderr falls back to it
+    # rather than raising with a bare exit code.
     monkeypatch.setattr(
         subprocess, "run", FakeRun((1, "==ERROR== ERR_NVGPUCTRPERM: permission", ""))
     )

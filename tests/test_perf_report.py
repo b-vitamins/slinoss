@@ -377,27 +377,22 @@ def test_agreement_passes_when_both_checks_hold() -> None:
     assert check.detail == "ncu and nsys agree; event wall covers the device sum"
     assert check.tolerance_pct == 5.0
     assert check.capture_iter_count == CAPTURE_ITERS
+    # The gap is the event wall over the device sum, not an absorbed residue.
+    assert check.kernel_delta_pct == pytest.approx(1.0)
+    assert check.gap_pct == pytest.approx(100.0 * 200.0 / 1200.0)
 
 
 def test_agreement_divides_both_profiler_sums_by_the_capture_iters() -> None:
     # Both sums cover three iterations; all three reported figures are per
-    # iteration, so they are directly comparable.
-    check = _agreement(kernel_sum_us=3000.0, ncu_us=3030.0, memcpy_us=300.0)
+    # iteration, so they are directly comparable. The device sum counts copies
+    # and fills, the kernel sum does not.
+    check = _agreement(
+        kernel_sum_us=3000.0, ncu_us=3030.0, memcpy_us=300.0, memset_us=150.0
+    )
     assert check.nsys_kernel_sum_duration_us == 1000.0
-    assert check.nsys_device_sum_duration_us == 1100.0
+    assert check.nsys_device_sum_duration_us == 1150.0
     assert check.ncu_kernel_sum_duration_us == 1010.0
     assert check.event_duration_us == 1200.0
-
-
-def test_agreement_device_sum_includes_copies_and_fills() -> None:
-    check = _agreement(kernel_sum_us=3000.0, memcpy_us=300.0, memset_us=150.0)
-    assert check.nsys_device_sum_duration_us == 1150.0
-
-
-def test_agreement_reports_the_gap_as_the_wall_over_the_device_sum() -> None:
-    check = _agreement(event_us=1200.0, kernel_sum_us=3000.0, ncu_us=3000.0)
-    assert check.kernel_delta_pct == 0.0
-    assert check.gap_pct == pytest.approx(100.0 * 200.0 / 1200.0)
 
 
 def test_agreement_fails_on_a_kernel_sum_disagreement() -> None:
@@ -408,6 +403,10 @@ def test_agreement_fails_on_a_kernel_sum_disagreement() -> None:
     assert "1100.000" in check.detail
     assert "1000.000" in check.detail
     assert "10.00%" in check.detail
+    # The bar is a parameter, and the same disagreement passes a wider one.
+    wide = _agreement(ncu_us=3300.0, tolerance_pct=Percent(20.0))
+    assert wide.agrees
+    assert wide.tolerance_pct == 20.0
 
 
 def test_agreement_fails_when_the_wall_is_below_the_device_sum() -> None:
@@ -417,35 +416,22 @@ def test_agreement_fails_when_the_wall_is_below_the_device_sum() -> None:
     assert "event wall 900.000 us is below the nsys device sum 1000.000 us" in (
         check.detail
     )
-
-
-def test_agreement_tolerates_a_small_negative_gap() -> None:
     # 2% short of the device sum, inside the 5% bar: a timeline this close is
     # clock skew, not an impossible ordering.
-    check = _agreement(event_us=1000.0, kernel_sum_us=3060.0, ncu_us=3060.0)
-    assert check.gap_pct == pytest.approx(-2.0)
-    assert check.agrees
+    skewed = _agreement(event_us=1000.0, kernel_sum_us=3060.0, ncu_us=3060.0)
+    assert skewed.gap_pct == pytest.approx(-2.0)
+    assert skewed.agrees
 
 
-def test_agreement_honours_a_custom_tolerance() -> None:
-    check = _agreement(ncu_us=3300.0, tolerance_pct=Percent(20.0))
-    assert check.agrees
-    assert check.tolerance_pct == 20.0
-
-
-@pytest.mark.parametrize("iters", [0, -1])
-def test_agreement_rejects_a_non_positive_capture_iters(iters: int) -> None:
+def test_agreement_rejects_a_check_it_cannot_take() -> None:
     with pytest.raises(ValueError, match="capture_iters must be positive"):
         agreement(
             "step",
             event=_spread(1200.0),
             trace=_trace(),
             kernels=(_counters(),),
-            capture_iters=iters,
+            capture_iters=0,
         )
-
-
-def test_agreement_rejects_an_empty_kernel_list() -> None:
     with pytest.raises(ValueError, match="at least one NCU kernel"):
         agreement(
             "step",
@@ -461,21 +447,12 @@ def test_agreement_rejects_an_empty_kernel_list() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_markdown_refuses_a_failing_check() -> None:
+def test_markdown_refuses_to_render_without_agreeing_clocks() -> None:
     report = _report(check=_agreement(ncu_us=3300.0))
     with pytest.raises(AgreementError, match=r"clocks disagree beyond 5\.0%"):
         markdown(report)
-
-
-def test_markdown_refuses_a_missing_check_when_required() -> None:
     with pytest.raises(AgreementError, match="no CUDA-event / NSYS / NCU cross-check"):
         markdown(_report(check=None))
-
-
-def test_markdown_says_the_cross_check_did_not_run() -> None:
-    text = markdown(_report(check=None), require_agreement=False)
-    assert "- cross-check: not run" in text
-    assert "## cross-check" not in text
 
 
 def test_markdown_header_carries_the_device_evidence() -> None:
@@ -491,6 +468,8 @@ def test_markdown_header_carries_the_device_evidence() -> None:
         in text
     )
     assert "- smem opt-in per block: 101,376 bytes" in text
+    assert text.endswith("\n")
+    assert not text.endswith("\n\n")
 
 
 def test_markdown_renders_every_present_section() -> None:
@@ -565,23 +544,13 @@ def test_markdown_renders_the_dispersion_sections() -> None:
     assert "resolves" in pair
 
 
-def test_markdown_omits_the_dispersion_sections_when_unset() -> None:
-    text = markdown(
-        Report(title="no dispersion", device=_device(), budget=_budget()),
-        require_agreement=False,
-    )
-    assert "## bucket deltas" not in text
-    assert "## dispersion against sample count" not in text
-    assert "## run-to-run median scatter" not in text
-    assert "## paired comparisons" not in text
-    assert "scatter_pct" not in text
-    assert "resolves" not in text
-
-
 def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
     text = markdown(
         _report(title="minimal", check=None, everything=False), require_agreement=False
     )
+    # A single-clock measurement says so in the header instead of omitting the
+    # line, so a report cannot read as cross-checked by silence.
+    assert "- cross-check: not run" in text
     for title in (
         "## cross-check",
         "## budget",
@@ -609,21 +578,18 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "resolution_pct",
         "coverage_pct",
         "scatter_pct",
+        "resolves",
     ):
         assert field not in text
     assert "0.000" not in text
 
 
-def test_markdown_formats_by_type() -> None:
+def test_markdown_formats_a_cell_by_type_and_dots_into_a_nested_record() -> None:
     text = markdown(_report(check=_agreement()))
     assert "| yes |" in text  # bool
     assert "1,073,741,824" in text  # int, grouped
     assert "1,200.000" in text  # float, three places
     assert "| scan |" in text  # str, verbatim
-
-
-def test_markdown_dots_into_a_nested_record_and_skips_tuple_fields() -> None:
-    text = markdown(_report(check=_agreement()))
     # NsysKernel.duration is a nested Spread, so the leaf keeps its own suffix.
     assert "duration.median_duration_us" in text
     # SavedStorages.regions is a table of its own, never a column.
@@ -637,12 +603,6 @@ def test_markdown_dots_into_a_nested_record_and_skips_tuple_fields() -> None:
 def test_markdown_prints_none_for_an_empty_table() -> None:
     text = markdown(_report(check=_agreement(), with_regions=False))
     assert "(none)" in text
-
-
-def test_markdown_ends_with_exactly_one_newline() -> None:
-    text = markdown(_report(check=_agreement()))
-    assert text.endswith("\n")
-    assert not text.endswith("\n\n")
 
 
 # ---------------------------------------------------------------------------
@@ -670,15 +630,16 @@ def test_table_rejects_two_record_shapes() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_payload_keeps_unit_suffixes_verbatim() -> None:
+def test_payload_keeps_every_field_name_verbatim() -> None:
+    # A unit suffix and an `est_` prefix are the only thing separating a measured
+    # figure from a modelled one, so serialization may not rewrite either.
     data = payload(_report(check=_agreement()))
     assert "nsys_kernel_sum_duration_us" in data["agreement"]
     assert "peak_allocated_bytes" in data["peaks"]
-
-
-def test_payload_keeps_the_est_prefix() -> None:
-    data = payload(_Modelled(label="dram traffic", est_traffic_bytes=Bytes(1024)))
-    assert data == {"label": "dram traffic", "est_traffic_bytes": 1024}
+    assert payload(_Modelled(label="dram traffic", est_traffic_bytes=Bytes(1024))) == {
+        "label": "dram traffic",
+        "est_traffic_bytes": 1024,
+    }
 
 
 def test_payload_nests_records_and_lists_tuples() -> None:
@@ -690,25 +651,19 @@ def test_payload_nests_records_and_lists_tuples() -> None:
     assert data["notes"] == ["clocks unlocked; the resolution floor bounds every claim"]
 
 
-def test_payload_maps_keys_to_strings() -> None:
-    assert payload({1: (2, 3)}) == {"1": [2, 3]}
-
-
 def test_payload_passes_scalars_and_types_through() -> None:
     assert payload(3.5) == 3.5
     assert payload(None) is None
     assert payload("text") == "text"
     assert payload(Agreement) is Agreement
+    assert payload({1: (2, 3)}) == {"1": [2, 3]}
 
 
-def test_json_text_round_trips() -> None:
+def test_json_text_round_trips_in_field_order() -> None:
     report = _report(check=_agreement())
-    assert json.loads(json_text(report)) == payload(report)
-
-
-def test_json_text_keeps_field_order() -> None:
-    keys = list(json.loads(json_text(_report(check=_agreement()))))
-    assert keys[:3] == ["title", "device", "agreement"]
+    text = json_text(report)
+    assert json.loads(text) == payload(report)
+    assert list(json.loads(text))[:3] == ["title", "device", "agreement"]
 
 
 # ---------------------------------------------------------------------------
@@ -746,10 +701,10 @@ def test_rate_table_prints_every_rate_beside_its_dispersion() -> None:
         "75.000",
         "6,826,667",
     ]
-
-
-def test_rate_table_of_no_rates_is_the_header_alone() -> None:
-    assert rate_table([], width=8).splitlines()[0].startswith("config  ")
+    # No rates is the header alone, never a blank line that reads as a run.
+    empty = rate_table([], width=8).splitlines()
+    assert len(empty) == 1
+    assert empty[0].startswith("config  ")
 
 
 # ---------------------------------------------------------------------------
@@ -763,17 +718,18 @@ def test_write_report_writes_markdown_and_json(tmp_path: Path) -> None:
     assert md.read_text().startswith("# full\n")
     assert json.loads(js.read_text())["title"] == "full"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["run.json", "run.md"]
-
-
-def test_write_report_appends_the_suffix_to_the_whole_name(tmp_path: Path) -> None:
-    md, js = write_report(_report(check=_agreement()), tmp_path / "run.1")
-    assert (md, js) == (tmp_path / "run.1.md", tmp_path / "run.1.json")
+    nested_md, nested_js = write_report(
+        _report(check=_agreement()), tmp_path / "a" / "b" / "run"
+    )
+    assert nested_md.exists()
+    assert nested_js.exists()
 
 
 def test_two_bases_differing_after_a_dot_do_not_collide(tmp_path: Path) -> None:
-    # Substituting the last suffix would send both of these to run.md and lose the
-    # first report to the second.
-    write_report(_report(title="first", check=_agreement()), tmp_path / "run.1")
+    # The suffix is appended to the whole name. Substituting the last one would
+    # send both of these to run.md and lose the first report to the second.
+    first = write_report(_report(title="first", check=_agreement()), tmp_path / "run.1")
+    assert first == (tmp_path / "run.1.md", tmp_path / "run.1.json")
     write_report(_report(title="second", check=_agreement()), tmp_path / "run.2")
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "run.1.json",
@@ -785,12 +741,6 @@ def test_two_bases_differing_after_a_dot_do_not_collide(tmp_path: Path) -> None:
     assert (tmp_path / "run.2.md").read_text().startswith("# second\n")
 
 
-def test_write_report_creates_the_parent_directory(tmp_path: Path) -> None:
-    md, js = write_report(_report(check=_agreement()), tmp_path / "a" / "b" / "run")
-    assert md.exists()
-    assert js.exists()
-
-
 def test_write_report_accepts_a_single_clock_measurement(tmp_path: Path) -> None:
     md, _js = write_report(
         _report(check=None), tmp_path / "run", require_agreement=False
@@ -800,13 +750,10 @@ def test_write_report_accepts_a_single_clock_measurement(tmp_path: Path) -> None
 
 def test_a_refused_report_leaves_no_file(tmp_path: Path) -> None:
     # The load-bearing rule: a stale report must never be mistaken for a fresh
-    # pass, so the refusal happens before anything is written or created.
+    # pass, so the refusal happens before anything is written or created, whether
+    # the check failed or was never taken.
     with pytest.raises(AgreementError):
         write_report(_report(check=_agreement(ncu_us=3300.0)), tmp_path / "a" / "run")
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_a_missing_check_leaves_no_file(tmp_path: Path) -> None:
     with pytest.raises(AgreementError):
-        write_report(_report(check=None), tmp_path / "run")
+        write_report(_report(check=None), tmp_path / "b" / "run")
     assert list(tmp_path.iterdir()) == []

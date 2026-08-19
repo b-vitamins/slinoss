@@ -15,7 +15,6 @@ on the clock.
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from collections.abc import Sequence
@@ -270,18 +269,25 @@ def test_the_defaults_are_the_ones_the_report_stamps() -> None:
     assert args.out == Path("out/profile-op")
     assert args.skip_ncu is False
     assert args.skip_nsys is False
+    named = profile_op.parse_args(
+        ["--python", "/usr/bin/python3", "--ncu", "/opt/ncu", "--nsys", "/opt/nsys"]
+    )
+    assert named.python == "/usr/bin/python3"
+    assert profile_op.target_argv(named)[0] == "/usr/bin/python3"
+    assert (named.ncu, named.nsys) == ("/opt/ncu", "/opt/nsys")
 
 
-@pytest.mark.parametrize(
-    ("flag", "value"),
-    [("--shape", "enormous"), ("--mode", "backward"), ("--dtype", "fp8")],
-)
-def test_parse_args_rejects_a_value_outside_its_table(flag: str, value: str) -> None:
+def test_parse_args_rejects_a_value_outside_its_table() -> None:
     # argparse exits 2 rather than raising, so a typo in a sweep script stops the
     # run instead of silently profiling the default shape.
-    with pytest.raises(SystemExit) as exc:
-        profile_op.parse_args([flag, value])
-    assert exc.value.code == 2
+    for flag, value in (
+        ("--shape", "enormous"),
+        ("--mode", "backward"),
+        ("--dtype", "fp8"),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            profile_op.parse_args([flag, value])
+        assert exc.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -309,20 +315,16 @@ def test_the_target_argv_carries_every_argument_the_target_needs() -> None:
         "--device",
         "cuda",
     ]
-
-
-def test_the_target_argv_names_a_backend_only_when_one_is_asked_for() -> None:
+    # The profilers run a second process, so the target path is resolved from this
+    # module's location rather than from the working directory.
+    assert profile_op.TARGET.name == "profile_target.py"
+    assert profile_op.TARGET.parent == Path(profile_op.__file__).parent
+    # A backend is named only when one is asked for; absent means the fastest
+    # registered one, which is the profiled path.
     auto = profile_op.target_argv(profile_op.parse_args([]))
     named = profile_op.target_argv(profile_op.parse_args(["--backend", "cute"]))
     assert "--backend" not in auto
     assert named[-2:] == ["--backend", "cute"]
-
-
-def test_the_target_is_the_sibling_profile_target_script() -> None:
-    # The profilers run a second process, so the path is resolved from this
-    # module's location rather than from the working directory.
-    assert profile_op.TARGET.name == "profile_target.py"
-    assert profile_op.TARGET.parent == Path(profile_op.__file__).parent
 
 
 # ---------------------------------------------------------------------------
@@ -330,15 +332,15 @@ def test_the_target_is_the_sibling_profile_target_script() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spec", ["cpu", "cuda"])
 def test_main_refuses_a_device_the_report_cannot_name(
-    monkeypatch: pytest.MonkeyPatch, spec: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Both arcs of the shared guard: a host device, and a CUDA device on a host
     # without CUDA. Refused before the inputs are allocated.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="is not a usable cuda device"):
-        profile_op.main(["--device", spec])
+    for spec in ("cpu", "cuda"):
+        with pytest.raises(RuntimeError, match="is not a usable cuda device"):
+            profile_op.main(["--device", spec])
 
 
 def test_main_cross_checks_three_clocks_and_writes_both_files(
@@ -411,41 +413,34 @@ def test_main_raises_when_an_ncu_table_reports_a_metric_absent(
     assert TABLE_NAMES[0] in str(exc.value)
 
 
-def test_skipping_ncu_emits_without_counters_and_says_the_check_was_skipped(
+def test_skipping_a_profiler_emits_without_it_and_says_the_check_was_skipped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    seen = patch_externals(monkeypatch)
-    out = tmp_path / "prof"
-    assert profile_op.main(argv_for(out, "--skip-ncu")) == 0
-    text = (tmp_path / "prof-tiny-forward.md").read_text()
-    assert seen.ncu_tables == []
+    # A cross-check needs all three clocks, so any skip drops it, and the report
+    # says so rather than omitting the section silently.
+    no_ncu = patch_externals(monkeypatch)
+    assert profile_op.main(argv_for(tmp_path / "a" / "prof", "--skip-ncu")) == 0
+    text = (tmp_path / "a" / "prof-tiny-forward.md").read_text()
+    assert no_ncu.ncu_tables == []
     assert "## cross-check" not in text
     assert "cross-check skipped" in text
     assert "## gpu trace" in text
 
-
-def test_skipping_nsys_emits_without_the_launch_stream(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    seen = patch_externals(monkeypatch)
-    out = tmp_path / "prof"
-    assert profile_op.main(argv_for(out, "--skip-nsys")) == 0
-    text = (tmp_path / "prof-tiny-forward.md").read_text()
-    assert seen.nsys_argv == []
+    no_nsys = patch_externals(monkeypatch)
+    assert profile_op.main(argv_for(tmp_path / "b" / "prof", "--skip-nsys")) == 0
+    text = (tmp_path / "b" / "prof-tiny-forward.md").read_text()
+    assert no_nsys.nsys_argv == []
     assert "## cross-check" not in text
     assert "cross-check skipped" in text
     assert "## kernel counters" in text
 
-
-def test_skipping_both_profilers_still_emits_the_event_wall(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    seen = patch_externals(monkeypatch)
-    out = tmp_path / "prof"
-    assert profile_op.main(argv_for(out, "--skip-ncu", "--skip-nsys")) == 0
-    text = (tmp_path / "prof-tiny-forward.md").read_text()
-    assert seen.ncu_tables == []
-    assert seen.nsys_argv == []
+    neither = patch_externals(monkeypatch)
+    argv = argv_for(tmp_path / "c" / "prof", "--skip-ncu", "--skip-nsys")
+    assert profile_op.main(argv) == 0
+    text = (tmp_path / "c" / "prof-tiny-forward.md").read_text()
+    assert neither.ncu_tables == []
+    assert neither.nsys_argv == []
+    # The event wall survives both skips.
     assert "## budget" in text
     assert "## throughput" in text
     assert "cross-check skipped" in text
@@ -476,18 +471,3 @@ def test_the_notes_quote_the_command_the_profilers_ran(
     assert "--backend reference" in text
     assert "event iters=2 capture iters=2" in text
     assert "nsys report: fabricated.nsys-rep" in text
-
-
-def test_parse_args_reads_an_explicit_python_and_profiler_pair() -> None:
-    args = profile_op.parse_args(
-        ["--python", "/usr/bin/python3", "--ncu", "/opt/ncu", "--nsys", "/opt/nsys"]
-    )
-    assert args.python == "/usr/bin/python3"
-    assert profile_op.target_argv(args)[0] == "/usr/bin/python3"
-    assert (args.ncu, args.nsys) == ("/opt/ncu", "/opt/nsys")
-
-
-def test_the_module_exposes_only_argparse_namespaces_for_argv() -> None:
-    # `parse_args` returning a Namespace rather than a tuple is what lets the
-    # notes stamp every field by name without a positional order to maintain.
-    assert isinstance(profile_op.parse_args([]), argparse.Namespace)

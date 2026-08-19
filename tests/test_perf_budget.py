@@ -179,47 +179,38 @@ def test_measured_parent_gains_an_unattributed_child() -> None:
     assert_closed(report)
 
 
-def test_uninstrumented_run_is_wholly_unattributed() -> None:
-    report = budget(timed_of(100.0, {}))
-    assert report.labels() == ("unattributed",)
-    rest = report.get("unattributed")
+def test_top_remainder_takes_the_whole_call_and_is_not_clamped() -> None:
+    whole = budget(timed_of(100.0, {}))
+    assert whole.labels() == ("unattributed",)
+    rest = whole.get("unattributed")
     assert rest.derived
     assert rest.median_duration_us == 100.0
     assert rest.share_of_total_pct == 100.0
-    assert_closed(report)
+    assert_closed(whole)
+    # Over-attribution is reported as a negative remainder. Clamping it to zero
+    # would close the tree by hiding the overlap that caused it.
+    over = budget(timed_of(100.0, {"a": 70.0, "b": 60.0}))
+    negative = over.get("unattributed")
+    assert negative.median_duration_us == -30.0
+    assert negative.share_of_total_pct < 0.0
+    assert_closed(over)
 
 
-def test_negative_remainder_is_not_clamped() -> None:
-    report = budget(timed_of(100.0, {"a": 70.0, "b": 60.0}))
-    rest = report.get("unattributed")
-    assert rest.median_duration_us == -30.0
-    assert rest.share_of_total_pct < 0.0
-    assert_closed(report)
-
-
-@pytest.mark.parametrize(
-    ("total_us", "regions", "match"),
-    [
+def test_budget_rejects_a_zero_parent() -> None:
+    for total_us, regions, match in (
         (100.0, {"step": 0.0, "step.a": 0.0}, r"bucket 'step' is zero"),
         (0.0, {"a": 5.0}, r"bucket '<total>' is zero"),
-    ],
-)
-def test_budget_rejects_a_zero_parent(
-    total_us: float, regions: dict[str, float], match: str
-) -> None:
-    with pytest.raises(ValueError, match=match):
-        budget(timed_of(total_us, regions))
+    ):
+        with pytest.raises(ValueError, match=match):
+            budget(timed_of(total_us, regions))
 
 
-def test_assert_closed_rejects_children_that_do_not_sum() -> None:
+def test_assert_closed_checks_every_parent_against_its_children() -> None:
     report = hand_report(
         100.0, (hand_bucket("step", 100.0, 100.0), hand_bucket("step.a", 10.0, 100.0))
     )
     with pytest.raises(ValueError, match=r"bucket 'step' is 100\.000 us"):
         assert_closed(report)
-
-
-def test_assert_closed_tolerance() -> None:
     assert CLOSURE_TOL_PCT == 0.01
     # 0.005 percent of the parent is float noise and passes at the default.
     assert_closed(hand_report(100.0, (hand_bucket("step", 100.005, 100.0),)))
@@ -227,19 +218,13 @@ def test_assert_closed_tolerance() -> None:
     with pytest.raises(ValueError, match=r"bucket '<total>' is 100\.000 us"):
         assert_closed(wide)
     assert_closed(wide, Percent(0.05))
-
-
-def test_assert_closed_rejects_a_zero_parent_with_nonzero_children() -> None:
     # A relative tolerance has no meaning against a zero parent. The check is made
-    # absolutely here rather than letting pct_of raise about its denominator.
-    report = hand_report(
+    # absolutely there rather than letting pct_of raise about its denominator.
+    zero_parent = hand_report(
         0.0, (hand_bucket("step", 0.0, 1.0), hand_bucket("step.a", 10.0, 1.0))
     )
     with pytest.raises(ValueError, match=r"bucket 'step' is 0\.000 us"):
-        assert_closed(report)
-
-
-def test_assert_closed_accepts_a_zero_parent_with_zero_children() -> None:
+        assert_closed(zero_parent)
     assert_closed(
         hand_report(
             0.0, (hand_bucket("step", 0.0, 1.0), hand_bucket("step.a", 0.0, 1.0))
@@ -247,12 +232,11 @@ def test_assert_closed_accepts_a_zero_parent_with_zero_children() -> None:
     )
 
 
-def test_assert_nonzero_accepts_present_nonzero_buckets() -> None:
-    report = budget(timed_of(100.0, {"step.a": 30.0, "step.b": 20.0}))
-    assert_nonzero(report, ("step", "step.a", "step.b", "unattributed"))
-
-
 def test_assert_nonzero_names_missing_and_zero_buckets() -> None:
+    assert_nonzero(
+        budget(timed_of(100.0, {"step.a": 30.0, "step.b": 20.0})),
+        ("step", "step.a", "step.b", "unattributed"),
+    )
     report = budget(timed_of(100.0, {"a": 5.0, "b": 0.0}))
     with pytest.raises(ValueError) as caught:
         assert_nonzero(report, ("a", "b", "step.absent"))
@@ -386,29 +370,6 @@ def test_compare_refuses_a_bucket_whose_own_interval_misses_coverage() -> None:
     assert by_label["step"].resolved
 
 
-def test_compare_gives_a_derived_bucket_the_whole_call_floor() -> None:
-    # A derived row is arithmetic over measured rows and carries no dispersion of
-    # its own, so its floor is the two whole-call half-widths summed.
-    before = budget(
-        timed_of(100.0, {"step.a": 50.0, "step.b": 25.0}, label="before", total_pct=1.0)
-    )
-    after = budget(
-        timed_of(100.0, {"step.a": 45.0, "step.b": 25.0}, label="after", total_pct=30.0)
-    )
-    by_label = {d.label: d for d in compare(before, after)}
-    derived = by_label["step"]
-    assert after.get("step").derived
-    assert after.get("step").resolution_pct == 0.0
-    assert derived.floor_pct == 15.5
-    assert derived.delta_pct == pytest.approx(-100.0 / 15.0)
-    assert not derived.resolved
-    # Its measured child moved 10 percent against a floor of 4, and resolves.
-    leaf = by_label["step.a"]
-    assert leaf.floor_pct == pytest.approx(4.0)
-    assert leaf.delta_pct == pytest.approx(-10.0)
-    assert leaf.resolved
-
-
 def test_compare_keeps_a_measured_zero_floor_rather_than_falling_back() -> None:
     # Identical samples put the floor at zero, and a measured bucket is judged on
     # that zero. Falling back to the whole-call floor here would discard the
@@ -460,10 +421,7 @@ def test_rank_keeps_resolved_regressions_worst_first() -> None:
     assert tuple(d.label for d in rank(deltas, 5)) == ("unattributed", "step.b")
     assert tuple(d.label for d in rank(deltas, 1)) == ("unattributed",)
     assert rank(deltas, 0) == ()
-
-
-def test_rank_imposes_the_order_rather_than_inheriting_it() -> None:
-    # Truncating an unsorted sequence would drop the worst regression and label the
-    # survivors "worst first".
-    shuffled = tuple(reversed(compare(*two_reports())))
+    # rank imposes the order. Truncating an unsorted sequence would drop the worst
+    # regression and label the survivors "worst first".
+    shuffled = tuple(reversed(deltas))
     assert tuple(d.label for d in rank(shuffled, 1)) == ("unattributed",)

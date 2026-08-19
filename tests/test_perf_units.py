@@ -2,8 +2,9 @@
 
 Every raise in :mod:`slinoss.perf.units` is triggered here. The schema validates
 in ``__init_subclass__``, so a rejection is a class-definition failure and each
-rejection test defines its own frozen dataclass inside the ``pytest.raises``
-block.
+rejection defines its own frozen dataclass inside a ``pytest.raises`` block.
+Rejections are grouped by the rule they violate, since one rule is one failure
+mode however many field types reach it.
 
 ``MIN_RESOLVING_SAMPLES`` is derived from ``CONFIDENCE_PCT`` through the
 order-statistic coverage, so the tests assert that relation through the private
@@ -153,11 +154,11 @@ class Underscored(PerfRecord):
 
 
 # ---------------------------------------------------------------------------
-# Markers
+# Exports and markers
 # ---------------------------------------------------------------------------
 
 
-def test_all_lists_every_unit_type_record_and_conversion() -> None:
+def test_all_lists_every_public_name_and_nothing_dangling() -> None:
     # A unit type absent from __all__ is invisible to a star import while every
     # other unit is visible, which is worse than exporting none of them.
     missing = sorted(
@@ -169,17 +170,12 @@ def test_all_lists_every_unit_type_record_and_conversion() -> None:
         and name not in units_mod.__all__
     )
     assert missing == []
-
-
-def test_all_exports_the_confidence_constants_and_nothing_dangling() -> None:
     # Neither constant carries __module__, so the sweep above cannot see them.
     assert "CONFIDENCE_PCT" in units_mod.__all__
     assert "MIN_RESOLVING_SAMPLES" in units_mod.__all__
     dangling = [name for name in units_mod.__all__ if not hasattr(units_mod, name)]
     assert dangling == []
-
-
-def test_marker_repr_names_the_marker() -> None:
+    # Marker identity is the whole of its meaning, so the repr names it.
     assert repr(MODELLED) == "<modelled>"
     assert repr(SUM) == "<sum>"
     assert repr(MEDIAN) == "<median>"
@@ -191,141 +187,122 @@ def test_marker_repr_names_the_marker() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rejects_unit_field_without_the_matching_suffix() -> None:
+def test_rejects_a_name_and_a_unit_that_disagree() -> None:
     with pytest.raises(TypeError, match="'duration_ms' is Microseconds"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class WrongSuffix(PerfRecord):
             duration_ms: Annotated[Microseconds, MEDIAN]
 
-
-def test_rejects_suffix_claimed_by_a_non_unit_type() -> None:
     with pytest.raises(TypeError, match="'foo_bytes' claims unit '_bytes'"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class ClaimedByAnInt(PerfRecord):
             foo_bytes: int
 
+    # A tuple of one unit type is a sample list and carries the unit exactly as a
+    # scalar does.
+    with pytest.raises(TypeError, match="'samples' is Microseconds"):
 
-def test_rejects_modelled_field_without_the_est_prefix() -> None:
+        @dataclass(frozen=True)
+        class UnnamedSampleList(PerfRecord):
+            samples: Annotated[tuple[Microseconds, ...], SUM]
+
+    # A fixed-length tuple is a structure, not a sample list, so it does not
+    # carry the unit of its first element and may not claim one by name.
+    with pytest.raises(TypeError, match="'bounds_us' claims unit '_us'"):
+
+        @dataclass(frozen=True)
+        class ClaimedByAStructure(PerfRecord):
+            bounds_us: Annotated[tuple[Microseconds, Percent], SUM]
+
+
+def test_rejects_a_model_that_could_read_as_a_measurement() -> None:
     with pytest.raises(TypeError, match="must start with 'est_'"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class UnprefixedModel(PerfRecord):
             duration_us: Annotated[Microseconds, MODELLED, MEDIAN]
 
-
-def test_rejects_est_prefix_without_the_modelled_marker() -> None:
     with pytest.raises(TypeError, match="'est_duration_us' is named est_"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class UnmarkedEstimate(PerfRecord):
             est_duration_us: Annotated[Microseconds, MEDIAN]
 
-
-def test_rejects_unit_field_without_a_reduction() -> None:
-    with pytest.raises(TypeError, match="has a unit and no reduction"):
-
-        @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            duration_us: Microseconds
-
-
-def test_rejects_two_reductions_on_one_field() -> None:
-    with pytest.raises(TypeError, match="declares 2 reductions"):
-
-        @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            duration_us: Annotated[Microseconds, MEDIAN, SUM]
-
-
-def test_rejects_measured_and_modelled_of_one_unit() -> None:
     with pytest.raises(TypeError, match="a measured and a modelled Bytes"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class AdjacentColumns(PerfRecord):
             moved_bytes: Annotated[Bytes, SUM]
             est_moved_bytes: Annotated[Bytes, MODELLED, SUM]
 
 
-def test_rejects_median_on_a_count() -> None:
-    with pytest.raises(TypeError, match="the median of integers is not an integer"):
-
-        @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            launch_count: Annotated[Count, MEDIAN]
-
-
-def test_rejects_median_on_a_byte_count() -> None:
-    with pytest.raises(TypeError, match="the median of integers is not an integer"):
-
-        @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            moved_bytes: Annotated[Bytes, MEDIAN]
-
-
-def test_rejects_sample_list_without_the_matching_suffix() -> None:
-    # A tuple of a unit type carries the unit exactly as a scalar does.
-    with pytest.raises(TypeError, match="'samples' is Microseconds"):
-
-        @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            samples: Annotated[tuple[Microseconds, ...], SUM]
-
-
-def test_rejects_sample_list_without_a_reduction() -> None:
+def test_rejects_a_reduction_that_cannot_be_taken() -> None:
     with pytest.raises(TypeError, match="has a unit and no reduction"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            samples_duration_us: tuple[Microseconds, ...]
+        class NoReduction(PerfRecord):
+            duration_us: Microseconds
 
+    with pytest.raises(TypeError, match="declares 2 reductions"):
 
-def test_rejects_median_on_a_sample_list() -> None:
+        @dataclass(frozen=True)
+        class TwoReductions(PerfRecord):
+            duration_us: Annotated[Microseconds, MEDIAN, SUM]
+
+    with pytest.raises(TypeError, match="the median of integers is not an integer"):
+
+        @dataclass(frozen=True)
+        class MedianOnACount(PerfRecord):
+            launch_count: Annotated[Count, MEDIAN]
+
     with pytest.raises(TypeError, match="'samples_duration_us' is a tuple and MEDIAN"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class MedianOnASampleList(PerfRecord):
             samples_duration_us: Annotated[tuple[Microseconds, ...], MEDIAN]
 
-
-def test_rejects_median_on_a_tuple_of_a_non_unit_type() -> None:
     # The ban is on the tuple, not on its element type: the median of a list of
     # labels is a label nobody measured, and statistics.median would raise on it
     # at report time rather than here.
     with pytest.raises(TypeError, match="'labels' is a tuple and MEDIAN"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class MedianOnLabels(PerfRecord):
             labels: Annotated[tuple[str, ...], MEDIAN]
 
 
-def test_rejects_suffix_claimed_by_a_fixed_length_tuple() -> None:
-    # A fixed-length tuple is a structure, not a sample list, so it does not
-    # carry the unit of its first element and may not claim one by name.
-    with pytest.raises(TypeError, match="'bounds_us' claims unit '_us'"):
-
-        @dataclass(frozen=True)
-        class Bad(PerfRecord):
-            bounds_us: Annotated[tuple[Microseconds, Percent], SUM]
-
-
-def test_rejects_conflict_count_without_a_wavefront_count() -> None:
+def test_requires_the_denominator_beside_a_count_and_a_floor() -> None:
     with pytest.raises(TypeError, match="conflict count and no wavefront_count"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class BareConflicts(PerfRecord):
             bank_conflict_count: Annotated[Count, SUM]
 
-
-def test_rejects_a_resolution_floor_without_its_coverage() -> None:
     # A half-width is only a floor at a stated coverage, so the pairing is
     # structural rather than a convention a new record can forget.
     with pytest.raises(TypeError, match="resolution floor and no coverage_pct"):
 
         @dataclass(frozen=True)
-        class Bad(PerfRecord):
+        class BareFloor(PerfRecord):
             resolution_pct: Annotated[Percent, MEDIAN]
+
+    @dataclass(frozen=True)
+    class Paired(PerfRecord):
+        bank_conflict_count: Annotated[Count, SUM]
+        wavefront_count: Annotated[Count, SUM]
+        resolution_pct: Annotated[Percent, MEDIAN]
+        coverage_pct: Annotated[Percent, MEDIAN]
+
+    rec = Paired(
+        bank_conflict_count=Count(2),
+        wavefront_count=Count(8),
+        resolution_pct=Percent(1.0),
+        coverage_pct=Percent(96.0),
+    )
+    assert ratio_of(rec.bank_conflict_count, rec.wavefront_count) == 0.25
+    assert rec.coverage_pct >= CONFIDENCE_PCT
 
 
 # ---------------------------------------------------------------------------
@@ -333,33 +310,11 @@ def test_rejects_a_resolution_floor_without_its_coverage() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_accepts_conflict_count_beside_its_wavefront_count() -> None:
-    @dataclass(frozen=True)
-    class Conflicts(PerfRecord):
-        bank_conflict_count: Annotated[Count, SUM]
-        wavefront_count: Annotated[Count, SUM]
-
-    rec = Conflicts(bank_conflict_count=Count(2), wavefront_count=Count(8))
-    assert ratio_of(rec.bank_conflict_count, rec.wavefront_count) == 0.25
-
-
-def test_accepts_a_resolution_floor_beside_its_coverage() -> None:
-    @dataclass(frozen=True)
-    class Floor(PerfRecord):
-        resolution_pct: Annotated[Percent, MEDIAN]
-        coverage_pct: Annotated[Percent, MEDIAN]
-
-    rec = Floor(resolution_pct=Percent(1.0), coverage_pct=Percent(96.0))
-    assert rec.coverage_pct >= CONFIDENCE_PCT
-
-
-def test_accepts_a_sample_list_named_for_its_unit() -> None:
-    # Definition-time acceptance is the assertion. The reductions show the
+def test_a_sample_list_and_a_fixed_length_tuple_reduce_differently() -> None:
+    # Definition-time acceptance is half the assertion. The reductions show the
     # sample list was validated and the tuple of str was left alone.
     assert Sampled._reductions == {"samples_duration_us": SUM, "labels": INVARIANT}
 
-
-def test_accepts_a_fixed_length_tuple_as_one_structure() -> None:
     @dataclass(frozen=True)
     class Bounds(PerfRecord):
         bounds: tuple[Microseconds, Percent]
@@ -373,27 +328,23 @@ def test_accepts_a_fixed_length_tuple_as_one_structure() -> None:
         aggregate([Bounds(bounds=pair), Bounds(bounds=other)])
 
 
-def test_classvar_skips_validation() -> None:
+def test_classvar_skips_validation_in_both_annotation_forms() -> None:
     # page_bytes claims a unit its type lacks; a validated field would raise.
+    # dataclasses treats an unsubscripted ClassVar as a class variable, so the
+    # schema must too, and get_origin is None for that form.
     @dataclass(frozen=True)
-    class WithClassVar(PerfRecord):
+    class Subscripted(PerfRecord):
         page_bytes: ClassVar[int] = 4096
         duration_us: Annotated[Microseconds, MEDIAN]
 
-    assert WithClassVar.page_bytes == 4096
-    assert WithClassVar(duration_us=Microseconds(1.0)).duration_us == 1.0
-
-
-def test_bare_classvar_skips_validation() -> None:
-    # dataclasses treats an unsubscripted ClassVar as a class variable, so the
-    # schema must too. get_origin is None for this form.
     @dataclass(frozen=True)
-    class WithBareClassVar(PerfRecord):
+    class Bare(PerfRecord):
         page_bytes: ClassVar = 4096
         duration_us: Annotated[Microseconds, MEDIAN]
 
-    assert WithBareClassVar.page_bytes == 4096
-    assert [f.name for f in fields(WithBareClassVar)] == ["duration_us"]
+    assert (Subscripted.page_bytes, Bare.page_bytes) == (4096, 4096)
+    assert Subscripted(duration_us=Microseconds(1.0)).duration_us == 1.0
+    assert [f.name for f in fields(Bare)] == ["duration_us"]
 
 
 def test_underscored_field_skips_validation_and_reduces_as_invariant() -> None:
@@ -405,11 +356,6 @@ def test_underscored_field_skips_validation_and_reduces_as_invariant() -> None:
     other = Underscored(duration_us=Microseconds(3.0), _scratch_bytes=8)
     with pytest.raises(ValueError, match="'_scratch_bytes' is INVARIANT"):
         aggregate([low, other])
-
-
-def test_non_unit_field_without_a_marker_defaults_to_invariant() -> None:
-    with pytest.raises(ValueError, match="field 'label' is INVARIANT"):
-        aggregate([sample(label="scan"), sample(label="mixer")])
 
 
 # ---------------------------------------------------------------------------
@@ -444,13 +390,6 @@ def test_aggregate_reduces_field_by_field() -> None:
     assert out.spread.samples_duration_us == (10.0, 30.0, 20.0)
 
 
-def test_combine_is_none_on_a_record_of_independent_fields() -> None:
-    # Field by field is right unless the fields are functions of one sample list,
-    # so the hook opts in and every other record ignores it.
-    assert Sample.combine([sample(), sample()]) is None
-    assert Sampled.combine([sampled(1.0)]) is None
-
-
 def test_aggregate_combines_a_spread_from_the_samples_behind_its_parts() -> None:
     # Field by field would give min 2.5, max 4.5 and a 70 percent range over six
     # samples spanning 1 to 6, which is a record contradicting its own sample
@@ -467,7 +406,7 @@ def test_aggregate_combines_a_spread_from_the_samples_behind_its_parts() -> None
     assert not parts[0].resolves(Percent(1000.0))
 
 
-def test_aggregate_rejects_a_spread_built_without_its_samples() -> None:
+def test_spread_combine_needs_the_samples_behind_every_part() -> None:
     # A hand-built Spread carries no samples, so there is nothing to pool and no
     # honest way to reduce it.
     bare = Spread(
@@ -481,21 +420,15 @@ def test_aggregate_rejects_a_spread_built_without_its_samples() -> None:
     )
     with pytest.raises(ValueError, match="needs the samples behind every part"):
         aggregate([bare, Spread.of(us(10.0))])
-
-
-def test_spread_combine_rejects_no_runs() -> None:
     empty: list[Spread] = []
     with pytest.raises(ValueError, match="needs at least one sample"):
         Spread.combine(empty)
 
 
-def test_aggregate_concatenates_sample_lists_under_sum() -> None:
+def test_aggregate_concatenates_sample_lists_and_holds_tuple_invariants() -> None:
     out = aggregate([sampled(10.0, 30.0), sampled(20.0)])
     assert out.samples_duration_us == (10.0, 30.0, 20.0)
     assert out.labels == ("scan",)
-
-
-def test_aggregate_rejects_tuple_invariant_disagreement() -> None:
     with pytest.raises(ValueError, match="field 'labels' is INVARIANT"):
         aggregate([sampled(10.0), sampled(10.0, label="mixer")])
 
@@ -517,22 +450,16 @@ def test_aggregate_rejects_invariant_disagreement() -> None:
         aggregate([sample(occupancy_pct=50.0), sample(occupancy_pct=60.0)])
 
 
-def test_aggregate_rejects_an_empty_sequence() -> None:
-    empty: list[Spread] = []
-    with pytest.raises(ValueError, match="needs at least one sample"):
-        aggregate(empty)
-
-
-def test_aggregate_rejects_mixed_record_types() -> None:
-    mixed: list[PerfRecord] = [sample(), Spread.of(us(1.0))]
-    with pytest.raises(ValueError, match="needs one record type"):
-        aggregate(mixed)
-
-
-def test_aggregate_rejects_a_non_dataclass_record() -> None:
+def test_aggregate_rejects_a_malformed_sample_sequence() -> None:
     class Plain(PerfRecord):
         pass
 
+    empty: list[Spread] = []
+    with pytest.raises(ValueError, match="needs at least one sample"):
+        aggregate(empty)
+    mixed: list[PerfRecord] = [sample(), Spread.of(us(1.0))]
+    with pytest.raises(ValueError, match="needs one record type"):
+        aggregate(mixed)
     with pytest.raises(ValueError, match="Plain is not a dataclass"):
         aggregate([Plain()])
 
@@ -542,25 +469,18 @@ def test_aggregate_rejects_a_non_dataclass_record() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_us_from_ns() -> None:
+def test_conversions_carry_the_base_they_declare() -> None:
     assert us_from_ns(Nanoseconds(1500.0)) == 1.5
-
-
-def test_ms_from_us() -> None:
     assert ms_from_us(Microseconds(2500.0)) == 2.5
-
-
-def test_us_from_ms() -> None:
     assert us_from_ms(Milliseconds(2.5)) == 2500.0
-
-
-def test_mib_from_bytes_is_1024_based() -> None:
+    assert tflops_from_flop_us(Count(2_000_000), Microseconds(1.0)) == 2.0
+    assert tps_from_tokens_us(Count(1000), Microseconds(1000.0)) == pytest.approx(1e6)
+    assert pct_of(25.0, 200.0) == 12.5
+    assert ratio_of(3.0, 4.0) == 0.75
+    # Mebibytes are 1024-based, so 10**6 bytes is under one.
     assert mib_from_bytes(Bytes(2**20)) == 1.0
     assert mib_from_bytes(Bytes(3 * 2**19)) == 1.5
     assert mib_from_bytes(Bytes(1_000_000)) < 1.0
-
-
-def test_gbs_from_bytes_us_is_1000_based() -> None:
     # 1e9 bytes in one second is 1 GB/s exactly. 2**30 bytes in that second is
     # more than 1, which is what distinguishes the 1000 base from 1024.
     assert gbs_from_bytes_us(Bytes(10**9), Microseconds(1e6)) == 1.0
@@ -569,46 +489,16 @@ def test_gbs_from_bytes_us_is_1000_based() -> None:
     )
 
 
-def test_tflops_from_flop_us() -> None:
-    assert tflops_from_flop_us(Count(2_000_000), Microseconds(1.0)) == 2.0
-
-
-def test_tps_from_tokens_us() -> None:
-    assert tps_from_tokens_us(Count(1000), Microseconds(1000.0)) == pytest.approx(1e6)
-
-
-def test_pct_of() -> None:
-    assert pct_of(25.0, 200.0) == 12.5
-
-
-def test_ratio_of() -> None:
-    assert ratio_of(3.0, 4.0) == 0.75
-
-
-@pytest.mark.parametrize("duration", [0.0, -1.0])
-def test_gbs_from_bytes_us_rejects_a_nonpositive_duration(duration: float) -> None:
-    with pytest.raises(ValueError, match="duration_us must be positive"):
-        gbs_from_bytes_us(Bytes(1), Microseconds(duration))
-
-
-@pytest.mark.parametrize("duration", [0.0, -1.0])
-def test_tflops_from_flop_us_rejects_a_nonpositive_duration(duration: float) -> None:
-    with pytest.raises(ValueError, match="duration_us must be positive"):
-        tflops_from_flop_us(Count(1), Microseconds(duration))
-
-
-@pytest.mark.parametrize("duration", [0.0, -1.0])
-def test_tps_from_tokens_us_rejects_a_nonpositive_duration(duration: float) -> None:
-    with pytest.raises(ValueError, match="duration_us must be positive"):
-        tps_from_tokens_us(Count(1), Microseconds(duration))
-
-
-def test_pct_of_rejects_a_zero_whole() -> None:
+def test_conversions_reject_a_denominator_that_is_not_positive() -> None:
+    for duration in (0.0, -1.0):
+        with pytest.raises(ValueError, match="duration_us must be positive"):
+            gbs_from_bytes_us(Bytes(1), Microseconds(duration))
+        with pytest.raises(ValueError, match="duration_us must be positive"):
+            tflops_from_flop_us(Count(1), Microseconds(duration))
+        with pytest.raises(ValueError, match="duration_us must be positive"):
+            tps_from_tokens_us(Count(1), Microseconds(duration))
     with pytest.raises(ValueError, match="percent of zero is undefined"):
         pct_of(1.0, 0.0)
-
-
-def test_ratio_of_rejects_a_zero_denominator() -> None:
     with pytest.raises(ValueError, match="zero denominator is undefined"):
         ratio_of(1.0, 0.0)
 
@@ -629,25 +519,28 @@ def test_sign_coverage_is_the_binomial_tail() -> None:
     assert units_mod._sign_coverage_pct(30, 10) == pytest.approx(95.7226, abs=1e-4)
 
 
-def test_median_ci_rank_tightens_as_samples_accumulate() -> None:
-    # Under six samples no interval reaches the coverage, so the rank falls back
-    # to 1, the widest the samples have. Rank 1 stays the tightest one that
-    # covers until nine samples admit the next.
-    assert [units_mod._median_ci_rank(n) for n in (1, 5, 6, 8)] == [1, 1, 1, 1]
-    assert [units_mod._median_ci_rank(n) for n in (9, 10, 11)] == [2, 2, 2]
-    assert units_mod._median_ci_rank(20) == 6
+def test_median_ci_rank_is_the_tightest_interval_holding_the_confidence() -> None:
+    # Coverage falls as the rank rises, so the tightest covering rank is the last
+    # one before the first miss, at every count that has one.
+    for count in range(MIN_RESOLVING_SAMPLES, 65):
+        rank = units_mod._median_ci_rank(count)
+        assert units_mod._sign_coverage_pct(count, rank) >= CONFIDENCE_PCT
+        assert units_mod._sign_coverage_pct(count, rank + 1) < CONFIDENCE_PCT
+    # Below the minimum no rank covers, so the search falls back to 1, the widest
+    # interval the samples admit.
+    for count in range(1, MIN_RESOLVING_SAMPLES):
+        assert units_mod._median_ci_rank(count) == 1
     # The binomial tail steps, so one rank covers several counts.
-    assert [units_mod._median_ci_rank(n) for n in (30, 31)] == [10, 10]
-    assert units_mod._median_ci_rank(40) == 14
-
-
-@pytest.mark.parametrize("count", [6, 7, 10, 20, 30, 31, 40, 64])
-def test_median_ci_rank_is_the_tightest_interval_holding_the_confidence(
-    count: int,
-) -> None:
-    rank = units_mod._median_ci_rank(count)
-    assert units_mod._sign_coverage_pct(count, rank) >= CONFIDENCE_PCT
-    assert units_mod._sign_coverage_pct(count, rank + 1) < CONFIDENCE_PCT
+    assert [units_mod._median_ci_rank(n) for n in (6, 8, 9, 11, 20, 30, 31, 40)] == [
+        1,
+        1,
+        2,
+        2,
+        6,
+        10,
+        10,
+        14,
+    ]
 
 
 def test_min_resolving_samples_is_derived_from_the_confidence() -> None:
@@ -660,14 +553,12 @@ def test_min_resolving_samples_is_derived_from_the_confidence() -> None:
 def test_median_ci_returns_two_of_the_samples() -> None:
     # Rank 2 of ten, so the bounds are the second and the ninth in order. They are
     # samples, not derived quantities, so they carry the unit and need no scale.
+    # The input is unsorted, so this also fixes that order does not matter.
     low, high, coverage = median_ci(
         us(104.0, 92.0, 96.0, 100.0, 108.0, 100.0, 99.0, 101.0, 100.0, 100.0)
     )
     assert (low, high) == (96.0, 104.0)
     assert coverage == units_mod._sign_coverage_pct(10, 2)
-
-
-def test_median_ci_widens_to_the_whole_range_below_nominal_coverage() -> None:
     # Five samples admit no interval at the nominal coverage, so the widest one
     # they have is returned with the coverage it really has.
     low, high, coverage = median_ci(us(30.0, 10.0, 40.0, 100.0, 20.0))
@@ -684,14 +575,12 @@ def test_median_ci_is_the_one_definition_behind_a_spread() -> None:
     assert s.coverage_pct == coverage
 
 
-def test_median_ci_takes_samples_in_any_order() -> None:
-    assert median_ci(us(3.0, 1.0, 2.0)) == median_ci(us(1.0, 2.0, 3.0))
-
-
-def test_median_ci_rejects_an_empty_sample_list() -> None:
+def test_empty_sample_lists_are_rejected() -> None:
     empty: list[Microseconds] = []
     with pytest.raises(ValueError, match="median_ci needs at least one sample"):
         median_ci(empty)
+    with pytest.raises(ValueError, match="needs at least one sample"):
+        Spread.of(empty)
 
 
 # ---------------------------------------------------------------------------
@@ -710,28 +599,14 @@ def test_spread_of_known_samples() -> None:
     assert s.spread_pct == 300.0
     assert s.resolution_pct == 150.0
     assert s.sample_count == 5
-    # Five samples cannot reach the nominal coverage, and the floor says so on its
-    # own row rather than printing as though it were nominal.
+    # Five samples cannot reach the nominal coverage. The floor still prints,
+    # labelled with the coverage it has, and it licenses nothing at any size.
     assert s.coverage_pct == 93.75
     assert s.coverage_pct < CONFIDENCE_PCT
     assert not s.resolves(Percent(1000.0))
 
 
-def test_spread_resolution_at_ten_samples() -> None:
-    # Ten samples take rank 2, so the interval is [x_(2), x_(9)] = [96, 104] and
-    # the half-width is 4 over a median of 100.
-    s = Spread.of(us(100.0, 92.0, 108.0, 96.0, 104.0, 100.0, 99.0, 101.0, 100.0, 100.0))
-    assert s.median_duration_us == 100.0
-    assert s.min_duration_us == 92.0
-    assert s.max_duration_us == 108.0
-    assert s.spread_pct == 16.0
-    assert s.resolution_pct == 4.0
-    assert s.sample_count == 10
-    assert s.coverage_pct == pytest.approx(97.8516, abs=1e-4)
-    assert s.coverage_pct >= CONFIDENCE_PCT
-
-
-def test_spread_resolution_at_twenty_samples() -> None:
+def test_spread_resolution_at_twenty_samples_decides_what_resolves() -> None:
     # Twenty samples take rank 6, so the interval is [x_(6), x_(15)] = [98, 102]
     # and the half-width is 2 over a median of 100. Both tails fall outside it,
     # which is the whole difference from the range. Sorted here for legibility.
@@ -745,6 +620,14 @@ def test_spread_resolution_at_twenty_samples() -> None:
     # 1 - 2 * P(Bin(20, 1/2) < 6) = 1 - 43,400 / 1,048,576, the first rank at this
     # count whose interval still reaches nominal coverage.
     assert s.coverage_pct == pytest.approx(95.8610535, abs=1e-6)
+    # The floor decides, not the range: a 3 percent claim resolves against a 999
+    # percent range because the outliers lie outside the interval.
+    assert s.resolves(Percent(3.0))
+    assert not s.resolves(Percent(2.0))
+    assert not s.resolves(Percent(1.0))
+    # Magnitude decides, so a regression resolves on the same threshold.
+    assert s.resolves(Percent(-3.0))
+    assert not s.resolves(Percent(-1.0))
 
 
 def test_spread_range_grows_while_the_floor_shrinks() -> None:
@@ -784,30 +667,37 @@ def test_spread_resolution_is_zero_when_the_interval_collapses() -> None:
     assert s.spread_pct == 499.0
     assert s.resolution_pct == 0.0
     assert s.resolves(Percent(0.5))
+    # A collapsed floor at nominal coverage admits any delta above it, and a zero
+    # delta is not above zero.
+    least = Spread.of(us(*[100.0] * MIN_RESOLVING_SAMPLES))
+    assert least.resolution_pct == 0.0
+    assert least.coverage_pct >= CONFIDENCE_PCT
+    assert least.resolves(Percent(0.01))
+    assert not least.resolves(Percent(0.0))
 
 
-def test_spread_of_one_sample_has_no_spread() -> None:
-    s = Spread.of(us(7.0))
-    assert s.median_duration_us == 7.0
-    assert s.min_duration_us == 7.0
-    assert s.max_duration_us == 7.0
-    assert s.spread_pct == 0.0
-    assert s.resolution_pct == 0.0
-    assert s.sample_count == 1
-    assert s.samples_duration_us == (7.0,)
+def test_spread_below_the_minimum_sample_count_resolves_nothing() -> None:
+    # Identical samples put the floor at zero and the gate still refuses: no
+    # interval over this few samples reaches CONFIDENCE_PCT, so the floor means
+    # nothing and licenses nothing.
+    for count in range(1, MIN_RESOLVING_SAMPLES):
+        s = Spread.of(us(*[100.0] * count))
+        assert s.resolution_pct == 0.0
+        assert s.coverage_pct < CONFIDENCE_PCT
+        assert not s.resolves(Percent(1000.0))
     # One sample bounds nothing, and a zero floor at zero coverage must not read
     # as a perfectly resolved measurement.
-    assert s.coverage_pct == 0.0
-    assert not s.resolves(Percent(1000.0))
+    one = Spread.of(us(7.0))
+    assert one.median_duration_us == 7.0
+    assert one.min_duration_us == 7.0
+    assert one.max_duration_us == 7.0
+    assert one.spread_pct == 0.0
+    assert one.sample_count == 1
+    assert one.samples_duration_us == (7.0,)
+    assert one.coverage_pct == 0.0
 
 
-def test_spread_of_rejects_no_samples() -> None:
-    empty: list[Microseconds] = []
-    with pytest.raises(ValueError, match="needs at least one sample"):
-        Spread.of(empty)
-
-
-def test_spread_of_identical_zero_samples_has_no_spread() -> None:
+def test_spread_of_a_zero_median() -> None:
     # A measurement that rounds to zero is still a measurement, and identical
     # samples span nothing, so both statistics are zero rather than undefined.
     s = Spread.of(us(0.0, 0.0))
@@ -815,37 +705,9 @@ def test_spread_of_identical_zero_samples_has_no_spread() -> None:
     assert s.spread_pct == 0.0
     assert s.resolution_pct == 0.0
     assert s.sample_count == 2
-
-
-def test_spread_of_rejects_a_zero_median_under_a_nonzero_span() -> None:
     # Samples that differ need a denominator, and a zero median is not one.
     with pytest.raises(ValueError, match="percent of zero is undefined"):
         Spread.of(us(0.0, 0.0, 1.0))
-
-
-def test_resolves_compares_the_delta_against_the_resolution_floor() -> None:
-    s = Spread.of(us(*([1.0] + [98.0] * 5 + [100.0] * 8 + [102.0] * 5 + [1000.0])))
-    assert s.resolution_pct == 2.0
-    # The floor decides, not the range: a 3 percent claim resolves against a 999
-    # percent range because the outliers lie outside the interval.
-    assert s.spread_pct == 999.0
-    assert s.resolves(Percent(3.0))
-    assert not s.resolves(Percent(2.0))
-    assert not s.resolves(Percent(1.0))
-    # Magnitude decides, so a regression resolves on the same threshold.
-    assert s.resolves(Percent(-3.0))
-    assert not s.resolves(Percent(-1.0))
-
-
-@pytest.mark.parametrize("count", range(1, MIN_RESOLVING_SAMPLES))
-def test_resolves_is_false_below_the_minimum_sample_count(count: int) -> None:
-    # Identical samples put the floor at zero and the gate still refuses: no
-    # interval over this few samples reaches CONFIDENCE_PCT, so the floor means
-    # nothing and licenses nothing.
-    s = Spread.of(us(*[100.0] * count))
-    assert s.resolution_pct == 0.0
-    assert s.coverage_pct < CONFIDENCE_PCT
-    assert not s.resolves(Percent(1000.0))
 
 
 def test_resolves_gates_on_the_coverage_and_not_on_the_sample_count() -> None:
@@ -864,23 +726,3 @@ def test_resolves_gates_on_the_coverage_and_not_on_the_sample_count() -> None:
     )
     assert thin.sample_count > MIN_RESOLVING_SAMPLES
     assert not thin.resolves(Percent(50.0))
-
-
-def test_a_sub_nominal_floor_carries_the_coverage_it_actually_has() -> None:
-    # The floor still prints below the minimum, because suppressing it would hide
-    # how wide the measurement was. It prints beside the coverage that says the
-    # nominal figure was not reached, and it licenses nothing.
-    s = Spread.of(us(99.0, 100.0, 101.0))
-    assert s.resolution_pct == 1.0
-    assert s.coverage_pct == 75.0
-    assert s.coverage_pct < CONFIDENCE_PCT
-    assert not s.resolves(Percent(50.0))
-
-
-def test_resolves_admits_a_delta_above_a_collapsed_floor_at_the_minimum() -> None:
-    s = Spread.of(us(*[100.0] * MIN_RESOLVING_SAMPLES))
-    assert s.resolution_pct == 0.0
-    assert s.coverage_pct >= CONFIDENCE_PCT
-    assert s.resolves(Percent(0.01))
-    # A zero delta is not larger than a zero floor.
-    assert not s.resolves(Percent(0.0))

@@ -58,9 +58,6 @@ def test_profile_command() -> None:
         "--iters",
         "8",
     ]
-
-
-def test_profile_command_overrides() -> None:
     got = nsys_profile_command(
         TARGET, Path("/tmp/run"), nsys="/opt/nsight/nsys", trace="cuda,nvtx"
     )
@@ -69,9 +66,6 @@ def test_profile_command_overrides() -> None:
     # The target is the tail, immediately after the output path.
     assert got[-len(TARGET) :] == list(TARGET)
     assert got[-len(TARGET) - 2 : -len(TARGET)] == ["-o", "/tmp/run"]
-
-
-def test_profile_command_needs_a_target() -> None:
     with pytest.raises(ValueError, match="nsys needs a target command"):
         nsys_profile_command((), Path("out/profile-op"))
 
@@ -87,9 +81,6 @@ def test_stats_command() -> None:
         "--force-export=true",
         "out/profile-op.nsys-rep",
     ]
-
-
-def test_stats_command_overrides() -> None:
     got = nsys_stats_command(
         Path("out/run.nsys-rep"), nsys="/opt/nsight/nsys", name="cuda_gpu_kern_sum"
     )
@@ -107,9 +98,8 @@ def test_stats_command_overrides() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("column", "want"),
-    [
+def test_duration_scale_ns_reads_the_header_parenthetical() -> None:
+    for column, want in (
         ("Duration (ns)", 1.0),
         ("Duration (nsec)", 1.0),
         ("Duration (NS)", 1.0),
@@ -122,16 +112,11 @@ def test_stats_command_overrides() -> None:
         ("Duration (msec)", 1e6),
         ("Duration (s)", 1e9),
         ("Duration (sec)", 1e9),
-    ],
-)
-def test_duration_scale_ns(column: str, want: float) -> None:
-    assert duration_scale_ns(column) == want
-
-
-@pytest.mark.parametrize("column", ["Duration", "Duration ()", "Duration (fortnight)"])
-def test_duration_scale_ns_rejects(column: str) -> None:
-    with pytest.raises(ValueError, match="carries no recognized duration unit"):
-        duration_scale_ns(column)
+    ):
+        assert duration_scale_ns(column) == want
+    for column in ("Duration", "Duration ()", "Duration (fortnight)"):
+        with pytest.raises(ValueError, match="carries no recognized duration unit"):
+            duration_scale_ns(column)
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +200,12 @@ def test_parse_gpu_trace_splits_the_work_kinds() -> None:
     assert trace.memcpy_count == 2
     assert trace.memset_count == 1
     assert trace.device_sum_duration_us == pytest.approx(93.76)
+    # Longest first, and no copy or fill among them.
     assert [k.kernel for k in trace.kernels] == [CHUNK, CPASYNC]
+    assert [k.duration_us for k in trace.kernels] == sorted(
+        (k.duration_us for k in trace.kernels), reverse=True
+    )
+    assert all(not k.kernel.startswith("[CUDA") for k in trace.kernels)
 
 
 def test_parse_gpu_trace_sums_the_launches_of_one_kernel() -> None:
@@ -237,22 +227,15 @@ def test_parse_gpu_trace_sums_the_launches_of_one_kernel() -> None:
     assert trace.kernel(CPASYNC).share_pct == pytest.approx(100.0 * 3.2 / 93.76)
 
 
-def test_parse_gpu_trace_orders_kernels_by_descending_duration() -> None:
-    got = parse_gpu_trace(GPU_TRACE_CSV).kernels
-    assert [k.duration_us for k in got] == sorted(
-        (k.duration_us for k in got), reverse=True
+def test_parse_gpu_trace_reads_the_duration_cell_as_nsys_wrote_it() -> None:
+    # A microsecond column read as nanoseconds is a 1000x error in every duration,
+    # and a grouped cell parsed with its separators is not a number at all.
+    assert parse_gpu_trace(MICROSECOND_CSV).kernel(CHUNK).duration_us == pytest.approx(
+        41.28
     )
-    assert all(not k.kernel.startswith("[CUDA") for k in got)
-
-
-def test_parse_gpu_trace_reads_a_microsecond_column() -> None:
-    trace = parse_gpu_trace(MICROSECOND_CSV)
-    assert trace.kernel(CHUNK).duration_us == pytest.approx(41.28)
-
-
-def test_parse_gpu_trace_strips_thousands_separators() -> None:
-    trace = parse_gpu_trace(GROUPED_CSV)
-    assert trace.kernel(CHUNK).duration_us == pytest.approx(1048.576)
+    assert parse_gpu_trace(GROUPED_CSV).kernel(CHUNK).duration_us == pytest.approx(
+        1048.576
+    )
 
 
 def test_parse_gpu_trace_drops_unusable_rows() -> None:
@@ -269,22 +252,13 @@ def test_parse_gpu_trace_without_a_kernel() -> None:
     assert trace.device_sum_duration_us == pytest.approx(2.56)
 
 
-def test_parse_gpu_trace_needs_a_header() -> None:
+def test_parse_gpu_trace_rejects_output_it_cannot_read() -> None:
     with pytest.raises(ValueError, match="no cuda_gpu_trace header in nsys output"):
         parse_gpu_trace(NO_HEADER_CSV, label="so3ssd fwd")
-
-
-def test_parse_gpu_trace_needs_a_duration_column() -> None:
     with pytest.raises(ValueError, match="no 'duration' column"):
         parse_gpu_trace(NO_DURATION_COLUMN_CSV)
-
-
-def test_parse_gpu_trace_needs_a_name_column() -> None:
     with pytest.raises(ValueError, match="no 'name' column"):
         parse_gpu_trace(NO_NAME_COLUMN_CSV)
-
-
-def test_parse_gpu_trace_rejects_an_empty_window() -> None:
     # No device work means the capture range never opened. That is a broken run,
     # not a fast one.
     with pytest.raises(ValueError, match="the capture range never opened"):
@@ -380,7 +354,7 @@ def test_run_nsys_appends_the_suffix_to_a_dotted_base(
     assert fake.commands[1][-1] == trace.report_path
 
 
-def test_run_nsys_raises_on_a_failed_profile(
+def test_run_nsys_raises_on_either_failed_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     fake = FakeRun((3, "", DIAGNOSTIC))
@@ -393,23 +367,16 @@ def test_run_nsys_raises_on_a_failed_profile(
     assert "diagnostic 04" in message
     assert "diagnostic 03" not in message  # the tail is the last twelve lines
     assert len(fake.commands) == 1  # the stats command never ran
-
-
-def test_run_nsys_raises_on_failed_stats(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    fake = FakeRun((0, PROFILE_LOG, ""), (4, "", "** ERROR: report file not found"))
-    monkeypatch.setattr(subprocess, "run", fake)
-    with pytest.raises(RuntimeError) as caught:
+    # A profile that ran and a stats export that failed is the other failure, and
+    # it names the command that failed rather than the pair.
+    stats = FakeRun((0, PROFILE_LOG, ""), (4, "", "** ERROR: report file not found"))
+    monkeypatch.setattr(subprocess, "run", stats)
+    with pytest.raises(RuntimeError) as failed:
         run_nsys(TARGET, tmp_path / "profile-op")
-    assert "stats exited 4" in str(caught.value)
-    assert "report file not found" in str(caught.value)
-    assert len(fake.commands) == 2
-
-
-def test_run_nsys_falls_back_to_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+    assert "stats exited 4" in str(failed.value)
+    assert "report file not found" in str(failed.value)
+    assert len(stats.commands) == 2
+    # nsys prints some diagnostics on stdout, so an empty stderr falls back to it.
     monkeypatch.setattr(
         subprocess, "run", FakeRun((1, "** ERROR: no CUDA device present", ""))
     )

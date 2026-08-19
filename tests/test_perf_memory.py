@@ -40,18 +40,6 @@ def _saved(saved_bytes: int) -> SavedStorages:
     )
 
 
-def _probe_two_views() -> SavedStorages:
-    """Probe a graph that saves two views of one buffer, several times each."""
-    buf = torch.randn(8, requires_grad=True)
-    lo = buf[:4]
-    hi = buf[4:]
-    probe = SavedTensorProbe()
-    with probe:
-        out = (lo * lo).sum() + (hi * hi).sum()
-    assert out.requires_grad
-    return probe.report("two views", inputs=(buf,))
-
-
 # ---------------------------------------------------------------------------
 # SavedTensorProbe
 # ---------------------------------------------------------------------------
@@ -70,43 +58,33 @@ def test_probe_splits_input_bytes_from_derived_bytes() -> None:
     assert saved.input_bytes == 4 * FLOAT32_BYTES
     assert saved.derived_bytes == 4 * FLOAT32_BYTES
     assert saved.saved_bytes == saved.input_bytes + saved.derived_bytes
-
-
-def test_probe_with_no_declared_inputs_calls_everything_derived() -> None:
-    x = torch.randn(4, requires_grad=True)
-    probe = SavedTensorProbe()
-    with probe:
-        out = (x * x).sum()
-    assert out.requires_grad
-    saved = probe.report("undeclared")
-    assert saved.input_bytes == 0
-    assert saved.derived_bytes == saved.saved_bytes
-    assert saved.saved_bytes == 4 * FLOAT32_BYTES
-
-
-def test_probe_observes_without_changing_the_graph() -> None:
-    x = torch.randn(4, requires_grad=True)
-    probe = SavedTensorProbe()
-    with probe:
-        out = (x * x).sum()
+    # Declaring no input makes the same saved set wholly derived.
+    bare = probe.report("undeclared")
+    assert bare.saved_bytes == saved.saved_bytes
+    assert bare.input_bytes == 0
+    assert bare.derived_bytes == bare.saved_bytes
+    # The hooks pass the tensor through, so the backward is the one the graph
+    # would have run unprobed.
     out.backward()
     assert x.grad is not None
-    assert torch.allclose(x.grad, 2.0 * x.detach())
+    assert torch.allclose(x.grad, (1.0 + x.detach()) * x.detach().exp())
 
 
 def test_probe_dedupes_by_storage_identity() -> None:
     # Two views of one buffer are one storage, so they cost one buffer.
-    saved = _probe_two_views()
+    buf = torch.randn(8, requires_grad=True)
+    lo = buf[:4]
+    hi = buf[4:]
+    probe = SavedTensorProbe()
+    with probe:
+        out = (lo * lo).sum() + (hi * hi).sum()
+    assert out.requires_grad
+    saved = probe.report("two views", inputs=(buf,))
     assert saved.storage_count == 1
     assert saved.saved_bytes == 8 * FLOAT32_BYTES
     assert saved.input_bytes == 8 * FLOAT32_BYTES
     assert saved.derived_bytes == 0
-
-
-def test_save_event_count_exceeds_storage_count() -> None:
-    # One buffer saved by several nodes: the events count each save, the storages
-    # count the buffer once.
-    saved = _probe_two_views()
+    # The events count each save of that one buffer, the storages count it once.
     assert saved.save_event_count > saved.storage_count
 
 
@@ -129,26 +107,24 @@ def test_probe_attributes_saves_to_the_open_region() -> None:
 
 def test_probe_labels_saves_outside_a_region_unattributed() -> None:
     # A blank label prints as a blank table cell, which reads as a bug in the
-    # table rather than as a save taken outside every region.
+    # table rather than as a save taken outside every region. Both ways of having
+    # no region are covered: no recorder at all, and a recorder with nothing open.
     x = torch.randn(4, requires_grad=True)
-    probe = SavedTensorProbe()
-    with probe:
+    bare = SavedTensorProbe()
+    with bare:
         out = (x * x).sum()
     assert out.requires_grad
-    assert [r.label for r in probe.report("bare").regions] == [UNATTRIBUTED]
+    assert [r.label for r in bare.report("bare").regions] == [UNATTRIBUTED]
 
-
-def test_probe_labels_saves_inside_a_measurement_but_outside_a_region() -> None:
-    x = torch.randn(4, requires_grad=True)
-    probe = SavedTensorProbe()
+    unregioned = SavedTensorProbe()
 
     def body() -> None:
-        with probe:
-            out = (x * x).sum()
-        assert out.requires_grad
+        with unregioned:
+            inner = (x * x).sum()
+        assert inner.requires_grad
 
     measure(body, label="probe", iters=1, warmup=0, device=CPU)
-    assert [r.label for r in probe.report("unregioned").regions] == [UNATTRIBUTED]
+    assert [r.label for r in unregioned.report("unregioned").regions] == [UNATTRIBUTED]
 
 
 def test_probe_reports_nothing_for_an_empty_graph() -> None:
@@ -178,20 +154,13 @@ def test_saved_mib_is_1024_based() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_saved_storage_bytes_counts_aliases_once() -> None:
+def test_saved_storage_bytes_counts_each_storage_once() -> None:
     buf = torch.empty(1024, dtype=torch.float32)
     total = 1024 * FLOAT32_BYTES
     assert saved_storage_bytes([buf]) == total
     assert saved_storage_bytes([buf[:512], buf[512:], buf]) == total
-
-
-def test_saved_storage_bytes_sums_distinct_storages() -> None:
-    a = torch.empty(1024, dtype=torch.float32)
-    b = torch.empty(16, dtype=torch.float32)
-    assert saved_storage_bytes([a, b]) == (1024 + 16) * FLOAT32_BYTES
-
-
-def test_saved_storage_bytes_of_nothing_is_zero() -> None:
+    other = torch.empty(16, dtype=torch.float32)
+    assert saved_storage_bytes([buf, other]) == total + 16 * FLOAT32_BYTES
     assert saved_storage_bytes([]) == 0
 
 
@@ -200,21 +169,15 @@ def test_saved_storage_bytes_of_nothing_is_zero() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_memory_peaks_on_cpu_are_zero() -> None:
+def test_allocator_peaks_on_cpu_are_zero() -> None:
     # The CUDA caching allocator is the only instrumented allocator, so a CPU
-    # device reports zeros rather than a fabricated figure.
+    # device reports zeros rather than a fabricated figure, and the reset is a noop.
     peaks = memory_peaks("cpu window", CPU)
     assert peaks.label == "cpu window"
     assert peaks.peak_allocated_bytes == 0
     assert peaks.peak_reserved_bytes == 0
-
-
-def test_reset_memory_peaks_on_cpu_is_a_noop() -> None:
     reset_memory_peaks(CPU)
     assert memory_peaks("after reset", CPU).peak_allocated_bytes == 0
-
-
-def test_peak_window_on_cpu_fills_the_sink_on_exit() -> None:
     with peak_window("cpu window", CPU) as sink:
         assert sink == []
     assert len(sink) == 1
@@ -232,32 +195,23 @@ def test_peak_window_fills_the_sink_even_when_the_body_raises() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-def test_memory_peaks_on_cuda_read_the_allocator() -> None:
+def test_allocator_peaks_on_cuda_read_and_clear_the_marks() -> None:
     device = torch.device("cuda")
     reset_memory_peaks(device)
-    buf = torch.empty(1 << 20, dtype=torch.float32, device=device)
-    wanted = buf.numel() * buf.element_size()
-    peaks = memory_peaks("cuda window", device)
-    assert peaks.peak_allocated_bytes >= wanted
-    assert peaks.peak_reserved_bytes >= peaks.peak_allocated_bytes
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-def test_reset_memory_peaks_on_cuda_clears_the_marks() -> None:
-    device = torch.device("cuda")
     big = torch.empty(1 << 22, dtype=torch.float32, device=device)
     high = big.numel() * big.element_size()
-    del big
-    before = memory_peaks("before reset", device)
+    before = memory_peaks("cuda window", device)
     assert before.peak_allocated_bytes >= high
+    # Reserved above allocated is fragmentation, and never the other way round.
+    assert before.peak_reserved_bytes >= before.peak_allocated_bytes
+    # The mark survives the free, so it is a high-water mark and not a live total.
+    del big
+    assert memory_peaks("after free", device).peak_allocated_bytes >= high
     reset_memory_peaks(device)
-    after = memory_peaks("after reset", device)
-    assert after.peak_allocated_bytes < before.peak_allocated_bytes
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-def test_peak_window_on_cuda_captures_the_body_high_water_mark() -> None:
-    device = torch.device("cuda")
+    assert (
+        memory_peaks("after reset", device).peak_allocated_bytes
+        < before.peak_allocated_bytes
+    )
     with peak_window("cuda window", device) as sink:
         tmp = torch.empty(1 << 20, dtype=torch.float32, device=device)
         wanted = tmp.numel() * tmp.element_size()
