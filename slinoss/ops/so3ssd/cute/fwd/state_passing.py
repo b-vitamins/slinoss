@@ -50,7 +50,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss._cute import dev_tensor
+from slinoss._cute import dev_tensor, jit_launch
 from slinoss.ops.so3ssd.cute.common import THREADS, mat3_matvec, rot_hom
 from slinoss.ops.so3ssd.cute.guard import Named, check_layout, check_pinned
 
@@ -229,17 +229,19 @@ def state_passing_forward(
     # that owns 3-vector v owns exactly elements 3v..3v+2 of it. No index
     # arithmetic, and a warp covers 384 contiguous bytes.
     tiles = rows * dim // 3 // THREADS
-    state_passing_fwd(
-        dev_tensor(inc.view(bsz, heads, chunks, rows * dim)),
-        dev_tensor(cquat),
-        dev_tensor(cscale),
-        dev_tensor(start.view(bsz, heads, rows * dim)),
-        dev_tensor(state.view(bsz, heads, rows * dim)),
-        chunks,
-        tiles,
-        bsz,
-        heads,
-        THREADS,
-        z0 is not None,
+    jit_launch(
+        state_passing_fwd,
+        (
+            dev_tensor(inc.view(bsz, heads, chunks, rows * dim)),
+            dev_tensor(cquat),
+            dev_tensor(cscale),
+            dev_tensor(start.view(bsz, heads, rows * dim)),
+            dev_tensor(state.view(bsz, heads, rows * dim)),
+            chunks,
+            tiles,
+            bsz,
+            heads,
+        ),
+        (THREADS, z0 is not None),
     )
     return StatePassing(zstart=inc, state=state)

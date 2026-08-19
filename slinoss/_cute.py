@@ -22,8 +22,8 @@ it.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
-from typing import NamedTuple
+from collections.abc import Callable, Hashable, Iterable, Sequence
+from typing import Any, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -40,7 +40,9 @@ __all__ = [
     "cute_dtype",
     "decay",
     "dev_tensor",
+    "executor_count",
     "f32",
+    "jit_launch",
     "narrow",
     "select",
     "shuffle_up",
@@ -108,6 +110,57 @@ def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(
         leading_dim=tensor.ndim - 1
     )
+
+
+# ---------------------------------------------------------------------------
+# Compiled launch
+# ---------------------------------------------------------------------------
+
+_EXECUTORS: dict[Hashable, Any] = {}
+
+
+def executor_count() -> int:
+    """Number of compiled executors held. For tests that assert cache reuse."""
+    return len(_EXECUTORS)
+
+
+def jit_launch(
+    fn: Callable[..., None],
+    dynamic: Sequence[Any],
+    static: tuple[Hashable, ...],
+) -> None:
+    """Launch a ``@cute.jit`` entry point through a cached executor.
+
+    Calling a ``@cute.jit`` function retraces it. The trace is not the kernel
+    compile -- that is cached by the DSL -- so it is paid on every call and it
+    dominates everything the kernel does. Measured on sm_86 at the standard
+    shape: 316 ms per direct call of the chunk increment against 0.126 ms
+    through the executor, over a kernel whose DRAM floor is tens of
+    microseconds. ``cute.compile`` traces once and returns a callable that takes
+    the dynamic arguments alone.
+
+    ``static`` is the trailing run of :class:`cutlass.Constexpr` parameters. It
+    is the cache key, so it must name every property that shapes the generated
+    code. That holds because :func:`dev_tensor` marks every layout dynamic
+    except the leading mode: a tensor argument contributes its element type,
+    its rank, and nothing else, and the element type and every constrained
+    extent are already declared static by the entry points.
+
+    Args:
+        fn: The ``@cute.jit`` launcher.
+        dynamic: Its leading run of runtime arguments, tensors and scalars.
+        static: Its trailing run of compile-time arguments, in order.
+
+    Raises:
+        TypeError: If ``static`` holds an unhashable value, which would mean a
+            compile-time argument that cannot key the cache.
+    """
+    key = (fn, static, torch.cuda.current_device())
+    executor = _EXECUTORS.get(key)
+    if executor is None:
+        executor = cute.compile(fn, *dynamic, *static)
+        _EXECUTORS[key] = executor
+    executor(*dynamic)
 
 
 # ---------------------------------------------------------------------------

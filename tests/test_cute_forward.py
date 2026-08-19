@@ -20,6 +20,7 @@ pytest.importorskip("cutlass.cute", reason="CuTe DSL not installed")
 if not torch.cuda.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
 
+from slinoss._cute import executor_count
 from slinoss.ops.so3ssd import SO3SSDResult, resolve, so3ssd, so3ssd_ref
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
@@ -188,6 +189,36 @@ def test_the_streaming_split_reproduces_the_whole_sequence() -> None:
     bound = BOUNDS[torch.bfloat16]
     assert_max_rel(joined, whole.y, bound, "cute-split.y")
     assert_max_rel(tail.state, whole.state, bound, "cute-split.state")
+
+
+# ---------------------------------------------------------------------------
+# Compiled launch
+# ---------------------------------------------------------------------------
+
+
+def test_one_executor_per_kernel_serves_every_batch_head_and_length() -> None:
+    """The shape is not in the executor cache key, and the chunk length is.
+
+    ``dev_tensor`` marks every layout dynamic but the leading mode, so a tensor
+    argument contributes its element type and its rank and nothing else. If the
+    extents entered the key instead, a variable sequence length would retrace
+    the host function on every call, and the trace is milliseconds against a
+    kernel that is microseconds.
+
+    The second half is the other side of the same claim: a compile-time argument
+    must key the cache, or a second chunk length would silently run the first
+    one's code.
+    """
+    warm = _make(2, 2, 128, 48, 16, False, torch.bfloat16)
+    so3ssd(*warm.args(), 64, backend="cute")
+    before = executor_count()
+
+    other = _make(1, 3, 320, 48, 16, False, torch.bfloat16)
+    so3ssd(*other.args(), 64, backend="cute")
+    assert executor_count() == before
+
+    so3ssd(*warm.args(), 32, backend="cute")
+    assert executor_count() > before
 
 
 # ---------------------------------------------------------------------------

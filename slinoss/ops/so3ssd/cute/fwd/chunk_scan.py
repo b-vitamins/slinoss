@@ -59,6 +59,7 @@ from slinoss._cute import (
     cute_dtype,
     decay,
     dev_tensor,
+    jit_launch,
     narrow,
     select,
     smem_bytes,
@@ -524,25 +525,23 @@ def chunk_scan_forward(
     # would read it is closed at compile time.
     ustream = U[:, :, 0] if u_prev is None else u_prev
     bstream = B[:, :, 0] if b_prev is None else b_prev
-    chunk_scan_fwd(
-        dev_tensor(U),
-        dev_tensor(trans),
-        dev_tensor(K),
-        dev_tensor(B),
-        dev_tensor(C),
-        dev_tensor(zstart),
-        dev_tensor(ustream),
-        dev_tensor(bstream),
-        dev_tensor(Y),
-        seqlen,
-        chunks,
-        bsz,
-        heads,
-        cute_dtype(dtype),
-        THREADS,
-        chunk_size,
-        rows,
-        dim,
-        has_prev,
+    jit_launch(
+        chunk_scan_fwd,
+        (
+            dev_tensor(U),
+            dev_tensor(trans),
+            dev_tensor(K),
+            dev_tensor(B),
+            dev_tensor(C),
+            dev_tensor(zstart),
+            dev_tensor(ustream),
+            dev_tensor(bstream),
+            dev_tensor(Y),
+            seqlen,
+            chunks,
+            bsz,
+            heads,
+        ),
+        (cute_dtype(dtype), THREADS, chunk_size, rows, dim, has_prev),
     )
     return Y
