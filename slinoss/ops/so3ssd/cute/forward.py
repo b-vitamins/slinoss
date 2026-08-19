@@ -9,11 +9,12 @@ Three launches, in order:
 3. ``chunk_scan_fwd`` -- every token's output, from the chunk-local score matrix and
    the chunk start state.
 
-Nothing between the launches. No reshape, no cast, no zero fill, no staging copy:
-each kernel writes the layout the next one reads, and the increment buffer is reused
-as the start-state buffer rather than allocated twice. A step that appeared here
-would be glue on the hot path, and glue on the hot path is the defect this file
-exists to make visible.
+Nothing between the launches and nothing after them. No reshape, no cast, no zero
+fill, no staging copy: each kernel writes the layout the next one reads, the
+increment buffer is reused as the start-state buffer rather than allocated twice,
+and the segment carry-out is written by the increment kernel rather than sliced out
+of the inputs here. A step that appeared here would be glue on the hot path, and
+glue on the hot path is the defect this file exists to make visible.
 
 The chunk-local prefixes do not appear here either. Each kernel recomputes them from
 ``trans``, so they never reach global memory and the three kernels cannot disagree
@@ -90,11 +91,9 @@ def so3ssd_fwd_cute(
         u_prev=u_prev,
         b_prev=b_prev,
     )
-    # The last token, not the last chunk slot: a ragged tail pads the chunk, and a
-    # padded token is a no-op whose b and u are zero rather than the carry.
     return SO3SSDResult(
         y=y,
         state=passing.state,
-        b_last=B[:, :, -1].contiguous(),
-        u_last=U[:, :, -1].contiguous(),
+        b_last=increment.b_last,
+        u_last=increment.u_last,
     )

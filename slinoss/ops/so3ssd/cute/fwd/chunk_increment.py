@@ -51,6 +51,11 @@ which is why the padded M mode costs nothing measurable.
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so both tap matrices are zero past ``valid`` and every
 padded row of the ``b`` tile is zero regardless of what ``u`` holds.
+
+Carry-out. The block holding the last real token also copies ``b`` and ``u`` at
+that token to the segment carry-out. This kernel consumes the carry-in, so it
+emits the carry-out; slicing it on the host is two copy launches on a path whose
+kernels are otherwise back to back.
 """
 
 from typing import NamedTuple
@@ -198,6 +203,8 @@ def chunk_increment_fwd_kernel(
     ginc: cute.Tensor,
     gcquat: cute.Tensor,
     gcscale: cute.Tensor,
+    gblast: cute.Tensor,
+    gulast: cute.Tensor,
     seqlen: cutlass.Int32,
     tiled_mma: cute.TiledMma,
     threads: cutlass.Constexpr,
@@ -209,7 +216,8 @@ def chunk_increment_fwd_kernel(
 ) -> None:
     """Accumulate one chunk's local increment and emit its transition.
 
-    One block per ``(chunk, batch, head)``.
+    One block per ``(chunk, batch, head)``. The block holding token ``T-1`` also
+    emits the segment carry-out.
 
     Args:
         gu: ``(B,H,T,P)`` operand-dtype input weights.
@@ -221,6 +229,10 @@ def chunk_increment_fwd_kernel(
         ginc: ``(B,H,C,P,3N)`` float32, written with the chunk-local increment.
         gcquat: ``(B,H,C,4)`` float32, written with the unit chunk rotation.
         gcscale: ``(B,H,C)`` float32, written with ``exp(2*lp_{L-1})``.
+        gblast: ``(B,G,3N)`` operand-dtype, written with ``b`` at token ``T-1`` by
+            the block that holds it.
+        gulast: ``(B,H,P)`` operand-dtype, written with ``u`` at token ``T-1`` by
+            the block that holds it.
         seqlen: ``T``. Dynamic.
         tiled_mma: From :func:`make_mma`.
         threads: Block width. Compile-time.
@@ -269,6 +281,27 @@ def chunk_increment_fwd_kernel(
 
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
+
+    # The segment carry-out, from the one block that holds the last real token:
+    # ``t0 + valid == seqlen`` only there, since every earlier block is full. The
+    # index is ``seqlen - 1`` and not the last chunk slot, because a ragged tail
+    # pads the chunk and a padded token is a no-op whose b and u are zero.
+    # Emitted here rather than sliced on the host, where it would be two copy
+    # launches between kernels that are otherwise back to back. Ahead of the
+    # staging, so the loads issue while shared memory fills.
+    if t0 + valid == seqlen:
+        tlast = seqlen - 1
+        for step in cutlass.range_constexpr((rows + threads - 1) // threads):
+            p = tid + step * threads
+            if p < rows:
+                gulast[bidx, hidx, p] = gu[bidx, hidx, tlast, p]
+        # One writer per group, or every head in a group would write the same row.
+        # The compare folds away at ``G == H``, where ``gidx`` is ``hidx``.
+        if hidx == gidx * per_group:
+            for step in cutlass.range_constexpr((dim + threads - 1) // threads):
+                d = tid + step * threads
+                if d < dim:
+                    gblast[bidx, gidx, d] = gb[bidx, gidx, tlast, d]
 
     stage_chunk(
         gtrans[bidx, hidx, None, None],
@@ -395,6 +428,8 @@ def chunk_increment_fwd(
     ginc: cute.Tensor,
     gcquat: cute.Tensor,
     gcscale: cute.Tensor,
+    gblast: cute.Tensor,
+    gulast: cute.Tensor,
     seqlen: cutlass.Int32,
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
@@ -423,6 +458,8 @@ def chunk_increment_fwd(
         ginc,
         gcquat,
         gcscale,
+        gblast,
+        gulast,
         seqlen,
         make_mma(dtype),
         threads,
@@ -443,11 +480,15 @@ class ChunkIncrement(NamedTuple):
             which consumes it in place.
         cquat: ``(B,H,C,4)`` float32 unit chunk rotation, scalar-first.
         cscale: ``(B,H,C)`` float32 chunk decay ``exp(2*lp_{L-1})``.
+        b_last: ``(B,G,3N)`` ``b`` at token ``T-1``, the dtype of ``B``, contiguous.
+        u_last: ``(B,H,P)`` ``u`` at token ``T-1``, the dtype of ``U``, contiguous.
     """
 
     inc: Tensor
     cquat: Tensor
     cscale: Tensor
+    b_last: Tensor
+    u_last: Tensor
 
 
 def chunk_increment_forward(
@@ -460,7 +501,7 @@ def chunk_increment_forward(
     u_prev: Tensor | None = None,
     b_prev: Tensor | None = None,
 ) -> ChunkIncrement:
-    """Accumulate every chunk's local increment and its transition.
+    """Accumulate every chunk's local increment, its transition, and the carry-out.
 
     Args:
         U: ``(B,H,T,P)``, one of
@@ -503,6 +544,8 @@ def chunk_increment_forward(
     inc = torch.empty(bsz, heads, chunks, rows, dim, **opts)
     cquat = torch.empty(bsz, heads, chunks, 4, **opts)
     cscale = torch.empty(bsz, heads, chunks, **opts)
+    b_last = torch.empty(bsz, groups, dim, dtype=dtype, device=U.device)
+    u_last = torch.empty(bsz, heads, rows, dtype=dtype, device=U.device)
 
     # A placeholder keeps one launch signature. It is never read: the branch that
     # would read it is closed at compile time.
@@ -520,6 +563,8 @@ def chunk_increment_forward(
             inc,
             cquat,
             cscale,
+            b_last,
+            u_last,
             seqlen,
             chunks,
             bsz,
@@ -535,4 +580,6 @@ def chunk_increment_forward(
             has_prev,
         ),
     )
-    return ChunkIncrement(inc=inc, cquat=cquat, cscale=cscale)
+    return ChunkIncrement(
+        inc=inc, cquat=cquat, cscale=cscale, b_last=b_last, u_last=u_last
+    )
