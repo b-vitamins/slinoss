@@ -19,6 +19,11 @@ import torch
 from torch import Tensor
 
 from slinoss.ops.so3ssd import (
+    ChunkedBackward,
+    as_lanes,
+    chunk_pad,
+    chunked_backward,
+    chunked_forward,
     quat_exp,
     quat_exp_vjp,
     quat_prefix_scan,
@@ -320,3 +325,140 @@ def test_matches_oracle_on_device(device: torch.device) -> None:
         _oracle(ref, cotangents),
         f"analytic on {device.type}",
     )
+
+
+# ---------------------------------------------------------------------------
+# The named intermediates
+# ---------------------------------------------------------------------------
+#
+# These are the quantities the backward's stages hand to each other, and each is
+# the standard a separate kernel is held to. So each is checked against autograd
+# through the primal that defines it, not against the assembled gradients: a term
+# that is only ever seen inside a correct total can be wrong in a way that another
+# term cancels, and the kernel that produces it alone would then have no standard
+# at all.
+
+
+def _parts(inp: ScanInputs, cot: Optionals, chunk: int) -> ChunkedBackward:
+    return chunked_backward(*cot, *inp.args(), chunk, **inp.kw())
+
+
+def _rebuild_starts(
+    rot: Tensor, scale: Tensor, inc: Tensor, first: Tensor
+) -> tuple[Tensor, Tensor]:
+    """The inter-chunk recurrence, forward, as ``chunked_forward`` runs it.
+
+    Args:
+        rot: Each chunk's closing rotation, ``(B,H,C,3,3)``.
+        scale: Each chunk's closing scale, ``(B,H,C)``.
+        inc: Each chunk's increment in the outer frame, ``(B,H,C,P,N,3)``.
+        first: The state entering chunk 0, ``(B,H,P,N,3)``.
+
+    Returns:
+        The per-chunk start states and the state after the last chunk.
+    """
+    starts = []
+    state = first
+    for c in range(int(inc.shape[2])):
+        starts.append(state)
+        state = (
+            scale[:, :, c, None, None, None]
+            * torch.einsum("bhij,bhpnj->bhpni", rot[:, :, c], state)
+            + inc[:, :, c]
+        )
+    return torch.stack(starts, dim=2), state
+
+
+@pytest.mark.parametrize(("seqlen", "chunk"), [(16, 16), (48, 16), (40, 16)])
+def test_reverse_recurrence_cotangents_match_autograd(seqlen: int, chunk: int) -> None:
+    """The four outputs of the reverse chunk recurrence, at one chunk, three, and
+    a ragged tail.
+
+    Autograd runs through the forward recurrence rebuilt from the forward's own
+    operands, so the standard is the primal and not a second derivation of its
+    adjoint. The rebuild is asserted to reproduce ``zstart`` and ``state`` before
+    it is differentiated; otherwise an error in the rebuild would quietly redefine
+    what the cotangents are compared against.
+
+    ``dchunk_scale`` is a partial: the closing scale also reaches the output
+    through the increment weight, and that path is part of ``dlogp`` instead. The
+    rebuilt recurrence takes the scale as an independent operand, which is what
+    isolates the one share this field carries.
+    """
+    ref, fast = _pair(seqlen=seqlen, seed=193 + seqlen)
+    cot = _cotangents(ref, 197)
+    parts = _parts(fast, cot, chunk)
+    fw = chunked_forward(*fast.args(), chunk, **fast.kw())
+
+    # The closing rotation and scale of each chunk, as the recurrence reads them.
+    rot = fw.table.rot[..., -1, :, :].clone().requires_grad_(True)
+    scale = torch.exp(2.0 * fw.lprefix[..., -1]).clone().requires_grad_(True)
+    local = as_lanes(fw.inc_local).clone().requires_grad_(True)
+    first = fw.zstart[:, :, 0].clone().requires_grad_(True)
+    # inc is built inside the graph, not taken as a leaf: the closing rotation
+    # reaches the output through the frame change as well as the recurrence, and
+    # dchunk_rot carries both shares.
+    inc = torch.einsum("bhcij,bhcpnj->bhcpni", rot, local)
+    starts, state = _rebuild_starts(rot, scale, inc, first)
+    assert_max_rel(starts, fw.zstart, 1e-15, "rebuilt zstart")
+    assert_max_rel(state, fw.state, 1e-15, "rebuilt state")
+
+    loss = (as_lanes(parts.dzstart) * starts).sum() + (as_lanes(cot[1]) * state).sum()
+    g_rot, g_scale, g_inc, g_first = torch.autograd.grad(loss, (rot, scale, inc, first))
+    assert_max_rel(parts.dinc, g_inc.flatten(-2, -1), BWD_REL, "dinc")
+    assert_max_rel(parts.dz0, g_first.flatten(-2, -1), BWD_REL, "dz0")
+    assert_max_rel(parts.dchunk_rot, g_rot, BWD_REL, "dchunk_rot")
+    assert_max_rel(parts.dchunk_scale, g_scale, BWD_REL, "dchunk_scale")
+
+
+def test_dzstart_carries_the_offset_term_only() -> None:
+    """``dzstart`` is what the readout contributes to each chunk's start state.
+
+    The recurrence's share arrives afterwards, so differentiating the whole output
+    would accept the total here and leave the reverse scan with nothing to add.
+    """
+    ref, fast = _pair(seqlen=40, seed=199)
+    cot = _cotangents(ref, 211)
+    parts = _parts(fast, cot, 16)
+    fw = chunked_forward(*ref.args(), 16, **ref.kw())
+    dy_c = chunk_pad(cot[0], fw.length)
+    (want,) = torch.autograd.grad((dy_c * fw.y_off).sum(), fw.zstart)
+    assert_max_rel(parts.dzstart, want.flatten(-2, -1), BWD_REL, "dzstart")
+
+
+def test_dlogp_matches_autograd_and_neither_half_is_empty() -> None:
+    """The log-scale-prefix cotangent, and the split that two stages produce.
+
+    The total is checked against autograd. The two halves sum to it by
+    construction, so what needs checking is that each one is doing work: a split
+    where one side is identically zero is a mislabelled stage, not a free one.
+    """
+    ref, fast = _pair(seqlen=40, seed=229)
+    cot = _cotangents(ref, 233)
+    parts = _parts(fast, cot, 16)
+    fw = chunked_forward(*ref.args(), 16, **ref.kw())
+    # b_last and u_last are slices of the inputs and reach no prefix, so the two
+    # terms here are the whole dependence.
+    loss = (cot[0] * fw.y).sum() + (as_lanes(cot[1]) * fw.state).sum()
+    (want,) = torch.autograd.grad(loss, fw.lprefix)
+    assert_max_rel(parts.dlogp, want, BWD_REL, "dlogp")
+    assert bool(parts.dlogp_scan.any()), "the diagonal and increment half is zero"
+    assert bool(parts.dlogp_off.any()), "the offset and transition half is zero"
+
+
+@pytest.mark.parametrize("groups", [1, 2])
+def test_chunk_zero_carry_is_the_streaming_feedback(groups: int) -> None:
+    """``carry_u[0]`` and ``carry_b[0]`` are ``du_prev`` and ``db_prev``.
+
+    The boundary stage reads one buffer for both jobs, scattering rows 1 onward
+    onto chunk boundaries and handing row 0 back as the streaming gradient, so the
+    two must be the same values and not merely close. Both group counts run
+    because ``carry_b`` is summed over each group's heads and ``carry_u`` is not.
+    """
+    _, fast = _pair(seqlen=40, heads=2, groups=groups, seed=239)
+    dy = torch.randn_like(fast.U)
+    parts = _parts(fast, (dy, None, None, None), 16)
+    assert parts.grads.du_prev is not None and parts.grads.db_prev is not None
+    assert bool(parts.carry_u.any()) and bool(parts.carry_b.any())
+    assert torch.equal(parts.carry_u[:, :, 0], parts.grads.du_prev)
+    assert torch.equal(parts.carry_b[:, :, 0], parts.grads.db_prev)

@@ -9,7 +9,12 @@ from slinoss.ops.so3ssd.backends import (
     register,
     resolve,
 )
-from slinoss.ops.so3ssd.backward import SO3SSDGrads, so3ssd_bwd_ref
+from slinoss.ops.so3ssd.backward import (
+    ChunkedBackward,
+    SO3SSDGrads,
+    chunked_backward,
+    so3ssd_bwd_ref,
+)
 from slinoss.ops.so3ssd.interface import SO3SSDFunction, so3ssd
 from slinoss.ops.so3ssd.reference import (
     ChunkedForward,
@@ -38,6 +43,7 @@ from slinoss.ops.so3ssd.reference import (
 
 __all__ = [
     "Backend",
+    "ChunkedBackward",
     "ChunkedForward",
     "SO3SSDFunction",
     "SO3SSDGrads",
@@ -48,6 +54,7 @@ __all__ = [
     "TransformTable",
     "as_lanes",
     "chunk_pad",
+    "chunked_backward",
     "chunked_forward",
     "get",
     "names",

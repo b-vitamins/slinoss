@@ -36,7 +36,7 @@ from slinoss.ops.so3ssd.reference import (
     tap_matrix_vjp,
 )
 
-__all__ = ["SO3SSDGrads", "so3ssd_bwd_ref"]
+__all__ = ["ChunkedBackward", "SO3SSDGrads", "chunked_backward", "so3ssd_bwd_ref"]
 
 
 class SO3SSDGrads(NamedTuple):
@@ -69,6 +69,65 @@ class SO3SSDGrads(NamedTuple):
     du_prev: Tensor | None
 
 
+class ChunkedBackward(NamedTuple):
+    """The cotangents, and every backward quantity that spans two kernels.
+
+    Produced by :func:`chunked_backward`. The counterpart of
+    :class:`slinoss.ops.so3ssd.reference.ChunkedForward`: the backward does not
+    factor into one pass, so the quantities its stages hand to each other are
+    named here rather than left anonymous inside one function. That makes each
+    stage's parity testable against float64 autograd through the reference
+    instead of against a second hand-derivation of the same algebra.
+
+    Time is chunked: an axis pair ``(C,L)`` replaces ``T``, with the ragged tail
+    zero-padded. Every field is in the pinned working dtype and follows the
+    trailing-``3N`` lane-major layout of the tensor contract, so nothing here
+    needs reshaping to compare against a kernel's buffer.
+
+    ``partial_bc`` has no entry: it is a split-sequence partial sum of ``dB``,
+    an artifact of how wide a reduction one launch covers, and it has no
+    counterpart in the factorization.
+
+    Attributes:
+        grads: The operator's cotangents, the public projection of the rest.
+        dzstart: Cotangent of ``zstart``, ``(B,H,C,P,3N)``. The readout half of
+            each chunk's start state, before the reverse chunk recurrence.
+        dinc: Cotangent of each chunk's increment, ``(B,H,C,P,3N)``. The reverse
+            chunk recurrence carries this.
+        dz0: Cotangent of the initial state, ``(B,H,P,3N)``. The exit value of
+            that recurrence, present whether or not ``z0`` was.
+        dlogp_scan: The part of the log-scale-prefix cotangent that the diagonal
+            and increment terms produce, ``(B,H,C,L)``.
+        dlogp_off: The rest of it: the offset term and the chunk-transition
+            scale, ``(B,H,C,L)``. Where the split falls is a consequence of which
+            stage holds which operand, so both halves are named and neither is
+            derivable from the other.
+        dlogp: The sum of the two, ``(B,H,C,L)``. The reverse cumulative sum of
+            this over the chunk is the log-scale cotangent.
+        dchunk_rot: Cotangent of each chunk's closing rotation matrix,
+            ``(B,H,C,3,3)``, row-major.
+        dchunk_scale: Cotangent of each chunk's closing scale, ``(B,H,C)``.
+        carry_u: The ``u_{t-1}`` cotangent of each chunk's first token,
+            ``(B,H,C,P)``, which belongs to the previous chunk's last token.
+            Index 0 is ``grads.du_prev``.
+        carry_b: The ``b_{t-1}`` cotangent of each chunk's first token,
+            ``(B,G,C,3N)``, summed over each group's heads. Index 0 is
+            ``grads.db_prev``.
+    """
+
+    grads: SO3SSDGrads
+    dzstart: Tensor
+    dinc: Tensor
+    dz0: Tensor
+    dlogp_scan: Tensor
+    dlogp_off: Tensor
+    dlogp: Tensor
+    dchunk_rot: Tensor
+    dchunk_scale: Tensor
+    carry_u: Tensor
+    carry_b: Tensor
+
+
 def _unchunk(t: Tensor, seqlen: int) -> Tensor:
     """``(B,H,C,L,...) -> (B,H,T,...)``, dropping the zero-padded tail."""
     return t.flatten(2, 3)[:, :, :seqlen]
@@ -79,7 +138,7 @@ def _scatter_last(t: Tensor, length: int) -> Tensor:
     return _pad(t[..., None], (length - 1, 0))
 
 
-def so3ssd_bwd_ref(
+def chunked_backward(
     dy: Tensor | None,
     dstate: Tensor | None,
     db_last: Tensor | None,
@@ -94,8 +153,11 @@ def so3ssd_bwd_ref(
     z0: Tensor | None = None,
     b_prev: Tensor | None = None,
     u_prev: Tensor | None = None,
-) -> SO3SSDGrads:
-    """Cotangents of every input of :func:`so3ssd_ref`.
+) -> ChunkedBackward:
+    """Differentiate the chunked factorization and keep every shared quantity.
+
+    Vectorized over ``T``. The only Python loop is over chunks, in reverse, which
+    is the recurrence the backward ``state_passing`` kernel owns.
 
     Args:
         dy: Cotangent of ``y``, shape ``(B,H,T,P)``. ``None`` is zero.
@@ -113,7 +175,7 @@ def so3ssd_bwd_ref(
         u_prev: ``u_{-1}``, shape ``(B,H,P)``.
 
     Returns:
-        A :class:`SO3SSDGrads`.
+        A :class:`ChunkedBackward`.
 
     Raises:
         ValueError: On a shape, contiguity, device, or pairing violation, or a
@@ -145,7 +207,7 @@ def so3ssd_bwd_ref(
         expl = torch.exp(2.0 * fw.lprefix)[..., None]
         gram = torch.einsum("bhclni,bhcpni->bhclp", fw.crot, fw.zstart)
         dgram = dy_c * expl
-        dlp = 2.0 * expl[..., 0] * (dy_c * gram).sum(-1)
+        dlp_off = 2.0 * expl[..., 0] * (dy_c * gram).sum(-1)
         dcrot = torch.einsum("bhclp,bhcpni->bhclni", dgram, fw.zstart)
         dzstart = torch.einsum("bhclp,bhclni->bhcpni", dgram, fw.crot)
 
@@ -159,7 +221,7 @@ def so3ssd_bwd_ref(
         # The strictly upper triangle of dmask is exactly zero, so the cotangent
         # of the exponent is too: the causal mask needs no separate handling.
         dexpo = (dm_now * fw.score_now + dm_prv * fw.score_prv) * fw.dmask
-        dlp = dlp + 2.0 * (dexpo.sum(-1) - dexpo.sum(-2))
+        dlp_scan = 2.0 * (dexpo.sum(-1) - dexpo.sum(-2))
 
         crot_f = fw.crot.flatten(-2, -1)
         bnow_f = fw.bnow.flatten(-2, -1)
@@ -220,10 +282,14 @@ def so3ssd_bwd_ref(
 
         # lp reaches the output through dmask, wgt, chunk_scale, and exp(2*lp).
         # wgt and chunk_scale both differentiate the last token of the chunk.
-        dlp = dlp - 2.0 * dexpw
-        dlp = dlp + _scatter_last(
-            2.0 * (dexpw.sum(-1) + chunk_scale * dchunk_scale), length
-        )
+        # Split by producer: the diagonal and increment terms are one stage's, the
+        # offset and chunk-transition terms another's, and the two stages meet
+        # across a launch. Summing them here in one expression would leave the
+        # first stage's output unnamed and so untestable on its own.
+        dlp_scan = dlp_scan - 2.0 * dexpw
+        dlp_scan = dlp_scan + _scatter_last(2.0 * dexpw.sum(-1), length)
+        dlp_off = dlp_off + _scatter_last(2.0 * chunk_scale * dchunk_scale, length)
+        dlp = dlp_scan + dlp_off
 
         # Rowwise change of basis. The 3x3 operand is shared by all N lanes, so
         # its cotangent is a lane reduction and the vector cotangent is a matvec.
@@ -281,7 +347,13 @@ def so3ssd_bwd_ref(
         # cotangent would be counted once per head of that group.
         if db_last is not None:
             dB_g = dB_g + _pad(db_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
-        return SO3SSDGrads(
+
+        # Token 0 of each chunk carries into the previous chunk's last token, so
+        # its two shift cotangents are the rows that cross a chunk boundary. Chunk
+        # 0's rows have no previous chunk and are the streaming feedback instead.
+        carry_u = dushift[:, :, :, 0, :]
+        carry_b = from_heads(dbs_n[:, :, :, 0].flatten(-2, -1), groups)
+        grads = SO3SSDGrads(
             dU=dU_t.to(U.dtype).contiguous(),
             dtrans=dtrans_t.to(trans.dtype).contiguous(),
             dK=dK_t.to(K.dtype).contiguous(),
@@ -293,13 +365,85 @@ def so3ssd_bwd_ref(
             db_prev=(
                 None
                 if b_prev is None
-                else from_heads(dbshift_t[:, :, 0], groups)
-                .to(b_prev.dtype)
-                .contiguous()
+                else carry_b[:, :, 0].to(b_prev.dtype).contiguous()
             ),
             du_prev=(
                 None
                 if u_prev is None
-                else dushift_t[:, :, 0].to(u_prev.dtype).contiguous()
+                else carry_u[:, :, 0].to(u_prev.dtype).contiguous()
             ),
         )
+        return ChunkedBackward(
+            grads=grads,
+            dzstart=dzstart.flatten(-2, -1),
+            dinc=dinc.flatten(-2, -1),
+            dz0=acc.flatten(-2, -1),
+            dlogp_scan=dlp_scan,
+            dlogp_off=dlp_off,
+            dlogp=dlp,
+            dchunk_rot=dchunk_rot,
+            dchunk_scale=dchunk_scale,
+            carry_u=carry_u,
+            carry_b=carry_b,
+        )
+
+
+def so3ssd_bwd_ref(
+    dy: Tensor | None,
+    dstate: Tensor | None,
+    db_last: Tensor | None,
+    du_last: Tensor | None,
+    U: Tensor,
+    trans: Tensor,
+    K: Tensor,
+    B: Tensor,
+    C: Tensor,
+    chunk_size: int,
+    *,
+    z0: Tensor | None = None,
+    b_prev: Tensor | None = None,
+    u_prev: Tensor | None = None,
+) -> SO3SSDGrads:
+    """Cotangents of every input of :func:`slinoss.ops.so3ssd.reference.so3ssd_ref`.
+
+    A thin projection of :func:`chunked_backward` onto the operator's gradient
+    contract.
+
+    Args:
+        dy: Cotangent of ``y``, shape ``(B,H,T,P)``. ``None`` is zero.
+        dstate: Cotangent of ``state``, shape ``(B,H,P,3N)``. ``None`` is zero.
+        db_last: Cotangent of ``b_last``, shape ``(B,G,3N)``. ``None`` is zero.
+        du_last: Cotangent of ``u_last``, shape ``(B,H,P)``. ``None`` is zero.
+        U: Input weights, shape ``(B,H,T,P)``.
+        trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
+        K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
+        B: Input vectors, shape ``(B,G,T,3N)``.
+        C: Output vectors, shape ``(B,G,T,3N)``.
+        chunk_size: Chunk length ``L``. Must match the forward.
+        z0: Initial state, shape ``(B,H,P,3N)``, pinned.
+        b_prev: ``b_{-1}``, shape ``(B,G,3N)``.
+        u_prev: ``u_{-1}``, shape ``(B,H,P)``.
+
+    Returns:
+        A :class:`SO3SSDGrads`.
+
+    Raises:
+        ValueError: On a shape, contiguity, device, or pairing violation, or a
+            non-positive ``chunk_size``. Raised by the rematerializing forward.
+        TypeError: On an unsupported dtype, or a low-precision pinned tensor.
+    """
+    return chunked_backward(
+        dy,
+        dstate,
+        db_last,
+        du_last,
+        U,
+        trans,
+        K,
+        B,
+        C,
+        chunk_size,
+        z0=z0,
+        b_prev=b_prev,
+        u_prev=u_prev,
+    ).grads
