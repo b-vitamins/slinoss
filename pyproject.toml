@@ -78,7 +78,7 @@ known-first-party = ["slinoss"]
 # --------------------------------------------------------------------------
 
 [tool.pyright]
-include = ["slinoss", "tests", "scripts", "examples"]
+include = ["slinoss", "tests", "scripts"]
 exclude = ["slinoss/_aot", "**/__pycache__"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"

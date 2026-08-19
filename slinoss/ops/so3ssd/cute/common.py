@@ -2,7 +2,8 @@
 
 One implementation each of the quaternion exponential, composition, conjugation,
 normalization, the homogeneous rotation matrix, the tap chart, and the 3x3
-composition. Every kernel in this package calls these. Duplicated device math
+composition, plus the adjoint of the exponential, of the rotation matrix, and of
+the tap chart. Every kernel in this package calls these. Duplicated device math
 diverges, and the divergence is a correctness bug.
 
 DSL shims that no operator owns -- the scalar retype, the select, the shuffle, the
@@ -40,28 +41,37 @@ import cutlass
 import cutlass.cute as cute
 
 from slinoss._cute import Scalar, Tile, f32
-from slinoss.ops.so3ssd.reference import series_coeffs
+from slinoss.ops.so3ssd.reference import deriv_coeffs, series_coeffs
 
 __all__ = [
     "COS_HALF",
+    "COS_HALF_D",
     "FP32_SERIES_TERMS",
     "SINC_HALF",
+    "SINC_HALF_D",
     "TABLE_AC",
     "TABLE_AN",
     "TABLE_AP",
     "THREADS",
     "WARPS",
+    "mat3_add",
     "mat3_matvec",
     "mat3_mul",
+    "mat3_outer",
     "mat3_transpose",
+    "quat_add",
     "quat_conj",
     "quat_exp",
+    "quat_exp_vjp",
     "quat_mul",
     "quat_normalize",
     "rot_hom",
+    "rot_hom_vjp",
     "scalar_tile",
+    "sym_asym",
     "table_tile",
     "tap_matrix",
+    "tap_matrix_vjp",
     "tap_tile",
     "trans_tile",
     "vec_tile",
@@ -80,6 +90,16 @@ FP32_SERIES_TERMS: int = 10
 
 COS_HALF: tuple[float, ...] = series_coeffs(0, FP32_SERIES_TERMS)
 SINC_HALF: tuple[float, ...] = series_coeffs(1, FP32_SERIES_TERMS)
+
+# Derivatives in s of the two series above, for the adjoint of the exponential.
+# Differentiating scales term k by k and drops the constant term, so the same
+# truncation carries one term less and a factor of at most nine. Over the
+# reachable domain that leaves the derivative series exact to float32 rounding,
+# which tests/test_cute_common_vjp.py measures against the float64 truncation.
+# Both come from the reference's generator, so a derivative cannot drift from the
+# primal it differentiates.
+COS_HALF_D: tuple[float, ...] = deriv_coeffs(COS_HALF)
+SINC_HALF_D: tuple[float, ...] = deriv_coeffs(SINC_HALF)
 
 WARPS: int = 4
 """Warps per block, everywhere in the tree.
@@ -194,6 +214,33 @@ def quat_exp(w: Vec3) -> Quat:
     )
 
 
+def quat_exp_vjp(dq: Quat, w: Vec3) -> Vec3:
+    """Adjoint of :func:`quat_exp`.
+
+    Differentiating in ``s = |w|^2`` keeps the chain rule polynomial too: the
+    inner derivative is ``2 w``, so nothing divides by ``|w|`` and the origin
+    needs no branch. Two more Horner evaluations than the primal, in
+    :data:`COS_HALF_D` and :data:`SINC_HALF_D`.
+
+    Args:
+        dq: Cotangent of the quaternion, ``(dqw, dqx, dqy, dqz)``.
+        w: The rotation vector the primal was evaluated at.
+
+    Returns:
+        Cotangent of ``w``.
+    """
+    s = w[0] * w[0] + w[1] * w[1] + w[2] * w[2]
+    dot = dq[1] * w[0] + dq[2] * w[1] + dq[3] * w[2]
+    ds = dq[0] * _horner(s, COS_HALF_D) + 0.5 * _horner(s, SINC_HALF_D) * dot
+    half_sinc = 0.5 * _horner(s, SINC_HALF)
+    radial = 2.0 * ds
+    return (
+        half_sinc * dq[1] + radial * w[0],
+        half_sinc * dq[2] + radial * w[1],
+        half_sinc * dq[3] + radial * w[2],
+    )
+
+
 def quat_mul(a: Quat, b: Quat) -> Quat:
     """Hamilton product ``a (*) b``, so ``R(a (*) b) == R(a) R(b)``."""
     return (
@@ -207,6 +254,16 @@ def quat_mul(a: Quat, b: Quat) -> Quat:
 def quat_conj(q: Quat) -> Quat:
     """Conjugate, which inverts the rotation of a unit quaternion."""
     return (q[0], -q[1], -q[2], -q[3])
+
+
+def quat_add(a: Quat, b: Quat) -> Quat:
+    """Componentwise sum.
+
+    The group operation on quaternions is :func:`quat_mul`; this is the vector-space
+    one, which is what an adjoint accumulates. Commutative, so a reduction over it
+    needs no ordering.
+    """
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3])
 
 
 def quat_normalize(q: Quat) -> Quat:
@@ -270,6 +327,58 @@ def rot_hom(q: Quat) -> Mat3:
     )
 
 
+def sym_asym(dm: Mat3) -> tuple[Vec3, Vec3, Vec3]:
+    """Off-diagonal symmetric part, axial vector, and diagonal of a cotangent.
+
+    Every 3x3 adjoint here contracts ``dm`` against a matrix that is either
+    symmetric or antisymmetric, so both halves are formed once and shared.
+
+    Args:
+        dm: Cotangent matrix, row-major, entry ``3*r + c``.
+
+    Returns:
+        ``((s01, s02, s12), axial, diag)`` where ``s_ij = dm_ij + dm_ji``,
+        ``axial`` is the vector ``v`` satisfying ``<dm, skew(v)> = <axial, v>``,
+        and ``diag`` holds the three diagonal entries.
+    """
+    return (
+        (dm[1] + dm[3], dm[2] + dm[6], dm[5] + dm[7]),
+        (dm[7] - dm[5], dm[2] - dm[6], dm[3] - dm[1]),
+        (dm[0], dm[4], dm[8]),
+    )
+
+
+def rot_hom_vjp(dm: Mat3, q: Quat) -> Quat:
+    """Adjoint of the unit-norm rotation matrix.
+
+    :func:`rot_hom` equals that primal wherever ``|q| = 1`` and exceeds it by
+    ``(|q|^2 - 1) I`` elsewhere, so this cotangent and the adjoint of
+    :func:`rot_hom` differ by a multiple of ``q``. The difference is radial, the
+    prefix-scan adjoint projects the radial component out (I5), and the parameter
+    gradient is therefore the same through either.
+
+    The radial component is kept here. Projecting it out is the adjoint of the
+    renormalization, and that belongs to the scan that renormalized.
+
+    Args:
+        dm: Cotangent of the rotation matrix, row-major, entry ``3*r + c``.
+        q: The quaternion the primal was evaluated at.
+
+    Returns:
+        Cotangent of ``q``, radial component included.
+    """
+    sym, axial, diag = sym_asym(dm)
+    return (
+        2.0 * (q[1] * axial[0] + q[2] * axial[1] + q[3] * axial[2]),
+        2.0 * (q[2] * sym[0] + q[3] * sym[1] + q[0] * axial[0])
+        - 4.0 * q[1] * (diag[1] + diag[2]),
+        2.0 * (q[1] * sym[0] + q[3] * sym[2] + q[0] * axial[1])
+        - 4.0 * q[2] * (diag[0] + diag[2]),
+        2.0 * (q[1] * sym[1] + q[2] * sym[2] + q[0] * axial[2])
+        - 4.0 * q[3] * (diag[0] + diag[1]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tap chart and 3x3 algebra
 # ---------------------------------------------------------------------------
@@ -309,6 +418,44 @@ def tap_matrix(tap: Vec3, w: Vec3) -> Mat3:
     )
 
 
+def tap_matrix_vjp(dm: Mat3, tap: Vec3, w: Vec3) -> tuple[Vec3, Vec3]:
+    """Adjoint of :func:`tap_matrix`.
+
+    The three basis matrices are the identity, ``w w^T``, and ``skew(w)``, so each
+    tap cotangent is one Frobenius inner product: the trace, the quadratic form,
+    and the axial contraction. Polynomial in ``w`` like the primal, so the origin
+    needs no branch.
+
+    Lane 3 of the packed tap is a hard zero that this chart never reads and never
+    writes; a caller storing into ``K``'s layout owns it.
+
+    Args:
+        dm: Cotangent of the tap matrix, row-major, entry ``3*r + c``.
+        tap: ``(kr, g, h)`` the primal was evaluated at.
+        w: The rotation vector the primal was evaluated at.
+
+    Returns:
+        ``(dtap, dw)``, the cotangents of ``(kr, g, h)`` and of ``w``.
+    """
+    sym, axial, diag = sym_asym(dm)
+    symw = (
+        2.0 * diag[0] * w[0] + sym[0] * w[1] + sym[1] * w[2],
+        sym[0] * w[0] + 2.0 * diag[1] * w[1] + sym[2] * w[2],
+        sym[1] * w[0] + sym[2] * w[1] + 2.0 * diag[2] * w[2],
+    )
+    dtap = (
+        diag[0] + diag[1] + diag[2],
+        0.5 * (w[0] * symw[0] + w[1] * symw[1] + w[2] * symw[2]),
+        w[0] * axial[0] + w[1] * axial[1] + w[2] * axial[2],
+    )
+    dw = (
+        tap[1] * symw[0] + tap[2] * axial[0],
+        tap[1] * symw[1] + tap[2] * axial[1],
+        tap[1] * symw[2] + tap[2] * axial[2],
+    )
+    return dtap, dw
+
+
 def mat3_mul(a: Mat3, b: Mat3) -> Mat3:
     """Row-major 3x3 product ``a @ b``."""
     out = []
@@ -318,6 +465,40 @@ def mat3_mul(a: Mat3, b: Mat3) -> Mat3:
                 a[3 * r] * b[c] + a[3 * r + 1] * b[3 + c] + a[3 * r + 2] * b[6 + c]
             )
     return (out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7], out[8])
+
+
+def mat3_add(a: Mat3, b: Mat3) -> Mat3:
+    """Row-major 3x3 sum, entry by entry."""
+    return (
+        a[0] + b[0],
+        a[1] + b[1],
+        a[2] + b[2],
+        a[3] + b[3],
+        a[4] + b[4],
+        a[5] + b[5],
+        a[6] + b[6],
+        a[7] + b[7],
+        a[8] + b[8],
+    )
+
+
+def mat3_outer(u: Vec3, v: Vec3) -> Mat3:
+    """Outer product ``u v^T``: entry ``3*i + j`` is ``u_i v_j``.
+
+    One term of a parameter-gradient reduction, which accumulates
+    ``sum_n outer(dv_n, v_n)`` over the lane dimension.
+    """
+    return (
+        u[0] * v[0],
+        u[0] * v[1],
+        u[0] * v[2],
+        u[1] * v[0],
+        u[1] * v[1],
+        u[1] * v[2],
+        u[2] * v[0],
+        u[2] * v[1],
+        u[2] * v[2],
+    )
 
 
 def mat3_transpose(a: Mat3) -> Mat3:

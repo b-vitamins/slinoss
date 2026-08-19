@@ -69,6 +69,7 @@ __all__ = [
     "as_lanes",
     "chunk_pad",
     "chunked_forward",
+    "deriv_coeffs",
     "from_heads",
     "quat_conj",
     "quat_exp",
@@ -129,14 +130,28 @@ def series_coeffs(offset: int, terms: int = _SERIES_TERMS) -> tuple[float, ...]:
     )
 
 
-def _deriv_coeffs(coeffs: tuple[float, ...]) -> tuple[float, ...]:
+def deriv_coeffs(coeffs: tuple[float, ...]) -> tuple[float, ...]:
+    """Coefficients of ``d/ds`` of a series in ``s``.
+
+    Term ``k`` becomes ``k`` times term ``k``, and the constant term drops, so the
+    result is one shorter than its input.
+
+    The device path differentiates the same series at a shorter truncation, so it
+    takes these coefficients from here rather than deriving them again.
+
+    Args:
+        coeffs: Coefficients in ascending powers of ``s``.
+
+    Returns:
+        Coefficients of the derivative, in ascending powers of ``s``.
+    """
     return tuple(k * coeffs[k] for k in range(1, len(coeffs)))
 
 
 _COS_HALF: tuple[float, ...] = series_coeffs(0)
 _SINC_HALF: tuple[float, ...] = series_coeffs(1)
-_COS_HALF_D: tuple[float, ...] = _deriv_coeffs(_COS_HALF)
-_SINC_HALF_D: tuple[float, ...] = _deriv_coeffs(_SINC_HALF)
+_COS_HALF_D: tuple[float, ...] = deriv_coeffs(_COS_HALF)
+_SINC_HALF_D: tuple[float, ...] = deriv_coeffs(_SINC_HALF)
 
 
 def _horner(s: Tensor, coeffs: tuple[float, ...]) -> Tensor:
