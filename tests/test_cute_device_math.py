@@ -24,12 +24,12 @@ if not torch.cuda.is_available():
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
 from slinoss._cute import (
     Tile,
     assert_smem_fits,
     cute_dtype,
+    dev_tensor,
     smem_bytes,
     smem_capacity,
 )
@@ -152,12 +152,6 @@ def _probe_launch(
     ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
 
 
-def _dev(tensor: torch.Tensor) -> cute.Tensor:
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
-
-
 def _run_probe(
     trans: torch.Tensor, tap: torch.Tensor, chunk: int, mats: int = 3
 ) -> tuple[torch.Tensor, ...]:
@@ -171,13 +165,13 @@ def _run_probe(
     oend = torch.empty(bsz, heads, chunks, 4, **opts)
     oscale = torch.empty(bsz, heads, chunks, **opts)
     _probe_launch(
-        _dev(trans),
-        _dev(tap),
-        _dev(olp),
-        _dev(oquat),
-        _dev(otable),
-        _dev(oend),
-        _dev(oscale),
+        dev_tensor(trans),
+        dev_tensor(tap),
+        dev_tensor(olp),
+        dev_tensor(oquat),
+        dev_tensor(otable),
+        dev_tensor(oend),
+        dev_tensor(oscale),
         seqlen,
         chunks,
         bsz,

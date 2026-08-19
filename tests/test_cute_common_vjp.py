@@ -37,8 +37,8 @@ if not torch.cuda.is_available():
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
+from slinoss._cute import dev_tensor
 from slinoss.ops.so3ssd import (
     deriv_coeffs,
     quat_exp,
@@ -209,12 +209,6 @@ def _vjp_launch(
     ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1))
 
 
-def _dev(tensor: torch.Tensor) -> cute.Tensor:
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
-
-
 def _run(w_scale: float) -> _Probe:
     """Build one point per token and run every adjoint on it.
 
@@ -257,18 +251,18 @@ def _run(w_scale: float) -> _Probe:
     oouter = torch.empty(count, 9, **opts)
 
     _vjp_launch(
-        _dev(w),
-        _dev(tap),
-        _dev(q),
-        _dev(dm),
-        _dev(dq),
-        _dev(odq),
-        _dev(odtap),
-        _dev(odwtap),
-        _dev(odwexp),
-        _dev(osym),
-        _dev(oadd),
-        _dev(oouter),
+        dev_tensor(w),
+        dev_tensor(tap),
+        dev_tensor(q),
+        dev_tensor(dm),
+        dev_tensor(dq),
+        dev_tensor(odq),
+        dev_tensor(odtap),
+        dev_tensor(odwtap),
+        dev_tensor(odwexp),
+        dev_tensor(osym),
+        dev_tensor(oadd),
+        dev_tensor(oouter),
         count,
         (count + THREADS - 1) // THREADS,
         THREADS,

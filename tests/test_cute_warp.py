@@ -26,11 +26,11 @@ if not torch.cuda.is_available():
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
 from slinoss._cute import (
     Tile,
     block_reduce_add,
+    dev_tensor,
     shuffle_down,
     shuffle_up,
     shuffle_xor,
@@ -86,16 +86,10 @@ def _reduce_launch(
     _reduce_kernel(gin, gout, threads).launch(grid=(1, 1, 1), block=(threads, 1, 1))
 
 
-def _dev(tensor: torch.Tensor) -> cute.Tensor:
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
-
-
 def _shuffle(mode: int, offset: int) -> list[int]:
     """Lane indices as permuted by one shuffle across a full warp."""
     out = torch.empty(WARP, dtype=torch.float32, device="cuda")
-    _shuffle_launch(_dev(out), mode, offset)
+    _shuffle_launch(dev_tensor(out), mode, offset)
     torch.cuda.synchronize()
     return out.int().tolist()
 
@@ -153,7 +147,7 @@ def test_block_reduce_add_totals_in_every_thread(threads: int) -> None:
     values = torch.randn(threads, generator=gen, dtype=torch.float32, device="cuda")
     out = torch.empty_like(values)
 
-    _reduce_launch(_dev(values), _dev(out), threads)
+    _reduce_launch(dev_tensor(values), dev_tensor(out), threads)
     torch.cuda.synchronize()
 
     assert bool((out == out[0]).all()), "the total is not broadcast to every thread"

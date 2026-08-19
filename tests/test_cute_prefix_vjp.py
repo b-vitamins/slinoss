@@ -27,8 +27,8 @@ if not torch.cuda.is_available():
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
+from slinoss._cute import dev_tensor
 from slinoss.config import MAX_CHUNK, MIN_CHUNK
 from slinoss.ops.so3ssd.cute.common import (
     THREADS,
@@ -141,12 +141,6 @@ def _probe_launch(
     ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
 
 
-def _dev(tensor: torch.Tensor) -> cute.Tensor:
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
-
-
 def _run_probe(
     trans: torch.Tensor,
     tap: torch.Tensor,
@@ -166,13 +160,13 @@ def _run_probe(
     oquat = torch.empty(bsz, heads, chunks, 4, chunk, **opts)
     odquat = torch.empty(bsz, heads, chunks, 4, chunk, **opts)
     _probe_launch(
-        _dev(trans),
-        _dev(tap),
-        _dev(dlp),
-        _dev(drot),
-        _dev(osuf),
-        _dev(oquat),
-        _dev(odquat),
+        dev_tensor(trans),
+        dev_tensor(tap),
+        dev_tensor(dlp),
+        dev_tensor(drot),
+        dev_tensor(osuf),
+        dev_tensor(oquat),
+        dev_tensor(odquat),
         chunks,
         bsz,
         heads,
