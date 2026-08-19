@@ -27,22 +27,33 @@ from tests.conftest import ScanInputs, assert_max_rel, make_inputs, max_err
 
 LANES3 = (-1, 3)
 
-# (bsz, heads, seqlen, rows, lanes, chunk)
-#   40/16 is ragged over three chunks; 16/16 is one exact chunk; 7 and 1 tokens
-#   sit below the chunk; 64/16 is four exact chunks; 33/16 and 65/32 are ragged;
-#   the smallest legal N is 16 and the smallest legal P is 16.
+# (bsz, heads, seqlen, rows, lanes, chunk).
+#
+# One case per distinct path through the factorization:
+#
+# - 40/16, a ragged tail over three chunks at the smallest legal N and the
+#   smallest legal P, which is the generic case;
+# - 16/16, one exact chunk, where no chunk reads a predecessor's state;
+# - one token, which is also B = 1 and H = 1;
+# - 64/16, four exact chunks, with P above the minimum and H neither 1 nor 2;
+# - 33/16, a ragged tail of a single token, with N above the minimum;
+# - 20/32, T below L, so the one chunk is 12 slots of padding, at H = 1 and the
+#   widest P;
+# - 128/64, the largest chunk length, two exact chunks, B = H = 1.
 SHAPES: tuple[tuple[int, int, int, int, int, int], ...] = (
     (2, 2, 40, 16, 16, 16),
     (2, 2, 16, 16, 16, 16),
-    (1, 1, 7, 16, 16, 16),
     (1, 1, 1, 16, 16, 16),
     (2, 3, 64, 32, 16, 16),
     (1, 2, 33, 16, 32, 16),
     (2, 1, 20, 48, 16, 32),
-    (1, 1, 48, 16, 16, 16),
-    (2, 2, 65, 16, 16, 32),
     (1, 1, 128, 16, 16, 64),
 )
+
+# (with_state, streaming), the carry-in combinations other than both present.
+# Each names a pair of ``None`` branches, one per implementation, and nothing
+# else: an absent ``z0`` is a zero state and an absent tap pair is a zero tap.
+CARRY_IN: tuple[tuple[bool, bool], ...] = ((False, True), (True, False), (False, False))
 
 # float64 end to end. The two implementations reassociate the same sums, so the
 # gap is reordering roundoff over at most 128 tokens and 96 state components.
@@ -68,15 +79,14 @@ def _shape_id(shape: tuple[int, ...]) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
-@pytest.mark.parametrize("with_state", [False, True])
-@pytest.mark.parametrize("streaming", [False, True])
-def test_chunked_matches_sequential(
+def _parity(
     shape: tuple[int, int, int, int, int, int],
+    *,
+    device: torch.device | str,
     with_state: bool,
     streaming: bool,
-    device: torch.device,
 ) -> None:
+    """One chunked call against the sequential one. The only copy of the body."""
     bsz, heads, seqlen, rows, lanes, chunk = shape
     inp = make_inputs(
         bsz=bsz,
@@ -97,7 +107,36 @@ def test_chunked_matches_sequential(
     assert torch.equal(got.u_last, want.u_last)
 
 
-@pytest.mark.parametrize("chunk", [16, 32, 64, 128])
+@pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
+def test_chunked_matches_sequential(
+    shape: tuple[int, int, int, int, int, int], device: torch.device
+) -> None:
+    """Chunk geometry against the recurrence, with every carry-in present.
+
+    The shape is what the factorization reassociates, so it carries the full
+    sweep, crossed only with the device: the two implementations reduce over
+    different extents and the BLAS behind each reduction is per device. The
+    carry-in flags do not touch the geometry and are swept once, below.
+    """
+    _parity(shape, device=device, with_state=True, streaming=True)
+
+
+@pytest.mark.parametrize(("with_state", "streaming"), CARRY_IN)
+def test_chunked_matches_sequential_without_a_carry_in(
+    with_state: bool, streaming: bool
+) -> None:
+    """The zero-fill branches, at the ragged three-chunk shape.
+
+    An omitted operand is a zero tensor built inside each implementation, so a
+    wrong shape or dtype there shows up as a parity failure at any geometry.
+    """
+    _parity(SHAPES[0], device="cpu", with_state=with_state, streaming=streaming)
+
+
+# 16 is the base the others are compared against. 32 divides T as well and halves
+# the chunk count; 64 leaves a ragged tail; 128 exceeds T, so the sequence is one
+# padded chunk.
+@pytest.mark.parametrize("chunk", [32, 64, 128])
 def test_output_does_not_depend_on_chunk_size(chunk: int) -> None:
     inp = make_inputs(seqlen=96, seed=3)
     base = so3ssd_ref(*inp.args(), 16, **inp.kw())
@@ -106,8 +145,17 @@ def test_output_does_not_depend_on_chunk_size(chunk: int) -> None:
     assert_max_rel(got.state, base.state, PARITY_REL, f"state at L={chunk}")
 
 
-@pytest.mark.parametrize("chunk", [16, 32])
-@pytest.mark.parametrize("split", [1, 16, 17, 32, 47])
+# (chunk, split) at T = 48. One case per distinct boundary:
+#
+# - a head of one token, so the tail starts from a state formed by a single step;
+# - a split one token past a chunk boundary, where the head's last chunk is
+#   ragged and its padding must not reach the carried state;
+# - a split on a chunk boundary, the only case with no padding on either side;
+# - a tail of one token, at a chunk length that leaves the whole-sequence call
+#   ragged as well.
+@pytest.mark.parametrize(
+    ("chunk", "split"), [(16, 1), (16, 17), (16, 32), (32, 47)], ids=str
+)
 def test_streaming_split_matches_the_whole_sequence(chunk: int, split: int) -> None:
     """A split carries ``state``, ``b_last``, and ``u_last`` forward. Nothing
     else crosses the boundary."""
@@ -538,16 +586,22 @@ def test_rejects_bad_inputs(
     exc: type[Exception],
     match: str,
 ) -> None:
+    """Every message, on both entry points.
+
+    The two share one checker today, so the backend axis is a duplicate of the
+    table; it stays because each arm is a separate public function and a refusal
+    that a rewrite moved behind a repack is what this table exists to catch.
+    """
     inp = mutate(_base(**base_kwargs))
     with pytest.raises(exc, match=match):
         backend(inp)
 
 
-@pytest.mark.parametrize("chunk", [0, -1, -64])
-def test_rejects_non_positive_chunk_size(chunk: int) -> None:
+def test_rejects_non_positive_chunk_size() -> None:
+    # One comparison against 1 refuses zero and every negative alike.
     inp = _base()
     with pytest.raises(ValueError, match="chunk_size must be positive"):
-        so3ssd_ref(*inp.args(), chunk, **inp.kw())
+        so3ssd_ref(*inp.args(), 0, **inp.kw())
 
 
 @pytest.mark.cuda

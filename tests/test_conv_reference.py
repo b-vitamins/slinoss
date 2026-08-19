@@ -37,27 +37,32 @@ from slinoss.ops.conv import (
 )
 from tests.conftest import assert_max_rel, max_err
 
-# (B, T, D, W). Sweeps T against the kernel's 64-token tile, the smallest legal
-# B, D, and T, both ends of the width range, and T below W-1, where the returned
-# window straddles the incoming state.
+# (B, T, D, W). One case per distinct path through the reference, which has no
+# tile: the time tiles are the kernel's and tests/test_conv_cuda.py sweeps them
+# against its own shapes.
+#
+# - base, the generic window, several tokens per channel;
+# - single-token, the decode step, at the smallest legal B and D, where the whole
+#   window comes from the incoming state;
+# - pointwise, W = 1, which returns early from the padding and carries an empty
+#   window;
+# - straddle, T below W-1 with T above 1, at the top of the width range, where
+#   the returned window spans both the incoming state and x.
 SHAPES = [
     pytest.param(2, 40, 8, 4, id="base"),
     pytest.param(1, 1, 1, 4, id="single-token"),
-    pytest.param(1, 1, 1, 1, id="pointwise-single"),
     pytest.param(2, 16, 3, 1, id="pointwise"),
-    pytest.param(2, 5, 4, 8, id="short-wide"),
     pytest.param(1, 3, 2, 8, id="straddle"),
-    pytest.param(3, 64, 4, 4, id="one-tile"),
-    pytest.param(2, 65, 4, 4, id="tile-plus-one"),
-    pytest.param(2, 130, 2, 2, id="three-tiles"),
 ]
 
+# (activation, with_bias, with_state). Each case turns off exactly one of the
+# three optional terms; all three on is the shape sweep's own setting. The terms
+# are a separate epilogue, a separate summand, and a separate prefix source, so
+# they are swept one at a time and not crossed.
 FLAGS = [
-    pytest.param(True, True, True, id="act-bias-state"),
     pytest.param(False, True, True, id="noact-bias-state"),
     pytest.param(True, False, True, id="act-nobias-state"),
     pytest.param(True, True, False, id="act-bias-nostate"),
-    pytest.param(False, False, False, id="bare"),
 ]
 
 
@@ -247,7 +252,7 @@ def test_forward_matches_oracle(
 def test_forward_flag_combinations_match_oracle(
     activation: bool, with_bias: bool, with_state: bool
 ) -> None:
-    """Every combination of the three optional terms, at one shape.
+    """Each optional term turned off in turn, at one shape.
 
     An absent bias and an absent state are ``None`` rather than a zero tensor, so
     each one is a separate branch in the reference; the activation is the epilogue.
@@ -266,14 +271,14 @@ def test_forward_flag_combinations_match_oracle(
     )
 
 
-# Three shapes rather than the sweep: the two entry points share `_contract`, so
-# what is under test is the wiring, and W = 1 (which returns early from the
-# padding) plus a straddling window are the only distinct wirings. Every entry
-# has more than one token, which causality needs.
+# Two shapes rather than the sweep: the two entry points share `_contract`, so
+# what is under test is the wiring, and W = 1, which returns early from the
+# padding, is the only second wiring. A straddling window changes the returned
+# state, which neither test below reads. Both entries have more than one token,
+# which causality needs.
 WIRING_SHAPES = [
     pytest.param(2, 40, 8, 4, id="base"),
     pytest.param(2, 16, 3, 1, id="pointwise"),
-    pytest.param(1, 3, 2, 8, id="straddle"),
 ]
 
 
@@ -352,12 +357,13 @@ def test_token_at_a_time_decode_reproduces_the_whole_sequence(
 # What the layout interacts with is W, which selects the padding branch, and H,
 # which is what the channel split reindexes. The activation is not on that list: it
 # is elementwise, so it commutes with any reindexing, and FLAGS already sweeps it.
+# Neither is a straddling window: the returned state is token-major at both
+# layouts, so SHAPES covers it. H = 3 is not on the list either, because
+# ``unflatten`` splits an axis the same way at every H above one.
 HEAD_MAJOR_SHAPES = [
     pytest.param(2, 40, 32, 4, 16, id="two-heads"),
-    pytest.param(2, 9, 48, 4, 16, id="three-heads"),
     pytest.param(2, 9, 32, 4, 32, id="one-head"),
     pytest.param(2, 16, 32, 1, 16, id="pointwise"),
-    pytest.param(1, 3, 32, 8, 16, id="straddle"),
 ]
 
 
@@ -505,16 +511,20 @@ def test_a_rank_4_dy_with_the_wrong_head_count_is_rejected() -> None:
         )
 
 
+# (B, T, D, W, activation). The gradient is a sum over the same window the forward
+# reads, so the cases are the window regimes: the generic one, a window that
+# reaches into the incoming state, and W = 1, where there is no window and the
+# state carries no gradient. The activation is one factor in the epilogue and does
+# not interact with the window, so it is turned off once.
 @pytest.mark.parametrize(
-    ("bsz", "seqlen", "channels", "width"),
+    ("bsz", "seqlen", "channels", "width", "activation"),
     [
-        pytest.param(2, 6, 3, 4, id="base"),
-        pytest.param(1, 1, 1, 4, id="single-token"),
-        pytest.param(2, 3, 2, 8, id="straddle"),
-        pytest.param(2, 4, 2, 1, id="pointwise"),
+        pytest.param(2, 6, 3, 4, True, id="base"),
+        pytest.param(2, 3, 2, 8, True, id="straddle"),
+        pytest.param(2, 4, 2, 1, True, id="pointwise"),
+        pytest.param(2, 6, 3, 4, False, id="noact"),
     ],
 )
-@pytest.mark.parametrize("activation", [True, False])
 def test_gradcheck(
     bsz: int, seqlen: int, channels: int, width: int, activation: bool
 ) -> None:
@@ -623,12 +633,16 @@ def test_absent_optional_inputs_get_no_gradient() -> None:
     ],
 )
 def test_low_precision_forward_tracks_the_float64_oracle(
-    dtype: torch.dtype, bound: float, device: torch.device
+    dtype: torch.dtype, bound: float
 ) -> None:
+    """One narrowing of the output, at each storage width.
+
+    The device is not an axis here: the contraction accumulates in the pinned
+    dtype on both, so the only device-dependent figure is the float64 gap the
+    shape sweep already measures on each.
+    """
     bsz, seqlen, channels, width = 2, 40, 8, 4
-    x, weight, bias, state = make_call(
-        bsz, seqlen, channels, width, dtype=dtype, device=device
-    )
+    x, weight, bias, state = make_call(bsz, seqlen, channels, width, dtype=dtype)
     want = oracle(x, weight, bias, activation=True, initial_state=state)
     got = causal_conv1d_update_ref(x, weight, bias, initial_state=state)
     assert got.y.dtype == dtype
@@ -808,10 +822,16 @@ def _cloned_leaves(
     )
 
 
-@pytest.mark.parametrize("activation", [True, False])
+# (activation, d_head). Both layouts, then the activation turned off at one of
+# them: the flag is forwarded to the same backward either way, so it does not
+# interact with the layout.
 @pytest.mark.parametrize(
-    "d_head",
-    [pytest.param(None, id="token-major"), pytest.param(16, id="head-major")],
+    ("activation", "d_head"),
+    [
+        pytest.param(True, None, id="token-major"),
+        pytest.param(True, 16, id="head-major"),
+        pytest.param(False, None, id="noact"),
+    ],
 )
 def test_public_operator_backward_matches_the_reference(
     activation: bool, d_head: int | None

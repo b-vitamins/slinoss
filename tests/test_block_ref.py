@@ -9,10 +9,11 @@ Each pullback is checked by ``gradcheck`` against a finite difference of the
 forward above it. That needs the pair presented as one op, so each one gets an
 :class:`torch.autograd.Function` whose backward calls it; without the wrapper
 autograd would differentiate the forward again and the pullback under test would
-never run.
+never run. Every pullback is autograd through its own forward, so those four
+checks are also the check that each forward is differentiable: a bare
+``gradcheck`` on a forward would put the same two quantities side by side.
 """
 
-import math
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -33,10 +34,11 @@ from slinoss.ops.block import (
 
 EPS = 1e-5
 
+# The norm reduces the trailing axis and broadcasts the result back, so rank is
+# the only thing a shape selects here: leading axes to broadcast against, and the
+# rank-1 case where there are none.
 SHAPES = [
-    pytest.param((3, 8), id="rank-2"),
     pytest.param((2, 5, 16), id="rank-3"),
-    pytest.param((1, 1, 64), id="one-token"),
     pytest.param((7,), id="rank-1"),
 ]
 
@@ -112,14 +114,15 @@ def test_rmsnorm_residual_none_is_the_first_block() -> None:
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_rmsnorm_residual_returns_a_wide_residual(dtype: torch.dtype) -> None:
+def test_rmsnorm_residual_returns_a_wide_residual() -> None:
     """The residual comes back wide even when the branch output is narrow.
 
     Narrowing the residual stream is what the fusion exists to avoid, so the
     dtype is part of the contract. The normed output still carries the input
-    dtype.
+    dtype. bfloat16 stands for float16 as well: both reach float32 through the
+    same arm of ``pinned_dtype``.
     """
+    dtype = torch.bfloat16
     x = _rnd((2, 4, 16), dtype=torch.float32).to(dtype)
     residual = _rnd((2, 4, 16), dtype=torch.float32, seed=1).to(dtype)
     weight = _rnd((16,), dtype=torch.float32, seed=2).to(dtype)
@@ -162,11 +165,10 @@ def test_rmsnorm_residual_accumulates_wider_than_its_operands() -> None:
     assert (kept - wide).abs().max() < (narrowed.float() - wide).abs().max()
 
 
-@pytest.mark.parametrize("shape", SHAPES)
-def test_swiglu_matches_the_written_form(shape: tuple[int, ...]) -> None:
-    """``silu(gate) * up``."""
-    gate = _rnd(shape)
-    up = _rnd(shape, seed=1)
+def test_swiglu_matches_the_written_form() -> None:
+    """``silu(gate) * up``. Elementwise, so no shape selects a path."""
+    gate = _rnd((2, 5, 16))
+    up = _rnd((2, 5, 16), seed=1)
     assert torch.allclose(swiglu_ref(gate, up), silu(gate) * up, rtol=0.0, atol=1e-15)
 
 
@@ -177,46 +179,15 @@ def test_swiglu_closed_gate_kills_the_row() -> None:
     assert torch.equal(got, torch.zeros_like(got))
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+# bfloat16 is the narrowing arm, where the float32 accumulation is rounded back
+# down; float32 is the arm where the accumulation dtype is already the output's.
+# float16 is the same arm as bfloat16.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_swiglu_output_carries_the_dtype_of_up(dtype: torch.dtype) -> None:
     """The activation is an elementwise map, so it does not widen its output."""
     gate = _rnd((2, 8), dtype=torch.float32).to(dtype)
     up = _rnd((2, 8), dtype=torch.float32, seed=1).to(dtype)
     assert swiglu_ref(gate, up).dtype is dtype
-
-
-def test_gradcheck_rmsnorm() -> None:
-    """float64 autograd on the input and the weight."""
-    x = _rnd((3, 8)).requires_grad_(True)
-    weight = _rnd((8,), seed=1).requires_grad_(True)
-    assert gradcheck(lambda a, w: rmsnorm_ref(a, w, eps=EPS), (x, weight))
-
-
-def test_gradcheck_rmsnorm_residual() -> None:
-    """float64 autograd on both outputs and all three inputs."""
-    x = _rnd((3, 8)).requires_grad_(True)
-    residual = _rnd((3, 8), seed=1).requires_grad_(True)
-    weight = _rnd((8,), seed=2).requires_grad_(True)
-    assert gradcheck(
-        lambda a, r, w: rmsnorm_residual_ref(a, r, w, eps=EPS),
-        (x, residual, weight),
-    )
-
-
-def test_gradcheck_rmsnorm_residual_none() -> None:
-    """The no-residual path is differentiable too."""
-    x = _rnd((3, 8)).requires_grad_(True)
-    weight = _rnd((8,), seed=1).requires_grad_(True)
-    assert gradcheck(
-        lambda a, w: rmsnorm_residual_ref(a, None, w, eps=EPS), (x, weight)
-    )
-
-
-def test_gradcheck_swiglu() -> None:
-    """float64 autograd on both operands."""
-    gate = _rnd((3, 8)).requires_grad_(True)
-    up = _rnd((3, 8), seed=1).requires_grad_(True)
-    assert gradcheck(swiglu_ref, (gate, up))
 
 
 class _RMSNorm(torch.autograd.Function):
@@ -403,11 +374,13 @@ def test_rejects_mismatched_weight() -> None:
         rmsnorm_ref(_rnd((2, 8)), _rnd((7,), seed=1), eps=EPS)
 
 
-@pytest.mark.parametrize("eps", [0.0, -1e-5, -math.inf])
-def test_rejects_non_positive_eps(eps: float) -> None:
-    """A non-positive epsilon reintroduces the division by zero it exists to stop."""
+def test_rejects_non_positive_eps() -> None:
+    """A non-positive epsilon reintroduces the division by zero it exists to stop.
+
+    Zero is the boundary; one comparison against it refuses every negative too.
+    """
     with pytest.raises(ValueError, match="eps must be positive"):
-        rmsnorm_ref(_rnd((2, 8)), _rnd((8,), seed=1), eps=eps)
+        rmsnorm_ref(_rnd((2, 8)), _rnd((8,), seed=1), eps=0.0)
 
 
 @pytest.mark.parametrize("name", ["x", "weight"])
