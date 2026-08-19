@@ -8,6 +8,8 @@ a view.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 
@@ -17,6 +19,7 @@ from slinoss.perf.memory import (
     SavedTensorProbe,
     memory_peaks,
     peak_window,
+    pool_retention,
     reset_memory_peaks,
     saved_storage_bytes,
 )
@@ -217,3 +220,23 @@ def test_allocator_peaks_on_cuda_read_and_clear_the_marks() -> None:
         wanted = tmp.numel() * tmp.element_size()
         del tmp
     assert sink[0].peak_allocated_bytes >= wanted
+
+
+# ---------------------------------------------------------------------------
+# Descriptor pool
+# ---------------------------------------------------------------------------
+
+
+def test_pool_retention_reports_zeros_where_the_dsl_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A report is built on hosts with no CuTe DSL, where no launch is reachable and
+    # the pool cannot exist. An unguarded import would make the whole report module
+    # unimportable there instead of printing a bucket of zeros. What the pool holds
+    # when it does exist is pinned in tests/test_cute_launch.py, against the pool.
+    monkeypatch.setitem(sys.modules, "slinoss._cute", None)
+    got = pool_retention("no dsl")
+    assert got.label == "no dsl"
+    assert got.layout_count == 0
+    assert got.descriptor_count == 0
+    assert got.retained_bytes == 0

@@ -41,6 +41,7 @@ from slinoss.perf.memory import (
     SavedStorages,
     SavedTensorProbe,
     memory_peaks,
+    pool_retention,
     reset_memory_peaks,
 )
 from slinoss.perf.report import Report, rate_table, write_report
@@ -160,6 +161,7 @@ def bench(
         ceilings=limits,
         saved=_saved(shape, device, dtype, args.backend) if grads else None,
         peaks=peaks,
+        pool=pool_retention(label),
         notes=(
             shape.describe(),
             f"mode={mode} dtype={args.dtype} backend={args.backend or 'auto'}",
@@ -247,6 +249,7 @@ def compare_backends(
         comparisons=(out.comparison,),
         ceilings=limits,
         peaks=peaks,
+        pool=pool_retention(label),
         notes=(
             shape.describe(),
             f"mode={mode} dtype={args.dtype}",

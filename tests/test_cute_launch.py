@@ -34,6 +34,7 @@ from torch import Tensor
 
 from slinoss import _cute
 from slinoss._cute import clear_dev_pool, dev_tensor, jit_launch
+from slinoss.perf.memory import pool_retention
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -256,3 +257,28 @@ def test_clear_dev_pool_drops_what_the_pool_pins() -> None:
     clear_dev_pool()
     assert _pool() == {}
     assert torch.equal(_combine(a, b), a - b)
+
+
+def test_reported_retention_counts_an_allocation_once_across_layouts() -> None:
+    """The reported figure must be allocations pinned, not slots filled.
+
+    Two layouts of one buffer are two keys holding two descriptors that pin one
+    allocation. A sum over slots would double it, and the figure exists to be
+    subtracted from an allocator peak.
+    """
+    clear_dev_pool()
+    a, b = _operands()
+    _combine(a, b)
+    half = N // 2
+    _combine(a[:half], b[:half])
+    use = pool_retention("two layouts")
+    assert use.label == "two layouts"
+    # Two keys, three descriptors each: the two arguments and the output. Four
+    # allocations behind them, since the halves alias ``a`` and ``b`` and only the
+    # two outputs are distinct.
+    assert use.layout_count == 2
+    assert use.descriptor_count == 6
+    full = N * a.element_size()
+    assert use.retained_bytes == 3 * full + full // 2
+    clear_dev_pool()
+    assert pool_retention("cleared").retained_bytes == 0

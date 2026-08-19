@@ -36,6 +36,7 @@ from cutlass.utils import get_smem_capacity_in_bytes
 __all__ = [
     "LOG2_E",
     "TWO_LOG2_E",
+    "DevPoolUse",
     "Scalar",
     "Tile",
     "assert_smem_fits",
@@ -43,6 +44,7 @@ __all__ = [
     "clear_dev_pool",
     "cute_dtype",
     "decay",
+    "dev_pool_use",
     "dev_tensor",
     "executor_count",
     "f32",
@@ -154,18 +156,31 @@ _POOLABLE = True
 A borrow re-points that word, so the check is what makes the patch legal."""
 
 
-class _Slots:
-    """The pooled descriptors of one layout, and the live borrow count.
+class _Pooled(NamedTuple):
+    """One pooled descriptor.
 
-    Each view is paired with a one-word ctypes view of the leading word of its
-    memref, which is the descriptor's base pointer. Borrowing re-points it.
+    Attributes:
+        view: The CuTe view.
+        word: One-word ctypes view of the leading word of the memref, which is the
+            descriptor's base pointer. Borrowing re-points it.
+        storage: ``(data_ptr, nbytes)`` of the allocation the view's DLPack capsule
+            pins. Recorded at build time, which is the allocation that stays
+            pinned: the capsule outlives the tensor the slot was built from.
     """
+
+    view: cute.Tensor
+    word: Any
+    storage: tuple[int, int]
+
+
+class _Slots:
+    """The pooled descriptors of one layout, and the live borrow count."""
 
     __slots__ = ("taken", "views")
 
     def __init__(self) -> None:
         self.taken = 0
-        self.views: list[tuple[cute.Tensor, Any]] = []
+        self.views: list[_Pooled] = []
 
 
 def _borrow(tensor: torch.Tensor) -> cute.Tensor:
@@ -208,9 +223,9 @@ def _borrow(tensor: torch.Tensor) -> cute.Tensor:
     _POOLS.borrowed.append(entry)
 
     if index < len(entry.views):
-        view, word = entry.views[index]
-        word[0] = tensor.data_ptr()
-        return view
+        pooled = entry.views[index]
+        pooled.word[0] = tensor.data_ptr()
+        return pooled.view
 
     view = dev_tensor(tensor)
     if index >= _POOL_DEPTH:
@@ -222,7 +237,8 @@ def _borrow(tensor: torch.Tensor) -> cute.Tensor:
         slots.clear()
         _POOLS.borrowed.clear()
         return view
-    entry.views.append((view, word))
+    storage = tensor.untyped_storage()
+    entry.views.append(_Pooled(view, word, (storage.data_ptr(), storage.nbytes())))
     return view
 
 
@@ -255,11 +271,50 @@ def clear_dev_pool() -> None:
     Correctness does not depend on this: a dropped layout is rebuilt on its next
     borrow. It exists for a caller that sweeps layouts and then stops, such as a
     shape sweep in the perf harness. Not callable from inside a launch.
+    :func:`dev_pool_use` reads what is held before and after.
     """
     slots: dict[Hashable, _Slots] | None = getattr(_POOLS, "slots", None)
     if slots is not None:
         slots.clear()
         _POOLS.borrowed.clear()
+
+
+class DevPoolUse(NamedTuple):
+    """What the descriptor pool holds on the calling thread.
+
+    Attributes:
+        layout_count: Layouts with a slot list. Bounded by the pool's key cap; past
+            it a borrow is built unpooled and retains nothing.
+        descriptor_count: Filled slots, summed over layouts.
+        retained_bytes: Distinct storage the filled slots pin. Two layouts of one
+            allocation are two slots and one storage, so it counts once.
+    """
+
+    layout_count: int
+    descriptor_count: int
+    retained_bytes: int
+
+
+def dev_pool_use() -> DevPoolUse:
+    """Read the pool's occupancy and what it retains.
+
+    The retained figure is the cost side of the pool: it is what
+    :func:`clear_dev_pool` gives back, and without it those bytes read as a leak
+    or as autograd's saved set in a memory report.
+
+    Returns:
+        The counts on this thread. All zero before the first launch, and in a
+        process where the descriptor patch was refused.
+    """
+    slots: dict[Hashable, _Slots] | None = getattr(_POOLS, "slots", None)
+    if slots is None:
+        return DevPoolUse(0, 0, 0)
+    pinned = {pooled.storage for entry in slots.values() for pooled in entry.views}
+    return DevPoolUse(
+        layout_count=len(slots),
+        descriptor_count=sum(len(entry.views) for entry in slots.values()),
+        retained_bytes=sum(nbytes for _, nbytes in pinned),
+    )
 
 
 def executor_count() -> int:

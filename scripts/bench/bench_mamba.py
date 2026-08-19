@@ -43,6 +43,7 @@ from slinoss.perf.memory import (
     SavedStorages,
     SavedTensorProbe,
     memory_peaks,
+    pool_retention,
     reset_memory_peaks,
 )
 from slinoss.perf.report import Report, rate_table, write_report
@@ -319,6 +320,7 @@ def compare_so3ssd(
         ),
         comparisons=(out.comparison,),
         peaks=memory_peaks(label, device),
+        pool=pool_retention(label),
         notes=(
             shape.describe(),
             f"mamba2 ngroups={groups} headdim={shape.rows} dstate={shape.d_state}",
@@ -422,6 +424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     throughput=(rate,),
                     saved=_saved(scan, shape, groups, device, dtype) if grads else None,
                     peaks=peaks,
+                    pool=pool_retention(label),
                     notes=(
                         shape.describe(),
                         f"mamba2 ngroups={groups} headdim={shape.rows} "

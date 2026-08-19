@@ -29,7 +29,7 @@ from slinoss.perf.budget import BucketDelta, BudgetReport
 from slinoss.perf.ceiling import Ceilings, ClassVerdict
 from slinoss.perf.device import DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
-from slinoss.perf.memory import MemoryPeaks, SavedStorages
+from slinoss.perf.memory import MemoryPeaks, PoolRetention, SavedStorages
 from slinoss.perf.ncu import SOL_FIELDS, STALL_FIELDS, KernelCounters
 from slinoss.perf.nsys import NsysTrace
 from slinoss.perf.timing import Throughput
@@ -187,6 +187,7 @@ class Report:
         trace: The NSYS trace.
         saved: Autograd saved-storage forensics.
         peaks: Allocator high-water marks.
+        pool: What the launch-descriptor pool holds.
         verdicts: Per-kernel class verdicts.
         deltas: Bucket-level comparison against a prior report.
         growth: Dispersion against the sample count.
@@ -205,6 +206,7 @@ class Report:
     trace: NsysTrace | None = None
     saved: SavedStorages | None = None
     peaks: MemoryPeaks | None = None
+    pool: PoolRetention | None = None
     verdicts: tuple[ClassVerdict, ...] = ()
     deltas: tuple[BucketDelta, ...] = ()
     growth: tuple[GrowthRow, ...] = ()
@@ -421,6 +423,8 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
         lines += _section("saved tensors by region", report.saved.regions)
     if report.peaks is not None:
         lines += _section("memory peaks", [report.peaks])
+    if report.pool is not None:
+        lines += _section("descriptor pool", [report.pool])
     if report.deltas:
         lines += _section("bucket deltas", report.deltas)
     if report.growth:

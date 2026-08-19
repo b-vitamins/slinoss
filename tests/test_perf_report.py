@@ -44,7 +44,12 @@ from slinoss.perf.dispersion import (
     paired,
     repeats,
 )
-from slinoss.perf.memory import MemoryPeaks, RegionSaved, SavedStorages
+from slinoss.perf.memory import (
+    MemoryPeaks,
+    PoolRetention,
+    RegionSaved,
+    SavedStorages,
+)
 from slinoss.perf.ncu import KernelCounters
 from slinoss.perf.nsys import NsysKernel, NsysTrace
 from slinoss.perf.report import (
@@ -362,6 +367,12 @@ def _report(
             peak_allocated_bytes=Bytes(268435456),
             peak_reserved_bytes=Bytes(335544320),
         ),
+        pool=PoolRetention(
+            label="step",
+            layout_count=Count(12),
+            descriptor_count=Count(19),
+            retained_bytes=Bytes(14712832),
+        ),
         verdicts=(
             ClassVerdict(
                 kernel="scan",
@@ -530,6 +541,7 @@ def test_markdown_renders_every_present_section() -> None:
         "## gpu trace",
         "## saved tensors",
         "## memory peaks",
+        "## descriptor pool",
         "## bucket deltas",
         "## dispersion against sample count",
         "## run-to-run median scatter",
@@ -609,6 +621,7 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "## gpu trace",
         "## saved tensors",
         "## memory peaks",
+        "## descriptor pool",
         "## bucket deltas",
         "## dispersion against sample count",
         "## run-to-run median scatter",
@@ -620,6 +633,7 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "total_duration_us",
         "kernel_sum_duration_us",
         "peak_allocated_bytes",
+        "retained_bytes",
         "achieved_gbs",
         "saved_bytes",
         "resolution_pct",
@@ -717,6 +731,7 @@ def test_payload_keeps_every_field_name_verbatim() -> None:
     data = payload(_report(check=_agreement()))
     assert "nsys_kernel_sum_duration_us" in data["agreement"]
     assert "peak_allocated_bytes" in data["peaks"]
+    assert "retained_bytes" in data["pool"]
     assert payload(_Modelled(label="dram traffic", est_traffic_bytes=Bytes(1024))) == {
         "label": "dram traffic",
         "est_traffic_bytes": 1024,

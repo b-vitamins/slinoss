@@ -9,6 +9,11 @@ a view: two views of one buffer cost one buffer.
 the saved bytes that do not belong to any declared input, so a kernel that
 stashes a workspace shows up here and nowhere else.
 
+The launch-descriptor pool is reported separately. It pins one allocation per
+filled slot, which the allocator counts as live and which belongs to neither the
+saved set nor a leak, so a report that named only those two would attribute those
+bytes to whichever of them it printed.
+
 There is no generic summarizer in this module. A byte total and a duration do not
 share a reduction, and a summarizer that names its output for one unit while
 holding another is how a byte count ends up in a field called ``mean_ms``.
@@ -38,11 +43,13 @@ from slinoss.perf.units import (
 
 __all__ = [
     "MemoryPeaks",
+    "PoolRetention",
     "RegionSaved",
     "SavedStorages",
     "SavedTensorProbe",
     "memory_peaks",
     "peak_window",
+    "pool_retention",
     "reset_memory_peaks",
     "saved_storage_bytes",
 ]
@@ -260,6 +267,54 @@ def peak_window(label: str, device: torch.device) -> Iterator[list[MemoryPeaks]]
         yield sink
     finally:
         sink.append(memory_peaks(label, device))
+
+
+@dataclass(frozen=True)
+class PoolRetention(PerfRecord):
+    """What the launch-descriptor pool holds.
+
+    Attributes:
+        label: What the window covered.
+        layout_count: Layouts with a pooled slot. Read against the pool's key cap:
+            a sweep that approaches it stops pooling rather than growing.
+        descriptor_count: Pooled descriptors.
+        retained_bytes: Distinct storage the descriptors pin. Live to the allocator
+            and reachable from no tensor the caller holds, so it appears in
+            ``peak_allocated_bytes`` and in no other record here.
+    """
+
+    label: str
+    layout_count: Annotated[Count, INVARIANT]
+    descriptor_count: Annotated[Count, INVARIANT]
+    retained_bytes: Annotated[Bytes, INVARIANT]
+
+
+def pool_retention(label: str) -> PoolRetention:
+    """Read the launch-descriptor pool.
+
+    Args:
+        label: What the window covered.
+
+    Returns:
+        The record. Zeros on a host with no CuTe DSL, where nothing is pooled
+        because no launch is reachable.
+    """
+    try:
+        from slinoss._cute import dev_pool_use
+    except ImportError:
+        return PoolRetention(
+            label=label,
+            layout_count=Count(0),
+            descriptor_count=Count(0),
+            retained_bytes=Bytes(0),
+        )
+    use = dev_pool_use()
+    return PoolRetention(
+        label=label,
+        layout_count=Count(use.layout_count),
+        descriptor_count=Count(use.descriptor_count),
+        retained_bytes=Bytes(use.retained_bytes),
+    )
 
 
 def saved_storage_bytes(tensors: Sequence[Tensor]) -> Bytes:
