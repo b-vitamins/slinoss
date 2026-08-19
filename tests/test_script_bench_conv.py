@@ -33,6 +33,7 @@ from scripts.bench.bench_conv import (
     main,
     parse_args,
 )
+from slinoss import _C
 from slinoss.perf import timing
 from slinoss.perf.ceiling import Ceilings, DramCeiling, TensorCeiling
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
@@ -357,6 +358,9 @@ def test_bench_measures_a_forward_and_holds_no_saved_tensors(
     )
 
 
+@pytest.mark.skipif(
+    not _C.is_available(), reason=f"{_C.EXTENSION} is not built; run {_C.BUILD_COMMAND}"
+)
 def test_bench_measures_a_step_and_probes_what_autograd_holds(
     tmp_path: Path, pinned_device: DeviceInfo
 ) -> None:
