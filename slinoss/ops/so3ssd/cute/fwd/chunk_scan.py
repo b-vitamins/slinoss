@@ -22,10 +22,17 @@ same accumulator rather than concatenating along K, and both reuse one pair of
 shared tiles.
 
 I6. The decay mask multiplies the float32 score accumulator in registers and is
-narrowed once on the way into the score tile. Folding it into either bfloat16
-operand would round the mask itself, and the mask spans the whole dynamic range of
-the chunk decay. The causal half is a select against exact zero rather than a
-masked exponential, so no infinity is formed (I3).
+narrowed once into the operand dtype. Folding it into either bfloat16 operand would
+round the mask itself, and the mask spans the whole dynamic range of the chunk
+decay. The causal half is a select against exact zero rather than a masked
+exponential, so no infinity is formed (I3).
+
+The narrowed score never reaches shared memory. The score GEMM's C fragment is the
+diagonal GEMM's A fragment thread for thread, two N atoms of the atom's C tile
+being one K atom of its A tile, so the score is retiled in registers by
+:func:`slinoss.ops.so3ssd.cute.mma.mma_areg`. That removes a score tile from the
+shared budget and, per tap, one scalar store per accumulator element, one
+``ldmatrix``, and one barrier.
 
 Score slicing. The score is computed in column slices of :data:`NBLOCK_MAX` source
 tokens. Its accumulator lives alongside the output accumulator, so an unsliced
@@ -33,7 +40,7 @@ score at ``MAX_CHUNK`` would be four times the float32 register footprint of the
 output it feeds. The slice count is one at ``L`` up to 32 and ``L/32`` above it.
 
 The readout basis is staged once per chunk and stays resident: it is the A operand
-of every GEMM in the kernel. The forcing tile is not, because the two taps need
+of the offset and the score GEMM. The forcing tile is not, because the two taps need
 different table slots and different source tokens; it is restaged per tap, and it
 doubles as the chunk-start state tile for the offset GEMM, which is why it is
 allocated at the wider of ``P`` and the slice width. Neither the rotated forcing
@@ -90,8 +97,10 @@ from slinoss.ops.so3ssd.cute.mma import (
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
+    mma_areg,
     mma_coords,
     mma_gemm,
+    mma_gemm_areg,
     mma_rows,
     operand_tile,
     smem_pitch,
@@ -114,7 +123,6 @@ __all__ = [
     "nblock",
     "readout_tile",
     "scan_smem_bytes",
-    "score_tile",
 ]
 
 NBLOCK_MAX: int = 32
@@ -123,7 +131,7 @@ THREADS`` float32 per thread and is live alongside the output accumulator, so th
 cap bounds the pair independently of ``L``. Every legal chunk length is a power of
 two at or above 16, so this divides it exactly."""
 
-RESIDENT_MAX: int = 3
+RESIDENT_MAX: int = 2
 """Ceiling on the blocks per SM the launch bound asks for.
 
 The launch asks for the residency the shared-memory budget already allows, which
@@ -132,9 +140,20 @@ whatever the schedule prefers. The ceiling exists because the register file is t
 scarcer resource of the two: ``N`` blocks of :data:`THREADS` threads cap each
 thread at ``65536 / (N * THREADS)``, so a short chunk whose tiles leave room for
 five blocks would ask for a cap of 102, and this body's live set is two float32
-accumulators, both GEMMs' fragments, and one staging group. Three is the largest
-value measured; at the cap it implies the body spills a few words and still
-measures faster than the two-block schedule."""
+accumulators, both GEMMs' fragments, and one staging group.
+
+Two, because the score fragment is one of those groups. Measured on sm_86 at the
+standard shape, asking for three caps the thread at 168 registers and the body
+spills 491,520 load and 245,760 store sectors per launch, for 111.2 us; asking for
+two leaves 255 registers, no spill at all, and 105.0 us. The bound's function here
+is to stop the allocator targeting a residency this body does not fit in, not to
+make two blocks resident: at 255 registers one is. Before the score moved into
+registers the ordering was the other way round, 107.0 us at three against 118.7 at
+two, so this constant follows the live set and is not a fixed property of the SM.
+
+Whether it binds is a property of the tile widths, not of ``L``: at ``P`` 48 and
+``3N`` 48 the budget allows three and this is what refuses the third, while at the
+wider readout and the longer chunk the budget allows two on its own."""
 
 
 def nblock(chunk: int) -> int:
@@ -161,16 +180,6 @@ def readout_tile(chunk: int, dim: int) -> Tile:
     return operand_tile(mma_rows(chunk), dim)
 
 
-def score_tile(chunk: int, nblk: int) -> Tile:
-    """Masked score tile, ``(mma_rows(L), pitch)``.
-
-    Args:
-        chunk: ``L``.
-        nblk: Column extent of one slice.
-    """
-    return operand_tile(mma_rows(chunk), nblk)
-
-
 def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     """Shared memory the kernel allocates, in bytes.
 
@@ -194,7 +203,6 @@ def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
             (readout_tile(chunk, dim), itemsize),
             (operand_tile(max(rows, nblk), dim), itemsize),
             (operand_tile(nblk + 1, rows), itemsize),
-            (score_tile(chunk, nblk), itemsize),
         ]
     )
 
@@ -264,7 +272,6 @@ def chunk_scan_fwd_kernel(
     mpad = mma_rows(chunk)
     ldv = smem_pitch(dim)
     ldu = smem_pitch(rows)
-    lds = smem_pitch(nblk)
 
     smem = cutlass.utils.SmemAllocator()
     strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
@@ -280,9 +287,6 @@ def chunk_scan_fwd_kernel(
     )
     su = smem.allocate_tensor(
         gu.element_type, operand_tile(nblk + 1, rows).layout(), SMEM_SEGMENT
-    )
-    sscore = smem.allocate_tensor(
-        gc.element_type, score_tile(chunk, nblk).layout(), SMEM_SEGMENT
     )
 
     t0 = cidx * chunk
@@ -305,10 +309,10 @@ def chunk_scan_fwd_kernel(
     build_table(strans, stap, squat, stable, tid, threads, chunk, 3)
     cute.arch.sync_threads()
 
-    # The readout basis is the A operand of every GEMM below, so it is staged once
-    # and never restaged. ``slp`` is passed as the scale tile and left unread: the
-    # per-row factor belongs to the offset term alone, and applying it here would
-    # scale the score too.
+    # The readout basis is the A operand of the offset and the score GEMM, so it is
+    # staged once and never restaged. ``slp`` is passed as the scale tile and left
+    # unread: the per-row factor belongs to the offset term alone, and applying it
+    # here would scale the score too.
     stage_rotated(
         gc,
         gc,
@@ -341,9 +345,6 @@ def chunk_scan_fwd_kernel(
     vb_f = cute.make_tensor(
         sbz.iterator, cute.make_layout((nblk, dim), stride=(ldv, 1))
     )
-    va_score = cute.make_tensor(
-        sscore.iterator, cute.make_layout((mpad, nblk), stride=(lds, 1))
-    )
     # Two views of one staging tile, one row of pitch apart: the current tap reads
     # token t0+nbase+k, the previous one reads t0+nbase+k-1.
     vb_unow = cute.make_tensor(
@@ -364,9 +365,13 @@ def chunk_scan_fwd_kernel(
         acc[i] = acc[i] * decay(slp[cutlass.min(m, last)])
 
     zero = cutlass.Float32(0.0)
-    elem = sscore.element_type
+    elem = gc.element_type
     scrd = mma_coords(tiled_mma, tid, (mpad, nblk))
     sacc = mma_acc(tiled_mma, tid, (mpad, nblk))
+    # The narrowed score is the A operand of the diagonal GEMM. Fragment and view
+    # are built once: the retile is a layout, so nothing here is per-slice work.
+    sfrag = cute.make_fragment_like(sacc, elem)
+    fa_score = mma_areg(sfrag)
     # The slice loop's form follows the chunk length, because the two costs it
     # trades scale differently. Unrolled, the slice base is a trace-time constant and
     # every score-epilogue index folds into an immediate, which is worth
@@ -422,15 +427,13 @@ def chunk_scan_fwd_kernel(
                 # I6: the mask lands on the float32 accumulator, then one narrowing
                 # into the operand. I3: one exponential of a log difference.
                 masked = sacc[i] * decay(slp[cutlass.min(m, last)] - slp[src])
-                sscore[m, r] = narrow(select(m >= src, masked, zero), elem)
-            cute.arch.sync_threads()
-            mma_gemm(
+                sfrag[i] = narrow(select(m >= src, masked, zero), elem)
+            mma_gemm_areg(
                 tiled_mma,
                 tid,
                 acc,
-                va_score,
+                fa_score,
                 vb_unow if tap == 0 else vb_uprv,
-                True,
                 False,
             )
 

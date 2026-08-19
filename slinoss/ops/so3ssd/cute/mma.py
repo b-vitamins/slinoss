@@ -51,8 +51,10 @@ __all__ = [
     "fp32_tile",
     "make_mma",
     "mma_acc",
+    "mma_areg",
     "mma_coords",
     "mma_gemm",
+    "mma_gemm_areg",
     "mma_rows",
     "mma_store",
     "operand_tile",
@@ -294,3 +296,75 @@ def mma_store(
             m, n = crd[i]
             if m < rows:
                 dst[m, n] = acc[i]
+
+
+@cute.jit
+def mma_areg(frag: cute.Tensor) -> cute.Tensor:
+    """View a fragment in the C layout as the A operand of the same tiled MMA.
+
+    One warp's C fragment for the atom is four values over a 16x8 tile; its A
+    fragment is eight over 16x16, and the eight are the two adjacent 16x8 C tiles
+    with the N mode reread as K. The correspondence is per thread, so a product one
+    contraction computed is the left operand of the next with no data movement, no
+    ``ldmatrix``, and no barrier. FlashAttention-2's ``convert_layout_acc_Aregs``.
+
+    Args:
+        frag: Register fragment laid out as :func:`mma_acc` lays one out,
+            ``((4), MMA_M, MMA_N)``, already narrowed to the operand dtype.
+
+    Returns:
+        A view over the same registers with layout ``((4,2), MMA_M, MMA_N // 2)``:
+        the A fragment of a GEMM whose K extent is the N extent of ``frag``.
+
+    Invariants:
+        ``MMA_N`` must be even, so the N extent must be a multiple of twice the
+        atom's 8 columns. Every N extent in the operator is a multiple of
+        :data:`MMA_TILE_N`, which is 16, so this holds. The consuming GEMM's B
+        operand must have that same K extent.
+    """
+    split = cute.logical_divide(frag.layout, (None, None, 2))
+    return cute.make_tensor(
+        frag.iterator,
+        cute.make_layout(
+            ((split.shape[0], split.shape[2][0]), split.shape[1], split.shape[2][1]),
+            stride=(
+                (split.stride[0], split.stride[2][0]),
+                split.stride[1],
+                split.stride[2][1],
+            ),
+        ),
+    )
+
+
+@cute.jit
+def mma_gemm_areg(
+    tiled_mma: cute.TiledMma,
+    tid: cutlass.Int32,
+    acc: cute.Tensor,
+    fa: cute.Tensor,
+    vb: cute.Tensor,
+    b_k_major: cutlass.Constexpr,
+) -> None:
+    """Accumulate ``fa @ vb^T`` into ``acc`` with A already in registers.
+
+    The sibling of :func:`mma_gemm` for a left operand a previous contraction
+    produced. Only B is loaded through ``ldmatrix``.
+
+    Args:
+        tiled_mma: From :func:`make_mma`. The same one that produced ``fa``, since
+            the M partition across warps has to agree.
+        tid: Thread index within the block.
+        acc: From :func:`mma_acc`. Updated in place.
+        fa: A fragment from :func:`mma_areg`.
+        vb: Shared-memory view of shape ``(N,K)``.
+        b_k_major: Whether ``vb``'s K mode is the stride-1 mode.
+    """
+    thr = tiled_mma.get_slice(tid)
+    fb = tiled_mma.make_fragment_B(thr.partition_B(vb))
+    atom_b = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(not b_k_major, 4), vb.element_type
+    )
+    copy_b = cute.make_tiled_copy_B(atom_b, tiled_mma)
+    thr_b = copy_b.get_slice(tid)
+    cute.copy(copy_b, thr_b.partition_S(vb), thr_b.retile(fb))
+    cute.gemm(tiled_mma, acc, fa, fb, acc)
