@@ -173,6 +173,39 @@ def test_grouped_readout_reads_its_own_group(groups: int) -> None:
     assert_max_rel(got, want, BOUNDS[torch.bfloat16], f"cute-chunk-start[G{groups}]")
 
 
+def _projection_band(C: torch.Tensor) -> torch.Tensor:
+    """``C`` as the mixer hands it over: one column band of a wider tensor.
+
+    The fused projection is token-major, so the view the kernel receives strides by
+    the projection width from one token to the next and by ``3N`` from one group to
+    the next. The group axis therefore strides less than the axis before it, which a
+    band cut out of a head-major buffer would not reproduce. Two bands sit ahead of
+    it and one behind, so neither the offset nor the pitch is the one a dedicated
+    buffer would have.
+    """
+    bsz, groups, seqlen, dim = C.shape
+    wide = torch.empty(bsz, seqlen, groups + 3, dim, dtype=C.dtype, device=C.device)
+    band = wide[:, :, 2 : 2 + groups]
+    band.copy_(C.permute(0, 2, 1, 3))
+    return band.permute(0, 2, 1, 3)
+
+
+def test_reads_a_band_of_the_fused_projection() -> None:
+    """``C`` ships pitched, and the kernel indexes the band rather than a copy of it.
+
+    One projection GEMM feeds every consumer, so ``C`` is a column band of its
+    output and never a buffer of its own. Recovering contiguity would be the staging
+    copy the layout contract exists to refuse. Nothing about the arithmetic changes,
+    so the two layouts must agree bit for bit rather than within a tolerance.
+    """
+    inp = _make(2, 4, 128, 16, 16, torch.bfloat16, groups=2)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = chunk_start_backward(dy, inp.trans, inp.C, 64)
+    got = chunk_start_backward(dy, inp.trans, _projection_band(inp.C), 64)
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)
+
+
 def test_matches_autograd_through_the_forward() -> None:
     """``dzstart`` is the cotangent ``autograd`` sends into the forward's ``zstart``.
 
@@ -238,18 +271,15 @@ def _ok() -> dict[str, torch.Tensor]:
     return {"dy": _cotangent(inp, torch.bfloat16), "trans": inp.trans, "C": inp.C}
 
 
-def _strided(tensor: torch.Tensor) -> torch.Tensor:
-    """A view of ``tensor``'s shape whose last axis is strided."""
-    shape = (*tensor.shape[:-1], 2 * int(tensor.shape[-1]))
-    wide = torch.empty(shape, device=tensor.device, dtype=tensor.dtype)
-    return wide[..., : tensor.shape[-1]]
-
-
 Operands = dict[str, torch.Tensor]
 
 REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     (lambda a: a.update(dy=a["dy"].cpu()), ValueError, "dy must be on a CUDA device"),
-    (lambda a: a.update(C=_strided(a["C"])), ValueError, "C must be contiguous"),
+    # An arbitrary pitch between rows is legal on ``C``; a gap inside one is not,
+    # since a thread reads the three components of its 3-vector as adjacent
+    # elements. The other pitched rejections belong to the shared rule and are
+    # covered against it; this one says ``C`` reaches that rule at all.
+    (lambda a: a.update(C=a["C"][..., ::2]), ValueError, "C must have unit stride"),
     (lambda a: a.update(dy=a["dy"].float()), TypeError, "dy has dtype"),
     (lambda a: a.update(C=a["C"].half()), TypeError, "one dtype per call"),
     (lambda a: a.update(trans=a["trans"].bfloat16()), ValueError, "trans must be"),
@@ -302,7 +332,11 @@ def test_rejects_a_bad_operand(
     ("chunk", "lanes", "match"),
     [
         (24, 16, "multiple of 16"),
-        (64, 15, "3N must be"),
+        # 3N = 24 rather than any smaller miss: the pitch of a contiguous ``C`` is
+        # ``3N``, so a 3N that is not a multiple of 8 elements is refused by the
+        # pitched rule before the extent rule is reached. 24 clears alignment and
+        # still fails the atom's N extent.
+        (64, 8, "3N must be"),
     ],
 )
 def test_rejects_an_extent_the_atom_cannot_cover(

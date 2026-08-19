@@ -6,6 +6,11 @@ strided operand is either misread with no error or fails later inside an interna
 reshape. Repacking instead of raising would be the staging copy the kernels exist
 to avoid.
 
+The vector operands are the exception. ``B`` and ``C`` are column bands of the
+mixer's fused projection, so they are pitched rather than contiguous and go to
+:func:`check_pitched`. A contiguous buffer satisfies that rule too, at a pitch
+equal to its row width, so the two layouts are one call.
+
 One implementation rather than one per kernel. Two kernels of the same operator
 that disagree about what a legal call is have a caller that can reach the
 disagreement, and the check order is part of the contract: layout, then dtype,
@@ -23,7 +28,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from slinoss._guard import Named, check_dtypes, check_layout
+from slinoss._guard import Named, check_dtypes, check_layout, check_pitched
 from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K, MMA_TILE_N
 
@@ -35,6 +40,7 @@ __all__ = [
     "check_layout",
     "check_operands",
     "check_pinned",
+    "check_pitched",
     "check_rows",
     "check_shapes",
     "check_stream",

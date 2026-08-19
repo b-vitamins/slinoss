@@ -60,6 +60,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_layout,
     check_operands,
     check_pinned,
+    check_pitched,
     check_shapes,
 )
 from slinoss.ops.so3ssd.cute.mma import (
@@ -308,8 +309,10 @@ def chunk_start_backward(
             :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous. A
             caller with no ``dy`` skips this kernel rather than passing zeros.
         trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
-        C: ``(B,G,T,3N)``, the dtype of ``dy``, contiguous. ``G`` divides ``H``;
-            head ``h`` reads group ``h // (H // G)``.
+        C: ``(B,G,T,3N)``, the dtype of ``dy``, pitched. One column band of the
+            mixer's fused projection, so the token stride is the projection width
+            rather than ``3N``; a contiguous buffer is the case where the two
+            agree. ``G`` divides ``H``; head ``h`` reads group ``h // (H // G)``.
         chunk_size: ``L``. A multiple of 16.
 
     Returns:
@@ -321,7 +324,8 @@ def chunk_start_backward(
     """
     activations: Named = ((dy, "dy"), (C, "C"))
     pinned: Named = ((trans, "trans"),)
-    check_layout((*activations, *pinned))
+    check_layout(((dy, "dy"), *pinned))
+    check_pitched(((C, "C"),))
     dtype = check_operands(activations)
     check_pinned(pinned)
     bsz, heads, groups, seqlen, rows, dim = check_shapes(
