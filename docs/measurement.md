@@ -42,3 +42,6 @@ Each rule below exists because it has been violated before.
 - A budget bucket that reads exactly zero is a broken label, not a free
   operation. A test asserts every declared bucket is nonzero on the fused path.
 - A performance claim in a comment needs a committed measurement behind it.
+- A kernel's declared class needs a benchmarked operator that launches it. A
+  class no driver reaches is a claim with no gate behind it, and it reads as
+  verified because the audit judges only what a capture contained.

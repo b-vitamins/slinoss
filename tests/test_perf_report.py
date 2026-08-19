@@ -888,8 +888,9 @@ def test_class_audit_judges_each_kernel_against_the_class_it_declares(
     its share of the step, which is an upper bound rather than a floor. A failing
     verdict is returned, not raised: the report exists to show it.
 
-    The SERIAL-tiny declaration is patched in because no kernel currently carries
-    one. The arc under test is the audit's choice of comparison, not the table.
+    The SERIAL-tiny declaration is patched onto a DRAM-bound kernel rather than
+    read off the one real SERIAL-tiny entry: the arc under test is the audit's
+    choice of comparison, so it must not move when the table does.
     """
     monkeypatch.setitem(DECLARED, "state_passing_fwd_kernel", SERIAL_TINY)
     audit = class_audit(
