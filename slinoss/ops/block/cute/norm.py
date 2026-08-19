@@ -90,7 +90,7 @@ from slinoss._cute import (
     smem_bytes,
     widen,
 )
-from slinoss._guard import check_layout
+from slinoss._guard import check_dtypes, check_layout
 from slinoss._precision import KERNEL_DTYPES
 from slinoss.ops.block.reference import NormResidual, NormResidualGrads, RMSNormGrads
 
@@ -817,6 +817,10 @@ def check_operand(tensor: Tensor, name: str) -> None:
     policy is the block's own, and is wider than the scan's because these kernels
     are rowwise and read float32 natively.
 
+    One operand at a time, so the shared checker's second half is inert here: the
+    block kernels widen each operand on load independently, so a bfloat16 input
+    against a float32 cotangent is a supported call rather than a mixed group.
+
     Args:
         tensor: The operand.
         name: Name used in the message.
@@ -825,11 +829,9 @@ def check_operand(tensor: Tensor, name: str) -> None:
         ValueError: If the tensor is off CUDA or not contiguous.
         TypeError: If the dtype has no kernel path.
     """
-    check_layout(((tensor, name),))
-    if tensor.dtype not in KERNEL_DTYPES:
-        raise TypeError(
-            f"{name} has dtype {tensor.dtype}; kernel dtypes: {KERNEL_DTYPES}"
-        )
+    named = ((tensor, name),)
+    check_layout(named)
+    check_dtypes(named, KERNEL_DTYPES, "kernel dtypes")
 
 
 def _check_norm(x: Tensor, weight: Tensor, eps: float) -> tuple[int, int]:

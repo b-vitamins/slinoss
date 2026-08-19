@@ -83,7 +83,7 @@ from slinoss._cute import (
     smem_bytes,
     widen,
 )
-from slinoss._guard import Named, check_layout, check_pitched
+from slinoss._guard import check_dtypes, check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
 from slinoss.ops.mixer.reference import MixerTailGrads, tail_shape
 
@@ -550,28 +550,6 @@ def _check_eps(eps: float) -> None:
         raise ValueError(f"eps must be positive, got {eps}")
 
 
-def _check_dtypes(named: Named) -> None:
-    """Raises:
-    TypeError: If an operand dtype has no kernel path, or if the group does not
-        share one dtype. One dtype per group keeps a single widening type
-        inside the kernel; the operand group and the parameter group are
-        independent, so float32 parameters against low-precision activations is
-        one call.
-    """
-    for tensor, name in named:
-        if tensor.dtype not in KERNEL_DTYPES:
-            raise TypeError(
-                f"{name} has dtype {tensor.dtype}; kernel dtypes: {KERNEL_DTYPES}"
-            )
-    head, head_name = named[0]
-    for tensor, name in named[1:]:
-        if tensor.dtype is not head.dtype:
-            raise TypeError(
-                f"{name} is {tensor.dtype} and {head_name} is {head.dtype}; "
-                "one dtype per group"
-            )
-
-
 def _check_shapes(
     y: Tensor, u: Tensor, gate: Tensor, d_skip: Tensor, weight: Tensor
 ) -> tuple[int, int, int, int]:
@@ -613,8 +591,18 @@ def _check_operands(
     """
     shape = _check_shapes(y, u, gate, d_skip, weight)
     _check_eps(eps)
-    _check_dtypes(((y, "y"), (u, "u"), (gate, "gate")))
-    _check_dtypes(((d_skip, "d_skip"), (weight, "weight")))
+    # Two groups, not one call: the activations and the parameters widen
+    # independently inside the kernel, so float32 parameters against
+    # low-precision activations is a supported call.
+    check_dtypes(
+        ((y, "y"), (u, "u"), (gate, "gate")), KERNEL_DTYPES, "kernel dtypes", "group"
+    )
+    check_dtypes(
+        ((d_skip, "d_skip"), (weight, "weight")),
+        KERNEL_DTYPES,
+        "kernel dtypes",
+        "group",
+    )
     check_layout(((y, "y"), (u, "u"), (d_skip, "d_skip"), (weight, "weight")))
     check_pitched(((gate, "gate"),))
     _budget(_segments(shape[3]))
@@ -724,7 +712,7 @@ def mixer_tail_backward(
         raise ValueError(
             f"dout must be {(bsz, seqlen, width)}, got {tuple(dout.shape)}"
         )
-    _check_dtypes(((y, "y"), (dout, "dout")))
+    check_dtypes(((y, "y"), (dout, "dout")), KERNEL_DTYPES, "kernel dtypes", "group")
     check_pitched(((dout, "dout"),))
 
     dy = torch.empty_like(y)
