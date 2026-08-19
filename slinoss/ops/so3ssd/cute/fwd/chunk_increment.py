@@ -101,6 +101,7 @@ from slinoss.ops.so3ssd.cute.prefix import chunk_endpoint, chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
     build_table,
     stage_chunk,
+    stage_pad,
     stage_rotated,
     stage_shifted,
 )
@@ -271,15 +272,11 @@ def chunk_increment_fwd_kernel(
         threads,
         chunk,
     )
-    # Columns past 3N take part in no MMA read, but garbage there would be read
-    # as an operand. The per-slice restage covers only the first 3N columns, so
-    # the pad is zeroed once here.
-    if cutlass.const_expr(ldb > dim):
-        pad = ldb - dim
-        zero = sb.element_type(0.0)
-        for i in cutlass.range(tid, kblk * pad, threads):
-            r = i // pad
-            sb[r, dim + i - r * pad] = zero
+    # Columns at or past the data width are read as operands but never restaged,
+    # so they are zeroed once here. ``su`` runs to its full pitch because its M
+    # mode is the rounded extent: columns P..mpad-1 are read as zero rows.
+    stage_pad(sb, tid, threads, kblk, dim, ldb)
+    stage_pad(su, tid, threads, kblk + 1, rows, lda)
 
     cute.arch.sync_threads()
     chunk_prefixes(strans, slp, squat, tid, chunk)
@@ -324,7 +321,6 @@ def chunk_increment_fwd_kernel(
             tid,
             threads,
             kblk,
-            lda,
             rows,
             has_prev,
         )

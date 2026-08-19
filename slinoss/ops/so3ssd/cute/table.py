@@ -72,12 +72,21 @@ from slinoss.ops.so3ssd.cute.common import (
 )
 
 __all__ = [
+    "PREFETCH",
     "build_table",
     "stage_chunk",
+    "stage_pad",
     "stage_rotated",
     "stage_shifted",
     "stage_state",
 ]
+
+PREFETCH: int = 4
+"""Staging steps whose global loads are issued before any of them is consumed.
+
+Bounds the load phase at ``3 * PREFETCH`` live float32 registers while keeping
+``3 * PREFETCH`` loads outstanding per thread, which is what covers one global
+latency. One is the serial form: load, transform, store, wait, repeat."""
 
 
 @cute.jit
@@ -190,7 +199,6 @@ def stage_shifted(
     tid: cutlass.Int32,
     threads: cutlass.Constexpr,
     span: cutlass.Constexpr,
-    lda: cutlass.Constexpr,
     width: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
 ) -> None:
@@ -202,18 +210,21 @@ def stage_shifted(
     not per chunk, so row 0 of the first run of a chunk crosses the chunk boundary
     and, at the first chunk, reaches the streaming ``u_prev``.
 
-    Columns past ``width`` and rows past the sequence are zeroed. A zero there
-    multiplies a forcing row that is itself zero, so no store is skipped.
+    Rows past the sequence are zeroed. A zero there multiplies a forcing row that
+    is itself zero, so no store is skipped. Columns at or past ``width`` are not
+    touched: they are the caller's business, through :func:`stage_pad`, because
+    they never change and a per-slice restage would rewrite the same zeros.
 
-    Every store is inside a divergent branch and every ``(r, p)`` pair is owned by
-    exactly one thread on exactly one branch. Two guarded stores to the same address
-    would race, because the thread that owns the address in the flat loop is not the
-    one that owns it in an overlay pass.
+    The pass runs in groups of :data:`PREFETCH` steps, loads first, on clamped
+    indices with a select afterwards, for the reason given in
+    :func:`stage_rotated`. This is the longest staging pass in the operator:
+    ``(span + 1) * width`` elements at one element per thread per step.
 
     Args:
         gu: ``(B,H,T,P)`` operand-dtype source.
         guprev: ``(B,H,P)`` streaming ``u_{-1}``. Read only when ``has_prev``.
-        su: Operand-dtype tile of ``span + 1`` rows and ``lda`` pitch, written.
+        su: Operand-dtype tile of ``span + 1`` rows and ``lda`` pitch. Columns
+            below ``width`` are written.
         bidx: Batch index.
         hidx: Head index.
         t0: First token of the chunk.
@@ -222,29 +233,79 @@ def stage_shifted(
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         span: Tokens of the run. Compile-time.
-        lda: Row pitch of ``su``. Compile-time.
         width: Columns that carry data, ``P``. Compile-time.
         has_prev: Whether ``guprev`` was supplied. Compile-time.
     """
-    zero = su.element_type(0.0)
-    for i in cutlass.range(tid, (span + 1) * lda, threads):
-        r = i // lda
-        p = i - r * lda
-        # The predicate keeps the read in bounds on its own: token < valid implies
-        # t0 + token < seqlen, so no clamp is needed under a divergent branch,
-        # where an inactive lane issues no load.
-        token = lbase + r - 1
-        g = t0 + token
-        if (p < width) & (g >= 0) & (token < valid):
-            su[r, p] = gu[bidx, hidx, g, p]
-        else:
+    src = gu.element_type
+    zero = cutlass.Float32(0.0)
+    total = (span + 1) * width
+    steps = -(-total // threads)
+    exact = total % threads == 0
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        count = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // width
+            p = i - r * width
+            token = lbase + r - 1
+            # token < valid implies t0 + token < seqlen, so clamping the token
+            # bounds the read above; the row before the sequence bounds it below.
+            gbase = t0 + cutlass.min(token, valid - 1)
+            got = widen(gu[bidx, hidx, cutlass.max(gbase, 0), p], src)
             if cutlass.const_expr(has_prev):
-                if (p < width) & (g < 0):
-                    su[r, p] = guprev[bidx, hidx, p]
-                else:
-                    su[r, p] = zero
+                got = select(gbase < 0, widen(guprev[bidx, hidx, p], src), got)
+            keep = token < valid
+            if cutlass.const_expr(not has_prev):
+                keep = keep & (gbase >= 0)
+            held.append((r, p, keep, got))
+
+        for step in cutlass.range_constexpr(count):
+            r, p, keep, got = held[step]
+            # The select is float32 because there is one select helper; the
+            # operand round trip through float32 is exact at every operand width.
+            out = narrow(select(keep, got, zero), src)
+            if cutlass.const_expr(exact):
+                su[r, p] = out
             else:
-                su[r, p] = zero
+                if tid + (group * PREFETCH + step) * threads < total:
+                    su[r, p] = out
+
+
+@cute.jit
+def stage_pad(
+    dst: cute.Tensor,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    pitch: cutlass.Constexpr,
+) -> None:
+    """Zero the columns of a tile between its data width and its row pitch.
+
+    An MMA operand view whose N mode is the rounded extent reads columns past the
+    data, so garbage there is read as an operand. Those columns never change, so
+    they are zeroed once per block rather than on every restage.
+
+    No-op at compile time when the pitch carries no pad.
+
+    Args:
+        dst: Operand-dtype tile, written at columns ``width .. pitch - 1``.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        span: Rows to cover. Compile-time.
+        width: First column to zero. Compile-time.
+        pitch: Row pitch. Compile-time.
+    """
+    if cutlass.const_expr(pitch > width):
+        pad = pitch - width
+        zero = dst.element_type(0.0)
+        for i in cutlass.range(tid, span * pad, threads):
+            r = i // pad
+            dst[r, width + i - r * pad] = zero
 
 
 @cute.jit
@@ -263,6 +324,12 @@ def stage_state(
     state is read by one contraction per chunk and never written, so there is no
     accumulation for the narrowing to compound through.
 
+    ``(P, 3N)`` is one contiguous float32 run and the loop walks it at the block
+    stride, so a warp covers 512 contiguous bytes per step and no index arithmetic
+    survives. The steps run in groups of :data:`PREFETCH`, loads first, so the
+    group's loads overlap: this is the largest single read in the operator and a
+    serial step-by-step form pays one global latency per element per thread.
+
     Args:
         gz: ``(P, 3N)`` float32 view of the chunk-start state for one
             ``(chunk, batch, head)``.
@@ -274,9 +341,27 @@ def stage_state(
         dim: ``3N``. Compile-time.
     """
     elem = sz.element_type
-    for i in cutlass.range(tid, width * dim, threads):
-        p = i // dim
-        sz[p, i - p * dim] = narrow(gz[p, i - p * dim], elem)
+    total = width * dim
+    steps = -(-total // threads)
+    exact = total % threads == 0
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        span = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(span):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            p = i // dim
+            held.append((p, i - p * dim))
+        got = [gz[p, col] for p, col in held]
+        for step in cutlass.range_constexpr(span):
+            p, col = held[step]
+            if cutlass.const_expr(exact):
+                sz[p, col] = narrow(got[step], elem)
+            else:
+                if tid + (group * PREFETCH + step) * threads < total:
+                    sz[p, col] = narrow(got[step], elem)
 
 
 @cute.jit
@@ -298,9 +383,12 @@ def _store_rotated(
         stable: ``(mats, L, 9)`` float32 transform table.
         sscale: ``(L,)`` float32 per-token scale. Read only when ``scaled``.
         row: Row of the destination tile.
-        token: Chunk-local token index, indexing ``stable`` and ``sscale``.
+        token: Chunk-local token index, indexing ``stable`` and ``sscale``. Already
+            clamped below ``valid`` by the caller: an M extent rounded up past the
+            chunk would otherwise read both tiles out of bounds.
         lane: Which of the ``N`` 3-vectors.
-        vec: The 3-vector, already widened to float32.
+        vec: The 3-vector, already widened to float32 and already zeroed if the
+            row carries no token.
         slot: Table slot. Compile-time.
         scaled: Whether to multiply by ``sscale[token]``. Compile-time.
     """
@@ -358,10 +446,19 @@ def stage_rotated(
     One thread owns one 3-vector: three coalesced global reads, nine FMA, three
     shared-memory stores.
 
+    The pass runs in groups of :data:`PREFETCH` steps, loads first and transforms
+    second, so ``3 * PREFETCH`` loads are outstanding when the first of them is
+    consumed. Nothing is loaded under a predicate: the index is clamped into range
+    and the out-of-range value is replaced afterwards by a select. A load inside a
+    divergent branch cannot be hoisted above the branch, and a value produced
+    inside one has no phi node to leave through, so the predicated form serializes
+    on one global latency per step.
+
     Rows whose token is at or past ``valid`` are zeroed, which also zeroes the rows
     an M extent was rounded up by, since ``lbase`` is zero whenever ``span``
     exceeds the chunk. A zero row contributes nothing to any contraction, so no
-    consumer needs a predicate.
+    consumer needs a predicate. Zeroing the float32 input rather than the stored
+    output is the same three selects and makes the nine FMA exact.
 
     Args:
         gv: ``(B,H,T,3N)`` operand-dtype source.
@@ -385,53 +482,59 @@ def stage_rotated(
         scaled: Whether to apply ``sscale``. Compile-time.
     """
     src = gv.element_type
-    zero = dst.element_type(0.0)
-    for i in cutlass.range(tid, span * lanes, threads):
-        r = i // lanes
-        n = i - r * lanes
-        token = lbase + r
-        g = t0 + token - back
-        if (token < valid) & (g >= 0):
-            _store_rotated(
-                dst,
-                stable,
-                sscale,
-                r,
-                token,
-                n,
-                (
-                    widen(gv[bidx, hidx, g, 3 * n], src),
-                    widen(gv[bidx, hidx, g, 3 * n + 1], src),
-                    widen(gv[bidx, hidx, g, 3 * n + 2], src),
-                ),
-                slot,
-                scaled,
+    zero = cutlass.Float32(0.0)
+    total = span * lanes
+    steps = -(-total // threads)
+    # The staging extents are all multiples of the block width at every legal
+    # shape, so the store predicate below is elided. The general form is kept
+    # because it costs nothing when it is not needed.
+    exact = total % threads == 0
+    # g < 0 is reachable only for the previous tap at the first token of the first
+    # chunk, which is exactly the streaming carry-in.
+    carry = has_prev and back == 1
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        width = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(width):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // lanes
+            n = i - r * lanes
+            # One clamp serves both reads: valid is at most the chunk, so the
+            # clamped token indexes stable and sscale in bounds even when the M
+            # extent was rounded up past the chunk, and t0 + it is inside the
+            # sequence.
+            tsafe = cutlass.min(lbase + r, valid - 1)
+            gbase = t0 + tsafe - back
+            gsafe = cutlass.max(gbase, 0)
+            got = (
+                widen(gv[bidx, hidx, gsafe, 3 * n], src),
+                widen(gv[bidx, hidx, gsafe, 3 * n + 1], src),
+                widen(gv[bidx, hidx, gsafe, 3 * n + 2], src),
             )
-        else:
-            # g < 0 is reachable only for the previous tap at the first token of
-            # the first chunk, which is exactly the streaming carry-in.
-            if cutlass.const_expr(has_prev and back == 1):
-                if token < valid:
-                    _store_rotated(
-                        dst,
-                        stable,
-                        sscale,
-                        r,
-                        token,
-                        n,
-                        (
-                            widen(gvprev[bidx, hidx, 3 * n], src),
-                            widen(gvprev[bidx, hidx, 3 * n + 1], src),
-                            widen(gvprev[bidx, hidx, 3 * n + 2], src),
-                        ),
-                        slot,
-                        scaled,
-                    )
-                else:
-                    dst[r, 3 * n] = zero
-                    dst[r, 3 * n + 1] = zero
-                    dst[r, 3 * n + 2] = zero
+            if cutlass.const_expr(carry):
+                at_start = gbase < 0
+                got = (
+                    select(at_start, widen(gvprev[bidx, hidx, 3 * n], src), got[0]),
+                    select(at_start, widen(gvprev[bidx, hidx, 3 * n + 1], src), got[1]),
+                    select(at_start, widen(gvprev[bidx, hidx, 3 * n + 2], src), got[2]),
+                )
+            keep = lbase + r < valid
+            if cutlass.const_expr(back == 1 and not has_prev):
+                keep = keep & (gbase >= 0)
+            held.append((r, n, tsafe, keep, got))
+
+        for step in cutlass.range_constexpr(width):
+            r, n, tsafe, keep, got = held[step]
+            vec = (
+                select(keep, got[0], zero),
+                select(keep, got[1], zero),
+                select(keep, got[2], zero),
+            )
+            if cutlass.const_expr(exact):
+                _store_rotated(dst, stable, sscale, r, tsafe, n, vec, slot, scaled)
             else:
-                dst[r, 3 * n] = zero
-                dst[r, 3 * n + 1] = zero
-                dst[r, 3 * n + 2] = zero
+                if tid + (group * PREFETCH + step) * threads < total:
+                    _store_rotated(dst, stable, sscale, r, tsafe, n, vec, slot, scaled)

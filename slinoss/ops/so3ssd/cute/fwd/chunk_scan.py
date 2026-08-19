@@ -379,7 +379,6 @@ def chunk_scan_fwd_kernel(
                     tid,
                     threads,
                     nblk,
-                    ldu,
                     rows,
                     has_prev,
                 )
