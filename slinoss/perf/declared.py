@@ -63,6 +63,7 @@ extension namespace."""
 DECLARED: Final[dict[str, str]] = {
     "boundary_bwd_kernel": SERIAL_TINY,
     "chunk_increment_fwd_kernel": DRAM_BOUND,
+    "chunk_input_bwd_kernel": DRAM_BOUND,
     "chunk_scan_fwd_kernel": DRAM_BOUND,
     "chunk_start_bwd_kernel": DRAM_BOUND,
     "conv1d_bwd_kernel": DRAM_BOUND,
