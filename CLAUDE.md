@@ -123,19 +123,13 @@ identically.
 This makes every contraction MMA-k friendly with no padding. Do not add a
 padding path; fix the shape constraint instead.
 
-The multiples live in `config.py` and nowhere else: `LANE_MULTIPLE = 16`,
-`STATE_MULTIPLE = 48`, `HEAD_MULTIPLE = 16`, `MIN_CHUNK = 16`, `MAX_CHUNK = 128`.
-`MAX_CHUNK` is a shared-memory bound, not a taste: the score tile is `L*L` and the
-staged operands scale with `L`, so `L = 128` puts `chunk_scan` at roughly 56 KB and
-one block per SM. `L` is a lever at long `T`, where the grid absorbs the occupancy
-loss; it is not a lever at the standard shape.
+Every shape multiple lives in `config.py`, with its reason. Do not restate one here
+or hardcode one elsewhere.
 
-One exception to the no-padding rule, and only one. In a GEMM the `N` and `K` modes
-must be multiples of 16 and are, by the constraints above; the `M` mode is free,
-because `P` is a row count and not a contraction extent. `M` is rounded up to
-`MMA_TILE_M`, the pad rows are zero-filled, and the store is predicated on the real
-row count. That is padding inside one tile's register fragment, never a padded
-tensor and never a staging copy.
+The no-padding rule has one exception. A GEMM's `N` and `K` modes are multiples of
+16 by the constraints above; the `M` mode is free, because `P` is a row count and
+not a contraction extent. `M` is rounded up to `MMA_TILE_M` inside the tile, the pad
+rows are zero-filled, and the store is predicated. Never a padded tensor.
 
 ## Numerical invariants
 
@@ -199,24 +193,19 @@ chunk-local frame, every contraction is a dense real GEMM. Preserve that.
 - No `torch.zeros` or `aten::fill_` on a hot path. Accumulators initialize
   inside kernels.
 - No staging copies to satisfy a kernel's layout preference.
-- Bank conflicts are a bug, not a tradeoff. Conflict freedom comes from the pitch,
-  not from a swizzle functor: the pinned DSL cannot compose a swizzled layout with
-  the MMA fragment loads these kernels need, so every shared tile is allocated at
-  an odd number of 16-byte units. `smem_pitch` in `common.py` is the one
-  implementation; do not hand-pick a pitch. Measured ways for a bf16 tile: 48 -> 2,
-  56 -> 1, 64 -> 8, 72 -> 1, 80 -> 2. A power-of-two pitch is the worst case, which
-  is why the rounding is to an odd multiple and not to the next power of two.
-- Never load from global inside a divergent branch, and never inside a
-  `cutlass.range` loop that also transforms what it loads. `cutlass.range` lowers
-  to IR that ptxas cannot unroll, and a load under a branch cannot be hoisted above
-  it, so both shapes serialize the loop on one full global latency per step. Split
-  load from transform: issue a `range_constexpr` group of `PREFETCH` loads into
-  trace-time lists, then transform the group. Clamp the index unconditionally and
-  fix the result with `select`; never predicate the load. This is also forced by the
-  DSL, which emits no phi node for a dynamic `if`, so a value produced inside a
-  branch cannot be read after it.
-- Compile once. A `@cute.jit` function called directly retraces on every call.
-  Every launch goes through the executor cache in `slinoss/_cute.py`.
+- Bank conflicts are a bug, not a tradeoff. Conflict freedom comes from the pitch:
+  every shared tile is allocated at an odd number of 16-byte units, a power-of-two
+  pitch being the worst case. `smem_pitch` in `common.py` is the one implementation;
+  do not hand-pick a pitch.
+- No global load inside a divergent branch, and none inside a `cutlass.range` loop
+  that also transforms what it loads: neither can be unrolled or hoisted, so both
+  serialize on one global latency per step. Split load from transform -- a
+  `range_constexpr` group of `PREFETCH` loads, then the group's math. Clamp the index
+  unconditionally and correct with `select`; never predicate a load. The DSL emits no
+  phi node for a dynamic `if`, so a value produced inside a branch cannot be read
+  after it.
+- Compile once. Every launch goes through the executor cache in `slinoss/_cute.py`;
+  a `@cute.jit` function called directly retraces on every call.
 - Parameter gradients are nine float32 accumulators per token per tap, reduced
   over the lane dimension. They fuse into the `dB` and `dC` kernel epilogues.
   There is no dedicated parameter-gradient kernel and there will not be one.
@@ -239,26 +228,20 @@ chunk-local frame, every contraction is a dense real GEMM. Preserve that.
 
 ## Dispatch
 
-One entry point per operator, not one per implementation. An operator whose fast
-path is reachable only by importing a kernel module has two entry points, and the
-second one is untested by definition.
+One entry point per operator, not one per implementation.
 
-- `interface.py` holds the operator's single `torch.autograd.Function` and its
-  single public callable. The callable takes `backend: str | None`, resolves, then
-  applies. Nothing else constructs an autograd function for that operator.
-- `backends.py` holds the forward and backward `Protocol`s, the `Registry`, and the
-  registrations: reference at priority 0 over `("cpu", "cuda")` with
-  `SUPPORTED_DTYPES`; CuTe at priority 10 over `("cuda",)` with `KERNEL_DTYPES`,
-  behind a `torch.cuda.is_available()` check and then an `ImportError` guard. A tree
-  with no CUDA and no DSL must still import and resolve to the reference.
-- The gradient named type lives in `reference.py`. Defining it in the kernel module
-  forces the reference backend to import a kernel to name its own return type, which
-  inverts the dependency and breaks the CPU-only tree.
+- `interface.py` holds the operator's single `torch.autograd.Function` and its single
+  public callable, which takes `backend: str | None` and resolves before applying.
+  Nothing else constructs an autograd function for that operator.
+- `backends.py` holds the two `Protocol`s, the `Registry`, and the registrations:
+  reference at priority 0 over `("cpu", "cuda")`; CuTe at priority 10 over
+  `("cuda",)`, behind a CUDA-availability check and then an `ImportError` guard. A
+  tree with no CUDA and no DSL still imports and resolves to the reference.
+- The gradient named type lives in `reference.py`. In the kernel module it would
+  force the reference backend to import a kernel to name its own return type.
 - Resolution is on device type and activation dtype. Shape is not a resolution axis.
-- No `torch.amp.custom_fwd`. It casts every input to the autocast dtype, which is
-  the opposite of I4. The backend decides the promotion.
-- The registry's resolution rules are tested once, against a fixture the test owns.
-  They are not re-tested per operator.
+- No `torch.amp.custom_fwd`. It casts every input to the autocast dtype, which is the
+  opposite of I4. The backend decides the promotion.
 
 ## Optimization workflow
 
@@ -278,18 +261,17 @@ Use `scripts/bench/` and `scripts/perf/`. Never write an ad-hoc timing script
 outside them; extend them instead.
 
 Rank candidates from the stall decomposition, never from a byte count alone. A byte
-count says where the floor is; it does not say what the kernel is waiting on. A
-kernel at half its bandwidth ceiling with `long_scoreboard` near 100% is latency
-bound, and every traffic-cut hypothesis aimed at it is mis-ranked. Reading a
-bottleneck off the shape of an indexing expression instead of off the layout and the
-counters has already produced one retracted finding.
+count gives the floor; it does not say what the kernel waits on. A kernel at half its
+bandwidth ceiling with `long_scoreboard` dominant is latency bound and a traffic cut
+will not move it. Read the bottleneck off the layout and the counters, never off the
+shape of an indexing expression.
 
 Every kernel is declared `DRAM-bound`, `TENSOR-bound`, or `SERIAL-tiny` and
 held to that class: at least 85% of measured achievable bandwidth, or at least
 70% of achievable tensor-core throughput, or under 2% of step time. A kernel
 that is none of the three is a defect, not a result. The declaration lives in the
-module docstring with the analytic byte count it rests on, and a `SERIAL-tiny`
-claim needs a committed step-time measurement, not an assertion.
+module docstring with the analytic byte count it rests on, and a `SERIAL-tiny` claim
+is a measurement, not an assertion.
 
 ## Measurement honesty
 
@@ -309,18 +291,15 @@ Each rule below exists because it has been violated before.
 
 ## Test policy
 
-100% coverage on public APIs. Coverage is the floor, not the goal: every test
-justifies its own existence by naming the thing that breaks without it. An
-indiscriminate parametrize product is a defect, not thoroughness.
+100% coverage on public APIs. Coverage is the floor, not the goal: every test names
+the thing that breaks without it. An indiscriminate parametrize product is a defect.
 
-- Sweep an axis; do not cross it. A parametrize axis that does not interact with
-  another axis is swept once: full sweep on the interacting axis, one representative
-  case per independent axis, and the non-interaction stated in the docstring. Dtype
-  crossed with shape crossed with backend is a product that tests one thing many
-  times and costs the suite its ability to be run.
+- Sweep an axis; do not cross it. An axis that does not interact with another is
+  swept once: full sweep on the interacting axis, one representative case per
+  independent axis, non-interaction stated in the docstring.
 - A rule shared by N operators is tested once, against a fixture the test owns.
-- A pure performance change that alters no contract needs no new test. Its evidence
-  is the measurement, and the existing parity tests are what protect it.
+- A pure performance change that alters no contract needs no new test. The existing
+  parity tests protect it and the measurement is its evidence.
 - Write the failing test before fixing a bug. Always.
 - Correctness ground truth is float64 autograd through the reference, not a
   hand-derived VJP. A hand-derived reference shares its derivation with the
@@ -337,9 +316,7 @@ indiscriminate parametrize product is a defect, not thoroughness.
   smallest legal `P`, and the streaming split.
 - Tolerances must be tight enough to fail. A tolerance loose enough to admit
   any output is not a test. Justify every tolerance above `1e-2` in a comment.
-  Never write a tolerance, or a measured error in a comment beside one, that has
-  not been run and read off. A fabricated bound is worse than a loose one, because
-  it reads as evidence.
+  Every tolerance, and every measured error quoted beside one, is run and read off.
 - Never relax a gate. Do not xfail, skip, or loosen an existing test to make a
   change pass. A failing existing test is the change's bug.
 - Every `raise` in a public path has a test that triggers it.

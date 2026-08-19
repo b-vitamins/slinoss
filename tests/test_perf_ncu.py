@@ -210,33 +210,33 @@ DRAM_CSV: Final = f"""==PROF== Connected to process 4711 (/gnu/store/py3-3.11.11
 ==PROF== Profiling "so3ssd_chunk_fwd" - 1: 0%....50%....100% - 1 pass
 ==PROF== Profiling "so3ssd_state_cpasync_fwd" - 2: 0%....50%....100% - 1 pass
 {HEADER}
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","41.28"
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_read.sum","Mbyte","2.5"
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_write.sum","Kbyte","640"
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","62.5"
-"1","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","43.52"
-"1","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_read.sum","Mbyte","2.5"
-"1","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_write.sum","Kbyte","640"
-"1","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","70.0"
-"2","4711","python3","ada1","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","gpu__time_duration.sum","usecond","3.2"
-"2","4711","python3","ada1","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","dram__bytes_read.sum","Kbyte","96"
-"2","4711","python3","ada1","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","dram__bytes_write.sum","Kbyte","32"
-"2","4711","python3","ada1","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","12.5"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","41.28"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_read.sum","Mbyte","2.5"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_write.sum","Kbyte","640"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","62.5"
+"1","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","43.52"
+"1","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_read.sum","Mbyte","2.5"
+"1","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_write.sum","Kbyte","640"
+"1","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","70.0"
+"2","4711","python3","host","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","gpu__time_duration.sum","usecond","3.2"
+"2","4711","python3","host","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","dram__bytes_read.sum","Kbyte","96"
+"2","4711","python3","host","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","dram__bytes_write.sum","Kbyte","32"
+"2","4711","python3","host","so3ssd_state_cpasync_fwd","2026-08-19 09:14:04","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","12.5"
 ==PROF== Disconnected from process 4711
 """
 
 SPARSE_CSV: Final = f"""==PROF== Connected to process 4711 (/gnu/store/py3-3.11.11/bin/python3)
 {HEADER}
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","41.28"
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_read.sum","Mbyte",""
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_write.sum","Kbyte","n/a"
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","nan"
-"","4711","python3","ada1","","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","1.0"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","41.28"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_read.sum","Mbyte",""
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__bytes_write.sum","Kbyte","n/a"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","nan"
+"","4711","python3","host","","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","usecond","1.0"
 ==PROF== Disconnected from process 4711
 """
 
 BAD_UNIT_CSV: Final = f"""{HEADER}
-"0","4711","python3","ada1","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","furlong","41.28"
+"0","4711","python3","host","so3ssd_chunk_fwd","2026-08-19 09:14:03","1","7","","gpu__time_duration.sum","furlong","41.28"
 """
 
 NO_UNIT_COLUMN_CSV: Final = """"ID","Kernel Name","Metric Name","Metric Value"
@@ -378,7 +378,7 @@ ALL_METRICS: Final = NcuTable("all", REQUIRED_METRICS)
 def record(launch: str, kernel: str, metric: str, unit: str, value: str) -> str:
     """One CSV record, in NCU's column order."""
     return (
-        f'"{launch}","4711","python3","ada1","{kernel}",'
+        f'"{launch}","4711","python3","host","{kernel}",'
         f'"2026-08-19 09:14:03","1","7","","{metric}","{unit}","{value}"\n'
     )
 
