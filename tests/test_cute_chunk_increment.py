@@ -25,6 +25,7 @@ from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import (
+    KBLOCK_MAX,
     chunk_increment_forward,
     increment_smem_bytes,
 )
@@ -42,8 +43,9 @@ LS_BIAS = -4.0
 #
 # One case per distinct path through this kernel:
 #
-# - the K slice count, one at L=64 and two at L=128, which is the only loop whose
-#   trip count changes what is staged;
+# - the K slice count, which is the only loop whose trip count changes what is
+#   staged. One slice at ``L == KBLOCK_MAX`` and four at ``MAX_CHUNK``, written
+#   against the constant so the two trip counts stay covered if it is retuned;
 # - a ragged tail, where the pad tap must zero the operand rather than the
 #   predicate skipping a store;
 # - the streaming split, which is the only way the previous tap reaches a token
@@ -53,9 +55,11 @@ LS_BIAS = -4.0
 # - two ``N``, because the lane stride loop is per-thread;
 # - both operand dtypes, because each is a different MMA atom.
 SHAPES = [
-    pytest.param(2, 2, 256, 64, 16, 16, True, torch.bfloat16, id="one-slice-streaming"),
+    pytest.param(
+        2, 2, 256, KBLOCK_MAX, 16, 16, True, torch.bfloat16, id="one-slice-streaming"
+    ),
     pytest.param(2, 2, 200, 64, 48, 32, False, torch.bfloat16, id="ragged-no-carry"),
-    pytest.param(1, 1, 256, MAX_CHUNK, 64, 16, True, torch.bfloat16, id="two-slices"),
+    pytest.param(1, 1, 256, MAX_CHUNK, 64, 16, True, torch.bfloat16, id="many-slices"),
     pytest.param(2, 2, 64, 64, 16, 16, True, torch.float16, id="single-chunk-fp16"),
 ]
 
@@ -179,8 +183,10 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     """
     nbytes = increment_smem_bytes(MAX_CHUNK, 64, 96)
     assert nbytes <= smem_capacity()
-    # Two blocks per SM at the widest shape is what keeps the DRAM pipe fed.
-    assert 2 * nbytes <= smem_capacity()
+    # Residency is what keeps the DRAM pipe fed, and shared memory is what bounds
+    # it: measured on sm_86, one resident block per SM less costs the increment 5 us
+    # of 62 at the standard shape. Three at the widest shape is what the tiles buy.
+    assert 3 * nbytes <= smem_capacity()
     assert increment_smem_bytes(64, 16, 48) < nbytes
 
 

@@ -44,9 +44,12 @@ second tap would add its whole extent to a forward pass that moves about 131 MB.
 ``b`` is transformed on the way in by :func:`stage_rotated` and restaged between
 the two taps, so the rotated forcing never reaches global memory.
 
-DRAM-bound. Analytic traffic at ``standard`` is about 42.4 MB against 906 MFLOP,
-so 24 flop/byte against a ridge point of 165: memory bound by a factor of seven,
-which is why the padded M mode costs nothing measurable.
+DRAM-bound. Analytic traffic at ``standard`` is 37.7 MB against 906 MFLOP, so 24
+flop/byte against a ridge point of 165: memory bound by a factor of seven, which
+is why the padded M mode costs nothing measurable. Measured DRAM traffic on sm_86
+is 37.4 MB per launch, so there is no redundant traffic to remove and the achieved
+fraction is set by how much of the pipe the resident blocks keep busy, which is
+what :data:`KBLOCK_MAX` bounds.
 
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so both tap matrices are zero past ``valid`` and every
@@ -122,11 +125,20 @@ __all__ = [
     "kblock",
 ]
 
-KBLOCK_MAX: int = 64
-"""Longest K slice. The two operand tiles are the only per-slice allocations, and
-capping their K extent keeps ``MAX_CHUNK`` resident two blocks per SM instead of
-one. Every legal chunk length is a power of two, so this divides it exactly and
-the slice count is one or two."""
+KBLOCK_MAX: int = 32
+"""Longest K slice. The two operand tiles are the only per-slice allocations, so
+this constant sets the block's shared total, and that total sets how many blocks
+an SM holds.
+
+At 32 the ``standard`` shape allocates 17,552 B and sm_86 holds four blocks where
+64 held three: 33.33% theoretical occupancy against 25.00%, and 62.6 us per launch
+against 67.2, which is what carries the kernel past the 85% DRAM-bound gate there.
+Four blocks need at most 25,344 B of the 101,376 B carveout and at most 128
+registers per thread, against 17,552 B and 114 measured, so a further shared tile
+or a register spill is what would cost the next residency step, not this constant.
+
+Every legal chunk length is a power of two, so this divides it exactly: one slice
+at 16 and 32, two at 64, four at 128."""
 
 
 def kblock(chunk: int) -> int:
@@ -348,6 +360,9 @@ def chunk_increment_fwd_kernel(
     )
     vb = cute.make_tensor(sb.iterator, cute.make_layout((dim, kblk), stride=(1, ldb)))
 
+    # The slice loop stays unrolled. Measured on sm_86 at the standard shape, a
+    # dynamic loop over the same body costs 168 registers against 114, which drops
+    # the SM from four resident blocks to three: 65.5 us against 62.6.
     for s in cutlass.range_constexpr(slices):
         lbase = s * kblk
         cute.arch.sync_threads()
@@ -510,7 +525,8 @@ def chunk_increment_forward(
         K: ``(B,H,T,2,4)`` float32, contiguous. Per-tap ``(kr, g, h, 0)``.
         B: ``(B,G,T,3N)``, the dtype of ``U``, contiguous. ``G`` divides ``H``;
             head ``h`` reads group ``h // (H // G)``.
-        chunk_size: ``L``. A multiple of 16.
+        chunk_size: ``L``. A multiple of :func:`kblock` of itself, which every
+            power of two satisfies and 48 does not.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, the dtype of ``U``. Paired with
             ``b_prev``.
         b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, the dtype of ``U``.
