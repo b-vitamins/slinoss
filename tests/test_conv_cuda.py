@@ -44,10 +44,12 @@ from tests.test_conv_reference import assert_bitwise, make_call, oracle
 
 pytestmark = [pytest.mark.cuda]
 
-# (B, T, D, W). Sweeps T against the 64-token tile, D against the 32-channel warp
-# and the 128-channel block, the smallest legal B, D, and T, both ends of the
-# width range, and T below W-1, where the returned window straddles the incoming
-# state.
+# (B, T, D, W). Sweeps T against both time tiles, which differ between the two
+# directions, D against the 32-channel warp and the channel block, batch parity
+# against the backward's stream interleaving, the smallest legal B, D, and T, both
+# ends of the width range, and T below W-1, where the returned window straddles
+# the incoming state. The ids name the property, not a tile count: the tiles are
+# tuning constants and have changed.
 SHAPES = [
     pytest.param(2, 40, 8, 4, id="base"),
     pytest.param(1, 1, 1, 4, id="single-token"),
@@ -55,10 +57,10 @@ SHAPES = [
     pytest.param(2, 16, 3, 1, id="pointwise"),
     pytest.param(2, 5, 4, 8, id="short-wide"),
     pytest.param(1, 3, 2, 8, id="straddle"),
-    pytest.param(3, 64, 32, 4, id="one-tile-one-warp"),
-    pytest.param(2, 65, 33, 4, id="tile-plus-one-warp-plus-one"),
-    pytest.param(2, 200, 128, 4, id="four-tiles-one-block"),
-    pytest.param(2, 130, 129, 2, id="three-tiles-two-blocks"),
+    pytest.param(3, 64, 32, 4, id="exact-tiles-one-warp-odd-batch"),
+    pytest.param(2, 65, 33, 4, id="ragged-tile-ragged-warp"),
+    pytest.param(2, 200, 128, 4, id="many-tiles-full-blocks"),
+    pytest.param(2, 130, 129, 2, id="many-tiles-ragged-last-block"),
 ]
 
 # Against the float64 oracle: one rounding of the output at the storage width.
@@ -210,7 +212,7 @@ def test_forward_matches_the_oracle(
     ("bsz", "seqlen", "channels", "width"),
     [
         pytest.param(2, 40, 8, 4, id="base"),
-        pytest.param(2, 65, 33, 4, id="tile-plus-one-warp-plus-one"),
+        pytest.param(2, 65, 33, 4, id="ragged-tile-ragged-warp"),
     ],
 )
 def test_forward_matches_the_oracle_at_every_width(
@@ -312,12 +314,35 @@ def test_backward_matches_float64_autograd_through_the_reference(
 ) -> None:
     """The backward tiling, with every gradient live.
 
-    The backward's decomposition differs from the forward's: it folds the batch into
-    a serial loop, reads a window that overhangs its tile by ``W-1``, and emits one
-    parameter-gradient partial per time tile. Shape selects all three, so it carries
-    the sweep; the flags are swept once below.
+    The backward's decomposition differs from the forward's: it walks the batch in
+    interleaved groups inside a serial loop, reads a window that overhangs its tile
+    by ``W-1``, and emits one parameter-gradient partial per time tile. Shape selects
+    all three, so it carries the sweep; the flags are swept once below.
+
+    Batch parity is part of what shape selects. A batch that is not a multiple of the
+    interleaving width leaves the final group with dead streams, which address a
+    clamped batch entry so that their loads stay in bounds and are held back from
+    accumulating. An odd batch is what distinguishes a dead stream that is correctly
+    silent from one that double-counts the entry it was clamped onto.
     """
     _check_backward(bsz, seqlen, channels, width)
+
+
+@pytest.mark.parametrize("width", range(1, int(_C.extension().MAX_WIDTH) + 1))
+def test_backward_matches_float64_autograd_at_every_instantiated_width(
+    width: int,
+) -> None:
+    """Every width the backward instantiates, at one multi-tile shape.
+
+    Width is a template parameter of the backward kernel, so each value is its own
+    compiled instantiation reached through a switch. A case that launches the wrong
+    instantiation is invisible to the shape sweep above, which only covers the
+    widths its shapes happen to carry. Shape does not interact: the tiling is
+    indexed from the sequence length and the channel count, and the width enters it
+    only as the ``W-1`` overhang, so one shape wide enough to overhang carries all
+    eight.
+    """
+    _check_backward(2, 40, 8, width)
 
 
 @pytest.mark.parametrize(("activation", "with_bias", "with_state"), FLAGS)
@@ -384,7 +409,7 @@ def test_absent_cotangents_match_the_reference(
 CONNECTED_SHAPES = [
     pytest.param(2, 40, 8, 4, id="base"),
     pytest.param(2, 16, 3, 1, id="pointwise"),
-    pytest.param(2, 130, 129, 2, id="three-tiles-two-blocks"),
+    pytest.param(2, 130, 129, 2, id="many-tiles-ragged-last-block"),
 ]
 
 
@@ -478,14 +503,16 @@ def test_partial_count_matches_the_tile_count() -> None:
     # A loop, not a parametrize: the assertion is arithmetic on one host function,
     # so the cases share everything except an integer and none of them can fail
     # independently of the others.
-    tile = int(_C.extension().TILE_T)
+    tile = int(_C.extension().BWD_TILE_T)
     for seqlen in (1, tile - 1, tile, tile + 1, 200):
         assert _C.extension().bwd_parts(seqlen) == -(-seqlen // tile)
 
 
 def test_more_than_one_partial_is_reduced() -> None:
-    # A single-tile sequence cannot detect a dropped partial. This one spans four
-    # tiles, so each parameter gradient is a sum of four slices.
+    # A single-tile sequence cannot detect a dropped partial. This one spans many
+    # backward tiles, so each parameter gradient is a sum over slices. The count is
+    # asserted from the exported tile rather than written here, because the tile is a
+    # tuning constant.
     bsz, seqlen, channels, width = 2, 200, 8, 4
     operands = cuda_call(bsz, seqlen, channels, width)
     leaves = as_reference(operands)

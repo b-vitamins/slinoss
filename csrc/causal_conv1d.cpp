@@ -107,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Causal depthwise conv1d CUDA kernels.";
   m.attr("MAX_WIDTH") = py::int_(slinoss::kMaxWidth);
   m.attr("TILE_T") = py::int_(slinoss::kTileT);
+  m.attr("BWD_TILE_T") = py::int_(slinoss::kBwdTileT);
   m.def("fwd", &fwd, py::arg("x"), py::arg("weight"), py::arg("bias"),
         py::arg("initial_state"), py::arg("y"), py::arg("final_state"),
         py::arg("activation"),

@@ -1,31 +1,60 @@
 // Causal depthwise conv1d kernels.
 //
-// Class: DRAM-bound, both directions.
+// Class: DRAM-bound, both directions. The arithmetic intensity below is 1.75 and
+// 2.7 flop/B against a ridge of 164, and measured DRAM traffic is within 3% of
+// the compulsory count for the forward and 6% for the backward, so there are no
+// bytes left to recover and the class is not in question.
 //
-// Analytic byte count, per token per channel, at bfloat16 with W = 4 and a
-// 64-token tile:
+// OPEN DEFECT: neither direction clears that class's floor of 85% of the measured
+// copy ceiling. On an RTX A6000, clocks unlocked, at the standard shape the
+// forward reaches 66% and the backward 61%. Reproduce with
 //
-//   forward   read x 2 B, write y 2 B, plus (W-1)/kTileT = 3/64 re-read of x
-//             for the tile prologue: 4.09 B for 2W-1 = 7 flop, 1.7 flop/B.
-//   backward  read x 2 B, read dy 2 B, write dx 2 B, plus the same prologue
-//             re-read on x and dy and the (W-1)/kTileT extra ds recompute:
-//             6.28 B for 4W+2 = 18 flop, 2.9 flop/B.
+//   scripts/perf/profile_op.py --op conv --shape standard --mode step
 //
-// The tap bank is D*W*4 B, resident in L2 for every reachable D, and the
-// parameter-gradient partials are parts*D*(W+1)*4 B with parts = ceil(T/64), an
-// order 1/16 addition to the traffic at W = 4. Both figures are analytic and
-// hold no claim about achieved bandwidth.
+// What is missing is not traffic but memory-level parallelism to cover DRAM
+// latency. SERIAL-tiny is not the escape: the two are 29% and 54% of the conv
+// step against that class's 2% ceiling.
 //
-// Decomposition. One thread per channel, walking kTileT timesteps with the
-// window in registers. The layout is channels-last, so a warp at a fixed
-// timestep reads 32 consecutive channels: one coalesced transaction. No shared
-// memory, so there is no tile to swizzle and occupancy is bounded by registers
-// alone.
+// For the backward that shortfall is structural. Its grid is
+// ceil(D/kMaxChannelsPerBlock) * ceil(T/kBwdTileT) and carries no batch axis,
+// because folding batch into the block's serial loop is what makes each block's
+// parameter-gradient accumulator complete over batch and leaves exactly one
+// partial per time tile. Achieved bandwidth then tracks the block count the time
+// tile alone can supply: 60% at the standard shape, which supplies 2304 blocks,
+// against 76% at the long shape, which supplies 9216 from the identical code.
+// Shrinking the tile further to buy blocks reverses at kBwdTileT = 4, where the
+// partial count doubles and the host-side sum of the partials grows faster than
+// the kernel shrinks. Moving batch onto the grid raises the block count at
+// unchanged traffic, but the partial count then depends on batch, and
+// causal_conv1d_bwd_parts takes only a sequence length; changing that signature
+// changes the (P,D,W) allocation in slinoss/ops/conv/backends.py, so it is not a
+// change this file can make alone.
 //
-// The forward grid is (channel tiles, time tiles, batch). The backward folds
-// batch into the block's serial loop instead, which makes each block's
-// parameter-gradient accumulator complete over the batch axis and leaves one
-// partial per time tile.
+// Compulsory byte count, per token per channel, at bfloat16 with W = 4:
+//
+//   forward   read x 2 B, write y 2 B: 4 B for 2W-1 = 7 flop, 1.75 flop/B.
+//   backward  read x 2 B, read dy 2 B, write dx 2 B, plus the partials at
+//             (W+1)*4/(kBwdTileT*B) = 0.63 B: 6.63 B for 4W+2 = 18 flop,
+//             2.7 flop/B.
+//
+// Both kernels re-read past their tile: the forward re-reads W-1 activations for
+// the prologue, the backward re-reads W-1 timesteps of both x and dy and
+// recomputes their ds, because dx at u needs ds at u .. u+W-1. Those re-reads
+// raise requested loads to 1.8x the compulsory ones for the backward at
+// kBwdTileT = 8, and do not appear in the count above: at the shapes measured L2
+// absorbs them, which is why DRAM traffic stays near the compulsory figure.
+// The tap bank is D*W*4 B and is L2-resident for every reachable D. Every figure
+// here is analytic and holds no claim about achieved bandwidth.
+//
+// Decomposition. One thread per channel, walking the time tile with the window
+// in registers. The layout is channels-last, so a warp at a fixed timestep reads
+// 32 consecutive channels: one coalesced transaction. No shared memory, so there
+// is no tile to swizzle and occupancy is bounded by registers and by the
+// blocks-per-SM limit alone.
+//
+// The forward grid is (channel tiles, time tiles, batch). The backward grid is
+// (channel tiles, time tiles), with batch in the block's serial loop and
+// kBwdStreams entries of it interleaved per thread.
 
 #include "causal_conv1d.h"
 
@@ -136,7 +165,7 @@ __global__ void conv1d_fwd_kernel(const input_t *__restrict__ x,
   }
 }
 
-template <typename input_t>
+template <typename input_t, int kWidth>
 __global__ void
 conv1d_bwd_kernel(const input_t *__restrict__ dy,
                   const input_t *__restrict__ dfinal_state,
@@ -147,119 +176,145 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
                   input_t *__restrict__ dx, input_t *__restrict__ dinitial_state,
                   float *__restrict__ dweight_parts,
                   float *__restrict__ dbias_parts, int batch, int seqlen,
-                  int channels, int width, bool activation) {
+                  int channels, bool activation) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   if (channel >= channels) {
     return;
   }
   const int part = blockIdx.y;
-  const int t0 = part * kTileT;
-  const int t1 = min(t0 + kTileT, seqlen);
+  const int t0 = part * kBwdTileT;
+  const int t1 = min(t0 + kBwdTileT, seqlen);
   // dx at index u needs ds at u .. u+W-1, so the walk runs W-1 steps past the
   // tile and recomputes those ds. The tile owns dx over [t0, t1) and, at t0 = 0,
   // the W-1 negative indices that are the gradient of the incoming state.
-  const int tend = t1 - 1 + width - 1;
-  const int u_min = t0 == 0 ? -(width - 1) : t0;
+  const int tend = t1 - 1 + kWidth - 1;
+  const int u_min = t0 == 0 ? -(kWidth - 1) : t0;
 
-  float wr[kMaxWidth];
-  float wf[kMaxWidth];
-  float dwacc[kMaxWidth];
+  // wr[j] is the tap at lag j; wf is the same bank in the order the dx
+  // contraction wants. Holding both is not a duplicated register cost: the two
+  // index the same eight values, and nvcc allocates them as one bank.
+  float wr[kWidth];
+  float wf[kWidth];
+  float dwacc[kWidth];
 #pragma unroll
-  for (int j = 0; j < kMaxWidth; ++j) {
-    const bool live = j < width;
-    wr[j] = live ? static_cast<float>(
-                       weight[static_cast<long>(channel) * width + width - 1 - j])
-                 : 0.0f;
-    wf[j] = live
-                ? static_cast<float>(weight[static_cast<long>(channel) * width + j])
-                : 0.0f;
+  for (int j = 0; j < kWidth; ++j) {
+    wr[j] = static_cast<float>(
+        weight[static_cast<long>(channel) * kWidth + kWidth - 1 - j]);
+    wf[j] =
+        static_cast<float>(weight[static_cast<long>(channel) * kWidth + j]);
     dwacc[j] = 0.0f;
   }
   const float bias_of_channel =
       bias == nullptr ? 0.0f : static_cast<float>(bias[channel]);
   float dbacc = 0.0f;
 
-  for (int b = 0; b < batch; ++b) {
-    const long xbase = static_cast<long>(b) * seqlen * channels + channel;
-    const long sbase = static_cast<long>(b) * (width - 1) * channels + channel;
-
-    float xw[kMaxWidth];
-    float dsw[kMaxWidth];
+  // Batch entries are independent, so the walk carries kBwdStreams of them at
+  // once rather than one after another. That is what puts more than one load per
+  // thread in flight over a serial timestep walk: the stream loads at a given t
+  // have no dependence on each other, and interleaving them costs no traffic,
+  // because the same bytes are read either way.
+  //
+  // A dead stream in the final partial group addresses its own clamped batch
+  // entry, so every load is in bounds and needs no predicate; only the
+  // accumulations and the stores are held back, which is what keeps a dead
+  // stream from double-counting the entry it was clamped onto.
+  for (int b0 = 0; b0 < batch; b0 += kBwdStreams) {
+    const int live = batch - b0;
+    long xbase[kBwdStreams];
+    long sbase[kBwdStreams];
+    float xw[kBwdStreams][kWidth];
+    float dsw[kBwdStreams][kWidth];
 #pragma unroll
-    for (int j = 0; j < kMaxWidth; ++j) {
-      // Pre-shift state, as in the forward: slot j lands at lag j+1.
-      xw[j] = j < width - 1
-                  ? read_extended(x, initial_state, xbase, sbase, channels,
-                                  seqlen, width, t0 - 1 - j)
-                  : 0.0f;
-      // ds before the tile is zero at t0 = 0 because there is no output there,
-      // and is never read at t0 > 0 because u_min holds dx back until the
-      // window is full of ds values this tile computed.
-      dsw[j] = 0.0f;
+    for (int g = 0; g < kBwdStreams; ++g) {
+      const int b = b0 + min(g, live - 1);
+      xbase[g] = static_cast<long>(b) * seqlen * channels + channel;
+      sbase[g] = static_cast<long>(b) * (kWidth - 1) * channels + channel;
+#pragma unroll
+      for (int j = 0; j < kWidth; ++j) {
+        // Pre-shift state, as in the forward: slot j lands at lag j+1.
+        xw[g][j] = j < kWidth - 1
+                       ? read_extended(x, initial_state, xbase[g], sbase[g],
+                                       channels, seqlen, kWidth, t0 - 1 - j)
+                       : 0.0f;
+        // ds before the tile is zero at t0 = 0 because there is no output there,
+        // and is never read at t0 > 0 because u_min holds dx back until the
+        // window is full of ds values this tile computed.
+        dsw[g][j] = 0.0f;
+      }
     }
 
     for (int t = t0; t <= tend; ++t) {
+      // Every stream's loads are issued before any of them is consumed, so the
+      // group's misses overlap instead of serializing.
+      float xc[kBwdStreams];
+      float dyc[kBwdStreams];
 #pragma unroll
-      for (int j = kMaxWidth - 1; j > 0; --j) {
-        xw[j] = xw[j - 1];
+      for (int g = 0; g < kBwdStreams; ++g) {
+        const long at = xbase[g] + static_cast<long>(t) * channels;
+        xc[g] = t < seqlen ? static_cast<float>(x[at]) : 0.0f;
+        dyc[g] = (dy != nullptr && t < seqlen) ? static_cast<float>(dy[at]) : 0.0f;
       }
-      xw[0] = t < seqlen ? static_cast<float>(
-                               x[xbase + static_cast<long>(t) * channels])
-                         : 0.0f;
 
-      float ds = 0.0f;
-      if (dy != nullptr && t < seqlen) {
-        ds = static_cast<float>(dy[xbase + static_cast<long>(t) * channels]);
-        if (activation) {
+#pragma unroll
+      for (int g = 0; g < kBwdStreams; ++g) {
+#pragma unroll
+        for (int j = kWidth - 1; j > 0; --j) {
+          xw[g][j] = xw[g][j - 1];
+        }
+        xw[g][0] = xc[g];
+
+        float ds = dyc[g];
+        if (activation && dy != nullptr) {
           float acc = 0.0f;
 #pragma unroll
-          for (int j = kMaxWidth - 1; j >= 0; --j) {
-            acc = fmaf(wr[j], xw[j], acc);
+          for (int j = kWidth - 1; j >= 0; --j) {
+            acc = fmaf(wr[j], xw[g][j], acc);
           }
           ds *= silu_grad_of(acc + bias_of_channel);
         }
-      }
 
-      // The tile owns the parameter gradient over [t0, t1); the overhang past
-      // t1 belongs to the next tile and must not be counted twice.
-      if (t < t1) {
+        // The tile owns the parameter gradient over [t0, t1); the overhang past
+        // t1 belongs to the next tile and must not be counted twice.
+        if (t < t1 && g < live) {
 #pragma unroll
-        for (int j = 0; j < kMaxWidth; ++j) {
-          dwacc[j] = fmaf(ds, xw[j], dwacc[j]);
-        }
-        dbacc += ds;
-      }
-
-#pragma unroll
-      for (int j = kMaxWidth - 1; j > 0; --j) {
-        dsw[j] = dsw[j - 1];
-      }
-      dsw[0] = ds;
-
-      const int u = t - (width - 1);
-      if (u >= u_min) {
-        float acc = 0.0f;
-#pragma unroll
-        for (int j = kMaxWidth - 1; j >= 0; --j) {
-          acc = fmaf(wf[j], dsw[j], acc);
-        }
-        // The trailing window is returned as the next call's state, so its
-        // cotangent lands on the extended index it was sliced from. Below
-        // T = W-1 that index is negative and the contribution belongs to the
-        // gradient of the incoming state, which the same test covers.
-        if (dfinal_state != nullptr) {
-          const int i = u - (seqlen - (width - 1));
-          if (i >= 0 && i < width - 1) {
-            acc += static_cast<float>(
-                dfinal_state[sbase + static_cast<long>(i) * channels]);
+          for (int j = 0; j < kWidth; ++j) {
+            dwacc[j] = fmaf(ds, xw[g][j], dwacc[j]);
           }
+          dbacc += ds;
         }
-        if (u >= 0) {
-          dx[xbase + static_cast<long>(u) * channels] =
-              static_cast<input_t>(acc);
-        } else if (dinitial_state != nullptr) {
-          dinitial_state[sbase + static_cast<long>(u + width - 1) * channels] =
-              static_cast<input_t>(acc);
+
+#pragma unroll
+        for (int j = kWidth - 1; j > 0; --j) {
+          dsw[g][j] = dsw[g][j - 1];
+        }
+        dsw[g][0] = ds;
+
+        const int u = t - (kWidth - 1);
+        if (u >= u_min && g < live) {
+          float acc = 0.0f;
+#pragma unroll
+          for (int j = kWidth - 1; j >= 0; --j) {
+            acc = fmaf(wf[j], dsw[g][j], acc);
+          }
+          // The trailing window is returned as the next call's state, so its
+          // cotangent lands on the extended index it was sliced from. Below
+          // T = W-1 that index is negative and the contribution belongs to the
+          // gradient of the incoming state, which the same test covers.
+          if (dfinal_state != nullptr) {
+            const int i = u - (seqlen - (kWidth - 1));
+            if (i >= 0 && i < kWidth - 1) {
+              acc += static_cast<float>(
+                  dfinal_state[sbase[g] + static_cast<long>(i) * channels]);
+            }
+          }
+          if (u >= 0) {
+            dx[xbase[g] + static_cast<long>(u) * channels] =
+                static_cast<input_t>(acc);
+          } else if (dinitial_state != nullptr) {
+            dinitial_state[sbase[g] +
+                           static_cast<long>(u + kWidth - 1) * channels] =
+                static_cast<input_t>(acc);
+          }
         }
       }
     }
@@ -267,15 +322,13 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
 
   // Plain stores, one slice per time tile, so no output is read back and
   // nothing needs zeroing before the launch. dwacc is indexed by lag; tap k is
-  // lag width-1-k. The loop bound is the compile-time one so that the register
+  // lag kWidth-1-k. The bound is the template parameter so that the register
   // array is never indexed dynamically, which would put it in local memory.
-  float *dw = dweight_parts + static_cast<long>(part) * channels * width +
-              static_cast<long>(channel) * width;
+  float *dw = dweight_parts + static_cast<long>(part) * channels * kWidth +
+              static_cast<long>(channel) * kWidth;
 #pragma unroll
-  for (int j = 0; j < kMaxWidth; ++j) {
-    if (j < width) {
-      dw[width - 1 - j] = dwacc[j];
-    }
+  for (int j = 0; j < kWidth; ++j) {
+    dw[kWidth - 1 - j] = dwacc[j];
   }
   if (dbias_parts != nullptr) {
     dbias_parts[static_cast<long>(part) * channels + channel] = dbacc;
@@ -288,6 +341,10 @@ int block_width(int channels) {
 }
 
 int time_tiles(int seqlen) { return (seqlen + kTileT - 1) / kTileT; }
+
+int bwd_time_tiles(int seqlen) {
+  return (seqlen + kBwdTileT - 1) / kBwdTileT;
+}
 
 template <typename input_t>
 const input_t *data_or_null(const std::optional<at::Tensor> &t) {
@@ -319,6 +376,37 @@ void launch_fwd(const at::Tensor &x, const at::Tensor &weight,
           channels, width, activation);
 }
 
+// Backward operands, gathered so the width dispatch names them once instead of
+// once per instantiated width.
+template <typename input_t> struct BwdArgs {
+  const input_t *dy;
+  const input_t *dfinal_state;
+  const input_t *x;
+  const input_t *weight;
+  const input_t *bias;
+  const input_t *initial_state;
+  input_t *dx;
+  input_t *dinitial_state;
+  float *dweight_parts;
+  float *dbias_parts;
+  int batch;
+  int seqlen;
+  int channels;
+  bool activation;
+};
+
+template <typename input_t, int kWidth>
+void launch_bwd_width(const BwdArgs<input_t> &a) {
+  const int threads = block_width(a.channels);
+  const dim3 grid((a.channels + threads - 1) / threads,
+                  bwd_time_tiles(a.seqlen), 1);
+  conv1d_bwd_kernel<input_t, kWidth>
+      <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          a.dy, a.dfinal_state, a.x, a.weight, a.bias, a.initial_state, a.dx,
+          a.dinitial_state, a.dweight_parts, a.dbias_parts, a.batch, a.seqlen,
+          a.channels, a.activation);
+}
+
 template <typename input_t>
 void launch_bwd(const std::optional<at::Tensor> &dy,
                 const std::optional<at::Tensor> &dfinal_state,
@@ -330,27 +418,64 @@ void launch_bwd(const std::optional<at::Tensor> &dy,
                 const at::Tensor &dweight_parts,
                 const std::optional<at::Tensor> &dbias_parts,
                 bool activation) {
-  const int batch = static_cast<int>(x.size(0));
-  const int seqlen = static_cast<int>(x.size(1));
-  const int channels = static_cast<int>(x.size(2));
-  const int width = static_cast<int>(weight.size(1));
-  const int threads = block_width(channels);
-  const dim3 grid((channels + threads - 1) / threads, time_tiles(seqlen), 1);
-  conv1d_bwd_kernel<input_t>
-      <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-          data_or_null<input_t>(dy), data_or_null<input_t>(dfinal_state),
-          x.const_data_ptr<input_t>(), weight.const_data_ptr<input_t>(),
-          data_or_null<input_t>(bias), data_or_null<input_t>(initial_state),
-          dx.data_ptr<input_t>(), mutable_or_null<input_t>(dinitial_state),
-          dweight_parts.data_ptr<float>(),
-          dbias_parts.has_value() ? dbias_parts->data_ptr<float>() : nullptr,
-          batch, seqlen, channels, width, activation);
+  const BwdArgs<input_t> a{
+      data_or_null<input_t>(dy),
+      data_or_null<input_t>(dfinal_state),
+      x.const_data_ptr<input_t>(),
+      weight.const_data_ptr<input_t>(),
+      data_or_null<input_t>(bias),
+      data_or_null<input_t>(initial_state),
+      dx.data_ptr<input_t>(),
+      mutable_or_null<input_t>(dinitial_state),
+      dweight_parts.data_ptr<float>(),
+      dbias_parts.has_value() ? dbias_parts->data_ptr<float>() : nullptr,
+      static_cast<int>(x.size(0)),
+      static_cast<int>(x.size(1)),
+      static_cast<int>(x.size(2)),
+      activation,
+  };
+  // Width is a template parameter, not an argument: it sizes the five register
+  // arrays the walk carries, so a runtime width would size all of them at
+  // kMaxWidth and cap occupancy at the widest case for every call. The
+  // assertion is what keeps the case list from falling behind the bound; with it
+  // the default arm is unreachable, because the host already refused every width
+  // outside [1, kMaxWidth].
+  static_assert(kMaxWidth == 8, "the width dispatch below enumerates 1 .. 8");
+  switch (static_cast<int>(weight.size(1))) {
+  case 1:
+    launch_bwd_width<input_t, 1>(a);
+    break;
+  case 2:
+    launch_bwd_width<input_t, 2>(a);
+    break;
+  case 3:
+    launch_bwd_width<input_t, 3>(a);
+    break;
+  case 4:
+    launch_bwd_width<input_t, 4>(a);
+    break;
+  case 5:
+    launch_bwd_width<input_t, 5>(a);
+    break;
+  case 6:
+    launch_bwd_width<input_t, 6>(a);
+    break;
+  case 7:
+    launch_bwd_width<input_t, 7>(a);
+    break;
+  case 8:
+    launch_bwd_width<input_t, 8>(a);
+    break;
+  default:
+    TORCH_CHECK(false, "causal_conv1d_bwd: width ", weight.size(1),
+                " has no instantiation; the bound is ", kMaxWidth);
+  }
 }
 
 } // namespace
 
 int64_t causal_conv1d_bwd_parts(int64_t seqlen) {
-  return (seqlen + kTileT - 1) / kTileT;
+  return (seqlen + kBwdTileT - 1) / kBwdTileT;
 }
 
 void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,

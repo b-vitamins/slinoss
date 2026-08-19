@@ -16,13 +16,33 @@ namespace slinoss {
 // refuses the call.
 constexpr int kMaxWidth = 8;
 
-// Timesteps one block walks. The prologue re-reads W-1 activations per block,
-// so the tile is what amortizes that re-read.
-constexpr int kTileT = 64;
+// Timesteps one forward block walks. The prologue re-reads W-1 activations per
+// block, so the tile is what amortizes that re-read; the tile is also what
+// supplies the grid its blocks along time, so it trades that re-read against
+// how much of the machine one launch fills.
+constexpr int kTileT = 32;
+
+// Timesteps one backward block walks. Smaller than the forward tile because the
+// backward folds batch into the block's serial loop, so the time tile is the
+// only axis that supplies it blocks: the grid holds D*ceil(T/kBwdTileT) threads
+// whatever the batch is, where the forward gets a factor of B on top. The
+// backward pays a wider re-read for it, W-1 timesteps of x and dy per block
+// instead of W-1 of x. Halving it again is not free: the partial count is
+// ceil(T/kBwdTileT), so it doubles the partials the host has to sum.
+constexpr int kBwdTileT = 8;
+
+// Batch entries one backward thread walks at once. The walk over time is serial
+// and each step depends on the one before it, so this is the axis that supplies
+// the thread independent loads to overlap: bytes in flight per thread scale with
+// it, and the window registers do too.
+constexpr int kBwdStreams = 2;
 
 // Channels per block. A warp reads 32 consecutive channels at a fixed timestep,
-// which is one coalesced transaction because the layout is channels-last.
-constexpr int kMaxChannelsPerBlock = 128;
+// which is one coalesced transaction because the layout is channels-last. Two
+// warps rather than four: the block is the unit the grid is quantized in, so a
+// narrower block divides a channel count more often and leaves fewer idle lanes
+// in the last block of a row, and it splits the tail wave finer.
+constexpr int kMaxChannelsPerBlock = 64;
 
 // y = act(conv(x)), with the activation in the kernel epilogue.
 //

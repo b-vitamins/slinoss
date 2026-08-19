@@ -256,10 +256,13 @@ def test_conv_shapes_carry_the_scan_shape_names_and_the_kernel_bounds() -> None:
         assert max(s.width for s in CONV_SHAPES) == int(module.MAX_WIDTH)
         # A sequence length that is not a whole number of time tiles, so a
         # tail-handling regression shows up in the bench and not only in the tests.
-        assert ragged.seq % int(module.TILE_T) != 0
-        assert all(
-            s.seq % int(module.TILE_T) == 0 for s in CONV_SHAPES if s.name != "ragged"
-        )
+        # Both tiles, because the two directions tile time differently: a length
+        # ragged against one and exact against the other leaves that direction's
+        # tail unmeasured, which is how the property silently lapses when a tile is
+        # retuned.
+        for tile in (int(module.TILE_T), int(module.BWD_TILE_T)):
+            assert ragged.seq % tile != 0
+            assert all(s.seq % tile == 0 for s in CONV_SHAPES if s.name != "ragged")
 
 
 # ---------------------------------------------------------------------------

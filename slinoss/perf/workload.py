@@ -117,7 +117,7 @@ SHAPES: Final[tuple[OpShape, ...]] = (
     OpShape("standard", bsz=4, heads=12, seq=2048, rows=48, lanes=16, chunk=64),
     OpShape("wide", bsz=4, heads=12, seq=2048, rows=64, lanes=32, chunk=64),
     OpShape("long", bsz=2, heads=12, seq=8192, rows=48, lanes=16, chunk=128),
-    OpShape("ragged", bsz=4, heads=12, seq=2000, rows=48, lanes=16, chunk=64),
+    OpShape("ragged", bsz=4, heads=12, seq=2004, rows=48, lanes=16, chunk=64),
 )
 """The standard sizes. Every optimization is measured at all of them, before and
 after, with the same commands. ``ragged`` has a sequence length that is not a
@@ -334,13 +334,15 @@ CONV_SHAPES: Final[tuple[ConvShape, ...]] = (
     ConvShape("standard", bsz=4, seq=2048, channels=576, width=4),
     ConvShape("wide", bsz=4, seq=2048, channels=768, width=8),
     ConvShape("long", bsz=2, seq=8192, channels=576, width=4),
-    ConvShape("ragged", bsz=4, seq=2000, channels=576, width=4),
+    ConvShape("ragged", bsz=4, seq=2004, channels=576, width=4),
 )
 """The standard conv sizes. One name per entry of :data:`SHAPES`, and the same
 names, so one ``--shape`` table serves both operators: ``D`` is that shape's
 ``H*P``, which is what the mixer feeds the conv. ``wide`` also takes the widest
 tap bank the kernel instantiates, and ``ragged`` a sequence length that is not a
-multiple of the kernel's time tile."""
+multiple of either time tile. The two directions tile time differently, so a
+length ragged against one and exact against the other would leave the bench blind
+to a tail regression in that direction."""
 
 SHAPE_NAMES: Final[tuple[str, ...]] = tuple(s.name for s in SHAPES)
 """One shape-name table for every operator, so a driver offers one ``--shape``

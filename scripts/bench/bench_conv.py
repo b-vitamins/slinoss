@@ -11,9 +11,11 @@ per-kernel picture and the three-way agreement come from
 
     python3 scripts/bench/bench_conv.py --shape standard --mode both
 
-The operator is declared ``DRAM-bound`` in both directions. This script measures
-the wall and the DRAM ceiling; the achieved bandwidth that the declaration is
-held to is a counter, and it comes from the NCU report.
+The operator is declared ``DRAM-bound`` in both directions and currently clears
+neither direction's floor; the shortfall and its diagnosis are recorded in
+``csrc/causal_conv1d_kernel.cu``. This script measures the wall and the DRAM
+ceiling; the achieved bandwidth that the declaration is held to is a counter, and
+it comes from the NCU report.
 
 Two backends are compared in one loop, not in two runs. Run-to-run medians on a
 shared host scatter further than either run's own floor, so a difference of two
