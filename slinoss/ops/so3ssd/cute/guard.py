@@ -35,6 +35,7 @@ from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K, MMA_TILE_N
 __all__ = [
     "OPERAND_DTYPES",
     "Named",
+    "check_cotangents",
     "check_dtypes",
     "check_extents",
     "check_layout",
@@ -137,6 +138,59 @@ def check_shapes(
                 f"{name} must be {(*glead, dim)}, got {tuple(tensor.shape)}"
             )
     return bsz, heads, groups, seqlen, rows, dim
+
+
+def check_cotangents(
+    dy: Tensor | None,
+    dstate: Tensor | None,
+    db_last: Tensor | None,
+    du_last: Tensor | None,
+    shape: tuple[int, int, int, int, int, int],
+) -> None:
+    """Check the backward's four cotangents against the forward shape.
+
+    One is absent exactly when the caller did not differentiate the output it
+    belongs to, so any subset may be ``None``. All four absent is not a call: the
+    driver would run the whole backward to produce zeros.
+
+    The activation cotangents are checked against each other here and not in the
+    kernels that read them. ``dy`` reaches the chunk-start stage while ``db_last``
+    and ``du_last`` reach the boundary stage, so no one kernel sees two of them and
+    a dtype disagreement would otherwise pass as two launches at two dtypes.
+
+    Args:
+        dy: ``(B,H,T,P)`` or ``None``.
+        dstate: ``(B,H,P,3N)`` or ``None``.
+        db_last: ``(B,G,3N)`` or ``None``.
+        du_last: ``(B,H,P)`` or ``None``.
+        shape: ``(B, H, G, T, P, 3N)``, as :func:`check_shapes` returns it.
+
+    Raises:
+        ValueError: If every cotangent is ``None``, or on a shape mismatch.
+        TypeError: If two activation cotangents disagree about dtype, or one has no
+            tensor-core path.
+    """
+    bsz, heads, groups, seqlen, rows, dim = shape
+    against = (
+        (dy, "dy", (bsz, heads, seqlen, rows)),
+        (dstate, "dstate", (bsz, heads, rows, dim)),
+        (db_last, "db_last", (bsz, groups, dim)),
+        (du_last, "du_last", (bsz, heads, rows)),
+    )
+    if all(tensor is None for tensor, _, _ in against):
+        raise ValueError("a backward needs at least one cotangent")
+    for tensor, name, want in against:
+        if tensor is not None and tuple(tensor.shape) != want:
+            raise ValueError(f"{name} must be {want}, got {tuple(tensor.shape)}")
+    # Differentiating only the final state leaves no activation cotangent at all,
+    # and there is then no dtype for the group to agree on.
+    activations: Named = tuple(
+        (tensor, name)
+        for tensor, name in ((dy, "dy"), (db_last, "db_last"), (du_last, "du_last"))
+        if tensor is not None
+    )
+    if activations:
+        check_operands(activations)
 
 
 def check_extents(chunk_size: int, dim: int, slice_size: int) -> None:
