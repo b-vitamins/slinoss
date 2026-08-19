@@ -34,6 +34,12 @@ a transposed score tile is not.
   memory bound and must fuse into its producer or consumer. The rotated `B` and
   `C` never reach global memory.
 - No staging copies to satisfy a kernel's layout preference.
+- A pitched band is read at its own pitch, so the pitch sets sector alignment. A
+  pitch that is not a multiple of the 32-byte sector starts every other row
+  mid-sector: a third more read sectors at a 96-byte row, and about 8% more time
+  on a DRAM-bound kernel. The achieved fraction cannot see that loss, since it
+  divides measured bytes by measured time and both rise together, so the width of
+  the tensor the band is cut from carries the requirement.
 - No `torch.zeros` or `aten::fill_` on a hot path. Accumulators initialize
   inside kernels.
 - No gradient tensor doubles as scratch. No tensor whose name and contents
