@@ -95,8 +95,16 @@ wrong, not the kernel.
 
 ## Tensor contracts
 
-Time-major, contiguous. A backend does not transpose or repack an input to suit
-a kernel; a kernel that wants a different layout is rewritten.
+Time-major. A backend does not transpose or repack an input to suit a kernel; a
+kernel that wants a different layout is rewritten.
+
+Contiguous, except `B` and `C`. Those two are column bands of the mixer's fused
+projection, so their token stride is the projection width and not `3N`. The
+requirement on them is pitched instead: unit stride on the trailing axis,
+non-overlapping rows, and a base address and pitch both aligned to 16 bytes. A
+contiguous buffer meets that rule at a pitch equal to its row width, so the two
+layouts are one contract and a standalone caller needs no change. `3N` is a
+multiple of 48, so the shape constraint already carries the alignment.
 
 | tensor  | shape         | dtype           |
 |---------|---------------|-----------------|

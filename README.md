@@ -78,17 +78,24 @@ y, state, b_last, u_last = so3ssd(U, trans, K, B, C, chunk_size=64)
 
 ## Tensor contracts
 
-Time-major and contiguous. `N` is a multiple of 16, so `3N` is a multiple of 48.
+Time-major. `N` is a multiple of 16, so `3N` is a multiple of 48.
 
 | tensor  | shape         | dtype          | contents                |
 |---------|---------------|----------------|-------------------------|
 | `U`     | `(B,H,T,P)`   | bf16/fp16/fp32 | input weights           |
 | `trans` | `(B,H,T,4)`   | fp32           | `(w_x, w_y, w_z, ls)`   |
 | `K`     | `(B,H,T,2,4)` | fp32           | per tap `(kr, g, h, 0)` |
-| `B`     | `(B,H,T,3N)`  | bf16/fp16/fp32 | input vectors           |
-| `C`     | `(B,H,T,3N)`  | bf16/fp16/fp32 | output vectors          |
+| `B`     | `(B,G,T,3N)`  | bf16/fp16/fp32 | input vectors           |
+| `C`     | `(B,G,T,3N)`  | bf16/fp16/fp32 | output vectors          |
 | `z`     | `(B,H,P,3N)`  | fp32           | state                   |
 | `Y`     | `(B,H,T,P)`   | bf16/fp16/fp32 | output                  |
+
+Contiguous, except `B` and `C`, which may be pitched: unit trailing stride,
+non-overlapping rows, 16-byte aligned base and pitch. That is what lets them be
+column bands of one fused projection rather than buffers of their own.
+
+`B` and `C` are grouped. `G` divides `H` and head `h` reads group
+`h // (H // G)`, so `G == H` is the ungrouped case and not a second signature.
 
 The trailing `3N` is `N` 3-vectors in lane-major order: element `3n+i` is
 component `i` of 3-vector `n`.
@@ -97,7 +104,7 @@ Taps act as `K(v) = kr*v + g*(w.v)*w + h*(w x v)`. The chart is polynomial in
 `w`, hence analytic at `w = 0`; the axis-angle normal form is not. Tap lane 3 is
 a hard zero kept for alignment.
 
-`B_prev (B,H,3N)` and `U_prev (B,H,P)` supply the time-0 previous values for
+`b_prev (B,G,3N)` and `u_prev (B,H,P)` supply the time-0 previous values for
 streaming. Pass both or neither.
 
 ## Development
