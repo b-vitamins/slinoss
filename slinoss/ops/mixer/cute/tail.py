@@ -20,10 +20,13 @@ offset and pitch carry the alignment the producer padded them to.
 
 Parallel decomposition. The reduction runs over ``P`` and never crosses the head
 axis, so one ``(b, h, t)`` triple is one independent problem of length ``P``. One
-warp owns one triple: lane ``l`` holds columns ``l``, ``l + 32``, ... and the sum
-over ``P`` is a full-warp butterfly, so the reduction never touches shared memory
-and each segment is 32 consecutive columns across the lanes of the warp, which is
-one coalesced run. A warp runs :data:`ROWS_PER_WARP` triples in sequence and a
+warp owns one triple: lane ``l`` holds the ``ceil(P/32)`` consecutive columns from
+``l*ceil(P/32)`` and the sum over ``P`` is a full-warp butterfly, so the reduction
+never touches shared memory. A warp's access for one segment spans the row's whole
+``P``, which is one coalesced run and, at a ``P`` the warp width does not divide,
+a full request: columns strided by the warp width instead would leave the last
+segment carrying ``P mod 32`` lanes, and bytes per request is what bounds the
+in-flight byte count. A warp runs :data:`ROWS_PER_WARP` triples in sequence and a
 block is :data:`WARPS` warps, so the grid is ``(ceil(B*T / ROWS), H)``, which at
 any trained shape exceeds twice the SM count. ``B*T`` is arbitrary, so the row
 index carries a bounds predicate;
@@ -46,10 +49,11 @@ so the partial buffer is ``torch.empty``, every element of it is written by the
 kernel, and the cross-tile sum is a reduction over that buffer alone.
 
 Shared memory. One tile, :func:`param_tile`, holding the per-warp parameter
-partials. Consecutive lanes touch consecutive words both when the warps write it
-and when warp 0 reads it back, so neither access can conflict. Its budget is
-computed from the layout and checked against the queried capacity, which is what
-bounds ``P``.
+partials. A lane's accumulators sit at the warp-strided positions of :func:`_slots`
+rather than at the columns they belong to, so consecutive lanes touch consecutive
+words both when the warps write the tile and when warp 0 reads it back, and neither
+access can conflict. Its budget is computed from the layout and checked against the
+queried capacity, which is what bounds ``P``.
 
 DRAM-bound, both directions. Analytic byte counts, no measurement is committed.
 Per ``(b,h,t)`` row the forward reads ``y``, ``u`` and ``gate`` and writes the
@@ -161,10 +165,17 @@ def _columns(
 ) -> list[tuple[Any, Any, bool]]:
     """Per-segment ``(column, read position, masked)`` for one lane.
 
-    ``P`` is arbitrary, so the last segment can run past it. That segment reads a
-    clamped position and drops the value with a select, which keeps the load in
-    bounds without a branch. No earlier segment can overrun: ``P`` exceeds
-    ``32*(segments-1)``.
+    A lane owns ``segments`` consecutive columns, so a warp's request for any
+    segment spans the row's whole ``P`` rather than one warp width of it. That is
+    what keeps a request full at ``P`` not a multiple of the warp width: with the
+    columns strided by the warp width instead, the last segment has ``P mod 32``
+    live lanes and carries that fraction of a request's bytes, and bytes per
+    request is what bounds the in-flight byte count and so the achieved bandwidth.
+
+    ``P`` is arbitrary, so any segment can run past it. Those segments read a
+    clamped position and drop the value with a select, which keeps the load in
+    bounds without a branch; the clamp is unconditional whenever ``P`` is not a
+    multiple of the warp width.
 
     Args:
         lane: Lane index within the warp.
@@ -173,14 +184,32 @@ def _columns(
         exact: Whether ``P`` is a multiple of the warp width. Compile-time.
 
     Returns:
-        One entry per segment, outermost first.
+        One entry per segment, in column order.
     """
     out: list[tuple[Any, Any, bool]] = []
     for j in range(segments):
-        col = j * cute.arch.WARP_SIZE + lane
-        masked = not exact and j == segments - 1
-        out.append((col, cutlass.min(col, rows - 1) if masked else col, masked))
+        col = lane * segments + j
+        out.append((col, col if exact else cutlass.min(col, rows - 1), not exact))
     return out
+
+
+def _slots(lane: Any, segments: int) -> list[Any]:
+    """Shared-tile position holding each of a lane's segment accumulators.
+
+    Strided by the warp width, not the lane's own column: consecutive lanes then
+    touch consecutive words both when the warps write the tile and when warp 0
+    reads it back, so neither access can conflict. Write and read index it with
+    this same expression, so the position a value lands in identifies the column
+    it came from.
+
+    Args:
+        lane: Lane index within the warp.
+        segments: ``ceil(P/32)``. Compile-time.
+
+    Returns:
+        One position per segment, matching :func:`_columns` entry for entry.
+    """
+    return [j * cute.arch.WARP_SIZE + lane for j in range(segments)]
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +408,7 @@ def mixer_tail_bwd_kernel(
     dst = gdy.element_type
     zero = cutlass.Float32(0.0)
     cols = _columns(lane, rows, segments, exact)
+    slots = _slots(lane, segments)
     # This head's band of the token-major operands. Uniform across the block.
     band = head * rows
 
@@ -443,9 +473,8 @@ def mixer_tail_bwd_kernel(
                     gdgate[bidx, tidx, band + col] = dgate
 
     for j in cutlass.range_constexpr(segments):
-        col, _, _ = cols[j]
-        spartial[SLOT_DSKIP, warp, col] = acc_skip[j]
-        spartial[SLOT_WEIGHT, warp, col] = acc_weight[j]
+        spartial[SLOT_DSKIP, warp, slots[j]] = acc_skip[j]
+        spartial[SLOT_WEIGHT, warp, slots[j]] = acc_weight[j]
     cute.arch.sync_threads()
 
     if warp == 0:
@@ -454,8 +483,8 @@ def mixer_tail_bwd_kernel(
             total_skip = zero
             total_weight = zero
             for other in cutlass.range_constexpr(WARPS):
-                total_skip = total_skip + spartial[SLOT_DSKIP, other, col]
-                total_weight = total_weight + spartial[SLOT_WEIGHT, other, col]
+                total_skip = total_skip + spartial[SLOT_DSKIP, other, slots[j]]
+                total_weight = total_weight + spartial[SLOT_WEIGHT, other, slots[j]]
             if cutlass.const_expr(masked):
                 if col < rows:
                     gpartial[SLOT_DSKIP, tile, head, col] = total_skip
