@@ -287,16 +287,20 @@ def jit_launch(
     materialization, 8.4 us on sm_86, so the nine a launch needs put the host
     ahead of a kernel that runs in tens of microseconds; a pooled borrow
     re-points the memref's base word instead. Host cost per launch at the
-    standard shape on sm_86, clocks unlocked: the chunk increment 193 us to
-    108 us, the state passing 114 us to 55 us. Converting here rather than in the
+    standard shape on sm_86, clocks unlocked: the chunk increment 197 us to
+    120 us, the state passing 113 us to 65 us. Converting here rather than in the
     caller is what bounds a pooled descriptor's life to one launch.
 
-    ``static`` is the trailing run of :class:`cutlass.Constexpr` parameters. It
-    is the cache key, so it must name every property that shapes the generated
-    code. That holds because :func:`dev_tensor` marks every layout dynamic
-    except the leading mode: a tensor argument contributes its element type,
-    its rank, and nothing else, and the element type and every constrained
-    extent are already declared static by the entry points.
+    The cache key must name every property that shapes the generated code, and
+    ``static`` is not all of it. A tensor argument contributes its element type
+    and its rank -- and nothing else, because :func:`dev_tensor` marks every
+    layout dynamic except the leading mode -- and a kernel is free to read its
+    element type off the tensor rather than take it as a
+    :class:`cutlass.Constexpr`, in which case ``static`` names no dtype at all.
+    So the key is built from ``static`` and from what the arguments themselves
+    declare. Leaving that to the caller is silent: an executor takes a base
+    pointer and a dynamic layout, so a second dtype launched through the first
+    dtype's code reads the buffer at the wrong element width and returns.
 
     Args:
         fn: The ``@cute.jit`` launcher.
@@ -310,10 +314,23 @@ def jit_launch(
             compile-time argument that cannot key the cache.
     """
     try:
-        args = tuple(
-            _borrow(arg) if isinstance(arg, torch.Tensor) else arg for arg in dynamic
-        )
-        key = (fn, static, torch.cuda.current_device())
+        args: list[Any] = []
+        # Flat rather than one entry per argument: the arity is fixed by ``fn``,
+        # so a pair per tensor costs a tuple allocation and a nested hash per
+        # launch and buys nothing.
+        signature: list[Hashable] = []
+        for arg in dynamic:
+            if isinstance(arg, torch.Tensor):
+                args.append(_borrow(arg))
+                signature.append(arg.dtype)
+                signature.append(arg.ndim)
+            else:
+                # A scalar declares nothing: its type is fixed by the entry
+                # point's own signature. A descriptor the caller built declares
+                # its element type the same way a tensor does.
+                args.append(arg)
+                signature.append(getattr(arg, "element_type", None))
+        key = (fn, static, torch.cuda.current_device(), tuple(signature))
         executor = _EXECUTORS.get(key)
         if executor is None:
             executor = cute.compile(fn, *args, *static)

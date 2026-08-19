@@ -1,9 +1,11 @@
-"""The descriptor pool behind :func:`slinoss._cute.jit_launch`.
+"""The two caches behind :func:`slinoss._cute.jit_launch`.
 
-Building a ``cute.Tensor`` is a DLPack export plus a memref materialization,
-measured at 8.4 us on sm_86 against launchers that need nine of them, so
-:func:`jit_launch` keeps one descriptor per layout and re-points its base word.
-Every test here names one way that reuse turns into a wrong launch.
+Both exist because the DSL charges for repetition. Tracing a ``@cute.jit``
+function is 316 ms and building a ``cute.Tensor`` is 8.4 us on sm_86, against
+launchers that trace one function and build nine descriptors per call, so
+:func:`jit_launch` keeps a compiled executor per key and a descriptor per layout
+and re-points the descriptor's base word. Every test here names one way that
+reuse turns into a wrong launch.
 
 One probe kernel computes ``out = a - b`` over three tensors of one layout. The
 aliasing case is then visible in the output rather than only in the pool: two
@@ -11,9 +13,10 @@ arguments sharing a descriptor gives an exact zero, and the launch goes through
 the shipped path, raw tensors into :func:`jit_launch`, not through a private
 helper.
 
-The pool is keyed on layout and not on address, so the axes that matter are
-address freshness and borrow order. Shape is not swept: it is not a resolution
-axis for the pool, and the kernels' own parity tests sweep it.
+The pool is keyed on layout and not on address, so its axes are address freshness
+and borrow order. The executor is keyed on what shapes the generated code, so its
+axis is dtype. Shape is not swept: it is a resolution axis for neither cache, and
+the kernels' own parity tests sweep it.
 """
 
 import threading
@@ -136,6 +139,25 @@ def test_repeated_launches_build_one_descriptor_per_argument() -> None:
     _combine(a, b)
     key = (a.dtype, a.device, a.shape, a.stride())
     assert len(_pool()[key].views) == 3
+
+
+def test_two_operand_dtypes_do_not_share_one_executor() -> None:
+    """An executor is specialized on its operands' element type.
+
+    A kernel is free to read its element type off the tensor instead of taking it
+    as a :class:`cutlass.Constexpr`, so ``static`` need not name the dtype and for
+    several entry points here it does not. Keyed without it, the second dtype's
+    launch runs the first dtype's compiled code: the executor takes a base pointer
+    and a dynamic layout, so nothing at call time contradicts it and the kernel
+    reads the buffer at the wrong element width.
+
+    Two dtypes of one length, so ``static`` is identical across the pair and the
+    dtype is the only thing separating them.
+    """
+    a = torch.arange(N, dtype=torch.float32, device="cuda")
+    assert torch.equal(_combine(a, a * 3.0), a - a * 3.0)
+    h = a.to(torch.float16)
+    assert torch.equal(_combine(h, h * 3.0), h - h * 3.0)
 
 
 def test_pools_are_per_thread() -> None:
