@@ -59,12 +59,15 @@ DECLARED: Final[dict[str, str]] = {
     "conv1d_fwd_kernel": DRAM_BOUND,
     "mixer_tail_bwd_kernel": DRAM_BOUND,
     "mixer_tail_fwd_kernel": DRAM_BOUND,
+    "rmsnorm_bwd_kernel": DRAM_BOUND,
     "rmsnorm_fwd_kernel": DRAM_BOUND,
+    "rmsnorm_residual_bwd_kernel": DRAM_BOUND,
     "rmsnorm_residual_fwd_kernel": DRAM_BOUND,
     "scanprep_bwd_kernel": DRAM_BOUND,
     "scanprep_fwd_kernel": DRAM_BOUND,
     "state_passing_bwd_kernel": DRAM_BOUND,
     "state_passing_fwd_kernel": DRAM_BOUND,
+    "swiglu_bwd_kernel": DRAM_BOUND,
     "swiglu_fwd_kernel": DRAM_BOUND,
 }
 """Every kernel this repo compiles, and the class its module docstring declares.
