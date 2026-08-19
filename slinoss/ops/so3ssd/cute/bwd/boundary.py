@@ -85,6 +85,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_dtypes,
     check_layout,
     check_pinned,
+    check_pitched,
 )
 
 __all__ = [
@@ -590,9 +591,11 @@ def boundary_backward(
             reduced over the heads of the group.
         dU: ``(B,H,T,P)``, one of :data:`slinoss._precision.KERNEL_DTYPES`,
             contiguous. Read-modified at ``(c+1)L-1`` and ``T-1``.
-        dB: ``(B,G,T,3N)``, the dtype of ``dU``, contiguous. Written over every
-            token when ``partial_bc`` is given, then read-modified at the same two
-            tokens as ``dU``.
+        dB: ``(B,G,T,3N)``, the dtype of ``dU``, pitched. The gradient of one
+            column band of the mixer's fused projection, so its token stride is the
+            projection width and a contiguous buffer is the case where the two
+            agree. Written over every token when ``partial_bc`` is given, then
+            read-modified at the same two tokens as ``dU``.
         chunk_size: ``L``. Must match the chunk length the carries were produced
             at; ``C`` is derived from it.
         partial_bc: ``(B,G,S,T,3N)`` float32, contiguous, ``S >= 2``. The split
@@ -611,16 +614,20 @@ def boundary_backward(
         TypeError: On a gradient dtype with no kernel path, or on gradients that
             do not share one dtype.
     """
-    activations: Named = ((dU, "dU"), (dB, "dB"))
+    taps: Named = ()
     if du_last is not None:
-        activations = (*activations, (du_last, "du_last"))
+        taps = (*taps, (du_last, "du_last"))
     if db_last is not None:
-        activations = (*activations, (db_last, "db_last"))
+        taps = (*taps, (db_last, "db_last"))
+    activations: Named = ((dU, "dU"), (dB, "dB"), *taps)
     pinned: Named = ((carry_u, "carry_u"), (carry_b, "carry_b"))
     if partial_bc is not None:
         pinned = (*pinned, (partial_bc, "partial_bc"))
 
-    check_layout((*activations, *pinned))
+    # dB is the one pitched operand. Every other tensor here is either a whole
+    # buffer or a reduction the kernels allocate, so none of them is a band.
+    check_layout(((dU, "dU"), *taps, *pinned))
+    check_pitched(((dB, "dB"),))
     dtype = check_dtypes(activations, KERNEL_DTYPES, "kernel dtypes")
     check_pinned(pinned)
     bsz, heads, groups, chunks, seqlen, rows, dim = _check_shapes(

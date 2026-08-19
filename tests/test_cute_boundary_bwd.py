@@ -297,6 +297,42 @@ def test_the_wide_case_is_wider_than_the_block() -> None:
     assert 3 * WIDE.lanes > THREADS
 
 
+def _projection_band(t: Tensor) -> Tensor:
+    """``t`` as the mixer hands it over: one column band of a token-major buffer.
+
+    The projection strides by its own width from one token to the next and by
+    ``3N`` from one group to the next, so the group axis strides less than the axis
+    before it, which a band cut from a group-major buffer would not reproduce. Two
+    bands sit ahead of this one and one behind, so neither the offset nor the pitch
+    is the one a dedicated buffer would have.
+    """
+    bsz, groups, seqlen, dim = (int(d) for d in t.shape)
+    wide = torch.empty(bsz, seqlen, groups + 3, dim, dtype=t.dtype, device=t.device)
+    band = wide[:, :, 2 : 2 + groups]
+    band.copy_(t.permute(0, 2, 1, 3))
+    return band.permute(0, 2, 1, 3)
+
+
+def test_writes_a_band_of_the_fused_projection_gradient() -> None:
+    """``dB`` ships pitched, and the kernel writes the band rather than a copy.
+
+    ``B`` is a column band of one projection GEMM's output, so its gradient is a
+    band of that GEMM's cotangent. Staging a contiguous ``dB`` and scattering it
+    back afterwards is the copy the layout contract exists to refuse. Nothing about
+    the arithmetic changes, so the two layouts must agree bit for bit rather than
+    within a tolerance. The split case, because that is the one where the kernel
+    writes every row of ``dB`` and not only the two boundary rows.
+    """
+    want = _build(SPLIT)
+    got = _build(SPLIT)
+    got.dB = _projection_band(got.dB)
+    want.run()
+    got.run()
+    torch.cuda.synchronize()
+    assert torch.equal(got.dB, want.dB)
+    assert torch.equal(got.dU, want.dU)
+
+
 # ---------------------------------------------------------------------------
 # Rejection
 # ---------------------------------------------------------------------------
@@ -304,11 +340,19 @@ def test_the_wide_case_is_wider_than_the_block() -> None:
 OPERANDS = ["carry_u", "carry_b", "dU", "dB", "partial_bc", "du_last", "db_last"]
 """Every tensor the wrapper takes. The split case supplies all seven."""
 
+CONTIGUOUS = [name for name in OPERANDS if name != "dB"]
+"""The operands the wrapper requires contiguous. ``dB`` is pitched, so a wider
+pitch is legal on it and it takes its own rejection below."""
+
 SPLIT = Case(splits=2)
 
 
 def _strided(t: Tensor) -> Tensor:
-    """The same shape and dtype, non-contiguous."""
+    """The same shape and dtype, a pitch twice the row width.
+
+    Legal on a pitched operand and refused on a contiguous one, which is the whole
+    difference between the two rules.
+    """
     wide = torch.empty(
         *t.shape[:-1], 2 * int(t.shape[-1]), dtype=t.dtype, device=t.device
     )
@@ -328,7 +372,7 @@ def test_rejects_a_host_operand(name: str) -> None:
         call.run()
 
 
-@pytest.mark.parametrize("name", OPERANDS)
+@pytest.mark.parametrize("name", CONTIGUOUS)
 def test_rejects_a_non_contiguous_operand(name: str) -> None:
     """Nothing is repacked, so a strided operand is refused rather than fixed.
 
@@ -339,6 +383,20 @@ def test_rejects_a_non_contiguous_operand(name: str) -> None:
     call = _build(SPLIT)
     setattr(call, name, _strided(getattr(call, name)))
     with pytest.raises(ValueError, match="contiguous"):
+        call.run()
+
+
+def test_rejects_a_gap_inside_a_row_of_db() -> None:
+    """An arbitrary pitch is legal on ``dB``; a gap inside one row is not.
+
+    A thread writes the three components of its 3-vector as adjacent elements. The
+    remaining pitched rejections belong to the shared rule and are covered against
+    it; this one says ``dB`` reaches that rule at all rather than the contiguous
+    one.
+    """
+    call = _build(SPLIT)
+    call.dB = call.dB[..., ::2]
+    with pytest.raises(ValueError, match="dB must have unit stride"):
         call.run()
 
 
@@ -409,7 +467,11 @@ SHAPES = [
         "does not divide H",
         id="carry-b-no-groups",
     ),
-    pytest.param("dB", lambda t: t[..., :-3].contiguous(), "dB must be", id="db-dim"),
+    # Narrowed by a whole alignment quantum, not by one 3-vector: ``dB`` is pitched,
+    # and the pitch of a contiguous one is its row width, so a width that is not a
+    # multiple of the 16-byte quantum is refused by the layout rule before the
+    # shape rule is reached.
+    pytest.param("dB", lambda t: t[..., :-16].contiguous(), "dB must be", id="db-dim"),
     pytest.param(
         "partial_bc",
         lambda t: t.flatten(1, 2),
