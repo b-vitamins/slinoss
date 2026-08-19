@@ -9,7 +9,8 @@ a caller to hit the disagreement.
 
 Dtype policy is not here, because it legitimately differs: the scan's GEMM
 operands have no float32 tensor-core path, while the mixer tail and the block
-kernels run float32 natively. Each operator's guard module states its own.
+kernels run float32 natively. Each operator's guard module states its own set and
+hands it in; only the loop over it is shared.
 
 Every check runs before the launch. A host pointer handed to a kernel faults
 inside CUDA and leaves the context unusable for the rest of the process, and a
@@ -22,9 +23,10 @@ No CuTe DSL import. A reference path can use this.
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor
 
-__all__ = ["ALIGN_BYTES", "Named", "check_layout", "check_pitched"]
+__all__ = ["ALIGN_BYTES", "Named", "check_dtypes", "check_layout", "check_pitched"]
 
 Named = tuple[tuple[Tensor, str], ...]
 """Operands paired with the name to report them under."""
@@ -98,3 +100,43 @@ def check_pitched(named: Named) -> None:
                 f"{name} must start and step on a multiple of {multiple} elements; "
                 f"got byte offset {tensor.data_ptr() % ALIGN_BYTES} and pitch {pitch}"
             )
+
+
+def check_dtypes(
+    named: Named,
+    allowed: tuple[torch.dtype, ...],
+    label: str,
+    unit: str = "call",
+) -> torch.dtype:
+    """Check a group against a dtype set, then against itself.
+
+    Both halves are one rule everywhere: an operand outside the set has no kernel
+    path, and a group that mixes dtypes would need more than one widening type
+    inside the kernel. Only the set is per-operator, so the set is an argument and
+    the loop is not.
+
+    Args:
+        named: ``(tensor, name)`` pairs. Order is the reporting order.
+        allowed: Dtypes the caller's kernel path accepts.
+        label: What ``allowed`` is called in the rejection, for a caller whose set
+            is narrower than the repo's and whose reason for that is its own.
+        unit: What the group spans. ``"call"`` when every operand of the call shares
+            one dtype, ``"group"`` when a call carries two independent groups.
+
+    Returns:
+        The shared dtype.
+
+    Raises:
+        TypeError: If a dtype is outside ``allowed``, or if the group mixes dtypes.
+    """
+    for tensor, name in named:
+        if tensor.dtype not in allowed:
+            raise TypeError(f"{name} has dtype {tensor.dtype}; {label}: {allowed}")
+    head, head_name = named[0]
+    for tensor, name in named[1:]:
+        if tensor.dtype is not head.dtype:
+            raise TypeError(
+                f"{name} is {tensor.dtype} and {head_name} is {head.dtype}; "
+                f"one dtype per {unit}"
+            )
+    return head.dtype

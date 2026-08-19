@@ -12,9 +12,10 @@ disagreement, and the check order is part of the contract: layout, then dtype,
 then shape, then extent. A mutation that violates two at once must be reported by
 the first check it reaches.
 
-The layout half of that contract is repo-wide, so it comes from
-:mod:`slinoss._guard` and is re-exported here: a scan kernel imports one guard
-module, not two. Only the dtype policy below is this operator's own.
+The layout half of that contract is repo-wide, and so is the loop that checks a
+dtype group, so both come from :mod:`slinoss._guard` and are re-exported here: a
+scan kernel imports one guard module, not two. Only the dtype sets below are this
+operator's own.
 """
 
 from __future__ import annotations
@@ -22,13 +23,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from slinoss._guard import Named, check_layout
+from slinoss._guard import Named, check_dtypes, check_layout
 from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K, MMA_TILE_N
 
 __all__ = [
     "OPERAND_DTYPES",
     "Named",
+    "check_dtypes",
     "check_extents",
     "check_layout",
     "check_operands",
@@ -46,27 +48,19 @@ being downcast behind the caller. Narrower than
 
 
 def check_operands(named: Named) -> torch.dtype:
-    """Raises:
-    TypeError: If an activation dtype has no tensor-core path, or if the
-        activations do not share one dtype.
+    """The activation dtype a GEMM kernel of this operator was called at.
+
+    Args:
+        named: ``(tensor, name)`` pairs holding the activations.
 
     Returns:
         The shared activation dtype.
+
+    Raises:
+        TypeError: If an activation dtype has no tensor-core path, or if the
+            activations do not share one dtype.
     """
-    for tensor, name in named:
-        if tensor.dtype not in OPERAND_DTYPES:
-            raise TypeError(
-                f"{name} has dtype {tensor.dtype}; "
-                f"tensor-core operand dtypes: {OPERAND_DTYPES}"
-            )
-    head, head_name = named[0]
-    for tensor, name in named[1:]:
-        if tensor.dtype is not head.dtype:
-            raise TypeError(
-                f"{name} is {tensor.dtype} and {head_name} is {head.dtype}; "
-                "one activation dtype per call"
-            )
-    return head.dtype
+    return check_dtypes(named, OPERAND_DTYPES, "tensor-core operand dtypes")
 
 
 def check_pinned(named: Named) -> None:
