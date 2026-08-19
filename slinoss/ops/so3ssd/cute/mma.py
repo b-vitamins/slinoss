@@ -231,6 +231,12 @@ def mma_store(
 ) -> None:
     """Write the accumulator out, dropping the rows M was rounded up by.
 
+    When no rows were added, the store is one vectorized copy. That path needs a
+    static destination layout, and a tensor handed in from the host carries dynamic
+    strides, so the extents and the row pitch are rebuilt here from ``shape_mn``.
+    Sound because every destination is a contiguous row-major ``(rows, N)``
+    sub-tensor, which the tensor contract already requires.
+
     Args:
         tiled_mma: From :func:`make_mma`.
         tid: Thread index within the block.
@@ -240,7 +246,10 @@ def mma_store(
         rows: Logical rows, before :func:`mma_rows` rounded them up.
     """
     if cutlass.const_expr(rows == shape_mn[0]):
-        cute.autovec_copy(acc, tiled_mma.get_slice(tid).partition_C(dst))
+        view = cute.make_tensor(
+            dst.iterator, cute.make_layout(shape_mn, stride=(shape_mn[1], 1))
+        )
+        cute.autovec_copy(acc, tiled_mma.get_slice(tid).partition_C(view))
     else:
         crd = mma_coords(tiled_mma, tid, shape_mn)
         for i in cutlass.range_constexpr(cute.size(acc)):

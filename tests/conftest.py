@@ -94,8 +94,11 @@ def make_inputs(
         ls_bias: Added to the raw log-scale. Positive means stronger decay.
         w_max: Rotation-vector bound handed to the parameter map.
         requires_grad: Mark every operand a differentiable leaf.
-        u_dtype: Cast ``U`` after construction. Defaults to ``dtype``.
-        bc_dtype: Cast ``B`` and ``C`` after construction. Defaults to ``dtype``.
+        u_dtype: Cast ``U`` and ``u_prev`` after construction. Defaults to
+            ``dtype``. The streaming tail is part of ``U``, so it carries the
+            same dtype.
+        bc_dtype: Cast ``B``, ``C``, and ``b_prev`` after construction. Defaults
+            to ``dtype``.
 
     Returns:
         A :class:`ScanInputs`.
@@ -126,8 +129,8 @@ def make_inputs(
         B=leaf(rnd(bsz, heads, seqlen, state_dim), bc_dtype),
         C=leaf(rnd(bsz, heads, seqlen, state_dim), bc_dtype),
         z0=leaf(rnd(bsz, heads, rows, state_dim)) if with_state else None,
-        b_prev=leaf(rnd(bsz, heads, state_dim)) if streaming else None,
-        u_prev=leaf(rnd(bsz, heads, rows)) if streaming else None,
+        b_prev=leaf(rnd(bsz, heads, state_dim), bc_dtype) if streaming else None,
+        u_prev=leaf(rnd(bsz, heads, rows), u_dtype) if streaming else None,
     )
 
 
