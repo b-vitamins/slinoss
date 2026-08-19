@@ -48,11 +48,11 @@ from slinoss._cute import (
     select,
     widen,
 )
-from slinoss._precision import LOW_PRECISION_DTYPES
+from slinoss._guard import Named, check_layout
+from slinoss._precision import KERNEL_DTYPES
 from slinoss.ops.scanprep.reference import ScanParams
 
 __all__ = [
-    "KERNEL_DTYPES",
     "THREADS",
     "ScanGrads",
     "ScanPrepFunction",
@@ -68,11 +68,6 @@ __all__ = [
 # One token per thread, eight warps. Live state is under a dozen float32 and
 # there is no shared memory, so occupancy is capped by nothing.
 THREADS = 256
-
-KERNEL_DTYPES: tuple[torch.dtype, ...] = (*LOW_PRECISION_DTYPES, torch.float32)
-"""Input dtypes with a kernel path. float64 has none; the reference is the fp64
-oracle and runs in torch."""
-
 
 # ---------------------------------------------------------------------------
 # Device math
@@ -298,20 +293,7 @@ def _check_w_max(w_max: float) -> None:
         raise ValueError(f"w_max must lie in (0, pi), got {w_max}")
 
 
-def _check_layout(named: tuple[tuple[Tensor, str], ...]) -> None:
-    """Raises:
-    ValueError: If any operand is off CUDA or not contiguous. The tensor
-        contract is time-major and contiguous, so a repack here would be a
-        staging copy the kernel does not get.
-    """
-    for tensor, name in named:
-        if tensor.device.type != "cuda":
-            raise ValueError(f"{name} must be on a CUDA device, got {tensor.device}")
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-
-
-def _check_dtypes(named: tuple[tuple[Tensor, str], ...]) -> None:
+def _check_dtypes(named: Named) -> None:
     """Raises:
     TypeError: If an operand dtype has no kernel path, or if the operands do
         not share one dtype. One dtype per call keeps a single widening type
@@ -331,7 +313,7 @@ def _check_dtypes(named: tuple[tuple[Tensor, str], ...]) -> None:
             )
 
 
-def _check_pinned(named: tuple[tuple[Tensor, str], ...]) -> None:
+def _check_pinned(named: Named) -> None:
     """Raises:
     ValueError: If a cotangent of ``trans`` or ``K`` is not float32. Both are
         float32-pinned (I4), so their cotangents are too.
@@ -408,7 +390,7 @@ def scanprep_forward(
 
     Args:
         w_raw: Unconstrained rotation vectors, ``(B,H,T,3)``, contiguous CUDA,
-            one of :data:`KERNEL_DTYPES`.
+            one of :data:`slinoss._precision.KERNEL_DTYPES`.
         ls_raw: Unconstrained log-scales, ``(B,H,T)``, same dtype.
         tap_raw: Unconstrained taps ``(kr, g, h)``, ``(B,H,T,2,3)``, same dtype.
         w_max: Rotation-vector norm bound, in ``(0, pi)``.
@@ -430,7 +412,7 @@ def scanprep_forward(
         raise ValueError(f"tap_raw must be {(*lead, 2, 3)}, got {tuple(tap_raw.shape)}")
     named = ((w_raw, "w_raw"), (ls_raw, "ls_raw"), (tap_raw, "tap_raw"))
     _check_dtypes(named)
-    _check_layout(named)
+    check_layout(named)
 
     tokens = lead[0] * lead[1] * lead[2]
     trans = torch.empty(*lead, 4, dtype=torch.float32, device=w_raw.device)
@@ -489,7 +471,7 @@ def scanprep_backward(
     raws = ((w_raw, "w_raw"), (ls_raw, "ls_raw"))
     _check_dtypes(raws)
     _check_pinned(((dtrans, "dtrans"), (dK, "dK")))
-    _check_layout(((dtrans, "dtrans"), (dK, "dK"), *raws))
+    check_layout(((dtrans, "dtrans"), (dK, "dK"), *raws))
 
     tokens = lead[0] * lead[1] * lead[2]
     dw_raw = torch.empty_like(w_raw)

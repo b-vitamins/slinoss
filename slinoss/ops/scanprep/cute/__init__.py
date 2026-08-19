@@ -5,7 +5,6 @@ Importing this package imports the CuTe DSL. The reference path is
 """
 
 from slinoss.ops.scanprep.cute.maps import (
-    KERNEL_DTYPES,
     THREADS,
     ScanGrads,
     scanprep,
@@ -14,7 +13,6 @@ from slinoss.ops.scanprep.cute.maps import (
 )
 
 __all__ = [
-    "KERNEL_DTYPES",
     "THREADS",
     "ScanGrads",
     "scanprep",

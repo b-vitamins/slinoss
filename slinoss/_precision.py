@@ -26,6 +26,16 @@ WIDE_DTYPES: tuple[torch.dtype, ...] = (torch.float32, torch.float64)
 
 SUPPORTED_DTYPES: tuple[torch.dtype, ...] = LOW_PRECISION_DTYPES + WIDE_DTYPES
 
+KERNEL_DTYPES: tuple[torch.dtype, ...] = (*LOW_PRECISION_DTYPES, torch.float32)
+"""Dtypes a rowwise CuTe kernel can read and write.
+
+Wider than :data:`LOW_PRECISION_DTYPES` because a rowwise kernel computes in
+float32 whatever it loads, so a float32 operand costs it bandwidth and nothing
+else. A GEMM operand is narrower than this: the tensor-core atom is 16-bit, so
+the scan states its own set. float64 has no kernel path at all; it is the
+reference oracle's width and runs in torch.
+"""
+
 PINNED_TENSORS: tuple[str, ...] = ("trans", "K", "q", "Q", "lp", "table", "z")
 """Names that must never carry a dtype from :data:`LOW_PRECISION_DTYPES`."""
 
