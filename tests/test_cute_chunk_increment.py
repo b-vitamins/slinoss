@@ -211,7 +211,7 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     (lambda a: a.update(U=a["U"].cpu()), ValueError, "U must be on a CUDA device"),
     (lambda a: a.update(B=_strided(a["B"])), ValueError, "B must be contiguous"),
     (lambda a: a.update(U=a["U"].float()), TypeError, "U has dtype"),
-    (lambda a: a.update(B=a["B"].half()), TypeError, "one activation dtype"),
+    (lambda a: a.update(B=a["B"].half()), TypeError, "one dtype per call"),
     (lambda a: a.update(trans=a["trans"].bfloat16()), ValueError, "trans must be"),
     (lambda a: a.update(K=a["K"].bfloat16()), ValueError, "K must be float32"),
     (
