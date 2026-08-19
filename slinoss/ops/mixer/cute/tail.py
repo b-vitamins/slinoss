@@ -73,8 +73,8 @@ from slinoss._cute import (
     Scalar,
     Tile,
     assert_smem_fits,
-    dev_tensor,
     f32,
+    jit_launch,
     narrow,
     select,
     sigmoid,
@@ -648,22 +648,24 @@ def mixer_tail_forward(
     bsz, heads, seqlen, rows = _check_operands(y, u, gate, d_skip, weight, eps)
     out = torch.empty(bsz, seqlen, heads * rows, dtype=y.dtype, device=y.device)
     tokens = bsz * seqlen
-    mixer_tail_fwd(
-        dev_tensor(y),
-        dev_tensor(u),
-        dev_tensor(gate),
-        dev_tensor(d_skip),
-        dev_tensor(weight),
-        dev_tensor(out),
-        tokens,
-        seqlen,
-        rows,
-        float(rows),
-        float(eps),
-        (tokens + ROWS - 1) // ROWS,
-        heads,
-        _segments(rows),
-        rows % cute.arch.WARP_SIZE == 0,
+    jit_launch(
+        mixer_tail_fwd,
+        (
+            y,
+            u,
+            gate,
+            d_skip,
+            weight,
+            out,
+            tokens,
+            seqlen,
+            rows,
+            float(rows),
+            float(eps),
+            (tokens + ROWS - 1) // ROWS,
+            heads,
+        ),
+        (_segments(rows), rows % cute.arch.WARP_SIZE == 0),
     )
     return out
 
@@ -725,26 +727,28 @@ def mixer_tail_backward(
     partial = torch.empty(
         SLOTS, tiles, heads, rows, dtype=torch.float32, device=y.device
     )
-    mixer_tail_bwd(
-        dev_tensor(dout),
-        dev_tensor(y),
-        dev_tensor(u),
-        dev_tensor(gate),
-        dev_tensor(d_skip),
-        dev_tensor(weight),
-        dev_tensor(dy),
-        dev_tensor(du),
-        dev_tensor(dgate),
-        dev_tensor(partial),
-        tokens,
-        seqlen,
-        rows,
-        float(rows),
-        float(eps),
-        tiles,
-        heads,
-        _segments(rows),
-        rows % cute.arch.WARP_SIZE == 0,
+    jit_launch(
+        mixer_tail_bwd,
+        (
+            dout,
+            y,
+            u,
+            gate,
+            d_skip,
+            weight,
+            dy,
+            du,
+            dgate,
+            partial,
+            tokens,
+            seqlen,
+            rows,
+            float(rows),
+            float(eps),
+            tiles,
+            heads,
+        ),
+        (_segments(rows), rows % cute.arch.WARP_SIZE == 0),
     )
     totals = partial.sum(1)
     return MixerTailGrads(

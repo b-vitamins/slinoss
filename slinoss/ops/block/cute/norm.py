@@ -950,14 +950,10 @@ def rmsnorm_forward(x: Tensor, weight: Tensor, *, eps: float) -> Tensor:
     """
     rows, width = _check_norm(x, weight, eps)
     out = torch.empty_like(x)
-    rmsnorm_fwd(
-        dev_tensor(x.view(rows, width)),
-        dev_tensor(weight),
-        dev_tensor(out.view(rows, width)),
-        float(eps),
-        rows,
-        width,
-        NORM_THREADS,
+    jit_launch(
+        rmsnorm_fwd,
+        (x.view(rows, width), weight, out.view(rows, width), float(eps), rows),
+        (width, NORM_THREADS),
     )
     return out
 
@@ -997,17 +993,18 @@ def rmsnorm_residual_forward(
     normed = torch.empty_like(x)
     total = torch.empty(x.shape, dtype=torch.float32, device=x.device)
     stream = x if residual is None else residual
-    rmsnorm_residual_fwd(
-        dev_tensor(x.view(rows, width)),
-        dev_tensor(stream.view(rows, width)),
-        dev_tensor(total.view(rows, width)),
-        dev_tensor(weight),
-        dev_tensor(normed.view(rows, width)),
-        float(eps),
-        rows,
-        width,
-        NORM_THREADS,
-        residual is not None,
+    jit_launch(
+        rmsnorm_residual_fwd,
+        (
+            x.view(rows, width),
+            stream.view(rows, width),
+            total.view(rows, width),
+            weight,
+            normed.view(rows, width),
+            float(eps),
+            rows,
+        ),
+        (width, NORM_THREADS, residual is not None),
     )
     return NormResidual(normed=normed, residual=total)
 
@@ -1054,11 +1051,11 @@ def rmsnorm_backward(
     jit_launch(
         rmsnorm_bwd,
         (
-            dev_tensor(dout.view(rows, width)),
-            dev_tensor(x.view(rows, width)),
-            dev_tensor(weight),
-            dev_tensor(dx.view(rows, width)),
-            dev_tensor(partial),
+            dout.view(rows, width),
+            x.view(rows, width),
+            weight,
+            dx.view(rows, width),
+            partial,
             float(eps),
             rows,
             blocks,
@@ -1138,22 +1135,25 @@ def rmsnorm_residual_backward(
         else torch.empty((blocks, width), dtype=torch.float32, device=x.device)
     )
 
-    # One tensor fills every slot the compiled variant does not read. `x` is the
-    # placeholder because it is the one operand always present, and the kernel's
-    # `const_expr` guards mean an unread slot is never addressed.
+    # One descriptor fills every slot the compiled variant does not read. `x` is
+    # the placeholder because it is the one operand always present, and the
+    # kernel's `const_expr` guards mean an unread slot is never addressed. Built
+    # here rather than handed to `jit_launch` as a tensor: one build shared by up
+    # to five slots is cheaper than five pooled borrows of one layout, which
+    # would run past the pool's depth.
     gx = dev_tensor(x.view(rows, width))
     absent = gx
     jit_launch(
         rmsnorm_residual_bwd,
         (
-            absent if dnormed is None else dev_tensor(dnormed.view(rows, width)),
-            absent if dresidual is None else dev_tensor(dresidual.view(rows, width)),
+            absent if dnormed is None else dnormed.view(rows, width),
+            absent if dresidual is None else dresidual.view(rows, width),
             gx,
-            absent if residual is None else dev_tensor(residual.view(rows, width)),
-            dev_tensor(weight),
-            dev_tensor(dx.view(rows, width)),
-            absent if dres_out is None else dev_tensor(dres_out.view(rows, width)),
-            absent if partial is None else dev_tensor(partial),
+            absent if residual is None else residual.view(rows, width),
+            weight,
+            dx.view(rows, width),
+            absent if dres_out is None else dres_out.view(rows, width),
+            absent if partial is None else partial,
             float(eps),
             rows,
             blocks,

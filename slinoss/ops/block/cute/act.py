@@ -47,7 +47,6 @@ from torch import Tensor
 
 from slinoss._cute import (
     cute_dtype,
-    dev_tensor,
     jit_launch,
     narrow,
     sigmoid,
@@ -335,16 +334,18 @@ def swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
     vec = _vector_width(gate.dtype)
     groups = count // vec
     blocks = 2 * sm_count(gate.device.index)
-    swiglu_fwd(
-        dev_tensor(gate.view(count)),
-        dev_tensor(up.view(count)),
-        dev_tensor(out.view(count)),
-        groups,
-        count - groups * vec,
-        blocks * ACT_THREADS,
-        blocks,
-        vec,
-        ACT_THREADS,
+    jit_launch(
+        swiglu_fwd,
+        (
+            gate.view(count),
+            up.view(count),
+            out.view(count),
+            groups,
+            count - groups * vec,
+            blocks * ACT_THREADS,
+            blocks,
+        ),
+        (vec, ACT_THREADS),
     )
     return out
 
@@ -389,11 +390,11 @@ def swiglu_backward(dout: Tensor, gate: Tensor, up: Tensor, /) -> SwiGLUGrads:
     jit_launch(
         swiglu_bwd,
         (
-            dev_tensor(dout.view(count)),
-            dev_tensor(gate.view(count)),
-            dev_tensor(up.view(count)),
-            dev_tensor(dgate.view(count)),
-            dev_tensor(dup.view(count)),
+            dout.view(count),
+            gate.view(count),
+            up.view(count),
+            dgate.view(count),
+            dup.view(count),
             groups,
             count - groups * vec,
             blocks * ACT_THREADS,
