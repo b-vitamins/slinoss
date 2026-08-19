@@ -63,6 +63,7 @@ from slinoss._cute import (
     narrow,
     select,
     smem_bytes,
+    smem_capacity,
 )
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
@@ -85,6 +86,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
+    MMA_TILE_M,
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
@@ -105,6 +107,7 @@ from slinoss.ops.so3ssd.cute.table import (
 
 __all__ = [
     "NBLOCK_MAX",
+    "RESIDENT_MAX",
     "chunk_scan_forward",
     "chunk_scan_fwd",
     "chunk_scan_fwd_kernel",
@@ -119,6 +122,19 @@ NBLOCK_MAX: int = 32
 THREADS`` float32 per thread and is live alongside the output accumulator, so the
 cap bounds the pair independently of ``L``. Every legal chunk length is a power of
 two at or above 16, so this divides it exactly."""
+
+RESIDENT_MAX: int = 3
+"""Ceiling on the blocks per SM the launch bound asks for.
+
+The launch asks for the residency the shared-memory budget already allows, which
+is what makes the register allocator target that residency instead of spending
+whatever the schedule prefers. The ceiling exists because the register file is the
+scarcer resource of the two: ``N`` blocks of :data:`THREADS` threads cap each
+thread at ``65536 / (N * THREADS)``, so a short chunk whose tiles leave room for
+five blocks would ask for a cap of 102, and this body's live set is two float32
+accumulators, both GEMMs' fragments, and one staging group. Three is the largest
+value measured; at the cap it implies the body spills a few words and still
+measures faster than the two-block schedule."""
 
 
 def nblock(chunk: int) -> int:
@@ -351,7 +367,13 @@ def chunk_scan_fwd_kernel(
     elem = sscore.element_type
     scrd = mma_coords(tiled_mma, tid, (mpad, nblk))
     sacc = mma_acc(tiled_mma, tid, (mpad, nblk))
-    for s in cutlass.range_constexpr(slices):
+    # The slice loop's form follows the chunk length, because the two costs it
+    # trades scale differently. Unrolled, the slice base is a trace-time constant and
+    # every score-epilogue index folds into an immediate, which is worth
+    # ``cute.size(sacc)`` addresses a slice; dynamic, the body is emitted once and
+    # ptxas schedules it without carrying every slice's live set at once. At one M
+    # tile the schedule wins and at two the folding does.
+    for s in cutlass.range(slices, unroll_full=chunk > MMA_TILE_M):
         nbase = s * nblk
         for tap in cutlass.range_constexpr(2):
             cute.arch.sync_threads()
@@ -449,7 +471,14 @@ def chunk_scan_fwd(
     ``L``, ``P``, ``3N``, and ``H // G`` are compile-time because the accumulator
     partition shapes are and because the group index folds away at ``G == H``.
     Batch, head, chunk count, and sequence length are dynamic.
+
+    The launch carries a residency bound. Without one the register allocator spends
+    218 per thread on this body and two blocks per SM is all that fits, which
+    measures slower than the same schedule at the residency the shared-memory budget
+    already allows. The bound is that residency, computed rather than chosen, so it
+    asks for no register cut that occupancy cannot spend.
     """
+    resident = min(RESIDENT_MAX, smem_capacity() // scan_smem_bytes(chunk, rows, dim))
     chunk_scan_fwd_kernel(
         gu,
         gtrans,
@@ -468,7 +497,11 @@ def chunk_scan_fwd(
         dim,
         per_group,
         has_prev,
-    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
+    ).launch(
+        grid=(chunks, bsz, heads),
+        block=(threads, 1, 1),
+        min_blocks_per_mp=resident,
+    )
 
 
 def chunk_scan_forward(
