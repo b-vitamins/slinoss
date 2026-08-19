@@ -39,11 +39,12 @@ which is every transposed operand above.
 import cutlass
 import cutlass.cute as cute
 
-from slinoss._cute import Tile
+from slinoss._cute import Tile, narrow
 from slinoss.ops.so3ssd.cute.common import WARPS
 
 __all__ = [
     "MMA_INST",
+    "MMA_PAIR",
     "MMA_TILE_K",
     "MMA_TILE_M",
     "MMA_TILE_N",
@@ -72,6 +73,16 @@ MMA_TILE_N: int = 16
 
 MMA_TILE_K: int = MMA_INST[2]
 """K mode of the tile. Every K extent must be a multiple of this."""
+
+MMA_PAIR: int = 2
+"""Adjacent output columns one thread holds in the atom's C fragment.
+
+The ``m16n8k16`` C layout gives a thread four values as two column pairs eight rows
+apart, and consecutive flat indices of the accumulator are one pair. The pair is
+contiguous in a row-major destination, so the epilogue's unit is two elements, not
+one. Four lanes of a phase then cover 32 bytes of a float32 row, which is one whole
+sector; one element at a time covers half of it and pays the other half anyway.
+"""
 
 SMEM_SEGMENT: int = 16
 """Shared-memory segment in bytes. Eight threads of an ``ldmatrix`` phase read one
@@ -271,11 +282,15 @@ def mma_store(
 ) -> None:
     """Write the accumulator out, dropping the rows M was rounded up by.
 
-    When no rows were added, the store is one vectorized copy. That path needs a
-    static destination layout, and a tensor handed in from the host carries dynamic
-    strides, so the extents and the row pitch are rebuilt here from ``shape_mn``.
-    Sound because every destination is a contiguous row-major ``(rows, N)``
-    sub-tensor, which the tensor contract already requires.
+    When no rows were added, the store is one vectorized copy over the whole
+    fragment. When rows were added, the predicate is per row and the unit is the
+    :data:`MMA_PAIR` columns the fragment already holds side by side, so a
+    predicated store is one access rather than two.
+
+    Both paths need a static destination layout, and a tensor handed in from the
+    host carries dynamic strides, so the extents and the row pitch are rebuilt here
+    from ``shape_mn``. Sound because every destination is a contiguous row-major
+    ``(rows, N)`` sub-tensor, which the tensor contract already requires.
 
     Args:
         tiled_mma: From :func:`make_mma`.
@@ -284,18 +299,52 @@ def mma_store(
         dst: Destination of shape ``(rows, N)``.
         shape_mn: The same ``(M,N)`` passed to :func:`mma_acc`.
         rows: Logical rows, before :func:`mma_rows` rounded them up.
+
+    Invariants:
+        ``N`` is a multiple of :data:`MMA_TILE_N`, so :data:`MMA_PAIR` divides both
+        the row width and the column of every pair, and no pair straddles a row.
+
+        The destination's base is aligned to :data:`MMA_PAIR` elements. Every
+        destination is a sub-tensor of a ``(...,rows,N)`` tensor sliced on the
+        leading modes, so its base is a whole multiple of ``rows * N`` elements and
+        ``MMA_TILE_N`` divides ``N``.
+
+        Flat accumulator index ``2i`` and ``2i+1`` are adjacent columns of one row,
+        which is what makes a pair one access. This is the atom's C layout, whose
+        innermost mode has extent :data:`MMA_PAIR`, so it holds for any ``MMA_M`` and
+        ``MMA_N`` and is independent of :data:`WARPS` and :data:`MMA_TILE_M`. It
+        would not survive a ``permutation_mnk`` that reorders the N mode, and it
+        fails silently rather than loudly if it ever does.
     """
+    # A sub-tensor taken at a dynamic index reports its iterator as aligned to one
+    # element whatever the parent claimed, and cute.autovec_copy caps the access
+    # width at the iterator's claim. Restating the alignment the invariant above
+    # already gives is what makes either path below wider than one element; without
+    # it both measured 1.99x the payload's store sectors on sm_86.
+    base = dst.iterator.align(MMA_PAIR * (dst.element_type.width // 8))
     if cutlass.const_expr(rows == shape_mn[0]):
         view = cute.make_tensor(
-            dst.iterator, cute.make_layout(shape_mn, stride=(shape_mn[1], 1))
+            base, cute.make_layout(shape_mn, stride=(shape_mn[1], 1))
         )
         cute.autovec_copy(acc, tiled_mma.get_slice(tid).partition_C(view))
     else:
+        cols = shape_mn[1]
+        flat = cute.make_tensor(base, cute.make_layout((rows * cols,), stride=(1,)))
+        pairs = cute.zipped_divide(flat, (MMA_PAIR,))
+        frag = cute.make_fragment((MMA_PAIR,), dst.element_type)
         crd = mma_coords(tiled_mma, tid, shape_mn)
-        for i in cutlass.range_constexpr(cute.size(acc)):
-            m, n = crd[i]
+        for i in cutlass.range_constexpr(cute.size(acc) // MMA_PAIR):
+            first = i * MMA_PAIR
+            # Filled before the predicate: a value produced inside a dynamic branch
+            # is not readable after it, and the fill costs nothing on the rows the
+            # predicate drops, which are whole warps.
+            for j in cutlass.range_constexpr(MMA_PAIR):
+                frag[j] = narrow(acc[first + j], dst.element_type)
+            m, n = crd[first]
             if m < rows:
-                dst[m, n] = acc[i]
+                cute.autovec_copy(
+                    frag, pairs[(None, m * (cols // MMA_PAIR) + n // MMA_PAIR)]
+                )
 
 
 @cute.jit

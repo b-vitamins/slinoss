@@ -18,6 +18,10 @@ The last two forms are the score and the diagonal back to back, once with the
 score staged through shared memory and once with it retiled in registers. They
 exist to compare the two, because a retile that puts an element in the wrong place
 compiles and returns a wrong answer.
+
+The last form repeats the first with the epilogue written one element at a time.
+That is the reference the predicated store's column pairing is held to, and this is
+the only place it survives.
 """
 
 import pytest
@@ -35,6 +39,7 @@ from slinoss._cute import cute_dtype
 from slinoss.config import HEAD_MULTIPLE, LANE_MULTIPLE, MIN_CHUNK
 from slinoss.ops.so3ssd.cute.common import THREADS
 from slinoss.ops.so3ssd.cute.mma import (
+    MMA_PAIR,
     MMA_TILE_K,
     MMA_TILE_M,
     MMA_TILE_N,
@@ -60,6 +65,7 @@ OFFSET = 3
 TWO_TAP = 4
 FUSED_SMEM = 5
 FUSED_REG = 6
+SCALAR_STORE = 7
 
 # (L, P, 3N). Every extent the operator can present: the default head width, a
 # head width that does not divide the M tile, a doubled state, a chunk longer than
@@ -145,7 +151,7 @@ def _probe_kernel(
     smem = cutlass.utils.SmemAllocator()
     elem = ga0.element_type
 
-    if cutlass.const_expr(form in (INCREMENT, TWO_TAP)):
+    if cutlass.const_expr(form in (INCREMENT, TWO_TAP, SCALAR_STORE)):
         # M is P and is the stride-1 mode, so the pitch carries the rounding.
         mpad = mma_rows(rows)
         lda = smem_pitch(mpad)
@@ -176,7 +182,17 @@ def _probe_kernel(
             _stage(gb1, sb, tid, chunk, dim, ldb, chunk)
             cute.arch.sync_threads()
             mma_gemm(tiled_mma, tid, acc, va, vb, False, False)
-        mma_store(tiled_mma, tid, acc, gd, (mpad, dim), rows)
+        if cutlass.const_expr(form == SCALAR_STORE):
+            # One element per store, the shape :func:`mma_store`'s predicated path
+            # had before it moved a column pair per access. The reference for the
+            # bit-identity test, and the only place it survives.
+            crd = mma_coords(tiled_mma, tid, (mpad, dim))
+            for i in cutlass.range_constexpr(cute.size(acc)):
+                m, n = crd[i]
+                if m < rows:
+                    gd[m, n] = acc[i]
+        else:
+            mma_store(tiled_mma, tid, acc, gd, (mpad, dim), rows)
         return
 
     # M is L and is the strided mode, so the tile carries the rounding in rows.
@@ -317,7 +333,7 @@ def _shapes(
     form: int, chunk: int, rows: int, dim: int
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
     """``(A, B, D)`` shapes for one form."""
-    if form in (INCREMENT, TWO_TAP):
+    if form in (INCREMENT, TWO_TAP, SCALAR_STORE):
         return (chunk, rows), (chunk, dim), (rows, dim)
     if form == SCORE:
         return (chunk, dim), (chunk, dim), (chunk, chunk)
@@ -332,7 +348,7 @@ def _oracle(
     form: int, a0: torch.Tensor, b0: torch.Tensor, a1: torch.Tensor, b1: torch.Tensor
 ) -> torch.Tensor:
     """The contraction in float32, from the same rounded bits the kernel reads."""
-    if form == INCREMENT:
+    if form in (INCREMENT, SCALAR_STORE):
         return a0.float().T @ b0.float()
     if form == TWO_TAP:
         return a0.float().T @ b0.float() + a1.float().T @ b1.float()
@@ -409,6 +425,24 @@ def test_padded_rows_do_not_reach_the_output() -> None:
     assert tuple(got.shape) == (rows, dim)
     assert torch.isfinite(got).all()
     assert_max_rel(got, want, TOL, "cute-mma[predicated-store]")
+
+
+def test_the_predicated_store_pairs_the_columns_it_is_handed() -> None:
+    """A column pair per access holds what one element per access held.
+
+    ``P = 48`` rounds to 64, so the store is predicated. The two paths run the same
+    contraction and differ only in the width of the access, so nothing about the
+    arithmetic changes and the bits must match. What they would catch is a pair that
+    is not the two adjacent columns of one row it is assumed to be: that writes a
+    finite, plausible tile and no tolerance would see it.
+    """
+    chunk, rows, dim = 64, 48, 48
+    assert mma_rows(rows) > rows, "the predicated path is the one under test"
+    assert dim % MMA_PAIR == 0, "no pair may straddle a row of the destination"
+    paired, _ = _run(INCREMENT, chunk, rows, dim, torch.bfloat16, seed=17)
+    scalar, _ = _run(SCALAR_STORE, chunk, rows, dim, torch.bfloat16, seed=17)
+    assert torch.count_nonzero(paired) == paired.numel()
+    assert torch.equal(paired, scalar)
 
 
 def test_two_taps_accumulate_rather_than_overwrite() -> None:
