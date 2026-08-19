@@ -6,9 +6,14 @@ with the right clamp, the dtype map, the DLPack wrapper, and a way to state a
 shared-memory budget. They live here rather than in one operator's module so a
 second operator does not have to import the first one's internals.
 
-Operator math does not live here. The quaternion algebra, the tap chart, and the
-3x3 composition belong to :mod:`slinoss.ops.so3ssd.cute.common`, which is their
-only device-side implementation.
+A scalar function shared by more than one operator lives here, as its only
+device-side implementation: the decay exponential and the logistic family. Two
+operators rounding the same activation two ways is a divergence, and the
+divergence is a correctness bug.
+
+Per-operator algebra does not live here. The quaternion algebra, the tap chart,
+and the 3x3 composition belong to :mod:`slinoss.ops.so3ssd.cute.common`, which is
+their only device-side implementation.
 
 Importing this module imports the CuTe DSL. Nothing on a reference path imports
 it.
@@ -39,6 +44,9 @@ __all__ = [
     "narrow",
     "select",
     "shuffle_up",
+    "sigmoid",
+    "silu",
+    "silu_grad",
     "smem_bytes",
     "smem_capacity",
     "widen",
@@ -298,3 +306,54 @@ def decay(log_diff: Scalar) -> Scalar:
         The decay factor.
     """
     return f32(cute.exp2(log_diff * TWO_LOG2_E))
+
+
+def sigmoid(value: Scalar) -> Scalar:
+    """``sigmoid(value)``, evaluated so no intermediate exceeds one.
+
+    ``e = exp(-|value|)`` lies in ``(0, 1]`` at every finite input, and the result
+    is ``1 / (1 + e)`` above zero and ``e / (1 + e)`` below it. The naive form
+    exponentiates ``-value`` directly, which overflows to infinity on the negative
+    side and then divides infinity by infinity. The absolute value is a select, so
+    the two cases cost one predicated move and no divergence.
+
+    Args:
+        value: A float32 scalar. Unbounded: the mixer's gate and the block's
+            activation both reach the saturated ends.
+
+    Returns:
+        The logistic, in ``(0, 1)``.
+    """
+    positive = value > cutlass.Float32(0.0)
+    small = f32(cute.exp2(select(positive, -value, value) * LOG2_E))
+    return select(positive, cutlass.Float32(1.0), small) / (small + 1.0)
+
+
+def silu(value: Scalar, sig: Scalar) -> Scalar:
+    """``silu(value) = value * sigmoid(value)``.
+
+    Takes the sigmoid rather than recomputing it: a backward needs both the
+    activation and its derivative from one evaluation, and a forward that
+    recomputed would be a second implementation.
+
+    Args:
+        value: A float32 scalar.
+        sig: :func:`sigmoid` of the same value.
+
+    Returns:
+        The activation.
+    """
+    return value * sig
+
+
+def silu_grad(value: Scalar, sig: Scalar) -> Scalar:
+    """``d silu / d value = sigmoid * (1 + value * (1 - sigmoid))``.
+
+    Args:
+        value: A float32 scalar.
+        sig: :func:`sigmoid` of the same value.
+
+    Returns:
+        The derivative.
+    """
+    return sig * (1.0 + value * (1.0 - sig))
