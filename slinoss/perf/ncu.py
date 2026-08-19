@@ -32,6 +32,16 @@ executions, so they do not share a row without a stated disagreement:
 ``pass_duration_spread_pct`` carries the duration disagreement between passes,
 which is the replay-stability signal for everything else in the record.
 
+:data:`SPILL_TABLE` is a ninth pass and is deliberately not in
+:data:`NCU_TABLES`. Its two counters are a verdict input rather than a row in a
+counter table: a register spill invalidates the byte model a DRAM-bound verdict
+rests on, so it is judged, not printed. Keeping it out of the merge also keeps it
+out of :class:`KernelCounters`, which is constructed outside this package; a field
+added there would need a default, and a defaulted spill count reads as no spill
+wherever a caller omits it. :func:`slinoss.perf.declared.floor_audit` requires a
+:class:`SpillCounters` record for every kernel it judges instead, so a pass that
+was never run fails loudly rather than passing everything.
+
 The ``stall`` and ``sol`` tables answer two different questions and are two
 tables for that reason. ``stall`` is the scheduler's view: how often it issued,
 and every reason it did not, as percentages of warp-active cycles. ``sol`` is the
@@ -71,17 +81,20 @@ __all__ = [
     "NCU_TABLES",
     "REQUIRED_METRICS",
     "SOL_FIELDS",
+    "SPILL_TABLE",
     "STALL_FIELDS",
     "STALL_REASONS",
     "KernelCounters",
     "NcuInvocation",
     "NcuPass",
     "NcuTable",
+    "SpillCounters",
     "kernel_counters",
     "metric_scale",
     "ncu_command",
     "parse_ncu_csv",
     "run_ncu",
+    "spill_counters",
     "stall_field",
     "stall_metric",
 ]
@@ -243,6 +256,21 @@ REQUIRED_METRICS: Final[tuple[str, ...]] = tuple(
     dict.fromkeys(metric for table in NCU_TABLES for metric in table.metrics)
 )
 """Every metric :func:`kernel_counters` needs, in table order."""
+
+_LOCAL_LD: Final = "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum"
+_LOCAL_ST: Final = "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum"
+
+SPILL_TABLE: Final[NcuTable] = NcuTable("spill", (_DURATION, _LOCAL_LD, _LOCAL_ST))
+"""Local-memory sectors, the counter a register spill lands in.
+
+Local memory carries spilled registers and any per-thread array the compiler could
+not keep in registers. Either is the register budget running out, and neither is
+something a kernel held to a bandwidth is entitled to.
+
+Sectors rather than bytes, because the question is whether the spill happened at
+all: a spilled store and its reload are two events and both are counted, and a
+store with no reload still says the register budget ran out.
+"""
 
 STALL_FIELDS: Final[tuple[str, ...]] = (
     "issue_active_pct",
@@ -889,6 +917,80 @@ def kernel_counters(
                 memory_pct=Percent(values[_MEMORY_SOL]),
                 l1tex_pct=Percent(values[_L1TEX_SOL]),
                 l2_pct=Percent(values[_L2_SOL]),
+            )
+        )
+    return tuple(sorted(out, key=lambda k: k.duration_us, reverse=True))
+
+
+@dataclass(frozen=True)
+class SpillCounters(PerfRecord):
+    """Local-memory traffic for one kernel, over one capture window.
+
+    Attributes:
+        kernel: Demangled kernel name.
+        launch_count: Launches profiled.
+        duration_us: Summed kernel duration, on the same footing as
+            :attr:`KernelCounters.duration_us`, so the two records can be checked
+            against each other.
+        local_load_sector_count: L1 sectors touched by local loads, which on these
+            kernels is a spilled register being read back.
+        local_store_sector_count: L1 sectors touched by local stores, which is a
+            register being spilled.
+    """
+
+    kernel: str
+    launch_count: Annotated[Count, SUM]
+    duration_us: Annotated[Microseconds, SUM]
+    local_load_sector_count: Annotated[Count, SUM]
+    local_store_sector_count: Annotated[Count, SUM]
+
+    @property
+    def spill_sector_count(self) -> Count:
+        """Local-memory sectors, load plus store."""
+        return Count(self.local_load_sector_count + self.local_store_sector_count)
+
+    @property
+    def spilled(self) -> bool:
+        """Whether the kernel touched local memory at all."""
+        return self.spill_sector_count > 0
+
+
+def spill_counters(one: NcuPass) -> tuple[SpillCounters, ...]:
+    """Read local-memory sectors per kernel out of one :data:`SPILL_TABLE` pass.
+
+    Args:
+        one: The parsed spill pass.
+
+    Returns:
+        One record per kernel, ordered by descending duration.
+
+    Raises:
+        ValueError: If the pass carried no launch, or if a kernel is missing either
+            counter. An absent spill counter filled with a zero would report a
+            spilling kernel as clean, which is the one direction that turns a
+            failing verdict into a passing one.
+    """
+    launches, merged, _durations = _merge((one,))
+    if not merged:
+        raise ValueError(f"no kernel launches in ncu pass {one.table!r}")
+    out: list[SpillCounters] = []
+    for kernel, values in sorted(merged.items()):
+        absent = [
+            metric
+            for metric in (_DURATION, _LOCAL_LD, _LOCAL_ST)
+            if metric not in values
+        ]
+        if absent:
+            raise ValueError(
+                f"kernel {kernel!r} is missing {absent[0]!r}; run SPILL_TABLE"
+            )
+        out.append(
+            SpillCounters(
+                kernel=kernel,
+                launch_count=Count(launches[kernel]),
+                duration_us=us_from_ns(Nanoseconds(values[_DURATION])),
+                local_load_sector_count=Count(round(values[_LOCAL_LD])),
+                local_store_sector_count=Count(round(values[_LOCAL_ST])),
             )
         )
     return tuple(sorted(out, key=lambda k: k.duration_us, reverse=True))

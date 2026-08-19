@@ -30,11 +30,28 @@ how much foreign load the probe saw. ``spread_pct`` is not a trust bar on the
 minimum: intermittent load raises it while leaving a clean fastest sample, and
 uniform load lowers it while corrupting every sample. Contention is read from
 ``device.sharing``, which is a direct probe, not inferred from dispersion.
+
+A rate at one footprint is not a denominator for a kernel at another. A copy
+carries a fixed cost, so its rate rises with its footprint, and a kernel moving a
+fraction of what the copy moved is charged for a fixed cost the copy amortized
+away. On an A6000 a 25 MB copy read 599 and 614 GB/s over two runs where an
+805 MB copy read 681 and 682. :class:`DramTimeFloor` sweeps the copy over several
+footprints and fits ``t = c + bytes/B`` to the fastest sample at each, and
+:func:`dram_floor_verdict` divides the floor at the kernel's own traffic by the
+kernel's own duration. Both fitted terms and every sample are reported, so the
+fit is checked rather than trusted.
+
+The sweep is sized from the queried L2 and every point is at least two L2
+capacities per buffer. A copy whose buffers fit in L2 measures L2 and reads as a
+DRAM rate, so the small-footprint floor comes from the fit and never from a small
+copy.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Annotated, Final
 
 import torch
@@ -47,26 +64,35 @@ from slinoss.perf.units import (
     Bytes,
     Count,
     GBPerSecond,
+    Microseconds,
     Percent,
     PerfRecord,
+    Ratio,
     Spread,
     TFlopsPerSecond,
     gbs_from_bytes_us,
+    mib_from_bytes,
     pct_of,
+    ratio_of,
     tflops_from_flop_us,
 )
 
 __all__ = [
     "CLASS_FLOOR_PCT",
     "DRAM_BOUND",
+    "L2_MULTIPLES",
     "SERIAL_TINY",
     "TENSOR_BOUND",
     "Ceilings",
     "ClassVerdict",
+    "CopySample",
     "DramCeiling",
+    "DramTimeFloor",
     "TensorCeiling",
     "ceilings",
     "dram_ceiling",
+    "dram_floor_verdict",
+    "dram_time_floor",
     "dram_verdict",
     "serial_verdict",
     "tensor_ceiling",
@@ -259,6 +285,251 @@ def ceilings(
     )
 
 
+L2_MULTIPLES: Final[tuple[int, ...]] = (2, 4, 8, 16, 32, 64)
+"""Sweep footprints, as multiples of the queried L2 size, per buffer.
+
+Derived from the device rather than written in mebibytes, so the smallest point
+stays above L2 on any part and no architecture is named. A thirty-twofold span is
+what pins the two fitted terms apart: a narrow sweep trades them off, and the
+intercept is the term the small-footprint floor rests on.
+"""
+
+
+@dataclass(frozen=True)
+class CopySample(PerfRecord):
+    """One device-to-device copy, at one footprint.
+
+    Attributes:
+        moved_bytes: Bytes crossing DRAM per iteration, read plus write.
+        duration: Per-iteration dispersion of the copy at this footprint.
+        achieved_gbs: ``moved_bytes`` over the fastest duration.
+        l2_multiple_ratio: Bytes per buffer over the queried L2 size. Above one by
+            construction; see :func:`dram_time_floor`.
+    """
+
+    moved_bytes: Annotated[Bytes, INVARIANT]
+    duration: Spread
+    achieved_gbs: Annotated[GBPerSecond, MEDIAN]
+    l2_multiple_ratio: Annotated[Ratio, MEDIAN]
+
+
+@dataclass(frozen=True)
+class DramTimeFloor(PerfRecord):
+    """Fastest a copy of a given size can run, as a fitted time law.
+
+    ``t = c + bytes/B`` over the sweep, by least squares on the fastest sample at
+    each footprint. Both terms are measurements: ``c`` is the part of a copy's
+    duration that does not scale with its size, ``B`` the rate the copy approaches
+    once it does. Neither comes from a product page, and every sample they were
+    fitted to travels with them.
+
+    A fit is only a floor if it holds at the footprint it is used at.
+    ``max_residual_pct`` is what says whether it does, and it is reported rather
+    than gated: a sweep that does not fit a line is a fact about the device, and
+    hiding it behind a threshold would leave the verdict resting on it anyway.
+
+    The fit is far better pinned at the top of the sweep than below it. Over ten
+    takes on an A6000 the fitted rate at the largest swept footprint agreed with a
+    single-point copy measured there to within 0.11%, while the floor the same fits
+    extrapolated to a 10 MB footprint ranged over 443 to 531 GB/s. The residual is
+    what separates those takes: 0.16% on the tightest, 14.5% on the loosest. A
+    small-footprint verdict is worth no more than the residual beside it.
+
+    A negative ``fixed_duration_us`` is possible on a noisy sweep. It lowers the
+    floor, which tightens every verdict built on it, so it is left visible rather
+    than clamped; :meth:`floor_us` refuses only a floor that is not positive.
+
+    Attributes:
+        label: Probe description.
+        l2_bytes: Queried L2 size, so the sweep's L2 multiples can be rechecked.
+        fixed_duration_us: Fitted ``c``, the size-independent term.
+        asymptotic_gbs: Fitted ``B``, the rate the law approaches.
+        max_residual_pct: Largest fitted-against-measured duration disagreement
+            over the samples, as a percentage of the measured duration.
+        copies: Every sample, in ascending footprint order.
+    """
+
+    label: str
+    l2_bytes: Annotated[Bytes, INVARIANT]
+    fixed_duration_us: Annotated[Microseconds, MEDIAN]
+    asymptotic_gbs: Annotated[GBPerSecond, MEDIAN]
+    max_residual_pct: Annotated[Percent, MEDIAN]
+    copies: tuple[CopySample, ...]
+
+    @classmethod
+    def of(
+        cls, label: str, copies: Sequence[CopySample], *, l2_bytes: Bytes
+    ) -> DramTimeFloor:
+        """Fit the time law to measured copies.
+
+        Args:
+            label: Probe description.
+            copies: Samples at two or more distinct footprints.
+            l2_bytes: Queried L2 size.
+
+        Returns:
+            The fitted floor.
+
+        Raises:
+            ValueError: If fewer than two distinct footprints were measured, which
+                leaves the two terms indistinguishable, or if the fitted slope is
+                not positive, which means the sweep measured no bandwidth at all.
+        """
+        sizes = [float(one.moved_bytes) for one in copies]
+        times = [float(one.duration.min_duration_us) for one in copies]
+        if len(set(sizes)) < 2:
+            raise ValueError(
+                f"a time law needs two distinct footprints, got {len(set(sizes))}; "
+                f"one footprint fits infinitely many lines"
+            )
+        count = len(sizes)
+        mean_size = sum(sizes) / count
+        mean_time = sum(times) / count
+        span = sum((size - mean_size) ** 2 for size in sizes)
+        covariance = sum(
+            (size - mean_size) * (time - mean_time)
+            for size, time in zip(sizes, times, strict=True)
+        )
+        slope = covariance / span
+        if slope <= 0.0:
+            raise ValueError(
+                f"fitted slope {slope} is not positive; a copy that does not take "
+                f"longer as it grows is not measuring bandwidth"
+            )
+        intercept = mean_time - slope * mean_size
+        residual = max(
+            pct_of(abs(intercept + slope * size - time), time)
+            for size, time in zip(sizes, times, strict=True)
+        )
+        return cls(
+            label=label,
+            l2_bytes=l2_bytes,
+            fixed_duration_us=Microseconds(intercept),
+            # slope is us per byte; its reciprocal is bytes per us, and GB/s is
+            # 1000-based, so the same 1e3 as gbs_from_bytes_us.
+            asymptotic_gbs=GBPerSecond(1.0 / (slope * 1e3)),
+            max_residual_pct=residual,
+            copies=tuple(copies),
+        )
+
+    def floor_us(self, moved_bytes: Bytes) -> Microseconds:
+        """Fastest one copy of ``moved_bytes`` can run, per the fitted law.
+
+        Args:
+            moved_bytes: Bytes crossing DRAM in one launch, read plus write.
+
+        Returns:
+            The floor duration.
+
+        Raises:
+            ValueError: If ``moved_bytes`` is not positive, or if the law puts the
+                floor at or below zero, which no duration can be under.
+        """
+        if moved_bytes <= 0:
+            raise ValueError(f"moved_bytes must be positive, got {moved_bytes}")
+        floor = Microseconds(
+            self.fixed_duration_us + moved_bytes / (1e3 * self.asymptotic_gbs)
+        )
+        if floor <= 0.0:
+            raise ValueError(
+                f"the fitted law puts the floor for {moved_bytes} bytes at "
+                f"{floor} us; fixed_duration_us={self.fixed_duration_us} is too "
+                f"negative for this footprint and the sweep needs widening"
+            )
+        return floor
+
+    def floor_gbs(self, moved_bytes: Bytes) -> GBPerSecond:
+        """Rate a copy of ``moved_bytes`` reaches at its own floor.
+
+        This is the denominator the single-point ceiling should have been: the same
+        probe, measured at the footprint the kernel has.
+
+        Args:
+            moved_bytes: Bytes crossing DRAM in one launch, read plus write.
+
+        Returns:
+            The size-matched rate.
+        """
+        return gbs_from_bytes_us(moved_bytes, self.floor_us(moved_bytes))
+
+
+def dram_time_floor(
+    device: torch.device,
+    *,
+    l2_multiples: Sequence[int] = L2_MULTIPLES,
+    iters: int = _ITERS,
+    warmup: int = _WARMUP,
+) -> DramTimeFloor:
+    """Sweep the copy over several footprints and fit its time law.
+
+    One buffer pair is allocated at the largest footprint and the smaller copies
+    run on prefixes of it. Every sample then comes from one allocation, at one set
+    of clocks, in the process that measures the kernel, and the sweep costs the
+    peak memory of its largest point rather than the sum of all of them.
+
+    Args:
+        device: CUDA device.
+        l2_multiples: Footprints per buffer, as multiples of the queried L2 size.
+        iters: Timed iterations per footprint.
+        warmup: Untimed iterations per footprint.
+
+    Returns:
+        The fitted floor, with every sample.
+
+    Raises:
+        RuntimeError: If the device is not CUDA.
+        ValueError: If free memory collapses the sweep to fewer than two distinct
+            footprints, or if any footprint is not above L2. A copy inside L2 is
+            not a DRAM copy, and its rate would enter the fit as one.
+    """
+    if device.type != "cuda":
+        raise RuntimeError("dram_time_floor needs a CUDA device")
+    ordinal = device_ordinal(device)
+    l2 = Bytes(torch.cuda.get_device_properties(ordinal).L2_cache_size)
+    sizes = sorted({_buffer_bytes(device, multiple * l2) for multiple in l2_multiples})
+    if len(sizes) < 2:
+        raise ValueError(
+            f"the sweep collapsed to {len(sizes)} distinct footprints; free memory "
+            f"clamps every buffer to the same size and no law can be fitted"
+        )
+    # Checked after the collapse: a device too full to hold two footprints clamps
+    # every point to the same size, and the L2 message would name the symptom.
+    inside = [size for size in sizes if size <= l2]
+    if inside:
+        raise ValueError(
+            f"footprints {inside} are within the {l2}-byte L2; a copy that fits in "
+            f"L2 does not measure DRAM and its rate is not a DRAM rate"
+        )
+    src = torch.empty(sizes[-1], dtype=torch.uint8, device=device)
+    dst = torch.empty_like(src)
+    src.random_(0, 255)
+    copies: list[CopySample] = []
+    for size in sizes:
+        timed = measure(
+            partial(dst[:size].copy_, src[:size]),
+            label=f"dram copy {mib_from_bytes(Bytes(size)):.0f} MiB",
+            iters=iters,
+            warmup=warmup,
+            device=device,
+        )
+        moved = Bytes(2 * size)
+        copies.append(
+            CopySample(
+                moved_bytes=moved,
+                duration=timed.total,
+                achieved_gbs=gbs_from_bytes_us(moved, timed.total.min_duration_us),
+                l2_multiple_ratio=ratio_of(size, l2),
+            )
+        )
+    return DramTimeFloor.of(
+        f"device-to-device copy over {len(sizes)} footprints, "
+        f"{mib_from_bytes(Bytes(sizes[0])):.0f} to "
+        f"{mib_from_bytes(Bytes(sizes[-1])):.0f} MiB per buffer",
+        copies,
+        l2_bytes=l2,
+    )
+
+
 @dataclass(frozen=True)
 class ClassVerdict(PerfRecord):
     """Whether a kernel meets the bar for the class it declares.
@@ -303,6 +574,61 @@ def dram_verdict(
         achieved_pct=share,
         required_pct=floor,
         passed=share >= floor,
+    )
+
+
+def dram_floor_verdict(
+    kernel: str,
+    *,
+    moved_bytes: Bytes,
+    launch_count: Count,
+    duration_us: Microseconds,
+    floor: DramTimeFloor,
+) -> ClassVerdict:
+    """Judge a DRAM-bound kernel against the time floor at its own traffic.
+
+    The bar is :data:`CLASS_FLOOR_PCT`, unchanged. What changes is the denominator:
+    the kernel is compared against a copy of its own size rather than against the
+    largest copy the device can run. ``floor_us / duration_us`` is the same number
+    as ``achieved_gbs / floor_gbs``, so ``achieved_pct`` still reads as a share of
+    a measured copy rate.
+
+    The fixed term is charged once per launch. Both measurements sum over the
+    launches in the capture window, and a window of ``n`` launches pays the fixed
+    cost ``n`` times, so folding it in once would understate the floor by
+    ``(n - 1) * c`` and score every multi-launch kernel low.
+
+    ``moved_bytes`` is measured DRAM traffic, not an analytic byte count, so a
+    kernel that moves more bytes raises its own floor. Traffic the byte model does
+    not contain therefore does not fail here; a register spill is caught by the
+    spill rule in :func:`slinoss.perf.declared.floor_audit` instead.
+
+    Args:
+        kernel: Kernel name.
+        moved_bytes: Measured DRAM read plus write, summed over the launches.
+        launch_count: Launches those two sums cover.
+        duration_us: Measured kernel duration, summed over the same launches.
+        floor: The fitted time floor, measured on the same device in the same
+            process.
+
+    Returns:
+        The verdict.
+
+    Raises:
+        ValueError: If ``launch_count`` is not positive.
+    """
+    if launch_count <= 0:
+        raise ValueError(f"launch_count must be positive, got {launch_count}")
+    per_launch = Bytes(moved_bytes // launch_count)
+    total_floor = Microseconds(launch_count * floor.floor_us(per_launch))
+    share = pct_of(total_floor, duration_us)
+    bar = CLASS_FLOOR_PCT[DRAM_BOUND]
+    return ClassVerdict(
+        kernel=kernel,
+        declared=DRAM_BOUND,
+        achieved_pct=share,
+        required_pct=bar,
+        passed=share >= bar,
     )
 
 

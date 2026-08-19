@@ -18,12 +18,17 @@ An undeclared kernel is not silently unverdicted. A profiled symbol carrying one
 of :data:`OWNED_MARKERS` and matching no key raises; a symbol carrying neither
 marker came from torch, cuBLAS, or the driver, so it is reported as unjudged
 rather than judged against a class this repo did not declare.
+
+Two drivers judge that table. :func:`class_audit` scores a DRAM-bound kernel
+against the single-point copy ceiling. :func:`floor_audit` scores it against the
+copy's time law at the kernel's own traffic and fails a register spill outright.
+Both are here because the first has consumers this module does not own.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final
 
 from slinoss.perf.ceiling import (
@@ -32,18 +37,23 @@ from slinoss.perf.ceiling import (
     TENSOR_BOUND,
     Ceilings,
     ClassVerdict,
+    DramTimeFloor,
+    dram_floor_verdict,
     dram_verdict,
     serial_verdict,
 )
-from slinoss.perf.ncu import KernelCounters
-from slinoss.perf.units import Microseconds, pct_of
+from slinoss.perf.ncu import KernelCounters, SpillCounters
+from slinoss.perf.units import Bytes, Microseconds, pct_of
 
 __all__ = [
     "DECLARED",
     "OWNED_MARKERS",
+    "SPILL_FREE_CLASSES",
     "ClassAudit",
+    "FloorAudit",
     "class_audit",
     "declared_class",
+    "floor_audit",
 ]
 
 OWNED_MARKERS: Final[tuple[str, ...]] = ("kernel_cutlass_", "slinoss::")
@@ -183,3 +193,121 @@ def class_audit(
                 f"table in NCU_TABLES collects one"
             )
     return ClassAudit(verdicts=tuple(verdicts), unjudged=tuple(unjudged))
+
+
+SPILL_FREE_CLASSES: Final[frozenset[str]] = frozenset((DRAM_BOUND, TENSOR_BOUND))
+"""Classes a register spill fails outright.
+
+Both hold a kernel to a rate, and a rate is a counted quantity over a duration. A
+spill adds traffic and instructions that the class's own byte or flop model does
+not contain, so it moves the counted quantity as well as the duration and the
+percentage stops ordering two configurations of the same kernel by speed:
+measured on an A6000, ``chunk_scan_fwd_kernel`` at two blocks per SM spilled
+nothing and ran 5.5% faster than the same body at three blocks per SM, and scored
+2.9 points lower for it.
+
+SERIAL-tiny is absent because its bar is a share of the step wall, which a spill
+can only worsen. A spilling SERIAL-tiny kernel is still worth fixing; it is not a
+corrupted verdict.
+"""
+
+
+@dataclass(frozen=True)
+class FloorAudit:
+    """The class check against the measured time floor, with the spill rule.
+
+    Attributes:
+        verdicts: One verdict per profiled kernel this repo compiles, in the order
+            profiled. A verdict failed by the spill rule carries the percentage it
+            achieved and ``passed`` False.
+        unjudged: Symbols of profiled kernels this repo does not compile.
+        spilled: Kernels the spill rule failed, whatever their percentage.
+    """
+
+    verdicts: tuple[ClassVerdict, ...]
+    unjudged: tuple[str, ...]
+    spilled: tuple[str, ...]
+
+
+def floor_audit(
+    kernels: Sequence[KernelCounters],
+    *,
+    floor: DramTimeFloor,
+    spills: Sequence[SpillCounters],
+    step_duration_us: Microseconds,
+    capture_iters: int,
+) -> FloorAudit:
+    """Judge every profiled kernel against its class, at the floor and for spills.
+
+    Two departures from :func:`class_audit`, which is left in place beside this and
+    unchanged.
+
+    A DRAM-bound kernel is scored against the time floor at its own measured
+    traffic rather than against the rate of the largest copy the device can run;
+    see :func:`slinoss.perf.ceiling.dram_floor_verdict`. The bar in
+    ``CLASS_FLOOR_PCT`` is the same 85%.
+
+    A kernel in :data:`SPILL_FREE_CLASSES` that touched local memory fails,
+    whatever its percentage. The percentage is still reported, because the
+    achieved figure is what says how far the spill moved the kernel.
+
+    Args:
+        kernels: Merged NCU counters for one capture window.
+        floor: Time floor measured on the same device in the same process, so
+            numerator and denominator drift together under an unlocked clock.
+        spills: One :func:`slinoss.perf.ncu.spill_counters` record per kernel, from
+            a :data:`slinoss.perf.ncu.SPILL_TABLE` pass over the same window.
+        step_duration_us: Measured per-iteration wall. The SERIAL-tiny divisor.
+        capture_iters: Iterations the capture window contained. Divides a counter
+            sum onto the same per-iteration footing as ``step_duration_us``.
+
+    Returns:
+        The audit.
+
+    Raises:
+        ValueError: If ``capture_iters`` is not positive, if a kernel in a
+            spill-free class carries no spill record, or if a declared class cannot
+            be judged from the collected counters. A missing spill record is a pass
+            that was never run, and treating it as no spill would report every
+            spilling kernel as clean.
+    """
+    if capture_iters <= 0:
+        raise ValueError(f"capture_iters must be positive, got {capture_iters}")
+    by_kernel = {one.kernel: one for one in spills}
+    verdicts: list[ClassVerdict] = []
+    unjudged: list[str] = []
+    spilled: list[str] = []
+    for one in kernels:
+        declared = declared_class(one.kernel)
+        if declared is None:
+            unjudged.append(one.kernel)
+            continue
+        if declared in SPILL_FREE_CLASSES and one.kernel not in by_kernel:
+            raise ValueError(
+                f"kernel {one.kernel!r} declares {declared} and carries no spill "
+                f"record; run SPILL_TABLE over the same window"
+            )
+        if declared == DRAM_BOUND:
+            verdict = dram_floor_verdict(
+                one.kernel,
+                moved_bytes=Bytes(one.dram_read_bytes + one.dram_write_bytes),
+                launch_count=one.launch_count,
+                duration_us=one.duration_us,
+                floor=floor,
+            )
+        elif declared == SERIAL_TINY:
+            per_iter = Microseconds(one.duration_us / capture_iters)
+            verdict = serial_verdict(one.kernel, pct_of(per_iter, step_duration_us))
+        else:
+            raise ValueError(
+                f"kernel {one.kernel!r} declares {declared}, which the collected "
+                f"counters cannot judge: {TENSOR_BOUND} needs a flop count and no "
+                f"table in NCU_TABLES collects one"
+            )
+        if declared in SPILL_FREE_CLASSES and by_kernel[one.kernel].spilled:
+            spilled.append(one.kernel)
+            verdict = replace(verdict, passed=False)
+        verdicts.append(verdict)
+    return FloorAudit(
+        verdicts=tuple(verdicts), unjudged=tuple(unjudged), spilled=tuple(spilled)
+    )
