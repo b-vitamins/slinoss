@@ -3,15 +3,21 @@
 The lookup itself is :class:`slinoss._registry.Registry`, which every operator
 shares. This module holds only what is the scan's own: the two call signatures, and
 which implementations exist.
+
+The CuTe backend registers only when the DSL imports and a CUDA device is visible.
+Importing the DSL on a host without one raises, and an operator that cannot be
+imported on a CPU host is not an operator, so the import is guarded and a tree with
+no DSL resolves to the reference everywhere.
 """
 
 from __future__ import annotations
 
 from typing import Protocol
 
+import torch
 from torch import Tensor
 
-from slinoss._precision import SUPPORTED_DTYPES
+from slinoss._precision import LOW_PRECISION_DTYPES, SUPPORTED_DTYPES
 from slinoss._registry import Backend, Registry
 from slinoss.ops.so3ssd.backward import SO3SSDGrads, so3ssd_bwd_ref
 from slinoss.ops.so3ssd.reference import SO3SSDResult, so3ssd_ref
@@ -28,6 +34,7 @@ __all__ = [
 ]
 
 REFERENCE = "reference"
+CUTE = "cute"
 
 
 class ScanForward(Protocol):
@@ -91,3 +98,33 @@ register(
         priority=0,
     )
 )
+
+
+def _register_cute() -> None:
+    """Register the CuTe backend if this host can run it.
+
+    The forward is the three-kernel tree; the backward is still the reference, so a
+    training step on this backend runs a fast forward against a torch backward. That
+    is a deliberate intermediate state, not a fallback: the forward is the half that
+    is finished, and shipping it under its own name keeps the benchmarked path and
+    the public path identical while the backward lands.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        from slinoss.ops.so3ssd.cute.forward import so3ssd_fwd_cute
+    except ImportError:
+        return
+    register(
+        Backend(
+            name=CUTE,
+            forward=so3ssd_fwd_cute,
+            backward=so3ssd_bwd_ref,
+            device_types=("cuda",),
+            dtypes=LOW_PRECISION_DTYPES,
+            priority=10,
+        )
+    )
+
+
+_register_cute()
