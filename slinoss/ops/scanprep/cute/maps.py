@@ -32,7 +32,7 @@ cotangents and four input elements in, ten input elements out: 104 B at float32,
 """
 
 import math
-from typing import Any, NamedTuple, cast
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -50,13 +50,10 @@ from slinoss._cute import (
 )
 from slinoss._guard import Named, check_layout
 from slinoss._precision import KERNEL_DTYPES
-from slinoss.ops.scanprep.reference import ScanParams
+from slinoss.ops.scanprep.reference import ScanGrads, ScanParams
 
 __all__ = [
     "THREADS",
-    "ScanGrads",
-    "ScanPrepFunction",
-    "scanprep",
     "scanprep_backward",
     "scanprep_bwd",
     "scanprep_bwd_kernel",
@@ -365,20 +362,6 @@ def _flat(tensor: Tensor, *shape: int) -> cute.Tensor:
     return dev_tensor(tensor.view(*shape))
 
 
-class ScanGrads(NamedTuple):
-    """Gradients of the bounded maps.
-
-    Attributes:
-        dw_raw: ``(B,H,T,3)``, input dtype.
-        dls_raw: ``(B,H,T)``, input dtype.
-        dtap_raw: ``(B,H,T,2,3)``, input dtype.
-    """
-
-    dw_raw: Tensor
-    dls_raw: Tensor
-    dtap_raw: Tensor
-
-
 def scanprep_forward(
     w_raw: Tensor,
     ls_raw: Tensor,
@@ -491,69 +474,3 @@ def scanprep_backward(
         THREADS,
     )
     return ScanGrads(dw_raw=dw_raw, dls_raw=dls_raw, dtap_raw=dtap_raw)
-
-
-_Packed = tuple[Tensor, Tensor]
-
-
-class ScanPrepFunction(torch.autograd.Function):
-    """Differentiable bounded maps.
-
-    Returns a positional tuple because :class:`torch.autograd.Function` requires
-    one. :func:`scanprep` names the fields.
-
-    Saves ``w_raw`` and ``ls_raw`` only. The tap map is the identity, so
-    ``tap_raw`` carries nothing the backward needs, and neither packed output is
-    read back: the backward sees the two cotangents and the two raw operands.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        w_raw: Tensor,
-        ls_raw: Tensor,
-        tap_raw: Tensor,
-        w_max: float,
-    ) -> _Packed:
-        out = scanprep_forward(w_raw, ls_raw, tap_raw, w_max=w_max)
-        ctx.save_for_backward(w_raw, ls_raw)
-        ctx.w_max = w_max
-        return out.trans, out.K
-
-    @staticmethod
-    def backward(  # type: ignore[override]
-        ctx: Any,
-        dtrans: Tensor,
-        dK: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, None]:
-        w_raw, ls_raw = ctx.saved_tensors
-        grads = scanprep_backward(dtrans, dK, w_raw, ls_raw, w_max=ctx.w_max)
-        return grads.dw_raw, grads.dls_raw, grads.dtap_raw, None
-
-
-def scanprep(
-    w_raw: Tensor,
-    ls_raw: Tensor,
-    tap_raw: Tensor,
-    *,
-    w_max: float,
-) -> ScanParams:
-    """Bounded maps with an analytic backward. The public fast path.
-
-    Args:
-        w_raw: Unconstrained rotation vectors, ``(B,H,T,3)``.
-        ls_raw: Unconstrained log-scales, ``(B,H,T)``.
-        tap_raw: Unconstrained taps ``(kr, g, h)``, ``(B,H,T,2,3)``.
-        w_max: Rotation-vector norm bound, in ``(0, pi)``.
-
-    Returns:
-        A :class:`slinoss.ops.scanprep.ScanParams`, float32 (I4).
-
-    Raises:
-        ValueError: On a shape, layout, device, or bound violation.
-        TypeError: On an unsupported or mixed dtype.
-    """
-    trans, packed = cast(
-        "_Packed", ScanPrepFunction.apply(w_raw, ls_raw, tap_raw, w_max)
-    )
-    return ScanParams(trans=trans, K=packed)

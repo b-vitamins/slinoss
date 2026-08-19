@@ -10,7 +10,13 @@ import pytest
 import torch
 from torch import Tensor
 
-from slinoss.ops.scanprep import bounded_logscale, bounded_rotvec, scanprep_ref
+from slinoss.ops.scanprep import (
+    bounded_logscale,
+    bounded_rotvec,
+    scanprep,
+    scanprep_bwd_ref,
+    scanprep_ref,
+)
 
 Triple = tuple[Tensor, Tensor, Tensor]
 Mutator = Callable[[Tensor, Tensor, Tensor], Triple]
@@ -294,3 +300,48 @@ def test_pack_rejects_unsupported_dtype(index: int) -> None:
     raws[index] = raws[index].to(torch.int64)
     with pytest.raises(TypeError, match="supported"):
         scanprep_ref(*raws, w_max=W_MAX)
+
+
+def test_reference_backward_matches_autograd_through_the_public_operator() -> None:
+    """The dispatched reference path is the same gradient autograd produces.
+
+    :func:`scanprep` routes the backward through the registry rather than through
+    autograd's own graph, and the registry's backward signature omits ``tap_raw``
+    because the tap map is the identity. The two arms are only equal if that
+    omission is sound and the saved set is right.
+    """
+    raws = _raw_triple(bsz=2, heads=3, seqlen=5, seed=3)
+    dtrans = torch.randn(2, 3, 5, 4, dtype=torch.float64)
+    dK = torch.randn(2, 3, 5, 2, 4, dtype=torch.float64)
+
+    leaves = tuple(t.detach().clone().requires_grad_(True) for t in raws)
+    got = scanprep(*leaves, w_max=W_MAX, backend="reference")
+    (got.trans * dtrans).sum().add((got.K * dK).sum()).backward()
+
+    direct = tuple(t.detach().clone().requires_grad_(True) for t in raws)
+    want = scanprep_ref(*direct, w_max=W_MAX)
+    (want.trans * dtrans).sum().add((want.K * dK).sum()).backward()
+
+    names = ("dw_raw", "dls_raw", "dtap_raw")
+    for leaf, ref, name in zip(leaves, direct, names, strict=True):
+        assert leaf.grad is not None and ref.grad is not None
+        torch.testing.assert_close(leaf.grad, ref.grad, msg=name)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda dtrans, dK: (dtrans[..., :3], dK), "dtrans must be"),
+        (lambda dtrans, dK: (dtrans, dK[..., :3]), "dK must be"),
+    ],
+)
+def test_reference_backward_rejects_a_mismatched_cotangent(
+    mutate: Callable[[Tensor, Tensor], tuple[Tensor, Tensor]],
+    match: str,
+) -> None:
+    """Both cotangents are the packed layouts; a narrower one is a bug."""
+    w_raw, ls_raw, _ = _raw_triple(bsz=1, heads=1, seqlen=2)
+    dtrans = torch.zeros(1, 1, 2, 4, dtype=torch.float64)
+    dK = torch.zeros(1, 1, 2, 2, 4, dtype=torch.float64)
+    with pytest.raises(ValueError, match=match):
+        scanprep_bwd_ref(*mutate(dtrans, dK), w_raw, ls_raw, w_max=W_MAX)

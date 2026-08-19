@@ -22,10 +22,9 @@ if not torch.cuda.is_available():
 
 from collections.abc import Callable
 
-from slinoss.ops.scanprep import scanprep_ref
+from slinoss.ops.scanprep import scanprep, scanprep_ref
 from slinoss.ops.scanprep.cute import (
     THREADS,
-    scanprep,
     scanprep_backward,
     scanprep_forward,
 )
@@ -332,7 +331,7 @@ def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     fast = _leaves(raws, double=False)
     oracle = _leaves(raws, double=True)
 
-    got = scanprep(*fast, w_max=W_MAX)
+    got = scanprep(*fast, w_max=W_MAX, backend="cute")
     (got.trans * dtrans).sum().add((got.K * dK).sum()).backward()
 
     want = scanprep_ref(*oracle, w_max=W_MAX)

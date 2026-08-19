@@ -30,7 +30,14 @@ from torch.nn.functional import softplus
 
 from slinoss._precision import autocast_disabled, check_supported, pinned_dtype
 
-__all__ = ["ScanParams", "bounded_logscale", "bounded_rotvec", "scanprep_ref"]
+__all__ = [
+    "ScanGrads",
+    "ScanParams",
+    "bounded_logscale",
+    "bounded_rotvec",
+    "scanprep_bwd_ref",
+    "scanprep_ref",
+]
 
 
 def bounded_rotvec(raw: Tensor, w_max: float) -> Tensor:
@@ -126,3 +133,74 @@ def scanprep_ref(
             trans=torch.cat([w, ls[..., None]], dim=-1).contiguous(),
             K=torch.cat([tap, torch.zeros_like(tap[..., :1])], dim=-1).contiguous(),
         )
+
+
+class ScanGrads(NamedTuple):
+    """Gradients of the bounded maps.
+
+    Attributes:
+        dw_raw: ``(B,H,T,3)``, dtype of ``w_raw``.
+        dls_raw: ``(B,H,T)``, dtype of ``ls_raw``.
+        dtap_raw: ``(B,H,T,2,3)``, dtype of ``w_raw``.
+    """
+
+    dw_raw: Tensor
+    dls_raw: Tensor
+    dtap_raw: Tensor
+
+
+def scanprep_bwd_ref(
+    dtrans: Tensor,
+    dK: Tensor,
+    w_raw: Tensor,
+    ls_raw: Tensor,
+    /,
+    *,
+    w_max: float,
+) -> ScanGrads:
+    """Pullback of :func:`scanprep_ref`, by autograd through it.
+
+    Autograd through the forward rather than a written-out VJP. A hand-derived
+    pullback shares its algebra with the forward it was derived from, so an
+    algebra error passes silently. In float64 this is the gradient authority the
+    kernel is measured against.
+
+    ``tap_raw`` is not a parameter: the tap map is the identity, so its pullback
+    depends on nothing but ``dK``. The leaf differentiated here is a zero of the
+    right shape and dtype, which the linearity makes exact.
+
+    Args:
+        dtrans: Cotangent of ``trans``, shape ``(B,H,T,4)``.
+        dK: Cotangent of ``K``, shape ``(B,H,T,2,4)``. Lane 3 is the cotangent of
+            a constant and is discarded.
+        w_raw: The forward's rotation vectors, shape ``(B,H,T,3)``.
+        ls_raw: The forward's log-scales, shape ``(B,H,T)``.
+        w_max: The forward's norm bound.
+
+    Returns:
+        A :class:`ScanGrads`.
+
+    Raises:
+        ValueError: On a rank or shape mismatch, or a ``w_max`` outside
+            ``(0, pi)``.
+        TypeError: On an unsupported dtype.
+    """
+    if w_raw.ndim != 4 or w_raw.shape[-1] != 3:
+        raise ValueError(f"w_raw must be (B,H,T,3), got {tuple(w_raw.shape)}")
+    lead = tuple(int(d) for d in w_raw.shape[:3])
+    if tuple(dtrans.shape) != (*lead, 4):
+        raise ValueError(f"dtrans must be {(*lead, 4)}, got {tuple(dtrans.shape)}")
+    if tuple(dK.shape) != (*lead, 2, 4):
+        raise ValueError(f"dK must be {(*lead, 2, 4)}, got {tuple(dK.shape)}")
+
+    wl = w_raw.detach().requires_grad_(True)
+    ll = ls_raw.detach().requires_grad_(True)
+    tl = torch.zeros(
+        *lead, 2, 3, dtype=w_raw.dtype, device=w_raw.device, requires_grad=True
+    )
+    with torch.enable_grad():
+        out = scanprep_ref(wl, ll, tl, w_max=w_max)
+    dw_raw, dls_raw, dtap_raw = torch.autograd.grad(
+        (out.trans, out.K), (wl, ll, tl), (dtrans, dK)
+    )
+    return ScanGrads(dw_raw=dw_raw, dls_raw=dls_raw, dtap_raw=dtap_raw)
