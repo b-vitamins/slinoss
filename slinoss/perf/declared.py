@@ -203,8 +203,8 @@ spill adds traffic and instructions that the class's own byte or flop model does
 not contain, so it moves the counted quantity as well as the duration and the
 percentage stops ordering two configurations of the same kernel by speed:
 measured on an A6000, ``chunk_scan_fwd_kernel`` at two blocks per SM spilled
-nothing and ran 5.5% faster than the same body at three blocks per SM, and scored
-2.9 points lower for it.
+nothing and ran 5.8% faster than the same body at three blocks per SM, and scored
+2.7 points lower for it under the floor this module judges against.
 
 SERIAL-tiny is absent because its bar is a share of the step wall, which a spill
 can only worsen. A spilling SERIAL-tiny kernel is still worth fixing; it is not a

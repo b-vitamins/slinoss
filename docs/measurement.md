@@ -45,3 +45,12 @@ Each rule below exists because it has been violated before.
 - A kernel's declared class needs a benchmarked operator that launches it. A
   class no driver reaches is a claim with no gate behind it, and it reads as
   verified because the audit judges only what a capture contained.
+- A ceiling is measured in the same process, on the same device, at the same
+  clocks as the kernel it is a denominator for, and at the kernel's own
+  footprint. A ceiling carried over from another run drifts against the number
+  it divides.
+- A fitted denominator is reported with its residual. A fit quoted without one is
+  an extrapolation presented as a measurement.
+- A percentage of a ceiling is an efficiency, not a speed. Two configurations of
+  one kernel are ranked by duration; the percentage says only how much of the
+  bus each reached.

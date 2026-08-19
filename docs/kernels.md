@@ -106,3 +106,19 @@ A kernel that is none of the three is a defect, not a result. The declaration
 lives in the module docstring with the analytic byte count it rests on, and a
 `SERIAL-tiny` claim is a measurement, not an assertion. Redeclaring a class to
 make a number pass is the same defect as loosening a tolerance.
+
+The bandwidth a `DRAM-bound` kernel is held to is measured at the kernel's own
+footprint, not at the largest one the device can run. A copy carries a fixed cost,
+so its rate rises with its size, and a rate measured at 512 MiB is not a
+denominator for a kernel moving 10 MB. The probe sweeps the copy over footprints
+spanning thirty-twofold, each above L2, and fits `t = c + bytes/B`; the floor at
+the kernel's traffic comes from the fit, with the fixed term charged once per
+launch. The fit's residual is reported beside the verdict, because the
+extrapolation to a small footprint is only worth that residual.
+
+A register spill fails a `DRAM-bound` or `TENSOR-bound` kernel outright, whatever
+the percentage says. Both classes hold a counted quantity against a duration, and
+a spill moves both: at three blocks per SM `chunk_scan_fwd_kernel` scored 2.7
+points higher than the same body at two blocks per SM while running 5.8% slower.
+Local-memory sectors are read in their own NCU pass and are required, not
+optional -- a pass that was never run must not read as clean.
