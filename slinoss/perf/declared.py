@@ -51,6 +51,7 @@ OWNED_MARKERS: Final[tuple[str, ...]] = ("kernel_cutlass_", "slinoss::")
 extension namespace."""
 
 DECLARED: Final[dict[str, str]] = {
+    "boundary_bwd_kernel": SERIAL_TINY,
     "chunk_increment_fwd_kernel": DRAM_BOUND,
     "chunk_scan_fwd_kernel": DRAM_BOUND,
     "conv1d_bwd_kernel": DRAM_BOUND,
@@ -61,17 +62,22 @@ DECLARED: Final[dict[str, str]] = {
     "rmsnorm_residual_fwd_kernel": DRAM_BOUND,
     "scanprep_bwd_kernel": DRAM_BOUND,
     "scanprep_fwd_kernel": DRAM_BOUND,
+    "state_passing_bwd_kernel": DRAM_BOUND,
     "state_passing_fwd_kernel": DRAM_BOUND,
     "swiglu_fwd_kernel": DRAM_BOUND,
 }
 """Every kernel this repo compiles, and the class its module docstring declares.
 
-Every entry is DRAM-bound. The chunk recurrence in ``state_passing_fwd_kernel`` is
-the one provably serial step in the operator, but serial is not the same as latency
-bound: once the chunk fetch is pipelined ahead of the rotation, the serial chain is
-arithmetic and the kernel saturates the bus. It is held to a bandwidth like the
-rest. A shape with too few blocks to fill the device is SERIAL-tiny instead, which
-is a statement about a shape and not about a kernel, so it does not live here."""
+The chunk recurrence in the two ``state_passing`` kernels is the one provably serial
+step in the operator, but serial is not the same as latency bound: once the chunk
+fetch is pipelined ahead of the rotation, the serial chain is arithmetic and the
+kernel saturates the bus. Both are held to a bandwidth like the rest.
+
+``boundary_bwd_kernel`` is the one SERIAL-tiny entry. Its traffic is a fixed few
+rows per chunk rather than a pass over the sequence, so no shape makes it large
+enough to hold to a bandwidth. That is a property of the kernel and belongs here. A
+shape with too few blocks to fill the device is a different thing: a statement about
+a shape rather than about a kernel, and it does not live here."""
 
 
 def declared_class(kernel: str) -> str | None:

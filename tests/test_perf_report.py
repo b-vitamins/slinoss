@@ -90,9 +90,10 @@ FOREIGN = "void at::native::vectorized_elementwise_kernel<4>"
 two CuTe DSL kernels, the compiled extension, and a kernel from torch that this
 repo does not compile.
 
-No entry of :data:`DECLARED` declares SERIAL-tiny, so the test that exercises that
-arc patches one in. Binding the arc to whichever kernel currently declares the
-class would make an unrelated reclassification break a test about the audit."""
+The test that exercises the SERIAL-tiny arc patches the class onto one of these
+symbols rather than reaching for the entry that declares it. Binding the arc to
+whichever kernel currently declares the class would make an unrelated
+reclassification break a test about the audit."""
 
 
 # ---------------------------------------------------------------------------
