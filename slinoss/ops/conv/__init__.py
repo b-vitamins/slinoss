@@ -21,6 +21,7 @@ from slinoss.ops.conv.reference import (
     causal_conv1d_update_ref,
     check_cotangents,
     check_operands,
+    conv_output_shape,
     conv_state_shape,
 )
 
@@ -40,6 +41,7 @@ __all__ = [
     "causal_conv1d_update_ref",
     "check_cotangents",
     "check_operands",
+    "conv_output_shape",
     "conv_state_shape",
     "get",
     "names",

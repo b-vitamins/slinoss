@@ -314,11 +314,14 @@ def test_the_conv_operator_builds_the_conv_workload_at_the_named_shape(
     )
     assert tuple(inputs.weight.shape) == (SMALL_CONV.channels, SMALL_CONV.width)
     assert tuple(inputs.initial_state.shape) == SMALL_CONV.state_shape
-    assert {t.dtype for t in inputs} == {torch.float32}
+    assert {t.dtype for t in inputs.tensors} == {torch.float32}
     assert all(t.requires_grad for t in inputs.differentiable)
     # The output-gradient seed is preallocated and takes no gradient, so the
     # backward inside the window allocates nothing of its own.
     assert not inputs.dy.requires_grad
+    # Token-major by default, which is the layout every earlier report was taken at.
+    assert inputs.d_head is None
+    assert tuple(inputs.dy.shape) == tuple(inputs.x.shape)
     # Forward mode drops the graph, and a named backend reaches the factory.
     assert profile_target.main(argv("--op", "conv", "--backend", "reference")) == 0
     assert trace.factories[1] == "conv-step"
@@ -326,3 +329,24 @@ def test_the_conv_operator_builds_the_conv_workload_at_the_named_shape(
     assert profile_target.main(argv("--op", "conv", "--mode", "forward")) == 0
     assert trace.factories[2] == "conv-forward"
     assert not any(t.requires_grad for t in trace.inputs[2].differentiable)
+
+
+def test_the_conv_output_layout_reaches_the_seed_and_not_the_scan(
+    trace: Trace,
+) -> None:
+    # The seed's shape is the only place the layout is visible to the runner, so a
+    # flag that reached the forward and left dy token-major would raise inside the
+    # window rather than here.
+    assert profile_target.main(argv("--op", "conv", "--d-head", "16")) == 0
+    conv = trace.inputs[0]
+    assert isinstance(conv, ConvInputs)
+    assert conv.d_head == 16
+    assert tuple(conv.dy.shape) == (
+        SMALL_CONV.bsz,
+        SMALL_CONV.channels // 16,
+        SMALL_CONV.seq,
+        16,
+    )
+    # The scan takes no such flag, and passing one leaves its inputs untouched.
+    assert profile_target.main(argv("--d-head", "16")) == 0
+    assert isinstance(trace.inputs[1], OpInputs)

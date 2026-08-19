@@ -52,31 +52,41 @@ constexpr int kMaxChannelsPerBlock = 64;
 //   weight        (D,W)     contiguous, same dtype as x
 //   bias          (D,)      contiguous, same dtype as x, or nullopt
 //   initial_state (B,W-1,D) contiguous, same dtype as x, or nullopt
-//   y             (B,T,D)   contiguous, same dtype as x, written in full
+//   y             (B,T,D) or (B,D/P,T,P), contiguous, same dtype as x, written
+//                           in full
 //   final_state   (B,W-1,D) contiguous, same dtype as x, written in full,
 //                           or nullopt
+//
+// y_rows is P, the elements of y that one (b,h,t) row holds: D for the
+// token-major shape and P for the head-major one, where channel d = h*P + p
+// lands at (b,h,t,p). The store is base plus t*y_rows either way, so the
+// head-major output is a store address and never a repack.
 void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
                        const std::optional<at::Tensor> &bias,
                        const std::optional<at::Tensor> &initial_state,
                        const at::Tensor &y,
                        const std::optional<at::Tensor> &final_state,
-                       bool activation);
+                       int64_t y_rows, bool activation);
 
 // Pullback of causal_conv1d_fwd.
 //
-//   dy             (B,T,D)   contiguous, same dtype as x, or nullopt for a
-//                            cotangent that is identically zero
+//   dy             (B,T,D) or (B,D/P,T,P), contiguous, same dtype as x, or
+//                            nullopt for a cotangent that is identically zero
 //   dfinal_state   (B,W-1,D) contiguous, same dtype as x, or nullopt
 //   dx             (B,T,D)   contiguous, same dtype as x, written in full
 //   dinitial_state (B,W-1,D) contiguous, same dtype as x, written in full,
 //                            or nullopt
-//   dweight_parts  (P,W,D)   contiguous float32, written in full
-//   dbias_parts    (P,D)     contiguous float32, written in full, or nullopt
+//   dweight_parts  (S,W,D)   contiguous float32, written in full
+//   dbias_parts    (S,D)     contiguous float32, written in full, or nullopt
 //
-// P is causal_conv1d_bwd_parts(T). The parameter gradients are per-lag float32
+// dy_rows is dy's own y_rows: the cotangent carries the layout the forward's y
+// was written in, and dy is the only operand the layout reaches. dx is
+// token-major because x is. The value is unread when dy is nullopt.
+//
+// S is causal_conv1d_bwd_parts(T). The parameter gradients are per-lag float32
 // accumulators reduced along time inside the block and stored, never
 // accumulated, so no output needs zeroing before the launch. The caller sums
-// the P slices. Both partial buffers are channel-minor, so a warp's store is one
+// the S slices. Both partial buffers are channel-minor, so a warp's store is one
 // coalesced transaction; the caller transposes the summed tap block once.
 void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dfinal_state,
@@ -87,7 +97,7 @@ void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dinitial_state,
                        const at::Tensor &dweight_parts,
                        const std::optional<at::Tensor> &dbias_parts,
-                       bool activation);
+                       int64_t dy_rows, bool activation);
 
 // Number of time-tile partials the backward writes for a sequence length.
 int64_t causal_conv1d_bwd_parts(int64_t seqlen);

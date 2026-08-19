@@ -40,7 +40,7 @@ from torch import Tensor
 from slinoss._guard import ALIGN_BYTES
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.block import rmsnorm_residual, swiglu
-from slinoss.ops.conv import causal_conv1d, conv_state_shape
+from slinoss.ops.conv import causal_conv1d, conv_output_shape, conv_state_shape
 from slinoss.ops.scanprep import scanprep
 from slinoss.ops.scanprep.reference import PARAM_COLS, pack_params, scanprep_ref
 from slinoss.ops.so3ssd import so3ssd
@@ -429,8 +429,12 @@ class ConvInputs(NamedTuple):
         initial_state: ``(B,W-1,D)``, the window before ``x``. Present, because
             the decode path always carries one and its pullback is a separate
             kernel arc.
-        dy: ``(B,T,D)`` output-gradient seed, preallocated so the backward
-            measurement contains no allocation of its own.
+        dy: Output-gradient seed at the output's own shape, ``(B,T,D)`` or
+            ``(B,H,T,P)``, preallocated so the backward measurement contains no
+            allocation of its own.
+        d_head: The output layout ``dy`` was allocated at, carried here rather
+            than passed to the runners: the seed's shape and the forward's layout
+            are one fact, and two arguments for it can disagree.
     """
 
     x: Tensor
@@ -438,11 +442,17 @@ class ConvInputs(NamedTuple):
     bias: Tensor
     initial_state: Tensor
     dy: Tensor
+    d_head: int | None = None
 
     @property
     def differentiable(self) -> tuple[Tensor, ...]:
         """The four tensors gradients are taken with respect to."""
         return (self.x, self.weight, self.bias, self.initial_state)
+
+    @property
+    def tensors(self) -> tuple[Tensor, ...]:
+        """Every tensor, in field order. ``d_head`` is not one."""
+        return (*self.differentiable, self.dy)
 
 
 def make_conv_inputs(
@@ -452,6 +462,7 @@ def make_conv_inputs(
     dtype: torch.dtype = torch.bfloat16,
     requires_grad: bool = True,
     seed: int = 0,
+    d_head: int | None = None,
 ) -> ConvInputs:
     """Build causal conv1d inputs at one shape.
 
@@ -461,6 +472,9 @@ def make_conv_inputs(
         dtype: Dtype of every operand.
         requires_grad: Whether the four differentiable inputs carry gradients.
         seed: Generator seed, so two runs benchmark the same numbers.
+        d_head: Output layout. ``dy`` is allocated at the shape that layout
+            produces, so the backward is handed the cotangent the forward's output
+            would carry, and the runners read the layout back off the inputs.
 
     Returns:
         The inputs.
@@ -475,7 +489,8 @@ def make_conv_inputs(
         weight=randn(shape.channels, shape.width).requires_grad_(requires_grad),
         bias=randn(shape.channels).requires_grad_(requires_grad),
         initial_state=randn(*shape.state_shape).requires_grad_(requires_grad),
-        dy=randn(shape.bsz, shape.seq, shape.channels),
+        dy=randn(*conv_output_shape(shape.bsz, shape.seq, shape.channels, d_head)),
+        d_head=d_head,
     )
 
 
@@ -485,7 +500,7 @@ def conv_forward_only(
     """A callable that runs the conv forward under ``no_grad``.
 
     Args:
-        inputs: Conv inputs.
+        inputs: Conv inputs. Their ``d_head`` selects the output layout.
         backend: Backend name, or None for the fastest registered one.
         prefix: Region label prefix. See :func:`forward_only`.
 
@@ -500,6 +515,7 @@ def conv_forward_only(
                 inputs.weight,
                 inputs.bias,
                 initial_state=inputs.initial_state,
+                d_head=inputs.d_head,
                 backend=backend,
             )
 
@@ -519,7 +535,8 @@ def conv_step(
     and the backward skips the state pullback. That is the training path.
 
     Args:
-        inputs: Conv inputs. The four differentiable ones must require grad.
+        inputs: Conv inputs. The four differentiable ones must require grad, and
+            their ``d_head`` selects the output layout ``dy`` was allocated at.
         backend: Backend name, or None for the fastest registered one.
         wrt: Tensors to differentiate with respect to. Defaults to all four.
         prefix: Region label prefix. See :func:`forward_only`.
@@ -542,6 +559,7 @@ def conv_step(
                 inputs.weight,
                 inputs.bias,
                 initial_state=inputs.initial_state,
+                d_head=inputs.d_head,
                 backend=backend,
             ).y
         with region(f"{prefix}.backward"):

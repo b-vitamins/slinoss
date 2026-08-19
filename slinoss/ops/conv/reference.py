@@ -17,6 +17,14 @@ window can be folded away.
 Layout. Time-major and channels-last, ``(B,T,D)``, contiguous. The taps are
 ``(D,W)`` so a channel's whole bank is contiguous. Nothing here transposes.
 
+``d_head`` widens the output layout only. At ``d_head = P`` the output is
+head-major, ``(B, D//P, T, P)``, with channel ``d = h*P + p`` landing at
+``(b,h,t,p)``; the map, the taps, the state, and every input shape are unchanged.
+The scan reads ``U`` head-major, so this is the one consumer's layout produced in
+the store rather than in a repack afterwards. Here the head-major result is
+computed by reshaping the operands and contracting into the head-major shape, so
+it is the definition at that shape and not a permuted copy of the token-major one.
+
 Precision. The tap contraction accumulates in float32, or float64 when any
 operand is float64, and the output carries the dtype of ``x``. Accumulating a
 ``W``-term sum at the input width would put the reference and the kernel on
@@ -32,6 +40,7 @@ from torch import Tensor
 from torch.nn.functional import silu
 
 from slinoss._precision import autocast_disabled, check_supported, pinned_dtype
+from slinoss.config import HEAD_MULTIPLE
 
 __all__ = [
     "ConvDims",
@@ -42,6 +51,7 @@ __all__ = [
     "causal_conv1d_update_ref",
     "check_cotangents",
     "check_operands",
+    "conv_output_shape",
     "conv_state_shape",
 ]
 
@@ -59,6 +69,38 @@ def conv_state_shape(bsz: int, width: int, channels: int) -> tuple[int, int, int
         pointwise and carries nothing between steps.
     """
     return (bsz, width - 1, channels)
+
+
+def conv_output_shape(
+    bsz: int, seqlen: int, channels: int, d_head: int | None
+) -> tuple[int, ...]:
+    """Shape of ``y``.
+
+    Args:
+        bsz: Batch ``B``.
+        seqlen: Tokens ``T``.
+        channels: Channels ``D``.
+        d_head: Rows per head ``P``, for a head-major output, or None for a
+            token-major one.
+
+    Returns:
+        ``(B,T,D)`` when ``d_head`` is None, else ``(B, D//P, T, P)``.
+
+    Raises:
+        ValueError: If ``P`` is not a positive multiple of
+            :data:`slinoss.config.HEAD_MULTIPLE`, or does not divide ``D``. The
+            multiple is the scan's rule, not the conv's: a ``P`` the scan cannot
+            take is not a ``P`` worth writing.
+    """
+    if d_head is None:
+        return (bsz, seqlen, channels)
+    if d_head < 1 or d_head % HEAD_MULTIPLE != 0:
+        raise ValueError(
+            f"d_head must be a positive multiple of {HEAD_MULTIPLE}, got {d_head}"
+        )
+    if channels % d_head != 0:
+        raise ValueError(f"d_head {d_head} must divide D={channels}")
+    return (bsz, channels // d_head, seqlen, d_head)
 
 
 class ConvDims(NamedTuple):
@@ -162,10 +204,15 @@ def _contract(
     *,
     activation: bool,
     out_dtype: torch.dtype,
+    d_head: int | None,
 ) -> Tensor:
     """Slide the tap bank over ``xp`` and apply the epilogue.
 
-    ``unfold`` is a view, so the window axis costs no copy of ``xp``.
+    ``unfold`` is a view, so the window axis costs no copy of ``xp``. So is the
+    head-major reshape of the operands: splitting the channel axis needs only its
+    unit stride, and the transpose that follows moves no element. The contraction
+    therefore writes the head-major output directly rather than permuting a
+    token-major one.
 
     Args:
         padded: ``xp``, shape ``(B,T+W-1,D)``, accumulation dtype.
@@ -174,16 +221,29 @@ def _contract(
         width: Tap count ``W``.
         activation: Apply SiLU.
         out_dtype: Dtype of the returned tensor.
+        d_head: Rows per head ``P``, or None for a token-major output.
 
     Returns:
-        Shape ``(B,T,D)`` in ``out_dtype``.
+        Shape ``(B,T,D)``, or ``(B, D//P, T, P)`` at ``d_head = P``, in
+        ``out_dtype``.
     """
     dtype = padded.dtype
-    # (B,T,D,W): component W of the window is xp[t + W], i.e. tap index k.
-    windows = padded.unfold(1, width, 1)
-    total = (windows * weight.to(dtype)).sum(-1)
-    if bias is not None:
-        total = total + bias.to(dtype)
+    taps = weight.to(dtype)
+    shifted = None if bias is None else bias.to(dtype)
+    if d_head is not None:
+        # (B,H,T+W-1,P), (H,1,P,W), (H,1,P). Both reshapes are views: splitting the
+        # channel axis needs only its unit stride and the transpose moves no
+        # element. The token axis is -2 in either layout and the taps broadcast
+        # against the trailing modes in either, so the contraction below is one
+        # expression at both settings.
+        padded = padded.unflatten(-1, (-1, d_head)).transpose(1, 2)
+        taps = taps.unflatten(0, (-1, d_head))[:, None]
+        if shifted is not None:
+            shifted = shifted.unflatten(0, (-1, d_head))[:, None]
+    # Component W of the window is xp[t + W], i.e. tap index k.
+    total = (padded.unfold(-2, width, 1) * taps).sum(-1)
+    if shifted is not None:
+        total = total + shifted
     return (silu(total) if activation else total).to(out_dtype)
 
 
@@ -194,6 +254,7 @@ def causal_conv1d_ref(
     *,
     activation: bool = True,
     initial_state: Tensor | None = None,
+    d_head: int | None = None,
 ) -> Tensor:
     """Causal depthwise conv1d over a whole sequence.
 
@@ -205,16 +266,21 @@ def causal_conv1d_ref(
         activation: Apply SiLU to the tap sum.
         initial_state: The ``W-1`` timesteps before ``x``, shape ``(B,W-1,D)``.
             Zero if omitted.
+        d_head: Rows per head ``P``, which makes the output head-major, or None
+            for the token-major output. Changes the output layout and nothing
+            else.
 
     Returns:
-        Shape ``(B,T,D)``, dtype of ``x``.
+        Shape ``(B,T,D)``, or ``(B, D//P, T, P)`` at ``d_head = P``, dtype of
+        ``x``.
 
     Raises:
-        ValueError: On a rank or shape mismatch, an empty ``x``, or a
-            non-positive ``W``.
+        ValueError: On a rank or shape mismatch, an empty ``x``, a non-positive
+            ``W``, or a ``d_head`` outside :func:`conv_output_shape`.
         TypeError: On an unsupported dtype.
     """
-    width = check_operands(x, weight, bias, initial_state).width
+    dims = check_operands(x, weight, bias, initial_state)
+    conv_output_shape(dims.batch, dims.seqlen, dims.channels, d_head)
     operands = [x, weight]
     if bias is not None:
         operands.append(bias)
@@ -222,14 +288,15 @@ def causal_conv1d_ref(
         operands.append(initial_state)
     dtype = pinned_dtype(*operands)
     with autocast_disabled(x.device.type):
-        padded = _padded(x, initial_state, width, dtype)
+        padded = _padded(x, initial_state, dims.width, dtype)
         return _contract(
             padded,
             weight,
             bias,
-            width,
+            dims.width,
             activation=activation,
             out_dtype=x.dtype,
+            d_head=d_head,
         )
 
 
@@ -237,10 +304,13 @@ class ConvStep(NamedTuple):
     """Result of a streaming step.
 
     Attributes:
-        y: Output, shape ``(B,T,D)``, dtype of ``x``.
+        y: Output, shape ``(B,T,D)``, or ``(B, D//P, T, P)`` when the call named
+            ``d_head = P``, dtype of ``x``. The head-major form is the layout the
+            scan reads ``U`` in: channel ``d = h*P + p`` is at ``(b,h,t,p)``.
         state: The ``W-1`` timesteps that follow ``x``, shape ``(B,W-1,D)``,
             dtype of ``x``. Feeds the next call's ``initial_state``. Empty at
-            ``W = 1``.
+            ``W = 1``. Token-major at both output layouts, because it is a window
+            of ``x``.
     """
 
     y: Tensor
@@ -254,6 +324,7 @@ def causal_conv1d_update_ref(
     *,
     activation: bool = True,
     initial_state: Tensor | None = None,
+    d_head: int | None = None,
 ) -> ConvStep:
     """Causal depthwise conv1d that also returns the next window.
 
@@ -268,16 +339,21 @@ def causal_conv1d_update_ref(
         activation: Apply SiLU to the tap sum.
         initial_state: The ``W-1`` timesteps before ``x``, shape ``(B,W-1,D)``.
             Zero if omitted.
+        d_head: Rows per head ``P``, which makes ``y`` head-major, or None for the
+            token-major ``y``. The returned window is token-major either way, so
+            the streaming identity holds at both settings.
 
     Returns:
         A :class:`ConvStep`.
 
     Raises:
-        ValueError: On a rank or shape mismatch, an empty ``x``, or a
-            non-positive ``W``.
+        ValueError: On a rank or shape mismatch, an empty ``x``, a non-positive
+            ``W``, or a ``d_head`` outside :func:`conv_output_shape`.
         TypeError: On an unsupported dtype.
     """
-    width = check_operands(x, weight, bias, initial_state).width
+    dims = check_operands(x, weight, bias, initial_state)
+    conv_output_shape(dims.batch, dims.seqlen, dims.channels, d_head)
+    width = dims.width
     operands = [x, weight]
     if bias is not None:
         operands.append(bias)
@@ -293,6 +369,7 @@ def causal_conv1d_update_ref(
             width,
             activation=activation,
             out_dtype=x.dtype,
+            d_head=d_head,
         )
     # The trailing window of xp, which is the trailing window of x whenever
     # T >= W-1 and otherwise straddles the incoming state. Slicing xp covers
@@ -305,21 +382,36 @@ def check_cotangents(
     dy: Tensor | None,
     dfinal_state: Tensor | None,
     dims: ConvDims,
-) -> None:
-    """Validate the cotangents of a :class:`ConvStep`.
+) -> int | None:
+    """Validate the cotangents of a :class:`ConvStep` and read off ``dy``'s layout.
+
+    The layout is inferred from ``dy``'s rank rather than carried as a saved flag.
+    ``dy`` is the only operand the output layout reaches -- ``dx`` is token-major
+    because ``x`` is -- and its rank already states that layout, so a flag would be
+    a second source of truth that can disagree with the tensor in hand. It would
+    also protect nothing: the flag would be available only on the autograd path,
+    where the cotangent's shape is already the output's, and not to a direct call
+    on a backend's backward, which is public too. Rank plus the
+    :func:`conv_output_shape` rules pin ``P`` and ``H`` exactly, so an inconsistent
+    rank-4 cotangent is rejected rather than read the wrong way.
 
     Args:
-        dy: Cotangent of ``y``, shape ``(B,T,D)``, or None.
+        dy: Cotangent of ``y``, shape ``(B,T,D)`` or ``(B, D//P, T, P)``, or None.
         dfinal_state: Cotangent of the returned window, shape ``(B,W-1,D)``, or
             None.
         dims: Extents of the forward call.
+
+    Returns:
+        The ``d_head`` the forward was called with: ``P`` for a rank-4 ``dy``, None
+        for a rank-3 one and for an absent one, which leaves the layout unread.
 
     Raises:
         ValueError: On a shape mismatch.
         TypeError: On an unsupported dtype.
     """
-    want_y = (dims.batch, dims.seqlen, dims.channels)
+    d_head = None if dy is None or dy.ndim != 4 else int(dy.shape[-1])
     if dy is not None:
+        want_y = conv_output_shape(dims.batch, dims.seqlen, dims.channels, d_head)
         if tuple(dy.shape) != want_y:
             raise ValueError(f"dy must be {want_y}, got {tuple(dy.shape)}")
         check_supported(dy, "dy")
@@ -330,6 +422,7 @@ def check_cotangents(
                 f"dfinal_state must be {want_state}, got {tuple(dfinal_state.shape)}"
             )
         check_supported(dfinal_state, "dfinal_state")
+    return d_head
 
 
 class ConvGrads(NamedTuple):
@@ -340,7 +433,8 @@ class ConvGrads(NamedTuple):
     argument.
 
     Attributes:
-        dx: Shape ``(B,T,D)``, dtype of ``x``.
+        dx: Shape ``(B,T,D)``, dtype of ``x``. Token-major at both output layouts,
+            because ``x`` is.
         dweight: Shape ``(D,W)``, dtype of ``weight``.
         dbias: Shape ``(D,)`` or ``None``.
         dinitial_state: Shape ``(B,W-1,D)`` or ``None``.
@@ -372,7 +466,9 @@ def causal_conv1d_bwd_ref(
     kernels are measured against.
 
     Args:
-        dy: Cotangent of ``y``, shape ``(B,T,D)``, or None.
+        dy: Cotangent of ``y``, shape ``(B,T,D)`` or ``(B, D//P, T, P)``, or None.
+            Its rank is how the forward's output layout is recovered; see
+            :func:`check_cotangents`.
         dfinal_state: Cotangent of the returned window, shape ``(B,W-1,D)``, or
             None.
         x: The forward's activations, shape ``(B,T,D)``.
@@ -391,7 +487,7 @@ def causal_conv1d_bwd_ref(
         TypeError: On an unsupported dtype.
     """
     dims = check_operands(x, weight, bias, initial_state)
-    check_cotangents(dy, dfinal_state, dims)
+    d_head = check_cotangents(dy, dfinal_state, dims)
 
     xl = x.detach().requires_grad_(True)
     wl = weight.detach().requires_grad_(True)
@@ -405,7 +501,7 @@ def causal_conv1d_bwd_ref(
 
     with torch.enable_grad():
         out = causal_conv1d_update_ref(
-            xl, wl, bl, activation=activation, initial_state=sl
+            xl, wl, bl, activation=activation, initial_state=sl, d_head=d_head
         )
     outputs: list[Tensor] = []
     cotangents: list[Tensor] = []

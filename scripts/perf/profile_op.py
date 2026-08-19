@@ -92,6 +92,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "report names the part the numbers came from.",
     )
     parser.add_argument("--backend", default=None)
+    parser.add_argument(
+        "--d-head",
+        type=int,
+        default=0,
+        help="Rows per head for the conv output layout, or 0 for token-major. "
+        "Forwarded to the target, so the counters and the event wall cover one "
+        "layout. Ignored by every other operator.",
+    )
     parser.add_argument("--ncu", default="ncu")
     parser.add_argument("--nsys", default="nsys")
     parser.add_argument("--python", default=sys.executable)
@@ -134,6 +142,10 @@ def target_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--op", args.op]
     if args.backend is not None:
         argv += ["--backend", args.backend]
+    # The layout has to reach the profiled process, or the counters describe the
+    # token-major kernel while the event wall describes the head-major one.
+    if args.d_head:
+        argv += ["--d-head", str(args.d_head)]
     return argv
 
 
@@ -156,7 +168,13 @@ def build_workload(
     dtype = DTYPES[args.dtype]
     if args.op == CONV:
         conv_shape = conv_shape_by_name(args.shape)
-        conv = make_conv_inputs(conv_shape, device, dtype=dtype, requires_grad=grads)
+        conv = make_conv_inputs(
+            conv_shape,
+            device,
+            dtype=dtype,
+            requires_grad=grads,
+            d_head=args.d_head or None,
+        )
         runner = (
             conv_step(conv, backend=args.backend)
             if grads
@@ -221,7 +239,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv_target = target_argv(args)
     notes = [
         shape.describe(),
-        f"mode={args.mode} dtype={args.dtype} backend={args.backend or 'auto'}",
+        f"mode={args.mode} dtype={args.dtype} backend={args.backend or 'auto'}"
+        + (f" d_head={args.d_head}" if args.d_head else ""),
         f"event iters={args.event_iters} capture iters={args.iters}",
         f"timer={timed.timer} clocks={timed.clocks}",
         "target: " + " ".join(argv_target),

@@ -54,6 +54,13 @@ SMALL = OpShape("small", bsz=1, heads=1, seq=8, rows=16, lanes=16, chunk=4)
 SMALL_CONV = ConvShape("small", bsz=1, seq=8, channels=4, width=4)
 """One tap bank wider than one token, so the streaming carry is not degenerate."""
 
+HEAD_CONV = ConvShape("head", bsz=1, seq=8, channels=32, width=4)
+""":data:`SMALL_CONV` at two heads of ``HEAD_MULTIPLE`` channels.
+
+Two heads, not one: at one head the head-major output holds the same elements in
+the same order as the token-major one, so the layout would be untested.
+"""
+
 SMALL_LAYER = OpShape("small", bsz=1, heads=1, seq=8, rows=16, lanes=16, chunk=16)
 """:data:`SMALL` at the shortest legal layer chunk.
 
@@ -304,12 +311,13 @@ def test_make_conv_inputs_matches_the_tensor_contract() -> None:
     assert tuple(got.bias.shape) == (SMALL_CONV.channels,)
     assert tuple(got.initial_state.shape) == SMALL_CONV.state_shape
     assert tuple(got.dy.shape) == lead
-    for t in got:
+    assert got.d_head is None
+    for t in got.tensors:
         assert t.is_contiguous()
     # One dtype throughout: the native backend is one template instantiation per
     # dtype and refuses a mixed-dtype call rather than promoting an operand.
     low = make_conv_inputs(SMALL_CONV, CPU, dtype=torch.bfloat16)
-    assert {t.dtype for t in low} == {torch.bfloat16}
+    assert {t.dtype for t in low.tensors} == {torch.bfloat16}
 
 
 def test_make_conv_inputs_carries_gradients_on_the_four_differentiable_inputs() -> None:
@@ -329,7 +337,7 @@ def test_make_conv_inputs_is_reproducible_from_the_seed() -> None:
     first = make_conv_inputs(SMALL_CONV, CPU, seed=7)
     same = make_conv_inputs(SMALL_CONV, CPU, seed=7)
     other = make_conv_inputs(SMALL_CONV, CPU, seed=8)
-    for a, b in zip(first, same):
+    for a, b in zip(first.tensors, same.tensors):
         assert torch.equal(a, b)
     assert not torch.equal(first.x, other.x)
 
@@ -359,6 +367,25 @@ def test_the_conv_runners_record_their_own_regions() -> None:
         conv_step(inputs, prefix="arm-b"), label="conv", iters=1, warmup=0, device=CPU
     )
     assert [t.label for t in prefixed.regions] == ["arm-b.forward", "arm-b.backward"]
+
+
+def test_the_conv_output_layout_reaches_both_runners() -> None:
+    # d_head lives on the inputs rather than on the runner calls, so the seed's
+    # shape and the forward's layout cannot disagree. What that buys is only real
+    # if both runners read it: a runner that dropped it would return a token-major
+    # y against a rank-4 dy, which autograd rejects on shape.
+    inputs = make_conv_inputs(
+        HEAD_CONV, CPU, dtype=torch.float32, requires_grad=True, d_head=16
+    )
+    heads = HEAD_CONV.channels // 16
+    assert inputs.d_head == 16
+    assert tuple(inputs.dy.shape) == (HEAD_CONV.bsz, heads, HEAD_CONV.seq, 16)
+    forward = measure(
+        conv_forward_only(inputs), label="conv", iters=1, warmup=0, device=CPU
+    )
+    assert [t.label for t in forward.regions] == ["conv.forward"]
+    timed = measure(conv_step(inputs), label="conv", iters=1, warmup=0, device=CPU)
+    assert [t.label for t in timed.regions] == ["conv.forward", "conv.backward"]
 
 
 def test_conv_step_rejects_inputs_that_take_no_gradient() -> None:

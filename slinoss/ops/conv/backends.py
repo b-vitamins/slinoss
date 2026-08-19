@@ -28,6 +28,7 @@ from slinoss.ops.conv.reference import (
     causal_conv1d_update_ref,
     check_cotangents,
     check_operands,
+    conv_output_shape,
     conv_state_shape,
 )
 
@@ -60,11 +61,16 @@ class ConvForward(Protocol):
         *,
         activation: bool = True,
         initial_state: Tensor | None = None,
+        d_head: int | None = None,
     ) -> ConvStep: ...
 
 
 class ConvBackward(Protocol):
-    """Backward signature every backend implements."""
+    """Backward signature every backend implements.
+
+    No ``d_head``: the output layout reaches the backward only through ``dy``, and
+    :func:`slinoss.ops.conv.reference.check_cotangents` reads it off there.
+    """
 
     def __call__(
         self,
@@ -143,8 +149,13 @@ def causal_conv1d_fwd_native(
     *,
     activation: bool = True,
     initial_state: Tensor | None = None,
+    d_head: int | None = None,
 ) -> ConvStep:
     """Causal depthwise conv1d on the CUDA kernel.
+
+    ``d_head`` moves the store address and nothing else: the output is allocated at
+    the head-major shape and the kernel's epilogue writes it there, so the layout
+    the scan needs costs no pass over the largest activation in the step.
 
     Args:
         x: Activations, shape ``(B,T,D)``, contiguous, bf16/fp16/fp32.
@@ -154,16 +165,20 @@ def causal_conv1d_fwd_native(
         activation: Apply SiLU. Fused into the kernel epilogue.
         initial_state: The ``W-1`` timesteps before ``x``, shape ``(B,W-1,D)``,
             contiguous, dtype of ``x``. Zero if omitted.
+        d_head: Rows per head ``P``, which makes ``y`` head-major, or None for the
+            token-major ``y``.
 
     Returns:
         A :class:`ConvStep`.
 
     Raises:
-        ValueError: On a shape, contiguity, dtype, device, or width violation.
+        ValueError: On a shape, contiguity, dtype, device, width, or ``d_head``
+            violation.
         TypeError: On an unsupported dtype.
         RuntimeError: If the extension is not built.
     """
     dims = check_operands(x, weight, bias, initial_state)
+    shape = conv_output_shape(dims.batch, dims.seqlen, dims.channels, d_head)
     _check_native(
         (
             ("x", x),
@@ -174,7 +189,8 @@ def causal_conv1d_fwd_native(
         dims,
         x.dtype,
     )
-    y = torch.empty_like(x)
+    # empty, never a fill: the kernel writes every element of both outputs.
+    y = x.new_empty(shape)
     state = x.new_empty(conv_state_shape(dims.batch, dims.width, dims.channels))
     _C.extension().fwd(x, weight, bias, initial_state, y, state, activation)
     return ConvStep(y=y, state=state)
@@ -197,9 +213,13 @@ def causal_conv1d_bwd_native(
     summed here. The kernel writes every partial with a plain store, so nothing
     is zeroed before the launch.
 
+    A head-major cotangent moves the kernel's ``dy`` load address and nothing else.
+    ``dx`` is token-major because ``x`` is.
+
     Args:
-        dy: Cotangent of ``y``, shape ``(B,T,D)``, contiguous, or None for a
-            cotangent that is identically zero.
+        dy: Cotangent of ``y``, shape ``(B,T,D)`` or ``(B, D//P, T, P)``,
+            contiguous, or None for a cotangent that is identically zero. Its rank
+            is how the forward's output layout is recovered.
         dfinal_state: Cotangent of the returned window, shape ``(B,W-1,D)``,
             contiguous, or None.
         x: The forward's activations, shape ``(B,T,D)``.

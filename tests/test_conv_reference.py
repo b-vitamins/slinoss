@@ -2,7 +2,9 @@
 
 The forward is checked against an oracle that spells the index arithmetic out as
 two explicit loops, so the reference's ``unfold`` view has to agree with direct
-indexing rather than with itself. Gradients are checked by float64
+indexing rather than with itself. The head-major output is the same oracle with
+its channel axis split by a third loop, so the reference's reshape has to agree
+with the index map rather than with itself. Gradients are checked by float64
 :func:`torch.autograd.gradcheck`; no pullback is written out anywhere in this
 file, because a hand-derived pullback shares its algebra with the forward it came
 from and an algebra error would pass silently.
@@ -27,6 +29,7 @@ from slinoss.ops.conv import (
     causal_conv1d_ref,
     causal_conv1d_update_ref,
     check_operands,
+    conv_output_shape,
     conv_state_shape,
     get,
     names,
@@ -102,6 +105,27 @@ def make_call(
     )
 
 
+def head_major_of(y: Tensor, d_head: int) -> Tensor:
+    """``y`` token-major, reindexed head-major one channel at a time.
+
+    The destination index is written out rather than obtained from a reshape, so a
+    reshape that splits or transposes the wrong axis cannot agree with it.
+
+    Args:
+        y: Token-major output, shape ``(B,T,D)``.
+        d_head: Rows per head ``P``. Must divide ``D``.
+
+    Returns:
+        Shape ``(B, D//P, T, P)``, contiguous, dtype of ``y``, with channel
+        ``d = h*P + p`` at ``(b,h,t,p)``.
+    """
+    bsz, seqlen, channels = (int(d) for d in y.shape)
+    out = y.new_empty(bsz, channels // d_head, seqlen, d_head)
+    for d in range(channels):
+        out[:, d // d_head, :, d % d_head] = y[:, :, d]
+    return out
+
+
 def oracle(
     x: Tensor,
     weight: Tensor,
@@ -109,6 +133,7 @@ def oracle(
     *,
     activation: bool,
     initial_state: Tensor | None,
+    d_head: int | None = None,
 ) -> ConvStep:
     """Causal conv1d written as explicit loops over time and tap index.
 
@@ -121,9 +146,13 @@ def oracle(
         bias: Per-channel bias, shape ``(D,)``, or None.
         activation: Apply SiLU.
         initial_state: Previous window, shape ``(B,W-1,D)``, or None.
+        d_head: Rows per head ``P``, which reindexes ``y`` through
+            :func:`head_major_of`, or None for the token-major ``y``. The map is
+            unchanged: the layout is a destination index.
 
     Returns:
-        A :class:`ConvStep` in float64.
+        A :class:`ConvStep` in float64. Its ``state`` is token-major at both
+        output layouts.
     """
     bsz, seqlen, channels = (int(d) for d in x.shape)
     width = int(weight.shape[1])
@@ -142,6 +171,8 @@ def oracle(
         y = y + bias.detach().double()
     if activation:
         y = y * torch.sigmoid(y)
+    if d_head is not None:
+        y = head_major_of(y, d_head)
     return ConvStep(y=y, state=padded[:, seqlen:].clone())
 
 
@@ -167,15 +198,23 @@ def _check_oracle(
     with_bias: bool,
     with_state: bool,
     device: torch.device | str,
+    d_head: int | None = None,
 ) -> None:
     """One reference call against the two-loop oracle. The only copy of the body."""
     x, weight, bias, state = make_call(
         bsz, seqlen, channels, width, bias=with_bias, state=with_state, device=device
     )
-    want = oracle(x, weight, bias, activation=activation, initial_state=state)
-    got = causal_conv1d_update_ref(
-        x, weight, bias, activation=activation, initial_state=state
+    want = oracle(
+        x, weight, bias, activation=activation, initial_state=state, d_head=d_head
     )
+    got = causal_conv1d_update_ref(
+        x, weight, bias, activation=activation, initial_state=state, d_head=d_head
+    )
+    assert got.y.shape == conv_output_shape(bsz, seqlen, channels, d_head)
+    assert got.y.dtype == x.dtype
+    # A consumer reads y with a base and a stride, so a head-major output that is
+    # not contiguous would need the repack the keyword exists to remove.
+    assert got.y.is_contiguous()
     assert_max_rel(got.y, want.y, 1e-12, "conv/ref/y")
     assert got.state.shape == want.state.shape
     if got.state.numel():
@@ -306,6 +345,164 @@ def test_token_at_a_time_decode_reproduces_the_whole_sequence(
         steps.append(out.y)
         carry = out.state
     assert max_err(torch.cat(steps, dim=1), whole.y) < 1e-14
+
+
+# (B, T, D, W, P) with D = H*P. The head-major axis needs its own shapes: P is a
+# multiple of slinoss.config.HEAD_MULTIPLE and the channel counts above are not.
+# What the layout interacts with is W, which selects the padding branch, and H,
+# which is what the channel split reindexes. The activation is not on that list: it
+# is elementwise, so it commutes with any reindexing, and FLAGS already sweeps it.
+HEAD_MAJOR_SHAPES = [
+    pytest.param(2, 40, 32, 4, 16, id="two-heads"),
+    pytest.param(2, 9, 48, 4, 16, id="three-heads"),
+    pytest.param(2, 9, 32, 4, 32, id="one-head"),
+    pytest.param(2, 16, 32, 1, 16, id="pointwise"),
+    pytest.param(1, 3, 32, 8, 16, id="straddle"),
+]
+
+
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"), HEAD_MAJOR_SHAPES
+)
+def test_head_major_forward_matches_the_oracle(
+    bsz: int,
+    seqlen: int,
+    channels: int,
+    width: int,
+    d_head: int,
+    device: torch.device,
+) -> None:
+    """The head-major reshape against the index map written out as a loop.
+
+    ``H = 1`` is on the sweep because it is the case where the head-major shape
+    holds the same elements in the same order as the token-major one, so a reshape
+    that is wrong for ``H > 1`` still passes there.
+    """
+    _check_oracle(
+        bsz,
+        seqlen,
+        channels,
+        width,
+        activation=True,
+        with_bias=True,
+        with_state=True,
+        device=device,
+        d_head=d_head,
+    )
+
+
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"), HEAD_MAJOR_SHAPES
+)
+def test_head_major_whole_sequence_matches_streaming_form(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int
+) -> None:
+    x, weight, bias, state = make_call(bsz, seqlen, channels, width)
+    plain = causal_conv1d_ref(x, weight, bias, initial_state=state, d_head=d_head)
+    step = causal_conv1d_update_ref(x, weight, bias, initial_state=state, d_head=d_head)
+    assert plain.shape == step.y.shape
+    assert max_err(plain, step.y) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"), HEAD_MAJOR_SHAPES
+)
+def test_head_major_streaming_split_reproduces_the_whole_sequence(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int
+) -> None:
+    """The identity across a boundary whose two sides store what they carry apart.
+
+    The state stays token-major while ``y`` does not, so this is what catches a
+    carry written in the output's layout: it would still be the right elements and
+    the wrong ones would be read back at the next call.
+    """
+    x, weight, bias, state = make_call(bsz, seqlen, channels, width)
+    whole = causal_conv1d_update_ref(
+        x, weight, bias, initial_state=state, d_head=d_head
+    )
+    # Uneven on purpose: an even split hides an off-by-one in the carried window.
+    cut = max(1, seqlen // 3)
+    carry = state
+    pieces: list[Tensor] = []
+    for piece in torch.split(x, [cut, seqlen - cut], dim=1):
+        out = causal_conv1d_update_ref(
+            piece, weight, bias, initial_state=carry, d_head=d_head
+        )
+        pieces.append(out.y)
+        carry = out.state
+    # The token axis is -2 head-major and 1 token-major.
+    joined = torch.cat(pieces, dim=-2)
+    assert joined.shape == whole.y.shape
+    assert max_err(joined, whole.y) < 1e-14
+    assert carry is not None
+    assert_bitwise(carry, whole.state)
+
+
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"), HEAD_MAJOR_SHAPES
+)
+def test_head_major_backward_matches_the_token_major_backward(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int
+) -> None:
+    """A rank-4 cotangent pulled back to the same gradients as its token-major twin.
+
+    Chains to the gradient authority rather than restating it: ``test_gradcheck``
+    is what makes the token-major pullback correct, so equality here is what makes
+    the head-major one correct. It also pins the layout inference, which reads ``P``
+    off the cotangent's rank and reaches the reindexed cotangent no other way.
+    """
+    x, weight, bias, state = make_call(bsz, seqlen, channels, width)
+    gen = torch.Generator().manual_seed(23)
+    dy = torch.randn(bsz, seqlen, channels, generator=gen, dtype=torch.float64)
+    dstate = torch.randn(
+        *conv_state_shape(bsz, width, channels), generator=gen, dtype=torch.float64
+    )
+    want = causal_conv1d_bwd_ref(dy, dstate, x, weight, bias, initial_state=state)
+    got = causal_conv1d_bwd_ref(
+        head_major_of(dy, d_head), dstate, x, weight, bias, initial_state=state
+    )
+    for have, expect in zip(got, want):
+        assert have is not None and expect is not None
+        assert have.shape == expect.shape
+        if have.numel():
+            assert max_err(have, expect) < 1e-14
+
+
+@pytest.mark.parametrize(
+    "d_head",
+    [
+        pytest.param(8, id="not-a-multiple"),
+        pytest.param(0, id="non-positive"),
+    ],
+)
+def test_a_d_head_the_scan_cannot_take_is_rejected(d_head: int) -> None:
+    # P is the N mode of the scan's GEMMs and their MMA tile is HEAD_MULTIPLE wide,
+    # so a P the scan would refuse is refused here instead of being written.
+    x, weight, bias, state = make_call(2, 6, 32, 4)
+    with pytest.raises(ValueError, match="positive multiple"):
+        causal_conv1d_ref(x, weight, bias, initial_state=state, d_head=d_head)
+
+
+def test_a_d_head_that_does_not_divide_the_channels_is_rejected() -> None:
+    x, weight, bias, state = make_call(2, 6, 48, 4)
+    with pytest.raises(ValueError, match="must divide"):
+        causal_conv1d_ref(x, weight, bias, initial_state=state, d_head=32)
+
+
+def test_a_rank_4_dy_with_the_wrong_head_count_is_rejected() -> None:
+    # What makes reading the layout off the rank safe is that the rank plus the
+    # d_head rules pin P and H: a rank-4 dy that is not the output's shape is
+    # rejected rather than read as some other layout.
+    x, weight, bias, state = make_call(2, 6, 32, 4)
+    with pytest.raises(ValueError, match="dy must be"):
+        causal_conv1d_bwd_ref(
+            torch.ones(2, 1, 6, 16, dtype=torch.float64),
+            None,
+            x,
+            weight,
+            bias,
+            initial_state=state,
+        )
 
 
 @pytest.mark.parametrize(
@@ -444,6 +641,14 @@ def test_conv_state_shape() -> None:
     assert conv_state_shape(3, 1, 8) == (3, 0, 8)
 
 
+def test_conv_output_shape() -> None:
+    assert conv_output_shape(3, 5, 32, None) == (3, 5, 32)
+    assert conv_output_shape(3, 5, 32, 16) == (3, 2, 5, 16)
+    # H = 1 holds the same elements in the same order as the token-major shape, so
+    # it is the setting at which a stride of P is a stride of D.
+    assert conv_output_shape(3, 5, 32, 32) == (3, 1, 5, 32)
+
+
 def test_check_operands_returns_the_extents() -> None:
     x, weight, bias, state = make_call(2, 40, 8, 4)
     assert check_operands(x, weight, bias, state) == ConvDims(
@@ -574,10 +779,14 @@ def test_the_reference_is_selected_on_the_cpu() -> None:
     assert resolve(None, "cpu", torch.float32).name == "reference"
 
 
-def test_public_operator_matches_the_reference() -> None:
-    x, weight, bias, state = make_call(2, 40, 8, 4)
-    got = causal_conv1d(x, weight, bias, initial_state=state)
-    want = causal_conv1d_update_ref(x, weight, bias, initial_state=state)
+@pytest.mark.parametrize(
+    "d_head",
+    [pytest.param(None, id="token-major"), pytest.param(16, id="head-major")],
+)
+def test_public_operator_matches_the_reference(d_head: int | None) -> None:
+    x, weight, bias, state = make_call(2, 40, 32, 4)
+    got = causal_conv1d(x, weight, bias, initial_state=state, d_head=d_head)
+    want = causal_conv1d_update_ref(x, weight, bias, initial_state=state, d_head=d_head)
     assert_bitwise(got.y, want.y)
     assert_bitwise(got.state, want.state)
 
@@ -600,22 +809,45 @@ def _cloned_leaves(
 
 
 @pytest.mark.parametrize("activation", [True, False])
-def test_public_operator_backward_matches_the_reference(activation: bool) -> None:
-    bsz, seqlen, channels, width = 2, 9, 3, 4
+@pytest.mark.parametrize(
+    "d_head",
+    [pytest.param(None, id="token-major"), pytest.param(16, id="head-major")],
+)
+def test_public_operator_backward_matches_the_reference(
+    activation: bool, d_head: int | None
+) -> None:
+    """The autograd wiring at both output layouts.
+
+    The head-major case is what checks that the cotangent autograd hands back is
+    the one the backward can read: ``d_head`` is not saved, so a layout the
+    backward could not recover from ``dy`` alone would fail here.
+    """
+    bsz, seqlen, channels, width = 2, 9, 32, 4
     args = make_call(bsz, seqlen, channels, width, requires_grad=True)
     x, weight, bias, state = args
     other = _cloned_leaves(args)
     gen = torch.Generator().manual_seed(11)
-    dy = torch.randn(bsz, seqlen, channels, generator=gen, dtype=torch.float64)
+    dy = torch.randn(
+        *conv_output_shape(bsz, seqlen, channels, d_head),
+        generator=gen,
+        dtype=torch.float64,
+    )
     dstate = torch.randn(
         *conv_state_shape(bsz, width, channels), generator=gen, dtype=torch.float64
     )
 
-    out = causal_conv1d(x, weight, bias, activation=activation, initial_state=state)
+    out = causal_conv1d(
+        x, weight, bias, activation=activation, initial_state=state, d_head=d_head
+    )
     ((out.y * dy).sum() + (out.state * dstate).sum()).backward()
 
     ref = causal_conv1d_update_ref(
-        other[0], other[1], other[2], activation=activation, initial_state=other[3]
+        other[0],
+        other[1],
+        other[2],
+        activation=activation,
+        initial_state=other[3],
+        d_head=d_head,
     )
     ((ref.y * dy).sum() + (ref.state * dstate).sum()).backward()
 

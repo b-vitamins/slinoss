@@ -76,6 +76,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "report names the part the numbers came from.",
     )
     parser.add_argument("--backend", default=None)
+    parser.add_argument(
+        "--d-head",
+        type=int,
+        default=0,
+        help="Rows per head for the conv output layout, or 0 for token-major. "
+        "Nonzero makes the conv write y head-major, which is the layout the scan "
+        "reads U in. Ignored by every other operator.",
+    )
     return parser.parse_args(argv)
 
 
@@ -94,7 +102,11 @@ def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[],
     dtype = DTYPES[args.dtype]
     if args.op == CONV:
         conv = make_conv_inputs(
-            conv_shape_by_name(args.shape), device, dtype=dtype, requires_grad=grads
+            conv_shape_by_name(args.shape),
+            device,
+            dtype=dtype,
+            requires_grad=grads,
+            d_head=args.d_head or None,
         )
         if grads:
             return conv_step(conv, backend=args.backend)

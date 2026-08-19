@@ -35,12 +35,18 @@ from slinoss.ops.conv import (
     causal_conv1d_bwd_ref,
     causal_conv1d_fwd_native,
     causal_conv1d_update_ref,
+    conv_output_shape,
     conv_state_shape,
     names,
     resolve,
 )
 from tests.conftest import assert_max_rel, max_err
-from tests.test_conv_reference import assert_bitwise, make_call, oracle
+from tests.test_conv_reference import (
+    assert_bitwise,
+    head_major_of,
+    make_call,
+    oracle,
+)
 
 pytestmark = [pytest.mark.cuda]
 
@@ -267,6 +273,50 @@ def test_forward_matches_the_reference_at_the_same_dtype(
     assert_bitwise(got.state, want.state)
 
 
+# (B, T, D, W, P) with D = H*P. The layout is a store address, so what it interacts
+# with is the store's own geometry: the head count, which sets how many contiguous
+# runs a channel block's warps write; the time tiling, which the store is inside;
+# and the width, which the epilogue is reached through. H = 1 is on the sweep
+# because the head-major address collapses to the token-major one there -- a stride
+# of P is a stride of D -- so a wrong stride still agrees at H = 1.
+HEAD_MAJOR_SHAPES = [
+    pytest.param(2, 40, 32, 4, 16, id="two-heads-one-warp"),
+    pytest.param(2, 200, 128, 4, 16, id="many-tiles-two-blocks"),
+    pytest.param(2, 65, 32, 4, 16, id="ragged-tile"),
+    pytest.param(1, 3, 32, 8, 16, id="straddle-widest"),
+    pytest.param(2, 16, 32, 1, 16, id="pointwise"),
+    pytest.param(2, 40, 64, 4, 64, id="one-head"),
+]
+
+
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"), HEAD_MAJOR_SHAPES
+)
+@pytest.mark.parametrize("activation", [True, False])
+def test_head_major_forward_is_the_token_major_forward_reindexed(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int, activation: bool
+) -> None:
+    """Bitwise, because the layout is a store address and nothing else.
+
+    Bitwise is the whole claim: a staging pass, a promoted intermediate, or a
+    different accumulation order would show here as a rounding difference rather
+    than as a wrong answer, and the token-major side is what the oracle sweep
+    already pins. The activation is swept because the epilogue and the store are
+    one expression in the kernel.
+    """
+    x, weight, bias, state = cuda_call(bsz, seqlen, channels, width)
+    want = causal_conv1d_fwd_native(
+        x, weight, bias, activation=activation, initial_state=state
+    )
+    got = causal_conv1d_fwd_native(
+        x, weight, bias, activation=activation, initial_state=state, d_head=d_head
+    )
+    assert got.y.shape == conv_output_shape(bsz, seqlen, channels, d_head)
+    assert got.y.is_contiguous()
+    assert_bitwise(got.y, head_major_of(want.y, d_head))
+    assert_bitwise(got.state, want.state)
+
+
 def _check_backward(
     bsz: int,
     seqlen: int,
@@ -361,6 +411,31 @@ def test_backward_flag_combinations_match_float64_autograd(
 
 
 @pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"), HEAD_MAJOR_SHAPES
+)
+def test_head_major_backward_is_the_token_major_backward_reindexed(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int
+) -> None:
+    """Bitwise: a head-major cotangent is a load address and nothing else.
+
+    Every gradient is compared rather than ``dx`` alone. The parameter gradients
+    reduce over every ``(b,t)`` the block owns, so a ``dy`` load that reads the
+    wrong head is visible there even at a shape where ``dx`` happens to agree.
+    """
+    operands = cuda_call(bsz, seqlen, channels, width)
+    dy, dstate = cotangents(bsz, seqlen, channels, width, seed=29)
+    want = causal_conv1d_bwd_native(
+        dy, dstate, *operands[:3], initial_state=operands[3]
+    )
+    got = causal_conv1d_bwd_native(
+        head_major_of(dy, d_head), dstate, *operands[:3], initial_state=operands[3]
+    )
+    for have, expect in zip(got, want):
+        assert have is not None and expect is not None
+        assert_bitwise(have, expect)
+
+
+@pytest.mark.parametrize(
     ("with_dy", "with_dstate"),
     [
         pytest.param(True, False, id="dy-only"),
@@ -439,10 +514,62 @@ def test_forward_and_backward_are_connected(
         assert_max_rel(have.grad, expect.grad, bound, f"conv/native/connected/{name}")
 
 
-def _check_split(bsz: int, seqlen: int, channels: int, width: int, chunks: int) -> None:
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"),
+    [
+        pytest.param(2, 40, 32, 4, 16, id="two-heads"),
+        pytest.param(2, 200, 128, 4, 16, id="many-tiles-two-blocks"),
+    ],
+)
+def test_head_major_forward_and_backward_are_connected(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int
+) -> None:
+    """The public path at ``d_head`` against the float64 reference.
+
+    Two shapes, because what this catches is wiring: ``d_head`` is not saved, so a
+    keyword that reached the forward and left the backward reading the cotangent as
+    token-major is only visible where autograd supplies the cotangent itself.
+    """
+    operands = cuda_call(bsz, seqlen, channels, width, requires_grad=True)
+    leaves = as_reference(operands)
+    gen = torch.Generator(device="cuda").manual_seed(31)
+    dy = torch.randn(
+        *conv_output_shape(bsz, seqlen, channels, d_head),
+        generator=gen,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    _, dstate = cotangents(bsz, seqlen, channels, width, seed=31)
+
+    out = causal_conv1d(
+        *operands[:3], initial_state=operands[3], d_head=d_head, backend="native"
+    )
+    ((out.y * dy).sum() + (out.state * dstate).sum()).backward()
+
+    ref = causal_conv1d_update_ref(*leaves[:3], initial_state=leaves[3], d_head=d_head)
+    ((ref.y * dy.double()).sum() + (ref.state * dstate.double()).sum()).backward()
+
+    assert_max_rel(out.y, ref.y, 2e-6, "conv/native/head-major/y")
+    for name, have, expect in zip(OPERAND_NAMES, operands, leaves):
+        assert have is not None and expect is not None
+        assert have.grad is not None and expect.grad is not None
+        bound = DX_BOUND if name in ("x", "initial_state") else DPARAM_BOUND
+        assert_max_rel(have.grad, expect.grad, bound, f"conv/native/head-major/{name}")
+
+
+def _check_split(
+    bsz: int,
+    seqlen: int,
+    channels: int,
+    width: int,
+    chunks: int,
+    d_head: int | None = None,
+) -> None:
     """One streaming split against the whole-sequence call. The only copy."""
     x, weight, bias, state = cuda_call(bsz, seqlen, channels, width)
-    whole = causal_conv1d_fwd_native(x, weight, bias, initial_state=state)
+    whole = causal_conv1d_fwd_native(
+        x, weight, bias, initial_state=state, d_head=d_head
+    )
     # Uneven splits on purpose: an even split hides an off-by-one in the window
     # that is carried across a boundary.
     sizes = [seqlen // chunks] * chunks
@@ -452,14 +579,17 @@ def _check_split(bsz: int, seqlen: int, channels: int, width: int, chunks: int) 
     pieces: list[Tensor] = []
     for piece in torch.split(x, sizes, dim=1):
         out = causal_conv1d_fwd_native(
-            piece.contiguous(), weight, bias, initial_state=carry
+            piece.contiguous(), weight, bias, initial_state=carry, d_head=d_head
         )
         pieces.append(out.y)
         carry = out.state
     assert carry is not None
+    # The token axis is -2 at both output layouts.
+    joined = torch.cat(pieces, dim=-2)
+    assert joined.shape == whole.y.shape
     # Exact, not approximate: the split changes which block owns a token, not the
     # order its tap sum is accumulated in.
-    assert max_err(torch.cat(pieces, dim=1), whole.y) == 0.0
+    assert max_err(joined, whole.y) == 0.0
     assert_bitwise(carry, whole.state)
 
 
@@ -473,6 +603,28 @@ def test_streaming_split_reproduces_the_whole_sequence(
     exercises the carry: the second call reads a window the first call wrote.
     """
     _check_split(bsz, seqlen, channels, width, 2)
+
+
+@pytest.mark.parametrize(
+    ("bsz", "seqlen", "channels", "width", "d_head"),
+    [
+        pytest.param(2, 40, 32, 4, 16, id="two-heads"),
+        pytest.param(1, 3, 32, 8, 16, id="straddle-widest"),
+    ],
+)
+def test_head_major_streaming_split_reproduces_the_whole_sequence(
+    bsz: int, seqlen: int, channels: int, width: int, d_head: int
+) -> None:
+    """The identity at a layout the carry does not share.
+
+    The carried window stays token-major while ``y`` does not, so this is what
+    catches a state written in the output's layout: the second call would read the
+    right elements from the wrong place and only the boundary tokens would move.
+    Two shapes, not the whole sweep: the failure mode is which layout the carry is
+    written in, which no head count reaches, and the straddle is the case where the
+    carry crosses into the incoming state.
+    """
+    _check_split(bsz, seqlen, channels, width, 2, d_head=d_head)
 
 
 def test_a_seven_piece_split_reproduces_the_whole_sequence() -> None:

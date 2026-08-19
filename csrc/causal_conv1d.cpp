@@ -40,6 +40,8 @@ struct Dims {
   int64_t seqlen;
   int64_t channels;
   int64_t width;
+  at::ScalarType dtype;
+  at::Device device;
 };
 
 Dims check_common(const at::Tensor &x, const at::Tensor &weight,
@@ -48,18 +50,38 @@ Dims check_common(const at::Tensor &x, const at::Tensor &weight,
   TORCH_CHECK(x.is_cuda(), "x must be on a CUDA device");
   TORCH_CHECK(x.dim() == 3, "x must be (B,T,D)");
   TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-  const Dims d{x.size(0), x.size(1), x.size(2), weight.size(1)};
+  const Dims d{x.size(0),      x.size(1),       x.size(2),
+               weight.size(1), x.scalar_type(), x.device()};
   TORCH_CHECK(weight.dim() == 2 && weight.size(0) == d.channels,
               "weight must be (D,W)");
   TORCH_CHECK(d.width >= 1 && d.width <= slinoss::kMaxWidth,
               "width must lie in [1, ", slinoss::kMaxWidth, "], got ", d.width);
-  const at::ScalarType dtype = x.scalar_type();
-  const at::Device device = x.device();
-  expect(weight, "weight", {d.channels, d.width}, dtype, device);
-  expect_optional(bias, "bias", {d.channels}, dtype, device);
+  expect(weight, "weight", {d.channels, d.width}, d.dtype, d.device);
+  expect_optional(bias, "bias", {d.channels}, d.dtype, d.device);
   expect_optional(initial_state, "initial_state",
-                  {d.batch, d.width - 1, d.channels}, dtype, device);
+                  {d.batch, d.width - 1, d.channels}, d.dtype, d.device);
   return d;
+}
+
+// Rows one (b,h,t) of an output holds, read off its rank rather than passed
+// alongside it: (B,T,D) is token-major and gives D, (B,D/P,T,P) is head-major and
+// gives P. The rank is the whole layout, so a separate flag would be a second
+// source of truth for something the shape already states.
+int64_t output_rows(const at::Tensor &t, const std::string &name,
+                    const Dims &d) {
+  TORCH_CHECK(t.dim() == 3 || t.dim() == 4, name,
+              " must be (B,T,D) or (B,D/P,T,P)");
+  if (t.dim() == 3) {
+    expect(t, name, {d.batch, d.seqlen, d.channels}, d.dtype, d.device);
+    return d.channels;
+  }
+  const int64_t rows = t.size(3);
+  TORCH_CHECK(rows >= 1 && d.channels % rows == 0, name,
+              " has trailing extent ", rows, ", which does not divide D=",
+              d.channels);
+  expect(t, name, {d.batch, d.channels / rows, d.seqlen, rows}, d.dtype,
+         d.device);
+  return rows;
 }
 
 void fwd(const at::Tensor &x, const at::Tensor &weight,
@@ -67,12 +89,11 @@ void fwd(const at::Tensor &x, const at::Tensor &weight,
          const std::optional<at::Tensor> &initial_state, const at::Tensor &y,
          const std::optional<at::Tensor> &final_state, bool activation) {
   const Dims d = check_common(x, weight, bias, initial_state);
-  expect(y, "y", {d.batch, d.seqlen, d.channels}, x.scalar_type(), x.device());
+  const int64_t y_rows = output_rows(y, "y", d);
   expect_optional(final_state, "final_state",
-                  {d.batch, d.width - 1, d.channels}, x.scalar_type(),
-                  x.device());
+                  {d.batch, d.width - 1, d.channels}, d.dtype, d.device);
   slinoss::causal_conv1d_fwd(x, weight, bias, initial_state, y, final_state,
-                             activation);
+                             y_rows, activation);
 }
 
 void bwd(const std::optional<at::Tensor> &dy,
@@ -84,10 +105,12 @@ void bwd(const std::optional<at::Tensor> &dy,
          const at::Tensor &dweight_parts,
          const std::optional<at::Tensor> &dbias_parts, bool activation) {
   const Dims d = check_common(x, weight, bias, initial_state);
-  const at::ScalarType dtype = x.scalar_type();
-  const at::Device device = x.device();
+  const at::ScalarType dtype = d.dtype;
+  const at::Device device = d.device;
   const std::vector<int64_t> window{d.batch, d.width - 1, d.channels};
-  expect_optional(dy, "dy", {d.batch, d.seqlen, d.channels}, dtype, device);
+  // Absent dy leaves the layout unread, so the token-major row count stands in.
+  const int64_t dy_rows =
+      dy.has_value() ? output_rows(*dy, "dy", d) : d.channels;
   expect(dx, "dx", {d.batch, d.seqlen, d.channels}, dtype, device);
   expect_optional(dfinal_state, "dfinal_state", window, dtype, device);
   expect_optional(dinitial_state, "dinitial_state", window, dtype, device);
@@ -98,7 +121,7 @@ void bwd(const std::optional<at::Tensor> &dy,
                   device);
   slinoss::causal_conv1d_bwd(dy, dfinal_state, x, weight, bias, initial_state,
                              dx, dinitial_state, dweight_parts, dbias_parts,
-                             activation);
+                             dy_rows, activation);
 }
 
 } // namespace

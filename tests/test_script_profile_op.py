@@ -376,6 +376,14 @@ def test_the_target_argv_carries_every_argument_the_target_needs() -> None:
     assert named[-2:] == ["--backend", "cute"]
     conv = profile_op.target_argv(profile_op.parse_args(["--op", "conv"]))
     assert conv[-2:] == ["--op", "conv"]
+    # The output layout has to reach the profiled process. Without it the counters
+    # would describe one layout and the event wall the other, and the cross-check
+    # compares the two.
+    assert "--d-head" not in auto
+    layout = profile_op.target_argv(
+        profile_op.parse_args(["--op", "conv", "--d-head", "48"])
+    )
+    assert layout[-2:] == ["--d-head", "48"]
 
 
 # ---------------------------------------------------------------------------

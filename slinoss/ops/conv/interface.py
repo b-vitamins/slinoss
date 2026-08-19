@@ -9,6 +9,11 @@ two in the training path with no bias and no streaming carry.
 returned window leaves that window's cotangent absent rather than zero, and the
 backend skips the whole state pullback instead of contracting a zero tensor.
 
+``d_head`` is not saved. Autograd hands the backward a cotangent whose shape is the
+output's, so the head-major layout arrives on ``dy`` itself and the backward reads
+it off there; an absent ``dy`` leaves the layout unread. See
+:func:`slinoss.ops.conv.reference.check_cotangents`.
+
 No ``torch.amp.custom_fwd``. It casts every input to the autocast dtype, which
 would silently promote or demote the taps and put the reference and the kernel
 on different footings.
@@ -34,6 +39,7 @@ _Grads = tuple[
     Tensor | None,
     None,
     None,
+    None,
 ]
 
 
@@ -52,10 +58,16 @@ class CausalConv1dFunction(torch.autograd.Function):
         bias: Tensor | None,
         initial_state: Tensor | None,
         activation: bool,
+        d_head: int | None,
         backend_name: str,
     ) -> _Outputs:
         out = get(backend_name).forward(
-            x, weight, bias, activation=activation, initial_state=initial_state
+            x,
+            weight,
+            bias,
+            activation=activation,
+            initial_state=initial_state,
+            d_head=d_head,
         )
         ctx.save_for_backward(x, weight, bias, initial_state)
         ctx.activation = activation
@@ -86,6 +98,7 @@ class CausalConv1dFunction(torch.autograd.Function):
             grads.dinitial_state,
             None,
             None,
+            None,
         )
 
 
@@ -96,6 +109,7 @@ def causal_conv1d(
     *,
     activation: bool = True,
     initial_state: Tensor | None = None,
+    d_head: int | None = None,
     backend: str | None = None,
 ) -> ConvStep:
     """Causal depthwise conv1d. The public operator.
@@ -112,6 +126,12 @@ def causal_conv1d(
         activation: Apply SiLU to the tap sum. Fused into the kernel epilogue.
         initial_state: The ``W-1`` timesteps before ``x``, shape ``(B,W-1,D)``.
             Zero if omitted.
+        d_head: Rows per head ``P``, which makes ``y`` head-major, ``(B, D//P, T,
+            P)``, or None for the token-major ``(B,T,D)``. Head-major is what the
+            scan reads ``U`` in, and it is produced in the store, so selecting it
+            costs no repack. The returned state is token-major either way. A ``P``
+            that is not a multiple of 64 splits a warp's ``dy`` request in two and
+            costs the backward single-digit percent; see the kernel header.
         backend: Backend name, or ``None`` to select the fastest registered
             backend for the device.
 
@@ -119,8 +139,8 @@ def causal_conv1d(
         A :class:`ConvStep`.
 
     Raises:
-        ValueError: On a shape, contiguity, device, or width violation, or an
-            unusable backend.
+        ValueError: On a shape, contiguity, device, width, or ``d_head``
+            violation, or an unusable backend.
         TypeError: On an unsupported dtype.
         RuntimeError: If the selected backend needs the extension and it is not
             built.
@@ -129,7 +149,7 @@ def causal_conv1d(
     y, state = cast(
         "_Outputs",
         CausalConv1dFunction.apply(
-            x, weight, bias, initial_state, activation, impl.name
+            x, weight, bias, initial_state, activation, d_head, impl.name
         ),
     )
     return ConvStep(y=y, state=state)

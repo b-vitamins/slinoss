@@ -59,6 +59,35 @@
 //
 // The forward grid is (channel tiles, time tiles, batch). The backward grid is
 // (channel tiles, time tiles), with batch in the block's serial loop.
+//
+// Output layout. The forward writes y token-major, (B,T,D), or head-major,
+// (B,H,T,P) with D = H*P and channel d = h*P + p, and the backward reads dy in
+// whichever layout the forward wrote. Both are one base plus one stride:
+//
+//   token-major  base = b*T*D + d,               stride = D
+//   head-major   base = b*T*D + h*T*P + p,       stride = P
+//
+// and stride = D is head-major at H = 1, so the head-major expression covers both
+// and neither the prologue nor the loop branches on the layout. Only the store
+// and the dy load move; x, the incoming state, the trailing window, dx, and the
+// partials are token-major either way, so no byte count above changes.
+//
+// Coalescing. A warp still moves one contiguous run, but the run is P elements
+// rather than D, because one (b,h,t) row is P contiguous elements. P is a
+// multiple of 16, so at every reachable dtype the run is a whole number of
+// 32-byte sectors and a warp's request splits into aligned sectors exactly as it
+// did token-major; the sector count and the DRAM byte count are unchanged in
+// both directions, measured, not argued.
+//
+// What P changes is the request count. A warp covers 32 channels and the block's
+// channel tile is 64 wide, so a warp's run crosses a head boundary unless P is a
+// multiple of 64: never at P = 64, one warp in three at P = 48, every warp at
+// P = 16. Rows of two heads are seqlen*P apart, so a crossing run costs two
+// requests instead of one. The forward absorbs that in the store pipe and is
+// unaffected. The backward reads dy on the critical path and is slower for it,
+// by single-digit percent at P = 48 and P = 16 and not at all at P = 64. Removing
+// that would take a thread mapping over (t, p) inside one head rather than over
+// channels, which is a different decomposition, not a store index.
 
 #include "causal_conv1d.h"
 
@@ -109,7 +138,7 @@ __global__ void conv1d_fwd_kernel(const input_t *__restrict__ x,
                                   const input_t *__restrict__ initial_state,
                                   input_t *__restrict__ y,
                                   input_t *__restrict__ final_state, int seqlen,
-                                  int channels, bool activation) {
+                                  int channels, int y_rows, bool activation) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   if (channel >= channels) {
     return;
@@ -119,6 +148,13 @@ __global__ void conv1d_fwd_kernel(const input_t *__restrict__ x,
   const long xbase = static_cast<long>(blockIdx.z) * seqlen * channels + channel;
   const long sbase =
       static_cast<long>(blockIdx.z) * (kWidth - 1) * channels + channel;
+  // y is (B, D/y_rows, T, y_rows), which is token-major at y_rows == channels.
+  // The whole layout is this base and the stride y_rows, so the store below is
+  // one expression and the head-major case costs it no branch and no copy.
+  const int head = channel / y_rows;
+  const long ybase = static_cast<long>(blockIdx.z) * seqlen * channels +
+                     static_cast<long>(head) * seqlen * y_rows +
+                     (channel - head * y_rows);
 
   // wr[j] is the tap that multiplies lag j, so tap kWidth-1 is the current
   // token.
@@ -166,7 +202,7 @@ __global__ void conv1d_fwd_kernel(const input_t *__restrict__ x,
       }
       acc += bias_of_channel;
       if (t + p < t1) {
-        y[xbase + static_cast<long>(t + p) * channels] =
+        y[ybase + static_cast<long>(t + p) * y_rows] =
             static_cast<input_t>(activation ? silu_of(acc) : acc);
       }
     }
@@ -197,11 +233,16 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
                   input_t *__restrict__ dx, input_t *__restrict__ dinitial_state,
                   float *__restrict__ dweight_parts,
                   float *__restrict__ dbias_parts, int batch, int seqlen,
-                  int channels, bool activation) {
+                  int channels, int dy_rows, bool activation) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   if (channel >= channels) {
     return;
   }
+  // dy carries the layout the forward's y was written in, so it is read through
+  // its own base and stride; see the header comment. dx, x, and both windows are
+  // token-major whatever dy is.
+  const int head = channel / dy_rows;
+  const int dyrow = channel - head * dy_rows;
   const int part = blockIdx.y;
   const int t0 = part * kBwdTileT;
   const int t1 = min(t0 + kBwdTileT, seqlen);
@@ -237,6 +278,8 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
   for (int b = 0; b < batch; ++b) {
     const long xbase = static_cast<long>(b) * seqlen * channels + channel;
     const long sbase = static_cast<long>(b) * (kWidth - 1) * channels + channel;
+    const long dybase = static_cast<long>(b) * seqlen * channels +
+                        static_cast<long>(head) * seqlen * dy_rows + dyrow;
     float xw[kWidth];
     float dsw[kWidth];
 #pragma unroll
@@ -253,10 +296,13 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
     }
 
     for (int t = t0; t <= tend; ++t) {
-      const long at = xbase + static_cast<long>(t) * channels;
-      const float xc = t < seqlen ? static_cast<float>(x[at]) : 0.0f;
+      const float xc = t < seqlen ? static_cast<float>(
+                                       x[xbase + static_cast<long>(t) * channels])
+                                  : 0.0f;
       const float dyc =
-          (dy != nullptr && t < seqlen) ? static_cast<float>(dy[at]) : 0.0f;
+          (dy != nullptr && t < seqlen)
+              ? static_cast<float>(dy[dybase + static_cast<long>(t) * dy_rows])
+              : 0.0f;
 
 #pragma unroll
       for (int j = kWidth - 1; j > 0; --j) {
@@ -317,7 +363,6 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
         }
       }
     }
-
   }
 
   // Plain stores, one slice per time tile, so no output is read back and
@@ -416,6 +461,7 @@ template <typename input_t> struct FwdArgs {
   int batch;
   int seqlen;
   int channels;
+  int y_rows;
   bool activation;
 };
 
@@ -427,7 +473,7 @@ void launch_fwd_width(const FwdArgs<input_t> &a) {
   conv1d_fwd_kernel<input_t, kWidth>
       <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
           a.x, a.weight, a.bias, a.initial_state, a.y, a.final_state, a.seqlen,
-          a.channels, a.activation);
+          a.channels, a.y_rows, a.activation);
 }
 
 template <typename input_t>
@@ -435,7 +481,8 @@ void launch_fwd(const at::Tensor &x, const at::Tensor &weight,
                 const std::optional<at::Tensor> &bias,
                 const std::optional<at::Tensor> &initial_state,
                 const at::Tensor &y,
-                const std::optional<at::Tensor> &final_state, bool activation) {
+                const std::optional<at::Tensor> &final_state, int64_t y_rows,
+                bool activation) {
   const FwdArgs<input_t> a{
       x.const_data_ptr<input_t>(),
       weight.const_data_ptr<input_t>(),
@@ -446,6 +493,7 @@ void launch_fwd(const at::Tensor &x, const at::Tensor &weight,
       static_cast<int>(x.size(0)),
       static_cast<int>(x.size(1)),
       static_cast<int>(x.size(2)),
+      static_cast<int>(y_rows),
       activation,
   };
   dispatch_width(static_cast<int>(weight.size(1)), [&](auto w) {
@@ -469,6 +517,7 @@ template <typename input_t> struct BwdArgs {
   int batch;
   int seqlen;
   int channels;
+  int dy_rows;
   bool activation;
 };
 
@@ -481,7 +530,7 @@ void launch_bwd_width(const BwdArgs<input_t> &a) {
       <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
           a.dy, a.dfinal_state, a.x, a.weight, a.bias, a.initial_state, a.dx,
           a.dinitial_state, a.dweight_parts, a.dbias_parts, a.batch, a.seqlen,
-          a.channels, a.activation);
+          a.channels, a.dy_rows, a.activation);
 }
 
 template <typename input_t>
@@ -493,7 +542,7 @@ void launch_bwd(const std::optional<at::Tensor> &dy,
                 const at::Tensor &dx,
                 const std::optional<at::Tensor> &dinitial_state,
                 const at::Tensor &dweight_parts,
-                const std::optional<at::Tensor> &dbias_parts,
+                const std::optional<at::Tensor> &dbias_parts, int64_t dy_rows,
                 bool activation) {
   const BwdArgs<input_t> a{
       data_or_null<input_t>(dy),
@@ -509,6 +558,7 @@ void launch_bwd(const std::optional<at::Tensor> &dy,
       static_cast<int>(x.size(0)),
       static_cast<int>(x.size(1)),
       static_cast<int>(x.size(2)),
+      static_cast<int>(dy_rows),
       activation,
   };
   dispatch_width(static_cast<int>(weight.size(1)), [&](auto w) {
@@ -527,19 +577,19 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
                        const std::optional<at::Tensor> &initial_state,
                        const at::Tensor &y,
                        const std::optional<at::Tensor> &final_state,
-                       bool activation) {
+                       int64_t y_rows, bool activation) {
   const at::cuda::CUDAGuard guard(x.device());
   switch (x.scalar_type()) {
   case at::ScalarType::BFloat16:
     launch_fwd<at::BFloat16>(x, weight, bias, initial_state, y, final_state,
-                             activation);
+                             y_rows, activation);
     break;
   case at::ScalarType::Half:
-    launch_fwd<at::Half>(x, weight, bias, initial_state, y, final_state,
+    launch_fwd<at::Half>(x, weight, bias, initial_state, y, final_state, y_rows,
                          activation);
     break;
   case at::ScalarType::Float:
-    launch_fwd<float>(x, weight, bias, initial_state, y, final_state,
+    launch_fwd<float>(x, weight, bias, initial_state, y, final_state, y_rows,
                       activation);
     break;
   default:
@@ -557,22 +607,23 @@ void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dinitial_state,
                        const at::Tensor &dweight_parts,
                        const std::optional<at::Tensor> &dbias_parts,
-                       bool activation) {
+                       int64_t dy_rows, bool activation) {
   const at::cuda::CUDAGuard guard(x.device());
   switch (x.scalar_type()) {
   case at::ScalarType::BFloat16:
     launch_bwd<at::BFloat16>(dy, dfinal_state, x, weight, bias, initial_state,
                              dx, dinitial_state, dweight_parts, dbias_parts,
-                             activation);
+                             dy_rows, activation);
     break;
   case at::ScalarType::Half:
     launch_bwd<at::Half>(dy, dfinal_state, x, weight, bias, initial_state, dx,
-                         dinitial_state, dweight_parts, dbias_parts,
+                         dinitial_state, dweight_parts, dbias_parts, dy_rows,
                          activation);
     break;
   case at::ScalarType::Float:
     launch_bwd<float>(dy, dfinal_state, x, weight, bias, initial_state, dx,
-                      dinitial_state, dweight_parts, dbias_parts, activation);
+                      dinitial_state, dweight_parts, dbias_parts, dy_rows,
+                      activation);
     break;
   default:
     TORCH_CHECK(false, "causal_conv1d_bwd: unsupported dtype ",
