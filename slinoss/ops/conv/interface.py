@@ -125,7 +125,7 @@ def causal_conv1d(
         RuntimeError: If the selected backend needs the extension and it is not
             built.
     """
-    impl = resolve(backend, x.device.type)
+    impl = resolve(backend, x.device.type, x.dtype)
     y, state = cast(
         "_Outputs",
         CausalConv1dFunction.apply(

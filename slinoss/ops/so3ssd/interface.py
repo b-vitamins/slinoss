@@ -143,7 +143,7 @@ def so3ssd(
             non-positive ``chunk_size``, or an unusable backend.
         TypeError: On an unsupported dtype, or a low-precision pinned tensor.
     """
-    impl = resolve(backend, U.device.type)
+    impl = resolve(backend, U.device.type, U.dtype)
     y, state, b_last, u_last = cast(
         "_Outputs",
         SO3SSDFunction.apply(

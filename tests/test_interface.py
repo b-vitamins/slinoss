@@ -24,7 +24,6 @@ from slinoss.ops.so3ssd import (
     SO3SSDResult,
     get,
     names,
-    register,
     resolve,
     so3ssd,
     so3ssd_ref,
@@ -305,9 +304,17 @@ def test_saved_count_is_independent_of_sequence_length() -> None:
 # ---------------------------------------------------------------------------
 
 
+# The resolution rule itself is tested in tests/test_registry.py, against a
+# registry that test owns. What is the scan's own is which backends it registers
+# and what that makes resolve return.
 def test_reference_backend_is_registered() -> None:
     assert "reference" in names()
-    assert get("reference").name == "reference"
+    backend = get("reference")
+    assert backend.priority == 0
+    assert backend.device_types == ("cpu", "cuda")
+    # The reference is the float64 oracle, so it declares the operator's whole
+    # supported set rather than the tensor-core operand set.
+    assert torch.float64 in backend.dtypes
 
 
 def test_explicit_backend_matches_automatic_selection() -> None:
@@ -318,28 +325,7 @@ def test_explicit_backend_matches_automatic_selection() -> None:
 
 
 def test_resolve_picks_the_reference_on_cpu() -> None:
-    assert resolve(None, "cpu").name == "reference"
-
-
-def test_unknown_backend_name_raises() -> None:
-    with pytest.raises(ValueError, match="unknown backend"):
-        get("no-such-backend")
-
-
-def test_named_backend_on_wrong_device_raises() -> None:
-    with pytest.raises(ValueError, match="supports"):
-        resolve("reference", "meta")
-
-
-def test_no_backend_for_device_raises() -> None:
-    with pytest.raises(ValueError, match="no backend supports"):
-        resolve(None, "meta")
-
-
-def test_duplicate_registration_raises() -> None:
-    """Two implementations under one name is exactly what the registry prevents."""
-    with pytest.raises(ValueError, match="already registered"):
-        register(get("reference"))
+    assert resolve(None, "cpu", torch.float32).name == "reference"
 
 
 def test_bad_input_raises_through_the_function() -> None:

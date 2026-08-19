@@ -1,29 +1,25 @@
 """Backend registry for the causal depthwise conv1d.
 
-One entry point per implementation. A variant reachable from a benchmark and not
-from the public path is a defect, so selection goes through :func:`resolve` and
-nothing else.
+The lookup itself is :class:`slinoss._registry.Registry`, which every operator
+shares. This module holds only what is the conv's own: the two call signatures, the
+native operand contract, and which implementations exist.
 
-Registration order does not decide anything. Each backend declares the device
-types it runs on and a priority; :func:`resolve` picks the highest priority
-backend that supports the requested device. That keeps the shipped path and the
-benchmarked path identical without an import-order dependency.
-
-The native backend registers only when the compiled extension imported. An
-unbuilt tree therefore resolves to the reference on every device instead of
-resolving to a path that cannot run.
+The native backend registers only when the compiled extension imported. An unbuilt
+tree therefore resolves to the reference on every device instead of resolving to a
+path that cannot run.
 """
 
 from __future__ import annotations
 
-from typing import NamedTuple, Protocol
+from typing import Protocol
 
 import torch
 from torch import Tensor
 
 from slinoss import _C
 from slinoss._guard import check_layout
-from slinoss._precision import KERNEL_DTYPES
+from slinoss._precision import KERNEL_DTYPES, SUPPORTED_DTYPES
+from slinoss._registry import Backend, Registry
 from slinoss.ops.conv.reference import (
     ConvDims,
     ConvGrads,
@@ -37,6 +33,7 @@ from slinoss.ops.conv.reference import (
 
 __all__ = [
     "Backend",
+    "ConvBackend",
     "ConvBackward",
     "ConvForward",
     "causal_conv1d_bwd_native",
@@ -83,93 +80,14 @@ class ConvBackward(Protocol):
     ) -> ConvGrads: ...
 
 
-class Backend(NamedTuple):
-    """One conv1d implementation.
+ConvBackend = Backend[ConvForward, ConvBackward]
 
-    Attributes:
-        name: Registry key.
-        forward: Forward entry point.
-        backward: Backward entry point.
-        device_types: Torch device types this backend runs on, e.g. ``("cuda",)``.
-        priority: Higher wins in :func:`resolve`. The reference is 0.
-    """
+_REGISTRY: Registry[ConvForward, ConvBackward] = Registry("conv")
 
-    name: str
-    forward: ConvForward
-    backward: ConvBackward
-    device_types: tuple[str, ...]
-    priority: int
-
-
-_REGISTRY: dict[str, Backend] = {}
-
-
-def register(backend: Backend) -> Backend:
-    """Add a backend to the registry.
-
-    Args:
-        backend: The backend.
-
-    Returns:
-        The backend, so a module can register and bind in one statement.
-
-    Raises:
-        ValueError: If the name is already registered. Two implementations under
-            one name is the defect this registry exists to prevent.
-    """
-    if backend.name in _REGISTRY:
-        raise ValueError(f"backend {backend.name!r} is already registered")
-    _REGISTRY[backend.name] = backend
-    return backend
-
-
-def names() -> tuple[str, ...]:
-    """Registered backend names, sorted."""
-    return tuple(sorted(_REGISTRY))
-
-
-def get(name: str) -> Backend:
-    """Look a backend up by name.
-
-    Args:
-        name: Registry key.
-
-    Returns:
-        The backend.
-
-    Raises:
-        ValueError: If no backend is registered under that name.
-    """
-    if name not in _REGISTRY:
-        raise ValueError(f"unknown backend {name!r}; registered: {names()}")
-    return _REGISTRY[name]
-
-
-def resolve(name: str | None, device_type: str) -> Backend:
-    """Select a backend for a device.
-
-    Args:
-        name: Explicit backend name, or ``None`` to select automatically.
-        device_type: Torch device type, e.g. ``"cuda"``.
-
-    Returns:
-        The backend.
-
-    Raises:
-        ValueError: If a named backend does not support the device, or if no
-            registered backend supports it.
-    """
-    if name is not None:
-        backend = get(name)
-        if device_type not in backend.device_types:
-            raise ValueError(
-                f"backend {name!r} supports {backend.device_types}, not {device_type!r}"
-            )
-        return backend
-    usable = [b for b in _REGISTRY.values() if device_type in b.device_types]
-    if not usable:
-        raise ValueError(f"no backend supports device type {device_type!r}")
-    return max(usable, key=lambda b: b.priority)
+register = _REGISTRY.register
+names = _REGISTRY.names
+get = _REGISTRY.get
+resolve = _REGISTRY.resolve
 
 
 def _check_native(
@@ -350,6 +268,7 @@ register(
         forward=causal_conv1d_update_ref,
         backward=causal_conv1d_bwd_ref,
         device_types=("cpu", "cuda"),
+        dtypes=SUPPORTED_DTYPES,
         priority=0,
     )
 )
@@ -361,6 +280,7 @@ if _C.is_available():
             forward=causal_conv1d_fwd_native,
             backward=causal_conv1d_bwd_native,
             device_types=("cuda",),
+            dtypes=KERNEL_DTYPES,
             priority=10,
         )
     )

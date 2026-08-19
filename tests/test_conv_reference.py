@@ -20,7 +20,6 @@ from torch import Tensor
 
 from slinoss import _C
 from slinoss.ops.conv import (
-    Backend,
     ConvDims,
     ConvStep,
     causal_conv1d,
@@ -31,7 +30,6 @@ from slinoss.ops.conv import (
     conv_state_shape,
     get,
     names,
-    register,
     resolve,
 )
 from tests.conftest import assert_max_rel, max_err
@@ -559,50 +557,21 @@ def test_cotangent_dtype_is_rejected(name: str) -> None:
         causal_conv1d_bwd_ref(*args, x, weight, bias, initial_state=state)
 
 
+# The resolution rule itself is tested in tests/test_registry.py, against a
+# registry that test owns. What is the conv's own is which backends it registers
+# and what that makes resolve return.
 def test_reference_backend_is_registered() -> None:
     assert "reference" in names()
     backend = get("reference")
     assert backend.priority == 0
     assert backend.device_types == ("cpu", "cuda")
+    # The reference is the float64 oracle, so it declares the operator's whole
+    # supported set rather than the kernel's.
+    assert torch.float64 in backend.dtypes
 
 
-def test_registering_a_name_twice_is_rejected() -> None:
-    with pytest.raises(ValueError, match="already registered"):
-        register(get("reference"))
-
-
-def test_unknown_backend_is_rejected() -> None:
-    with pytest.raises(ValueError, match="unknown backend"):
-        get("nope")
-
-
-def test_backend_that_does_not_support_the_device_is_rejected() -> None:
-    with pytest.raises(ValueError, match="supports"):
-        resolve("reference", "meta")
-
-
-def test_device_with_no_backend_is_rejected() -> None:
-    with pytest.raises(ValueError, match="no backend supports"):
-        resolve(None, "meta")
-
-
-def test_resolve_prefers_the_highest_priority_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import slinoss.ops.conv.backends as backends
-
-    reference = get("reference")
-    faster = Backend(
-        name="faster",
-        forward=reference.forward,
-        backward=reference.backward,
-        device_types=("cpu",),
-        priority=1,
-    )
-    monkeypatch.setitem(backends._REGISTRY, "faster", faster)
-    assert resolve(None, "cpu").name == "faster"
-    # An explicit name overrides priority.
-    assert resolve("reference", "cpu").name == "reference"
+def test_the_reference_is_selected_on_the_cpu() -> None:
+    assert resolve(None, "cpu", torch.float32).name == "reference"
 
 
 def test_public_operator_matches_the_reference() -> None:

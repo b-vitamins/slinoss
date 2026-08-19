@@ -505,8 +505,15 @@ def test_more_than_one_partial_is_reduced() -> None:
 
 def test_native_backend_is_registered_and_preferred() -> None:
     assert "native" in names()
-    assert resolve(None, "cuda").name == "native"
-    assert resolve(None, "cpu").name == "reference"
+    assert resolve(None, "cuda", torch.float32).name == "native"
+    assert resolve(None, "cpu", torch.float32).name == "reference"
+
+
+def test_float64_resolves_to_the_reference_rather_than_raising() -> None:
+    # The kernel is instantiated per dtype and float64 has no instantiation, so
+    # resolution routes around it. A float64 call is the oracle width; the caller
+    # wants the answer, not an exception from inside a backend it did not name.
+    assert resolve(None, "cuda", torch.float64).name == "reference"
 
 
 def test_public_operator_selects_the_native_backend() -> None:
@@ -519,7 +526,7 @@ def test_public_operator_selects_the_native_backend() -> None:
 
 def test_native_backend_does_not_run_on_the_cpu() -> None:
     with pytest.raises(ValueError, match="supports"):
-        resolve("native", "cpu")
+        resolve("native", "cpu", torch.float32)
 
 
 def test_width_above_the_kernel_bound_is_rejected() -> None:
