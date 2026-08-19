@@ -93,7 +93,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss._cute import dev_tensor, jit_launch
+from slinoss._cute import jit_launch
 from slinoss.ops.so3ssd.cute.common import (
     THREADS,
     mat3_matvec,
@@ -342,11 +342,11 @@ def state_passing_backward(
     jit_launch(
         state_passing_bwd,
         (
-            dev_tensor(dzstart.view(bsz, heads, chunks, rows * dim)),
-            dev_tensor(cquat),
-            dev_tensor(cscale),
-            dev_tensor(seed.view(bsz, heads, rows * dim)),
-            dev_tensor(dz0.view(bsz, heads, rows * dim)),
+            dzstart.view(bsz, heads, chunks, rows * dim),
+            cquat,
+            cscale,
+            seed.view(bsz, heads, rows * dim),
+            dz0.view(bsz, heads, rows * dim),
             chunks,
             tiles,
             bsz,

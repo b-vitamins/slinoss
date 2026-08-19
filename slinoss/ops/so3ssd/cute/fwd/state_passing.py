@@ -68,7 +68,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss._cute import dev_tensor, jit_launch
+from slinoss._cute import jit_launch
 from slinoss.ops.so3ssd.cute.common import THREADS, mat3_matvec, rot_hom
 from slinoss.ops.so3ssd.cute.guard import Named, check_layout, check_pinned
 
@@ -266,11 +266,11 @@ def state_passing_forward(
     jit_launch(
         state_passing_fwd,
         (
-            dev_tensor(inc.view(bsz, heads, chunks, rows * dim)),
-            dev_tensor(cquat),
-            dev_tensor(cscale),
-            dev_tensor(start.view(bsz, heads, rows * dim)),
-            dev_tensor(state.view(bsz, heads, rows * dim)),
+            inc.view(bsz, heads, chunks, rows * dim),
+            cquat,
+            cscale,
+            start.view(bsz, heads, rows * dim),
+            state.view(bsz, heads, rows * dim),
             chunks,
             tiles,
             bsz,

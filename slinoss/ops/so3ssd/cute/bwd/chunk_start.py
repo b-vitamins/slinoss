@@ -44,7 +44,6 @@ from slinoss._cute import (
     Tile,
     assert_smem_fits,
     cute_dtype,
-    dev_tensor,
     jit_launch,
     smem_bytes,
 )
@@ -342,10 +341,10 @@ def chunk_start_backward(
     jit_launch(
         chunk_start_bwd,
         (
-            dev_tensor(dy),
-            dev_tensor(trans),
-            dev_tensor(C),
-            dev_tensor(dzstart),
+            dy,
+            trans,
+            C,
+            dzstart,
             seqlen,
             chunks,
             bsz,

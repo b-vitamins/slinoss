@@ -21,7 +21,9 @@ it.
 
 from __future__ import annotations
 
+import ctypes
 import math
+import threading
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from typing import Any, NamedTuple
 
@@ -38,6 +40,7 @@ __all__ = [
     "Tile",
     "assert_smem_fits",
     "block_reduce_add",
+    "clear_dev_pool",
     "cute_dtype",
     "decay",
     "dev_tensor",
@@ -91,6 +94,11 @@ def cute_dtype(dtype: torch.dtype) -> type:
         raise TypeError(f"no CuTe kernel path for {dtype}") from None
 
 
+# ---------------------------------------------------------------------------
+# Device tensor descriptors
+# ---------------------------------------------------------------------------
+
+
 def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
     """Wrap a contiguous torch tensor for a kernel launch.
 
@@ -104,11 +112,17 @@ def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
     carry the flag even though grad mode is off. Detaching aliases the same
     storage, so it is not a staging copy.
 
+    Building a descriptor costs 8.4 us on sm_86, so a launcher does not call this
+    per operand: it hands its torch tensors to :func:`jit_launch`, which converts
+    them through the descriptor pool. This is the unpooled builder, for a caller
+    that holds a descriptor across launches or invokes a ``@cute.jit`` function
+    directly.
+
     Args:
         tensor: A contiguous CUDA tensor.
 
     Returns:
-        The CuTe view of it.
+        The CuTe view of it, valid for as long as ``tensor`` is.
     """
     return from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(
         leading_dim=tensor.ndim - 1
@@ -120,6 +134,132 @@ def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
 # ---------------------------------------------------------------------------
 
 _EXECUTORS: dict[Hashable, Any] = {}
+
+_POOL_DEPTH = 4
+"""Pooled descriptors per layout. Four is the largest number of arguments of one
+layout any launch here has -- ``U``, ``B``, ``C`` and ``Y`` of the chunk scan
+coincide where ``P == 3N``. Past it a borrow is built unpooled."""
+
+_POOL_KEYS = 256
+"""Layouts pooled per thread. A filled slot pins one allocation, so an unbounded
+key count is an unbounded leak in a process that sweeps shapes. Past the cap a
+borrow is built unpooled, and :func:`clear_dev_pool` gives back what is held."""
+
+_POOLS = threading.local()
+"""Per-thread pools. Autograd runs a backward on its own thread, and a borrow
+count shared across threads would hand one descriptor to two launches."""
+
+_POOLABLE = True
+"""Cleared for the process if the memref's leading word is not the base pointer.
+A borrow re-points that word, so the check is what makes the patch legal."""
+
+
+class _Slots:
+    """The pooled descriptors of one layout, and the live borrow count.
+
+    Each view is paired with a one-word ctypes view of the leading word of its
+    memref, which is the descriptor's base pointer. Borrowing re-points it.
+    """
+
+    __slots__ = ("taken", "views")
+
+    def __init__(self) -> None:
+        self.taken = 0
+        self.views: list[tuple[cute.Tensor, Any]] = []
+
+
+def _borrow(tensor: torch.Tensor) -> cute.Tensor:
+    """A descriptor for one launch argument, from the pool where possible.
+
+    Valid until :func:`_release`, which is why :func:`jit_launch` is the only
+    caller: a borrow taken outside a launch has no scope that ends, and a
+    descriptor that outlived its launch would be handed out again while the first
+    launch still held it, putting two arguments on one base pointer.
+
+    The key is ``(dtype, device, shape, stride)`` and holds no address, so a
+    recycled allocation is not reachable through a stale descriptor: the base
+    pointer is re-read from the live tensor on every borrow. Two arguments of one
+    launch that share a layout get two slots, because the count advances per
+    argument and drops only when the launch ends.
+
+    Args:
+        tensor: A contiguous CUDA tensor.
+
+    Returns:
+        The CuTe view of it.
+    """
+    global _POOLABLE
+    if not _POOLABLE:
+        return dev_tensor(tensor)
+
+    slots: dict[Hashable, _Slots] | None = getattr(_POOLS, "slots", None)
+    if slots is None:
+        slots = _POOLS.slots = {}
+        _POOLS.borrowed = []
+
+    key = (tensor.dtype, tensor.device, tensor.shape, tensor.stride())
+    entry = slots.get(key)
+    if entry is None:
+        if len(slots) >= _POOL_KEYS:
+            return dev_tensor(tensor)
+        entry = slots[key] = _Slots()
+    index = entry.taken
+    entry.taken = index + 1
+    _POOLS.borrowed.append(entry)
+
+    if index < len(entry.views):
+        view, word = entry.views[index]
+        word[0] = tensor.data_ptr()
+        return view
+
+    view = dev_tensor(tensor)
+    if index >= _POOL_DEPTH:
+        return view
+
+    word = (ctypes.c_int64 * 1).from_address(view.__c_pointers__()[0])
+    if word[0] != tensor.data_ptr():
+        _POOLABLE = False
+        slots.clear()
+        _POOLS.borrowed.clear()
+        return view
+    entry.views.append((view, word))
+    return view
+
+
+def _release() -> None:
+    """Drop the borrow counts of the launch that is ending.
+
+    Every borrow on the list belongs to that launch: :func:`jit_launch` converts
+    its own arguments and is the only caller of :func:`_borrow`, so no borrow
+    spans a call out into other code and none can belong to an enclosing launch.
+    """
+    borrowed: list[_Slots] | None = getattr(_POOLS, "borrowed", None)
+    if not borrowed:
+        return
+    for entry in borrowed:
+        entry.taken -= 1
+    borrowed.clear()
+
+
+def clear_dev_pool() -> None:
+    """Drop every pooled descriptor on this thread.
+
+    A pooled descriptor holds the DLPack capsule of the tensor it was built from,
+    which pins that allocation. The capsule cannot be dropped: the DSL wrapper
+    reads the element type and the MLIR type through it, and a compile against a
+    stripped descriptor fails. So the pool retains one allocation per filled slot
+    whose tensor the caller does not hold itself, which is a launcher's own
+    outputs -- 14.03 MiB for the chunk increment at the standard shape on sm_86,
+    one copy of its increment tensor.
+
+    Correctness does not depend on this: a dropped layout is rebuilt on its next
+    borrow. It exists for a caller that sweeps layouts and then stops, such as a
+    shape sweep in the perf harness. Not callable from inside a launch.
+    """
+    slots: dict[Hashable, _Slots] | None = getattr(_POOLS, "slots", None)
+    if slots is not None:
+        slots.clear()
+        _POOLS.borrowed.clear()
 
 
 def executor_count() -> int:
@@ -142,6 +282,15 @@ def jit_launch(
     microseconds. ``cute.compile`` traces once and returns a callable that takes
     the dynamic arguments alone.
 
+    Torch tensors in ``dynamic`` are converted here rather than by the caller.
+    Building a descriptor is a DLPack export, a wrapper construction and a memref
+    materialization, 8.4 us on sm_86, so the nine a launch needs put the host
+    ahead of a kernel that runs in tens of microseconds; a pooled borrow
+    re-points the memref's base word instead. Host cost per launch at the
+    standard shape on sm_86, clocks unlocked: the chunk increment 193 us to
+    108 us, the state passing 114 us to 55 us. Converting here rather than in the
+    caller is what bounds a pooled descriptor's life to one launch.
+
     ``static`` is the trailing run of :class:`cutlass.Constexpr` parameters. It
     is the cache key, so it must name every property that shapes the generated
     code. That holds because :func:`dev_tensor` marks every layout dynamic
@@ -151,19 +300,27 @@ def jit_launch(
 
     Args:
         fn: The ``@cute.jit`` launcher.
-        dynamic: Its leading run of runtime arguments, tensors and scalars.
+        dynamic: Its leading run of runtime arguments. A torch tensor is
+            converted to a pooled descriptor; anything else -- a scalar, or a
+            descriptor the caller built itself -- is passed through.
         static: Its trailing run of compile-time arguments, in order.
 
     Raises:
         TypeError: If ``static`` holds an unhashable value, which would mean a
             compile-time argument that cannot key the cache.
     """
-    key = (fn, static, torch.cuda.current_device())
-    executor = _EXECUTORS.get(key)
-    if executor is None:
-        executor = cute.compile(fn, *dynamic, *static)
-        _EXECUTORS[key] = executor
-    executor(*dynamic)
+    try:
+        args = tuple(
+            _borrow(arg) if isinstance(arg, torch.Tensor) else arg for arg in dynamic
+        )
+        key = (fn, static, torch.cuda.current_device())
+        executor = _EXECUTORS.get(key)
+        if executor is None:
+            executor = cute.compile(fn, *args, *static)
+            _EXECUTORS[key] = executor
+        executor(*args)
+    finally:
+        _release()
 
 
 # ---------------------------------------------------------------------------

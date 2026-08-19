@@ -77,7 +77,7 @@ import cutlass.cute as cute
 import torch
 from torch import Tensor
 
-from slinoss._cute import cute_dtype, dev_tensor, jit_launch, narrow, widen
+from slinoss._cute import cute_dtype, jit_launch, narrow, widen
 from slinoss._precision import KERNEL_DTYPES
 from slinoss.ops.so3ssd.cute.common import THREADS
 from slinoss.ops.so3ssd.cute.guard import (
@@ -643,15 +643,15 @@ def boundary_backward(
     jit_launch(
         boundary_bwd,
         (
-            dev_tensor(carry_u),
-            dev_tensor(carry_b),
-            dev_tensor(carry_b.unsqueeze(2) if partial_bc is None else partial_bc),
-            dev_tensor(dU[:, :, 0] if du_last is None else du_last),
-            dev_tensor(dB[:, :, 0] if db_last is None else db_last),
-            dev_tensor(dU),
-            dev_tensor(dB),
-            dev_tensor(carry_u[:, :, 0] if du_prev is None else du_prev),
-            dev_tensor(carry_b[:, :, 0] if db_prev is None else db_prev),
+            carry_u,
+            carry_b,
+            carry_b.unsqueeze(2) if partial_bc is None else partial_bc,
+            dU[:, :, 0] if du_last is None else du_last,
+            dB[:, :, 0] if db_last is None else db_last,
+            dU,
+            dB,
+            carry_u[:, :, 0] if du_prev is None else du_prev,
+            carry_b[:, :, 0] if db_prev is None else db_prev,
             seqlen,
             chunks,
             bsz,
