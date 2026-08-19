@@ -61,6 +61,7 @@ DECLARED: Final[dict[str, str]] = {
     "mixer_tail_bwd_kernel": DRAM_BOUND,
     "mixer_tail_fwd_kernel": DRAM_BOUND,
     "rmsnorm_bwd_kernel": DRAM_BOUND,
+    "rmsnorm_dweight_kernel": SERIAL_TINY,
     "rmsnorm_fwd_kernel": DRAM_BOUND,
     "rmsnorm_residual_bwd_kernel": DRAM_BOUND,
     "rmsnorm_residual_fwd_kernel": DRAM_BOUND,
@@ -78,11 +79,22 @@ step in the operator, but serial is not the same as latency bound: once the chun
 fetch is pipelined ahead of the rotation, the serial chain is arithmetic and the
 kernel saturates the bus. Both are held to a bandwidth like the rest.
 
-``boundary_bwd_kernel`` is the one SERIAL-tiny entry. Its traffic is a fixed few
-rows per chunk rather than a pass over the sequence, so no shape makes it large
-enough to hold to a bandwidth. That is a property of the kernel and belongs here. A
-shape with too few blocks to fill the device is a different thing: a statement about
-a shape rather than about a kernel, and it does not live here."""
+Three entries are SERIAL-tiny, and only the first is unconditionally so.
+``boundary_bwd_kernel`` reads a fixed few rows per chunk rather than a pass over the
+sequence, so no shape makes it large enough to hold to a bandwidth. That is a
+property of the kernel and belongs here. A shape with too few blocks to fill the
+device is a different thing: a statement about a shape rather than about a kernel,
+and it does not live here.
+
+``conv1d_reduce_parts_kernel`` and ``rmsnorm_dweight_kernel`` are reduction tails
+over a per-block partial, so their traffic follows the reduced width rather than the
+sequence. That width is bounded in the configuration for the first and is ``D`` for
+the second, which means the second's declaration has a range. Measured on sm_86:
+2.84 us at ``d_model`` 288, under 1% of the backward step; 17.0 us at ``D`` 4096,
+76-80% of the copy ceiling and 11% of the step; 30.8 us at ``D`` 8192, 88.5-89.5%.
+SERIAL-tiny is right for every shape the driver measures and stops being right
+somewhere above ``D`` 2048. Widening the workload past that needs the class
+revisited, not the floor lowered."""
 
 
 def declared_class(kernel: str) -> str | None:

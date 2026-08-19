@@ -16,10 +16,19 @@ handed to :func:`slinoss._cute.silu` and :func:`slinoss._cute.silu_grad`.
 
 Parallel decomposition, both directions. A grid-stride loop over vectors of ``V``
 consecutive elements, ``V = 8`` at two bytes and ``V = 4`` at four, so one thread
-step spans 16 bytes of each operand. The grid is twice the SM count, which is the
-block-count floor, and the stride loop covers any element count from that one
-launch shape. The trailing ``numel % V`` elements do not fill a vector and are
-taken by the first warp of block 0, so the vector path carries no predicate.
+step spans 16 bytes of each operand. The grid is
+:func:`slinoss.ops.block.cute.norm.fill_blocks`, and the stride loop covers any
+element count from that one launch shape. The trailing ``numel % V`` elements do
+not fill a vector and are taken by the first warp of block 0, so the vector path
+carries no predicate.
+
+Each vector crosses the boundary as one access, through a register fragment and
+:func:`cutlass.cute.autovec_copy`. ``V`` separate subscripts of the global tensor
+are ``V`` separate requests at a 16-byte lane stride, which is eight times the
+necessary L1TEX load traffic and, on the store side, eight partial writes per
+32-byte sector: measured on sm_86 at 8x the sector count on both sides, and the
+partial stores turned into 1.9x the necessary DRAM write traffic once the grid was
+large enough to keep more of them live in L2 at once.
 
 The exponential argument is unbounded. A strongly negative gate drives
 ``exp(-g)`` past float32 range, and ``g / inf`` is a signed zero, which is the
@@ -46,6 +55,7 @@ import torch
 from torch import Tensor
 
 from slinoss._cute import (
+    Scalar,
     cute_dtype,
     jit_launch,
     narrow,
@@ -54,7 +64,7 @@ from slinoss._cute import (
     silu_grad,
     widen,
 )
-from slinoss.ops.block.cute.norm import check_operand, sm_count
+from slinoss.ops.block.cute.norm import check_operand, fill_blocks
 from slinoss.ops.block.reference import SwiGLUGrads
 
 __all__ = [
@@ -85,54 +95,61 @@ elements."""
 # function, and two roundings of one activation is a divergence.
 
 
-def _store_swiglu(
-    ggate: cute.Tensor,
-    gup: cute.Tensor,
-    gy: cute.Tensor,
-    index: cutlass.Int32,
-) -> None:
-    """Write one element of ``silu(gate) * up``. The only copy of the body.
+def _swiglu(gate: Scalar, up: Scalar) -> Scalar:
+    """``silu(gate) * up`` in float32. The only copy of the forward body.
 
     Args:
-        ggate: ``(numel,)`` gate, activation dtype.
-        gup: ``(numel,)`` up, same dtype.
-        gy: ``(numel,)`` output, same dtype.
-        index: Flat element index. In range at every call site.
+        gate: Gate element, widened.
+        up: Up element, widened.
+
+    Returns:
+        The activation.
     """
-    gate = widen(ggate[index], ggate.element_type)
-    gy[index] = narrow(
-        silu(gate, sigmoid(gate)) * widen(gup[index], gup.element_type),
-        gy.element_type,
-    )
+    return silu(gate, sigmoid(gate)) * up
 
 
-def _store_swiglu_grads(
-    gdout: cute.Tensor,
-    ggate: cute.Tensor,
-    gup: cute.Tensor,
-    gdgate: cute.Tensor,
-    gdup: cute.Tensor,
-    index: cutlass.Int32,
-    dtype: cutlass.Constexpr,
-) -> None:
-    """Write one element of each gradient. The only copy of the body.
+def _swiglu_grads(gate: Scalar, up: Scalar, cot: Scalar) -> tuple[Scalar, Scalar]:
+    """``(dgate, dup)`` in float32. The only copy of the backward body.
 
     Args:
-        gdout: ``(numel,)`` cotangent of the output, ``dtype``.
-        ggate: ``(numel,)`` gate, ``dtype``.
-        gup: ``(numel,)`` up, ``dtype``.
-        gdgate: ``(numel,)`` written, ``dtype``.
-        gdup: ``(numel,)`` written, ``dtype``.
-        index: Flat element index. In range at every call site.
-        dtype: The one element type of all five tensors. Compile-time and passed
-            rather than read off the tensor because it keys the executor cache in
-            :func:`slinoss._cute.jit_launch`.
+        gate: Gate element, widened.
+        up: Up element, widened.
+        cot: Cotangent of the output, widened.
+
+    Returns:
+        The gradient of the gate and the gradient of the up operand.
     """
-    gate = widen(ggate[index], dtype)
     sig = sigmoid(gate)
-    cot = widen(gdout[index], dtype)
-    gdgate[index] = narrow(cot * widen(gup[index], dtype) * silu_grad(gate, sig), dtype)
-    gdup[index] = narrow(cot * silu(gate, sig), dtype)
+    return cot * up * silu_grad(gate, sig), cot * silu(gate, sig)
+
+
+def _vector(tensor: cute.Tensor, vec: cutlass.Constexpr) -> cute.Tensor:
+    """Retile a flat tensor as ``(vec, groups)``, one whole vector per column.
+
+    Args:
+        tensor: ``(numel,)``, contiguous.
+        vec: Elements per vector. Compile-time.
+
+    Returns:
+        The retiled view. Column ``g`` is statically shaped ``(vec,)``, which is
+        what lets :func:`cutlass.cute.autovec_copy` pick the widest access. A
+        trailing partial column exists when ``vec`` does not divide ``numel`` and
+        is never addressed: the caller's loop bound is the whole-vector count.
+    """
+    return cute.zipped_divide(tensor, (vec,))
+
+
+def _fragment(tensor: cute.Tensor, vec: cutlass.Constexpr) -> cute.Tensor:
+    """A register fragment holding one vector of ``tensor``'s element type.
+
+    Args:
+        tensor: The tensor the fragment is copied to or from.
+        vec: Elements per vector. Compile-time.
+
+    Returns:
+        The fragment.
+    """
+    return cute.make_fragment((vec,), tensor.element_type)
 
 
 # ---------------------------------------------------------------------------
@@ -171,14 +188,36 @@ def swiglu_fwd_kernel(
     bid, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
 
+    vgate = _vector(ggate, vec)
+    vup = _vector(gup, vec)
+    vy = _vector(gy, vec)
+    fgate = _fragment(ggate, vec)
+    fup = _fragment(gup, vec)
+    fy = _fragment(gy, vec)
+
     for group in cutlass.range(bid * threads + tid, groups, span):
-        base = group * vec
+        cute.autovec_copy(vgate[(None, group)], fgate)
+        cute.autovec_copy(vup[(None, group)], fup)
         for j in cutlass.range_constexpr(vec):
-            _store_swiglu(ggate, gup, gy, base + j)
+            fy[j] = narrow(
+                _swiglu(
+                    widen(fgate[j], ggate.element_type),
+                    widen(fup[j], gup.element_type),
+                ),
+                gy.element_type,
+            )
+        cute.autovec_copy(fy, vy[(None, group)])
 
     # `&`, not `and`: both operands are device values.
     if (bid == 0) & (tid < tail):
-        _store_swiglu(ggate, gup, gy, groups * vec + tid)
+        index = groups * vec + tid
+        gy[index] = narrow(
+            _swiglu(
+                widen(ggate[index], ggate.element_type),
+                widen(gup[index], gup.element_type),
+            ),
+            gy.element_type,
+        )
 
 
 @cute.jit
@@ -240,14 +279,40 @@ def swiglu_bwd_kernel(
     bid, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
 
+    vdout = _vector(gdout, vec)
+    vgate = _vector(ggate, vec)
+    vup = _vector(gup, vec)
+    vdgate = _vector(gdgate, vec)
+    vdup = _vector(gdup, vec)
+    fdout = _fragment(gdout, vec)
+    fgate = _fragment(ggate, vec)
+    fup = _fragment(gup, vec)
+    fdgate = _fragment(gdgate, vec)
+    fdup = _fragment(gdup, vec)
+
     for group in cutlass.range(bid * threads + tid, groups, span):
-        base = group * vec
+        cute.autovec_copy(vdout[(None, group)], fdout)
+        cute.autovec_copy(vgate[(None, group)], fgate)
+        cute.autovec_copy(vup[(None, group)], fup)
         for j in cutlass.range_constexpr(vec):
-            _store_swiglu_grads(gdout, ggate, gup, gdgate, gdup, base + j, dtype)
+            dgate, dup = _swiglu_grads(
+                widen(fgate[j], dtype), widen(fup[j], dtype), widen(fdout[j], dtype)
+            )
+            fdgate[j] = narrow(dgate, dtype)
+            fdup[j] = narrow(dup, dtype)
+        cute.autovec_copy(fdgate, vdgate[(None, group)])
+        cute.autovec_copy(fdup, vdup[(None, group)])
 
     # `&`, not `and`: both operands are device values.
     if (bid == 0) & (tid < tail):
-        _store_swiglu_grads(gdout, ggate, gup, gdgate, gdup, groups * vec + tid, dtype)
+        index = groups * vec + tid
+        dgate, dup = _swiglu_grads(
+            widen(ggate[index], dtype),
+            widen(gup[index], dtype),
+            widen(gdout[index], dtype),
+        )
+        gdgate[index] = narrow(dgate, dtype)
+        gdup[index] = narrow(dup, dtype)
 
 
 @cute.jit
@@ -333,7 +398,7 @@ def swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
     out = torch.empty_like(up)
     vec = _vector_width(gate.dtype)
     groups = count // vec
-    blocks = 2 * sm_count(gate.device.index)
+    blocks = fill_blocks(ACT_THREADS, gate.device.index)
     jit_launch(
         swiglu_fwd,
         (
@@ -386,7 +451,7 @@ def swiglu_backward(dout: Tensor, gate: Tensor, up: Tensor, /) -> SwiGLUGrads:
     dup = torch.empty_like(up)
     vec = _vector_width(gate.dtype)
     groups = count // vec
-    blocks = 2 * sm_count(gate.device.index)
+    blocks = fill_blocks(ACT_THREADS, gate.device.index)
     jit_launch(
         swiglu_bwd,
         (

@@ -42,10 +42,17 @@ from slinoss.ops.block import (
 from slinoss.ops.block.cute import (
     ACT_THREADS,
     BWD_SLOTS,
+    DWEIGHT_COLS,
+    DWEIGHT_THREADS,
     FWD_SLOTS,
+    LOOP_ROUNDS,
     NORM_THREADS,
+    ONE_ROUND,
     VECTOR_BYTES,
     WARPS,
+    dweight_smem_bytes,
+    dweight_tile,
+    fill_blocks,
     norm_smem_bytes,
     reduce_tile,
     rmsnorm_backward,
@@ -56,7 +63,7 @@ from slinoss.ops.block.cute import (
     sm_count,
     swiglu_backward,
     swiglu_forward,
-    total_tile,
+    threads_per_sm,
 )
 from tests.conftest import assert_max_rel
 
@@ -78,27 +85,36 @@ NORM_SHAPES = [
     pytest.param(5, 2048, id="many-rows"),
 ]
 
+# Rows that make the backward's stride loop run three times on every block and
+# four on some, so a trip count that differs between blocks is covered. Read off
+# the grid rather than fixed: the grid is a device property, and a literal row
+# count above it on one part is below it on the next.
+STRIDE_ROWS = 3 * fill_blocks(NORM_THREADS, torch.cuda.current_device()) + 1
+
 # (rows, D) for the backwards, whose grid is fixed and strided over rows rather
 # than one block per row. The D entries are the forward's, minus the 5x2048 case
-# that adds nothing on this axis, plus a row count above twice the SM count so the
-# stride loop runs several times and its trip count differs between blocks.
+# that adds nothing on this axis, plus :data:`STRIDE_ROWS`.
 NORM_BWD_SHAPES = [
     pytest.param(1, 1, id="single-row-single-column"),
     pytest.param(3, 48, id="D-under-block"),
     pytest.param(80, 300, id="ragged-D"),
     pytest.param(1, 4096, id="single-row-wide-D"),
-    pytest.param(500, 300, id="grid-stride-rows"),
+    pytest.param(STRIDE_ROWS, 300, id="grid-stride-rows"),
 ]
 
+# Rows that put more vectors in flight than the grid holds threads at both vector
+# widths, and not a whole multiple of them at the narrow width, so the stride
+# loop's trip count differs between threads.
+ACT_STRIDE_ROWS = 3 * fill_blocks(ACT_THREADS, torch.cuda.current_device())
+
 # (rows, D) for the activation, which sees only the element count. 1 is a
-# tail-only launch, 2107 is a count whose remainder is nonzero at both vector
-# widths, and 1048576 is more vectors than the grid holds threads, so the stride
-# loop runs several times.
+# tail-only launch, 7x301 is a count whose remainder is nonzero at both vector
+# widths, and the last entry is :data:`ACT_STRIDE_ROWS`.
 ACT_SHAPES = [
     pytest.param(1, 1, id="one-element"),
     pytest.param(7, 301, id="ragged-tail"),
     pytest.param(80, 300, id="exact-vectors"),
-    pytest.param(256, 4096, id="grid-stride"),
+    pytest.param(ACT_STRIDE_ROWS, 1024, id="grid-stride"),
 ]
 
 # Both kernels compute in float32 and store at the operand width, so both bounds
@@ -318,7 +334,11 @@ def _norm_bwd(rows: int, width: int, dtype: torch.dtype) -> None:
     dout = _rnd(shape, dtype, seed=10)
     want = rmsnorm_bwd_ref(dout.double(), x.double(), weight.double(), eps=EPS)
 
-    _poison((shape, dtype), ((_blocks(rows), width), torch.float32))
+    _poison(
+        (shape, dtype),
+        ((_blocks(rows), width), torch.float32),
+        ((width,), torch.float32),
+    )
     got = rmsnorm_backward(dout, x, weight, eps=EPS)
     torch.cuda.synchronize()
 
@@ -349,6 +369,28 @@ def test_rmsnorm_backward_matches_the_reference(rows: int, width: int) -> None:
     was reset per row rather than held across the loop only fails there.
     """
     _norm_bwd(rows, width, torch.float32)
+
+
+def test_weight_gradient_is_bitwise_reproducible() -> None:
+    """The reduction of the partial buffer must not depend on arrival order.
+
+    Its order is fixed by the launch geometry alone -- ascending partial row within
+    a slot, then ascending slot -- and it uses no atomics, so two calls at one
+    shape agree bit for bit. A float atomic into the output, or an order taken from
+    the order blocks finish in, passes every tolerance check here and fails this.
+    The shape is the one whose grid is the full device, so the reduction spans the
+    most partial rows it ever will.
+    """
+    rows, width = STRIDE_ROWS, 300
+    shape = (1, rows, width)
+    x = _rnd(shape, torch.float32, seed=8)
+    weight = _rnd((width,), torch.float32, seed=9)
+    dout = _rnd(shape, torch.float32, seed=10)
+
+    first = rmsnorm_backward(dout, x, weight, eps=EPS).dweight
+    second = rmsnorm_backward(dout, x, weight, eps=EPS).dweight
+    torch.cuda.synchronize()
+    assert bool(torch.equal(first, second))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -407,6 +449,7 @@ def _residual_bwd(
         specs.append((shape, residual.dtype))
     if dnormed is not None:
         specs.append(((_blocks(rows), width), torch.float32))
+        specs.append(((width,), torch.float32))
     _poison(*specs)
     got = rmsnorm_residual_backward(dnormed, dresidual, x, residual, weight, eps=EPS)
     torch.cuda.synchronize()
@@ -1042,22 +1085,41 @@ def test_launch_geometry_and_smem_budget_hold() -> None:
     total is undefined; a partial tile count breaks the one-partial-per-warp
     layout; a vector width that does not divide the load span reads past the end
     of a thread's slice; and a budget over the queried capacity fails at launch
-    rather than at build. The budget comes from the tile layouts, with no slop
-    constant.
+    rather than at build. The budget comes from the tile layout, with no slop
+    constant. Every kernel that reduces per trip of a stride loop needs two rounds,
+    not one: with one barrier per trip, a trip's write must land clear of the
+    partials the previous trip's readers have not finished with. The
+    weight-gradient reduction rests on its column tile dividing its block width,
+    which is what makes the block a whole rectangle of row slots, and on that tile
+    being one 32-byte sector wide.
     """
     assert NORM_THREADS % 32 == 0
     assert ACT_THREADS % 32 == 0
     assert WARPS * 32 == NORM_THREADS
     assert (FWD_SLOTS, BWD_SLOTS) == (1, 2)
+    assert (ONE_ROUND, LOOP_ROUNDS) == (1, 2)
 
-    for slots, name in ((FWD_SLOTS, "rmsnorm_fwd"), (BWD_SLOTS, "rmsnorm_bwd")):
-        assert reduce_tile(slots).shape == (slots * WARPS,)
-        assert total_tile(slots).shape == (slots,)
-        budget = norm_smem_bytes(slots)
-        assert budget == smem_bytes([(reduce_tile(slots), 4), (total_tile(slots), 4)])
-        assert budget == 4 * slots * (WARPS + 1)
+    for slots, rounds, name in (
+        (FWD_SLOTS, ONE_ROUND, "rmsnorm_residual_fwd"),
+        (FWD_SLOTS, LOOP_ROUNDS, "rmsnorm_fwd"),
+        (BWD_SLOTS, LOOP_ROUNDS, "rmsnorm_bwd"),
+    ):
+        assert reduce_tile(slots, rounds).shape == (rounds * slots * WARPS,)
+        budget = norm_smem_bytes(slots, rounds)
+        assert budget == smem_bytes([(reduce_tile(slots, rounds), 4)])
+        assert budget == 4 * rounds * slots * WARPS
         assert assert_smem_fits(name, budget) == budget
         assert budget < smem_capacity()
+
+    assert DWEIGHT_THREADS % 32 == 0
+    assert DWEIGHT_THREADS % DWEIGHT_COLS == 0
+    assert DWEIGHT_COLS * 4 == 32
+    assert dweight_tile(DWEIGHT_THREADS).shape == (DWEIGHT_THREADS,)
+    budget = dweight_smem_bytes(DWEIGHT_THREADS)
+    assert budget == smem_bytes([(dweight_tile(DWEIGHT_THREADS), 4)])
+    assert budget == 4 * DWEIGHT_THREADS
+    assert assert_smem_fits("rmsnorm_dweight", budget) == budget
+    assert budget < smem_capacity()
 
     for dtype in KERNEL_DTYPES:
         itemsize = torch.empty(0, dtype=dtype).element_size()
@@ -1065,19 +1127,25 @@ def test_launch_geometry_and_smem_budget_hold() -> None:
         assert VECTOR_BYTES // itemsize in (4, 8)
 
 
-def test_backward_grid_meets_the_block_floor() -> None:
-    """The row stride is the grid, and the grid is the block-count floor.
+def test_grid_fills_the_device_and_never_exceeds_the_rows() -> None:
+    """The row stride is the grid, and the grid fills the device.
 
-    Twice the SM count is the floor every kernel is held to. Fewer rows than that
-    caps the grid at the row count, which is the whole available parallelism: a row
-    reduction cannot cross a grid barrier. A grid above the row count would launch
-    blocks whose stride loop never runs and whose partial row is never written,
-    which the host sum would read as NaN.
+    A grid-strided launch is held to twice the SM count as a floor, and
+    :func:`fill_blocks` clears it by filling every SM with resident threads.
+    Fewer rows than that caps the grid at the row count, which is the whole
+    available parallelism: a row reduction cannot cross a grid barrier. A grid
+    above the row count would launch blocks whose stride loop never runs: in the
+    backward the partial row they own is never written and the reduction reads
+    uninitialized memory, and in the forward their lookahead read of row ``block``
+    is out of bounds.
     """
     index = torch.cuda.current_device()
-    floor = 2 * sm_count(index)
-    assert floor > 0
+    for threads in (NORM_THREADS, ACT_THREADS):
+        grid = fill_blocks(threads, index)
+        assert grid >= 2 * sm_count(index)
+        assert grid == sm_count(index) * (threads_per_sm(index) // threads)
+    grid = fill_blocks(NORM_THREADS, index)
     assert row_blocks(1, index) == 1
-    assert row_blocks(floor - 1, index) == floor - 1
-    assert row_blocks(floor, index) == floor
-    assert row_blocks(10 * floor + 1, index) == floor
+    assert row_blocks(grid - 1, index) == grid - 1
+    assert row_blocks(grid, index) == grid
+    assert row_blocks(10 * grid + 1, index) == grid
