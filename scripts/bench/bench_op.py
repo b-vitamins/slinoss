@@ -1,8 +1,13 @@
-"""Bench the SO(3) scan operator with CUDA events.
+"""Bench one operator with CUDA events.
 
 One event pair per region per iteration, so the reported spread is the real
 run-to-run dispersion and a delta smaller than it is not a result. No profiler is
 attached, so this is the cheap measurement to run before and after every change.
+
+``--op`` selects the operator, out of the same registry the profiler drivers
+dispatch on. Every operator is reachable from every driver, because a change is
+judged by the arm it moved and an operator only the profiler can reach is measured
+once under a profiler and never in the cheap loop.
 
 Emits one report per shape and mode under ``--out``, and a summary table on
 stdout. The reports carry no cross-check, because only one clock ran; the
@@ -28,11 +33,12 @@ a speedup.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
 
+from slinoss.perf.arms import op_arm
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.ceiling import Ceilings, ceilings
 from slinoss.perf.device import device_info, device_ordinal, require_cuda
@@ -46,14 +52,7 @@ from slinoss.perf.memory import (
 )
 from slinoss.perf.report import Report, rate_table, write_report
 from slinoss.perf.timing import Throughput, measure, measure_paired
-from slinoss.perf.workload import (
-    SHAPES,
-    OpShape,
-    forward_only,
-    make_inputs,
-    shape_by_name,
-    step,
-)
+from slinoss.perf.workload import OPS, SHAPE_NAMES
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 MODES = ("forward", "step")
@@ -64,10 +63,11 @@ SAME = "same"
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--op", choices=OPS, default=OPS[0])
     parser.add_argument(
         "--shape",
         action="append",
-        choices=[s.name for s in SHAPES],
+        choices=SHAPE_NAMES,
         help="Shape to bench. Repeatable. Defaults to every standard shape.",
     )
     parser.add_argument("--mode", choices=[*MODES, "both"], default="both")
@@ -100,7 +100,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _saved(
-    shape: OpShape,
+    op: str,
+    shape_name: str,
     device: torch.device,
     dtype: torch.dtype,
     backend: str | None,
@@ -110,37 +111,37 @@ def _saved(
     Runs under a recorder so each save attributes to the region it was taken in.
     Without one every row would read ``unattributed``, which says nothing about
     which part of the graph holds the bytes.
+
+    A second arm, because the timed one may carry no gradients. Its inputs are
+    allocated after the timing loop, so they are outside the peaks it reports.
     """
-    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=True)
+    arm = op_arm(op, shape_name, device, dtype=dtype, grads=True)
     probe = SavedTensorProbe()
     with probe:
         measure(
-            step(inputs, shape.chunk, backend=backend),
-            label=f"so3ssd {shape.name} saved",
+            arm.run(backend, arm.prefix),
+            label=f"{op} {shape_name} saved",
             iters=1,
             warmup=0,
             device=device,
         )
-    return probe.report(f"so3ssd {shape.name}", inputs.differentiable)
+    return probe.report(f"{op} {shape_name}", arm.differentiable)
 
 
 def bench(
-    shape: OpShape,
+    shape_name: str,
     mode: str,
     args: argparse.Namespace,
     device: torch.device,
     limits: Ceilings | None,
 ) -> tuple[Report, Throughput]:
-    """Measure one shape in one mode and build its report."""
+    """Measure one operator at one shape in one mode and build its report."""
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
-    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
-    runner = (
-        step(inputs, shape.chunk, backend=args.backend)
-        if grads
-        else forward_only(inputs, shape.chunk, backend=args.backend)
-    )
-    label = f"so3ssd {shape.name} {mode}"
+    arm = op_arm(args.op, shape_name, device, dtype=dtype, grads=grads)
+    shape = arm.shape
+    runner = arm.run(args.backend, arm.prefix)
+    label = f"{args.op} {shape.name} {mode}"
     reset_memory_peaks(device)
     timed = measure(
         runner,
@@ -159,7 +160,9 @@ def bench(
         budget=tree,
         throughput=(rate,),
         ceilings=limits,
-        saved=_saved(shape, device, dtype, args.backend) if grads else None,
+        saved=_saved(args.op, shape.name, device, dtype, args.backend)
+        if grads
+        else None,
         peaks=peaks,
         pool=pool_retention(label),
         notes=(
@@ -172,10 +175,12 @@ def bench(
     return report, rate
 
 
-def arm_labels(a: str | None, b: str | None) -> tuple[str, str]:
+def arm_labels(op: str, a: str | None, b: str | None) -> tuple[str, str]:
     """Region prefixes for two backends measured in one loop.
 
     Args:
+        op: Operator name. It leads the label, so a report holding two operators'
+            regions still says which arm each row came from.
         a: Baseline backend name, or None for the fastest registered one.
         b: Backend name for the arm under test.
 
@@ -184,14 +189,14 @@ def arm_labels(a: str | None, b: str | None) -> tuple[str, str]:
         :func:`slinoss.perf.timing.measure_paired` refuses one label for both arms
         and the null test still has to be runnable.
     """
-    labels = [f"so3ssd-{name or 'auto'}" for name in (a, b)]
+    labels = [f"{op}-{name or 'auto'}" for name in (a, b)]
     if labels[0] == labels[1]:
         return f"{labels[0]}-a", f"{labels[1]}-b"
     return labels[0], labels[1]
 
 
 def compare_backends(
-    shape: OpShape,
+    shape_name: str,
     mode: str,
     args: argparse.Namespace,
     device: torch.device,
@@ -200,7 +205,7 @@ def compare_backends(
     """Measure two backends against each other in one loop at one shape and mode.
 
     Args:
-        shape: The problem size.
+        shape_name: The problem size, resolved against the operator's own table.
         mode: ``forward`` or ``step``.
         args: Parsed command line. ``--backend`` is the baseline arm and
             ``--against`` the arm under test.
@@ -213,23 +218,18 @@ def compare_backends(
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
     against = args.backend if args.against == SAME else args.against
-    a_label, b_label = arm_labels(args.backend, against)
+    a_label, b_label = arm_labels(args.op, args.backend, against)
     # One input set for both arms. Two would differ in address and in cache
     # residency, and that difference would be attributed to the backend.
-    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
-
-    def arm(backend: str | None, prefix: str) -> Callable[[], None]:
-        if grads:
-            return step(inputs, shape.chunk, backend=backend, prefix=prefix)
-        return forward_only(inputs, shape.chunk, backend=backend, prefix=prefix)
-
-    label = f"so3ssd {shape.name} {mode} paired"
+    arm = op_arm(args.op, shape_name, device, dtype=dtype, grads=grads)
+    shape = arm.shape
+    label = f"{args.op} {shape.name} {mode} paired"
     reset_memory_peaks(device)
     out = measure_paired(
         a_label,
-        arm(args.backend, a_label),
+        arm.run(args.backend, a_label),
         b_label,
-        arm(against, b_label),
+        arm.run(against, b_label),
         label=label,
         iters=args.iters,
         warmup=args.warmup,
@@ -262,7 +262,7 @@ def compare_backends(
 
 
 def _run_comparisons(
-    shapes: Sequence[OpShape],
+    shape_names: Sequence[str],
     modes: Sequence[str],
     args: argparse.Namespace,
     device: torch.device,
@@ -278,14 +278,13 @@ def _run_comparisons(
     null_test = args.against in (SAME, args.backend)
     rates: list[tuple[str, Throughput]] = []
     verdicts: list[PairedRow] = []
-    for shape in shapes:
+    for name in shape_names:
         for mode in modes:
-            report, row = compare_backends(shape, mode, args, device, limits)
-            base = args.out.with_name(f"{args.out.name}-{shape.name}-{mode}-paired")
+            report, row = compare_backends(name, mode, args, device, limits)
+            base = args.out.with_name(f"{args.out.name}-{name}-{mode}-paired")
             md, _ = write_report(report, base, require_agreement=False)
             rates += [
-                (f"{shape.name}/{mode}/{rate.label}", rate)
-                for rate in report.throughput
+                (f"{name}/{mode}/{rate.label}", rate) for rate in report.throughput
             ]
             verdicts.append(row)
             print(f"wrote {md}")
@@ -317,18 +316,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
-    shapes = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]
+    names = list(args.shape or SHAPE_NAMES)
     modes = MODES if args.mode == "both" else (args.mode,)
     limits = None if args.no_ceilings else ceilings(device)
     if args.against is not None:
-        return _run_comparisons(shapes, modes, args, device, limits)
+        return _run_comparisons(names, modes, args, device, limits)
     rows: list[tuple[str, Throughput]] = []
-    for shape in shapes:
+    for name in names:
         for mode in modes:
-            report, rate = bench(shape, mode, args, device, limits)
-            base = args.out.with_name(f"{args.out.name}-{shape.name}-{mode}")
+            report, rate = bench(name, mode, args, device, limits)
+            base = args.out.with_name(f"{args.out.name}-{name}-{mode}")
             md, _ = write_report(report, base, require_agreement=False)
-            rows.append((f"{shape.name}/{mode}", rate))
+            rows.append((f"{name}/{mode}", rate))
             print(f"wrote {md}")
     print()
     print(rate_table(rows, width=20))

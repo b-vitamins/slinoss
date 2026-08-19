@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from scripts.perf import profile_target
+from slinoss.perf import arms
 from slinoss.perf.workload import (
     OPS,
     SHAPES,
@@ -87,6 +88,8 @@ class Trace:
         chunks: Chunk length handed to each factory, or None for the conv, which
             has no chunk.
         backends: Backend name handed to each factory.
+        prefixes: Region label prefix handed to each factory. Every region in a
+            report is named under it, so a wrong one mislabels the whole budget.
         inputs: Operator inputs handed to each factory.
         devices: Device each window opened on.
     """
@@ -95,6 +98,7 @@ class Trace:
     factories: list[str] = field(default_factory=list)
     chunks: list[int | None] = field(default_factory=list)
     backends: list[str | None] = field(default_factory=list)
+    prefixes: list[str] = field(default_factory=list)
     inputs: list[OpInputs | ConvInputs] = field(default_factory=list)
     devices: list[torch.device] = field(default_factory=list)
 
@@ -103,9 +107,10 @@ class Trace:
 def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
     """Count runner calls and window edges instead of running either.
 
-    Every name is patched in the driver's namespace, which is where it imported
-    them and therefore where it looks them up. The stub runner does no work, so
-    the counts are the driver's control flow and nothing else.
+    The factories are patched in :mod:`slinoss.perf.arms`, which is the one place
+    an operator name is resolved to a family, and the window in the driver, which
+    is where it opens. The stub runner does no work, so the counts are the
+    driver's control flow and nothing else.
 
     Args:
         monkeypatch: Patcher, undone after the test.
@@ -121,10 +126,12 @@ def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
             chunk: int | None = None,
             *,
             backend: str | None = None,
+            prefix: str = "",
         ) -> Callable[[], None]:
             out.factories.append(name)
             out.chunks.append(chunk)
             out.backends.append(backend)
+            out.prefixes.append(prefix)
             out.inputs.append(inputs)
 
             def run() -> None:
@@ -143,10 +150,10 @@ def trace(monkeypatch: pytest.MonkeyPatch) -> Trace:
         finally:
             out.events.append("exit")
 
-    monkeypatch.setattr(profile_target, "step", factory("step"))
-    monkeypatch.setattr(profile_target, "forward_only", factory("forward"))
-    monkeypatch.setattr(profile_target, "conv_step", factory("conv-step"))
-    monkeypatch.setattr(profile_target, "conv_forward_only", factory("conv-forward"))
+    monkeypatch.setattr(arms, "step", factory("step"))
+    monkeypatch.setattr(arms, "forward_only", factory("forward"))
+    monkeypatch.setattr(arms, "conv_step", factory("conv-step"))
+    monkeypatch.setattr(arms, "conv_forward_only", factory("conv-forward"))
     monkeypatch.setattr(profile_target, "profiler_window", window)
     return out
 
@@ -270,6 +277,9 @@ def test_the_shape_the_device_and_the_backend_reach_the_runner(trace: Trace) -> 
     assert profile_target.main(argv()) == 0
     assert trace.devices == [torch.device("cuda")]
     assert trace.chunks == [SMALL.chunk]
+    # The scan's regions are `op.*`, which is the prefix every earlier report and
+    # every declared kernel's owner is named under.
+    assert trace.prefixes == ["op"]
     inputs = trace.inputs[0]
     assert isinstance(inputs, OpInputs)
     lead = (SMALL.bsz, SMALL.heads, SMALL.seq)
@@ -304,6 +314,8 @@ def test_the_conv_operator_builds_the_conv_workload_at_the_named_shape(
     # The conv has no chunk. A driver that passed the scan shape's chunk to it
     # would be reading the wrong shape table.
     assert trace.chunks == [None]
+    # Its own prefix, so a report holding both operators separates their regions.
+    assert trace.prefixes == ["conv"]
     assert trace.devices == [torch.device("cuda")]
     inputs = trace.inputs[0]
     assert isinstance(inputs, ConvInputs)

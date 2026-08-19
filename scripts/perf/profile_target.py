@@ -23,37 +23,11 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+from slinoss.perf.arms import op_arm
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.device import require_cuda
 from slinoss.perf.timing import on_device
-from slinoss.perf.workload import (
-    BLOCK,
-    CONV,
-    MIXER,
-    OPS,
-    SCANPREP,
-    SHAPE_NAMES,
-    block_forward_only,
-    block_shape_by_name,
-    block_step,
-    conv_forward_only,
-    conv_shape_by_name,
-    conv_step,
-    forward_only,
-    make_block_inputs,
-    make_conv_inputs,
-    make_inputs,
-    make_mixer_inputs,
-    make_prep_inputs,
-    mixer_forward_only,
-    mixer_shape_by_name,
-    mixer_step,
-    prep_forward_only,
-    prep_shape_by_name,
-    prep_step,
-    shape_by_name,
-    step,
-)
+from slinoss.perf.workload import OPS, SHAPE_NAMES
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 MODES = ("forward", "step")
@@ -104,42 +78,15 @@ def build_runner(args: argparse.Namespace, device: torch.device) -> Callable[[],
         for the conv, ``prep.*`` for the frontier, ``block.*`` for the block and
         ``mixer.*`` for the fused tail.
     """
-    grads = args.mode == "step"
-    dtype = DTYPES[args.dtype]
-    if args.op == CONV:
-        conv = make_conv_inputs(
-            conv_shape_by_name(args.shape),
-            device,
-            dtype=dtype,
-            requires_grad=grads,
-            d_head=args.d_head or None,
-        )
-        if grads:
-            return conv_step(conv, backend=args.backend)
-        return conv_forward_only(conv, backend=args.backend)
-    if args.op == SCANPREP:
-        prep_shape = prep_shape_by_name(args.shape)
-        prep = make_prep_inputs(prep_shape, device, dtype=dtype, requires_grad=grads)
-        if grads:
-            return prep_step(prep, prep_shape, backend=args.backend)
-        return prep_forward_only(prep, prep_shape, backend=args.backend)
-    if args.op == BLOCK:
-        block_shape = block_shape_by_name(args.shape)
-        block = make_block_inputs(block_shape, device, dtype=dtype, requires_grad=grads)
-        if grads:
-            return block_step(block, block_shape, backend=args.backend)
-        return block_forward_only(block, block_shape, backend=args.backend)
-    if args.op == MIXER:
-        mixer_shape = mixer_shape_by_name(args.shape)
-        mixer = make_mixer_inputs(mixer_shape, device, dtype=dtype, requires_grad=grads)
-        if grads:
-            return mixer_step(mixer, mixer_shape, backend=args.backend)
-        return mixer_forward_only(mixer, mixer_shape, backend=args.backend)
-    shape = shape_by_name(args.shape)
-    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
-    if grads:
-        return step(inputs, shape.chunk, backend=args.backend)
-    return forward_only(inputs, shape.chunk, backend=args.backend)
+    arm = op_arm(
+        args.op,
+        args.shape,
+        device,
+        dtype=DTYPES[args.dtype],
+        grads=args.mode == "step",
+        d_head=args.d_head or None,
+    )
+    return arm.run(args.backend, arm.prefix)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

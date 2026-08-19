@@ -29,7 +29,8 @@ from scripts.bench.bench_op import (
     main,
     parse_args,
 )
-from slinoss.perf import timing
+from slinoss.perf import arms, timing
+from slinoss.perf.arms import op_arm
 from slinoss.perf.ceiling import Ceilings, DramCeiling, TensorCeiling
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.dispersion import paired
@@ -46,7 +47,7 @@ from slinoss.perf.units import (
     Spread,
     TFlopsPerSecond,
 )
-from slinoss.perf.workload import OpInputs, OpShape, shape_by_name
+from slinoss.perf.workload import OPS, OpInputs, OpShape
 
 pytestmark = [
     pytest.mark.cuda,
@@ -55,8 +56,9 @@ pytestmark = [
 
 CUDA = torch.device("cuda")
 
-TINY = shape_by_name("tiny")
-"""The cheapest standard shape: ``B=1 H=1 T=256 P=16 N=16 L=64``."""
+TINY = "tiny"
+"""The cheapest standard shape, ``B=1 H=1 T=256 P=16 N=16 L=64`` for the scan. Every
+family's table holds the name, at the same token count."""
 
 PAIRS = 8
 """Pairs behind a pinned verdict. Eight reaches nominal coverage, so the verdict
@@ -187,13 +189,16 @@ def _pin_ceilings(monkeypatch: pytest.MonkeyPatch) -> list[torch.device]:
 
 
 def _count_input_sets(monkeypatch: pytest.MonkeyPatch) -> list[OpInputs]:
-    """Record every input set the driver builds.
+    """Record every scan input set the driver builds.
+
+    Patched where the arm is allocated, since that is the one place a driver
+    reaches an operator's inputs.
 
     Returns:
         The input sets, appended in construction order.
     """
     built: list[OpInputs] = []
-    real = bench_op.make_inputs
+    real = arms.make_inputs
 
     def patched(
         shape: OpShape,
@@ -207,7 +212,7 @@ def _count_input_sets(monkeypatch: pytest.MonkeyPatch) -> list[OpInputs]:
         built.append(got)
         return got
 
-    monkeypatch.setattr(bench_op, "make_inputs", patched)
+    monkeypatch.setattr(arms, "make_inputs", patched)
     return built
 
 
@@ -271,6 +276,7 @@ def _pin_comparison(
 
 def test_parse_args_defaults_to_every_shape_in_both_modes_with_no_comparison() -> None:
     args = parse_args([])
+    assert args.op == "so3ssd"
     # None, not a list: main expands it to every standard shape.
     assert args.shape is None
     assert args.mode == "both"
@@ -297,6 +303,7 @@ def test_parse_args_rejects_a_value_outside_its_table() -> None:
     # argparse exits 2 rather than raising, so a typo in a sweep script stops the
     # run instead of silently benching the default configuration.
     for flag, value in (
+        ("--op", "attention"),
         ("--shape", "huge"),
         ("--mode", "backward"),
         ("--dtype", "fp8"),
@@ -312,16 +319,22 @@ def test_parse_args_rejects_a_value_outside_its_table() -> None:
 
 
 def test_arm_labels_name_each_backend_and_separate_the_two_null_arms() -> None:
-    assert arm_labels("reference", "cute") == ("so3ssd-reference", "so3ssd-cute")
+    assert arm_labels("so3ssd", "reference", "cute") == (
+        "so3ssd-reference",
+        "so3ssd-cute",
+    )
+    # The operator leads, so a report holding two operators' regions still says
+    # which arm each row came from.
+    assert arm_labels("conv", "reference", "cuda") == ("conv-reference", "conv-cuda")
     # An unselected backend is the fastest registered one, named auto.
-    assert arm_labels(None, "cute") == ("so3ssd-auto", "so3ssd-cute")
+    assert arm_labels("so3ssd", None, "cute") == ("so3ssd-auto", "so3ssd-cute")
     # measure_paired refuses one label for both arms, and the null test still has
     # to be runnable.
-    assert arm_labels("reference", "reference") == (
+    assert arm_labels("so3ssd", "reference", "reference") == (
         "so3ssd-reference-a",
         "so3ssd-reference-b",
     )
-    assert arm_labels(None, None) == ("so3ssd-auto-a", "so3ssd-auto-b")
+    assert arm_labels("so3ssd", None, None) == ("so3ssd-auto-a", "so3ssd-auto-b")
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +386,39 @@ def test_bench_measures_a_step_and_probes_what_autograd_holds(
     # The probe runs under a recorder, so no save reads as unattributed.
     assert [r.label for r in report.saved.regions] == ["op.forward"]
     assert report.notes[1] == "mode=step dtype=fp32 backend=auto"
+
+
+def test_bench_reaches_every_operator_under_its_own_region_prefix(
+    tmp_path: Path, pinned_device: DeviceInfo
+) -> None:
+    """Every operator the profiler drivers dispatch on is also benchable.
+
+    An operator only the profiler can reach is measured once under a profiler and
+    never in the cheap loop. Forward only, and one shape: the axis under test is
+    the dispatch, and the step arms are the expensive ones.
+    """
+    prefixes = {
+        "so3ssd": "op",
+        "conv": "conv",
+        "scanprep": "prep",
+        "block": "block",
+        "mixer": "mixer",
+    }
+    assert sorted(prefixes) == sorted(OPS)
+    for op in OPS:
+        args = parse_args(_argv(tmp_path / "bench", "--op", op))
+        report, rate = bench(TINY, "forward", args, CUDA, None)
+        assert report.title == f"bench: {op} tiny forward"
+        assert rate.label == f"{op} tiny forward"
+        # One name per family table, and every family sees the same tokens at it.
+        assert rate.token_count == 256
+        assert report.notes[0].startswith("tiny: B=1 ")
+        assert report.budget is not None
+        assert f"{prefixes[op]}.forward" in report.budget.labels()
+    # Argparse refuses an unknown name on the command line. The raise is what a
+    # caller that is not argparse gets.
+    with pytest.raises(ValueError, match="unknown op 'attention'"):
+        op_arm("attention", TINY, CUDA, dtype=torch.float32, grads=False)
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +524,7 @@ def test_main_benches_every_standard_shape_when_none_is_named(
 ) -> None:
     # The standard set is replaced rather than run: 'long' is B=2 H=12 T=8192 on
     # the reference, and the driver's shape default is what is under test.
-    monkeypatch.setattr(bench_op, "SHAPES", (TINY,))
+    monkeypatch.setattr(bench_op, "SHAPE_NAMES", (TINY,))
     code = main(_argv(tmp_path / "bench", "--mode", "forward", "--no-ceilings"))
     assert code == 0
     rows = capsys.readouterr().out.splitlines()[3:]
