@@ -4,9 +4,17 @@ Checked against properties that pin each map uniquely rather than against a
 faster path: the reference is the authority. The fused add-and-norm is checked
 against the unfused pair it replaces, which is the one comparison that can catch
 a fusion that changed the answer.
+
+Each pullback is checked by ``gradcheck`` against a finite difference of the
+forward above it. That needs the pair presented as one op, so each one gets an
+:class:`torch.autograd.Function` whose backward calls it; without the wrapper
+autograd would differentiate the forward again and the pullback under test would
+never run.
 """
 
 import math
+from collections.abc import Callable
+from typing import Any, cast
 
 import pytest
 import torch
@@ -15,8 +23,11 @@ from torch.nn.functional import silu
 
 from slinoss.ops.block import (
     NormResidual,
+    rmsnorm_bwd_ref,
     rmsnorm_ref,
+    rmsnorm_residual_bwd_ref,
     rmsnorm_residual_ref,
+    swiglu_bwd_ref,
     swiglu_ref,
 )
 
@@ -208,6 +219,178 @@ def test_gradcheck_swiglu() -> None:
     assert gradcheck(swiglu_ref, (gate, up))
 
 
+class _RMSNorm(torch.autograd.Function):
+    """:func:`rmsnorm_ref` with :func:`rmsnorm_bwd_ref` as its backward."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, x: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        ctx.save_for_backward(x, weight)
+        ctx.eps = eps
+        return rmsnorm_ref(x, weight, eps=eps)
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any, dout: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        x, weight = ctx.saved_tensors
+        grads = rmsnorm_bwd_ref(dout, x, weight, eps=ctx.eps)
+        return grads.dx, grads.dweight, None
+
+
+class _NormResidual(torch.autograd.Function):
+    """:func:`rmsnorm_residual_ref` with :func:`rmsnorm_residual_bwd_ref`.
+
+    Materialized gradients are off, so an output that carries no cotangent hands
+    the pullback None rather than a zero tensor. That is the case the None policy
+    exists for, and gradcheck differentiates one output at a time, so it runs on
+    every call.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        residual: torch.Tensor | None,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(x, residual, weight)
+        ctx.eps = eps
+        out = rmsnorm_residual_ref(x, residual, weight, eps=eps)
+        return out.normed, out.residual
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any, dnormed: torch.Tensor | None, dresidual: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
+        x, residual, weight = ctx.saved_tensors
+        grads = rmsnorm_residual_bwd_ref(
+            dnormed, dresidual, x, residual, weight, eps=ctx.eps
+        )
+        return grads.dx, grads.dresidual, grads.dweight, None
+
+
+class _SwiGLU(torch.autograd.Function):
+    """:func:`swiglu_ref` with :func:`swiglu_bwd_ref` as its backward."""
+
+    @staticmethod
+    def forward(ctx: Any, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(gate, up)
+        return swiglu_ref(gate, up)
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any, dout: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        gate, up = ctx.saved_tensors
+        grads = swiglu_bwd_ref(dout, gate, up)
+        return grads.dgate, grads.dup
+
+
+# `Function.apply` is untyped, so each wrapper is cast at the one call site rather
+# than at four, which is the pattern the interface modules use.
+def _norm_pair(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return cast("torch.Tensor", _RMSNorm.apply(x, weight, EPS))
+
+
+def _residual_pair(
+    x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = _NormResidual.apply(x, residual, weight, EPS)
+    return cast("tuple[torch.Tensor, torch.Tensor]", out)
+
+
+def _swiglu_pair(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    return cast("torch.Tensor", _SwiGLU.apply(gate, up))
+
+
+def test_gradcheck_rmsnorm_bwd_ref() -> None:
+    """The pullback against a finite difference of the forward, in float64."""
+    x = _rnd((3, 8)).requires_grad_(True)
+    weight = _rnd((8,), seed=1).requires_grad_(True)
+    assert gradcheck(_norm_pair, (x, weight))
+
+
+def test_gradcheck_rmsnorm_residual_bwd_ref() -> None:
+    """Both outputs and all three inputs, with the residual present."""
+    x = _rnd((3, 8)).requires_grad_(True)
+    residual = _rnd((3, 8), seed=1).requires_grad_(True)
+    weight = _rnd((8,), seed=2).requires_grad_(True)
+    assert gradcheck(_residual_pair, (x, residual, weight))
+
+
+def test_gradcheck_rmsnorm_residual_bwd_ref_none() -> None:
+    """The first block of a stack: no incoming stream, so no ``dresidual``."""
+    x = _rnd((3, 8)).requires_grad_(True)
+    weight = _rnd((8,), seed=1).requires_grad_(True)
+    assert gradcheck(lambda a, w: _residual_pair(a, None, w), (x, weight))
+
+
+def test_gradcheck_swiglu_bwd_ref() -> None:
+    """Both operand gradients against a finite difference of the forward."""
+    gate = _rnd((3, 8)).requires_grad_(True)
+    up = _rnd((3, 8), seed=1).requires_grad_(True)
+    assert gradcheck(_swiglu_pair, (gate, up))
+
+
+def test_rmsnorm_residual_bwd_ref_with_no_cotangent_returns_nothing() -> None:
+    """Neither output differentiated is no gradient, not a zero gradient.
+
+    A zero tensor here would be indistinguishable from a real gradient that
+    happened to vanish, and it would cost a full-size allocation per absent
+    cotangent.
+    """
+    grads = rmsnorm_residual_bwd_ref(
+        None, None, _rnd((3, 8)), _rnd((3, 8), seed=1), _rnd((8,), seed=2), eps=EPS
+    )
+    assert grads.dx is None
+    assert grads.dresidual is None
+    assert grads.dweight is None
+
+
+def test_rmsnorm_residual_bwd_ref_residual_only_leaves_the_weight_out() -> None:
+    """The weight does not reach the residual output, so its gradient is None.
+
+    The residual output is the plain sum, so its pullback is the identity on both
+    summands and the comparison needs no tolerance.
+    """
+    x = _rnd((3, 8))
+    residual = _rnd((3, 8), seed=1)
+    dresidual = _rnd((3, 8), seed=3)
+    grads = rmsnorm_residual_bwd_ref(
+        None, dresidual, x, residual, _rnd((8,), seed=2), eps=EPS
+    )
+    assert grads.dweight is None
+    assert grads.dx is not None and torch.equal(grads.dx, dresidual)
+    assert grads.dresidual is not None and torch.equal(grads.dresidual, dresidual)
+
+
+def test_rmsnorm_residual_bwd_ref_normed_only_is_the_unfused_pullback() -> None:
+    """With only the normed cotangent the fusion is the plain norm of the sum.
+
+    Both input gradients are then the same ``ds``, which is what the fused kernel
+    exploits, and the weight gradient is the unfused one.
+    """
+    x = _rnd((3, 8))
+    residual = _rnd((3, 8), seed=1)
+    weight = _rnd((8,), seed=2)
+    dnormed = _rnd((3, 8), seed=3)
+
+    grads = rmsnorm_residual_bwd_ref(dnormed, None, x, residual, weight, eps=EPS)
+    want = rmsnorm_bwd_ref(dnormed, x + residual, weight, eps=EPS)
+
+    assert grads.dx is not None and torch.allclose(
+        grads.dx, want.dx, rtol=0.0, atol=1e-15
+    )
+    assert grads.dresidual is not None and torch.equal(grads.dresidual, grads.dx)
+    assert grads.dweight is not None and torch.allclose(
+        grads.dweight, want.dweight, rtol=0.0, atol=1e-15
+    )
+
+
 def test_rejects_scalar_input() -> None:
     """A norm needs an axis to reduce over."""
     with pytest.raises(ValueError, match="at least one axis"):
@@ -268,3 +451,63 @@ def test_rejects_unsupported_swiglu_dtype(name: str) -> None:
     tensors[name] = tensors[name].to(torch.int32)
     with pytest.raises(TypeError, match=name):
         swiglu_ref(tensors["gate"], tensors["up"])
+
+
+@pytest.mark.parametrize(
+    ("call", "match"),
+    [
+        pytest.param(
+            lambda: rmsnorm_bwd_ref(
+                _rnd((2, 7), seed=3), _rnd((2, 8)), _rnd((8,), seed=1), eps=EPS
+            ),
+            r"dout must be \(2, 8\)",
+            id="norm-dout",
+        ),
+        pytest.param(
+            lambda: rmsnorm_residual_bwd_ref(
+                _rnd((2, 7), seed=3),
+                None,
+                _rnd((2, 8)),
+                _rnd((2, 8), seed=1),
+                _rnd((8,), seed=2),
+                eps=EPS,
+            ),
+            r"dnormed must be \(2, 8\)",
+            id="residual-dnormed",
+        ),
+        pytest.param(
+            lambda: rmsnorm_residual_bwd_ref(
+                None,
+                _rnd((2, 7), seed=3),
+                _rnd((2, 8)),
+                _rnd((2, 8), seed=1),
+                _rnd((8,), seed=2),
+                eps=EPS,
+            ),
+            r"dresidual must be \(2, 8\)",
+            id="residual-dresidual",
+        ),
+        pytest.param(
+            lambda: swiglu_bwd_ref(
+                _rnd((2, 7), seed=3), _rnd((2, 8)), _rnd((2, 8), seed=1)
+            ),
+            r"dout must be \(2, 8\)",
+            id="swiglu-dout",
+        ),
+        pytest.param(
+            lambda: swiglu_bwd_ref(
+                _rnd((2, 8), seed=3), _rnd((2, 8)), _rnd((2, 7), seed=1)
+            ),
+            r"up must be \(2, 8\)",
+            id="swiglu-up",
+        ),
+    ],
+)
+def test_rejects_mismatched_cotangent(call: Callable[[], object], match: str) -> None:
+    """A cotangent is elementwise against the output it belongs to.
+
+    A pullback that broadcast instead would return a gradient of the wrong shape
+    and the caller would only find out at the optimizer.
+    """
+    with pytest.raises(ValueError, match=match):
+        call()
