@@ -53,6 +53,9 @@ def _raws(dtype: torch.dtype = torch.float64) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
+# Both wide dtypes: float32 is what the pinned transition ships in and float64 is
+# the oracle width. No kernel clamps ``ls``, so the bound is asserted in each
+# format the map is evaluated in rather than in one and assumed in the other.
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_logscale_is_non_positive(dtype: torch.dtype) -> None:
     ls = bounded_logscale(_raws(dtype))
@@ -60,24 +63,20 @@ def test_logscale_is_non_positive(dtype: torch.dtype) -> None:
     assert bool(torch.isfinite(ls).all())
 
 
-def test_logscale_decay_lies_in_the_unit_interval() -> None:
-    # I1 admits underflow: at raw = 1e4 the decay is exp(-2e4), which is zero in
-    # every float format. Zero decay is the correct limit, so the closed interval
-    # is the invariant and the open one is asserted where it holds.
-    decay = torch.exp(2.0 * bounded_logscale(_raws()))
-    assert bool((decay >= 0.0).all())
-    assert bool((decay <= 1.0).all())
+def test_logscale_is_strictly_negative_with_a_positive_decay() -> None:
+    """Both strict claims, on the moderate range, in both wide dtypes.
 
-
-def test_logscale_decay_is_strictly_positive_for_moderate_raws() -> None:
-    decay = torch.exp(2.0 * bounded_logscale(torch.linspace(-40.0, 40.0, 201)))
-    assert bool((decay > 0.0).all())
-    assert bool((decay <= 1.0).all())
-
-
-def test_logscale_is_strictly_negative_for_moderate_raws() -> None:
-    ls = bounded_logscale(torch.linspace(-30.0, 30.0, 101, dtype=torch.float64))
-    assert bool((ls < 0.0).all())
+    I1 admits underflow: at raw = 1e4 the decay is exp(-2e4), which is zero in
+    every float format, and zero decay is the correct limit. So the closed interval
+    is the invariant, asserted over the extremes above, and the open one holds only
+    while softplus is nonzero.
+    """
+    for dtype in (torch.float32, torch.float64):
+        ls = bounded_logscale(torch.linspace(-40.0, 40.0, 201, dtype=dtype))
+        decay = torch.exp(2.0 * ls)
+        assert bool((ls < 0.0).all())
+        assert bool((decay > 0.0).all())
+        assert bool((decay <= 1.0).all())
 
 
 def test_logscale_matches_the_closed_form() -> None:
@@ -114,8 +113,28 @@ def _ball_bound(dtype: torch.dtype) -> float:
     return W_MAX * (1.0 + ROUNDING_ULP * torch.finfo(dtype).eps)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("scale", [0.0, 1e-8, 1.0, 1e4, 1e8, 1e16])
+# (dtype, scale). The map is one branchless expression, so the raw magnitude
+# selects a regime of the ratio ``|raw| / sqrt(1 + |raw|^2)`` rather than a path.
+# One case per regime, crossed with dtype because the admissible excess over the
+# radius is dtype-scaled and the two figures above were measured separately:
+#
+# - ``|raw| = 0``, the boundary where the ratio is 0/1 and a normalize-by-``|raw|``
+#   map would divide by zero. float32 only; float64 at the origin is pinned to an
+#   exact zero by ``test_rotvec_at_zero_is_zero_exactly``;
+# - a generic ``|raw|``, where the ratio is strictly inside ``(0,1)`` in both
+#   formats and the norm is strictly inside the ball;
+# - ``|raw|`` past the reciprocal of the machine epsilon, where the ratio rounds to
+#   one, the radius is attained, and the two roundings can put the norm outside it.
+BALL_CASES = [
+    pytest.param(torch.float32, 0.0, id="f32-zero"),
+    pytest.param(torch.float32, 1.0, id="f32-generic"),
+    pytest.param(torch.float64, 1.0, id="f64-generic"),
+    pytest.param(torch.float32, 1e16, id="f32-saturated"),
+    pytest.param(torch.float64, 1e16, id="f64-saturated"),
+]
+
+
+@pytest.mark.parametrize(("dtype", "scale"), BALL_CASES)
 def test_rotvec_stays_inside_the_ball(dtype: torch.dtype, scale: float) -> None:
     gen = torch.Generator().manual_seed(2)
     raw = torch.randn(256, 3, generator=gen, dtype=torch.float64).to(dtype) * scale
@@ -146,6 +165,11 @@ def test_rotvec_survives_an_overflowing_raw_norm() -> None:
 
 
 def test_rotvec_matches_the_closed_form() -> None:
+    """Magnitude and direction both, against the closed form.
+
+    The reference is a positive scalar times ``raw``, so agreement pins the
+    direction too: a per-component ratio in place of the shared norm fails here.
+    """
     gen = torch.Generator().manual_seed(4)
     raw = torch.randn(128, 3, generator=gen, dtype=torch.float64) * 7.0
     want = W_MAX * raw / torch.sqrt(1.0 + raw.pow(2).sum(-1, keepdim=True))
@@ -155,15 +179,6 @@ def test_rotvec_matches_the_closed_form() -> None:
 def test_rotvec_at_zero_is_zero_exactly() -> None:
     raw = torch.zeros(4, 3, dtype=torch.float64)
     assert torch.equal(bounded_rotvec(raw, W_MAX), raw)
-
-
-def test_rotvec_preserves_direction() -> None:
-    gen = torch.Generator().manual_seed(6)
-    raw = torch.randn(64, 3, generator=gen, dtype=torch.float64) * 3.0
-    w = bounded_rotvec(raw, W_MAX)
-    cross = torch.linalg.cross(raw, w)
-    assert float(cross.abs().max()) < 1e-14
-    assert bool(((raw * w).sum(-1) > 0.0).all())
 
 
 def test_rotvec_is_monotone_in_the_raw_norm() -> None:
@@ -317,20 +332,18 @@ def test_frontier_shapes_dtypes_and_contiguity() -> None:
 
 
 def test_frontier_applies_the_bounded_maps_to_the_biased_row() -> None:
-    """The maps are the ones asserted above, applied after the bias. A frontier
-    that biased after the map, or dropped the bias, would still have every shape
-    and dtype right."""
+    """The maps are the ones asserted above, applied after the bias.
+
+    A frontier that biased after the map, or dropped the bias, would still have
+    every shape and dtype right. The tap columns and the hard zero in lane 3 are
+    one packing contract, so they are asserted together.
+    """
     params, bc, pb = _operands(bias=1.0, seed=1)
     rows = _head_major(params, pb, heads=3)
     out = _apply(params, bc, pb)
     assert torch.equal(out.trans[..., :3], bounded_rotvec(rows[..., 0:3], W_MAX))
     assert torch.equal(out.trans[..., 3], bounded_logscale(rows[..., 3]))
     assert torch.equal(out.K[..., :3], rows[..., 4:].unflatten(-1, (2, 3)))
-
-
-def test_frontier_lane_three_is_a_hard_zero() -> None:
-    params, bc, pb = _operands(bias=1.0)
-    out = _apply(params, bc, pb)
     assert torch.equal(out.K[..., 3], torch.zeros_like(out.K[..., 3]))
 
 
@@ -361,7 +374,11 @@ def test_frontier_reads_a_projection_slice_without_repacking_it() -> None:
         assert torch.equal(got, want)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+# ``pinned_dtype`` reads float64 or nothing, so the two 16-bit formats take one
+# path. bfloat16 is the case where the pinned math is an upcast of the activation
+# dtype; float32 is the case where it is the activation dtype itself and no cast
+# happens. float64, the third branch, is the test below.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_frontier_pins_the_transition_to_float32(dtype: torch.dtype) -> None:
     params, bc, pb = _operands(dtype=dtype)
     out = _apply(params, bc, pb)

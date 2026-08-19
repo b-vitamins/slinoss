@@ -68,7 +68,12 @@ def _rand(*shape: int, seed: int, scale: float = 1.0) -> Tensor:
     return scale * torch.randn(*shape, generator=gen, dtype=torch.float64)
 
 
-@pytest.mark.parametrize("scale", [0.0, 1e-8, 1.0, 3.0])
+# ``quat_exp`` and its adjoint are Horner polynomials in ``s = |w|^2`` with no
+# branch, so the scale selects a regime and never a path. Two: ``w = 0`` exactly,
+# the boundary where the axis normal form has no derivative and every odd term
+# vanishes, and a draw whose ``|w|`` spans the ball radius and past it, where the
+# high-order terms carry the value.
+@pytest.mark.parametrize("scale", [0.0, 3.0])
 def test_quat_exp_vjp_matches_autograd(scale: float) -> None:
     """Includes ``w = 0`` exactly, where the axis normal form has no derivative."""
     w = _rand(2, 3, 5, 3, seed=3, scale=scale).requires_grad_(True)
@@ -79,7 +84,11 @@ def test_quat_exp_vjp_matches_autograd(scale: float) -> None:
     assert_max_rel(got, want, 1e-14, f"quat_exp_vjp at |w| ~ {scale}")
 
 
-@pytest.mark.parametrize("length", [1, 2, 7, 16])
+# The forward is Hillis-Steele over ``ceil(log2(L))`` rounds, so ``L`` sets the
+# round count the closed form has to invert: no round at all at 1, three rounds at 7
+# where the last shift exceeds half the axis, and four rounds at a power of two
+# where every shift divides it.
+@pytest.mark.parametrize("length", [1, 7, 16])
 def test_quat_prefix_scan_vjp_matches_autograd(length: int) -> None:
     """The closed form replaces a sequential quaternion recurrence with a reverse
     cumulative sum, so it is checked at a power of two and away from one.
@@ -106,7 +115,10 @@ def test_rot_matrix_vjp_matches_autograd() -> None:
     assert_max_rel(got, want, 1e-14, "rot_matrix_vjp")
 
 
-@pytest.mark.parametrize("scale", [0.0, 1.0, 3.0])
+# ``kr*I + g*w w^T + h*skew(w)`` is polynomial in ``w`` as well, so the same two
+# regimes: ``w = 0``, where only the identity term survives and both ``w``-adjoints
+# lose their leading factor, and a draw whose ``|w|`` spans the ball.
+@pytest.mark.parametrize("scale", [0.0, 3.0])
 def test_tap_matrix_vjp_matches_autograd(scale: float) -> None:
     tap = _rand(2, 3, 5, 3, seed=19).requires_grad_(True)
     w = _rand(2, 3, 5, 3, seed=23, scale=scale).requires_grad_(True)
@@ -182,9 +194,21 @@ def _compare(
         assert_max_rel(a, b, BWD_REL, f"{name} {label}")
 
 
+# (T, L). One case per distinct chunk geometry:
+#
+# - T = 1, the smallest legal sequence, a single chunk that is pad but for one
+#   token;
+# - T = L, a single chunk with no pad at all, where the intra-chunk terms carry the
+#   whole output and the inter-chunk recurrence has one step;
+# - a tail of one token over three chunks, the largest pad the recurrence has to
+#   keep out of the carried state;
+# - a ragged tail at L = 32, the only arm whose chunk-local prefix is longer than
+#   16;
+# - four chunks with no pad, so the recurrence runs past the two-chunk case;
+# - L past T at T > 1, the whole sequence as one padded chunk.
 @pytest.mark.parametrize(
     ("seqlen", "chunk"),
-    [(1, 16), (8, 16), (16, 16), (17, 16), (33, 16), (40, 32), (64, 16), (48, 64)],
+    [(1, 16), (16, 16), (33, 16), (40, 32), (64, 16), (48, 64)],
 )
 def test_analytic_matches_autograd_oracle(seqlen: int, chunk: int) -> None:
     """Shape sweep: ragged tail, single chunk, three or more chunks, and a chunk
@@ -369,10 +393,13 @@ def _rebuild_starts(
     return torch.stack(starts, dim=2), state
 
 
-@pytest.mark.parametrize(("seqlen", "chunk"), [(16, 16), (48, 16), (40, 16)])
+# (T, L). One chunk with an empty pad, and three chunks with a ragged tail: the
+# recurrence's trip count and the pad are the only two things this stage reads off
+# the shape.
+@pytest.mark.parametrize(("seqlen", "chunk"), [(16, 16), (40, 16)])
 def test_reverse_recurrence_cotangents_match_autograd(seqlen: int, chunk: int) -> None:
-    """The four outputs of the reverse chunk recurrence, at one chunk, three, and
-    a ragged tail.
+    """The four outputs of the reverse chunk recurrence, at one chunk and at three
+    with a ragged tail.
 
     Autograd runs through the forward recurrence rebuilt from the forward's own
     operands, so the standard is the primal and not a second derivation of its

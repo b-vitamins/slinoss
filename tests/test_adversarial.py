@@ -15,6 +15,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from slinoss.config import MAX_CHUNK, MIN_CHUNK
 from slinoss.ops.so3ssd import SO3SSDResult, so3ssd_ref, so3ssm
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs, max_err
 
@@ -50,7 +51,18 @@ def _check_parity(inp: ScanInputs, chunk: int, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ls_bias", [0.0, 5.0, 20.0, 50.0, 400.0])
+# One case per regime of the chunk-local decay ``exp(2*(lp_t - lp_s))`` at L = 16:
+#
+# - 5.0, where the prefix reaches -80 and the decay spans seventy decades without
+#   reaching zero, so underflow is nearest to meeting overflow;
+# - 20.0, where the distant pairs underflow to zero and the near-diagonal ones do
+#   not, which is the only arm that mixes the two inside one chunk;
+# - 400.0, where every off-diagonal decay is a hard zero and the prefix itself
+#   reaches -19200.
+#
+# The unbiased case is the file's control and runs as
+# ``test_rotation_magnitude_generic``.
+@pytest.mark.parametrize("ls_bias", [5.0, 20.0, 400.0])
 def test_saturated_decay(ls_bias: float) -> None:
     """``exp(2*(lp_t - lp_s))`` underflows to zero and stays there. Forming the
     difference before the exponential is what keeps underflow from meeting
@@ -59,7 +71,10 @@ def test_saturated_decay(ls_bias: float) -> None:
     _check_parity(inp, 16, f"decay bias {ls_bias}")
 
 
-@pytest.mark.parametrize("ls_bias", [-20.0, -50.0, -400.0])
+# -20.0 leaves ``ls`` nonzero, so the prefix still shrinks. -50.0 is the boundary of
+# the predicate the body branches on, where softplus has underflowed far enough that
+# the decay is exactly one; a more negative bias is interior to it.
+@pytest.mark.parametrize("ls_bias", [-20.0, -50.0])
 def test_vanishing_decay(ls_bias: float) -> None:
     """``softplus`` underflows toward zero, so the transition approaches a pure
     rotation and the prefix stops shrinking. ``softplus(x) <= exp(x)`` bounds the
@@ -88,18 +103,34 @@ def test_decay_factors_stay_in_the_unit_interval() -> None:
 
 
 def test_zero_rotation_exactly() -> None:
+    """``w = 0`` is the boundary of the small-``|w|`` regime.
+
+    The quaternion series sits on its constant term and every odd term vanishes. A
+    nonzero but tiny ``w_scale`` is interior to this: it moves the series by less
+    than the parity tolerance.
+    """
     inp = make_inputs(seqlen=40, seed=79, w_scale=0.0, **TINY)
     assert float(inp.trans[..., :3].abs().max()) == 0.0
     _check_parity(inp, 16, "w = 0")
 
 
-@pytest.mark.parametrize("w_scale", [1e-14, 1e-7, 1.0, 1e7, 1e14])
-def test_rotation_magnitude_sweep(w_scale: float) -> None:
-    inp = make_inputs(seqlen=40, seed=83, w_scale=w_scale, **TINY)
-    _check_parity(inp, 16, f"w_scale {w_scale}")
+def test_rotation_magnitude_generic() -> None:
+    """Unsaturated ``|w|`` at no log-scale bias, the control for every extreme."""
+    inp = make_inputs(seqlen=40, seed=83, w_scale=1.0, **TINY)
+    _check_parity(inp, 16, "w_scale 1.0")
 
 
-@pytest.mark.parametrize("w_max", [1e-6, 0.5, 3.0, 3.14, 3.1415926])
+# One case per distinct behaviour of the quaternion series at the bound, which
+# ``w_scale`` saturates so that ``|w| == w_max`` at every token:
+#
+# - 1e-6, a near-identity rotation, where the vector part is the only departure
+#   from the constant term;
+# - 3.0, the shipped bound;
+# - 3.1415926, five parts in 1e8 below pi, where the scalar part of the quaternion
+#   cancels to zero.
+#
+# Every arm asserts the norm below pi, which is what sizes the consumer.
+@pytest.mark.parametrize("w_max", [1e-6, 3.0, 3.1415926])
 def test_rotation_at_the_bound(w_max: float) -> None:
     """``w_scale`` saturates the parameter map, so ``|w|`` sits at ``w_max`` to
     within the rounding of the final multiply. Near pi the scalar part of the
@@ -110,12 +141,8 @@ def test_rotation_at_the_bound(w_max: float) -> None:
     slack = 3.0 * torch.finfo(torch.float64).eps
     assert float(norm.min()) == pytest.approx(w_max, rel=slack)
     assert float(norm.max()) <= w_max * (1.0 + slack)
+    assert float(norm.max()) < math.pi
     _check_parity(inp, 16, f"w_max {w_max}")
-
-
-def test_rotation_bound_is_below_pi() -> None:
-    inp = make_inputs(seqlen=8, seed=97, w_scale=1e12, w_max=3.1415926, **TINY)
-    assert float(inp.trans[..., :3].norm(dim=-1).max()) < torch.pi
 
 
 # ---------------------------------------------------------------------------
@@ -123,14 +150,16 @@ def test_rotation_bound_is_below_pi() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("seqlen", "chunk"), [(40, 16), (33, 16), (20, 32), (7, 16)])
+# (T, L). Both are ragged by construction, which is the premise: T = 33 leaves one
+# real token in the last of three chunks, the largest pad the tail can carry, and
+# T = 20 at L = 32 is a single chunk shorter than L.
+@pytest.mark.parametrize(("seqlen", "chunk"), [(33, 16), (20, 32)])
 def test_zero_padding_is_a_no_op(seqlen: int, chunk: int) -> None:
     """A padded token has ``w = 0`` and ``ls = 0``, so its transition is the
     identity, and zero taps kill its forcing. Padding to a whole number of
     chunks by hand must reproduce the ragged call bit for bit."""
     inp = make_inputs(seqlen=seqlen, seed=101, **TINY)
     tail = (-seqlen) % chunk
-    assert tail > 0
 
     def padded(t: Tensor) -> Tensor:
         shape = (*t.shape[:2], tail, *t.shape[3:])
@@ -149,7 +178,10 @@ def test_zero_padding_is_a_no_op(seqlen: int, chunk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("scale", [1e-30, 1e-8, 1e8, 1e30])
+# The two ends of the range the cube of the scale still fits in float64: ``y``
+# carries ``scale**3``, so 1e-30 puts it at 1e-90 and 1e30 at 1e90. Anything
+# between is interior to both.
+@pytest.mark.parametrize("scale", [1e-30, 1e30])
 def test_operand_magnitude_sweep(scale: float) -> None:
     """The operator is linear in ``U``, ``B``, ``C``, and ``z0``, so a uniform
     rescale must come straight back out."""
@@ -241,8 +273,14 @@ def test_mixed_operand_dtypes() -> None:
         assert out.state.dtype is torch.float32
 
 
-@pytest.mark.parametrize("low", [torch.bfloat16, torch.float16])
-def test_low_precision_survives_saturated_decay(low: torch.dtype) -> None:
+def test_low_precision_survives_saturated_decay() -> None:
+    """float16 only: finiteness is a range claim and float16 has the narrow range.
+
+    bfloat16 carries float32's exponent, so any magnitude that overflows it
+    overflows float16 first, and an underflow is a zero either way. The bfloat16
+    rounding is covered by the envelope above.
+    """
+    low = torch.float16
     inp = make_inputs(seqlen=64, seed=127, ls_bias=30.0, **TINY)
     cast = _downcast(inp, torch.float32, low)
     _finite(so3ssd_ref(*cast.args(), 16, **cast.kw()), f"{low} saturated")
@@ -254,12 +292,16 @@ def test_low_precision_survives_saturated_decay(low: torch.dtype) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("chunk", [16, 32, 64, 128, 256])
+# The ends of the legal chunk range, written against the constants so both stay
+# covered if either is retuned. At T = 1 the chunk length is the pad length and
+# nothing else, so the arms between the ends select nothing.
+@pytest.mark.parametrize("chunk", [MIN_CHUNK, MAX_CHUNK])
 def test_smallest_legal_shape(chunk: int) -> None:
     inp = make_inputs(bsz=1, heads=1, seqlen=1, rows=16, lanes=16, seed=131)
     _check_parity(inp, chunk, f"minimum at L={chunk}")
 
 
 def test_chunk_larger_than_the_sequence() -> None:
+    """A chunk past the legal maximum, over a sequence of more than one token."""
     inp = make_inputs(seqlen=5, seed=137, **TINY)
     _check_parity(inp, 256, "chunk beyond T")
