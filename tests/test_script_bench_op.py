@@ -286,6 +286,7 @@ def test_parse_args_defaults_to_every_shape_in_both_modes_with_no_comparison() -
     assert args.device == "cuda"
     assert args.backend is None
     assert args.against is None
+    assert args.d_head == 0
     assert args.out == Path("out/bench-op")
     assert args.no_ceilings is False
     # --shape appends, so a repeated flag is a list in command-line order.
@@ -419,6 +420,25 @@ def test_bench_reaches_every_operator_under_its_own_region_prefix(
     # caller that is not argparse gets.
     with pytest.raises(ValueError, match="unknown op 'attention'"):
         op_arm("attention", TINY, CUDA, dtype=torch.float32, grads=False)
+
+
+def test_the_conv_output_layout_reaches_the_arm_and_the_report(
+    tmp_path: Path, pinned_device: DeviceInfo
+) -> None:
+    """A head-major conv is a different measurement, so the report names it.
+
+    The layout changes the conv's store pattern and its wall. Two reports that do
+    not say which one ran are not comparable, and the flag is silent on every
+    other operator.
+    """
+    argv = _argv(tmp_path / "bench", "--op", "conv")
+    head_major, _rate = bench(
+        TINY, "forward", parse_args([*argv, "--d-head", "16"]), CUDA, None
+    )
+    assert head_major.notes[1] == "mode=forward dtype=fp32 backend=auto d_head=16"
+    # Zero is token-major, and the note reads as every earlier report's did.
+    token_major, _same = bench(TINY, "forward", parse_args(argv), CUDA, None)
+    assert token_major.notes[1] == "mode=forward dtype=fp32 backend=auto"
 
 
 # ---------------------------------------------------------------------------

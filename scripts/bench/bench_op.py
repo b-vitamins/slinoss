@@ -90,6 +90,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             f"comparison itself. Needs an even --iters."
         ),
     )
+    parser.add_argument(
+        "--d-head",
+        type=int,
+        default=0,
+        help="Rows per head for the conv output layout, or 0 for token-major. "
+        "Nonzero makes the conv write y head-major, which is the layout the scan "
+        "reads U in, and must be a multiple of the scan's head multiple that "
+        "divides the channel count. Ignored by every other operator.",
+    )
     parser.add_argument("--out", type=Path, default=Path("out/bench-op"))
     parser.add_argument(
         "--no-ceilings",
@@ -105,6 +114,7 @@ def _saved(
     device: torch.device,
     dtype: torch.dtype,
     backend: str | None,
+    d_head: int | None,
 ) -> SavedStorages:
     """Probe what autograd holds for one forward at this shape.
 
@@ -115,7 +125,7 @@ def _saved(
     A second arm, because the timed one may carry no gradients. Its inputs are
     allocated after the timing loop, so they are outside the peaks it reports.
     """
-    arm = op_arm(op, shape_name, device, dtype=dtype, grads=True)
+    arm = op_arm(op, shape_name, device, dtype=dtype, grads=True, d_head=d_head)
     probe = SavedTensorProbe()
     with probe:
         measure(
@@ -138,7 +148,11 @@ def bench(
     """Measure one operator at one shape in one mode and build its report."""
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
-    arm = op_arm(args.op, shape_name, device, dtype=dtype, grads=grads)
+    d_head = args.d_head or None
+    # Named in the note only when set, since the layout is a condition of the
+    # measurement and token-major is what every earlier report was taken at.
+    layout = f" d_head={d_head}" if d_head else ""
+    arm = op_arm(args.op, shape_name, device, dtype=dtype, grads=grads, d_head=d_head)
     shape = arm.shape
     runner = arm.run(args.backend, arm.prefix)
     label = f"{args.op} {shape.name} {mode}"
@@ -160,14 +174,14 @@ def bench(
         budget=tree,
         throughput=(rate,),
         ceilings=limits,
-        saved=_saved(args.op, shape.name, device, dtype, args.backend)
+        saved=_saved(args.op, shape.name, device, dtype, args.backend, d_head)
         if grads
         else None,
         peaks=peaks,
         pool=pool_retention(label),
         notes=(
             shape.describe(),
-            f"mode={mode} dtype={args.dtype} backend={args.backend or 'auto'}",
+            f"mode={mode} dtype={args.dtype} backend={args.backend or 'auto'}{layout}",
             f"iters={args.iters} warmup={args.warmup}",
             f"timer={timed.timer} clocks={timed.clocks}",
         ),
@@ -219,9 +233,11 @@ def compare_backends(
     grads = mode == "step"
     against = args.backend if args.against == SAME else args.against
     a_label, b_label = arm_labels(args.op, args.backend, against)
+    d_head = args.d_head or None
+    layout = f" d_head={d_head}" if d_head else ""
     # One input set for both arms. Two would differ in address and in cache
     # residency, and that difference would be attributed to the backend.
-    arm = op_arm(args.op, shape_name, device, dtype=dtype, grads=grads)
+    arm = op_arm(args.op, shape_name, device, dtype=dtype, grads=grads, d_head=d_head)
     shape = arm.shape
     label = f"{args.op} {shape.name} {mode} paired"
     reset_memory_peaks(device)
@@ -252,7 +268,7 @@ def compare_backends(
         pool=pool_retention(label),
         notes=(
             shape.describe(),
-            f"mode={mode} dtype={args.dtype}",
+            f"mode={mode} dtype={args.dtype}{layout}",
             f"arm a={a_label} b={b_label}, one loop, order swapped each iteration",
             f"iters={args.iters} warmup={args.warmup}",
             f"timer={out.timed.timer} clocks={out.timed.clocks}",
