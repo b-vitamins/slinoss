@@ -58,7 +58,7 @@ class OpShape:
         bsz: Batch, ``B``.
         heads: Heads, ``H``.
         seq: Sequence length, ``T``. Not required to be a multiple of ``chunk``.
-        rows: Rows per head, ``P``. Multiple of 8.
+        rows: Rows per head, ``P``. Multiple of 16.
         lanes: Independent 3-vectors, ``N``. Multiple of 16.
         chunk: Chunk length ``L``.
     """
@@ -90,7 +90,7 @@ class OpShape:
 
 
 SHAPES: Final[tuple[OpShape, ...]] = (
-    OpShape("tiny", bsz=1, heads=1, seq=256, rows=8, lanes=16, chunk=64),
+    OpShape("tiny", bsz=1, heads=1, seq=256, rows=16, lanes=16, chunk=64),
     OpShape("standard", bsz=4, heads=12, seq=2048, rows=48, lanes=16, chunk=64),
     OpShape("wide", bsz=4, heads=12, seq=2048, rows=64, lanes=32, chunk=64),
     OpShape("long", bsz=2, heads=12, seq=8192, rows=48, lanes=16, chunk=128),

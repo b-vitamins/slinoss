@@ -31,7 +31,7 @@ pytestmark = [
 ]
 
 SMALL: Final = shape_by_name("tiny")
-"""The smallest standard shape the driver accepts: B=1 H=1 T=256 P=8 N=16 L=64."""
+"""The smallest standard shape the driver accepts: B=1 H=1 T=256 P=16 N=16 L=64."""
 
 
 def argv(*extra: str) -> list[str]:

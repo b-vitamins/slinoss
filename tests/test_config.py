@@ -38,9 +38,9 @@ def test_defaults() -> None:
 
 
 def test_fractional_expand_rounds() -> None:
-    c = cfg(expand=1.5, d_head=8)
+    c = cfg(expand=1.5, d_head=16)
     assert c.d_inner == 96
-    assert c.n_heads == 12
+    assert c.n_heads == 6
 
 
 def test_fractional_ffn_ratio_rounds() -> None:
@@ -60,7 +60,7 @@ def test_legal_state_widths(d_state: int) -> None:
     assert c.n_lanes % LANE_MULTIPLE == 0
 
 
-@pytest.mark.parametrize("chunk_size", [16, 32, 64, 128, 256])
+@pytest.mark.parametrize("chunk_size", [16, 32, 64, 128])
 def test_legal_chunk_sizes(chunk_size: int) -> None:
     assert cfg(chunk_size=chunk_size).chunk_size == chunk_size
 
@@ -79,7 +79,7 @@ def test_legal_chunk_sizes(chunk_size: int) -> None:
         ({"d_head": 0}, "d_head"),
         ({"d_head": 4}, "d_head"),
         ({"d_head": 12}, "d_head"),
-        ({"d_head": 24}, "not divisible by d_head"),
+        ({"d_head": 48}, "not divisible by d_head"),
         ({"chunk_size": MIN_CHUNK - 1}, "chunk_size must lie in"),
         ({"chunk_size": MAX_CHUNK + 1}, "chunk_size must lie in"),
         ({"chunk_size": 48}, "power of two"),
@@ -101,9 +101,9 @@ def test_rejects(overrides: dict[str, Any], match: str) -> None:
         cfg(**overrides)
 
 
-@pytest.mark.parametrize("d_head", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize("d_head", [16, 32, 64, 128])
 def test_heads_tile_the_inner_width(d_head: int) -> None:
-    # d_head is P. The (L,L)x(L,P) GEMM has no padding path, so P must tile.
+    # d_head is P, the N mode of two scan GEMMs. The MMA N tile is 16 wide.
     c = cfg(d_head=d_head)
     assert d_head % HEAD_MULTIPLE == 0
     assert c.n_heads * c.d_head == c.d_inner

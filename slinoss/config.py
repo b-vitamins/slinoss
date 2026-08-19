@@ -16,11 +16,29 @@ LANE_MULTIPLE = 16
 STATE_MULTIPLE = 3 * LANE_MULTIPLE
 """``d_state`` is ``3N`` and therefore a multiple of 48."""
 
-HEAD_MULTIPLE = 8
-"""``P`` is a multiple of this so the ``(L,L)x(L,P)`` GEMM needs no padding."""
+HEAD_MULTIPLE = 16
+"""``P`` is a multiple of this because it is the N mode of two of the scan GEMMs.
+
+The MMA tile's N mode is 16 wide. An N extent that is not a multiple of 16 does
+not compile: the tiled MMA fails IR verification rather than padding. 8 and 24
+were measured to fail, 16, 48, 64, 96 and 128 to pass. The M mode is free; it is
+rounded up inside the kernel and the store is predicated.
+"""
 
 MIN_CHUNK = 16
-MAX_CHUNK = 256
+"""Shortest legal chunk. Below this the chunked form loses to the streaming one:
+the per-chunk transform table costs order 120 FMA per token and amortizes over
+``N`` lanes only from ``N = 16``."""
+
+MAX_CHUNK = 128
+"""Longest legal chunk, set by a measured bank-conflict cliff.
+
+The prefix scan gives one lane a block of ``ceil(L/32)`` consecutive tokens. Up to
+four words the compiler folds that block into one vector load and both shared
+bank-conflict counters read zero; at eight words, which is ``L = 256``, they go
+nonzero. Bank conflicts are a defect rather than a tradeoff, so the shape is
+constrained instead. Nothing is lost: at ``L = 256`` the score tile alone is 256 KB
+of float32 accumulator, four times the register file of a block."""
 
 
 @dataclass(frozen=True)
@@ -31,8 +49,8 @@ class SLinOSSConfig:
         d_model: Residual-stream width.
         d_state: Per-head state width ``3N``. Multiple of 48.
         expand: Inner width multiplier. ``d_inner = round(expand * d_model)``.
-        d_head: Rows per head, ``P``. Multiple of 8.
-        chunk_size: Scan chunk length ``L``. Power of two in [16, 256]; the
+        d_head: Rows per head, ``P``. Multiple of 16.
+        chunk_size: Scan chunk length ``L``. Power of two in [16, 128]; the
             quaternion prefix scan is a shuffle scan over ``log2(L)`` steps.
         d_conv: Causal depthwise convolution width.
         w_max: Bound on the rotation-vector norm. Strictly below pi so

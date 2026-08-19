@@ -62,7 +62,7 @@ def make_inputs(
     bsz: int = 2,
     heads: int = 2,
     seqlen: int = 40,
-    rows: int = 8,
+    rows: int = 16,
     lanes: int = 16,
     dtype: torch.dtype = torch.float64,
     device: torch.device | str = "cpu",

@@ -59,7 +59,7 @@ pytestmark = [
 
 CUDA = torch.device("cuda")
 
-SMALL = OpShape("small", bsz=1, heads=2, seq=8, rows=8, lanes=16, chunk=4)
+SMALL = OpShape("small", bsz=1, heads=2, seq=8, rows=16, lanes=16, chunk=4)
 """Two whole chunks at the smallest legal row and lane counts, over two heads."""
 
 ITERS = 2
@@ -427,7 +427,7 @@ def test_group_counts_resolve_the_kinds_in_the_order_requested() -> None:
 def test_group_counts_collapse_to_one_configuration_at_a_single_head() -> None:
     # At heads=1 the two kinds are one configuration. Measuring both would time
     # one thing twice and let the second report overwrite the first.
-    one_head = OpShape("one-head", bsz=1, heads=1, seq=8, rows=8, lanes=16, chunk=4)
+    one_head = OpShape("one-head", bsz=1, heads=1, seq=8, rows=16, lanes=16, chunk=4)
     assert group_counts(one_head, ["heads", "one"]) == (1,)
 
 
@@ -473,8 +473,8 @@ def test_main_writes_a_markdown_and_a_json_report_per_group_configuration(
         notes_of(tmp_path / f"bench-mamba-small-g{count}-forward.json")[1]
         for count in (2, 1)
     ] == [
-        "mamba2 ngroups=2 headdim=8 dstate=48",
-        "mamba2 ngroups=1 headdim=8 dstate=48",
+        "mamba2 ngroups=2 headdim=16 dstate=48",
+        "mamba2 ngroups=1 headdim=16 dstate=48",
     ]
 
 
@@ -484,8 +484,8 @@ def test_main_notes_the_shape_the_group_count_the_mode_and_the_timer(
     install(monkeypatch)
     assert main(argv(tmp_path, "--mode", "forward", "--groups", "heads")) == 0
     assert notes_of(tmp_path / "bench-mamba-small-g2-forward.json") == [
-        "small: B=1 H=2 T=8 P=8 N=16 3N=48 L=4",
-        "mamba2 ngroups=2 headdim=8 dstate=48",
+        "small: B=1 H=2 T=8 P=16 N=16 3N=48 L=4",
+        "mamba2 ngroups=2 headdim=16 dstate=48",
         "mode=forward dtype=fp32",
         "iters=2 warmup=0",
         "timer=cuda_event clocks=locked at 1740 MHz",
@@ -623,8 +623,8 @@ def test_compare_so3ssd_notes_that_each_arm_holds_its_own_inputs(
     # The two operators take different tensors, so the arms cannot share inputs
     # the way two backends of one operator do, and the peak belongs to neither.
     assert report.notes == (
-        "small: B=1 H=2 T=8 P=8 N=16 3N=48 L=4",
-        "mamba2 ngroups=2 headdim=8 dstate=48",
+        "small: B=1 H=2 T=8 P=16 N=16 3N=48 L=4",
+        "mamba2 ngroups=2 headdim=16 dstate=48",
         "mode=forward dtype=fp32",
         "arm a=mamba-g2 b=so3ssd-auto, one loop, order swapped each iteration",
         "each arm holds its own inputs; the memory peak covers both",

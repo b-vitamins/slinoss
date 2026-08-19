@@ -26,7 +26,7 @@ from slinoss.perf.workload import (
 
 CPU = torch.device("cpu")
 
-SMALL = OpShape("small", bsz=1, heads=1, seq=8, rows=8, lanes=16, chunk=4)
+SMALL = OpShape("small", bsz=1, heads=1, seq=8, rows=16, lanes=16, chunk=4)
 """Two whole chunks at the smallest legal row and lane counts."""
 
 
@@ -38,7 +38,7 @@ SMALL = OpShape("small", bsz=1, heads=1, seq=8, rows=8, lanes=16, chunk=4)
 def test_op_shape_derives_the_state_width_and_the_token_count() -> None:
     assert SMALL.d_state == 48
     assert SMALL.token_count == 8
-    assert SMALL.describe() == "small: B=1 H=1 T=8 P=8 N=16 3N=48 L=4"
+    assert SMALL.describe() == "small: B=1 H=1 T=8 P=16 N=16 3N=48 L=4"
 
 
 def test_standard_shapes_satisfy_the_operator_constraints() -> None:

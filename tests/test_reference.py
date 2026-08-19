@@ -30,18 +30,18 @@ LANES3 = (-1, 3)
 # (bsz, heads, seqlen, rows, lanes, chunk)
 #   40/16 is ragged over three chunks; 16/16 is one exact chunk; 7 and 1 tokens
 #   sit below the chunk; 64/16 is four exact chunks; 33/16 and 65/32 are ragged;
-#   the smallest legal N is 16 and the smallest legal P is 8.
+#   the smallest legal N is 16 and the smallest legal P is 16.
 SHAPES: tuple[tuple[int, int, int, int, int, int], ...] = (
-    (2, 2, 40, 8, 16, 16),
-    (2, 2, 16, 8, 16, 16),
-    (1, 1, 7, 8, 16, 16),
-    (1, 1, 1, 8, 16, 16),
-    (2, 3, 64, 16, 16, 16),
-    (1, 2, 33, 8, 32, 16),
-    (2, 1, 20, 24, 16, 32),
-    (1, 1, 48, 8, 16, 16),
-    (2, 2, 65, 8, 16, 32),
-    (1, 1, 128, 8, 16, 64),
+    (2, 2, 40, 16, 16, 16),
+    (2, 2, 16, 16, 16, 16),
+    (1, 1, 7, 16, 16, 16),
+    (1, 1, 1, 16, 16, 16),
+    (2, 3, 64, 32, 16, 16),
+    (1, 2, 33, 16, 32, 16),
+    (2, 1, 20, 48, 16, 32),
+    (1, 1, 48, 16, 16, 16),
+    (2, 2, 65, 16, 16, 32),
+    (1, 1, 128, 16, 16, 64),
 )
 
 # float64 end to end. The two implementations reassociate the same sums, so the
@@ -192,7 +192,7 @@ def test_result_shapes_and_dtypes() -> None:
 def test_decay_only_matches_the_global_prefix_form() -> None:
     """With both taps zero the state is a pure homogeneous transport of ``z0``,
     so the output follows from the global prefixes with no chunking at all."""
-    inp = make_inputs(seqlen=37, rows=8, lanes=16, seed=17, streaming=False)
+    inp = make_inputs(seqlen=37, rows=16, lanes=16, seed=17, streaming=False)
     assert inp.z0 is not None
     zero_k = torch.zeros_like(inp.K)
 
@@ -214,7 +214,7 @@ def test_zero_rotation_reduces_to_a_diagonal_state_space_model() -> None:
     """With ``w = 0`` every rotation is the identity and both taps collapse to
     ``kr``, so the operator is a scalar-decay SSM written out here in full."""
     seqlen = 24
-    inp = make_inputs(seqlen=seqlen, rows=8, lanes=16, w_scale=0.0, seed=19)
+    inp = make_inputs(seqlen=seqlen, rows=16, lanes=16, w_scale=0.0, seed=19)
     assert inp.z0 is not None and inp.b_prev is not None and inp.u_prev is not None
     assert float(inp.trans[..., :3].abs().max()) == 0.0
 
@@ -245,7 +245,7 @@ def test_zero_rotation_reduces_to_a_diagonal_state_space_model() -> None:
 
 
 def test_single_token_is_one_forced_step() -> None:
-    inp = make_inputs(seqlen=1, rows=8, lanes=16, seed=23)
+    inp = make_inputs(seqlen=1, rows=16, lanes=16, seed=23)
     assert inp.z0 is not None and inp.b_prev is not None and inp.u_prev is not None
     w = inp.trans[..., :3]
     rot = rot_matrix(quat_exp(w))[:, :, 0]
@@ -297,7 +297,7 @@ def _base(**overrides: Any) -> ScanInputs:
         "bsz": 2,
         "heads": 2,
         "seqlen": 8,
-        "rows": 8,
+        "rows": 16,
         "lanes": 16,
         "seed": 29,
     }
@@ -415,7 +415,7 @@ BAD_INPUTS: tuple[Case, ...] = (
         {"rows": 12},
         lambda i: i,
         ValueError,
-        "P must be a multiple of 8",
+        "P must be a multiple of 16",
     ),
     (
         "unpaired_b",

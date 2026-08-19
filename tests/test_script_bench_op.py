@@ -56,7 +56,7 @@ pytestmark = [
 CUDA = torch.device("cuda")
 
 TINY = shape_by_name("tiny")
-"""The cheapest standard shape: ``B=1 H=1 T=256 P=8 N=16 L=64``."""
+"""The cheapest standard shape: ``B=1 H=1 T=256 P=16 N=16 L=64``."""
 
 PAIRS = 8
 """Pairs behind a pinned verdict. Eight reaches nominal coverage, so the verdict
@@ -359,7 +359,7 @@ def test_bench_measures_a_forward_and_holds_no_saved_tensors(
     assert report.peaks is not None
     assert report.peaks.label == "so3ssd tiny forward"
     assert report.notes == (
-        "tiny: B=1 H=1 T=256 P=8 N=16 3N=48 L=64",
+        "tiny: B=1 H=1 T=256 P=16 N=16 3N=48 L=64",
         "mode=forward dtype=fp32 backend=reference",
         "iters=2 warmup=0",
         "timer=cuda_event clocks=locked at 1740 MHz",
@@ -426,7 +426,7 @@ def test_compare_backends_reports_one_rate_per_arm_and_one_comparison(
         "so3ssd-reference.backward",
     } <= set(report.budget.labels())
     assert report.notes == (
-        "tiny: B=1 H=1 T=256 P=8 N=16 3N=48 L=64",
+        "tiny: B=1 H=1 T=256 P=16 N=16 3N=48 L=64",
         "mode=step dtype=fp32",
         "arm a=so3ssd-auto b=so3ssd-reference, one loop, order swapped each iteration",
         "iters=2 warmup=0",

@@ -32,7 +32,7 @@ from slinoss.ops.so3ssd import (
 )
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
-TINY: dict[str, Any] = {"bsz": 1, "heads": 1, "rows": 8, "lanes": 16}
+TINY: dict[str, Any] = {"bsz": 1, "heads": 1, "rows": 16, "lanes": 16}
 
 # float64 analytic VJP against float64 autograd. The gap is reordering roundoff.
 # Worst measured over this file: 7.6e-15.

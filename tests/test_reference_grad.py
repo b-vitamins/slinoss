@@ -21,7 +21,7 @@ from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
 # Smallest legal geometry: N = 16 so 3N = 48, and P = 8. Full-mode gradcheck
 # costs two forward passes per input element, so the shape stays minimal.
-TINY: dict[str, Any] = {"bsz": 1, "heads": 1, "rows": 8, "lanes": 16}
+TINY: dict[str, Any] = {"bsz": 1, "heads": 1, "rows": 16, "lanes": 16}
 
 # float64 autograd against float64 autograd. The gap is reordering roundoff.
 # Worst measured over this file: 1.1e-14.

@@ -20,7 +20,7 @@ from tests.conftest import ScanInputs, assert_max_rel, make_inputs, max_err
 
 # Worst measured under the extremes below: 1.8e-15.
 PARITY_REL = 1e-13
-TINY: dict[str, Any] = {"bsz": 1, "heads": 1, "rows": 8, "lanes": 16}
+TINY: dict[str, Any] = {"bsz": 1, "heads": 1, "rows": 16, "lanes": 16}
 
 
 def _finite(out: SO3SSDResult, label: str) -> None:
@@ -256,7 +256,7 @@ def test_low_precision_survives_saturated_decay(low: torch.dtype) -> None:
 
 @pytest.mark.parametrize("chunk", [16, 32, 64, 128, 256])
 def test_smallest_legal_shape(chunk: int) -> None:
-    inp = make_inputs(bsz=1, heads=1, seqlen=1, rows=8, lanes=16, seed=131)
+    inp = make_inputs(bsz=1, heads=1, seqlen=1, rows=16, lanes=16, seed=131)
     _check_parity(inp, chunk, f"minimum at L={chunk}")
 
 

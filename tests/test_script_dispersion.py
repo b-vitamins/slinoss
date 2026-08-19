@@ -357,7 +357,7 @@ def test_the_notes_state_the_shape_the_settings_and_the_timer(tmp_path: Path) ->
     base = tmp_path / "dispersion"
     main(argv(base))
     assert notes_of(base) == [
-        "- tiny: B=1 H=1 T=256 P=8 N=16 3N=48 L=64",
+        "- tiny: B=1 H=1 T=256 P=16 N=16 3N=48 L=64",
         "- mode=step dtype=fp32 backend=default",
         "- iters=1 warmup=0 repeat=2",
         # The stamp is the policy the run was handed, not the state of this host.
