@@ -234,11 +234,30 @@ it does reach is zero spill, worth 34.0% of the call. Beyond that, occupancy is 
 what the one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident
 blocks,
 16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5% at
-``P 64`` where the same ``L`` holds one block. The remaining candidate is 256 threads
-per block, which is the atom tiling's shape and not this file's: the M mode of the atom
-tiling is pinned, the extra warps are absorbed by ``N`` at atom granularity, and the
-arena is the same bytes at eight warps as at four. The declared class follows the
-traffic; the figures above are what the kernel reaches against it.
+``P 64`` where the same ``L`` holds one block.
+
+The other lever is the block width, and it is a parameter: ``warps`` selects the atom
+tiling and the thread count together. The M mode of the tiling is pinned and the extra
+warps go to ``N`` at atom granularity, so the tile, the pitches and the staging passes
+are the width's invariants. Measured at eight warps on the shape above, medians of
+three runs::
+
+    warps  us/launch  MB/launch  GB/s  of 85%  regs  arena   occ theo/ach
+        4    7,029.2     667.01  95.0   13.9%   255  91,344   8.3% / 8.3%
+        8    3,306.7     656.85 198.6   29.2%   242  91,600  16.7% / 16.6%
+
+Registers fall to 242, so 256 threads hold 61,952 of the 65,536 a multiprocessor has
+and the second warp per scheduler is available. ``no_instruction`` goes 52.8% to 1.0%
+and issue-active 12.5% to 28.8%: instruction supply was the whole of that gap. What
+takes its place is the shared-memory pipe, ``mio_throttle`` 34.7%, l1tex
+speed-of-light 75.5%, LSU shared wavefronts 44.1% of peak against 18.6%, with DRAM at
+27.2%, so the bar is still not the traffic. Local traffic stays zero, conflicts
+0.1511 per wavefront against 0.1612, instructions issued rise 1.1% for the readout
+term's reread, and the arena grows by the ``4 * L`` bytes a warp group past the first
+that :func:`offset_tile` takes -- one resident block at either width. Sixteen warps is
+refused by the register file before any tiling question: 512 threads admit 128
+registers a thread. The declared class follows the traffic; the figures above are what
+the kernel reaches against it.
 """
 
 from typing import NamedTuple
@@ -2228,7 +2247,10 @@ def chunk_vector_backward(
             pitch are the width's invariants and the footprint grows by ``4 * L``
             bytes per warp group past the first. The source-token block is chosen at
             the default width, so a shape that fits at four warps and not at eight is
-            refused rather than run at a narrower block.
+            refused rather than run at a narrower block. Every output but the
+            log-scale column of ``dtrans`` is bitwise the same at both widths; that
+            column sums a row's state width group by group, which measured 7.8e-08
+            of the reference magnitude against the column's own 1.4e-03 residual.
 
     Returns:
         :class:`ChunkVectorBwd`.
