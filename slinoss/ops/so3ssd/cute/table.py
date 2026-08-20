@@ -76,14 +76,13 @@ the weight rather than its partner needs.
 import cutlass
 import cutlass.cute as cute
 
-from slinoss._cute import decay, narrow, select, widen
+from slinoss._cute import Scalar, decay, narrow, select, widen
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
     TABLE_AC_SOLE,
     TABLE_AN,
     TABLE_AP,
     Mat3,
-    Vec3,
     mat3_matvec,
     mat3_mul,
     mat3_transpose,
@@ -92,6 +91,7 @@ from slinoss.ops.so3ssd.cute.common import (
 )
 
 __all__ = [
+    "LANE_PAIR",
     "PREFETCH",
     "build_table",
     "stage_chunk",
@@ -110,6 +110,120 @@ PREFETCH: int = 4
 Bounds the load phase at ``3 * PREFETCH`` live float32 registers while keeping
 ``3 * PREFETCH`` loads outstanding per thread, which is what covers one global
 latency. One is the serial form: load, transform, store, wait, repeat."""
+
+LANE_PAIR: int = 2
+"""Adjacent 3-vectors one thread transforms and stores per step.
+
+Two, not one, because of the shared-memory store. A pair's six elements are one
+contiguous 12-byte run at four-byte alignment, so they go out as three accesses of
+:data:`LANE_PAIR` elements rather than six scalars. The source elements of a pair
+are contiguous too, so the read is three paired accesses over the same sectors.
+
+What that buys is instruction count, not a conflict-free pattern. Measured at
+``standard``, forward, sm_86, median of four launches: ``chunk_scan_fwd`` shared
+stores fall 840,192 to 619,008 and store conflicts 442,368 to 221,184,
+``chunk_increment_fwd`` 608,256 to 460,800 and 363,332 to 184,320. The conflicts
+track the halved store count, so a paired store is conflicted where the two scalar
+stores it replaces were. Global load requests fall 743,424 to 522,240 and 485,568
+to 338,112; duration falls 120.4 to 107.7 and 69.3 to 64.0 us; neither kernel
+spills. The residue is not attributed to a site, because the counters are per
+kernel and the staging stores share them with the operand stores; separating the
+two needs source-level counters.
+
+A step carries twice the elements, so both paired passes take ``PREFETCH //
+LANE_PAIR`` steps per group and the live float32 count and the elements in flight
+are the ones :data:`PREFETCH` states.
+
+``lanes`` is even at every legal shape:
+:func:`slinoss.ops.so3ssd.cute.guard.check_extents` requires ``3N`` to be a multiple
+of 3 and of :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_N`, so ``3N`` is a multiple
+of 48 and ``lanes`` a multiple of 16."""
+
+
+def _paired(tile: cute.Tensor) -> cute.Tensor:
+    """View a row-major tile in units of :data:`LANE_PAIR` adjacent elements.
+
+    Args:
+        tile: ``(rows, pitch)`` shared tile, unit stride on the columns and a pitch
+            from :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`.
+
+    Returns:
+        The retiled view. Element ``(None, (r, k))`` is elements
+        ``LANE_PAIR * k`` through ``LANE_PAIR * k + LANE_PAIR - 1`` of row ``r``,
+        statically shaped, which is what lets :func:`cutlass.cute.autovec_copy` pick
+        one access rather than :data:`LANE_PAIR`.
+
+    Invariants:
+        Every access is aligned to ``LANE_PAIR`` elements. The pitch is a whole
+        number of 16-byte segments, so a row starts on a 16-byte boundary, and the
+        column offset is a multiple of ``LANE_PAIR``. The claim is restated on the
+        iterator because a tile arriving as a parameter reports one element whatever
+        its allocation asked for, and ``autovec_copy`` caps the access at the claim.
+    """
+    base = tile.iterator.align(LANE_PAIR * (tile.element_type.width // 8))
+    return cute.zipped_divide(cute.make_tensor(base, tile.layout), (1, LANE_PAIR))
+
+
+def _paired_row(row: cute.Tensor) -> cute.Tensor:
+    """View one contiguous row in units of :data:`LANE_PAIR` adjacent elements.
+
+    Args:
+        row: ``(3N,)`` unit-stride view of one row of a global tensor.
+
+    Returns:
+        The retiled view. Element ``(None, k)`` is elements ``LANE_PAIR * k``
+        through ``LANE_PAIR * k + LANE_PAIR - 1``.
+
+    Invariants:
+        ``3N`` is a multiple of 48, so a row offset is a multiple of 48 elements and
+        every access is aligned to ``LANE_PAIR``. The claim is restated for the
+        reason given in :func:`_paired`.
+    """
+    base = row.iterator.align(LANE_PAIR * (row.element_type.width // 8))
+    return cute.zipped_divide(cute.make_tensor(base, row.layout), (LANE_PAIR,))
+
+
+@cute.jit
+def _load_pair(
+    row: cute.Tensor, frag: cute.Tensor, slot: cutlass.Constexpr, pair: cutlass.Int32
+) -> None:
+    """Read one pair's ``3 * LANE_PAIR`` elements as three paired accesses.
+
+    Args:
+        row: A row from :func:`_paired_row`.
+        frag: ``(slots, LANE_PAIR)`` fragment of the row's element type.
+        pair: Which pair of 3-vectors. Its accesses are ``3 * pair`` to
+            ``3 * pair + 2``.
+        slot: First fragment row to fill, three from there. Compile-time: one slot
+            per outstanding load, since a reused slot would order the loads.
+    """
+    for k in cutlass.range_constexpr(3):
+        cute.autovec_copy(row[(None, 3 * pair + k)], frag[(slot + k, None)])
+
+
+@cute.jit
+def _store_pair(
+    words: cute.Tensor,
+    frag: cute.Tensor,
+    row: cutlass.Int32,
+    col: cutlass.Int32,
+    vals: tuple[Scalar, ...],
+) -> None:
+    """Store one pair's ``3 * LANE_PAIR`` values as three paired accesses.
+
+    Args:
+        words: A tile from :func:`_paired`.
+        frag: ``(1, LANE_PAIR)`` fragment of the tile's element type, built once by
+            the caller: a fragment per step is an allocation per step.
+        row: Row of the tile.
+        col: First paired column of the pair, ``3 * m`` for pair ``m``.
+        vals: The values in element order, float32. Narrowed here, once.
+    """
+    elem = words.element_type
+    for k in cutlass.range_constexpr(3):
+        for j in cutlass.range_constexpr(LANE_PAIR):
+            frag[0, j] = narrow(vals[LANE_PAIR * k + j], elem)
+        cute.autovec_copy(frag, words[(None, (row, col + k))])
 
 
 @cute.jit
@@ -527,16 +641,16 @@ def stage_matrix(
 
     One matrix for the whole chunk, not a per-token table, so the caller reads the
     nine entries once as a broadcast and hands them over in registers. Every one of
-    the ``N`` lanes takes the same matrix, so the stride loop owns one 3-vector per
-    thread per step: three coalesced global reads, nine FMA, three shared-memory
-    stores.
+    the ``N`` lanes takes the same matrix, so the stride loop owns :data:`LANE_PAIR`
+    3-vectors per thread per step: three paired global reads, eighteen FMA, three
+    paired shared-memory accesses per tile written.
 
     ``keep_fp32`` adds the float32 copy for a consumer that needs the untruncated
-    result as well as the operand. That is one extra shared-memory store per
-    component against a second pass over the ``(P, 3N)`` global read.
+    result as well as the operand. That is one extra shared-memory access per pair
+    against a second pass over the ``(P, 3N)`` global read.
 
-    The pass runs in groups of :data:`PREFETCH` steps, loads first, for the reason
-    given in :func:`stage_rotated`.
+    The pass runs in groups of ``PREFETCH // LANE_PAIR`` steps, loads first, for the
+    reason given in :func:`stage_rotated`.
 
     Args:
         gv: ``(B,H,C,P,3N)`` float32 source. Read at ``[bidx, hidx, cidx]``.
@@ -553,76 +667,100 @@ def stage_matrix(
         rows: Rows to fill, ``P``. Compile-time.
         lanes: ``N``. Compile-time.
         keep_fp32: Whether to write ``sfp32``. Compile-time.
+
+    Invariants:
+        ``lanes`` is even and both tiles are pitched by
+        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`, which is what :data:`LANE_PAIR`
+        rests on.
     """
     src = gv.element_type
     elem = dst.element_type
-    total = rows * lanes
+    span = 3 * LANE_PAIR
+    pairs = lanes // LANE_PAIR
+    total = rows * pairs
     steps = -(-total // threads)
     exact = total % threads == 0
+    depth = max(1, PREFETCH // LANE_PAIR)
 
-    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
-        span = min(PREFETCH, steps - group * PREFETCH)
+    words = _paired(dst)
+    frag = cute.make_fragment((1, LANE_PAIR), elem)
+    loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
+    # The false arm aliases the operand pair. Every use is under the same
+    # compile-time flag, so the alias is never reached and never allocated, and the
+    # name is bound on both paths.
+    if cutlass.const_expr(keep_fp32):
+        words32 = _paired(sfp32)
+        frag32 = cute.make_fragment((1, LANE_PAIR), cutlass.Float32)
+    else:
+        words32 = words
+        frag32 = frag
+
+    for group in cutlass.range_constexpr(-(-steps // depth)):
+        count = min(depth, steps - group * depth)
         held = []
-        for step in cutlass.range_constexpr(span):
-            i = tid + (group * PREFETCH + step) * threads
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * depth + step) * threads
             if cutlass.const_expr(not exact):
                 i = cutlass.min(i, total - 1)
-            p = i // lanes
-            n = i - p * lanes
-            held.append(
-                (
-                    p,
-                    n,
-                    (
-                        widen(gv[bidx, hidx, cidx, p, 3 * n], src),
-                        widen(gv[bidx, hidx, cidx, p, 3 * n + 1], src),
-                        widen(gv[bidx, hidx, cidx, p, 3 * n + 2], src),
-                    ),
-                )
-            )
+            p = i // pairs
+            m = i - p * pairs
+            _load_pair(_paired_row(gv[bidx, hidx, cidx, p, None]), loads, 3 * step, m)
+            held.append((p, m))
 
-        for step in cutlass.range_constexpr(span):
-            p, n, got = held[step]
-            out = mat3_matvec(mat, got)
+        for step in cutlass.range_constexpr(count):
+            p, m = held[step]
+            got = tuple(
+                widen(loads[3 * step + j // LANE_PAIR, j % LANE_PAIR], src)
+                for j in range(span)
+            )
+            out = mat3_matvec(mat, (got[0], got[1], got[2])) + mat3_matvec(
+                mat, (got[3], got[4], got[5])
+            )
+            col = 3 * m
             if cutlass.const_expr(exact):
-                for j in cutlass.range_constexpr(3):
-                    dst[p, 3 * n + j] = narrow(out[j], elem)
-                    if cutlass.const_expr(keep_fp32):
-                        sfp32[p, 3 * n + j] = out[j]
+                _store_pair(words, frag, p, col, out)
+                if cutlass.const_expr(keep_fp32):
+                    _store_pair(words32, frag32, p, col, out)
             else:
-                if tid + (group * PREFETCH + step) * threads < total:
-                    for j in cutlass.range_constexpr(3):
-                        dst[p, 3 * n + j] = narrow(out[j], elem)
-                        if cutlass.const_expr(keep_fp32):
-                            sfp32[p, 3 * n + j] = out[j]
+                if tid + (group * depth + step) * threads < total:
+                    _store_pair(words, frag, p, col, out)
+                    if cutlass.const_expr(keep_fp32):
+                        _store_pair(words32, frag32, p, col, out)
 
 
 @cute.jit
 def _store_rotated(
-    dst: cute.Tensor,
+    words: cute.Tensor,
+    frag: cute.Tensor,
     stable: cute.Tensor,
     sscale: cute.Tensor,
     row: cutlass.Int32,
     token: cutlass.Int32,
-    lane: cutlass.Int32,
-    vec: Vec3,
+    pair: cutlass.Int32,
+    vecs: tuple[Scalar, ...],
     slot: cutlass.Constexpr,
     scaled: cutlass.Constexpr,
     transposed: cutlass.Constexpr = False,
 ) -> None:
-    """Transform one 3-vector by one table slot and store it.
+    """Transform one pair of 3-vectors by one table slot and store both.
+
+    Both vectors of the pair sit in one row, so they take the same matrix and the
+    same scale: the nine table words and the one scale word are read once and
+    applied twice, which halves the table reads per element.
 
     Args:
-        dst: Operand-dtype tile, written at ``[row, 3*lane .. 3*lane+2]``.
+        words: The destination tile through :func:`_paired`, written at row ``row``,
+            paired columns ``3 * pair`` through ``3 * pair + 2``.
+        frag: ``(1, LANE_PAIR)`` fragment of the tile's element type.
         stable: ``(mats, L, 9)`` float32 transform table.
         sscale: ``(L,)`` float32 per-token scale. Read only when ``scaled``.
         row: Row of the destination tile.
         token: Chunk-local token index, indexing ``stable`` and ``sscale``. Already
             clamped below ``valid`` by the caller: an M extent rounded up past the
             chunk would otherwise read both tiles out of bounds.
-        lane: Which of the ``N`` 3-vectors.
-        vec: The 3-vector, already widened to float32 and already zeroed if the
-            row carries no token.
+        pair: Which pair of 3-vectors, below ``lanes // LANE_PAIR``.
+        vecs: The pair's ``3 * LANE_PAIR`` components in element order, already
+            widened to float32 and already zeroed if the row carries no token.
         slot: Table slot. Compile-time.
         scaled: Whether to multiply by ``sscale[token]``. Compile-time.
         transposed: Apply the slot's transpose. Compile-time: the nine reads are
@@ -642,14 +780,13 @@ def _store_rotated(
     )
     if cutlass.const_expr(transposed):
         mat = mat3_transpose(mat)
-    out = mat3_matvec(mat, vec)
-    elem = dst.element_type
+    out = mat3_matvec(mat, (vecs[0], vecs[1], vecs[2])) + mat3_matvec(
+        mat, (vecs[3], vecs[4], vecs[5])
+    )
     if cutlass.const_expr(scaled):
         weight = sscale[token]
-        out = (weight * out[0], weight * out[1], weight * out[2])
-    dst[row, 3 * lane] = narrow(out[0], elem)
-    dst[row, 3 * lane + 1] = narrow(out[1], elem)
-    dst[row, 3 * lane + 2] = narrow(out[2], elem)
+        out = tuple(weight * value for value in out)
+    _store_pair(words, frag, row, 3 * pair, out)
 
 
 @cute.jit
@@ -682,13 +819,14 @@ def stage_rotated(
     tap and the readout, 1 for the previous tap: the matrix is indexed at the token
     it acts on while the previous tap's vector comes from the token before it.
 
-    One thread owns one 3-vector: three coalesced global reads, nine FMA, three
-    shared-memory stores.
+    One thread owns :data:`LANE_PAIR` adjacent 3-vectors of one row: three paired
+    global reads, eighteen FMA over one matrix read, three paired shared-memory
+    accesses.
 
-    The pass runs in groups of :data:`PREFETCH` steps, loads first and transforms
-    second, so ``3 * PREFETCH`` loads are outstanding when the first of them is
-    consumed. Nothing is loaded under a predicate: the index is clamped into range
-    and the out-of-range value is replaced afterwards by a select. A load inside a
+    The pass runs in groups of ``PREFETCH // LANE_PAIR`` steps, loads first and
+    transforms second, so ``3 * PREFETCH`` elements are in flight when the first of
+    them is consumed. Nothing is loaded under a predicate: the index is clamped into
+    range and the out-of-range value is replaced afterwards by a select. A load inside a
     divergent branch cannot be hoisted above the branch, and a value produced
     inside one has no phi node to leave through, so the predicated form serializes
     on one global latency per step.
@@ -697,7 +835,7 @@ def stage_rotated(
     an M extent was rounded up by, since ``lbase`` is zero whenever ``span``
     exceeds the chunk. A zero row contributes nothing to any contraction, so no
     consumer needs a predicate. Zeroing the float32 input rather than the stored
-    output is the same three selects and makes the nine FMA exact.
+    output is one select per component and makes the FMAs exact.
 
     Args:
         gv: ``(B,G,T,3N)`` operand-dtype source.
@@ -723,28 +861,48 @@ def stage_rotated(
         scaled: Whether to apply ``sscale``. Compile-time.
         transposed: Apply the slot's transpose rather than the slot. Compile-time,
             and free: it permutes an index triple during the trace.
+
+    Invariants:
+        ``lanes`` is even and ``dst`` is pitched by
+        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`, which is what
+        :data:`LANE_PAIR` rests on.
     """
     src = gv.element_type
     zero = cutlass.Float32(0.0)
-    total = span * lanes
+    wide = 3 * LANE_PAIR
+    pairs = lanes // LANE_PAIR
+    total = span * pairs
     steps = -(-total // threads)
     # The staging extents are all multiples of the block width at every legal
-    # shape, so the store predicate below is elided. The general form is kept
-    # because it costs nothing when it is not needed.
+    # shape, so the store predicate below is elided. Both extents are multiples of
+    # 16 and the block is four warps, so pairing keeps that. The general form is
+    # kept because it costs nothing when it is not needed.
     exact = total % threads == 0
+    depth = max(1, PREFETCH // LANE_PAIR)
     # g < 0 is reachable only for the previous tap at the first token of the first
     # chunk, which is exactly the streaming carry-in.
     carry = has_prev and back == 1
 
-    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
-        width = min(PREFETCH, steps - group * PREFETCH)
+    words = _paired(dst)
+    frag = cute.make_fragment((1, LANE_PAIR), dst.element_type)
+    loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
+    # The false arm aliases the current-tap fragment, which is never read under it:
+    # every use of the carry fragment sits under the same compile-time flag.
+    prior = (
+        cute.make_fragment((3 * depth, LANE_PAIR), src)
+        if cutlass.const_expr(carry)
+        else loads
+    )
+
+    for group in cutlass.range_constexpr(-(-steps // depth)):
+        width = min(depth, steps - group * depth)
         held = []
         for step in cutlass.range_constexpr(width):
-            i = tid + (group * PREFETCH + step) * threads
+            i = tid + (group * depth + step) * threads
             if cutlass.const_expr(not exact):
                 i = cutlass.min(i, total - 1)
-            r = i // lanes
-            n = i - r * lanes
+            r = i // pairs
+            m = i - r * pairs
             # One clamp serves both reads: valid is at most the chunk, so the
             # clamped token indexes stable and sscale in bounds even when the M
             # extent was rounded up past the chunk, and t0 + it is inside the
@@ -752,36 +910,59 @@ def stage_rotated(
             tsafe = cutlass.min(lbase + r, valid - 1)
             gbase = t0 + tsafe - back
             gsafe = cutlass.max(gbase, 0)
-            got = (
-                widen(gv[bidx, gidx, gsafe, 3 * n], src),
-                widen(gv[bidx, gidx, gsafe, 3 * n + 1], src),
-                widen(gv[bidx, gidx, gsafe, 3 * n + 2], src),
+            _load_pair(_paired_row(gv[bidx, gidx, gsafe, None]), loads, 3 * step, m)
+            if cutlass.const_expr(carry):
+                _load_pair(_paired_row(gvprev[bidx, gidx, None]), prior, 3 * step, m)
+            held.append((r, m, tsafe, gbase))
+
+        for step in cutlass.range_constexpr(width):
+            r, m, tsafe, gbase = held[step]
+            # A plain range, not range_constexpr: a comprehension reaches the
+            # runtime stub. Both unroll at trace time.
+            got = tuple(
+                widen(loads[3 * step + j // LANE_PAIR, j % LANE_PAIR], src)
+                for j in range(wide)
             )
             if cutlass.const_expr(carry):
                 at_start = gbase < 0
-                got = (
-                    select(at_start, widen(gvprev[bidx, gidx, 3 * n], src), got[0]),
-                    select(at_start, widen(gvprev[bidx, gidx, 3 * n + 1], src), got[1]),
-                    select(at_start, widen(gvprev[bidx, gidx, 3 * n + 2], src), got[2]),
+                got = tuple(
+                    select(
+                        at_start,
+                        widen(prior[3 * step + j // LANE_PAIR, j % LANE_PAIR], src),
+                        got[j],
+                    )
+                    for j in range(wide)
                 )
             keep = lbase + r < valid
             if cutlass.const_expr(back == 1 and not has_prev):
                 keep = keep & (gbase >= 0)
-            held.append((r, n, tsafe, keep, got))
-
-        for step in cutlass.range_constexpr(width):
-            r, n, tsafe, keep, got = held[step]
-            vec = (
-                select(keep, got[0], zero),
-                select(keep, got[1], zero),
-                select(keep, got[2], zero),
-            )
+            vec = tuple(select(keep, value, zero) for value in got)
             if cutlass.const_expr(exact):
                 _store_rotated(
-                    dst, stable, sscale, r, tsafe, n, vec, slot, scaled, transposed
+                    words,
+                    frag,
+                    stable,
+                    sscale,
+                    r,
+                    tsafe,
+                    m,
+                    vec,
+                    slot,
+                    scaled,
+                    transposed,
                 )
             else:
-                if tid + (group * PREFETCH + step) * threads < total:
+                if tid + (group * depth + step) * threads < total:
                     _store_rotated(
-                        dst, stable, sscale, r, tsafe, n, vec, slot, scaled, transposed
+                        words,
+                        frag,
+                        stable,
+                        sscale,
+                        r,
+                        tsafe,
+                        m,
+                        vec,
+                        slot,
+                        scaled,
+                        transposed,
                     )

@@ -35,6 +35,7 @@ from slinoss._cute import (
     Tile,
     assert_smem_fits,
     dev_tensor,
+    narrow,
     smem_bytes,
     smem_capacity,
 )
@@ -109,6 +110,7 @@ def _probe_kernel(
     otable: cute.Tensor,
     ooff: cute.Tensor,
     oon: cute.Tensor,
+    opad: cute.Tensor,
     omat: cute.Tensor,
     omat32: cute.Tensor,
     seqlen: cutlass.Constexpr,
@@ -132,6 +134,8 @@ def _probe_kernel(
         otable: ``(B,H,C,3,L,9)`` float32, written with the table.
         ooff: ``(B,H,C,L,3N)`` operand-dtype, written with the untransposed tile.
         oon: ``(B,H,C,L,3N)`` operand-dtype, written with the transposed tile.
+        opad: ``(B,H,C,L,pitch-3N)`` operand-dtype, written with the untransposed
+            tile's pitch padding, prefilled with :data:`SENTINEL` before staging.
         omat: ``(B,H,C,P,3N)`` operand-dtype, written with the narrowed matrix tile.
         omat32: ``(B,H,C,P,3N)`` float32, written with the float32 matrix tile.
         seqlen: ``T``. Compile-time.
@@ -178,6 +182,13 @@ def _probe_kernel(
     for i in cutlass.range(tid, rows * dim, threads):
         p = i // dim
         sfp32[p, i - p * dim] = cutlass.Float32(SENTINEL)
+    # The padding of the rotated tile is prefilled and read back, and nothing else
+    # writes it, so a staging store that ran past ``3N`` shows up there.
+    pad = operand_tile(chunk, dim).stride[0] - dim
+    thin = narrow(cutlass.Float32(SENTINEL), gv.element_type)
+    for i in cutlass.range(tid, chunk * pad, threads):
+        r = i // pad
+        soff[r, dim + (i - r * pad)] = thin
     cute.arch.sync_threads()
     chunk_prefixes(strans, slp, squat, tid, chunk)
     cute.arch.sync_threads()
@@ -251,6 +262,10 @@ def _probe_kernel(
         c = i - r * dim
         ooff[bidx, hidx, cidx, r, c] = soff[r, c]
         oon[bidx, hidx, cidx, r, c] = son[r, c]
+    for i in cutlass.range(tid, chunk * pad, threads):
+        r = i // pad
+        k = i - r * pad
+        opad[bidx, hidx, cidx, r, k] = soff[r, dim + k]
     for i in cutlass.range(tid, rows * dim, threads):
         p = i // dim
         c = i - p * dim
@@ -275,6 +290,7 @@ def _probe_launch(
     otable: cute.Tensor,
     ooff: cute.Tensor,
     oon: cute.Tensor,
+    opad: cute.Tensor,
     omat: cute.Tensor,
     omat32: cute.Tensor,
     seqlen: cutlass.Constexpr,
@@ -295,6 +311,7 @@ def _probe_launch(
         otable,
         ooff,
         oon,
+        opad,
         omat,
         omat32,
         seqlen,
@@ -313,6 +330,8 @@ class Probe(NamedTuple):
         table: ``(B,H,C,3,L,9)`` float32 transform table.
         off: ``(B,H,C,L,3N)`` the table applied without the transpose.
         on: ``(B,H,C,L,3N)`` the same table applied with it.
+        pad: ``(B,H,C,L,pitch-3N)`` the pitch padding of the ``off`` tile, all
+            :data:`SENTINEL` unless a staging store ran past ``3N``.
         mat: ``(B,H,C,P,3N)`` the chunk-wide matrix, narrowed to the operand dtype.
         mat32: ``(B,H,C,P,3N)`` the same result at float32, or :data:`SENTINEL`.
     """
@@ -320,6 +339,7 @@ class Probe(NamedTuple):
     table: Tensor
     off: Tensor
     on: Tensor
+    pad: Tensor
     mat: Tensor
     mat32: Tensor
 
@@ -338,6 +358,8 @@ def _run_probe(inp: ScanInputs, zstart: Tensor, chunk: int, keep_fp32: bool) -> 
     omat32 = torch.empty(bsz, heads, chunks, rows, dim, **wide)
     ooff = torch.empty(bsz, heads, chunks, chunk, dim, **thin)
     oon = torch.empty_like(ooff)
+    pad = operand_tile(chunk, dim).stride[0] - dim
+    opad = torch.empty(bsz, heads, chunks, chunk, pad, **thin)
     omat = torch.empty(bsz, heads, chunks, rows, dim, **thin)
     _probe_launch(
         dev_tensor(inp.trans),
@@ -347,6 +369,7 @@ def _run_probe(inp: ScanInputs, zstart: Tensor, chunk: int, keep_fp32: bool) -> 
         dev_tensor(otable),
         dev_tensor(ooff),
         dev_tensor(oon),
+        dev_tensor(opad),
         dev_tensor(omat),
         dev_tensor(omat32),
         seqlen,
@@ -360,7 +383,7 @@ def _run_probe(inp: ScanInputs, zstart: Tensor, chunk: int, keep_fp32: bool) -> 
         keep_fp32,
     )
     torch.cuda.synchronize()
-    return Probe(otable, ooff, oon, omat, omat32)
+    return Probe(otable, ooff, oon, opad, omat, omat32)
 
 
 def _make(
@@ -576,6 +599,23 @@ def test_keep_fp32_off_leaves_the_float32_tile_untouched() -> None:
         BOUNDS[torch.bfloat16],
         "cute-stage[keep-fp32-off].matrix",
     )
+
+
+def test_the_paired_store_leaves_the_pitch_padding_untouched() -> None:
+    """A store wider than the pair writes the padding, which no column check sees.
+
+    :func:`stage_rotated` stores two 3-vectors per thread as three paired accesses.
+    An access past the last pair lands in the pitch padding, leaving every column
+    below ``3N`` correct, and the padding is zeroed once per block and then read as a
+    GEMM operand, so the corruption reaches the contraction and not the oracle.
+    """
+    chunk = 64
+    inp = _make(2, 2, 128, 16, 32, torch.bfloat16, w_scale=2.0)
+    got = _run_probe(inp, _zstart(inp, chunk), chunk, keep_fp32=False)
+
+    assert got.pad.shape[-1] > 0
+    assert torch.equal(got.pad, torch.full_like(got.pad, SENTINEL))
+    assert torch.count_nonzero(got.off) > 0
 
 
 @pytest.mark.parametrize(("chunk", "rows", "dim"), [(64, 144, 48), (MAX_CHUNK, 16, 96)])
