@@ -38,6 +38,11 @@ Each rule below exists because it has been violated before.
   report refuses to emit rather than picking a favourite.
 - A contended device produces a number, not a measurement. Stamp it and do not
   quote it.
+- A contention stamp names the physical part it probed, by UUID. `nvidia-smi`
+  numbers devices the way the driver does and `CUDA_VISIBLE_DEVICES` renumbers
+  only torch's ordinals, so a stamp that names an ordinal is a claim about
+  whichever device the driver numbered the same, and it reads clean because the
+  probe succeeded.
 - Every quoted figure is measured twice.
 - A budget bucket that reads exactly zero is a broken label, not a free
   operation. A test asserts every declared bucket is nonzero on the fused path.

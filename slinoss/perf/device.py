@@ -9,6 +9,12 @@ are probed and stamped: whether the clock is pinned, and whether anything else
 was on the device. Both fail towards the pessimistic reading, so a probe that
 does not run never produces a report claiming a locked clock or an idle part.
 
+Two index spaces meet here and only one crosses the module boundary. Every entry
+point takes a torch ordinal; the ``nvidia-smi`` readers take a driver selector,
+which :func:`smi_selector` resolves from the ordinal by UUID. Handing an ordinal
+to the driver under ``CUDA_VISIBLE_DEVICES`` stamps one part while measuring
+another, and the stamp reads clean because the probe succeeded.
+
 No spec-sheet peak appears in this module. A ceiling divides a measurement, so
 it is itself measured; see :mod:`slinoss.perf.ceiling`. A modelled peak beside a
 measured rate is the exact adjacency the schema in :mod:`slinoss.perf.units`
@@ -48,16 +54,24 @@ __all__ = [
     "device_ordinal",
     "require_cuda",
     "smi_query",
+    "smi_selector",
 ]
 
-SmiQuery = Callable[[Sequence[str], int], "str | None"]
-"""Reads comma-separated ``nvidia-smi`` query fields, or None if unavailable."""
+SmiQuery = Callable[[Sequence[str], str], "str | None"]
+"""Reads comma-separated ``nvidia-smi`` query fields, or None if unavailable.
 
-ComputeAppsQuery = Callable[[int], "str | None"]
+The second argument is a driver selector, never a torch ordinal; see
+:func:`smi_selector`.
+"""
+
+ComputeAppsQuery = Callable[[str], "str | None"]
 """Reads one device's compute processes as ``pid, used_memory`` lines.
 
 Empty means the device has none. None means the probe did not run, which is a
 different fact and is reported as one.
+
+The argument is a driver selector, never a torch ordinal; see
+:func:`smi_selector`.
 """
 
 
@@ -111,12 +125,48 @@ def device_ordinal(device: torch.device) -> int:
     return -1
 
 
-def smi_query(fields: Sequence[str], index: int) -> str | None:
+def smi_selector(ordinal: int) -> str:
+    """Driver selector for a torch ordinal, for ``nvidia-smi --id=``.
+
+    ``nvidia-smi`` numbers devices the way the driver does, and
+    ``CUDA_VISIBLE_DEVICES`` renumbers torch's ordinals without renumbering the
+    driver's. The ordinal a report names and the index a probe needs are
+    therefore two different integers, and passing one for the other stamps a
+    part the measurement did not run on. A UUID is in neither space and is
+    correct whatever the variable holds, in whatever order, including when it
+    names devices by UUID rather than by index.
+
+    Args:
+        ordinal: Torch device ordinal, as :func:`device_ordinal` returns.
+
+    Returns:
+        ``GPU-<uuid>`` when torch reports the part's UUID, else the entry
+        ``CUDA_VISIBLE_DEVICES`` maps the ordinal to, verbatim, else the ordinal
+        as a string. A selector the driver rejects fails the probe, and a failed
+        probe reports unknown rather than a clean device.
+    """
+    try:
+        uuid = torch.cuda.get_device_properties(ordinal).uuid
+    except (AssertionError, AttributeError, RuntimeError):
+        # No CUDA, no such ordinal, or a torch with no UUID on the properties.
+        pass
+    else:
+        return f"GPU-{uuid}"
+    visible = [
+        item.strip() for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    ]
+    if 0 <= ordinal < len(visible) and visible[ordinal]:
+        return visible[ordinal]
+    return str(ordinal)
+
+
+def smi_query(fields: Sequence[str], selector: str) -> str | None:
     """Run one ``nvidia-smi`` query.
 
     Args:
         fields: Query field names, passed to ``--query-gpu``.
-        index: Device index.
+        selector: Driver selector, as :func:`smi_selector` returns. A torch
+            ordinal is not one.
 
     Returns:
         The single output line, or None if ``nvidia-smi`` is missing, times out,
@@ -124,7 +174,7 @@ def smi_query(fields: Sequence[str], index: int) -> str | None:
     """
     cmd = [
         "nvidia-smi",
-        f"--id={index}",
+        f"--id={selector}",
         f"--query-gpu={','.join(fields)}",
         "--format=csv,noheader,nounits",
     ]
@@ -138,11 +188,12 @@ def smi_query(fields: Sequence[str], index: int) -> str | None:
     return line[0] if line else None
 
 
-def compute_apps_query(index: int) -> str | None:
+def compute_apps_query(selector: str) -> str | None:
     """Read one device's compute processes.
 
     Args:
-        index: Device index.
+        selector: Driver selector, as :func:`smi_selector` returns. A torch
+            ordinal is not one.
 
     Returns:
         One ``pid, used_memory`` line per process with the memory in mebibytes,
@@ -151,7 +202,7 @@ def compute_apps_query(index: int) -> str | None:
     """
     cmd = [
         "nvidia-smi",
-        f"--id={index}",
+        f"--id={selector}",
         "--query-compute-apps=pid,used_memory",
         "--format=csv,noheader,nounits",
     ]
@@ -203,14 +254,15 @@ def _as_mhz(text: str) -> Megahertz:
     return Megahertz(_as_float(text))
 
 
-def clock_policy(index: int = 0, query: SmiQuery = smi_query) -> ClockPolicy:
+def clock_policy(ordinal: int = 0, query: SmiQuery = smi_query) -> ClockPolicy:
     """Probe the clock state of one device.
 
     A failed probe reports unlocked. That is the conservative direction: it keeps
     the spread discipline on rather than silently claiming a pinned clock.
 
     Args:
-        index: Device index.
+        ordinal: Torch device ordinal. Resolved to a driver selector here, so the
+            probe reads the part torch would run on.
         query: Injected ``nvidia-smi`` reader. Tests supply their own.
 
     Returns:
@@ -222,7 +274,7 @@ def clock_policy(index: int = 0, query: SmiQuery = smi_query) -> ClockPolicy:
         "clocks.applications.graphics",
         "clocks_throttle_reasons.applications_clocks_setting",
     )
-    line = query(fields, index)
+    line = query(fields, smi_selector(ordinal))
     if line is None:
         return ClockPolicy(
             locked=False,
@@ -308,18 +360,18 @@ class Contention(PerfRecord):
         )
 
 
-def _unknown(detail: str) -> Contention:
+def _unknown(selector: str, reason: str) -> Contention:
     return Contention(
         probed=False,
         foreign_process_count=Count(0),
         foreign_memory_mib=Mebibytes(0.0),
         utilization_pct=Percent(0.0),
-        detail=detail,
+        detail=f"device {selector}: {reason}",
     )
 
 
 def contention(
-    index: int = 0,
+    ordinal: int = 0,
     *,
     apps: ComputeAppsQuery = compute_apps_query,
     query: SmiQuery = smi_query,
@@ -327,31 +379,37 @@ def contention(
 ) -> Contention:
     """Probe what else is running on one device.
 
+    Both probes read one driver selector resolved from the ordinal, so the record
+    names the part the ordinal resolves to and not whichever device the driver
+    happens to number the same.
+
     Args:
-        index: Device index.
+        ordinal: Torch device ordinal. Resolved to a driver selector here.
         apps: Injected compute-process reader. Tests supply their own.
         query: Injected ``nvidia-smi`` reader for utilization and memory.
         own_pid: Process to exclude. Defaults to this one, which holds a context
             on the device it measures and would otherwise read as a competitor.
 
     Returns:
-        The contention record, with the raw probe text in ``detail``.
+        The contention record, naming the probed part and carrying the raw probe
+        text in ``detail``.
     """
     mine = os.getpid() if own_pid is None else own_pid
-    text = apps(index)
+    selector = smi_selector(ordinal)
+    text = apps(selector)
     fields = ("utilization.gpu", "memory.used")
-    line = query(fields, index)
+    line = query(fields, selector)
     if text is None or line is None:
-        return _unknown("nvidia-smi unavailable")
+        return _unknown(selector, "nvidia-smi unavailable")
     gpu = [p.strip() for p in line.split(",")]
     if len(gpu) != len(fields):
-        return _unknown(f"unparsed nvidia-smi output: {line!r}")
+        return _unknown(selector, f"unparsed nvidia-smi output: {line!r}")
     rows = [row for row in text.splitlines() if row.strip()]
     foreign: list[tuple[int, float]] = []
     for row in rows:
         parts = [p.strip() for p in row.split(",")]
         if len(parts) != 2:
-            return _unknown(f"unparsed nvidia-smi output: {row!r}")
+            return _unknown(selector, f"unparsed nvidia-smi output: {row!r}")
         pid, used = parts
         if int(_as_float(pid)) != mine:
             foreign.append((int(_as_float(pid)), _as_float(used)))
@@ -362,7 +420,8 @@ def contention(
         foreign_memory_mib=Mebibytes(sum(used for _, used in foreign)),
         utilization_pct=Percent(_as_float(utilization)),
         detail=(
-            f"compute apps {len(rows)} (own pid {mine} excluded) "
+            f"device {selector}: compute apps {len(rows)} "
+            f"(own pid {mine} excluded) "
             f"foreign pids {[pid for pid, _ in foreign]} "
             f"utilization.gpu={utilization} memory.used={memory}"
         ),
@@ -415,14 +474,16 @@ class DeviceInfo(PerfRecord):
 
 
 def device_info(
-    index: int = 0,
+    ordinal: int = 0,
     query: SmiQuery = smi_query,
     apps: ComputeAppsQuery = compute_apps_query,
 ) -> DeviceInfo:
     """Read the identity, limits, clock state, and sharing of one CUDA device.
 
     Args:
-        index: Device index.
+        ordinal: Torch device ordinal. The properties come from torch and the
+            clock and sharing probes from the driver, and the two number devices
+            differently, so the probes resolve a selector rather than reuse this.
         query: Injected ``nvidia-smi`` reader for the clock and sharing probes.
         apps: Injected compute-process reader for the sharing probe.
 
@@ -430,17 +491,17 @@ def device_info(
         The device record.
 
     Raises:
-        ValueError: If the index is negative. :func:`device_ordinal` yields ``-1``
-            for a device that has no ordinal, so this is a CPU device arriving
-            where a part is being named. Checked first, or the failure reports the
-            absence of CUDA on a host that has it.
+        ValueError: If the ordinal is negative. :func:`device_ordinal` yields
+            ``-1`` for a device that has no ordinal, so this is a CPU device
+            arriving where a part is being named. Checked first, or the failure
+            reports the absence of CUDA on a host that has it.
         RuntimeError: If CUDA is unavailable.
     """
-    if index < 0:
-        raise ValueError(f"device_info needs a cuda ordinal, got {index}")
+    if ordinal < 0:
+        raise ValueError(f"device_info needs a cuda ordinal, got {ordinal}")
     if not torch.cuda.is_available():
         raise RuntimeError("device_info needs CUDA")
-    props = torch.cuda.get_device_properties(index)
+    props = torch.cuda.get_device_properties(ordinal)
     return DeviceInfo(
         name=props.name,
         capability=f"{props.major}.{props.minor}",
@@ -453,6 +514,6 @@ def device_info(
         smem_per_sm_bytes=Bytes(props.shared_memory_per_multiprocessor),
         l2_bytes=Bytes(props.L2_cache_size),
         total_memory_bytes=Bytes(props.total_memory),
-        clocks=clock_policy(index, query),
-        sharing=contention(index, apps=apps, query=query),
+        clocks=clock_policy(ordinal, query),
+        sharing=contention(ordinal, apps=apps, query=query),
     )

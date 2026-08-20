@@ -39,7 +39,12 @@ import torch
 from slinoss.ops.so3ssd.cute.bwd.boundary import boundary_backward
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import dram_floor_verdict, dram_time_floor
-from slinoss.perf.device import compute_apps_query, device_ordinal, require_cuda
+from slinoss.perf.device import (
+    compute_apps_query,
+    device_ordinal,
+    require_cuda,
+    smi_selector,
+)
 from slinoss.perf.ncu import (
     NCU_TABLES,
     SPILL_TABLE,
@@ -333,7 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     ordinal = device_ordinal(device)
-    before = compute_apps_query(ordinal)
+    before = compute_apps_query(smi_selector(ordinal))
     runner = build_runner(
         shape, groups, device, dtype, taps=args.taps, want_prev=args.want_prev
     )
@@ -374,7 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             local = local_sectors(one)
         else:
             passes.append(one)
-    after = compute_apps_query(ordinal)
+    after = compute_apps_query(smi_selector(ordinal))
 
     print(f"shape        {shape.describe()}")
     print(f"groups       {groups} fold {shape.heads // groups}")

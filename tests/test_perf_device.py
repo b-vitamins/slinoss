@@ -6,6 +6,10 @@ The clock and sharing probes are driven through an injected
 through a monkeypatched ``subprocess.run``, so every parse branch runs without
 ``nvidia-smi``. The two ceilings need a GPU to measure but their refusal on a CPU
 device does not, and the verdicts are pure arithmetic over hand-built ceilings.
+
+The index space a probe reads is tested the same way: the injected reader records
+the selector it was handed, and the UUID and the visible-device mapping are pinned
+to fabricated values, so which part a stamp names is asserted with no GPU.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from slinoss.perf.device import (
     device_ordinal,
     require_cuda,
     smi_query,
+    smi_selector,
 )
 from slinoss.perf.units import (
     Bytes,
@@ -70,8 +75,8 @@ FIELDS = (
 def _returning(line: str | None) -> SmiQuery:
     """An injected nvidia-smi reader that always answers with one line."""
 
-    def query(fields: Sequence[str], index: int) -> str | None:
-        del fields, index
+    def query(fields: Sequence[str], selector: str) -> str | None:
+        del fields, selector
         return line
 
     return query
@@ -80,11 +85,36 @@ def _returning(line: str | None) -> SmiQuery:
 def _apps(text: str | None) -> ComputeAppsQuery:
     """An injected compute-process reader that always answers with one block."""
 
-    def query(index: int) -> str | None:
-        del index
+    def query(selector: str) -> str | None:
+        del selector
         return text
 
     return query
+
+
+class _Properties:
+    """A stand-in for the torch device properties, carrying only the UUID."""
+
+    def __init__(self, uuid: str) -> None:
+        self.uuid = uuid
+
+
+def _uuid_from(monkeypatch: pytest.MonkeyPatch, uuid: str | None) -> None:
+    """Pin what torch reports as the part's UUID, or make it unavailable.
+
+    Args:
+        monkeypatch: The fixture.
+        uuid: The UUID torch reports, or None to make the properties raise the way
+            a CPU-only host does. Fabricated, so the test does not depend on the
+            host it runs on.
+    """
+
+    def properties(ordinal: int) -> _Properties:
+        if uuid is None:
+            raise RuntimeError("no CUDA GPUs are available")
+        return _Properties(f"{uuid}{ordinal}")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
 
 
 def _failed_run(
@@ -176,15 +206,22 @@ def _tensor(achieved_tflops: float) -> TensorCeiling:
 # ---------------------------------------------------------------------------
 
 
-def test_clock_policy_passes_the_fields_and_reports_a_missing_nvidia_smi() -> None:
-    seen: list[tuple[tuple[str, ...], int]] = []
+def test_clock_policy_passes_the_fields_and_reports_a_missing_nvidia_smi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reader receives a driver selector, never the ordinal it was called with.
+    # With no UUID and no mapping the two coincide, which is the only case where
+    # asserting a literal says anything about the fields.
+    _uuid_from(monkeypatch, None)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    seen: list[tuple[tuple[str, ...], str]] = []
 
-    def query(fields: Sequence[str], index: int) -> str | None:
-        seen.append((tuple(fields), index))
+    def query(fields: Sequence[str], selector: str) -> str | None:
+        seen.append((tuple(fields), selector))
         return None
 
     policy = clock_policy(3, query)
-    assert seen == [(FIELDS, 3)]
+    assert seen == [(FIELDS, "3")]
     assert policy.detail == "nvidia-smi unavailable"
     assert not policy.locked
     assert policy.stamp == "unlocked"
@@ -230,6 +267,58 @@ def test_clock_policy_parses_a_non_numeric_clock_as_zero() -> None:
 
 
 # ---------------------------------------------------------------------------
+# smi_selector
+#
+# Two index spaces meet in this module. `nvidia-smi` numbers devices the way the
+# driver does and `CUDA_VISIBLE_DEVICES` renumbers only torch's ordinals, so
+# handing an ordinal to the driver stamps one part while measuring another, and
+# the stamp reads clean because the probe succeeded.
+# ---------------------------------------------------------------------------
+
+
+def test_smi_selector_prefers_the_uuid_over_every_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A UUID is in neither index space, so it is right whatever the mapping holds.
+    # Asserted against a mapping that contradicts the ordinal, or an identity
+    # mapping would pass without the UUID route being taken at all.
+    _uuid_from(monkeypatch, "0badf00d-0000-4000-8000-00000000000")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,0")
+    assert smi_selector(0) == "GPU-0badf00d-0000-4000-8000-000000000000"
+    assert smi_selector(1) == "GPU-0badf00d-0000-4000-8000-000000000001"
+
+
+def test_smi_selector_remaps_through_the_visible_device_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fallback for a torch that reports no UUID. A mapping entry is already a
+    # selector the driver accepts, so it is passed through rather than parsed: an
+    # entry naming a device by UUID is correct and an integer parse would drop it.
+    _uuid_from(monkeypatch, None)
+    for visible, ordinal, want in (
+        ("1", 0, "1"),
+        ("3, 2", 1, "2"),
+        ("GPU-fixture-a,GPU-fixture-b", 1, "GPU-fixture-b"),
+    ):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+        assert smi_selector(ordinal) == want
+
+
+def test_smi_selector_falls_back_to_the_ordinal_with_no_usable_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An absent variable, an empty one, and one too short to cover the ordinal all
+    # leave the ordinal as the only index available. That is the pre-existing
+    # behaviour and it is correct exactly when the driver numbering is unchanged.
+    _uuid_from(monkeypatch, None)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert smi_selector(0) == "0"
+    for visible, ordinal in (("", 0), ("2", 1), ("2,3", 7)):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+        assert smi_selector(ordinal) == str(ordinal)
+
+
+# ---------------------------------------------------------------------------
 # smi_query
 # ---------------------------------------------------------------------------
 
@@ -248,7 +337,7 @@ def test_smi_query_builds_the_argv(monkeypatch: pytest.MonkeyPatch) -> None:
         return subprocess.CompletedProcess(list(cmd), 0, "1740, 1800\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert smi_query(("clocks.sm", "clocks.max.sm"), 2) == "1740, 1800"
+    assert smi_query(("clocks.sm", "clocks.max.sm"), "2") == "1740, 1800"
     assert seen == [
         (
             [
@@ -269,7 +358,7 @@ def test_smi_query_returns_none_on_every_failed_probe(
     # four distinct outcomes and one report: the probe did not run.
     for failure in ("missing", "timeout", "nonzero", "blank"):
         monkeypatch.setattr(subprocess, "run", _failed_run(failure))
-        assert smi_query(FIELDS, 0) is None
+        assert smi_query(FIELDS, "0") is None
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +386,7 @@ def test_compute_apps_query_builds_the_argv_and_reads_an_idle_device(
         return subprocess.CompletedProcess(list(cmd), 0, "17, 28\n99, 36918\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert compute_apps_query(1) == "17, 28\n99, 36918"
+    assert compute_apps_query("1") == "17, 28\n99, 36918"
     assert seen == [
         (
             [
@@ -319,7 +408,7 @@ def test_compute_apps_query_builds_the_argv_and_reads_an_idle_device(
         return subprocess.CompletedProcess(list(cmd), 0, "\n", "")
 
     monkeypatch.setattr(subprocess, "run", idle_run)
-    assert compute_apps_query(0) == ""
+    assert compute_apps_query("0") == ""
 
 
 def test_compute_apps_query_returns_none_on_a_failed_probe(
@@ -327,7 +416,7 @@ def test_compute_apps_query_returns_none_on_a_failed_probe(
 ) -> None:
     for failure in ("nonzero", "missing", "timeout"):
         monkeypatch.setattr(subprocess, "run", _failed_run(failure))
-        assert compute_apps_query(0) is None
+        assert compute_apps_query("0") is None
 
 
 def test_contention_reports_a_device_holding_only_this_process() -> None:
@@ -372,7 +461,7 @@ def test_contention_reports_a_failed_probe_as_shared() -> None:
         got = contention(0, apps=apps, query=query, own_pid=4321)
         assert not got.exclusive
         assert got.foreign_process_count == 0
-        assert got.detail == "nvidia-smi unavailable"
+        assert got.detail.endswith("nvidia-smi unavailable")
         assert got.stamp == "sharing unknown"
 
 
@@ -386,7 +475,7 @@ def test_contention_reports_an_unparsed_probe_as_shared() -> None:
     ):
         got = contention(0, apps=apps, query=query, own_pid=4321)
         assert not got.exclusive
-        assert got.detail.startswith("unparsed nvidia-smi output:")
+        assert "unparsed nvidia-smi output:" in got.detail
         assert got.stamp == "sharing unknown"
 
 
@@ -409,6 +498,37 @@ def test_contention_defaults_to_this_process_id() -> None:
     # this exclusion every report would read as shared with itself.
     got = contention(0, apps=_apps(f"{os.getpid()}, 512"), query=_returning("0, 512"))
     assert got.exclusive
+
+
+def test_contention_probes_the_part_the_ordinal_resolves_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both probes read the driver's device, and the record names which one.
+
+    Every measurement on the verification fleet pins one device with
+    ``CUDA_VISIBLE_DEVICES``, so torch ordinal 0 is not driver device 0. Probing
+    the ordinal reads a part the measurement never touched, and the record it
+    produces is a stamp for the wrong device rather than a failed probe.
+    """
+    _uuid_from(monkeypatch, None)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    apps_seen: list[str] = []
+    query_seen: list[str] = []
+
+    def apps(selector: str) -> str | None:
+        apps_seen.append(selector)
+        return "99, 1578"
+
+    def query(fields: Sequence[str], selector: str) -> str | None:
+        del fields
+        query_seen.append(selector)
+        return "37, 2440"
+
+    got = contention(0, apps=apps, query=query, own_pid=4321)
+    assert apps_seen == ["1"]
+    assert query_seen == ["1"]
+    assert got.detail.startswith("device 1:")
+    assert got.foreign_process_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +595,9 @@ def test_device_info_reads_the_part_it_runs_on() -> None:
     # This process holds a context on the device, so the probe ran and excluded
     # it. Whether anything else is there is the host's business, not a property
     # the test can assert.
-    assert info.sharing.detail != "nvidia-smi unavailable"
+    assert "nvidia-smi unavailable" not in info.sharing.detail
+    # The record names the part the driver was asked about, not the torch ordinal.
+    assert info.sharing.detail.startswith(f"device {smi_selector(0)}:")
     assert info.sharing.foreign_memory_mib >= 0.0
 
 

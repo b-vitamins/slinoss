@@ -32,7 +32,6 @@ would misattribute it.
 """
 
 import argparse
-import os
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -43,7 +42,12 @@ import torch
 from slinoss import aot
 from slinoss._cute import cache_events, compiled_launches, executor_count
 from slinoss.config import SLinOSSConfig
-from slinoss.perf.device import contention, device_ordinal, require_cuda
+from slinoss.perf.device import (
+    contention,
+    device_ordinal,
+    require_cuda,
+    smi_selector,
+)
 from slinoss.stack import SLinOSSStack
 from slinoss.state import StackState
 
@@ -196,28 +200,6 @@ def build_step(
     return train
 
 
-def _physical(device: torch.device) -> int:
-    """The ``nvidia-smi`` index of a torch device.
-
-    ``CUDA_VISIBLE_DEVICES`` renumbers torch's ordinals and not the driver's, so
-    probing the torch ordinal would report a different part than the step ran on.
-
-    Args:
-        device: The device.
-
-    Returns:
-        The driver index, or the torch ordinal if the variable is unset or names
-        devices by UUID.
-    """
-    ordinal = device_ordinal(device)
-    visible = [
-        item.strip() for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    ]
-    if ordinal < len(visible) and visible[ordinal].isdigit():
-        return int(visible[ordinal])
-    return ordinal
-
-
 def _stamp(device: torch.device) -> None:
     """Print what else was on the device.
 
@@ -227,10 +209,10 @@ def _stamp(device: torch.device) -> None:
     Args:
         device: The device the step ran on.
     """
-    index = _physical(device)
-    seen = contention(index)
+    ordinal = device_ordinal(device)
+    seen = contention(ordinal)
     print(
-        f"device {index}  exclusive {seen.exclusive}  "
+        f"device {smi_selector(ordinal)}  exclusive {seen.exclusive}  "
         f"foreign {seen.foreign_process_count} processes "
         f"{seen.foreign_memory_mib:,.0f} MiB"
     )
