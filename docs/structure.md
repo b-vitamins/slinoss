@@ -62,6 +62,7 @@ slinoss/
   _registry.py    Backend and Registry, shared by every operator
   _cute.py        the one device-side helper set and the executor cache
   _guard.py       host-side layout, device, and dtype checks
+  _reduce.py      the row reduction of a per-block partial buffer
   ops/
     so3ssd/       the scan operator
       cute/
@@ -87,11 +88,11 @@ examples/
 assets/           plots only, 300 DPI minimum, vector where possible
 ```
 
-`slinoss/_cute.py`, `_guard.py`, `_registry.py`, and every shared module under
-`ops/so3ssd/cute/` are single-implementation modules. A helper that belongs in
-one of them is added there, never copied into a kernel module. A rule shared by
-several kernels lives in the shared module even when only one kernel reaches it
-today.
+`slinoss/_cute.py`, `_guard.py`, `_registry.py`, `_reduce.py`, and every shared
+module under `ops/so3ssd/cute/` are single-implementation modules. A helper that
+belongs in one of them is added there, never copied into a kernel module. A rule
+shared by several kernels lives in the shared module even when only one kernel
+reaches it today.
 
 Every package directory has an `__init__.py`. A namespace package that works
 in-tree and breaks in a wheel is a packaging bug. A subpackage `__init__.py`

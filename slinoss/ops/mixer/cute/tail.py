@@ -4,9 +4,9 @@
     x   = x * silu(gate)
     out = x * rsqrt(mean(x^2) + eps) * weight
 
-One kernel and one launch per direction. The skip, the gate, and the norm are one
-pass over the operands: every element is read once and every intermediate stays in
-registers.
+One kernel per direction, and one launch for the forward. The skip, the gate, and
+the norm are one pass over the operands: every element is read once and every
+intermediate stays in registers.
 
 Layout. ``y`` and ``u`` are head-major, ``(B,H,T,P)``, and ``gate`` and the output
 are token-major, ``(B,T,H*P)``, with head ``h`` at columns ``h*P`` through
@@ -47,7 +47,10 @@ one ``(H,P)`` row of tile partials. That is the kernel's epilogue; there is no
 second pass over the operands. Closing the reduction inside the launch would need
 an accumulator zeroed before it, and a zero fill on the hot path is not available,
 so the partial buffer is ``torch.empty``, every element of it is written by the
-kernel, and the cross-tile sum is a reduction over that buffer alone.
+kernel, and the cross-tile sum is the backward's second launch,
+:func:`slinoss._reduce.reduce_partials` over that buffer alone. Both slots reduce
+in the one launch, and it narrows on its store, so the parameter dtype costs no
+cast here.
 
 Shared memory. One tile, :func:`param_tile`, holding the per-warp parameter
 partials. A lane's accumulators sit at the warp-strided positions of :func:`_slots`
@@ -90,6 +93,7 @@ from slinoss._cute import (
 )
 from slinoss._guard import check_dtypes, check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
+from slinoss._reduce import reduce_partials
 from slinoss.ops.mixer.reference import MixerTailGrads, check_dgate_dest, tail_shape
 
 __all__ = [
@@ -711,12 +715,12 @@ def mixer_tail_backward(
     eps: float,
     dgate: Tensor | None = None,
 ) -> MixerTailGrads:
-    """Pull the cotangent of the tail back to all five operands, in one launch.
+    """Pull the cotangent of the tail back to all five operands.
 
     The norm scale is recomputed from the operands, so the forward saves no
     intermediate. Both parameter gradients are accumulated in the kernel's
-    epilogue as one ``(H,P)`` row of tile partials; the cross-tile sum is a
-    reduction over that buffer and reads no operand a second time.
+    epilogue as one ``(H,P)`` row of tile partials; the cross-tile sum is a second
+    launch over that buffer and reads no operand a second time.
 
     A supplied ``dgate`` is stored into directly. The kernel's layouts are dynamic
     except the trailing mode, so a destination at the projection's pitch is a store
@@ -792,11 +796,17 @@ def mixer_tail_backward(
         ),
         (_segments(rows), rows % cute.arch.WARP_SIZE == 0),
     )
-    totals = partial.sum(1)
+    # Both slots reduce in one launch: head and row are the reduced width and the
+    # buffer is contiguous, so the flattening is a view. `_check_operands` holds the
+    # two parameters to one dtype, so one output dtype covers both slots and the
+    # narrowing happens on the kernel's store.
+    totals = reduce_partials(
+        partial.view(SLOTS, tiles, heads * rows), out_dtype=d_skip.dtype
+    ).view(SLOTS, heads, rows)
     return MixerTailGrads(
         dy=dy,
         du=du,
         dgate=dgate,
-        dd_skip=totals[SLOT_DSKIP].to(d_skip.dtype),
-        dweight=totals[SLOT_WEIGHT].to(weight.dtype),
+        dd_skip=totals[SLOT_DSKIP],
+        dweight=totals[SLOT_WEIGHT],
     )

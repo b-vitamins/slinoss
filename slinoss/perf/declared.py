@@ -68,6 +68,7 @@ DECLARED: Final[dict[str, str]] = {
     "conv1d_reduce_parts_kernel": SERIAL_TINY,
     "mixer_tail_bwd_kernel": DRAM_BOUND,
     "mixer_tail_fwd_kernel": DRAM_BOUND,
+    "reduce_rows_kernel": SERIAL_TINY,
     "rmsnorm_bwd_kernel": DRAM_BOUND,
     "rmsnorm_dweight_kernel": SERIAL_TINY,
     "rmsnorm_fwd_kernel": DRAM_BOUND,
@@ -87,7 +88,7 @@ step in the operator, but serial is not the same as latency bound: once the chun
 fetch is pipelined ahead of the rotation, the serial chain is arithmetic and the
 kernel saturates the bus. Both are held to a bandwidth like the rest.
 
-Three entries are SERIAL-tiny, and only the first is unconditionally so.
+Four entries are SERIAL-tiny, and only the first is unconditionally so.
 ``boundary_bwd_kernel`` on the single-partial path reads a fixed few rows per chunk
 rather than a pass over the sequence, so no shape makes that path large enough to
 hold to a bandwidth. That is a property of the kernel and belongs here. Its
@@ -104,7 +105,16 @@ the second, which means the second's declaration has a range. Measured on sm_86:
 76-80% of the copy ceiling and 11% of the step; 30.8 us at ``D`` 8192, 88.5-89.5%.
 SERIAL-tiny is right for every shape the driver measures and stops being right
 somewhere above ``D`` 2048. Widening the workload past that needs the class
-revisited, not the floor lowered."""
+revisited, not the floor lowered.
+
+``reduce_rows_kernel`` is the same kind of tail, shared by the scan's parameter
+frontier and the fused mixer tail. Its row extent follows the sequence where the
+other two are bounded by their own grid, but so does the pass that produced the
+rows: one partial row per block of that pass, so the reduction's traffic is a fixed
+fraction of it and the share holds as ``B*T`` grows rather than climbing with it.
+Measured on sm_86, clocks unlocked: 5.952 us at the frontier's ragged shape,
+0.999% of the scan-prep step; 4.128 us at the tail's standard shape into a
+bfloat16 destination, 0.555% of the mixer-tail step."""
 
 
 def declared_class(kernel: str) -> str | None:

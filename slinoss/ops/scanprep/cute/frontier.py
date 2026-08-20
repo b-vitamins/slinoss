@@ -1,9 +1,9 @@
 """The scan's parameter frontier. CuTe DSL forward and backward.
 
-One kernel and one launch per direction. The forward reads the token-major
-parameter slice of the projection and writes ``trans`` and ``K``. ``B`` and ``C``
-reach the scan's kernels as pitched bands of the same projection, so no phase here
-touches them. The maps themselves are in
+One kernel per direction, and one launch for the forward. The forward reads the
+token-major parameter slice of the projection and writes ``trans`` and ``K``.
+``B`` and ``C`` reach the scan's kernels as pitched bands of the same projection,
+so no phase here touches them. The maps themselves are in
 :mod:`slinoss.ops.scanprep.cute.maps`, which is their only device-side
 implementation.
 
@@ -37,7 +37,9 @@ parameter row, applies both Jacobians, stores its ten gradient columns, and then
 reduces them over the tile's tokens by warp shuffle. ``TILE_TOKENS`` divides the
 warp width, so a token run lies inside one warp and the reduction needs neither
 shared memory nor a barrier; the run's last lane writes the block's partial
-``dparam_bias`` row.
+``dparam_bias`` row. Summing those rows is the backward's second launch,
+:func:`slinoss._reduce.reduce_partials` over the ``(batch, tile)`` axes flattened
+into one.
 
 Invariants. I1 and I2 are produced here rather than asserted here, and I4 holds:
 ``trans`` and ``K`` are float32 at every input width, including under autocast,
@@ -71,6 +73,7 @@ from slinoss._cute import (
 )
 from slinoss._guard import check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
+from slinoss._reduce import reduce_partials
 from slinoss.ops.scanprep.cute.maps import (
     log_scale,
     log_scale_grad,
@@ -759,7 +762,11 @@ def scanprep_backward(
             heads,
         ),
     )
+    # One slab of `bsz * tiles` rows: batch and tile are both reduced away, and the
+    # buffer is contiguous, so the flattening is a view.
     return ScanGrads(
         dparams=dparams,
-        dparam_bias=partial.sum(dim=(0, 1)).view(heads, PARAM_COLS),
+        dparam_bias=reduce_partials(partial.view(1, bsz * tiles, width)).view(
+            heads, PARAM_COLS
+        ),
     )
