@@ -179,9 +179,9 @@
 // sees of that depends on the caller. A paired step driving the backends directly
 // reads 9.664 us, interval [-14.400, -5.120] us over 40 pairs, because there the
 // launches queue behind the backward kernel and only their kernel time is exposed.
-// Through autograd, whose engine leaves host gaps between them, bench_conv reads
-// 419 and 430 us before against 357 and 359 us after, unpaired medians at 17% to
-// 72% spread that resolve nothing on their own.
+// Through autograd, whose engine leaves host gaps between them, the bench driver
+// read 419 and 430 us before against 357 and 359 us after, unpaired medians at 17%
+// to 72% spread that resolve nothing on their own.
 //
 // Shared memory is rows[kReduceRows][kReduceChannels] floats, and the block is
 // kReduceChannels wide, so a warp's store covers two rows, 32 consecutive floats,
