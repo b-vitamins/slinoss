@@ -14,6 +14,7 @@ from slinoss.config import (
     MAX_CHUNK,
     MIN_CHUNK,
     STATE_MULTIPLE,
+    VOCAB_MULTIPLE,
     SLinOSSConfig,
 )
 
@@ -35,6 +36,8 @@ def test_defaults() -> None:
     assert (c.d_inner, c.n_heads, c.n_lanes, c.d_ffn) == (128, 2, 16, 256)
     assert c.chunk_size == 64
     assert c.vocab_size is None
+    assert c.padded_vocab_size is None
+    assert c.vocab_pad_multiple == VOCAB_MULTIPLE
 
 
 def test_fractional_expand_rounds() -> None:
@@ -94,11 +97,43 @@ def test_legal_chunk_sizes(chunk_size: int) -> None:
         ({"norm_eps": 0.0}, "norm_eps must be positive"),
         ({"norm_eps": -1e-5}, "norm_eps must be positive"),
         ({"vocab_size": 0}, "vocab_size must be positive"),
+        ({"vocab_pad_multiple": 0}, "vocab_pad_multiple must be positive"),
+        ({"vocab_pad_multiple": -8}, "vocab_pad_multiple must be positive"),
+        ({"vocab_pad_multiple": 2}, "vocab_pad_multiple is 1 for no padding"),
+        ({"vocab_pad_multiple": 12}, "vocab_pad_multiple is 1 for no padding"),
     ],
 )
 def test_rejects(overrides: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         cfg(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("vocab", "multiple", "padded"),
+    [
+        (50257, 8, 50264),
+        (50257, 1, 50257),
+        (50257, 128, 50304),
+        (50264, 8, 50264),
+        (17, 8, 24),
+        (1, 8, 8),
+    ],
+)
+def test_the_head_width_rounds_up_and_an_aligned_vocabulary_pays_nothing(
+    vocab: int, multiple: int, padded: int
+) -> None:
+    """The widened head width, against widths worked out by hand.
+
+    The head's three GEMMs each carry this width on the mode that decides which
+    kernel cuBLAS picks, so an off-by-one here costs all three their wide load and
+    reports as nothing but a slower step. Rounding the wrong way costs correctness
+    instead: a width below ``vocab_size`` drops logits the vocabulary needs.
+    """
+    c = cfg(vocab_size=vocab, vocab_pad_multiple=multiple)
+    assert c.padded_vocab_size == padded
+    assert padded >= vocab
+    assert padded % multiple == 0
+    assert padded - vocab < multiple
 
 
 @pytest.mark.parametrize("d_head", [16, 32, 64, 128])
