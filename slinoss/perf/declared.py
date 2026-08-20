@@ -88,11 +88,13 @@ fetch is pipelined ahead of the rotation, the serial chain is arithmetic and the
 kernel saturates the bus. Both are held to a bandwidth like the rest.
 
 Three entries are SERIAL-tiny, and only the first is unconditionally so.
-``boundary_bwd_kernel`` reads a fixed few rows per chunk rather than a pass over the
-sequence, so no shape makes it large enough to hold to a bandwidth. That is a
-property of the kernel and belongs here. A shape with too few blocks to fill the
-device is a different thing: a statement about a shape rather than about a kernel,
-and it does not live here.
+``boundary_bwd_kernel`` on the single-partial path reads a fixed few rows per chunk
+rather than a pass over the sequence, so no shape makes that path large enough to
+hold to a bandwidth. That is a property of the kernel and belongs here. Its
+multi-partial path is a pass over ``S`` partials, is not SERIAL-tiny, and takes its
+own class when a producer that emits partials lands. A shape with too few blocks to
+fill the device is a different thing again: a statement about a shape rather than
+about a kernel, and it does not live here.
 
 ``conv1d_reduce_parts_kernel`` and ``rmsnorm_dweight_kernel`` are reduction tails
 over a per-block partial, so their traffic follows the reduced width rather than the
@@ -138,9 +140,10 @@ Both hold a kernel to a rate, and a rate is a counted quantity over a duration. 
 spill adds traffic and instructions that the class's own byte or flop model does
 not contain, so it moves the counted quantity as well as the duration and the
 percentage stops ordering two configurations of the same kernel by speed:
-measured on an A6000, ``chunk_scan_fwd_kernel`` at two blocks per SM spilled
-nothing and ran 5.8% faster than the same body at three blocks per SM, and scored
-2.7 points lower for it under the floor this module judges against.
+measured on an A6000 at the standard shape, ``chunk_scan_fwd_kernel`` at two blocks
+per SM spilled nothing and ran 9% faster than the same body at three blocks per SM,
+104.4 us against 114.8, and scored 2.7 points lower for it under the floor this
+module judges against.
 
 SERIAL-tiny is absent because its bar is a share of the step wall, which a spill
 can only worsen. A spilling SERIAL-tiny kernel is still worth fixing; it is not a

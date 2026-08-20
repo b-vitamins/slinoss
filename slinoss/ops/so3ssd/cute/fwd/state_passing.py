@@ -52,9 +52,9 @@ step in the operator, but the serial chain is the rotation, not the fetch, so th
 kernel reaches a bandwidth fraction rather than a latency floor.
 ``long_scoreboard`` remains the dominant stall reason at 88.90%; at 84.23% of peak
 DRAM throughput that is warps waiting on a saturated bus, not on an idle one. The
-class is asserted for shapes whose grid covers the device; a shape with too few
-blocks to fill it is SERIAL-tiny instead, and which shapes fall on which side is
-not yet measured.
+class is asserted for shapes whose grid covers the device. A shape with too few
+blocks to fill it is a statement about the shape rather than about the kernel, and
+no second class is claimed for it here.
 
 The grid is ``(P*N/threads, B, H)``. That is under twice the SM count only when
 ``B*H`` is small, and widening it is not available, because the parallelism is

@@ -44,7 +44,7 @@ a transposed score tile is not.
   consecutive elements of one row fill the request; lanes strided by the warp
   width leave the last segment carrying `width mod 32` lanes and that fraction of
   the request's bytes. At a 48-element row the strided map averaged 48 bytes a
-  request against 64, and packing the columns cut 15% off a kernel whose DRAM
+  request against 64, and packing the columns cut the time of a kernel whose DRAM
   traffic did not move. L1 sector count rose in the same change, so sectors are
   not the quantity to minimize. Sectors per request is, read against the
   instruction's own bytes per lane. Bytes over sectors is not a coalescing
@@ -148,6 +148,7 @@ shape, where DRAM reads are zero.
 A register spill fails a `DRAM-bound` or `TENSOR-bound` kernel outright, whatever
 the percentage says. Both classes hold a counted quantity against a duration, and
 a spill moves both: at three blocks per SM `chunk_scan_fwd_kernel` scored 2.7
-points higher than the same body at two blocks per SM while running 5.8% slower.
+points higher than the same body at two blocks per SM while running 10% slower,
+114.8 us against 104.4 at the standard shape on sm_86.
 Local-memory sectors are read in their own NCU pass and are required, not
 optional -- a pass that was never run must not read as clean.

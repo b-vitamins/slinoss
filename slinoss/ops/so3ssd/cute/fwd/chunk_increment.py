@@ -46,7 +46,8 @@ the two taps, so the rotated forcing never reaches global memory.
 
 DRAM-bound. Analytic traffic at ``standard`` is 37.7 MB against 906 MFLOP, so 24
 flop/byte against a ridge point of 165: memory bound by a factor of seven, which
-is why the padded M mode costs nothing measurable. Measured DRAM traffic on sm_86
+is what makes the padded M mode affordable; it adds arithmetic and no traffic, and
+was not timed against a variant without it. Measured DRAM traffic on sm_86
 is 37.4 MB per launch, so there is no redundant traffic to remove and the achieved
 fraction is set by how much of the pipe the resident blocks keep busy, which is
 what :func:`kblock` sizes the slice for.

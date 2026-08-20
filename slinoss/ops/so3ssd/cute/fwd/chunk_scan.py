@@ -495,10 +495,11 @@ def chunk_scan_fwd(
     Batch, head, chunk count, and sequence length are dynamic.
 
     The launch carries a residency bound. Without one the register allocator spends
-    218 per thread on this body and two blocks per SM is all that fits, which
-    measures slower than the same schedule at the residency the shared-memory budget
-    already allows. The bound is that residency, computed rather than chosen, so it
-    asks for no register cut that occupancy cannot spend.
+    218 per thread on this body and the residency is whatever that leaves; with one
+    the thread cap follows the residency the shared-memory budget allows, so the
+    schedule is chosen rather than inherited. The A/B the ceiling rests on is in
+    :data:`RESIDENT_MAX`. The bound is computed rather than chosen, so it asks for no
+    register cut that occupancy cannot spend.
     """
     resident = min(RESIDENT_MAX, smem_capacity() // scan_smem_bytes(chunk, rows, dim))
     chunk_scan_fwd_kernel(

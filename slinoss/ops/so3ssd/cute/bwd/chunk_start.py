@@ -32,7 +32,10 @@ SM, ``MAX_CHUNK`` at ``3N = 48`` two, and ``MAX_CHUNK`` at ``3N = 96`` one.
 DRAM-bound. Analytic traffic at ``standard`` is ``dy 9.44 + trans 1.57 + C 9.44 +
 dzstart 14.16 = 34.61 MB`` against ``1536 * 2*64*48*64 = 604 MFLOP``, so 17.5
 flop/byte against a ridge point of 164: memory bound by a factor of nine, which is
-why the padded M mode and the recomputed prefixes cost nothing measurable.
+what makes the padded M mode and the recomputed prefixes affordable. Both add
+arithmetic and no traffic: measured at ``standard`` on one A6000, clocks unlocked,
+device otherwise idle, DRAM traffic is 34.62 MB against that analytic 34.61. Neither
+was timed against a variant without it.
 """
 
 import cutlass

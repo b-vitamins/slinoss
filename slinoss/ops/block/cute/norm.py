@@ -119,8 +119,11 @@ percent floor the class carries::
     rmsnorm_bwd             93.1-94.1  104.9-105.7   90.3-91.1   93.8-94.6
     rmsnorm_residual_bwd  100.3-100.5
 
-Past 100 is legitimate: the floor is fitted to a copy, and a read/write mix
-friendlier than a copy's beats it. Every one of these is one wave of
+Past 100 is not a claim of beating the bus. The floor is fitted to a copy, so a
+read/write mix friendlier than a copy's clears it, and so does a fit residual of the
+same size; the residual travels with the report each column was read from and is not
+transcribed here, so a figure within a few points of 100 does not separate the two.
+Every one of these is one wave of
 ``row_blocks`` blocks, 504 on this device, at 40 registers per thread and no local
 memory. Achieved occupancy is 90.9 to 93.6 percent forward; backward it is 76.2 to
 77.8 at ``D = 288`` against 91.7 to 92.3 at ``D = 384``, where DRAM's speed of
@@ -128,11 +131,11 @@ light is 73.8 to 74.1 and 85.2 to 85.8 percent respectively, so the wider shape 
 the one that saturates the bus.
 
 ``rmsnorm_dweight_kernel`` is the one kernel here whose traffic is not a sequence
-extent: ``4*D`` per block of the backward grid, so it grows with ``D`` alone. At
-every standard width it is SERIAL-tiny and held to a share of the step, 2.84 us at
+extent: ``4*D`` per block of the backward grid, so it grows with ``D`` alone. At both
+widths the bench covers it is SERIAL-tiny and held to a share of the step, 2.84 us at
 ``d_model = 288`` and under one percent of it. It leaves that class as ``D`` grows:
-17.0 us at ``D = 4096`` and 30.8 at ``D = 8192``, 76 and 90 percent of the measured
-ceiling, where bandwidth is the bound instead.
+17.0 us at ``D = 4096`` and 30.8 at ``D = 8192``, 76-80 and 88.5-89.5 percent of the
+measured ceiling, where bandwidth is the bound instead.
 """
 
 from functools import cache

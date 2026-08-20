@@ -135,9 +135,10 @@
 // unaffected. The backward reads dy on the critical path, and on the scalar walk was
 // 4.5% slower at P = 48 and 6.9% at P = 16. The strip moves the crossing off the
 // walk and into the fill, whose slot index runs flat over (stream, timestep, channel
-// vector): 51.64, 51.82 and 52.22 us at P = 64, 48 and 16, so +0.35% and +1.12%,
-// measured with another tenant holding 3.7 GB of device 0 at 24% utilization. What
-// is left is request count alone. A 16 B vector never straddles a head, because P is
+// vector). No duration is quoted for the strip across P: the only run taken shared
+// device 0 with another tenant holding 3.7 GB at 24% utilization, which is a number
+// and not a measurement. What is left is the sector count, which is a per-launch
+// counter and not a duration. A 16 B vector never straddles a head, because P is
 // a multiple of 16, so at P = 16 a warp's fill touches four times the rows for the
 // same sectors: 2.468M load sectors against 2.472M at P = 64, and neither the sector
 // count nor the DRAM count moves.

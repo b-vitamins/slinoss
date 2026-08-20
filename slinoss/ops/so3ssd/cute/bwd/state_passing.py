@@ -82,9 +82,9 @@ The grid is ``(P*N/threads, B, H)``. That is under twice the SM count only when
 exactly ``B*H*P*N`` independent 3-vectors and no more. At the standard shape it is
 288 blocks of 128 threads, 0.34 waves per multiprocessor, and achieved occupancy
 is 26.5% against a theoretical 83.33%: capped by the launch, not by the register
-count. The class is asserted for shapes whose grid covers the device; a shape with
-too few blocks to fill it is SERIAL-tiny instead, and which shapes fall on which
-side is not yet measured.
+count. The class is asserted for shapes whose grid covers the device. A shape with
+too few blocks to fill it is a statement about the shape rather than about the
+kernel, and no second class is claimed for it here.
 """
 
 from typing import NamedTuple
