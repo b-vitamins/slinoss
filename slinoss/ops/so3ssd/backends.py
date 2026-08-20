@@ -119,15 +119,14 @@ register(
 def _register_cute() -> None:
     """Register the CuTe backend if this host can run it.
 
-    The forward is the three-kernel tree; the backward is still the reference, so a
-    training step on this backend runs a fast forward against a torch backward. That
-    is a deliberate intermediate state, not a fallback: the forward is the half that
-    is finished, and shipping it under its own name keeps the benchmarked path and
-    the public path identical while the backward lands.
+    Both directions are kernel trees: three launches forward, seven backward. The
+    backward rematerializes the chunk-start state rather than saving it, so a
+    training step on this backend touches no torch fallback.
     """
     if not torch.cuda.is_available():
         return
     try:
+        from slinoss.ops.so3ssd.cute.backward import so3ssd_bwd_cute
         from slinoss.ops.so3ssd.cute.forward import so3ssd_fwd_cute
     except ImportError:
         return
@@ -135,7 +134,7 @@ def _register_cute() -> None:
         Backend(
             name=CUTE,
             forward=so3ssd_fwd_cute,
-            backward=so3ssd_bwd_ref,
+            backward=so3ssd_bwd_cute,
             device_types=("cuda",),
             dtypes=LOW_PRECISION_DTYPES,
             priority=10,
