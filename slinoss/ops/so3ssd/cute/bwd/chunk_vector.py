@@ -125,19 +125,21 @@ up to the tile.
 The budget bounds ``L``, ``P`` and the fold. It does not bound ``3N``, and this is
 still the widest live set in the tree. ``L 16`` and ``L 32`` fit at every ``P``,
 every fold and every ``3N``.
-``L 64`` fits to ``P 64`` at every fold, in 91,600 B at fold one and 93,648 B above
+``L 64`` fits to ``P 64`` at every fold, in 93,904 B at fold one and 95,952 B above
 it at the shipped width and 256 B less at one warp group, whether ``3N`` is 48 or
-240. ``L 64`` at ``P 128`` and ``L 128`` at every ``P``
-are refused: the smallest live set at ``L 128`` is 120,528 B, above the capacity of
+240. The table's segment-aligned pitch costs ``36 * L`` B of each figure, 2,304 B at
+``L 64``, and it does not scale with the fold. ``L 64`` at ``P 128`` and ``L 128`` at
+every ``P``
+are refused: the smallest live set at ``L 128`` is 125,136 B, above the capacity of
 every device the DSL reports. :func:`slinoss._cute.assert_smem_fits` refuses the
 rest rather than any path here degrading.
 
 The largest ``L`` this layout admits is 64, at one resident block, at ``P 64`` and at
 ``P 48`` alike. Two resident blocks of 128 threads need 50,688 B of the 101,376 B
 carveout, and no legal shape at ``P 64`` reaches it: the smallest arena there is
-53,648 B, at ``L 16`` and fold one. Splitting the fold across blocks removes the one
-accumulator that exists only above fold one, 13,312 B of the 93,392, and leaves
-80,080 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
+54,224 B, at ``L 16`` and fold one. Splitting the fold across blocks removes the one
+accumulator that exists only above fold one, 13,312 B of the 95,696, and leaves
+82,384 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
 the two float32 fold sums, the output tile and the aliased float32 readout -- which
 is why 128 is refused and why grid-izing the lane tile does not unpin it.
 
@@ -197,8 +199,9 @@ that query named another process the duration is a bound, not a rate.
 
 At the default configuration -- 11,520 blocks of 256 threads, five lane tiles, the
 fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
-515.74 MB of DRAM per launch in 1,994.8 us on device time at 1.7955 GHz, median of
-five steady-state launches, 3,537,566 active cycles.
+515.74 MB of DRAM per launch in 1,851.8 us on device time at 1.7969 GHz, median of
+five steady-state launches in each of two A/B blocks, 3,285,344 active cycles at a
+0.59% spread.
 :func:`vector_reduce` closes the head sum in 222.0 us at 152.77 MB and 102.7% of its
 own floor; the two lane-slot reductions add 44.2 and 23.0 us. Three of the four
 launches are at their bandwidth; the main kernel is the one that misses the 85% the
@@ -211,13 +214,13 @@ one under the same counter passes. Cycles are the invariant; a duration is not.
 Stamp the clock from ``gpc__cycles_elapsed.avg.per_second`` beside any duration.
 
 That percentage is not a traffic problem, and at the shipped width it is not
-instruction supply either. 91,600 B and 154 registers a thread each admit one
+instruction supply either. 93,904 B and 154 registers a thread each admit one
 256-thread block per multiprocessor, ``launch__occupancy_limit_shared_mem`` and
 ``launch__occupancy_limit_registers`` both reading 1: 16.7% theoretical occupancy,
 16.6% achieved, two warps a scheduler. ``mio_throttle`` leads the stalls, issue-active
 is 30.7%, and DRAM runs at 26.6% of peak against tensor at 13.9%. What the launch
-spends its cycles on is the LSU issue port, which carries 74.27 M warp instructions
-and occupies 50.0% of the port's peak issue rate: read ``l1tex__throughput`` as that
+spends its cycles on is the LSU issue port, which carries 66.80 M warp instructions
+and occupies 48.4% of the port's peak issue rate: read ``l1tex__throughput`` as that
 occupancy and not as a bandwidth, since it measures equal to
 ``sm__inst_executed_pipe_lsu`` against its own peak digit for digit. The padding rule
 is held centrally. Local traffic is zero at every one of the three launches.
