@@ -25,19 +25,23 @@ a transposed score tile is not.
   operand is a broadcast shared-memory read, bank-conflict-free by
   construction. The rotation and the tap are never applied as separate per-lane
   passes.
-- That rule is under review on the backward, and the measurement is against it. A
-  broadcast read is conflict-free and still costs a full LSU instruction, so the
-  matvec form buys freedom from conflicts with instruction count. On sm_86
-  `chunk_vector_bwd` spent 73.0% of its duration issuing memory instructions at
-  9.4% of the tensor pipe and 23-24% of DRAM speed of light. Low tensor
-  utilization with an issue-bound memory port is the signature of scalar rowwise
-  work around the GEMMs, and this form is what produces it. Deleting the lane
-  butterfly took the port to 54.6% and left `LDS` as the largest row in the
-  census, most of which is the table broadcast this rule prescribes, so the form
-  is now the top item rather than a background term. The open question is whether
-  the 3x3 apply belongs on the tensor pipe instead, priced in instructions per
-  token rather than in FMAs. Nothing has measured the alternative, so the rule
-  stands and the doubt is stated.
+- That rule was held under review on the backward for two profiles, on the
+  argument that a broadcast read is conflict-free and still costs a full LSU
+  instruction, so the matvec form buys freedom from conflicts with instruction
+  count. The review is closed and the rule survives it. Measured on sm_86 at the
+  acceptance shape, the table reads the rule prescribes are 12,648,960 `LDS.32`,
+  137.25 per warp, 40.5% of `LDS` and 14.9% of the LSU term, which prices at
+  214.6 us of a 2,652.5 us launch. Deleting the table and everything that reads
+  it is worth 8.1%, so the form is not what makes this kernel slow. Two further
+  measurements say the same thing from the other side: 76.9% of the kernel's
+  shared loads are already classified broadcast or conflict-free, so these reads
+  are as cheap per instruction as shared memory gets and no access-pattern change
+  reaches them; and the tensor pipe the alternative would move work onto sits at
+  13.86%, against an LSU class that is 22.56% of all instructions issued. A form
+  that puts the 3x3 apply on the tensor pipe has to stage its operands in fewer
+  than 137.25 instructions per warp to win anything at all, and it cannot win
+  more than 8.1% however cheap it is. The rule stands on the measurement rather
+  than on the assertion it was written with.
 - Chunk-local prefixes are recomputed inside every kernel that needs them,
   forward and backward. They never cross a kernel boundary and never touch
   global memory. They are shared across all `N` lanes and all `P` rows, so one
@@ -157,22 +161,45 @@ instructions, and the class bar says nothing about that.
 - The ranked cost is the instruction census, one row per opcode. On
   `chunk_vector_bwd`, before and after that cut:
 
-      opcode    16 lanes       4 lanes
-      SHFL    69,258,240    11,197,440
-      LDS     49,271,040    32,129,280
-      STS     20,989,440    19,054,080
-      LDSM    14,008,320    14,008,320
-      LDG      6,842,880     6,842,880
-      STG      5,276,160     3,064,320
-      total  166,152,960    86,803,200
-      port         73.0%         54.6%
+      opcode    16 lanes       4 lanes     4 lanes + paired stores
+      SHFL    69,258,240    11,197,440    11,197,440
+      LDS     49,271,040    32,129,280    31,207,680
+      STS     20,989,440    19,054,080    18,132,480
+      LDSM    14,008,320    14,008,320    14,008,320
+      LDG      6,842,880     6,842,880     6,842,880
+      STG      5,276,160     3,064,320     3,064,320
+      S2R              -             -       368,640
+      total  166,152,960    86,803,200    84,960,000
+      port         73.0%         54.6%        55.06%
 
   The three reduction tails beside it are DRAM-bound and issue almost nothing.
+- A census is complete only when it closes against the counter with nothing left
+  over. The first two columns above left 506,880 instructions, 5.5 per warp,
+  unnamed, and an unnamed row is a place a wrong conclusion hides. It resolved into
+  `S2R` at 4.0 per warp, which is a register move off the special-register file and
+  not a memory access at all, plus a 1.5 per warp shortfall of the `LDG` counter
+  against the `SASS` line count. Name the row or state that it is unnamed. Two
+  narrower disagreements are open and stated rather than folded away: the
+  `op_shared_st` counter under-counts `SASS` `STS` by 3.0 per warp, and two harnesses
+  that agree on a store delta to the instruction disagree on the absolute by 99 per
+  warp, so a delta from one report is not comparable to an absolute from another.
 - A census goes stale the moment an arm lands, and so does everything derived from
-  it. That one change halved the total, moved the largest row from `SHFL` to `LDS`,
-  and moved the dominant stall from `mio_throttle` to `wait`, which is arithmetic
-  dependency rather than a memory queue. Every rank, share and width histogram taken
-  at the old width was void in one commit. Re-profile before choosing the next arm.
+  it. The group cut halved the total and moved the largest row from `SHFL` to `LDS`.
+  It also moved the dominant stall from `mio_throttle` to `wait`, and then the store
+  pairing moved it back, so a stall ordering read once is not a property of the
+  kernel. Every rank, share and width histogram taken at the old width was void in
+  one commit. Re-profile before choosing the next arm.
+- Rank by source line, not only by opcode, because an opcode row spans call sites
+  that different arms reach. Setting `CUTE_DSL_LINEINFO=1` in the profiling
+  environment is sufficient and costs nothing measurable: instruction counts and
+  register allocation come out bit-identical and the duration moves 0.004%. Two
+  defects bound what it can say. The line numbers are sound and the file identity is
+  not, because one `.file` is emitted for the whole module, so intersect the reported
+  lines with the module's own location set. And an op is attributed to the innermost
+  frame that emitted it, so a helper called from many sites reports as the helper and
+  cannot be split among its callers. Locate a shared-memory region by its immediates
+  in `SASS` rather than by inference, then attribute every access to it by base
+  register and check that the parts sum to the whole.
 - Shared wavefronts are a second-order term, not the currency. They set how long a
   conflicted access occupies the pipe, so a conflict is still a bug, but removing
   wavefronts without removing instructions does not move an issue-bound kernel:
@@ -185,10 +212,20 @@ instructions, and the class bar says nothing about that.
 - A width change is therefore worth more than the wavefront law allows, not less.
   Folding four scalar `LDS` into one `LDS.128` leaves the wavefront count invariant
   and deletes three instructions of four. Two adjacent bfloat16 accesses pack into
-  one 32-bit access for a straight halving. The share of `chunk_vector_bwd`'s
-  accesses that are four bytes or fewer per lane was 82% at the old group width; the
-  figure at the current one is not measured yet, and the old one is not to be quoted
-  for it.
+  one 32-bit access for a straight halving. Price the lever off the width histogram
+  of the tree in hand, never off a share carried forward. On `chunk_vector_bwd`:
+
+      width    instructions    per warp
+       16b       20,643,840       224.0
+       32b       35,619,840       386.5
+       64b        3,214,080      34.875
+      128b       14,192,640       154.0
+
+  Perfect 2:1 packing of the 16-bit class deletes 10,321,920 instructions, 245,760
+  port cycles, 175 us, 6.6% of the launch. The same lever was advertised at 835 us
+  from a share taken one arm earlier, which was 4.8x optimistic. The histogram sums
+  to the `SASS` memory-instruction total exactly, so it is a partition and not an
+  estimate.
 - 16-byte access also changes the conflict question, and the scalar answer does
   not carry over. An `LDS.128` is serviced in four phases of eight threads, each
   phase covering the full 128-byte width, so the unit is the 16-byte segment and
@@ -210,8 +247,10 @@ instructions, and the class bar says nothing about that.
   `L 64 P 64 3N 240` the six contractions of `chunk_vector_bwd` count 34.12 G flop,
   40% of the backward's 85.46 G. That puts its tensor floor at 304.7 us and its 70%
   bar at 435.3 us; its 515.84 MB of counted traffic puts its DRAM floor at 889.8 us;
-  its instruction census put the port term at 2,232 us, and after the group cut at
-  about 1,166 us. The port bound by a factor of 2.5 over the next floor and still
+  its instruction census puts the port term at 3,956,022 SM-cycles before the group
+  cut and 2,022,857 after it, which is 2,232 us and 1,166 us at 1.773 GHz but 2,818
+  and 1,441 at the 1.404 GHz the profiler actually clocked. Quote the cycles. The
+  port bound by a factor of 2.5 over the next floor and still
   binds above the target, so the arithmetic is not the obstacle and neither is the
   traffic. The port term is not a floor in the way the other two are: it is the
   current instruction count priced, and it falls with every instruction deleted --
@@ -226,6 +265,18 @@ instructions, and the class bar says nothing about that.
   `FADD` at 25,259 of about 41 k samples, which are the butterfly's own dependent
   adds, not a load. Stall percentages name a queue; only attribution names an
   instruction.
+- Attribution also decides whether a stall is worth an arm at all, and the shape of
+  its distribution is the answer. After the group cut `mio_throttle` at 18.18% and
+  `wait` at 17.65% were within noise of each other, and they are not the same kind of
+  object. `mio_throttle` concentrates: 98.31% of its samples sit on the LSU class,
+  `LDS` 39.63%, `SHFL` 21.66% at 7.3x its instruction share, `STS` 19.72%, and single
+  `SASS` lines carry 2-3% each. `wait` is flat: its hottest line is 0.35%, the top 25
+  lines carry under 8%, and it spreads over roughly 4,900 lines with only `HMMA` at
+  3.0x its share and the alignment `NOP`s beside the MMA sequences at 12.6x standing
+  out. So `wait` is tensor result latency plus a tax spread over everything, and
+  there is no chain in it to cut. `stall_barrier` is the opposite extreme, four
+  predicated `BRA` lines carrying 43.7% of its samples. Rank a stall by how
+  concentrated its attribution is, not by its percentage.
 - Occupancy is not the answer when two limiters pin it independently. On
   `chunk_vector_bwd` `launch__occupancy_limit_registers` and `_shared_mem` are each
   exactly 1, so cutting registers alone cannot buy a second block while the arena is
@@ -334,11 +385,13 @@ bandwidth is reporting that bytes are not what it is spending its time on. Read 
 LSU instruction census beside the percentage; see "The LSU port" above.
 
 The three classes do not cover the machine. `chunk_vector_bwd` sat at 23-24% of DRAM
-speed of light and 9.4% of the tensor pipe while spending 73.0% of the LSU issue
+speed of light and 13.86% of the tensor pipe while spending 73.0% of the LSU issue
 port, so it was issue-bound and the model has no name for that. The group cut took
-the port term to 54.6% and moved the dominant stall to arithmetic dependency, so the
-kernel is now no single thing, which the model has no name for either. The
-declaration in
+the port term to 55.06% against 26.61% of DRAM, so the kernel is now no single
+thing, which the model has no name for either. Its instruction classes read `INT`
+33.87%, `FP32` 30.34%, `LSU` 22.56%, `MOVE` 5.10%, `TENSOR` 2.83%: the rule set's own
+bottleneck rule calls compute and memory well balanced, which is the tooling
+independently reporting that no throughput unit is the limiter. The declaration in
 `slinoss/perf/declared.py` stays as it is and the kernel stays failing until either
 the port term comes down or the model grows a fourth class with its own measured
 bar. Declaring the shortfall away is not available.
