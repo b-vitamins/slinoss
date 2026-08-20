@@ -382,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         -(-shape.seq // shape.chunk),
         shape.d_state,
         shards,
+        DTYPES[args.dtype].itemsize,
     )
     print(f"shape        {shape.describe()}")
     print(f"groups       {groups} fold {fold}")

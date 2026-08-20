@@ -83,11 +83,13 @@ a launch and the 51.2 MB a head it divides into are a property of the loop exist
 
 A shard owns a partial and not an output. At depth one the block writes the three
 outputs itself, after the last head, in shared memory throughout. Above one it writes
-float32 rows that :func:`vector_reduce` sums in a second launch, which is what
+rows that :func:`vector_reduce` sums in a second launch, which is what
 :mod:`slinoss.ops.so3ssd.cute.bwd.boundary` does for partials of ``dB``. There are no
-atomics either way, and float32 is the partial width because the reference rounds the
-head sum once: the narrowing is at the last store on the path and nowhere else, so the
-depth changes the summation order and not the rounding count.
+atomics either way, and each partial carries its own output's width: the closure
+accumulates in float32 whatever it reads, so a partial wider than the output buys a
+rounding the output does not keep, and the depth changes the summation order and the
+rounding count together. That is the launch's largest single traffic item and it is
+what the width is measured against, below.
 
 The state width is tiled. Every tile of either set that spans ``3N`` spans
 :data:`LANE_BLOCK` lanes of it, so the live set is bounded by a lane tile and one
@@ -170,7 +172,9 @@ group, there are five tiles and the split is what the tile count costs::
 read-modify-write of the same two outputs, 2.1%. ``U`` dominates the per-tile term
 because its tile is one atom M tile whatever the ``span``, so a ``span 32`` shape
 reads it twice. ``dinc`` and ``zstart`` are float32 ``(B, H, C, P, 3N)`` and together
-are 40% of the total.
+are 40% of the total. The three write terms are the depth-one form. At the shipped
+depth they are :func:`partial_bytes` instead, 143.77 MB, which is the largest single
+item in the launch and the whole of what the closure reads.
 
 Measured, the bar is missed, and the distance is latency and not traffic. Every
 counter below is from one profile of this kernel on an RTX A6000, ``sm_86``, 84
@@ -184,25 +188,59 @@ that query named another process the duration is a bound, not a rate.
 
 At the default configuration -- 11,520 blocks of 128 threads, five lane tiles, the
 fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
-667.10 MB of DRAM per launch in 7,051.8 us, 13.9% of the 978.5 us floor of those
-bytes. :func:`vector_reduce` closes the head sum in 432.8 us at 294.72 MB and 100.5%
-of its own floor; the two lane-slot reductions add 43.8 and 23.3 us at 106.4% and
-110.7%. The operator is 7,551.7 us a call and the main kernel is 93.4% of it. Only
-the main kernel is under the 85% the class asks.
+515.36 MB of DRAM per launch in 5,202.4 us, 14.6% of the 757.2 us floor of those
+bytes. :func:`vector_reduce` closes the head sum in 323.6 us at 153.05 MB and 70.4%
+of its own floor; the two lane-slot reductions add 43.7 and 23.1 us at 94.5% and
+110.4%. The operator is 5,584.9 us a call, event-timed, and the main kernel is 93.1%
+of it. Neither the main kernel nor the closure reaches the 85% the class asks.
 
 That percentage is not a traffic problem. 91,344 B admits one 128-thread block per
 multiprocessor: 8.3% theoretical occupancy, 8.3% achieved, one warp per scheduler and
-nothing to cover an instruction fetch or a barrier. ``no_instruction`` is 52.6% of the
-warp cycles, issue-active 12.58%, memory speed-of-light 33.8%, tensor 3.8%. Shared
-conflicts are 0.1610 per wavefront, load and store together, and the padding rule is
+nothing to cover an instruction fetch or a barrier. ``no_instruction`` is 32.3% of the
+warp cycles, issue-active 18.68%, memory speed-of-light 44.9%, tensor 5.6%. Shared
+conflicts are 0.1612 per wavefront, load and store together, and the padding rule is
 held centrally. Local traffic is zero at every one of the three launches.
+
+Where the bytes are, measured rather than counted. The launch's DRAM splits 347.69 MB
+read and 319.73 MB write with float32 vector partials, against a write side the
+partials, ``dtrans`` slots and ``dK`` slots account for to within 1.00 MB and a read
+side ``dinc`` and ``zstart`` alone account for 283.12 MB of. The remaining 64.57 MB of
+reads stands against 370 MB of requests for ``dy``, ``U``, ``trans``, ``K``, ``dlogp``,
+``B`` and ``C``, whose distinct footprint is 53.27 MB: the L2 read hit rate is 59.39%
+and it serves the lane-tile and group re-reads at 1.21x compulsory. So neither the
+five-fold re-read of the per-token operands nor the eighteen-fold re-read of the
+group's two vectors is a device-traffic item, and only the head-sum partials and the
+two float32 state buffers are.
+
+Narrowing the two vector partials from float32 to the activation width is what the
+measured split says to do, and it pays twice what its bytes are worth. Same device,
+same session, three runs each, the narrowed runs under strictly more foreign
+compute-apps contention than the float32 ones: the main launch goes from 668.40 MB and
+7,601.9 us to 515.36 MB and 5,202.4 us, 22.9% of the traffic for 31.6% of the time,
+and the closure from 294.82 MB and 433.2 us to 153.05 MB and 323.6 us. The call falls
+7,575.6 us to 5,584.9 us and the workspace 285.33 MB to 143.77 MB. The time is not the
+bytes: ``no_instruction`` falls 54.3% to 32.3%, issue-active rises 12.13% to 18.68%,
+and every speed-of-light rises with it, memory 30.6% to 44.9%. At 14.6% of its own
+floor the launch was never paying for those bytes at the bus; the store width was
+gating the front end. The mechanism is not established here. What is established is
+that the counter that moved is an issue counter, so a traffic argument does not
+predict this launch's time in either direction, and the remaining 283.12 MB of
+float32 ``dinc`` and ``zstart`` cannot be priced from its bytes either.
+
+The closure paid for it in class. ``vector_reduce`` read float32 at 680.5 GB/s and
+100.4% of floor; at the activation width a warp's 32 columns are 64 B and two sectors
+rather than 128 B and four, the request rate is unchanged, and it reads 472.9 GB/s at
+70.4% of floor with ``long_scoreboard`` at 92.7%. 109.6 us of the 141.77 MB it stopped
+reading came back as time; the rest is a vector-load width that kernel does not take
+yet.
 
 The depth is what took it there, and not by cutting traffic. At depth one the same
 kernel is 11,376.9 us over 640 blocks, moves 775.81 MB, and spills 536.74 MB of local
-load and 344.06 MB of local store a launch, 94.9% and 99.9% of that past L1. The
-operator's own DRAM total goes the other way, 819.1 MB at depth one against 1,005.3 MB
-at the full depth, while the call falls 34.0%: what the depth buys is 18x the blocks
-and no spill, so the traffic sum is not what it is chosen against.
+load and 344.06 MB of local store a launch, 94.9% and 99.9% of that past L1. Depth one
+carries no workspace at all, 819.1 MB of operator DRAM against 1,005.3 MB at the full
+depth when the vector partials were float32, and still lost by 34.0% of the call: what
+the depth buys is 18x the blocks and no spill, so the traffic sum is not what it is
+chosen against. At the narrowed partial the full depth wins on both, 711.5 MB.
 
 The allocator stops at the 255-register cap at either depth. The fold is what spills,
 and only the fold. Holding ``P 64``, ``3N 240`` and the code fixed and moving one
@@ -215,8 +253,10 @@ extent, with the fold folded in the block::
     32     18   71,504    255     398.46     693.58  137.1      5,060.0
     64     18   93,392    255     922.42     985.73   82.3     11,982.6
 
-At fold one there is no local traffic at any ``L``, at 255 registers, with the lane
-tile in the grid and the ``L`` extents at their largest. At fold 18 there is, and it
+The three fold-one rows carry a float32 vector partial, so their DRAM column is
+141.56 MB high for the shipped width; the local column, which is what the table is
+for, does not depend on it. At fold one there is no local traffic at any ``L``, at 255
+registers, with the lane tile in the grid and the ``L`` extents at their largest. At fold 18 there is, and it
 grows with ``L``. The register count is at the cap either way, so the cap is not the
 signal; what crosses a rolled fold iteration is. Unrolling the fold at trace time
 does not fix it and makes it worse, 1,290.4 MB, because the live ranges of eighteen
@@ -768,7 +808,10 @@ def vector_splits(fold: int, splits: int | None = None) -> int:
         MB          0    31.7    47.6    95.1   142.7   285.3
 
     So the depth is the fold unless a caller has a reason of its own, and the
-    workspace that costs is linear in it.
+    workspace that costs is linear in it. The sweep ran with float32 vector partials,
+    which the MB row is; the two vector buffers now carry the activation width, so
+    depth eighteen is 143.8 MB. The ordering is set by the spill and not by the
+    workspace, so narrowing the partial cannot reorder it.
 
     Args:
         fold: ``H // G``, the heads sharing a group.
@@ -790,7 +833,13 @@ def vector_splits(fold: int, splits: int | None = None) -> int:
 
 
 def partial_bytes(
-    bsz: int, groups: int, seqlen: int, chunks: int, dim: int, splits: int
+    bsz: int,
+    groups: int,
+    seqlen: int,
+    chunks: int,
+    dim: int,
+    splits: int,
+    itemsize: int,
 ) -> int:
     """Device workspace the head-sum partials occupy, in bytes.
 
@@ -801,15 +850,18 @@ def partial_bytes(
         chunks: ``C``.
         dim: ``3N``.
         splits: Partial depth, from :func:`vector_splits`.
+        itemsize: Activation dtype width, which the two vector partials carry.
 
     Returns:
         Bytes, zero at depth one where the three outputs are written directly. The
-        depth multiplies the row axis of ``dB``, ``dC`` and the carry, all float32
-        in the workspace whatever the activation dtype.
+        depth multiplies the row axis of ``dB``, ``dC`` and the carry. The two
+        vectors follow their output's width; the carry is a float32 output and its
+        partial follows it.
     """
     if splits == 1:
         return 0
-    return 4 * bsz * groups * splits * (2 * seqlen + chunks) * dim
+    rows = bsz * groups * splits * dim
+    return itemsize * rows * 2 * seqlen + 4 * rows * chunks
 
 
 class Slots(NamedTuple):
@@ -842,8 +894,8 @@ class Slots(NamedTuple):
     carry with them, the three sharing one launch.
 
     Attributes:
-        dest: What the kernel writes. The output at one slot, a float32 partial
-            buffer above one.
+        dest: What the kernel writes. The output at one slot, a partial buffer at the
+            output's own dtype above one.
         slots: Copies of each row, one per lane tile or one per head shard.
         out: The output the sum closes onto, or None at one slot.
         slabs: ``S`` of the reduction, the modes before the slot axis.
@@ -880,11 +932,15 @@ def open_slots(out: Tensor, slots: int, axis: int = -2) -> Slots:
         width *= extent
     if slots == 1:
         return Slots(dest=out, slots=1, out=None, slabs=slabs, width=width)
+    # The output's own width, not float32. A partial is one term of a sum the closure
+    # rounds again on its own store, so a wider partial buys a rounding the output
+    # cannot keep, and at the widest configured state the two vector buffers are
+    # 141.56 MB of the launch's write traffic and all of the closure's read traffic.
     held = torch.empty(
         *shape[:axis],
         shape[axis] * slots,
         *shape[axis + 1 :],
-        dtype=torch.float32,
+        dtype=out.dtype,
         device=out.device,
     )
     return Slots(dest=held, slots=slots, out=out, slabs=slabs, width=width)
@@ -1384,9 +1440,9 @@ def chunk_vector_bwd_kernel(
             the chunk-input stage.
         gdscale: ``(B,H,C)`` float32 closing-scale cotangent, from the chunk-input
             stage.
-        gdb: ``(B,G,splits*T,3N)`` ``dB`` or its shard buffer, written. At one shard
-            it is the output under its own dtype; above one it is the float32 partial
-            :func:`vector_reduce` sums.
+        gdb: ``(B,G,splits*T,3N)`` ``dB`` or its shard buffer, written, under the
+            output's own dtype either way. At one shard it is the output; above one it
+            is the partial :func:`vector_reduce` sums.
         gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, under the contract of
             ``gdb``.
         gcarry: ``(B,G,splits*C,3N)`` float32 carry or its shard buffer, written with
@@ -2080,8 +2136,8 @@ def vector_reduce_kernel(
     each coalesced across the warp.
 
     Args:
-        gpb: ``(B,G,splits*T,3N)`` float32 ``dB`` partials.
-        gpc: ``(B,G,splits*T,3N)`` float32 ``dC`` partials.
+        gpb: ``(B,G,splits*T,3N)`` ``dB`` partials at the activation width.
+        gpc: ``(B,G,splits*T,3N)`` ``dC`` partials at the activation width.
         gpcarry: ``(B,G,splits*C,3N)`` float32 carry partials.
         gdb: ``(B,G,T,3N)`` ``dB`` at the activation width, written.
         gdc: ``(B,G,T,3N)`` ``dC`` at the activation width, written.
@@ -2095,22 +2151,24 @@ def vector_reduce_kernel(
 
     Invariants:
         The producer writes every element of every partial row exactly once, so this
-        needs no fill and no atomic. The accumulator is float32 and the narrowing is
-        on the store, which is the one rounding the head sum takes on the path.
-        Reduction order is ascending shard, fixed by the launch geometry, so a rerun
-        at one shape reproduces the result bit for bit.
+        needs no fill and no atomic. The accumulator is float32 whatever the partial's
+        width, so the sum itself is exact to float32 and the roundings on the path are
+        the producer's store and this one. Reduction order is ascending shard, fixed
+        by the launch geometry, so a rerun at one shape reproduces the result bit for
+        bit.
     """
     tid, _, _ = cute.arch.thread_idx()
     token, bidx, gidx = cute.arch.block_idx()
     out = gdb.element_type
+    part = gpb.element_type
 
     for col in cutlass.range(tid, dim, threads):
         vecb = cutlass.Float32(0.0)
         vecc = cutlass.Float32(0.0)
         row = token
         for _ in cutlass.range_constexpr(splits):
-            vecb = vecb + gpb[bidx, gidx, row, col]
-            vecc = vecc + gpc[bidx, gidx, row, col]
+            vecb = vecb + widen(gpb[bidx, gidx, row, col], part)
+            vecc = vecc + widen(gpc[bidx, gidx, row, col], part)
             row = row + seqlen
         gdb[bidx, gidx, token, col] = narrow(vecb, out)
         gdc[bidx, gidx, token, col] = narrow(vecc, out)
@@ -2205,13 +2263,15 @@ def chunk_vector_backward(
     closing rotation and scale are one contraction over the chunk-start state that
     stage already ran.
 
-    Two workspaces, both float32, both allocated here and freed on return, and both
-    holding one partial row per block of a sum whose terms separate blocks cannot
-    share. Above one lane tile the transition chart is a sum over lanes:
-    ``(B, H, tiles * T, 4)`` and ``(B, H, tiles * T, 2, 4)``. Above partial depth one
+    Two workspaces, both allocated here and freed on return, and both holding one
+    partial row per block of a sum whose terms separate blocks cannot share. Above one
+    lane tile the transition chart is a sum over lanes: ``(B, H, tiles * T, 4)`` and
+    ``(B, H, tiles * T, 2, 4)``, float32 with their outputs. Above partial depth one
     the two vectors and the carry are sums over heads: ``(B, G, splits * T, 3N)``
-    twice and ``(B, G, splits * C, 3N)``, which is :func:`partial_bytes`. At one copy
-    of either there is no buffer and the kernel stores the output directly.
+    twice at the activation width and ``(B, G, splits * C, 3N)`` at float32, which is
+    :func:`partial_bytes`. Each partial carries its own output's width, that output's
+    store being one more rounding on the same path. At one copy of either there is no
+    buffer and the kernel stores the output directly.
 
     Args:
         dy: ``(B,H,T,P)`` cotangent of ``y``, one of

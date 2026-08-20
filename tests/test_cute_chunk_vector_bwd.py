@@ -43,6 +43,7 @@ from slinoss.ops.so3ssd import chunked_backward, chunked_forward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     ChunkVectorBwd,
     chunk_vector_backward,
+    open_slots,
     partial_bytes,
     vblock,
     vector_smem_bytes,
@@ -298,10 +299,10 @@ def _run(
 # over ``L`` tokens, and its log-scale half is a suffix sum over the chunk.
 #
 #              bfloat16   float16
-# dB           4.779e-3   3.524e-4
+# dB           5.319e-3   3.524e-4
 # dC           4.539e-3   4.318e-4
 # carry_b      3.422e-3   3.317e-4
-# dtrans       2.489e-3   1.426e-4
+# dtrans       2.917e-3   1.426e-4
 # dK           3.782e-3   2.035e-4
 #
 # Worst measured over every shape and every test in this file, read off a
@@ -309,6 +310,14 @@ def _run(
 # float16 column runs 11 to 17 times tighter than the bfloat16 one, which brackets
 # the factor of eight between the two significands, so the two dtypes do not share
 # a bound.
+#
+# ``dB`` at bfloat16 is 5.319e-3 at partial depth two, where nine heads are summed in
+# float32 in the block and the two shard partials carry the activation width, against
+# 4.794e-3 at depth eighteen, where every head is one partial. Narrowing the partial
+# from float32 moved that column from 4.779e-3 and no other, the closure summing in
+# float32 either way. The ``dtrans`` figure is the widest state at every depth
+# including one, where no partial is allocated at all, so it is a row the column had
+# not been read at rather than a row the partial's width moved.
 BOUNDS: dict[torch.dtype, dict[str, float]] = {
     torch.bfloat16: {
         "dB": 1e-2,
@@ -468,15 +477,36 @@ def test_the_partial_depth_takes_only_divisors_of_the_fold() -> None:
 def test_the_partial_workspace_follows_the_depth() -> None:
     """The head-sum workspace is what the depth costs, and nothing at depth one.
 
-    Three float32 buffers, two over the sequence and one over the chunks, each with
-    its row axis multiplied by the depth. At the default configuration and depth six
-    that is 95.11 MB, which is the figure the depth is chosen against.
+    Three buffers, two over the sequence at the activation width and one over the
+    chunks at float32, each with its row axis multiplied by the depth. At the default
+    configuration and depth eighteen that is 143.77 MB in bfloat16, which is the
+    figure the depth is measured against, and 285.33 MB were the two vectors float32.
     """
-    assert partial_bytes(4, 1, 2048, 32, 240, 1) == 0
-    assert partial_bytes(4, 1, 2048, 32, 240, 6) == 95_109_120
-    assert partial_bytes(4, 1, 2048, 32, 240, 18) == 3 * partial_bytes(
-        4, 1, 2048, 32, 240, 6
+    assert partial_bytes(4, 1, 2048, 32, 240, 1, 2) == 0
+    assert partial_bytes(4, 1, 2048, 32, 240, 18, 2) == 143_769_600
+    assert partial_bytes(4, 1, 2048, 32, 240, 18, 4) == 285_327_360
+    assert (
+        partial_bytes(4, 1, 2048, 32, 240, 6, 2)
+        == partial_bytes(4, 1, 2048, 32, 240, 18, 2) // 3
     )
+
+
+def test_the_head_sum_partials_carry_the_activation_width() -> None:
+    """The two vector partials narrow with the output; the carry stays float32.
+
+    The partial is one head's term of a sum the closure rounds once more on its own
+    store, so holding it at float32 buys a rounding the output cannot keep. It is
+    half the launch's device traffic and all of the closure's, which is the one
+    launch of the group at its bandwidth bound. ``carry_b`` is a float32 output and
+    its partial follows it.
+    """
+    inp = _make(1, 18, 128, 64, 80, torch.bfloat16, groups=1)
+    dB = torch.empty(1, 1, 128, 240, dtype=torch.bfloat16, device=inp.U.device)
+    carry = torch.empty(1, 1, 2, 240, dtype=torch.float32, device=inp.U.device)
+    assert open_slots(dB, 1).dest is dB
+    assert open_slots(dB, 18).dest.dtype == torch.bfloat16
+    assert open_slots(carry, 18).dest.dtype == torch.float32
+    assert open_slots(dB, 18).dest.shape == (1, 1, 18 * 128, 240)
 
 
 def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:
