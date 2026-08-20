@@ -31,13 +31,15 @@ the per-chunk transform table costs order 120 FMA per token and amortizes over
 ``N`` lanes only from ``N = 16``."""
 
 MAX_CHUNK = 128
-"""Longest legal chunk, set by a measured bank-conflict cliff.
+"""Longest legal chunk, set by the widest block one vector load covers.
 
 The prefix scan gives one lane a block of ``ceil(L/32)`` consecutive tokens. Up to
-four words the compiler folds that block into one vector load and both shared
-bank-conflict counters read zero; at eight words, which is ``L = 256``, they go
-nonzero. Bank conflicts are a defect rather than a tradeoff, so the shape is
-constrained instead. Nothing is lost: at ``L = 256`` the score tile alone is 256 KB
+four words the compiler folds that block into one vector load, so the access is
+conflict-free by construction, and both shared bank-conflict counters read zero at
+the chunk sizes the bench covers. At eight words, which is ``L = 256``, the block
+is wider than any shared vector load and the construction no longer holds. Bank
+conflicts are a defect rather than a tradeoff, so the shape is constrained
+instead. Nothing is lost: at ``L = 256`` the score tile alone is 256 KB
 of float32 accumulator, four times the register file of a block."""
 
 

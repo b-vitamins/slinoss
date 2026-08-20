@@ -25,11 +25,13 @@ Shared-memory tiles. Per-chunk staging is component-major: consecutive tokens
 are consecutive addresses within one component. The staging and table builds are
 one thread per token, so those accesses are unit stride across the warp. The
 prefix scan is the exception: it gives lane ``l`` a block of ``ceil(L/32)``
-consecutive tokens, so its reads are strided by that block size. Measured with
-``l1tex__data_bank_conflicts_pipe_lsu_mem_shared``, both counters are zero at
-every legal chunk size, because the block is at most four words and the compiler
-vectorizes it into one wide load. That is why ``MAX_CHUNK`` is 128: at 256 the
-block is eight words, wider than any vector load, and the counters go nonzero.
+consecutive tokens, so its reads are strided by that block size. At every legal
+chunk size that block is at most four words, which the compiler vectorizes into
+one wide load, so the pattern is conflict-free by construction. Both
+``l1tex__data_bank_conflicts_pipe_lsu_mem_shared`` counters read zero at the chunk
+sizes the bench covers, 64 and 128. That construction is what bounds
+``MAX_CHUNK`` at 128: at 256 the block is eight words, wider than any shared
+vector load, so the access splits and the argument no longer holds.
 The 3x3 table is token-major with the nine entries innermost; a nine-word stride
 is coprime with the 32 banks, so the build stores conflict-free, and every read
 of it during application is a broadcast.

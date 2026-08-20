@@ -37,9 +37,8 @@ broadcast. Neither needs a swizzle.
 Staging is transposed on the way in: global ``(L, 4)`` and ``(L, 8)`` become
 shared ``(4, L)`` and ``(8, L)``. One thread owns one token here and in the build,
 so a component access is unit stride across the warp. The prefix scan reads the
-same tiles at a block stride instead; both shared-memory bank-conflict counters
-are measured zero at every legal chunk size, which is the constraint
-``MAX_CHUNK`` is set by.
+same tiles at a block stride instead, conflict-free by the block-width argument in
+``common.py``, which is the constraint ``MAX_CHUNK`` is set by.
 
 A ragged tail is staged as the identity transition and a zero tap, which is what
 :func:`slinoss.ops.so3ssd.reference.chunk_pad` does: ``quat_exp(0)`` is the
