@@ -11,14 +11,15 @@ default drives; ``--window`` is the process NCU attaches to.
 
 ``--rows``, ``--lanes``, ``--heads`` and ``--chunk`` override the named shape's
 per-block geometry. ``--groups`` sets ``G``, and the fold ``H // G`` with it, which
-is what decides whether the float32 readout sum is allocated at all. The overrides
-rename the shape, so a figure taken under one cannot be read as a figure at the
-name it started from.
+is what decides whether the float32 readout sum is allocated at all. ``--splits``
+sets how many blocks that fold is shared over, which trades the in-block fold's
+local traffic against a workspace partial. The overrides rename the shape, so a
+figure taken under one cannot be read as a figure at the name it started from.
 
     python3 scripts/perf/profile_chunk_vector_bwd.py --shape standard
     python3 scripts/perf/profile_chunk_vector_bwd.py --rows 64 --lanes 80 --heads 18
     python3 scripts/perf/profile_chunk_vector_bwd.py --rows 64 --lanes 80 --heads 18 \
-        --groups 1
+        --groups 1 --splits 6
 """
 
 from __future__ import annotations
@@ -30,7 +31,11 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
+from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
+    chunk_vector_backward,
+    partial_bytes,
+    vector_splits,
+)
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import dram_floor_verdict, dram_time_floor
 from slinoss.perf.device import (
@@ -53,12 +58,15 @@ from slinoss.perf.timing import measure, on_device
 from slinoss.perf.units import Bytes, Count
 from slinoss.perf.workload import SHAPE_NAMES, OpShape, make_inputs, shape_by_name
 
-KERNEL = "chunk_vector_bwd|reduce_rows_kernel"
+KERNEL = "chunk_vector_bwd|vector_reduce_kernel|reduce_rows_kernel"
 """Regex NCU narrows to. The mangled symbol carries the constexpr suffix.
 
-The operator is two launches: the main kernel writes float32 workspace partials
-and ``slinoss._reduce.reduce_rows_kernel`` sums them. Narrowing to the first
-alone credits a candidate that moves traffic into the second.
+The operator is more than one launch: the main kernel writes float32 workspace
+partials, ``slinoss._reduce.reduce_rows_kernel`` sums the lane-tile slots of
+``dtrans`` and ``dK``, and
+``slinoss.ops.so3ssd.cute.bwd.chunk_vector.vector_reduce_kernel`` sums the
+head-shard slots of ``dB``, ``dC`` and the carry. Narrowing to the first alone
+credits a candidate that moves traffic into the others.
 """
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
@@ -106,6 +114,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Groups, G. Divides H. Defaults to H, which is fold one.",
     )
     parser.add_argument(
+        "--splits",
+        type=int,
+        default=None,
+        help="Partial depth of the head sum, S. Divides the fold H // G. Defaults "
+        "to the operator's own choice.",
+    )
+    parser.add_argument(
         "--iters",
         type=int,
         default=1,
@@ -143,13 +158,19 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
     suffix = "".join(f"-{f}{v}" for f, v in sorted(given.items()))
     if args.groups is not None:
         suffix += f"-g{args.groups}"
+    if args.splits is not None:
+        suffix += f"-s{args.splits}"
     if not suffix:
         return shape
     return dataclasses.replace(shape, name=f"{shape.name}{suffix}", **given)
 
 
 def build_runner(
-    shape: OpShape, groups: int, device: torch.device, dtype: torch.dtype
+    shape: OpShape,
+    groups: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    splits: int | None = None,
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the kernel.
 
@@ -169,6 +190,8 @@ def build_runner(
         groups: ``G``. Divides ``shape.heads``.
         device: Where to allocate.
         dtype: Activation dtype.
+        splits: Partial depth of the head sum. ``None`` leaves the choice to the
+            operator, which is the configuration a step runs.
 
     Returns:
         The callable, allocating its five outputs per call as the host entry does.
@@ -212,6 +235,7 @@ def build_runner(
             dchunk_rot,
             dchunk_scale,
             shape.chunk,
+            splits=splits,
         )
 
     return run
@@ -240,6 +264,8 @@ def target_argv(args: argparse.Namespace) -> list[str]:
             argv += [f"--{field}", str(value)]
     if args.groups is not None:
         argv += ["--groups", str(args.groups)]
+    if args.splits is not None:
+        argv += ["--splits", str(args.splits)]
     return argv
 
 
@@ -283,7 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     groups = shape.heads if args.groups is None else args.groups
 
     if args.window:
-        runner = build_runner(shape, groups, device, dtype)
+        runner = build_runner(shape, groups, device, dtype, args.splits)
         with on_device(device):
             for _ in range(args.warmup):
                 runner()
@@ -294,7 +320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
-    runner = build_runner(shape, groups, device, dtype)
+    runner = build_runner(shape, groups, device, dtype, args.splits)
     label = f"chunk_vector_bwd {shape.name}"
     timed = measure(
         runner,
@@ -327,8 +353,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             passes.append(one)
     after = compute_apps_query(smi_selector(ordinal))
 
+    fold = shape.heads // groups
+    shards = vector_splits(fold, args.splits)
+    workspace = partial_bytes(
+        shape.bsz,
+        groups,
+        shape.seq,
+        -(-shape.seq // shape.chunk),
+        shape.d_state,
+        shards,
+    )
     print(f"shape        {shape.describe()}")
-    print(f"groups       {groups} fold {shape.heads // groups}")
+    print(f"groups       {groups} fold {fold}")
+    print(f"splits       {shards} in-block fold {fold // shards}")
+    print(f"workspace    {workspace / 1e6:.2f} MB of head-sum partials")
     print(f"dtype        {args.dtype}")
     print(f"clocks       {timed.clocks}")
     print(f"smi before   {before}")

@@ -67,14 +67,25 @@ three columns per thread. ``tap_matrix_vjp`` runs there too: its input is comple
 the moment that tap's reduction is, which keeps the scratch at nine floats per
 token rather than twenty-seven.
 
-One block walks every head of its group. ``dB``, ``dC`` and the carry are sums
-over the heads sharing a group, and neither way of splitting that sum across
-blocks exists here: there are no atomics in the tree, and
-:mod:`slinoss.ops.so3ssd.cute.bwd.boundary` reduces partials of ``dB`` alone. A
-read-modify-write of a low-precision output would also round once per head where
-the reference rounds once. So the sum is float32 in shared memory over the fold
-``H // G``, the store happens after the last head, and no partial buffer exists.
-The fold is one at ``standard`` and twelve at the default configuration.
+``dB``, ``dC`` and the carry are sums over the heads sharing a group, and the fold
+``H // G`` is cut into :func:`vector_splits` shards, one block to a shard. The fold is
+one at ``standard`` and eighteen at the default configuration.
+
+The depth of that cut is a parameter because its two costs run opposite each other.
+Every head a block walks past the first is a rolled iteration between an accumulator's
+allocation and its uses, which is what defeats register promotion; measured at
+``L 64 P 64 3N 240``, 51.2 MB of local traffic a head. Every shard past the first is a
+float32 partial of ``dB`` and of ``dC`` written once and read once, 31.4 MB a shard at
+the same shape. So the sum of the two has an interior minimum and neither extreme is
+it. :data:`VECTOR_SPLITS` is where it falls; the shard count is otherwise free.
+
+A shard owns a partial and not an output. At depth one the block writes the three
+outputs itself, after the last head, in shared memory throughout. Above one it writes
+float32 rows that :func:`vector_reduce` sums in a second launch, which is what
+:mod:`slinoss.ops.so3ssd.cute.bwd.boundary` does for partials of ``dB``. There are no
+atomics either way, and float32 is the partial width because the reference rounds the
+head sum once: the narrowing is at the last store on the path and nowhere else, so the
+depth changes the summation order and not the rounding count.
 
 The state width is tiled. Every tile of either set that spans ``3N`` spans
 :data:`LANE_BLOCK` lanes of it, so the live set is bounded by a lane tile and one
@@ -301,6 +312,7 @@ __all__ = [
     "LANE_GROUP",
     "RESIDENT_MAX",
     "ROW_WORDS",
+    "VECTOR_SPLITS",
     "Arena",
     "ChunkVectorBwd",
     "Slots",
@@ -314,13 +326,17 @@ __all__ = [
     "lane_block",
     "open_slots",
     "out_tile",
+    "partial_bytes",
     "readout_tile",
     "row_tile",
     "score_tile",
     "shifted_tile",
     "state_tile",
     "vblock",
+    "vector_reduce",
+    "vector_reduce_kernel",
     "vector_smem_bytes",
+    "vector_splits",
 ]
 
 LANE_BLOCK: int = 16
@@ -366,6 +382,13 @@ RESIDENT_MAX: int = 2
 The budget lowers it to one at every standard size. Asking for two costs nothing
 where it cannot be had and takes it at the small shapes where the arena is half as
 wide."""
+
+VECTOR_SPLITS: int = 6
+"""Default partial depth of the head sum, capped by the fold and its divisors.
+
+Where the sum of the two traffic terms in this module's docstring is least at the
+default configuration, both terms taken from measurement and the sum from them.
+:func:`vector_splits` takes any divisor of the fold."""
 
 
 def lane_block(dim: int) -> int:
@@ -663,14 +686,71 @@ def vblock(chunk: int, rows: int, dim: int, fold: int, itemsize: int = 2) -> int
     return span
 
 
+def vector_splits(fold: int, splits: int | None = None) -> int:
+    """Partial depth of the head sum: shards the fold ``H // G`` is cut into.
+
+    The head sum has two costs that run opposite each other. Every head a block
+    walks in a rolled loop costs local traffic, measured at 51.2 MB per head
+    iteration at ``L 64 P 64 3N 240``; every shard of the sum costs a float32
+    partial of ``dB`` and ``dC`` written once and read once, 31.4 MB a shard at that
+    shape. So neither extreme is the traffic optimum and the depth is a parameter.
+
+    Args:
+        fold: ``H // G``, the heads sharing a group.
+        splits: The depth. ``None`` takes :data:`VECTOR_SPLITS` where it divides the
+            fold and the largest divisor below it otherwise.
+
+    Returns:
+        The depth. One where the fold is one, and never above the fold.
+
+    Raises:
+        ValueError: If ``splits`` is not a positive divisor of the fold. A depth that
+            does not divide it would leave a block walking a ragged head count and
+            the reduction reading rows no producer wrote.
+    """
+    if splits is None:
+        for candidate in range(min(VECTOR_SPLITS, fold), 0, -1):
+            if fold % candidate == 0:
+                return candidate
+        return 1
+    if splits < 1 or fold % splits:
+        raise ValueError(f"splits must be a positive divisor of the fold {fold}")
+    return splits
+
+
+def partial_bytes(
+    bsz: int, groups: int, seqlen: int, chunks: int, dim: int, splits: int
+) -> int:
+    """Device workspace the head-sum partials occupy, in bytes.
+
+    Args:
+        bsz: ``B``.
+        groups: ``G``.
+        seqlen: ``T``.
+        chunks: ``C``.
+        dim: ``3N``.
+        splits: Partial depth, from :func:`vector_splits`.
+
+    Returns:
+        Bytes, zero at depth one where the three outputs are written directly. The
+        depth multiplies the row axis of ``dB``, ``dC`` and the carry, all float32
+        in the workspace whatever the activation dtype.
+    """
+    if splits == 1:
+        return 0
+    return 4 * bsz * groups * splits * (2 * seqlen + chunks) * dim
+
+
 class Slots(NamedTuple):
     """One output and the slot rows the grid writes it through.
 
-    The lane tile is a grid axis, so the blocks holding the terms of a sum over
-    lanes are concurrent and none can see the others' partials. Each such output
-    gains a slot axis immediately outside its row axis: a block writes row
-    ``slot * rows + local``, and :func:`close_slots` sums the ``slots`` copies of a
-    row into the output's own.
+    Two of this kernel's axes are grid axes over the terms of a sum: the lane tile
+    over ``dtrans`` and ``dK``, which are sums over lanes, and the head shard over
+    ``dB``, ``dC`` and the carry, which are sums over the heads of a group. The blocks
+    holding the terms are concurrent and none can see the others' partials. Each such
+    output gains a slot axis immediately outside its row axis: a block writes row
+    ``slot * rows + local``, and one second launch sums the ``slots`` copies of a row
+    into the output's own.
 
     At ``slots == 1`` there is no buffer and ``dest`` is the output. The row index is
     the same expression either way, ``slot`` being zero, so the kernel body does not
@@ -683,13 +763,17 @@ class Slots(NamedTuple):
     grid over columns carries the parallelism, and the block count rises rather than
     the slab count.
 
-    Only ``dtrans`` and ``dK`` reach here. Every other output of this kernel spans the
-    state width, so a lane tile owns its own columns and no sum crosses a block.
+    Which second launch closes a buffer follows its output's layout, not its axis.
+    ``dtrans`` and ``dK`` are contiguous, so :func:`close_slots` views them as
+    ``(S, R, W)`` and :func:`slinoss._reduce.reduce_partials` sums the rows.
+    ``dB`` and ``dC`` are bands that may be pitched in their last mode, where no such
+    view exists, so :func:`vector_reduce` sums them by mode instead; it takes the
+    carry with them, the three sharing one launch.
 
     Attributes:
         dest: What the kernel writes. The output at one slot, a float32 partial
             buffer above one.
-        slots: Copies of each row, one per lane tile.
+        slots: Copies of each row, one per lane tile or one per head shard.
         out: The output the sum closes onto, or None at one slot.
         slabs: ``S`` of the reduction, the modes before the slot axis.
         width: ``W`` of the reduction, the row axis and everything after it.
@@ -706,8 +790,9 @@ def open_slots(out: Tensor, slots: int, axis: int = -2) -> Slots:
     """Allocate the slot rows one output needs, or none.
 
     Args:
-        out: The output, contiguous.
-        slots: Copies of each row, the lane tile count.
+        out: The output. Its shape is read, not its layout: the buffer this allocates
+            is contiguous whether the output is.
+        slots: Copies of each row, the lane tile count or the partial depth.
         axis: Row axis of ``out``, the mode the slot count multiplies. ``-2`` where
             one trailing mode follows it, ``-3`` where two do.
 
@@ -736,6 +821,9 @@ def open_slots(out: Tensor, slots: int, axis: int = -2) -> Slots:
 
 def close_slots(held: Slots) -> Tensor:
     """Sum a slot buffer onto its output, in one launch, or return the output.
+
+    The output must be contiguous, the reduction being a row view of it. A pitched
+    destination goes through :func:`vector_reduce`.
 
     Args:
         held: From :func:`open_slots`.
@@ -1082,6 +1170,7 @@ def _readout_epilogue(
     srow: cute.Tensor,
     bidx: cutlass.Int32,
     gidx: cutlass.Int32,
+    sbase: cutlass.Int32,
     t0: cutlass.Int32,
     valid: cutlass.Int32,
     tid: cutlass.Int32,
@@ -1095,12 +1184,13 @@ def _readout_epilogue(
     Per token and lane, ``dc = ac^T dcrot`` and ``rotation += outer(dcrot,
     crot)``, the same collapsed form the tap epilogue accumulates into.
 
-    A single head writes ``dC`` in the output dtype directly. A fold above one
-    accumulates in float32 instead, because the group's ``dC`` is a sum over its
-    heads and the reference rounds that sum once.
+    One head writes its shard's ``dC`` row in the destination's own dtype. A fold
+    above one accumulates in float32 instead, because a shard's ``dC`` is a sum over
+    the heads it walks and the reference rounds the head sum once.
 
     Args:
-        gdc: ``(B,G,T,3N)`` ``dC``, written when ``fold`` is one.
+        gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, written when ``fold``
+            is one.
         sdc: ``(mma_rows(L), pitch)`` float32 readout gradient.
         ssum: ``(L, pitch)`` float32 readout sum over the fold, accumulated when
             ``fold`` is above one and untouched otherwise.
@@ -1109,6 +1199,8 @@ def _readout_epilogue(
         srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated.
         bidx: Batch index.
         gidx: Group index.
+        sbase: First row of this block's shard, ``shard * T``. Zero at one shard,
+            where the destination is the output.
         t0: First token of the chunk.
         valid: Tokens of the chunk that exist.
         tid: Thread index within the block.
@@ -1140,7 +1232,7 @@ def _readout_epilogue(
             if keep:
                 for j in cutlass.range_constexpr(3):
                     if cutlass.const_expr(fold == 1):
-                        gdc[bidx, gidx, t0 + ts, col + j] = narrow(dc[j], out)
+                        gdc[bidx, gidx, sbase + t0 + ts, col + j] = narrow(dc[j], out)
                     else:
                         ssum[ts, col + j] += dc[j]
         gsum = _sum_over_lanes(gsum)
@@ -1173,6 +1265,7 @@ def chunk_vector_bwd_kernel(
     gdtrans: cute.Tensor,
     gdtap: cute.Tensor,
     seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
     tiled_mma: cute.TiledMma,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
@@ -1180,16 +1273,21 @@ def chunk_vector_bwd_kernel(
     dim: cutlass.Constexpr,
     span: cutlass.Constexpr,
     fold: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
 ) -> None:
     """Differentiate one chunk's rowwise vectors and transition parameters.
 
-    One block per ``(chunk, lane tile, batch, group)``, walking the ``fold`` heads of
-    the group. Everything a head owns alone is rebuilt per head; the two vector sums
-    and the carry are the group's, outlive the fold and belong to the block's own lane
-    tile. ``dtrans`` and ``dK`` are the only outputs a lane tile does not own: both are
-    sums over lanes, so each tile writes its own slot row and
-    :func:`close_slots` sums them.
+    One block per ``(chunk, head shard, lane tile, batch, group)``, walking the
+    ``fold`` heads of its shard. Everything a head owns alone is rebuilt per head; the
+    two vector sums and the carry outlive the fold and belong to the block's own shard
+    and lane tile.
+
+    Two outputs a block does not own alone, and they part company on which axis takes
+    them. ``dtrans`` and ``dK`` are sums over lanes, so a lane tile past the first
+    writes its own slot row; ``dB``, ``dC`` and the carry are sums over the heads of a
+    group, so a shard past the first writes its own. Both row offsets are zero at one
+    copy, where the destination is the output itself.
 
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
@@ -1208,20 +1306,26 @@ def chunk_vector_bwd_kernel(
             the chunk-input stage.
         gdscale: ``(B,H,C)`` float32 closing-scale cotangent, from the chunk-input
             stage.
-        gdb: ``(B,G,T,3N)`` ``dB``, written.
-        gdc: ``(B,G,T,3N)`` ``dC``, written.
-        gcarry: ``(B,G,C,3N)`` float32, written with the forcing gradient of the
-            token before the chunk's first.
+        gdb: ``(B,G,splits*T,3N)`` ``dB`` or its shard buffer, written. At one shard
+            it is the output under its own dtype; above one it is the float32 partial
+            :func:`vector_reduce` sums.
+        gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, under the contract of
+            ``gdb``.
+        gcarry: ``(B,G,splits*C,3N)`` float32 carry or its shard buffer, written with
+            the forcing gradient of the token before the chunk's first.
         gdtrans: ``(B,H,tiles*T,4)`` float32 ``dtrans`` or its slot buffer, written.
         gdtap: ``(B,H,tiles*T,2,4)`` float32 ``dK`` or its slot buffer, written.
         seqlen: ``T``. Dynamic.
+        chunks: ``C``. Dynamic. The row extent the carry's shard axis multiplies.
         tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
         rows: ``P``. Compile-time.
         dim: ``3N``. Compile-time.
         span: Source-token block, :func:`vblock`. Compile-time.
-        fold: Heads of one group, ``H // G``. Compile-time.
+        fold: Heads of one shard, ``H // G // splits``. Compile-time.
+        splits: Partial depth of the head sum, from :func:`vector_splits`.
+            Compile-time, the grid's first-mode divides being compile-time.
         has_prev: Whether the streaming carry-in was supplied. Compile-time.
 
     Invariants:
@@ -1232,7 +1336,8 @@ def chunk_vector_bwd_kernel(
         block are the padded modes:
         M is rounded up in shared memory, the rounded rows are zeroed by the
         staging predicate or masked by the score, and every store is predicated.
-        ``fold`` divides ``H``.
+        ``fold * splits`` divides ``H``, and one head reaches exactly one block, so no
+        row of any output is written twice.
     """
     tid, _, _ = cute.arch.thread_idx()
     xidx, bidx, gidx = cute.arch.block_idx()
@@ -1324,12 +1429,20 @@ def chunk_vector_bwd_kernel(
     mfrag = cute.make_fragment_like(dmacc, elem)
     fa_m = mma_areg(mfrag)
 
-    # The lane tile is a grid axis, not a loop. Every accumulator above then sits
-    # between its hoisted allocation and its uses with no rolled loop in between,
-    # which is the condition register promotion needs; the divisor is compile-time,
-    # so the decode is a multiply and a subtract rather than an integer division.
-    cidx = xidx // tiles
-    jstep = xidx - cidx * tiles
+    # The lane tile and the head shard are grid axes, not loops. Every accumulator
+    # above then sits between its hoisted allocation and its uses with a loop of the
+    # shard's heads and nothing else in between, which is what register promotion
+    # needs; the divisors are compile-time, so each decode is a multiply and a
+    # subtract rather than an integer division.
+    #
+    # Chunk outermost, then shard, then lane tile: the tiles of one head share every
+    # operand with no state extent, which is the traffic the tile count multiplies, and
+    # the shards of one chunk share the ``B`` and ``C`` rows. Both sets are dispatched
+    # together in this order.
+    cidx = xidx // (splits * tiles)
+    within = xidx - cidx * (splits * tiles)
+    sidx = within // tiles
+    jstep = within - sidx * tiles
 
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
@@ -1339,6 +1452,11 @@ def chunk_vector_bwd_kernel(
     # immediately outside the token axis, so this is the whole of the row offset and
     # it is zero at one tile, where the destination is the output itself.
     jbase = jstep * seqlen
+    # Shard row base of the three outputs that are sums over heads, on the same
+    # convention: the shard axis sits immediately outside the row axis, and the row
+    # axis of the carry is the chunk rather than the token.
+    sbase = sidx * seqlen
+    cbase = sidx * chunks
     first = jstep == 0
     gbj = _lane_view(gb, joff)
     gbprevj = _lane_view(gbprev, joff)
@@ -1359,14 +1477,12 @@ def chunk_vector_bwd_kernel(
     if cutlass.const_expr(fold > 1):
         _fill_zero(sumc, chunk * ldf, tid, threads)
 
-    # Rolled. Unrolling it at trace time was measured and does not promote the
-    # accumulators: local traffic rose from 1,135.3 MB to 1,290.4 MB per launch at
-    # ``3N 240`` fold 18 with every device loop at trip count one, so the spill is a
-    # live set against the 255-register cap and not a loop form. The two vector sums
-    # and the carry stay the group's and outlive the fold, so nothing here becomes a
-    # partial buffer.
+    # The heads of one shard, rolled. Unrolling it at trace time was measured at fold
+    # 18 and does not promote the accumulators: local traffic rose from 1,135.3 MB to
+    # 1,290.4 MB per launch, eighteen inlined bodies overlapping their live ranges. The
+    # depth is what cuts the spill, not the loop form.
     for hstep in cutlass.range(fold, unroll=1):
-        hidx = gidx * fold + hstep
+        hidx = (gidx * splits + sidx) * fold + hstep
         cute.arch.sync_threads()
         stage_chunk(
             gtrans[bidx, hidx, None, None],
@@ -1618,6 +1734,7 @@ def chunk_vector_bwd_kernel(
             srow,
             bidx,
             gidx,
+            sbase,
             t0,
             valid,
             tid,
@@ -1700,8 +1817,9 @@ def chunk_vector_bwd_kernel(
 
     cute.arch.sync_threads()
 
-    # The group's two sums for this lane tile, rounded once. Row t+1 of the
-    # forcing sum is token t and row 0 is the row the boundary kernel owns.
+    # The shard's two sums for this lane tile, rounded once: the narrowing is here at
+    # one shard and at the reduction above one, never twice. Row t+1 of the forcing sum
+    # is token t and row 0 is the row the boundary kernel owns.
     total = chunk * tile
     for step in cutlass.range_constexpr(-(-total // threads)):
         i = tid + step * threads
@@ -1709,13 +1827,13 @@ def chunk_vector_bwd_kernel(
             t = i // tile
             c = i - t * tile
             if t < valid:
-                gdbj[bidx, gidx, t0 + t, c] = narrow(sumb[t + 1, c], out)
+                gdbj[bidx, gidx, sbase + t0 + t, c] = narrow(sumb[t + 1, c], out)
                 if cutlass.const_expr(fold > 1):
-                    gdcj[bidx, gidx, t0 + t, c] = narrow(sumc[t, c], out)
+                    gdcj[bidx, gidx, sbase + t0 + t, c] = narrow(sumc[t, c], out)
     for step in cutlass.range_constexpr(-(-tile // threads)):
         c = tid + step * threads
         if c < tile:
-            gcarryj[bidx, gidx, cidx, c] = sumb[0, c]
+            gcarryj[bidx, gidx, cbase + cidx, c] = sumb[0, c]
 
 
 @cute.jit
@@ -1750,19 +1868,21 @@ def chunk_vector_bwd(
     dim: cutlass.Constexpr,
     span: cutlass.Constexpr,
     fold: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
     resident: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`chunk_vector_bwd_kernel`.
 
-    ``P``, ``3N``, the source-token block and the fold are compile-time because the
-    accumulator partitions and the arena offsets are. Batch, group, chunk count and
-    sequence length are dynamic.
+    ``P``, ``3N``, the source-token block, the fold and the partial depth are
+    compile-time because the accumulator partitions, the arena offsets and the grid's
+    first-mode divides are. Batch, group, chunk count and sequence length are dynamic.
 
-    The x extent carries the chunk and the lane tile, chunk outermost. The lane tile
-    is a grid axis rather than a loop so that no rolled loop sits between an
-    accumulator's allocation and its uses, and the block count rises by the tile
-    count with it.
+    The x extent carries the chunk, the head shard and the lane tile, chunk outermost
+    and lane tile innermost. Both inner axes are grid axes rather than loops: the lane
+    tile so that no rolled loop sits between an accumulator's allocation and its uses,
+    the shard so that the loop which remains there is short. The block count rises by
+    their product.
     """
     chunk_vector_bwd_kernel(
         gdy,
@@ -1784,6 +1904,7 @@ def chunk_vector_bwd(
         gdtrans,
         gdtap,
         seqlen,
+        chunks,
         make_mma(dtype),
         threads,
         chunk,
@@ -1791,13 +1912,113 @@ def chunk_vector_bwd(
         dim,
         span,
         fold,
+        splits,
         has_prev,
     ).launch(
-        grid=(chunks * (dim // lane_block(dim)), bsz, groups),
+        grid=(chunks * splits * (dim // lane_block(dim)), bsz, groups),
         block=(threads, 1, 1),
         min_blocks_per_mp=resident,
         stream=stream,
     )
+
+
+@cute.kernel
+def vector_reduce_kernel(
+    gpb: cute.Tensor,
+    gpc: cute.Tensor,
+    gpcarry: cute.Tensor,
+    gdb: cute.Tensor,
+    gdc: cute.Tensor,
+    gcarry: cute.Tensor,
+    seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    dim: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
+) -> None:
+    """Sum the head-shard partials of ``dB``, ``dC`` and the carry.
+
+    One block per ``(token, batch, group)``, walking ``3N`` at the block width; the
+    blocks whose token indexes a chunk take that chunk's carry row too. There are
+    never fewer token blocks than chunks, ``L`` being at least 16.
+
+    Indexed by mode rather than by a flat row view, because ``dB`` and ``dC`` are
+    bands that may be pitched in their last mode. The partials are contiguous and the
+    shard stride is the row extent, so a warp's ``splits`` loads for one column are
+    each coalesced across the warp.
+
+    Args:
+        gpb: ``(B,G,splits*T,3N)`` float32 ``dB`` partials.
+        gpc: ``(B,G,splits*T,3N)`` float32 ``dC`` partials.
+        gpcarry: ``(B,G,splits*C,3N)`` float32 carry partials.
+        gdb: ``(B,G,T,3N)`` ``dB`` at the activation width, written.
+        gdc: ``(B,G,T,3N)`` ``dC`` at the activation width, written.
+        gcarry: ``(B,G,C,3N)`` float32 carry, written.
+        seqlen: ``T``, the row extent of the two token partials. Dynamic.
+        chunks: ``C``, the row extent of the carry partial. Dynamic.
+        threads: Block width. Compile-time.
+        dim: ``3N``. Compile-time.
+        splits: Partial depth, at least two. Compile-time, so a column's loads issue
+            together.
+
+    Invariants:
+        The producer writes every element of every partial row exactly once, so this
+        needs no fill and no atomic. The accumulator is float32 and the narrowing is
+        on the store, which is the one rounding the head sum takes on the path.
+        Reduction order is ascending shard, fixed by the launch geometry, so a rerun
+        at one shape reproduces the result bit for bit.
+    """
+    tid, _, _ = cute.arch.thread_idx()
+    token, bidx, gidx = cute.arch.block_idx()
+    out = gdb.element_type
+
+    for col in cutlass.range(tid, dim, threads):
+        vecb = cutlass.Float32(0.0)
+        vecc = cutlass.Float32(0.0)
+        row = token
+        for _ in cutlass.range_constexpr(splits):
+            vecb = vecb + gpb[bidx, gidx, row, col]
+            vecc = vecc + gpc[bidx, gidx, row, col]
+            row = row + seqlen
+        gdb[bidx, gidx, token, col] = narrow(vecb, out)
+        gdc[bidx, gidx, token, col] = narrow(vecc, out)
+
+    if token < chunks:
+        for col in cutlass.range(tid, dim, threads):
+            held = cutlass.Float32(0.0)
+            row = token
+            for _ in cutlass.range_constexpr(splits):
+                held = held + gpcarry[bidx, gidx, row, col]
+                row = row + chunks
+            gcarry[bidx, gidx, token, col] = held
+
+
+@cute.jit
+def vector_reduce(
+    gpb: cute.Tensor,
+    gpc: cute.Tensor,
+    gpcarry: cute.Tensor,
+    gdb: cute.Tensor,
+    gdc: cute.Tensor,
+    gcarry: cute.Tensor,
+    seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
+    bsz: cutlass.Int32,
+    groups: cutlass.Int32,
+    stream: Stream,
+    threads: cutlass.Constexpr,
+    dim: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
+) -> None:
+    """Launch :func:`vector_reduce_kernel`, one block per token per batch and group.
+
+    No activation dtype is taken: the kernel reads the destination's element type off
+    the operand, and :func:`slinoss._cute.jit_launch` puts that type in the executor
+    key itself.
+    """
+    vector_reduce_kernel(
+        gpb, gpc, gpcarry, gdb, gdc, gcarry, seqlen, chunks, threads, dim, splits
+    ).launch(grid=(seqlen, bsz, groups), block=(threads, 1, 1), stream=stream)
 
 
 class ChunkVectorBwd(NamedTuple):
@@ -1842,6 +2063,7 @@ def chunk_vector_backward(
     b_prev: Tensor | None = None,
     dB: Tensor | None = None,
     dC: Tensor | None = None,
+    splits: int | None = None,
 ) -> ChunkVectorBwd:
     """Differentiate the rowwise vectors and the transition parameters.
 
@@ -1850,11 +2072,13 @@ def chunk_vector_backward(
     closing rotation and scale are one contraction over the chunk-start state that
     stage already ran.
 
-    Above one lane tile the two transition-chart outputs are sums over lanes that
-    separate blocks cannot share, so each tile writes its own float32 slot row and a
-    second launch closes them. That workspace is ``(B, H, tiles * T, 4)`` and
-    ``(B, H, tiles * T, 2, 4)`` float32, allocated here and freed on return; at one
-    tile there is none and the kernel stores the outputs directly.
+    Two workspaces, both float32, both allocated here and freed on return, and both
+    holding one partial row per block of a sum whose terms separate blocks cannot
+    share. Above one lane tile the transition chart is a sum over lanes:
+    ``(B, H, tiles * T, 4)`` and ``(B, H, tiles * T, 2, 4)``. Above partial depth one
+    the two vectors and the carry are sums over heads: ``(B, G, splits * T, 3N)``
+    twice and ``(B, G, splits * C, 3N)``, which is :func:`partial_bytes`. At one copy
+    of either there is no buffer and the kernel stores the output directly.
 
     Args:
         dy: ``(B,H,T,P)`` cotangent of ``y``, one of
@@ -1884,6 +2108,11 @@ def chunk_vector_backward(
             and it is returned as this same object. ``None`` allocates. See
             :func:`slinoss.ops.so3ssd.reference.check_grad_band`.
         dC: Destination for the ``C`` cotangent, under the contract of ``dB``.
+        splits: Partial depth of the head sum, a divisor of ``H // G``. ``None`` takes
+            :func:`vector_splits`'s default. One walks every head of a group in one
+            block and writes the three summed outputs directly; above one the heads
+            are shared out over that many blocks and a second launch closes the
+            partials. The returned tensors are the full sums either way.
 
     Returns:
         :class:`ChunkVectorBwd`.
@@ -1891,7 +2120,8 @@ def chunk_vector_backward(
     Raises:
         ValueError: On a layout, rank, shape or extent violation, on a destination
             that is not the band of its operand, on a shared-memory budget the
-            device cannot hold, or on half a streaming pair.
+            device cannot hold, on half a streaming pair, or on a ``splits`` that
+            does not divide the fold.
         TypeError: On an activation dtype with no tensor-core path.
     """
     activations: Named = ((dy, "dy"), (U, "U"), (B, "B"), (C, "C"))
@@ -1914,7 +2144,8 @@ def chunk_vector_backward(
     if tuple(dy.shape) != tuple(U.shape):
         raise ValueError(f"dy must be {tuple(U.shape)}, got {tuple(dy.shape)}")
     check_rows(rows)
-    fold = heads // groups
+    shards = vector_splits(heads // groups, splits)
+    fold = heads // groups // shards
     span = vblock(chunk_size, rows, dim, fold, dy.element_size())
     check_extents(chunk_size, dim, span)
     has_prev = check_stream(u_prev, b_prev, (bsz, heads, groups, rows, dim))
@@ -1934,7 +2165,7 @@ def chunk_vector_backward(
             raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
 
     budget = assert_smem_fits(
-        f"chunk_vector_bwd[L{chunk_size}/P{rows}/3N{dim}/fold{fold}]",
+        f"chunk_vector_bwd[L{chunk_size}/P{rows}/3N{dim}/fold{fold}/S{shards}]",
         vector_smem_bytes(chunk_size, rows, dim, fold, span, dy.element_size()),
     )
 
@@ -1953,10 +2184,12 @@ def chunk_vector_backward(
     carry_b = torch.empty(bsz, groups, chunks, dim, dtype=torch.float32, device=device)
     dtrans = torch.empty(bsz, heads, seqlen, 4, dtype=torch.float32, device=device)
     dK = torch.empty(bsz, heads, seqlen, 2, 4, dtype=torch.float32, device=device)
-    # The two outputs that are sums over lanes. Every other output spans the state
-    # width, so the lane tile that owns a column owns it alone.
+    # The two outputs that are sums over lanes, and the three that are sums over the
+    # heads of a group. Nothing else needs a partial row: every other output spans the
+    # state width and belongs to one head, so one block owns it.
     tiles = dim // lane_block(dim)
     held = (open_slots(dtrans, tiles), open_slots(dK, tiles, axis=-3))
+    shared = tuple(open_slots(out, shards) for out in (dB, dC, carry_b))
     jit_launch(
         chunk_vector_bwd,
         (
@@ -1973,9 +2206,9 @@ def chunk_vector_backward(
             dlogp,
             dchunk_rot,
             dchunk_scale,
-            dB,
-            dC,
-            carry_b,
+            shared[0].dest,
+            shared[1].dest,
+            shared[2].dest,
             held[0].dest,
             held[1].dest,
             seqlen,
@@ -1991,10 +2224,28 @@ def chunk_vector_backward(
             dim,
             span,
             fold,
+            shards,
             has_prev,
             min(RESIDENT_MAX, max(1, smem_capacity() // budget)),
         ),
     )
     for slots in held:
         close_slots(slots)
+    if shards > 1:
+        jit_launch(
+            vector_reduce,
+            (
+                shared[0].dest,
+                shared[1].dest,
+                shared[2].dest,
+                dB,
+                dC,
+                carry_b,
+                seqlen,
+                chunks,
+                bsz,
+                groups,
+            ),
+            (THREADS, dim, shards),
+        )
     return ChunkVectorBwd(dB=dB, dC=dC, carry_b=carry_b, dtrans=dtrans, dK=dK)

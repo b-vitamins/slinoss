@@ -41,10 +41,13 @@ from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_backward, chunked_forward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
+    VECTOR_SPLITS,
     ChunkVectorBwd,
     chunk_vector_backward,
+    partial_bytes,
     vblock,
     vector_smem_bytes,
+    vector_splits,
 )
 from slinoss.ops.so3ssd.reference import from_heads
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
@@ -255,6 +258,7 @@ def _run(
     chunk: int,
     dB: Tensor | None = None,
     dC: Tensor | None = None,
+    splits: int | None = None,
 ) -> ChunkVectorBwd:
     """One launch, against the float32 inputs the oracle carries."""
     got = chunk_vector_backward(
@@ -274,6 +278,7 @@ def _run(
         b_prev=inp.b_prev,
         dB=dB,
         dC=dC,
+        splits=splits,
     )
     torch.cuda.synchronize()
     return got
@@ -383,10 +388,11 @@ def test_grouped_vectors_sum_over_their_heads(groups: int) -> None:
 
     ``G == 1`` is the only case where every head contributes to one ``B``/``C``
     pair, and it is the case a missing reduction silently passes at ``G == H``. An
-    intermediate ``G`` takes the same head fold, so it is not swept. The fold is
-    the kernel's own loop rather than a grid axis, so ``G < H`` also runs the arena
-    twice over without reallocating it, and the ``dB`` accumulator has to survive
-    the head boundary that the last store crosses.
+    intermediate ``G`` takes the same head fold, so it is not swept. At this fold
+    the default depth leaves one head to a block, so what is under test is the
+    closure rather than the in-block loop;
+    :func:`test_the_head_shard_closure_sums_every_head` sweeps the depth that runs
+    both.
 
     The shape is also where the budget halves the source-token block, at ``G == 1``
     only, so it is the case that runs two blocks in the tap loop and the case where
@@ -409,15 +415,66 @@ def test_holds_the_widest_state_the_mixer_configures(groups: int) -> None:
     launch path every narrower state takes rather than a second one, and the arena
     costs what it costs at ``3N = 48``. The geometry is the one the throughput
     targets are stated at: ``d_head 64``, ``L 64``, ``N 80``, ``H 18``. At ``G == 1``
-    the whole fold runs inside the block and the budget halves the source-token
+    the fold is shared over the default depth and the budget halves the source-token
     block as well, so the two sums that cross lanes are accumulated over five lane
-    tiles while the forcing sum crosses eighteen heads and two source blocks.
+    tiles while the forcing sum crosses one shard's heads and two source blocks.
     """
     inp = _make(1, 18, 128, 64, 80, torch.bfloat16, groups=groups)
     dy = _cotangent(inp, torch.bfloat16)
     want = _oracle(inp, dy, 64, dstate=_dstate(inp))
     got = _run(inp, dy, want, 64)
     _compare(got, want, torch.bfloat16, f"cute-chunk-vector[3N240/G{groups}]")
+
+
+@pytest.mark.parametrize("splits", [1, 2, 3, 9, 18])
+def test_the_head_shard_closure_sums_every_head(splits: int) -> None:
+    """Every partial depth of the head sum reaches the same three outputs.
+
+    ``dB``, ``dC`` and the carry are sums over the eighteen heads of the one group,
+    and the depth decides how many blocks that sum is shared over: at one the block
+    walks every head, above one each block walks ``18 // splits`` of them into a
+    float32 partial and a second launch closes it. A depth that lost a shard, or
+    read a row no producer wrote, shows up as a wrong sum and not as noise. Compared
+    to the float64 reference and not to depth one, because the shards change the
+    association of the head sum and no two depths are bitwise equal.
+    """
+    inp = _make(1, 18, 128, 64, 80, torch.bfloat16, groups=1)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _oracle(inp, dy, 64, dstate=_dstate(inp))
+    got = _run(inp, dy, want, 64, splits=splits)
+    _compare(got, want, torch.bfloat16, f"cute-chunk-vector[S{splits}]")
+
+
+def test_the_partial_depth_takes_only_divisors_of_the_fold() -> None:
+    """A depth that does not divide the fold is refused, not rounded.
+
+    A ragged depth would leave one block walking fewer heads than the shard stride
+    covers and the closure summing rows no producer wrote. The default is the
+    deepest divisor at or below :data:`VECTOR_SPLITS`, so a fold that is prime above
+    it stays at one rather than paying a partial it cannot balance.
+    """
+    assert vector_splits(1) == 1
+    assert vector_splits(18) == VECTOR_SPLITS
+    assert vector_splits(4) == 4
+    assert vector_splits(7) == 1
+    assert vector_splits(18, 9) == 9
+    for bad in (0, -1, 4, 12):
+        with pytest.raises(ValueError, match="divisor of the fold"):
+            vector_splits(18, bad)
+
+
+def test_the_partial_workspace_follows_the_depth() -> None:
+    """The head-sum workspace is what the depth costs, and nothing at depth one.
+
+    Three float32 buffers, two over the sequence and one over the chunks, each with
+    its row axis multiplied by the depth. At the default configuration and depth six
+    that is 95.11 MB, which is the figure the depth is chosen against.
+    """
+    assert partial_bytes(4, 1, 2048, 32, 240, 1) == 0
+    assert partial_bytes(4, 1, 2048, 32, 240, 6) == 95_109_120
+    assert partial_bytes(4, 1, 2048, 32, 240, 18) == 3 * partial_bytes(
+        4, 1, 2048, 32, 240, 6
+    )
 
 
 def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:
@@ -832,24 +889,31 @@ def test_rejects_a_bad_operand(
 
 
 @pytest.mark.parametrize(
-    ("chunk", "rows", "lanes", "groups", "match"),
+    ("chunk", "rows", "lanes", "groups", "splits", "match"),
     [
         # 48 is a multiple of 16 and so clears the atom's K extent; what it fails is
         # the source-token block, which is this kernel's own tiling and not the
         # atom's. It fails only where the budget halves that block, since the full
         # block is the chunk itself, and since the arena is flat in ``3N`` the only
-        # axes that reach the halving are ``P`` and the fold. The public config
-        # admits only powers of two, so no reachable configuration hits this; the
-        # check is what keeps that true.
-        (48, 128, 16, 1, "K slice"),
+        # axes that reach the halving are ``P`` and the in-block fold. The depth is
+        # pinned to one for that reason: at the default depth this fold is one block
+        # to a head, the arena is the unhalved one and the shape is legal. The public
+        # config admits only powers of two, so no reachable configuration hits this;
+        # the check is what keeps that true.
+        (48, 128, 16, 1, 1, "K slice"),
         # ``P`` is the N mode of the two increment contractions here, unlike the
         # kernels where it is only a row count, so it carries the atom's constraint.
-        (64, 24, 16, None, "P must be"),
-        (64, 16, 8, None, "3N must be"),
+        (64, 24, 16, None, None, "P must be"),
+        (64, 16, 8, None, None, "3N must be"),
     ],
 )
 def test_rejects_an_extent_the_atom_cannot_cover(
-    chunk: int, rows: int, lanes: int, groups: int | None, match: str
+    chunk: int,
+    rows: int,
+    lanes: int,
+    groups: int | None,
+    splits: int | None,
+    match: str,
 ) -> None:
     """The fix for an illegal extent is the shape, never a padding path.
 
@@ -883,4 +947,5 @@ def test_rejects_an_extent_the_atom_cannot_cover(
             chunk,
             u_prev=inp.u_prev,
             b_prev=inp.b_prev,
+            splits=splits,
         )
