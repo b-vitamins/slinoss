@@ -27,12 +27,14 @@ from typing import Annotated, Any, Final
 
 from slinoss.perf.budget import BucketDelta, BudgetReport
 from slinoss.perf.ceiling import Ceilings, ClassVerdict, GeometryVerdict
+from slinoss.perf.coverage import CoverageVerdict, DispatchVerdict
 from slinoss.perf.device import DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
 from slinoss.perf.memory import MemoryPeaks, PoolRetention, SavedStorages
 from slinoss.perf.ncu import SOL_FIELDS, STALL_FIELDS, KernelCounters, SpillCounters
 from slinoss.perf.nsys import NsysTrace
 from slinoss.perf.timing import Throughput
+from slinoss.perf.traffic import TrafficMix
 from slinoss.perf.units import (
     INVARIANT,
     MEDIAN,
@@ -192,6 +194,14 @@ class Report:
         geometry: Per-kernel launch-geometry verdicts, one per declared kernel the
             capture held. Longer than ``verdicts`` whenever a kernel was left
             without a class verdict, since neither geometry rule needs traffic.
+        traffic: Per-kernel request stream beside DRAM stream. Report only: it says
+            what fraction of a kernel's demand the caches served, which the
+            DRAM-referenced floor does not price.
+        coverage: Whether the audit judged every kernel its arm declares. An audit
+            that judged nothing is not a pass, and this is what says so.
+        dispatch: What each of the operator's registries resolved to. A run that
+            fell back to the reference launched no declared kernel, so every other
+            rule in the report held vacuously.
         spills: Per-kernel local-memory sectors, from the spill pass the verdicts
             were judged with. Carried as a table and not only as a note, because a
             spill fails a class outright and the verdict it fails records the
@@ -218,6 +228,9 @@ class Report:
     pool: PoolRetention | None = None
     verdicts: tuple[ClassVerdict, ...] = ()
     geometry: tuple[GeometryVerdict, ...] = ()
+    traffic: tuple[TrafficMix, ...] = ()
+    coverage: CoverageVerdict | None = None
+    dispatch: DispatchVerdict | None = None
     spills: tuple[SpillCounters, ...] = ()
     deltas: tuple[BucketDelta, ...] = ()
     growth: tuple[GrowthRow, ...] = ()
@@ -409,10 +422,17 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
     if report.ceilings is not None:
         lines += _section("measured dram ceiling", [report.ceilings.dram])
         lines += _section("measured tensor ceiling", [report.ceilings.tensor])
+    if report.dispatch is not None:
+        lines += _section("dispatch", [report.dispatch])
+        lines += _section("registry choices", report.dispatch.choices)
+    if report.coverage is not None:
+        lines += _section("coverage", [report.coverage])
     if report.verdicts:
         lines += _section("class verdicts", report.verdicts)
     if report.geometry:
         lines += _section("launch geometry", report.geometry)
+    if report.traffic:
+        lines += _section("traffic mix", report.traffic)
     if report.spills:
         lines += _section("local memory", report.spills)
     if report.kernels:

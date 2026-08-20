@@ -20,6 +20,23 @@ and the block-count floor are gates, so a violation is an exit status a sweep or
 CI step can act on rather than a line in a file nobody read. The report is written
 either way: a refused emission would leave the failing measurement unreadable.
 
+An audit that judged nothing exits nonzero too, and this is not the same rule. Every
+gate above is a statement about a kernel the capture held, so a capture holding no
+kernel passes all of them: a conv audit exited zero having judged nothing, the
+compiled extension never having been built in that environment, so the operator
+resolved to its reference and thirteen torch kernels were reported as unjudged. Three
+checks close that, in the order they can be answered:
+
+1. Dispatch, before any profiler runs. Every registry the operator selects through is
+   asked what it resolves for this device and dtype, and a reference answer ends the
+   run: nine NCU passes over a torch path cost the same as nine over a kernel path.
+2. The profiler paths, also before the workload. A profiler that is not installed is
+   an environment defect, and finding that out after the event bench and the ceiling
+   fits wastes the measurement it would have gated.
+3. Coverage, after the audit. What was judged is compared against the kernels
+   :data:`slinoss.perf.coverage.COVERAGE` says the arm launches, so a capture short
+   by one launch is an exit status and not a shorter table.
+
     python3 scripts/perf/profile_op.py --shape standard --mode step
 
 ``--op`` picks the operator, out of :data:`slinoss.perf.workload.OPS`. The report
@@ -34,15 +51,18 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
 
+from slinoss.perf.arms import op_arm
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.ceiling import ceilings, dram_time_floor
+from slinoss.perf.coverage import MODES, TARGETED, coverage_verdict, unreachable
 from slinoss.perf.declared import FloorAudit, floor_audit
 from slinoss.perf.device import device_info, device_ordinal, require_cuda
+from slinoss.perf.dispatch import dispatch_verdict
 from slinoss.perf.ncu import (
     NCU_TABLES,
     SPILL_TABLE,
@@ -55,42 +75,11 @@ from slinoss.perf.ncu import (
 from slinoss.perf.nsys import run_nsys
 from slinoss.perf.report import Report, agreement, write_report
 from slinoss.perf.timing import Throughput, measure
-from slinoss.perf.workload import (
-    BLOCK,
-    CONV,
-    MIXER,
-    OPS,
-    SCANPREP,
-    SHAPE_NAMES,
-    BlockShape,
-    ConvShape,
-    MixerShape,
-    OpShape,
-    PrepShape,
-    block_forward_only,
-    block_shape_by_name,
-    block_step,
-    conv_forward_only,
-    conv_shape_by_name,
-    conv_step,
-    forward_only,
-    make_block_inputs,
-    make_conv_inputs,
-    make_inputs,
-    make_mixer_inputs,
-    make_prep_inputs,
-    mixer_forward_only,
-    mixer_shape_by_name,
-    mixer_step,
-    prep_forward_only,
-    prep_shape_by_name,
-    prep_step,
-    shape_by_name,
-    step,
-)
+from slinoss.perf.tools import resolve_tool
+from slinoss.perf.traffic import traffic_mix
+from slinoss.perf.workload import OPS, SHAPE_NAMES
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-MODES = ("forward", "step")
 TARGET = Path(__file__).with_name("profile_target.py")
 
 
@@ -125,7 +114,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "Forwarded to the target, so the counters and the event wall cover one "
         "layout. Ignored by every other operator.",
     )
-    parser.add_argument("--ncu", default="ncu")
+    parser.add_argument(
+        "--ncu",
+        default="ncu",
+        help="Path to ncu, or a bare name resolved through PATH and then the CUDA "
+        "bin directories. Resolved before the workload is allocated, so a profiler "
+        "that is not installed costs no measurement.",
+    )
     parser.add_argument(
         "--kernel",
         default=None,
@@ -134,19 +129,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "replaying the whole step. The cross-check and the class audit then "
         "cover only what was profiled, and the report says so.",
     )
-    parser.add_argument("--nsys", default="nsys")
+    parser.add_argument("--nsys", default="nsys", help="Path to nsys. See --ncu.")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--out", type=Path, default=Path("out/profile-op"))
     parser.add_argument(
         "--skip-ncu",
         action="store_true",
-        help="Emit without the counter tables. The cross-check cannot run, and "
-        "the report says so.",
+        help="Emit without the counter tables. The cross-check cannot run, no "
+        "kernel is judged, and the run exits nonzero on the coverage rule: a "
+        "report with no verdict in it is not a pass.",
     )
     parser.add_argument(
         "--skip-nsys",
         action="store_true",
-        help="Emit without the launch stream. Same consequence.",
+        help="Emit without the launch stream. The cross-check cannot run; the "
+        "counters and the audit are unaffected.",
     )
     return parser.parse_args(argv)
 
@@ -182,90 +179,49 @@ def target_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def build_workload(
-    args: argparse.Namespace, device: torch.device
-) -> tuple[
-    OpShape | ConvShape | PrepShape | BlockShape | MixerShape, Callable[[], None]
-]:
-    """Resolve the shape and build the event-bench runner for ``--op``.
-
-    The same dispatch runs in :mod:`scripts.perf.profile_target`, so the event
-    wall and the profiled window cover one workload.
-
-    Args:
-        args: Parsed command line.
-        device: Device to allocate on.
-
-    Returns:
-        The shape record and the workload callable.
-    """
-    grads = args.mode == "step"
-    dtype = DTYPES[args.dtype]
-    if args.op == CONV:
-        conv_shape = conv_shape_by_name(args.shape)
-        conv = make_conv_inputs(
-            conv_shape,
-            device,
-            dtype=dtype,
-            requires_grad=grads,
-            d_head=args.d_head or None,
-        )
-        runner = (
-            conv_step(conv, backend=args.backend)
-            if grads
-            else conv_forward_only(conv, backend=args.backend)
-        )
-        return conv_shape, runner
-    if args.op == SCANPREP:
-        prep_shape = prep_shape_by_name(args.shape)
-        prep = make_prep_inputs(prep_shape, device, dtype=dtype, requires_grad=grads)
-        return prep_shape, (
-            prep_step(prep, prep_shape, backend=args.backend)
-            if grads
-            else prep_forward_only(prep, prep_shape, backend=args.backend)
-        )
-    if args.op == BLOCK:
-        block_shape = block_shape_by_name(args.shape)
-        block = make_block_inputs(block_shape, device, dtype=dtype, requires_grad=grads)
-        return block_shape, (
-            block_step(block, block_shape, backend=args.backend)
-            if grads
-            else block_forward_only(block, block_shape, backend=args.backend)
-        )
-    if args.op == MIXER:
-        mixer_shape = mixer_shape_by_name(args.shape)
-        mixer = make_mixer_inputs(mixer_shape, device, dtype=dtype, requires_grad=grads)
-        return mixer_shape, (
-            mixer_step(mixer, mixer_shape, backend=args.backend)
-            if grads
-            else mixer_forward_only(mixer, mixer_shape, backend=args.backend)
-        )
-    shape = shape_by_name(args.shape)
-    inputs = make_inputs(shape, device, dtype=dtype, requires_grad=grads)
-    return shape, (
-        step(inputs, shape.chunk, backend=args.backend)
-        if grads
-        else forward_only(inputs, shape.chunk, backend=args.backend)
-    )
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Measure, profile, cross-check, emit, and judge.
 
     Returns:
-        Process exit status: zero when every kernel the capture held cleared every
-        rule the audit applied, one when any of them failed. A run that collected
-        no counters has nothing to judge and exits zero.
+        Process exit status: zero when the operator dispatched to its kernels, the
+        capture held every kernel the arm launches, and every one of them cleared
+        every rule the audit applied. One when any of the three failed, the run that
+        judged nothing included.
 
     Raises:
         RuntimeError: If the requested device is not a usable CUDA device.
+        ToolNotFoundError: If a profiler that was not skipped is on neither PATH nor
+            any CUDA bin directory. Raised before the workload is allocated.
         ValueError: If NCU returned a table with a metric absent, which means the
             metric name is wrong for this driver version, or if a profiled kernel
             this repo compiles declares no class.
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
-    shape, runner = build_workload(args, device)
+    # Before the workload and before the profilers. A reference dispatch launches no
+    # declared kernel, so every rule below it would hold over torch's kernels, and a
+    # profiler that is not installed cannot judge what the bench would measure.
+    chosen = dispatch_verdict(
+        args.op,
+        device_type=device.type,
+        dtype=DTYPES[args.dtype],
+        backend=args.backend,
+    )
+    if not chosen.passed:
+        print(f"dispatch failure: {chosen.detail}")
+        return 1
+    ncu_path = None if args.skip_ncu else resolve_tool(args.ncu)
+    nsys_path = None if args.skip_nsys else resolve_tool(args.nsys)
+    arm = op_arm(
+        args.op,
+        args.shape,
+        device,
+        dtype=DTYPES[args.dtype],
+        grads=args.mode == "step",
+        d_head=args.d_head or None,
+    )
+    shape = arm.shape
+    runner = arm.run(args.backend, arm.prefix)
     label = f"{args.op} {shape.name} {args.mode}"
     timed = measure(
         runner,
@@ -294,13 +250,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"B={floor.asymptotic_gbs:.2f} GB/s "
         f"max residual={floor.max_residual_pct:.2f}% "
         f"l2={floor.l2_bytes} B",
+        f"dispatch: {chosen.detail}",
+        f"profilers: ncu={ncu_path or 'skipped'} nsys={nsys_path or 'skipped'}",
     ]
+    # Read every run, not only the run that adds one: an excuse nobody reads is how a
+    # kernel stops being profiled at all.
+    notes += [
+        f"declared and driven elsewhere: {one.kernel} by {one.driver}, {one.reason}"
+        for one in TARGETED
+    ]
+    orphans = unreachable()
+    if orphans:
+        notes.append(
+            "declared and reached by nothing, so the class is a claim with no gate: "
+            + ", ".join(orphans)
+        )
 
     trace = None
-    if not args.skip_nsys:
+    if nsys_path is not None:
         base = args.out.with_name(f"{args.out.name}-{shape.name}-{args.mode}")
         base.parent.mkdir(parents=True, exist_ok=True)
-        trace = run_nsys(argv_target, base, label=label, nsys=args.nsys)
+        trace = run_nsys(argv_target, base, label=label, nsys=nsys_path)
         notes.append(f"nsys report: {trace.report_path}")
 
     passes: list[NcuPass] = []
@@ -311,9 +281,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"ncu narrowed to kernels matching {args.kernel!r}; the cross-check "
             f"and the class audit cover only those"
         )
-    if not args.skip_ncu:
+    if ncu_path is not None:
         for table in (*NCU_TABLES, SPILL_TABLE):
-            one = run_ncu(table, argv_target, ncu=args.ncu, extra=narrow)
+            one = run_ncu(table, argv_target, ncu=ncu_path, extra=narrow)
             if one.missing_metrics:
                 raise ValueError(
                     f"ncu table {table.name!r} returned no value for "
@@ -376,6 +346,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         notes += [f"audit failure: {line}" for line in audit.failures]
 
+    # Judged, not captured: a kernel the capture held and the audit could not judge is
+    # not covered, and the whole point of the rule is that the count is of verdicts.
+    covered = coverage_verdict(
+        args.op,
+        args.mode,
+        () if audit is None else audit.judged,
+        narrowed=bool(narrow),
+    )
+    notes.append(f"coverage: {covered.detail}")
+
     report = Report(
         title=f"profile: {label}",
         device=device_info(device_ordinal(device)),
@@ -386,6 +366,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         kernels=kernels,
         verdicts=() if audit is None else audit.verdicts,
         geometry=() if audit is None else audit.geometry,
+        traffic=traffic_mix(kernels),
+        coverage=covered,
+        dispatch=chosen,
         spills=spills,
         trace=trace,
         notes=tuple(notes),
@@ -397,11 +380,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"wrote {md}")
     print(f"wrote {js}")
-    if audit is not None and not audit.passed:
-        for line in audit.failures:
-            print(f"audit failure: {line}")
-        return 1
-    return 0
+    failures = (
+        [] if audit is None else [f"audit failure: {one}" for one in audit.failures]
+    )
+    if not covered.passed:
+        failures.append(f"coverage failure: {covered.detail}")
+    for line in failures:
+        print(line)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -13,6 +13,10 @@ Layering, innermost first:
   kernel class verdicts, and the two launch-geometry rules.
 - :mod:`slinoss.perf.capture` -- the window an external profiler attaches to.
 - :mod:`slinoss.perf.ncu`, :mod:`slinoss.perf.nsys` -- the two profiler drivers.
+- :mod:`slinoss.perf.coverage` -- which kernels each arm launches, so an audit that
+  judged nothing fails rather than passing vacuously.
+- :mod:`slinoss.perf.traffic` -- the request stream beside the DRAM stream, which is
+  the traffic the DRAM-referenced floor does not price.
 - :mod:`slinoss.perf.report` -- emission, gated by the three-way cross-check.
 """
 

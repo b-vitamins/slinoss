@@ -23,6 +23,10 @@ carries the condition. It is judged when the capture holds it and is not require
 it does not, which is the one thing this module cannot decide from the operator name
 and the mode alone. Everything else is required, so an absence is a defect.
 
+A kernel no arm launches at any shape is declared :data:`TARGETED` and carries the
+driver that does launch it. That is the whole escape hatch: two entries, both named
+in the report, neither excused from anything but :func:`unreachable`.
+
 The table is data, not an import: naming a kernel here pulls in neither the operator
 packages nor the DSL, so the completeness test runs on a host with no GPU.
 """
@@ -39,11 +43,13 @@ from slinoss.perf.units import INVARIANT, Count, PerfRecord
 __all__ = [
     "COVERAGE",
     "MODES",
+    "TARGETED",
     "Conditional",
     "CoverageVerdict",
     "DispatchVerdict",
     "OpCoverage",
     "RegistryChoice",
+    "Targeted",
     "coverage_of",
     "coverage_verdict",
     "unreachable",
@@ -106,8 +112,7 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
             "chunk_increment_fwd_kernel",
             "state_passing_fwd_kernel",
             "chunk_scan_fwd_kernel",
-            "chunk_start_bwd_kernel",
-            "state_passing_bwd_kernel",
+            "start_passing_bwd_kernel",
             "chunk_input_bwd_kernel",
             "chunk_vector_bwd_kernel",
             "boundary_bwd_kernel",
@@ -184,6 +189,51 @@ there, by the plain norm's backward and by the residual norm's. One key, because
 capture merges the launches of one symbol into one counter row."""
 
 
+@dataclass(frozen=True)
+class Targeted:
+    """A declared kernel no benchmarked arm launches, and the driver that does.
+
+    Attributes:
+        kernel: Key of :data:`slinoss.perf.declared.DECLARED`.
+        driver: Path of the script that launches it, with the flags that select it.
+        reason: Why no arm in :data:`COVERAGE` reaches it.
+    """
+
+    kernel: str
+    driver: str
+    reason: str
+
+
+TARGETED: Final[tuple[Targeted, ...]] = (
+    Targeted(
+        "chunk_start_bwd_kernel",
+        "scripts/perf/profile_chunk_start_bwd.py",
+        "the backward fused this GEMM into start_passing_bwd, so the operator no "
+        "longer launches it on any path; it survives as the arm the fusion is "
+        "ranked against and is declared here until it is deleted",
+    ),
+    Targeted(
+        "state_passing_bwd_kernel",
+        "scripts/perf/profile_start_passing_bwd.py --arm pair",
+        "the operator launches the recurrence alone only when dy is absent, which "
+        "is a caller differentiating the carried state and not the sequence; every "
+        "arm in COVERAGE differentiates the output",
+    ),
+)
+"""Declared kernels reached by a targeted driver rather than by a benchmarked arm.
+
+The escape hatch, and it is narrow by construction: it excuses a kernel from
+:func:`unreachable` and from nothing else, it names the command that does profile
+the kernel, and every entry is a line in the report so the excuse is read every time
+the audit runs. An entry whose kernel an arm does launch is a contradiction the
+completeness test refuses.
+
+Neither entry is a shape condition, which is why neither is a :class:`Conditional`:
+one kernel is off the operator's path entirely and the other is on a path no arm
+here takes. A kernel that some shapes launch and others do not belongs in
+``conditional`` instead, where it is judged whenever the capture holds it."""
+
+
 def coverage_of(op: str, mode: str) -> OpCoverage:
     """The kernels one arm launches.
 
@@ -207,16 +257,18 @@ def coverage_of(op: str, mode: str) -> OpCoverage:
 
 
 def unreachable() -> tuple[str, ...]:
-    """Declared kernels no arm launches, sorted.
+    """Declared kernels neither an arm nor a targeted driver launches, sorted.
 
     A class no driver reaches is a claim with no gate behind it: the audit judges what
     a capture contained, so a kernel nothing launches reads as verified. This is the
     static half of the coverage rule and needs no device.
 
     Returns:
-        Keys of :data:`slinoss.perf.declared.DECLARED` absent from :data:`COVERAGE`.
+        Keys of :data:`slinoss.perf.declared.DECLARED` absent from both
+        :data:`COVERAGE` and :data:`TARGETED`.
     """
     claimed = {key for entry in COVERAGE.values() for key in entry.kernels}
+    claimed |= {one.kernel for one in TARGETED}
     return tuple(sorted(set(DECLARED) - claimed))
 
 
