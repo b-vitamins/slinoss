@@ -28,7 +28,7 @@ from slinoss.perf.declared import DECLARED
 from slinoss.perf.workload import OPS
 
 SCAN_STEP = ("so3ssd", "step")
-"""The one arm with a conditional kernel, so it exercises both branches."""
+"""The one arm with conditional kernels, so it exercises both branches."""
 
 
 def symbol(key: str) -> str:
@@ -145,14 +145,18 @@ def test_a_full_capture_passes_and_two_instantiations_of_one_kernel_count_once()
     assert verdict.judged_count == len(entry.required)
     assert verdict.missing == ()
     assert f"every one of the {len(entry.required)} kernels" in verdict.detail
-    # The conditional kernel is absent, and that is reported with its condition
-    # rather than failed: at 3N == 48 the launch does not happen.
-    assert verdict.absent == ("reduce_rows_kernel",)
+    # Both conditionals are absent, and that is reported with the condition rather
+    # than failed: the benchmarked standard shape has one lane tile and one head per
+    # group, so neither launch happens there.
+    assert verdict.absent == ("reduce_rows_kernel", "vector_reduce_kernel")
     assert "reduce_rows_kernel absent: 3N above one lane tile" in verdict.detail
-    # Present, it is judged and counted, and the report says nothing about it.
-    both = coverage_verdict(*SCAN_STEP, [*judged, symbol("reduce_rows_kernel")])
+    assert "vector_reduce_kernel absent: a head-sum depth above one" in verdict.detail
+    # Present, each is judged and counted, and the report says nothing about it. The
+    # two conditions are separate shape properties, so one can hold without the other.
+    conditional = [symbol(c.kernel) for c in entry.conditional]
+    both = coverage_verdict(*SCAN_STEP, [*judged, *conditional])
     assert both.absent == ()
-    assert both.judged_count == len(entry.required) + 1
+    assert both.judged_count == len(entry.required) + len(conditional)
     assert both.passed is True
 
 

@@ -129,6 +129,13 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
                 "dtrans and dK once per lane tile and closes the slots in one "
                 "reduction, and at 3N == 48 there is one tile and no slot buffer",
             ),
+            Conditional(
+                "vector_reduce_kernel",
+                "a head-sum depth above one: the vector backward shares a group's "
+                "heads over that many blocks and a second launch closes the partials, "
+                "and at H // G == 1 the depth is one and the kernel writes the summed "
+                "outputs directly",
+            ),
         ),
     ),
     ("conv", "forward"): OpCoverage(required=("conv1d_fwd_kernel",)),
@@ -188,6 +195,12 @@ the chunk increment and the forward recurrence rather than saving them, so the s
 holds each of them twice. ``reduce_rows_kernel`` is shared by four arms: the
 frontier's parameter-bias reduction, the fused tail's two parameter slots, the
 loss's mean, and the vector backward's slot close. Only the last is conditional.
+
+The step's two conditionals are separate shape properties and can differ. The slot
+close follows the lane count, which the state width sets; ``vector_reduce_kernel``
+follows the head-sum depth, which ``H // G`` sets. The benchmarked standard shape has
+one lane tile and one head per group, so both are absent there and the acceptance
+shape launches both.
 
 ``rmsnorm_dweight_kernel`` appears once in ``block``'s step and is launched twice
 there, by the plain norm's backward and by the residual norm's. One key, because a
