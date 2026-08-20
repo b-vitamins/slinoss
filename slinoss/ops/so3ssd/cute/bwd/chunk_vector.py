@@ -2731,8 +2731,8 @@ def chunk_vector_backward(
         dinc: ``(B,H,C,P,3N)`` float32 increment cotangent in the global frame,
             contiguous, from
             :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward`.
-        zstart: ``(B,H,C,P,3N)`` float32 chunk-start state, contiguous, from the
-            rematerialized forward.
+        zstart: ``(B,H,C,P,3N)`` float32 chunk-start state, contiguous, held from the
+            forward, or rebuilt when the boundary did not cross.
         dlogp: ``(B,H,C,L)`` float32, contiguous, from
             :func:`slinoss.ops.so3ssd.cute.bwd.chunk_input.chunk_input_backward`.
         dchunk_rot: ``(B,H,C,3,3)`` float32, contiguous, from the same.

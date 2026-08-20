@@ -41,9 +41,12 @@ One entry point per operator, not one per implementation.
   trigger.
 - A direction implemented as several launches has one driver module in `cute/`
   that sequences them, and `backends.py` registers the driver, never a kernel.
-  The backward driver rematerializes what it needs from the saved inputs; a
-  quantity the forward saved only for the backward's convenience is activation
-  memory the operator does not need.
+  The backward driver rematerializes what it needs from the saved inputs, except
+  where holding a quantity is measured cheaper than recomputing it: the chunk
+  boundary costs 141.60 MB a layer to hold and 790 us a call to rebuild, and the
+  one-call peak falls when it is held, because the rebuilding driver allocated the
+  same buffer for itself. A driver that holds one keeps the rebuild branch, so the
+  backward runs from the saved inputs alone when the boundary is absent.
 - No `torch.amp.custom_fwd`. It casts every input to the autocast dtype, which is
   the opposite of I4. The backend decides the promotion.
 

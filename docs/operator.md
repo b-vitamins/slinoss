@@ -70,10 +70,11 @@ The state passing over chunks is the only serial dimension left.
 
 ## Adjoint
 
-The backward saves no derived quantity. Only the operator inputs cross the
-boundary between the two passes, and every chunk-local intermediate is
-rematerialized by the forward's own code, so the recompute cannot drift from the
-forward.
+The backward saves the chunk boundary and nothing else derived. Every other
+chunk-local intermediate is rematerialized by the forward's own code, so the
+recompute cannot drift from the forward, and the held boundary is the forward's own
+output rather than a second expression of it. It is read-only in the backward, and
+the gradients are bit-identical either way.
 
 The pieces mirror the forward. The diagonal term transposes the decay mask. The
 reverse chunk recurrence carries a `(B,H,P,3N)` accumulator and is the only
