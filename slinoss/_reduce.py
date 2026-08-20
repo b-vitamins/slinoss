@@ -3,14 +3,23 @@
 A kernel that closed a parameter gradient inside its own launch would need the
 accumulator zeroed before it, and a zero fill on a hot path is not available. So a
 fused backward writes one partial row per block into ``torch.empty``, every element
-of it, and the sum over those rows is a second launch. Two backwards reach this
-one: the scan's parameter frontier and the fused mixer tail. The buffer is
+of it, and the sum over those rows is a second launch. Three backwards reach this
+one: the scan's parameter frontier, the fused mixer tail, and the chunk-vector
+backward, whose row axis is a grid extent rather than a tile count. The buffer is
 ``(S, R, W)``, the reduction is over ``R``, and a caller reaches that form with
 views, which are free on the contiguous buffer its own kernel wrote.
 
-The row extent here is a sequence extent: ``R`` is ``B*ceil(T/TILE_TOKENS)`` at the
-frontier and ``ceil(B*T/ROWS)`` at the tail, so it grows with the sequence while
-``W`` stays a parameter width.
+The destination is pitched, not contiguous. The chunk-vector backward closes onto
+one column band of a fused projection gradient, and demanding contiguity there
+would buy a staging copy of the whole band. The reduction never sees the pitch:
+the row index reaches the destination through its own layout.
+
+Which axis grows with the sequence is the caller's. ``R`` is
+``B*ceil(T/TILE_TOKENS)`` at the frontier and ``ceil(B*T/ROWS)`` at the tail, so
+there it grows with the sequence while ``W`` stays a parameter width. At the
+chunk-vector backward it is ``S`` that carries the sequence and ``R`` is a grid
+extent under twenty, which leaves most of a block's row slots idle and makes that
+caller's launch bound by its slab count rather than by its rows.
 :func:`slinoss.ops.block.cute.norm.rmsnorm_dweight_kernel` is the same geometry
 over a row extent bounded by its own grid, and it carries its own measured record
 at four widths.
@@ -48,7 +57,7 @@ import torch
 from torch import Tensor
 
 from slinoss._cute import Stream, Tile, jit_launch, narrow, smem_bytes
-from slinoss._guard import check_dtypes, check_layout
+from slinoss._guard import check_dtypes, check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
 
 __all__ = [
@@ -190,9 +199,12 @@ def reduce_partials(
         partial: ``(S, R, W)`` float32, contiguous CUDA. The reduction is over
             ``R``. float32 is I4 and not a preference: the producer accumulates at
             that width and the sum closes it.
-        out: Destination, ``(S, W)`` contiguous CUDA in one of
-            :data:`slinoss._precision.KERNEL_DTYPES`, written in full. ``None``
-            allocates one.
+        out: Destination, ``(S, W)`` CUDA in one of
+            :data:`slinoss._precision.KERNEL_DTYPES`, written in full. Pitched
+            rather than contiguous, so a caller closing onto one column band of a
+            fused gradient needs no staging copy: the kernel indexes rows through
+            the operand's own layout and the pitch never reaches the reduction.
+            ``None`` allocates a contiguous one.
         out_dtype: Dtype of the allocated result, float32 by default. Refused
             beside ``out``, which carries its own.
 
@@ -202,8 +214,9 @@ def reduce_partials(
 
     Raises:
         ValueError: On a rank other than three, an empty operand, a destination of
-            the wrong shape, a non-CUDA or non-contiguous operand, or an
-            ``out_dtype`` beside an ``out``.
+            the wrong shape, a non-CUDA operand, a non-contiguous ``partial``, a
+            destination that is not a pitched band, or an ``out_dtype`` beside an
+            ``out``.
         TypeError: If ``partial`` is not float32, or the destination dtype has no
             kernel path.
     """
@@ -231,7 +244,8 @@ def reduce_partials(
         else out
     )
     check_dtypes(((dest, "out"),), KERNEL_DTYPES, "kernel dtypes")
-    check_layout(((partial, "partial"), (dest, "out")))
+    check_layout(((partial, "partial"),))
+    check_pitched(((dest, "out"),))
 
     jit_launch(
         reduce_rows,
