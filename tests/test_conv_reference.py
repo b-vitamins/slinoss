@@ -271,6 +271,25 @@ def test_forward_flag_combinations_match_oracle(
     )
 
 
+def test_the_reference_reads_a_band_of_the_projection() -> None:
+    """``x`` ships pitched here too, not only on the native backend.
+
+    One projection GEMM feeds every consumer, so ``x`` is the value band of its
+    output and never a buffer of its own. The native backend states that rule in a
+    guard; the reference states it by having no guard, which is a claim about torch's
+    indexing rather than about this file, and so is worth one test. The pitch moves a
+    load address and no arithmetic, so the two layouts agree exactly.
+    """
+    x, weight, bias, state = make_call(2, 40, 8, 4)
+    pad = 3
+    wide = x.new_empty(2, 40, 8 + 2 * pad)
+    band = wide[:, :, pad : pad + 8]
+    band.copy_(x)
+    want = causal_conv1d_ref(x, weight, bias, initial_state=state)
+    got = causal_conv1d_ref(band, weight, bias, initial_state=state)
+    assert_bitwise(got, want)
+
+
 # Two shapes rather than the sweep: the two entry points share `_contract`, so
 # what is under test is the wiring, and W = 1, which returns early from the
 # padding, is the only second wiring. A straddling window changes the returned

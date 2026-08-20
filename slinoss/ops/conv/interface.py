@@ -119,7 +119,9 @@ def causal_conv1d(
     step and no separate operator is needed for it.
 
     Args:
-        x: Activations, shape ``(B,T,D)``, contiguous.
+        x: Activations, shape ``(B,T,D)``. May be one column band of a wider
+            tensor, with unit stride on the channel axis, which is how the fused
+            projection hands its value band over.
         weight: Taps, shape ``(D,W)``. Tap ``k`` multiplies lag ``W-1-k``, so tap
             ``W-1`` is the current token.
         bias: Per-channel bias, shape ``(D,)``, or None.
@@ -139,8 +141,8 @@ def causal_conv1d(
         A :class:`ConvStep`.
 
     Raises:
-        ValueError: On a shape, contiguity, device, width, or ``d_head``
-            violation, or an unusable backend.
+        ValueError: On a shape, layout, device, width, or ``d_head`` violation, or
+            an unusable backend.
         TypeError: On an unsupported dtype.
         RuntimeError: If the selected backend needs the extension and it is not
             built.
