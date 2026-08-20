@@ -174,30 +174,39 @@ are 40% of the total.
 
 Measured, the bar is missed, and the distance is latency and not traffic. Every
 counter below is from one profile of this kernel on an RTX A6000, ``sm_86``, 84
-multiprocessors, six profiled launches per counter pass, clocks unlocked because
+multiprocessors, one profiled launch per counter pass at the shipped depth and six for
+the extent table below, clocks unlocked because
 locking is denied on this fleet. A floor is ``c + bytes / B`` on a fit taken in the
 same process, ``c`` about 4.3 us and ``B`` about 685 GB/s at a worst residual of
 0.40%, and ``bytes`` is the analytic traffic above unless stated otherwise. A
 duration is stamped with the compute-apps query taken before and after it; where
 that query named another process the duration is a bound, not a rate.
 
-At the default configuration, 640 blocks of 128 threads, five lane tiles, fold 18:
-985.73 MB of DRAM per launch against the 701.75 MB of the table, 40% over, and
-11,982.6 us. That is 8.6% of the 1,028.5 us floor of the table and 12.0% of the
-1,442.9 us floor of the bytes the counters move. Both are far under the 85% the
-class asks.
+At the default configuration -- 11,520 blocks of 128 threads, five lane tiles, the
+fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
+667.10 MB of DRAM per launch in 7,051.8 us, 13.9% of the 978.5 us floor of those
+bytes. :func:`vector_reduce` closes the head sum in 432.8 us at 294.72 MB and 100.5%
+of its own floor; the two lane-slot reductions add 43.8 and 23.3 us at 106.4% and
+110.7%. The operator is 7,551.7 us a call and the main kernel is 93.4% of it. Only
+the main kernel is under the 85% the class asks.
 
-Neither percentage is a traffic problem. 93,392 B admits one 128-thread block per
-multiprocessor: 8.330% theoretical occupancy, 8.330% achieved, one warp per
-scheduler and nothing to cover an instruction fetch or a barrier. ``no_instruction``
-is 64.1% of the warp cycles, issue-active 8.80%, memory speed-of-light 21.9%, tensor
-3.5%. Shared conflicts are 0.1556 per wavefront, load and store together, and the
-padding rule is held centrally.
+That percentage is not a traffic problem. 91,344 B admits one 128-thread block per
+multiprocessor: 8.3% theoretical occupancy, 8.3% achieved, one warp per scheduler and
+nothing to cover an instruction fetch or a barrier. ``no_instruction`` is 52.6% of the
+warp cycles, issue-active 12.58%, memory speed-of-light 33.8%, tensor 3.8%. Shared
+conflicts are 0.1610 per wavefront, load and store together, and the padding rule is
+held centrally. Local traffic is zero at every one of the three launches.
 
-The allocator stops at the 255-register cap and spills 479.07 MB of local load and
-443.35 MB of local store per launch, which fails the spill rule whatever the
-percentage says. The fold is what spills, and only the fold. Holding ``P 64``,
-``3N 240`` and the code fixed and moving one extent::
+The depth is what took it there, and not by cutting traffic. At depth one the same
+kernel is 11,376.9 us over 640 blocks, moves 775.81 MB, and spills 536.74 MB of local
+load and 344.06 MB of local store a launch, 94.9% and 99.9% of that past L1. The
+operator's own DRAM total goes the other way, 819.1 MB at depth one against 1,005.3 MB
+at the full depth, while the call falls 34.0%: what the depth buys is 18x the blocks
+and no spill, so the traffic sum is not what it is chosen against.
+
+The allocator stops at the 255-register cap at either depth. The fold is what spills,
+and only the fold. Holding ``P 64``, ``3N 240`` and the code fixed and moving one
+extent, with the fold folded in the block::
 
     L    fold   smem     regs   local MB   DRAM MB   GB/s    us/launch
     16      1   53,648    205       0.00   1,507.72  214.8      7,018.1
@@ -211,18 +220,19 @@ tile in the grid and the ``L`` extents at their largest. At fold 18 there is, an
 grows with ``L``. The register count is at the cap either way, so the cap is not the
 signal; what crosses a rolled fold iteration is. Unrolling the fold at trace time
 does not fix it and makes it worse, 1,290.4 MB, because the live ranges of eighteen
-inlined bodies overlap. Only taking the fold out of the block removes it, which is
-also the 13,312 B the arena needs.
+inlined bodies overlap. Only taking the fold out of the block removes it, and it does:
+zero local sectors at the shipped depth.
 
 The lane tile is not implicated. At fold 18 and one lane tile the local traffic is
 276.96 MB, and the tile count moves neither the register count nor the footprint.
 
 Two resident blocks need 50,688 B and no legal shape at ``P 64`` reaches it: the
-smallest arena there is 53,648 B, at ``L 16`` and fold one. Taking the fold out of
-the block removes the 13,312 B accumulator that exists only above fold one and leaves
-80,080 B, so it does not reach it either; what it does reach is zero spill, which the
-table above prices at 2.10x on this shape. Beyond that, occupancy is worth what the
-one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident blocks,
+smallest arena there is 53,648 B, at ``L 16`` and fold one. Taking the fold out of the
+block drops the summed accumulator that exists only above fold one, but the spaces
+alias and only 2,048 B of the 93,392 come back, so it does not reach it either. What
+it does reach is zero spill, worth 34.0% of the call. Beyond that, occupancy is worth
+what the one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident
+blocks,
 16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5% at
 ``P 64`` where the same ``L`` holds one block. The remaining candidate is 256 threads
 per block, which is the atom tiling's shape and not this file's: the M mode of the atom
