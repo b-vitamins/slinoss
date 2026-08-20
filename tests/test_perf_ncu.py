@@ -978,6 +978,22 @@ NO_LINE_SOURCE_CSV: Final = "\n".join(
     )
 )
 
+RAGGED_SOURCE_CSV: Final = "\n".join(
+    (
+        f'"File Path","{CVB_PATH}"',
+        '"Function Name","chunk_vector_bwd_kernel"',
+        _source_header(),
+        # A line row one cell short of the header, as NCU prints it when the last
+        # requested metric has no value for the line.
+        _source_row(
+            "1163", "    return sview[row, col]", "", "", samples=34, inst=100
+        ).rsplit(",", 1)[0],
+        _source_row(
+            "", "", "0x0000000000008000", "LDS.U.32 R4, [R8]", inst=100, size=32
+        ),
+    )
+)
+
 NO_INST_SOURCE_CSV: Final = "\n".join(
     (
         f'"File Path","{CVB_PATH}"',
@@ -1055,6 +1071,17 @@ def test_a_source_page_with_no_correlated_line_names_the_missing_lineinfo() -> N
     # from a build flag, so the message has to name the variable.
     with pytest.raises(ValueError, match="CUTE_DSL_LINEINFO=1"):
         parse_source_csv(NO_LINE_SOURCE_CSV)
+
+
+def test_a_line_row_short_of_the_header_keeps_its_pass() -> None:
+    # NCU can print a line row missing its trailing cells. Dropping the row would
+    # cost the whole pass, which is an hour of collection, so an absent cell reads
+    # as zero.
+    got = parse_source_csv(RAGGED_SOURCE_CSV)
+    (one,) = got.lines
+    assert one.line == 1163
+    assert one.lsu_inst_count == 100
+    assert one.stall_samples[STALL_REASONS[-1]] == 0
 
 
 def test_parse_source_csv_rejects_output_it_cannot_read() -> None:

@@ -1719,6 +1719,7 @@ def parse_source_csv(
     kernel = ""
     columns: dict[str, int] = {}
     sass_column = -1
+    fields = 0
     line = 0
     unattributed = 0
     inst: dict[tuple[str, str, int], int] = {}
@@ -1736,6 +1737,7 @@ def parse_source_csv(
             continue
         if row and row[0] == _LINE_NO:
             columns, sass_column = _source_columns(row)
+            fields = len(row)
             absent = [m for m in required if m not in columns]
             if absent:
                 raise ValueError(
@@ -1749,7 +1751,10 @@ def parse_source_csv(
         number = row[columns[_LINE_NO]].strip()
         if number.isdigit():
             line = int(number)
-            aggregate[(kernel, path, line)] = list(row)
+            # A row can arrive short of the header when a metric has no value for
+            # the line. Pad it, because an absent cell reads as zero and a ragged
+            # row would otherwise drop the whole pass.
+            aggregate[(kernel, path, line)] = list(row) + [""] * (fields - len(row))
             continue
         if not row[columns[_ADDRESS]].strip().startswith("0x"):
             continue
