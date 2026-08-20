@@ -404,6 +404,7 @@ def test_bench_reaches_every_operator_under_its_own_region_prefix(
         "scanprep": "prep",
         "block": "block",
         "mixer": "mixer",
+        "xent": "xent",
     }
     assert sorted(prefixes) == sorted(OPS)
     for op in OPS:
