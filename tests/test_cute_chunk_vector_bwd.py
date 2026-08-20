@@ -420,6 +420,27 @@ def test_holds_the_widest_state_the_mixer_configures(groups: int) -> None:
     _compare(got, want, torch.bfloat16, f"cute-chunk-vector[3N240/G{groups}]")
 
 
+def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:
+    """Two launches at a tiled state width agree exactly, not within a bound.
+
+    ``dtrans`` and ``dK`` are sums over lanes and the lane tile is a grid axis, so
+    above one tile each tile writes its own slot row and a second launch sums them.
+    That closure has no atomics and its order is fixed by the launch geometry, so the
+    result is a function of the shape alone. A tolerance cannot tell that apart from
+    an order that varies per run, which is what an atomic closure would give, so the
+    two runs are compared exactly. The smallest shape with a second lane tile is
+    used: the closure either has an order or it does not, and one tile past the first
+    is enough to expose it.
+    """
+    inp = _make(1, 1, 128, 32, 32, torch.bfloat16)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _oracle(inp, dy, 64, dstate=_dstate(inp))
+    first = _run(inp, dy, want, 64)
+    second = _run(inp, dy, want, 64)
+    for name in BOUNDS[torch.bfloat16]:
+        assert torch.equal(getattr(first, name), getattr(second, name)), name
+
+
 def test_without_the_streaming_carry_in() -> None:
     """The absent carry-in is a zero row, not an out-of-range read.
 
@@ -633,6 +654,13 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert vector_smem_bytes(64, 64, 240, 1, 64) <= smem_capacity()
     assert vblock(64, 64, 240, 18) == 32
     assert vector_smem_bytes(64, 64, 240, 18, 32) <= smem_capacity()
+    # ``L 64`` is the largest chunk the layout admits, at one resident block at both
+    # row counts. The next legal chunk overflows at fold one and the halved block,
+    # which is the cheapest corner it has, so no fold or block saves it.
+    assert smem_capacity() < 2 * vector_smem_bytes(64, 48, 240, 1, 64)
+    assert smem_capacity() < 2 * vector_smem_bytes(64, 64, 240, 18, 32)
+    assert vector_smem_bytes(96, 48, 240, 1, vblock(96, 48, 240, 1)) > smem_capacity()
+    assert vector_smem_bytes(96, 64, 240, 1, vblock(96, 64, 240, 1)) > smem_capacity()
 
 
 def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
