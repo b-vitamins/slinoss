@@ -178,6 +178,25 @@ def test_grouped_readout_reads_its_own_group(groups: int) -> None:
     assert_max_rel(got, want, BOUNDS[torch.bfloat16], f"cute-chunk-start[G{groups}]")
 
 
+def test_grid_modes_are_paired_with_their_indices() -> None:
+    """Each grid mode reaches the index it is dimensioned for.
+
+    The grid is head-fastest and every other chunked kernel is chunk-fastest, so the
+    launch order and the unpack are stated in two places and only agree by
+    construction. A swapped pair addresses the wrong tensor slice, which every shape
+    above hides: they all carry ``B == H``, or a chunk count equal to one of the two.
+    Three pairwise-distinct extents above one is the smallest shape where any
+    transposition either faults or reads the wrong slice.
+    """
+    inp = _make(3, 2, 256, 16, 16, torch.bfloat16)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _reference(inp, dy, 64)
+    got = chunk_start_backward(dy, inp.trans, inp.C, 64)
+    torch.cuda.synchronize()
+    assert got.shape == (3, 2, 4, 16, 48)
+    assert_max_rel(got, want, BOUNDS[torch.bfloat16], "cute-chunk-start[grid]")
+
+
 def test_reads_a_band_of_the_fused_projection() -> None:
     """``C`` ships pitched, and the kernel indexes the band rather than a copy of it.
 

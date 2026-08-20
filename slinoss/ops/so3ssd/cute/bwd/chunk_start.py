@@ -25,17 +25,52 @@ A ragged tail needs no separate path. Both staging passes zero every row at or p
 ``valid``, so the K extent stays the whole chunk and the padded rows contribute
 nothing.
 
-The K extent is the whole chunk, one GEMM and no slice loop, so the two operand
-tiles scale with ``L``. From the layouts: ``standard`` is resident four blocks per
-SM, ``MAX_CHUNK`` at ``3N = 48`` two, and ``MAX_CHUNK`` at ``3N = 96`` one.
+The K extent is the whole chunk, one GEMM and no slice loop, so every tile in
+:func:`start_smem_bytes` is proportional to ``L``. Against the 101,376 B carveout:
+``L=64`` at ``P=64, 3N=240`` is 45,568 B and two blocks per SM, ``L=128`` is
+91,136 B and one, ``L=192`` is 136,704 B and refused. At ``3N=48`` the same
+progression is four, two, and one. This is the only kernel on the chunk-start path
+whose footprint follows ``L``.
 
-DRAM-bound. Analytic traffic at ``standard`` is ``dy 9.44 + trans 1.57 + C 9.44 +
-dzstart 14.16 = 34.61 MB`` against ``1536 * 2*64*48*64 = 604 MFLOP``, so 17.5
-flop/byte against a ridge point of 164: memory bound by a factor of nine, which is
-what makes the padded M mode and the recomputed prefixes affordable. Both add
-arithmetic and no traffic: measured at ``standard`` on one A6000, clocks unlocked,
-device otherwise idle, DRAM traffic is 34.62 MB against that analytic 34.61. Neither
-was timed against a variant without it.
+Dispatch order. The grid is head-fastest. ``C`` is per group, so at ``G < H`` the
+``H // G`` blocks sharing one group's readout tile have to be co-resident for L2 to
+hold it. Chunk-fastest dispatch instead passes a whole head's blocks, and their
+``dzstart`` writes, between two reads of the same tile, and refetches it every time.
+
+Measured on one A6000, clocks unlocked, one launch per NCU run, nothing but the MPS
+daemon resident before and after. At ``B=4 H=18 T=2048 P=64 3N=240 L=64`` with
+``G=1``, per launch:
+
+    dy       4*18*2048*64*2    =  18.87 MB read
+    trans    4*18*2048*4*4     =   2.36 MB read
+    C        4*2048*240*2      =   3.93 MB read, one band for all 18 heads
+    dzstart  4*18*32*64*240*4  = 141.56 MB written
+                                 166.72 MB
+
+Charging ``C`` once per head instead of once gives 233.57 MB. Measured 167.14 MB and
+167.03 MB over two runs, 25.49 MB of it read against the 25.16 MB the table reads:
+L2 holds the band across the heads that share it. Chunk-fastest dispatch measured
+217.88 MB and 217.79 MB, 76.14 MB and 76.11 MB read, which is 50.7 MB of the same
+band fetched again.
+
+On the fitted copy law ``t = c + bytes/B``, ``c = 4.01 us`` and ``B = 682.8 GB/s``
+with a worst residual of 0.23%, 166.72 MB floors at 248.6 us. Measured 316.8 us and
+315.6 us, 78.8% of that floor, against 338.3 us and 338.8 us chunk-fastest. So the
+reorder removes 23% of the bytes and 6% of the time, and the bus stops being what
+bounds the launch: DRAM speed-of-light falls from 88.1% to 72.1% and
+``mio_throttle`` rises from 8.7% to 15.8% of stalls. What bounds it then is
+occupancy, 16.7% theoretical and 16.0% achieved at two blocks per SM. Below the 85%
+bar, and the byte count is no longer the reason.
+
+At ``standard`` the traffic is ``dy 9.44 + trans 1.57 + C 9.44 + dzstart 14.16 =
+34.60 MB``, and ``G == H`` there so no band is shared and the two byte counts
+coincide. Measured 34.36 MB, 54.7 us against a 54.9 us floor, 100.3% of it, at four
+blocks per SM. Dispatch order is neutral where nothing is shared: 34.50 MB and
+54.3 us chunk-fastest, inside the 4.4% pass spread.
+
+The same 34.60 MB carries ``1536 * 2*64*48*64 = 604 MFLOP``, 17.5 flop/byte against
+a ridge point of 164, which is what makes the padded M mode and the recomputed
+prefixes affordable. Neither was timed against a variant without it.
 """
 
 import cutlass
@@ -182,7 +217,10 @@ def chunk_start_bwd_kernel(
         renormalized once, inside :func:`chunk_prefixes` (I5).
     """
     tid, _, _ = cute.arch.thread_idx()
-    cidx, bidx, hidx = cute.arch.block_idx()
+    # Head is the fastest grid mode. Blocks are dispatched in that order, so the
+    # ``H // G`` blocks that read one group's readout tile are co-resident and the
+    # tile is fetched from DRAM once instead of once per head.
+    hidx, cidx, bidx = cute.arch.block_idx()
 
     # Only gc is grouped; everything else this block reads is per head. The branch
     # is trace-time, so the ungrouped shape emits no divide at all.
@@ -285,6 +323,10 @@ def chunk_start_bwd(
     ``P``, ``3N``, and ``H // G`` are compile-time because the accumulator's
     partition shape is and because the group index folds away at ``G == H``. Batch,
     head, chunk count, and sequence length are dynamic.
+
+    The grid is head-fastest, against the chunk-fastest order the other chunked
+    kernels use, so that the ``H // G`` blocks sharing a readout tile run together.
+    The unpack in :func:`chunk_start_bwd_kernel` matches it.
     """
     chunk_start_bwd_kernel(
         gdy,
@@ -298,7 +340,7 @@ def chunk_start_bwd(
         rows,
         dim,
         per_group,
-    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1), stream=stream)
+    ).launch(grid=(heads, chunks, bsz), block=(threads, 1, 1), stream=stream)
 
 
 def chunk_start_backward(
