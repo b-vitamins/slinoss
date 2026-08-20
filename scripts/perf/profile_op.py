@@ -208,7 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
-    tree = tree_provenance(Path(__file__))
+    provenance = tree_provenance(Path(__file__))
     # Before the workload and before the profilers. A reference dispatch launches no
     # declared kernel, so every rule below it would hold over torch's kernels, and a
     # profiler that is not installed cannot judge what the bench would measure.
@@ -263,8 +263,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"l2={floor.l2_bytes} B",
         f"dispatch: {chosen.detail}",
         f"profilers: ncu={ncu_path or 'skipped'} nsys={nsys_path or 'skipped'}",
-        f"tree: package={tree.package_root} driver={tree.driver_root} "
-        f"same={tree.same_tree} extension={tree.extension} {tree.extension_stamp}",
+        f"tree: package={provenance.package_root} driver={provenance.driver_root} "
+        f"same={provenance.same_tree} extension={provenance.extension} "
+        f"{provenance.extension_stamp}",
     ]
     # Read every run, not only the run that adds one: an excuse nobody reads is how a
     # kernel stops being profiled at all.
@@ -382,7 +383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         traffic=traffic_mix(kernels),
         coverage=covered,
         dispatch=chosen,
-        provenance=tree,
+        provenance=provenance,
         spills=spills,
         trace=trace,
         notes=tuple(notes),
