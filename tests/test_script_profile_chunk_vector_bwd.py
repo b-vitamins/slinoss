@@ -71,16 +71,19 @@ def test_local_sectors_separates_kernels() -> None:
     }
 
 
-def test_kernel_regex_admits_the_reduce_pass() -> None:
-    """The narrowing regex matches both kernels the operator launches.
+def test_kernel_regex_admits_every_reduce_pass() -> None:
+    """The narrowing regex matches every kernel the operator launches.
 
-    The two names are the mangled symbols NCU reports, truncated after the first
-    operand. A regex written against the Python function name would miss the
-    reduce pass, which is the failure this covers.
+    The names are the mangled symbols NCU reports, truncated after the first
+    operand. A regex written against the Python function name would miss a reduce
+    pass, and a pass the regex drops leaves its cost out of the capture entirely
+    rather than failing: at the model geometry ``vector_reduce_kernel`` is 432.8 us
+    of a 3,811.3 us call, so a silent omission understates the operator by 11%.
     """
     import re
 
     module = load_driver()
     pattern = re.compile(module.KERNEL)
     assert pattern.search("kernel_cutlass_chunk_vector_bwd_kernel_tensorptrbf16_0")
+    assert pattern.search("kernel_cutlass_vector_reduce_kernel_tensorptrf32_0")
     assert pattern.search("kernel_cutlass_reduce_rows_kernel_tensorptrf32_0")
