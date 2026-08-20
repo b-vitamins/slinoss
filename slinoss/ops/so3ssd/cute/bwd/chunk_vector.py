@@ -427,6 +427,7 @@ from slinoss.ops.so3ssd.cute.mma import (
     mma_gemm,
     mma_gemm_areg,
     mma_groups,
+    mma_offsets,
     mma_rows,
     operand_tile,
     smem_pitch,
@@ -1731,6 +1732,19 @@ def chunk_vector_bwd_kernel(
     # from ``tid`` so the thread layout of the tiling is not restated here.
     wgroup = 0 if cutlass.const_expr(wgroups == 1) else ccrd[0][1] // MMA_INST[1]
 
+    # The offset accumulator's element indices grouped by row. The atom's C layout
+    # gives a thread several columns of one row, and the offset term's destination is
+    # per row, so one group is one read-modify-write of :func:`offset_tile` and one
+    # exponential rather than one of each per element. Grouped through the offsets
+    # because they are trace-time constants where a coordinate is not; the row itself
+    # comes from the coordinate of the group's first element, the base being one value
+    # for the whole fragment.
+    coffsets = mma_offsets(tiled_mma, (mpad, tile))
+    crows = tuple(
+        tuple(i for i, (m, _) in enumerate(coffsets) if m == row)
+        for row in sorted({m for m, _ in coffsets})
+    )
+
     # The lane tile and the head shard are grid axes, not loops. Every accumulator
     # above then sits between its hoisted allocation and its uses with a loop of the
     # shard's heads and nothing else in between, which is what register promotion
@@ -1869,13 +1883,22 @@ def chunk_vector_bwd_kernel(
         # after the reduction that needs the unscaled value.
         dcacc.fill(0.0)
         mma_gemm(tiled_mma, tid, dcacc, vdy, vstate, True, False)
-        for i in cutlass.range_constexpr(cute.size(dcacc)):
-            m, d = ccrd[i]
+        # One store per row, not one per element. The row's contributions are summed
+        # in a register in fragment order and the tile is zeroed before the head, so
+        # the sum the row receives is the one the per-element form left there:
+        # ``0 + p0`` is ``p0``, and every later addition is in the same order and the
+        # same association.
+        for group in crows:
+            m, _ = ccrd[group[0]]
             expl = decay(slp[cutlass.min(m, last)])
-            held = _sum_over_n(dcacc[i] * widen(scrot[m, d], elem))
+            term = zero
+            for i in group:
+                _, d = ccrd[i]
+                held = _sum_over_n(dcacc[i] * widen(scrot[m, d], elem))
+                term = term + 2.0 * expl * held
+                dcacc[i] = dcacc[i] * expl
             if tid % 4 == 0 and m < chunk:
-                sdlp[wgroup, m] = sdlp[wgroup, m] + 2.0 * expl * held
-            dcacc[i] = dcacc[i] * expl
+                sdlp[wgroup, m] = sdlp[wgroup, m] + term
 
         cute.arch.sync_threads()
         stage_matrix(
