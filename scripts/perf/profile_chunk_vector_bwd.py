@@ -53,8 +53,13 @@ from slinoss.perf.timing import measure, on_device
 from slinoss.perf.units import Bytes, Count
 from slinoss.perf.workload import SHAPE_NAMES, OpShape, make_inputs, shape_by_name
 
-KERNEL = "chunk_vector_bwd"
-"""Regex NCU narrows to. The mangled symbol carries the constexpr suffix."""
+KERNEL = "chunk_vector_bwd|reduce_rows_kernel"
+"""Regex NCU narrows to. The mangled symbol carries the constexpr suffix.
+
+The operator is two launches: the main kernel writes float32 workspace partials
+and ``slinoss._reduce.reduce_rows_kernel`` sums them. Narrowing to the first
+alone credits a candidate that moves traffic into the second.
+"""
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -238,21 +243,23 @@ def target_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def local_sectors(one: NcuPass) -> dict[str, float]:
-    """Sum the local-memory lookup metrics over the profiled launches.
+def local_sectors(one: NcuPass) -> dict[tuple[str, str], float]:
+    """Sum the local-memory lookup metrics per kernel over the profiled launches.
 
     Args:
         one: The parsed ``local`` pass.
 
     Returns:
-        Metric name to summed sector count, empty for a metric this driver does
-        not carry.
+        Kernel and metric name to summed sector count, empty for a metric this
+        driver does not carry. Kept separate by kernel because the pass covers
+        both launches and one total would hide spill moved between them.
     """
-    out: dict[str, float] = {}
+    out: dict[tuple[str, str], float] = {}
     for invocation in one.invocations:
         for metric, value in invocation.values.items():
             if metric.endswith(".sum") and "local" in metric:
-                out[metric] = out.get(metric, 0.0) + value
+                key = (invocation.kernel, metric)
+                out[key] = out.get(key, 0.0) + value
     return out
 
 
@@ -303,7 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     narrow = ("--kernel-name", f"regex:{KERNEL}")
     passes: list[NcuPass] = []
     spills: tuple[SpillCounters, ...] = ()
-    local: dict[str, float] = {}
+    local: dict[tuple[str, str], float] = {}
     for table in tables:
         one = run_ncu(table, target_argv(args), ncu=args.ncu, extra=narrow)
         if one.missing_metrics:
@@ -403,8 +410,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"  st MB      {record.local_store_sector_count * 32 / launches / 1e6:.2f}"
         )
-    for metric, value in sorted(local.items()):
-        print(f"local        {metric} {value:.0f}")
+    for (kernel, metric), value in sorted(local.items()):
+        print(f"local        {kernel} {metric} {value:.0f}")
     return 0
 
 
