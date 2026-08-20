@@ -237,10 +237,10 @@ blocks,
 ``P 64`` where the same ``L`` holds one block.
 
 The other lever is the block width, and it is a parameter: ``warps`` selects the atom
-tiling and the thread count together. The M mode of the tiling is pinned and the extra
-warps go to ``N`` at atom granularity, so the tile, the pitches and the staging passes
-are the width's invariants. Measured at eight warps on the shape above, medians of
-three runs::
+tiling and the thread count together, and eight is the default. The M mode of the tiling
+is pinned and the extra warps go to ``N`` at atom granularity, so the tile, the pitches
+and the staging passes are the width's invariants. Measured at both widths on the shape
+above, medians of three runs::
 
     warps  us/launch  MB/launch  GB/s  of 85%  regs  arena   occ theo/ach
         4    7,029.2     667.01  95.0   13.9%   255  91,344   8.3% / 8.3%
@@ -294,7 +294,6 @@ from slinoss.ops.so3ssd.cute.common import (
     TABLE_AN,
     TABLE_AP,
     THREADS,
-    WARPS,
     Mat3,
     Vec3,
     mat3_add,
@@ -325,6 +324,7 @@ from slinoss.ops.so3ssd.cute.mma import (
     MMA_INST,
     MMA_TILE_M,
     SMEM_SEGMENT,
+    WARPS_WIDE,
     fp32_tile,
     make_mma,
     mma_acc,
@@ -2196,7 +2196,7 @@ def chunk_vector_backward(
     dB: Tensor | None = None,
     dC: Tensor | None = None,
     splits: int | None = None,
-    warps: int = WARPS,
+    warps: int = WARPS_WIDE,
 ) -> ChunkVectorBwd:
     """Differentiate the rowwise vectors and the transition parameters.
 
@@ -2248,15 +2248,16 @@ def chunk_vector_backward(
             partials. The returned tensors are the full sums either way.
         warps: Warps per block of the main kernel, a multiple of
             :data:`slinoss.ops.so3ssd.cute.common.WARPS` at most
-            :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`. Warps past the first four
-            go to the atom tiling's N mode, so the tile, every M extent and every
-            pitch are the width's invariants and the footprint grows by ``4 * L``
-            bytes per warp group past the first. The source-token block is chosen at
-            the default width, so a shape that fits at four warps and not at eight is
-            refused rather than run at a narrower block. Every output but the
-            log-scale column of ``dtrans`` is bitwise the same at both widths; that
-            column sums a row's state width group by group, which measured 7.8e-08
-            of the reference magnitude against the column's own 1.4e-03 residual.
+            :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`, which is the default.
+            Warps past the first four go to the atom tiling's N mode, so the tile,
+            every M extent and every pitch are the width's invariants and the
+            footprint grows by ``4 * L`` bytes per warp group past the first. The
+            source-token block is chosen at the default width, so a shape that fits at
+            four warps and not at eight is refused rather than run at a narrower block.
+            Every output but the log-scale column of ``dtrans`` is bitwise the same at
+            both widths; that column sums a row's state width group by group, which
+            measured 7.8e-08 of the reference magnitude against the column's own
+            1.4e-03 residual.
 
     Returns:
         :class:`ChunkVectorBwd`.
