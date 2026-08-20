@@ -197,28 +197,30 @@ that query named another process the duration is a bound, not a rate.
 
 At the default configuration -- 11,520 blocks of 256 threads, five lane tiles, the
 fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
-515.74 MB of DRAM per launch in 2,186.3 us on device time, median of nine
-steady-state iterations spanning 2,126.9 to 2,202.5 us.
+515.74 MB of DRAM per launch in 1,994.8 us on device time at 1.7955 GHz, median of
+five steady-state launches, 3,537,566 active cycles.
 :func:`vector_reduce` closes the head sum in 222.0 us at 152.77 MB and 102.7% of its
 own floor; the two lane-slot reductions add 44.2 and 23.0 us. Three of the four
 launches are at their bandwidth; the main kernel is the one that misses the 85% the
 class asks, and it is issue-bound rather than short of bandwidth.
 
-Read a duration here as device time under a tracer, not under a counter profiler.
-The same kernel measures 2,649.0 us under per-pass counter collection because the
-part clocks down to 1.406 GHz there against 1.8 GHz in a plain run. Cycles are the
-invariant across the two, 3.67 M for this kernel; a microsecond figure is not.
+Read a microsecond figure here against the clock it was taken at. The part boosts
+between 1.4 and 1.9 GHz with contention from other processes on the device, and the
+same kernel has measured 2,649.0 us on a contended part and 2,103.5 us on an idle
+one under the same counter passes. Cycles are the invariant; a duration is not.
+Stamp the clock from ``gpc__cycles_elapsed.avg.per_second`` beside any duration.
 
 That percentage is not a traffic problem, and at the shipped width it is not
-instruction supply either. 91,600 B and 242 registers a thread each admit one
+instruction supply either. 91,600 B and 154 registers a thread each admit one
 256-thread block per multiprocessor, ``launch__occupancy_limit_shared_mem`` and
 ``launch__occupancy_limit_registers`` both reading 1: 16.7% theoretical occupancy,
-16.6% achieved, two warps a scheduler. ``mio_throttle`` leads the stalls at 35.0% of
-the warp cycles, issue-active is 29.2%, l1tex speed-of-light 76.3% and memory 75.6%
-against 21.6% of peak DRAM throughput, tensor 8.7%. The LSU shared pipe runs at
-44.59% of peak over 150.4 M load and store wavefronts and 34.7 M more from
-``ldmatrix``, at 0.1511 conflicts a wavefront, and the padding rule is held
-centrally. Local traffic is zero at every one of the three launches.
+16.6% achieved, two warps a scheduler. ``mio_throttle`` leads the stalls, issue-active
+is 30.7%, and DRAM runs at 26.6% of peak against tensor at 13.9%. What the launch
+spends its cycles on is the LSU issue port, which carries 74.27 M warp instructions
+and occupies 50.0% of the port's peak issue rate: read ``l1tex__throughput`` as that
+occupancy and not as a bandwidth, since it measures equal to
+``sm__inst_executed_pipe_lsu`` against its own peak digit for digit. The padding rule
+is held centrally. Local traffic is zero at every one of the three launches.
 
 Where the bytes are, measured rather than counted. The launch's DRAM splits 347.69 MB
 read and 319.73 MB write with float32 vector partials, against a write side the
@@ -313,9 +315,9 @@ The other lever is the block width, and it is a parameter: ``warps`` selects the
 tiling and the thread count together, and eight is the default. The M mode of the tiling
 is pinned and the extra warps go to ``N`` at atom granularity, so the tile, the pitches
 and the staging passes are the width's invariants. Measured at both widths on the shape
-above, medians of three runs, at both vector-partial widths. Every row is counter-pass
-time at the throttled clock, so the rows compare to each other and not to the device
-time quoted for the shipped configuration above::
+above, medians of three runs, at both vector-partial widths. Every row was taken in one
+session on a contended part at a lower clock than the shipped figure above, so the rows
+compare to each other and not to it::
 
     warps  partial  us/launch  MB/launch  GB/s  of 85%  regs  arena   occ theo/ach
         4      f32    7,029.2     667.01  95.0   13.9%   255  91,344   8.3% / 8.3%
