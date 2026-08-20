@@ -49,19 +49,35 @@ between threads and every value read is already a cotangent.
 SERIAL-tiny at ``S == 1``, by the budget clause of the kernel-class rule rather
 than by a bandwidth fraction. Traffic is ``(2e + 4)`` bytes per updated element --
 a read and a write of the gradient row at the activation itemsize ``e``, plus one
-float32 carry row -- over at most ``C`` rows of ``P`` per ``(B,H)`` and ``C`` rows
-of ``3N`` per ``(B,G)``, and one float32 row each for the carry-out. At
-``standard`` with ``G == H`` and bfloat16 activations that is ``4*12*32*48*8``
-bytes twice, about 1.2 MB analytically and 0.95 MB measured, against a forward pass
-of about 131 MB.
+float32 carry row -- over ``C - 1`` rows of ``P`` per ``(B,H)`` and ``C - 1`` rows
+of ``3N`` per ``(B,G)``, and one float32 row each for the carry-out. At ``B=4 H=18
+T=2048 P=64 3N=240 L=64`` with ``G=1`` and bfloat16 activations that is 1.38 MB, and
+at ``standard`` 1.14 MB.
 
-Measured at ``standard`` on one RTX A6000, clocks unlocked, device otherwise idle:
-5.70 us and 5.86 us as the medians of two runs of three launches, 5.70 to 6.34 us
-over all six, at 21% of peak DRAM throughput and 21 registers per thread. The 2%
-clause wants the full step as its denominator, and there is no backward step while
-the backward is being assembled, so the gate is taken against 2% of the
-forward-only step at the same shape, 7.1 us. A full step is strictly longer than
-its forward, so clearing the forward's 2% clears the step's.
+None of it is DRAM traffic. The rows touched are ``C - 1`` of every ``C``, so the
+whole working set is 1.4 MB against a 6 MB L2 and the device sees write-back alone:
+0.10 MB and 0.07 MB measured per launch at the first shape, 0.12 MB at ``standard``,
+all of it writes, 2.4% to 4.8% of DRAM speed-of-light. There is no bandwidth verdict
+to take below L2, and the percentage-of-floor the class rule computes is meaningless
+at this byte count.
+
+Measured on one RTX A6000, clocks unlocked, nothing but the MPS daemon resident
+before and after: 4.4 us and 4.7 us per launch at the first shape over two runs, and
+3.7 us at ``standard``. A launch this short is at the limit of the profiler's
+resolution -- the spread across NCU replay passes is 27% and 50% respectively -- so
+the figure is a range and not a median. 16 registers per thread at the first shape,
+19 at ``standard``, no shared memory, no bank conflicts, and 2304 and 1536 blocks.
+
+The budget clause is taken against the step, not against the forward. The backward
+launches this kernel once per layer, 13 times per step at the acceptance geometry,
+so 57 to 61 us of a step whose device time measures 461 to 465 ms on the same host:
+0.013%. It does not appear in the printed rows of
+``scripts/perf/attribute_step.py``, which cut off two orders of magnitude above it,
+which is why ``scripts/perf/profile_boundary_bwd.py`` exists.
+
+Neither the grid nor any allocation follows ``L``: the block count is ``C = T / L``
+and the traffic is ``C - 1`` rows, so both fall as the chunk length rises. At
+``L = 128`` the launch is 1152 blocks, still above twice the SM count.
 
 The ``S > 1`` path is not covered by that estimate and is not SERIAL-tiny. It
 streams ``S`` passes over a ``(B,G,S,T,3N)`` float32 tensor and one over ``dB``:

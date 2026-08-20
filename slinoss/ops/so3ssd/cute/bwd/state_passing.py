@@ -50,9 +50,9 @@ registers; the two kernels have the same chain and the same operand count.
 ``R(Q_c)^T`` is rebuilt by every thread on every chunk rather than staged once.
 That buys a dynamic chunk count, so no recompile per sequence length. The
 transpose is a reindexing of a Python tuple at trace time and costs nothing on
-the device. Measured cost of the rebuild: ``sm__throughput`` is 13.63% of peak
-against ``dram__throughput`` at 84.64%, so the redundant arithmetic is not what
-bounds the kernel.
+the device. Measured cost of the rebuild: SM throughput is 14.6% of peak against
+92.4% for memory at the shape below, and 14.4% against 85.0% at ``standard``, so the
+redundant arithmetic is not what bounds the kernel.
 
 Both cotangent seeds are compile-time. An absent ``dstate`` drops its load and
 starts the accumulator at zero; an absent ``dzstart`` -- which is what an absent
@@ -60,31 +60,48 @@ starts the accumulator at zero; an absent ``dzstart`` -- which is what an absent
 filled it never launched -- drops both its load and its add. Neither is
 multiplied by zero at runtime.
 
-DRAM-bound. Analytic traffic at the standard shape, ``B=4 H=12 T=2048 P=48 N=16
-L=64`` and so ``C=32``, every tensor float32 and touched once: ``dzstart``
-14.156 MB read, ``dinc`` 14.156 MB written over it, ``dstate`` 0.442 MB,
-``dz0`` 0.442 MB, ``cquat`` 0.025 MB, ``cscale`` 0.006 MB, total 29.227 MB. NCU
-puts the traffic at 29.125 MB and 29.193 MB per launch over two runs, within
-0.35% of that count, so nothing is read twice and nothing spills.
+DRAM-bound, and at the floor. Every tensor is float32 and touched once. At ``B=4
+H=18 T=2048 P=64 3N=240 L=64``, so ``C=32``, with ``dzstart`` present and ``dstate``
+absent, per launch:
 
-Measured at 46.992 us and 47.013 us per launch over two independent NCU runs,
-three launches each, clocks unlocked and pass spread 3.4%. Achieved 619.794 GB/s
-and 620.947 GB/s against a measured achievable 680.010 GB/s on the verification
-host, which is 91.0% and 91.3% of ceiling; the same ceiling puts the floor for
-this byte count at 43.0 us. ``long_scoreboard`` is the dominant stall reason at
-88.79% and ``issue_active`` is 15.02%: at 84.64% of peak DRAM throughput that is
-warps waiting on a saturated bus, not on an idle one. 48 registers per thread, no
-shared memory, no bank conflicts, 32.0 bytes per sector, and 32.00 active threads
-per warp.
+    dzstart  4*18*32*64*240*4  = 141.56 MB read
+    dinc     4*18*32*64*240*4  = 141.56 MB written over it
+    dz0      4*18*64*240*4     =   4.42 MB written
+    cquat    4*18*32*4*4       =   0.04 MB read
+    cscale   4*18*32*4         =   0.01 MB read
+                                 287.59 MB
+
+Measured on one A6000, clocks unlocked, one launch per NCU run, nothing but the MPS
+daemon resident before and after: 287.95 MB and 288.08 MB over two runs, 0.17% above
+that count, so nothing is read twice. Zero local load and store sectors at 48
+registers, so nothing spills.
+
+On the fitted copy law ``t = c + bytes/B``, ``c = 4.83 us`` and ``B = 683.9 GB/s``
+with a worst residual of 1.01%, that byte count floors at 425.9 us. Measured 427.4 us
+and 427.9 us, 99.6% and 99.3% of the floor, 673.7 GB/s achieved and 92.4% of DRAM
+speed-of-light. ``long_scoreboard`` is 58.6% of stalls and ``lg_throttle`` 35.9% at
+14.9% issue: warps waiting on a saturated bus. Fewer bytes is the only lever this
+kernel has left, and the ``dzstart`` round trip is 98% of them.
+
+The serialization is not what bounds it. One thread carries one 3-vector through the
+whole reverse chain, but the chain is ``C`` rotations over ``B*H*P*N`` independent
+threads: 2880 blocks of 128, 76.0% and 76.3% achieved occupancy against 83.3%
+theoretical, and 14.6% of SM throughput against 92.4% of memory throughput. Written
+serially, bounded by bandwidth.
+
+Nothing here is allocated in shared memory, so no extent of this kernel follows
+``L``. The traffic does, through ``C = T / L``: every term above except ``dz0``
+halves when the chunk length doubles.
 
 The grid is ``(P*N/threads, B, H)``. That is under twice the SM count only when
-``B*H`` is small, and widening it is not available, because the parallelism is
-exactly ``B*H*P*N`` independent 3-vectors and no more. At the standard shape it is
-288 blocks of 128 threads, 0.34 waves per multiprocessor, and achieved occupancy
-is 26.5% against a theoretical 83.33%: capped by the launch, not by the register
-count. The class is asserted for shapes whose grid covers the device. A shape with
-too few blocks to fill it is a statement about the shape rather than about the
-kernel, and no second class is claimed for it here.
+``B*H*P*N`` is small, and widening it is not available, because the parallelism is
+exactly ``B*H*P*N`` independent 3-vectors and no more. At ``standard`` -- ``B=4 H=12
+P=48 N=16``, 28.78 MB analytic against 28.87 MB measured -- it is 288 blocks, 0.34
+waves per multiprocessor, and 26.6% achieved occupancy against the same 83.3%
+theoretical: capped by the launch, not by the register count. It still reaches
+46.9 us against a 45.9 us floor, 98.0% of it. The class is asserted for shapes whose
+grid covers the device. A shape with too few blocks to fill it is a statement about
+the shape rather than about the kernel, and no second class is claimed for it here.
 """
 
 from typing import NamedTuple
