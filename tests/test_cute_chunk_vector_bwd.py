@@ -45,6 +45,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     chunk_vector_backward,
     open_slots,
     partial_bytes,
+    partial_pack,
     vblock,
     vector_smem_bytes,
     vector_splits,
@@ -507,6 +508,23 @@ def test_the_head_sum_partials_carry_the_activation_width() -> None:
     assert open_slots(dB, 18).dest.dtype == torch.bfloat16
     assert open_slots(carry, 18).dest.dtype == torch.float32
     assert open_slots(dB, 18).dest.shape == (1, 1, 18 * 128, 240)
+
+
+def test_the_closure_reads_a_whole_request_per_thread() -> None:
+    """The closure's vector width is set by the partial's dtype, not by the shape.
+
+    One element per thread puts 32 elements in a warp's request, a whole 128-byte line
+    at float32 and half of one at bfloat16 for the same instruction count, and the
+    closure is request-rate bound. The width restores the request; ``3N`` divides by it
+    at every legal shape, so the scalar fallback is reachable only through a dtype
+    width no table carries.
+    """
+    assert partial_pack(4, 240) == 1
+    assert partial_pack(2, 240) == 2
+    assert partial_pack(2, 48) == 2
+    assert partial_pack(1, 240) == 4
+    assert partial_pack(2, 3) == 1
+    assert partial_pack(8, 240) == 1
 
 
 def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:

@@ -188,11 +188,12 @@ that query named another process the duration is a bound, not a rate.
 
 At the default configuration -- 11,520 blocks of 128 threads, five lane tiles, the
 fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
-515.36 MB of DRAM per launch in 5,202.4 us, 14.6% of the 757.2 us floor of those
-bytes. :func:`vector_reduce` closes the head sum in 323.6 us at 153.05 MB and 70.4%
-of its own floor; the two lane-slot reductions add 43.7 and 23.1 us at 94.5% and
-110.4%. The operator is 5,584.9 us a call, event-timed, and the main kernel is 93.1%
-of it. Neither the main kernel nor the closure reaches the 85% the class asks.
+517.82 MB of DRAM per launch in 5,221.0 us, 14.6% of the floor of those bytes.
+:func:`vector_reduce` closes the head sum in 221.6 us at 152.85 MB, 689.5 GB/s and
+102.8% of its own floor; the two lane-slot reductions add 43.3 and 23.2 us at 107.0%
+and 109.5%. The operator is 5,517.3 us a call, event-timed, and the main kernel is
+94.6% of it. Three of the four launches are at their bandwidth; the main kernel is
+the one that misses the 85% the class asks.
 
 That percentage is not a traffic problem. 91,344 B admits one 128-thread block per
 multiprocessor: 8.3% theoretical occupancy, 8.3% achieved, one warp per scheduler and
@@ -227,12 +228,16 @@ that the counter that moved is an issue counter, so a traffic argument does not
 predict this launch's time in either direction, and the remaining 283.12 MB of
 float32 ``dinc`` and ``zstart`` cannot be priced from its bytes either.
 
-The closure paid for it in class. ``vector_reduce`` read float32 at 680.5 GB/s and
-100.4% of floor; at the activation width a warp's 32 columns are 64 B and two sectors
-rather than 128 B and four, the request rate is unchanged, and it reads 472.9 GB/s at
-70.4% of floor with ``long_scoreboard`` at 92.7%. 109.6 us of the 141.77 MB it stopped
-reading came back as time; the rest is a vector-load width that kernel does not take
-yet.
+The closure paid for it in class until it took the request back. ``vector_reduce`` read
+float32 at 680.5 GB/s and 100.4% of floor; one narrowed element a thread makes a warp's
+32 columns 64 B and two sectors rather than 128 B and four at an unchanged request
+rate, and it fell to 472.9 GB/s and 70.4% of floor with ``long_scoreboard`` at 92.7%.
+:func:`partial_pack` restores the request at :data:`PARTIAL_REQUEST_BYTES` a thread,
+which is two bfloat16 columns and one float32 column, and the pass returns to 689.5
+GB/s and 102.8% of floor in 221.6 us. That is 102.0 us off the narrowed pass and 211.2
+us off the float32 pass it replaces, at 56 registers against 96, no local traffic, and
+the same bits: the shard order is the launch geometry's and the vector width does not
+enter it.
 
 The depth is what took it there, and not by cutting traffic. At depth one the same
 kernel is 11,376.9 us over 640 blocks, moves 775.81 MB, and spills 536.74 MB of local
@@ -392,6 +397,7 @@ from slinoss.ops.so3ssd.reference import check_grad_band
 __all__ = [
     "LANE_BLOCK",
     "LANE_GROUP",
+    "PARTIAL_REQUEST_BYTES",
     "RESIDENT_MAX",
     "ROW_WORDS",
     "Arena",
@@ -409,6 +415,7 @@ __all__ = [
     "open_slots",
     "out_tile",
     "partial_bytes",
+    "partial_pack",
     "readout_tile",
     "row_tile",
     "score_tile",
@@ -862,6 +869,36 @@ def partial_bytes(
         return 0
     rows = bsz * groups * splits * dim
     return itemsize * rows * 2 * seqlen + 4 * rows * chunks
+
+
+PARTIAL_REQUEST_BYTES: int = 4
+"""Bytes one thread loads from one partial per shard in :func:`vector_reduce_kernel`.
+
+The closure is request-rate bound and not sector bound. One element per thread puts
+32 elements in a warp's request, which is a whole 128-byte line at float32 and half
+of one at bfloat16 for the same instruction count, and the narrowed partial cost the
+kernel its class that way: 680.5 GB/s at float32 against 472.9 GB/s at bfloat16 for
+the same loop. Four bytes per thread holds the request at a full line whatever the
+partial's width."""
+
+
+def partial_pack(itemsize: int, dim: int) -> int:
+    """Elements one thread loads per partial per shard, at least one.
+
+    Args:
+        itemsize: Partial dtype width in bytes.
+        dim: ``3N``, the mode the vector is cut from.
+
+    Returns:
+        ``PARTIAL_REQUEST_BYTES // itemsize`` where that divides ``3N``, one otherwise.
+        Divisibility is the whole condition: the width times the itemsize is the
+        request itself, so a ``3N`` the width divides puts every row of the partial at
+        a multiple of the access as well. ``3N`` is a multiple of 48 and the partial is
+        two or four bytes wide, so the fallback is for a width no dtype table carries
+        rather than for a shape the operator runs.
+    """
+    pack = max(1, PARTIAL_REQUEST_BYTES // itemsize)
+    return 1 if dim % pack else pack
 
 
 class Slots(NamedTuple):
@@ -2123,17 +2160,19 @@ def vector_reduce_kernel(
     threads: cutlass.Constexpr,
     dim: cutlass.Constexpr,
     splits: cutlass.Constexpr,
+    pack: cutlass.Constexpr,
 ) -> None:
     """Sum the head-shard partials of ``dB``, ``dC`` and the carry.
 
-    One block per ``(token, batch, group)``, walking ``3N`` at the block width; the
-    blocks whose token indexes a chunk take that chunk's carry row too. There are
-    never fewer token blocks than chunks, ``L`` being at least 16.
+    One block per ``(token, batch, group)``, walking ``3N`` at ``pack`` elements a
+    thread; the blocks whose token indexes a chunk take that chunk's carry row too.
+    There are never fewer token blocks than chunks, ``L`` being at least 16.
 
     Indexed by mode rather than by a flat row view, because ``dB`` and ``dC`` are
     bands that may be pitched in their last mode. The partials are contiguous and the
-    shard stride is the row extent, so a warp's ``splits`` loads for one column are
-    each coalesced across the warp.
+    shard stride is the row extent, so each of a thread's ``splits`` loads is
+    coalesced across the warp; the vector is cut from the contiguous mode of the
+    partial alone, which is why the reads take it and the stores do not.
 
     Args:
         gpb: ``(B,G,splits*T,3N)`` ``dB`` partials at the activation width.
@@ -2148,30 +2187,50 @@ def vector_reduce_kernel(
         dim: ``3N``. Compile-time.
         splits: Partial depth, at least two. Compile-time, so a column's loads issue
             together.
+        pack: Elements one thread takes per load, from :func:`partial_pack`. Divides
+            ``dim``. Compile-time, the vector width being a static property of the
+            slice.
 
     Invariants:
         The producer writes every element of every partial row exactly once, so this
         needs no fill and no atomic. The accumulator is float32 whatever the partial's
         width, so the sum itself is exact to float32 and the roundings on the path are
         the producer's store and this one. Reduction order is ascending shard, fixed
-        by the launch geometry, so a rerun at one shape reproduces the result bit for
-        bit.
+        by the launch geometry and independent of ``pack``, so a rerun at one shape
+        reproduces the result bit for bit and a change of vector width does not move
+        a bit of it.
     """
     tid, _, _ = cute.arch.thread_idx()
     token, bidx, gidx = cute.arch.block_idx()
     out = gdb.element_type
     part = gpb.element_type
+    vectors: cutlass.Constexpr = dim // pack
 
-    for col in cutlass.range(tid, dim, threads):
-        vecb = cutlass.Float32(0.0)
-        vecc = cutlass.Float32(0.0)
+    # Allocated outside the column loop and indexed only by a trace-time constant,
+    # which is what keeps all four of them in registers.
+    fragb = cute.make_fragment((pack,), part)
+    fragc = cute.make_fragment((pack,), part)
+    accb = cute.make_fragment((pack,), cutlass.Float32)
+    accc = cute.make_fragment((pack,), cutlass.Float32)
+
+    for group in cutlass.range(tid, vectors, threads):
+        for j in cutlass.range_constexpr(pack):
+            accb[j] = cutlass.Float32(0.0)
+            accc[j] = cutlass.Float32(0.0)
         row = token
         for _ in cutlass.range_constexpr(splits):
-            vecb = vecb + widen(gpb[bidx, gidx, row, col], part)
-            vecc = vecc + widen(gpc[bidx, gidx, row, col], part)
+            vecb = cute.zipped_divide(gpb[bidx, gidx, row, None], (pack,))
+            vecc = cute.zipped_divide(gpc[bidx, gidx, row, None], (pack,))
+            cute.autovec_copy(vecb[(None, group)], fragb)
+            cute.autovec_copy(vecc[(None, group)], fragc)
+            for j in cutlass.range_constexpr(pack):
+                accb[j] = accb[j] + widen(fragb[j], part)
+                accc[j] = accc[j] + widen(fragc[j], part)
             row = row + seqlen
-        gdb[bidx, gidx, token, col] = narrow(vecb, out)
-        gdc[bidx, gidx, token, col] = narrow(vecc, out)
+        for j in cutlass.range_constexpr(pack):
+            col = group * pack + j
+            gdb[bidx, gidx, token, col] = narrow(accb[j], out)
+            gdc[bidx, gidx, token, col] = narrow(accc[j], out)
 
     if token < chunks:
         for col in cutlass.range(tid, dim, threads):
@@ -2199,15 +2258,17 @@ def vector_reduce(
     threads: cutlass.Constexpr,
     dim: cutlass.Constexpr,
     splits: cutlass.Constexpr,
+    pack: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`vector_reduce_kernel`, one block per token per batch and group.
 
     No activation dtype is taken: the kernel reads the destination's element type off
     the operand, and :func:`slinoss._cute.jit_launch` puts that type in the executor
-    key itself.
+    key itself. ``pack`` is passed rather than derived, the partial's width being a
+    host fact.
     """
     vector_reduce_kernel(
-        gpb, gpc, gpcarry, gdb, gdc, gcarry, seqlen, chunks, threads, dim, splits
+        gpb, gpc, gpcarry, gdb, gdc, gcarry, seqlen, chunks, threads, dim, splits, pack
     ).launch(grid=(seqlen, bsz, groups), block=(threads, 1, 1), stream=stream)
 
 
@@ -2459,6 +2520,6 @@ def chunk_vector_backward(
                 bsz,
                 groups,
             ),
-            (THREADS, dim, shards),
+            (THREADS, dim, shards, partial_pack(dB.element_size(), dim)),
         )
     return ChunkVectorBwd(dB=dB, dC=dC, carry_b=carry_b, dtrans=dtrans, dK=dK)
