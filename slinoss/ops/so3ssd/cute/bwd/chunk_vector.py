@@ -1836,6 +1836,12 @@ def chunk_vector_backward(
     closing rotation and scale are one contraction over the chunk-start state that
     stage already ran.
 
+    Above one lane tile the two transition-chart outputs are sums over lanes that
+    separate blocks cannot share, so each tile writes its own float32 slot row and a
+    second launch closes them. That workspace is ``(B, H, tiles * T, 4)`` and
+    ``(B, H, tiles * T, 2, 4)`` float32, allocated here and freed on return; at one
+    tile there is none and the kernel stores the outputs directly.
+
     Args:
         dy: ``(B,H,T,P)`` cotangent of ``y``, one of
             :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous. A
