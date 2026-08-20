@@ -93,7 +93,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss._cute import jit_launch
+from slinoss._cute import Stream, jit_launch
 from slinoss.ops.so3ssd.cute.common import (
     THREADS,
     mat3_matvec,
@@ -234,6 +234,7 @@ def state_passing_bwd(
     tiles: cutlass.Int32,
     bsz: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     threads: cutlass.Constexpr,
     has_dstate: cutlass.Constexpr,
     has_dzstart: cutlass.Constexpr,
@@ -253,7 +254,7 @@ def state_passing_bwd(
         threads,
         has_dstate,
         has_dzstart,
-    ).launch(grid=(tiles, bsz, heads), block=(threads, 1, 1))
+    ).launch(grid=(tiles, bsz, heads), block=(threads, 1, 1), stream=stream)
 
 
 class StatePassingBwd(NamedTuple):

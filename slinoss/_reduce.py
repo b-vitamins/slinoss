@@ -47,7 +47,7 @@ import cutlass.cute as cute
 import torch
 from torch import Tensor
 
-from slinoss._cute import Tile, jit_launch, narrow, smem_bytes
+from slinoss._cute import Stream, Tile, jit_launch, narrow, smem_bytes
 from slinoss._guard import check_dtypes, check_layout
 from slinoss._precision import KERNEL_DTYPES
 
@@ -167,13 +167,14 @@ def reduce_rows(
     gout: cute.Tensor,
     rows: cutlass.Int32,
     slabs: cutlass.Int32,
+    stream: Stream,
     width: cutlass.Constexpr,
     cols: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`reduce_rows_kernel`, one block per column tile per slab."""
     reduce_rows_kernel(gpartial, gout, rows, width, cols, threads).launch(
-        grid=(-(-width // cols), slabs, 1), block=(threads, 1, 1)
+        grid=(-(-width // cols), slabs, 1), block=(threads, 1, 1), stream=stream
     )
 
 

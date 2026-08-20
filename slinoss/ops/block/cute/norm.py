@@ -148,6 +148,7 @@ from torch import Tensor
 
 from slinoss._cute import (
     Scalar,
+    Stream,
     Tile,
     cute_dtype,
     dev_tensor,
@@ -1226,6 +1227,7 @@ def rmsnorm_fwd(
     eps: cutlass.Float32,
     rows: cutlass.Int32,
     blocks: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     width: cutlass.Constexpr,
     threads: cutlass.Constexpr,
@@ -1236,7 +1238,7 @@ def rmsnorm_fwd(
     :func:`rmsnorm_bwd`.
     """
     rmsnorm_fwd_kernel(gx, gw, gy, eps, rows, blocks, dtype, width, threads).launch(
-        grid=(blocks, 1, 1), block=(threads, 1, 1)
+        grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream
     )
 
 
@@ -1249,6 +1251,7 @@ def rmsnorm_residual_fwd(
     gy: cute.Tensor,
     eps: cutlass.Float32,
     rows: cutlass.Int32,
+    stream: Stream,
     width: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     has_residual: cutlass.Constexpr,
@@ -1256,7 +1259,7 @@ def rmsnorm_residual_fwd(
     """Launch :func:`rmsnorm_residual_fwd_kernel`, one block per row."""
     rmsnorm_residual_fwd_kernel(
         gx, gres, gsum, gw, gy, eps, width, threads, has_residual
-    ).launch(grid=(rows, 1, 1), block=(threads, 1, 1))
+    ).launch(grid=(rows, 1, 1), block=(threads, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -1269,6 +1272,7 @@ def rmsnorm_bwd(
     eps: cutlass.Float32,
     rows: cutlass.Int32,
     blocks: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     width: cutlass.Constexpr,
     threads: cutlass.Constexpr,
@@ -1280,7 +1284,7 @@ def rmsnorm_bwd(
     """
     rmsnorm_bwd_kernel(
         gdout, gx, gw, gdx, gpartial, eps, rows, blocks, dtype, width, threads
-    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1))
+    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -1296,6 +1300,7 @@ def rmsnorm_residual_bwd(
     eps: cutlass.Float32,
     rows: cutlass.Int32,
     blocks: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     rdtype: cutlass.Constexpr,
     width: cutlass.Constexpr,
@@ -1324,7 +1329,7 @@ def rmsnorm_residual_bwd(
         has_residual,
         has_normed,
         has_dres,
-    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1))
+    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -1332,13 +1337,14 @@ def rmsnorm_dweight(
     gpartial: cute.Tensor,
     gdweight: cute.Tensor,
     blocks: cutlass.Int32,
+    stream: Stream,
     width: cutlass.Constexpr,
     cols: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`rmsnorm_dweight_kernel`, one block per column tile."""
     rmsnorm_dweight_kernel(gpartial, gdweight, blocks, width, cols, threads).launch(
-        grid=(-(-width // cols), 1, 1), block=(threads, 1, 1)
+        grid=(-(-width // cols), 1, 1), block=(threads, 1, 1), stream=stream
     )
 
 

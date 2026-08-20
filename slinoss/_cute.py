@@ -30,6 +30,7 @@ from typing import Any, NamedTuple
 import cutlass
 import cutlass.cute as cute
 import torch
+from cuda.bindings import driver as cuda_driver
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import get_smem_capacity_in_bytes
 
@@ -38,10 +39,12 @@ __all__ = [
     "TWO_LOG2_E",
     "DevPoolUse",
     "Scalar",
+    "Stream",
     "Tile",
     "assert_smem_fits",
     "block_reduce_add",
     "clear_dev_pool",
+    "current_stream",
     "cute_dtype",
     "decay",
     "dev_pool_use",
@@ -137,6 +140,40 @@ def dev_tensor(tensor: torch.Tensor) -> cute.Tensor:
 # ---------------------------------------------------------------------------
 # Compiled launch
 # ---------------------------------------------------------------------------
+
+Stream = cuda_driver.CUstream
+"""The launch stream's type, as a ``@cute.jit`` launcher declares it.
+
+Every launcher takes one, last of its runtime arguments, and hands it to
+``launch(stream=...)``. It is not optional and it has no default: a launch with no
+stream goes to the legacy default stream, which is neither the stream the operands
+were produced on nor a stream a graph can capture. Measured: a launch without it
+runs during capture instead of being recorded, and the graph replays as a no-op.
+"""
+
+_STREAMS: dict[int, Stream] = {}
+"""Stream handles by raw pointer. Wrapping one costs a construction per launch and
+a process sees at most a handful, so they are interned rather than rebuilt."""
+
+
+def current_stream() -> Stream:
+    """The handle of torch's current stream on the current device.
+
+    Every CuTe launch takes this. Torch produced the operands on this stream and
+    consumes the results on it, so a kernel on any other stream is ordered against
+    neither; the legacy default stream survives that only by implicitly
+    synchronizing every blocking stream, which serializes what it appears to
+    overlap and cannot be captured into a graph at all.
+
+    Returns:
+        A ``cuda.bindings.driver.CUstream`` for the current stream, interned.
+    """
+    raw = torch.cuda.current_stream().cuda_stream
+    handle = _STREAMS.get(raw)
+    if handle is None:
+        handle = _STREAMS[raw] = Stream(raw)
+    return handle
+
 
 _EXECUTORS: dict[Hashable, Any] = {}
 
@@ -360,11 +397,15 @@ def jit_launch(
     pointer and a dynamic layout, so a second dtype launched through the first
     dtype's code reads the buffer at the wrong element width and returns.
 
+    The launch stream is appended to ``dynamic`` here, so every launcher takes a
+    :data:`Stream` last of its runtime arguments. See :func:`current_stream` for
+    why a launcher may not be called without one.
+
     Args:
         fn: The ``@cute.jit`` launcher.
-        dynamic: Its leading run of runtime arguments. A torch tensor is
-            converted to a pooled descriptor; anything else -- a scalar, or a
-            descriptor the caller built itself -- is passed through.
+        dynamic: Its leading run of runtime arguments, stream excluded. A torch
+            tensor is converted to a pooled descriptor; anything else -- a scalar,
+            or a descriptor the caller built itself -- is passed through.
         static: Its trailing run of compile-time arguments, in order.
 
     Raises:
@@ -388,6 +429,11 @@ def jit_launch(
                 # its element type the same way a tensor does.
                 args.append(arg)
                 signature.append(getattr(arg, "element_type", None))
+        # The stream is appended here rather than taken from the caller: it is the
+        # same for every launcher, it is not the caller's to choose, and a launcher
+        # that could be called without one would be a launch on the default stream.
+        # It shapes no generated code, so it stays out of the key.
+        args.append(current_stream())
         key = (fn, static, torch.cuda.current_device(), tuple(signature))
         executor = _EXECUTORS.get(key)
         if executor is None:

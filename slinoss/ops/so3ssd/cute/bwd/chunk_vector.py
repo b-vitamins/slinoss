@@ -139,6 +139,7 @@ from torch import Tensor
 
 from slinoss._cute import (
     Scalar,
+    Stream,
     Tile,
     assert_smem_fits,
     cute_dtype,
@@ -1389,6 +1390,7 @@ def chunk_vector_bwd(
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
     groups: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
@@ -1437,6 +1439,7 @@ def chunk_vector_bwd(
         grid=(chunks, bsz, groups),
         block=(threads, 1, 1),
         min_blocks_per_mp=resident,
+        stream=stream,
     )
 
 

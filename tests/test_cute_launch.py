@@ -33,7 +33,7 @@ import cutlass.cute as cute
 from torch import Tensor
 
 from slinoss import _cute
-from slinoss._cute import clear_dev_pool, dev_tensor, jit_launch
+from slinoss._cute import Stream, clear_dev_pool, dev_tensor, jit_launch
 from slinoss.perf.memory import pool_retention
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
@@ -50,9 +50,13 @@ def _combine_kernel(ga: cute.Tensor, gb: cute.Tensor, gout: cute.Tensor) -> None
 
 @cute.jit
 def _combine_launch(
-    ga: cute.Tensor, gb: cute.Tensor, gout: cute.Tensor, n: cutlass.Constexpr
+    ga: cute.Tensor,
+    gb: cute.Tensor,
+    gout: cute.Tensor,
+    stream: Stream,
+    n: cutlass.Constexpr,
 ) -> None:
-    _combine_kernel(ga, gb, gout).launch(grid=(1, 1, 1), block=(n, 1, 1))
+    _combine_kernel(ga, gb, gout).launch(grid=(1, 1, 1), block=(n, 1, 1), stream=stream)
 
 
 def _combine(a: Tensor, b: Tensor) -> Tensor:

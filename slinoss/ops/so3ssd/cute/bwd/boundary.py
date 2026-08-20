@@ -77,7 +77,7 @@ import cutlass.cute as cute
 import torch
 from torch import Tensor
 
-from slinoss._cute import cute_dtype, jit_launch, narrow, widen
+from slinoss._cute import Stream, cute_dtype, jit_launch, narrow, widen
 from slinoss._precision import KERNEL_DTYPES
 from slinoss.ops.so3ssd.cute.common import THREADS
 from slinoss.ops.so3ssd.cute.guard import (
@@ -383,6 +383,7 @@ def boundary_bwd(
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
@@ -422,7 +423,7 @@ def boundary_bwd(
         has_du_last,
         has_db_last,
         want_prev,
-    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
+    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------

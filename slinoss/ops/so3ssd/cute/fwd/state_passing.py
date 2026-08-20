@@ -68,7 +68,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss._cute import jit_launch
+from slinoss._cute import Stream, jit_launch
 from slinoss.ops.so3ssd.cute.common import THREADS, mat3_matvec, rot_hom
 from slinoss.ops.so3ssd.cute.guard import Named, check_layout, check_pinned
 
@@ -181,6 +181,7 @@ def state_passing_fwd(
     tiles: cutlass.Int32,
     bsz: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     threads: cutlass.Constexpr,
     has_z0: cutlass.Constexpr,
 ) -> None:
@@ -191,7 +192,7 @@ def state_passing_fwd(
     """
     state_passing_fwd_kernel(
         ginc, gcquat, gcscale, gz0, gstate, chunks, threads, has_z0
-    ).launch(grid=(tiles, bsz, heads), block=(threads, 1, 1))
+    ).launch(grid=(tiles, bsz, heads), block=(threads, 1, 1), stream=stream)
 
 
 class StatePassing(NamedTuple):

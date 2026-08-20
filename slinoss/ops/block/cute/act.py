@@ -56,6 +56,7 @@ from torch import Tensor
 
 from slinoss._cute import (
     Scalar,
+    Stream,
     cute_dtype,
     jit_launch,
     narrow,
@@ -229,6 +230,7 @@ def swiglu_fwd(
     tail: cutlass.Int32,
     span: cutlass.Int32,
     blocks: cutlass.Int32,
+    stream: Stream,
     vec: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ) -> None:
@@ -238,7 +240,7 @@ def swiglu_fwd(
     operand dtype covers every element count.
     """
     swiglu_fwd_kernel(ggate, gup, gy, groups, tail, span, vec, threads).launch(
-        grid=(blocks, 1, 1), block=(threads, 1, 1)
+        grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream
     )
 
 
@@ -326,6 +328,7 @@ def swiglu_bwd(
     tail: cutlass.Int32,
     span: cutlass.Int32,
     blocks: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     vec: cutlass.Constexpr,
     threads: cutlass.Constexpr,
@@ -333,7 +336,7 @@ def swiglu_bwd(
     """Launch :func:`swiglu_bwd_kernel`."""
     swiglu_bwd_kernel(
         gdout, ggate, gup, gdgate, gdup, groups, tail, span, dtype, vec, threads
-    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1))
+    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------

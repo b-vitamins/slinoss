@@ -70,6 +70,7 @@ import torch
 from torch import Tensor
 
 from slinoss._cute import (
+    Stream,
     Tile,
     assert_smem_fits,
     cute_dtype,
@@ -483,6 +484,7 @@ def chunk_increment_fwd(
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
@@ -517,7 +519,7 @@ def chunk_increment_fwd(
         dim,
         per_group,
         has_prev,
-    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
+    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1), stream=stream)
 
 
 class ChunkIncrement(NamedTuple):

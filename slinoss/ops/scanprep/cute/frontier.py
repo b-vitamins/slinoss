@@ -64,6 +64,7 @@ from torch import Tensor
 
 from slinoss._cute import (
     Scalar,
+    Stream,
     cute_dtype,
     jit_launch,
     narrow,
@@ -442,6 +443,7 @@ def scanprep_fwd(
     tiles: cutlass.Int32,
     bsz: cutlass.Int32,
     w_max: cutlass.Float32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     tokens: cutlass.Constexpr,
@@ -463,7 +465,7 @@ def scanprep_fwd(
         threads,
         tokens,
         heads,
-    ).launch(grid=(tiles, bsz, 1), block=(threads, 1, 1))
+    ).launch(grid=(tiles, bsz, 1), block=(threads, 1, 1), stream=stream)
 
 
 @cute.kernel
@@ -538,6 +540,7 @@ def scanprep_bwd(
     tiles: cutlass.Int32,
     bsz: cutlass.Int32,
     w_max: cutlass.Float32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     tokens: cutlass.Constexpr,
@@ -557,7 +560,7 @@ def scanprep_bwd(
         threads,
         tokens,
         heads,
-    ).launch(grid=(tiles, bsz, 1), block=(threads, 1, 1))
+    ).launch(grid=(tiles, bsz, 1), block=(threads, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------

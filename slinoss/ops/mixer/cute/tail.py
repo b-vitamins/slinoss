@@ -79,6 +79,7 @@ from torch import Tensor
 
 from slinoss._cute import (
     Scalar,
+    Stream,
     Tile,
     assert_smem_fits,
     f32,
@@ -322,6 +323,7 @@ def mixer_tail_fwd(
     eps: cutlass.Float32,
     tiles: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     segments: cutlass.Constexpr,
     exact: cutlass.Constexpr,
 ) -> None:
@@ -344,7 +346,7 @@ def mixer_tail_fwd(
         eps,
         segments,
         exact,
-    ).launch(grid=(tiles, heads, 1), block=(THREADS, 1, 1))
+    ).launch(grid=(tiles, heads, 1), block=(THREADS, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +520,7 @@ def mixer_tail_bwd(
     eps: cutlass.Float32,
     tiles: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     segments: cutlass.Constexpr,
     exact: cutlass.Constexpr,
 ) -> None:
@@ -540,7 +543,7 @@ def mixer_tail_bwd(
         eps,
         segments,
         exact,
-    ).launch(grid=(tiles, heads, 1), block=(THREADS, 1, 1))
+    ).launch(grid=(tiles, heads, 1), block=(THREADS, 1, 1), stream=stream)
 
 
 # ---------------------------------------------------------------------------

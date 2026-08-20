@@ -44,6 +44,7 @@ import torch
 from torch import Tensor
 
 from slinoss._cute import (
+    Stream,
     Tile,
     assert_smem_fits,
     cute_dtype,
@@ -271,6 +272,7 @@ def chunk_start_bwd(
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
@@ -296,7 +298,7 @@ def chunk_start_bwd(
         rows,
         dim,
         per_group,
-    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
+    ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1), stream=stream)
 
 
 def chunk_start_backward(

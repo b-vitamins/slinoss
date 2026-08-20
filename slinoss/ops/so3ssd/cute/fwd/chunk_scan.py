@@ -61,6 +61,7 @@ import torch
 from torch import Tensor
 
 from slinoss._cute import (
+    Stream,
     Tile,
     assert_smem_fits,
     cute_dtype,
@@ -480,6 +481,7 @@ def chunk_scan_fwd(
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
     heads: cutlass.Int32,
+    stream: Stream,
     dtype: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
@@ -524,6 +526,7 @@ def chunk_scan_fwd(
         grid=(chunks, bsz, heads),
         block=(threads, 1, 1),
         min_blocks_per_mp=resident,
+        stream=stream,
     )
 
 
