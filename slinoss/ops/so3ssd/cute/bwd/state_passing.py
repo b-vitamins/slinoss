@@ -51,8 +51,10 @@ registers; the two kernels have the same chain and the same operand count.
 That buys a dynamic chunk count, so no recompile per sequence length. The
 transpose is a reindexing of a Python tuple at trace time and costs nothing on
 the device. Measured cost of the rebuild: SM throughput is 14.6% of peak against
-92.4% for memory at the shape below, and 14.4% against 85.0% at ``standard``, so the
-redundant arithmetic is not what bounds the kernel.
+92.4% for memory at the shape below, and 14.30% against 84.37% at ``standard``, so
+the redundant arithmetic is not what bounds the kernel. The ``standard`` pair is
+this kernel's own, taken in a window that captured the forward and the backward
+together so neither figure is attributed by inference.
 
 Both cotangent seeds are compile-time. An absent ``dstate`` drops its load and
 starts the accumulator at zero; an absent ``dzstart`` -- which is what an absent
