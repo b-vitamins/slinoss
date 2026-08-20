@@ -9,12 +9,16 @@ must therefore stay separated by kernel.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import pathlib
 import sys
 import types
 
 import pytest
 
+from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
+from slinoss.ops.so3ssd.cute.common import WARPS
+from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
 from slinoss.perf.ncu import NcuInvocation, NcuPass
 from slinoss.perf.workload import shape_by_name
 
@@ -88,6 +92,23 @@ def test_the_default_groups_is_what_the_operands_are_allocated_at() -> None:
     assert module.requested_groups(acceptance, 2) == 2
     standard = shape_by_name("standard")
     assert module.requested_groups(standard, None) == standard.heads
+
+
+def test_the_default_width_is_the_one_the_operator_ships() -> None:
+    """``--warps`` defaults to the operator's own block width, not to the narrow one.
+
+    ``chunk_vector_backward`` ships ``WARPS_WIDE``. A driver defaulting to ``WARPS``
+    printed every counter for a 128-thread block while the step launches 256, so the
+    duration, the register count and the arena all belonged to a width no caller runs.
+    """
+    module = load_driver()
+    signature = inspect.signature(chunk_vector_backward)
+    assert signature.parameters["warps"].default == WARPS_WIDE
+    assert module.requested_warps(None) == WARPS_WIDE
+    assert module.requested_warps(WARPS) == WARPS
+    assert inspect.signature(module.build_runner).parameters["warps"].default == (
+        WARPS_WIDE
+    )
 
 
 def test_kernel_regex_admits_every_reduce_pass() -> None:

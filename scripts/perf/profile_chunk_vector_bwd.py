@@ -14,15 +14,15 @@ per-block geometry. ``--groups`` sets ``G``, and the fold ``H // G`` with it, wh
 is what decides whether the float32 readout sum is allocated at all. ``--splits``
 sets how many blocks that fold is shared over, which trades the in-block fold's
 local traffic against a workspace partial. ``--warps`` sets the block width, which
-is the lever on how many warps are resident per scheduler. The overrides rename the
-shape, so a figure taken under one cannot be read as a figure at the name it
-started from.
+is the lever on how many warps are resident per scheduler; it defaults to the width
+the operator ships. The overrides rename the shape, so a figure taken under one
+cannot be read as a figure at the name it started from.
 
     python3 scripts/perf/profile_chunk_vector_bwd.py --shape standard
     python3 scripts/perf/profile_chunk_vector_bwd.py --rows 64 --lanes 80 --heads 18
     python3 scripts/perf/profile_chunk_vector_bwd.py --rows 64 --lanes 80 --heads 18 \
         --groups 1 --splits 6
-    python3 scripts/perf/profile_chunk_vector_bwd.py --shape standard --warps 8
+    python3 scripts/perf/profile_chunk_vector_bwd.py --shape standard --warps 4
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     partial_bytes,
     vector_splits,
 )
-from slinoss.ops.so3ssd.cute.common import WARPS
+from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import dram_floor_verdict, dram_time_floor
 from slinoss.perf.device import (
@@ -129,7 +129,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--warps",
         type=int,
         default=None,
-        help=f"Block width in warps. Defaults to {WARPS}, the operator's own.",
+        help=f"Block width in warps. Defaults to {WARPS_WIDE}, the operator's own.",
     )
     parser.add_argument(
         "--iters",
@@ -197,13 +197,31 @@ def requested_groups(shape: OpShape, override: int | None) -> int:
     return shape.groups if override is None else override
 
 
+def requested_warps(override: int | None) -> int:
+    """Block width the run takes, the operator's own unless overridden.
+
+    :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_backward` ships
+    :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`, so a default of
+    the narrow :data:`slinoss.ops.so3ssd.cute.common.WARPS` profiled a width no step
+    runs and
+    every figure it printed was the narrow block's.
+
+    Args:
+        override: ``--warps``, or None.
+
+    Returns:
+        Warps per block.
+    """
+    return WARPS_WIDE if override is None else override
+
+
 def build_runner(
     shape: OpShape,
     groups: int,
     device: torch.device,
     dtype: torch.dtype,
     splits: int | None = None,
-    warps: int = WARPS,
+    warps: int = WARPS_WIDE,
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the kernel.
 
@@ -344,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     shape = requested_shape(args)
     dtype = DTYPES[args.dtype]
     groups = requested_groups(shape, args.groups)
-    warps = WARPS if args.warps is None else args.warps
+    warps = requested_warps(args.warps)
 
     if args.window:
         runner = build_runner(shape, groups, device, dtype, args.splits, warps)
