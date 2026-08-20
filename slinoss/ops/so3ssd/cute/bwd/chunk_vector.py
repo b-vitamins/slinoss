@@ -77,11 +77,18 @@ the reference rounds once. So the sum is float32 in shared memory over the fold
 The fold is one at ``standard`` and twelve at the default configuration.
 
 The state width is tiled. Every tile of either set that spans ``3N`` spans
-:data:`LANE_BLOCK` lanes of it, and the block walks the lane tiles in a loop outside
-the fold, so the live set is bounded by a lane tile and one launch path serves every
-``d_state``. What crosses a lane tile is the transition chart: ``dtrans`` and ``dK``
-are sums over lanes, so a tile past the first accumulates into the row the first one
-stored, which one block owns.
+:data:`LANE_BLOCK` lanes of it, so the live set is bounded by a lane tile and one
+launch path serves every ``d_state``. The tile is a grid axis, not a loop: ``3N`` is
+the one extent the budget does not bound, so a loop over it multiplies the code by a
+count that grows with the model while a grid axis multiplies the blocks. At the
+default configuration that is 640 blocks where the loop form launched 128, on an
+84-multiprocessor part.
+
+What crosses a lane tile is the transition chart: ``dtrans`` and ``dK`` are sums over
+lanes. A loop accumulated them in the row one block owned; separate blocks cannot,
+so each tile writes its own float32 slot row and :func:`close_slots` sums the slots
+in a second launch. At one tile there are no slots and the store is the output
+itself, which is the whole of the difference between the two modes.
 
 Shared memory is one resident set and one phase arena. Resident: ``trans``, ``K``,
 the two chunk-local prefixes, the three-slot transform table, the nine-float
@@ -107,6 +114,15 @@ are refused: the smallest live set at ``L 128`` is 120,528 B, above the capacity
 every device the DSL reports. :func:`slinoss._cute.assert_smem_fits` refuses the
 rest rather than any path here degrading.
 
+The largest ``L`` this layout admits is 64, at one resident block, at ``P 64`` and at
+``P 48`` alike. Two resident blocks of 128 threads need 50,688 B of the 101,376 B
+carveout, and no legal shape at ``P 64`` reaches it: the smallest arena there is
+53,648 B, at ``L 16`` and fold one. Splitting the fold across blocks removes the one
+accumulator that exists only above fold one, 13,312 B of the 93,392, and leaves
+80,080 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
+the two float32 fold sums, the output tile and the aliased float32 readout -- which
+is why 128 is refused and why grid-izing the lane tile does not unpin it.
+
 DRAM-bound. Analytic traffic at ``standard``, operand by operand, with ``U`` and
 ``B`` at the ``L + 1`` rows per chunk their shifted span reads::
 
@@ -124,60 +140,66 @@ flop/byte at the default configuration, still under the ridge.
 It is also the one-lane-tile form. Every operand carrying ``3N`` is read once
 whatever the tile count, since each tile reads its own columns; the operands with no
 state extent are read once per tile. At the scale above that is ``dy``, ``U``,
-``trans``, ``K``, ``dlogp`` and the two chunk cotangents, 24.20 MB, plus ``dtrans``
-and ``dK`` at 4.72 MB written per tile and read back on every tile past the first.
-``standard`` is one tile, so the table stands there as written.
+``trans``, ``K``, ``dlogp`` and the two chunk cotangents, 24.20 MB. ``standard`` is
+one tile, so the table stands there as written.
 
-Measured, the bar is missed. Every figure below is from one profile of this kernel
-on an RTX A6000, ``sm_86``, 84 multiprocessors, six profiled launches per counter
-pass, clocks unlocked because locking is denied on this fleet, on a device whose
-only other resident was the MPS daemon at 28 MiB in the same query before and after
-the run. A floor is ``c + bytes / B`` on the fit ``c = 4.504 us``,
-``B = 684.90 GB/s``, whose worst residual is 1.75%, and ``bytes`` is the analytic
-traffic above unless stated otherwise.
+At the default configuration, ``B 4 H 18 T 2048 P 64 3N 240 L 64`` chunk 64 with one
+group, there are five tiles and the split is what the tile count costs::
 
-At ``standard``, 1,536 blocks of 128 threads: 1,002.1 us per launch by NCU, and an
-nsys median of 996.4 us over the same six launches, 990.7 to 1,215.3, the high
-sample being the first. Against the 143.8 us floor of the table that is 14.4%, and
-against the 146.8 us floor of the bytes the counters actually move it is 14.6%,
-which is the harness reading. The traffic model is not what is wrong -- 97.45 MB
-per launch against the table's 95.42, 2.1% over -- the live set is. 85,424 B admits
-one 128-thread block per multiprocessor: 8.330% theoretical occupancy, 8.330%
-achieved, one warp per scheduler. The allocator stops at the 255-register cap and
-spills 24,576 local load and 24,576 local store sectors per launch, 1.57 MB, which
-fails the spill rule whatever the percentage says. Nothing covers the instruction
-fetch behind a single warp: ``no_instruction`` is 50.65% of the warp cycles,
-issue-active 12.13%, ``wait`` 14.88%, memory speed-of-light 31.1%.
+    per tile x5   dy 18.87 + U 38.34 + trans 2.36 + K 4.72 + dlogp 0.59
+                + dchunk_rot 0.08 + dchunk_scale 0.01     = 64.97 -> 324.86 MB
+    once          B 3.99 + C 3.93 + dinc 141.56 + zstart 141.56 r,
+                  dB 3.93 + dC 3.93 + carry_b 0.12 w      =           298.99 MB
+    slot rows     dtrans 2.36 + dK 4.72 written and read back per tile,
+                  then 7.08 written out once               =           77.85 MB
 
-The spill is not flat in the tile count, and the widest state pays it. At
-``B 4 H 18 T 2048 P 64 L 64``, chunk 64, one group per head, every extent but
-``3N`` held::
+701.75 MB, and the slot rows are 14.16 MB more than the loop form's
+read-modify-write of the same two outputs, 2.1%. ``U`` dominates the per-tile term
+because its tile is one atom M tile whatever the ``span``, so a ``span 32`` shape
+reads it twice. ``dinc`` and ``zstart`` are float32 ``(B, H, C, P, 3N)`` and together
+are 40% of the total.
 
-    3N   tiles   local sectors   local MB   DRAM MB   us/launch   floor
-     48      1               0          0     169.2     1,761.6   14.1%
-     96      2      36,928,512    1,181.7        --     6,282.0      --
-    240      5      80,759,808    2,584.3   3,293.4    15,151.7    8.3%
+Measured, the bar is missed, and the distance is latency and not traffic. Every
+counter below is from one profile of this kernel on an RTX A6000, ``sm_86``, 84
+multiprocessors, six profiled launches per counter pass, clocks unlocked because
+locking is denied on this fleet. A floor is ``c + bytes / B`` on a fit taken in the
+same process, ``c`` about 4.3 us and ``B`` about 685 GB/s at a worst residual of
+0.40%, and ``bytes`` is the analytic traffic above unless stated otherwise. A
+duration is stamped with the compute-apps query taken before and after it; where
+that query named another process the duration is a bound, not a rate.
 
-The one-tile compile does not spill at all. Each tile past it adds 11.4 M local
-load and 3.3 M local store sectors, and at ``3N 240`` that local traffic is 78% of
-the DRAM bytes the launch moves and the whole of the distance between 15,151.7 us
-and the 8,808 us that five times the one-tile launch costs. Unrolling the lane loop
-cuts the local traffic to 963.8 MB and the time to 13,033 us and multiplies the code
-by a tile count that is unbounded in ``3N``, so the loop stays dynamic. Neither the
-footprint nor the occupancy moves with the tile count: 91,344 B, 255 registers and
-8.330% at ``3N 48`` and at ``3N 240`` alike.
+At the default configuration, 640 blocks of 128 threads, five lane tiles, fold 18:
+985.73 MB of DRAM per launch against the 701.75 MB of the table, 40% over, and
+11,982.6 us. That is 8.6% of the 1,028.5 us floor of the table and 12.0% of the
+1,442.9 us floor of the bytes the counters move. Both are far under the 85% the
+class asks.
 
-The same geometry with one group, fold 18: 93,392 B, 255 registers, 8.330%
-occupancy, 1,765.8 MB of local traffic, 16,659.7 us per launch against a 1,014 us
-floor, 6.1% of it. That fold fails the block-count gate on shape alone, since
-``B * chunks * G`` is 128 blocks where two per multiprocessor is 168.
+Neither percentage is a traffic problem. 93,392 B admits one 128-thread block per
+multiprocessor: 8.330% theoretical occupancy, 8.330% achieved, one warp per
+scheduler and nothing to cover an instruction fetch or a barrier. ``no_instruction``
+is 64.1% of the warp cycles, issue-active 8.80%, memory speed-of-light 21.9%, tensor
+3.5%. Shared conflicts are 0.1556 per wavefront, load and store together, and the
+padding rule is held centrally.
 
-Closing the gap needs the resident set below half the carveout at ``L 64``, which
-no legal ``span`` reaches: 24,320 B of fixed resident set plus 13,520 B and
-13,312 B for the two float32 sums is 51,152 B before the first operand tile,
-against a 51,200 B two-block ceiling. The alternative is 256 threads per block,
-which is the atom tiling's shape and not this file's: at eight warps the M tile
-doubles and the same live set is 128,432 B, off the device. The declared class
+The allocator stops at the 255-register cap in every compile and spills 479.07 MB of
+local load and 443.35 MB of local store per launch, which fails the spill rule
+whatever the percentage says. The spill is a live set, not a loop form: recompiling
+with every device loop at trip count one raises the local traffic to 1,290.4 MB and
+the DRAM to 1,654.10 MB, and the register count and the footprint do not move.
+Neither does occupancy move with the tile count -- 255 registers and 8.330% at
+``3N 48`` and at ``3N 240`` alike -- and at ``3N 48``, one lane tile, the local
+traffic is 276.96 MB and the launch is 2,999.2 us against a 196.8 us floor.
+
+Closing the gap needs two resident blocks, which needs 50,688 B. The smallest arena
+at ``P 64`` is 53,648 B, at ``L 16`` and fold one, so no legal shape reaches it.
+Splitting the fold across blocks leaves 80,080 B. Splitting the kernel by output
+group would: the transition chart needs the five float32 ``L`` tiles, the table, the
+scratch and the score tile, and the state outputs need the two float32 fold sums and
+the four operand tiles, and neither half holds the other's. It costs a second read
+of ``dy``, ``U``, ``trans`` and ``K``, 324.86 MB at this configuration, for a floor
+of about 1,027 MB against today's 701.75. The other candidate is 256 threads per
+block, which is the atom tiling's shape and not this file's: at eight warps the M
+tile doubles and the same live set is 128,432 B, off the device. The declared class
 follows the traffic; the figures above are what the kernel reaches against it.
 """
 
@@ -1323,12 +1345,13 @@ def chunk_vector_bwd_kernel(
     if cutlass.const_expr(fold > 1):
         _fill_zero(sumc, chunk * ldf, tid, threads)
 
-    # Unrolled at trace time, which is what keeps the accumulators in registers: a
-    # rolled loop here defeats promotion whatever the lane tile does. The fold is
-    # bounded by the head count, so the code size is bounded; the lane tile, which
-    # is not, went to the grid instead. The two vector sums and the carry stay the
-    # group's and outlive the fold, so nothing here becomes a partial buffer.
-    for hstep in cutlass.range_constexpr(fold):
+    # Rolled. Unrolling it at trace time was measured and does not promote the
+    # accumulators: local traffic rose from 1,135.3 MB to 1,290.4 MB per launch at
+    # ``3N 240`` fold 18 with every device loop at trip count one, so the spill is a
+    # live set against the 255-register cap and not a loop form. The two vector sums
+    # and the carry stay the group's and outlive the fold, so nothing here becomes a
+    # partial buffer.
+    for hstep in cutlass.range(fold, unroll=1):
         hidx = gidx * fold + hstep
         cute.arch.sync_threads()
         stage_chunk(
