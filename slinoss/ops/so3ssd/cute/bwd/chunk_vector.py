@@ -1265,6 +1265,20 @@ def _row_pairs(threads: int, span: int, pairs: int) -> int:
     return per_row
 
 
+def _mat_of(mats: tuple[Mat3, ...], step: int) -> Mat3:
+    """One matrix of a per-step tuple.
+
+    A ``range_constexpr`` variable carries no static type, so indexing a tuple with
+    it directly widens to the slice result. This pins the index to an int and the
+    result to one matrix.
+
+    Args:
+        mats: One matrix per step of a row pass.
+        step: Step of the pass. Compile-time.
+    """
+    return mats[step]
+
+
 def _vec_at(src: cute.Tensor, row: cutlass.Int32, col: cutlass.Int32) -> Vec3:
     """One lane's 3-vector of a shared tile, widened to float32.
 
@@ -1412,6 +1426,7 @@ def _tap_epilogue(
     sb: cute.Tensor,
     ssum: cute.Tensor,
     stable: cute.Tensor,
+    acrow: tuple[Mat3, ...],
     stap: cute.Tensor,
     strans: cute.Tensor,
     srow: cute.Tensor,
@@ -1459,6 +1474,9 @@ def _tap_epilogue(
         sb: ``(span + 1, pitch)`` operand-dtype raw forcing tile.
         ssum: ``(L + 1, pitch)`` float32 forcing sum, accumulated.
         stable: ``(mats, L, 9)`` float32 transform table.
+        acrow: One transposed readout entry per step of the row pass, for the row
+            this thread holds at that step. Read by the caller because the row does
+            not depend on the tap, so the pair of taps reads it once.
         stap: ``(8, L)`` float32 tap parameters, component-major.
         strans: ``(4, L)`` float32 ``(w, ls)``, component-major.
         srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated.
@@ -1495,7 +1513,7 @@ def _tap_epilogue(
         inside = r < span
         gsum = tuple(zero for _ in range(9))
         msum = tuple(zero for _ in range(9))
-        act = mat3_transpose(_mat_at(stable, TABLE_AC, token))
+        act = _mat_of(acrow, step)
         atap = _mat_at(stable, slot, token)
         atapt = mat3_transpose(atap)
         rotated = sbrot.element_type
@@ -2079,6 +2097,23 @@ def chunk_vector_bwd_kernel(
                 rows,
                 has_prev,
             )
+            # The readout entry the tap epilogue applies is indexed by the row a
+            # thread holds, and a thread holds the same row at both taps, so the pair
+            # reads it once here instead of once a tap. Transposed at the read because
+            # that is the only form used. The table is published by the barrier above
+            # the source-token loop and nothing writes it after, so this needs no
+            # barrier of its own.
+            taprows = threads // LANE_GROUP
+            acrow = tuple(
+                mat3_transpose(
+                    _mat_at(
+                        stable,
+                        TABLE_AC,
+                        nbase + cutlass.min(tid // LANE_GROUP + s * taprows, span - 1),
+                    )
+                )
+                for s in range(-(-span // taprows))
+            )
             for tap in cutlass.range_constexpr(2):
                 cute.arch.sync_threads()
                 _rotate_rows(
@@ -2169,6 +2204,7 @@ def chunk_vector_bwd_kernel(
                     sb,
                     sumb,
                     stable,
+                    acrow,
                     stap,
                     strans,
                     srow,
