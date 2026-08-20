@@ -34,10 +34,11 @@ being one K atom of its A tile, so the score is retiled in registers by
 shared budget and, per tap, one scalar store per accumulator element, one
 ``ldmatrix``, and one barrier.
 
-Score slicing. The score is computed in column slices of :data:`NBLOCK_MAX` source
+Score slicing. The score is computed in column slices of :func:`nblock` source
 tokens. Its accumulator lives alongside the output accumulator, so an unsliced
 score at ``MAX_CHUNK`` would be four times the float32 register footprint of the
-output it feeds. The slice count is one at ``L`` up to 32 and ``L/32`` above it.
+output it feeds. The slice is 32 wide up to ``L`` 64 and 16 above it, where the
+output spans more than one M tile and the wider slice spills.
 
 Both contractions over ``3N`` are blocked over K in :data:`KBLOCK_MAX` passes for
 the same reason: an operand is copied whole into registers before it issues, so the
@@ -134,6 +135,7 @@ from slinoss.ops.so3ssd.cute.table import (
 
 __all__ = [
     "KBLOCK_MAX",
+    "NBLOCK_LONG",
     "NBLOCK_MAX",
     "RESIDENT_MAX",
     "chunk_scan_forward",
@@ -150,6 +152,25 @@ NBLOCK_MAX: int = 32
 THREADS`` float32 per thread and is live alongside the output accumulator, so the
 cap bounds the pair independently of ``L``. Every legal chunk length is a power of
 two at or above 16, so this divides it exactly."""
+
+NBLOCK_LONG: int = 16
+"""Score column slice once ``L`` passes :data:`MMA_TILE_M`.
+
+Above that the output tile is more than one M tile, which doubles both
+accumulators, the score's narrowed operand, and every operand fragment at once. The
+live set then passes the architectural 255 and the allocator spills: measured on
+sm_86 at ``P`` 48, ``3N`` 48 and ``L`` 128, a 32-wide slice takes 255 registers and
+983,040 local load and 245,760 local store sectors a launch, 40 bytes a thread
+stored and each reloaded four times. Halving the slice takes the same geometry to
+228 registers and no local traffic at all, for 3.2% more time. The spill is not what
+costs the time here -- the body is latency-bound with bandwidth to spare, so the
+spilling arm is the faster one -- but a spill fails the class outright, and every
+other way to bound the live set at this ``L`` measured worse: splitting the
+accumulators along M costs 4%.
+
+Only ``L`` selects it. At ``L`` at or below :data:`MMA_TILE_M` the narrower slice is
+worse at every width measured, by 6.6% at ``3N`` 96 and 10.9% at the smallest
+shape."""
 
 KBLOCK_MAX: int = 16
 """K extent of one pass over a ``3N`` contraction.
@@ -199,9 +220,10 @@ def nblock(chunk: int) -> int:
         chunk: ``L``.
 
     Returns:
-        ``min(L, NBLOCK_MAX)``.
+        ``min(L, NBLOCK_MAX)``, or ``min(L, NBLOCK_LONG)`` once ``L`` passes
+        :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_M`.
     """
-    return min(chunk, NBLOCK_MAX)
+    return min(chunk, NBLOCK_MAX if chunk <= MMA_TILE_M else NBLOCK_LONG)
 
 
 def readout_tile(chunk: int, dim: int) -> Tile:
@@ -462,8 +484,9 @@ def chunk_scan_fwd_kernel(
     # ``2 * slices`` copies against one register file: at ``L`` 128 that is 257
     # registers of demand against the architectural 255, and the two integer
     # addresses it evicts cost 73,728 local load and 49,152 local store sectors a
-    # launch. Measured on sm_86, dropping the unroll at ``L`` 128 removes the spill
-    # and the kernel runs 212.1 us against 242.0 us unrolled.
+    # launch. Measured on sm_86, dropping the unroll at ``L`` 128 runs 212.1 us
+    # against 242.0 us unrolled. It does not by itself make the body spill-free:
+    # the slice width does, and :data:`NBLOCK_LONG` records that measurement.
     for s in cutlass.range(slices):
         nbase = s * nblk
         for tap in cutlass.range_constexpr(2):
