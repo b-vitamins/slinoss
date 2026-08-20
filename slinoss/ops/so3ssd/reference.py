@@ -53,6 +53,7 @@ import torch
 from torch import Tensor
 from torch.nn.functional import pad as _pad
 
+from slinoss._guard import Named, check_pitched
 from slinoss._precision import (
     autocast_disabled,
     check_pinned,
@@ -677,13 +678,24 @@ def _check_inputs(
     if (b_prev is None) != (u_prev is None):
         raise ValueError("b_prev and u_prev are passed together or not at all")
 
+    # ``B`` and ``C`` arrive as column bands of the mixer's fused projection: their
+    # token stride is the projection width, not ``3N``. Demanding contiguity of them
+    # would demand a copy of that projection. Every other operand owns its buffer, so
+    # the layout rule splits here while the device rule does not. Layout is checked
+    # after the shapes above: a wrong-shaped operand reports its shape, not a pitch.
+    bands: Named = ((B, "B"), (C, "C"))
+    banded = {name for _, name in bands}
     for name, tensor in [("U", U), *((n, t) for n, t, _ in named)]:
-        if not tensor.is_contiguous():
+        if name not in banded and not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous; no repacking is done")
         if tensor.device != U.device:
             raise ValueError(
                 f"{name} is on {tensor.device}, U is on {U.device}; one device only"
             )
+    # A contiguous band meets the pitched rule at a pitch equal to its row width, so
+    # only a strided one is handed to it. That rule's alignment clause is a device
+    # rule, and this reference is the CPU oracle as well.
+    check_pitched(tuple(one for one in bands if not one[0].is_contiguous()))
     check_supported(U, "U")
     check_supported(B, "B")
     check_supported(C, "C")

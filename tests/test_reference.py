@@ -19,11 +19,18 @@ from slinoss.ops.so3ssd import (
     quat_exp,
     quat_prefix_scan,
     rot_matrix,
+    so3ssd_bwd_ref,
     so3ssd_ref,
     so3ssm,
     tap_matrix,
 )
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs, max_err
+from tests.conftest import (
+    ScanInputs,
+    assert_max_rel,
+    make_inputs,
+    max_err,
+    projection_band,
+)
 
 LANES3 = (-1, 3)
 
@@ -340,6 +347,20 @@ def _noncontig(t: Tensor) -> Tensor:
     return out
 
 
+def _lane_strided(t: Tensor) -> Tensor:
+    """``t``'s values with a step along the trailing axis.
+
+    A row pitch describes the gap between two rows, so no pitch expresses this
+    one: the ``3N`` components of a token are not adjacent.
+    """
+    wide = torch.zeros(
+        *t.shape[:-1], 2 * int(t.shape[-1]), dtype=t.dtype, device=t.device
+    )
+    out = wide[..., ::2]
+    out.copy_(t)
+    return out
+
+
 def _base(**overrides: Any) -> ScanInputs:
     defaults: dict[str, Any] = {
         "bsz": 2,
@@ -501,13 +522,6 @@ BAD_INPUTS: tuple[Case, ...] = (
         "K must be contiguous",
     ),
     (
-        "c_strided",
-        {},
-        lambda i: i._replace(C=_noncontig(i.C)),
-        ValueError,
-        "C must be contiguous",
-    ),
-    (
         "z_strided",
         {},
         lambda i: i._replace(z0=_noncontig(_state(i))),
@@ -612,3 +626,54 @@ def test_rejects_mixed_devices(backend: Backend) -> None:
     inp = _base(device="cuda")
     with pytest.raises(ValueError, match="one device only"):
         backend(inp._replace(C=inp.C.cpu()))
+
+
+@pytest.mark.cuda
+def test_accepts_the_vector_operands_as_projection_bands() -> None:
+    """``B`` and ``C`` as column bands of a wider buffer, forward and backward.
+
+    The mixer projects both in one GEMM and hands each out at the projection
+    pitch, so a reference that demanded contiguity would need a staging copy to be
+    that call's ground truth. A band holds the values of its packed copy, so every
+    output must match bit for bit: the pitch reaches the math as a view and changes
+    no number. ``T`` is an exact multiple of the chunk length, which is the case
+    where the chunked path splits the token axis by ``view`` rather than by the
+    padding copy a ragged tail forces.
+
+    CUDA only: the pitched rule's alignment clause is a device rule, so the shared
+    guard admits a band on a CUDA device alone.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    packed = _base(seqlen=32, device="cuda")
+    banded = packed._replace(B=projection_band(packed.B), C=projection_band(packed.C))
+    assert not banded.B.is_contiguous()
+    assert not banded.C.is_contiguous()
+
+    for backend, ident in zip(BACKENDS, BACKEND_IDS):
+        want, got = backend(packed), backend(banded)
+        for field in want._fields:
+            assert torch.equal(getattr(got, field), getattr(want, field)), (
+                f"{ident} {field}"
+            )
+
+    dy = torch.randn_like(packed.U)
+    want_g = so3ssd_bwd_ref(dy, None, None, None, *packed.args(), 16, **packed.kw())
+    got_g = so3ssd_bwd_ref(dy, None, None, None, *banded.args(), 16, **banded.kw())
+    for field in want_g._fields:
+        assert torch.equal(getattr(got_g, field), getattr(want_g, field)), field
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", BACKENDS, ids=BACKEND_IDS)
+def test_rejects_a_strided_state_axis_on_b(backend: Backend) -> None:
+    """The band rule frees ``B``'s row pitch and nothing else.
+
+    A step along ``3N`` leaves a token's components non-adjacent, which no pitch
+    argument expresses and no kernel reads.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    inp = _base(device="cuda")
+    with pytest.raises(ValueError, match="unit stride on its trailing axis"):
+        backend(inp._replace(B=_lane_strided(inp.B)))
