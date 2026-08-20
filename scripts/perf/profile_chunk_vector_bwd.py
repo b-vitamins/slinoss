@@ -9,6 +9,12 @@ Two modes in one file, for the reason
 policy and one capture window, and a second file would only let them drift. The
 default drives; ``--window`` is the process NCU attaches to.
 
+``--atomic-probe`` is a third, and answers a different question: whether the head-sum
+partials need to exist. It launches nothing of this operator's, only the two scatters
+whose difference is what an atomic close would cost, at the destination extent and
+fold the geometry above sets. It lives here because those two numbers are only
+readable against the workspace and closure figures the default mode prints.
+
 ``--rows``, ``--lanes``, ``--heads`` and ``--chunk`` override the named shape's
 per-block geometry. ``--groups`` sets ``G``, and the fold ``H // G`` with it, which
 is what decides whether the float32 readout sum is allocated at all. ``--splits``
@@ -146,6 +152,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run as the profiler's target: warm up, then launch inside the "
         "capture window. Emits nothing.",
+    )
+    parser.add_argument(
+        "--atomic-probe",
+        action="store_true",
+        help="Price a float32 atomic close against the head-sum round trip instead "
+        "of profiling. Launches no kernel of this operator's.",
     )
     return parser.parse_args(argv)
 
@@ -294,6 +306,110 @@ def build_runner(
     return run
 
 
+@dataclasses.dataclass(frozen=True)
+class AtomicPrice:
+    """What an accumulating scatter costs over a plain one of the same bytes.
+
+    Attributes:
+        order: ``blocked``, the shard-major layout the partials actually carry, or
+            ``adjacent``, the same fold with a token's shards next to each other.
+        rows: Destination rows, ``B * G * T``.
+        fold: Contributions landing on one destination element.
+        bytes_moved: Source bytes one call reads, the same for both arms.
+        plain_us: Median of the non-accumulating scatter.
+        atomic_us: Median of the accumulating scatter.
+        tax_us: The difference, which is the atomic and nothing else.
+        resolution_us: Sum of the two medians' half-widths. A tax under this is
+            not a result.
+    """
+
+    order: str
+    rows: int
+    fold: int
+    bytes_moved: Bytes
+    plain_us: float
+    atomic_us: float
+    tax_us: float
+    resolution_us: float
+
+
+ATOMIC_ORDERS = ("blocked", "adjacent")
+"""Index orderings the probe brackets the atomic close between.
+
+``blocked`` is faithful: a partial row is ``shard * T + token``, so the fold's
+contributions to one output are the row extent apart. ``adjacent`` is the bound the
+same fold would reach if the two axes were transposed, and it is the cheaper of the
+two, so a refusal that holds at ``adjacent`` holds at any layout."""
+
+
+def atomic_price(
+    shape: OpShape,
+    groups: int,
+    device: torch.device,
+    splits: int | None = None,
+    *,
+    order: str = "blocked",
+    iters: int = 30,
+    warmup: int = 5,
+) -> AtomicPrice:
+    """Price a float32 atomic close against the round trip it would replace.
+
+    Answers whether :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.vector_reduce`
+    can be deleted by having the producer accumulate into the destination instead.
+    Two scatters of identical extent, dtype and byte count over the destination the
+    close would target, one accumulating and one not, so their difference is the
+    atomic's contention and nothing else. float32 both sides: the destinations carry
+    the activation width, but an atomic close cannot, the fold being deeper than
+    eight mantissa bits tolerate, so the shadow it would need is what is priced.
+
+    Args:
+        shape: The named shape, after any geometry override.
+        groups: ``G``.
+        device: A CUDA device.
+        splits: Partial depth. ``None`` takes the fold, which is the shipped depth.
+        order: One of :data:`ATOMIC_ORDERS`.
+        iters: Timed iterations.
+        warmup: Untimed iterations first.
+
+    Returns:
+        The price.
+
+    Raises:
+        ValueError: If ``order`` is not one of :data:`ATOMIC_ORDERS`.
+    """
+    if order not in ATOMIC_ORDERS:
+        raise ValueError(f"order must be one of {ATOMIC_ORDERS}, got {order!r}")
+    fold = vector_splits(shape.heads // groups, splits)
+    rows = shape.bsz * groups * shape.seq
+    dest = torch.zeros((rows, shape.d_state), dtype=torch.float32, device=device)
+    src = torch.ones((rows * fold, shape.d_state), dtype=torch.float32, device=device)
+    flat = torch.arange(rows, device=device)
+    index = flat.repeat(fold) if order == "blocked" else flat.repeat_interleave(fold)
+
+    def plain() -> None:
+        dest.index_copy_(0, index, src)
+
+    def atomic() -> None:
+        dest.index_add_(0, index, src)
+
+    common = {"iters": iters, "warmup": warmup, "device": device}
+    one = measure(plain, label=f"index_copy_ {order}", **common).total
+    two = measure(atomic, label=f"index_add_ {order}", **common).total
+    return AtomicPrice(
+        order=order,
+        rows=rows,
+        fold=fold,
+        bytes_moved=Bytes(src.numel() * src.element_size()),
+        plain_us=float(one.median_duration_us),
+        atomic_us=float(two.median_duration_us),
+        tax_us=float(two.median_duration_us - one.median_duration_us),
+        resolution_us=float(
+            one.median_duration_us * one.resolution_pct / 100.0
+            + two.median_duration_us * two.resolution_pct / 100.0
+        ),
+    )
+
+
 def target_argv(args: argparse.Namespace) -> list[str]:
     """The argv NCU attaches to. Carries every geometry override forward."""
     argv = [
@@ -376,6 +492,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
+
+    if args.atomic_probe:
+        print(f"shape        {shape.describe()}")
+        print(f"smi before   {before}")
+        for order in ATOMIC_ORDERS:
+            price = atomic_price(
+                shape,
+                groups,
+                device,
+                args.splits,
+                order=order,
+                iters=args.event_iters,
+                warmup=args.warmup,
+            )
+            print(
+                f"{price.order:9s}    dest {price.rows} x {shape.d_state} f32, "
+                f"fold {price.fold}, {price.bytes_moved / 1e6:.2f} MB a call"
+            )
+            print(
+                f"             copy {price.plain_us:,.1f} us  "
+                f"add {price.atomic_us:,.1f} us  tax {price.tax_us:,.1f} us "
+                f"+/- {price.resolution_us:,.1f}"
+            )
+        print(f"smi after    {compute_apps_query(smi_selector(ordinal))}")
+        return 0
+
     runner = build_runner(shape, groups, device, dtype, args.splits, warps)
     label = f"chunk_vector_bwd {shape.name}"
     timed = measure(

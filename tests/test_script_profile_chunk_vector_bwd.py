@@ -8,6 +8,7 @@ must therefore stay separated by kernel.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import inspect
 import pathlib
@@ -15,6 +16,7 @@ import sys
 import types
 
 import pytest
+import torch
 
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
 from slinoss.ops.so3ssd.cute.common import WARPS
@@ -109,6 +111,34 @@ def test_the_default_width_is_the_one_the_operator_ships() -> None:
     assert inspect.signature(module.build_runner).parameters["warps"].default == (
         WARPS_WIDE
     )
+
+
+def test_the_atomic_probe_prices_the_closure_s_own_geometry() -> None:
+    """The probe's destination and fold are the ones an atomic close would face.
+
+    The tax it reports is only readable against the pass it would replace, so a
+    destination of the wrong extent or a fold of the wrong depth prices a different
+    question at the same shape name. The destination is ``dB``'s own ``(B*G*T, 3N)``
+    and the fold is the head-sum depth, and both arms move the same bytes, which is
+    what makes their difference the atomic and not the traffic.
+    """
+    module = load_driver()
+    shape = dataclasses.replace(
+        shape_by_name("acceptance"), name="probe", seq=8, chunk=4, lanes=16, heads=6
+    )
+    price = module.atomic_price(
+        shape, 1, torch.device("cpu"), None, order="blocked", iters=3, warmup=1
+    )
+    assert price.rows == shape.bsz * shape.seq
+    assert price.fold == shape.heads
+    assert price.bytes_moved == price.rows * price.fold * shape.d_state * 4
+    assert price.atomic_us - price.plain_us == pytest.approx(price.tax_us)
+    shallow = module.atomic_price(
+        shape, 1, torch.device("cpu"), 2, order="adjacent", iters=3, warmup=1
+    )
+    assert shallow.fold == 2
+    with pytest.raises(ValueError, match="order must be one of"):
+        module.atomic_price(shape, 1, torch.device("cpu"), None, order="strided")
 
 
 def test_kernel_regex_admits_every_reduce_pass() -> None:

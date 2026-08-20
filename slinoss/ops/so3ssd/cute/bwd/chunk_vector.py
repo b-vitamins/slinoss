@@ -2228,6 +2228,27 @@ def vector_reduce_kernel(
     coalesced across the warp; the vector is cut from the contiguous mode of the
     partial alone, which is why the reads take it and the stores do not.
 
+    The pass is at its own ceiling -- 152.77 MB in 221.6 us, 689.4 GB/s, 102.6% of the
+    copy floor of those bytes, part of the buffer being served from L2 -- so its cost
+    is the buffer's and not the kernel's, and the only way to spend less is not to
+    round trip. Closing with a float32 atomic instead does not: at this destination
+    extent and this fold, an accumulating scatter costs 151.6 us more than a
+    non-accumulating one of the same bytes where the shards land adjacent and 193.5
+    where they land blocked, which is the layout the partials carry, so the two vector
+    outputs are 303.2 to 387.0 us of atomic tax against the 221.6 us it would delete,
+    before the shadow buffer such a close needs. It needs one: the destinations carry
+    the activation width, and eighteen read-modify-writes at eight mantissa bits is not
+    the float32 sum the invariant below promises, so the atomic would land in a float32
+    shadow to be filled and then narrowed, 15.7 and 23.6 MB more. ``--atomic-probe`` on
+    the profile driver is that measurement.
+
+    The form that is not refused is a close inside the producer. The shard axis sits
+    inside the chunk axis of the launch grid, so the eighteen shards of one chunk are
+    ninety consecutive blocks holding 1.1 MB of partials, which L2 holds; the last
+    shard of a token block could sum them from there for an arrival counter and a
+    fence, deleting this launch and most of its DRAM read. That epilogue is in the
+    producer's device body, not here.
+
     Args:
         gpb: ``(B,G,splits*T,3N)`` ``dB`` partials at the activation width.
         gpc: ``(B,G,splits*T,3N)`` ``dC`` partials at the activation width.
