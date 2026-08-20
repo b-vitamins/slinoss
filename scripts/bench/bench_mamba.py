@@ -25,6 +25,9 @@ the floor that resolves anything.
     python3 scripts/bench/bench_mamba.py --shape standard --mode step \\
         --groups heads --against-so3ssd
 
+``--seq`` holds one shape's geometry and varies its sequence length, which the six
+names cannot: they differ in five other extents as well.
+
 The comparison states what it holds equal. :func:`mapping_of` fixes the geometry,
 :func:`mamba_arithmetic` and :func:`so3ssd_arithmetic` count the GEMM flop of each
 side at it, and :func:`parameter_counts` counts the parameters of the two layers the
@@ -36,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -467,6 +471,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=["heads", "one"],
         help="Group configuration. Repeatable. Defaults to both.",
     )
+    parser.add_argument(
+        "--seq",
+        action="append",
+        type=int,
+        help="Sequence length to hold each shape at. Repeatable. Defaults to the "
+        "shape's own. The named shapes differ in H, P, N, L and G as well as T, so "
+        "a table over the names is five geometries and not a sweep in T.",
+    )
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
@@ -506,6 +518,36 @@ def group_counts(shape: OpShape, kinds: Sequence[str]) -> tuple[int, ...]:
     """
     counts = [shape.heads if kind == "heads" else 1 for kind in kinds]
     return tuple(dict.fromkeys(counts))
+
+
+def seq_variants(shape: OpShape, lengths: Sequence[int]) -> tuple[OpShape, ...]:
+    """One copy of a shape per requested sequence length.
+
+    Only ``T`` moves. A ratio taken across the named shapes moves ``H``, ``P``,
+    ``N``, ``L`` and ``G`` with it, so it says nothing about sequence length; this
+    holds the geometry the headline ratio was measured at and varies the one extent.
+
+    ``T`` reaches the shape name and therefore the report file name, so two lengths
+    of one shape write two reports instead of the second overwriting the first.
+
+    Args:
+        shape: The named shape.
+        lengths: Sequence lengths, or empty for the shape's own.
+
+    Returns:
+        The shapes to measure, in the order requested.
+
+    Raises:
+        ValueError: If a length is not positive.
+    """
+    if not lengths:
+        return (shape,)
+    for seq in lengths:
+        if seq < 1:
+            raise ValueError(f"a sequence length must be positive, got {seq}")
+    return tuple(
+        replace(shape, name=f"{shape.name}-t{seq}", seq=seq) for seq in lengths
+    )
 
 
 def _saved(
@@ -712,7 +754,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = require_cuda(args.device)
     scan = load_scan()
     dtype = DTYPES[args.dtype]
-    shapes = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]
+    named = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]
+    shapes = [
+        variant for shape in named for variant in seq_variants(shape, args.seq or ())
+    ]
     modes = MODES if args.mode == "both" else (args.mode,)
     wanted = args.groups or ["heads", "one"]
     if args.against_so3ssd:

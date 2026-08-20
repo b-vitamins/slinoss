@@ -50,6 +50,7 @@ from scripts.bench.bench_mamba import (
     parameter_counts,
     parse_args,
     runner,
+    seq_variants,
     so3ssd_arithmetic,
 )
 from slinoss.perf import timing
@@ -246,6 +247,7 @@ def test_parse_args_defaults_to_every_shape_both_modes_and_both_group_kinds() ->
     # both group kinds. A default list would be appended to, not replaced.
     assert args.shape is None
     assert args.groups is None
+    assert args.seq is None
     assert args.mode == "both"
     assert args.iters == 30
     assert args.warmup == 10
@@ -268,6 +270,7 @@ def test_parse_args_defaults_to_every_shape_both_modes_and_both_group_kinds() ->
     )
     assert repeated.shape == ["tiny", "standard"]
     assert repeated.groups == ["one", "heads"]
+    assert parse_args(["--seq", "512", "--seq", "1024"]).seq == [512, 1024]
 
 
 def test_parse_args_rejects_a_value_outside_the_choices() -> None:
@@ -435,6 +438,51 @@ def test_group_counts_resolve_the_kinds_in_the_order_requested() -> None:
     # one thing twice and let the second report overwrite the first.
     one_head = OpShape("one-head", bsz=1, heads=1, seq=8, rows=16, lanes=16, chunk=4)
     assert group_counts(one_head, ["heads", "one"]) == (1,)
+
+
+# ---------------------------------------------------------------------------
+# seq_variants
+# ---------------------------------------------------------------------------
+
+
+def test_seq_variants_move_only_the_sequence_length() -> None:
+    # No lengths means the shape's own, so the default command is unchanged.
+    assert seq_variants(SMALL, ()) == (SMALL,)
+    variants = seq_variants(SMALL, [4, 16])
+    assert [v.seq for v in variants] == [4, 16]
+    # T reaches the name, so two lengths write two reports instead of one
+    # overwriting the other.
+    assert [v.name for v in variants] == ["small-t4", "small-t16"]
+    # Everything the ratio depends on besides T is held, or the sweep would be a
+    # sweep over geometries.
+    for got in variants:
+        assert (got.bsz, got.heads, got.rows, got.lanes, got.chunk, got.groups) == (
+            SMALL.bsz,
+            SMALL.heads,
+            SMALL.rows,
+            SMALL.lanes,
+            SMALL.chunk,
+            SMALL.groups,
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        seq_variants(SMALL, [0])
+
+
+def test_main_holds_one_shape_at_each_requested_sequence_length(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install(monkeypatch)
+    argument = argv(tmp_path, "--mode", "forward", "--groups", "one", "--seq", "4")
+    assert main([*argument, "--seq", "8"]) == 0
+    assert capsys.readouterr().out.splitlines()[:2] == [
+        f"wrote {tmp_path / 'bench-mamba-small-t4-g1-forward.md'}",
+        f"wrote {tmp_path / 'bench-mamba-small-t8-g1-forward.md'}",
+    ]
+    assert notes_of(tmp_path / "bench-mamba-small-t4-g1-forward.json")[0] == (
+        "small-t4: B=1 H=2 T=4 P=16 N=16 3N=48 L=4 G=1"
+    )
 
 
 # ---------------------------------------------------------------------------
