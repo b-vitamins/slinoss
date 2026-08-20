@@ -6,12 +6,14 @@ rather than surfacing from whichever stage happens to read it. Two of those rule
 cannot be checked anywhere else, because the dtype agreement spans two stages and
 the all-absent call reaches no stage at all.
 
-Then the composition. Each of the seven launches has its own test module driving
+Then the composition. Each of the five launches has its own test module driving
 it from synthetic inputs; none of them drives stage ``N`` from stage ``N-1``'s
-real output, and none drives any stage from the rematerialized forward. That seam
-is what the parity test covers, and it is the only place two buffers consumed in
-place -- the chunk-start state over the increment, and the increment cotangent
-over the chunk-start cotangent -- are shown to survive their passes.
+real output, and none drives any stage from a chunk boundary the forward produced.
+That seam is what the parity test covers, and it is the only place two buffers
+consumed in place -- the chunk-start state over the increment, and the increment
+cotangent over the chunk-start cotangent -- are shown to survive their passes. The
+driver reaches that boundary two ways, rebuilt here and held by the caller, and
+the last test in this module is what holds the two to the same bytes.
 
 Authority. The float64 autograd of the operator is the ground truth for the
 analytic reference, established in ``tests/test_reference_grad.py``. The CuTe
@@ -34,6 +36,7 @@ from typing import NamedTuple
 
 from slinoss.ops.so3ssd.backward import so3ssd_bwd_ref
 from slinoss.ops.so3ssd.cute.backward import so3ssd_bwd_cute
+from slinoss.ops.so3ssd.cute.forward import so3ssd_fwd_cute
 from slinoss.ops.so3ssd.cute.guard import check_cotangents
 from tests.conftest import assert_max_rel, make_inputs, projection_band
 
@@ -464,3 +467,34 @@ def test_the_forcing_seed_reaches_the_epilogue() -> None:
     assert_max_rel(
         seeded.dU, plain.dU.float() + seed.float(), BOUNDS["dU"], "backward/seed/dU"
     )
+
+
+def test_a_held_chunk_boundary_is_read_only_and_gives_the_rebuilt_gradients() -> None:
+    """A supplied ``prologue`` is read, never written, and changes no gradient.
+
+    While the backward rebuilt the boundary itself, a kernel that wrote over it was
+    invisible: every call got a buffer nothing else would ever read. Held across the
+    step, the same write corrupts the next backward, the forward's ``state``, or
+    both, and no other test here reads those buffers after a backward has run.
+
+    Bit-exact rather than toleranced. The two paths launch the same kernels over the
+    same bytes, so a difference of any size is a defect in which tensor was read and
+    not a rounding.
+    """
+    dy, U, trans, K, B, C = _inputs()
+    out = so3ssd_fwd_cute(U, trans, K, B, C, 16)
+    assert out.prologue is not None
+    before = tuple(t.clone() for t in out.prologue)
+    rebuilt = so3ssd_bwd_cute(dy, None, None, None, U, trans, K, B, C, 16)
+    held = so3ssd_bwd_cute(
+        dy, None, None, None, U, trans, K, B, C, 16, prologue=out.prologue
+    )
+    for name in BOUNDS:
+        mine, theirs = getattr(held, name), getattr(rebuilt, name)
+        if theirs is None:
+            assert mine is None, f"{name} present where the rebuilt path has none"
+            continue
+        assert mine is not None, f"{name} absent where the rebuilt path has one"
+        assert torch.equal(mine, theirs), f"{name} differs from the rebuilt path"
+    for name, kept, was in zip(out.prologue._fields, out.prologue, before, strict=True):
+        assert torch.equal(kept, was), f"the backward wrote over {name}"

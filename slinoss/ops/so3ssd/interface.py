@@ -1,11 +1,23 @@
 """Autograd entry point for the SO(3) scan.
 
-Saves inputs only. Every chunk-local intermediate -- the log-scale prefix, the
-quaternion prefix, the 3x3 table, the rotated ``B`` and ``C``, the two score
-matrices, the decay mask, the chunk increments, and the chunk-start states -- is
-recomputed in the backward by the same function the forward calls, so the two
-passes cannot disagree about what they share. In the training path, with no
-streaming carry, the saved set is five tensors per layer.
+Saves the inputs and the chunk boundary. Every chunk-local intermediate -- the
+log-scale prefix, the quaternion prefix, the 3x3 table, the rotated ``B`` and
+``C``, the two score matrices, the decay mask, and the chunk increments -- is
+recomputed in the backward by the kernel that reads it, so none of it reaches
+global memory and no two kernels can disagree about it.
+
+The chunk boundary is the exception. The chunk-start state and the two chunk
+transitions cross a chunk boundary rather than a token boundary, so no backward
+kernel can rebuild one from what it already reads: rebuilding them means running
+the forward's first two launches again, 13% of the operator's device time at the
+acceptance shape. Holding them instead costs one ``(B,H,C,P,3N)`` float32 buffer
+per layer, which is the same buffer the rebuilding backward allocated for itself,
+so the trade is live activation across the step against launches inside it. They
+are held. A backend that returns no boundary saves three ``None`` and its own
+backward rebuilds; the reference does.
+
+In the training path, with no streaming carry, the saved set is eight tensors per
+layer.
 
 No ``torch.amp.custom_fwd``. It casts every input to the autocast dtype, which
 would demote ``trans``, ``K``, and ``z0`` and break the float32 pinning of
@@ -20,7 +32,7 @@ import torch
 from torch import Tensor
 
 from slinoss.ops.so3ssd.backends import get, resolve
-from slinoss.ops.so3ssd.reference import SO3SSDResult
+from slinoss.ops.so3ssd.reference import ScanPrologue, SO3SSDResult
 
 __all__ = ["SO3SSDFunction", "so3ssd"]
 
@@ -63,7 +75,11 @@ class SO3SSDFunction(torch.autograd.Function):
         out = get(backend_name).forward(
             U, trans, K, B, C, chunk_size, z0=z0, b_prev=b_prev, u_prev=u_prev
         )
-        ctx.save_for_backward(U, trans, K, B, C, z0, b_prev, u_prev)
+        # Held, not rebuilt: nothing writes the chunk boundary after the forward's
+        # inter-chunk recurrence leaves it, and autograd's version counter fails
+        # loudly if that ever stops being true.
+        prologue = (None, None, None) if out.prologue is None else out.prologue
+        ctx.save_for_backward(U, trans, K, B, C, z0, b_prev, u_prev, *prologue)
         ctx.chunk_size = chunk_size
         ctx.backend_name = backend_name
         return out.y, out.state, out.b_last, out.u_last
@@ -76,7 +92,7 @@ class SO3SSDFunction(torch.autograd.Function):
         db_last: Tensor | None,
         du_last: Tensor | None,
     ) -> _Grads:
-        U, trans, K, B, C, z0, b_prev, u_prev = ctx.saved_tensors
+        U, trans, K, B, C, z0, b_prev, u_prev, zstart, cquat, cscale = ctx.saved_tensors
         grads = get(ctx.backend_name).backward(
             dy,
             dstate,
@@ -91,6 +107,7 @@ class SO3SSDFunction(torch.autograd.Function):
             z0=z0,
             b_prev=b_prev,
             u_prev=u_prev,
+            prologue=(None if zstart is None else ScanPrologue(zstart, cquat, cscale)),
         )
         return (
             grads.dU,
@@ -137,7 +154,8 @@ def so3ssd(
             backend for the device.
 
     Returns:
-        A :class:`SO3SSDResult`.
+        A :class:`SO3SSDResult`. ``prologue`` is ``None``: the chunk boundary is
+        the backward's, and the graph holds it.
 
     Raises:
         ValueError: On a shape, contiguity, device, or pairing violation, a

@@ -1,34 +1,35 @@
 """Host orchestrator for the CuTe backward.
 
-Two rematerializing launches, then four backward launches, in order:
+Four backward launches, in order:
 
-1. ``chunk_increment_fwd`` -- the forward's chunk increment, unit chunk rotation,
-   and chunk decay, recomputed. Only the last two are read again; the increment
-   buffer is recomputed because the next launch turns it into the chunk-start
-   state.
-2. ``state_passing_fwd`` -- the forward's inter-chunk recurrence, in place over
-   that buffer, leaving each chunk's start state where its increment was.
-3. ``start_passing_bwd`` -- the readout half of every chunk-start state cotangent
+1. ``start_passing_bwd`` -- the readout half of every chunk-start state cotangent
    and the reverse inter-chunk recurrence over it, in one launch that keeps that
    cotangent in shared memory. With ``dy`` absent the readout half is identically
    zero, and ``state_passing_bwd`` runs the recurrence alone in place over an
    allocated buffer.
-4. ``chunk_input_bwd`` -- ``dU``, the streaming input carry, and the log-scale and
+2. ``chunk_input_bwd`` -- ``dU``, the streaming input carry, and the log-scale and
    closing-transition cotangents.
-5. ``chunk_vector_bwd`` -- ``dB``, ``dC``, ``dtrans``, ``dK``, and the streaming
+3. ``chunk_vector_bwd`` -- ``dB``, ``dC``, ``dtrans``, ``dK``, and the streaming
    vector carry.
-6. ``boundary_bwd`` -- the chunk-boundary rows of ``dU`` and ``dB``, and the
+4. ``boundary_bwd`` -- the chunk-boundary rows of ``dU`` and ``dB``, and the
    streaming terms.
 
 Nothing between the launches. No reshape, no cast, no staging copy: each kernel
-writes the layout the next one reads, the forward's increment buffer is consumed
-in place rather than allocated twice, and every cotangent leaves in the layout the
+writes the layout the next one reads, and every cotangent leaves in the layout the
 operator contract states.
 
-The saved set is the operator's inputs and nothing derived, so the recompute is
-the forward by construction. The chunk-local prefixes do not appear here either:
-each kernel recomputes them from ``trans``, so they never reach global memory and
-no two kernels can disagree about them.
+Three quantities cross the chunk boundary rather than a token boundary and none of
+the four kernels can rebuild one: the chunk-start state and the two chunk
+transitions. A caller holding the forward's ``prologue`` passes it and no forward
+kernel runs here. A caller without one -- a direct call, or a forward whose
+intermediates were freed -- gets ``chunk_increment_fwd`` and ``state_passing_fwd``
+run again to rebuild all three, which is two launches and one
+``(B,H,C,P,3N)`` float32 buffer. Both paths read the same three tensors from that
+point on, and the rebuild is the forward's own code, so they cannot disagree.
+
+The chunk-local prefixes cross no boundary and appear on neither path: each kernel
+recomputes them from ``trans``, so they never reach global memory and no two
+kernels can disagree about them.
 
 The three caller-owned buffers cross straight to the kernel that fills them.
 ``dB`` and ``dC`` reach ``chunk_vector_bwd``'s store and ``dU_init`` reaches
@@ -51,7 +52,7 @@ from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
 from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
 from slinoss.ops.so3ssd.cute.guard import check_cotangents, check_shapes
-from slinoss.ops.so3ssd.reference import check_grad_band
+from slinoss.ops.so3ssd.reference import ScanPrologue, check_grad_band
 
 __all__ = ["so3ssd_bwd_cute"]
 
@@ -75,6 +76,7 @@ def so3ssd_bwd_cute(
     dB: Tensor | None = None,
     dC: Tensor | None = None,
     dU_init: Tensor | None = None,
+    prologue: ScanPrologue | None = None,
 ) -> SO3SSDGrads:
     """Chunked SO(3) scan backward on the CuTe kernels.
 
@@ -99,6 +101,11 @@ def so3ssd_bwd_cute(
         dC: Destination for ``dC``, shaped and typed like ``C``. Like ``dB``.
         dU_init: Addend for ``dU``, shaped and typed like ``U``, pitched, or None.
             Read only. The returned ``dU`` is it plus the cotangent of ``U``.
+        prologue: The matching forward's
+            :class:`slinoss.ops.so3ssd.reference.ScanPrologue`, read and never
+            written, or None to rebuild it with two forward launches. Supplying one
+            the forward did not produce at this ``chunk_size`` and these inputs
+            gives wrong gradients and raises nothing: the shapes agree.
 
     Returns:
         A :class:`slinoss.ops.so3ssd.backward.SO3SSDGrads`. ``dz0`` is present
@@ -125,12 +132,21 @@ def so3ssd_bwd_cute(
     bsz, heads, _, seqlen, rows, dim = shape
     chunks = -(-seqlen // chunk_size)
 
-    increment = chunk_increment_forward(
-        U, trans, K, B, chunk_size, u_prev=u_prev, b_prev=b_prev
-    )
-    passing = state_passing_forward(
-        increment.inc, increment.cquat, increment.cscale, z0
-    )
+    # Rebuild the chunk boundary only when the caller kept none of it. The two
+    # launches cost more than every other host-side term here put together, and
+    # both paths leave the same three read-only tensors.
+    if prologue is None:
+        increment = chunk_increment_forward(
+            U, trans, K, B, chunk_size, u_prev=u_prev, b_prev=b_prev
+        )
+        passing = state_passing_forward(
+            increment.inc, increment.cquat, increment.cscale, z0
+        )
+        prologue = ScanPrologue(
+            zstart=passing.zstart,
+            cquat=increment.cquat,
+            cscale=increment.cscale,
+        )
 
     # The chunk-start cotangent never reaches memory: the fused launch contracts
     # each chunk's readout cotangent into shared memory and the reverse recurrence
@@ -142,15 +158,15 @@ def so3ssd_bwd_cute(
     # has_dzstart drops the load and the add at compile time.
     if dy is not None:
         reverse = start_passing_backward(
-            dy, trans, C, increment.cquat, increment.cscale, chunk_size, dstate
+            dy, trans, C, prologue.cquat, prologue.cscale, chunk_size, dstate
         )
     else:
         reverse = state_passing_backward(
             torch.empty(
                 bsz, heads, chunks, rows, dim, dtype=torch.float32, device=U.device
             ),
-            increment.cquat,
-            increment.cscale,
+            prologue.cquat,
+            prologue.cscale,
             dstate,
             has_dzstart=False,
         )
@@ -171,7 +187,7 @@ def so3ssd_bwd_cute(
         B,
         C,
         reverse.dinc,
-        passing.zstart,
+        prologue.zstart,
         chunk_size,
         u_prev=u_prev,
         b_prev=b_prev,
@@ -185,7 +201,7 @@ def so3ssd_bwd_cute(
         B,
         C,
         reverse.dinc,
-        passing.zstart,
+        prologue.zstart,
         inputs.dlogp,
         inputs.dchunk_rot,
         inputs.dchunk_scale,

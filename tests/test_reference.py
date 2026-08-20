@@ -653,9 +653,13 @@ def test_accepts_the_vector_operands_as_projection_bands() -> None:
     for backend, ident in zip(BACKENDS, BACKEND_IDS):
         want, got = backend(packed), backend(banded)
         for field in want._fields:
-            assert torch.equal(getattr(got, field), getattr(want, field)), (
-                f"{ident} {field}"
-            )
+            mine, theirs = getattr(got, field), getattr(want, field)
+            # Neither reference returns a chunk boundary, so that field is absent on
+            # both sides and the band cannot move it.
+            if theirs is None:
+                assert mine is None, f"{ident} {field}"
+                continue
+            assert torch.equal(mine, theirs), f"{ident} {field}"
 
     dy = torch.randn_like(packed.U)
     want_g = so3ssd_bwd_ref(dy, None, None, None, *packed.args(), 16, **packed.kw())

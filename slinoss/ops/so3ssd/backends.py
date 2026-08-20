@@ -20,7 +20,7 @@ from torch import Tensor
 from slinoss._precision import LOW_PRECISION_DTYPES, SUPPORTED_DTYPES
 from slinoss._registry import Backend, Registry
 from slinoss.ops.so3ssd.backward import SO3SSDGrads, so3ssd_bwd_ref
-from slinoss.ops.so3ssd.reference import SO3SSDResult, so3ssd_ref
+from slinoss.ops.so3ssd.reference import ScanPrologue, SO3SSDResult, so3ssd_ref
 
 __all__ = [
     "Backend",
@@ -70,6 +70,11 @@ class ScanBackward(Protocol):
     The mixer tail's ``du`` and the scan's ``dU`` both feed the conv's ``dy``, and the
     scan builds ``dU`` by accumulation already, so seeding that accumulation replaces
     a separate read-read-write over ``(B,H,T,P)`` and narrows the sum once.
+
+    ``prologue`` is the matching forward's, or ``None``. A backend is free to ignore
+    it and rebuild what it needs from the inputs, and the reference does. It is in the
+    signature rather than in one backend's because the autograd boundary holds one
+    saved set for every backend and dispatches on a name.
     """
 
     def __call__(
@@ -92,6 +97,7 @@ class ScanBackward(Protocol):
         dB: Tensor | None = None,
         dC: Tensor | None = None,
         dU_init: Tensor | None = None,
+        prologue: ScanPrologue | None = None,
     ) -> SO3SSDGrads: ...
 
 
@@ -119,9 +125,10 @@ register(
 def _register_cute() -> None:
     """Register the CuTe backend if this host can run it.
 
-    Both directions are kernel trees: three launches forward, seven backward. The
-    backward rematerializes the chunk-start state rather than saving it, so a
-    training step on this backend touches no torch fallback.
+    Both directions are kernel trees: three launches forward, five backward. The
+    backward reads the chunk boundary the forward left rather than rebuilding it, so a
+    training step on this backend touches no torch fallback and launches no forward
+    kernel twice.
     """
     if not torch.cuda.is_available():
         return

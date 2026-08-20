@@ -18,6 +18,7 @@ from slinoss.ops.so3ssd.backward import (
 from slinoss.ops.so3ssd.interface import SO3SSDFunction, so3ssd
 from slinoss.ops.so3ssd.reference import (
     ChunkedForward,
+    ScanPrologue,
     SO3SSDResult,
     TapGrads,
     TransformTable,
@@ -52,6 +53,7 @@ __all__ = [
     "SO3SSDResult",
     "ScanBackward",
     "ScanForward",
+    "ScanPrologue",
     "TapGrads",
     "TransformTable",
     "as_lanes",

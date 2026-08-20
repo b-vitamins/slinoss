@@ -25,6 +25,7 @@ from torch.nn.functional import pad as _pad
 
 from slinoss._precision import autocast_disabled, pinned_dtype
 from slinoss.ops.so3ssd.reference import (
+    ScanPrologue,
     as_lanes,
     check_grad_band,
     chunk_pad,
@@ -457,6 +458,7 @@ def so3ssd_bwd_ref(
     dB: Tensor | None = None,
     dC: Tensor | None = None,
     dU_init: Tensor | None = None,
+    prologue: ScanPrologue | None = None,
 ) -> SO3SSDGrads:
     """Cotangents of every input of :func:`slinoss.ops.so3ssd.reference.so3ssd_ref`.
 
@@ -488,6 +490,10 @@ def so3ssd_bwd_ref(
             device of ``U``, possibly pitched. Read and never written: the returned
             ``dU`` is this plus the cotangent of ``U``. Not a destination, and never
             returned by identity.
+        prologue: Ignored. This backward rematerializes the whole forward, in the
+            reference's own chunk-major representation, so the chunked kernels'
+            chunk boundary buys it nothing. Present because
+            :class:`slinoss.ops.so3ssd.backends.ScanBackward` carries it.
 
     Returns:
         A :class:`SO3SSDGrads`.

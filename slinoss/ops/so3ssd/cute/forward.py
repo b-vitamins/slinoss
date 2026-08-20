@@ -19,6 +19,11 @@ glue on the hot path is the defect this file exists to make visible.
 The chunk-local prefixes do not appear here either. Each kernel recomputes them from
 ``trans``, so they never reach global memory and the three kernels cannot disagree
 about them.
+
+The chunk-start state and the two chunk transitions leave with the result. The
+backward reads all three and the first two launches are what produce them, so the
+alternative is running those launches again there. Nothing writes them after the
+second launch, so returning them costs no launch, no copy, and no store.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from torch import Tensor
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_scan import chunk_scan_forward
 from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
-from slinoss.ops.so3ssd.reference import SO3SSDResult
+from slinoss.ops.so3ssd.reference import ScanPrologue, SO3SSDResult
 
 __all__ = ["so3ssd_fwd_cute"]
 
@@ -67,7 +72,10 @@ def so3ssd_fwd_cute(
 
     Returns:
         A :class:`slinoss.ops.so3ssd.reference.SO3SSDResult`. ``state`` is float32;
-        ``y`` carries the dtype of ``U``.
+        ``y`` carries the dtype of ``U``. ``prologue`` carries the chunk-start
+        state and the two chunk transitions, which
+        :func:`slinoss.ops.so3ssd.cute.backward.so3ssd_bwd_cute` reads instead of
+        rebuilding.
 
     Raises:
         ValueError: On a layout, rank, shape, extent, or pairing violation, or a
@@ -97,4 +105,9 @@ def so3ssd_fwd_cute(
         state=passing.state,
         b_last=increment.b_last,
         u_last=increment.u_last,
+        prologue=ScanPrologue(
+            zstart=passing.zstart,
+            cquat=increment.cquat,
+            cscale=increment.cscale,
+        ),
     )

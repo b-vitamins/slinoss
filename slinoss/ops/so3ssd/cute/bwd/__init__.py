@@ -1,7 +1,6 @@
 """Backward kernels for the SO(3) chunked scan.
 
-Five kernels, run in this order after the forward's chunk increment and state
-passing are rematerialized:
+Five kernels, run in this order over the chunk boundary the forward left:
 
 - ``chunk_start``: the cotangent of each chunk's start state.
 - ``state_passing``: the reverse inter-chunk scan, in place over that buffer.

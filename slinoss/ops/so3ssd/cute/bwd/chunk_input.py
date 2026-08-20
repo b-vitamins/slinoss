@@ -1370,7 +1370,7 @@ def chunk_input_backward(
             contiguous, from
             :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward`.
         zstart: ``(B,H,C,P,3N)`` float32 chunk-start state, contiguous, from the
-            rematerialized forward.
+            forward's inter-chunk recurrence. Read, never written.
         chunk_size: ``L``. A multiple of 16.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, or None.
         b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, or None.

@@ -31,6 +31,7 @@ from slinoss.ops.mixer import backends as tail_dispatch
 from slinoss.ops.scanprep import LS_COLUMN, PARAM_COLS, ROTVEC_COLUMNS, TAP_COLUMNS
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
+from slinoss.ops.so3ssd.reference import ScanPrologue
 from slinoss.state import MixerState
 
 __all__ = [
@@ -375,10 +376,13 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
     :meth:`forward` and a nested node would record nothing.
 
     Saved: ``x``, ``proj``, the convolution output, ``trans``, ``K``, the scan
-    output, the tail output, and every parameter. Saving ``trans`` and ``K`` rather
-    than rematerializing scanprep in the backward is this commit's choice; the two
-    trade ``(B,H,T,4)`` plus ``(B,H,T,2,4)`` of float32 against one extra
-    elementwise pass, and neither has been measured here.
+    output, the tail output, every parameter, and the scan's chunk boundary. Saving
+    ``trans`` and ``K`` rather than rematerializing scanprep in the backward is this
+    commit's choice; the two trade ``(B,H,T,4)`` plus ``(B,H,T,2,4)`` of float32
+    against one extra elementwise pass, and neither has been measured here. The
+    chunk boundary is measured: it trades one ``(B,H,C,P,3N)`` float32 buffer per
+    layer against the scan's first two launches, which the scan's backward would
+    otherwise run again, and ``scripts/perf/profile_prologue.py`` prices both arms.
 
     No :func:`torch.amp.custom_fwd`. It casts every input to the autocast dtype,
     which would demote ``param_bias``, ``trans``, and ``K`` and break I4.
@@ -447,6 +451,9 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             norm_weight,
             out_weight,
             out_bias,
+            # Last, so the parameter slices above stay fixed. Three Nones from a
+            # backend whose backward rebuilds the boundary instead.
+            *((None, None, None) if scan.prologue is None else scan.prologue),
         )
         ctx.layout = layout
         ctx.config = config
@@ -458,7 +465,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         saved = ctx.saved_tensors
         x, proj, conv_y, trans, K, scan_y, tail = saved[:7]
         in_weight, in_bias, conv_weight, conv_bias, param_bias = saved[7:12]
-        d_skip, norm_weight, out_weight, out_bias = saved[12:]
+        d_skip, norm_weight, out_weight, out_bias = saved[12:16]
+        zstart, cquat, cscale = saved[16:]
         layout: ProjectionLayout = ctx.layout
         config: SLinOSSConfig = ctx.config
         picks: _Backends = ctx.picks
@@ -498,6 +506,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             dB=layout.b(dproj),
             dC=layout.c(dproj),
             dU_init=tail_grads.du,
+            prologue=(None if zstart is None else ScanPrologue(zstart, cquat, cscale)),
         )
         prep_grads = prep_dispatch.get(picks.prep).backward(
             scan_grads.dtrans,

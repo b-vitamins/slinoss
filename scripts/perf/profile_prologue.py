@@ -1,11 +1,11 @@
 """What the chunk-boundary prologue costs at the model geometry, both ways.
 
-The backward rematerializes the prologue: it relaunches ``chunk_increment_fwd`` and
-``state_passing_fwd`` to rebuild ``cquat``, ``cscale`` and ``zstart``, so a step
-runs each of them twice per layer. Saving the three tensors instead deletes those
-launches and pays in live activation. The trade has two units, device time and
-allocator bytes, and neither is readable off the other, so both are measured here
-in one process at the geometry the stack trains at.
+The forward's ``chunk_increment_fwd`` and ``state_passing_fwd`` produce ``cquat``,
+``cscale`` and ``zstart``, and the backward reads all three. Holding them across the
+step deletes the two launches that would rebuild them there and pays in live
+activation. The trade has two units, device time and allocator bytes, and neither is
+readable off the other, so both are measured here in one process at the geometry the
+stack trains at.
 
     python3 scripts/perf/profile_prologue.py
 
@@ -23,33 +23,34 @@ consumer already held.
 Each repeat is a whole measurement, timed loop and profile both, so every figure
 printed twice is a figure measured twice.
 
-Both policies measured, on one A6000 at unlocked clocks sharing the part with one
-28 MiB context at 0% utilization, two repeats each, 13 layers, d_model 576, 3N 240,
-d_head 64, chunk 64, 18 heads, batch 4, seqlen 2048, bfloat16. Recompute, which is
-what the tree holds: step 418.685 and 419.985 ms, peak allocated 11,330.44 MiB,
-peak reserved 12,938.00 MiB, prologue 20.593 and 20.603 ms per step over 52
-launches. Saving all three: step 407.609 and 408.973 ms, peak allocated
-13,250.41 MiB, peak reserved 14,566.00 MiB, prologue 10.320 and 10.332 ms over 26.
-The trade is 11.04 ms of a 418.7 ms step, 2.64%, against 1,919.97 MiB of peak,
-16.95%, and 174 MiB of peak per millisecond bought. Half-widths were 0.05% to 0.15%,
-so the delta resolves by two orders of magnitude.
+Both policies measured back to back, on one A6000 at unlocked clocks sharing the
+part with two contexts holding 6,564 MiB at 0% utilization, two repeats each, 13
+layers, d_model 576, 3N 240, d_head 64, chunk 64, 18 heads, batch 4, seqlen 2048,
+bfloat16. Recompute: step 220.378 and 220.795 ms, peak allocated 9,275.99 MiB, peak
+reserved 9,366.00 MiB, prologue 20.722 and 20.720 ms per step over 52 launches.
+Saving all three, which is what the tree holds: step 210.442 and 210.752 ms, peak
+allocated 11,187.88 MiB, peak reserved 11,328.00 MiB, prologue 10.333 and 10.335 ms
+over 26. The trade is 9.99 ms of a 220.4 ms step, 4.53%, against 1,911.89 MiB of
+peak, 20.61%, and 191 MiB of peak per millisecond bought. Half-widths were 0.07% to
+0.19%, so the delta resolves by two orders of magnitude.
 
-Per-launch time does not move: ``state_passing_fwd`` 428.6 us against 428.9,
-``chunk_increment_fwd`` 363.5 against 364.9. The policy deletes launches; it does not
+Per-launch time does not move: ``state_passing_fwd`` 428.8 us against 429.1,
+``chunk_increment_fwd`` 367.9 against 366.7. The policy deletes launches; it does not
 make the surviving ones faster, which is why the whole win is readable off the launch
 counts alone.
 
-The retained tensors are 1,755.6 MiB of the 1,919.97 MiB the peak rose by: 13 layers
+The retained tensors are 1,755.6 MiB of the 1,911.89 MiB the peak rose by: 13 layers
 of ``zstart`` at 135.00 MiB, ``cquat`` at 0.036, ``cscale`` at 0.009. The remaining
-164.4 MiB is not a tensor. The peak is a maximum over a step and the two policies do
+156.3 MiB is not a tensor. The peak is a maximum over a step and the two policies do
 not reach it at the same instant, which is the reason the memory side is measured
-rather than added up.
+rather than added up. The saved set rose by less than either figure, 5,687.65 MiB
+over 386 storages to 7,227.12 MiB over 419.
 
 Saving less is not available. ``state_passing_fwd`` consumes the increment buffer
 that ``chunk_increment_fwd`` alone produces, so saving ``cquat`` and ``cscale``
 without ``zstart`` deletes neither launch and buys nothing for its 0.045 MiB. Saving
 ``zstart`` without them pays the whole 1,755 MiB and still launches
-``chunk_increment_fwd`` for the two transitions, so it returns 5.57 ms of the 10.27 ms
+``chunk_increment_fwd`` for the two transitions, so it returns 5.57 ms of the 10.39 ms
 the backward's two launches cost. Both partial policies are dominated, so the choice
 is the two arms above and nothing between them.
 """

@@ -65,6 +65,7 @@ from slinoss.config import HEAD_MULTIPLE, LANE_MULTIPLE
 __all__ = [
     "ChunkedForward",
     "SO3SSDResult",
+    "ScanPrologue",
     "TapGrads",
     "TransformTable",
     "as_lanes",
@@ -503,11 +504,34 @@ def transform_table(w: Tensor, tap: Tensor, qprefix: Tensor) -> TransformTable:
 # ---------------------------------------------------------------------------
 
 
+class ScanPrologue(NamedTuple):
+    """The chunk-boundary quantities the backward reads rather than recomputes.
+
+    Every one is an output of the forward's first two stages. A backend that
+    returns it lets the autograd boundary hold it and the backward skip those two
+    stages; a backend that returns ``None`` in its place leaves the backward to
+    rematerialize them. Nothing in either direction writes these buffers after
+    the forward's inter-chunk recurrence has left them, so holding them cannot
+    perturb the forward's own outputs.
+
+    Attributes:
+        zstart: Chunk-start state, shape ``(B,H,C,P,3N)``, float32, contiguous,
+            over ``C`` chunks.
+        cquat: Unit chunk rotation, shape ``(B,H,C,4)``, float32, contiguous.
+        cscale: Chunk decay ``exp(2*lp_{L-1})``, shape ``(B,H,C)``, float32,
+            contiguous.
+    """
+
+    zstart: Tensor
+    cquat: Tensor
+    cscale: Tensor
+
+
 class SO3SSDResult(NamedTuple):
     """Return type of both reference implementations.
 
-    Every field is contiguous. A ragged tail leaves the chunked path holding a
-    time slice of a padded buffer, and that must not reach a caller.
+    Every tensor field is contiguous. A ragged tail leaves the chunked path
+    holding a time slice of a padded buffer, and that must not reach a caller.
 
     Attributes:
         y: Output, shape ``(B,H,T,P)``, dtype of ``U``.
@@ -516,6 +540,11 @@ class SO3SSDResult(NamedTuple):
             ``b_prev`` of the next call in a streaming split.
         u_last: ``u`` at the last token, shape ``(B,H,P)``, contiguous. Feeds
             ``u_prev``.
+        prologue: The chunk-boundary quantities of :class:`ScanPrologue`, for a
+            backward that reads them, or ``None`` from a backend whose backward
+            rematerializes them. It is not an output of the operator: the public
+            callable returns ``None`` here, and only the autograd boundary reads
+            it.
 
     ``b_last`` and ``u_last`` are contiguous because they are fed straight back
     in and the operator repacks nothing. A time slice of ``B`` is strided over
@@ -526,6 +555,7 @@ class SO3SSDResult(NamedTuple):
     state: Tensor
     b_last: Tensor
     u_last: Tensor
+    prologue: ScanPrologue | None = None
 
 
 class _Shapes(NamedTuple):

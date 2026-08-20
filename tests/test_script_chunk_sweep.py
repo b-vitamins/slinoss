@@ -228,10 +228,9 @@ def test_no_global_memory_term_grows_with_the_chunk_length() -> None:
             assert 2 * far.nbytes == near.nbytes
         else:
             assert near.nbytes // 2 < far.nbytes < near.nbytes
-    # Both rematerialized launches move their bytes again, so each appears twice.
-    kernels = [t.kernel for t in here]
-    assert "chunk_increment_fwd[remat]" in kernels
-    assert "state_passing_fwd[remat]" in kernels
+    # The backward reads the chunk start states the forward left, so no launch in
+    # the model re-runs a forward kernel and no term is counted twice.
+    assert not [t.kernel for t in here if "[remat]" in t.kernel]
 
 
 @CUTE

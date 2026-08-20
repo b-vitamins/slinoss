@@ -340,8 +340,7 @@ class TrafficTerm(NamedTuple):
     """One tensor one launch touches once.
 
     Attributes:
-        kernel: Kernel name, with ``[remat]`` where the backward re-runs a forward
-            kernel to rematerialize the chunk start states.
+        kernel: Kernel name, as the source spells it.
         tensor: Tensor name, as the kernel's own docstring spells it.
         side: ``read`` or ``write``.
         nbytes: Bytes at the chunk length asked for.
@@ -372,9 +371,8 @@ def _scaling(fn: Callable[[int], int], chunk: int) -> str:
 def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
     """Every global-memory term of one whole step of one operator call.
 
-    Ten launches: the forward's three, then the backward's seven, two of which
-    re-run forward kernels because the chunk start states are rematerialized rather
-    than saved. Both re-runs move their bytes again and both are listed.
+    Eight launches: the forward's three, then the backward's five. No forward kernel
+    appears twice; the backward reads the chunk start states the forward left.
 
     ``U`` and ``B`` are read over ``L + 1`` rows per chunk: the two-tap forcing at a
     chunk's first token reads the previous chunk's last row. ``C`` carries no tap and
@@ -468,8 +466,6 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
                 ("y", "write", rowwise),
             ),
         ),
-        ("chunk_increment_fwd[remat]", increment),
-        ("state_passing_fwd[remat]", passing),
         (
             "chunk_start_bwd",
             (
@@ -597,7 +593,6 @@ def flop_terms(geo: Geometry) -> tuple[FlopTerm, ...]:
     return (
         FlopTerm("chunk_increment_fwd", "increment", 4 * p * d, 0),
         FlopTerm("chunk_scan_fwd", "offset+score+diagonal", 2 * p * d, 4 * (p + d)),
-        FlopTerm("chunk_increment_fwd[remat]", "increment", 4 * p * d, 0),
         FlopTerm("chunk_start_bwd", "offset transpose", 2 * d * mma_rows(p), 0),
         FlopTerm("chunk_input_bwd", "all forms", 8 * p * d, 6 * (p + d)),
         FlopTerm("chunk_vector_bwd", "all forms", 6 * p * d, 8 * (p + d)),
