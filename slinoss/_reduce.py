@@ -15,16 +15,29 @@ frontier and ``ceil(B*T/ROWS)`` at the tail, so it grows with the sequence while
 over a row extent bounded by its own grid, and it carries its own measured record
 at four widths.
 
-Parallel decomposition. A block owns :data:`REDUCE_COLS` columns of one slab and
-splits the rows across ``REDUCE_THREADS // REDUCE_COLS`` slots, so the grid is
-``(ceil(W / REDUCE_COLS), S)`` and the row axis supplies the parallelism a grid
-over ``W`` alone cannot. A slot walks its rows at a stride of the slot count and
-reads a column clamped to ``W - 1`` rather than predicated; the store is what
-guards a ragged column tile. One float32 per thread in shared memory,
-1,024 B, one barrier, then slot 0 sums the slots.
+Parallel decomposition. A block owns a column tile of one slab and splits the rows
+across ``threads // cols`` slots, so the grid is ``(ceil(W / cols), S)``. A slot
+walks its rows at a stride of the slot count and reads a column clamped to
+``W - 1`` rather than predicated; the store is what guards a ragged column tile.
+
+:func:`reduce_cols` picks the tile from ``R``, and the two cases are different
+kernels in the same source. A deep buffer splits the rows, because a grid over
+``W`` alone cannot fill the device: :data:`REDUCE_COLS` columns, 32 slots, one
+float32 per thread in shared memory, one barrier, then slot 0 sums the slots. A
+shallow one does not: at ``R`` no deeper than the slot count the split leaves most
+slots holding one row or none, and the block still pays the barrier and a combine
+over 32 mostly-zero partials. There the tile is the whole block, one column per
+thread, no shared memory and no barrier, and the parallelism comes from ``W`` and
+``S``, which a shallow buffer has enough of. A slot count of 32 against ``R = 5``
+cost 347 us a call in the chunk-vector backward, 64% of it stalled on that
+barrier.
 
 The reduction order is fixed by the launch geometry: ascending row within a slot,
 then ascending slot. There are no atomics, so one shape reproduces bit for bit.
+The tile does not enter the order. It can only change where ``R`` is no deeper
+than the slot count, and there the deep form's slots hold one row each in
+ascending order and the rest hold an exact zero, which is the shallow form's
+ascending sum.
 
 ``W`` and the two block constants are compile-time, ``R`` is dynamic and ``S`` is a
 grid extent, so one compiled variant per width and output dtype covers every
@@ -54,6 +67,7 @@ from slinoss._precision import KERNEL_DTYPES
 __all__ = [
     "REDUCE_COLS",
     "REDUCE_THREADS",
+    "reduce_cols",
     "reduce_partials",
     "reduce_rows",
     "reduce_rows_kernel",
@@ -62,24 +76,44 @@ __all__ = [
 ]
 
 REDUCE_COLS = 8
-"""Columns one block owns. Eight float32 is one 32-byte sector, so a block's row
-segment is a whole sector, and therefore the widest grid over ``W`` that wastes
-none of one."""
+"""Columns one block owns where the rows are split. Eight float32 is one 32-byte
+sector, so a block's row segment is a whole sector, and therefore the widest grid
+over ``W`` that wastes none of one."""
 
 REDUCE_THREADS = 256
 """Block width. Divisible by :data:`REDUCE_COLS`, so the block is a rectangle of
-row slots by columns, 32 slots deep. The grid is ``ceil(W / REDUCE_COLS)`` blocks
-per slab and cannot fill the device: the slots are the only other axis, and each
-one costs a dependent load."""
+row slots by columns, 32 slots deep where the rows are split. The grid is
+``ceil(W / cols)`` blocks per slab, and at :data:`REDUCE_COLS` it cannot fill the
+device: the slots are the only other axis, and each one costs a dependent load."""
+
+
+def reduce_cols(rows: int) -> int:
+    """Columns one block owns, from the row extent.
+
+    The row split exists to fill a device a grid over ``W`` alone cannot. It buys
+    that with a barrier and a combine over 32 slots, and a buffer no deeper than
+    the slot count has no rows to give it: every slot holds one row or none, and the
+    block pays the barrier for a sum it already had.
+
+    Args:
+        rows: ``R``, the reduced extent.
+
+    Returns:
+        :data:`REDUCE_COLS` where the rows are deep enough to split, and
+        :data:`REDUCE_THREADS` otherwise, which is one column per thread and one row
+        slot. The result divides :data:`REDUCE_THREADS`.
+    """
+    slots = REDUCE_THREADS // REDUCE_COLS
+    return REDUCE_THREADS if rows <= slots else REDUCE_COLS
 
 
 def slot_tile(threads: int) -> Tile:
-    """Per-thread accumulators of the row reduction.
+    """Per-thread accumulators of the row reduction, where the rows are split.
 
-    One float32 per thread, the block laid out as ``threads // REDUCE_COLS`` row
-    slots by :data:`REDUCE_COLS` columns with the column index innermost, so a
-    slot's partials are contiguous and the combine over slots reads one bank per
-    column.
+    One float32 per thread, the block laid out as ``threads // cols`` row slots by
+    ``cols`` columns with the column index innermost, so a slot's partials are
+    contiguous and the combine over slots reads one bank per column. Unallocated at
+    one row slot, which has nothing to combine.
 
     Args:
         threads: Block width. Compile-time.
@@ -91,13 +125,15 @@ def slot_tile(threads: int) -> Tile:
 
 
 def slot_smem_bytes(threads: int) -> int:
-    """Shared memory :func:`reduce_rows_kernel` holds, in bytes.
+    """Shared memory :func:`reduce_rows_kernel` holds where it splits the rows, in
+    bytes.
 
     Args:
         threads: Block width.
 
     Returns:
-        Total bytes.
+        Total bytes. Zero is what the kernel holds at one row slot, which this does
+        not report: it is the budget of the split form.
     """
     return smem_bytes([(slot_tile(threads), 4)])
 
@@ -121,21 +157,21 @@ def reduce_rows_kernel(
             second compile-time argument.
         rows: ``R``. Dynamic, so one variant covers every sequence length.
         width: ``W``. Compile-time.
-        cols: Columns per block, :data:`REDUCE_COLS`. Compile-time, and divides
-            ``threads``.
+        cols: Columns per block, from :func:`reduce_cols`. Compile-time, and divides
+            ``threads``. At ``threads`` the block is one row slot and the combine,
+            the shared buffer and the barrier are all traced away.
         threads: Block width. Compile-time.
 
     Invariants:
         The reduction order is fixed by the launch geometry alone: ascending row
         within a slot, then ascending slot. It has no atomics, so a rerun at one
-        shape reproduces the result bit for bit. A column past ``W`` reads a
+        shape reproduces the result bit for bit, and the column tile does not enter
+        the order at any ``R`` where it can change. A column past ``W`` reads a
         clamped position and stores nothing. The accumulator is float32 whatever
         the destination width, and the narrowing is the one rounding on the path.
     """
     tile, slab, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
-    smem = cutlass.utils.SmemAllocator()
-    sacc = smem.allocate_tensor(cutlass.Float32, slot_tile(threads).layout(), 16)
     dst = gout.element_type
 
     slots = threads // cols
@@ -148,17 +184,22 @@ def reduce_rows_kernel(
     for row in cutlass.range(slot, rows, slots):
         acc = acc + gpartial[slab, row, cutlass.min(col, width - 1)]
 
-    sacc[slot * cols + lane] = acc
-    cute.arch.sync_threads()
-
-    if slot == 0:
-        total = cutlass.Float32(0.0)
-        # Rolled, not unrolled: the chain of adds is serial either way, and the
-        # unrolled form is the slower thing to compile.
-        for index in cutlass.range(slots):
-            total = total + sacc[index * cols + lane]
+    if cutlass.const_expr(slots == 1):
         if col < width:
-            gout[slab, col] = narrow(total, dst)
+            gout[slab, col] = narrow(acc, dst)
+    else:
+        smem = cutlass.utils.SmemAllocator()
+        sacc = smem.allocate_tensor(cutlass.Float32, slot_tile(threads).layout(), 16)
+        sacc[slot * cols + lane] = acc
+        cute.arch.sync_threads()
+        if slot == 0:
+            total = cutlass.Float32(0.0)
+            # Rolled, not unrolled: the chain of adds is serial either way, and the
+            # unrolled form is the slower thing to compile.
+            for index in cutlass.range(slots):
+                total = total + sacc[index * cols + lane]
+            if col < width:
+                gout[slab, col] = narrow(total, dst)
 
 
 @cute.jit
@@ -236,6 +277,6 @@ def reduce_partials(
     jit_launch(
         reduce_rows,
         (partial, dest, rows, slabs),
-        (width, REDUCE_COLS, REDUCE_THREADS),
+        (width, reduce_cols(rows), REDUCE_THREADS),
     )
     return dest

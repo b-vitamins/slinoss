@@ -12,6 +12,10 @@ store's rounding.
 The axes swept are the row extent against the slot count and the width against the
 column tile, one at a time. The ragged width is the case the clamped read exists
 for: a lane past the width reads a column that is in bounds and stores nothing.
+
+The tile is not a constant: the launch takes it from the row extent, so a third
+property is pinned bitwise too, that the tiling a caller gets does not decide the
+sum it gets.
 """
 
 import pytest
@@ -24,13 +28,15 @@ if not torch.cuda.is_available():
 
 from collections.abc import Callable
 
-from slinoss._cute import assert_smem_fits, smem_bytes, smem_capacity
+from slinoss._cute import assert_smem_fits, jit_launch, smem_bytes, smem_capacity
 from slinoss._guard import SECTOR_BYTES
 from slinoss._precision import KERNEL_DTYPES
 from slinoss._reduce import (
     REDUCE_COLS,
     REDUCE_THREADS,
+    reduce_cols,
     reduce_partials,
+    reduce_rows,
     slot_smem_bytes,
     slot_tile,
 )
@@ -156,6 +162,25 @@ def test_rejections(
     reading past an operand."""
     with pytest.raises(error, match=match):
         call(_partial(1, 33, 120))
+
+
+@pytest.mark.parametrize("rows", [1, 5, SLOTS])
+def test_the_column_tile_does_not_change_the_sum(rows: int) -> None:
+    """Dropping the row split leaves the same bits behind.
+
+    :func:`reduce_cols` takes the whole block as one row slot at an extent no deeper
+    than the split's slot count, which is what every slot-buffer caller reaches it
+    with. Bitwise, not to a tolerance: there the split's slots hold one row each in
+    ascending order and the rest hold an exact zero, so the two orders coincide and
+    a tolerance would hide a reordering.
+    """
+    partial = _partial(2, rows, 120, seed=rows)
+    assert reduce_cols(rows) == REDUCE_THREADS
+    split = torch.empty(2, 120, dtype=torch.float32, device="cuda")
+    jit_launch(
+        reduce_rows, (partial, split, rows, 2), (120, REDUCE_COLS, REDUCE_THREADS)
+    )
+    assert torch.equal(reduce_partials(partial), split), f"reordered at rows={rows}"
 
 
 def test_geometry_and_shared_memory() -> None:
