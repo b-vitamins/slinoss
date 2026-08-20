@@ -1240,6 +1240,31 @@ def _mat_at(stable: cute.Tensor, slot: int, token: cutlass.Int32) -> Mat3:
     )
 
 
+def _row_pairs(threads: int, span: int, pairs: int) -> int:
+    """Threads one row of a rotation pass takes.
+
+    The largest divisor of ``pairs`` reached by doubling that keeps the whole block
+    inside one row pass, so a thread's pairs tile the row and the block covers
+    ``threads // per_row`` rows a step. It lands on ``threads // span`` exactly
+    wherever that quotient is such a divisor, which is every shape :func:`vblock`
+    returns against a block of 128 or 256 threads except the shortest span, where the
+    block is wider than the row count and the ragged arm runs.
+
+    Undecorated, and taking plain ints rather than tensors, so the search runs during
+    the trace and no loop reaches the IR. A ``while`` inside a ``cute.jit`` body is
+    rewritten into a dynamic loop and its result stops being compile-time.
+
+    Args:
+        threads: Block width.
+        span: Rows to fill.
+        pairs: Lane pairs of one row.
+    """
+    per_row = 1
+    while pairs % (per_row * 2) == 0 and per_row * 2 * span <= threads:
+        per_row *= 2
+    return per_row
+
+
 def _vec_at(src: cute.Tensor, row: cutlass.Int32, col: cutlass.Int32) -> Vec3:
     """One lane's 3-vector of a shared tile, widened to float32.
 
@@ -1300,10 +1325,14 @@ def _rotate_rows(
 
     A step carries :data:`slinoss.ops.so3ssd.cute.table.LANE_PAIR` adjacent lanes,
     the unit :func:`slinoss.ops.so3ssd.cute.table.stage_rotated` already pairs from
-    global. Both lanes of a pair sit in one row, so the nine table words are read
-    once and applied twice, and the pair's six components are one contiguous
-    twelve-byte run at either width, so the read and the write are three paired
-    accesses each rather than six scalars.
+    global. The pair's six components are one contiguous twelve-byte run at either
+    width, so the read and the write are three paired accesses each rather than six
+    scalars.
+
+    A row is held by ``per_row`` threads and a thread holds one row for the whole
+    call, covering ``pairs / per_row`` of its lane pairs, so the row's nine table
+    words are read once a row rather than once a step and are applied to every pair
+    the thread holds.
 
     Rows of ``src`` past the chunk's valid tokens are already zero, so the rows an
     M extent was rounded up by stay zero and no consumer needs a predicate.
@@ -1324,43 +1353,55 @@ def _rotate_rows(
 
     Invariants:
         ``lanes`` is even and both tiles are pitched by :func:`smem_pitch`, which is
-        what the pair rests on. Pairing halves the step count, so the tail predicate
-        is reachable where the scalar form's never was: ``span * lanes`` is a
-        multiple of 256 at every legal shape and the pair count only a multiple of
-        128, which a block of 256 threads does not divide.
+        what the pair rests on. The tail predicate is reachable, at the one legal
+        shape whose span is shorter than the rows one pass covers.
     """
     raw = src.element_type
     pairs = lanes // LANE_PAIR
-    total = span * pairs
-    exact = total % threads == 0
+    # One thread to a row, walking that row's pairs, so the row's table entry is read
+    # once and held in registers across them. A flat pass over the pairs gave a thread
+    # a different row at each step and reread the nine words there. The entry is what
+    # the step count multiplies; the copies and the stores are one per pair either way.
+    #
+    # Every legal shape but the shortest span puts :func:`_row_pairs` on
+    # ``threads // span`` exactly, so the row loop has a trip count of one and no
+    # thread idles. The ragged arm is what that span takes.
+    per_row = _row_pairs(threads, span, pairs)
+    rows_per_pass = threads // per_row
+    exact = span % rows_per_pass == 0
+    col0 = 3 * (tid % per_row)
 
     words = paired(dst)
     source = paired(src)
     frag = cute.make_fragment((1, LANE_PAIR), dst.element_type)
     held = cute.make_fragment((3, LANE_PAIR), raw)
 
-    for step in cutlass.range_constexpr(-(-total // threads)):
-        i = tid + step * threads
+    for step in cutlass.range_constexpr(-(-span // rows_per_pass)):
+        r = tid // per_row + step * rows_per_pass
+        # Clamped rather than branched: a row past the run reads real data whose every
+        # use below is predicated away.
+        rs = r
         if cutlass.const_expr(not exact):
-            i = cutlass.min(i, total - 1)
-        r = i // pairs
-        p = i - r * pairs
-        col = 3 * p
-        for k in cutlass.range_constexpr(3):
-            cute.autovec_copy(source[(None, (r + shift, col + k))], held[(k, None)])
-        mat = _mat_at(stable, slot, nbase + r)
-        got = tuple(
-            widen(held[j // LANE_PAIR, j % LANE_PAIR], raw)
-            for j in range(3 * LANE_PAIR)
-        )
-        out = mat3_matvec(mat, (got[0], got[1], got[2])) + mat3_matvec(
-            mat, (got[3], got[4], got[5])
-        )
-        if cutlass.const_expr(exact):
-            store_pair(words, frag, r, col, out)
-        else:
-            if tid + step * threads < total:
-                store_pair(words, frag, r, col, out)
+            rs = cutlass.min(r, span - 1)
+        mat = _mat_at(stable, slot, nbase + rs)
+        for rep in cutlass.range_constexpr(pairs // per_row):
+            col = col0 + 3 * rep * per_row
+            for k in cutlass.range_constexpr(3):
+                cute.autovec_copy(
+                    source[(None, (rs + shift, col + k))], held[(k, None)]
+                )
+            got = tuple(
+                widen(held[j // LANE_PAIR, j % LANE_PAIR], raw)
+                for j in range(3 * LANE_PAIR)
+            )
+            out = mat3_matvec(mat, (got[0], got[1], got[2])) + mat3_matvec(
+                mat, (got[3], got[4], got[5])
+            )
+            if cutlass.const_expr(exact):
+                store_pair(words, frag, rs, col, out)
+            else:
+                if r < span:
+                    store_pair(words, frag, rs, col, out)
 
 
 @cute.jit
