@@ -59,3 +59,17 @@ Each rule below exists because it has been violated before.
 - A percentage of a ceiling is an efficiency, not a speed. Two configurations of
   one kernel are ranked by duration; the percentage says only how much of the
   bus each reached.
+- A quotient of two clocks carries the offset between them. The per-iteration
+  event sum over the host wall bracketing the loop is bounded by that wall in
+  exact arithmetic, but the sum comes off the GPU timer and the wall off the host
+  timer, so once device work fills the wall the quotient sits on the crystal
+  offset: measured on an A6000, 4 to 13 ppm above unity over regions of 3.5 to
+  10.7 s, and 78 to 155 ppm below it under half a second where host overhead
+  dominates instead. A bound of exactly one rejects correct measurements; a bound
+  that is a real check is ppm-scale, not percent-scale.
+- A pass that ran and failed something reaches the machine-readable output, not
+  only the prose. The spill pass fed the class audit and the audit overturned a
+  verdict on it while the JSON carried neither the sectors nor the fact, so a
+  harvest that read the file rather than the log read clean. This is the
+  never-run-pass rule one layer out: an unserialized result is as invisible as an
+  uncollected one.
