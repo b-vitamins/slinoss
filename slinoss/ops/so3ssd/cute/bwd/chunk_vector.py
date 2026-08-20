@@ -498,7 +498,10 @@ LANE_GROUP: int = 16
 whatever the shape, and a 16-lane butterfly stays inside a warp. One thread holds
 one 3-vector, which is what the rowwise transforms and the outer products need and
 what an accumulator fragment cannot give: the atom hands a thread two adjacent
-columns, and a 3-vector straddles that pair."""
+columns, and a 3-vector straddles that pair.
+
+Nine words do not fit one to a lane below a group of nine, so the scratch row is
+stored in ``ceil(ROW_WORDS / LANE_GROUP)`` rounds of ``LANE_GROUP`` words."""
 
 ROW_WORDS: int = 9
 """Float32 scratch per token: the 3x3 rotation cotangent, summed over ``N``.
@@ -507,13 +510,15 @@ The tap cotangents do not appear because ``tap_matrix_vjp`` runs inside the
 epilogue that reduces them, so only the rotation's own sum outlives a phase.
 
 The pitch is this count itself, so a token's nine words are consecutive. The
-rowwise epilogues accumulate them one word a lane over the first nine lanes of a
-:data:`LANE_GROUP`, and a warp spans two groups, so a warp's read-modify-write
-touches 18 consecutive words: 18 distinct banks, at every token. That is a property
-of the pitch rather than a counter reading, and it is why the count is not rounded
-up to a power of two. The post-loop reader takes a whole row per thread instead,
-where nine and 32 being coprime is what keeps 32 consecutive tokens on 32 distinct
-banks. Both hold at every ``L``: the chunk length sets how many lanes the
+rowwise epilogues accumulate them one word a lane, :data:`LANE_GROUP` words a round,
+so a warp's read-modify-write spans ``32 / LANE_GROUP`` tokens and
+``9 * 32 / LANE_GROUP`` consecutive words. At a group of 16 that is two tokens and 18
+words on 18 distinct banks, at every token. That is a property of the pitch rather
+than a counter reading, and it is why the count is not rounded up to a power of two.
+The post-loop reader takes a whole row per thread instead, where nine and 32 being
+coprime is what keeps 32 consecutive tokens on 32 distinct banks.
+
+Both hold at every ``L``: the chunk length sets how many lanes the
 ``token < chunk`` guard leaves active, and masking lanes off removes accesses
 rather than colliding them."""
 
@@ -1148,7 +1153,9 @@ def _spread(vals: tuple[Scalar, ...], lane: cutlass.Int32) -> Scalar:
 
     Args:
         vals: One value per component, the same in every lane of the group, as
-            :func:`_sum_over_lanes` leaves it.
+            :func:`_sum_over_lanes` leaves it. A caller with more components than the
+            group is wide passes one compile-time slice a round, so the chain is never
+            longer than the group and a one-component round costs no select at all.
         lane: Lane within the group. A lane past the last component takes component
             zero, so the caller must predicate it off.
 
@@ -1401,17 +1408,21 @@ def _tap_epilogue(
                         ssum[token + shift, col + j] += out[j]
         gsum = _sum_over_lanes(gsum)
         msum = _sum_over_lanes(msum)
-        # One word a lane. The butterfly leaves the whole nine in every lane of the
-        # group, so the read-modify-write costs one access on nine lanes instead of
-        # nine on one, and the words the group touches are consecutive.
-        held = _spread(gsum, lane)
-        rows = lane < ROW_WORDS
         keep = lane == 0
         if cutlass.const_expr(not exact):
-            rows = rows & inside
             keep = keep & inside
-        if rows:
-            srow[token, lane] += held
+        # One word a lane, a group of words a round. The butterfly leaves the whole
+        # nine in every lane of the group, so the read-modify-write costs one access
+        # on as many lanes as a round is wide instead of nine on one, and the words a
+        # round touches are consecutive.
+        for word in cutlass.range_constexpr(-(-ROW_WORDS // LANE_GROUP)):
+            base = word * LANE_GROUP
+            rows = lane < ROW_WORDS - base
+            if cutlass.const_expr(not exact):
+                rows = rows & inside
+            held = _spread(gsum[base : base + LANE_GROUP], lane)
+            if rows:
+                srow[token, base + lane] += held
         if keep:
             dtap, dw = tap_matrix_vjp(
                 msum,
@@ -1508,13 +1519,15 @@ def _readout_epilogue(
                     else:
                         ssum[ts, col + j] += dc[j]
         gsum = _sum_over_lanes(gsum)
-        # One word a lane, as in :func:`_tap_epilogue`.
-        held = _spread(gsum, lane)
-        keep = lane < ROW_WORDS
-        if cutlass.const_expr(not exact):
-            keep = keep & inside
-        if keep:
-            srow[ts, lane] += held
+        # One word a lane, a group of words a round, as in :func:`_tap_epilogue`.
+        for word in cutlass.range_constexpr(-(-ROW_WORDS // LANE_GROUP)):
+            base = word * LANE_GROUP
+            rows = lane < ROW_WORDS - base
+            if cutlass.const_expr(not exact):
+                rows = rows & inside
+            held = _spread(gsum[base : base + LANE_GROUP], lane)
+            if rows:
+                srow[ts, base + lane] += held
 
 
 @cute.kernel
