@@ -82,11 +82,14 @@ a transposed score tile is not.
   50,688 B; past it the second resident block is gone, so the spending stops
   buying occupancy and starts costing it. Count the tapped region and the operand
   tiles, not the accumulators alone.
-- Past that point the only remaining lever on latency hiding is the grid.
-  `chunk_vector_bwd` is the standing example: at `P = 64` no legal chunk size
-  reaches two blocks per multiprocessor, so at 128 blocks over 84
-  multiprocessors it runs 1.52 waves at 8.33% occupancy and no traffic fix
-  touches that. Put the loop extents in the grid instead.
+- Past that point the grid is the remaining lever on latency hiding, and on a kernel
+  pinned by both registers and shared memory it is not a lever on occupancy.
+  `chunk_vector_bwd` is the standing example: at `P = 64` no legal chunk size reaches
+  two blocks per multiprocessor. Putting the loop extents in the grid took it from
+  128 blocks to 11,520 and from 1.52 waves to 137 per multiprocessor, which was worth
+  taking, and occupancy did not move off 16.6% because two limiters hold it there at
+  once. Put the loop extents in the grid, and price the result as issue rate rather
+  than as occupancy.
 - A footprint that grows with a configuration knob is a ceiling on that knob.
   Tile the knob, or the supported range is whatever the arena happens to hold.
   The backward holds whole `3N` extents, which caps `d_state` well below what
@@ -102,40 +105,53 @@ a transposed score tile is not.
 - No kernel launches fewer blocks than twice the SM count unless it is provably
   serial, documented as such, and measured under 2% of step time.
 
-## The shared pipe
+## The LSU port
 
-A kernel far under its DRAM bar is not moving bytes slowly. It is moving shared
-traffic, and the class bar says nothing about that until the pipe is priced.
+A kernel far under its DRAM bar is not moving bytes slowly. It is issuing memory
+instructions, and the class bar says nothing about that.
 
-- Price an arm in shared wavefronts as well as in bytes. Measured on sm_86, three
-  independent arms of `chunk_vector_bwd`, differing in block width and grid, sat at
-  41.3, 45.4 and 40.9 k wavefronts per microsecond. A change that does not move
-  wavefronts does not move that kernel.
-- That rate is an average and it is not the rate an arm is paid at. Removing
-  22,136,987 wavefronts from `chunk_vector_bwd` bought 216.1 us, a marginal
-  102.4 k/us against the 42.3 k/us average of the same launch. The quotient
-  216.1/527 is 0.41, which is the shared pipe's measured 44.6% of peak: the pipe
-  carries about that fraction of the critical path and the rest is not paid back.
-  Extrapolate an arm with the marginal rate, and treat even that as optimistic,
-  since the pipe's share of the path falls as the count does. Pricing a whole-pipe
-  target at the average overstates it by 2.4x. On this kernel the average said the
-  shared pipe held 3.05x and the marginal rate says it holds at most 1.8x, so the
-  rest of the gap is somewhere else and has to be found rather than assumed.
-- The count to move is `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld`,
-  `..._op_st`, and the `ldmatrix` wavefronts, summed. At the model geometry
-  `chunk_vector_bwd` issues 185 M of them per launch against 6.84 M global loads,
-  runs the pipe at 44.6% of peak with `mio_throttle` at 35.0% and l1tex at 75.5%
-  of speed of light, and reaches 27-29% of DRAM speed of light. The three
-  reduction tails beside it issue zero. Wavefronts are the currency of the first
-  and irrelevant to the others.
-- The wavefront count, not the instruction count, is the cost. One 16-byte access
-  per thread is one wavefront per eight threads; one 4-byte access is one per
-  thread.
-- But the instruction count is the floor a vectorization can reach, so dividing a
-  wavefront count by four to price one is wrong twice over. Conflict-free shared
-  traffic on `chunk_vector_bwd` already runs at about 1.4 wavefronts per shared
-  instruction, 150.4 M wavefronts over 90.4 M instructions, because wide accesses
-  are already there. What vectorizing buys is the instructions it deletes.
+- The unit of cost is the LSU warp-instruction, not the byte and not the shared
+  wavefront. On GA10x the port issues 4 threads per cycle per scheduler, which is
+  half a warp-instruction per multiprocessor per cycle, so **every** LSU
+  warp-instruction costs two multiprocessor cycles: the same for an 8-bit access as
+  for a 128-bit one, and the same however few lanes are active. At 84
+  multiprocessors and 1.78 GHz that is 13.43 ps each, 74.4 k per microsecond. The
+  rate is clock-dependent; recompute it as `2 / (SMs * clock)` rather than quoting
+  74.4 k.
+- The identity that establishes it, on `chunk_vector_bwd` at two clocks:
+
+      sm__inst_executed_pipe_lsu / (SMs * SM_active_cycles * 0.5) == L1/TEX throughput
+      166,152,960 / (84 * 5,421,733 * 0.5) = 72.97%   reported 72.97%
+      166,152,960 / (84 * 5,456,401 * 0.5) = 72.51%   reported 72.50%
+
+  The reported throughput is the instruction count and nothing else, so a kernel
+  near that ceiling is issue-bound on the port and no byte, wavefront or occupancy
+  figure will say so.
+- Warp shuffles issue on the port. `SHFL` moves no bytes, produces no wavefronts and
+  cannot conflict, and it costs full price. On `chunk_vector_bwd` the butterfly in
+  `_sum_over_lanes` is 69,258,240 warp-instructions, 930 us, 30.4% of the kernel and
+  the single largest item in it, and every wavefront-denominated estimate priced it
+  at zero. Rank an arm by the instructions it deletes.
+- The ranked cost is the instruction census, one row per opcode. On
+  `chunk_vector_bwd`: SHFL 69,258,240 (930 us), LDS 49,271,040 (662 us), STS
+  20,989,440 (282 us), LDSM 14,008,320 (188 us), LDG 6,842,880 (92 us), STG
+  5,276,160 (71 us); 166,152,960 in total is 2,232 us of a 3,058.9 us launch, 73.0%.
+  The three reduction tails beside it are DRAM-bound and issue almost nothing.
+- Shared wavefronts are a second-order term, not the currency. They set how long a
+  conflicted access occupies the pipe, so a conflict is still a bug, but removing
+  wavefronts without removing instructions does not move an issue-bound kernel:
+  3.3 M excess wavefronts out of 128 M, from an `STS.64` pitch defect, price at
+  roughly nothing while the port binds. The earlier reading of this kernel derived a
+  marginal 102.4 k wavefronts per microsecond and a 0.41 payback ratio from two
+  landed arms. Both arms removed instructions as well as wavefronts, and the
+  instruction count alone accounts for their microseconds. The ratio was a wrong
+  denominator, not a property of the hardware.
+- A width change is therefore worth more than the wavefront law allows, not less.
+  Folding four scalar `LDS` into one `LDS.128` leaves the wavefront count invariant
+  and deletes three instructions of four. On `chunk_vector_bwd` 79.4 M of 96.8 M
+  memory instructions move four bytes or fewer per lane -- 58,752,000 at 32 bits and
+  20,643,840 at 16 -- so grouping what is legal to group is worth up to 835 us.
+  Two adjacent bfloat16 accesses pack into one 32-bit access for a straight halving.
 - 16-byte access also changes the conflict question, and the scalar answer does
   not carry over. An `LDS.128` is serviced in four phases of eight threads, each
   phase covering the full 128-byte width, so the unit is the 16-byte segment and
@@ -154,26 +170,31 @@ traffic, and the class bar says nothing about that until the pipe is priced.
   padding is what makes the vector form legal, and it is not free: it is a third more
   table bytes, against a shared budget the residency already binds.
 - Bound an arm against every floor at once, or the binding one stays hidden. At
-  `L 64 P 64 3N 240` the six contractions of `chunk_vector_bwd` count 34.12 G flop
-  over 2,304 blocks, 40% of the backward's 85.46 G. That puts its tensor floor at
-  304.7 us and its 70% bar at 435.3 us; its 515.81 MB of counted traffic puts its
-  DRAM floor at 889.8 us; and deleting every one of its 128.2 M shared wavefronts at
-  the measured marginal rate leaves 2,089.9 us. The shared pipe is the binding floor
-  by a factor of two over the next one, and it binds above the target. The kernel
-  runs at 9.1% of bf16 peak and 29.6% is what the budget asks for, so the arithmetic
-  is not the obstacle and neither is the traffic.
-- A pipe that binds while running at 44.6% of its own peak is two levers, not one,
-  and they multiply. The count is one; the utilization is the other, and it is what
-  the 0.41 marginal payback measures. Cutting the count without raising the
-  utilization pays 41 cents on the dollar and the floor stays at 2,089.9 us. The
-  cause of the low utilization is not the pipe: at 16.6% occupancy, eight warps of 48
-  slots, there are too few independent requests in flight to keep the MIO queue fed,
-  which is what `mio_throttle` at 35% reports. Occupancy cannot answer it here, being
-  register-capped at one block. Warp-level ILP can: issue a group of independent
-  shared loads, then the group's math, so the queue stays fed while the warp runs on.
-  That is the rule already stated below for global loads, never yet applied to shared
-  ones. Raising a pipe's utilization multiplies every count-cutting arm behind it, so
-  price it before spending another arm on the count.
+  `L 64 P 64 3N 240` the six contractions of `chunk_vector_bwd` count 34.12 G flop,
+  40% of the backward's 85.46 G. That puts its tensor floor at 304.7 us and its 70%
+  bar at 435.3 us; its 515.84 MB of counted traffic puts its DRAM floor at 889.8 us;
+  its instruction census puts the port term at 2,232 us. The port binds by a factor
+  of 2.5 over the next floor, and it binds above the target, so the arithmetic is not
+  the obstacle and neither is the traffic. The port term is not a floor in the way
+  the other two are: it is the current instruction count priced, and it falls with
+  every instruction deleted.
+- Read the dominant stall to name the queue, then attribute the stall by opcode
+  before prescribing for it. `mio_throttle` at 28.16% of warp-active cycles says the
+  MIO queue is saturated; PC sampling says 55.69% of those samples sit on `SHFL` and
+  25.55% on `LDS`. A saturated queue whose top occupant is a shuffle is not short of
+  requests in flight, so adding independent loads per warp -- the standing
+  prescription for a latency-bound warp -- makes the top stall worse. The same
+  correction applies to the latency term: `short_scoreboard` at 9.84% is held by
+  `FADD` at 25,259 of about 41 k samples, which are the butterfly's own dependent
+  adds, not a load. Stall percentages name a queue; only attribution names an
+  instruction.
+- Occupancy is not the answer when two limiters pin it independently. On
+  `chunk_vector_bwd` `launch__occupancy_limit_registers` and `_shared_mem` are each
+  exactly 1, so cutting registers alone cannot buy a second block while the arena is
+  91.6 KB, and cutting the arena alone cannot while the kernel is at 242 registers.
+  Achieved occupancy is 16.58-16.63% against a theoretical 16.67%, which is 99.5%:
+  there is no imbalance and no tail to recover, and the launch runs 137 waves per
+  multiprocessor, so wave quantization is not in play either.
 - `ldmatrix` reads per flop are set by the warp tiling, not by the instruction.
   The A operand is broadcast across the N warp groups and B across the M groups,
   so a `(warps_m, warps_n)` tiling of an `M*N*K` tile reads `warps_n*M*K +
@@ -270,9 +291,16 @@ named as unjudged rather than passed or failed. This is the reading at the small
 shape, where DRAM reads are zero.
 
 A percentage far under the bar names the shortfall and not its cause. Nothing in
-the class model is a statement about the shared pipe, so a kernel at 13.6% of its
+the class model is a statement about instruction issue, so a kernel at 13.6% of its
 bandwidth is reporting that bytes are not what it is spending its time on. Read the
-wavefront count beside the percentage; see "The shared pipe" above.
+LSU instruction census beside the percentage; see "The LSU port" above.
+
+The three classes do not cover the machine. `chunk_vector_bwd` is at 23-24% of DRAM
+speed of light and 9.4% of the tensor pipe while sitting at 73.0% of the LSU issue
+port, so it is issue-bound and the model has no name for that. The declaration in
+`slinoss/perf/declared.py` stays as it is and the kernel stays failing until either
+the port term comes down or the model grows a fourth class with its own measured
+bar. Declaring the shortfall away is not available.
 
 The percentage also cannot rank two ways of computing the same thing, because an
 arm that deletes traffic takes bytes out of its own numerator. `start_passing_bwd`
