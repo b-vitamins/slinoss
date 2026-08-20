@@ -36,7 +36,7 @@ import torch
 from slinoss.ops.so3ssd.cute.bwd.chunk_start import chunk_start_backward
 from slinoss.ops.so3ssd.cute.bwd.start_passing import SPLIT, start_passing_backward
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
-from slinoss.ops.so3ssd.cute.common import WARPS
+from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import dram_floor_verdict, dram_time_floor
 from slinoss.perf.device import (
@@ -104,7 +104,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--warps",
         type=int,
-        default=WARPS,
+        default=WARPS_WIDE,
         help="Warps per block of the fused kernel. Warps past the first four go to "
         "the tile's N mode, which halves both accumulators at unchanged shared "
         "bytes. Ignored by the pair.",
@@ -163,7 +163,7 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
         suffix += f"-g{args.groups}"
     if args.arm == "fused" and args.span != SPLIT:
         suffix += f"-span{args.span}"
-    if args.arm == "fused" and args.warps != WARPS:
+    if args.arm == "fused" and args.warps != WARPS_WIDE:
         suffix += f"-w{args.warps}"
     if args.arm == "fused" and args.resident is not None:
         suffix += f"-r{args.resident}"

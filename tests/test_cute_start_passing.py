@@ -17,6 +17,8 @@ nontrivial thing the recurrence does. They are functions of ``trans`` alone, so
 the activation width does not enter them.
 """
 
+import inspect
+
 import pytest
 import torch
 from torch import Tensor
@@ -39,6 +41,7 @@ from slinoss.ops.so3ssd.cute.bwd.start_passing import (
     start_passing_backward,
 )
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
+from slinoss.ops.so3ssd.cute.common import WARPS
 from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
@@ -248,7 +251,7 @@ def test_fused_matches_the_unfused_pair(
     ("bsz", "heads", "seqlen", "rows", "lanes", "groups", "dtype", "with_dstate"),
     [case for case in SHAPES if case.id in ("ragged-three", "five-bands")],
 )
-def test_wide_block_matches_the_default_width(
+def test_narrow_block_matches_the_shipped_width(
     bsz: int,
     heads: int,
     seqlen: int,
@@ -258,7 +261,7 @@ def test_wide_block_matches_the_default_width(
     dtype: torch.dtype,
     with_dstate: bool,
 ) -> None:
-    """A wider block moves the tile's N mode and no arithmetic.
+    """The block width moves the tile's N mode and no arithmetic.
 
     Warps past the first four are absorbed into the N atoms, so each accumulator
     element is still one K-long dot product summed in the same order and each
@@ -269,7 +272,16 @@ def test_wide_block_matches_the_default_width(
     Two shapes, one per store path: a ``P`` off the MMA tile selects the predicated
     store, and a ``P`` on it selects the vectorized one, whose partition is the
     width's own.
+
+    The shipped width is the wide one, so the narrow arm is what this passes
+    explicitly. The default is asserted here rather than in the driver's test,
+    because a default that drifted back would leave the operator paying 65 us a call
+    with every assertion still green.
     """
+    assert (
+        inspect.signature(start_passing_backward).parameters["warps"].default
+        == WARPS_WIDE
+    )
     inp = _make(bsz, heads, seqlen, rows, lanes, dtype, groups)
     wide = _double(inp)
     dy, dstate = _seeds(inp, rows, lanes, with_dstate, dtype)
@@ -277,7 +289,7 @@ def test_wide_block_matches_the_default_width(
 
     args = (dy, inp.trans, inp.C, cquat, cscale, CHUNK, dstate)
     want = start_passing_backward(*args)
-    got = start_passing_backward(*args, warps=WARPS_WIDE)
+    got = start_passing_backward(*args, warps=WARPS)
     torch.cuda.synchronize()
 
     assert torch.equal(got.dinc, want.dinc)

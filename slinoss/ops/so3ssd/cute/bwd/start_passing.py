@@ -120,8 +120,10 @@ The class percentage rose with them, 64.0% to 64.9%, on a kernel 11% slower -- a
 :data:`slinoss.perf.declared.DECLARED` cannot be ranked by. The M mode has no atom
 narrower than 64 rows, so the band has no cheaper form and is not a lever.
 
-``warps`` is a parameter and the default is four; nothing in the operator's backward
-passes it.
+``warps`` is a parameter and the default is
+:data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`, the width the table above measures
+fastest. The narrow width stays reachable because the driver prices both under one
+floor fit and the two are asserted bitwise equal.
 """
 
 import cutlass
@@ -145,7 +147,6 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
 )
 from slinoss.ops.so3ssd.cute.bwd.state_passing import StatePassingBwd
 from slinoss.ops.so3ssd.cute.common import (
-    WARPS,
     mat3_matvec,
     mat3_transpose,
     rot_hom,
@@ -164,6 +165,7 @@ from slinoss.ops.so3ssd.cute.guard import (
 )
 from slinoss.ops.so3ssd.cute.mma import (
     SMEM_SEGMENT,
+    WARPS_WIDE,
     make_mma,
     mma_acc,
     mma_atoms,
@@ -570,7 +572,7 @@ def start_passing_backward(
     dstate: Tensor | None = None,
     *,
     span: int = SPLIT,
-    warps: int = WARPS,
+    warps: int = WARPS_WIDE,
     resident: int | None = None,
 ) -> StatePassingBwd:
     """Form every chunk's start-state cotangent and pass it back through the scan.

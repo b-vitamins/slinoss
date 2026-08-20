@@ -102,6 +102,42 @@ a transposed score tile is not.
 - No kernel launches fewer blocks than twice the SM count unless it is provably
   serial, documented as such, and measured under 2% of step time.
 
+## The shared pipe
+
+A kernel far under its DRAM bar is not moving bytes slowly. It is moving shared
+traffic, and the class bar says nothing about that until the pipe is priced.
+
+- Price an arm in shared wavefronts as well as in bytes. Measured on sm_86,
+  duration follows the wavefront count at about 42 k/us: three independent arms
+  of `chunk_vector_bwd`, differing in block width and grid, sat at 41.3, 45.4 and
+  40.9 k/us. A change that does not move wavefronts does not move that kernel.
+- The count to move is `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld`,
+  `..._op_st`, and the `ldmatrix` wavefronts, summed. At the model geometry
+  `chunk_vector_bwd` issues 185 M of them per launch against 6.84 M global loads,
+  runs the pipe at 44.6% of peak with `mio_throttle` at 35.0% and l1tex at 75.5%
+  of speed of light, and reaches 27-29% of DRAM speed of light. The three
+  reduction tails beside it issue zero. Wavefronts are the currency of the first
+  and irrelevant to the others.
+- The wavefront count, not the instruction count, is the cost. One 16-byte access
+  per thread is one wavefront per eight threads; one 4-byte access is one per
+  thread. Vectorizing every shared access of `chunk_vector_bwd` to 16 bytes takes
+  185 M to 60.7 M without deleting one byte of traffic.
+- 16-byte access also changes the conflict question, and the scalar answer does
+  not carry over. An `LDS.128` is serviced in four phases of eight threads, each
+  phase covering the full 128-byte width, so the unit is the 16-byte segment and
+  the modulus is 8 rather than 32. A 48-byte row is 4-way conflicting at scalar
+  width, `gcd(12, 32) = 4`, and conflict-free at vector width, `segment = 3t mod
+  8` being a bijection on eight threads. `48 = 3*16` divides exactly, so three
+  `float4` cover the row with no remainder. The tile base must be 16-byte aligned
+  for it.
+- `ldmatrix` reads per flop are set by the warp tiling, not by the instruction.
+  The A operand is broadcast across the N warp groups and B across the M groups,
+  so a `(warps_m, warps_n)` tiling of an `M*N*K` tile reads `warps_n*M*K +
+  warps_m*N*K` and the ratio is `warps_n/N + warps_m/M`. Widening a block in N
+  buys issue rate and pays that ratio: four warps on a `(64, 16)` tile read
+  0.1250, eight warps read 0.1875, and eight warps on `(64, 32)` read 0.1250
+  again. Widen the tile with the block or the width costs 1.5x in operand reads.
+
 ## DSL rules that come from measurement
 
 - No global load inside a divergent branch, and none inside a `cutlass.range`
@@ -188,6 +224,18 @@ bound on the work a launch did, so the same kernel scores anywhere depending on
 what L2 already held, and the fit is extrapolated there as well. The kernel is
 named as unjudged rather than passed or failed. This is the reading at the smallest
 shape, where DRAM reads are zero.
+
+A percentage far under the bar names the shortfall and not its cause. Nothing in
+the class model is a statement about the shared pipe, so a kernel at 13.6% of its
+bandwidth is reporting that bytes are not what it is spending its time on. Read the
+wavefront count beside the percentage; see "The shared pipe" above.
+
+The percentage also cannot rank two ways of computing the same thing, because an
+arm that deletes traffic takes bytes out of its own numerator. `start_passing_bwd`
+scored 55.2% moving 176 MB in 474.9 us against the 78.7% and 99.3% of the two
+kernels it replaces, which together moved 454 MB in 741.7 us. A row band on the
+same kernel scored 64.9% against 64.0% while running 11% slower. Rank arms by
+microseconds and use the class to ask whether one kernel is done.
 
 A register spill fails a `DRAM-bound` or `TENSOR-bound` kernel outright, whatever
 the percentage says. Both classes hold a counted quantity against a duration, and
