@@ -13,7 +13,6 @@ import pytest
 import torch
 from torch import Tensor
 
-from slinoss.config import STATE_MULTIPLE
 from slinoss.ops.scanprep import PARAM_COLS, pack_params, scanprep_ref
 
 W_MAX = 3.0
@@ -123,14 +122,8 @@ def make_inputs(
             rnd(bsz, heads, seqlen) + ls_bias,
             rnd(bsz, heads, seqlen, 2, 3),
         ),
-        # trans and K depend on neither bc nor 3N, so bc is the narrowest legal
-        # placeholder and its width is unrelated to lanes: one group at the smallest
-        # legal state, outputs discarded. Fixing it here keeps make_inputs able to
-        # build an illegal 3N for a test that asserts the scan rejects one.
-        torch.zeros(bsz, seqlen, 2 * STATE_MULTIPLE, dtype=dtype, device=device),
         torch.zeros(heads, PARAM_COLS, dtype=torch.float32, device=device),
         heads=heads,
-        state_dim=STATE_MULTIPLE,
         w_max=w_max,
     )
 

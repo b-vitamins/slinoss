@@ -1,4 +1,4 @@
-"""The scan's parameter frontier: bounded maps, tap packing, ``B``/``C`` permute."""
+"""The scan's parameter frontier: bounded maps and tap packing."""
 
 from slinoss.ops.scanprep.backends import (
     Backend,

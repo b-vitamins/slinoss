@@ -44,19 +44,17 @@ CUTE = "cute"
 class ScanPrepForward(Protocol):
     """Forward signature every backend implements.
 
-    ``heads`` and ``state_dim`` are keyword-only because they are shape metadata,
-    not operands. ``G`` is absent: it is read off ``bc``.
+    ``heads`` is keyword-only because it is shape metadata, not an operand. ``3N``
+    and ``G`` are absent: nothing here is indexed by the state width.
     """
 
     def __call__(
         self,
         params: Tensor,
-        bc: Tensor,
         param_bias: Tensor,
         /,
         *,
         heads: int,
-        state_dim: int,
         w_max: float,
     ) -> ScanParams: ...
 
@@ -64,8 +62,7 @@ class ScanPrepForward(Protocol):
 class ScanPrepBackward(Protocol):
     """Backward signature every backend implements.
 
-    ``bc`` is absent: the permute is linear, so its pullback reads only ``dB`` and
-    ``dC``. ``param_bias`` is present because the maps' Jacobians are evaluated at
+    ``param_bias`` is present because the maps' Jacobians are evaluated at
     ``params + param_bias``.
     """
 
@@ -73,14 +70,11 @@ class ScanPrepBackward(Protocol):
         self,
         dtrans: Tensor,
         dK: Tensor,
-        dB: Tensor,
-        dC: Tensor,
         params: Tensor,
         param_bias: Tensor,
         /,
         *,
         heads: int,
-        state_dim: int,
         w_max: float,
     ) -> ScanGrads: ...
 

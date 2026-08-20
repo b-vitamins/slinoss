@@ -1,12 +1,14 @@
 """The scan's parameter frontier. Pure-PyTorch reference.
 
-Takes the token-major slices of one projection output and emits every per-token
-operand the scan reads except ``U``: the packed transition ``trans``, the packed
-taps ``K``, and the head-major ``B`` and ``C``.
+Takes the token-major parameter slice of one projection output and emits the two
+operands the scan cannot read off that projection as it lies: the packed
+transition ``trans`` and the packed taps ``K``. ``B`` and ``C`` are pitched bands
+of the same projection and reach the scan's kernels unchanged, so they are not
+operands here.
 
-Both operands are slices of a single ``(B,T,W)`` projection output, so neither is
+``params`` is a slice of a single ``(B,T,W)`` projection output, so it is not
 contiguous: the trailing axis has unit stride and the row stride is the full
-projection width. Nothing here repacks them.
+projection width. Nothing here repacks it.
 
 The numerical invariants the kernels rely on hold by construction, so no kernel
 needs a clamp, an epsilon, or a validity pass:
@@ -41,7 +43,6 @@ from slinoss._precision import (
     check_supported,
     pinned_dtype,
 )
-from slinoss.config import STATE_MULTIPLE
 
 __all__ = [
     "LS_COLUMN",
@@ -151,21 +152,17 @@ def pack_params(w_raw: Tensor, ls_raw: Tensor, tap_raw: Tensor) -> Tensor:
 
 
 class ScanParams(NamedTuple):
-    """Every per-token operand the scan reads except ``U``.
+    """The per-token operands the scan cannot read off the projection as it lies.
 
     Attributes:
         trans: ``(w_x, w_y, w_z, ls)``, shape ``(B,H,T,4)``, pinned dtype.
         K: Per tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned dtype. Tap
             index 0 is previous and 1 is current. Lane 3 is a hard zero, present
             for float4 alignment.
-        B: ``(B,G,T,3N)``, activation dtype, contiguous.
-        C: ``(B,G,T,3N)``, activation dtype, contiguous.
     """
 
     trans: Tensor
     K: Tensor
-    B: Tensor
-    C: Tensor
 
 
 class ScanGrads(NamedTuple):
@@ -173,96 +170,37 @@ class ScanGrads(NamedTuple):
 
     Attributes:
         dparams: ``(B,T,H*PARAM_COLS)``, contiguous, dtype of ``params``.
-        dbc: ``(B,T,2*G*3N)``, contiguous, dtype of ``bc``.
         dparam_bias: ``(H,PARAM_COLS)``, dtype of ``param_bias``.
     """
 
     dparams: Tensor
-    dbc: Tensor
     dparam_bias: Tensor
 
 
-def _groups(bc: Tensor, state_dim: int, heads: int) -> int:
-    """``G``, read off ``bc`` rather than taken on trust.
+def check_operands(params: Tensor, param_bias: Tensor, heads: int) -> None:
+    """Validate the operand set.
 
-    A caller that passed ``G`` could claim one grouping and hand over another, so
-    the grouping is a property of the operand.
-
-    Args:
-        bc: The concatenated ``B``/``C`` operand, ``(B,T,2*G*3N)``.
-        state_dim: ``3N``.
-        heads: ``H``.
-
-    Returns:
-        ``G``.
-
-    Raises:
-        ValueError: If the trailing width is not ``2*G*3N`` for a positive ``G``
-            dividing ``heads``.
-    """
-    width = int(bc.shape[-1])
-    pair = 2 * state_dim
-    if width % pair != 0 or width // pair < 1:
-        raise ValueError(
-            f"bc must be (B,T,2*G*{state_dim}) for a positive G, "
-            f"got trailing width {width}"
-        )
-    groups = width // pair
-    if heads % groups != 0:
-        raise ValueError(
-            f"G {groups}, read off bc, does not divide heads {heads}; "
-            f"a group holds a whole number of heads"
-        )
-    return groups
-
-
-def check_operands(
-    params: Tensor,
-    bc: Tensor,
-    param_bias: Tensor,
-    heads: int,
-    state_dim: int,
-) -> int:
-    """Validate the operand set and return ``G``.
-
-    The shape, stride, and grouping contract every backend shares. The kernel host
+    The shape, stride, and dtype contract every backend shares. The kernel host
     path calls this rather than restating it, so the two cannot disagree; the CuTe
     path adds only what is its own, namely device residency, base alignment, and
     the narrower kernel dtype set.
 
     Args:
         params: ``(B,T,H*PARAM_COLS)``.
-        bc: ``(B,T,2*G*3N)``.
         param_bias: ``(H,PARAM_COLS)``.
         heads: ``H``.
-        state_dim: ``3N``.
-
-    Returns:
-        ``G``.
 
     Raises:
-        ValueError: On a non-positive ``heads``, a ``state_dim`` that is not a
-            positive multiple of :data:`slinoss.config.STATE_MULTIPLE`, a rank or
-            shape mismatch, or a trailing axis whose stride is not one.
-        TypeError: On an unsupported dtype, on two activation dtypes, or on a
-            low-precision ``param_bias``.
+        ValueError: On a non-positive ``heads``, a rank or shape mismatch, or a
+            trailing axis whose stride is not one.
+        TypeError: On an unsupported dtype, or on a low-precision ``param_bias``.
     """
     if heads < 1:
         raise ValueError(f"heads must be positive, got {heads}")
-    if state_dim < STATE_MULTIPLE or state_dim % STATE_MULTIPLE != 0:
-        raise ValueError(
-            f"state_dim is 3N with N a multiple of {STATE_MULTIPLE // 3}, so it "
-            f"must be a positive multiple of {STATE_MULTIPLE}; got {state_dim}"
-        )
     want = heads * PARAM_COLS
     if params.ndim != 3 or params.shape[-1] != want:
         raise ValueError(
             f"params must be (B,T,{want}) at heads={heads}, got {tuple(params.shape)}"
-        )
-    lead = (int(params.shape[0]), int(params.shape[1]))
-    if bc.ndim != 3 or tuple(bc.shape[:2]) != lead:
-        raise ValueError(
-            f"bc must be ({lead[0]},{lead[1]},2*G*3N), got {tuple(bc.shape)}"
         )
     if tuple(param_bias.shape) != (heads, PARAM_COLS):
         raise ValueError(
@@ -274,58 +212,38 @@ def check_operands(
             f"params must have unit stride on its trailing axis, "
             f"got {params.stride(-1)}"
         )
-    if bc.stride(-1) != 1:
-        raise ValueError(
-            f"bc must have unit stride on its trailing axis, got {bc.stride(-1)}"
-        )
     check_supported(params, "params")
-    check_supported(bc, "bc")
     check_pinned(param_bias, "param_bias")
-    if bc.dtype is not params.dtype:
-        raise TypeError(
-            f"bc is {bc.dtype} and params is {params.dtype}; "
-            "both are slices of one projection, so one activation dtype per call"
-        )
-    return _groups(bc, state_dim, heads)
 
 
 def scanprep_ref(
     params: Tensor,
-    bc: Tensor,
     param_bias: Tensor,
     *,
     heads: int,
-    state_dim: int,
     w_max: float,
 ) -> ScanParams:
-    """Apply the bounded maps, pack, and permute ``bc`` head-major.
+    """Apply the bounded maps and pack the result.
 
     Args:
         params: Projection slice, ``(B,T,H*PARAM_COLS)``, activation dtype.
             Trailing stride one; the row stride is the projection width. Per head,
             in order ``(w_x, w_y, w_z, ls, kr0, g0, h0, kr1, g1, h1)``.
-        bc: Projection slice, ``(B,T,2*G*3N)``, same dtype. The first ``G*3N``
-            columns are ``B`` and the second ``G*3N`` are ``C``; within each half
-            group ``g`` occupies columns ``g*3N`` to ``(g+1)*3N``.
         param_bias: ``(H,PARAM_COLS)``, float32, added to every token's row
             before the maps.
         heads: ``H``.
-        state_dim: ``3N``. Positive multiple of
-            :data:`slinoss.config.STATE_MULTIPLE`. ``G`` is
-            ``bc.shape[-1] // (2 * state_dim)``, read off the operand.
         w_max: Rotation-vector norm bound, in ``(0, pi)``.
 
     Returns:
-        A :class:`ScanParams`. ``trans`` and ``K`` are in the pinned dtype (I4);
-        ``B`` and ``C`` keep the activation dtype. All four are contiguous.
+        A :class:`ScanParams`, both fields in the pinned dtype (I4) and
+        contiguous.
 
     Raises:
-        ValueError: On a shape mismatch, a trailing stride other than one, a ``G``
-            that does not divide ``heads``, or a ``w_max`` outside ``(0, pi)``.
-        TypeError: On an unsupported dtype, on two activation dtypes, or on a
-            low-precision ``param_bias``.
+        ValueError: On a shape mismatch, a trailing stride other than one, or a
+            ``w_max`` outside ``(0, pi)``.
+        TypeError: On an unsupported dtype, or on a low-precision ``param_bias``.
     """
-    groups = check_operands(params, bc, param_bias, heads, state_dim)
+    check_operands(params, param_bias, heads)
     dtype = pinned_dtype(params, param_bias)
     with autocast_disabled(params.device.type):
         # (B,T,H,PARAM_COLS) -> (B,H,T,PARAM_COLS). unflatten of a unit-stride
@@ -338,28 +256,17 @@ def scanprep_ref(
         trans = torch.cat([w, ls[..., None]], dim=-1).contiguous()
         packed = torch.cat([tap, torch.zeros_like(tap[..., :1])], dim=-1).contiguous()
 
-    # (B,T,2,G,3N) -> (B,2,G,T,3N). A permute, so its pullback is a permute and
-    # needs nothing saved.
-    split = bc.unflatten(-1, (2, groups, state_dim)).permute(0, 2, 3, 1, 4)
-    return ScanParams(
-        trans=trans,
-        K=packed,
-        B=split[:, 0].contiguous(),
-        C=split[:, 1].contiguous(),
-    )
+    return ScanParams(trans=trans, K=packed)
 
 
 def scanprep_bwd_ref(
     dtrans: Tensor,
     dK: Tensor,
-    dB: Tensor,
-    dC: Tensor,
     params: Tensor,
     param_bias: Tensor,
     /,
     *,
     heads: int,
-    state_dim: int,
     w_max: float,
 ) -> ScanGrads:
     """Pullback of :func:`scanprep_ref`, by autograd through it.
@@ -369,21 +276,14 @@ def scanprep_bwd_ref(
     algebra error passes silently. In float64 this is the gradient authority the
     kernel is measured against.
 
-    ``bc`` is not a parameter: the permute is linear, so its pullback depends on
-    nothing but ``dB`` and ``dC``. The leaf differentiated here is a zero of the
-    right shape and dtype, which the linearity makes exact.
-
     Args:
         dtrans: Cotangent of ``trans``, ``(B,H,T,4)``.
         dK: Cotangent of ``K``, ``(B,H,T,2,4)``. Lane 3 is the cotangent of a
             constant and is discarded.
-        dB: Cotangent of ``B``, ``(B,G,T,3N)``.
-        dC: Cotangent of ``C``, ``(B,G,T,3N)``.
         params: The forward's projection slice, ``(B,T,H*PARAM_COLS)``.
         param_bias: The forward's bias, ``(H,PARAM_COLS)``. The maps' Jacobians
             are evaluated at ``params + param_bias``, so the bias is saved too.
         heads: ``H``.
-        state_dim: ``3N``.
         w_max: The forward's norm bound.
 
     Returns:
@@ -394,58 +294,37 @@ def scanprep_bwd_ref(
             ``(0, pi)``.
         TypeError: On an unsupported dtype.
     """
-    bsz, seqlen, groups = check_cotangents(
-        dtrans, dK, dB, dC, params, param_bias, heads, state_dim
-    )
+    check_cotangents(dtrans, dK, params, param_bias, heads)
     pl = params.detach().requires_grad_(True)
-    bl = torch.zeros(
-        bsz,
-        seqlen,
-        2 * groups * state_dim,
-        dtype=params.dtype,
-        device=params.device,
-        requires_grad=True,
-    )
     cl = param_bias.detach().requires_grad_(True)
     with torch.enable_grad():
-        out = scanprep_ref(pl, bl, cl, heads=heads, state_dim=state_dim, w_max=w_max)
-    dparams, dbc, dparam_bias = torch.autograd.grad(
-        (out.trans, out.K, out.B, out.C), (pl, bl, cl), (dtrans, dK, dB, dC)
+        out = scanprep_ref(pl, cl, heads=heads, w_max=w_max)
+    dparams, dparam_bias = torch.autograd.grad(
+        (out.trans, out.K), (pl, cl), (dtrans, dK)
     )
-    return ScanGrads(
-        dparams=dparams.contiguous(),
-        dbc=dbc.contiguous(),
-        dparam_bias=dparam_bias,
-    )
+    return ScanGrads(dparams=dparams.contiguous(), dparam_bias=dparam_bias)
 
 
 def check_cotangents(
     dtrans: Tensor,
     dK: Tensor,
-    dB: Tensor,
-    dC: Tensor,
     params: Tensor,
     param_bias: Tensor,
     heads: int,
-    state_dim: int,
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     """Validate the backward's operand set.
 
-    Shared by both backends for the same reason as :func:`check_operands`. ``G`` is
-    read off ``dB`` rather than passed.
+    Shared by both backends for the same reason as :func:`check_operands`.
 
     Args:
         dtrans: Cotangent of ``trans``.
         dK: Cotangent of ``K``.
-        dB: Cotangent of ``B``.
-        dC: Cotangent of ``C``.
         params: The forward's projection slice.
         param_bias: The forward's bias.
         heads: ``H``.
-        state_dim: ``3N``.
 
     Returns:
-        ``(B, T, G)``.
+        ``(B, T)``.
 
     Raises:
         ValueError: On a rank or shape mismatch.
@@ -473,16 +352,4 @@ def check_cotangents(
         raise ValueError(
             f"dK must be {(bsz, heads, seqlen, 2, 4)}, got {tuple(dK.shape)}"
         )
-    if dB.ndim != 4 or tuple(dB.shape[2:]) != (seqlen, state_dim):
-        raise ValueError(
-            f"dB must be ({bsz},G,{seqlen},{state_dim}), got {tuple(dB.shape)}"
-        )
-    if tuple(dC.shape) != tuple(dB.shape):
-        raise ValueError(f"dC must be {tuple(dB.shape)}, got {tuple(dC.shape)}")
-    groups = int(dB.shape[1])
-    if int(dB.shape[0]) != bsz or groups < 1 or heads % groups != 0:
-        raise ValueError(
-            f"dB must be ({bsz},G,{seqlen},{state_dim}) with G dividing "
-            f"heads {heads}, got {tuple(dB.shape)}"
-        )
-    return bsz, seqlen, groups
+    return bsz, seqlen

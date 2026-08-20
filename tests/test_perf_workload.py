@@ -455,7 +455,8 @@ def test_prep_shapes_align_every_band_and_carry_the_scan_shape_names() -> None:
         assert shape.params_offset % PROJ_ALIGN == 0
         assert shape.proj_width % PROJ_ALIGN == 0
         assert shape.proj_width >= shape.params_offset + shape.params_width
-    # Neither G = 1 nor G = H exercises the general h // (H//G) address.
+    # G sets the B/C band's share of the projection, so it fixes the column offset
+    # the parameter band is read at.
     wide = prep_shape_by_name("wide")
     assert 1 < wide.groups < wide.scan.heads
     assert SMALL_PREP.token_count == 8
@@ -469,22 +470,20 @@ def test_prep_shapes_align_every_band_and_carry_the_scan_shape_names() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_make_prep_inputs_keeps_the_projection_pitch_on_both_operands() -> None:
+def test_make_prep_inputs_keeps_the_projection_pitch_on_the_parameter_band() -> None:
     got = make_prep_inputs(SMALL_PREP, CPU, dtype=torch.float32)
     scan = SMALL_PREP.scan
     assert tuple(got.proj.shape) == (scan.bsz, scan.seq, SMALL_PREP.proj_width)
     assert tuple(got.params.shape) == (scan.bsz, scan.seq, SMALL_PREP.params_width)
-    assert tuple(got.bc.shape) == (scan.bsz, scan.seq, SMALL_PREP.bc_width)
     # The row pitch is the whole projection and only the trailing axis is unit
     # stride. A contiguous copy here would measure an access pattern the mixer
     # never produces.
     pitch = SMALL_PREP.proj_width
-    for band in (got.params, got.bc):
-        assert band.stride() == (scan.seq * pitch, pitch, 1)
-        assert not band.is_contiguous()
+    assert got.params.stride() == (scan.seq * pitch, pitch, 1)
+    assert not got.params.is_contiguous()
     # Leaves, so the backward measures the frontier and not a pullback into a
     # zeroed projection buffer.
-    assert got.differentiable == (got.params, got.bc, got.param_bias)
+    assert got.differentiable == (got.params, got.param_bias)
     assert all(t.requires_grad and t.is_leaf for t in got.differentiable)
     assert not any(t.requires_grad for t in got.cotangents)
     plain = make_prep_inputs(SMALL_PREP, CPU, requires_grad=False)
@@ -493,20 +492,12 @@ def test_make_prep_inputs_keeps_the_projection_pitch_on_both_operands() -> None:
     # packed outputs' cotangents.
     low = make_prep_inputs(SMALL_PREP, CPU, dtype=torch.bfloat16)
     assert low.params.dtype == torch.bfloat16
-    assert low.bc.dtype == torch.bfloat16
     assert low.param_bias.dtype == torch.float32
     assert low.dtrans.dtype == torch.float32
     assert low.dK.dtype == torch.float32
-    assert low.dB.dtype == torch.bfloat16
     lead = (scan.bsz, scan.heads, scan.seq)
     assert tuple(low.dtrans.shape) == (*lead, 4)
     assert tuple(low.dK.shape) == (*lead, 2, 4)
-    assert tuple(low.dB.shape) == (
-        scan.bsz,
-        SMALL_PREP.groups,
-        scan.seq,
-        scan.d_state,
-    )
     # Two runs of a bench must compare the same numbers.
     assert torch.equal(
         make_prep_inputs(SMALL_PREP, CPU, seed=7).proj,

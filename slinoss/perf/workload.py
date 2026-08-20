@@ -242,18 +242,8 @@ def make_inputs(
                 randn(*lead, dt=torch.float32),
                 randn(*lead, 2, 3, dt=torch.float32),
             ),
-            # trans and K do not depend on bc, and B and C are drawn below, so bc
-            # is the narrowest legal placeholder: one group, outputs discarded.
-            torch.zeros(
-                shape.bsz,
-                shape.seq,
-                2 * shape.d_state,
-                dtype=torch.float32,
-                device=device,
-            ),
             torch.zeros(shape.heads, PARAM_COLS, dtype=torch.float32, device=device),
             heads=shape.heads,
-            state_dim=shape.d_state,
             w_max=W_MAX,
         )
     trans = params.trans.detach().requires_grad_(requires_grad)
@@ -676,9 +666,9 @@ PREP_SHAPES: Final[tuple[PrepShape, ...]] = tuple(
 """The standard frontier sizes, one per entry of :data:`SHAPES` and the same names.
 
 ``G`` is 1 at every name but ``wide``, which is the config default and therefore
-the headline case. ``wide`` takes ``G = 4`` against ``H = 12``, so three heads share
-a pair: neither ``G = 1`` nor ``G = H`` exercises the general ``h // (H//G)``
-address, and the ``B``/``C`` band's share of the projection is a function of ``G``.
+the headline case. ``wide`` takes ``G = 4`` against ``H = 12``: the ``B``/``C``
+band's share of the projection is a function of ``G``, so ``G`` fixes the column
+offset the parameter band is read at.
 """
 
 
@@ -703,41 +693,35 @@ def prep_shape_by_name(name: str) -> PrepShape:
 class PrepInputs(NamedTuple):
     """Parameter-frontier inputs at one shape.
 
-    ``params`` and ``bc`` are detached slices of ``proj``, so each is a leaf with
-    the row pitch the fused projection gives it. Slicing a leaf instead would put
-    a pullback into a zeroed ``(B,T,W)`` buffer inside the backward measurement,
-    which is the projection's cost and not the frontier's.
+    ``params`` is a detached slice of ``proj``, so it is a leaf with the row pitch
+    the fused projection gives it. Slicing a leaf instead would put a pullback into
+    a zeroed ``(B,T,W)`` buffer inside the backward measurement, which is the
+    projection's cost and not the frontier's.
 
     Attributes:
-        proj: ``(B,T,W)`` projection output, contiguous. Held only to keep the two
-            slices alive and to name the pitch; not differentiated.
+        proj: ``(B,T,W)`` projection output, contiguous. Held only to keep the
+            slice alive and to name the pitch; not differentiated.
         params: ``(B,T,10H)`` pitched slice, activation dtype.
-        bc: ``(B,T,2*G*3N)`` pitched slice, same dtype.
         param_bias: ``(H,10)``, float32.
         dtrans: ``(B,H,T,4)`` float32 cotangent seed.
         dK: ``(B,H,T,2,4)`` float32 cotangent seed.
-        dB: ``(B,G,T,3N)`` cotangent seed, activation dtype.
-        dC: ``(B,G,T,3N)`` cotangent seed, activation dtype.
     """
 
     proj: Tensor
     params: Tensor
-    bc: Tensor
     param_bias: Tensor
     dtrans: Tensor
     dK: Tensor
-    dB: Tensor
-    dC: Tensor
 
     @property
     def differentiable(self) -> tuple[Tensor, ...]:
-        """The three tensors gradients are taken with respect to."""
-        return (self.params, self.bc, self.param_bias)
+        """The two tensors gradients are taken with respect to."""
+        return (self.params, self.param_bias)
 
     @property
     def cotangents(self) -> tuple[Tensor, ...]:
-        """The four output-gradient seeds, in output order."""
-        return (self.dtrans, self.dK, self.dB, self.dC)
+        """The two output-gradient seeds, in output order."""
+        return (self.dtrans, self.dK)
 
 
 def make_prep_inputs(
@@ -755,7 +739,7 @@ def make_prep_inputs(
         device: Where to allocate.
         dtype: Dtype of the projection. ``param_bias`` is float32 regardless, as
             I4 requires.
-        requires_grad: Whether the three differentiable inputs carry gradients.
+        requires_grad: Whether the two differentiable inputs carry gradients.
         seed: Generator seed, so two runs benchmark the same numbers.
 
     Returns:
@@ -770,21 +754,17 @@ def make_prep_inputs(
 
     with torch.no_grad():
         proj = randn(scan.bsz, scan.seq, shape.proj_width)
-    # Each band by offset and width, not to the end: the padding that squares the
-    # projection width with the alignment sits past the last band.
-    bc_columns = slice(shape.bc_offset, shape.bc_offset + shape.bc_width)
+    # By offset and width, not to the end: the padding that squares the projection
+    # width with the alignment sits past the last band.
     param_columns = slice(shape.params_offset, shape.params_offset + shape.params_width)
     return PrepInputs(
         proj=proj,
         params=proj[..., param_columns].detach().requires_grad_(requires_grad),
-        bc=proj[..., bc_columns].detach().requires_grad_(requires_grad),
         param_bias=torch.zeros(
             scan.heads, PARAM_COLS, dtype=torch.float32, device=device
         ).requires_grad_(requires_grad),
         dtrans=randn(*lead, 4, dt=torch.float32),
         dK=randn(*lead, 2, 4, dt=torch.float32),
-        dB=randn(scan.bsz, shape.groups, scan.seq, scan.d_state),
-        dC=randn(scan.bsz, shape.groups, scan.seq, scan.d_state),
     )
 
 
@@ -799,7 +779,7 @@ def prep_forward_only(
 
     Args:
         inputs: Frontier inputs.
-        shape: The problem size, for ``H`` and ``3N``.
+        shape: The problem size, for ``H``.
         backend: Backend name, or None for the fastest registered one.
         prefix: Region label prefix. See :func:`forward_only`.
 
@@ -811,10 +791,8 @@ def prep_forward_only(
         with torch.no_grad(), region(f"{prefix}.forward"):
             scanprep(
                 inputs.params,
-                inputs.bc,
                 inputs.param_bias,
                 heads=shape.scan.heads,
-                state_dim=shape.scan.d_state,
                 w_max=W_MAX,
                 backend=backend,
             )
@@ -833,10 +811,10 @@ def prep_step(
     """A callable that runs the frontier forward and backward.
 
     Args:
-        inputs: Frontier inputs. The three differentiable ones must require grad.
-        shape: The problem size, for ``H`` and ``3N``.
+        inputs: Frontier inputs. The two differentiable ones must require grad.
+        shape: The problem size, for ``H``.
         backend: Backend name, or None for the fastest registered one.
-        wrt: Tensors to differentiate with respect to. Defaults to all three.
+        wrt: Tensors to differentiate with respect to. Defaults to both.
         prefix: Region label prefix. See :func:`forward_only`.
 
     Returns:
@@ -854,10 +832,8 @@ def prep_step(
         with region(f"{prefix}.forward"):
             out = scanprep(
                 inputs.params,
-                inputs.bc,
                 inputs.param_bias,
                 heads=shape.scan.heads,
-                state_dim=shape.scan.d_state,
                 w_max=W_MAX,
                 backend=backend,
             )

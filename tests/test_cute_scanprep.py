@@ -12,11 +12,11 @@ so the same seed at two dtypes is two different problems. The oracle reads the c
 operands, so the kernel and the oracle evaluate the maps at identical values at
 every width.
 
-Both operands are cut out of one wider row at aligned column offsets, which is the
+``params`` is cut out of one wider row at an aligned column offset, which is the
 shipped layout: the mixer runs one projection GEMM and hands out views. The sweep
-narrows them to their own allocation at the smallest legal row pitch, and one test
-keeps them at the projection pitch and demands bitwise equality, because a kernel
-that only handled one pitch would pass every other test here.
+narrows it to its own allocation at the smallest legal row pitch, and one test keeps
+it at the projection pitch and demands bitwise equality, because a kernel that only
+handled one pitch would pass every other test here.
 """
 
 import pytest
@@ -32,7 +32,6 @@ from collections.abc import Callable
 import cutlass.cute as cute
 
 from slinoss._guard import ALIGN_BYTES
-from slinoss.config import STATE_MULTIPLE
 from slinoss.ops.scanprep import (
     PARAM_COLS,
     ScanGrads,
@@ -51,35 +50,34 @@ from tests.conftest import W_MAX, assert_max_rel, max_err
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-Shape = tuple[int, int, int, int, int]
-Operands = tuple[Tensor, Tensor, Tensor]
-Cotangents = tuple[Tensor, Tensor, Tensor, Tensor]
-FwdMutator = Callable[[Tensor, Tensor, Tensor], Operands]
-BwdCase = tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
-BwdMutator = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], BwdCase]
+Shape = tuple[int, int, int]
+Operands = tuple[Tensor, Tensor]
+Cotangents = tuple[Tensor, Tensor]
+FwdMutator = Callable[[Tensor, Tensor], Operands]
+BwdCase = tuple[Tensor, Tensor, Tensor]
+BwdMutator = Callable[[Tensor, Tensor, Tensor], BwdCase]
 
-# (bsz, heads, seqlen, groups, state_dim). One block covers TILE_TOKENS tokens of
-# one batch, so the sweep is over T against that tile and over the head and group
-# counts the tile arithmetic is compiled for: one exact tile, a tail shorter than a
-# tile, a ragged tail above three tiles at G = H, many exact tiles at a head and
-# group count whose work counts divide the block width so the tail predicates
-# elide, the widest state at the mixer's head count, and a single token. B = 1,
-# H = 1, G = 1, and the smallest legal 3N all appear. Every T is written against
+# (bsz, heads, seqlen). One block covers TILE_TOKENS tokens of one batch, so the
+# sweep is over T against that tile and over the head counts the tile arithmetic is
+# compiled for: one exact tile, a tail shorter than a tile, a ragged tail above
+# three tiles, many exact tiles at a head count whose work counts divide the block
+# width so the tail predicates elide, the mixer's own head count over many tiles,
+# and a single token. B = 1 and H = 1 both appear. Every T is written against
 # TILE_TOKENS, so shrinking the tile cannot silently retire the ragged cases.
 SHAPES: list[Shape] = [
-    (1, 1, TILE_TOKENS, 1, STATE_MULTIPLE),
-    (1, 1, TILE_TOKENS - 1, 1, STATE_MULTIPLE),
-    (2, 3, 25 * TILE_TOKENS + 1, 3, STATE_MULTIPLE),
-    (4, 32, 8 * TILE_TOKENS, 2, STATE_MULTIPLE),
-    (2, 12, 50 * TILE_TOKENS, 1, 2 * STATE_MULTIPLE),
-    (1, 1, 1, 1, STATE_MULTIPLE),
+    (1, 1, TILE_TOKENS),
+    (1, 1, TILE_TOKENS - 1),
+    (2, 3, 25 * TILE_TOKENS + 1),
+    (4, 32, 8 * TILE_TOKENS),
+    (2, 12, 50 * TILE_TOKENS),
+    (1, 1, 1),
 ]
 SHAPE_IDS = [
     "one-exact-tile",
     "tail-only",
-    "ragged-tail-grouped",
+    "ragged-tail",
     "many-tiles-exact",
-    "wide-state",
+    "mixer-heads",
     "single-token",
 ]
 
@@ -150,9 +148,9 @@ def _narrow(view: Tensor) -> Tensor:
 
 
 def _tag(shape: Shape, dtype: torch.dtype) -> str:
-    bsz, heads, seqlen, groups, state_dim = shape
+    bsz, heads, seqlen = shape
     width = str(dtype).removeprefix("torch.")
-    return f"cute-scanprep[{bsz}x{heads}x{seqlen}/G{groups}/{state_dim}/{width}]"
+    return f"cute-scanprep[{bsz}x{heads}x{seqlen}/{width}]"
 
 
 def _operands(
@@ -163,85 +161,65 @@ def _operands(
     bias: float = 1.0,
     strided: bool = False,
 ) -> Operands:
-    """``(params, bc, param_bias)`` on CUDA.
+    """``(params, param_bias)`` on CUDA.
 
-    Both projection slices are cut out of one row at aligned column offsets, with
-    padding before, between, and after them, so a kernel that assumed a compact
-    operand reads the wrong columns. ``strided`` leaves them as views; otherwise
-    they are narrowed by :func:`_narrow`, and the two hold the same values.
+    The projection slice is cut out of a wider row at an aligned column offset, with
+    padding before and after it, so a kernel that assumed a compact operand reads
+    the wrong columns. ``strided`` leaves it as a view; otherwise it is narrowed by
+    :func:`_narrow`, and the two hold the same values.
     """
-    bsz, heads, seqlen, groups, state_dim = shape
+    bsz, heads, seqlen = shape
     gen = torch.Generator(device="cuda").manual_seed(seed)
     pwidth = heads * PARAM_COLS
-    bwidth = 2 * groups * state_dim
     poff = ALIGN_ELEMS
-    boff = _align(poff + pwidth)
-    width = _align(boff + bwidth) + ALIGN_ELEMS
+    width = _align(poff + pwidth) + ALIGN_ELEMS
     row = torch.randn(
         bsz, seqlen, width, generator=gen, dtype=torch.float32, device="cuda"
     )
     row[..., poff : poff + 3] *= W_SCALE
     row = row.to(dtype)
     params = row[..., poff : poff + pwidth]
-    bc = row[..., boff : boff + bwidth]
     if not strided:
-        params, bc = _narrow(params), _narrow(bc)
+        params = _narrow(params)
     pbias = torch.randn(
         heads, PARAM_COLS, generator=gen, dtype=torch.float32, device="cuda"
     )
-    return params, bc, pbias * bias
+    return params, pbias * bias
 
 
-def _cotangents(shape: Shape, dtype: torch.dtype, *, seed: int) -> Cotangents:
-    """``(dtrans, dK, dB, dC)``. The packed pair is float32 whatever the width,
-    because I4 pins both packed outputs."""
-    bsz, heads, seqlen, groups, state_dim = shape
+def _cotangents(shape: Shape, *, seed: int) -> Cotangents:
+    """``(dtrans, dK)``. Both are float32 whatever the activation width, because I4
+    pins both packed outputs."""
+    bsz, heads, seqlen = shape
     gen = torch.Generator(device="cuda").manual_seed(seed)
 
     def rnd(*size: int) -> Tensor:
         return torch.randn(*size, generator=gen, dtype=torch.float32, device="cuda")
 
-    return (
-        rnd(bsz, heads, seqlen, 4),
-        rnd(bsz, heads, seqlen, 2, 4),
-        rnd(bsz, groups, seqlen, state_dim).to(dtype),
-        rnd(bsz, groups, seqlen, state_dim).to(dtype),
-    )
+    return rnd(bsz, heads, seqlen, 4), rnd(bsz, heads, seqlen, 2, 4)
 
 
 def _forward(ops: Operands, shape: Shape) -> ScanParams:
-    return scanprep_forward(*ops, heads=shape[1], state_dim=shape[4], w_max=W_MAX)
+    return scanprep_forward(*ops, heads=shape[1], w_max=W_MAX)
 
 
 def _oracle(ops: Operands, shape: Shape) -> ScanParams:
-    params, bc, pbias = ops
-    return scanprep_ref(
-        params.double(),
-        bc.double(),
-        pbias.double(),
-        heads=shape[1],
-        state_dim=shape[4],
-        w_max=W_MAX,
-    )
+    params, pbias = ops
+    return scanprep_ref(params.double(), pbias.double(), heads=shape[1], w_max=W_MAX)
 
 
 def _backward(cots: Cotangents, ops: Operands, shape: Shape) -> ScanGrads:
-    return scanprep_backward(
-        *cots, ops[0], ops[2], heads=shape[1], state_dim=shape[4], w_max=W_MAX
-    )
+    return scanprep_backward(*cots, *ops, heads=shape[1], w_max=W_MAX)
 
 
 def _oracle_grads(cots: Cotangents, ops: Operands, shape: Shape) -> ScanGrads:
-    dtrans, dK, dB, dC = cots
+    dtrans, dK = cots
     return scanprep_bwd_ref(
         dtrans.double(),
         dK.double(),
-        dB.double(),
-        dC.double(),
         ops[0].double(),
-        ops[2].double(),
+        ops[1].double(),
         heads=shape[1],
-        state_dim=shape[4],
         w_max=W_MAX,
     )
 
@@ -249,16 +227,15 @@ def _oracle_grads(cots: Cotangents, ops: Operands, shape: Shape) -> ScanGrads:
 def _leaves(ops: Operands, *, double: bool) -> Operands:
     """The same operands as differentiable leaves. The upcast is exact.
 
-    The two projection slices are rebuilt through :func:`_narrow` rather than
-    ``clone``, which would give them a row pitch off the alignment at a head count
-    whose row is not already a multiple of :data:`ALIGN_ELEMS`.
+    The projection slice is rebuilt through :func:`_narrow` rather than ``clone``,
+    which would give it a row pitch off the alignment at a head count whose row is
+    not already a multiple of :data:`ALIGN_ELEMS`.
     """
-    params, bc, pbias = ops
+    params, pbias = ops
     if double:
-        params, bc, pbias = params.double(), bc.double(), pbias.double()
+        params, pbias = params.double(), pbias.double()
     return (
         _narrow(params).detach().requires_grad_(),
-        _narrow(bc).detach().requires_grad_(),
         pbias.detach().clone().requires_grad_(),
     )
 
@@ -276,13 +253,8 @@ def _grad(tensor: Tensor) -> Tensor:
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES, ids=SHAPE_IDS)
 def test_forward_matches_reference(shape: Shape, dtype: torch.dtype) -> None:
-    """Every output the scan reads, against the float64 frontier.
-
-    ``B`` and ``C`` are a permute of the operand, so their bound is equality: the
-    kernel converts nothing on that path and a tolerance there would hide a
-    misplaced column.
-    """
-    bsz, heads, seqlen, groups, state_dim = shape
+    """Both outputs the scan reads, against the float64 frontier."""
+    bsz, heads, seqlen = shape
     ops = _operands(shape, dtype, seed=1)
     want = _oracle(ops, shape)
 
@@ -291,23 +263,13 @@ def test_forward_matches_reference(shape: Shape, dtype: torch.dtype) -> None:
 
     assert got.trans.shape == (bsz, heads, seqlen, 4)
     assert got.K.shape == (bsz, heads, seqlen, 2, 4)
-    assert got.B.shape == (bsz, groups, seqlen, state_dim)
-    assert got.C.shape == got.B.shape
     assert got.trans.dtype is torch.float32
     assert got.K.dtype is torch.float32
-    assert got.B.dtype is dtype
-    assert got.C.dtype is dtype
     assert all(t.is_contiguous() for t in got)
 
     tag = _tag(shape, dtype)
     assert_max_rel(got.trans, want.trans, FWD_TOL, f"{tag}.trans")
     assert_max_rel(got.K, want.K, FWD_TOL, f"{tag}.K")
-    bc = ops[1]
-    half = groups * state_dim
-    for grp in range(groups):
-        lo = grp * state_dim
-        assert torch.equal(got.B[:, grp], bc[..., lo : lo + state_dim])
-        assert torch.equal(got.C[:, grp], bc[..., half + lo : half + lo + state_dim])
 
 
 def test_lane_three_is_a_hard_zero() -> None:
@@ -317,7 +279,7 @@ def test_lane_three_is_a_hard_zero() -> None:
     the same block back to the output; without it the check passes on any allocator
     that happens to return zeros.
     """
-    bsz, heads, seqlen, _, _ = ONE
+    bsz, heads, seqlen = ONE
     poison = torch.full((bsz, heads, seqlen, 2, 4), float("nan"), device="cuda")
     assert bool(poison.isnan().all())
     del poison
@@ -328,23 +290,22 @@ def test_lane_three_is_a_hard_zero() -> None:
 
 
 def test_kernels_read_a_projection_slice_without_repacking_it() -> None:
-    """Bitwise equality against narrowed operands, in both directions.
+    """Bitwise equality against a narrowed operand, in both directions.
 
     The row pitch is taken from the operand at runtime, so the wide-pitch and the
     narrow-pitch call are the same executor and must produce identical bits. The
     backward reads ``params`` the same way, so it is checked in the same test
     rather than under a second fixture.
     """
-    params, bc, pbias = _operands(ONE, seed=3, strided=True)
+    params, pbias = _operands(ONE, seed=3, strided=True)
     assert params.stride(-1) == 1 and not params.is_contiguous()
-    assert bc.stride(-1) == 1 and not bc.is_contiguous()
-    compact = (_narrow(params), _narrow(bc), pbias)
+    compact = (_narrow(params), pbias)
     assert compact[0].stride(-2) != params.stride(-2)
-    cots = _cotangents(ONE, torch.float32, seed=4)
+    cots = _cotangents(ONE, seed=4)
 
-    strided_out = _forward((params, bc, pbias), ONE)
+    strided_out = _forward((params, pbias), ONE)
     compact_out = _forward(compact, ONE)
-    strided_grads = _backward(cots, (params, bc, pbias), ONE)
+    strided_grads = _backward(cots, (params, pbias), ONE)
     compact_grads = _backward(cots, compact, ONE)
     torch.cuda.synchronize()
 
@@ -362,7 +323,6 @@ def test_outputs_stay_float32_under_autocast() -> None:
         got = _forward(ops, SHAPES[0])
     assert got.trans.dtype is torch.float32
     assert got.K.dtype is torch.float32
-    assert got.B.dtype is torch.float32
 
 
 def test_float16_takes_its_own_kernel_path() -> None:
@@ -372,7 +332,7 @@ def test_float16_takes_its_own_kernel_path() -> None:
     neither of which interacts with the shape, so one shape covers the axis.
     """
     ops = _operands(SHAPES[0], torch.float16, seed=12)
-    cots = _cotangents(SHAPES[0], torch.float16, seed=13)
+    cots = _cotangents(SHAPES[0], seed=13)
     want = _oracle(ops, SHAPES[0])
     want_grads = _oracle_grads(cots, ops, SHAPES[0])
 
@@ -380,7 +340,6 @@ def test_float16_takes_its_own_kernel_path() -> None:
     got_grads = _backward(cots, ops, SHAPES[0])
     torch.cuda.synchronize()
 
-    assert got.B.dtype is torch.float16
     assert got_grads.dparams.dtype is torch.float16
     tag = _tag(SHAPES[0], torch.float16)
     assert_max_rel(got.trans, want.trans, FWD_TOL, f"{tag}.trans")
@@ -400,7 +359,6 @@ def _extreme_operands() -> Operands:
     params = vals[:, None].expand(count, PARAM_COLS).reshape(1, count, PARAM_COLS)
     return (
         _narrow(params),
-        torch.zeros(1, count, 2 * STATE_MULTIPLE, dtype=torch.float32, device="cuda"),
         torch.zeros(1, PARAM_COLS, dtype=torch.float32, device="cuda"),
     )
 
@@ -414,7 +372,7 @@ def test_extreme_raws_match_the_reference() -> None:
     that the float32 map and the float64 oracle disagree by width, not by kernel,
     which is the next test.
     """
-    shape: Shape = (1, 1, len(EXTREME_RAWS), 1, STATE_MULTIPLE)
+    shape: Shape = (1, 1, len(EXTREME_RAWS))
     ops = _extreme_operands()
     want = _oracle(ops, shape)
 
@@ -444,11 +402,10 @@ def test_overflowing_raw_norm_stays_finite() -> None:
     is all I2 claims. The float64 oracle does not overflow, so this is a property
     check and not a parity check.
     """
-    shape: Shape = (1, 1, 8, 1, STATE_MULTIPLE)
+    shape: Shape = (1, 1, 8)
     huge = torch.full((1, 8, PARAM_COLS), 1e30, dtype=torch.float32, device="cuda")
     ops = (
         _narrow(huge),
-        torch.zeros(1, 8, 2 * STATE_MULTIPLE, dtype=torch.float32, device="cuda"),
         torch.zeros(1, PARAM_COLS, dtype=torch.float32, device="cuda"),
     )
     got = _forward(ops, shape)
@@ -466,43 +423,36 @@ def test_overflowing_raw_norm_stays_finite() -> None:
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES, ids=SHAPE_IDS)
 def test_backward_matches_reference_autograd(shape: Shape, dtype: torch.dtype) -> None:
-    """All three gradients against float64 autograd through the reference.
-
-    ``dbc`` is the inverse permute of ``dB`` and ``dC``, so its bound is equality
-    after widening: the kernel moves those bits and computes nothing.
-    """
-    bsz, heads, seqlen, groups, state_dim = shape
+    """Both gradients against float64 autograd through the reference."""
+    bsz, heads, seqlen = shape
     ops = _operands(shape, dtype, seed=1)
-    cots = _cotangents(shape, dtype, seed=2)
+    cots = _cotangents(shape, seed=2)
     want = _oracle_grads(cots, ops, shape)
 
     got = _backward(cots, ops, shape)
     torch.cuda.synchronize()
 
     assert got.dparams.shape == (bsz, seqlen, heads * PARAM_COLS)
-    assert got.dbc.shape == (bsz, seqlen, 2 * groups * state_dim)
     assert got.dparam_bias.shape == (heads, PARAM_COLS)
     assert got.dparams.dtype is dtype
-    assert got.dbc.dtype is dtype
     assert got.dparam_bias.dtype is torch.float32
     assert all(t.is_contiguous() for t in got)
 
     tag = _tag(shape, dtype)
     assert_max_rel(got.dparams, want.dparams, BWD_TOL[dtype], f"{tag}.dparams")
     assert_max_rel(got.dparam_bias, want.dparam_bias, BIAS_TOL, f"{tag}.dparam_bias")
-    assert torch.equal(got.dbc.double(), want.dbc)
 
 
 def test_backward_ignores_the_lane_three_cotangent() -> None:
     """Lane 3 of each tap is a constant zero, so its cotangent is the cotangent of
     nothing. A pullback that read it would leak into ``dparams``."""
     ops = _operands(ONE, seed=8)
-    dtrans, dK, dB, dC = _cotangents(ONE, torch.float32, seed=9)
+    dtrans, dK = _cotangents(ONE, seed=9)
     loud = dK.clone()
     loud[..., 3] = 1e6
 
-    quiet = _backward((dtrans, dK, dB, dC), ops, ONE)
-    got = _backward((dtrans, loud, dB, dC), ops, ONE)
+    quiet = _backward((dtrans, dK), ops, ONE)
+    got = _backward((dtrans, loud), ops, ONE)
     torch.cuda.synchronize()
 
     assert torch.equal(got.dparams, quiet.dparams)
@@ -518,38 +468,36 @@ def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     and its registry dispatch, so a disagreement between the two cannot hide behind
     a surrogate forward.
     """
-    heads, state_dim = ONE[1], ONE[4]
+    heads = ONE[1]
     ops = _operands(ONE, dtype, seed=10)
-    dtrans, dK, dB, dC = _cotangents(ONE, dtype, seed=11)
+    dtrans, dK = _cotangents(ONE, seed=11)
     fast = _leaves(ops, double=False)
     oracle = _leaves(ops, double=True)
 
-    got = scanprep(*fast, heads=heads, state_dim=state_dim, w_max=W_MAX, backend="cute")
-    total = (got.trans * dtrans).sum() + (got.K * dK).sum()
-    (total + (got.B * dB).sum() + (got.C * dC).sum()).backward()
+    got = scanprep(*fast, heads=heads, w_max=W_MAX, backend="cute")
+    ((got.trans * dtrans).sum() + (got.K * dK).sum()).backward()
 
-    want = scanprep_ref(*oracle, heads=heads, state_dim=state_dim, w_max=W_MAX)
+    want = scanprep_ref(*oracle, heads=heads, w_max=W_MAX)
     ref = (want.trans * dtrans.double()).sum() + (want.K * dK.double()).sum()
-    (ref + (want.B * dB.double()).sum() + (want.C * dC.double()).sum()).backward()
+    ref.backward()
     torch.cuda.synchronize()
 
     tag = f"{_tag(ONE, dtype)}.e2e"
     assert_max_rel(got.trans, want.trans, FWD_TOL, f"{tag}.trans")
     assert_max_rel(_grad(fast[0]), _grad(oracle[0]), BWD_TOL[dtype], f"{tag}.dparams")
-    assert_max_rel(_grad(fast[2]), _grad(oracle[2]), BIAS_TOL, f"{tag}.dparam_bias")
-    assert torch.equal(_grad(fast[1]).double(), _grad(oracle[1]))
+    assert_max_rel(_grad(fast[1]), _grad(oracle[1]), BIAS_TOL, f"{tag}.dparam_bias")
 
 
 # ---------------------------------------------------------------------------
 # Rejections
 # ---------------------------------------------------------------------------
 
-REJECT: Shape = (2, 3, 8, 1, STATE_MULTIPLE)
+REJECT: Shape = (2, 3, 8)
 
 
 def _unaligned(shape: Shape) -> Tensor:
     """A ``params``-shaped slice whose base address is one element in."""
-    bsz, heads, seqlen, _, _ = shape
+    bsz, heads, seqlen = shape
     width = heads * PARAM_COLS
     row = torch.randn(bsz, seqlen, width + 2, dtype=torch.float32, device="cuda")
     return row[..., 1 : 1 + width]
@@ -557,7 +505,7 @@ def _unaligned(shape: Shape) -> Tensor:
 
 def _stride_two(shape: Shape) -> Tensor:
     """A ``params``-shaped view whose trailing stride is two."""
-    bsz, heads, seqlen, _, _ = shape
+    bsz, heads, seqlen = shape
     width = heads * PARAM_COLS
     row = torch.randn(bsz, seqlen, 2 * width, dtype=torch.float32, device="cuda")
     return row[..., ::2]
@@ -573,32 +521,32 @@ def _gapped(tensor: Tensor) -> Tensor:
     ("mutate", "error", "match"),
     [
         (
-            lambda p, b, pb: (p.double(), b.double(), pb.double()),
+            lambda p, pb: (p.double(), pb.double()),
             TypeError,
             r"kernel dtypes",
         ),
         (
-            lambda p, b, pb: (p.bfloat16(), b, pb),
-            TypeError,
-            r"one activation dtype per call",
+            lambda p, pb: (p[..., :-PARAM_COLS], pb),
+            ValueError,
+            r"params must be \(B,T,",
         ),
         (
-            lambda p, b, pb: (p.cpu(), b.cpu(), pb.cpu()),
+            lambda p, pb: (p.cpu(), pb.cpu()),
             ValueError,
             r"must be on a CUDA device",
         ),
         (
-            lambda p, b, pb: (_unaligned(REJECT), b, pb),
+            lambda p, pb: (_unaligned(REJECT), pb),
             ValueError,
             r"must start and step on a multiple of",
         ),
         (
-            lambda p, b, pb: (p[:, :0], b[:, :0], pb),
+            lambda p, pb: (p[:, :0], pb),
             ValueError,
             r"at least one token",
         ),
         (
-            lambda p, b, pb: (p, b, _gapped(pb)),
+            lambda p, pb: (p, _gapped(pb)),
             ValueError,
             r"param_bias must be contiguous",
         ),
@@ -612,8 +560,8 @@ def test_forward_rejects(
     is not a projection slice.
 
     Two cases here belong to contracts this path shares rather than owns, and each
-    is one case, not that contract's table: the mixed-dtype case pins that this path
-    runs the shared shape checker, and the misaligned case pins that it runs the
+    is one case, not that contract's table: the narrowed-width case pins that this
+    path runs the shared shape checker, and the misaligned case pins that it runs the
     pitched-layout checker. The pitched table itself, including the pitch multiple
     and the overlapping-row rejection, is ``tests/test_guard.py``'s. The rest of the
     shape contract is covered against the reference in ``test_scanprep.py``.
@@ -625,59 +573,51 @@ def test_forward_rejects(
 @pytest.mark.parametrize("w_max", [0.0, -1.0, 4.0, float("inf")])
 def test_forward_rejects_illegal_bound(w_max: float) -> None:
     """I2 needs a bound strictly inside ``(0, pi)``."""
-    params, bc, pbias = _operands(REJECT, seed=3)
+    params, pbias = _operands(REJECT, seed=3)
     with pytest.raises(ValueError, match=r"w_max must lie in \(0, pi\)"):
-        scanprep_forward(
-            params, bc, pbias, heads=REJECT[1], state_dim=REJECT[4], w_max=w_max
-        )
+        scanprep_forward(params, pbias, heads=REJECT[1], w_max=w_max)
 
 
 @pytest.mark.parametrize(
     ("mutate", "error", "match"),
     [
         (
-            lambda dt, dk, db, dc, p: (dt.bfloat16(), dk, db, dc, p),
+            lambda dt, dk, p: (dt.bfloat16(), dk, p),
             ValueError,
             r"dtrans must be float32",
         ),
         (
-            lambda dt, dk, db, dc, p: (dt, dk.bfloat16(), db, dc, p),
+            lambda dt, dk, p: (dt, dk.bfloat16(), p),
             ValueError,
             r"dK must be float32",
         ),
         (
-            lambda dt, dk, db, dc, p: (dt, dk, db.double(), dc, p),
+            lambda dt, dk, p: (dt, dk, p.double()),
             TypeError,
             r"kernel dtypes",
         ),
         (
-            lambda dt, dk, db, dc, p: (dt[..., :3], dk, db, dc, p),
+            lambda dt, dk, p: (dt[..., :3], dk, p),
             ValueError,
             r"dtrans must be",
         ),
         (
-            lambda dt, dk, db, dc, p: (dt, dk, _gapped(db), dc, p),
+            lambda dt, dk, p: (_gapped(dt), dk, p),
             ValueError,
-            r"dB must be contiguous",
+            r"dtrans must be contiguous",
         ),
         (
-            lambda dt, dk, db, dc, p: (dt, dk, db, dc, _stride_two(REJECT)),
+            lambda dt, dk, p: (dt, dk, _stride_two(REJECT)),
             ValueError,
             r"params must have unit stride",
         ),
         (
-            lambda dt, dk, db, dc, p: (dt, dk, db, dc, p.cpu()),
+            lambda dt, dk, p: (dt, dk, p.cpu()),
             ValueError,
             r"must be on a CUDA device",
         ),
         (
-            lambda dt, dk, db, dc, p: (
-                dt[:, :, :0],
-                dk[:, :, :0],
-                db[:, :, :0],
-                dc[:, :, :0],
-                p[:, :0],
-            ),
+            lambda dt, dk, p: (dt[:, :, :0], dk[:, :, :0], p[:, :0]),
             ValueError,
             r"at least one token",
         ),
@@ -691,30 +631,18 @@ def test_backward_rejects(
     revalidated here because the backward reads it and the forward's checker does
     not run again."""
     ops = _operands(REJECT, seed=3)
-    cots = _cotangents(REJECT, torch.float32, seed=4)
-    dtrans, dK, dB, dC, params = mutate(*cots, ops[0])
+    cots = _cotangents(REJECT, seed=4)
+    dtrans, dK, params = mutate(*cots, ops[0])
     with pytest.raises(error, match=match):
-        scanprep_backward(
-            dtrans,
-            dK,
-            dB,
-            dC,
-            params,
-            ops[2],
-            heads=REJECT[1],
-            state_dim=REJECT[4],
-            w_max=W_MAX,
-        )
+        scanprep_backward(dtrans, dK, params, ops[1], heads=REJECT[1], w_max=W_MAX)
 
 
 def test_backward_rejects_illegal_bound() -> None:
     """The bound scales the gradient, so the backward checks it too."""
     ops = _operands(REJECT, seed=3)
-    cots = _cotangents(REJECT, torch.float32, seed=4)
+    cots = _cotangents(REJECT, seed=4)
     with pytest.raises(ValueError, match=r"w_max must lie in \(0, pi\)"):
-        scanprep_backward(
-            *cots, ops[0], ops[2], heads=REJECT[1], state_dim=REJECT[4], w_max=4.0
-        )
+        scanprep_backward(*cots, *ops, heads=REJECT[1], w_max=4.0)
 
 
 # ---------------------------------------------------------------------------
