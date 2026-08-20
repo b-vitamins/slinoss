@@ -29,7 +29,8 @@ constexpr int kTileT = 32;
 // that, the tile is what amortizes the backward's overhang: a block walks
 // kBwdTileT + kWidth - 1 steps and loads both x and dy at each, so the loads per
 // owned timestep are (kWidth-1 + 2*(kBwdTileT+kWidth-1)) / kBwdTileT, and the
-// partial count is ceil(T/kBwdTileT), which is also what the host sums.
+// tile count is ceil(T/kBwdTileT). The tile count is not the partial count: see
+// kBwdTargetBlocks.
 constexpr int kBwdTileT = 16;
 
 // Time tiles one backward block covers, which is blockDim.y. The block is the
@@ -37,8 +38,48 @@ constexpr int kBwdTileT = 16;
 // warps, and sm_86's cap of 16 blocks per SM then holds the SM to 32 of its 48
 // warp slots, 66.7 percent, whatever the register count. Two tiles per block
 // make the block four warps, so the warp slots bind instead of the block slots.
-// The tiles in a block share no state, so this costs no synchronization.
+// The tiles in a block meet once, at the end, to combine their parameter-gradient
+// accumulators, so the walk itself needs no synchronization.
 constexpr int kBwdTilesPerBlock = 2;
+
+// Blocks along time the backward aims for, and with it the size of the partial
+// stack: the stack holds one slice per block along time, so what bounds the grid
+// bounds the stack. A grid that follows the sequence gives a stack that follows
+// it too, and a stack that follows the sequence is what put the reduction over
+// its class ceiling at T = 8192.
+//
+// Above this count a block walks several tile groups in a grid-stride loop and
+// still writes one slice. The division that sets the stride is a floor, so a
+// block takes on another group only when a whole extra group is there for it and
+// the grid never drops below the target; the slice count is then at most twice
+// ceil(kBwdTargetBlocks / grid.x) whatever T is.
+//
+// The number is a residency and not a wave: at 8 blocks an SM it covers 96 SMs,
+// and sm_86 holds 6 blocks an SM at W = 8 and 10 at W = 1, so the grid stays at
+// or above one full wave on every part these kernels are built for.
+constexpr int kBwdTargetBlocks = 768;
+
+// Blocks per SM the backward is compiled to hold, which is a register ceiling:
+// this many blocks of blockDim.x*kBwdTilesPerBlock/32 warps, against sm_86's
+// 65536 registers per SM and its 256-register-per-warp allocation granularity.
+// At 6 blocks of 4 warps the ceiling is 80 registers a thread.
+//
+// The bound is here because the tile groups are a loop rather than a grid axis:
+// left to itself nvcc holds more of the walk across that loop than the occupancy
+// is worth, 124 registers on the scalar path at kWidth = 8 for 4 blocks an SM
+// where 80 gives 6, and it spills nothing at 80.
+//
+// 8 is available on the staged walk and buys nothing. That walk reads its window
+// from shared memory rather than registers, so it reaches 64 registers, 8 blocks,
+// and 32 of the 48 warp slots at every width with nothing spilled, where 6 blocks
+// leave it 74 registers and 24 slots at kWidth = 8. Measured at the wide shape,
+// which is the only benched shape at that width: achieved occupancy 40.16 to
+// 49.17 percent, and the kernel 93.311 to 93.662 us against a run-to-run spread of
+// 0.10 to 2.44 percent, so the duration did not move. The kernel is not occupancy
+// limited and the tighter ceiling is a constraint on every future edit to the walk
+// in exchange for nothing, so it is not taken. The scalar walk cannot take 8 in any
+// case: it spills there, 20 B of stores and 20 B of loads at kWidth = 8.
+constexpr int kBwdMinBlocksPerSm = 6;
 
 // Timesteps one forward thread loads before it consumes any of them. The window
 // carries a serial dependence across time but the loads do not, so this is the
@@ -114,12 +155,13 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
 // the two bands are cut from different buffers. The value is unread when dy is
 // nullopt.
 //
-// S is causal_conv1d_bwd_parts(T). The parameter gradients are per-lag float32
-// accumulators reduced along time inside the block and stored, never
-// accumulated, so no output needs zeroing before the launch. Both partial
-// buffers are channel-minor, so a warp's store is one coalesced transaction;
-// causal_conv1d_reduce_parts sums the S slices and transposes the tap block on
-// the way out.
+// S is causal_conv1d_bwd_parts(T, D), the backward's block count along time and
+// not its tile count: a block reduces every tile group it walks into one slice.
+// The parameter gradients are per-lag float32 accumulators reduced along time
+// inside the block and stored, never accumulated, so no output needs zeroing
+// before the launch. Both partial buffers are channel-minor, so a warp's store is
+// one coalesced transaction; causal_conv1d_reduce_parts sums the S slices and
+// transposes the tap block on the way out.
 void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dfinal_state,
                        const at::Tensor &x, const at::Tensor &weight,
@@ -131,8 +173,11 @@ void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
                        const std::optional<at::Tensor> &dbias_parts,
                        int64_t dy_rows, bool activation);
 
-// Number of time-tile partials the backward writes for a sequence length.
-int64_t causal_conv1d_bwd_parts(int64_t seqlen);
+// Number of partial slices the backward writes, which is its block count along
+// time. Bounded by kBwdTargetBlocks and the channel count, so it stops growing
+// with the sequence length; the channel count enters because the grid's channel
+// axis is what is left of the target.
+int64_t causal_conv1d_bwd_parts(int64_t seqlen, int64_t channels);
 
 // Reduce the backward's partials into the parameter gradients.
 //

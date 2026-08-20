@@ -292,7 +292,7 @@ def causal_conv1d_bwd_native(
         # preserved format would be its stride pattern rather than a buffer.
         dx = x.new_empty((dims.batch, dims.seqlen, dims.channels))
     dinitial_state = None if initial_state is None else torch.empty_like(initial_state)
-    parts = int(module.bwd_parts(dims.seqlen))
+    parts = int(module.bwd_parts(dims.seqlen, dims.channels))
     dweight_parts = x.new_empty((parts, dims.width, dims.channels), dtype=torch.float32)
     dbias_parts = (
         None

@@ -150,7 +150,7 @@ void bwd(const std::optional<at::Tensor> &dy,
   expect_pitched(dx, "dx", {d.batch, d.seqlen, d.channels}, dtype, device);
   expect_optional(dfinal_state, "dfinal_state", window, dtype, device);
   expect_optional(dinitial_state, "dinitial_state", window, dtype, device);
-  const int64_t parts = slinoss::causal_conv1d_bwd_parts(d.seqlen);
+  const int64_t parts = slinoss::causal_conv1d_bwd_parts(d.seqlen, d.channels);
   expect(dweight_parts, "dweight_parts", {parts, d.width, d.channels},
          at::kFloat, device);
   expect_optional(dbias_parts, "dbias_parts", {parts, d.channels}, at::kFloat,
@@ -191,6 +191,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("MAX_WIDTH") = py::int_(slinoss::kMaxWidth);
   m.attr("TILE_T") = py::int_(slinoss::kTileT);
   m.attr("BWD_TILE_T") = py::int_(slinoss::kBwdTileT);
+  m.attr("BWD_TILES_PER_BLOCK") = py::int_(slinoss::kBwdTilesPerBlock);
+  m.attr("BWD_TARGET_BLOCKS") = py::int_(slinoss::kBwdTargetBlocks);
+  m.attr("CHANNELS_PER_BLOCK") = py::int_(slinoss::kMaxChannelsPerBlock);
   m.def("fwd", &fwd, py::arg("x"), py::arg("weight"), py::arg("bias"),
         py::arg("initial_state"), py::arg("y"), py::arg("final_state"),
         py::arg("activation"),
@@ -199,10 +202,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("weight"), py::arg("bias"), py::arg("initial_state"),
         py::arg("dx"), py::arg("dinitial_state"), py::arg("dweight_parts"),
         py::arg("dbias_parts"), py::arg("activation"),
-        "Write dx, the incoming-state gradient, and the per-time-tile "
-        "parameter-gradient partials.");
+        "Write dx, the incoming-state gradient, and the parameter-gradient "
+        "partials, one slice per block along time.");
   m.def("bwd_parts", &slinoss::causal_conv1d_bwd_parts, py::arg("seqlen"),
-        "Number of partial slices the backward writes for a sequence length.");
+        py::arg("channels"),
+        "Number of partial slices the backward writes for a sequence length and "
+        "channel count. Bounded independently of the sequence length.");
   m.def("bwd_reduce", &bwd_reduce, py::arg("dweight_parts"),
         py::arg("dbias_parts"), py::arg("dweight"), py::arg("dbias"),
         "Reduce the parameter-gradient partials into dweight, in the weight's "
