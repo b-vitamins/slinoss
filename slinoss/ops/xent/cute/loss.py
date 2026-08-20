@@ -60,6 +60,14 @@ of 50,257 bfloat16 classes: 823.4 MB in and 65.5 KB out for the forward, 823.4 M
 plus 65.5 KB in and 823.4 MB out for the backward, 2.47 GB over the pair. The label
 axis is 32 KB and rounds away.
 
+Measured on sm_86, clocks not lockable, at that shape, two passes with the arm order
+reversed: the forward 1.177 ms both times, 699.6 GB/s over its 823.4 MB, and the
+backward 2.643 and 2.645 ms, 622.9 GB/s over its 1,646.8 MB. A device copy of that
+size sustains 683 GB/s here, so the forward is at 102% of the copy law and the
+backward at 91%. The row reduction closing the mean adds 0.026 ms. The aten
+expression this replaces ran 27.715 ms over seven kernels at the same shape, 6.0 ms
+of it the float32 copy of the logits and its narrowing back, and its peak allocation
+was 6,282.9 MiB against 2,356.7 MiB here.
 """
 
 import cutlass

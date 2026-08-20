@@ -95,6 +95,11 @@ def test_forward_matches_float64(
     neighbours, and the block combine scales every partial sum to one maximum; an
     error in any of the three is a wrong partition function, which the loss carries
     logarithmically and would hide at a loose bound.
+
+    Measured worst case over the sweep, maximum absolute difference over the
+    reference magnitude: loss 1.226e-07, normalizer 6.883e-08. Both are the float32
+    accumulation's own error, and both sit inside one unit in the last place of the
+    float32 the loss is returned in.
     """
     logits, labels = operands(rows, classes, width, dtype)
     got = xent_forward(logits, labels, classes=classes)
@@ -118,6 +123,11 @@ def test_backward_matches_float64_autograd(
     there and the test would fail nondeterministically rather than not at all.
 
     The cotangent is not one, so the scale is checked rather than cancelled.
+
+    Measured worst case over the sweep, maximum absolute difference over the
+    reference magnitude: 2.879e-03 at bfloat16, 2.440e-04 at float16, 7.294e-07 at
+    float32. Each is the store's own rounding: the largest gradient element is
+    4.883e-04, and half a bfloat16 unit in the last place there is 1.95e-03 of it.
     """
     logits, labels = operands(rows, classes, width, dtype)
     cotangent = torch.tensor(0.25, dtype=torch.float32, device="cuda")
@@ -141,9 +151,17 @@ def test_pad_columns_enter_neither_direction() -> None:
     left there, so the only safe statement is that the loss does not move when they
     change and their gradient stays zero. The values here are far enough above the
     class logits that including one would swamp the loss rather than perturb it.
+
+    The second half pins the other contract the same head admits. A head that masks
+    its pad columns to the dtype's most negative value can be reduced over its whole
+    width, and the online rescale must turn that mask into an exact zero rather than
+    an overflow: the difference against the row's peak is unrepresentable, so the
+    exponential's argument is an infinity and only its underflow keeps the sum
+    finite.
     """
+    dtype = torch.bfloat16
     classes, width = 1000, 1024
-    logits, labels = operands(8, classes, width, torch.bfloat16)
+    logits, labels = operands(8, classes, width, dtype)
     plain = xent_forward(logits, labels, classes=classes)
 
     padded = logits.clone()
@@ -156,25 +174,61 @@ def test_pad_columns_enter_neither_direction() -> None:
     grads = xent_backward(cotangent, padded, labels, other.lse, classes=classes)
     assert bool((grads.dlogits[:, classes:] == 0.0).all())
 
+    masked = logits.clone()
+    masked[:, classes:] = torch.finfo(dtype).min
+    whole = xent_forward(masked, labels, classes=width)
+    assert bool(torch.equal(plain.loss, whole.loss))
+    assert bool(torch.equal(plain.lse, whole.lse))
+    over = xent_backward(cotangent, masked, labels, whole.lse, classes=width)
+    assert bool((over.dlogits[:, classes:] == 0.0).all())
+
 
 def test_matches_the_cast_expression_it_replaces() -> None:
     """The kernel against ``cross_entropy`` over a float32 copy of the logits.
 
-    Failure mode: a swap that moves the loss. The expression this replaces widens the
-    logits with a cast kernel and reduces at float32; the kernel reads them at their
-    own width and accumulates at float32, which is the same arithmetic in a different
-    order. Both are measured against the float64 oracle so the direction is stated
-    rather than assumed.
+    Failure mode: a swap that moves the loss or the gradient. The expression this
+    replaces widens the logits with a cast kernel and reduces at float32; the kernel
+    reads them at their own width and accumulates at float32, which is the same
+    arithmetic in a different order. Both are measured against the float64 oracle, so
+    the direction is stated rather than assumed.
+
+    Measured at 2,048 rows of 50,257 bfloat16 classes, maximum absolute difference
+    and the same over the reference magnitude. Loss: the kernel 2.552e-07 and
+    1.368e-08 from the oracle, the cast expression 1.652e-06 and 8.853e-08, the two
+    1.907e-06 and 1.022e-07 apart on a loss of 18.662 -- one float32 unit in the last
+    place at that magnitude, so the two agree to the width they both return.
+    Gradient: 9.538e-07 and 9.536e-07 from the oracle, the same to four digits, and
+    1.907e-06 apart, which is one bfloat16 unit in the last place of the largest
+    element.
+
+    The direction does not hold across operand widths. The kernel is 6.5 times closer
+    to the oracle at bfloat16, the cast is 3.1 times closer at float16 and 1.8 times
+    closer at float32, and every one of those figures is under a fifth of a float32
+    ulp of the loss. Neither expression is the more accurate one.
     """
     rows, classes = 2048, 50257
     logits, labels = operands(rows, classes, classes, torch.bfloat16)
-    oracle = xent_ref(logits.double(), labels, classes=classes).loss
+    ones = torch.ones((), dtype=torch.float32, device="cuda")
 
-    fused = xent_forward(logits, labels, classes=classes).loss
-    cast = torch.nn.functional.cross_entropy(logits.float(), labels)
-    assert_max_rel(fused, oracle, LOSS_REL, "xent/fused-against-f64")
+    leaf = logits.double().requires_grad_(True)
+    oracle = xent_ref(leaf, labels, classes=classes).loss
+    oracle.backward()
+    assert leaf.grad is not None
+
+    state = xent_forward(logits, labels, classes=classes)
+    fused = xent_backward(ones, logits, labels, state.lse, classes=classes).dlogits
+
+    cast_leaf = logits.clone().requires_grad_(True)
+    cast = torch.nn.functional.cross_entropy(cast_leaf.float(), labels)
+    cast.backward()
+    assert cast_leaf.grad is not None
+
+    assert_max_rel(state.loss, oracle, LOSS_REL, "xent/fused-against-f64")
     assert_max_rel(cast, oracle, LOSS_REL, "xent/cast-against-f64")
-    assert_max_rel(fused, cast, LOSS_REL, "xent/fused-against-cast")
+    assert_max_rel(state.loss, cast, LOSS_REL, "xent/fused-against-cast")
+    assert_max_rel(fused, leaf.grad, GRAD_REL, "xent/fused-grad-against-f64")
+    assert_max_rel(cast_leaf.grad, leaf.grad, GRAD_REL, "xent/cast-grad-against-f64")
+    assert_max_rel(fused, cast_leaf.grad, GRAD_REL, "xent/fused-grad-against-cast")
 
 
 def test_autograd_matches_torch_end_to_end() -> None:
