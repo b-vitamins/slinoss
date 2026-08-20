@@ -1726,7 +1726,10 @@ def parse_source_csv(
     lsu: dict[tuple[str, str, int], int] = {}
     opcodes: dict[tuple[str, str, int], dict[str, int]] = {}
     widths: dict[tuple[str, str, int], dict[int, int]] = {}
-    aggregate: dict[tuple[str, str, int], list[str]] = {}
+    # A row is kept beside the header it was printed under. NCU drops a metric
+    # column for a kernel that has no traffic of that kind, so a window holding
+    # two kernels holds two column maps and one cannot decode the other's rows.
+    aggregate: dict[tuple[str, str, int], tuple[list[str], dict[str, int]]] = {}
     for row in reader:
         if len(row) == 2 and row[0] == _FILE_PATH:
             blocks += 1
@@ -1754,7 +1757,10 @@ def parse_source_csv(
             # A row can arrive short of the header when a metric has no value for
             # the line. Pad it, because an absent cell reads as zero and a ragged
             # row would otherwise drop the whole pass.
-            aggregate[(kernel, path, line)] = list(row) + [""] * (fields - len(row))
+            aggregate[(kernel, path, line)] = (
+                list(row) + [""] * (fields - len(row)),
+                columns,
+            )
             continue
         if not row[columns[_ADDRESS]].strip().startswith("0x"):
             continue
@@ -1791,8 +1797,15 @@ def parse_source_csv(
             "the environment the target runs in"
         )
     out: list[SourceLine] = []
-    for key, row in aggregate.items():
-        stalls = {r: _int(row[columns[pcsamp_metric(r)]]) for r in STALL_REASONS}
+    for key, (row, cols) in aggregate.items():
+
+        def cell(
+            name: str, row: list[str] = row, cols: Mapping[str, int] = cols
+        ) -> str:
+            index = cols.get(name, -1)
+            return row[index] if 0 <= index < len(row) else ""
+
+        stalls = {r: _int(cell(pcsamp_metric(r))) for r in STALL_REASONS}
         out.append(
             SourceLine(
                 kernel=key[0],
@@ -1802,9 +1815,9 @@ def parse_source_csv(
                 lsu_inst_count=lsu.get(key, 0),
                 opcode_inst=dict(sorted(opcodes.get(key, {}).items())),
                 access_bit_inst=dict(sorted(widths.get(key, {}).items())),
-                shared_wavefront_count=_int(row[columns[_SRC_SHARED_WAVEFRONTS]]),
-                shared_wavefront_ideal_count=_int(row[columns[_SRC_SHARED_IDEAL]]),
-                sample_count=_int(row[columns[_SRC_SAMPLES]]),
+                shared_wavefront_count=_int(cell(_SRC_SHARED_WAVEFRONTS)),
+                shared_wavefront_ideal_count=_int(cell(_SRC_SHARED_IDEAL)),
+                sample_count=_int(cell(_SRC_SAMPLES)),
                 stall_samples=stalls,
             )
         )

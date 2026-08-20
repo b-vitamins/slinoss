@@ -881,7 +881,15 @@ def _source_header(*, metrics: Sequence[str] = SOURCE_METRICS) -> str:
     return ",".join(f'"{name}"' for name in names)
 
 
-def _source_row(line: str, text: str, address: str, sass: str, **values: int) -> str:
+def _source_row(
+    line: str,
+    text: str,
+    address: str,
+    sass: str,
+    *,
+    metrics: Sequence[str] = SOURCE_METRICS,
+    **values: int,
+) -> str:
     """One source-page row. A metric not named is blank, as NCU leaves it.
 
     Args:
@@ -889,6 +897,7 @@ def _source_row(line: str, text: str, address: str, sass: str, **values: int) ->
         text: High-level source, blank on an instruction row.
         address: Instruction address, blank on a line row.
         sass: Disassembly, blank on a line row.
+        metrics: The header this row is printed under, when it is not the full one.
         **values: Metric values, by :data:`_METRIC_ALIAS` key or stall reason.
     """
     filled = {
@@ -896,7 +905,7 @@ def _source_row(line: str, text: str, address: str, sass: str, **values: int) ->
         for key, value in values.items()
     }
     cells = [line, text, address, sass]
-    cells += [str(filled.get(metric, "")) for metric in SOURCE_METRICS]
+    cells += [str(filled.get(metric, "")) for metric in metrics]
     return ",".join(f'"{cell}"' for cell in cells)
 
 
@@ -994,6 +1003,48 @@ RAGGED_SOURCE_CSV: Final = "\n".join(
     )
 )
 
+_NARROW_METRICS: Final[tuple[str, ...]] = tuple(
+    m for m in SOURCE_METRICS if not m.startswith("memory_l1_wavefronts_shared")
+)
+
+NARROWED_SOURCE_CSV: Final = "\n".join(
+    (
+        f'"File Path","{CVB_PATH}"',
+        '"Function Name","chunk_vector_bwd_kernel"',
+        _source_header(),
+        _source_row(
+            "1163", "    return sview[row, col]", "", "", inst=100, wavefronts=7
+        ),
+        _source_row(
+            "", "", "0x0000000000008000", "LDS.U.32 R4, [R8]", inst=100, size=32
+        ),
+        # A kernel that touches no shared memory: NCU drops both wavefront
+        # columns from its header, so this block's rows decode under a narrower
+        # map than the block above.
+        '"Function Name","vector_reduce_kernel"',
+        _source_header(metrics=_NARROW_METRICS),
+        _source_row(
+            "1163",
+            "    return sview[row, col]",
+            "",
+            "",
+            metrics=_NARROW_METRICS,
+            samples=4,
+            inst=50,
+            mio_throttle=3,
+        ),
+        _source_row(
+            "",
+            "",
+            "0x0000000000009000",
+            "LDG.E R4, [R2]",
+            metrics=_NARROW_METRICS,
+            inst=50,
+            size=32,
+        ),
+    )
+)
+
 NO_INST_SOURCE_CSV: Final = "\n".join(
     (
         f'"File Path","{CVB_PATH}"',
@@ -1082,6 +1133,23 @@ def test_a_line_row_short_of_the_header_keeps_its_pass() -> None:
     assert one.line == 1163
     assert one.lsu_inst_count == 100
     assert one.stall_samples[STALL_REASONS[-1]] == 0
+
+
+def test_a_kernel_with_no_shared_traffic_decodes_under_its_own_header() -> None:
+    # NCU drops a metric column for a kernel that has no traffic of that kind, so
+    # one window can hold two column maps. Decoding every row under the last
+    # header seen loses the pass, and every window that names this kernel holds a
+    # shared-memory-free one beside it.
+    got = parse_source_csv(NARROWED_SOURCE_CSV)
+    wide, narrow = got.lines
+    assert (wide.kernel, wide.shared_wavefront_count) == (
+        "chunk_vector_bwd_kernel",
+        7,
+    )
+    assert narrow.kernel == "vector_reduce_kernel"
+    assert narrow.shared_wavefront_count == 0
+    assert narrow.sample_count == 4
+    assert narrow.stall_samples["mio_throttle"] == 3
 
 
 def test_parse_source_csv_rejects_output_it_cannot_read() -> None:
