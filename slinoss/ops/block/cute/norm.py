@@ -94,7 +94,7 @@ lane per warp writes one partial, so the writes land in distinct banks, and ever
 read of a partial is one address across the block; neither needs a swizzle.
 
 DRAM-bound, both directions. Analytic traffic per row, at operand itemsize ``i``
-and cotangent itemsize ``i_c``, with no measured bandwidth claimed here:
+and cotangent itemsize ``i_c``:
 
 - ``rmsnorm_fwd``: ``2*D*i``, plus the ``4*D`` float32 weight.
 - ``rmsnorm_residual_fwd``: ``D*(i_x + i_residual + 4 + i_normed)`` -- one read of
@@ -108,6 +108,24 @@ and cotangent itemsize ``i_c``, with no measured bandwidth claimed here:
 
 Both backwards add the ``4*D`` float32 weight and ``4*D`` float32 of partials per
 block, written once and read once by the reduction launch.
+
+Measured on sm_86 at bfloat16, three or more profiles per shape, as a percentage of
+the time floor at each kernel's own analytic traffic, min to max, against the 85
+percent floor the class carries::
+
+                          standard         wide         long       ragged
+    rmsnorm_fwd            99.8-101.5  105.2-106.6   97.0-98.6  100.5-102.7
+    rmsnorm_residual_fwd  104.8-105.2
+    rmsnorm_bwd             93.1-94.1  104.9-105.7   90.3-91.1   93.8-94.6
+    rmsnorm_residual_bwd  100.3-100.5
+
+Past 100 is legitimate: the floor is fitted to a copy, and a read/write mix
+friendlier than a copy's beats it. Every one of these is one wave of
+``row_blocks`` blocks, 504 on this device, at 40 registers per thread and no local
+memory. Achieved occupancy is 90.9 to 93.6 percent forward; backward it is 76.2 to
+77.8 at ``D = 288`` against 91.7 to 92.3 at ``D = 384``, where DRAM's speed of
+light is 73.8 to 74.1 and 85.2 to 85.8 percent respectively, so the wider shape is
+the one that saturates the bus.
 
 ``rmsnorm_dweight_kernel`` is the one kernel here whose traffic is not a sequence
 extent: ``4*D`` per block of the backward grid, so it grows with ``D`` alone. At
@@ -179,7 +197,15 @@ __all__ = [
 ]
 
 NORM_THREADS = 256
-"""Block width of every norm kernel. Eight warps, one row reduced at a time."""
+"""Block width of every norm kernel. Eight warps, one row reduced at a time.
+
+Fixed rather than fitted to ``D``, because the warps past ``D`` reach no memory. On
+sm_86 the plain forward issues 86,328 global load requests per launch at ``D = 288``,
+where one warp of eight covers the row, and 112,416 at ``D = 384``, where four do;
+each is exactly the covering-warp count per row read plus the block's clamped weight
+read, and every issued instruction runs 32 active threads at both widths. A width
+that divided ``D`` would retire idle warps, not traffic, so it would not move a
+DRAM-bound kernel."""
 
 WARPS = NORM_THREADS // cute.arch.WARP_SIZE
 """Warps per block, and therefore float32 partials per accumulator."""
