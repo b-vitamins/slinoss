@@ -93,6 +93,7 @@ __all__ = [
     "LANE_PAIR",
     "PREFETCH",
     "build_table",
+    "paired",
     "stage_chunk",
     "stage_matrix",
     "stage_pad",
@@ -101,6 +102,7 @@ __all__ = [
     "stage_state",
     "stage_trans",
     "stage_weighted",
+    "store_pair",
 ]
 
 PREFETCH: int = 4
@@ -139,7 +141,7 @@ of 3 and of :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_N`, so ``3N`` is a multi
 of 48 and ``lanes`` a multiple of 16."""
 
 
-def _paired(tile: cute.Tensor) -> cute.Tensor:
+def paired(tile: cute.Tensor) -> cute.Tensor:
     """View a row-major tile in units of :data:`LANE_PAIR` adjacent elements.
 
     Args:
@@ -176,7 +178,7 @@ def _paired_row(row: cute.Tensor) -> cute.Tensor:
     Invariants:
         ``3N`` is a multiple of 48, so a row offset is a multiple of 48 elements and
         every access is aligned to ``LANE_PAIR``. The claim is restated for the
-        reason given in :func:`_paired`.
+        reason given in :func:`paired`.
     """
     base = row.iterator.align(LANE_PAIR * (row.element_type.width // 8))
     return cute.zipped_divide(cute.make_tensor(base, row.layout), (LANE_PAIR,))
@@ -201,7 +203,7 @@ def _load_pair(
 
 
 @cute.jit
-def _store_pair(
+def store_pair(
     words: cute.Tensor,
     frag: cute.Tensor,
     row: cutlass.Int32,
@@ -211,7 +213,7 @@ def _store_pair(
     """Store one pair's ``3 * LANE_PAIR`` values as three paired accesses.
 
     Args:
-        words: A tile from :func:`_paired`.
+        words: A tile from :func:`paired`.
         frag: ``(1, LANE_PAIR)`` fragment of the tile's element type, built once by
             the caller: a fragment per step is an allocation per step.
         row: Row of the tile.
@@ -582,10 +584,14 @@ def stage_state(
     accumulation for the narrowing to compound through.
 
     ``(P, 3N)`` is one contiguous float32 run and the loop walks it at the block
-    stride, so a warp covers 512 contiguous bytes per step and no index arithmetic
+    stride, so a warp covers 1,024 contiguous bytes per step and no index arithmetic
     survives. The steps run in groups of :data:`PREFETCH`, loads first, so the
     group's loads overlap: this is the largest single read in the operator and a
     serial step-by-step form pays one global latency per element per thread.
+
+    A step carries :data:`LANE_PAIR` adjacent columns, which is one eight-byte read
+    and one four-byte write in place of two of each. The port issues one access per
+    two cycles whatever its width, so the pair halves the cost of the pass.
 
     Args:
         gz: ``(P, 3N)`` float32 view of the chunk-start state for one
@@ -681,14 +687,14 @@ def stage_matrix(
     exact = total % threads == 0
     depth = max(1, PREFETCH // LANE_PAIR)
 
-    words = _paired(dst)
+    words = paired(dst)
     frag = cute.make_fragment((1, LANE_PAIR), elem)
     loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
     # The false arm aliases the operand pair. Every use is under the same
     # compile-time flag, so the alias is never reached and never allocated, and the
     # name is bound on both paths.
     if cutlass.const_expr(keep_fp32):
-        words32 = _paired(sfp32)
+        words32 = paired(sfp32)
         frag32 = cute.make_fragment((1, LANE_PAIR), cutlass.Float32)
     else:
         words32 = words
@@ -717,14 +723,14 @@ def stage_matrix(
             )
             col = 3 * m
             if cutlass.const_expr(exact):
-                _store_pair(words, frag, p, col, out)
+                store_pair(words, frag, p, col, out)
                 if cutlass.const_expr(keep_fp32):
-                    _store_pair(words32, frag32, p, col, out)
+                    store_pair(words32, frag32, p, col, out)
             else:
                 if tid + (group * depth + step) * threads < total:
-                    _store_pair(words, frag, p, col, out)
+                    store_pair(words, frag, p, col, out)
                     if cutlass.const_expr(keep_fp32):
-                        _store_pair(words32, frag32, p, col, out)
+                        store_pair(words32, frag32, p, col, out)
 
 
 @cute.jit
@@ -748,7 +754,7 @@ def _store_rotated(
     applied twice, which halves the table reads per element.
 
     Args:
-        words: The destination tile through :func:`_paired`, written at row ``row``,
+        words: The destination tile through :func:`paired`, written at row ``row``,
             paired columns ``3 * pair`` through ``3 * pair + 2``.
         frag: ``(1, LANE_PAIR)`` fragment of the tile's element type.
         stable: ``(mats, L, 9)`` float32 transform table.
@@ -785,7 +791,7 @@ def _store_rotated(
     if cutlass.const_expr(scaled):
         weight = sscale[token]
         out = tuple(weight * value for value in out)
-    _store_pair(words, frag, row, 3 * pair, out)
+    store_pair(words, frag, row, 3 * pair, out)
 
 
 @cute.jit
@@ -882,7 +888,7 @@ def stage_rotated(
     # chunk, which is exactly the streaming carry-in.
     carry = has_prev and back == 1
 
-    words = _paired(dst)
+    words = paired(dst)
     frag = cute.make_fragment((1, LANE_PAIR), dst.element_type)
     loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
     # The false arm aliases the current-tap fragment, which is never read under it:

@@ -440,12 +440,15 @@ from slinoss.ops.so3ssd.cute.mma import (
 )
 from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes, chunk_suffix, quat_suffix_vjp
 from slinoss.ops.so3ssd.cute.table import (
+    LANE_PAIR,
     build_table,
+    paired,
     stage_chunk,
     stage_matrix,
     stage_rotated,
     stage_shifted,
     stage_state,
+    store_pair,
 )
 from slinoss.ops.so3ssd.reference import check_grad_band
 
@@ -1293,6 +1296,13 @@ def _rotate_rows(
     the raw tile the tap cotangent needs anyway costs nine FMA a lane and saves a
     pass over ``B`` per tap.
 
+    A step carries :data:`slinoss.ops.so3ssd.cute.table.LANE_PAIR` adjacent lanes,
+    the unit :func:`slinoss.ops.so3ssd.cute.table.stage_rotated` already pairs from
+    global. Both lanes of a pair sit in one row, so the nine table words are read
+    once and applied twice, and the pair's six components are one contiguous
+    twelve-byte run at either width, so the read and the write are three paired
+    accesses each rather than six scalars.
+
     Rows of ``src`` past the chunk's valid tokens are already zero, so the rows an
     M extent was rounded up by stay zero and no consumer needs a predicate.
 
@@ -1309,28 +1319,46 @@ def _rotate_rows(
         threads: Block width. Compile-time.
         span: Rows of ``dst`` to fill. Compile-time.
         lanes: ``N``. Compile-time.
+
+    Invariants:
+        ``lanes`` is even and both tiles are pitched by :func:`smem_pitch`, which is
+        what the pair rests on. Pairing halves the step count, so the tail predicate
+        is reachable where the scalar form's never was: ``span * lanes`` is a
+        multiple of 256 at every legal shape and the pair count only a multiple of
+        128, which a block of 256 threads does not divide.
     """
-    elem = dst.element_type
-    total = span * lanes
+    raw = src.element_type
+    pairs = lanes // LANE_PAIR
+    total = span * pairs
     exact = total % threads == 0
+
+    words = paired(dst)
+    source = paired(src)
+    frag = cute.make_fragment((1, LANE_PAIR), dst.element_type)
+    held = cute.make_fragment((3, LANE_PAIR), raw)
 
     for step in cutlass.range_constexpr(-(-total // threads)):
         i = tid + step * threads
         if cutlass.const_expr(not exact):
             i = cutlass.min(i, total - 1)
-        r = i // lanes
-        n = i - r * lanes
-        col = 3 * n
-        out = mat3_matvec(
-            _mat_at(stable, slot, nbase + r), _vec_at(src, r + shift, col)
+        r = i // pairs
+        p = i - r * pairs
+        col = 3 * p
+        for k in cutlass.range_constexpr(3):
+            cute.autovec_copy(source[(None, (r + shift, col + k))], held[(k, None)])
+        mat = _mat_at(stable, slot, nbase + r)
+        got = tuple(
+            widen(held[j // LANE_PAIR, j % LANE_PAIR], raw)
+            for j in range(3 * LANE_PAIR)
+        )
+        out = mat3_matvec(mat, (got[0], got[1], got[2])) + mat3_matvec(
+            mat, (got[3], got[4], got[5])
         )
         if cutlass.const_expr(exact):
-            for j in cutlass.range_constexpr(3):
-                dst[r, col + j] = narrow(out[j], elem)
+            store_pair(words, frag, r, col, out)
         else:
             if tid + step * threads < total:
-                for j in cutlass.range_constexpr(3):
-                    dst[r, col + j] = narrow(out[j], elem)
+                store_pair(words, frag, r, col, out)
 
 
 @cute.jit
