@@ -28,14 +28,16 @@ a transposed score tile is not.
 - That rule is under review on the backward, and the measurement is against it. A
   broadcast read is conflict-free and still costs a full LSU instruction, so the
   matvec form buys freedom from conflicts with instruction count. On sm_86
-  `chunk_vector_bwd` issues 166 M memory-pipe instructions, 73.0% of its
-  duration, at 9.4% of the tensor pipe and 23-24% of DRAM speed of light. Low
-  tensor utilization with an issue-bound memory port is the signature of scalar
-  rowwise work around the GEMMs, and this form is what produces it. The open
-  question is whether the 3x3 apply belongs on the tensor pipe instead, priced in
-  instructions per token rather than in FMAs; the two largest instruction
-  deletions still available do not close the kernel's gap on their own. Nothing
-  has measured the alternative, so the rule stands and the doubt is stated.
+  `chunk_vector_bwd` spent 73.0% of its duration issuing memory instructions at
+  9.4% of the tensor pipe and 23-24% of DRAM speed of light. Low tensor
+  utilization with an issue-bound memory port is the signature of scalar rowwise
+  work around the GEMMs, and this form is what produces it. Deleting the lane
+  butterfly took the port to 54.6% and left `LDS` as the largest row in the
+  census, most of which is the table broadcast this rule prescribes, so the form
+  is now the top item rather than a background term. The open question is whether
+  the 3x3 apply belongs on the tensor pipe instead, priced in instructions per
+  token rather than in FMAs. Nothing has measured the alternative, so the rule
+  stands and the doubt is stated.
 - Chunk-local prefixes are recomputed inside every kernel that needs them,
   forward and backward. They never cross a kernel boundary and never touch
   global memory. They are shared across all `N` lanes and all `P` rows, so one
@@ -134,20 +136,43 @@ instructions, and the class bar says nothing about that.
       sm__inst_executed_pipe_lsu / (SMs * SM_active_cycles * 0.5) == L1/TEX throughput
       166,152,960 / (84 * 5,421,733 * 0.5) = 72.97%   reported 72.97%
       166,152,960 / (84 * 5,456,401 * 0.5) = 72.51%   reported 72.50%
+      110,856,960 / (84 * 4,122,470 * 0.5) = 64.03%   reported 64.03%
+       86,803,200 / (84 * 3,782,303 * 0.5) = 54.64%   reported 54.64%
 
   The reported throughput is the instruction count and nothing else, so a kernel
   near that ceiling is issue-bound on the port and no byte, wavefront or occupancy
   figure will say so.
+- A freed port cycle is not a freed nanosecond. Across three group widths of
+  `chunk_vector_bwd`, 93.7% of the freed LSU cycles converted to time at one step
+  and 83.3% at the next, so the port term is an upper bound on what deleting an
+  instruction buys and the fraction falls as the term shrinks. Predict with it,
+  then measure.
 - Warp shuffles issue on the port. `SHFL` moves no bytes, produces no wavefronts and
-  cannot conflict, and it costs full price. On `chunk_vector_bwd` the butterfly in
-  `_sum_over_lanes` is 69,258,240 warp-instructions, 930 us, 30.4% of the kernel and
-  the single largest item in it, and every wavefront-denominated estimate priced it
-  at zero. Rank an arm by the instructions it deletes.
+  cannot conflict, and it costs full price. The butterfly in `_sum_over_lanes` was
+  69,258,240 warp-instructions on `chunk_vector_bwd`, 30.4% of the kernel and the
+  single largest item in it, and every wavefront-denominated estimate priced it at
+  zero. Narrowing the group the butterfly spans from 16 lanes to 4 cut it to
+  11,197,440 and the kernel by 29% of its cycles, at one register less and no spill.
+  Rank an arm by the instructions it deletes.
 - The ranked cost is the instruction census, one row per opcode. On
-  `chunk_vector_bwd`: SHFL 69,258,240 (930 us), LDS 49,271,040 (662 us), STS
-  20,989,440 (282 us), LDSM 14,008,320 (188 us), LDG 6,842,880 (92 us), STG
-  5,276,160 (71 us); 166,152,960 in total is 2,232 us of a 3,058.9 us launch, 73.0%.
+  `chunk_vector_bwd`, before and after that cut:
+
+      opcode    16 lanes       4 lanes
+      SHFL    69,258,240    11,197,440
+      LDS     49,271,040    32,129,280
+      STS     20,989,440    19,054,080
+      LDSM    14,008,320    14,008,320
+      LDG      6,842,880     6,842,880
+      STG      5,276,160     3,064,320
+      total  166,152,960    86,803,200
+      port         73.0%         54.6%
+
   The three reduction tails beside it are DRAM-bound and issue almost nothing.
+- A census goes stale the moment an arm lands, and so does everything derived from
+  it. That one change halved the total, moved the largest row from `SHFL` to `LDS`,
+  and moved the dominant stall from `mio_throttle` to `wait`, which is arithmetic
+  dependency rather than a memory queue. Every rank, share and width histogram taken
+  at the old width was void in one commit. Re-profile before choosing the next arm.
 - Shared wavefronts are a second-order term, not the currency. They set how long a
   conflicted access occupies the pipe, so a conflict is still a bug, but removing
   wavefronts without removing instructions does not move an issue-bound kernel:
@@ -159,10 +184,11 @@ instructions, and the class bar says nothing about that.
   denominator, not a property of the hardware.
 - A width change is therefore worth more than the wavefront law allows, not less.
   Folding four scalar `LDS` into one `LDS.128` leaves the wavefront count invariant
-  and deletes three instructions of four. On `chunk_vector_bwd` 79.4 M of 96.8 M
-  memory instructions move four bytes or fewer per lane -- 58,752,000 at 32 bits and
-  20,643,840 at 16 -- so grouping what is legal to group is worth up to 835 us.
-  Two adjacent bfloat16 accesses pack into one 32-bit access for a straight halving.
+  and deletes three instructions of four. Two adjacent bfloat16 accesses pack into
+  one 32-bit access for a straight halving. The share of `chunk_vector_bwd`'s
+  accesses that are four bytes or fewer per lane was 82% at the old group width; the
+  figure at the current one is not measured yet, and the old one is not to be quoted
+  for it.
 - 16-byte access also changes the conflict question, and the scalar answer does
   not carry over. An `LDS.128` is serviced in four phases of eight threads, each
   phase covering the full 128-byte width, so the unit is the 16-byte segment and
@@ -184,14 +210,15 @@ instructions, and the class bar says nothing about that.
   `L 64 P 64 3N 240` the six contractions of `chunk_vector_bwd` count 34.12 G flop,
   40% of the backward's 85.46 G. That puts its tensor floor at 304.7 us and its 70%
   bar at 435.3 us; its 515.84 MB of counted traffic puts its DRAM floor at 889.8 us;
-  its instruction census puts the port term at 2,232 us. The port binds by a factor
-  of 2.5 over the next floor, and it binds above the target, so the arithmetic is not
-  the obstacle and neither is the traffic. The port term is not a floor in the way
-  the other two are: it is the current instruction count priced, and it falls with
-  every instruction deleted.
+  its instruction census put the port term at 2,232 us, and after the group cut at
+  about 1,166 us. The port bound by a factor of 2.5 over the next floor and still
+  binds above the target, so the arithmetic is not the obstacle and neither is the
+  traffic. The port term is not a floor in the way the other two are: it is the
+  current instruction count priced, and it falls with every instruction deleted --
+  which is also why it cannot be quoted from a previous arm.
 - Read the dominant stall to name the queue, then attribute the stall by opcode
-  before prescribing for it. `mio_throttle` at 28.16% of warp-active cycles says the
-  MIO queue is saturated; PC sampling says 55.69% of those samples sit on `SHFL` and
+  before prescribing for it. `mio_throttle` at 28.16% of warp-active cycles said the
+  MIO queue was saturated; PC sampling said 55.69% of those samples sat on `SHFL` and
   25.55% on `LDS`. A saturated queue whose top occupant is a shuffle is not short of
   requests in flight, so adding independent loads per warp -- the standing
   prescription for a latency-bound warp -- makes the top stall worse. The same
@@ -306,9 +333,12 @@ the class model is a statement about instruction issue, so a kernel at 13.6% of 
 bandwidth is reporting that bytes are not what it is spending its time on. Read the
 LSU instruction census beside the percentage; see "The LSU port" above.
 
-The three classes do not cover the machine. `chunk_vector_bwd` is at 23-24% of DRAM
-speed of light and 9.4% of the tensor pipe while sitting at 73.0% of the LSU issue
-port, so it is issue-bound and the model has no name for that. The declaration in
+The three classes do not cover the machine. `chunk_vector_bwd` sat at 23-24% of DRAM
+speed of light and 9.4% of the tensor pipe while spending 73.0% of the LSU issue
+port, so it was issue-bound and the model has no name for that. The group cut took
+the port term to 54.6% and moved the dominant stall to arithmetic dependency, so the
+kernel is now no single thing, which the model has no name for either. The
+declaration in
 `slinoss/perf/declared.py` stays as it is and the kernel stays failing until either
 the port term comes down or the model grows a fourth class with its own measured
 bar. Declaring the shortfall away is not available.
