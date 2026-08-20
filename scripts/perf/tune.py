@@ -633,10 +633,10 @@ def select_overhead_us(
         Microseconds per :meth:`slinoss.autotune.Variants.select`, then
         microseconds per attribute read.
     """
-    variants.select(key.rows, key.width, key.itemsize, index)
+    variants.select(key.rows, key.width, key.itemsize, index, key.extents)
     start = time.perf_counter_ns()
     for _ in range(calls):
-        variants.select(key.rows, key.width, key.itemsize, index)
+        variants.select(key.rows, key.width, key.itemsize, index, key.extents)
     hooked = (time.perf_counter_ns() - start) / calls / 1e3
     start = time.perf_counter_ns()
     for _ in range(calls):

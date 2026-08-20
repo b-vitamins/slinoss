@@ -231,6 +231,55 @@ def test_width_and_itemsize_are_exact(cache: Path) -> None:
     assert _variants().select(rows, width, itemsize * 2, index) == DEFAULT
 
 
+def test_a_record_is_not_reused_across_extents(cache: Path) -> None:
+    """The failure the fourth axis exists to prevent. A scan geometry measured at one
+    chunk length holds a different arena from the same geometry at another, so a key
+    that could not tell them apart would answer a launch with a measurement of a
+    different kernel shape. Written through the file, so the round trip is covered
+    here too."""
+    scan = Variants(
+        kernel="probe_scan",
+        default=DEFAULT,
+        candidates=(DEFAULT, FASTER),
+        extent_names=("chunk", "rows_per_block"),
+    )
+    at_64 = ShapeKey.of(2048, 240, 2, extents=(64, 64))
+    autotune.save([_record(kernel="probe_scan", shape=at_64)], cache)
+    assert autotune.load(cache)[0].shape.extents == (64, 64)
+    assert scan.select(2048, 240, 2, 0, extents=(64, 64)) == FASTER
+    assert scan.select(2048, 240, 2, 0, extents=(128, 64)) == DEFAULT
+
+
+def test_a_kernel_that_declares_extents_must_supply_them(cache: Path) -> None:
+    """The omission is what makes the collision silent, so it is refused rather than
+    defaulted: a kernel resolving without its declared axes would write one record
+    per name and read it back at every arena."""
+    scan = Variants(
+        kernel="probe_scan",
+        default=DEFAULT,
+        candidates=(DEFAULT, FASTER),
+        extent_names=("chunk",),
+    )
+    with pytest.raises(ValueError, match="chunk"):
+        scan.select(*CALL)
+    with pytest.raises(ValueError, match="chunk"):
+        scan.select(2048, 384, 2, 0, extents=(64, 64))
+    with pytest.raises(ValueError, match="declares no extent"):
+        _variants().select(2048, 384, 2, 0, extents=(64,))
+
+
+def test_a_record_stored_without_extents_reads_as_none_declared(cache: Path) -> None:
+    """Absence means the three-axis key it was written under, which is what a kernel
+    declaring no extents resolves at. A cache written before the axis existed stays a
+    measurement."""
+    autotune.save([_record()], cache)
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    del payload["records"][0]["shape"]["extents"]
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    assert autotune.load(cache)[0].shape == SHAPE
+    assert _variants().select(*CALL) == FASTER
+
+
 # ---------------------------------------------------------------------------
 # Trust
 # ---------------------------------------------------------------------------

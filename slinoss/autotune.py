@@ -22,7 +22,7 @@ against and nothing else about a part does, so one measurement covers every
 identical part in a host and a second slot never re-measures it. A bus id or an
 ordinal is deliberately absent, for the same reason.
 
-Shape key. Three axes, because three are what move the answer:
+Shape key. Four axes, because four are what move the answer:
 
 - ``width``, exact. It is a compile-time argument of every block kernel and sets
   the per-thread segment count, hence the register footprint.
@@ -33,6 +33,22 @@ Shape key. Three axes, because three are what move the answer:
 - ``itemsize``, exact. It sets the bytes one vector covers and the traffic per
   row. Two dtypes of one width are one entry, because the geometry question they
   ask is the same one.
+- ``extents``, exact, all of it, and empty for a kernel that declares none. A
+  block kernel is launched over a flattened ``(rows, width)`` and the three axes
+  above fix its arena. A scan kernel's does not follow from them: the chunk
+  length, the rows a block holds and the state width are separate compile-time
+  extents, each of which sets shared bytes and so resident blocks. Bucketing any
+  of them would hand a record measured against one arena to a launch holding a
+  different one, which is the one way a cache can be wrong that the trust check
+  below cannot catch -- the geometry is still declared, so it is still admitted.
+  A kernel names these axes in its declaration and supplies them at every call;
+  the omission is refused rather than defaulted, because a kernel resolving
+  without its declared axes would write one record per name and read it back at
+  every arena.
+
+The schema does not change with that axis. A record stored without it means the
+three-axis key it was written under, which is exactly what a kernel declaring no
+extents resolves at, so an existing cache stays a measurement.
 
 Excluded from the key, and why. Batch and sequence separately: every block kernel
 is launched over a flattened ``(rows, width)`` and neither extent is visible to
@@ -162,30 +178,48 @@ class ShapeKey(NamedTuple):
         rows: Rows on the flattened axis, rounded up to a power of two.
         width: Trailing extent, exact.
         itemsize: Bytes of one operand element, exact.
+        extents: Further compile-time extents the kernel declared, exact and in
+            the order it declared them. Empty for a kernel declaring none.
     """
 
     rows: int
     width: int
     itemsize: int
+    extents: tuple[int, ...] = ()
 
     @classmethod
-    def of(cls, rows: int, width: int, itemsize: int) -> ShapeKey:
+    def of(
+        cls,
+        rows: int,
+        width: int,
+        itemsize: int,
+        extents: Sequence[int] = (),
+    ) -> ShapeKey:
         """Canonicalize a call's geometry.
 
         Args:
             rows: Rows on the flattened axis, as launched.
             width: Trailing extent.
             itemsize: Bytes of one operand element.
+            extents: Values of the axes the kernel declared, in its order.
 
         Returns:
             The key.
         """
-        return cls(rows=_bucket(rows), width=width, itemsize=itemsize)
+        return cls(
+            rows=_bucket(rows),
+            width=width,
+            itemsize=itemsize,
+            extents=tuple(int(v) for v in extents),
+        )
 
     @property
     def text(self) -> str:
         """One field for a report line or a file."""
-        return f"rows<={self.rows} width={self.width} itemsize={self.itemsize}"
+        head = f"rows<={self.rows} width={self.width} itemsize={self.itemsize}"
+        if not self.extents:
+            return head
+        return f"{head} extents={'x'.join(str(v) for v in self.extents)}"
 
 
 class DeviceKey(NamedTuple):
@@ -410,6 +444,7 @@ def _record_payload(record: Record) -> dict[str, Any]:
             "rows": record.shape.rows,
             "width": record.shape.width,
             "itemsize": record.shape.itemsize,
+            "extents": list(record.shape.extents),
         },
         "device": {
             "name": record.device.name,
@@ -464,6 +499,7 @@ def _record_of(data: Any) -> Record:
             rows=int(shape["rows"]),
             width=int(shape["width"]),
             itemsize=int(shape["itemsize"]),
+            extents=tuple(int(v) for v in shape.get("extents", ())),
         ),
         device=DeviceKey(
             name=str(device["name"]),
@@ -597,12 +633,13 @@ def merge(existing: Iterable[Record], fresh: Iterable[Record]) -> tuple[Record, 
 # Process state
 # ---------------------------------------------------------------------------
 
-_MEMO: dict[tuple[str, int, int, int, int], tuple[int, ...]] = {}
+_MEMO: dict[tuple[str, int, int, int, int, tuple[int, ...]], tuple[int, ...]] = {}
 """Resolved geometry per call site and raw shape. The steady-state path.
 
 Keyed on the raw arguments rather than the canonical key, so a hit costs one
 tuple construction and one lookup and the canonicalization is paid once per
-distinct call shape.
+distinct call shape. The extent values are in the key even when a kernel declares
+none, where they are the empty tuple: one key shape keeps the hit a single lookup.
 """
 
 _PINNED: dict[str, tuple[int, ...]] = {}
@@ -763,11 +800,17 @@ class Variants(Generic[G]):
             what it launched before it was tunable.
         candidates: Every geometry the kernel is allowed to launch, the default
             among them.
+        extent_names: The compile-time extents this kernel's answer depends on,
+            beyond the flattened shape, in the order :meth:`select` takes their
+            values. Empty for a kernel whose arena follows from the flattened
+            shape alone, which is every block kernel. Naming them is what makes
+            omitting them an error instead of a shared record.
     """
 
     kernel: str
     default: G
     candidates: tuple[G, ...]
+    extent_names: tuple[str, ...] = ()
     _allowed: dict[tuple[int, ...], G] = field(
         init=False, repr=False, compare=False, default_factory=dict
     )
@@ -801,7 +844,14 @@ class Variants(Generic[G]):
             self, "_allowed", {tuple(int(v) for v in c): c for c in self.candidates}
         )
 
-    def select(self, rows: int, width: int, itemsize: int, index: int) -> G:
+    def select(
+        self,
+        rows: int,
+        width: int,
+        itemsize: int,
+        index: int,
+        extents: tuple[int, ...] = (),
+    ) -> G:
         """The geometry to launch this call with.
 
         One tuple construction and one dict lookup once a shape has been seen. On
@@ -813,14 +863,24 @@ class Variants(Generic[G]):
             width: Trailing extent.
             itemsize: Bytes of one operand element.
             index: CUDA device ordinal.
+            extents: Values of :attr:`extent_names`, in that order. A tuple, so it
+                reaches the memo key without being copied.
 
         Returns:
             The geometry, in the kernel's own geometry type.
+
+        Raises:
+            ValueError: If ``extents`` does not match :attr:`extent_names`. Raised
+                on the first sight of a shape rather than on every call, so the
+                check costs nothing once resolved and still cannot be reached
+                without raising.
         """
-        key = (self.kernel, rows, width, itemsize, index)
+        key = (self.kernel, rows, width, itemsize, index, extents)
         choice = _MEMO.get(key)
         if choice is None:
-            choice = _MEMO.setdefault(key, self._resolve(rows, width, itemsize, index))
+            choice = _MEMO.setdefault(
+                key, self._resolve(rows, width, itemsize, index, extents)
+            )
         return cast("G", choice)
 
     def admits(self, geometry: Sequence[int]) -> G | None:
@@ -837,10 +897,27 @@ class Variants(Generic[G]):
         """
         return self._allowed.get(tuple(int(v) for v in geometry))
 
-    def _resolve(self, rows: int, width: int, itemsize: int, index: int) -> G:
+    def _resolve(
+        self,
+        rows: int,
+        width: int,
+        itemsize: int,
+        index: int,
+        extents: tuple[int, ...],
+    ) -> G:
         """Consult the pin, then the cache. Falls back to the default."""
+        if len(extents) != len(self.extent_names):
+            declared = (
+                f"({', '.join(self.extent_names)})"
+                if self.extent_names
+                else "no extent axes"
+            )
+            raise ValueError(
+                f"{self.kernel} declares {declared} and was resolved at {extents}"
+            )
+        key = ShapeKey.of(rows, width, itemsize, extents)
         if _WITNESS is not None:
-            _WITNESS.append((self.kernel, ShapeKey.of(rows, width, itemsize)))
+            _WITNESS.append((self.kernel, key))
         pin = _PINNED.get(self.kernel)
         if pin is not None:
             admitted = self.admits(pin)
@@ -849,9 +926,7 @@ class Variants(Generic[G]):
         table = _table()
         if not table:
             return self.default
-        found = table.get(
-            (device_key(index), self.kernel, ShapeKey.of(rows, width, itemsize))
-        )
+        found = table.get((device_key(index), self.kernel, key))
         if found is None:
             return self.default
         admitted = self.admits(found.winner.geometry)
