@@ -75,11 +75,13 @@ fold: one head to a block.
 A head a block walks past the first is a rolled iteration between an accumulator's
 allocation and its uses, which is what defeats register promotion. What that costs
 does not follow the trip count, so the two costs of the sum do not trade: at
-``L 64 P 64 3N 240 G 1`` a call takes 10,615.9 us at depth one, rises to 12,260.9 at
-depth nine as the partials accumulate on top of a spill that has not moved, and falls
-to 8,101.9 at the full depth, where the loop's trip count is one and the spill is gone
-with it. The 1,135.3 MB of local traffic a launch and the 51.2 MB a head it divides
-into are a property of the loop existing.
+``L 64 P 64 3N 240 G 1`` and the shipped width a call takes 4,301.8 us at depth one,
+holds between 4,033.5 and 4,262.9 from depth two to depth nine as the partials
+accumulate on top of a spill that has not moved, and falls to 3,493.9 at the full
+depth, where the loop's trip count is one and the spill is gone with it. One counter
+pass at each end of the sweep: 255 registers, 144.51 MB of local loads and 8.52 MB of
+local stores at depth one, against 242 registers and no local traffic at all at the
+full depth. The local traffic is a property of the loop existing.
 
 A shard owns a partial and not an output. At depth one the block writes the three
 outputs itself, after the last head, in shared memory throughout. Above one it writes
@@ -176,6 +178,12 @@ reads it twice. ``dinc`` and ``zstart`` are float32 ``(B, H, C, P, 3N)`` and tog
 are 40% of the total. The three write terms are the depth-one form. At the shipped
 depth they are :func:`partial_bytes` instead, 143.77 MB, which is the largest single
 item in the launch and the whole of what the closure reads.
+
+That total is an upper bound and the launch does not pay it. 837.5 MB analytic at the
+shipped depth against 515.81 MB of DRAM counted, 62% over. The 321.7 MB of daylight is
+the size of the per-tile re-read term, 259.89 MB, and the lane tile is the innermost
+axis of ``x``, so the five tiles of a token block run back to back and L2 serves the
+repeats. Score this kernel against its counted traffic, never against the table.
 
 Measured, the bar is missed, and the distance is latency and not traffic. Every
 counter below is from one profile of this kernel on an RTX A6000, ``sm_86``, 84
@@ -851,18 +859,20 @@ def vector_splits(fold: int, splits: int | None = None) -> int:
     follow the trip count. One rolled iteration is enough to sink the accumulators
     to local memory, and every head then pays that traffic whatever the loop's
     extent, so every depth between the two ends carries the full spill and its own
-    partials as well. Measured at ``B 4 H 18 T 2048 L 64 P 64 3N 240 G 1``, one call
-    each, event-timed, clocks unlocked:
+    partials as well. Measured at ``B 4 H 18 T 2048 L 64 P 64 3N 240 G 1`` and the
+    shipped width, event medians of three, clocks unlocked, MB the workspace:
 
         depth      1       2       3       6       9      18
-        us   10,615.9 11,241.0 11,278.4 11,530.8 12,260.9 8,101.9
-        MB          0    31.7    47.6    95.1   142.7   285.3
+        us     4,301.8 4,165.6 4,033.5 4,160.0 4,262.9 3,493.9
+        MB        0.00   15.97   23.96   47.92   71.88  143.77
 
     So the depth is the fold unless a caller has a reason of its own, and the
-    workspace that costs is linear in it. The sweep ran with float32 vector partials,
-    which the MB row is; the two vector buffers now carry the activation width, so
-    depth eighteen is 143.8 MB. The ordering is set by the spill and not by the
-    workspace, so narrowing the partial cannot reorder it.
+    workspace that costs is linear in it. The full depth is the only one that clears
+    the spill, and it wins by 807.9 us over the depth that carries no workspace at
+    all; the four between the ends span 5.7% and none of them reaches either end.
+    The ordering is set by the spill and not by the workspace, so narrowing the
+    partial cannot reorder it, and the depth that deletes the workspace is the one
+    that also divides the grid by the fold.
 
     Args:
         fold: ``H // G``, the heads sharing a group.
