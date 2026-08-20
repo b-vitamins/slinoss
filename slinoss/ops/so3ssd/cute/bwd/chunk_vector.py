@@ -313,7 +313,9 @@ The other lever is the block width, and it is a parameter: ``warps`` selects the
 tiling and the thread count together, and eight is the default. The M mode of the tiling
 is pinned and the extra warps go to ``N`` at atom granularity, so the tile, the pitches
 and the staging passes are the width's invariants. Measured at both widths on the shape
-above, medians of three runs, at both vector-partial widths::
+above, medians of three runs, at both vector-partial widths. Every row is counter-pass
+time at the throttled clock, so the rows compare to each other and not to the device
+time quoted for the shipped configuration above::
 
     warps  partial  us/launch  MB/launch  GB/s  of 85%  regs  arena   occ theo/ach
         4      f32    7,029.2     667.01  95.0   13.9%   255  91,344   8.3% / 8.3%
