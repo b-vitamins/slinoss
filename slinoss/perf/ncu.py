@@ -378,6 +378,26 @@ def _sums(metric: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_FIXED_FLAGS: Final[tuple[str, ...]] = (
+    "--csv",
+    "--clock-control",
+    "none",
+    "--cache-control",
+    "none",
+    "--profile-from-start",
+    "off",
+    "--target-processes",
+    "all",
+    "--replay-mode",
+    "kernel",
+)
+"""The flags every collection pass carries, whatever it requests.
+
+Shared so that a pass added later cannot quietly profile under a locked clock or a
+cold cache; the module docstring says why neither is optional.
+"""
+
+
 def ncu_command(
     table: NcuTable,
     argv: Sequence[str],
@@ -408,17 +428,7 @@ def ncu_command(
         raise ValueError("ncu needs a target command")
     return [
         ncu,
-        "--csv",
-        "--clock-control",
-        "none",
-        "--cache-control",
-        "none",
-        "--profile-from-start",
-        "off",
-        "--target-processes",
-        "all",
-        "--replay-mode",
-        "kernel",
+        *_FIXED_FLAGS,
         "--metrics",
         ",".join(table.metrics),
         *extra,
@@ -571,8 +581,37 @@ def run_ncu(
             code does not.
     """
     command = ncu_command(table, argv, ncu=resolve_tool(ncu), extra=extra)
+    text = _capture(
+        command, label=f"table {table.name!r}", cwd=cwd, timeout_s=timeout_s
+    )
+    return parse_ncu_csv(text, table.metrics, table=table.name, command=command)
+
+
+def _capture(
+    command: Sequence[str],
+    *,
+    label: str,
+    cwd: str | None = None,
+    timeout_s: float | None = None,
+) -> str:
+    """Run one NCU command and return its stdout.
+
+    Args:
+        command: The full argv, binary already resolved.
+        label: What to name in a failure message.
+        cwd: Working directory.
+        timeout_s: Wall clock limit, or None.
+
+    Returns:
+        Standard output, verbatim.
+
+    Raises:
+        RuntimeError: If NCU exits nonzero. The message carries the tail of
+            stderr, because NCU's own diagnostic names the cause and a bare exit
+            code does not.
+    """
     done = subprocess.run(
-        command,
+        list(command),
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -581,10 +620,8 @@ def run_ncu(
     )
     if done.returncode != 0:
         tail = (done.stderr or done.stdout or "").strip().splitlines()[-12:]
-        raise RuntimeError(
-            f"ncu table {table.name!r} exited {done.returncode}: " + " | ".join(tail)
-        )
-    return parse_ncu_csv(done.stdout, table.metrics, table=table.name, command=command)
+        raise RuntimeError(f"ncu {label} exited {done.returncode}: " + " | ".join(tail))
+    return done.stdout
 
 
 # ---------------------------------------------------------------------------
