@@ -197,6 +197,26 @@ def test_grid_modes_are_paired_with_their_indices() -> None:
     assert_max_rel(got, want, BOUNDS[torch.bfloat16], "cute-chunk-start[grid]")
 
 
+def test_the_chunk_serial_launch_matches_the_block_per_chunk_one() -> None:
+    """One block walking every chunk gives what one block per chunk gives.
+
+    The serial arm moves the chunk index out of the grid and into a reverse loop,
+    which reuses one set of staging tiles and one accumulator across iterations.
+    A missing barrier between iterations, a fragment left unzeroed, or an index
+    read off the grid instead of the loop all show here. Nothing about the
+    arithmetic changes, so the two must agree bit for bit.
+
+    Three pairwise-distinct extents above one, so a collapsed grid mode cannot be
+    mistaken for the one it collapsed into.
+    """
+    inp = _make(3, 2, 256, 16, 16, torch.bfloat16)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = chunk_start_backward(dy, inp.trans, inp.C, 64)
+    got = chunk_start_backward(dy, inp.trans, inp.C, 64, serial=True)
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)
+
+
 def test_reads_a_band_of_the_fused_projection() -> None:
     """``C`` ships pitched, and the kernel indexes the band rather than a copy of it.
 

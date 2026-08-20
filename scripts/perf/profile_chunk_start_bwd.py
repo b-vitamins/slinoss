@@ -119,6 +119,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run as the profiler's target: warm up, then launch inside the "
         "capture window. Emits nothing.",
     )
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="Walk the chunks inside one block instead of taking one block per "
+        "chunk. Same result, C times fewer blocks. Prices the parallelism a fusion "
+        "with the reverse state recurrence would have to give up.",
+    )
     return parser.parse_args(argv)
 
 
@@ -141,13 +148,19 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
     suffix = "".join(f"-{f}{v}" for f, v in sorted(given.items()))
     if args.groups is not None:
         suffix += f"-g{args.groups}"
+    if args.serial:
+        suffix += "-serial"
     if not suffix:
         return shape
     return dataclasses.replace(shape, name=f"{shape.name}{suffix}", **given)
 
 
 def build_runner(
-    shape: OpShape, groups: int, device: torch.device, dtype: torch.dtype
+    shape: OpShape,
+    groups: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    serial: bool = False,
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the kernel.
 
@@ -162,6 +175,7 @@ def build_runner(
         groups: ``G``. Divides ``shape.heads``.
         device: Where to allocate.
         dtype: Activation dtype.
+        serial: Whether the launch walks the chunks inside one block.
 
     Returns:
         The callable, allocating its output per call as the host entry does.
@@ -187,7 +201,7 @@ def build_runner(
         )
 
     def run() -> None:
-        chunk_start_backward(inputs.dy, inputs.trans, vecc, shape.chunk)
+        chunk_start_backward(inputs.dy, inputs.trans, vecc, shape.chunk, serial=serial)
 
     return run
 
@@ -215,6 +229,8 @@ def target_argv(args: argparse.Namespace) -> list[str]:
             argv += [f"--{field}", str(value)]
     if args.groups is not None:
         argv += ["--groups", str(args.groups)]
+    if args.serial:
+        argv += ["--serial"]
     return argv
 
 
@@ -279,7 +295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     groups = shape.heads if args.groups is None else args.groups
 
     if args.window:
-        runner = build_runner(shape, groups, device, dtype)
+        runner = build_runner(shape, groups, device, dtype, args.serial)
         with on_device(device):
             for _ in range(args.warmup):
                 runner()
@@ -290,7 +306,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
-    runner = build_runner(shape, groups, device, dtype)
+    runner = build_runner(shape, groups, device, dtype, args.serial)
     label = f"chunk_start_bwd {shape.name}"
     timed = measure(
         runner,

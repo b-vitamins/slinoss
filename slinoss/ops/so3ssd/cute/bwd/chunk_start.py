@@ -127,6 +127,7 @@ __all__ = [
     "chunk_start_bwd_kernel",
     "gram_tile",
     "rotated_tile",
+    "start_chunk",
     "start_smem_bytes",
 ]
 
@@ -178,83 +179,77 @@ def start_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     )
 
 
-@cute.kernel
-def chunk_start_bwd_kernel(
+@cute.jit
+def start_chunk(
     gdy: cute.Tensor,
     gtrans: cute.Tensor,
     gc: cute.Tensor,
     gdz: cute.Tensor,
-    seqlen: cutlass.Int32,
+    strans: cute.Tensor,
+    slp: cute.Tensor,
+    squat: cute.Tensor,
+    stable: cute.Tensor,
+    scrot: cute.Tensor,
+    sdy: cute.Tensor,
+    acc: cute.Tensor,
     tiled_mma: cute.TiledMma,
+    seqlen: cutlass.Int32,
+    cidx: cutlass.Int32,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    gidx: cutlass.Int32,
+    tid: cutlass.Int32,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
-    per_group: cutlass.Constexpr,
 ) -> None:
-    """Contract the weighted output cotangent against the rotated readout.
+    """One chunk's contraction, from the staging passes to the store.
 
-    One block per ``(chunk, batch, head)``.
+    Split out of :func:`chunk_start_bwd_kernel` so the block-per-chunk launch and
+    the chunk-serial launch run the same body rather than two copies of it.
 
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
         gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
         gc: ``(B,G,T,3N)`` operand-dtype output vectors.
         gdz: ``(B,H,C,P,3N)`` float32, written with the chunk-start cotangent.
-        seqlen: ``T``. Dynamic.
+        strans: ``(L,4)`` float32 transition tile.
+        slp: ``(L,)`` float32 log-decay prefix tile.
+        squat: ``(L,4)`` float32 quaternion prefix tile.
+        stable: ``(L,9)`` float32 transform table, ``Ac`` alone.
+        scrot: ``(L,pitch)`` operand-dtype rotated readout tile. Padded columns
+            are zero on entry and are not restaged here.
+        sdy: ``(mpad,pitch)`` operand-dtype weighted cotangent tile, same.
+        acc: Float32 accumulator fragment from :func:`mma_acc`. Zeroed here, so
+            one fragment serves every chunk a block walks.
         tiled_mma: From :func:`make_mma`.
+        seqlen: ``T``. Dynamic.
+        cidx: Chunk this call contracts. Dynamic.
+        bidx: Batch index. Dynamic.
+        hidx: Head index. Dynamic.
+        gidx: Group index, ``hidx // (H // G)``. Dynamic.
+        tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
         rows: ``P``. Compile-time.
         dim: ``3N``. Compile-time.
-        per_group: ``H // G``, heads sharing one ``c``. Compile-time.
 
     Invariants:
-        ``chunk`` is a multiple of :data:`MMA_TILE_K` and ``dim`` of
-        :data:`MMA_TILE_N`. ``rows`` is free: M is rounded up in shared memory,
-        zero-filled, and the store is predicated. ``per_group`` divides ``H``.
-        The prefixes and the table are float32 (I4) and the quaternion prefix is
-        renormalized once, inside :func:`chunk_prefixes` (I5).
+        Every barrier here is reached by the whole block, so the body is safe to
+        call inside a loop whose trip count is uniform. On entry no thread may
+        still be reading ``sdy`` or ``scrot`` from a previous call; the three
+        barriers ahead of the staging passes give that.
     """
-    tid, _, _ = cute.arch.thread_idx()
-    # Head is the fastest grid mode. Blocks are dispatched in that order, so the
-    # ``H // G`` blocks that read one group's readout tile are co-resident and the
-    # tile is fetched from DRAM once instead of once per head.
-    hidx, cidx, bidx = cute.arch.block_idx()
-
-    # Only gc is grouped; everything else this block reads is per head. The branch
-    # is trace-time, so the ungrouped shape emits no divide at all.
-    gidx = hidx
-    if cutlass.const_expr(per_group != 1):
-        gidx = hidx // per_group
-
     lanes = dim // 3
     mpad = mma_rows(rows)
     lda = smem_pitch(mpad)
     ldb = smem_pitch(dim)
 
-    smem = cutlass.utils.SmemAllocator()
-    strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
-    squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 1).layout(), 16)
-    scrot = smem.allocate_tensor(
-        gc.element_type, rotated_tile(chunk, dim).layout(), SMEM_SEGMENT
-    )
-    sdy = smem.allocate_tensor(
-        gdy.element_type, gram_tile(chunk, rows).layout(), SMEM_SEGMENT
-    )
-
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
 
     stage_trans(gtrans[bidx, hidx, None, None], strans, t0, valid, tid, threads, chunk)
-    # Columns at or past the data width are read as operands but never restaged, so
-    # they are zeroed once here. ``sdy`` runs to its full pitch because its M mode
-    # is the rounded extent: columns P..mpad-1 are read as zero rows.
-    stage_pad(scrot, tid, threads, chunk, dim, ldb)
-    stage_pad(sdy, tid, threads, chunk, rows, lda)
-
     cute.arch.sync_threads()
     chunk_prefixes(strans, slp, squat, tid, chunk)
     cute.arch.sync_threads()
@@ -289,7 +284,7 @@ def chunk_start_bwd_kernel(
     )
     cute.arch.sync_threads()
 
-    acc = mma_acc(tiled_mma, tid, (mpad, dim))
+    acc.fill(0.0)
     va = cute.make_tensor(
         sdy.iterator, cute.make_layout((mpad, chunk), stride=(1, lda))
     )
@@ -298,6 +293,142 @@ def chunk_start_bwd_kernel(
     )
     mma_gemm(tiled_mma, tid, acc, va, vb, False, False)
     mma_store(tiled_mma, tid, acc, gdz[bidx, hidx, cidx, None, None], (mpad, dim), rows)
+
+
+@cute.kernel
+def chunk_start_bwd_kernel(
+    gdy: cute.Tensor,
+    gtrans: cute.Tensor,
+    gc: cute.Tensor,
+    gdz: cute.Tensor,
+    seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
+    tiled_mma: cute.TiledMma,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    dim: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
+    serial: cutlass.Constexpr,
+) -> None:
+    """Contract the weighted output cotangent against the rotated readout.
+
+    One block per ``(chunk, batch, head)``, or one block per ``(batch, head)``
+    walking the chunks in reverse under ``serial``.
+
+    Args:
+        gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
+        gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
+        gc: ``(B,G,T,3N)`` operand-dtype output vectors.
+        gdz: ``(B,H,C,P,3N)`` float32, written with the chunk-start cotangent.
+        seqlen: ``T``. Dynamic.
+        chunks: ``C``. Dynamic. Read only under ``serial``.
+        tiled_mma: From :func:`make_mma`.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        rows: ``P``. Compile-time.
+        dim: ``3N``. Compile-time.
+        per_group: ``H // G``, heads sharing one ``c``. Compile-time.
+        serial: Whether one block walks every chunk instead of one block taking
+            one chunk. Compile-time. The chunk-serial order is the one a fusion
+            with the reverse state recurrence would force, so it is the arm that
+            prices that fusion's parallelism.
+
+    Invariants:
+        ``chunk`` is a multiple of :data:`MMA_TILE_K` and ``dim`` of
+        :data:`MMA_TILE_N`. ``rows`` is free: M is rounded up in shared memory,
+        zero-filled, and the store is predicated. ``per_group`` divides ``H``.
+        The prefixes and the table are float32 (I4) and the quaternion prefix is
+        renormalized once, inside :func:`chunk_prefixes` (I5).
+    """
+    tid, _, _ = cute.arch.thread_idx()
+    # Head is the fastest grid mode. Blocks are dispatched in that order, so the
+    # ``H // G`` blocks that read one group's readout tile are co-resident and the
+    # tile is fetched from DRAM once instead of once per head.
+    hidx, cidx, bidx = cute.arch.block_idx()
+
+    # Only gc is grouped; everything else this block reads is per head. The branch
+    # is trace-time, so the ungrouped shape emits no divide at all.
+    gidx = hidx
+    if cutlass.const_expr(per_group != 1):
+        gidx = hidx // per_group
+
+    mpad = mma_rows(rows)
+    ldb = smem_pitch(dim)
+    lda = smem_pitch(mpad)
+
+    smem = cutlass.utils.SmemAllocator()
+    strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
+    slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
+    squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
+    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 1).layout(), 16)
+    scrot = smem.allocate_tensor(
+        gc.element_type, rotated_tile(chunk, dim).layout(), SMEM_SEGMENT
+    )
+    sdy = smem.allocate_tensor(
+        gdy.element_type, gram_tile(chunk, rows).layout(), SMEM_SEGMENT
+    )
+
+    # Columns at or past the data width are read as operands but never restaged, so
+    # they are zeroed once here. ``sdy`` runs to its full pitch because its M mode
+    # is the rounded extent: columns P..mpad-1 are read as zero rows.
+    stage_pad(scrot, tid, threads, chunk, dim, ldb)
+    stage_pad(sdy, tid, threads, chunk, rows, lda)
+
+    acc = mma_acc(tiled_mma, tid, (mpad, dim))
+    if cutlass.const_expr(serial):
+        # Reverse order, the order the state recurrence consumes the chunks in, so
+        # the arm prices the launch a fused kernel would have to make.
+        for step in cutlass.range(chunks):
+            start_chunk(
+                gdy,
+                gtrans,
+                gc,
+                gdz,
+                strans,
+                slp,
+                squat,
+                stable,
+                scrot,
+                sdy,
+                acc,
+                tiled_mma,
+                seqlen,
+                chunks - 1 - step,
+                bidx,
+                hidx,
+                gidx,
+                tid,
+                threads,
+                chunk,
+                rows,
+                dim,
+            )
+    else:
+        start_chunk(
+            gdy,
+            gtrans,
+            gc,
+            gdz,
+            strans,
+            slp,
+            squat,
+            stable,
+            scrot,
+            sdy,
+            acc,
+            tiled_mma,
+            seqlen,
+            cidx,
+            bidx,
+            hidx,
+            gidx,
+            tid,
+            threads,
+            chunk,
+            rows,
+            dim,
+        )
 
 
 @cute.jit
@@ -317,6 +448,7 @@ def chunk_start_bwd(
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
     per_group: cutlass.Constexpr,
+    serial: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`chunk_start_bwd_kernel`.
 
@@ -326,21 +458,25 @@ def chunk_start_bwd(
 
     The grid is head-fastest, against the chunk-fastest order the other chunked
     kernels use, so that the ``H // G`` blocks sharing a readout tile run together.
-    The unpack in :func:`chunk_start_bwd_kernel` matches it.
+    The unpack in :func:`chunk_start_bwd_kernel` matches it. Under ``serial`` the
+    chunk mode leaves the grid and becomes a loop inside the block.
     """
+    tiles = cutlass.Int32(1) if cutlass.const_expr(serial) else chunks
     chunk_start_bwd_kernel(
         gdy,
         gtrans,
         gc,
         gdz,
         seqlen,
+        chunks,
         make_mma(dtype),
         threads,
         chunk,
         rows,
         dim,
         per_group,
-    ).launch(grid=(heads, chunks, bsz), block=(threads, 1, 1), stream=stream)
+        serial,
+    ).launch(grid=(heads, tiles, bsz), block=(threads, 1, 1), stream=stream)
 
 
 def chunk_start_backward(
@@ -348,6 +484,8 @@ def chunk_start_backward(
     trans: Tensor,
     C: Tensor,
     chunk_size: int,
+    *,
+    serial: bool = False,
 ) -> Tensor:
     """Accumulate every chunk's chunk-start state cotangent.
 
@@ -361,6 +499,11 @@ def chunk_start_backward(
             rather than ``3N``; a contiguous buffer is the case where the two
             agree. ``G`` divides ``H``; head ``h`` reads group ``h // (H // G)``.
         chunk_size: ``L``. A multiple of 16.
+        serial: Whether one block walks every chunk in reverse instead of one
+            block per chunk. Same result, ``C`` times fewer blocks. It exists to
+            price a fusion with the reverse state recurrence, which can only keep
+            the accumulator on chip if the chunk mode leaves the grid, and the
+            module docstring carries what it measured. Not a tuning knob.
 
     Returns:
         ``(B,H,C,P,3N)`` float32 cotangent of the chunk-start state (I4).
@@ -408,6 +551,7 @@ def chunk_start_backward(
             rows,
             dim,
             heads // groups,
+            serial,
         ),
     )
     return dzstart
