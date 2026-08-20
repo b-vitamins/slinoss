@@ -225,9 +225,10 @@ table above prices at 2.10x on this shape. Beyond that, occupancy is worth what 
 one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident blocks,
 16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5% at
 ``P 64`` where the same ``L`` holds one block. The remaining candidate is 256 threads
-per block, which is the atom tiling's shape and not this file's: at eight warps the M
-tile doubles and the same live set is 128,432 B, off the device. The declared class
-follows the traffic; the figures above are what the kernel reaches against it.
+per block, which is the atom tiling's shape and not this file's: the M mode of the atom
+tiling is pinned, the extra warps are absorbed by ``N`` at atom granularity, and the
+arena is the same bytes at eight warps as at four. The declared class follows the
+traffic; the figures above are what the kernel reaches against it.
 """
 
 from typing import NamedTuple
