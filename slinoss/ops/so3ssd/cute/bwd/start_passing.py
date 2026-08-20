@@ -1,0 +1,500 @@
+"""Chunk-start cotangent and reverse state recurrence in one launch.
+
+Unfused, the two halves talk through a whole ``(B,H,C,P,3N)`` float32 buffer:
+:func:`slinoss.ops.so3ssd.cute.bwd.chunk_start.chunk_start_backward` writes
+``dzstart`` and :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward`
+reads it back and overwrites it with ``dinc``. That round trip is 283 MB of the
+pair's 455 MB at the model geometry, and it is the only thing either kernel has
+left to give: the recurrence measured 99.6% of its own DRAM floor.
+
+Fused, ``dzstart`` never reaches DRAM. One block holds a chunk's tile in shared
+memory, the recurrence consumes it there, and only ``dinc`` and ``dz0`` are
+written:
+
+    dgram(L,P)      = dy * exp(2*lp)
+    dzstart_c(P,3N) = dgram_c^T crot_c
+    acc_C = dstate,  dinc_c = acc_{c+1},
+    acc_c = a_c R(Q_c)^T acc_{c+1} + dzstart_c,  dz0 = acc_0
+
+Parallelism. The recurrence is serial in the chunk, so the chunk mode leaves the
+grid and becomes a reverse loop inside the block, exactly the arm
+``chunk_start_backward(serial=True)`` prices. What replaces it is the lane band:
+the state's ``3N`` columns split into ``SPLIT``-wide bands, one block per band,
+because each 3-vector's recurrence is independent of every other. ``dy`` and
+``trans`` are then read once per band rather than once, and ``C`` is still read
+once because each band reads its own columns of it.
+
+Traffic at ``B=4 H=18 T=2048 P=64 3N=240 L=64``, ``G=1``, five bands, against the
+455 MB the unfused pair moves:
+
+    dy       5*18.87           =  94.35 MB read
+    trans    5*2.36            =  11.79 MB read
+    C        4*2048*240*2      =   3.93 MB read
+    cquat    5*4*18*32*4*4     =   0.23 MB read
+    cscale   5*4*18*32*4       =   0.06 MB read
+    dinc     4*18*32*64*240*4  = 141.56 MB written
+    dz0      4*18*64*240*4     =   4.42 MB written
+                                 256.34 MB
+
+The five bands of one head are dispatched 18 blocks apart and the whole grid is
+360 blocks against 168 resident, so the bands sharing a head's ``dy`` are
+co-resident and L2 can serve four of their five reads. The counted figure above
+charges none of that.
+
+Registers are what sets ``SPLIT``. The GEMM accumulator is ``mpad*SPLIT/threads``
+float32 and the recurrence carries ``rows*SPLIT/threads`` more, so the pair grows
+linearly in the band width: at ``P=64`` and 128 threads, 48 columns is 24 and 24.
+The whole state at once is 120 and 120, which cannot fit 255 registers, and a
+spilled recurrence accumulator touched once per chunk would move exactly the bytes
+this kernel exists to delete. The band is not a tuning knob for anything else.
+
+Barriers. :func:`start_chunk` ends on the store into shared memory with no barrier
+after it, so one is emitted here before the recurrence reads the tile. The reverse
+direction needs none: the three barriers inside the next iteration's staging keep
+any thread from reaching that iteration's store while another is still reading the
+tile.
+"""
+
+import cutlass
+import cutlass.cute as cute
+import torch
+from torch import Tensor
+
+from slinoss._cute import (
+    Stream,
+    Tile,
+    assert_smem_fits,
+    cute_dtype,
+    jit_launch,
+    smem_bytes,
+)
+from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
+    gram_tile,
+    rotated_tile,
+    start_chunk,
+    start_smem_bytes,
+)
+from slinoss.ops.so3ssd.cute.bwd.state_passing import StatePassingBwd
+from slinoss.ops.so3ssd.cute.common import (
+    THREADS,
+    mat3_matvec,
+    mat3_transpose,
+    rot_hom,
+    scalar_tile,
+    table_tile,
+    trans_tile,
+)
+from slinoss.ops.so3ssd.cute.guard import (
+    Named,
+    check_extents,
+    check_layout,
+    check_operands,
+    check_pinned,
+    check_pitched,
+    check_shapes,
+)
+from slinoss.ops.so3ssd.cute.mma import (
+    SMEM_SEGMENT,
+    make_mma,
+    mma_acc,
+    mma_rows,
+    smem_pitch,
+)
+from slinoss.ops.so3ssd.cute.table import stage_pad
+
+__all__ = [
+    "SPLIT",
+    "fold_smem_bytes",
+    "start_passing_backward",
+    "start_passing_bwd",
+    "start_passing_bwd_kernel",
+    "state_tile",
+]
+
+SPLIT: int = 48
+"""Columns of ``3N`` one block contracts and carries.
+
+A multiple of 3, so a band holds whole 3-vectors, and of
+:data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_N`, so it is an N extent the atom
+covers. 48 is the smallest width satisfying both, and every legal ``3N`` is a
+multiple of it, so one width divides every shape. The module docstring carries why
+a wider band does not fit the register file.
+"""
+
+
+def state_tile(rows: int, span: int) -> Tile:
+    """Chunk-start cotangent tile, ``(mpad, span)`` float32.
+
+    Contiguous and row-major, which is what :func:`mma_store` requires of any
+    destination, and pitched to the band width so the flat index of a 3-vector is
+    the same arithmetic in shared memory and in ``dinc``.
+
+    The rounded M extent is allocated even where the store predicates the added
+    rows away, because the vectorized path writes all of them.
+
+    Args:
+        rows: ``P``.
+        span: Band width, :data:`SPLIT`.
+    """
+    return Tile((mma_rows(rows), span), (span, 1))
+
+
+def fold_smem_bytes(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
+    """Shared memory the kernel allocates, in bytes.
+
+    The staging tiles of the chunk-start GEMM at the band width, plus the float32
+    tile the recurrence reads.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        span: Band width, :data:`SPLIT`.
+        itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+    """
+    return start_smem_bytes(chunk, rows, span, itemsize) + smem_bytes(
+        [(state_tile(rows, span), 4)]
+    )
+
+
+@cute.kernel
+def start_passing_bwd_kernel(
+    gdy: cute.Tensor,
+    gtrans: cute.Tensor,
+    gc: cute.Tensor,
+    gcquat: cute.Tensor,
+    gcscale: cute.Tensor,
+    gdstate: cute.Tensor,
+    gdinc: cute.Tensor,
+    gdz0: cute.Tensor,
+    seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
+    tiled_mma: cute.TiledMma,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    dim: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
+    has_dstate: cutlass.Constexpr,
+) -> None:
+    """Contract each chunk's readout cotangent and run the reverse recurrence.
+
+    One block per ``(band, batch, head)``, walking the chunks in reverse.
+
+    Args:
+        gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
+        gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
+        gc: ``(B,G,T,3N)`` operand-dtype output vectors.
+        gcquat: ``(B,H,C,4)`` float32 unit chunk rotations.
+        gcscale: ``(B,H,C)`` float32 chunk decays, ``exp(2*lp_{L-1})``.
+        gdstate: ``(B,H,3*P*N)`` float32 cotangent of the final state. Read only
+            when ``has_dstate``; the zero-seed variant is handed ``gdz0`` here so
+            the signature has one form.
+        gdinc: ``(B,H,C,3*P*N)`` float32, written with the cotangent of each
+            chunk's increment in the global frame.
+        gdz0: ``(B,H,3*P*N)`` float32, written with the cotangent of the initial
+            state.
+        seqlen: ``T``. Dynamic.
+        chunks: ``C``. Dynamic.
+        tiled_mma: From :func:`make_mma`.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        rows: ``P``. Compile-time.
+        dim: ``3N``. Compile-time.
+        span: Band width, :data:`SPLIT`. Compile-time.
+        per_group: ``H // G``, heads sharing one ``c``. Compile-time.
+        has_dstate: Whether a final-state cotangent is supplied. Compile-time.
+
+    Invariants:
+        ``span`` divides ``dim``, 3 divides ``span``, and ``threads`` divides
+        ``rows * span / 3``, so the band is a whole number of 3-vectors and every
+        thread owns the same count of them. ``|R(Q_c)| == 1`` and ``a_c`` lies in
+        ``(0, 1]`` by I1, so the reverse recurrence cannot grow.
+    """
+    tid, _, _ = cute.arch.thread_idx()
+    # Head is the fastest grid mode, as in the unfused GEMM: the ``H // G`` blocks
+    # reading one group's readout band are co-resident. The band mode is next, so
+    # the bands sharing a head's ``dy`` are close enough behind it to hit L2.
+    hidx, sidx, bidx = cute.arch.block_idx()
+
+    gidx = hidx
+    if cutlass.const_expr(per_group != 1):
+        gidx = hidx // per_group
+
+    mpad = mma_rows(rows)
+    lanes = span // 3
+    vecs = rows * lanes // threads
+    lda = smem_pitch(mpad)
+    ldb = smem_pitch(span)
+
+    smem = cutlass.utils.SmemAllocator()
+    strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
+    slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
+    squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
+    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 1).layout(), 16)
+    scrot = smem.allocate_tensor(
+        gc.element_type, rotated_tile(chunk, span).layout(), SMEM_SEGMENT
+    )
+    sdy = smem.allocate_tensor(
+        gdy.element_type, gram_tile(chunk, rows).layout(), SMEM_SEGMENT
+    )
+    sdz = smem.allocate_tensor(cutlass.Float32, state_tile(rows, span).layout(), 16)
+
+    stage_pad(scrot, tid, threads, chunk, span, ldb)
+    stage_pad(sdy, tid, threads, chunk, rows, lda)
+
+    # The band's origin is a pointer offset: ``3N`` is the last mode at unit stride,
+    # so the staging pass indexes the band's own columns and never learns that the
+    # state is wider.
+    band = cute.make_tensor(gc.iterator + sidx * span, gc.layout)
+
+    acc = mma_acc(tiled_mma, tid, (mpad, span))
+    state = cute.make_fragment((3 * vecs,), cutlass.Float32)
+
+    # One 3-vector's coordinates in the tile and in the ``(P,3N)`` plane. The band
+    # index is dynamic and the vector index is not, so these are hoisted out of the
+    # chunk loop rather than recomputed inside it.
+    tile_row = []
+    tile_col = []
+    plane = []
+    for k in cutlass.range_constexpr(vecs):
+        # A name reused inside the chunk loop below at another structure is read as
+        # a loop-carried variable whose type changes, which the DSL refuses.
+        owned = tid + k * threads
+        row = owned // lanes
+        lane = owned - row * lanes
+        tile_row.append(row)
+        tile_col.append(3 * lane)
+        plane.append(row * dim + sidx * span + 3 * lane)
+
+    for k in cutlass.range_constexpr(vecs):
+        for j in cutlass.range_constexpr(3):
+            if cutlass.const_expr(has_dstate):
+                state[3 * k + j] = gdstate[bidx, hidx, plane[k] + j]
+            else:
+                state[3 * k + j] = cutlass.Float32(0.0)
+
+    for step in cutlass.range(chunks):
+        cidx = chunks - 1 - step
+        start_chunk(
+            gdy,
+            gtrans,
+            band,
+            sdz,
+            strans,
+            slp,
+            squat,
+            stable,
+            scrot,
+            sdy,
+            acc,
+            tiled_mma,
+            seqlen,
+            cidx,
+            bidx,
+            hidx,
+            gidx,
+            tid,
+            threads,
+            chunk,
+            rows,
+            span,
+        )
+        cute.arch.sync_threads()
+
+        quat = (
+            gcquat[bidx, hidx, cidx, 0],
+            gcquat[bidx, hidx, cidx, 1],
+            gcquat[bidx, hidx, cidx, 2],
+            gcquat[bidx, hidx, cidx, 3],
+        )
+        decayed = gcscale[bidx, hidx, cidx]
+        # The transpose is a reindexing of a tuple at trace time, and the matrix is
+        # one per chunk for every 3-vector the thread carries.
+        mat = mat3_transpose(rot_hom(quat))
+        for k in cutlass.range_constexpr(vecs):
+            carried = (state[3 * k], state[3 * k + 1], state[3 * k + 2])
+            # The increment cotangent is the accumulator before this chunk's
+            # readout term enters it, so the store precedes the update.
+            for j in cutlass.range_constexpr(3):
+                gdinc[bidx, hidx, cidx, plane[k] + j] = carried[j]
+            # One rotation, then the scale, then the readout cotangent: the forward
+            # scales the state alone and rotates the sum, and transposing that
+            # order puts the scale outside the rotation.
+            turned = mat3_matvec(mat, carried)
+            for j in cutlass.range_constexpr(3):
+                state[3 * k + j] = (
+                    decayed * turned[j] + sdz[tile_row[k], tile_col[k] + j]
+                )
+
+    for k in cutlass.range_constexpr(vecs):
+        for j in cutlass.range_constexpr(3):
+            gdz0[bidx, hidx, plane[k] + j] = state[3 * k + j]
+
+
+@cute.jit
+def start_passing_bwd(
+    gdy: cute.Tensor,
+    gtrans: cute.Tensor,
+    gc: cute.Tensor,
+    gcquat: cute.Tensor,
+    gcscale: cute.Tensor,
+    gdstate: cute.Tensor,
+    gdinc: cute.Tensor,
+    gdz0: cute.Tensor,
+    seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
+    bands: cutlass.Int32,
+    bsz: cutlass.Int32,
+    heads: cutlass.Int32,
+    stream: Stream,
+    dtype: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    dim: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    per_group: cutlass.Constexpr,
+    has_dstate: cutlass.Constexpr,
+) -> None:
+    """Launch :func:`start_passing_bwd_kernel`.
+
+    The grid is ``(H, 3N/span, B)``, head-fastest, so the ordering argument the
+    unfused GEMM makes about ``C`` survives the fusion.
+    """
+    start_passing_bwd_kernel(
+        gdy,
+        gtrans,
+        gc,
+        gcquat,
+        gcscale,
+        gdstate,
+        gdinc,
+        gdz0,
+        seqlen,
+        chunks,
+        make_mma(dtype),
+        threads,
+        chunk,
+        rows,
+        dim,
+        span,
+        per_group,
+        has_dstate,
+    ).launch(grid=(heads, bands, bsz), block=(threads, 1, 1), stream=stream)
+
+
+def start_passing_backward(
+    dy: Tensor,
+    trans: Tensor,
+    C: Tensor,
+    cquat: Tensor,
+    cscale: Tensor,
+    chunk_size: int,
+    dstate: Tensor | None = None,
+    *,
+    span: int = SPLIT,
+) -> StatePassingBwd:
+    """Form every chunk's start-state cotangent and pass it back through the scan.
+
+    Args:
+        dy: ``(B,H,T,P)`` cotangent of ``y``, one of
+            :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous. A
+            caller with no ``dy`` has no chunk-start cotangent to form and runs the
+            recurrence alone rather than this kernel against zeros.
+        trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
+        C: ``(B,G,T,3N)``, the dtype of ``dy``, pitched. ``G`` divides ``H``; head
+            ``h`` reads group ``h // (H // G)``.
+        cquat: ``(B,H,C,4)`` float32, contiguous. Unit chunk rotations
+            ``Q_{L-1}``, scalar-first.
+        cscale: ``(B,H,C)`` float32, contiguous. Chunk decays ``exp(2*lp_{L-1})``.
+        chunk_size: ``L``. A multiple of 16.
+        dstate: ``(B,H,P,3N)`` float32, contiguous. Zero seed if omitted.
+        span: Band width. :data:`SPLIT` is the only value the register budget
+            admits at every legal ``P``; it is an argument so a driver can price a
+            wider one.
+
+    Returns:
+        A :class:`slinoss.ops.so3ssd.cute.bwd.state_passing.StatePassingBwd`. Both
+        fields are fresh buffers: nothing is written in place, because the
+        chunk-start cotangent this fuses away never exists in memory.
+
+    Raises:
+        ValueError: On a layout, rank, shape, or extent violation, or on a band
+            width the launch cannot cover exactly.
+        TypeError: On an activation dtype with no tensor-core path.
+    """
+    activations: Named = ((dy, "dy"), (C, "C"))
+    pinned: Named = ((trans, "trans"), (cquat, "cquat"), (cscale, "cscale"))
+    if dstate is not None:
+        pinned = (*pinned, (dstate, "dstate"))
+    check_layout(((dy, "dy"), *pinned))
+    check_pitched(((C, "C"),))
+    dtype = check_operands(activations)
+    check_pinned(pinned)
+    bsz, heads, groups, seqlen, rows, dim = check_shapes(
+        dy, trans, None, (C, "C"), label="dy"
+    )
+    check_extents(chunk_size, dim, chunk_size)
+
+    chunks = -(-seqlen // chunk_size)
+    if tuple(cquat.shape) != (bsz, heads, chunks, 4):
+        raise ValueError(
+            f"cquat must be {(bsz, heads, chunks, 4)}, got {tuple(cquat.shape)}"
+        )
+    if tuple(cscale.shape) != (bsz, heads, chunks):
+        raise ValueError(
+            f"cscale must be {(bsz, heads, chunks)}, got {tuple(cscale.shape)}"
+        )
+    if span % 3 != 0 or dim % span != 0 or (rows * span // 3) % THREADS != 0:
+        raise ValueError(
+            f"span must divide 3N={dim}, be a multiple of 3, and give a whole "
+            f"number of {THREADS}-thread tiles of P*span/3, got span={span} P={rows}"
+        )
+    assert_smem_fits(
+        f"start_passing_bwd[L{chunk_size}/P{rows}/span{span}]",
+        fold_smem_bytes(chunk_size, rows, span, dy.element_size()),
+    )
+
+    dinc = torch.empty(
+        bsz, heads, chunks, rows, dim, dtype=torch.float32, device=dy.device
+    )
+    dz0 = torch.empty(bsz, heads, rows, dim, dtype=torch.float32, device=dy.device)
+    if dstate is None:
+        seed = dz0
+    elif tuple(dstate.shape) != (bsz, heads, rows, dim):
+        raise ValueError(
+            f"dstate must be {(bsz, heads, rows, dim)}, got {tuple(dstate.shape)}"
+        )
+    else:
+        seed = dstate
+
+    jit_launch(
+        start_passing_bwd,
+        (
+            dy,
+            trans,
+            C,
+            cquat,
+            cscale,
+            seed.view(bsz, heads, rows * dim),
+            dinc.view(bsz, heads, chunks, rows * dim),
+            dz0.view(bsz, heads, rows * dim),
+            seqlen,
+            chunks,
+            dim // span,
+            bsz,
+            heads,
+        ),
+        (
+            cute_dtype(dtype),
+            THREADS,
+            chunk_size,
+            rows,
+            dim,
+            span,
+            heads // groups,
+            dstate is not None,
+        ),
+    )
+    return StatePassingBwd(dinc=dinc, dz0=dz0)

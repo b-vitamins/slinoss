@@ -85,6 +85,7 @@ DECLARED: Final[dict[str, str]] = {
     "rmsnorm_residual_fwd_kernel": DRAM_BOUND,
     "scanprep_bwd_kernel": DRAM_BOUND,
     "scanprep_fwd_kernel": DRAM_BOUND,
+    "start_passing_bwd_kernel": DRAM_BOUND,
     "state_passing_bwd_kernel": DRAM_BOUND,
     "state_passing_fwd_kernel": DRAM_BOUND,
     "swiglu_bwd_kernel": DRAM_BOUND,

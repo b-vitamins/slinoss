@@ -184,7 +184,7 @@ def start_chunk(
     gdy: cute.Tensor,
     gtrans: cute.Tensor,
     gc: cute.Tensor,
-    gdz: cute.Tensor,
+    dst: cute.Tensor,
     strans: cute.Tensor,
     slp: cute.Tensor,
     squat: cute.Tensor,
@@ -212,8 +212,11 @@ def start_chunk(
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
         gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
-        gc: ``(B,G,T,3N)`` operand-dtype output vectors.
-        gdz: ``(B,H,C,P,3N)`` float32, written with the chunk-start cotangent.
+        gc: ``(B,G,T,3N)`` operand-dtype output vectors. A caller contracting one
+            lane band hands over a view whose origin is that band's first column.
+        dst: Float32 ``(P,dim)`` destination, row-major and contiguous, already
+            sliced to this chunk. Global for the launch that writes ``dzstart``,
+            shared for the launch that consumes it on chip.
         strans: ``(L,4)`` float32 transition tile.
         slp: ``(L,)`` float32 log-decay prefix tile.
         squat: ``(L,4)`` float32 quaternion prefix tile.
@@ -233,7 +236,8 @@ def start_chunk(
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
         rows: ``P``. Compile-time.
-        dim: ``3N``. Compile-time.
+        dim: Columns contracted: ``3N``, or the width of one lane band of it.
+            Compile-time.
 
     Invariants:
         Every barrier here is reached by the whole block, so the body is safe to
@@ -292,7 +296,7 @@ def start_chunk(
         scrot.iterator, cute.make_layout((dim, chunk), stride=(1, ldb))
     )
     mma_gemm(tiled_mma, tid, acc, va, vb, False, False)
-    mma_store(tiled_mma, tid, acc, gdz[bidx, hidx, cidx, None, None], (mpad, dim), rows)
+    mma_store(tiled_mma, tid, acc, dst, (mpad, dim), rows)
 
 
 @cute.kernel
@@ -380,11 +384,12 @@ def chunk_start_bwd_kernel(
         # Reverse order, the order the state recurrence consumes the chunks in, so
         # the arm prices the launch a fused kernel would have to make.
         for step in cutlass.range(chunks):
+            cur = chunks - 1 - step
             start_chunk(
                 gdy,
                 gtrans,
                 gc,
-                gdz,
+                gdz[bidx, hidx, cur, None, None],
                 strans,
                 slp,
                 squat,
@@ -394,7 +399,7 @@ def chunk_start_bwd_kernel(
                 acc,
                 tiled_mma,
                 seqlen,
-                chunks - 1 - step,
+                cur,
                 bidx,
                 hidx,
                 gidx,
@@ -409,7 +414,7 @@ def chunk_start_bwd_kernel(
             gdy,
             gtrans,
             gc,
-            gdz,
+            gdz[bidx, hidx, cidx, None, None],
             strans,
             slp,
             squat,
