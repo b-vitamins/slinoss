@@ -98,12 +98,22 @@ __all__ = [
 UNATTRIBUTED = "unattributed"
 """Label for time or memory that belongs to no region."""
 
-MAX_TIMER_COVERAGE_PCT: Final[Percent] = Percent(100.0)
+MAX_TIMER_COVERAGE_PCT: Final[Percent] = Percent(100.01)
 """Most of the loop's host wall the per-iteration events can account for.
 
 The events tile the loop and the wall brackets all of them plus every boundary
 between them, so their sum is bounded by it. A sum that exceeds the wall it sits
 inside is measuring something outside the loop, whatever the durations look like.
+
+The bound is not exactly 100% because the two quantities come off two clocks: a
+CUDA event pair is timed by the GPU and the wall by the host, and the offset
+between the crystals is a systematic ppm-scale term that a loop whose device work
+fills its wall lands on. Measured on an A6000 over device-bound regions of 3.5 to
+10.7 s, the event clock ran 4.14, 4.50, 8.96, 11.56, 11.83 and 13.06 ppm ahead of
+the host clock, and the step-mode profile of the smallest shape failed a bound of
+exactly 100% at 8 ppm over a 14.1 s loop. A hundredth of a percent is 100 ppm,
+seven times the largest of those, and orders of magnitude below any event pair
+that really covers work outside the loop.
 
 There is no lower bound. A loop whose device work is shorter than the host cost of
 enqueueing it covers a small fraction of its own wall and is measured correctly;
@@ -547,7 +557,8 @@ class Timed(PerfRecord):
             percentage of the host wall around the whole loop. Below 100 it says
             how much of the loop was host cost outside the timed interval, which is
             a property of the work; a launch-bound loop reads low and is measured
-            correctly. Above 100 it is impossible; see
+            correctly. A few ppm above 100 is the offset between the two clocks the
+            quotient is taken across, and further than that is impossible; see
             :data:`MAX_TIMER_COVERAGE_PCT`.
     """
 
@@ -610,9 +621,10 @@ def measure(
     Raises:
         ValueError: If ``iters`` is not positive or ``warmup`` is negative.
         TimerError: If the current CUDA device is not the one being timed, or if the
-            per-iteration events sum past the host wall that brackets them. Either
-            way the events measure something other than what the result names, and
-            they do it without failing.
+            per-iteration events sum past the host wall that brackets them by more
+            than :data:`MAX_TIMER_COVERAGE_PCT`. Either way the events measure
+            something other than what the result names, and they do it without
+            failing.
     """
     if iters <= 0:
         raise ValueError(f"iters must be positive, got {iters}")

@@ -163,6 +163,52 @@ def test_measure_refuses_events_that_outlast_the_loop_around_them(
         measure(body, label="step", iters=3, warmup=0, device=CPU)
 
 
+def _two_clocks(
+    monkeypatch: pytest.MonkeyPatch, *, event_ns: int, wall_ns: int
+) -> None:
+    """Drive the event sum and the host wall independently.
+
+    The recorder's mark and the loop's wall both read ``perf_counter_ns`` on the
+    CPU path, so the ratio the coverage check sees cannot be set by sleeping: a
+    real wall carries a host overhead of microseconds, which at any duration a
+    test can afford is hundreds of ppm and swamps the skew being pinned. Stubbing
+    the mark leaves ``measure``'s two wall reads as the only consumers of the
+    clock, so both quantities are literals.
+    """
+    # Repeating the last value keeps a stray reader from raising StopIteration; the
+    # ratio it would shift is asserted, so an extra read still fails the test.
+    marks = itertools.chain((0, event_ns), itertools.repeat(event_ns))
+    walls = itertools.chain((0, wall_ns), itertools.repeat(wall_ns))
+    monkeypatch.setattr(RegionRecorder, "_mark", lambda _self: next(marks))
+    monkeypatch.setattr(time, "perf_counter_ns", lambda: next(walls))
+
+
+def test_the_coverage_bar_admits_the_skew_between_the_two_clocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The event sum comes off the GPU timer and the wall off the host timer, so a
+    # loop whose device work fills its wall lands at 100% plus the offset between
+    # two crystals. Measured on an A6000 over regions of 3.5 to 10.7 s, the event
+    # clock ran 4.14 to 13.06 ppm ahead of the host clock, and the step-mode
+    # profile of the tiny shape failed the bar at 8 ppm over a 14.1 s loop. A
+    # bound of exactly 100% rejects that, and it is not a measurement of anything
+    # outside the loop.
+    _two_clocks(monkeypatch, event_ns=10_000_080_000, wall_ns=10_000_000_000)
+    timed = measure(lambda: None, label="step", iters=1, warmup=0, device=CPU)
+    assert timed.timer_coverage_pct == pytest.approx(100.0008)
+
+
+def test_the_coverage_bar_still_rejects_an_overshoot_past_the_skew(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An event pair that actually covers work outside the loop misses by orders of
+    # magnitude, not by parts per million, so the allowance costs the check
+    # nothing. A hundredth of a percent is 77 times the largest skew measured.
+    _two_clocks(monkeypatch, event_ns=10_002_000_000, wall_ns=10_000_000_000)
+    with pytest.raises(TimerError, match=r"do not fit in the interval"):
+        measure(lambda: None, label="step", iters=1, warmup=0, device=CPU)
+
+
 def two_arms(
     slow_s: float,
 ) -> tuple[list[str], Callable[[], None], Callable[[], None]]:
