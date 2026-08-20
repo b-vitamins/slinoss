@@ -80,6 +80,8 @@ DECLARED: Final[dict[str, str]] = {
     "state_passing_fwd_kernel": DRAM_BOUND,
     "swiglu_bwd_kernel": DRAM_BOUND,
     "swiglu_fwd_kernel": DRAM_BOUND,
+    "xent_bwd_kernel": DRAM_BOUND,
+    "xent_fwd_kernel": DRAM_BOUND,
 }
 """Every kernel this repo compiles, and the class its module docstring declares.
 
