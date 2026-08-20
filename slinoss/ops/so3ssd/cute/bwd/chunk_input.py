@@ -80,7 +80,9 @@ DRAM-bound. Analytic traffic at ``standard`` is ``dy 9.44 + U 9.58 + trans 1.57 
 K 3.15 + B 19.02 + C 9.44 + dinc 14.16 + zstart 14.16 + dU 9.44 + carry_u 0.29 +
 dlogp 0.39 + dchunk_rot 0.06 + dchunk_scale 0.01 = 90.70 MB`` against ``1536 *
 3.54 MFLOP = 5.44 GFLOP``, so 60.0 flop/byte against a ridge point of 164: memory
-bound by a factor of nearly three.
+bound by a factor of nearly three. A supplied ``du_init`` adds one read of 9.44 MB
+at that shape, against the 28.32 MB a caller-side add of the same tensor would
+cost.
 
 The class is not yet met. Measured on an A6000 at ``standard``: 350.8 us per
 launch, 160.3 MB of device traffic against the 90.70 MB above, 457.0 GB/s, which is
@@ -164,6 +166,7 @@ from slinoss.ops.so3ssd.cute.table import (
     stage_rotated,
     stage_shifted,
 )
+from slinoss.ops.so3ssd.reference import check_grad_band
 
 __all__ = [
     "REDUCTIONS",
@@ -468,6 +471,7 @@ def chunk_input_bwd_kernel(
     gc: cute.Tensor,
     gdinc: cute.Tensor,
     gz: cute.Tensor,
+    gduinit: cute.Tensor,
     gdu: cute.Tensor,
     gcarry: cute.Tensor,
     gdlp: cute.Tensor,
@@ -482,6 +486,7 @@ def chunk_input_bwd_kernel(
     tblk: cutlass.Constexpr,
     per_group: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
+    has_seed: cutlass.Constexpr,
 ) -> None:
     """Differentiate one chunk's forcing input and closing transition.
 
@@ -498,6 +503,8 @@ def chunk_input_bwd_kernel(
         gc: ``(B,G,T,3N)`` operand-dtype output vectors.
         gdinc: ``(B,H,C,P,3N)`` float32 increment cotangent, global frame.
         gz: ``(B,H,C,P,3N)`` float32 chunk-start state.
+        gduinit: ``(B,H,T,P)`` operand-dtype addend for ``dU``. Read only when
+            ``has_seed``.
         gdu: ``(B,H,T,P)`` operand-dtype, written with ``dU`` except at the chunk's
             last valid token, which gets the diagonal term alone.
         gcarry: ``(B,H,C,P)`` float32, written with row 0 of ``dushift``.
@@ -514,6 +521,8 @@ def chunk_input_bwd_kernel(
         tblk: Target-token slice, from :func:`tblock`. Compile-time.
         per_group: ``H // G``, heads sharing one ``b`` and ``c``. Compile-time.
         has_prev: Whether the streaming carry-in pair was supplied. Compile-time.
+        has_seed: Whether ``gduinit`` is an addend rather than a stand-in.
+            Compile-time.
 
     Invariants:
         ``chunk``, ``dim``, ``rows`` and ``tblk`` are multiples of the atom's
@@ -862,7 +871,17 @@ def chunk_input_bwd_kernel(
         above = sshift[cutlass.min(m + 1, mpad - 1), p]
         held = du[i] + select(m + 1 < valid, above, zero)
         if m < valid:
-            gdu[bidx, hidx, t0 + m, p] = narrow(held, out)
+            # The seed joins the float32 sum ahead of the one narrowing, so a seeded
+            # dU carries no rounding a bare one does not, and it costs one read
+            # rather than the read, read and write a caller-side add would. Inside
+            # the predicate because a padded row has no token to seed. Its element
+            # type is dU's: the host holds the seed to U, and U is the stand-in when
+            # no seed was given.
+            if cutlass.const_expr(has_seed):
+                stored = held + widen(gduinit[bidx, hidx, t0 + m, p], out)
+            else:
+                stored = held
+            gdu[bidx, hidx, t0 + m, p] = narrow(stored, out)
 
 
 @cute.jit
@@ -877,6 +896,7 @@ def chunk_input_bwd(
     gc: cute.Tensor,
     gdinc: cute.Tensor,
     gz: cute.Tensor,
+    gduinit: cute.Tensor,
     gdu: cute.Tensor,
     gcarry: cute.Tensor,
     gdlp: cute.Tensor,
@@ -894,6 +914,7 @@ def chunk_input_bwd(
     tblk: cutlass.Constexpr,
     per_group: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
+    has_seed: cutlass.Constexpr,
     resident: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`chunk_input_bwd_kernel`.
@@ -913,6 +934,7 @@ def chunk_input_bwd(
         gc,
         gdinc,
         gz,
+        gduinit,
         gdu,
         gcarry,
         gdlp,
@@ -927,6 +949,7 @@ def chunk_input_bwd(
         tblk,
         per_group,
         has_prev,
+        has_seed,
     ).launch(
         grid=(chunks, bsz, heads),
         block=(threads, 1, 1),
@@ -971,6 +994,7 @@ def chunk_input_backward(
     *,
     u_prev: Tensor | None = None,
     b_prev: Tensor | None = None,
+    du_init: Tensor | None = None,
 ) -> ChunkInputBwd:
     """Differentiate the forcing input and the closing transition of every chunk.
 
@@ -993,6 +1017,10 @@ def chunk_input_backward(
         chunk_size: ``L``. A multiple of 16.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, or None.
         b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, or None.
+        du_init: ``(B,H,T,P)`` addend for ``dU``, shaped and typed like ``U``,
+            pitched, or None. Read only. The epilogue adds it to the float32 sum
+            before the one narrowing, so a caller with a gradient already bound for
+            ``dU`` pays one read rather than a pass of its own.
 
     Returns:
         :class:`ChunkInputBwd`.
@@ -1016,6 +1044,8 @@ def chunk_input_backward(
     check_rows(rows)
     check_extents(chunk_size, dim, tblock(chunk_size))
     has_prev = check_stream(u_prev, b_prev, (bsz, heads, groups, rows, dim))
+    if du_init is not None:
+        check_grad_band(du_init, U, "du_init")
 
     chunks = -(-seqlen // chunk_size)
     state = (bsz, heads, chunks, rows, dim)
@@ -1051,6 +1081,7 @@ def chunk_input_backward(
             C,
             dinc,
             zstart,
+            U if du_init is None else du_init,
             dU,
             carry_u,
             dlogp,
@@ -1070,6 +1101,7 @@ def chunk_input_backward(
             tblock(chunk_size),
             heads // groups,
             has_prev,
+            du_init is not None,
             min(RESIDENT_MAX, max(1, smem_capacity() // budget)),
         ),
     )

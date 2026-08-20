@@ -236,7 +236,13 @@ def _oracle(
     )
 
 
-def _run(inp: ScanInputs, dy: Tensor, want: Oracle, chunk: int) -> ChunkInputBwd:
+def _run(
+    inp: ScanInputs,
+    dy: Tensor,
+    want: Oracle,
+    chunk: int,
+    du_init: Tensor | None = None,
+) -> ChunkInputBwd:
     """One launch, against the float32 inputs the oracle carries."""
     got = chunk_input_backward(
         dy,
@@ -250,6 +256,7 @@ def _run(inp: ScanInputs, dy: Tensor, want: Oracle, chunk: int) -> ChunkInputBwd
         chunk,
         u_prev=inp.u_prev,
         b_prev=inp.b_prev,
+        du_init=du_init,
     )
     torch.cuda.synchronize()
     return got
@@ -437,6 +444,37 @@ def test_matches_autograd_through_the_forward() -> None:
     )
 
 
+def test_the_forcing_seed_joins_the_sum_before_the_narrowing() -> None:
+    """A supplied ``du_init`` reaches ``dU`` once, at its own token.
+
+    The seed is what lets a fused caller hand this kernel the forcing gradient its
+    other terms already produced: one read of ``(B,H,T,P)`` instead of the read, read
+    and write a host-side add would cost. It joins the float32 sum ahead of the one
+    narrowing, so a seeded ``dU`` carries no rounding a bare one does not.
+
+    Checked against the reference sum rather than against an unseeded launch: a
+    dropped seed, a seed added twice, a seed read at the wrong token and a seed added
+    after the narrowing all fail. Scaled to ``dU`` because a seed far below it would
+    vanish into the store's rounding and pass against a kernel that ignored it.
+    """
+    chunk = 64
+    inp = _make(2, 2, 200, 48, 16, torch.bfloat16)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _oracle(inp, dy, chunk, dstate=_dstate(inp))
+    gen = torch.Generator(device="cuda").manual_seed(31)
+    raw = torch.randn(
+        inp.U.shape, generator=gen, dtype=torch.float32, device=inp.U.device
+    )
+    seed = (raw * float(want.dU.abs().max())).to(inp.U.dtype)
+    got = _run(inp, dy, want, chunk, du_init=seed)
+    assert_max_rel(
+        got.dU,
+        want.dU + seed.double(),
+        BOUNDS[torch.bfloat16]["dU"],
+        "cute-chunk-input[seed].dU",
+    )
+
+
 def _projection_band(vec: Tensor) -> Tensor:
     """``B`` or ``C`` as the mixer hands it over: one column band of a wider tensor.
 
@@ -531,6 +569,7 @@ def _ok(chunk: int = 64) -> Operands:
         "zstart": want.zstart,
         "u_prev": inp.u_prev,
         "b_prev": inp.b_prev,
+        "du_init": None,
     }
 
 
@@ -548,6 +587,7 @@ def _call(args: Operands, chunk: int = 64) -> ChunkInputBwd:
         chunk,
         u_prev=args["u_prev"],
         b_prev=args["b_prev"],
+        du_init=args["du_init"],
     )
 
 
@@ -572,6 +612,14 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     ),
     (lambda a: a.update(b_prev=None), ValueError, "supplied together"),
     (lambda a: a.update(u_prev=None), ValueError, "supplied together"),
+    # The seed is held to ``U``, the operand whose gradient it is added to. One row
+    # is enough: the band check itself is covered where it is defined, and what is
+    # unproven here is that this host path reaches it at all.
+    (
+        lambda a: a.update(du_init=_t(a["U"])[:, :, :-1].contiguous()),
+        ValueError,
+        "du_init must have shape",
+    ),
     # One row per shared rule this kernel is the first to reach on an operand of
     # its own: ``U`` shares a dtype group with ``dy``, ``B`` and ``C``, and the two
     # float32 state buffers are pinned by I4 and read as dense tiles.
