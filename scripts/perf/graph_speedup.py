@@ -144,8 +144,14 @@ def build_train(
     def train(x: Tensor, target: Tensor) -> Tensor:
         optimizer.zero_grad(set_to_none=False)
         logits = stack(x)
+        # Classes come from the config, never from the logits' last extent: an
+        # aligned head pads its output width past the vocabulary, and a pad
+        # column is not a class a label indexes.
+        # The float32 copy is not removable through aten. log_softmax(dtype=)
+        # reaches the kernel that reads low precision and accumulates in float32
+        # for float16 only; bfloat16 casts first.
         loss = torch.nn.functional.cross_entropy(
-            logits.float().flatten(0, 1), target.flatten()
+            logits.flatten(0, 1)[:, :vocab].float(), target.flatten()
         )
         loss.backward()
         optimizer.step()
