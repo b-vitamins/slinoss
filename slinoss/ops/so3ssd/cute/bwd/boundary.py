@@ -68,6 +68,14 @@ resolution -- the spread across NCU replay passes is 27% and 50% respectively --
 the figure is a range and not a median. 16 registers per thread at the first shape,
 19 at ``standard``, no shared memory, no bank conflicts, and 2304 and 1536 blocks.
 
+Occupancy. Theoretical is 100% and achieved measures 44.6% to 51.4%, which the
+occupancy rule reads as a failure. The gap is the launch, not a resource: 2304
+blocks over 84 SMs at 16 resident is 2.29 waves, and a kernel whose whole duration
+is 4.7 us spends most of it in ramp and drain. ``imc_miss`` at 21.0% of stall
+cycles, second behind ``long_scoreboard``, is the cold constant-bank fetch of the
+launch itself. Nothing shortens a ramp of that fraction, so the gap is recorded
+rather than chased.
+
 The budget clause is taken against the step, not against the forward. The backward
 launches this kernel once per layer, 13 times per step at the acceptance geometry,
 so 57 to 61 us of a step whose device time measures 461 to 465 ms on the same host:
