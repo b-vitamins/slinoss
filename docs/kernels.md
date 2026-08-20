@@ -92,7 +92,12 @@ a transposed score tile is not.
   loop that also transforms what it loads: neither can be unrolled or hoisted,
   so both serialize on one global latency per step. Split load from transform --
   a `range_constexpr` group of `PREFETCH` loads, then the group's math. Clamp the
-  index unconditionally and correct with `select`; never predicate a load.
+  index unconditionally and correct with `select`; never predicate a load. The
+  rule holds while the unrolled body fits the instruction cache. Past that the
+  serialization is the cheaper cost: `chunk_input_bwd`'s lane loop both loads and
+  transforms, and rolling it moved the dominant stall from `no_instruction` at
+  48.3% and a 9.21% issue rate to `long_scoreboard` at 29.2% and 24.31%, halving
+  the launch. Measure both arms once the body is large.
 - The DSL emits no phi node for a dynamic `if`, so a value produced inside a
   dynamic branch cannot be read after it. A trace-time `const_expr` branch is
   plain Python and has no such limit.
@@ -108,6 +113,16 @@ a transposed score tile is not.
   unroll halves the traffic rather than removing it, and a kernel with two rolled
   loops has to reach trip count one in both at once. Read the local load and store
   sector counters at more than one `3N`; registers per thread alone hides this.
+- Trip count one is where that rule bites, not the whole account of a spill.
+  `chunk_scan_fwd` holds both accumulators across a rolled loop of trip count two
+  at the standard shape and moves no local traffic, and its spill is non-monotonic
+  in `3N`: 144 spills, 192 is clean, 240 spills, every spilling geometry sitting
+  at 255 registers. That is ptxas resolving an over-subscribed live set at the
+  architectural ceiling, not a footprint law. Rolling `chunk_input_bwd`'s lane
+  loop cut its local loads from 19,574,784 sectors to 6,156,288 without clearing
+  them, because the residual is loop-invariant state rematerialized once per trip
+  rather than accumulator thrash. Name which of the two a spill is before picking
+  a fix, and sweep the geometry: one shape cannot tell them apart.
 - Compile once. Every launch goes through the executor cache in
   `slinoss/_cute.py`; a `@cute.jit` function called directly retraces on every
   call.
