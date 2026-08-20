@@ -62,11 +62,15 @@ a transposed score tile is not.
   shared memory to buy them: query the device capacity and opt into the
   carveout, since the 48 KiB default is not the budget. Never hardcode an
   architecture string.
-- It buys them only up to half the carveout. Past that the second resident block
-  is gone, so the spending stops buying occupancy and starts costing it, and a
-  live set that also drives the allocator to the 255-register cap pays twice.
-  `chunk_vector_bwd` is the standing example: 85,424 B, one block per
-  multiprocessor, 11.8 MB of spill per launch, 13.5% of its DRAM time floor.
+- It buys them only up to half the carveout. On a 101,376 B carveout that is
+  50,688 B; past it the second resident block is gone, so the spending stops
+  buying occupancy and starts costing it. Count the tapped region and the operand
+  tiles, not the accumulators alone.
+- Past that point the only remaining lever on latency hiding is the grid.
+  `chunk_vector_bwd` is the standing example: at `P = 64` no legal chunk size
+  reaches two blocks per multiprocessor, so at 128 blocks over 84
+  multiprocessors it runs 1.52 waves at 8.33% occupancy and no traffic fix
+  touches that. Put the loop extents in the grid instead.
 - A footprint that grows with a configuration knob is a ceiling on that knob.
   Tile the knob, or the supported range is whatever the arena happens to hold.
   The backward holds whole `3N` extents, which caps `d_state` well below what
@@ -95,6 +99,15 @@ a transposed score tile is not.
 - `cutlass.range_constexpr` is rewritten only as the iterable of a `for`
   statement. In a comprehension or a generator expression it reaches the runtime
   stub and raises. Use a plain `range` there; both unroll at trace time.
+- A fragment reaches registers only if every loop between its allocation and its
+  uses has a trip count of one. Allocations are hoisted to kernel entry, and a
+  rolled loop in between defeats promotion: each access becomes a local load and
+  a local store. Measured on `chunk_vector_bwd` at 255 registers and 91,344 B of
+  shared memory in both runs, one lane tile moves no local traffic and five move
+  1,892.16 MB per launch. The declaration site is not the lever, a bounded partial
+  unroll halves the traffic rather than removing it, and a kernel with two rolled
+  loops has to reach trip count one in both at once. Read the local load and store
+  sector counters at more than one `3N`; registers per thread alone hides this.
 - Compile once. Every launch goes through the executor cache in
   `slinoss/_cute.py`; a `@cute.jit` function called directly retraces on every
   call.
