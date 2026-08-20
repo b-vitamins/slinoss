@@ -115,7 +115,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--groups",
         type=int,
         default=None,
-        help="Groups, G. Divides H. Defaults to H, which is fold one.",
+        help="Groups, G. Divides H. Defaults to the shape's own, which is what its "
+        "operands are allocated at.",
     )
     parser.add_argument(
         "--splits",
@@ -178,6 +179,24 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
     return dataclasses.replace(shape, name=f"{shape.name}{suffix}", **given)
 
 
+def requested_groups(shape: OpShape, override: int | None) -> int:
+    """``G`` the run takes, the shape's own unless overridden.
+
+    The shape's own and not ``H``: :func:`slinoss.perf.workload.make_inputs` allocates
+    ``B`` and ``C`` at ``shape.groups``, so defaulting to ``H`` reported fold one and a
+    zero workspace for the one shape whose fold is above one while the operator read
+    ``G`` off the operands and ran the fold anyway.
+
+    Args:
+        shape: The named shape, after any geometry override.
+        override: ``--groups``, or None.
+
+    Returns:
+        ``G``.
+    """
+    return shape.groups if override is None else override
+
+
 def build_runner(
     shape: OpShape,
     groups: int,
@@ -193,11 +212,10 @@ def build_runner(
     not reach a counter, so they are drawn from a generator rather than
     rematerialized through the two stages that produce them.
 
-    ``B`` and ``C`` come out of :func:`slinoss.perf.workload.make_inputs` at ``G ==
-    H``. A fold above one needs fewer groups than heads, so they are reallocated
-    here at ``(B,G,T,3N)`` rather than sliced: a slice of the head mode is a view
-    whose pitch is the parent's, and the budget the fold is being measured for is
-    read off the layout.
+    ``B`` and ``C`` come out of :func:`slinoss.perf.workload.make_inputs` at the
+    shape's own ``G``, so an override reallocates them at ``(B,G,T,3N)`` rather than
+    slicing: a slice of the head mode is a view whose pitch is the parent's, and the
+    budget the fold is being measured for is read off the layout.
 
     Args:
         shape: The problem size.
@@ -230,7 +248,7 @@ def build_runner(
     dlogp = randn(shape.bsz, shape.heads, chunks, shape.chunk)
     dchunk_rot = randn(shape.bsz, shape.heads, chunks, 3, 3)
     dchunk_scale = randn(shape.bsz, shape.heads, chunks)
-    if groups == shape.heads:
+    if groups == shape.groups:
         vecb, vecc = inputs.B, inputs.C
     else:
         band = (shape.bsz, groups, shape.seq, shape.d_state)
@@ -325,7 +343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = require_cuda(args.device)
     shape = requested_shape(args)
     dtype = DTYPES[args.dtype]
-    groups = shape.heads if args.groups is None else args.groups
+    groups = requested_groups(shape, args.groups)
     warps = WARPS if args.warps is None else args.warps
 
     if args.window:

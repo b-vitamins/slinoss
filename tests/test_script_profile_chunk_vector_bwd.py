@@ -16,6 +16,7 @@ import types
 import pytest
 
 from slinoss.perf.ncu import NcuInvocation, NcuPass
+from slinoss.perf.workload import shape_by_name
 
 DRIVER = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -69,6 +70,24 @@ def test_local_sectors_separates_kernels() -> None:
         ("chunk_vector_bwd_kernel", metric): 140.0,
         ("reduce_rows_kernel", metric): 7.0,
     }
+
+
+def test_the_default_groups_is_what_the_operands_are_allocated_at() -> None:
+    """``--groups`` defaults to the shape's own ``G``, not to ``H``.
+
+    ``make_inputs`` allocates ``B`` and ``C`` at the shape's ``G`` and the operator
+    reads ``G`` off those operands, so a default of ``H`` left the driver reporting
+    fold one and a zero workspace for the only shape whose fold is above one while the
+    run underneath it summed eighteen heads through a 143.77 MB partial.
+    """
+    module = load_driver()
+    acceptance = shape_by_name("acceptance")
+    assert acceptance.groups == 1
+    assert acceptance.heads == 18
+    assert module.requested_groups(acceptance, None) == 1
+    assert module.requested_groups(acceptance, 2) == 2
+    standard = shape_by_name("standard")
+    assert module.requested_groups(standard, None) == standard.heads
 
 
 def test_kernel_regex_admits_every_reduce_pass() -> None:
