@@ -131,6 +131,26 @@ Each rule below exists because it has been violated before.
   it divides.
 - A fitted denominator is reported with its residual. A fit quoted without one is
   an extrapolation presented as a measurement.
+- A cost model carries how it was obtained, and a derived figure never shares a
+  voice with a measured one. Four strengths, decreasing: an identity that closes
+  against a reported metric, a counter read directly, a ratio fitted to
+  observations, arithmetic over a datasheet. `chunk_vector_bwd` was priced at 42 k
+  shared wavefronts per microsecond, a ratio fitted to three launches, and that
+  figure entered this repo's rules in the same declarative voice as a counter. The
+  limiter was LSU instruction issue, which closes as an identity to two decimal
+  places at two clocks. Nobody can audit a number whose strength the number does
+  not state.
+- A change that beats its own prediction falsifies the model, and the microseconds
+  are not the evidence to keep. Three consecutive arms on `chunk_vector_bwd`
+  delivered about three times what the wavefront model priced them at. Each was
+  banked and the overshoot was read as diminishing returns in the model's favour.
+  All three had deleted LSU instructions, which that model did not count. An
+  unexplained win is a defect report against the cost model, and it outranks the
+  win.
+- A resource absent from the metric list is unmeasured, not free. `--metrics`
+  collects what somebody named, so a pipe nobody named reads as zero cost, and the
+  gap then gets filled with arithmetic over the pipes that were named. Derive a
+  floor only for a resource the capture counted, and name the ones it did not.
 - A percentage of a ceiling is an efficiency, not a speed. Two configurations of
   one kernel are ranked by duration; the percentage says only how much of the
   bus each reached.
