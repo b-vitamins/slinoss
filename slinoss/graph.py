@@ -28,6 +28,13 @@ A capture that records nothing is an error here rather than a warning. It is the
 one failure that is otherwise silent: an empty graph replays as a no-op, the
 output buffer still holds what the warmup left in it, and a comparison against the
 eager result passes.
+
+A capture that compiles is an error for the same reason. Tracing a CuTe entry point
+is host work, and host work inside a capture is not recorded: whatever it computes
+happens once, at capture time, and never on a replay. :func:`capture` counts the
+executors compiled across the recording and refuses a capture that grew the count.
+An ahead-of-time payload removes the compile; it does not remove the warmup, which
+the allocator needs.
 """
 
 from __future__ import annotations
@@ -50,8 +57,25 @@ WARMUP = 3
 
 Enough for the allocator to reach a steady state and for every kernel in the step
 to have compiled, since a CuTe entry point traces on its first call and tracing
-inside a capture is host work the graph cannot record.
+inside a capture is host work the graph cannot record. :func:`capture` enforces the
+second half: a recording that compiles anything raises.
 """
+
+
+def _compiled() -> int | None:
+    """Executors this process has compiled, or None if the DSL is not installed.
+
+    Imported here rather than at module scope: this module is importable, and every
+    reference-path test of it runs, on a tree with no CuTe DSL.
+
+    Returns:
+        The count, or None.
+    """
+    try:
+        from slinoss._cute import cache_events
+    except ImportError:
+        return None
+    return cache_events().compiled
 
 
 @dataclass(frozen=True)
@@ -127,7 +151,7 @@ def capture(
     Raises:
         ValueError: If ``warmup`` is not positive, if an input is not on CUDA, or
             if the inputs span two devices.
-        RuntimeError: If the capture recorded no work.
+        RuntimeError: If the capture recorded no work, or compiled anything.
     """
     if warmup < 1:
         raise ValueError(f"warmup must be positive, got {warmup}")
@@ -151,6 +175,7 @@ def capture(
         torch.cuda.current_stream().wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
+        compiled = _compiled()
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("error", message=".*CUDA Graph is empty.*")
@@ -164,6 +189,13 @@ def capture(
                 "it goes to the stream being captured, so a kernel launched on the "
                 "default stream, or on any other stream, runs instead"
             ) from exc
+    after = _compiled()
+    if compiled is not None and after is not None and after != compiled:
+        raise RuntimeError(
+            f"the capture compiled {after - compiled} executors. Tracing is "
+            f"host work and the graph did not record it, so the launch it traced is "
+            f"not in the graph; raise warmup above {warmup} or load a payload"
+        )
     return GraphedStep(graph=graph, inputs=statics, outputs=outputs)
 
 
