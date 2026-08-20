@@ -30,7 +30,7 @@ from slinoss.perf.ceiling import Ceilings, ClassVerdict
 from slinoss.perf.device import DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
 from slinoss.perf.memory import MemoryPeaks, PoolRetention, SavedStorages
-from slinoss.perf.ncu import SOL_FIELDS, STALL_FIELDS, KernelCounters
+from slinoss.perf.ncu import SOL_FIELDS, STALL_FIELDS, KernelCounters, SpillCounters
 from slinoss.perf.nsys import NsysTrace
 from slinoss.perf.timing import Throughput
 from slinoss.perf.units import (
@@ -189,6 +189,12 @@ class Report:
         peaks: Allocator high-water marks.
         pool: What the launch-descriptor pool holds.
         verdicts: Per-kernel class verdicts.
+        spills: Per-kernel local-memory sectors, from the spill pass the verdicts
+            were judged with. Carried as a table and not only as a note, because a
+            spill fails a class outright and the verdict it fails records the
+            percentage rather than the sectors: without this a consumer reading the
+            JSON cannot say how much local traffic a failure was, and a kernel left
+            without a verdict for being inside L2 would read clean.
         deltas: Bucket-level comparison against a prior report.
         growth: Dispersion against the sample count.
         scatter: Run-to-run median scatter against the reported floor.
@@ -208,6 +214,7 @@ class Report:
     peaks: MemoryPeaks | None = None
     pool: PoolRetention | None = None
     verdicts: tuple[ClassVerdict, ...] = ()
+    spills: tuple[SpillCounters, ...] = ()
     deltas: tuple[BucketDelta, ...] = ()
     growth: tuple[GrowthRow, ...] = ()
     scatter: RepeatRow | None = None
@@ -400,6 +407,8 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
         lines += _section("measured tensor ceiling", [report.ceilings.tensor])
     if report.verdicts:
         lines += _section("class verdicts", report.verdicts)
+    if report.spills:
+        lines += _section("local memory", report.spills)
     if report.kernels:
         lines += _section("kernel counters", report.kernels, _COUNTER_COLUMNS)
         lines += _section("warp stalls", report.kernels, _STALL_COLUMNS)

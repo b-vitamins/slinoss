@@ -374,6 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ceilings=limits,
         kernels=kernels,
         verdicts=() if audit is None else audit.verdicts,
+        spills=spills,
         trace=trace,
         notes=tuple(notes),
     )

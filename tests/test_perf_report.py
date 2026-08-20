@@ -50,7 +50,7 @@ from slinoss.perf.memory import (
     RegionSaved,
     SavedStorages,
 )
-from slinoss.perf.ncu import KernelCounters
+from slinoss.perf.ncu import KernelCounters, SpillCounters
 from slinoss.perf.nsys import NsysKernel, NsysTrace
 from slinoss.perf.report import (
     TOLERANCE_PCT,
@@ -344,6 +344,19 @@ def _saved(*, with_regions: bool = True) -> SavedStorages:
     )
 
 
+def _spill(
+    kernel: str, *, load_sectors: int = 0, store_sectors: int = 0
+) -> SpillCounters:
+    """One local-memory record. Zero sectors is a kernel that did not spill."""
+    return SpillCounters(
+        kernel=kernel,
+        launch_count=Count(13),
+        duration_us=Microseconds(3030.0),
+        local_load_sector_count=Count(load_sectors),
+        local_store_sector_count=Count(store_sectors),
+    )
+
+
 def _report(
     *,
     title: str = "full",
@@ -389,6 +402,13 @@ def _report(
                 required_pct=Percent(2.0),
                 passed=True,
             ),
+        ),
+        spills=(
+            _spill("scan"),
+            # `start` carries no verdict: its per-launch traffic stayed inside L2, so
+            # the audit left it unjudged and this table is the only place its spill
+            # appears.
+            _spill("start", load_sectors=6156288, store_sectors=1474560),
         ),
         deltas=(
             BucketDelta(
@@ -536,6 +556,7 @@ def test_markdown_renders_every_present_section() -> None:
         "## measured dram ceiling",
         "## measured tensor ceiling",
         "## class verdicts",
+        "## local memory",
         "## kernel counters",
         "## warp stalls",
         "## speed of light",
@@ -616,6 +637,7 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "## measured dram ceiling",
         "## measured tensor ceiling",
         "## class verdicts",
+        "## local memory",
         "## kernel counters",
         "## warp stalls",
         "## speed of light",
@@ -754,6 +776,25 @@ def test_payload_passes_scalars_and_types_through() -> None:
     assert payload("text") == "text"
     assert payload(Agreement) is Agreement
     assert payload({1: (2, 3)}) == {"1": [2, 3]}
+
+
+def test_the_local_memory_sectors_survive_serialization_without_a_verdict() -> None:
+    # A spill fails a DRAM-bound or TENSOR-bound kernel outright, and a kernel whose
+    # per-launch traffic stayed inside L2 carries no verdict to fail. Both reached the
+    # report only as a prose note before, so a consumer reading the JSON saw a clean
+    # run, and the sector counts a verdict was overturned by were not in the file at
+    # all.
+    report = _report(check=_agreement())
+    data = payload(report)
+    judged = {row["kernel"] for row in data["verdicts"]}
+    rows = {row["kernel"]: row for row in data["spills"]}
+    assert "start" not in judged
+    assert rows["start"]["local_load_sector_count"] == 6156288
+    assert rows["start"]["local_store_sector_count"] == 1474560
+    assert rows["scan"]["local_load_sector_count"] == 0
+    text = markdown(report)
+    assert "local_load_sector_count" in _header_under(text, "local memory")
+    assert "6,156,288" in text
 
 
 def test_json_text_round_trips_in_field_order() -> None:
