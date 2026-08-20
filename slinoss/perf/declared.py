@@ -58,6 +58,7 @@ __all__ = [
     "SPILL_FREE_CLASSES",
     "FloorAudit",
     "declared_class",
+    "declared_key",
     "floor_audit",
 ]
 
@@ -162,14 +163,17 @@ Measured on sm_86, clocks unlocked: 5.952 us at the frontier's ragged shape,
 bfloat16 destination, 0.555% of the mixer-tail step."""
 
 
-def declared_class(kernel: str) -> str | None:
-    """Look up the class a profiled kernel declares.
+def declared_key(kernel: str) -> str | None:
+    """Look up the :data:`DECLARED` entry a profiled symbol belongs to.
+
+    The key, not the class: a consumer asking which kernel ran needs the source name
+    that instantiated symbol carries, and two instantiations of one kernel share it.
 
     Args:
         kernel: Kernel symbol, as NCU reports it.
 
     Returns:
-        The declared class, or None if the symbol is not one this repo compiles.
+        The key, or None if the symbol is not one this repo compiles.
 
     Raises:
         ValueError: If the symbol is one this repo compiles and matches no entry
@@ -185,7 +189,24 @@ def declared_class(kernel: str) -> str | None:
         )
     if len(hits) > 1:
         raise ValueError(f"kernel {kernel!r} matches {hits}; one symbol, one class")
-    return DECLARED[hits[0]]
+    return hits[0]
+
+
+def declared_class(kernel: str) -> str | None:
+    """Look up the class a profiled kernel declares.
+
+    Args:
+        kernel: Kernel symbol, as NCU reports it.
+
+    Returns:
+        The declared class, or None if the symbol is not one this repo compiles.
+
+    Raises:
+        ValueError: If the symbol is one this repo compiles and matches no entry
+            of :data:`DECLARED`, or if it matches more than one.
+    """
+    key = declared_key(kernel)
+    return None if key is None else DECLARED[key]
 
 
 SPILL_FREE_CLASSES: Final[frozenset[str]] = frozenset((DRAM_BOUND, TENSOR_BOUND))
@@ -256,12 +277,23 @@ class FloorAudit:
         return tuple(out)
 
     @property
+    def judged(self) -> tuple[str, ...]:
+        """Symbols of every declared kernel this audit judged, in profile order.
+
+        Read off ``geometry`` rather than ``verdicts``: every declared kernel gets a
+        geometry verdict whatever its class and whatever its traffic did, so a kernel
+        left without a bandwidth verdict for being inside L2 still counts as judged.
+        """
+        return tuple(one.kernel for one in self.geometry)
+
+    @property
     def passed(self) -> bool:
         """Whether every judged kernel cleared every rule this audit applied.
 
-        An audit that judged nothing passes vacuously. What makes a class no driver
-        reaches a defect is the coverage rule in ``docs/measurement.md``, not this
-        property, which can only report on what a capture contained.
+        An audit that judged nothing passes vacuously. This property can only report
+        on what a capture contained; that the capture contained every kernel its arm
+        launches is :func:`slinoss.perf.coverage.coverage_verdict`, and a driver must
+        fold both into its exit status.
         """
         return not self.failures
 
