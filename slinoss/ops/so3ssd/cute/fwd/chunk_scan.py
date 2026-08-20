@@ -39,6 +39,17 @@ tokens. Its accumulator lives alongside the output accumulator, so an unsliced
 score at ``MAX_CHUNK`` would be four times the float32 register footprint of the
 output it feeds. The slice count is one at ``L`` up to 32 and ``L/32`` above it.
 
+The mask stays a mask and is not turned into a skip. Splitting both accumulators
+along M into :data:`MMA_TILE_M` row tiles makes a tile whose rows all precede a
+slice's first source token dead, which is a quarter of the diagonal work at ``L``
+128, and the split is what lets it be dropped. Measured on sm_86 that is slower:
+209.6 us against 201.4, with 48.3 M instructions against 41.6 M. The work dropped
+is tensor-pipe work, and the tensor pipe is 35% utilized at ``L`` 128 while the
+body issues at 36%, so an instruction is worth more than a multiply-accumulate
+here; the per-tile operand loads and the branch cost more than the tiles save.
+Hoisting the shared operand load out of the row-tile loop recovers 1 point of the
+16. Nothing in this body is short of arithmetic.
+
 The readout basis is staged once per chunk and stays resident: it is the A operand
 of the offset and the score GEMM. The forcing tile is not, because the two taps need
 different table slots and different source tokens; it is restaged per tap, and it
