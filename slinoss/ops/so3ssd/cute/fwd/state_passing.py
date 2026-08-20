@@ -27,6 +27,21 @@ onto 3-vectors, so only the thread that owns a 3-vector ever touches its three
 elements and the alias is entirely intra-thread. The operator carries one
 ``(B,H,C,P,3N)`` buffer instead of two.
 
+Store ratio. A thread owns 3-vector ``v``, so a warp's 32 stores cover 384
+contiguous bytes as 12 sectors per request rather than the 4 a 32-bit coalesced
+store would take. A planar ``(3, P*N)`` state makes each store one plane: measured,
+that is 12.000 sectors per store request down to 4.001, loads 5.125 down to 2.125,
+and 48 registers down to 42. It does not pay. ``long`` 49.520 us to 50.592 and
+91.70% to 86.44% of the DRAM time floor, ``standard`` 45.984 to 46.256 and 98.53%
+to 95.49%, ``wide`` 118.336 to 115.888 and 98.41% to 99.38%. The ratio is L1 tag
+work, not traffic: at ``long`` the kernel reads 13.85 MB and writes 14.23 MB per
+launch against a 14.16 MB ``inc`` buffer, so every element crosses DRAM once each
+way, L2 merges the sectors before eviction, and there is no amplification to
+remove. ``l2_pct`` stays at 33.7% to 37.8% and ``l1tex_pct`` at 28.2% to 32.6%,
+neither near binding. The interleaved layout is
+also the one that keeps ``3N`` contiguous for the consumer, so the planar variant
+would move a cost onto ``chunk_scan_fwd`` in exchange for none of a gain here.
+
 The chunk loop is a one-deep software pipeline: chunk ``c+1`` is fetched, then
 chunk ``c`` is stored, then chunk ``c`` is transformed. That order is required
 rather than incidental. A load of ``ginc`` may alias the store that overwrites it,
@@ -39,27 +54,50 @@ consumed; a value carried out of a dynamic branch has no phi node here.
 
 Depth one is the whole gain. Depth two and depth three were measured at the
 standard shape and moved the kernel by 0.08%, inside the run-to-run spread, while
-raising the register count from 48 to 62.
+raising the register count from 48 to 62. Depth two was remeasured at ``long``,
+the shape with the fewest blocks and so the most to gain from more bytes in flight:
+49.520 us to 48.960, 91.70% to 91.97% of the DRAM time floor, for the same 48 to 62
+registers, theoretical occupancy 83.33% to 66.67%, and achieved occupancy at
+``wide`` 62.79% to 59.17%. ``long_scoreboard`` did not move, 82.63% to 83.47%, so
+the extra depth bought no overlap rather than trading overlap for something
+unmeasured. Little's law predicts the near miss: 18,432 threads carrying 12 B each
+is 221 KB in flight against the roughly 476 KB the latency-bandwidth product needs,
+and doubling the depth does not close that.
 
 ``R(Q_c)`` is rebuilt by every thread on every chunk rather than staged once. That
-buys a dynamic chunk count, so no recompile per sequence length. Measured cost:
-``sm__throughput`` is 13.63% of peak against ``dram__throughput`` at 84.23%, so the
-redundant arithmetic is not what bounds the kernel.
+buys a dynamic chunk count, so no recompile per sequence length. Measured cost, in
+this kernel and not its backward twin: ``sm__throughput`` is 13.28% of peak against
+``dram__throughput`` 84.03% at ``standard``, and 12.07% against 78.42% at ``long``.
+The redundant arithmetic bounds neither. Arithmetic intensity is 2.3 flop/byte, 55
+flops per thread per chunk against 24 bytes moved, against a ridge point of 164.4:
+DRAM rather than tensor by a factor of seventy, and the kernel issues no tensor
+instruction at all.
 
-DRAM-bound at the standard shape: 603.728 GB/s against a measured achievable
-680.452 GB/s, which is 88.7% of ceiling. The recurrence is still the one serial
-step in the operator, but the serial chain is the rotation, not the fetch, so the
-kernel reaches a bandwidth fraction rather than a latency floor.
-``long_scoreboard`` remains the dominant stall reason at 88.90%; at 84.23% of peak
-DRAM throughput that is warps waiting on a saturated bus, not on an idle one. The
-class is asserted for shapes whose grid covers the device. A shape with too few
-blocks to fill it is a statement about the shape rather than about the kernel, and
-no second class is claimed for it here.
+DRAM-bound at the standard shape: 605.233 GB/s against a fitted achievable 684.708
+GB/s, and 97.65% of the DRAM time floor the gate holds the class to. The recurrence
+is still the one serial step in the operator, but the serial chain is the rotation,
+not the fetch, so the kernel reaches a bandwidth fraction rather than a latency
+floor. ``long_scoreboard`` remains the dominant stall reason at 89.06%; at 84.03%
+of peak DRAM throughput that is warps waiting on a saturated bus, not on an idle
+one. The class is asserted for shapes whose grid covers the device. A shape with too
+few blocks to fill it is a statement about the shape rather than about the kernel,
+and no second class is claimed for it here.
 
 The grid is ``(P*N/threads, B, H)``. That is under twice the SM count only when
 ``B*H`` is small, and widening it is not available, because the parallelism is
 exactly ``B*H*P*N`` independent 3-vectors and no more. Achieved occupancy is
-therefore capped by the launch, not by the register count.
+therefore capped by the launch, not by the register count: 62.63% at ``wide`` with
+768 blocks, 26.35% at ``standard`` with 288, and 13.55% at ``long`` with 144 over 84
+SMs, all against a register-permitted 83.33%. ``long`` still reaches 91.69% of the
+floor at 1.7 blocks per SM, so the launch bound costs the class nothing.
+
+``long`` and ``tiny`` are the two bench shapes whose grid is under twice the SM
+count, 144 blocks and 2. ``docs/kernels.md`` allows that only for a serial case
+measured under 2% of the step. At ``long`` the kernel is 13.75% of the forward's
+device time and 8.14% of its wall, so the exemption is unavailable and the class is
+carried by the floor instead, 89.29% on the repo's runner. At ``tiny`` it is 0.45%
+of the forward wall and inside the exemption, with no floor verdict because the
+traffic fits in L2.
 """
 
 from typing import NamedTuple
