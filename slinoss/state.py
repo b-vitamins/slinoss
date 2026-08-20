@@ -10,6 +10,13 @@ The one exception is a float64 activation dtype, which widens ``ssm`` to float64
 so a float64 path stays an oracle end to end instead of meeting a narrower
 state mid-recurrence.
 
+Four buffers, not two. The operator's forcing is two-tap: token ``t`` reads its own
+forcing vector and the one at ``t-1``. So the recurrent state alone does not
+determine the next token's output, and ``b_prev`` and ``u_prev`` carry the previous
+token's vector and input. Both are required rather than optional, because a state
+that can be missing them is a state whose continuation is silently not the
+whole-sequence result.
+
 No step counter. The decode path reads none, and a counter is state that can
 disagree with the buffers it claims to describe.
 """
@@ -41,10 +48,16 @@ class MixerState:
             activation dtype. Time-major, so index ``-1`` is the newest token.
         ssm: Recurrent scan state, shape ``(B, H, P, 3N)``. float32, or float64
             when the activation dtype is float64. ``H * P`` is ``d_inner``.
+        b_prev: Previous token's forcing vector, shape ``(B, G, 3N)``, activation
+            dtype. ``G`` divides ``H``.
+        u_prev: Previous token's forcing input, shape ``(B, H, P)``, activation
+            dtype.
     """
 
     conv: Tensor
     ssm: Tensor
+    b_prev: Tensor
+    u_prev: Tensor
 
     def __post_init__(self) -> None:
         if self.conv.ndim != 3:
@@ -53,6 +66,10 @@ class MixerState:
             )
         if self.ssm.ndim != 4:
             raise ValueError(f"ssm must be (B,H,P,3N), got {tuple(self.ssm.shape)}")
+        if self.b_prev.ndim != 3:
+            raise ValueError(f"b_prev must be (B,G,3N), got {tuple(self.b_prev.shape)}")
+        if self.u_prev.ndim != 3:
+            raise ValueError(f"u_prev must be (B,H,P), got {tuple(self.u_prev.shape)}")
         check_supported(self.conv, "conv")
         check_pinned(self.ssm, "ssm")
         if self.conv.dtype is torch.float64 and self.ssm.dtype is not torch.float64:
@@ -60,6 +77,16 @@ class MixerState:
                 f"conv is float64, so ssm must be float64 rather than "
                 f"{self.ssm.dtype}; a narrower state downcasts the recurrence"
             )
+        # The two carries join the activation group rather than the pinned one: they
+        # are the operands B and U themselves at one token, not an accumulator. After
+        # the pinning rule above, so a float64 activation dtype reports the state it
+        # needs rather than the carry that already followed it.
+        for name, carry in (("b_prev", self.b_prev), ("u_prev", self.u_prev)):
+            if carry.dtype is not self.conv.dtype:
+                raise ValueError(
+                    f"{name} is {carry.dtype} and conv is {self.conv.dtype}; "
+                    f"one activation dtype only"
+                )
         channels = int(self.conv.shape[2])
         heads, rows = (int(d) for d in self.ssm.shape[1:3])
         if channels != heads * rows:
@@ -67,16 +94,39 @@ class MixerState:
                 f"conv holds {channels} channels and ssm holds {heads} heads of "
                 f"{rows} rows; both are d_inner"
             )
-        batch, ssm_batch = int(self.conv.shape[0]), int(self.ssm.shape[0])
-        if batch != ssm_batch:
+        dim = int(self.ssm.shape[3])
+        if tuple(self.u_prev.shape[1:]) != (heads, rows):
             raise ValueError(
-                f"conv has batch {batch} and ssm has batch {ssm_batch}; one batch only"
+                f"u_prev holds {tuple(self.u_prev.shape[1:])} and ssm holds "
+                f"{(heads, rows)}; both are (H, P)"
             )
-        if self.conv.device != self.ssm.device:
+        groups = int(self.b_prev.shape[1])
+        if int(self.b_prev.shape[2]) != dim:
             raise ValueError(
-                f"conv is on {self.conv.device} and ssm is on {self.ssm.device}; "
-                f"one device only"
+                f"b_prev holds {int(self.b_prev.shape[2])} lanes and ssm holds "
+                f"{dim}; both are 3N"
             )
+        if groups < 1 or heads % groups:
+            raise ValueError(
+                f"b_prev holds {groups} groups, which does not divide the {heads} "
+                f"heads ssm holds"
+            )
+        batches = {
+            "conv": int(self.conv.shape[0]),
+            "ssm": int(self.ssm.shape[0]),
+            "b_prev": int(self.b_prev.shape[0]),
+            "u_prev": int(self.u_prev.shape[0]),
+        }
+        if len(set(batches.values())) != 1:
+            raise ValueError(f"one batch only, got {batches}")
+        devices = {
+            "conv": self.conv.device,
+            "ssm": self.ssm.device,
+            "b_prev": self.b_prev.device,
+            "u_prev": self.u_prev.device,
+        }
+        if len(set(devices.values())) != 1:
+            raise ValueError(f"one device only, got {devices}")
 
     @classmethod
     def allocate(
@@ -91,11 +141,13 @@ class MixerState:
 
         Args:
             config: Shape contract. ``d_conv`` and ``d_inner`` size ``conv``;
-                ``n_heads``, ``d_head``, and ``d_state`` size ``ssm``.
+                ``n_heads``, ``d_head``, and ``d_state`` size ``ssm``;
+                ``n_groups`` and ``d_state`` size ``b_prev``.
             batch: Batch ``B``, fixed for the lifetime of the buffers.
-            device: Where both buffers live.
-            dtype: Activation dtype, carried by ``conv``. ``ssm`` is float32,
-                or float64 when ``dtype`` is float64.
+            device: Where every buffer lives.
+            dtype: Activation dtype, carried by ``conv``, ``b_prev`` and
+                ``u_prev``. ``ssm`` is float32, or float64 when ``dtype`` is
+                float64.
 
         Returns:
             The state.
@@ -118,24 +170,37 @@ class MixerState:
                 dtype=_state_dtype(dtype),
                 device=device,
             ),
+            b_prev=torch.zeros(
+                batch, config.n_groups, config.d_state, dtype=dtype, device=device
+            ),
+            u_prev=torch.zeros(
+                batch, config.n_heads, config.d_head, dtype=dtype, device=device
+            ),
         )
 
     def reset(self) -> None:
-        """Zero both buffers in place.
+        """Zero every buffer in place.
 
         In place because a captured graph holds these addresses; a fresh
         allocation is not the buffer the graph writes.
         """
         self.conv.zero_()
         self.ssm.zero_()
+        self.b_prev.zero_()
+        self.u_prev.zero_()
 
     def clone(self) -> MixerState:
-        """Copy both buffers.
+        """Copy every buffer.
 
         Returns:
             A state sharing no storage with this one.
         """
-        return MixerState(conv=self.conv.clone(), ssm=self.ssm.clone())
+        return MixerState(
+            conv=self.conv.clone(),
+            ssm=self.ssm.clone(),
+            b_prev=self.b_prev.clone(),
+            u_prev=self.u_prev.clone(),
+        )
 
     @property
     def batch(self) -> int:
@@ -144,7 +209,7 @@ class MixerState:
 
     @property
     def device(self) -> torch.device:
-        """Device both buffers live on."""
+        """Device every buffer lives on."""
         return self.ssm.device
 
 

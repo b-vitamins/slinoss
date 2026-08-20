@@ -22,19 +22,35 @@ def mixer(dtype: torch.dtype = torch.bfloat16, device: str = "cpu") -> MixerStat
     return MixerState.allocate(CONFIG, BATCH, device=device, dtype=dtype)
 
 
+def _fields(state: MixerState) -> dict[str, Tensor]:
+    """Every buffer, by field name, read off ``state`` on each call."""
+    return {
+        "conv": state.conv,
+        "ssm": state.ssm,
+        "b_prev": state.b_prev,
+        "u_prev": state.u_prev,
+    }
+
+
 def test_allocate_matches_config(device: torch.device) -> None:
     """Buffer shapes come from the config, not from the default shape.
 
     Catches a container that assumes ``d_head == 64`` or ``d_conv == 4``: any
-    other config then allocates a state the scan cannot consume.
+    other config then allocates a state the scan cannot consume. The two carries
+    are here because ``b_prev`` follows ``n_groups`` and ``u_prev`` follows
+    ``n_heads``, so a carry sized from the other one passes at the default config.
     """
     config = SLinOSSConfig(d_model=48, d_state=96, d_head=32, d_conv=3)
     state = MixerState.allocate(config, 3, device=device, dtype=torch.bfloat16)
     assert tuple(state.conv.shape) == (3, config.d_conv - 1, config.d_inner)
     assert tuple(state.ssm.shape) == (3, config.n_heads, config.d_head, config.d_state)
+    assert tuple(state.b_prev.shape) == (3, config.n_groups, config.d_state)
+    assert tuple(state.u_prev.shape) == (3, config.n_heads, config.d_head)
     assert state.ssm.shape[-1] == 3 * config.n_lanes
-    assert state.ssm.is_contiguous() and state.conv.is_contiguous()
-    assert not state.conv.any() and not state.ssm.any()
+    assert all(
+        buffer.is_contiguous() and not buffer.any()
+        for buffer in _fields(state).values()
+    )
     assert state.batch == 3
     assert state.device.type == device.type
 
@@ -69,12 +85,13 @@ def test_reset_keeps_the_buffer_addresses() -> None:
     leaves the graph and the container pointing at different memory.
     """
     state = mixer(torch.float32)
-    state.conv.fill_(1.0)
-    state.ssm.fill_(2.0)
-    before = (state.conv.data_ptr(), state.ssm.data_ptr())
+    for index, buffer in enumerate(_fields(state).values(), start=1):
+        buffer.fill_(float(index))
+    before = [buffer.data_ptr() for buffer in _fields(state).values()]
     state.reset()
-    assert (state.conv.data_ptr(), state.ssm.data_ptr()) == before
-    assert not state.conv.any() and not state.ssm.any()
+    after = _fields(state)
+    assert [buffer.data_ptr() for buffer in after.values()] == before
+    assert not any(buffer.any() for buffer in after.values())
 
 
 def test_clone_is_independent() -> None:
@@ -82,12 +99,15 @@ def test_clone_is_independent() -> None:
     captured buffers it was taken from."""
     state = mixer(torch.float32)
     copy = state.clone()
-    copy.conv.fill_(1.0)
-    copy.ssm.fill_(2.0)
-    assert not state.conv.any() and not state.ssm.any()
-    assert copy.conv.dtype is state.conv.dtype
-    assert copy.ssm.dtype is state.ssm.dtype
-    assert tuple(copy.ssm.shape) == tuple(state.ssm.shape)
+    original = _fields(state)
+    for index, buffer in enumerate(_fields(copy).values(), start=1):
+        buffer.fill_(float(index))
+    assert not any(buffer.any() for buffer in original.values())
+    assert all(
+        buffer.dtype is original[name].dtype
+        and tuple(buffer.shape) == tuple(original[name].shape)
+        for name, buffer in _fields(copy).items()
+    )
 
 
 def test_stack_allocates_one_buffer_set_per_layer() -> None:
@@ -130,22 +150,48 @@ def test_containers_are_frozen() -> None:
 @pytest.mark.parametrize(
     ("mutate", "exc", "match"),
     [
-        (lambda s: (s.conv[0], s.ssm), ValueError, "conv must be"),
-        (lambda s: (s.conv, s.ssm[0]), ValueError, "ssm must be"),
-        (lambda s: (s.conv.to(torch.int64), s.ssm), TypeError, "conv has dtype"),
-        (lambda s: (s.conv, s.ssm.to(torch.bfloat16)), TypeError, "float32-pinned"),
+        (lambda s: {"conv": s.conv[0]}, ValueError, "conv must be"),
+        (lambda s: {"ssm": s.ssm[0]}, ValueError, "ssm must be"),
+        (lambda s: {"b_prev": s.b_prev[0]}, ValueError, "b_prev must be"),
+        (lambda s: {"u_prev": s.u_prev[0]}, ValueError, "u_prev must be"),
+        (lambda s: {"conv": s.conv.to(torch.int64)}, TypeError, "conv has dtype"),
+        (lambda s: {"ssm": s.ssm.to(torch.bfloat16)}, TypeError, "float32-pinned"),
         (
-            lambda s: (s.conv.to(torch.float64), s.ssm),
+            lambda s: {"conv": s.conv.to(torch.float64)},
             ValueError,
             "ssm must be float64",
         ),
-        (lambda s: (s.conv[:, :, :16], s.ssm), ValueError, "both are d_inner"),
-        (lambda s: (s.conv[:1], s.ssm), ValueError, "one batch only"),
-        (lambda s: (s.conv.to("meta"), s.ssm), ValueError, "one device only"),
+        # The carries are activation-dtype, so the pinned state's widening does not
+        # reach them. Ordered after the rule above, which the same mutation would
+        # otherwise mask.
+        (
+            lambda s: {"b_prev": s.b_prev.to(torch.float32)},
+            ValueError,
+            "one activation dtype only",
+        ),
+        (lambda s: {"conv": s.conv[:, :, :16]}, ValueError, "both are d_inner"),
+        (lambda s: {"u_prev": s.u_prev[:, :, :16]}, ValueError, "u_prev holds"),
+        (lambda s: {"b_prev": s.b_prev[:, :, :16]}, ValueError, "b_prev holds"),
+        # ``G`` divides ``H``: head ``h`` reads group ``h // (H // G)``, so a group
+        # count that does not divide sends some head past the end of the band.
+        (
+            lambda s: {"b_prev": s.b_prev.new_zeros(BATCH, 3, CONFIG.d_state)},
+            ValueError,
+            "does not divide",
+        ),
+        # Zero groups short-circuits ahead of the modulus, which would otherwise be
+        # ZeroDivisionError rather than a reported shape error.
+        (
+            lambda s: {"b_prev": s.b_prev.new_zeros(BATCH, 0, CONFIG.d_state)},
+            ValueError,
+            "does not divide",
+        ),
+        (lambda s: {"conv": s.conv[:1]}, ValueError, "one batch only"),
+        (lambda s: {"conv": s.conv.to("meta")}, ValueError, "one device only"),
     ],
 )
 def test_mixer_rejects_bad_buffers(
-    mutate: Callable[[MixerState], tuple[Tensor, Tensor]],
+    mutate: Callable[[MixerState], dict[str, Tensor]],
     exc: type[Exception],
     match: str,
 ) -> None:
@@ -154,10 +200,15 @@ def test_mixer_rejects_bad_buffers(
     Catches validation that trusts its caller: a rank, width, batch, device, or
     dtype error survives to a kernel launch, where it reads as a CUDA fault
     rather than as a shape mismatch.
+
+    Batch and device are mutated on ``conv`` alone. Both rules compare all four
+    buffers at once, so which one disagrees is not a separate failure mode.
     """
-    conv, ssm = mutate(mixer())
+    state = mixer()
+    fields = _fields(state)
+    fields.update(mutate(state))
     with pytest.raises(exc, match=match):
-        MixerState(conv=conv, ssm=ssm)
+        MixerState(**fields)
 
 
 @pytest.mark.parametrize(
