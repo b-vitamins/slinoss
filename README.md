@@ -111,6 +111,19 @@ logits = model(ids[:, -1:], state)   # one token
 
 Cast the module to the state's dtype rather than decoding under autocast.
 
+`generate` is that loop: prefill, then one call per token, sampling on the device.
+`temperature=0` is greedy, `top_k` truncates the distribution, and `stop_token_id`
+holds a finished sequence at its stop token so the returned block stays
+rectangular. The returned state has consumed every generated token but the last, so
+a continuation prompts with that one.
+
+```python
+from slinoss import generate
+
+out = generate(model, ids, max_new_tokens=64, temperature=0.8, top_k=50)
+more = generate(model, out.tokens[:, -1:], max_new_tokens=64, state=out.state)
+```
+
 The operator is callable directly. `so3ssm` is the sequential reference and is
 float64-capable; `so3ssd` is the chunked, autograd-complete, CUDA-accelerated
 path.

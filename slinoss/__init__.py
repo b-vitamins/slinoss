@@ -2,6 +2,7 @@
 
 from slinoss.blocks import BlockOutput, SLinOSSBlock
 from slinoss.config import SLinOSSConfig
+from slinoss.decode import DecodeOutput, generate
 from slinoss.mixer import SLinOSSMixer
 from slinoss.stack import SLinOSSStack
 from slinoss.state import MixerState, StackState
@@ -10,6 +11,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BlockOutput",
+    "DecodeOutput",
     "MixerState",
     "SLinOSSBlock",
     "SLinOSSConfig",
@@ -17,4 +19,5 @@ __all__ = [
     "SLinOSSStack",
     "StackState",
     "__version__",
+    "generate",
 ]
