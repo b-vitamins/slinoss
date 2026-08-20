@@ -5,9 +5,14 @@
 Every operator lives in `slinoss/ops/<name>/` and has the same five parts:
 
 - `reference.py` -- pure PyTorch. The mathematical authority. Holds the reference
-  forward, the reference backward, and the gradient named types.
+  forward, the reference backward, and the gradient named types. An analytic
+  backward large enough to stand alone takes its own `backward.py` beside it,
+  still pure PyTorch, and carries the gradient named types with it. `so3ssd` is
+  the one that does.
 - `cute/` -- CuTe DSL kernels and their host wrappers, and nothing else: no
-  autograd function, no public differentiable callable, no named type.
+  autograd function, no public differentiable callable, no named type. An
+  operator whose fast path is the C++ extension has no `cute/` at all; `conv` is
+  the one.
 - `backends.py` -- the forward and backward `Protocol`s, the `Registry`, the
   registrations.
 - `interface.py` -- the one `torch.autograd.Function` and the one public
@@ -31,7 +36,14 @@ One entry point per operator, not one per implementation.
 - The gradient named type lives in `reference.py`. In the kernel module it would
   force the reference backend to import a kernel to name its own return type.
 - Resolution is on device type and activation dtype. Shape is not a resolution
-  axis.
+  axis, so a shape a kernel cannot hold raises rather than resolving to another
+  backend. A shared-memory bound is a bound on the configuration, not a fallback
+  trigger.
+- A direction implemented as several launches has one driver module in `cute/`
+  that sequences them, and `backends.py` registers the driver, never a kernel.
+  The backward driver rematerializes what it needs from the saved inputs; a
+  quantity the forward saved only for the backward's convenience is activation
+  memory the operator does not need.
 - No `torch.amp.custom_fwd`. It casts every input to the autocast dtype, which is
   the opposite of I4. The backend decides the promotion.
 
@@ -58,6 +70,8 @@ slinoss/
         table.py    the 3x3 transform table and every staging helper
         prefix.py   both chunk-local prefixes and their adjoints
         guard.py    this operator's dtype sets and shape checks
+        forward.py  the driver that sequences the three forward launches
+        backward.py the driver that sequences the seven backward launches
         fwd/        chunk_increment, state_passing, chunk_scan
         bwd/        chunk_start, state_passing, chunk_input, chunk_vector, boundary
     scanprep/     parameter maps: rotation vector, log-scale, taps

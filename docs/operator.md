@@ -68,6 +68,27 @@ The chunk increment and the inter-chunk recurrence are
 
 The state passing over chunks is the only serial dimension left.
 
+## Adjoint
+
+The backward saves no derived quantity. Only the operator inputs cross the
+boundary between the two passes, and every chunk-local intermediate is
+rematerialized by the forward's own code, so the recompute cannot drift from the
+forward.
+
+The pieces mirror the forward. The diagonal term transposes the decay mask. The
+reverse chunk recurrence carries a `(B,H,P,3N)` accumulator and is the only
+serial dimension in the backward, as state passing is in the forward.
+
+Two-tap forcing makes the chunk boundary two-sided: the first token of a chunk
+owes a `u_{t-1}` and a `b_{t-1}` cotangent to the last token of the chunk before
+it. Those carries are one per chunk boundary, and at the sequence start they are
+the operator's `du_prev` and `db_prev`.
+
+The log-scale cotangent is a reverse cumulative sum over the chunk of a
+per-token quantity assembled from the diagonal, increment, offset, and
+chunk-transition terms. The split across those terms follows which stage holds
+which operand, so no stage can derive its own half from another's.
+
 ## Numerical invariants
 
 Guaranteed by parameterization, then asserted by tests. A clamp, an epsilon, or
@@ -104,7 +125,10 @@ requirement on them is pitched instead: unit stride on the trailing axis,
 non-overlapping rows, and a base address and pitch that both land on a boundary. A
 contiguous buffer meets that rule at a pitch equal to its row width, so the two
 layouts are one contract and a standalone caller needs no change. `3N` is a
-multiple of 48, so the shape constraint already carries the alignment.
+multiple of 48, so the shape constraint already carries the alignment. The rule
+holds for the cotangents too: `dB` and `dC` are written into the band the caller
+names, at that band's pitch, never gathered into a contiguous buffer and copied
+back.
 
 The boundary is a 32-byte sector where the pitch exceeds the row width and 16
 bytes where it does not. A band row starting mid-sector fetches one sector it
@@ -126,7 +150,8 @@ one free width last keeps every offset on a sector with no padding between bands
 
 `trans` packs `(w_x, w_y, w_z, ls)`. `K` packs per tap `(kr, g, h, 0)` with tap
 index `0` = previous and `1` = current; lane 3 is a hard zero, present for
-float4 alignment.
+float4 alignment, and its cotangent is exactly zero rather than within a
+tolerance.
 
 The trailing `3N` is `N` 3-vectors in lane-major order: element `3n+i` is
 component `i` of 3-vector `n`.
