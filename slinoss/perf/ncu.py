@@ -49,12 +49,34 @@ unit view: each engine against its own peak. A kernel far below the DRAM ceiling
 whose dominant stall is ``long_scoreboard`` while ``issue_active_pct`` sits in
 single digits is memory-latency bound with too few loads in flight, which no
 counter in the other six tables distinguishes from a bandwidth bound.
+
+Two further passes carry what a per-kernel counter cannot. :data:`RULE_SECTIONS`
+requests NCU's sections so its rules run, and keeps their text and their estimated
+speedups; the ten counter tables above collect metrics only, so no rule had ever
+fired. :data:`SOURCE_TABLE` requests the per-instruction source counters, which
+resolve a kernel total onto the source lines that own it. Both write a report with
+``--export``, because an ``--export`` run prints nothing to stdout and is read back
+with :func:`import_command`; keeping the report also makes a capture re-readable
+without re-running the kernel.
+
+Every pass here is read by metric name or by NCU's own machine columns, never by a
+display label. The rules pass is the one exception in kind: its subject is the
+``Rule Name``, ``Rule Description`` and ``Estimated Speedup`` columns, which are
+NCU's schema rather than a rendered table, and its metrics are not parsed at all.
+
+Both new passes fail loudly rather than reading as empty, on
+:data:`SPILL_TABLE`'s standard. :func:`parse_rule_csv` raises when the report
+carries no rule columns, which is a report collected without sections.
+:func:`parse_source_csv` raises when no line number came back, which on a CuTe DSL
+kernel means the target ran without ``CUTE_DSL_LINEINFO=1`` and the whole
+attribution would otherwise read as a kernel with no source.
 """
 
 from __future__ import annotations
 
 import csv
 import io
+import re
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -68,6 +90,7 @@ from slinoss.perf.units import (
     Bytes,
     Count,
     GBPerSecond,
+    Megahertz,
     Microseconds,
     Nanoseconds,
     Percent,
@@ -79,9 +102,14 @@ from slinoss.perf.units import (
 )
 
 __all__ = [
+    "LSU_INST_PER_SM_CYCLE",
+    "LSU_OPCODES",
     "NCU_TABLES",
     "REQUIRED_METRICS",
+    "RULE_SECTIONS",
     "SOL_FIELDS",
+    "SOURCE_TABLE",
+    "SOURCE_VIEW",
     "SPILL_TABLE",
     "STALL_FIELDS",
     "STALL_REASONS",
@@ -89,12 +117,26 @@ __all__ = [
     "NcuInvocation",
     "NcuPass",
     "NcuTable",
+    "RuleMessage",
+    "RulesPass",
+    "SourceLine",
+    "SourcePass",
     "SpillCounters",
+    "export_flags",
+    "import_command",
     "kernel_counters",
+    "lsu_floor_us",
     "metric_scale",
     "ncu_command",
     "parse_ncu_csv",
+    "parse_rule_csv",
+    "parse_source_csv",
+    "pcsamp_metric",
+    "report_file",
+    "rules_command",
     "run_ncu",
+    "run_rules",
+    "run_source",
     "spill_counters",
     "stall_field",
     "stall_metric",
@@ -1046,3 +1088,763 @@ def spill_counters(one: NcuPass) -> tuple[SpillCounters, ...]:
             )
         )
     return tuple(sorted(out, key=lambda k: k.duration_us, reverse=True))
+
+
+# ---------------------------------------------------------------------------
+# Reports on disk
+# ---------------------------------------------------------------------------
+
+
+def export_flags(report: str) -> tuple[str, ...]:
+    """Flags that write the profile to a report file with its source correlated.
+
+    An ``--export`` run prints no counter table to stdout, so a pass that exports
+    is read back with :func:`import_command` rather than parsed in place.
+
+    ``--force-overwrite`` is not optional: without it NCU exits nonzero on an
+    existing file, which loses the measurement that was just taken in order to keep
+    a stale report.
+
+    ``--import-source yes`` embeds the source files the binary names. It is what
+    the source page needs to show a line rather than an address, and it fails with
+    a warning rather than an error when the binary carries no line information, so
+    the loud failure is :func:`parse_source_csv`'s.
+
+    Args:
+        report: Report path. NCU appends ``.ncu-rep`` when it is absent.
+
+    Returns:
+        The flags.
+
+    Raises:
+        ValueError: If the path is empty.
+    """
+    if not report:
+        raise ValueError("an exporting pass needs a report path")
+    return ("--import-source", "yes", "--export", report, "--force-overwrite")
+
+
+def report_file(report: str) -> str:
+    """The path NCU actually writes for a given ``--export`` argument.
+
+    Args:
+        report: The ``--export`` argument.
+
+    Returns:
+        The same path with ``.ncu-rep`` appended when it is not already there.
+    """
+    return report if report.endswith(".ncu-rep") else f"{report}.ncu-rep"
+
+
+SOURCE_VIEW: Final[tuple[str, ...]] = ("cuda", "sass")
+"""The only source view that correlates counters with a source line.
+
+NCU correlates metrics in the ``sass`` and ``cuda,sass`` views only. ``cuda`` alone
+returns the line text with no counters beside it, and ``sass`` alone returns no
+line number, so the pair is the one view a per-line attribution can be read from.
+"""
+
+
+def import_command(
+    report: str,
+    *,
+    ncu: str = "ncu",
+    page: str = "details",
+    print_source: Sequence[str] = (),
+) -> list[str]:
+    """Build the command that re-reads a report NCU already wrote.
+
+    Args:
+        report: Report path, as NCU wrote it.
+        ncu: Path to the ``ncu`` binary.
+        page: The page to print: ``details`` for sections and rules, ``source``
+            for per-instruction counters, ``raw`` for every metric by name.
+        print_source: Source views to interleave, for ``page="source"``. Use
+            :data:`SOURCE_VIEW`.
+
+    Returns:
+        The full argv.
+
+    Raises:
+        ValueError: If the report path or the page is empty.
+    """
+    if not report:
+        raise ValueError("import needs a report path")
+    if not page:
+        raise ValueError("import needs a page")
+    out = [ncu, "--import", report, "--csv", "--page", page]
+    if print_source:
+        out += ["--print-source", ",".join(print_source)]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+RULE_SECTIONS: Final[tuple[str, ...]] = (
+    "ComputeWorkloadAnalysis",
+    "InstructionStats",
+    "LaunchStats",
+    "MemoryWorkloadAnalysis",
+    "MemoryWorkloadAnalysis_Tables",
+    "Occupancy",
+    "SchedulerStats",
+    "SourceCounters",
+    "SpeedOfLight",
+    "SpeedOfLight_RooflineChart",
+    "WarpStateStats",
+)
+"""Sections requested so that their rules run.
+
+A rule is attached to a section and only runs when that section was collected, so
+the ten counter tables above, which request metrics and no section, have never run
+one. Measured against ``--set full`` on this fleet these eleven fire the same
+fourteen rules; the sets ``full`` adds beyond them are the chart variants,
+``NumaAffinity``, the NVLink pair and ``PmSampling``, whose rules either do not
+exist or do not describe a kernel.
+"""
+
+_RULE_NAME: Final = "Rule Name"
+
+_RULE_COLUMNS: Final[tuple[str, ...]] = (
+    "Kernel Name",
+    "Section Name",
+    _RULE_NAME,
+    "Rule Type",
+    "Rule Description",
+    "Estimated Speedup Type",
+    "Estimated Speedup",
+)
+
+
+def rules_command(
+    argv: Sequence[str],
+    *,
+    report: str,
+    ncu: str = "ncu",
+    sections: Sequence[str] = RULE_SECTIONS,
+    extra: Sequence[str] = (),
+) -> list[str]:
+    """Build the command line for the rules pass.
+
+    Args:
+        argv: The target command, already split.
+        report: Where to write the report.
+        ncu: Path to the ``ncu`` binary.
+        sections: Sections to collect. Defaults to :data:`RULE_SECTIONS`.
+        extra: Additional NCU flags, inserted before the target.
+
+    Returns:
+        The full argv.
+
+    Raises:
+        ValueError: If no section is requested, if the target is empty, or if the
+            report path is empty.
+    """
+    if not sections:
+        raise ValueError("the rules pass requests no sections")
+    if not argv:
+        raise ValueError("ncu needs a target command")
+    requested: list[str] = []
+    for section in sections:
+        requested += ["--section", section]
+    return [
+        ncu,
+        *_FIXED_FLAGS,
+        *requested,
+        "--apply-rules",
+        "yes",
+        *export_flags(report),
+        *extra,
+        *argv,
+    ]
+
+
+@dataclass(frozen=True)
+class RuleMessage:
+    """One rule's verdict on one kernel.
+
+    Attributes:
+        kernel: Demangled kernel name.
+        section: The section the rule is attached to.
+        rule: Rule identifier, as ``--list-rules`` spells it.
+        severity: NCU's own three-letter type, ``OPT``, ``INF``, ``WRN`` or
+            ``ERR``.
+        message: The rule's text, verbatim. It carries the counters the rule
+            reached its verdict from, which no other output holds.
+        speedup_scope: ``global`` when the estimate is of the whole kernel's
+            duration, ``local`` when it is of the one unit the rule examined, and
+            empty when the rule offers no estimate.
+        speedup_pct: The estimate, or None. A local estimate is not a kernel
+            speedup and the two do not add.
+    """
+
+    kernel: str
+    section: str
+    rule: str
+    severity: str
+    message: str
+    speedup_scope: str
+    speedup_pct: Percent | None
+
+
+@dataclass(frozen=True)
+class RulesPass:
+    """Every rule that fired over one capture window.
+
+    Attributes:
+        report: The report the messages were read from, kept so a re-analysis can
+            reach the same capture without re-running the kernel.
+        command: The argv that collected it.
+        messages: The rules, in NCU's order.
+    """
+
+    report: str
+    command: tuple[str, ...]
+    messages: tuple[RuleMessage, ...]
+
+    def ranked(self, *, scope: str = "global") -> tuple[RuleMessage, ...]:
+        """Rules carrying an estimate of one scope, by descending estimate.
+
+        Args:
+            scope: ``global`` or ``local``.
+
+        Returns:
+            The matching messages, largest estimate first.
+        """
+        held = [
+            m
+            for m in self.messages
+            if m.speedup_scope == scope and m.speedup_pct is not None
+        ]
+        return tuple(sorted(held, key=lambda m: m.speedup_pct or 0.0, reverse=True))
+
+
+def parse_rule_csv(
+    text: str, *, report: str = "", command: Sequence[str] = ()
+) -> RulesPass:
+    """Parse the rule rows out of a details page.
+
+    The details page repeats every section metric under its display label and
+    carries a rule on the row that fired it. Only the rule columns are read; the
+    metrics on that page are display-labelled and belong to the ten counter tables.
+
+    Args:
+        text: Stdout of :func:`import_command` with ``page="details"``.
+        report: Report path to record.
+        command: Collection command to record.
+
+    Returns:
+        The pass. Empty ``messages`` means the rules ran and every one declined,
+        which is a clean kernel rather than a missing pass.
+
+    Raises:
+        ValueError: If the output carries no CSV header, or no rule columns. A
+            details page without them was collected with ``--metrics`` and no
+            section, so no rule ever ran, and reporting that as a clean kernel is
+            the failure this pass exists to prevent.
+    """
+    body = _csv_body(text)
+    if not body:
+        raise ValueError("no CSV header in ncu details output")
+    reader = csv.DictReader(io.StringIO(body))
+    columns = reader.fieldnames or []
+    absent = [c for c in _RULE_COLUMNS if c not in columns]
+    if absent:
+        raise ValueError(
+            f"ncu details page has no {absent[0]!r} column, so no rule ran; "
+            f"collect with rules_command rather than ncu_command"
+        )
+    out: list[RuleMessage] = []
+    for row in reader:
+        rule = (row[_RULE_NAME] or "").strip()
+        if not rule:
+            continue
+        estimate = _number(row["Estimated Speedup"] or "")
+        out.append(
+            RuleMessage(
+                kernel=(row["Kernel Name"] or "").strip(),
+                section=(row["Section Name"] or "").strip(),
+                rule=rule,
+                severity=(row["Rule Type"] or "").strip(),
+                message=(row["Rule Description"] or "").strip(),
+                speedup_scope=(row["Estimated Speedup Type"] or "").strip(),
+                speedup_pct=None if estimate is None else Percent(estimate),
+            )
+        )
+    return RulesPass(report=report, command=tuple(command), messages=tuple(out))
+
+
+def run_rules(
+    argv: Sequence[str],
+    *,
+    report: str,
+    ncu: str = "ncu",
+    sections: Sequence[str] = RULE_SECTIONS,
+    extra: Sequence[str] = (),
+    cwd: str | None = None,
+    timeout_s: float | None = None,
+) -> RulesPass:
+    """Collect the rules pass and read its rules back.
+
+    Two NCU invocations: the collection writes the report, and the report is
+    re-read, because an exporting run prints no table.
+
+    Args:
+        argv: The target command.
+        report: Where to write the report.
+        ncu: Path to the ``ncu`` binary, or a bare name to resolve.
+        sections: Sections to collect.
+        extra: Additional NCU flags for the collection.
+        cwd: Working directory for the target.
+        timeout_s: Wall clock limit for each invocation, or None.
+
+    Returns:
+        The pass.
+
+    Raises:
+        ToolNotFoundError: If ``ncu`` resolves to nothing.
+        RuntimeError: If either invocation exits nonzero.
+        ValueError: What :func:`parse_rule_csv` raises.
+    """
+    binary = resolve_tool(ncu)
+    collect = rules_command(
+        argv, report=report, ncu=binary, sections=sections, extra=extra
+    )
+    _capture(collect, label="rules pass", cwd=cwd, timeout_s=timeout_s)
+    written = report_file(report)
+    text = _capture(
+        import_command(written, ncu=binary, page="details"),
+        label="rules import",
+        timeout_s=timeout_s,
+    )
+    return parse_rule_csv(text, report=written, command=collect)
+
+
+# ---------------------------------------------------------------------------
+# Per-line attribution
+# ---------------------------------------------------------------------------
+
+_PCSAMP_PREFIX: Final = "smsp__pcsamp_warps_issue_stalled_"
+_PCSAMP_SUFFIX: Final = "_not_issued"
+
+_PCSAMP_SPELLING: Final[Mapping[str, str]] = {"no_instruction": "no_instructions"}
+"""Where the PC-sampling family spells a reason differently from the per-cycle one.
+
+The two families name the same seventeen reasons and agree on sixteen of them.
+Requesting the per-cycle spelling of the seventeenth returns no such metric, which
+is why the two names are built by two functions rather than one.
+"""
+
+
+def pcsamp_metric(reason: str) -> str:
+    """NCU metric carrying one stall reason's not-issued PC samples.
+
+    Not-issued rather than all samples: a warp stalled in a cycle where another
+    warp issued cost nothing, and requesting both families doubles the pass count
+    for a number that cannot be acted on.
+
+    Args:
+        reason: A member of :data:`STALL_REASONS`.
+
+    Returns:
+        The metric name, requested verbatim.
+    """
+    spelled = _PCSAMP_SPELLING.get(reason, reason)
+    return f"{_PCSAMP_PREFIX}{spelled}{_PCSAMP_SUFFIX}"
+
+
+_SRC_INST: Final = "inst_executed"
+_SRC_ACCESS_SIZE: Final = "memory_access_size_type"
+_SRC_SHARED_WAVEFRONTS: Final = "memory_l1_wavefronts_shared"
+_SRC_SHARED_IDEAL: Final = "memory_l1_wavefronts_shared_ideal"
+_SRC_SAMPLES: Final = "smsp__pcsamp_sample_count"
+
+SOURCE_TABLE: Final[NcuTable] = NcuTable(
+    "source",
+    (
+        _DURATION,
+        _SRC_INST,
+        _SRC_ACCESS_SIZE,
+        _SRC_SHARED_WAVEFRONTS,
+        _SRC_SHARED_IDEAL,
+        _SRC_SAMPLES,
+        *(pcsamp_metric(reason) for reason in STALL_REASONS),
+    ),
+)
+"""Per-instruction counters, the pass that resolves a kernel total onto its source.
+
+An eleventh pass, and like :data:`SPILL_TABLE` deliberately outside
+:data:`NCU_TABLES`: its values are per instruction rather than per launch, so they
+do not merge into :class:`KernelCounters` and are not a row in a counter table.
+
+``memory_access_size_type`` carries the access width in bits, which decides whether
+an instruction is deleteable: two 16-bit shared accesses to adjacent addresses are
+one 32-bit access, and the second instruction is pure LSU issue for no extra byte.
+
+The two shared-wavefront metrics are here rather than in the ``shared`` table
+because a conflicted wavefront is a replayed LSU instruction. The kernel total
+already sits in :attr:`KernelCounters.conflict_per_wavefront_ratio`; what a fix
+needs is the line, and the excess over ideal is the part a better layout removes.
+"""
+
+LSU_OPCODES: Final[frozenset[str]] = frozenset(
+    (
+        "ATOM",
+        "ATOMG",
+        "ATOMS",
+        "LD",
+        "LDG",
+        "LDL",
+        "LDS",
+        "LDSM",
+        "RED",
+        "SHFL",
+        "ST",
+        "STG",
+        "STL",
+        "STS",
+    )
+)
+"""SASS opcode classes that issue on the LSU port, without the modifier suffix.
+
+``SHFL`` is the non-obvious member: a warp shuffle moves no memory and still
+occupies the same issue port as a shared-memory access, so a kernel can be LSU
+bound with no load in it. Barrier and cache-control opcodes are left out, their
+port not having been measured here.
+
+Checked against the counter on this fleet: summing ``inst_executed`` over the
+instructions in this set reached 166,060,800 of ``sm__inst_executed_pipe_lsu.sum``
+= 166,152,960 on ``chunk_vector_bwd_kernel``, the residue being one instruction
+site that the source page omits from every opcode -- ``sm__inst_executed.sum``
+is short by the same 92,160.
+"""
+
+LSU_INST_PER_SM_CYCLE: Final = 0.5
+"""LSU warp-instructions one multiprocessor issues per cycle on GA10x.
+
+The LSU port accepts four threads per cycle per sub-partition, so a 32-thread warp
+instruction occupies eight cycles of one sub-partition, and four sub-partitions
+put the multiprocessor at half a warp-instruction per cycle. Verified against NCU
+on this fleet: ``sm__inst_executed_pipe_lsu.sum`` over ``sm_count *
+sm__cycles_active.avg * 0.5`` reproduced
+``sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active`` to four figures.
+"""
+
+_MEMORY_INST_PER_LSU_INST: Final = 2
+"""Multiplier from the rate above to the cost of one LSU warp-instruction, in
+multiprocessor cycles."""
+
+
+def lsu_floor_us(
+    lsu_inst_count: Count, *, sm_count: Count, clock_mhz: Megahertz
+) -> Microseconds:
+    """Time the LSU port needs to issue a given number of warp-instructions.
+
+    The rate is queried rather than written down, because it moves with the clock:
+    at 84 multiprocessors it is 74.4 thousand warp-instructions per microsecond at
+    1.77 GHz and 79.1 thousand at 1.88 GHz, and both clocks occur on one
+    uncontrolled part. A floor quoted as a constant is a floor that holds on one
+    run.
+
+    Args:
+        lsu_inst_count: LSU warp-instructions, summed over the launches in
+            question.
+        sm_count: Multiprocessors on the part. A figure taken at one count does
+            not transfer to another.
+        clock_mhz: Multiprocessor clock during the kernel, which is cycles per
+            microsecond.
+
+    Returns:
+        The floor.
+
+    Raises:
+        ValueError: If the multiprocessor count or the clock is not positive.
+    """
+    if sm_count <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    if clock_mhz <= 0.0:
+        raise ValueError(f"clock_mhz must be positive, got {clock_mhz}")
+    rate = sm_count * LSU_INST_PER_SM_CYCLE * clock_mhz
+    return Microseconds(lsu_inst_count / rate)
+
+
+@dataclass(frozen=True)
+class SourceLine:
+    """One source line of one kernel, and the SASS correlated to it.
+
+    Attributes:
+        kernel: Kernel name, from the source page's ``Function Name``.
+        file: The file NCU named. For a CuTe DSL kernel this is the entry module
+            on every line whatever file the line is really in; see
+            :func:`parse_source_csv`.
+        line: Line number, one-based.
+        inst_count: Warp-instructions executed at this line, every pipe.
+        lsu_inst_count: Those whose opcode is in :data:`LSU_OPCODES`.
+        opcode_inst: Opcode class to warp-instructions executed, over
+            :data:`LSU_OPCODES` only.
+        access_bit_inst: Access width in bits to warp-instructions executed of
+            that width. Only memory instructions carry a width.
+        shared_wavefront_count: Shared-memory wavefronts this line's instructions
+            asked L1 for.
+        shared_wavefront_ideal_count: Wavefronts a conflict-free layout would have
+            needed. The excess is the conflict replay.
+        sample_count: PC samples taken at this line, issuing or not.
+        stall_samples: :data:`STALL_REASONS` spelling to not-issued PC samples.
+    """
+
+    kernel: str
+    file: str
+    line: int
+    inst_count: int
+    lsu_inst_count: int
+    opcode_inst: Mapping[str, int]
+    access_bit_inst: Mapping[int, int]
+    shared_wavefront_count: int
+    shared_wavefront_ideal_count: int
+    sample_count: int
+    stall_samples: Mapping[str, int]
+
+    @property
+    def not_issued_count(self) -> int:
+        """Samples where this line stalled and no warp issued."""
+        return sum(self.stall_samples.values())
+
+    @property
+    def shared_wavefront_excess_count(self) -> int:
+        """Wavefronts a conflict-free layout would not have needed."""
+        return self.shared_wavefront_count - self.shared_wavefront_ideal_count
+
+
+@dataclass(frozen=True)
+class SourcePass:
+    """Per-line counters for one capture window.
+
+    Attributes:
+        report: The report the lines were read from.
+        command: The argv that collected it.
+        lines: One record per correlated source line, by descending LSU count.
+        unattributed_inst_count: Warp-instructions on instructions NCU printed
+            under no line. Nonzero means the attribution does not cover the kernel
+            and the shortfall is this large, which a table of lines alone would
+            hide.
+    """
+
+    report: str
+    command: tuple[str, ...]
+    lines: tuple[SourceLine, ...]
+    unattributed_inst_count: int
+
+    @property
+    def lsu_inst_count(self) -> Count:
+        """LSU warp-instructions over every attributed line."""
+        return Count(sum(one.lsu_inst_count for one in self.lines))
+
+
+_LINE_NO: Final = "Line No"
+_ADDRESS: Final = "Address"
+_SOURCE: Final = "Source"
+_FILE_PATH: Final = "File Path"
+_FUNCTION_NAME: Final = "Function Name"
+
+_OPCODE = re.compile(r"^\s*(?:@!?P\d+\s+)?([A-Z][A-Z0-9_.]*)")
+
+
+def _int(cell: str) -> int:
+    value = _number(cell)
+    return 0 if value is None else round(value)
+
+
+def _source_columns(header: Sequence[str]) -> tuple[dict[str, int], int]:
+    """Column indices for a source-page header, and the SASS text column.
+
+    The header names two columns ``Source``: the first is the high-level line, the
+    second the SASS. A name-keyed map keeps the first, so the second is returned
+    beside it.
+    """
+    columns: dict[str, int] = {}
+    for index, name in enumerate(header):
+        columns.setdefault(name, index)
+    sass = [i for i, name in enumerate(header) if name == _SOURCE]
+    return columns, sass[1] if len(sass) > 1 else -1
+
+
+def parse_source_csv(
+    text: str, *, report: str = "", command: Sequence[str] = ()
+) -> SourcePass:
+    """Parse a source page into one record per correlated line.
+
+    The page is a sequence of blocks, each opened by a ``File Path`` row and a
+    ``Function Name`` row and then its own header. Within a block a row carrying a
+    line number holds NCU's aggregate for that line, and the rows after it hold the
+    instructions correlated to it. An instruction row is attributed to the last
+    line number seen, which is the order NCU prints.
+
+    One warning about the file, for CuTe DSL kernels specifically. NVVM emits a
+    single ``.file`` for the whole module while preserving the line number of every
+    traced file, so every line of a DSL kernel is reported against the entry module
+    and ``file`` is only trustworthy for a single-file kernel. The line numbers
+    themselves are sound. Resolving them needs the MLIR location set, which is not
+    in the report.
+
+    Args:
+        text: Stdout of :func:`import_command` with ``page="source"`` and
+            ``print_source=SOURCE_VIEW``.
+        report: Report path to record.
+        command: Collection command to record.
+
+    Returns:
+        The pass, lines by descending LSU count.
+
+    Raises:
+        ValueError: If the output holds no source block, if the header is missing a
+            metric :data:`SOURCE_TABLE` requested, or if no instruction correlated
+            to a line. The last is the profile that has always been silent here:
+            the target was built without line information, and for a CuTe DSL
+            kernel that means it ran without ``CUTE_DSL_LINEINFO=1``.
+    """
+    reader = csv.reader(io.StringIO(text))
+    required = (_SRC_INST, _SRC_SAMPLES, *(pcsamp_metric(r) for r in STALL_REASONS))
+    blocks = 0
+    path = ""
+    kernel = ""
+    columns: dict[str, int] = {}
+    sass_column = -1
+    line = 0
+    unattributed = 0
+    inst: dict[tuple[str, str, int], int] = {}
+    lsu: dict[tuple[str, str, int], int] = {}
+    opcodes: dict[tuple[str, str, int], dict[str, int]] = {}
+    widths: dict[tuple[str, str, int], dict[int, int]] = {}
+    aggregate: dict[tuple[str, str, int], list[str]] = {}
+    for row in reader:
+        if len(row) == 2 and row[0] == _FILE_PATH:
+            blocks += 1
+            path, columns, line = row[1], {}, 0
+            continue
+        if len(row) == 2 and row[0] == _FUNCTION_NAME:
+            kernel, columns, line = row[1], {}, 0
+            continue
+        if row and row[0] == _LINE_NO:
+            columns, sass_column = _source_columns(row)
+            absent = [m for m in required if m not in columns]
+            if absent:
+                raise ValueError(
+                    f"ncu source page has no {absent[0]!r} column; collect "
+                    f"SOURCE_TABLE, which requests it"
+                )
+            line = 0
+            continue
+        if not columns or len(row) <= sass_column:
+            continue
+        number = row[columns[_LINE_NO]].strip()
+        if number.isdigit():
+            line = int(number)
+            aggregate[(kernel, path, line)] = list(row)
+            continue
+        if not row[columns[_ADDRESS]].strip().startswith("0x"):
+            continue
+        count = _int(row[columns[_SRC_INST]])
+        if line == 0:
+            unattributed += count
+            continue
+        key = (kernel, path, line)
+        inst[key] = inst.get(key, 0) + count
+        matched = _OPCODE.match(row[sass_column])
+        if matched is None:
+            continue
+        opcode = matched.group(1).partition(".")[0]
+        if opcode not in LSU_OPCODES:
+            continue
+        lsu[key] = lsu.get(key, 0) + count
+        opcodes.setdefault(key, {})
+        opcodes[key][opcode] = opcodes[key].get(opcode, 0) + count
+        width = (
+            row[columns[_SRC_ACCESS_SIZE]].strip()
+            if _SRC_ACCESS_SIZE in columns
+            else ""
+        )
+        if width.isdigit():
+            widths.setdefault(key, {})
+            bits = int(width)
+            widths[key][bits] = widths[key].get(bits, 0) + count
+    if blocks == 0:
+        raise ValueError("no source block in ncu output; import with page='source'")
+    if not aggregate:
+        raise ValueError(
+            "ncu correlated no instruction to a source line; the target carries no "
+            "line information, and a CuTe DSL kernel needs CUTE_DSL_LINEINFO=1 in "
+            "the environment the target runs in"
+        )
+    out: list[SourceLine] = []
+    for key, row in aggregate.items():
+        stalls = {r: _int(row[columns[pcsamp_metric(r)]]) for r in STALL_REASONS}
+        out.append(
+            SourceLine(
+                kernel=key[0],
+                file=key[1],
+                line=key[2],
+                inst_count=inst.get(key, 0),
+                lsu_inst_count=lsu.get(key, 0),
+                opcode_inst=dict(sorted(opcodes.get(key, {}).items())),
+                access_bit_inst=dict(sorted(widths.get(key, {}).items())),
+                shared_wavefront_count=_int(row[columns[_SRC_SHARED_WAVEFRONTS]]),
+                shared_wavefront_ideal_count=_int(row[columns[_SRC_SHARED_IDEAL]]),
+                sample_count=_int(row[columns[_SRC_SAMPLES]]),
+                stall_samples=stalls,
+            )
+        )
+    out.sort(key=lambda one: (-one.lsu_inst_count, one.file, one.line))
+    return SourcePass(
+        report=report,
+        command=tuple(command),
+        lines=tuple(out),
+        unattributed_inst_count=unattributed,
+    )
+
+
+def run_source(
+    argv: Sequence[str],
+    *,
+    report: str,
+    ncu: str = "ncu",
+    extra: Sequence[str] = (),
+    cwd: str | None = None,
+    timeout_s: float | None = None,
+) -> SourcePass:
+    """Collect :data:`SOURCE_TABLE` and read its source page back.
+
+    Two NCU invocations, for the reason :func:`run_rules` gives.
+
+    Args:
+        argv: The target command.
+        report: Where to write the report.
+        ncu: Path to the ``ncu`` binary, or a bare name to resolve.
+        extra: Additional NCU flags for the collection.
+        cwd: Working directory for the target.
+        timeout_s: Wall clock limit for each invocation, or None.
+
+    Returns:
+        The pass.
+
+    Raises:
+        ToolNotFoundError: If ``ncu`` resolves to nothing.
+        RuntimeError: If either invocation exits nonzero.
+        ValueError: What :func:`parse_source_csv` raises.
+    """
+    binary = resolve_tool(ncu)
+    collect = ncu_command(
+        SOURCE_TABLE,
+        argv,
+        ncu=binary,
+        extra=(*export_flags(report), *extra),
+    )
+    _capture(collect, label="source pass", cwd=cwd, timeout_s=timeout_s)
+    written = report_file(report)
+    text = _capture(
+        import_command(written, ncu=binary, page="source", print_source=SOURCE_VIEW),
+        label="source import",
+        timeout_s=timeout_s,
+    )
+    return parse_source_csv(text, report=written, command=collect)

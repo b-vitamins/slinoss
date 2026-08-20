@@ -23,18 +23,31 @@ from slinoss.perf.ncu import (
     NCU_TABLES,
     REQUIRED_METRICS,
     SOL_FIELDS,
+    SOURCE_TABLE,
+    SOURCE_VIEW,
     STALL_FIELDS,
     STALL_REASONS,
     NcuPass,
     NcuTable,
+    export_flags,
+    import_command,
     kernel_counters,
+    lsu_floor_us,
     metric_scale,
     ncu_command,
     parse_ncu_csv,
+    parse_rule_csv,
+    parse_source_csv,
+    pcsamp_metric,
+    report_file,
+    rules_command,
     run_ncu,
+    run_rules,
+    run_source,
     stall_field,
     stall_metric,
 )
+from slinoss.perf.units import Count, Megahertz
 
 DURATION: Final = "gpu__time_duration.sum"
 ISSUE: Final = "smsp__issue_active.avg.pct_of_peak_sustained_active"
@@ -725,3 +738,391 @@ def test_run_ncu_raises_with_the_diagnostic_tail(
     )
     with pytest.raises(RuntimeError, match="ERR_NVGPUCTRPERM"):
         run_ncu(DRAM, TARGET, ncu="/opt/nsight/ncu")
+
+
+# ---------------------------------------------------------------------------
+# Rules
+#
+# The details page carries a rule on the row that fired it, in NCU's own columns
+# rather than a rendered table. A counter table collects no section, so its
+# details page has no such column at all, which is the state this project profiled
+# in until now.
+# ---------------------------------------------------------------------------
+
+DETAILS_HEADER: Final = (
+    f'{HEADER},"Rule Name","Rule Type","Rule Description",'
+    '"Estimated Speedup Type","Estimated Speedup"'
+)
+
+_DETAIL_ROW: Final = (
+    '"0","4711","python3","host","chunk_vector_bwd_kernel","2026-08-18 11:02:07",'
+    '"1","7"'
+)
+
+DETAILS_CSV: Final = f"""==PROF== Connected to process 4711 (/gnu/store/py3-3.11.11/bin/python3)
+{DETAILS_HEADER}
+{_DETAIL_ROW},"Occupancy","Achieved Occupancy","%","16.61","","","","",""
+{_DETAIL_ROW},"SpeedOfLight","","","","SOLBottleneck","INF","Compute and Memory are well-balanced","",""
+{_DETAIL_ROW},"ComputeWorkloadAnalysis","","","","HighPipeUtilization","OPT","All compute pipelines are under-utilized","local","85.2"
+{_DETAIL_ROW},"SourceCounters","","","","UncoalescedGlobalAccess","OPT","28,016,640 excessive sectors","global","41.81"
+{_DETAIL_ROW},"MemoryWorkloadAnalysis_Tables","","","","SharedMemoryConflicts","OPT","1.5-way bank conflict","global","20.33"
+==PROF== Disconnected from process 4711
+"""
+
+
+def test_a_new_pass_profiles_under_the_conditions_the_counter_tables_do() -> None:
+    counters = ncu_command(DRAM, TARGET, ncu="/opt/nsight/ncu")
+    rules = rules_command(
+        TARGET, report="/tmp/cvb", ncu="/opt/nsight/ncu", sections=("Occupancy",)
+    )
+    # A pass taken with the clocks or the caches under a different policy is not
+    # comparable with the ten counter tables, so both share one fixed prefix.
+    fixed = counters[1 : counters.index("--metrics")]
+    assert fixed
+    assert rules[1 : 1 + len(fixed)] == fixed
+    assert rules[len(rules) - len(TARGET) :] == list(TARGET)
+    assert rules[rules.index("--section") + 1] == "Occupancy"
+    assert rules[rules.index("--apply-rules") + 1] == "yes"
+    # Without --force-overwrite NCU exits nonzero on an existing report, losing
+    # the measurement just taken in order to keep a stale one.
+    assert "--force-overwrite" in rules
+    assert rules[rules.index("--export") + 1] == "/tmp/cvb"
+    # NCU appends the suffix, so the import has to read the written name.
+    assert report_file("/tmp/cvb") == "/tmp/cvb.ncu-rep"
+    assert report_file("/tmp/cvb.ncu-rep") == "/tmp/cvb.ncu-rep"
+
+
+def test_the_new_passes_reject_a_request_that_would_collect_nothing() -> None:
+    # Each of these produces a command NCU accepts and a report with nothing in
+    # it, so the raise has to come before the target runs.
+    with pytest.raises(ValueError, match="no sections"):
+        rules_command(TARGET, report="/tmp/cvb", sections=())
+    with pytest.raises(ValueError, match="target command"):
+        rules_command((), report="/tmp/cvb")
+    with pytest.raises(ValueError, match="needs a report path"):
+        rules_command(TARGET, report="")
+    with pytest.raises(ValueError, match="needs a report path"):
+        export_flags("")
+    with pytest.raises(ValueError, match="needs a report path"):
+        import_command("")
+    with pytest.raises(ValueError, match="needs a page"):
+        import_command("/tmp/cvb.ncu-rep", page="")
+
+
+def test_a_details_page_with_no_rule_column_is_not_a_clean_kernel() -> None:
+    # The output of a counter table. Reading it as a kernel no rule objected to
+    # is the reading that kept every rule silent here, so it raises instead.
+    with pytest.raises(ValueError, match="no 'Rule Name' column"):
+        parse_rule_csv(DRAM_CSV)
+    with pytest.raises(ValueError, match="no CSV header"):
+        parse_rule_csv(NO_HEADER_CSV)
+
+
+def test_rules_keep_a_local_estimate_apart_from_a_kernel_estimate() -> None:
+    got = parse_rule_csv(DETAILS_CSV, report="/tmp/cvb.ncu-rep")
+    assert got.report == "/tmp/cvb.ncu-rep"
+    # The metric row carries no rule and is not a message.
+    assert [one.rule for one in got.messages] == [
+        "SOLBottleneck",
+        "HighPipeUtilization",
+        "UncoalescedGlobalAccess",
+        "SharedMemoryConflicts",
+    ]
+    informational = got.messages[0]
+    assert informational.severity == "INF"
+    assert informational.speedup_scope == ""
+    assert informational.speedup_pct is None
+    assert informational.section == "SpeedOfLight"
+    # The rule text carries the counters the verdict came from, which no other
+    # output holds, so it is kept verbatim.
+    assert got.messages[3].message == "1.5-way bank conflict"
+    # 85.2% of one under-utilized pipeline is not 85.2% of the kernel. Ranking
+    # the two scopes together puts the largest local estimate first and aims the
+    # next change at nothing.
+    assert [one.rule for one in got.ranked()] == [
+        "UncoalescedGlobalAccess",
+        "SharedMemoryConflicts",
+    ]
+    assert [one.rule for one in got.ranked(scope="local")] == ["HighPipeUtilization"]
+
+
+# ---------------------------------------------------------------------------
+# Per-line attribution
+#
+# The source page is a sequence of blocks, each opened by a File Path row and a
+# Function Name row and then its own header. A row carrying a line number is
+# NCU's aggregate for that line and the rows after it are the instructions
+# correlated to it. Two columns are named Source: the first is the high-level
+# line, the second the SASS, whose text carries commas of its own.
+# ---------------------------------------------------------------------------
+
+SOURCE_METRICS: Final[tuple[str, ...]] = (
+    # Not the order SOURCE_TABLE requests them in. NCU orders this header itself.
+    "smsp__pcsamp_sample_count",
+    "inst_executed",
+    "memory_access_size_type",
+    "memory_l1_wavefronts_shared",
+    "memory_l1_wavefronts_shared_ideal",
+    *(pcsamp_metric(reason) for reason in STALL_REASONS),
+)
+
+_METRIC_ALIAS: Final[Mapping[str, str]] = {
+    "samples": "smsp__pcsamp_sample_count",
+    "inst": "inst_executed",
+    "size": "memory_access_size_type",
+    "wavefronts": "memory_l1_wavefronts_shared",
+    "ideal": "memory_l1_wavefronts_shared_ideal",
+}
+
+
+def _source_header(*, metrics: Sequence[str] = SOURCE_METRICS) -> str:
+    """A source-page header row, ``Source`` named twice as NCU names it."""
+    names = ("Line No", "Source", "Address", "Source", *metrics)
+    return ",".join(f'"{name}"' for name in names)
+
+
+def _source_row(line: str, text: str, address: str, sass: str, **values: int) -> str:
+    """One source-page row. A metric not named is blank, as NCU leaves it.
+
+    Args:
+        line: The ``Line No`` cell, blank on an instruction row.
+        text: High-level source, blank on an instruction row.
+        address: Instruction address, blank on a line row.
+        sass: Disassembly, blank on a line row.
+        **values: Metric values, by :data:`_METRIC_ALIAS` key or stall reason.
+    """
+    filled = {
+        _METRIC_ALIAS.get(key, pcsamp_metric(key)): value
+        for key, value in values.items()
+    }
+    cells = [line, text, address, sass]
+    cells += [str(filled.get(metric, "")) for metric in SOURCE_METRICS]
+    return ",".join(f'"{cell}"' for cell in cells)
+
+
+CVB_PATH: Final = "/lane/slinoss/ops/so3ssd/cute/bwd/chunk_vector.py"
+
+SOURCE_CSV: Final = "\n".join(
+    (
+        f'"File Path","{CVB_PATH}"',
+        '"Function Name","chunk_vector_bwd_kernel"',
+        _source_header(),
+        # Instruction printed before any line row: NCU correlated it to nothing.
+        _source_row("", "", "0x0000000000007f00", "LDS.U.32 R4, [R8]", inst=8),
+        _source_row(
+            "1163",
+            "    return sview[row, col]",
+            "",
+            "",
+            samples=34,
+            inst=300,
+            wavefronts=300,
+            ideal=200,
+            mio_throttle=18,
+            wait=5,
+        ),
+        _source_row(
+            "", "", "0x0000000000008000", "LDS.U.32 R4, [R8]", inst=100, size=32
+        ),
+        # Predicated, and one opcode with two modifiers.
+        _source_row(
+            "",
+            "",
+            "0x0000000000008010",
+            "@!P0 LDS.U.32 R6, [R8+0x4]",
+            inst=100,
+            size=32,
+        ),
+        _source_row("", "", "0x0000000000008020", "IADD3 R9, R9, 0x4, RZ", inst=100),
+        # NCU elides a run of unattributed source with this row.
+        _source_row("...", "", "", ""),
+        _source_row(
+            "1184", "    return vview[j]", "", "", samples=12, inst=60, mio_throttle=7
+        ),
+        _source_row(
+            "", "", "0x0000000000008030", "LDS.U.16 R4, [R8]", inst=60, size=16
+        ),
+        _source_row(
+            "922",
+            "    return shuffle_xor(val, mask)",
+            "",
+            "",
+            samples=90,
+            inst=300,
+            no_instruction=6,
+            mio_throttle=64,
+        ),
+        _source_row(
+            "",
+            "",
+            "0x0000000000008040",
+            "SHFL.BFLY.IDX PT, R5, R4, 0x10, 0x1f",
+            inst=300,
+        ),
+        '"Function Name","vector_reduce_kernel"',
+        _source_header(),
+        _source_row("1163", "    return sview[row, col]", "", "", samples=4, inst=50),
+        _source_row(
+            "", "", "0x0000000000009000", "STS.U.16 [R2], R4", inst=50, size=16
+        ),
+    )
+)
+
+NO_LINE_SOURCE_CSV: Final = "\n".join(
+    (
+        f'"File Path","{CVB_PATH}"',
+        '"Function Name","chunk_vector_bwd_kernel"',
+        _source_header(),
+        _source_row("", "", "0x0000000000008000", "LDS.U.32 R4, [R8]", inst=100),
+        _source_row("", "", "0x0000000000008010", "IADD3 R9, R9, 0x4, RZ", inst=100),
+    )
+)
+
+NO_INST_SOURCE_CSV: Final = "\n".join(
+    (
+        f'"File Path","{CVB_PATH}"',
+        '"Function Name","chunk_vector_bwd_kernel"',
+        _source_header(
+            metrics=tuple(m for m in SOURCE_METRICS if m != "inst_executed")
+        ),
+    )
+)
+
+
+def test_the_pc_sampling_family_respells_one_stall_reason() -> None:
+    names = {reason: pcsamp_metric(reason) for reason in STALL_REASONS}
+    assert len(set(names.values())) == len(STALL_REASONS)
+    assert set(names.values()) <= set(SOURCE_TABLE.metrics)
+    # The two families name the same reasons and disagree on this one. Requesting
+    # the per-cycle spelling gets no such metric, and one reason of the seventeen
+    # is silently absent from the attribution.
+    assert "_no_instruction_per" in stall_metric("no_instruction")
+    assert names["no_instruction"].endswith("_no_instructions_not_issued")
+    for reason in STALL_REASONS:
+        if reason != "no_instruction":
+            assert (
+                names[reason] == f"smsp__pcsamp_warps_issue_stalled_{reason}_not_issued"
+            )
+    # The duration, so a source pass can be placed in the same window as the
+    # counter tables that bound it.
+    assert DURATION in SOURCE_TABLE.metrics
+
+
+def test_the_source_page_attributes_each_instruction_to_a_line_or_to_none() -> None:
+    got = parse_source_csv(SOURCE_CSV, report="/tmp/cvb.ncu-rep")
+    assert [(one.kernel, one.line) for one in got.lines] == [
+        ("chunk_vector_bwd_kernel", 922),
+        ("chunk_vector_bwd_kernel", 1163),
+        ("chunk_vector_bwd_kernel", 1184),
+        # Same file and line as the first kernel's, and a separate record: the
+        # block's Function Name is part of the key.
+        ("vector_reduce_kernel", 1163),
+    ]
+    assert all(one.file == CVB_PATH for one in got.lines)
+    mat = got.lines[1]
+    # Opcode class without its modifiers, predicate prefix stripped, and the
+    # arithmetic on the same line left out of the LSU count.
+    assert mat.opcode_inst == {"LDS": 200}
+    assert mat.inst_count == 300
+    assert mat.lsu_inst_count == 200
+    assert mat.access_bit_inst == {32: 200}
+    assert mat.sample_count == 34
+    assert mat.stall_samples["mio_throttle"] == 18
+    assert mat.stall_samples["wait"] == 5
+    assert mat.not_issued_count == 23
+    # A conflicted wavefront is a replayed LSU instruction, so the excess over
+    # ideal is the part of this line a better layout deletes.
+    assert mat.shared_wavefront_excess_count == 100
+    # A shuffle moves no memory and issues on the same port, so it is LSU work
+    # with no access width to it.
+    shuffle = got.lines[0]
+    assert shuffle.opcode_inst == {"SHFL": 300}
+    assert shuffle.access_bit_inst == {}
+    assert shuffle.stall_samples["no_instruction"] == 6
+    # 16-bit accesses are the deleteable ones: two of them pack into one 32-bit
+    # access and the second instruction buys no byte.
+    assert got.lines[2].access_bit_inst == {16: 60}
+    assert got.lines[3].opcode_inst == {"STS": 50}
+    assert got.lsu_inst_count == 610
+    # An instruction NCU printed under no line is the shortfall in the table, not
+    # a row to drop.
+    assert got.unattributed_inst_count == 8
+
+
+def test_a_source_page_with_no_correlated_line_names_the_missing_lineinfo() -> None:
+    # The profile this project has always taken: SASS with no line against it.
+    # A CuTe DSL kernel gets line information from the environment rather than
+    # from a build flag, so the message has to name the variable.
+    with pytest.raises(ValueError, match="CUTE_DSL_LINEINFO=1"):
+        parse_source_csv(NO_LINE_SOURCE_CSV)
+
+
+def test_parse_source_csv_rejects_output_it_cannot_read() -> None:
+    # The details page of a counter table opens no block.
+    with pytest.raises(ValueError, match="no source block"):
+        parse_source_csv(DRAM_CSV)
+    with pytest.raises(ValueError, match="no 'inst_executed' column"):
+        parse_source_csv(NO_INST_SOURCE_CSV)
+
+
+def test_the_lsu_floor_moves_with_the_clock() -> None:
+    inst = Count(166_152_960)
+    # Both clocks occur on one uncontrolled part, and 84 multiprocessors at
+    # 1.88 GHz issue 79.1 thousand LSU warp-instructions per microsecond against
+    # 74.4 thousand at 1.77 GHz. A floor written down as a constant holds on one
+    # run of the two.
+    fast = lsu_floor_us(inst, sm_count=Count(84), clock_mhz=Megahertz(1882.848))
+    slow = lsu_floor_us(inst, sm_count=Count(84), clock_mhz=Megahertz(1771.0))
+    assert fast == pytest.approx(2101.1, abs=0.1)
+    assert slow == pytest.approx(2233.8, abs=0.1)
+    assert lsu_floor_us(
+        inst, sm_count=Count(168), clock_mhz=Megahertz(1882.848)
+    ) == pytest.approx(fast / 2)
+    with pytest.raises(ValueError, match="sm_count must be positive"):
+        lsu_floor_us(inst, sm_count=Count(0), clock_mhz=Megahertz(1882.848))
+    with pytest.raises(ValueError, match="clock_mhz must be positive"):
+        lsu_floor_us(inst, sm_count=Count(84), clock_mhz=Megahertz(0.0))
+
+
+def test_both_new_passes_export_a_report_and_read_it_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An --export run prints no counter table at all, so parsing the collection's
+    # own stdout reads every pass as empty. Each pass is two invocations.
+    fake = FakeRun((0, "", ""), (0, DETAILS_CSV, ""))
+    monkeypatch.setattr(subprocess, "run", fake)
+    rules = run_rules(
+        TARGET, report="/tmp/cvb", ncu="/opt/nsight/ncu", sections=("Occupancy",)
+    )
+    assert fake.commands == [
+        rules_command(
+            TARGET, report="/tmp/cvb", ncu="/opt/nsight/ncu", sections=("Occupancy",)
+        ),
+        # The written name, not the name NCU was asked for.
+        import_command("/tmp/cvb.ncu-rep", ncu="/opt/nsight/ncu", page="details"),
+    ]
+    assert rules.report == "/tmp/cvb.ncu-rep"
+    assert rules.command == tuple(fake.commands[0])
+    assert len(rules.messages) == 4
+
+    fake = FakeRun((0, "", ""), (0, SOURCE_CSV, ""))
+    monkeypatch.setattr(subprocess, "run", fake)
+    source = run_source(TARGET, report="/tmp/cvb.ncu-rep", ncu="/opt/nsight/ncu")
+    assert fake.commands == [
+        ncu_command(
+            SOURCE_TABLE,
+            TARGET,
+            ncu="/opt/nsight/ncu",
+            extra=export_flags("/tmp/cvb.ncu-rep"),
+        ),
+        # cuda,sass is the only view that carries a line number and a counter at
+        # once: cuda alone has no counters and sass alone has no line.
+        import_command(
+            "/tmp/cvb.ncu-rep",
+            ncu="/opt/nsight/ncu",
+            page="source",
+            print_source=SOURCE_VIEW,
+        ),
+    ]
+    assert source.lines
+    assert source.report == "/tmp/cvb.ncu-rep"
