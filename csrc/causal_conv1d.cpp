@@ -9,6 +9,7 @@
 
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,6 +25,41 @@ void expect(const at::Tensor &t, const std::string &name,
   TORCH_CHECK(t.scalar_type() == dtype, name, " must be ", dtype, ", got ",
               t.scalar_type());
   TORCH_CHECK(t.sizes() == at::IntArrayRef(shape), name, " has the wrong shape");
+}
+
+// Same as expect but for a pitched operand: one column band of a wider tensor.
+// slinoss._guard.check_pitched is where the contract is stated and where a caller's
+// violation is reported; a failure here is a bug in that host code. The conditions
+// are the subset the kernels themselves need, so a strict band's sector rule is not
+// among them: it is about the sector an overhanging row fetches and discards, which
+// no kernel can detect.
+//
+// The alignment clause is skipped for a contiguous operand. It is the producer's
+// obligation on a band it cuts out of a projection, and D is an operator shape
+// that no producer chose, so holding a contiguous D to it would refuse channel
+// counts this operator has always accepted.
+void expect_pitched(const at::Tensor &t, const std::string &name,
+                    const std::vector<int64_t> &shape, at::ScalarType dtype,
+                    const at::Device &device) {
+  TORCH_CHECK(t.device() == device, name, " must be on ", device, ", got ",
+              t.device());
+  TORCH_CHECK(t.scalar_type() == dtype, name, " must be ", dtype, ", got ",
+              t.scalar_type());
+  TORCH_CHECK(t.sizes() == at::IntArrayRef(shape), name, " has the wrong shape");
+  TORCH_CHECK(t.stride(-1) == 1, name,
+              " must have unit stride on its trailing axis, got ", t.stride(-1));
+  TORCH_CHECK(t.stride(-2) >= t.size(-1), name, " rows overlap: pitch ",
+              t.stride(-2), " is below the row width ", t.size(-1));
+  if (t.is_contiguous()) {
+    return;
+  }
+  const int64_t multiple = slinoss::kAlignBytes / t.element_size();
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(t.const_data_ptr()) %
+                          slinoss::kAlignBytes ==
+                      0 &&
+                  t.stride(-2) % multiple == 0,
+              name, " must start and step on a multiple of ", multiple,
+              " elements; got pitch ", t.stride(-2));
 }
 
 void expect_optional(const std::optional<at::Tensor> &t,
@@ -49,9 +85,9 @@ Dims check_common(const at::Tensor &x, const at::Tensor &weight,
                   const std::optional<at::Tensor> &initial_state) {
   TORCH_CHECK(x.is_cuda(), "x must be on a CUDA device");
   TORCH_CHECK(x.dim() == 3, "x must be (B,T,D)");
-  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
   const Dims d{x.size(0),      x.size(1),       x.size(2),
                weight.size(1), x.scalar_type(), x.device()};
+  expect_pitched(x, "x", {d.batch, d.seqlen, d.channels}, d.dtype, d.device);
   TORCH_CHECK(weight.dim() == 2 && weight.size(0) == d.channels,
               "weight must be (D,W)");
   TORCH_CHECK(d.width >= 1 && d.width <= slinoss::kMaxWidth,
@@ -111,7 +147,7 @@ void bwd(const std::optional<at::Tensor> &dy,
   // Absent dy leaves the layout unread, so the token-major row count stands in.
   const int64_t dy_rows =
       dy.has_value() ? output_rows(*dy, "dy", d) : d.channels;
-  expect(dx, "dx", {d.batch, d.seqlen, d.channels}, dtype, device);
+  expect_pitched(dx, "dx", {d.batch, d.seqlen, d.channels}, dtype, device);
   expect_optional(dfinal_state, "dfinal_state", window, dtype, device);
   expect_optional(dinitial_state, "dinitial_state", window, dtype, device);
   const int64_t parts = slinoss::causal_conv1d_bwd_parts(d.seqlen);

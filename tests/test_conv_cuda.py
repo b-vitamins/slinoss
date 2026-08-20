@@ -110,6 +110,16 @@ DPARAM_BOUND = 4e-6
 
 OPERAND_NAMES = ("x", "weight", "bias", "initial_state")
 
+# Operands that are buffers of their own, so the layout rule on them is contiguity.
+# x is the exception: it is one band of the fused projection and is pitched.
+CONTIGUOUS_OPERANDS = ("weight", "bias", "initial_state")
+
+# Columns of padding on each side of a test band. A band whose pitch exceeds its row
+# width is a strict band and owes :data:`slinoss._guard.SECTOR_BYTES`, not the vector
+# width, so sixteen elements: 32 B at bfloat16 and 64 B at float32, and the pitch is
+# a whole number of sectors at every channel count used here.
+PAD = 16
+
 
 def cuda_call(
     bsz: int,
@@ -326,16 +336,27 @@ def _check_backward(
     activation: bool = True,
     with_bias: bool = True,
     with_state: bool = True,
+    dtype: torch.dtype = torch.float32,
+    bounds: tuple[float, float] = (DX_BOUND, DPARAM_BOUND),
+    band: bool = False,
 ) -> None:
     """One native backward against float64 autograd. The only copy of the body."""
-    operands = cuda_call(bsz, seqlen, channels, width, bias=with_bias, state=with_state)
+    operands = cuda_call(
+        bsz, seqlen, channels, width, bias=with_bias, state=with_state, dtype=dtype
+    )
     leaves = as_reference(operands)
     dy, dstate = cotangents(bsz, seqlen, channels, width, seed=3)
+    # The authority reads the rounded cotangents, so a two-byte call and its float64
+    # image consume the same numbers and the gap left is accumulation alone.
+    dy, dstate = dy.to(dtype), dstate.to(dtype)
+    x = _band(operands[0]) if band else operands[0]
+    dx_bound, param_bound = bounds
 
     got = causal_conv1d_bwd_native(
         dy,
         dstate,
-        *operands[:3],
+        x,
+        *operands[1:3],
         activation=activation,
         initial_state=operands[3],
     )
@@ -346,19 +367,19 @@ def _check_backward(
         activation=activation,
         initial_state=leaves[3],
     )
-    assert_max_rel(got.dx, want.dx, DX_BOUND, "conv/native/dx")
-    assert_max_rel(got.dweight, want.dweight, DPARAM_BOUND, "conv/native/dweight")
+    assert_max_rel(got.dx, want.dx, dx_bound, "conv/native/dx")
+    assert_max_rel(got.dweight, want.dweight, param_bound, "conv/native/dweight")
     # Present exactly when the forward carried a bias. The reduction reaches dbias
     # through one slice of its grid, so an absent bias is one fewer slice rather
     # than an output that is allocated and left unwritten.
     assert (got.dbias is None) == (not with_bias)
     if got.dbias is not None:
         assert want.dbias is not None
-        assert_max_rel(got.dbias, want.dbias, DPARAM_BOUND, "conv/native/dbias")
+        assert_max_rel(got.dbias, want.dbias, param_bound, "conv/native/dbias")
     if got.dinitial_state is not None and got.dinitial_state.numel():
         assert want.dinitial_state is not None
         assert_max_rel(
-            got.dinitial_state, want.dinitial_state, DX_BOUND, "conv/native/dstate"
+            got.dinitial_state, want.dinitial_state, dx_bound, "conv/native/dstate"
         )
 
 
@@ -397,6 +418,51 @@ def test_backward_matches_float64_autograd_at_every_instantiated_width(
     eight.
     """
     _check_backward(2, 40, 8, width)
+
+
+# Gradients at a two-byte dtype. The kernel accumulates in float32 and rounds once
+# on the store, so the gap to the float64 authority is that rounding: half an ulp of
+# bfloat16 is 2^-9 = 2.0e-3 relative, and the float32 sum behind it adds
+# B*T*2^-24 = 4.8e-6 at the shape below. The bound is that rounding with room for
+# one boundary straddle.
+BF16_GRAD_BOUND = 5e-3
+
+# The backward stages x and dy through shared memory only at a two-byte dtype and
+# only when every stride its 16 B request multiplies is a whole number of those
+# requests; the gate is in the kernel file. The strip is a second instantiation
+# reached at run time, and no case above reaches it, because every one of them is
+# float32.
+STAGED_CASES = [
+    pytest.param(16, 4, False, id="staged"),
+    pytest.param(16, 8, False, id="staged-widest-strip"),
+    pytest.param(16, 4, True, id="staged-pitched-x"),
+    pytest.param(12, 4, False, id="scalar-fallback"),
+]
+
+
+@pytest.mark.parametrize(("channels", "width", "band"), STAGED_CASES)
+def test_backward_at_bfloat16_matches_float64_autograd(
+    channels: int, width: int, band: bool
+) -> None:
+    """The staged strip and the walk it falls back to, at the dtype that reaches them.
+
+    Four failure modes, one case each: the strip; its span at the widest width,
+    which is ``2*kBwdTileT + 2*(W-1)`` timesteps and the only thing width changes
+    about it; the row pitch, which the fill multiplies by a timestep index instead
+    of walking; and the gate, which must refuse a channel count that is not a whole
+    number of requests and fall back to the scalar walk at the same dtype. float16
+    reaches the same instantiation over the same strides and is left to the
+    forward's dtype sweep.
+    """
+    _check_backward(
+        2,
+        40,
+        channels,
+        width,
+        dtype=torch.bfloat16,
+        bounds=(BF16_GRAD_BOUND, BF16_GRAD_BOUND),
+        band=band,
+    )
 
 
 @pytest.mark.parametrize(("activation", "with_bias", "with_state"), FLAGS)
@@ -801,6 +867,84 @@ def test_the_partial_reduction_is_reproducible() -> None:
         assert_bitwise(have, again)
 
 
+def _band(t: Tensor) -> Tensor:
+    """``t``'s values as one column band of a wider buffer.
+
+    What the fused input projection hands over: the band's row pitch is the
+    projection width, so neither the base offset nor the pitch is the one a
+    dedicated buffer would have. :data:`PAD` columns sit on each side.
+    """
+    width = int(t.shape[-1])
+    wide = t.new_empty((*t.shape[:-1], width + 2 * PAD))
+    band = wide[..., PAD : PAD + width]
+    band.copy_(t)
+    return band
+
+
+def test_the_forward_reads_a_band_of_the_projection() -> None:
+    """``x`` ships pitched, and the kernel indexes the band rather than a copy.
+
+    One projection GEMM feeds every consumer, so ``x`` is the value band of its
+    output and never a buffer of its own; recovering contiguity would be the
+    staging copy the layout contract exists to refuse. The pitch moves a load
+    address and no arithmetic, so the two layouts agree bit for bit rather than
+    within a tolerance.
+    """
+    x, weight, bias, state = cuda_call(2, 40, 8, 4)
+    want = causal_conv1d_fwd_native(x, weight, bias, initial_state=state)
+    got = causal_conv1d_fwd_native(_band(x), weight, bias, initial_state=state)
+    assert_bitwise(got.y, want.y)
+    assert_bitwise(got.state, want.state)
+
+
+def test_the_backward_reads_and_writes_bands_of_the_projection() -> None:
+    """``x`` read pitched and ``dx`` written pitched, against the contiguous call.
+
+    Two addresses, so two halves. The read side runs through the backend, which is
+    where the host rule on ``x`` lives, and covers the parameter gradients too:
+    ``x`` is the operand the ``dweight`` sum contracts against, so a pitch honoured
+    for ``dx`` and dropped there would show up in ``dweight`` alone. The store side
+    runs through the extension, because the backend allocates ``dx`` itself; the
+    band's wider buffer is filled with NaN, so a store that ignored the pitch would
+    both leave the band unwritten and land in a column the call does not own.
+    """
+    bsz, seqlen, channels, width = 2, 40, 8, 4
+    x, weight, bias, state = cuda_call(bsz, seqlen, channels, width)
+    dy, dstate = cotangents(bsz, seqlen, channels, width, seed=23)
+    want = causal_conv1d_bwd_native(dy, dstate, x, weight, bias, initial_state=state)
+    got = causal_conv1d_bwd_native(
+        dy, dstate, _band(x), weight, bias, initial_state=state
+    )
+    assert want.dbias is not None and got.dbias is not None
+    assert want.dinitial_state is not None and got.dinitial_state is not None
+    assert_bitwise(got.dx, want.dx)
+    assert_bitwise(got.dweight, want.dweight)
+    assert_bitwise(got.dbias, want.dbias)
+    assert_bitwise(got.dinitial_state, want.dinitial_state)
+
+    assert state is not None
+    module = _C.extension()
+    parts = int(module.bwd_parts(seqlen))
+    wide = x.new_full((bsz, seqlen, channels + 2 * PAD), float("nan"))
+    band = wide[..., PAD : PAD + channels]
+    module.bwd(
+        dy,
+        dstate,
+        x,
+        weight,
+        bias,
+        state,
+        band,
+        torch.empty_like(state),
+        x.new_empty((parts, width, channels), dtype=torch.float32),
+        x.new_empty((parts, channels), dtype=torch.float32),
+        True,
+    )
+    assert_bitwise(band, want.dx)
+    outside = torch.cat((wide[..., :PAD], wide[..., PAD + channels :]), dim=-1)
+    assert bool(outside.isnan().all())
+
+
 def test_native_backend_is_registered_and_preferred() -> None:
     assert "native" in names()
     assert resolve(None, "cuda", torch.float32).name == "native"
@@ -851,6 +995,14 @@ def _uncontiguous(t: Tensor) -> Tensor:
     return out
 
 
+def _strided_channels(t: Tensor) -> Tensor:
+    """``t``'s shape with a step along the channel axis, which no pitch describes."""
+    width = int(t.shape[-1])
+    out = t.new_empty((*t.shape[:-1], 2 * width))[..., ::2]
+    assert out.shape == t.shape and out.stride(-1) != 1
+    return out
+
+
 def _spoil(name: str, damage: Callable[[Tensor], Tensor]) -> ConvStep:
     """Run the native forward with one operand replaced by ``damage(operand)``.
 
@@ -874,10 +1026,21 @@ def _spoil(name: str, damage: Callable[[Tensor], Tensor]) -> ConvStep:
     )
 
 
-@pytest.mark.parametrize("name", OPERAND_NAMES)
+@pytest.mark.parametrize("name", CONTIGUOUS_OPERANDS)
 def test_a_noncontiguous_operand_is_rejected(name: str) -> None:
     with pytest.raises(ValueError, match=f"{name} must be contiguous"):
         _spoil(name, _uncontiguous)
+
+
+def test_a_strided_channel_axis_is_rejected() -> None:
+    """The rule x carries instead of contiguity.
+
+    A wider buffer is what a band is, so widening x no longer rejects; a step
+    along the channels does, because that is the one stride the kernel's address
+    arithmetic cannot express.
+    """
+    with pytest.raises(ValueError, match="x must have unit stride"):
+        _spoil("x", _strided_channels)
 
 
 @pytest.mark.parametrize("name", ["weight", "bias", "initial_state"])

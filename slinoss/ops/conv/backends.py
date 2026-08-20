@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from slinoss import _C
-from slinoss._guard import check_layout
+from slinoss._guard import check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES, SUPPORTED_DTYPES
 from slinoss._registry import Backend, Registry
 from slinoss.ops.conv.reference import (
@@ -97,31 +97,41 @@ resolve = _REGISTRY.resolve
 
 
 def _check_native(
+    pitched: tuple[tuple[str, Tensor], ...],
     named: tuple[tuple[str, Tensor | None], ...],
     dims: ConvDims,
     dtype: torch.dtype,
 ) -> None:
     """Enforce what the kernels assume beyond the shared operand contract.
 
-    The kernels index raw pointers with the channels-last stride pattern and are
-    instantiated per dtype, so a non-contiguous or differently typed operand is
-    refused rather than repacked or promoted.
+    The kernels index raw pointers and are instantiated per dtype, so a layout
+    outside the contract or a differently typed operand is refused rather than
+    repacked or promoted.
 
-    The layout half is :func:`slinoss._guard.check_layout`, which every kernel
-    path in the repo shares. Only the dtype rule is this backend's own: one dtype
-    for the whole call, because the kernel is one template instantiation.
+    Both layout rules are the shared ones. The activation stream is one column band
+    of a fused projection, so a non-contiguous one carries
+    :func:`slinoss._guard.check_pitched`: unit stride on the channel axis, and a row
+    pitch the kernel takes as an argument. A contiguous one carries
+    :func:`slinoss._guard.check_layout` instead, because the pitched rule's
+    alignment clause is the producer's obligation on a band it cuts and ``D`` is an
+    operator shape no producer chose. Every other operand is a buffer of its own and
+    is contiguous.
 
-    Order is layout, then dtype, so an operand that violates both is reported
-    under the layout rule.
+    Order is the banded operands, then the contiguous ones, then dtype, so an
+    operand that violates two rules is reported under the layout one.
 
     Args:
-        named: ``(name, tensor)`` pairs; a ``None`` tensor is skipped.
+        pitched: ``(name, tensor)`` pairs that may ship as one band of a wider
+            tensor.
+        named: ``(name, tensor)`` pairs held to the contiguous rule; a ``None``
+            tensor is skipped.
         dims: Extents of the call.
         dtype: Dtype every operand must carry, i.e. the dtype of ``x``.
 
     Raises:
-        ValueError: On a non-contiguous operand, a dtype that differs from
-            ``dtype``, a tap count above the kernel bound, or a non-CUDA device.
+        ValueError: On an operand outside its layout rule, a dtype that differs
+            from ``dtype``, a tap count above the kernel bound, or a non-CUDA
+            device.
         TypeError: If ``dtype`` has no kernel instantiation.
     """
     if dtype not in KERNEL_DTYPES:
@@ -134,9 +144,11 @@ def _check_native(
         raise ValueError(
             f"the native backend supports width <= {bound}, got {dims.width}"
         )
+    bands = tuple((tensor, name) for name, tensor in pitched)
     present = tuple((tensor, name) for name, tensor in named if tensor is not None)
-    check_layout(present)
-    for tensor, name in present:
+    check_pitched(tuple(one for one in bands if not one[0].is_contiguous()))
+    check_layout(tuple(one for one in bands if one[0].is_contiguous()) + present)
+    for tensor, name in bands + present:
         if tensor.dtype != dtype:
             raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
 
@@ -158,7 +170,9 @@ def causal_conv1d_fwd_native(
     the scan needs costs no pass over the largest activation in the step.
 
     Args:
-        x: Activations, shape ``(B,T,D)``, contiguous, bf16/fp16/fp32.
+        x: Activations, shape ``(B,T,D)``, pitched, bf16/fp16/fp32. One column band
+            of the fused projection is the layout this runs on; the kernel takes
+            the row pitch as an argument, so a band costs a load address.
         weight: Taps, shape ``(D,W)``, contiguous, dtype of ``x``.
         bias: Per-channel bias, shape ``(D,)``, contiguous, dtype of ``x``, or
             None.
@@ -172,7 +186,7 @@ def causal_conv1d_fwd_native(
         A :class:`ConvStep`.
 
     Raises:
-        ValueError: On a shape, contiguity, dtype, device, width, or ``d_head``
+        ValueError: On a shape, layout, dtype, device, width, or ``d_head``
             violation.
         TypeError: On an unsupported dtype.
         RuntimeError: If the extension is not built.
@@ -180,8 +194,8 @@ def causal_conv1d_fwd_native(
     dims = check_operands(x, weight, bias, initial_state)
     shape = conv_output_shape(dims.batch, dims.seqlen, dims.channels, d_head)
     _check_native(
+        (("x", x),),
         (
-            ("x", x),
             ("weight", weight),
             ("bias", bias),
             ("initial_state", initial_state),
@@ -217,13 +231,18 @@ def causal_conv1d_bwd_native(
     A head-major cotangent moves the kernel's ``dy`` load address and nothing else.
     ``dx`` is token-major because ``x`` is.
 
+    ``dx`` is allocated here and is therefore contiguous. The kernel writes it at a
+    caller-supplied row pitch, so a ``dx`` that is one band of a wider gradient
+    buffer is a legal store target; reaching that costs an out parameter this
+    signature does not have yet.
+
     Args:
         dy: Cotangent of ``y``, shape ``(B,T,D)`` or ``(B, D//P, T, P)``,
             contiguous, or None for a cotangent that is identically zero. Its rank
             is how the forward's output layout is recovered.
         dfinal_state: Cotangent of the returned window, shape ``(B,W-1,D)``,
             contiguous, or None.
-        x: The forward's activations, shape ``(B,T,D)``.
+        x: The forward's activations, shape ``(B,T,D)``, pitched.
         weight: The forward's taps, shape ``(D,W)``.
         bias: The forward's bias, shape ``(D,)``, or None.
         activation: The forward's activation flag.
@@ -234,15 +253,15 @@ def causal_conv1d_bwd_native(
         A :class:`ConvGrads`.
 
     Raises:
-        ValueError: On a shape, contiguity, dtype, device, or width violation.
+        ValueError: On a shape, layout, dtype, device, or width violation.
         TypeError: On an unsupported dtype.
         RuntimeError: If the extension is not built.
     """
     dims = check_operands(x, weight, bias, initial_state)
     check_cotangents(dy, dfinal_state, dims)
     _check_native(
+        (("x", x),),
         (
-            ("x", x),
             ("weight", weight),
             ("bias", bias),
             ("initial_state", initial_state),
@@ -253,7 +272,9 @@ def causal_conv1d_bwd_native(
         x.dtype,
     )
     module = _C.extension()
-    dx = torch.empty_like(x)
+    # new_empty, not empty_like: a pitched x is not dense, and empty_like's
+    # preserved format would be its stride pattern rather than a buffer.
+    dx = x.new_empty((dims.batch, dims.seqlen, dims.channels))
     dinitial_state = None if initial_state is None else torch.empty_like(initial_state)
     parts = int(module.bwd_parts(dims.seqlen))
     dweight_parts = x.new_empty((parts, dims.width, dims.channels), dtype=torch.float32)
