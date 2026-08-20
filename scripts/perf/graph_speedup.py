@@ -26,6 +26,7 @@ from torch import Tensor
 
 from slinoss.config import SLinOSSConfig
 from slinoss.graph import capture, capture_decode
+from slinoss.ops.xent import cross_entropy
 from slinoss.perf.device import device_ordinal, require_cuda
 from slinoss.perf.timing import Throughput, measure_paired
 from slinoss.perf.units import Count
@@ -146,13 +147,10 @@ def build_train(
         logits = stack(x)
         # Classes come from the config, never from the logits' last extent: an
         # aligned head pads its output width past the vocabulary, and a pad
-        # column is not a class a label indexes.
-        # The float32 copy is not removable through aten. log_softmax(dtype=)
-        # reaches the kernel that reads low precision and accumulates in float32
-        # for float16 only; bfloat16 casts first.
-        loss = torch.nn.functional.cross_entropy(
-            logits.flatten(0, 1)[:, :vocab].float(), target.flatten()
-        )
+        # column is not a class a label indexes. The fused operator takes the
+        # padded width and the class count separately, so the flatten is the
+        # only reshape and no slice narrows the operand.
+        loss = cross_entropy(logits.flatten(0, 1), target.flatten(), classes=vocab)
         loss.backward()
         optimizer.step()
         # Detached: a returned loss keeps its autograd graph alive across replays,

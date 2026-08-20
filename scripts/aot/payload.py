@@ -42,6 +42,7 @@ import torch
 from slinoss import aot
 from slinoss._cute import cache_events, compiled_launches, executor_count
 from slinoss.config import SLinOSSConfig
+from slinoss.ops.xent import cross_entropy
 from slinoss.perf.device import (
     contention,
     device_ordinal,
@@ -192,13 +193,10 @@ def build_step(
         logits = stack(ids)
         # Classes come from the config, never from the logits' last extent: an
         # aligned head pads its output width past the vocabulary, and a pad
-        # column is not a class a label indexes.
-        # The float32 copy is not removable through aten. log_softmax(dtype=)
-        # reaches the kernel that reads low precision and accumulates in float32
-        # for float16 only; bfloat16 casts first.
-        loss = torch.nn.functional.cross_entropy(
-            logits.flatten(0, 1)[:, :vocab].float(), labels.flatten()
-        )
+        # column is not a class a label indexes. The fused operator takes the
+        # padded width and the class count separately, so the flatten is the
+        # only reshape and no slice narrows the operand.
+        loss = cross_entropy(logits.flatten(0, 1), labels.flatten(), classes=vocab)
         loss.backward()
         optimizer.step()
         return loss.detach()

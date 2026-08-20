@@ -29,6 +29,7 @@ from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
 from slinoss.config import SLinOSSConfig
+from slinoss.ops.xent import cross_entropy
 from slinoss.perf.device import device_ordinal, require_cuda
 from slinoss.stack import SLinOSSStack
 from slinoss.state import StackState
@@ -38,18 +39,21 @@ DTYPE = torch.bfloat16
 """The dtype the kernel path runs. float32 falls back to the reference scan."""
 
 CLASSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("loss", ("SoftMax", "nll_loss", "cross_entropy", "xent_")),
     ("cute", ("kernel_cutlass_",)),
     ("gemm", ("cutlass::Kernel", "ampere_", "sm80_", "sm86_", "gemm", "gemv")),
-    ("loss", ("SoftMax", "nll_loss", "cross_entropy")),
     ("optim", ("multi_tensor_apply", "adamw", "fused_adam")),
     ("memory", ("Memcpy", "Memset")),
     ("elementwise", ("elementwise_kernel", "reduce_kernel", "fill_", "vectorized_")),
 )
 """Class name against the substrings that select it, first match winning.
 
-``cute`` is this package's own kernels, which are the only ones named by it.
-``gemm`` is cuBLAS and CUTLASS. ``elementwise`` is the aten glue that a fused
-kernel would have absorbed, and is the class a fusion is supposed to shrink.
+``loss`` is what turns logits into a scalar, whichever kernel does it, so it is
+matched ahead of ``cute``: the class is a stage of the step and a fusion that moved
+the stage into another class would report as a stage that vanished. ``cute`` is this
+package's own kernels. ``gemm`` is cuBLAS and CUTLASS. ``elementwise`` is the aten
+glue that a fused kernel would have absorbed, and is the class a fusion is supposed
+to shrink.
 """
 
 GLUE = ("elementwise", "memory", "other")
@@ -144,13 +148,10 @@ def build_step(
         logits = stack(ids)
         # Classes come from the config, never from the logits' last extent: an
         # aligned head pads its output width past the vocabulary, and a pad
-        # column is not a class a label indexes.
-        # The float32 copy is not removable through aten. log_softmax(dtype=)
-        # reaches the kernel that reads low precision and accumulates in float32
-        # for float16 only; bfloat16 casts first.
-        loss = torch.nn.functional.cross_entropy(
-            logits.flatten(0, 1)[:, :vocab].float(), labels.flatten()
-        )
+        # column is not a class a label indexes. The fused operator takes the
+        # padded width and the class count separately, so the flatten is the
+        # only reshape and no slice narrows the operand.
+        loss = cross_entropy(logits.flatten(0, 1), labels.flatten(), classes=vocab)
         loss.backward()
         optimizer.step()
         return loss.detach()
