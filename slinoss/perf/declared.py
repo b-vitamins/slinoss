@@ -90,6 +90,7 @@ DECLARED: Final[dict[str, str]] = {
     "state_passing_fwd_kernel": DRAM_BOUND,
     "swiglu_bwd_kernel": DRAM_BOUND,
     "swiglu_fwd_kernel": DRAM_BOUND,
+    "vector_reduce_kernel": DRAM_BOUND,
     "xent_bwd_kernel": DRAM_BOUND,
     "xent_fwd_kernel": DRAM_BOUND,
 }
@@ -110,6 +111,13 @@ kernel and the wrong one of two ways to compute the same thing. The arm total in
 ``scripts/perf/profile_start_passing_bwd.py`` is what ranked them, and the
 percentage this entry fails is a statement about the denominator rather than about
 the kernel.
+
+``vector_reduce_kernel`` sums the per-head partials the vector backward emits once
+the head-sum depth is a grid axis. Its traffic is the partial buffer and nothing
+else, and that buffer follows the sequence, so it is held to a bandwidth rather than
+treated as a tail. Measured on sm_86 at the model geometry: 294.72 MB in 432.8 us,
+681.0 GB/s, 99.4% of the bus. The pass is at its own ceiling, so its cost is an
+argument about whether the partials should exist rather than about this kernel.
 
 Four entries are SERIAL-tiny, and only the first is unconditionally so.
 ``boundary_bwd_kernel`` on the single-partial path reads a fixed few rows per chunk
