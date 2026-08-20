@@ -78,6 +78,29 @@ arms in one process under one floor fit, every figure twice:
 the 256 MB counted above, not the 176 MB crossing the bus, and the gap is the band
 re-reads L2 serves. What is left is 51.1% of the bus at 26.3% issue, 20.0% achieved
 occupancy of 25.0% theoretical, 152 registers, and no local memory.
+
+Block width. Occupancy is what is left, and the width buys it without buying bytes:
+``mma_atoms`` pins the M mode, so warps past the first four go to the tile's N mode
+at atom granularity and both accumulators halve at unchanged shared bytes. The GEMM
+accumulator goes from ``mpad*span/128`` to ``mpad*span/256`` and the recurrence's
+from ``rows*lanes/128`` to half that, which takes the kernel from 152 registers to
+80 and lets the same 20,992 B block hold three resident blocks of eight warps rather
+than three of four. Measured on sm_86 at the geometry above, one call, medians of
+three event runs and one NCU capture of three launches each:
+
+    warps  us/launch  MB/launch  GB/s  of 85%  regs  occ theo/ach  issue  barrier
+    4          473.7     176.51  372.6   55.4%   152  25.0%/19.2%  26.3%    12.8%
+    8          408.7     176.52  431.9   64.3%    80  50.0%/39.0%  32.5%    22.3%
+
+65 us a call for a parameter, traffic identical to two decimal places and nothing
+spilled at either width. The percentage rises with the time here, unlike the
+fusion's, because the width moves no bytes. What it does move is the barrier stall,
+12.8% to 22.3%: three barriers a chunk in this kernel and four more inside
+:func:`start_chunk`, and the chunk prefix behind one of them is warp 0's work, so a
+wider block waits wider. That is the next lever and it is not the width's.
+
+``warps`` is a parameter and the default is four; nothing in the operator's backward
+passes it.
 """
 
 import cutlass
@@ -101,7 +124,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
 )
 from slinoss.ops.so3ssd.cute.bwd.state_passing import StatePassingBwd
 from slinoss.ops.so3ssd.cute.common import (
-    THREADS,
+    WARPS,
     mat3_matvec,
     mat3_transpose,
     rot_hom,
@@ -122,6 +145,7 @@ from slinoss.ops.so3ssd.cute.mma import (
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
+    mma_atoms,
     mma_rows,
     smem_pitch,
 )
@@ -160,6 +184,20 @@ model geometry, one call of the fused kernel:
 
 Nothing spills at any of the three, so the cost of asking for four is the scheduling
 the 24 registers buy and not local memory.
+
+Three is also what the wide block prefers, and there the bound is the whole of it:
+at eight warps the cap is 85 registers at three blocks and 128 at two, and the
+kernel wants 80. Measured on sm_86 at the model geometry, medians of three event
+runs, one call:
+
+    blocks/SM   us
+    1          492.5
+    2          492.5
+    3          411.6
+    4          439.3
+
+One and two tie because both admit the register count the kernel wants and both fit
+two blocks of eight warps per SM; three is the first bound that fits a third.
 """
 
 SPLIT: int = 48
@@ -452,7 +490,7 @@ def start_passing_bwd(
     heads: cutlass.Int32,
     stream: Stream,
     dtype: cutlass.Constexpr,
-    threads: cutlass.Constexpr,
+    warps: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
@@ -468,7 +506,12 @@ def start_passing_bwd(
 
     ``resident`` is the launch bound, computed from the tiles by the host entry
     rather than chosen here; see :data:`RESIDENT_MAX`.
+
+    The block width is the tiling's warp count and nothing else, so it arrives as
+    ``warps`` and the thread count is derived from it: two parameters would let the
+    launch geometry and the accumulator partition disagree.
     """
+    threads = warps * 32
     start_passing_bwd_kernel(
         gdy,
         gtrans,
@@ -480,7 +523,7 @@ def start_passing_bwd(
         gdz0,
         seqlen,
         chunks,
-        make_mma(dtype),
+        make_mma(dtype, warps),
         threads,
         chunk,
         rows,
@@ -506,6 +549,7 @@ def start_passing_backward(
     dstate: Tensor | None = None,
     *,
     span: int = SPLIT,
+    warps: int = WARPS,
     resident: int | None = None,
 ) -> StatePassingBwd:
     """Form every chunk's start-state cotangent and pass it back through the scan.
@@ -526,6 +570,12 @@ def start_passing_backward(
         span: Band width. :data:`SPLIT` is the only value the register budget
             admits at every legal ``P``; it is an argument so a driver can price a
             wider one.
+        warps: Warps per block, a multiple of
+            :data:`slinoss.ops.so3ssd.cute.common.WARPS` at most
+            :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`. Warps past the first
+            four go to the tile's N mode, which halves both accumulators at
+            unchanged shared bytes and unchanged traffic; see the module docstring
+            for what that is worth.
         resident: Blocks per SM the launch bound asks for. Defaults to
             :data:`RESIDENT_MAX` capped by the shared-memory budget; it is an
             argument for the same reason ``span`` is, since the cap it puts on the
@@ -537,8 +587,9 @@ def start_passing_backward(
         chunk-start cotangent this fuses away never exists in memory.
 
     Raises:
-        ValueError: On a layout, rank, shape, or extent violation, or on a band
-            width the launch cannot cover exactly.
+        ValueError: On a layout, rank, shape, or extent violation, on a band width
+            the launch cannot cover exactly, or on a ``warps`` that is not a legal
+            block width.
         TypeError: On an activation dtype with no tensor-core path.
     """
     activations: Named = ((dy, "dy"), (C, "C"))
@@ -563,13 +614,19 @@ def start_passing_backward(
         raise ValueError(
             f"cscale must be {(bsz, heads, chunks)}, got {tuple(cscale.shape)}"
         )
-    if span % 3 != 0 or dim % span != 0 or (rows * span // 3) % THREADS != 0:
+    # Raises on an illegal width, so the block geometry is checked here rather than
+    # inside the trace.
+    mma_atoms(warps)
+    threads = warps * 32
+    if span % 3 != 0 or dim % span != 0 or (rows * span // 3) % threads != 0:
         raise ValueError(
             f"span must divide 3N={dim}, be a multiple of 3, and give a whole "
-            f"number of {THREADS}-thread tiles of P*span/3, got span={span} P={rows}"
+            f"number of {threads}-thread tiles of P*span/3, got span={span} P={rows}"
         )
     budget = fold_smem_bytes(chunk_size, rows, span, dy.element_size())
-    assert_smem_fits(f"start_passing_bwd[L{chunk_size}/P{rows}/span{span}]", budget)
+    assert_smem_fits(
+        f"start_passing_bwd[L{chunk_size}/P{rows}/span{span}/W{warps}]", budget
+    )
     asked = RESIDENT_MAX if resident is None else resident
     blocks = min(asked, max(1, smem_capacity() // budget))
 
@@ -605,7 +662,7 @@ def start_passing_backward(
         ),
         (
             cute_dtype(dtype),
-            THREADS,
+            warps,
             chunk_size,
             rows,
             dim,

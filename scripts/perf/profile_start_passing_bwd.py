@@ -36,6 +36,7 @@ import torch
 from slinoss.ops.so3ssd.cute.bwd.chunk_start import chunk_start_backward
 from slinoss.ops.so3ssd.cute.bwd.start_passing import SPLIT, start_passing_backward
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
+from slinoss.ops.so3ssd.cute.common import WARPS
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import dram_floor_verdict, dram_time_floor
 from slinoss.perf.device import (
@@ -101,6 +102,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Lane band width the fused arm splits 3N into. Ignored by the pair.",
     )
     parser.add_argument(
+        "--warps",
+        type=int,
+        default=WARPS,
+        help="Warps per block of the fused kernel. Warps past the first four go to "
+        "the tile's N mode, which halves both accumulators at unchanged shared "
+        "bytes. Ignored by the pair.",
+    )
+    parser.add_argument(
         "--resident",
         type=int,
         default=None,
@@ -154,6 +163,8 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
         suffix += f"-g{args.groups}"
     if args.arm == "fused" and args.span != SPLIT:
         suffix += f"-span{args.span}"
+    if args.arm == "fused" and args.warps != WARPS:
+        suffix += f"-w{args.warps}"
     if args.arm == "fused" and args.resident is not None:
         suffix += f"-r{args.resident}"
     if not suffix:
@@ -168,6 +179,7 @@ def build_runner(
     dtype: torch.dtype,
     arm: str,
     span: int,
+    warps: int,
     resident: int | None,
     seed_state: bool,
 ) -> Callable[[], None]:
@@ -190,6 +202,7 @@ def build_runner(
         dtype: Activation dtype.
         arm: ``fused`` or ``pair``.
         span: Lane band width for the fused arm.
+        warps: Block width for the fused arm.
         resident: Launch bound for the fused arm, or None for its default.
         seed_state: Whether to supply a final-state cotangent.
 
@@ -237,6 +250,7 @@ def build_runner(
             shape.chunk,
             seed,
             span=span,
+            warps=warps,
             resident=resident,
         )
 
@@ -263,6 +277,8 @@ def target_argv(args: argparse.Namespace) -> list[str]:
         args.device,
         "--span",
         str(args.span),
+        "--warps",
+        str(args.warps),
         "--iters",
         str(args.iters),
         "--warmup",
@@ -352,6 +368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dtype,
             args.arm,
             args.span,
+            args.warps,
             args.resident,
             args.seed_state,
         )
@@ -372,6 +389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dtype,
         args.arm,
         args.span,
+        args.warps,
         args.resident,
         args.seed_state,
     )
@@ -405,7 +423,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             passes.append(one)
     after = compute_apps_query(smi_selector(ordinal))
 
-    print(f"arm          {args.arm} span {args.span} resident {args.resident}")
+    print(
+        f"arm          {args.arm} span {args.span} warps {args.warps} "
+        f"resident {args.resident}"
+    )
     print(f"shape        {shape.describe()}")
     print(f"groups       {groups} fold {shape.heads // groups}")
     print(f"dtype        {args.dtype}")

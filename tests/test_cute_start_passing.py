@@ -39,6 +39,7 @@ from slinoss.ops.so3ssd.cute.bwd.start_passing import (
     start_passing_backward,
 )
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
+from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
@@ -237,6 +238,46 @@ def test_fused_matches_the_unfused_pair(
     dzstart = chunk_start_backward(dy, inp.trans, inp.C, CHUNK)
     want = state_passing_backward(dzstart, cquat, cscale, dstate)
     got = start_passing_backward(dy, inp.trans, inp.C, cquat, cscale, CHUNK, dstate)
+    torch.cuda.synchronize()
+
+    assert torch.equal(got.dinc, want.dinc)
+    assert torch.equal(got.dz0, want.dz0)
+
+
+@pytest.mark.parametrize(
+    ("bsz", "heads", "seqlen", "rows", "lanes", "groups", "dtype", "with_dstate"),
+    [case for case in SHAPES if case.id in ("ragged-three", "five-bands")],
+)
+def test_wide_block_matches_the_default_width(
+    bsz: int,
+    heads: int,
+    seqlen: int,
+    rows: int,
+    lanes: int,
+    groups: int | None,
+    dtype: torch.dtype,
+    with_dstate: bool,
+) -> None:
+    """A wider block moves the tile's N mode and no arithmetic.
+
+    Warps past the first four are absorbed into the N atoms, so each accumulator
+    element is still one K-long dot product summed in the same order and each
+    3-vector's recurrence still runs on one thread. Only which thread owns which
+    element changes, so the two widths agree bit for bit and a tolerance would hide
+    a real divergence in the partition.
+
+    Two shapes, one per store path: a ``P`` off the MMA tile selects the predicated
+    store, and a ``P`` on it selects the vectorized one, whose partition is the
+    width's own.
+    """
+    inp = _make(bsz, heads, seqlen, rows, lanes, dtype, groups)
+    wide = _double(inp)
+    dy, dstate = _seeds(inp, rows, lanes, with_dstate, dtype)
+    cquat, cscale = _transition(chunked_forward(*wide.args(), CHUNK, **wide.kw()))
+
+    args = (dy, inp.trans, inp.C, cquat, cscale, CHUNK, dstate)
+    want = start_passing_backward(*args)
+    got = start_passing_backward(*args, warps=WARPS_WIDE)
     torch.cuda.synchronize()
 
     assert torch.equal(got.dinc, want.dinc)
