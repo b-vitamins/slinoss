@@ -23,8 +23,8 @@ from dataclasses import replace
 
 import pytest
 import torch
-from torch import Tensor
-from torch.nn.functional import cross_entropy, silu
+from torch import Tensor, nn
+from torch.nn.functional import cross_entropy, linear, silu
 
 from slinoss.blocks import SLinOSSBlock
 from slinoss.config import SLinOSSConfig
@@ -66,7 +66,8 @@ of the three because it restarts the most often.
 PARITY_TOL = 1e-15
 """Bound on the stack against the pre-norm residual composition, at float64.
 
-Measured: 0.0 for both outputs and for all 58 gradients. float64 has no kernel
+Measured: 0.0 for both outputs and for every gradient of both leaf sets, 38 from
+the token entry point and 36 from the activation one. float64 has no kernel
 path, so the fused norm resolves to the reference backend, whose reduction is the
 one :func:`_norm` states; both paths then issue the same operations on the same
 operands and agree bitwise. The bound is a few float64 ulp, left as a tolerance
@@ -125,7 +126,13 @@ def _reference(stack: SLinOSSStack, x: Tensor) -> Tensor:
         hidden = hidden + module.mixer(_norm(hidden, module.mixer_norm_weight, eps))
         pre = _norm(hidden, module.ffn_norm_weight, eps)
         gated = silu(module.ffn_gate(pre)) * module.ffn_up(pre)
-        hidden = hidden + module.ffn_out(gated)
+        # Through the framework's own linear over the transposed weight. The block
+        # stores that weight (d_ffn, d_model) and contracts it directly, so this
+        # states the map the nn.Linear it replaced stated, and the gradient reaching
+        # the stored parameter through this view is the parity between the two call
+        # forms as well as the parity of the composition.
+        out = linear(gated, module.ffn_out_weight.t(), module.ffn_out_bias)
+        hidden = hidden + out
     normed = _norm(hidden, stack.norm_weight, eps)
     return normed if stack.head is None else stack.head(normed)
 
@@ -231,6 +238,49 @@ def test_norm_weights_stay_float32_through_a_module_cast() -> None:
     # A widening cast is left alone, so a float64 oracle stays float64 end to end.
     wide = SLinOSSStack(STACK_CONFIG).to(torch.float64)
     assert wide.norm_weight.dtype is torch.float64
+
+
+def test_the_ffn_output_weight_is_stored_transposed() -> None:
+    """The stored orientation of the output projection, and the fan_in with it.
+
+    ``(d_ffn, d_model)`` is a throughput contract, not a convention: the weight
+    gradient comes out in the stored shape, and in the :class:`torch.nn.Linear`
+    orientation that shape covers 0.64 of a wave on the device the block is written
+    for. A return to the framework orientation changes no value and no dtype.
+
+    Neither does initializing over the stored shape instead of over its transpose,
+    which is why the draw is checked against the framework's own and not only
+    against the extents. The default is uniform on ``+-1/sqrt(fan_in)`` with
+    ``fan_in`` the contraction extent, so reading ``fan_in`` off the wrong axis
+    rescales every weight in the layer by ``sqrt(d_ffn/d_model)`` and every bias
+    with it. The variance distinguishes that from the right draw; the bound alone
+    does not, since a wider uniform still fits under a maximum over finitely many
+    samples. The comparison is against a live :class:`torch.nn.Linear` of the map
+    this replaces, so it holds whatever the framework's default becomes.
+    """
+    cfg = STACK_CONFIG
+    # Seeded: the asserts below are sample statistics, and the tolerances are chosen
+    # against the sample count rather than against a run of luck.
+    torch.manual_seed(0)
+    block = SLinOSSBlock(cfg)
+    framework = nn.Linear(cfg.d_ffn, cfg.d_model, bias=cfg.bias)
+    weight = block.ffn_out_weight
+    assert weight.shape == (cfg.d_ffn, cfg.d_model)
+    assert weight.shape == framework.weight.t().shape
+    assert block.ffn_out_bias is not None
+    assert framework.bias is not None
+    assert block.ffn_out_bias.shape == framework.bias.shape
+    # A uniform's variance is a third of the square of its bound, so matching the
+    # framework's variance over 2,048 samples pins the bound, and with it the axis
+    # fan_in was read from. The relative standard error of the estimate is 2%; the
+    # error it has to catch is a factor of d_ffn/d_model, which is 4.
+    assert float(weight.var()) == pytest.approx(float(framework.weight.var()), rel=0.1)
+    assert float(block.ffn_out_bias.var()) == pytest.approx(
+        float(framework.bias.var()), rel=0.2
+    )
+    bound = cfg.d_ffn**-0.5
+    assert float(weight.abs().max()) <= bound
+    assert float(block.ffn_out_bias.abs().max()) <= bound
 
 
 DECODE_SPLITS = [

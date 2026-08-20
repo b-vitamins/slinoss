@@ -21,15 +21,46 @@ kernel. Slicing one fused weight is not a third option: each slice's pullback
 allocates a full-width zero buffer and the two are summed, which is an allocation
 per step that the two-weight form does not make. What the two-weight form costs
 instead is a second read of ``normed``.
+
+The output projection's weight is stored ``(d_ffn, d_model)``, the transpose of
+what :class:`torch.nn.Linear` holds, so the contraction is ``gated @ W`` and the
+weight gradient comes out ``(d_ffn, d_model)`` as well. The orientation is a
+throughput decision, not a convention.
+
+The model, which is a model and not a measurement: a weight gradient whose
+reduction extent is the token count is ``(d_model, d_ffn) = (576, 2304)`` in the
+``nn.Linear`` orientation, and cuBLAS covers that shape with a ``256x128`` tile.
+3 by 18 tiles is 54 blocks over 84 multiprocessors, 0.64 of one wave, so the tail
+of the wave is the whole kernel. Transposed, the same contraction fills 1.07
+waves.
+
+Measured at ``d_model 576``, ``d_ffn 2304``, 8,192 tokens, bf16, on an RTX A6000
+(sm_86, 84 multiprocessors) whose clocks cannot be locked, medians over 20
+launches per arm with the arms alternating: forward, dgrad and wgrad together take
+722.9 us at 90.2 TFLOPS stored ``(d_model, d_ffn)`` and 582.7 us at 112.0 TFLOPS
+stored ``(d_ffn, d_model)``. The wgrad alone goes from 294.6 us at 73.8 TFLOPS to
+173.5 us at 125.3 TFLOPS. An 8,192-cube bf16 GEMM measured in the same process
+reaches 112 to 113 TFLOPS, so the transposed store is at that ceiling and the
+framework orientation is at 80% of it.
+
+The win is per width. At ``d_model 1024``, ``d_ffn 4096`` the same three stages
+take 2,028.5 us at 101.6 TFLOPS stored ``(d_model, d_ffn)`` against 2,153.5 us at
+95.7 TFLOPS transposed, and there the framework orientation is the faster one.
+The store stays transposed because it is measured faster at the configured width,
+and the choice cannot be deferred to run time: the shape is in the state dict,
+and which orientation wins depends on the multiprocessor count of whichever
+device the gradient lands on.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
+from torch.nn import init
 
 from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.config import SLinOSSConfig
@@ -96,8 +127,15 @@ class SLinOSSBlock(nn.Module):
         self.ffn_up = nn.Linear(
             config.d_model, config.d_ffn, bias=config.bias, device=device, dtype=dtype
         )
-        self.ffn_out = nn.Linear(
-            config.d_ffn, config.d_model, bias=config.bias, device=device, dtype=dtype
+        # Transposed against nn.Linear. See the module docstring: this orientation
+        # is what puts the weight gradient on a full wave.
+        self.ffn_out_weight = nn.Parameter(
+            torch.empty(config.d_ffn, config.d_model, device=device, dtype=dtype)
+        )
+        self.ffn_out_bias: Tensor | None = (
+            nn.Parameter(torch.empty(config.d_model, device=device, dtype=dtype))
+            if config.bias
+            else None
         )
         self.reset_parameters()
 
@@ -112,7 +150,12 @@ class SLinOSSBlock(nn.Module):
             self.mixer.reset_parameters()
             self.ffn_gate.reset_parameters()
             self.ffn_up.reset_parameters()
-            self.ffn_out.reset_parameters()
+            # Over the transpose, so the framework default sees the fan_in it would
+            # see on the nn.Linear this replaces.
+            init.kaiming_uniform_(self.ffn_out_weight.t(), a=math.sqrt(5))
+            if self.ffn_out_bias is not None:
+                bound = 1.0 / math.sqrt(self.config.d_ffn)
+                self.ffn_out_bias.uniform_(-bound, bound)
 
     def _apply(
         self, fn: Callable[[Tensor], Tensor], recurse: bool = True
@@ -176,6 +219,16 @@ class SLinOSSBlock(nn.Module):
             )
             post = rmsnorm_residual(mixed, pre.residual, self.ffn_norm_weight, eps=eps)
             gated = swiglu(self.ffn_gate(post.normed), self.ffn_up(post.normed))
+            # Stated as one mm over the flattened tokens rather than left to
+            # matmul's folding rule, which reaches a batched kernel on an operand
+            # that is not contiguous.
+            flat = gated.flatten(0, 1)
+            out = (
+                torch.mm(flat, self.ffn_out_weight)
+                if self.ffn_out_bias is None
+                else torch.addmm(self.ffn_out_bias, flat, self.ffn_out_weight)
+            )
             return BlockOutput(
-                hidden=cast("Tensor", self.ffn_out(gated)), residual=post.residual
+                hidden=out.view(gated.shape[0], gated.shape[1], -1),
+                residual=post.residual,
             )
