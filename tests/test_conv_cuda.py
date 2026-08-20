@@ -722,13 +722,71 @@ def test_token_at_a_time_decode_reproduces_the_whole_sequence() -> None:
     assert max_err(torch.cat(steps, dim=1), whole.y) == 0.0
 
 
-def test_partial_count_matches_the_tile_count() -> None:
-    # A loop, not a parametrize: the assertion is arithmetic on one host function,
-    # so the cases share everything except an integer and none of them can fail
-    # independently of the others.
-    tile = int(_C.extension().BWD_TILE_T)
-    for seqlen in (1, tile - 1, tile, tile + 1, 200):
-        assert _C.extension().bwd_parts(seqlen) == -(-seqlen // tile)
+def test_partial_count_stops_growing_with_the_sequence() -> None:
+    """The stack the reduction reads is bounded by the launch target, not by T.
+
+    A count that follows T puts the reduction over its class ceiling at the long
+    shape; the bound is the whole point of the grid-stride walk. A loop, not a
+    parametrize: the assertion is arithmetic on one host function, so the cases
+    share everything except an integer and none can fail independently.
+    """
+    module = _C.extension()
+    tile = int(module.BWD_TILE_T)
+    per_block = int(module.BWD_TILES_PER_BLOCK)
+    target = int(module.BWD_TARGET_BLOCKS)
+    cpb = int(module.CHANNELS_PER_BLOCK)
+    for channels in (16, 64, 576):
+        rows = -(-channels // min(-(-channels // 32) * 32, cpb))
+        # The floor in the stride division leaves at most one extra iteration's
+        # worth of blocks over the target's share of the channel axis.
+        ceiling = 2 * -(-target // rows)
+        for seqlen in (1, tile - 1, tile, tile + 1, 200, 8192, 1 << 20):
+            parts = int(module.bwd_parts(seqlen, channels))
+            tiles = -(-seqlen // tile)
+            groups = -(-tiles // per_block)
+            assert 1 <= parts <= min(groups, ceiling)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_every_partial_slice_is_written(dtype: torch.dtype) -> None:
+    """No slice of the stack is left at its allocated value.
+
+    A block writes one slice for every tile group it walks, so a capped grid has
+    blocks that walk several groups and lanes that own no tile in the group they
+    are in. A slice nobody writes reaches the reduction as whatever the allocator
+    left, and NaN is what makes that visible where zero would pass. Both dtypes:
+    the staged path and the scalar walk leave the group loop by different routes.
+
+    The geometry is the one that caps: 513 tiles is more than twice the target's
+    share of a 576-channel grid, and the odd tile count is what leaves a lane in
+    the last group with nothing of its own.
+    """
+    module = _C.extension()
+    bsz, seqlen, channels, width = 1, 8200, 576, 4
+    x, weight, bias, state = cuda_call(bsz, seqlen, channels, width, dtype=dtype)
+    assert state is not None
+    dy, dstate = cotangents(bsz, seqlen, channels, width, seed=23)
+    parts = int(module.bwd_parts(seqlen, channels))
+    tiles = -(-seqlen // int(module.BWD_TILE_T))
+    assert parts < -(-tiles // int(module.BWD_TILES_PER_BLOCK))
+    nan = float("nan")
+    dweight_parts = x.new_full((parts, width, channels), nan, dtype=torch.float32)
+    dbias_parts = x.new_full((parts, channels), nan, dtype=torch.float32)
+    module.bwd(
+        dy.to(dtype),
+        dstate.to(dtype),
+        x,
+        weight,
+        bias,
+        state,
+        torch.empty_like(x),
+        torch.empty_like(state),
+        dweight_parts,
+        dbias_parts,
+        True,
+    )
+    assert bool(torch.isfinite(dweight_parts).all())
+    assert bool(torch.isfinite(dbias_parts).all())
 
 
 def test_more_than_one_partial_is_reduced() -> None:
@@ -739,7 +797,7 @@ def test_more_than_one_partial_is_reduced() -> None:
     bsz, seqlen, channels, width = 2, 200, 8, 4
     operands = cuda_call(bsz, seqlen, channels, width)
     leaves = as_reference(operands)
-    assert _C.extension().bwd_parts(seqlen) > 1
+    assert _C.extension().bwd_parts(seqlen, channels) > 1
     dy, _ = cotangents(bsz, seqlen, channels, width, seed=17)
 
     got = causal_conv1d_bwd_native(dy, None, *operands[:3], initial_state=operands[3])
@@ -786,7 +844,7 @@ def _bwd_partials(
     )
     dy, dstate = cotangents(bsz, seqlen, channels, width, seed=41)
     assert state is not None
-    parts = int(module.bwd_parts(seqlen))
+    parts = int(module.bwd_parts(seqlen, channels))
     assert parts > 1
     dweight_parts = x.new_empty((parts, width, channels), dtype=torch.float32)
     dbias_parts = (
@@ -925,7 +983,7 @@ def test_the_backward_reads_and_writes_bands_of_the_projection() -> None:
 
     assert state is not None
     module = _C.extension()
-    parts = int(module.bwd_parts(seqlen))
+    parts = int(module.bwd_parts(seqlen, channels))
     wide = x.new_full((bsz, seqlen, channels + 2 * PAD), float("nan"))
     band = wide[..., PAD : PAD + channels]
     module.bwd(
