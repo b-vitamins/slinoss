@@ -74,6 +74,28 @@ trades against `chunk_size` and `d_head`. Measured on a 101,376 B carveout:
 shape, so one the backward cannot hold raises from the backward rather than from
 the forward.
 
+A whole model is `SLinOSSStack`, and one layer of it `SLinOSSBlock`: a fused
+pre-norm around the mixer, and a second around a SwiGLU FFN of width
+`ffn_ratio * d_model`. A block hands its branch output back unadded, so the add
+is the next fused norm's first operation and the stack's final norm is the add
+the last block did not do. The residual stream is float32 from the first norm to
+the last, and the three norm weights stay float32 through a module-wide cast.
+
+```python
+from slinoss import SLinOSSStack
+
+cfg = SLinOSSConfig(
+    d_model=576, d_state=48, d_head=48, n_layers=13, vocab_size=50257
+)
+model = SLinOSSStack(cfg).cuda().to(torch.bfloat16)
+
+ids = torch.randint(0, 50257, (4, 2048), device="cuda")
+logits = model(ids)
+```
+
+`vocab_size=None` drops the embedding and the head, and the stack then takes and
+returns `(B,T,d_model)` activations.
+
 The operator is callable directly. `so3ssm` is the sequential reference and is
 float64-capable; `so3ssd` is the chunked, autograd-complete, CUDA-accelerated
 path.
