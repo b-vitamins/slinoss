@@ -146,6 +146,65 @@ instructions, and the class bar says nothing about that.
   The reported throughput is the instruction count and nothing else, so a kernel
   near that ceiling is issue-bound on the port and no byte, wavefront or occupancy
   figure will say so.
+- `l1tex__throughput` is not a bandwidth, and neither is `sm__throughput`. Across
+  five arms the L1/TEX figure equals `sm__inst_executed_pipe_lsu` against its own
+  peak digit for digit (55.05 / 55.21 / 55.11 / 54.93 / 54.94), which is why the
+  identity above closes at all: the two are the same quantity. `sm__throughput` is
+  that same LSU figure re-based on elapsed instead of active cycles,
+  `55.05 * 0.98670 = 54.32` against a reported 54.33. So neither metric reports
+  bytes, and a kernel cannot be judged bandwidth-bound from either one.
+- Every pipe has its own issue width, and the width is read off
+  `.avg.peak_sustained` rather than derived. Measured on this part, in
+  warp-instructions per multiprocessor per cycle, with every identity
+  `inst / (SMs * cycles_active * width)` closing against the reported percentage to
+  0.005 points:
+
+      pipe                                       width    ps per warp-inst
+      LSU, XU, ADU, TEX, IPA                       0.5              16.934
+      ALU, UNIFORM, IMAD.WIDE, IMAD.HI               2               4.234
+      FMA (FFMA, FMUL, FADD, plain IMAD), CBU        4               2.117
+      HMMA                                    4 SM-cycles          33.868
+
+  The picoseconds are at 1.406 GHz over 84 multiprocessors and are clock-dependent;
+  the widths are not. **One memory instruction costs four integer instructions or
+  eight float instructions, and one `HMMA` costs two memory instructions.** That
+  ratio, not the instruction count, is what ranks two candidate forms.
+- Divide by processing blocks, not by multiprocessors, or the answer is out by four.
+  The ALU is 16 INT32 units per scheduler, so an integer warp-instruction does cost
+  two cycles -- confirmed to the last digit, `sm__pipe_alu_cycles_active.avg`
+  predicted 2,926,628.57 and measured 2,926,628.57 -- but it spends them in one of
+  four parallel blocks, which is a width of 2.0 per multiprocessor and not 0.5. The
+  same reasoning applied per multiprocessor priced the integer term at 82.6% of a
+  launch whose busiest pipe was 55.05%. `sm__throughput` refuted it before any arm
+  was dispatched against it. An arithmetic derivation over a datasheet is the
+  weakest evidence class there is; check it against a counter before acting.
+- The issue-view and cycles-view counters disagree where an instruction issues at
+  reduced rate, and the cycles view is the one to price with.
+  `sm__pipe_fma_cycles_active` runs 8.9% above what the FMA instruction count
+  predicts at full rate; the excess is exactly the 12,810,240 `IMAD.WIDE.U32`,
+  `IMAD.HI.U32` and `IMAD.HI` instructions issuing at half rate, and pricing those
+  correctly moves FMA from 11.61% to 12.65%. `HMMA` occupies 16 unit-cycles across
+  4 units, so its cycles view is exactly twice its issue view: 13.85%, not 6.94%.
+- Price every pipe at once and the limiter cannot hide. On `chunk_vector_bwd`: LSU
+  55.05%, ALU 19.91%, tensor 13.85%, FMA 12.65%, XU 3.73%, ADU 1.61%, CBU 0.30%,
+  uniform 0.03%, FP64 zero. The eight budgets sum to 107.1% of the active wall, so
+  the machine is accounted for and there is no unmeasured unit left for a limiter to
+  sit in. The LSU port alone exceeds the sum of every other pipe on the chip, by a
+  factor of 2.76 over the next one. Replays are nil: `sm__inst_issued` exceeds
+  `sm__inst_executed` by 0.007%.
+- An instruction class being large does not make it a limiter, and this is where the
+  census alone misleads. Integer work is the largest class in `chunk_vector_bwd` by
+  count, 1,333.75 warp-instructions per warp against LSU's 921.88, and it prices at
+  520 us against LSU's 1,439 because it issues at four times the width. So no
+  integer-reduction arm can be rank 1 while the port is where it is. Rank by pipe
+  occupancy, then by instruction count within the limiting pipe.
+- Deleting work off a pipe that is not the limiter is unpriced, not free money. The
+  measured conversion of freed cycles to time, 83-93%, was established on the
+  limiting pipe only. A candidate that moves work from one idle pipe to another idle
+  pipe -- packing two `F2F` on the XU into one `F2FP` on the ALU, worth 33 us by port
+  arithmetic -- has no measured conversion behind it and does not reduce the port
+  term at all. State such a candidate as unpriced rather than banking its
+  microseconds.
 - A freed port cycle is not a freed nanosecond. Across three group widths of
   `chunk_vector_bwd`, 93.7% of the freed LSU cycles converted to time at one step
   and 83.3% at the next, so the port term is an upper bound on what deleting an
@@ -294,6 +353,27 @@ instructions, and the class bar says nothing about that.
 
 ## DSL rules that come from measurement
 
+- Unrolling fixes the loop counter and cannot fix a tensor stride. Every stride
+  arrives as a runtime kernel parameter in the constant bank, so a fully unrolled
+  body still recomputes each address rather than folding it into an immediate.
+  `chunk_vector_bwd` is unrolled to the point that every `SASS` site executes
+  exactly once per warp, and it still issues 1,334 integer instructions per warp.
+  Of those, 282 per warp exist only because a global address is 64 bits wide with a
+  runtime stride -- `IMAD.WIDE.U32`, `IADD3.X`, `LEA.HI.X` -- and 64.4% of all
+  integer work sits in four staging and epilogue regions, two of which contain no
+  floating-point instruction at all, against 6.3% in the two matvec bodies. Address
+  arithmetic is a property of the parameter, so reduce it by touching fewer
+  addresses, not by unrolling harder.
+- Clamping unconditionally is right, and it is not free. The rule below says never
+  predicate a load; the compiler honours it by materialising every clamp and every
+  in-bounds mask as a value select paid on all lanes. On `chunk_vector_bwd` that is
+  382 warp-instructions per warp of `ISETP`, `SEL` and `IMNMX`, 27.5% of the integer
+  work, with only 3 per warp of all integer work under a predicate. Correct, and
+  worth knowing before attributing that count to indexing.
+- A cross-lane reduction costs more than its shuffle. `SHF.L.U32` appears exactly
+  once per `SHFL.BFLY` -- 10,506,240 of each -- because the lane mask is computed in
+  the ALU. A butterfly step is 16.934 ps on the port plus 4.234 ps on the ALU, not
+  16.934.
 - No global load inside a divergent branch, and none inside a `cutlass.range`
   loop that also transforms what it loads: neither can be unrolled or hoisted,
   so both serialize on one global latency per step. Split load from transform --

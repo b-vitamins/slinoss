@@ -753,11 +753,19 @@ class KernelCounters(PerfRecord):
         stall_sleeping_pct: Warp asleep.
         stall_tex_throttle_pct: Texture and L1 request queue full.
         stall_wait_pct: Waiting on a fixed-latency execution dependency.
-        sm_pct: SM throughput against peak sustained. NCU's Compute SOL row.
+        sm_pct: SM throughput against peak sustained. NCU's Compute SOL row. A
+            maximum over the SM's pipes, taken against elapsed rather than
+            active cycles, so it reads as the busiest pipe's occupancy scaled by
+            the active fraction and is not an arithmetic intensity.
         memory_pct: Memory-pipeline throughput against peak sustained, the
             maximum over the memory subsystem. NCU's Memory SOL row. At or above
             ``dram_pct`` by construction.
-        l1tex_pct: L1TEX throughput against peak sustained.
+        l1tex_pct: not a bandwidth. Measured equal, digit for digit across five
+            arms, to ``sm__inst_executed_pipe_lsu`` against its own peak, so it
+            is the LSU issue port's occupancy: the share of cycles the memory
+            pipe spends issuing warp instructions, at 0.5 instructions per SM
+            per cycle. Sectors, wavefronts and bank conflicts do not enter it.
+            Read it beside the instruction census, never as bytes moved.
         l2_pct: L2 throughput against peak sustained.
     """
 
