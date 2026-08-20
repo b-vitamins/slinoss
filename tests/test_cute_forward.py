@@ -39,6 +39,11 @@ LS_BIAS = -4.0
 # against the same operand construction.
 BOUNDS = {torch.bfloat16: 6e-3, torch.float16: 8e-4}
 
+# The gradient bound of the autograd wiring test. Two contraction orders over the
+# same bf16 leaves, so it is the operand dtype's half-ulp against the largest
+# entry, like the forward's. Worst measured: 5.682e-3, on ``b_prev``.
+GRAD_BOUND = 8e-3
+
 # (bsz, heads, seqlen, chunk, rows, lanes, streaming, dtype).
 SHAPES = [
     # Ragged tail, streaming carry, nonzero initial state, three chunks and one
@@ -265,23 +270,26 @@ def test_one_executor_per_kernel_serves_every_batch_head_and_length() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_backward_is_the_reference_backward_on_the_same_saved_inputs() -> None:
-    """This backend's gradient is the reference's until the CuTe backward lands.
+def test_the_backward_reaches_every_leaf_the_forward_saved() -> None:
+    """The context this backend's backward is driven from.
 
-    Under one fixed cotangent the two backends must therefore agree bitwise: the
-    saved set, the chunk size, and the backend name all reach the backward
-    through the same context, and a divergence there is the only thing this can
-    catch. The connection test -- fast forward, differentiate, compare end to end
-    -- belongs to the backend whose backward is its own, and lives in
-    tests/test_interface.py for the reference.
+    The saved set, the chunk size and the streaming carry all reach the backward
+    through the context, and a leaf that was saved wrong or a chunk that was
+    recorded wrong lands far outside a rounding difference. What the two backends
+    agree to is a tolerance rather than a bit pattern: since the CuTe backward
+    landed, the gradient here is seven launches with their own contraction order,
+    and only the reference's own accuracy chain in tests/test_cute_backward.py can
+    call that order right. So the bound is the operand dtype's, and this test's
+    subject is which leaves are connected and how well, not the arithmetic.
+
+    One cotangent, not the outputs: squaring would feed each backward its own
+    forward error on top of its own rounding.
     """
     fast = _make(2, 2, 200, 48, 16, True, torch.bfloat16, requires_grad=True)
     ref = _make(2, 2, 200, 48, 16, True, torch.bfloat16, requires_grad=True)
     chunk = 64
     got = so3ssd(*fast.args(), chunk, **fast.kw(), backend="cute")
     want = so3ssd(*ref.args(), chunk, **ref.kw(), backend="reference")
-    # One cotangent, not the outputs: squaring would feed each backward its own
-    # forward error and turn a bitwise check into a tolerance.
     got.y.float().sum().backward()
     want.y.float().sum().backward()
     torch.cuda.synchronize()
@@ -290,4 +298,4 @@ def test_the_backward_is_the_reference_backward_on_the_same_saved_inputs() -> No
         a = getattr(fast, name).grad
         b = getattr(ref, name).grad
         assert a is not None and b is not None, name
-        assert torch.equal(a, b), name
+        assert_max_rel(a, b, GRAD_BOUND, f"cute autograd d{name}")
