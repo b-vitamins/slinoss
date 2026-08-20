@@ -1195,6 +1195,16 @@ def chunk_vector_bwd_kernel(
     # The narrowed score is the A operand of the GEMM that rereads it in place.
     # Fragment and view are built once: the retile is a layout, so nothing here is
     # per-tap work.
+    #
+    # These accumulators reach registers only when both loops below have a trip count
+    # of one. Every accumulator allocation is hoisted to the kernel entry, and a
+    # rolled loop between the allocation and its uses defeats register promotion, so
+    # each fragment access becomes a local load and a local store. Measured at
+    # ``P = 64``, ``L = 64``, span 64, fold one, at 255 registers and 91,344 B of
+    # shared memory in both runs: one lane tile moves no local traffic at all, and
+    # five lane tiles move 1,892.16 MB per call. The declaration site is not the
+    # lever, and moving all four inside both loops leaves the counters unchanged to
+    # the sector.
     mfrag = cute.make_fragment_like(dmacc, elem)
     fa_m = mma_areg(mfrag)
 
