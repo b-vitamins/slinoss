@@ -24,8 +24,9 @@ from dataclasses import replace
 import pytest
 import torch
 
+from slinoss._precision import SUPPORTED_DTYPES
 from slinoss.config import SLinOSSConfig
-from slinoss.decode import generate
+from slinoss.decode import _sample, generate
 from slinoss.stack import SLinOSSStack
 from slinoss.state import StackState
 
@@ -80,6 +81,51 @@ def _prompt(device: torch.device) -> torch.Tensor:
     """``(BATCH, PROMPT)`` ids, from a generator of their own."""
     gen = torch.Generator(device=device).manual_seed(1)
     return torch.randint(0, 17, (BATCH, PROMPT), generator=gen, device=device)
+
+
+@pytest.mark.parametrize(
+    "dtype", SUPPORTED_DTYPES, ids=lambda d: str(d).removeprefix("torch.")
+)
+@pytest.mark.parametrize(
+    ("temperature", "top_k"),
+    [(0.0, None), (1.0, None), (0.7, 4), (1.0, 4 * 17)],
+    ids=["argmax", "untruncated", "top_k", "top_k_past_the_vocabulary"],
+)
+def test_a_padding_column_is_never_argmaxed_or_sampled(
+    dtype: torch.dtype, temperature: float, top_k: int | None
+) -> None:
+    """Both sampler branches against a head wider than its vocabulary.
+
+    The head is ``padded_vocab_size`` wide, so every id past ``vocab_size`` is a
+    column the tokenizer cannot name and the model never trained. Returning one is
+    silent: it is an integer in the tensor's range, it indexes the embedding, and
+    the next step continues from it. What keeps it out is only the fill
+    :meth:`slinoss.SLinOSSStack.forward` writes, so this drives the sampler
+    directly rather than through a stack, which is the only way to reach every
+    dtype the stack admits without a kernel for each.
+
+    Adversarial on purpose: every real logit is below zero, so a padding column
+    left at zero, left at a framework init, or filled with anything finite and
+    positive wins the argmax outright and carries sampling mass. ``top_k`` above
+    the padded width is the case where padding columns do enter the truncation.
+    """
+    vocab = DECODE_CONFIG.vocab_size
+    padded = DECODE_CONFIG.padded_vocab_size
+    assert vocab is not None and padded is not None
+    assert padded > vocab, "this config no longer pads, so the test proves nothing"
+    rows = 256
+    gen = torch.Generator().manual_seed(3)
+    logits = torch.full((rows, padded), torch.finfo(dtype).min, dtype=dtype)
+    logits[:, :vocab] = (-1.0 - torch.rand(rows, vocab, generator=gen)).to(dtype)
+    for seed in range(4):
+        ids = _sample(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        assert ids.shape == (rows,)
+        assert bool((ids < vocab).all()), f"a padding id was returned, seed {seed}"
 
 
 @pytest.mark.cuda

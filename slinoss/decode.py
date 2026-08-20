@@ -34,8 +34,9 @@ class DecodeOutput(NamedTuple):
     """What one :func:`generate` call produces.
 
     Attributes:
-        tokens: ``(B, max_new_tokens)`` int64 sampled ids. Positions past a
-            sequence's stop token hold that token.
+        tokens: ``(B, max_new_tokens)`` int64 sampled ids, every one below
+            ``vocab_size``. Positions past a sequence's stop token hold that
+            token.
         state: The state the loop advanced. It has consumed the prompt and every
             generated token but the last, which was sampled and never fed back, so
             a continuation passes ``tokens[:, -1:]`` as its prompt. Feeding the
@@ -56,7 +57,12 @@ def _sample(
     """One token per row of ``logits``.
 
     Args:
-        logits: ``(B,V)``, any float dtype.
+        logits: ``(B,V)``, any float dtype, ``V`` the head's padded width. A
+            padding column holds ``finfo(dtype).min``, which is below every
+            reachable logit and exactly zero after the softmax, so neither branch
+            can return a padding id. ``top_k`` above ``vocab_size`` reaches padding
+            columns whose kth value is that minimum, which masks nothing and leaves
+            the untruncated distribution, as it would at an unpadded width.
         temperature: Zero for argmax. Positive scales the logits before the
             softmax.
         top_k: Keep the ``top_k`` highest logits per row, or None for all of them.
