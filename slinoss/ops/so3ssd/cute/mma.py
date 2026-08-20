@@ -13,6 +13,32 @@ into float32, with four warps partitioning M and a tile of ``(64,16,16)``. A
 transposed operand is a stride swap on the same shared-memory iterator, so no form
 needs a staging copy or a repack.
 
+Block width. Four warps partitioning M is :func:`mma_atoms` at :data:`WARPS`.
+Eight warps do not partition M further: the M mode stays :data:`WARPS` atoms wide
+and the extra warps subdivide the tile's N mode, two warps to each M tile. So
+:data:`MMA_TILE_M` is flat in the block width and every M-extent shared tile with
+it, which is what puts 256 threads within reach of a kernel whose live set already
+fills the carveout: one resident block of eight warps holds twice the resident
+warps of one resident block of four at the same bytes. The tile's N mode spans
+:data:`MMA_TILE_ATOMS_N` atoms and no more, so :data:`WARPS_WIDE` is the widest
+block this atom admits with M pinned. Widening the N mode to take more would raise
+the N divisibility requirement to 32, which ``3N`` at 48 fails.
+
+Two consequences of splitting N, both read off the device rather than assumed:
+
+- A warp group holds one atom of the B operand's N mode rather than two, so its
+  ``ldmatrix`` moves two 8x8 matrices rather than four. A count the fragment does
+  not divide fails IR verification, so :func:`mma_matrices` derives it from the
+  tiling.
+- :func:`mma_areg` does not survive the split, and a chained consumer takes its
+  left operand from shared memory at :data:`WARPS_WIDE`. A thread's consecutive N
+  steps are two atoms apart at two groups, so the N mode it would reread as K is
+  not contiguous. Letting K absorb the warps instead keeps that reread intact and
+  costs more than it saves: an atom layout with a K mode replicates the
+  accumulator across the K warps rather than partitioning it, so every product
+  needs a float32 ``M*N`` cross-warp reduction in the arena the wider block exists
+  to leave alone.
+
 Divisibility, measured on the device rather than assumed:
 
 - N must be a multiple of :data:`MMA_TILE_N`. An N extent of 8 or 24 fails IR
@@ -45,17 +71,23 @@ from slinoss.ops.so3ssd.cute.common import WARPS
 __all__ = [
     "MMA_INST",
     "MMA_PAIR",
+    "MMA_TILE_ATOMS_N",
     "MMA_TILE_K",
     "MMA_TILE_M",
     "MMA_TILE_N",
     "SMEM_SEGMENT",
+    "THREADS_WIDE",
+    "WARPS_WIDE",
     "fp32_tile",
     "make_mma",
     "mma_acc",
     "mma_areg",
+    "mma_atoms",
     "mma_coords",
     "mma_gemm",
     "mma_gemm_areg",
+    "mma_groups",
+    "mma_matrices",
     "mma_offsets",
     "mma_rows",
     "mma_store",
@@ -74,6 +106,20 @@ MMA_TILE_N: int = 16
 
 MMA_TILE_K: int = MMA_INST[2]
 """K mode of the tile. Every K extent must be a multiple of this."""
+
+MMA_TILE_ATOMS_N: int = MMA_TILE_N // MMA_INST[1]
+"""Atoms the tile's N mode spans, and the warp groups it can be split into."""
+
+WARPS_WIDE: int = WARPS * MMA_TILE_ATOMS_N
+"""Warps of the widest block the atom admits with the M mode pinned.
+
+Two warp groups of :data:`WARPS`, each holding one atom of the tile's N mode. A
+third group has no atom to hold, so this is a ceiling and not a default: the
+four-warp form remains what every caller gets from :func:`make_mma` unasked."""
+
+THREADS_WIDE: int = WARPS_WIDE * 32
+"""Threads of a :data:`WARPS_WIDE` block, the wide sibling of
+:data:`slinoss.ops.so3ssd.cute.common.THREADS`."""
 
 MMA_PAIR: int = 2
 """Adjacent output columns one thread holds in the atom's C fragment.
@@ -162,8 +208,79 @@ def fp32_tile(rows: int, width: int) -> Tile:
     return Tile((rows, pitch), (pitch, 1))
 
 
+def mma_atoms(warps: int) -> tuple[int, int, int]:
+    """Atom layout ``(M,N,K)`` for a block of ``warps`` warps.
+
+    The M mode is :data:`WARPS` atoms at every legal block width, so
+    :data:`MMA_TILE_M` and every shared tile whose rows or pitch carry an M extent
+    are flat in the warp count. Warps past :data:`WARPS` go to the N mode, which
+    holds :data:`MMA_TILE_ATOMS_N` atoms and therefore that many warp groups.
+
+    The K mode is never given a warp. An atom layout with a K mode replicates the
+    accumulator across those warps instead of partitioning it, so the partial sums
+    need a cross-warp reduction that neither of the other two modes needs.
+
+    Args:
+        warps: Warps per block. A multiple of :data:`WARPS`, at most
+            :data:`WARPS_WIDE`.
+
+    Returns:
+        The layout to hand :func:`cute.make_tiled_mma`.
+
+    Raises:
+        ValueError: If ``warps`` is not a legal block width.
+    """
+    if warps <= 0 or warps % WARPS or warps > WARPS_WIDE:
+        raise ValueError(
+            f"warps must be a multiple of {WARPS} at most {WARPS_WIDE}, got {warps}"
+        )
+    return (WARPS, warps // WARPS, 1)
+
+
+def mma_groups(tiled_mma: cute.TiledMma) -> int:
+    """Warp groups the tiling splits the tile's N mode into.
+
+    One for the four-warp form, :data:`MMA_TILE_ATOMS_N` for the wide one. Read off
+    the tiling rather than passed in, so a helper cannot be handed a count that
+    disagrees with the tiled MMA it was given.
+
+    Not a ``@cute.jit`` function: it is layout algebra on a static layout and it
+    emits nothing.
+
+    Args:
+        tiled_mma: From :func:`make_mma`.
+
+    Returns:
+        The N extent of the tiling's thread layout.
+    """
+    return cute.size(tiled_mma.thr_layout_vmnk, mode=[2])
+
+
+def mma_matrices(tiled_mma: cute.TiledMma) -> int:
+    """8x8 matrices one ``ldmatrix`` of the B operand moves.
+
+    A warp group holds ``MMA_TILE_N // groups`` columns over :data:`MMA_TILE_K`
+    rows of B, which is that many 64-element matrices: four at one group, two at
+    two. The op's count has to divide the fragment the copy retiles onto, and a
+    count that does not fails IR verification rather than returning a wrong answer.
+
+    The A operand is not split. Its patch is one atom of M over
+    :data:`MMA_TILE_K`, four matrices at every block width, and the tiling
+    broadcasts it across the N groups.
+
+    Args:
+        tiled_mma: From :func:`make_mma`.
+
+    Returns:
+        The count to hand :class:`cute.nvgpu.warp.LdMatrix8x8x16bOp`.
+    """
+    return MMA_TILE_N * MMA_TILE_K // (mma_groups(tiled_mma) * 64)
+
+
 @cute.jit
-def make_mma(dtype: cutlass.Constexpr) -> cute.TiledMma:
+def make_mma(
+    dtype: cutlass.Constexpr, warps: cutlass.Constexpr = WARPS
+) -> cute.TiledMma:
     """Build the one tiled MMA.
 
     Constructed on the host side and passed into the kernel, so a kernel holds no
@@ -171,13 +288,16 @@ def make_mma(dtype: cutlass.Constexpr) -> cute.TiledMma:
 
     Args:
         dtype: Operand element type. ``cutlass.BFloat16`` or ``cutlass.Float16``.
+        warps: Warps per block, defaulting to :data:`WARPS`. :data:`WARPS_WIDE`
+            asks for the wide form, whose tile is the same and whose block is
+            twice as many warps.
 
     Returns:
         The tiled MMA with tile ``(MMA_TILE_M, MMA_TILE_N, MMA_TILE_K)``.
     """
     return cute.make_tiled_mma(
         cute.nvgpu.warp.MmaF16BF16Op(dtype, cutlass.Float32, MMA_INST),
-        (WARPS, 1, 1),
+        mma_atoms(warps),
         permutation_mnk=(MMA_TILE_M, MMA_TILE_N, MMA_TILE_K),
     )
 
@@ -233,6 +353,9 @@ def mma_gemm(
         ``ldmatrix`` transposes exactly when the operand's stride-1 mode is M or N
         rather than K, so the flag is the negation of the major-ness. A wrong flag
         is a compile-time IR verification failure, not a wrong answer.
+
+        B's matrix count comes from :func:`mma_matrices`, since a wide tiling gives
+        a warp group half the N mode. A's is four at every block width.
     """
     thr = tiled_mma.get_slice(tid)
     fa = tiled_mma.make_fragment_A(thr.partition_A(va))
@@ -241,7 +364,8 @@ def mma_gemm(
         cute.nvgpu.warp.LdMatrix8x8x16bOp(not a_k_major, 4), va.element_type
     )
     atom_b = cute.make_copy_atom(
-        cute.nvgpu.warp.LdMatrix8x8x16bOp(not b_k_major, 4), vb.element_type
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(not b_k_major, mma_matrices(tiled_mma)),
+        vb.element_type,
     )
     copy_a = cute.make_tiled_copy_A(atom_a, tiled_mma)
     copy_b = cute.make_tiled_copy_B(atom_b, tiled_mma)
@@ -395,6 +519,12 @@ def mma_areg(frag: cute.Tensor) -> cute.Tensor:
         atom's 8 columns. Every N extent in the operator is a multiple of
         :data:`MMA_TILE_N`, which is 16, so this holds. The consuming GEMM's B
         operand must have that same K extent.
+
+        The fragment must come from a tiling of one N group. At
+        :data:`MMA_TILE_ATOMS_N` groups a thread's consecutive N steps are two
+        atoms apart rather than adjacent, so the pair this reads as one 16-row K
+        slab is two 8-row slabs eight rows apart. :func:`mma_gemm_areg` refuses
+        that tiling, which is where the reread is caught.
     """
     split = cute.logical_divide(frag.layout, (None, None, 2))
     return cute.make_tensor(
@@ -432,7 +562,18 @@ def mma_gemm_areg(
         fa: A fragment from :func:`mma_areg`.
         vb: Shared-memory view of shape ``(N,K)``.
         b_k_major: Whether ``vb``'s K mode is the stride-1 mode.
+
+    Raises:
+        ValueError: If the tiling splits the tile's N mode across warp groups.
+            The reread :func:`mma_areg` performs is not contiguous in K there, and
+            the product would be a plausible wrong answer rather than a failure.
+            A chained consumer of a wide tiling stages its left operand through
+            shared memory and takes :func:`mma_gemm`.
     """
+    if mma_groups(tiled_mma) != 1:
+        raise ValueError(
+            f"mma_gemm_areg needs one N group, got {mma_groups(tiled_mma)}"
+        )
     thr = tiled_mma.get_slice(tid)
     fb = tiled_mma.make_fragment_B(thr.partition_B(vb))
     atom_b = cute.make_copy_atom(
