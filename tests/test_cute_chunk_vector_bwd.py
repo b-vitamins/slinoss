@@ -68,10 +68,10 @@ LS_BIAS = -4.0
 # - a single chunk at the smallest legal ``P``, which is also the smallest ``N``:
 #   there the transition closes with no predecessor chunk and ``dB``'s boundary
 #   correction is empty;
-# - two ``N`` at the widest ``3N`` that fits, because every lane-indexed reduction
-#   strides over ``N`` and one that dropped the stride passes at a single ``N``.
-#   That is also the shape where the budget halves the source-token block, so it is
-#   the only case with two blocks in the tap loop;
+# - two ``N`` past one lane tile, because every lane-indexed reduction strides over
+#   ``N`` and one that dropped the stride passes at a single ``N``. That is also the
+#   only shape here with a second lane tile, so it is where the two sums that cross
+#   lanes are accumulated into rather than stored;
 # - both operand dtypes, because each is a different MMA atom.
 #
 # ``MAX_CHUNK`` is absent because this kernel refuses it at every ``P``: the
@@ -387,12 +387,37 @@ def test_grouped_vectors_sum_over_their_heads(groups: int) -> None:
     the kernel's own loop rather than a grid axis, so ``G < H`` also runs the arena
     twice over without reallocating it, and the ``dB`` accumulator has to survive
     the head boundary that the last store crosses.
+
+    The shape is also where the budget halves the source-token block, at ``G == 1``
+    only, so it is the case that runs two blocks in the tap loop and the case where
+    the halving and the second lane tile interact: the forcing sum is per lane tile
+    and per group, and it has to be rezeroed on the tile boundary but not on the
+    head boundary.
     """
-    inp = _make(2, 4, 128, 16, 16, torch.bfloat16, groups=groups)
+    inp = _make(2, 4, 128, 64, 32, torch.bfloat16, groups=groups)
     dy = _cotangent(inp, torch.bfloat16)
     want = _oracle(inp, dy, 64, dstate=_dstate(inp))
     got = _run(inp, dy, want, 64)
     _compare(got, want, torch.bfloat16, f"cute-chunk-vector[G{groups}]")
+
+
+@pytest.mark.parametrize("groups", [18, 1], ids=["group-per-head", "one-group"])
+def test_holds_the_widest_state_the_mixer_configures(groups: int) -> None:
+    """``3N = 240`` at the full chunk and the full row count, at both folds.
+
+    The resident set is bounded by one lane tile, not by ``3N``, so this is the same
+    launch path every narrower state takes rather than a second one, and the arena
+    costs what it costs at ``3N = 48``. The geometry is the one the throughput
+    targets are stated at: ``d_head 64``, ``L 64``, ``N 80``, ``H 18``. At ``G == 1``
+    the whole fold runs inside the block and the budget halves the source-token
+    block as well, so the two sums that cross lanes are accumulated over five lane
+    tiles while the forcing sum crosses eighteen heads and two source blocks.
+    """
+    inp = _make(1, 18, 128, 64, 80, torch.bfloat16, groups=groups)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _oracle(inp, dy, 64, dstate=_dstate(inp))
+    got = _run(inp, dy, want, 64)
+    _compare(got, want, torch.bfloat16, f"cute-chunk-vector[3N240/G{groups}]")
 
 
 def test_without_the_streaming_carry_in() -> None:
@@ -579,6 +604,10 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     doubles the ``U`` traffic and leaves the kernel memory bound either way, so the
     choice is the budget's and not the caller's. The widest legal ``L`` does not fit
     at any ``P`` and is refused on the host.
+
+    ``3N`` is not one of the axes the budget scales with. Every tile that spans the
+    state width spans one lane tile of it, so the arena is flat in ``3N`` and the
+    widest state the mixer configures costs what the narrowest does.
     """
     assert vblock(64, 48, 48, 1) == 64
     assert vector_smem_bytes(64, 48, 48, 1, 64) <= smem_capacity()
@@ -591,13 +620,19 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert vector_smem_bytes(MAX_CHUNK, 16, 48, 1, vblock(MAX_CHUNK, 16, 48, 1)) > (
         smem_capacity()
     )
-    # Every tile the arena holds scales with one of the four, so none of them is
-    # free: a budget that ignored an axis would compare equal on one of these.
+    # Three of the four axes scale the arena, so none of those three is free: a
+    # budget that ignored one would compare equal on one of these.
     assert vector_smem_bytes(32, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 1, 32)
     assert vector_smem_bytes(64, 16, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 1, 32)
-    assert vector_smem_bytes(64, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 96, 1, 32)
     assert vector_smem_bytes(64, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 1, 64)
     assert vector_smem_bytes(64, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 2, 32)
+    # The fourth is flat, and the state width the acceptance geometry asks for fits
+    # at the full block and at the widest fold the mixer configures.
+    assert vector_smem_bytes(64, 48, 48, 1, 32) == vector_smem_bytes(64, 48, 240, 1, 32)
+    assert vblock(64, 64, 240, 1) == 64
+    assert vector_smem_bytes(64, 64, 240, 1, 64) <= smem_capacity()
+    assert vblock(64, 64, 240, 18) == 32
+    assert vector_smem_bytes(64, 64, 240, 18, 32) <= smem_capacity()
 
 
 def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
@@ -769,22 +804,24 @@ def test_rejects_a_bad_operand(
 
 
 @pytest.mark.parametrize(
-    ("chunk", "rows", "lanes", "match"),
+    ("chunk", "rows", "lanes", "groups", "match"),
     [
         # 48 is a multiple of 16 and so clears the atom's K extent; what it fails is
         # the source-token block, which is this kernel's own tiling and not the
         # atom's. It fails only where the budget halves that block, since the full
-        # block is the chunk itself. The public config admits only powers of two, so
-        # no reachable configuration hits this; the check is what keeps that true.
-        (48, 48, 32, "K slice"),
+        # block is the chunk itself, and since the arena is flat in ``3N`` the only
+        # axes that reach the halving are ``P`` and the fold. The public config
+        # admits only powers of two, so no reachable configuration hits this; the
+        # check is what keeps that true.
+        (48, 128, 16, 1, "K slice"),
         # ``P`` is the N mode of the two increment contractions here, unlike the
         # kernels where it is only a row count, so it carries the atom's constraint.
-        (64, 24, 16, "P must be"),
-        (64, 16, 8, "3N must be"),
+        (64, 24, 16, None, "P must be"),
+        (64, 16, 8, None, "3N must be"),
     ],
 )
 def test_rejects_an_extent_the_atom_cannot_cover(
-    chunk: int, rows: int, lanes: int, match: str
+    chunk: int, rows: int, lanes: int, groups: int | None, match: str
 ) -> None:
     """The fix for an illegal extent is the shape, never a padding path.
 
@@ -794,7 +831,7 @@ def test_rejects_an_extent_the_atom_cannot_cover(
     """
     seqlen = 128
     chunks = -(-seqlen // chunk)
-    inp = _make(2, 2, seqlen, rows, lanes, torch.bfloat16)
+    inp = _make(2, 2, seqlen, rows, lanes, torch.bfloat16, groups=groups)
     dy = _cotangent(inp, torch.bfloat16)
     state = torch.zeros(
         2, 2, chunks, rows, 3 * lanes, dtype=torch.float32, device="cuda"
