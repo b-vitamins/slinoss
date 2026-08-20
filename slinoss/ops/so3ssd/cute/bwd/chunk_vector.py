@@ -69,15 +69,17 @@ token rather than twenty-seven.
 
 ``dB``, ``dC`` and the carry are sums over the heads sharing a group, and the fold
 ``H // G`` is cut into :func:`vector_splits` shards, one block to a shard. The fold is
-one at ``standard`` and eighteen at the default configuration.
+one at ``standard`` and eighteen at the default configuration, and the depth is the
+fold: one head to a block.
 
-The depth of that cut is a parameter because its two costs run opposite each other.
-Every head a block walks past the first is a rolled iteration between an accumulator's
-allocation and its uses, which is what defeats register promotion; measured at
-``L 64 P 64 3N 240``, 51.2 MB of local traffic a head. Every shard past the first is a
-float32 partial of ``dB`` and of ``dC`` written once and read once, 31.4 MB a shard at
-the same shape. So the sum of the two has an interior minimum and neither extreme is
-it. :data:`VECTOR_SPLITS` is where it falls; the shard count is otherwise free.
+A head a block walks past the first is a rolled iteration between an accumulator's
+allocation and its uses, which is what defeats register promotion. What that costs
+does not follow the trip count, so the two costs of the sum do not trade: at
+``L 64 P 64 3N 240 G 1`` a call takes 10,615.9 us at depth one, rises to 12,260.9 at
+depth nine as the partials accumulate on top of a spill that has not moved, and falls
+to 8,101.9 at the full depth, where the loop's trip count is one and the spill is gone
+with it. The 1,135.3 MB of local traffic
+a launch and the 51.2 MB a head it divides into are a property of the loop existing.
 
 A shard owns a partial and not an output. At depth one the block writes the three
 outputs itself, after the last head, in shared memory throughout. Above one it writes
@@ -312,7 +314,6 @@ __all__ = [
     "LANE_GROUP",
     "RESIDENT_MAX",
     "ROW_WORDS",
-    "VECTOR_SPLITS",
     "Arena",
     "ChunkVectorBwd",
     "Slots",
@@ -382,13 +383,6 @@ RESIDENT_MAX: int = 2
 The budget lowers it to one at every standard size. Asking for two costs nothing
 where it cannot be had and takes it at the small shapes where the arena is half as
 wide."""
-
-VECTOR_SPLITS: int = 6
-"""Default partial depth of the head sum, capped by the fold and its divisors.
-
-Where the sum of the two traffic terms in this module's docstring is least at the
-default configuration, both terms taken from measurement and the sum from them.
-:func:`vector_splits` takes any divisor of the fold."""
 
 
 def lane_block(dim: int) -> int:
@@ -689,16 +683,25 @@ def vblock(chunk: int, rows: int, dim: int, fold: int, itemsize: int = 2) -> int
 def vector_splits(fold: int, splits: int | None = None) -> int:
     """Partial depth of the head sum: shards the fold ``H // G`` is cut into.
 
-    The head sum has two costs that run opposite each other. Every head a block
-    walks in a rolled loop costs local traffic, measured at 51.2 MB per head
-    iteration at ``L 64 P 64 3N 240``; every shard of the sum costs a float32
-    partial of ``dB`` and ``dC`` written once and read once, 31.4 MB a shard at that
-    shape. So neither extreme is the traffic optimum and the depth is a parameter.
+    The whole fold by default, one head to a block. The two costs of the sum look
+    like they trade -- a block that walks more heads spills, a sum cut into more
+    shards writes more partials -- but they do not, because the spill does not
+    follow the trip count. One rolled iteration is enough to sink the accumulators
+    to local memory, and every head then pays that traffic whatever the loop's
+    extent, so every depth between the two ends carries the full spill and its own
+    partials as well. Measured at ``B 4 H 18 T 2048 L 64 P 64 3N 240 G 1``, one call
+    each, event-timed, clocks unlocked:
+
+        depth      1       2       3       6       9      18
+        us   10,615.9 11,241.0 11,278.4 11,530.8 12,260.9 8,101.9
+        MB          0    31.7    47.6    95.1   142.7   285.3
+
+    So the depth is the fold unless a caller has a reason of its own, and the
+    workspace that costs is linear in it.
 
     Args:
         fold: ``H // G``, the heads sharing a group.
-        splits: The depth. ``None`` takes :data:`VECTOR_SPLITS` where it divides the
-            fold and the largest divisor below it otherwise.
+        splits: The depth. ``None`` takes the fold.
 
     Returns:
         The depth. One where the fold is one, and never above the fold.
@@ -709,10 +712,7 @@ def vector_splits(fold: int, splits: int | None = None) -> int:
             the reduction reading rows no producer wrote.
     """
     if splits is None:
-        for candidate in range(min(VECTOR_SPLITS, fold), 0, -1):
-            if fold % candidate == 0:
-                return candidate
-        return 1
+        return fold
     if splits < 1 or fold % splits:
         raise ValueError(f"splits must be a positive divisor of the fold {fold}")
     return splits
@@ -1477,10 +1477,14 @@ def chunk_vector_bwd_kernel(
     if cutlass.const_expr(fold > 1):
         _fill_zero(sumc, chunk * ldf, tid, threads)
 
-    # The heads of one shard, rolled. Unrolling it at trace time was measured at fold
-    # 18 and does not promote the accumulators: local traffic rose from 1,135.3 MB to
-    # 1,290.4 MB per launch, eighteen inlined bodies overlapping their live ranges. The
-    # depth is what cuts the spill, not the loop form.
+    # The heads of one shard, rolled. Unrolling it at trace time does not promote the
+    # accumulators: at fold 18 local traffic rose from 1,135.3 MB to 1,290.4 MB a
+    # launch, and a call went from 12,260.9 us to 13,596.7 at fold 2 and 11,530.8 to
+    # 12,297.2 at fold 3. The depth is what cuts the spill, not the loop form. At one
+    # head, which is the default depth, the unrolled form has no body to duplicate and
+    # drops the loop instead, worth 562 us a call; taking that would mean the body
+    # written twice, since the loop form cannot be selected at trace time from one
+    # statement, and the body is four hundred lines.
     for hstep in cutlass.range(fold, unroll=1):
         hidx = (gidx * splits + sidx) * fold + hstep
         cute.arch.sync_threads()

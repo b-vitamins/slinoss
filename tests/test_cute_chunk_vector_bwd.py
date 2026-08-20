@@ -41,7 +41,6 @@ from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_backward, chunked_forward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
-    VECTOR_SPLITS,
     ChunkVectorBwd,
     chunk_vector_backward,
     partial_bytes,
@@ -449,14 +448,13 @@ def test_the_partial_depth_takes_only_divisors_of_the_fold() -> None:
     """A depth that does not divide the fold is refused, not rounded.
 
     A ragged depth would leave one block walking fewer heads than the shard stride
-    covers and the closure summing rows no producer wrote. The default is the
-    deepest divisor at or below :data:`VECTOR_SPLITS`, so a fold that is prime above
-    it stays at one rather than paying a partial it cannot balance.
+    covers and the closure summing rows no producer wrote. The default is the fold
+    itself, which is the measured optimum and the only depth with no rolled head
+    loop at all.
     """
     assert vector_splits(1) == 1
-    assert vector_splits(18) == VECTOR_SPLITS
-    assert vector_splits(4) == 4
-    assert vector_splits(7) == 1
+    assert vector_splits(18) == 18
+    assert vector_splits(7) == 7
     assert vector_splits(18, 9) == 9
     for bad in (0, -1, 4, 12):
         with pytest.raises(ValueError, match="divisor of the fold"):
