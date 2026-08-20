@@ -491,17 +491,38 @@ The cut is along a mode the six contractions carry as N or M, never as K, so no
 partial sum crosses a tile. What crosses is the transition chart: ``dtrans`` and
 ``dK`` are sums over lanes, so a tile past the first accumulates into them."""
 
-LANE_GROUP: int = 16
+LANE_GROUP: int = 4
 """Threads that cooperate on one token in a rowwise epilogue.
 
-``N`` is a multiple of 16 at every legal ``3N``, so this divides the lane count
-whatever the shape, and a 16-lane butterfly stays inside a warp. One thread holds
-one 3-vector, which is what the rowwise transforms and the outer products need and
-what an accumulator fragment cannot give: the atom hands a thread two adjacent
-columns, and a 3-vector straddles that pair.
+One thread holds one 3-vector, which is what the rowwise transforms and the outer
+products need and what an accumulator fragment cannot give: the atom hands a thread
+two adjacent columns, and a 3-vector straddles that pair. The group must divide the
+lanes of a lane tile, 16 at every shape that tiles, and stay inside a warp.
+
+The group is priced by its butterfly. A rowwise epilogue reduces nine floats over
+the group, so a pass issues ``9 * log2(group)`` shuffles per tuple, and a run of
+``span`` tokens takes ``span * group / threads`` passes: the shuffle count grows as
+``group * log2(group)`` while the reduced work is flat, every thread holding
+``lanes * span / threads`` 3-vectors at any group. On GA10x a shuffle moves no bytes
+and still costs a full LSU warp instruction, the same issue slot a shared load takes,
+so the butterfly is priced like traffic it does not generate. Everything else a pass
+carries -- the two table reads, the lane-zero tail, its four ``dtap`` words -- falls
+with the pass count as well.
+
+Measured on an A6000 at the acceptance shape, per warp: a group of 16 issues 751.5
+shuffles and 1,802.9 LSU instructions, a group of 8 issues 301.5 and 1,202.9, and a
+group of 4 issues 121.5 and 941.9. That is 73.9%, 64.0% and 54.6% of the L1TEX issue
+port, and 29.4% off the kernel's cycles between 16 and 4. Registers hold at 242, 242
+and 241 with no local traffic, so the shorter butterfly costs no spill.
+
+Below 4 a pass covers more tokens than ``L 64`` has and threads idle, so 4 is the
+floor at 256 threads. It already idles three quarters of the block at ``L 16``, where
+one pass of 64 tokens covers four chunks; that shape pays four passes where a group
+of 16 paid one, and is not what the group is set for.
 
 Nine words do not fit one to a lane below a group of nine, so the scratch row is
-stored in ``ceil(ROW_WORDS / LANE_GROUP)`` rounds of ``LANE_GROUP`` words."""
+stored in ``ceil(ROW_WORDS / LANE_GROUP)`` rounds of ``LANE_GROUP`` words, against
+a pass count that falls by the same factor the group does."""
 
 ROW_WORDS: int = 9
 """Float32 scratch per token: the 3x3 rotation cotangent, summed over ``N``.
@@ -512,13 +533,32 @@ epilogue that reduces them, so only the rotation's own sum outlives a phase.
 The pitch is this count itself, so a token's nine words are consecutive. The
 rowwise epilogues accumulate them one word a lane, :data:`LANE_GROUP` words a round,
 so a warp's read-modify-write spans ``32 / LANE_GROUP`` tokens and
-``9 * 32 / LANE_GROUP`` consecutive words. At a group of 16 that is two tokens and 18
-words on 18 distinct banks, at every token. That is a property of the pitch rather
-than a counter reading, and it is why the count is not rounded up to a power of two.
-The post-loop reader takes a whole row per thread instead, where nine and 32 being
-coprime is what keeps 32 consecutive tokens on 32 distinct banks.
+``9 * 32 / LANE_GROUP`` consecutive words. The pitch separates the banks of one
+round only while that span stays under 32 words: at a group of 16 a warp is two
+tokens and 18 words on 18 distinct banks, and below that the span passes 32 and the
+pitch has to be checked round by round.
 
-Both hold at every ``L``: the chunk length sets how many lanes the
+At a group of eight a warp is four tokens and 36 words. The full round takes words
+0 to 7 of each, 32 addresses, and ``9 * 3 + 5 == 32``, so word ``k`` of the first
+token and word ``k + 5`` of the fourth share a bank: three pairs collide, ``k`` being
+0, 1 or 2, one pair on each of three banks. That round is two-way and takes two
+wavefronts; the second round is word 8 alone on four lanes and is conflict-free.
+The same check at a group of four gives eight tokens, 72 words, and ``9 * 7 + 1 ==
+64``: three pairs again in each of the two full rounds, two-way, with the third
+round eight lanes wide and clean.
+
+No pitch clears both accesses. The post-loop reader takes a whole row per thread,
+where nine and 32 being coprime is what keeps 32 consecutive tokens on 32 distinct
+banks; the only pitches that make a group of four one-way, 12 and 20, share a factor
+with 32 and put that reader at four-way for a third more scratch. The pitch stays
+nine and the two-way stands, which is the cheaper side. A two-way round costs one
+extra wavefront, and two-way rounds times passes times the three epilogue calls comes
+to six a warp on the store and six on the load at either group: 552,960 stores at the
+acceptance shape, against a measured 553,737 rise in store conflicts from a group of
+16 to a group of 8, where nothing else on that access changed. What bounds this kernel
+is LSU warp instructions, which a conflict does not add to and the round count does.
+
+Every round holds at every ``L``: the chunk length sets how many lanes the
 ``token < chunk`` guard leaves active, and masking lanes off removes accesses
 rather than colliding them."""
 
