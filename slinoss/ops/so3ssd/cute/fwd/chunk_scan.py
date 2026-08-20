@@ -96,6 +96,7 @@ from slinoss.ops.so3ssd.cute.guard import (
 )
 from slinoss.ops.so3ssd.cute.mma import (
     MMA_PAIR,
+    MMA_TILE_M,
     SMEM_SEGMENT,
     make_mma,
     mma_acc,
@@ -454,16 +455,31 @@ def chunk_scan_fwd_kernel(
     )
     vy = cute.zipped_divide(flat, (MMA_PAIR,))
     fy = cute.make_fragment((MMA_PAIR,), out)
-    for p in cutlass.range_constexpr(cute.size(acc) // MMA_PAIR):
-        i = p * MMA_PAIR
-        m, n = ycrd[i]
-        # Filled before the predicate: a value produced inside a dynamic branch is
-        # not readable after it. The fill is free on the rows the predicate drops.
-        # ``rows`` and ``n`` are both even, so the flat index of the pair is exact.
-        for j in cutlass.range_constexpr(MMA_PAIR):
-            fy[j] = narrow(acc[i + j], out)
-        if m < valid:
-            cute.autovec_copy(fy, vy[(None, ((t0 + m) * rows + n) // MMA_PAIR)])
+    # Row-band order rather than accumulator order. M is the accumulator's second
+    # mode, so its flat order alternates between bands :data:`MMA_TILE_M` apart and
+    # holds twice as many rows' sectors open at once; walking M outermost closes each
+    # band before opening the next. A store of a lane pair covers 4 of a sector's 32
+    # bytes, so a sector is finished by eight lanes across two column groups and is
+    # exposed to eviction until then. Measured on sm_86 at ``L`` 128 over two runs an
+    # arm, the same stores move 23.39 MB in this order against 23.65 MB flat, against
+    # 18.87 MB of payload, at an identical instruction count. At ``L`` at or below
+    # :data:`MMA_TILE_M` the M mode has one value and the order is the flat one.
+    band = 2 * MMA_PAIR
+    mits = mpad // MMA_TILE_M
+    nits = cute.size(acc) // (band * mits)
+    for m_it in cutlass.range_constexpr(mits):
+        for n_it in cutlass.range_constexpr(nits):
+            for q in cutlass.range_constexpr(band // MMA_PAIR):
+                i = q * MMA_PAIR + band * (m_it + mits * n_it)
+                m, n = ycrd[i]
+                # Filled before the predicate: a value produced inside a dynamic
+                # branch is not readable after it. The fill is free on the rows the
+                # predicate drops. ``rows`` and ``n`` are both even, so the flat index
+                # of the pair is exact.
+                for j in cutlass.range_constexpr(MMA_PAIR):
+                    fy[j] = narrow(acc[i + j], out)
+                if m < valid:
+                    cute.autovec_copy(fy, vy[(None, ((t0 + m) * rows + n) // MMA_PAIR)])
 
 
 @cute.jit
