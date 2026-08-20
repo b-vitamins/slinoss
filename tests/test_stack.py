@@ -49,7 +49,16 @@ scan runs a partial chunk. ``bias=True`` puts a bias on all five projections.
 """
 
 VOCAB = 17
-"""Embedding and head width. Prime, so no shape below it divides it."""
+"""Embedding width, and the logits the head carries meaning on.
+
+Prime, so no shape below it divides it, and in particular not
+:data:`slinoss.config.VOCAB_MULTIPLE`: the default configuration therefore widens
+the head, and every test in this file runs the padded path.
+"""
+
+PADDED_VOCAB = 24
+"""Head width at :data:`VOCAB` and the default pad multiple. Stated, not derived,
+so a change to either is a diff here."""
 
 BATCH = 2
 SEQLEN = 40
@@ -134,7 +143,18 @@ def _reference(stack: SLinOSSStack, x: Tensor) -> Tensor:
         out = linear(gated, module.ffn_out_weight.t(), module.ffn_out_bias)
         hidden = hidden + out
     normed = _norm(hidden, stack.norm_weight, eps)
-    return normed if stack.head is None else stack.head(normed)
+    if stack.head is None:
+        return normed
+    logits = stack.head(normed)
+    vocab = stack.config.vocab_size
+    assert vocab is not None
+    # The head is wider than the vocabulary, and its padding columns are not
+    # logits. Stated out of place, so the composition owes nothing to the order the
+    # stack writes the fill in.
+    fill = logits.new_full(
+        (*logits.shape[:-1], logits.shape[-1] - vocab), torch.finfo(logits.dtype).min
+    )
+    return torch.cat((logits[..., :vocab], fill), dim=-1)
 
 
 @pytest.mark.cuda
@@ -175,6 +195,68 @@ def test_the_stack_is_the_prenorm_residual_stack(
     ref_grads = torch.autograd.grad(ref, ref_leaves, dout)
     for label, got, want in zip(labels, fused_grads, ref_grads, strict=True):
         assert_max_rel(got, want, PARITY_TOL, f"stack grad {tag} {label}")
+
+
+@pytest.mark.cuda
+def test_a_padded_head_is_an_unpadded_head_over_the_logits(cuda: torch.device) -> None:
+    """A 24-column head against a 17-column one, one weight, float64.
+
+    Padding the head widens the GEMM that produces every logit and adds parameter
+    rows no output reaches. Three things can go wrong and none of them shows in a
+    shape, a finite loss, or an id in range: the widening reaching the logits, the
+    padding columns entering the loss, and a padding row taking gradient, which
+    trains rows the vocabulary does not describe and, through the input gradient,
+    every layer below.
+
+    Measured, both stacks float64 on one device: the logits over the first
+    ``vocab_size`` columns agree bitwise, the loss agrees bitwise, all 38 parameter
+    gradients agree bitwise, and the head's 7 padding rows come back exactly zero.
+    Max absolute and max relative difference 0.0 throughout. At bf16 and the
+    shipping geometry -- 8192 tokens, ``d_model`` 576, 50257 against 50264 -- the
+    logits are bitwise as well and the head weight gradient is bitwise; the input
+    gradient differs by 7.63e-06 absolute, which is the wider GEMM's own reduction
+    order and not the padding.
+    """
+    padded_cfg = replace(STACK_CONFIG, vocab_size=VOCAB)
+    tight_cfg = replace(padded_cfg, vocab_pad_multiple=1)
+    padded = SLinOSSStack(padded_cfg, device=cuda).to(torch.float64)
+    tight = SLinOSSStack(tight_cfg, device=cuda).to(torch.float64)
+    assert padded.head is not None and tight.head is not None
+    assert padded.head.weight.shape == (PADDED_VOCAB, STACK_CONFIG.d_model)
+    assert tight.head.weight.shape == (VOCAB, STACK_CONFIG.d_model)
+    assert padded.embedding is not None
+    assert padded.embedding.weight.shape[0] == VOCAB, "a gather needs no padding"
+
+    named = list(zip(padded.named_parameters(), tight.named_parameters(), strict=True))
+    with torch.no_grad():
+        for (
+            (name, wide),
+            (same, narrow),
+        ) in named:
+            assert name == same
+            narrow.copy_(wide[:VOCAB] if name.startswith("head.") else wide)
+
+    ids = _tokens(VOCAB, cuda)
+    labels = _tokens(VOCAB, cuda, seed=1)
+    wide_logits = padded(ids)
+    narrow_logits = tight(ids)
+    assert wide_logits.shape == (BATCH, SEQLEN, PADDED_VOCAB)
+    assert torch.equal(wide_logits[..., :VOCAB], narrow_logits)
+    floor = torch.finfo(torch.float64).min
+    assert bool((wide_logits[..., VOCAB:] == floor).all()), "a padding column is live"
+
+    wide_loss = cross_entropy(wide_logits.flatten(0, 1), labels.flatten())
+    narrow_loss = cross_entropy(narrow_logits.flatten(0, 1), labels.flatten())
+    assert torch.equal(wide_loss, narrow_loss)
+    wide_loss.backward()
+    narrow_loss.backward()
+    for (name, wide), (_, narrow) in named:
+        assert wide.grad is not None and narrow.grad is not None, name
+        if name.startswith("head."):
+            assert torch.equal(wide.grad[:VOCAB], narrow.grad), name
+            assert bool((wide.grad[VOCAB:] == 0).all()), f"{name} padding took grad"
+        else:
+            assert torch.equal(wide.grad, narrow.grad), name
 
 
 @pytest.mark.cuda
@@ -357,7 +439,7 @@ def test_a_step_advances_the_state_in_place_and_records_no_graph(
 
     logits = stack(_tokens(VOCAB, cuda)[:, :1], state)
 
-    assert logits.shape == (BATCH, 1, VOCAB)
+    assert logits.shape == (BATCH, 1, PADDED_VOCAB)
     assert logits.dtype is torch.bfloat16
     assert not logits.requires_grad
     for name, buf in buffers.items():

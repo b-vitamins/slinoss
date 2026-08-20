@@ -18,6 +18,13 @@ wide.
 returns logits; without it the stack takes and returns activations, and embeds
 into a larger model that owns those two layers.
 
+The head is :attr:`slinoss.SLinOSSConfig.padded_vocab_size` wide, not
+``vocab_size``: all three of its GEMMs read their operand alignment off that
+width, so an unaligned one costs every one of them its wide load and half its MMA
+K-extent. The columns past ``vocab_size`` carry ``finfo(dtype).min``, which is
+zero under every softmax and unreachable by every argmax. The embedding is a
+gather and is not padded.
+
 A :class:`slinoss.StackState` threads decode through the same loop: each block
 continues its own layer and advances it in place, so a prefill and a single-token
 step are one call at two sequence lengths.
@@ -50,11 +57,19 @@ class SLinOSSStack(nn.Module):
 
     Initialization is the framework default everywhere except the final norm
     weight, which is ones, and the blocks, which own their own. No depth scaling
-    and no weight tying: the head is its own parameter.
+    and no weight tying: the head is its own parameter, and the embedding stays
+    ``vocab_size`` rows while the head is
+    :attr:`slinoss.SLinOSSConfig.padded_vocab_size`.
+
+    The head's rows past ``vocab_size`` are left at the framework default. Their
+    value never reaches an output and their gradient is exactly zero, because
+    :meth:`forward` overwrites their columns with ``finfo(dtype).min``.
 
     Args:
-        config: Shape and parameterization contract. ``n_layers`` sets the depth
-            and ``vocab_size`` decides whether the embedding and the head exist.
+        config: Shape and parameterization contract. ``n_layers`` sets the depth,
+            ``vocab_size`` decides whether the embedding and the head exist, and
+            ``vocab_pad_multiple`` sets how much wider than ``vocab_size`` the head
+            is.
         device: Device for every parameter.
         dtype: Dtype for every parameter except the norm weights.
     """
@@ -80,15 +95,16 @@ class SLinOSSStack(nn.Module):
         self.norm_weight = nn.Parameter(
             torch.empty(config.d_model, device=device, dtype=torch.float32)
         )
+        padded_vocab = config.padded_vocab_size
         self.head: nn.Linear | None = (
             nn.Linear(
                 config.d_model,
-                config.vocab_size,
+                padded_vocab,
                 bias=config.bias,
                 device=device,
                 dtype=dtype,
             )
-            if config.vocab_size is not None
+            if padded_vocab is not None
             else None
         )
         self.reset_parameters()
@@ -140,9 +156,18 @@ class SLinOSSStack(nn.Module):
                 sequences.
 
         Returns:
-            ``(B,T,vocab_size)`` logits when ``vocab_size`` is set, otherwise
-            ``(B,T,d_model)`` normed activations. Both in the dtype the last GEMM
-            produces.
+            ``(B,T,padded_vocab_size)`` logits when ``vocab_size`` is set,
+            otherwise ``(B,T,d_model)`` normed activations. Both in the dtype the
+            last GEMM produces.
+
+            The first ``vocab_size`` columns are the logits and are bit-identical
+            to an unpadded head's over the same weight rows. The rest hold
+            ``finfo(dtype).min``, and hold it as a constant: exactly zero under a
+            softmax at every supported dtype, below every reachable logit so no
+            argmax and no sample can land on one, and gradient-transparent, so a
+            cotangent placed on one reaches neither head gradient and the head's
+            rows past ``vocab_size`` come back with exactly zero. They are not
+            outputs and carry no meaning.
 
         Raises:
             ValueError: On a rank the configured input form does not admit, on a
@@ -186,4 +211,16 @@ class SLinOSSStack(nn.Module):
             ).normed
             if self.head is None:
                 return normed
-            return cast("Tensor", self.head(normed))
+            logits = cast("Tensor", self.head(normed))
+            vocab = self.config.vocab_size
+            if vocab is not None and logits.shape[-1] != vocab:
+                # Recorded, not under no_grad. The padding columns are constants,
+                # so autograd must drop whatever cotangent a consumer puts on them;
+                # skipping the record instead reports the unmasked linear's
+                # Jacobian, which sends a padding cotangent into both head
+                # gradients. Priced: the record makes autograd clone the logit block
+                # to zero a slice of it, 2448 us against 11288 us of GEMM saved at
+                # the reference geometry, and that clone is what a cheaper masking
+                # would have to remove.
+                logits[..., vocab:] = torch.finfo(logits.dtype).min
+            return logits
