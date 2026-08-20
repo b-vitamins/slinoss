@@ -123,6 +123,10 @@ class OpShape:
         rows: Rows per head, ``P``. Multiple of 16.
         lanes: Independent 3-vectors, ``N``. Multiple of 16.
         chunk: Chunk length ``L``.
+        groups: ``G``, groups sharing one ``B``/``C`` pair. Divides ``heads``.
+            ``G == heads`` is the ungrouped case, where every head carries its own
+            pair. :func:`make_inputs` allocates ``B`` and ``C`` at this width, so
+            the group count is the shape's and not a driver's argument.
     """
 
     name: str
@@ -132,6 +136,7 @@ class OpShape:
     rows: int
     lanes: int
     chunk: int
+    groups: int = 1
 
     @property
     def d_state(self) -> int:
@@ -147,21 +152,37 @@ class OpShape:
         """One line for a report note."""
         return (
             f"{self.name}: B={self.bsz} H={self.heads} T={self.seq} "
-            f"P={self.rows} N={self.lanes} 3N={self.d_state} L={self.chunk}"
+            f"P={self.rows} N={self.lanes} 3N={self.d_state} L={self.chunk} "
+            f"G={self.groups}"
         )
 
 
 SHAPES: Final[tuple[OpShape, ...]] = (
-    OpShape("tiny", bsz=1, heads=1, seq=256, rows=16, lanes=16, chunk=64),
-    OpShape("standard", bsz=4, heads=12, seq=2048, rows=48, lanes=16, chunk=64),
-    OpShape("wide", bsz=4, heads=12, seq=2048, rows=64, lanes=32, chunk=64),
-    OpShape("long", bsz=2, heads=12, seq=8192, rows=48, lanes=16, chunk=128),
-    OpShape("ragged", bsz=4, heads=12, seq=2004, rows=48, lanes=16, chunk=64),
+    OpShape("tiny", bsz=1, heads=1, seq=256, rows=16, lanes=16, chunk=64, groups=1),
+    OpShape(
+        "standard", bsz=4, heads=12, seq=2048, rows=48, lanes=16, chunk=64, groups=12
+    ),
+    OpShape("wide", bsz=4, heads=12, seq=2048, rows=64, lanes=32, chunk=64, groups=12),
+    OpShape("long", bsz=2, heads=12, seq=8192, rows=48, lanes=16, chunk=128, groups=12),
+    OpShape(
+        "ragged", bsz=4, heads=12, seq=2004, rows=48, lanes=16, chunk=64, groups=12
+    ),
+    OpShape(
+        "acceptance", bsz=4, heads=18, seq=2048, rows=64, lanes=80, chunk=64, groups=1
+    ),
 )
 """The standard sizes. Every optimization is measured at all of them, before and
 after, with the same commands. ``ragged`` has a sequence length that is not a
 multiple of the chunk, so a tail-handling regression shows up in the bench and
-not only in the tests."""
+not only in the tests.
+
+The first five carry ``G == H``, the ungrouped case, which is the width they have
+always been allocated at. ``acceptance`` is the geometry the whole-step attribution
+defaults to -- ``d_model 576``, ``expand 2``, so ``H*P`` is 1,152 -- and it takes
+``G = 1``, which is the configuration default and the one that shares ``B`` and
+``C`` across all eighteen heads. It is the only name whose fold ``H // G`` is above
+one, so it is the only one that reaches the cross-head reduction in
+:mod:`slinoss.ops.so3ssd.cute.bwd.chunk_vector`."""
 
 
 def shape_by_name(name: str) -> OpShape:
@@ -189,8 +210,8 @@ class OpInputs(NamedTuple):
         U: ``(B,H,T,P)``, low precision.
         trans: ``(B,H,T,4)``, float32, packing ``(w_x, w_y, w_z, ls)``.
         K: ``(B,H,T,2,4)``, float32, packing ``(kr, g, h, 0)`` per tap.
-        B: ``(B,H,T,3N)``, low precision.
-        C: ``(B,H,T,3N)``, low precision.
+        B: ``(B,G,T,3N)``, low precision.
+        C: ``(B,G,T,3N)``, low precision.
         dy: ``(B,H,T,P)`` output-gradient seed, preallocated so the backward
             measurement contains no allocation of its own.
     """
@@ -248,12 +269,13 @@ def make_inputs(
         )
     trans = params.trans.detach().requires_grad_(requires_grad)
     K = params.K.detach().requires_grad_(requires_grad)
+    band = (shape.bsz, shape.groups, shape.seq)
     return OpInputs(
         U=randn(*lead, shape.rows).requires_grad_(requires_grad),
         trans=trans,
         K=K,
-        B=randn(*lead, shape.d_state).requires_grad_(requires_grad),
-        C=randn(*lead, shape.d_state).requires_grad_(requires_grad),
+        B=randn(*band, shape.d_state).requires_grad_(requires_grad),
+        C=randn(*band, shape.d_state).requires_grad_(requires_grad),
         dy=randn(*lead, shape.rows),
     )
 
@@ -378,6 +400,7 @@ CONV_SHAPES: Final[tuple[ConvShape, ...]] = (
     ConvShape("wide", bsz=4, seq=2048, channels=768, width=8),
     ConvShape("long", bsz=2, seq=8192, channels=576, width=4),
     ConvShape("ragged", bsz=4, seq=2004, channels=576, width=4),
+    ConvShape("acceptance", bsz=4, seq=2048, channels=1152, width=4),
 )
 """The standard conv sizes. One name per entry of :data:`SHAPES`, and the same
 names, so one ``--shape`` table serves both operators: ``D`` is that shape's

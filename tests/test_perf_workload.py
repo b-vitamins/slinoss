@@ -93,7 +93,7 @@ SMALL_MIXER = MixerShape(SMALL_PREP)
 def test_op_shape_derives_the_state_width_and_the_token_count() -> None:
     assert SMALL.d_state == 48
     assert SMALL.token_count == 8
-    assert SMALL.describe() == "small: B=1 H=1 T=8 P=16 N=16 3N=48 L=4"
+    assert SMALL.describe() == "small: B=1 H=1 T=8 P=16 N=16 3N=48 L=4 G=1"
 
 
 def test_standard_shapes_satisfy_the_operator_constraints() -> None:
@@ -106,6 +106,9 @@ def test_standard_shapes_satisfy_the_operator_constraints() -> None:
         assert shape.d_state % 48 == 0
         assert shape.chunk > 0
         assert shape.seq > 0
+        # G divides H, so head h reads group h // (H // G) and no head straddles
+        # two groups.
+        assert shape.heads % shape.groups == 0
     names = [s.name for s in SHAPES]
     assert len(set(names)) == len(names)
     assert shape_by_name("tiny").name == "tiny"
@@ -116,6 +119,23 @@ def test_standard_shapes_satisfy_the_operator_constraints() -> None:
     assert all(s.seq % s.chunk == 0 for s in SHAPES if s.name != "ragged")
     with pytest.raises(KeyError, match="no shape 'huge'"):
         shape_by_name("huge")
+
+
+def test_the_acceptance_shape_is_the_layer_the_whole_step_is_attributed_at() -> None:
+    # The attribution driver's defaults and this shape are one geometry stated
+    # twice; a drift between them would report a sweep at widths the headline
+    # figures were never taken at.
+    shape = shape_by_name("acceptance")
+    config = layer_config(shape)
+    assert (config.d_model, config.d_state, config.d_head) == (576, 240, 64)
+    assert (config.n_heads, config.n_groups, config.chunk_size) == (18, 1, 64)
+    assert shape.heads // shape.groups == 18
+    # G reaches the allocation, so B and C are one shared band and not one per
+    # head. Every other name carries G == H and is unchanged by that.
+    got = make_inputs(shape, CPU, dtype=torch.bfloat16, requires_grad=False)
+    assert tuple(got.B.shape) == (4, 1, 2048, 240)
+    assert tuple(got.U.shape) == (4, 18, 2048, 64)
+    assert all(s.groups == s.heads for s in SHAPES if s.name != "acceptance")
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +149,9 @@ def test_make_inputs_matches_the_tensor_contract() -> None:
     assert tuple(got.U.shape) == (*lead, SMALL.rows)
     assert tuple(got.trans.shape) == (*lead, 4)
     assert tuple(got.K.shape) == (*lead, 2, 4)
-    assert tuple(got.B.shape) == (*lead, SMALL.d_state)
-    assert tuple(got.C.shape) == (*lead, SMALL.d_state)
+    band = (SMALL.bsz, SMALL.groups, SMALL.seq)
+    assert tuple(got.B.shape) == (*band, SMALL.d_state)
+    assert tuple(got.C.shape) == (*band, SMALL.d_state)
     assert tuple(got.dy.shape) == (*lead, SMALL.rows)
     for t in got:
         assert t.is_contiguous()
