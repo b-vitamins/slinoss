@@ -681,7 +681,14 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
       // of kMaxWidth, so a full tile unrolls by kWidth with no remainder and the
       // shifts become register renames: 2*(kWidth-1) moves a step leave the loop,
       // which is 14 of 114 executed instructions per step at kWidth = 8.
-#pragma unroll kWidth
+      //
+      // Only the staged path can pay for that unroll. The scalar path carries the
+      // two global address chains the strip replaces, and unrolled by 8 at
+      // kWidth = 8 it passed the launch bound's register cap and spilled: 98,304
+      // local load sectors and 24,576 store, which fails the class whatever the
+      // percentage. It keeps its shifts.
+      constexpr int kWalkUnroll = kStage ? kWidth : 1;
+#pragma unroll kWalkUnroll
       for (int t = t0; t < t1; ++t) {
         float xc;
         float dyc;
@@ -757,8 +764,9 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
       // dx at index u needs ds at u .. u+kWidth-1, so the walk runs kWidth-1
       // steps past the tile and recomputes those ds. Their tap gradient belongs
       // to the next tile and is not accumulated here. The trip count is
-      // compile-time, so the shifts here are renames too.
-#pragma unroll
+      // compile-time, so on the staged path the shifts here are renames too; the
+      // scalar path holds this loop rolled for the register reason above.
+#pragma unroll kWalkUnroll
       for (int k = 0; k < kWidth - 1; ++k) {
         const int t = t1 + k;
         float xc;
