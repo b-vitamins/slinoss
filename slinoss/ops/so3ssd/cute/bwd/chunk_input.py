@@ -87,27 +87,29 @@ cost.
 The class is met at ``3N = 240 H = 18`` and at ``wide``, and not at the other three
 shapes. Measured on an RTX A6000, sm_86, clocks not locked, 2026-08-20, one launch per
 profile, against a copy time law fitted in the same process at the same clocks: fixed
-cost 4.19 to 5.21 us, asymptote 683.5 to 686.2 GB/s, worst residual 2.37%. Durations
-are ``gpu__time_duration.sum``, and the device probe names the part by UUID. Every run
-opened with the device holding only the 28 MiB daemon and closed with a foreign process
-resident, and ``wide`` carried one in both brackets, so every duration below is stamped
-rather than quoted; the counters are per launch.
+cost 4.25 to 4.94 us, asymptote 683.3 to 685.5 GB/s, worst residual 1.45%. Durations
+are ``gpu__time_duration.sum``, and the device probe names the part by UUID. Every
+profile in the table below ran with foreign processes resident on the device in both
+brackets, so every duration is stamped rather than quoted. The per-launch counters are
+what the verdicts rest on: they are deterministic in the launch, and the sector counts
+repeat exactly across profiles where the wall does not.
 
     shape         blocks  us/launch      MB  GB/s  class  dominant stall
-    standard        1536      244.5  111.42   456  68.4%  long_sb    27.4%
-    ragged          1536      239.2  110.15   461  69.1%  long_sb    26.5%
-    wide            1536      505.6  296.01   586  86.4%  long_sb    48.9%
-    long            1536     1891.7  249.70   132  19.5%  no_instr   54.5%
-    3N=240 H=18     2304     1058.4  631.20   596  87.7%  long_sb    29.2%
+    standard        1536      235.7  108.02   458  68.9%  long_sb    25.0%
+    ragged          1536      231.8  106.65   460  69.1%  long_sb    24.2%
+    wide            1536      524.4  307.85   587  86.7%  long_sb    47.7%
+    long            1536     1762.3  183.56   104  15.5%  no_instr   52.8%
+    3N=240 H=18     2304      964.4  574.89   596  87.4%  long_sb    29.2%
 
-``class`` is the fitted floor over the duration, against a bar of 85%. The last row is
-the acceptance shape, ``B=4 H=18 T=2048 P=64 3N=240 L=64`` at one group: 87.7% of the
-floor, ``dram__throughput`` 81.8%, 24.31% issue, 255 registers, 48,752 B of shared
-memory, 16.7% theoretical occupancy against 16.4% achieved, 0.1241 shared bank
-conflicts per wavefront. Four profiles of it agree to 0.3%, 1057.6 to 1060.7 us at
-631.20 to 631.85 MB, with identical spill sectors across all four.
+``class`` is the fitted floor over the duration, against a bar of 85%. It falls when a
+change removes bytes, because the floor falls with them; the duration is the figure to
+read across the rows. The last row is the acceptance shape,
+``B=4 H=18 T=2048 P=64 3N=240 L=64`` at one group: 87.4% of the floor,
+``dram__throughput`` 81.6%, 25.68% issue, 255 registers, 48,752 B of shared memory,
+16.7% theoretical occupancy against 16.4% achieved, 0.1231 shared bank conflicts per
+wavefront, and SOL 52.5% sm against 83.0% memory.
 
-Four changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
+Five changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
 with the device to itself in both brackets. Traffic after each, at that shape:
 
 - The two forcing-cotangent GEMMs accumulate into the output fragment. The increment
@@ -131,30 +133,31 @@ with the device to itself in both brackets. Traffic after each, at that shape:
   issue rate. A rolled loop that stages and transforms what it loads is what
   ``docs/kernels.md`` warns against, so that rule holds only while the unrolled body
   still fits the instruction cache.
+- The increment staging pass indexes its row affinely in the step rather than through a
+  division of the flat index. 631.20 MB to 574.89 MB, and 1058.4 us to 964.4 us. It is
+  the only one of the five that shortened ``long`` as well, 1891.7 us to 1762.3 us,
+  and the only one that cost a shape: ``wide`` went 505.6 us to 524.4 us on a different
+  specialization, ``G != H``, whose spill loads rose 2,064,384 to 2,752,512 while every
+  other shape's fell.
 
 Registers sit at the 255 architectural cap at every shape and the kernel spills at
-every shape: 786,432 sectors per launch each way at ``standard`` and ``ragged``,
-2,064,384 and 884,736 at ``wide``, 3,956,736 and 3,981,312 at ``long``, 6,156,288 and
-1,474,560 at ``3N = 240 H = 18``. L1 absorbs 2.1% of the spill loads and none of the
-stores at the acceptance shape, so the spill is device traffic: 244.19 MB of the
-631.20 MB moved there. The carveout is why. Two resident blocks of 48,752 B leave
+every shape: 761,856 sectors per launch each way at ``standard`` and ``ragged``,
+2,752,512 and 958,464 at ``wide``, 1,966,080 each way at ``long``, 2,985,984 and
+995,328 at ``3N = 240 H = 18``. L1 absorbs 3.4% of the spill loads and none of the
+stores at the acceptance shape, so the spill is device traffic: 127.40 MB of the
+574.89 MB moved there. The carveout is why. Two resident blocks of 48,752 B leave
 under 30 KB of the 128 KB unified cache for data, against their own streaming global
 staging, so a local line does not survive to its reload.
 
-What the spill holds is loop-invariant, not the accumulators. Local sectors per launch
-against the lane-tile count, at ``P = 64 L = 64 H = 18`` and one group, 2304 blocks and
-48,752 B at all three, so only ``3N`` varies:
-
-    3N  tiles         ld         st    us
-    48      1    995,328    995,328   367
-    96      2  1,880,064  1,290,240   582
-    240     5  6,156,288  1,474,560  1067
-
-Stores are nearly flat in the trip count and loads grow by about a million sectors per
-trip: 27 to 40 words per thread, stored once and reloaded once per lane block. Rolling
-cut both against the unrolled form, which spilled 1,990,656 each way at one tile and
-19,574,784 and 13,529,088 at five, and it did not remove the reload. Without it the
-payload is 387 MB, which the fitted law puts near 570 us.
+What the spill holds is loop-invariant address arithmetic, not the accumulators. Read
+off the SASS at the acceptance shape, the frame is 160 B and both rolled lane loops
+carry no store at all: every ``STL`` is in the prologue or between the taps, and the
+``LDL`` cluster sits at the top of each loop body. At 36,864 sectors per launch per
+word per thread that made 167 words loaded and 40 stored, of which 14 were reloaded on
+each of the ten trips: the eight per-step element offsets of the increment staging pass
+and three 64-bit base pointers. Eliminating the eight leaves 81 loaded and 27 stored,
+about five words per trip. The three pointers survive slicing the two float32 tensors
+to the chunk's plane, so what remains is not addressed by removing coordinates.
 
 Neither bound is occupancy or block width. Occupancy is 16.7% theoretical against 16.3
 to 16.5% achieved at ``L = 64``, with ``launch__occupancy_limit_registers`` and
@@ -167,12 +170,12 @@ accumulator holds ``M*N/threads`` elements whatever
 chunk to 128 rows.
 
 ``long`` is the one shape whose bound is still instruction fetch: ``no_instruction``
-54.5% at a 7.81% issue rate and 18.1% of ``dram__throughput``, with one lane tile and
+52.8% at an 8.08% issue rate and 14.3% of ``dram__throughput``, with one lane tile and
 four target-token slices unrolled over a 128-row M tile. The lane loop's remedy applies
 to the slice loop unchanged, and is not taken here because the score bank is a list of
 fragments a trace-time index addresses, which a dynamic trip count cannot. ``standard``
-and ``ragged`` are latency-bound instead, ``long_scoreboard`` 27.4% and 26.5% at issue
-rates of 28.2% and 28.9%, with one lane tile and 50.34 MB of their 111.42 MB in the
+and ``ragged`` are latency-bound instead, ``long_scoreboard`` 25.0% and 24.2% at issue
+rates of 29.1% and 29.8%, with one lane tile and 48.76 MB of their 108.02 MB in the
 spill.
 """
 
@@ -894,6 +897,15 @@ def chunk_input_bwd_kernel(
         for s in range(slices)
     ]
 
+    # The chunk's plane of both float32 increment tensors, sliced once, as every other
+    # stager here takes its argument. The five-dimensional form measured three 64-bit
+    # local slots reloaded at the top of every lane-block trip, but slicing removed
+    # neither: the counters were sector-identical, 6,156,288 loads either way at
+    # ``3N = 240 H = 18``. The leading coordinates were already folded. Kept for the one
+    # address expression, not for a saving.
+    pdinc = gdinc[bidx, hidx, cidx, None, None]
+    pz = gz[bidx, hidx, cidx, None, None]
+
     # The two taps differ by the table slot, by which token the forcing vector comes
     # from, and by which row of the shifted tile pairs with an output row. The tap loop
     # is outside the lane loop because the score's K mode is the lane extent: one score
@@ -969,20 +981,34 @@ def chunk_input_bwd_kernel(
                 total = rows * lanes
                 steps = -(-total // threads)
                 exact = total % threads == 0
+                # A block is a whole number of lanes wide, so a step advances the flat
+                # index by a whole number of rows: the lane a thread reads is the same
+                # at every step and the row moves by a trace-time constant. Derived
+                # from the flat index instead, each step carries its own element offset
+                # and the eight of them are loop-invariant, outlive the whole lane loop
+                # and are spilled: measured eight local words reloaded at the top of
+                # every trip. Affine, they share one base and one row stride.
+                affine = exact and threads % lanes == 0
+                prow = tid // lanes
+                pcol = tid - prow * lanes
                 for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
                     count = min(PREFETCH, steps - group * PREFETCH)
                     held = []
                     for step in cutlass.range_constexpr(count):
-                        i = tid + (group * PREFETCH + step) * threads
-                        if cutlass.const_expr(not exact):
-                            i = cutlass.min(i, total - 1)
-                        p = i // lanes
-                        n = i - p * lanes
+                        if cutlass.const_expr(affine):
+                            p = prow + (group * PREFETCH + step) * (threads // lanes)
+                            n = pcol
+                        else:
+                            i = tid + (group * PREFETCH + step) * threads
+                            if cutlass.const_expr(not exact):
+                                i = cutlass.min(i, total - 1)
+                            p = i // lanes
+                            n = i - p * lanes
                         d0 = l0 + 3 * n
                         got = (
-                            gdinc[bidx, hidx, cidx, p, d0],
-                            gdinc[bidx, hidx, cidx, p, d0 + 1],
-                            gdinc[bidx, hidx, cidx, p, d0 + 2],
+                            pdinc[p, d0],
+                            pdinc[p, d0 + 1],
+                            pdinc[p, d0 + 2],
                         )
                         if cutlass.const_expr(tap == 0):
                             held.append(
@@ -990,11 +1016,7 @@ def chunk_input_bwd_kernel(
                                     p,
                                     n,
                                     got,
-                                    (
-                                        gz[bidx, hidx, cidx, p, d0],
-                                        gz[bidx, hidx, cidx, p, d0 + 1],
-                                        gz[bidx, hidx, cidx, p, d0 + 2],
-                                    ),
+                                    (pz[p, d0], pz[p, d0 + 1], pz[p, d0 + 2]),
                                 )
                             )
                         else:

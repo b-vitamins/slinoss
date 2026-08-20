@@ -316,7 +316,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             passes.append(one)
     after = compute_apps_query(smi_selector(ordinal))
 
-    print(f"shape        {shape.describe()} G={groups}")
+    # ``describe`` already carries the shape's own ``G``, which is ``H`` here and is not
+    # what ran. Spelled out so the two cannot be read as one field twice.
+    print(f"shape        {shape.describe()} driven at groups={groups}")
     print(f"dtype        {args.dtype}")
     print(f"clocks       {timed.clocks}")
     print(f"smi before   {before}")
