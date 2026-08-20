@@ -29,8 +29,10 @@ slots holding one row or none, and the block still pays the barrier and a combin
 over 32 mostly-zero partials. There the tile is the whole block, one column per
 thread, no shared memory and no barrier, and the parallelism comes from ``W`` and
 ``S``, which a shallow buffer has enough of. A slot count of 32 against ``R = 5``
-cost 347 us a call in the chunk-vector backward, 64% of it stalled on that
-barrier.
+cost 347 us a call in the chunk-vector backward over two launches, 64% of it
+stalled on that barrier, at 20.1% and 23.9% of its own floor. The same two
+launches at the tile the extent picks are 43.8 and 23.3 us, 106.4% and 110.7% of
+floor, barrier zero, over 4,608 and 2,304 blocks rather than 147,456 and 73,728.
 
 The reduction order is fixed by the launch geometry: ascending row within a slot,
 then ascending slot. There are no atomics, so one shape reproduces bit for bit.
