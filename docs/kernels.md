@@ -25,6 +25,17 @@ a transposed score tile is not.
   operand is a broadcast shared-memory read, bank-conflict-free by
   construction. The rotation and the tap are never applied as separate per-lane
   passes.
+- That rule is under review on the backward, and the measurement is against it. A
+  broadcast read is conflict-free and still costs a full LSU instruction, so the
+  matvec form buys freedom from conflicts with instruction count. On sm_86
+  `chunk_vector_bwd` issues 166 M memory-pipe instructions, 73.0% of its
+  duration, at 9.4% of the tensor pipe and 23-24% of DRAM speed of light. Low
+  tensor utilization with an issue-bound memory port is the signature of scalar
+  rowwise work around the GEMMs, and this form is what produces it. The open
+  question is whether the 3x3 apply belongs on the tensor pipe instead, priced in
+  instructions per token rather than in FMAs; the two largest instruction
+  deletions still available do not close the kernel's gap on their own. Nothing
+  has measured the alternative, so the rule stands and the doubt is stated.
 - Chunk-local prefixes are recomputed inside every kernel that needs them,
   forward and backward. They never cross a kernel boundary and never touch
   global memory. They are shared across all `N` lanes and all `P` rows, so one
