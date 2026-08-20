@@ -24,6 +24,7 @@ from collections.abc import Callable
 from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
+from slinoss.ops.so3ssd.cute.fwd import chunk_increment
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import (
     KBLOCK_MAX,
     TARGET_BLOCKS,
@@ -31,6 +32,7 @@ from slinoss.ops.so3ssd.cute.fwd.chunk_increment import (
     increment_smem_bytes,
     kblock,
 )
+from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K
 from tests.conftest import (
     ScanInputs,
     assert_max_rel,
@@ -188,30 +190,54 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     Residency is what keeps the DRAM pipe fed, and shared memory is what bounds it:
     measured on sm_86, one resident block per SM less costs the increment 5 us of 62
     at the standard shape. So the budget is held to :data:`TARGET_BLOCKS`, not to
-    the capacity, at every shape and not only at the widest.
+    the capacity, at every legal chunk length and not only at the widest.
     """
-    for chunk in (KBLOCK_MAX, MAX_CHUNK):
+    for chunk in (MMA_TILE_K, 64, MAX_CHUNK):
         for rows, dim in ((16, 48), (48, 48), (64, 96)):
             nbytes = increment_smem_bytes(chunk, rows, dim)
             assert TARGET_BLOCKS * nbytes <= smem_capacity(), (chunk, rows, dim)
     assert increment_smem_bytes(64, 16, 48) < increment_smem_bytes(MAX_CHUNK, 64, 96)
 
 
-def test_slice_narrows_only_when_the_widest_one_would_cost_a_block() -> None:
+def test_slice_is_the_atom_k_extent_at_every_legal_shape() -> None:
+    """The ceiling sits on the atom's K extent, so the search cannot narrow.
+
+    The narrowest legal slice is the fastest at every bench shape, which leaves the
+    search no candidate below its ceiling. Two things then need holding that the
+    budget no longer holds: that the width divides every legal chunk, so the slice
+    loop has no tail, and that the residency bound is met without the search having
+    to enforce it.
+    """
+    assert KBLOCK_MAX == MMA_TILE_K
+    budget = smem_capacity() // TARGET_BLOCKS
+    for chunk in (MMA_TILE_K, 64, MAX_CHUNK):
+        for rows, dim in ((16, 48), (48, 48), (64, 96)):
+            kblk = kblock(chunk, rows, dim)
+            assert kblk == MMA_TILE_K, (chunk, rows, dim)
+            assert chunk % kblk == 0
+            assert increment_smem_bytes(chunk, rows, dim) <= budget, (chunk, rows, dim)
+
+
+def test_slice_narrows_only_when_the_widest_one_would_cost_a_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``kblock`` trades slice width for residency, and only when it has to.
 
-    Both directions matter. A search that always returned :data:`KBLOCK_MAX` would
-    pass every budget assertion above at the shapes where it happens to fit, and one
-    that always narrowed would pay the extra staging pass for nothing.
+    Both directions matter, and neither is reachable at the running ceiling, so the
+    ceiling is raised one step to reach them. A search that always returned its
+    ceiling would pass every budget assertion above at the shapes where it happens
+    to fit, and one that always narrowed would pay the extra staging pass for
+    nothing. This is what makes the ceiling safe to widen again.
     """
+    monkeypatch.setattr(chunk_increment, "KBLOCK_MAX", 2 * MMA_TILE_K)
     budget = smem_capacity() // TARGET_BLOCKS
-    wide = increment_smem_bytes(MAX_CHUNK, 64, 96, kblk=min(MAX_CHUNK, KBLOCK_MAX))
+    wide = increment_smem_bytes(MAX_CHUNK, 64, 96, kblk=2 * MMA_TILE_K)
     assert wide > budget
-    assert kblock(MAX_CHUNK, 64, 96) < KBLOCK_MAX
+    assert kblock(MAX_CHUNK, 64, 96) == MMA_TILE_K
 
-    narrow_shape = increment_smem_bytes(64, 16, 48, kblk=KBLOCK_MAX)
+    narrow_shape = increment_smem_bytes(64, 16, 48, kblk=2 * MMA_TILE_K)
     assert narrow_shape <= budget
-    assert kblock(64, 16, 48) == KBLOCK_MAX
+    assert kblock(64, 16, 48) == 2 * MMA_TILE_K
 
 
 def test_reads_a_band_of_the_fused_projection() -> None:

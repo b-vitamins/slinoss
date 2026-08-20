@@ -45,12 +45,16 @@ second tap would add its whole extent to a forward pass that moves about 131 MB.
 the two taps, so the rotated forcing never reaches global memory.
 
 DRAM-bound. Analytic traffic at ``standard`` is 37.7 MB against 906 MFLOP, so 24
-flop/byte against a ridge point of 165: memory bound by a factor of seven, which
+flop/byte against a ridge point of 164.4: memory bound by a factor of seven, which
 is what makes the padded M mode affordable; it adds arithmetic and no traffic, and
 was not timed against a variant without it. Measured DRAM traffic on sm_86
-is 37.4 MB per launch, so there is no redundant traffic to remove and the achieved
+is 37.9 MB per launch, so there is no redundant traffic to remove and the achieved
 fraction is set by how much of the pipe the resident blocks keep busy, which is
-what :func:`kblock` sizes the slice for.
+what :data:`KBLOCK_MAX` is chosen for. At the slice the ceiling now fixes, the
+kernel reaches 86.9% to 90.8% of peak DRAM throughput and 96.6% to 102.8% of the
+gate's DRAM time floor across the four bench shapes whose traffic exceeds L2. Above
+100% is L2 absorbing traffic the fitted law charges to DRAM, not a kernel faster
+than the bus.
 
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so both tap matrices are zero past ``valid`` and every
@@ -131,24 +135,79 @@ __all__ = [
     "kblock",
 ]
 
-KBLOCK_MAX: int = 32
+KBLOCK_MAX: int = MMA_TILE_K
 """Longest K slice, whatever the budget allows.
 
-At 32 the ``standard`` shape allocates 17,552 B and sm_86 holds four blocks where
-64 held three: 33.33% theoretical occupancy against 25.00%, and 62.6 us per launch
-against 67.2, which is what carries the kernel past the 85% DRAM-bound gate there.
-Past 32 the wider slice buys nothing back: the staging pass it saves is shared
-loads, and the residency it costs is the whole gain above.
+The narrowest legal slice is the fastest one at every bench shape, so the ceiling
+sits on the atom's K extent and a slice never spans more than one MMA step.
+Measured per launch, isolated, with the budget lifted so each row is its slice
+alone. Under :data:`TARGET_BLOCKS` slice 64 is unreachable at every shape and slice
+32 at ``long``, so those rows are the candidates the ceiling rules out, not
+configurations the search could return:
 
-Every legal chunk length is a power of two, so this divides it exactly: one slice
-at 16 and 32, two at 64, four at 128."""
+============  =====  =======  ======  ====  =====  =====  =====  ========
+shape         slice  us       smem    regs  thocc  occ    dram%  smem ldc
+============  =====  =======  ======  ====  =====  =====  =====  ========
+``standard``     64   60.544  25,744    72  25.00  23.74  85.35    29,222
+``standard``     32   59.472  17,552   142  25.00  23.76  85.85         0
+``standard``     16   58.064  13,456   108  33.33  30.95  88.53         0
+``wide``         64  123.792  31,888   120  25.00  23.97  87.90    86,369
+``wide``         32  125.328  20,624    96  33.33  31.31  83.17    52,354
+``wide``         16  111.920  14,992   128  33.33  31.29  90.64         0
+``long``         32   97.296  26,768   146  25.00  24.04  87.29    25,454
+``long``         16   97.616  22,672    86  33.33  31.21  87.09    30,459
+============  =====  =======  ======  ====  =====  =====  =====  ========
+
+The reason differs by shape, which is why no one shape settles the ceiling. At
+``standard`` it is residency: two unrolled slices compile to 142 registers and
+three resident blocks, four compile to 108 and four blocks. At ``wide`` residency
+is unchanged from slice 32 and what moves is the shared pipe and the traffic: the
+52,354 shared-load conflicts the ``3N == 96`` tile shows at slice 32 go to zero at
+16, ``long_scoreboard`` falls from 57.6% to 47.7% of stalls, and DRAM traffic falls
+from 76.257 MB per launch to 74.571. Neither the duration nor the register count is
+monotone in the width -- at ``wide`` slice 64 beats 32 and loses to 16 -- so the
+width is not a single-variable trade and the ceiling rests on the sweep rather than
+on an argument. At ``long`` the two reachable widths tie inside the run-to-run
+spread and the narrower one is taken for the register count.
+
+``tiny`` pays 0.53 us for the ceiling, 6.720 us to 7.248 median over three
+captures: four blocks over 84 SMs, where one more slice barrier has nothing to hide
+behind. Its traffic fits in L2, so the floor gives it no verdict and that cost is
+not weighed against one. Four blocks is also under twice the SM count, which
+``docs/kernels.md`` allows only for a serial case measured under 2% of the step. On
+the repo's runner the kernel is 1.05% of the ``tiny`` forward wall at both slice
+widths, so the bound holds, and the grid is ``B*H*C`` rather than a tunable.
+
+The narrower slice restages the ``u`` overlap row once more per slice, which is
+``(kblk + 1) / kblk`` of that tensor's extent. That cost does not show: traffic at
+``standard`` is 37.882 MB at slice 16 against 37.803 at 32, inside the spread, and
+at ``wide`` the narrower slice moves less rather than more.
+
+One capture per row above. The run-to-run spread over three captures is under 1% at
+every one of these shapes, so the orderings hold outside it except at ``long``,
+where the two widths are within it.
+
+Every legal chunk length is a multiple of this, so it divides exactly: one slice at
+16, two at 32, four at 64, eight at 128."""
 
 TARGET_BLOCKS: int = 4
-"""Resident blocks per SM :func:`kblock` sizes the slice for.
+"""Shared-memory residency :func:`kblock` sizes the slice for.
 
-Four, because the register file is what stops the next step: ``N`` blocks of
-:data:`THREADS` threads cap each thread at ``65536 / (N * THREADS)``, so four
-allows 128 against the 114 this body measures, and five allows 102 and spills."""
+A block's footprint may not exceed a quarter of the carveout while a legal slice
+still divides ``chunk``. With :data:`KBLOCK_MAX` at the atom's K extent no legal
+shape has a narrower slice to fall back on, so this is a bound the layouts already
+satisfy rather than one that picks between candidates: the widest footprint any
+legal shape reaches is 24,208 B, at ``MAX_CHUNK`` and ``3N == 96``, against a
+quarter of 25,344. It selects again at any wider ceiling -- at 32 it narrows
+``long`` at 26,768 B, at 64 every shape from 25,744 to 41,104 -- and the hard bound
+behind it is :func:`slinoss._cute.assert_smem_fits` against the whole carveout.
+
+Six of the eight tiles are proportional to ``chunk`` and only the two operand tiles
+to the slice, so this budget, not the carveout, is what bounds the chunk length. The
+marginal cost is 144 B per token at ``P == 64`` and ``3N == 96``: 24,208 B at chunk
+128, 42,640 at 256, 79,504 at 512, 153,232 at 1024. Chunk 128 is the longest that
+holds four blocks; 256 and 512 fit :func:`slinoss._cute.assert_smem_fits` at two
+resident blocks and one; 1024 does not fit at all."""
 
 
 def input_tile(kblk: int, rows: int) -> Tile:
@@ -183,9 +242,10 @@ def kblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     operand tiles are the only per-slice allocations, so the slice width is the one
     lever on the block's total, and that total is what sets residency.
 
-    Halving it costs one more pass over the same shared staging and one more ``u``
-    overlap row per slice. At ``long`` that trade is 26,768 B and three blocks
-    against 22,672 B and four, for 0.8% more global traffic.
+    With the ceiling at :data:`MMA_TILE_K` the search returns it on the first
+    candidate at every legal shape and the budget does not choose between widths.
+    The loop stays because it is what holds the budget: widen the ceiling or add a
+    chunk-sized tile and it selects again.
 
     Args:
         chunk: ``L``.
