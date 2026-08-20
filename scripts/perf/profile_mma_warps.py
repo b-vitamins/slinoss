@@ -35,7 +35,10 @@ that decides which occupancy regime the arms land in: the M-extent bytes are lin
 in it and the flat bytes are not.
 """
 
-from __future__ import annotations
+# No `from __future__ import annotations`: the DSL reads a decorated function's
+# annotations at trace time and PEP 563 turns them into strings, so every Constexpr
+# parameter would be classified as a runtime argument. This is the only driver in
+# this directory that declares kernels, so it is the only one the rule reaches.
 
 import argparse
 import sys
@@ -721,6 +724,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  conflicts  ld={counters.shared_load_conflict_count} "
             f"st={counters.shared_store_conflict_count} "
             f"per_wavefront={counters.conflict_per_wavefront_ratio:.4f}"
+        )
+        # Shared traffic and warp-instruction count per launch: an N-mode split
+        # replicates the A operand across the groups, so both rise with the group
+        # count even though the M tile does not.
+        print(
+            f"  shared     wavefronts={counters.wavefront_count / launches:.0f}"
+            f"/launch inst={counters.inst_count / launches:.0f}/launch"
         )
         print(
             f"  sol        sm={counters.sm_pct:.1f}% mem={counters.memory_pct:.1f}% "
