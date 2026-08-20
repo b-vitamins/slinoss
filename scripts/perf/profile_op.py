@@ -37,6 +37,10 @@ checks close that, in the order they can be answered:
    :data:`slinoss.perf.coverage.COVERAGE` says the arm launches, so a capture short
    by one launch is an exit status and not a shorter table.
 
+The tree the measured package came out of is stamped in the report beside those
+three. It is not a fourth check: calling a tree wrong needs a declared expected
+tree, and nothing here records one.
+
     python3 scripts/perf/profile_op.py --shape standard --mode step
 
 ``--op`` picks the operator, out of :data:`slinoss.perf.workload.OPS`. The report
@@ -59,7 +63,13 @@ import torch
 from slinoss.perf.arms import op_arm
 from slinoss.perf.budget import assert_closed, budget
 from slinoss.perf.ceiling import ceilings, dram_time_floor
-from slinoss.perf.coverage import MODES, TARGETED, coverage_verdict, unreachable
+from slinoss.perf.coverage import (
+    MODES,
+    TARGETED,
+    coverage_verdict,
+    tree_provenance,
+    unreachable,
+)
 from slinoss.perf.declared import FloorAudit, floor_audit
 from slinoss.perf.device import device_info, device_ordinal, require_cuda
 from slinoss.perf.dispatch import dispatch_verdict
@@ -198,6 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
+    tree = tree_provenance(Path(__file__))
     # Before the workload and before the profilers. A reference dispatch launches no
     # declared kernel, so every rule below it would hold over torch's kernels, and a
     # profiler that is not installed cannot judge what the bench would measure.
@@ -252,6 +263,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"l2={floor.l2_bytes} B",
         f"dispatch: {chosen.detail}",
         f"profilers: ncu={ncu_path or 'skipped'} nsys={nsys_path or 'skipped'}",
+        f"tree: package={tree.package_root} driver={tree.driver_root} "
+        f"same={tree.same_tree} extension={tree.extension} {tree.extension_stamp}",
     ]
     # Read every run, not only the run that adds one: an excuse nobody reads is how a
     # kernel stops being profiled at all.
@@ -369,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         traffic=traffic_mix(kernels),
         coverage=covered,
         dispatch=chosen,
+        provenance=tree,
         spills=spills,
         trace=trace,
         notes=tuple(notes),

@@ -21,6 +21,15 @@ The operator axis does not interact with the skip flags, the cross-check, or the
 refusal paths: ``--op`` selects which workload the three clocks run over, and they
 run over whichever one that is. So it is swept once, against the report it names
 and the argv it forwards, and not crossed with the rest.
+
+The fabricated capture holds one kernel per kernel the arm declares, because the
+coverage rule fails a run that judged fewer. A test breaking one rule therefore
+alters one record of that set and leaves the rest passing, so the exit status it
+asserts is the rule it names and not a shortfall it introduced.
+
+The binary probe is replaced by identity. Resolution is a host property, tested in
+``tests/test_perf_tools.py``; here the subject is which binary the driver hands to
+which profiler, and a real probe would answer that differently per host.
 """
 
 from __future__ import annotations
@@ -36,12 +45,15 @@ import torch
 from scripts.perf import profile_op
 from slinoss.perf.ceiling import (
     DRAM_BOUND,
+    SERIAL_TINY,
     Ceilings,
     CopySample,
     DramCeiling,
     DramTimeFloor,
     TensorCeiling,
 )
+from slinoss.perf.coverage import TARGETED, coverage_of
+from slinoss.perf.declared import DECLARED, declared_key
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.ncu import (
     NCU_TABLES,
@@ -53,6 +65,7 @@ from slinoss.perf.ncu import (
 )
 from slinoss.perf.nsys import NsysKernel, NsysTrace
 from slinoss.perf.report import AgreementError
+from slinoss.perf.tools import ToolNotFoundError
 from slinoss.perf.units import (
     Bytes,
     Count,
@@ -101,10 +114,69 @@ FLOOR_ACHIEVED_PCT = 88.0
 bar, and the fixture's launch geometry clears both geometry rules, so the default
 fixture passes every rule and each test breaks the one it names."""
 
-OWNED = "kernel_cutlass_chunk_scan_fwd_kernel_bf16_Ampere_0"
-"""A profiled kernel under the symbol NCU reports. The declaration table matches
-the function name inside the mangled symbol, so the fabricated name carries the
-mangling rather than the bare table key."""
+SERIAL_US = 0.2
+"""Fabricated duration for a SERIAL-tiny kernel, in microseconds.
+
+Its class is a share of the measured step wall rather than a bandwidth, so a record
+at :data:`FAKE_SUM_US` would fail the 2% bar on the smallest shape and every default
+run would exit nonzero on a kernel no test is about."""
+
+
+def symbol(key: str) -> str:
+    """The symbol NCU reports for one declared kernel.
+
+    The declaration table matches the function name inside the mangled symbol, so a
+    fabricated name carries the mangling rather than the bare key. The conv kernels
+    come out of the extension and the rest out of the DSL, which is two markers.
+
+    Args:
+        key: Key of :data:`slinoss.perf.declared.DECLARED`.
+
+    Returns:
+        The symbol.
+    """
+    if key.startswith("conv1d_"):
+        return f"void slinoss::{key}<c10::BFloat16, 4, true>(int, float const*)"
+    return f"kernel_cutlass_{key}_bf16_Ampere_0"
+
+
+def arm_symbols(op: str = "so3ssd", mode: str = "forward") -> tuple[str, ...]:
+    """Every kernel one arm launches at every shape, as NCU would report them."""
+    return tuple(symbol(key) for key in coverage_of(op, mode).required)
+
+
+def fabricated(kernels: Sequence[str]) -> tuple[KernelCounters, ...]:
+    """A counter row per kernel, each consistent with the class it declares.
+
+    A DRAM-bound row carries the traffic the fabricated floor was fitted around; a
+    SERIAL-tiny row carries a duration far under the step and traffic inside L2,
+    which is what that class describes.
+
+    Args:
+        kernels: Symbols the capture held.
+
+    Returns:
+        One record per symbol, in order.
+    """
+    out: list[KernelCounters] = []
+    for name in kernels:
+        key = declared_key(name)
+        if key is not None and DECLARED[key] == SERIAL_TINY:
+            out.append(
+                counter_record(
+                    kernel=name,
+                    duration_us=SERIAL_US,
+                    read_bytes=0,
+                    write_bytes=1 << 10,
+                )
+            )
+        else:
+            out.append(counter_record(kernel=name))
+    return tuple(out)
+
+
+OWNED = symbol("chunk_scan_fwd_kernel")
+"""The kernel the focused tests alter. One of the default arm's three."""
 
 FOREIGN = "void at::native::vectorized_elementwise_kernel<4, ...>(int, ...)"
 """A kernel this repo does not compile. It gets no verdict, and the report says
@@ -248,6 +320,8 @@ def counter_record(
     write_bytes: int = FLOOR_WRITE_BYTES,
     blocks: int = 336,
     occupancy_pct: float = 62.5,
+    load_sectors: int = 1 << 20,
+    store_sectors: int = 1 << 19,
 ) -> KernelCounters:
     """Merged counters for one kernel, summing to ``duration_us``.
 
@@ -257,6 +331,9 @@ def counter_record(
 
     The launch geometry is a parameter for the same reason. The defaults clear both
     geometry rules, at four blocks per multiprocessor and occupancy over the bar.
+
+    The sector counts are parameters because the request stream is read against the
+    DRAM stream, and the two are independent measurements of one kernel.
     """
     return KernelCounters(
         kernel=kernel,
@@ -269,8 +346,8 @@ def counter_record(
         achieved_gbs=GBPerSecond((read_bytes + write_bytes) / (1e3 * duration_us)),
         global_load_request_count=Count(1 << 18),
         global_store_request_count=Count(1 << 17),
-        global_load_sector_count=Count(1 << 20),
-        global_store_sector_count=Count(1 << 19),
+        global_load_sector_count=Count(load_sectors),
+        global_store_sector_count=Count(store_sectors),
         sector_per_load_request_ratio=Ratio(4.0),
         sector_per_store_request_ratio=Ratio(4.0),
         wavefront_count=Count(4096),
@@ -331,26 +408,31 @@ class Recorder:
 def patch_externals(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    kernel_sum_us: float = FAKE_SUM_US,
-    ncu_sum_us: float = FAKE_SUM_US,
+    records: Sequence[KernelCounters] | None = None,
+    kernel_sum_us: float | None = None,
     missing_metrics: Sequence[str] = (),
     spill_sector_count: int = 0,
 ) -> Recorder:
-    """Replace the two profiler drivers and the three device measurements.
+    """Replace the two profiler drivers, the binary probe, and the device queries.
 
     Args:
         monkeypatch: Patch scope.
-        kernel_sum_us: NSYS kernel total for the whole capture window.
-        ncu_sum_us: NCU kernel total for the whole capture window. Equal to
-            ``kernel_sum_us`` means the two profilers agree exactly.
+        records: Counter rows the capture held. Defaults to one per kernel the
+            default arm declares, which is what the coverage rule requires of a
+            capture; a test that fails one rule replaces one of them.
+        kernel_sum_us: NSYS kernel total for the whole capture window. None makes it
+            the sum of ``records``, so the two profilers agree exactly.
         missing_metrics: Metrics every NCU pass reports as absent.
-        spill_sector_count: Local-memory sectors the profiled kernel touched, on
-            each side. Nonzero is a spill, which the spill rule fails.
+        spill_sector_count: Local-memory sectors the first kernel touched, on each
+            side. Nonzero is a spill, which the spill rule fails.
 
     Returns:
         The recorder holding what each fake was called with.
     """
     seen = Recorder()
+    counters = fabricated(arm_symbols()) if records is None else tuple(records)
+    device_total_us = sum(one.duration_us for one in counters)
+    nsys_total_us = device_total_us if kernel_sum_us is None else kernel_sum_us
 
     def fake_nsys(
         argv: Sequence[str], base: Path, *, label: str, nsys: str
@@ -358,7 +440,7 @@ def patch_externals(
         seen.nsys_argv.append(list(argv))
         seen.nsys_base.append(base)
         seen.nsys_binary.append(nsys)
-        return trace_record(kernel_sum_us=kernel_sum_us)
+        return trace_record(kernel_sum_us=nsys_total_us)
 
     def fake_ncu(
         table: NcuTable, argv: Sequence[str], *, ncu: str, extra: Sequence[str] = ()
@@ -379,16 +461,26 @@ def patch_externals(
         # the merge is the counter tables and no more: a spill duration folded in
         # here would double one kernel's time against the other two clocks.
         assert [one.table for one in passes] == [one.name for one in NCU_TABLES]
-        return (counter_record(duration_us=ncu_sum_us),)
+        return counters
 
     def fake_spills(one: NcuPass) -> tuple[SpillCounters, ...]:
         # Keyed off the local-memory pass and no other. A record read from a
-        # counter table would report every spilling kernel as clean.
+        # counter table would report every spilling kernel as clean. Sectors land on
+        # one kernel, so a spill test fails that kernel and not the whole arm.
         assert one.table == SPILL_TABLE.name
-        return (spill_record(sector_count=spill_sector_count),)
+        return tuple(
+            spill_record(
+                kernel=record.kernel,
+                sector_count=spill_sector_count if record.kernel == OWNED else 0,
+            )
+            for record in counters
+        )
 
     monkeypatch.setattr(profile_op, "run_nsys", fake_nsys)
     monkeypatch.setattr(profile_op, "run_ncu", fake_ncu)
+    # The probe answers differently per host, and what is under test is which binary
+    # reached which profiler. Its own failure path is a separate test.
+    monkeypatch.setattr(profile_op, "resolve_tool", lambda spec: spec)
     monkeypatch.setattr(profile_op, "kernel_counters", fake_counters)
     monkeypatch.setattr(profile_op, "spill_counters", fake_spills)
     monkeypatch.setattr(profile_op, "ceilings", lambda _device: ceiling_records())
@@ -570,20 +662,17 @@ def test_every_profiled_kernel_this_repo_compiles_lands_a_class_verdict(
     that is computed and never emitted leaves the class rule unchecked by the
     tooling that exists to check it, which is what this closes.
     """
-    # Both kernels at the fabricated duration, and the trace told the window held
-    # both, so the owned kernel's verdict is the same arithmetic as one kernel
-    # alone and the three clocks still agree.
-    patch_externals(monkeypatch, kernel_sum_us=2 * FAKE_SUM_US)
-
-    def two_kernels(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
-        return (counter_record(), counter_record(kernel=FOREIGN))
-
-    monkeypatch.setattr(profile_op, "kernel_counters", two_kernels)
+    # A torch kernel beside the arm's own. It is counted in the trace, so the three
+    # clocks still agree, and it is judged by nothing.
+    patch_externals(
+        monkeypatch,
+        records=(*fabricated(arm_symbols()), counter_record(kernel=FOREIGN)),
+    )
     assert profile_op.main(argv_for(tmp_path / "prof")) == 0
     doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
-    # One verdict, for the one kernel this repo owns.
-    assert [v["kernel"] for v in doc["verdicts"]] == [OWNED]
-    one = doc["verdicts"][0]
+    # One verdict per kernel this repo owns, and none for the one it does not.
+    assert [v["kernel"] for v in doc["verdicts"]] == list(arm_symbols())
+    one = next(v for v in doc["verdicts"] if v["kernel"] == OWNED)
     assert one["declared"] == DRAM_BOUND
     assert one["required_pct"] == 85.0
     # The floor at the kernel's own traffic, not the rate of the largest copy the
@@ -609,8 +698,7 @@ def test_a_spill_fails_a_dram_bound_kernel_whatever_percentage_it_reached(
     patch_externals(monkeypatch, spill_sector_count=1)
     assert profile_op.main(argv_for(tmp_path / "prof")) == 1
     doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
-    one = doc["verdicts"][0]
-    assert one["kernel"] == OWNED
+    one = next(v for v in doc["verdicts"] if v["kernel"] == OWNED)
     assert one["achieved_pct"] == pytest.approx(FLOOR_ACHIEVED_PCT, abs=5e-4)
     assert one["required_pct"] == 85.0
     assert one["passed"] is False
@@ -628,26 +716,30 @@ def test_a_kernel_whose_traffic_stays_inside_l2_gets_no_verdict(
     the kernel did. The counters are still emitted; only the verdict is withheld, and
     the report names the kernel it was withheld for.
     """
-    patch_externals(monkeypatch)
-
-    def inside_l2(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
-        return (counter_record(read_bytes=0, write_bytes=1 << 10),)
-
-    monkeypatch.setattr(profile_op, "kernel_counters", inside_l2)
+    # One kernel of the arm inside L2, the rest over it, so the withheld verdict is
+    # visible against two that landed.
+    inside = tuple(
+        counter_record(kernel=one.kernel, read_bytes=0, write_bytes=1 << 10)
+        if one.kernel == OWNED
+        else one
+        for one in fabricated(arm_symbols())
+    )
+    patch_externals(monkeypatch, records=inside)
     assert profile_op.main(argv_for(tmp_path / "prof")) == 0
     doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
-    assert doc["verdicts"] == []
+    assert OWNED not in [v["kernel"] for v in doc["verdicts"]]
     text = (tmp_path / "prof-tiny-forward.md").read_text()
-    assert "## class verdicts" not in text
     assert "## kernel counters" in text
     assert (
         "no dram verdict, per-launch traffic within L2 so the counters describe "
         f"the cache: {OWNED}" in text
     )
-    # The bandwidth verdict is withheld; the geometry one is not, and the launch it
-    # reports is the one the counters carried.
-    assert [g["kernel"] for g in doc["geometry"]] == [OWNED]
+    # The bandwidth verdict is withheld; the geometry one is not. That is also what
+    # keeps the kernel covered: the coverage rule counts verdicts, and a kernel with
+    # no verdict at all would read as a capture short by one launch.
+    assert [g["kernel"] for g in doc["geometry"]] == list(arm_symbols())
     assert "## launch geometry" in text
+    assert doc["coverage"]["passed"] is True
 
 
 def test_a_geometry_violation_fails_a_kernel_that_cleared_its_class_floor(
@@ -661,17 +753,17 @@ def test_a_geometry_violation_fails_a_kernel_that_cleared_its_class_floor(
     The report is written anyway, since a refused emission would leave the failing
     measurement unreadable.
     """
-    patch_externals(monkeypatch)
-
-    def thin_launch(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
-        return (counter_record(blocks=96, occupancy_pct=8.33),)
-
-    monkeypatch.setattr(profile_op, "kernel_counters", thin_launch)
+    thin = tuple(
+        counter_record(kernel=one.kernel, blocks=96, occupancy_pct=8.33)
+        if one.kernel == OWNED
+        else one
+        for one in fabricated(arm_symbols())
+    )
+    patch_externals(monkeypatch, records=thin)
     assert profile_op.main(argv_for(tmp_path / "prof")) == 1
     doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
-    assert doc["verdicts"][0]["passed"] is True
-    one = doc["geometry"][0]
-    assert one["kernel"] == OWNED
+    assert next(v for v in doc["verdicts"] if v["kernel"] == OWNED)["passed"] is True
+    one = next(g for g in doc["geometry"] if g["kernel"] == OWNED)
     assert (one["block_count"], one["block_floor_count"]) == (96, 168)
     assert one["required_occupancy_pct"] == 50.0
     assert (one["occupancy_passed"], one["block_floor_passed"]) == (False, False)
@@ -722,8 +814,9 @@ def test_the_cross_check_divides_by_the_capture_iters_and_uses_the_event_total(
     assert check["event_duration_us"] == doc["throughput"][0]["duration_us"]
     # The fabricated sums are per capture window, so the per-iteration figures
     # are the totals over the divisor.
-    assert check["nsys_kernel_sum_duration_us"] == pytest.approx(FAKE_SUM_US / 5)
-    assert check["ncu_kernel_sum_duration_us"] == pytest.approx(FAKE_SUM_US / 5)
+    window_us = sum(one.duration_us for one in fabricated(arm_symbols()))
+    assert check["nsys_kernel_sum_duration_us"] == pytest.approx(window_us / 5)
+    assert check["ncu_kernel_sum_duration_us"] == pytest.approx(window_us / 5)
     assert check["kernel_delta_pct"] == 0.0
     assert check["agrees"] is True
 
@@ -731,9 +824,9 @@ def test_the_cross_check_divides_by_the_capture_iters_and_uses_the_event_total(
 def test_a_report_whose_clocks_disagree_never_reaches_a_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # NCU sees twice what NSYS saw. A stale report that survives a failed run is
-    # indistinguishable from a fresh pass, so nothing is written at all.
-    patch_externals(monkeypatch, kernel_sum_us=2.0, ncu_sum_us=4.0)
+    # NSYS saw a fraction of what NCU counted. A stale report that survives a failed
+    # run is indistinguishable from a fresh pass, so nothing is written at all.
+    patch_externals(monkeypatch, kernel_sum_us=2.0)
     out = tmp_path / "prof"
     with pytest.raises(AgreementError, match="differ by"):
         profile_op.main(argv_for(out))
@@ -752,17 +845,24 @@ def test_main_raises_when_an_ncu_table_reports_a_metric_absent(
 
 
 def test_skipping_a_profiler_emits_without_it_and_says_the_check_was_skipped(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A cross-check needs all three clocks, so any skip drops it, and the report
-    # says so rather than omitting the section silently.
+    """Both skips drop the cross-check. Only one of them drops the audit.
+
+    Without the counter tables there is no verdict, so the run exits nonzero on the
+    coverage rule: a report holding a wall and no judgement is exactly the vacuous
+    pass. The trace-only skip leaves every verdict in place, so it exits zero.
+    """
     no_ncu = patch_externals(monkeypatch)
-    assert profile_op.main(argv_for(tmp_path / "a" / "prof", "--skip-ncu")) == 0
+    assert profile_op.main(argv_for(tmp_path / "a" / "prof", "--skip-ncu")) == 1
     text = (tmp_path / "a" / "prof-tiny-forward.md").read_text()
     assert no_ncu.ncu_tables == []
     assert "## cross-check" not in text
     assert "cross-check skipped" in text
     assert "## gpu trace" in text
+    assert "coverage: judged nothing" in text
+    assert "profilers: ncu=skipped nsys=nsys" in text
+    assert "coverage failure: judged nothing" in capsys.readouterr().out
 
     no_nsys = patch_externals(monkeypatch)
     assert profile_op.main(argv_for(tmp_path / "b" / "prof", "--skip-nsys")) == 0
@@ -771,14 +871,15 @@ def test_skipping_a_profiler_emits_without_it_and_says_the_check_was_skipped(
     assert "## cross-check" not in text
     assert "cross-check skipped" in text
     assert "## kernel counters" in text
+    assert "profilers: ncu=ncu nsys=skipped" in text
 
     neither = patch_externals(monkeypatch)
     argv = argv_for(tmp_path / "c" / "prof", "--skip-ncu", "--skip-nsys")
-    assert profile_op.main(argv) == 0
+    assert profile_op.main(argv) == 1
     text = (tmp_path / "c" / "prof-tiny-forward.md").read_text()
     assert neither.ncu_tables == []
     assert neither.nsys_argv == []
-    # The event wall survives both skips.
+    # The event wall survives both skips, and it is not a measurement of a kernel.
     assert "## budget" in text
     assert "## throughput" in text
     assert "cross-check skipped" in text
@@ -787,7 +888,9 @@ def test_skipping_a_profiler_emits_without_it_and_says_the_check_was_skipped(
 def test_step_mode_measures_the_backward_too(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    patch_externals(monkeypatch)
+    # The step arm launches the backward's kernels as well, and the coverage rule is
+    # keyed by mode, so the capture the step is judged against is its own.
+    patch_externals(monkeypatch, records=fabricated(arm_symbols("so3ssd", "step")))
     out = tmp_path / "prof"
     argv = argv_for(out)
     argv[argv.index("forward")] = "step"
@@ -801,7 +904,7 @@ def test_step_mode_measures_the_backward_too(
 def test_the_conv_operator_profiles_the_conv_and_names_it_in_the_report(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    seen = patch_externals(monkeypatch)
+    seen = patch_externals(monkeypatch, records=fabricated(arm_symbols("conv", "step")))
     out = tmp_path / "prof"
     argv = argv_for(out, "--op", "conv")
     argv[argv.index("forward")] = "step"
@@ -826,15 +929,132 @@ def test_the_notes_quote_the_command_the_profilers_ran(
 ) -> None:
     seen = patch_externals(monkeypatch)
     out = tmp_path / "prof"
-    assert profile_op.main(argv_for(out, "--backend", "reference")) == 0
+    # The kernel backend by name, not the reference: a reference dispatch ends the
+    # run before the profilers, which is what the next test is about.
+    assert profile_op.main(argv_for(out, "--backend", "cute")) == 0
     text = (tmp_path / "prof-tiny-forward.md").read_text()
     assert "target: " + " ".join(seen.nsys_argv[0]) in text
-    assert "--backend reference" in text
+    assert "--backend cute" in text
     assert "event iters=2 capture iters=2" in text
     assert "nsys report: fabricated.nsys-rep" in text
+    # The excuse for a declared kernel no arm launches is a line in every report, so
+    # a kernel that stopped being profiled cannot stop being noticed.
+    for one in TARGETED:
+        assert f"declared and driven elsewhere: {one.kernel} by {one.driver}" in text
+    # And the tree the measurement came out of, which no rule judges.
+    assert "tree: package=" in text
+    assert "same=True" in text
     # Both fitted terms and the residual travel with the verdicts they scored: a
     # floor extrapolated far below its sweep is worth no more than its residual,
     # and a reader cannot see that from the percentage alone.
     assert (
         "dram floor: c=0.160 us B=806.60 GB/s max residual=0.00% l2=6291456 B" in text
     )
+
+
+# ---------------------------------------------------------------------------
+# the audit judged something
+# ---------------------------------------------------------------------------
+
+
+def test_a_capture_short_of_the_arms_kernels_fails_and_names_the_missing_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rule the other rules cannot state: the capture held what it should have.
+
+    Every other gate is a statement about a kernel that was profiled, so a capture
+    missing a launch shortens the table and passes. The count is of verdicts, and the
+    failure names what was declared, what was judged, and what is absent.
+    """
+    short = [one for one in fabricated(arm_symbols()) if one.kernel != OWNED]
+    patch_externals(monkeypatch, records=short)
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 1
+    doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
+    covered = doc["coverage"]
+    assert covered["passed"] is False
+    assert covered["judged_count"] == len(short)
+    assert covered["required_count"] == len(arm_symbols())
+    assert covered["missing"] == ["chunk_scan_fwd_kernel"]
+    # The report is written anyway, since a refused emission would leave the
+    # incomplete measurement unreadable, and the status is what a sweep reads.
+    assert "chunk_scan_fwd_kernel" in capsys.readouterr().out
+    assert "## coverage" in (tmp_path / "prof-tiny-forward.md").read_text()
+
+
+def test_a_reference_dispatch_ends_the_run_before_any_profiler_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The hole as it was found: nine NCU passes over torch's kernels.
+
+    A conv audit exited zero having judged nothing, the extension never having been
+    built, so the operator ran its reference and every rule held over kernels this
+    repo does not compile. The registry is asked first, and the answer is fatal:
+    profiling a reference path costs what profiling a kernel path costs and answers
+    nothing.
+    """
+    seen = patch_externals(monkeypatch)
+    assert profile_op.main(argv_for(tmp_path / "prof", "--backend", "reference")) == 1
+    printed = capsys.readouterr().out
+    assert "dispatch failure" in printed
+    assert "resolves to the reference" in printed
+    assert "would judge nothing" in printed
+    # Before the profilers and before the workload: the cost of finding out late is
+    # the whole measurement.
+    assert seen.ncu_tables == []
+    assert seen.nsys_argv == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_profiler_that_is_not_installed_stops_the_run_before_the_workload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing binary is an environment defect, not a skipped pass.
+
+    Both drivers default to a bare name, and a venv's PATH does not carry the CUDA
+    bin directory, so this is the default path. The error is the outcome: degrading
+    to a run without counters would report a clean audit over an empty capture,
+    which is the rule above with a zero exit status.
+    """
+    seen = patch_externals(monkeypatch)
+
+    def absent(spec: str) -> str:
+        raise ToolNotFoundError(f"{spec!r} is not on PATH")
+
+    monkeypatch.setattr(profile_op, "resolve_tool", absent)
+    with pytest.raises(ToolNotFoundError, match="'ncu' is not on PATH"):
+        profile_op.main(argv_for(tmp_path / "prof"))
+    assert seen.nsys_argv == []
+    assert list(tmp_path.iterdir()) == []
+    # Skipping a profiler explicitly is not a resolution: nothing is probed for a
+    # binary the run will not spawn.
+    resolved = patch_externals(monkeypatch)
+    monkeypatch.setattr(
+        profile_op,
+        "resolve_tool",
+        lambda spec: absent(spec) if spec == "nsys" else spec,
+    )
+    assert profile_op.main(argv_for(tmp_path / "prof", "--skip-nsys")) == 0
+    assert resolved.ncu_binary == ["ncu"] * len(TABLE_NAMES)
+
+
+def test_the_traffic_table_reports_what_the_caches_served(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The request stream beside the DRAM stream, per kernel, judged by nothing.
+
+    The floor's denominator is the DRAM stream, so a kernel whose requests exceed it
+    is scored against a fraction of the work it issued. Reporting the fraction is
+    what makes that visible without moving a bar.
+    """
+    patch_externals(monkeypatch)
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 0
+    doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
+    assert [one["kernel"] for one in doc["traffic"]] == list(arm_symbols())
+    one = next(t for t in doc["traffic"] if t["kernel"] == OWNED)
+    assert one["dram_bytes"] == FLOOR_MOVED_BYTES
+    assert one["requested_bytes"] == 32 * ((1 << 20) + (1 << 19))
+    assert one["cached_bytes"] == one["requested_bytes"] - one["dram_bytes"]
+    assert one["dram_per_request_ratio"] < 1.0
+    # The verdict is unchanged by any of it, which is the point of the column.
+    assert next(v for v in doc["verdicts"] if v["kernel"] == OWNED)["passed"] is True
+    assert "## traffic mix" in (tmp_path / "prof-tiny-forward.md").read_text()

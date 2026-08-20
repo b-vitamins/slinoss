@@ -27,7 +27,7 @@ from typing import Annotated, Any, Final
 
 from slinoss.perf.budget import BucketDelta, BudgetReport
 from slinoss.perf.ceiling import Ceilings, ClassVerdict, GeometryVerdict
-from slinoss.perf.coverage import CoverageVerdict, DispatchVerdict
+from slinoss.perf.coverage import CoverageVerdict, DispatchVerdict, TreeProvenance
 from slinoss.perf.device import DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
 from slinoss.perf.memory import MemoryPeaks, PoolRetention, SavedStorages
@@ -202,6 +202,9 @@ class Report:
         dispatch: What each of the operator's registries resolved to. A run that
             fell back to the reference launched no declared kernel, so every other
             rule in the report held vacuously.
+        provenance: Which tree the measured package came out of, and whether the
+            compiled extension is in it. Reported, not judged: a stale module at a
+            shadowing path measures code nobody edited and reads clean.
         spills: Per-kernel local-memory sectors, from the spill pass the verdicts
             were judged with. Carried as a table and not only as a note, because a
             spill fails a class outright and the verdict it fails records the
@@ -231,6 +234,7 @@ class Report:
     traffic: tuple[TrafficMix, ...] = ()
     coverage: CoverageVerdict | None = None
     dispatch: DispatchVerdict | None = None
+    provenance: TreeProvenance | None = None
     spills: tuple[SpillCounters, ...] = ()
     deltas: tuple[BucketDelta, ...] = ()
     growth: tuple[GrowthRow, ...] = ()
@@ -422,6 +426,8 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
     if report.ceilings is not None:
         lines += _section("measured dram ceiling", [report.ceilings.dram])
         lines += _section("measured tensor ceiling", [report.ceilings.tensor])
+    if report.provenance is not None:
+        lines += _section("tree", [report.provenance])
     if report.dispatch is not None:
         lines += _section("dispatch", [report.dispatch])
         lines += _section("registry choices", report.dispatch.choices)

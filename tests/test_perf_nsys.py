@@ -4,6 +4,10 @@ The profiler binary is absent on this host and on the verification fleet, so no
 test launches ``nsys``. Every pure function is driven with fixture text held in
 this module, and :func:`run_nsys` is exercised through a fake
 :func:`subprocess.run` that records its argv.
+
+Every call names the binary by path. A bare name is resolved against PATH and the
+CUDA bin directories, so a default here would pass on a host that has the profiler
+and raise on one that does not, and the subject is the driver rather than the host.
 """
 
 from __future__ import annotations
@@ -349,7 +353,7 @@ def test_run_nsys_appends_the_suffix_to_a_dotted_base(
     fake = FakeRun((0, PROFILE_LOG, ""), (0, GPU_TRACE_CSV, ""))
     monkeypatch.setattr(subprocess, "run", fake)
     base = tmp_path / "run.standard.fwd"
-    trace = run_nsys(TARGET, base)
+    trace = run_nsys(TARGET, base, nsys="/opt/nsight/nsys")
     assert trace.report_path == str(tmp_path / "run.standard.fwd.nsys-rep")
     assert fake.commands[1][-1] == trace.report_path
 
@@ -360,7 +364,7 @@ def test_run_nsys_raises_on_either_failed_command(
     fake = FakeRun((3, "", DIAGNOSTIC))
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(RuntimeError) as caught:
-        run_nsys(TARGET, tmp_path / "profile-op")
+        run_nsys(TARGET, tmp_path / "profile-op", nsys="/opt/nsight/nsys")
     message = str(caught.value)
     assert "profile exited 3" in message
     assert "diagnostic 15" in message
@@ -372,7 +376,7 @@ def test_run_nsys_raises_on_either_failed_command(
     stats = FakeRun((0, PROFILE_LOG, ""), (4, "", "** ERROR: report file not found"))
     monkeypatch.setattr(subprocess, "run", stats)
     with pytest.raises(RuntimeError) as failed:
-        run_nsys(TARGET, tmp_path / "profile-op")
+        run_nsys(TARGET, tmp_path / "profile-op", nsys="/opt/nsight/nsys")
     assert "stats exited 4" in str(failed.value)
     assert "report file not found" in str(failed.value)
     assert len(stats.commands) == 2
@@ -381,4 +385,4 @@ def test_run_nsys_raises_on_either_failed_command(
         subprocess, "run", FakeRun((1, "** ERROR: no CUDA device present", ""))
     )
     with pytest.raises(RuntimeError, match="no CUDA device present"):
-        run_nsys(TARGET, tmp_path / "profile-op")
+        run_nsys(TARGET, tmp_path / "profile-op", nsys="/opt/nsight/nsys")

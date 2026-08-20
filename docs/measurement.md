@@ -23,6 +23,46 @@ half its bandwidth ceiling with `long_scoreboard` dominant is latency bound, and
 a traffic cut will not move it. Read the bottleneck off the layout and the
 counters, never off the shape of an indexing expression.
 
+## The denominator
+
+A DRAM-bound kernel is scored against the time its own measured DRAM traffic
+implies: `dram_time_floor` fits `c + bytes / B` from a copy sweep, and the verdict
+is that floor over the measured duration, against `CLASS_FLOOR_PCT`. The
+denominator is therefore the kernel's own bytes, and a kernel that moves less
+traffic is measured against a smaller floor.
+
+The case that exposed it, measured on sm_86 at the model geometry. The pair the
+backward used to launch moved 453.9 MB in 741.0 us and scored 78.7% and 99.3%. The
+fused kernel that replaced it moves 176.5 MB in 474.9 us and scores 55.2%. The
+fusion is 36.0% faster and moves 61.1% less, and it reads red. The mechanism is
+arithmetic: deleting a round trip removes bytes from the numerator and from the
+floor together, so the percentage holds only when time falls in the same
+proportion as traffic, and here traffic fell further than time.
+
+The floor is not the thing that is wrong. Derived from those two rows, the pair
+achieved 612.6 GB/s and the fused kernel achieves 371.7 GB/s, about half the bus.
+That is what 55.2% says, and it is true: the fused kernel is no longer limited by
+DRAM. What became wrong is the class. A percentage of a bus ceiling is an
+efficiency and never a ranking, so two arms that move different traffic are
+compared by duration at fixed work, and the kernel that fails its DRAM class by
+that margin is answered from the stall decomposition, not by moving the bar.
+
+An L2-aware floor would not rescue the percentage either. The request stream is
+counted at L1TEX: the same kernel requests 256 MB and reads 176.5 MB from DRAM, so
+31% of its demand never left the chip. The two-level form is
+`max(dram_bytes / B_dram, requested_bytes / B_l2)`, one term per level, and `B_l2`
+is measurable with the machinery already present -- the same copy fit run at
+footprints below the `l2_bytes` the floor record already carries. With L2 read
+bandwidth on this part between 1.5 and 2 times DRAM, which is a model and not a
+measurement here, the request term is the smaller one and the max stays the DRAM
+term, so the verdict stays near 55%. The L2-served fraction is a diagnostic that
+says where the missing bandwidth went, not a larger denominator to divide by.
+
+`slinoss/perf/traffic.py` reports the request stream, the DRAM stream, and the
+ratio, per kernel. Nothing reads those columns for a verdict, and no floor moved:
+changing a floor is the one edit that turns a failure into a pass, so it does not
+happen as a side effect of adding a column.
+
 ## Honesty
 
 Each rule below exists because it has been violated before.
@@ -50,6 +90,41 @@ Each rule below exists because it has been violated before.
 - A kernel's declared class needs a benchmarked operator that launches it. A
   class no driver reaches is a claim with no gate behind it, and it reads as
   verified because the audit judges only what a capture contained.
+- An audit that judged nothing fails. The class floor, the spill rule, the
+  occupancy rule and the block floor are each a statement about a kernel the
+  capture held, so a capture holding no kernel clears every one of them and the
+  run exits zero having measured nothing. A conv audit did that: the compiled
+  extension had not been built in that environment, the operator resolved to its
+  reference, and thirteen torch kernels were reported as unjudged. Every rule
+  held. `slinoss/perf/coverage.py` names the declared kernels each `(op, mode)`
+  arm launches, and the run exits nonzero when the audit judged fewer than that.
+  The count is of verdicts, not of captured kernels: a kernel the capture held
+  and the audit could not judge is not covered.
+- A kernel legitimately absent at a shape says so in the table. `Conditional`
+  carries the shape property that makes the launch happen, and is judged when the
+  capture holds it. A kernel no benchmarked arm launches at any shape is
+  `Targeted`, names the driver that does launch it, and is a line in every report
+  so the excuse is read every time the audit runs. Both hatches excuse a kernel
+  from `unreachable` and from nothing else. An absence with no entry is a defect.
+- A reference dispatch ends the run before any profiler starts. Each registry the
+  operator selects through is asked what it resolves for the profiled device and
+  dtype, and a `reference` answer is fatal. The signal is the registration guard
+  every operator already has -- `_C.is_available()` for the conv, a CUDA check
+  plus a DSL import for the rest -- so the check is one rule over six operators
+  rather than a patch for the one that failed.
+- A profiler that is not installed is an environment defect, named as one, before
+  the workload is allocated. `ncu` and `nsys` are probed on `PATH` and then in the
+  CUDA bin directories, and a miss raises with every path tried in the message.
+  Never a broad `except` around the profiler: a skipped profiler is an audit with
+  nothing to judge, which is the rule above with a clean exit status.
+- A report stamps the tree it measured. A remote directory that accumulates files,
+  or a `PYTHONPATH` naming a second checkout, measures code nobody edited and
+  reads clean, which is the vacuous pass one layer below the coverage rule. The
+  stamp is the resolved package directory, the driver's repository root, whether
+  one contains the other, and the compiled extension's path and mtime. It is
+  reported and not judged: calling a tree wrong needs a declared expected tree,
+  and nothing here records one. A rule would need that declaration -- a revision
+  or a content hash written by whatever publishes the tree, compared on load.
 - A ceiling is measured in the same process, on the same device, at the same
   clocks as the kernel it is a denominator for, and at the kernel's own
   footprint. A ceiling carried over from another run drifts against the number

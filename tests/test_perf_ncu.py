@@ -4,6 +4,10 @@ The profiler binary is absent on this host and on the verification fleet, so no
 test launches ``ncu``. Every pure function is driven with fixture text held in
 this module, and :func:`run_ncu` is exercised through a fake
 :func:`subprocess.run` that records its argv.
+
+Every call names the binary by path. A bare name is resolved against PATH and the
+CUDA bin directories, so a default here would pass on a host that has the profiler
+and raise on one that does not, and the subject is the driver rather than the host.
 """
 
 from __future__ import annotations
@@ -707,7 +711,7 @@ def test_run_ncu_raises_with_the_diagnostic_tail(
 ) -> None:
     monkeypatch.setattr(subprocess, "run", FakeRun((2, "", DIAGNOSTIC)))
     with pytest.raises(RuntimeError) as caught:
-        run_ncu(DRAM, TARGET)
+        run_ncu(DRAM, TARGET, ncu="/opt/nsight/ncu")
     message = str(caught.value)
     assert "ncu table 'dram' exited 2" in message
     assert "diagnostic 15" in message
@@ -720,4 +724,4 @@ def test_run_ncu_raises_with_the_diagnostic_tail(
         subprocess, "run", FakeRun((1, "==ERROR== ERR_NVGPUCTRPERM: permission", ""))
     )
     with pytest.raises(RuntimeError, match="ERR_NVGPUCTRPERM"):
-        run_ncu(DRAM, TARGET)
+        run_ncu(DRAM, TARGET, ncu="/opt/nsight/ncu")

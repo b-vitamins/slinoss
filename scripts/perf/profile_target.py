@@ -25,12 +25,14 @@ import torch
 
 from slinoss.perf.arms import op_arm
 from slinoss.perf.capture import profiler_window
+from slinoss.perf.coverage import MODES
 from slinoss.perf.device import require_cuda
 from slinoss.perf.timing import on_device
 from slinoss.perf.workload import OPS, SHAPE_NAMES
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-MODES = ("forward", "step")
+# MODES is imported, not restated: the coverage rule is keyed by mode, so a mode
+# this target accepts and the table does not know would be judged against no entry.
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Final
 
 from slinoss.perf.declared import DECLARED, declared_key
@@ -42,6 +44,7 @@ from slinoss.perf.units import INVARIANT, Count, PerfRecord
 
 __all__ = [
     "COVERAGE",
+    "EXTENSION_GLOB",
     "MODES",
     "TARGETED",
     "Conditional",
@@ -50,8 +53,10 @@ __all__ = [
     "OpCoverage",
     "RegistryChoice",
     "Targeted",
+    "TreeProvenance",
     "coverage_of",
     "coverage_verdict",
+    "tree_provenance",
     "unreachable",
 ]
 
@@ -270,6 +275,70 @@ def unreachable() -> tuple[str, ...]:
     claimed = {key for entry in COVERAGE.values() for key in entry.kernels}
     claimed |= {one.kernel for one in TARGETED}
     return tuple(sorted(set(DECLARED) - claimed))
+
+
+EXTENSION_GLOB: Final = "_C/_conv1d*.so"
+"""Where the compiled extension lands, relative to the package root.
+
+Matched on the filesystem rather than imported: the question is what the tree
+holds, and an import answers what ``sys.path`` found, which is the thing under
+suspicion."""
+
+
+@dataclass(frozen=True)
+class TreeProvenance(PerfRecord):
+    """Which source tree the measurement came out of.
+
+    Attributes:
+        package_root: Directory of the imported :mod:`slinoss` package, resolved.
+        driver_root: Repository root the driver script lives under, resolved.
+        same_tree: Whether ``package_root`` sits inside ``driver_root``. False means
+            the scripts being run and the package being measured are two checkouts.
+        extension: Path of the compiled conv extension inside ``package_root``, or
+            ``absent``. Absent is what made a conv audit resolve to its reference.
+        extension_stamp: The extension's mtime, UTC, to the second, or the empty
+            string when absent. A build older than the source it wraps measures the
+            old kernel and reports the new tree's name for it.
+    """
+
+    package_root: str
+    driver_root: str
+    same_tree: bool
+    extension: str
+    extension_stamp: str
+
+
+def tree_provenance(driver: Path) -> TreeProvenance:
+    """Record the tree the perf package was imported from, beside the driver's.
+
+    A remote tree that accumulates files, or a ``PYTHONPATH`` pointing at a second
+    checkout, measures one tree while the operator reads the scripts of another. The
+    result is a green run about code nobody edited, which is the vacuous pass one
+    layer below the coverage rule. Reported, not judged: a rule would need a
+    declared expected tree, and nothing in this repo records one.
+
+    Args:
+        driver: ``__file__`` of the script that runs the audit. Its repository root
+            is taken as two levels up, which is where ``scripts/perf/`` sits.
+
+    Returns:
+        The record. Every path is resolved, so a symlinked or relative invocation
+        does not read as a mismatch.
+    """
+    package_root = Path(__file__).resolve().parents[1]
+    driver_root = driver.resolve().parents[2]
+    built = sorted(package_root.glob(EXTENSION_GLOB))
+    stamp = ""
+    if built:
+        mtime = datetime.fromtimestamp(built[0].stat().st_mtime, tz=UTC)
+        stamp = mtime.isoformat(timespec="seconds")
+    return TreeProvenance(
+        package_root=str(package_root),
+        driver_root=str(driver_root),
+        same_tree=package_root.parent == driver_root,
+        extension=str(built[0]) if built else "absent",
+        extension_stamp=stamp,
+    )
 
 
 @dataclass(frozen=True)
