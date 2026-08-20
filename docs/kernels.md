@@ -62,6 +62,15 @@ a transposed score tile is not.
   shared memory to buy them: query the device capacity and opt into the
   carveout, since the 48 KiB default is not the budget. Never hardcode an
   architecture string.
+- It buys them only up to half the carveout. Past that the second resident block
+  is gone, so the spending stops buying occupancy and starts costing it, and a
+  live set that also drives the allocator to the 255-register cap pays twice.
+  `chunk_vector_bwd` is the standing example: 85,424 B, one block per
+  multiprocessor, 11.8 MB of spill per launch, 13.5% of its DRAM time floor.
+- A footprint that grows with a configuration knob is a ceiling on that knob.
+  Tile the knob, or the supported range is whatever the arena happens to hold.
+  The backward holds whole `3N` extents, which caps `d_state` well below what
+  `SLinOSSConfig` accepts.
 - The shared-memory budget is computed from the layouts and asserted against the
   queried capacity by a test. No guard or slop constants.
 - Bank conflicts are a bug, not a tradeoff. Conflict freedom comes from the

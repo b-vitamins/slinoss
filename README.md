@@ -59,12 +59,20 @@ Python 3.11+, PyTorch 2.1+. The CUDA path needs SM80 or newer and
 import torch
 from slinoss import SLinOSSMixer, SLinOSSConfig
 
-cfg = SLinOSSConfig(d_model=576, d_state=240, expand=2.0, d_head=64, chunk_size=64)
+cfg = SLinOSSConfig(d_model=576, d_state=48, expand=2.0, d_head=48, chunk_size=64)
 mixer = SLinOSSMixer(cfg).cuda().to(torch.bfloat16)
 
 x = torch.randn(4, 2048, 576, device="cuda", dtype=torch.bfloat16)
 y = mixer(x)
 ```
+
+The backward kernels hold whole `3N` extents in shared memory, so `d_state`
+trades against `chunk_size` and `d_head`. Measured on a 101,376 B carveout:
+`3N = 48` fits at every `chunk_size` and `d_head`; `3N = 96` needs
+`chunk_size <= 32`, and `chunk_size = 16` at `d_head = 64`; `3N = 144` needs
+`chunk_size = 16`; `3N = 240` does not fit. The forward accepts every legal
+shape, so one the backward cannot hold raises from the backward rather than from
+the forward.
 
 The operator is callable directly. `so3ssm` is the sequential reference and is
 float64-capable; `so3ssd` is the chunked, autograd-complete, CUDA-accelerated

@@ -543,6 +543,27 @@ def test_output_keeps_the_shape_and_the_dtype(
         assert bool(param.grad.isfinite().all()), name
 
 
+@pytest.mark.cuda
+@pytest.mark.cute
+def test_the_documented_shape_fits_the_backward_arena(cuda: torch.device) -> None:
+    """One training step at the configuration the README documents.
+
+    The backward's shared-memory live set is set by ``chunk_size``, ``d_head`` and
+    ``3N``, and it is wider than the forward's, so a configuration that forwards is
+    not evidence that it trains. Nothing here depends on the sequence length, which
+    is why the shared one is enough. The other configurations in this module run at
+    ``chunk_size = 16``, where the arena is at its narrowest and this bound is not
+    the one that binds.
+    """
+    cfg = SLinOSSConfig(d_model=576, d_state=48, expand=2.0, d_head=48, chunk_size=64)
+    mixer = SLinOSSMixer(cfg, device=cuda, dtype=torch.bfloat16)
+    out = mixer(_activations(cfg, cuda, torch.bfloat16))
+    out.float().square().sum().backward()
+    for name, param in mixer.named_parameters():
+        assert param.grad is not None, name
+        assert bool(param.grad.isfinite().all()), name
+
+
 def test_param_bias_stays_float32_through_a_module_cast() -> None:
     """A module-wide demotion must not take the one pinned parameter with it.
 
