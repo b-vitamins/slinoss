@@ -107,10 +107,20 @@ a transposed score tile is not.
 A kernel far under its DRAM bar is not moving bytes slowly. It is moving shared
 traffic, and the class bar says nothing about that until the pipe is priced.
 
-- Price an arm in shared wavefronts as well as in bytes. Measured on sm_86,
-  duration follows the wavefront count at about 42 k/us: three independent arms
-  of `chunk_vector_bwd`, differing in block width and grid, sat at 41.3, 45.4 and
-  40.9 k/us. A change that does not move wavefronts does not move that kernel.
+- Price an arm in shared wavefronts as well as in bytes. Measured on sm_86, three
+  independent arms of `chunk_vector_bwd`, differing in block width and grid, sat at
+  41.3, 45.4 and 40.9 k wavefronts per microsecond. A change that does not move
+  wavefronts does not move that kernel.
+- That rate is an average and it is not the rate an arm is paid at. Removing
+  22,136,987 wavefronts from `chunk_vector_bwd` bought 216.1 us, a marginal
+  102.4 k/us against the 42.3 k/us average of the same launch. The quotient
+  216.1/527 is 0.41, which is the shared pipe's measured 44.6% of peak: the pipe
+  carries about that fraction of the critical path and the rest is not paid back.
+  Extrapolate an arm with the marginal rate, and treat even that as optimistic,
+  since the pipe's share of the path falls as the count does. Pricing a whole-pipe
+  target at the average overstates it by 2.4x. On this kernel the average said the
+  shared pipe held 3.05x and the marginal rate says it holds at most 1.8x, so the
+  rest of the gap is somewhere else and has to be found rather than assumed.
 - The count to move is `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld`,
   `..._op_st`, and the `ldmatrix` wavefronts, summed. At the model geometry
   `chunk_vector_bwd` issues 185 M of them per launch against 6.84 M global loads,
@@ -120,8 +130,12 @@ traffic, and the class bar says nothing about that until the pipe is priced.
   and irrelevant to the others.
 - The wavefront count, not the instruction count, is the cost. One 16-byte access
   per thread is one wavefront per eight threads; one 4-byte access is one per
-  thread. Vectorizing every shared access of `chunk_vector_bwd` to 16 bytes takes
-  185 M to 60.7 M without deleting one byte of traffic.
+  thread.
+- But the instruction count is the floor a vectorization can reach, so dividing a
+  wavefront count by four to price one is wrong twice over. Conflict-free shared
+  traffic on `chunk_vector_bwd` already runs at about 1.4 wavefronts per shared
+  instruction, 150.4 M wavefronts over 90.4 M instructions, because wide accesses
+  are already there. What vectorizing buys is the instructions it deletes.
 - 16-byte access also changes the conflict question, and the scalar answer does
   not carry over. An `LDS.128` is serviced in four phases of eight threads, each
   phase covering the full 128-byte width, so the unit is the 16-byte segment and
@@ -130,6 +144,15 @@ traffic, and the class bar says nothing about that until the pipe is priced.
   8` being a bijection on eight threads. `48 = 3*16` divides exactly, so three
   `float4` cover the row with no remainder. The tile base must be 16-byte aligned
   for it.
+- That argument is about the row, so check what the access is actually shaped like
+  before spending on it. A 3-vector is 12 bytes at float32 and 6 at bfloat16 and no
+  16-byte form of it exists, whatever the tile's base: the widest the tree found is
+  a lane pair. The nine-float table entry is different -- consecutive and divisible
+  -- but `table_tile` pitches it at 9, so the token stride is 36 bytes and only every
+  fourth entry is 16-byte aligned. Pad the innermost extent to 12 and the stride is
+  48, every entry is aligned, and three `float4` replace nine scalar reads. The
+  padding is what makes the vector form legal, and it is not free: it is a third more
+  table bytes, against a shared budget the residency already binds.
 - `ldmatrix` reads per flop are set by the warp tiling, not by the instruction.
   The A operand is broadcast across the N warp groups and B across the M groups,
   so a `(warps_m, warps_n)` tiling of an `M*N*K` tile reads `warps_n*M*K +
