@@ -405,7 +405,6 @@ from slinoss.ops.so3ssd.cute.common import (
     quat_exp_vjp,
     rot_hom_vjp,
     scalar_tile,
-    table_tile,
     tap_matrix_vjp,
     tap_tile,
     trans_tile,
@@ -460,6 +459,8 @@ __all__ = [
     "PARTIAL_REQUEST_BYTES",
     "RESIDENT_MAX",
     "ROW_WORDS",
+    "TABLE_PITCH",
+    "TABLE_QUAD",
     "Arena",
     "ChunkVectorBwd",
     "Slots",
@@ -476,6 +477,7 @@ __all__ = [
     "out_tile",
     "partial_bytes",
     "partial_pack",
+    "quad_table_tile",
     "readout_tile",
     "row_tile",
     "score_tile",
@@ -580,6 +582,26 @@ The budget lowers it to one at every standard size. Asking for two costs nothing
 where it cannot be had and takes it at the small shapes where the arena is half as
 wide."""
 
+TABLE_QUAD: int = SMEM_SEGMENT // 4
+"""Float32 words in one 16-byte shared-memory segment."""
+
+TABLE_PITCH: int = 3 * TABLE_QUAD
+"""Float32 pitch of one transform-table entry: nine words padded to three segments.
+
+The pitch :func:`slinoss.ops.so3ssd.cute.common.table_tile` gives the entry is nine,
+which makes the token stride 36 bytes and leaves only every fourth entry 16-byte
+aligned, so no entry can be read at vector width. At twelve the stride is 48 bytes,
+every entry is aligned, and three 16-byte loads cover a row exactly: nine scalar
+loads become three, which is the deletion :func:`_mat_at` exists for.
+
+The three padding words are never written and never read for their value.
+
+The cost is a third more table bytes, ``3 * L * 12`` against ``3 * L * 9``, 2,304 B
+at ``L 64``. Residency does not move for it: registers and shared memory each pin
+one block per SM on their own at every standard size, and the padded budget stays
+inside the queried carveout at every shape
+:func:`slinoss.ops.so3ssd.cute.guard.check_extents` admits."""
+
 
 def lane_block(dim: int) -> int:
     """Columns of one lane tile, ``min(3N, 3 * LANE_BLOCK)``.
@@ -597,6 +619,27 @@ def lane_block(dim: int) -> int:
 def row_tile(chunk: int) -> Tile:
     """Per-token float32 scratch, ``(L, ROW_WORDS)``."""
     return Tile((chunk, ROW_WORDS), (ROW_WORDS, 1))
+
+
+def quad_table_tile(chunk: int, mats: int = 3) -> Tile:
+    """Transform table at the segment-aligned pitch, ``(mats, L, TABLE_PITCH)``.
+
+    The table :func:`slinoss.ops.so3ssd.cute.common.table_tile` describes, with the
+    innermost extent padded from nine to :data:`TABLE_PITCH` so an entry is a whole
+    number of 16-byte segments and :func:`_mat_at` can read it at vector width. Slot
+    and entry order are unchanged, so every producer and consumer that indexes
+    ``[slot, token, entry]`` reaches the same value at either pitch.
+
+    Args:
+        chunk: ``L``.
+        mats: Slots to allocate, 1, 2 or 3.
+
+    Raises:
+        ValueError: If ``mats`` is not 1, 2 or 3.
+    """
+    if mats not in (1, 2, 3):
+        raise ValueError(f"table needs 1, 2 or 3 matrices, got {mats}")
+    return Tile((mats, chunk, TABLE_PITCH), (TABLE_PITCH * chunk, TABLE_PITCH, 1))
 
 
 def offset_tile(chunk: int, warp_groups: int = 1) -> Tile:
@@ -862,7 +905,7 @@ def vector_smem_bytes(
             (scalar_tile(chunk), 4),
             (offset_tile(chunk, warp_groups), 4),
             (scalar_tile(chunk), 4),
-            (table_tile(chunk, 3), 4),
+            (quad_table_tile(chunk, 3), 4),
             (row_tile(chunk), 4),
             (readout_tile(chunk, lane_block(dim)), itemsize),
             (
@@ -1222,21 +1265,50 @@ def _spread(vals: tuple[Scalar, ...], lane: cutlass.Int32) -> Scalar:
 def _mat_at(stable: cute.Tensor, slot: int, token: cutlass.Int32) -> Mat3:
     """One transform-table entry as a 3x3, row-major.
 
+    Three 16-byte shared loads, not nine scalar ones. :data:`TABLE_PITCH` pads the
+    entry to three whole segments, so the row divides and the entry is aligned; the
+    claim is restated on the sliced iterator for the reason
+    :func:`slinoss.ops.so3ssd.cute.table._paired` gives, a tile arriving as a
+    parameter reporting one element whatever its allocation asked for.
+
+    Undecorated, so the slice and the retile are trace-time algebra and every
+    fragment index is compile-time, which is what keeps the fragment in registers.
+    A plain ``range``, for the reason the closing loop's comprehension gives: the
+    preprocessor rewrites ``range_constexpr`` only inside a decorated body, so here
+    it would reach the runtime stub and raise.
+
+    Conflict-free at every map the callers use. A load at vector width is serviced in
+    four phases of eight threads, so the unit is the segment and the modulus is 8
+    rather than 32: eight threads on consecutive tokens take segment ``3 * token + q
+    mod 8``, a bijection, and threads sharing a token share an address and broadcast.
+
     Args:
-        stable: ``(mats, L, 9)`` float32 table.
+        stable: ``(mats, L, TABLE_PITCH)`` float32 table from
+            :func:`quad_table_tile`, 16-byte aligned.
         slot: Table slot. Compile-time.
         token: Chunk-local token, already bounded by ``L``.
+
+    Returns:
+        Entries 0 through 8. The padding words ride the third load and are dropped.
     """
+    entry = stable[slot, token, None]
+    quads = cute.zipped_divide(
+        cute.make_tensor(entry.iterator.align(SMEM_SEGMENT), entry.layout),
+        (TABLE_QUAD,),
+    )
+    frag = cute.make_fragment((TABLE_PITCH // TABLE_QUAD, TABLE_QUAD), cutlass.Float32)
+    for quad in range(TABLE_PITCH // TABLE_QUAD):
+        cute.autovec_copy(quads[(None, quad)], frag[(quad, None)])
     return (
-        stable[slot, token, 0],
-        stable[slot, token, 1],
-        stable[slot, token, 2],
-        stable[slot, token, 3],
-        stable[slot, token, 4],
-        stable[slot, token, 5],
-        stable[slot, token, 6],
-        stable[slot, token, 7],
-        stable[slot, token, 8],
+        frag[0, 0],
+        frag[0, 1],
+        frag[0, 2],
+        frag[0, 3],
+        frag[1, 0],
+        frag[1, 1],
+        frag[1, 2],
+        frag[1, 3],
+        frag[2, 0],
     )
 
 
@@ -1354,7 +1426,7 @@ def _rotate_rows(
     Args:
         src: Operand-dtype shifted tile, row ``j`` holding token ``nbase + j - 1``.
         dst: Operand-dtype tile of at least ``span`` rows, written.
-        stable: ``(mats, L, 9)`` float32 transform table.
+        stable: ``(mats, L, TABLE_PITCH)`` float32 transform table.
         tid: Thread index within the block.
         nbase: First chunk-local token of the run.
         slot: Table slot. Compile-time.
@@ -1473,7 +1545,7 @@ def _tap_epilogue(
             element type, not read: the rotated vector is recomputed.
         sb: ``(span + 1, pitch)`` operand-dtype raw forcing tile.
         ssum: ``(L + 1, pitch)`` float32 forcing sum, accumulated.
-        stable: ``(mats, L, 9)`` float32 transform table.
+        stable: ``(mats, L, TABLE_PITCH)`` float32 transform table.
         acrow: One transposed readout entry per step of the row pass, for the row
             this thread holds at that step. Read by the caller because the row does
             not depend on the tap, so the pair of taps reads it once.
@@ -1613,7 +1685,7 @@ def _readout_epilogue(
         ssum: ``(L, pitch)`` float32 readout sum over the fold, accumulated when
             ``fold`` is above one and untouched otherwise.
         scrot: ``(mma_rows(L), pitch)`` operand-dtype rotated readout.
-        stable: ``(mats, L, 9)`` float32 transform table.
+        stable: ``(mats, L, TABLE_PITCH)`` float32 transform table.
         srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated.
         bidx: Batch index.
         gidx: Group index.
@@ -1797,7 +1869,9 @@ def chunk_vector_bwd_kernel(
         cutlass.Float32, offset_tile(chunk, wgroups).layout(), 16
     )
     sdls = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 3).layout(), 16)
+    stable = smem.allocate_tensor(
+        cutlass.Float32, quad_table_tile(chunk, 3).layout(), SMEM_SEGMENT
+    )
     srow = smem.allocate_tensor(cutlass.Float32, row_tile(chunk).layout(), 16)
     scrot = smem.allocate_tensor(elem, readout_tile(chunk, tile).layout(), SMEM_SEGMENT)
     space = arena(chunk, rows, dim, fold, span, elem.width // 8)
