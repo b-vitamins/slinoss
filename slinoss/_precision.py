@@ -98,6 +98,35 @@ def pinned_dtype(*tensors: Tensor) -> torch.dtype:
     return torch.float32
 
 
+def cast_to(tensor: Tensor, dtype: torch.dtype) -> Tensor:
+    """``tensor`` in ``dtype``, and ``tensor`` itself when it is already in it.
+
+    Only parameters and gradients reach this. Casting an activation band would copy
+    the tensor a fused projection exists to keep in place.
+
+    Args:
+        tensor: Tensor to cast.
+        dtype: Target dtype.
+
+    Returns:
+        ``tensor`` or a copy of it in ``dtype``.
+    """
+    return tensor if tensor.dtype is dtype else tensor.to(dtype)
+
+
+def cast_opt(tensor: Tensor | None, dtype: torch.dtype) -> Tensor | None:
+    """:func:`cast_to` through an absent operand.
+
+    Args:
+        tensor: Tensor to cast, or None.
+        dtype: Target dtype.
+
+    Returns:
+        None, or the cast tensor.
+    """
+    return None if tensor is None else cast_to(tensor, dtype)
+
+
 def device_type_of(tensor: Tensor) -> str:
     """Return the autocast device-type string for ``tensor``."""
     return tensor.device.type

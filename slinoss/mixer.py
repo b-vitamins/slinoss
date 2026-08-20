@@ -23,7 +23,8 @@ from torch import Tensor, nn
 from torch.nn.functional import linear
 
 from slinoss._guard import PROJ_ALIGN
-from slinoss._precision import LOW_PRECISION_DTYPES
+from slinoss._linear import linear_backward
+from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.conv import backends as conv_dispatch
 from slinoss.ops.mixer import backends as tail_dispatch
@@ -306,60 +307,6 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     return rows
 
 
-def _cast(tensor: Tensor, dtype: torch.dtype) -> Tensor:
-    """``tensor`` in ``dtype``, and ``tensor`` itself when it is already in it.
-
-    Only parameters and gradients reach this. Casting a band would copy the
-    activation the fused projection exists to keep in place.
-    """
-    return tensor if tensor.dtype is dtype else tensor.to(dtype)
-
-
-def _cast_opt(tensor: Tensor | None, dtype: torch.dtype) -> Tensor | None:
-    """:func:`_cast` through an absent operand."""
-    return None if tensor is None else _cast(tensor, dtype)
-
-
-class _LinearGrads(NamedTuple):
-    """Gradients of one ``linear``.
-
-    Attributes:
-        dinput: ``(B,T,in)``, dtype of ``dout``.
-        dweight: ``(out,in)``, dtype of ``dout``.
-        dbias: ``(out,)``, dtype of ``dout``, or None when the layer has no bias.
-    """
-
-    dinput: Tensor
-    dweight: Tensor
-    dbias: Tensor | None
-
-
-def _linear_backward(
-    dout: Tensor, inp: Tensor, weight: Tensor, *, has_bias: bool
-) -> _LinearGrads:
-    """Pullback of ``linear`` over a ``(B,T,*)`` batch.
-
-    ``has_bias`` is the layer's signature, not a gradient-need test: a gradient
-    returned for an absent input is an autograd error rather than an optimization.
-
-    Args:
-        dout: Cotangent, ``(B,T,out)``.
-        inp: Forward input, ``(B,T,in)``.
-        weight: ``(out,in)``, any dtype.
-        has_bias: Whether the layer carries a bias.
-
-    Returns:
-        A :class:`_LinearGrads`.
-    """
-    # flatten over batch and token is a view when the operand is contiguous. dout
-    # is always a GEMM or kernel output, so it is; a caller's non-contiguous x
-    # makes the other one copy.
-    flat = dout.flatten(0, 1)
-    dinput = dout @ _cast(weight, dout.dtype)
-    dweight = flat.t() @ _cast(inp.flatten(0, 1), dout.dtype)
-    return _LinearGrads(dinput, dweight, flat.sum(0) if has_bias else None)
-
-
 class _Backends(NamedTuple):
     """Backend name each stage resolved to, in call order.
 
@@ -464,8 +411,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         # of the convolution to one dtype, and the reference widens either way.
         step = conv_dispatch.get(picks.conv).forward(
             layout.value(proj),
-            _cast(conv_weight, proj.dtype),
-            _cast_opt(conv_bias, proj.dtype),
+            cast_to(conv_weight, proj.dtype),
+            cast_opt(conv_bias, proj.dtype),
             activation=True,
             d_head=config.d_head,
         )
@@ -516,7 +463,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         config: SLinOSSConfig = ctx.config
         picks: _Backends = ctx.picks
 
-        out_grads = _linear_backward(
+        out_grads = linear_backward(
             dout, tail, out_weight, has_bias=out_bias is not None
         )
         # One buffer for every band's cotangent, uninitialized: each consumer writes
@@ -565,23 +512,23 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             scan_grads.dU,
             None,
             layout.value(proj),
-            _cast(conv_weight, proj.dtype),
-            _cast_opt(conv_bias, proj.dtype),
+            cast_to(conv_weight, proj.dtype),
+            cast_opt(conv_bias, proj.dtype),
             activation=True,
             dx=layout.value(dproj),
         )
-        in_grads = _linear_backward(dproj, x, in_weight, has_bias=in_bias is not None)
+        in_grads = linear_backward(dproj, x, in_weight, has_bias=in_bias is not None)
         return (
-            _cast(in_grads.dinput, x.dtype),
-            _cast(in_grads.dweight, in_weight.dtype),
-            _cast_opt(in_grads.dbias, in_weight.dtype),
-            _cast(conv_grads.dweight, conv_weight.dtype),
-            _cast_opt(conv_grads.dbias, conv_weight.dtype),
+            cast_to(in_grads.dinput, x.dtype),
+            cast_to(in_grads.dweight, in_weight.dtype),
+            cast_opt(in_grads.dbias, in_weight.dtype),
+            cast_to(conv_grads.dweight, conv_weight.dtype),
+            cast_opt(conv_grads.dbias, conv_weight.dtype),
             prep_grads.dparam_bias,
             tail_grads.dd_skip,
             tail_grads.dweight,
-            _cast(out_grads.dweight, out_weight.dtype),
-            _cast_opt(out_grads.dbias, out_weight.dtype),
+            cast_to(out_grads.dweight, out_weight.dtype),
+            cast_opt(out_grads.dbias, out_weight.dtype),
             None,
             None,
         )
@@ -798,8 +745,8 @@ class SLinOSSMixer(nn.Module):
         picks = _resolve(proj)
         conv = conv_dispatch.get(picks.conv).forward(
             layout.value(proj),
-            _cast(self.conv_weight, proj.dtype),
-            _cast_opt(self.conv_bias, proj.dtype),
+            cast_to(self.conv_weight, proj.dtype),
+            cast_opt(self.conv_bias, proj.dtype),
             activation=True,
             initial_state=state.conv,
             d_head=cfg.d_head,
