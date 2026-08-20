@@ -900,7 +900,12 @@ def test_the_table_names_every_kernel_in_the_tree_and_nothing_else() -> None:
     } | {
         found.group(1)
         for path in (root / "csrc").rglob("*.c*")
-        for found in re.finditer(r"__global__\s+void\s+(\w+)", path.read_text())
+        # A launch-bounds attribute sits between ``void`` and the name, so the
+        # first identifier after the return type is not always the kernel's.
+        for found in re.finditer(
+            r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+)",
+            path.read_text(),
+        )
     }
     assert compiled
     assert set(DECLARED) == compiled
