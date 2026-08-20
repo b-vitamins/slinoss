@@ -85,6 +85,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--rows", type=int, default=24, help="Kernels listed.")
+    parser.add_argument(
+        "--name-width",
+        type=int,
+        default=64,
+        help="Width of the kernel-name column. Three CUTLASS instantiations of one "
+        "GEMM template share their first 64 characters and differ only past them, so "
+        "at the default they print as one repeated row and the table cannot be read "
+        "as an attribution.",
+    )
     parser.add_argument("--device", default="cuda")
     return parser.parse_args(argv)
 
@@ -288,11 +297,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     glue = sum(by_class.get(label, 0.0) for label in GLUE)
     print(f"{'glue':12s} {glue / 1000.0:10,.3f} ms  {100.0 * glue / total:6,.2f}%")
     print()
-    print(f"{'kernel':64s} {'ms/iter':>10s} {'share':>8s} {'calls':>8s}  class")
+    width = args.name_width
+    print(f"{'kernel':{width}s} {'ms/iter':>10s} {'share':>8s} {'calls':>8s}  class")
     for name, us, calls in rows[: args.rows]:
         print(
-            f"{name[:64]:64s} {us / 1000.0:10,.3f} {100.0 * us / total:7,.2f}% "
-            f"{calls:8,.1f}  {classify(name)}"
+            f"{name[:width]:{width}s} {us / 1000.0:10,.3f} "
+            f"{100.0 * us / total:7,.2f}% {calls:8,.1f}  {classify(name)}"
         )
     return 0
 
