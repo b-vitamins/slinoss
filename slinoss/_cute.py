@@ -24,26 +24,33 @@ from __future__ import annotations
 import ctypes
 import math
 import threading
+import time
 from collections.abc import Callable, Hashable, Iterable, Sequence
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 import cutlass
 import cutlass.cute as cute
 import torch
 from cuda.bindings import driver as cuda_driver
+from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import get_smem_capacity_in_bytes
 
 __all__ = [
     "LOG2_E",
     "TWO_LOG2_E",
+    "CacheEvents",
+    "Compiled",
     "DevPoolUse",
+    "LaunchPayload",
     "Scalar",
     "Stream",
     "Tile",
     "assert_smem_fits",
     "block_reduce_add",
+    "cache_events",
     "clear_dev_pool",
+    "compiled_launches",
     "current_stream",
     "cute_dtype",
     "decay",
@@ -53,6 +60,7 @@ __all__ = [
     "f32",
     "jit_launch",
     "narrow",
+    "reset_cache_events",
     "select",
     "shuffle_down",
     "shuffle_up",
@@ -62,6 +70,7 @@ __all__ = [
     "silu_grad",
     "smem_bytes",
     "smem_capacity",
+    "use_payload",
     "widen",
 ]
 
@@ -175,7 +184,12 @@ def current_stream() -> Stream:
     return handle
 
 
-_EXECUTORS: dict[Hashable, Any] = {}
+_Key = tuple[Callable[..., None], tuple[Hashable, ...], int, tuple[Hashable, ...]]
+"""An executor cache key: launcher, compile-time arguments, device, declared runtime
+types. Everything that shapes the generated code, plus the device the code was
+built for. The stream is not in it; see :func:`jit_launch`."""
+
+_EXECUTORS: dict[_Key, Any] = {}
 
 _POOL_DEPTH = 4
 """Pooled descriptors per layout. Four is the largest number of arguments of one
@@ -362,6 +376,237 @@ def executor_count() -> int:
     return len(_EXECUTORS)
 
 
+# ---------------------------------------------------------------------------
+# Where an executor came from
+# ---------------------------------------------------------------------------
+
+
+class LaunchPayload(Protocol):
+    """An ahead-of-time payload, as :func:`jit_launch` consults it.
+
+    Implemented by :class:`slinoss.aot.Payload`. A protocol and a slot rather
+    than an import, because the payload module imports this one to name a key.
+
+    Attributes:
+        strict: Raise on a key the payload does not hold instead of compiling it.
+    """
+
+    strict: bool
+
+    def lookup(
+        self,
+        fn: Callable[..., None],
+        static: tuple[Hashable, ...],
+        signature: tuple[Hashable, ...],
+    ) -> Any | None:
+        """The entry for one launch key, or None if the payload holds none.
+
+        Args:
+            fn: The ``@cute.jit`` launcher.
+            static: Its compile-time arguments, in order.
+            signature: What its runtime arguments declared.
+
+        Returns:
+            Something callable on the dynamic arguments alone, exactly as the
+            value ``cute.compile`` returns is, or None.
+        """
+        ...
+
+
+_PAYLOAD: LaunchPayload | None = None
+"""The payload consulted before a compile. None until one is loaded, and with
+none loaded the path is what it was before payloads existed."""
+
+
+def use_payload(payload: LaunchPayload | None) -> None:
+    """Install the payload :func:`jit_launch` consults, or remove it.
+
+    Process-wide, and not retroactive: an executor already in the cache stays,
+    since a payload entry and a freshly compiled one are the same code. Two
+    payloads at once is not a case -- the second call replaces the first.
+
+    Args:
+        payload: The payload, or None to go back to compiling every key.
+    """
+    global _PAYLOAD
+    _PAYLOAD = payload
+
+
+class _Events:
+    """The process's compile-cache event counts. One instance."""
+
+    __slots__ = ("compile_ns", "compiled", "hits", "payload_hits", "payload_misses")
+
+    def __init__(self) -> None:
+        self.compiled = 0
+        self.compile_ns = 0
+        self.hits = 0
+        self.payload_hits = 0
+        self.payload_misses = 0
+
+
+_EVENTS = _Events()
+
+
+class CacheEvents(NamedTuple):
+    """Where the process's launches got their executors.
+
+    The counters exist so that "the cold pass was actually cold" is a
+    measurement. Reading them costs a namedtuple construction and no profiler.
+
+    Attributes:
+        compiled: Executors built by ``cute.compile``. A second pass over work a
+            first pass already did adds none.
+        hits: Launches the executor cache served outright, which is every launch
+            past the first of its key.
+        payload_hits: Executors taken from a loaded payload rather than compiled.
+        payload_misses: Keys a loaded payload did not hold. Zero while none is
+            loaded, and in strict mode the first one raises instead of counting.
+        compile_us: Microseconds spent inside ``cute.compile``, summed. Trace,
+            MLIR passes and ptxas, which is the whole of what a payload removes.
+        dsl_hits: The DSL's own ``cache_hits``, or None when it is not counting.
+        dsl_misses: The DSL's own ``cache_misses``, or None. The DSL defines both
+            only under ``CUTE_DSL_JIT_TIME_PROFILING``, and ``cute.compile`` sets
+            ``no_cache`` unconditionally, so the miss count advances once per
+            compile and the hit count cannot advance at all. They are surfaced to
+            say that, not as a reuse signal.
+    """
+
+    compiled: int
+    hits: int
+    payload_hits: int
+    payload_misses: int
+    compile_us: float
+    dsl_hits: int | None
+    dsl_misses: int | None
+
+
+_DSL: Any = None
+"""The DSL singleton, memoized. Its accessor constructs the class."""
+
+
+def _dsl_cache_events() -> tuple[int | None, int | None]:
+    """The DSL's own cache counters, or ``(None, None)`` if it holds none."""
+    global _DSL
+    if _DSL is None:
+        _DSL = BaseDSL._get_dsl()
+    return getattr(_DSL, "cache_hits", None), getattr(_DSL, "cache_misses", None)
+
+
+def cache_events() -> CacheEvents:
+    """Read the compile-cache counters.
+
+    Returns:
+        The counts for this process. All zero before the first launch.
+    """
+    dsl_hits, dsl_misses = _dsl_cache_events()
+    return CacheEvents(
+        compiled=_EVENTS.compiled,
+        hits=_EVENTS.hits,
+        payload_hits=_EVENTS.payload_hits,
+        payload_misses=_EVENTS.payload_misses,
+        compile_us=_EVENTS.compile_ns / 1000.0,
+        dsl_hits=dsl_hits,
+        dsl_misses=dsl_misses,
+    )
+
+
+def reset_cache_events() -> None:
+    """Zero the counters, for a caller framing one interval.
+
+    The executors themselves are not dropped, so a zeroed count followed by a
+    nonzero ``hits`` and a zero ``compiled`` is the warm case. The DSL's own
+    counters are not this module's to zero.
+    """
+    _EVENTS.compiled = 0
+    _EVENTS.compile_ns = 0
+    _EVENTS.hits = 0
+    _EVENTS.payload_hits = 0
+    _EVENTS.payload_misses = 0
+
+
+class Compiled(NamedTuple):
+    """One held executor and the parts of its key that name it.
+
+    Attributes:
+        fn: The ``@cute.jit`` launcher.
+        static: Its compile-time arguments, in order.
+        signature: What its runtime arguments declared: dtype and rank per tensor,
+            element type or None per anything else.
+        executor: The compiled function, callable on the dynamic arguments alone.
+    """
+
+    fn: Callable[..., None]
+    static: tuple[Hashable, ...]
+    signature: tuple[Hashable, ...]
+    executor: Any
+
+
+def compiled_launches() -> tuple[Compiled, ...]:
+    """Every executor the process holds, with the key that reached it.
+
+    The executor cache is the record of what a workload compiled: an entry is
+    added on the first launch of a key and never evicted, so one pass over a step
+    leaves exactly the set that step needs. An ahead-of-time build reads this
+    rather than a hand-written key list, which drifts the moment a kernel gains a
+    :class:`cutlass.Constexpr`.
+
+    The device index is dropped. It keys the executor because an executor binds
+    to a device context, and it shapes no generated code.
+
+    Returns:
+        One entry per held executor, in the order they were built.
+    """
+    return tuple(
+        Compiled(fn=fn, static=static, signature=signature, executor=executor)
+        for (fn, static, _device, signature), executor in _EXECUTORS.items()
+    )
+
+
+def _executor_for(
+    fn: Callable[..., None],
+    args: list[Any],
+    static: tuple[Hashable, ...],
+    signature: tuple[Hashable, ...],
+) -> Any:
+    """The executor for a key the cache does not hold: from the payload, or built.
+
+    Off the hot path by construction -- reached once per key -- so the payload
+    consult costs a launch nothing after its first.
+
+    Args:
+        fn: The ``@cute.jit`` launcher.
+        args: Its runtime arguments, stream included, as the launch will pass
+            them.
+        static: Its compile-time arguments, in order.
+        signature: What the runtime arguments declared.
+
+    Returns:
+        The executor.
+
+    Raises:
+        KeyError: If a strict payload is loaded and does not hold the key.
+    """
+    payload = _PAYLOAD
+    if payload is not None:
+        entry = payload.lookup(fn, static, signature)
+        if entry is not None:
+            _EVENTS.payload_hits += 1
+            return entry
+        if payload.strict:
+            raise KeyError(
+                f"the payload holds no entry for {fn.__module__}.{fn.__qualname__} "
+                f"static={static} signature={signature}, and strict mode does not "
+                f"compile"
+            )
+        _EVENTS.payload_misses += 1
+    start = time.perf_counter_ns()
+    executor = cute.compile(fn, *args, *static)
+    _EVENTS.compile_ns += time.perf_counter_ns() - start
+    _EVENTS.compiled += 1
+    return executor
+
+
 def jit_launch(
     fn: Callable[..., None],
     dynamic: Sequence[Any],
@@ -399,7 +644,13 @@ def jit_launch(
 
     The launch stream is appended to ``dynamic`` here, so every launcher takes a
     :data:`Stream` last of its runtime arguments. See :func:`current_stream` for
-    why a launcher may not be called without one.
+    why a launcher may not be called without one. It shapes no generated code, so
+    it is neither in the key nor baked into an ahead-of-time entry: a payload
+    entry replayed on another stream launches on that stream.
+
+    A key the cache does not hold goes to :func:`_executor_for`, which consults a
+    loaded payload before it compiles. With no payload loaded that is a compile,
+    as it has always been. :func:`cache_events` counts both.
 
     Args:
         fn: The ``@cute.jit`` launcher.
@@ -411,6 +662,7 @@ def jit_launch(
     Raises:
         TypeError: If ``static`` holds an unhashable value, which would mean a
             compile-time argument that cannot key the cache.
+        KeyError: If a strict payload is loaded and holds no entry for the key.
     """
     try:
         args: list[Any] = []
@@ -434,11 +686,13 @@ def jit_launch(
         # that could be called without one would be a launch on the default stream.
         # It shapes no generated code, so it stays out of the key.
         args.append(current_stream())
-        key = (fn, static, torch.cuda.current_device(), tuple(signature))
+        declared = tuple(signature)
+        key = (fn, static, torch.cuda.current_device(), declared)
         executor = _EXECUTORS.get(key)
         if executor is None:
-            executor = cute.compile(fn, *args, *static)
-            _EXECUTORS[key] = executor
+            executor = _EXECUTORS[key] = _executor_for(fn, args, static, declared)
+        else:
+            _EVENTS.hits += 1
         executor(*args)
     finally:
         _release()
