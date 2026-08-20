@@ -256,7 +256,13 @@ speed-of-light 75.5%, LSU shared wavefronts 44.1% of peak against 18.6%, with DR
 term's reread, and the arena grows by the ``4 * L`` bytes a warp group past the first
 that :func:`offset_tile` takes -- one resident block at either width. Sixteen warps is
 refused by the register file before any tiling question: 512 threads admit 128
-registers a thread. The declared class follows the traffic; the figures above are what
+registers a thread.
+
+The width also reaches a spill the depth cannot. At ``B 4 H 12 T 2048 L 64 P 48 3N 48
+G 12`` the fold is already one, and four warps still move 0.79 MB each of local load
+and store a launch, 75.4% and 100% of that past L1. Eight warps take the register
+count from 255 to 208 and the local traffic to zero, 959.1 us to 463.2 and 15.3% to
+31.3% of the bar. The declared class follows the traffic; the figures above are what
 the kernel reaches against it.
 """
 
