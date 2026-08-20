@@ -203,6 +203,30 @@ def _load_pair(
 
 
 @cute.jit
+def _store_run(
+    words: cute.Tensor,
+    frag: cute.Tensor,
+    row: cutlass.Int32,
+    col: cutlass.Int32,
+    vals: tuple[Scalar, ...],
+) -> None:
+    """Store ``LANE_PAIR`` adjacent values as one access.
+
+    Args:
+        words: A tile from :func:`paired`.
+        frag: ``(1, LANE_PAIR)`` fragment of the tile's element type, built once by
+            the caller: a fragment per step is an allocation per step.
+        row: Row of the tile.
+        col: Paired column.
+        vals: ``LANE_PAIR`` values in element order, float32. Narrowed here, once.
+    """
+    elem = words.element_type
+    for j in cutlass.range_constexpr(LANE_PAIR):
+        frag[0, j] = narrow(vals[j], elem)
+    cute.autovec_copy(frag, words[(None, (row, col))])
+
+
+@cute.jit
 def store_pair(
     words: cute.Tensor,
     frag: cute.Tensor,
@@ -220,11 +244,8 @@ def store_pair(
         col: First paired column of the pair, ``3 * m`` for pair ``m``.
         vals: The values in element order, float32. Narrowed here, once.
     """
-    elem = words.element_type
     for k in cutlass.range_constexpr(3):
-        for j in cutlass.range_constexpr(LANE_PAIR):
-            frag[0, j] = narrow(vals[LANE_PAIR * k + j], elem)
-        cute.autovec_copy(frag, words[(None, (row, col + k))])
+        _store_run(words, frag, row, col + k, vals[LANE_PAIR * k : LANE_PAIR * (k + 1)])
 
 
 @cute.jit
@@ -474,10 +495,11 @@ def stage_shifted(
     touched: they are the caller's business, through :func:`stage_pad`, because
     they never change and a per-slice restage would rewrite the same zeros.
 
-    The pass runs in groups of :data:`PREFETCH` steps, loads first, on clamped
-    indices with a select afterwards, for the reason given in
+    The pass runs in groups of ``PREFETCH // LANE_PAIR`` steps, loads first, on
+    clamped indices with a select afterwards, for the reason given in
     :func:`stage_rotated`. This is the longest staging pass in the operator:
-    ``(span + 1) * width`` elements at one element per thread per step.
+    ``(span + 1) * width`` elements at :data:`LANE_PAIR` elements per thread per
+    step, which is one read and one write per step at either end.
 
     Args:
         gu: ``(B,H,T,P)`` operand-dtype source.
@@ -494,44 +516,74 @@ def stage_shifted(
         span: Tokens of the run. Compile-time.
         width: Columns that carry data, ``P``. Compile-time.
         has_prev: Whether ``guprev`` was supplied. Compile-time.
+
+    Invariants:
+        ``width`` is ``P`` or a lane tile of ``3N``, so it is even:
+        :func:`slinoss.ops.so3ssd.cute.guard.check_rows` holds ``P`` to a multiple of
+        16 and a lane tile is a multiple of 48. ``su`` is pitched by
+        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`, which is what
+        :data:`LANE_PAIR` rests on. The pair predicate is reachable where the element
+        predicate was not: pairing halves the extent, so an extent that was a
+        multiple of the block width need not stay one.
     """
     src = gu.element_type
     zero = cutlass.Float32(0.0)
-    total = (span + 1) * width
+    pairs = width // LANE_PAIR
+    total = (span + 1) * pairs
     steps = -(-total // threads)
     exact = total % threads == 0
+    depth = max(1, PREFETCH // LANE_PAIR)
 
-    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
-        count = min(PREFETCH, steps - group * PREFETCH)
+    words = paired(su)
+    frag = cute.make_fragment((1, LANE_PAIR), su.element_type)
+    loads = cute.make_fragment((depth, LANE_PAIR), src)
+    # The false arm aliases the current fragment, which is never read under it: every
+    # use of the carry fragment sits under the same compile-time flag.
+    prior = (
+        cute.make_fragment((depth, LANE_PAIR), src)
+        if cutlass.const_expr(has_prev)
+        else loads
+    )
+
+    for group in cutlass.range_constexpr(-(-steps // depth)):
+        count = min(depth, steps - group * depth)
         held = []
         for step in cutlass.range_constexpr(count):
-            i = tid + (group * PREFETCH + step) * threads
+            i = tid + (group * depth + step) * threads
             if cutlass.const_expr(not exact):
                 i = cutlass.min(i, total - 1)
-            r = i // width
-            p = i - r * width
+            r = i // pairs
+            p = i - r * pairs
             token = lbase + r - 1
             # token < valid implies t0 + token < seqlen, so clamping the token
             # bounds the read above; the row before the sequence bounds it below.
             gbase = t0 + cutlass.min(token, valid - 1)
-            got = widen(gu[bidx, hidx, cutlass.max(gbase, 0), p], src)
+            row = _paired_row(gu[bidx, hidx, cutlass.max(gbase, 0), None])
+            cute.autovec_copy(row[(None, p)], loads[(step, None)])
             if cutlass.const_expr(has_prev):
-                got = select(gbase < 0, widen(guprev[bidx, hidx, p], src), got)
+                back = _paired_row(guprev[bidx, hidx, None])
+                cute.autovec_copy(back[(None, p)], prior[(step, None)])
             keep = token < valid
             if cutlass.const_expr(not has_prev):
                 keep = keep & (gbase >= 0)
-            held.append((r, p, keep, got))
+            held.append((r, p, keep, gbase < 0))
 
         for step in cutlass.range_constexpr(count):
-            r, p, keep, got = held[step]
+            r, p, keep, at_start = held[step]
             # The select is float32 because there is one select helper; the
             # operand round trip through float32 is exact at every operand width.
-            out = narrow(select(keep, got, zero), src)
+            got = tuple(widen(loads[step, j], src) for j in range(LANE_PAIR))
+            if cutlass.const_expr(has_prev):
+                got = tuple(
+                    select(at_start, widen(prior[step, j], src), got[j])
+                    for j in range(LANE_PAIR)
+                )
+            out = tuple(select(keep, value, zero) for value in got)
             if cutlass.const_expr(exact):
-                su[r, p] = out
+                _store_run(words, frag, r, p, out)
             else:
-                if tid + (group * PREFETCH + step) * threads < total:
-                    su[r, p] = out
+                if tid + (group * depth + step) * threads < total:
+                    _store_run(words, frag, r, p, out)
 
 
 @cute.jit
@@ -602,29 +654,46 @@ def stage_state(
         threads: Block width. Compile-time.
         width: Rows to fill, ``P``. Compile-time.
         dim: ``3N``. Compile-time.
+
+    Invariants:
+        ``dim`` is a multiple of 48 or a lane tile of one, so it is even, and ``sz`` is
+        pitched by :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`: both ends of a pair
+        access are aligned to :data:`LANE_PAIR` elements. Each element is narrowed on
+        its own, so the pair does not associate anything.
     """
-    elem = sz.element_type
-    total = width * dim
+    src = gz.element_type
+    pairs = dim // LANE_PAIR
+    total = width * pairs
     steps = -(-total // threads)
     exact = total % threads == 0
+    depth = max(1, PREFETCH // LANE_PAIR)
 
-    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
-        span = min(PREFETCH, steps - group * PREFETCH)
+    words = paired(sz)
+    frag = cute.make_fragment((1, LANE_PAIR), sz.element_type)
+    loads = cute.make_fragment((depth, LANE_PAIR), src)
+
+    for group in cutlass.range_constexpr(-(-steps // depth)):
+        count = min(depth, steps - group * depth)
         held = []
-        for step in cutlass.range_constexpr(span):
-            i = tid + (group * PREFETCH + step) * threads
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * depth + step) * threads
             if cutlass.const_expr(not exact):
                 i = cutlass.min(i, total - 1)
-            p = i // dim
-            held.append((p, i - p * dim))
-        got = [gz[p, col] for p, col in held]
-        for step in cutlass.range_constexpr(span):
+            p = i // pairs
+            col = i - p * pairs
+            cute.autovec_copy(
+                _paired_row(gz[p, None])[(None, col)], loads[(step, None)]
+            )
+            held.append((p, col))
+
+        for step in cutlass.range_constexpr(count):
             p, col = held[step]
+            out = tuple(loads[step, j] for j in range(LANE_PAIR))
             if cutlass.const_expr(exact):
-                sz[p, col] = narrow(got[step], elem)
+                _store_run(words, frag, p, col, out)
             else:
-                if tid + (group * PREFETCH + step) * threads < total:
-                    sz[p, col] = narrow(got[step], elem)
+                if tid + (group * depth + step) * threads < total:
+                    _store_run(words, frag, p, col, out)
 
 
 @cute.jit
