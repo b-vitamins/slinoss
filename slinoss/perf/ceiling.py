@@ -17,8 +17,8 @@ and two of them divide nothing. :data:`MIN_OCCUPANCY_PCT` and the block floor on
 they are read off the launch configuration and the warp census rather than against
 a probe, and :class:`GeometryVerdict` carries them. A kernel passes on its class
 floor and fails on its geometry independently, which is the case
-``chunk_vector_bwd`` makes: one resident block of four warps hides no latency at
-any traffic figure.
+``chunk_vector_bwd`` makes: one resident block hides no latency at any traffic
+figure, at any block width.
 
 A kernel may read slightly above the copy ceiling if its read/write mix is
 friendlier than a copy's. That is a fact about the probe, not a licence to invent
@@ -130,9 +130,11 @@ latency the multiprocessor has left to hide. It is not a share of a ceiling and 
 does not belong in :data:`CLASS_FLOOR_PCT`: the two rules are independent, and a
 kernel far under this bar can still read high against a bandwidth. That is the
 reading this bar exists to catch. ``chunk_vector_bwd`` on sm_86 runs one resident
-block of four warps at 8.3% achieved occupancy, and its measured share of its own
-DRAM floor sat at 12 to 14% across three shapes and both spill states, so no
-traffic figure separates it from a kernel that merely moves more bytes.
+block at 8.3% achieved occupancy at four warps and 16.6% at eight, and its measured
+share of its own DRAM floor sat between 12 and 31% across three shapes, both spill
+states and both widths, so no traffic figure separates it from a kernel that merely
+moves more bytes. Its arena is above the two-block ceiling at either width, so the
+50% bar is unreachable there until the arena falls.
 """
 
 BLOCK_FLOOR_EXEMPT_CLASSES: Final[frozenset[str]] = frozenset((SERIAL_TINY,))
