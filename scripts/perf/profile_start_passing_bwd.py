@@ -101,6 +101,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Lane band width the fused arm splits 3N into. Ignored by the pair.",
     )
     parser.add_argument(
+        "--resident",
+        type=int,
+        default=None,
+        help="Blocks per SM the fused launch bound asks for. Defaults to "
+        "RESIDENT_MAX. The cap it puts on the register file is what decides "
+        "whether the residency is reached, so it is priced rather than assumed.",
+    )
+    parser.add_argument(
         "--seed-state",
         action="store_true",
         help="Supply a final-state cotangent, the has_dstate variant.",
@@ -146,6 +154,8 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
         suffix += f"-g{args.groups}"
     if args.arm == "fused" and args.span != SPLIT:
         suffix += f"-span{args.span}"
+    if args.arm == "fused" and args.resident is not None:
+        suffix += f"-r{args.resident}"
     if not suffix:
         return shape
     return dataclasses.replace(shape, name=f"{shape.name}{suffix}", **given)
@@ -158,6 +168,7 @@ def build_runner(
     dtype: torch.dtype,
     arm: str,
     span: int,
+    resident: int | None,
     seed_state: bool,
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the arm.
@@ -179,6 +190,7 @@ def build_runner(
         dtype: Activation dtype.
         arm: ``fused`` or ``pair``.
         span: Lane band width for the fused arm.
+        resident: Launch bound for the fused arm, or None for its default.
         seed_state: Whether to supply a final-state cotangent.
 
     Returns:
@@ -225,6 +237,7 @@ def build_runner(
             shape.chunk,
             seed,
             span=span,
+            resident=resident,
         )
 
     def pair() -> None:
@@ -261,6 +274,8 @@ def target_argv(args: argparse.Namespace) -> list[str]:
             argv += [f"--{field}", str(value)]
     if args.groups is not None:
         argv += ["--groups", str(args.groups)]
+    if args.resident is not None:
+        argv += ["--resident", str(args.resident)]
     if args.seed_state:
         argv += ["--seed-state"]
     return argv
@@ -331,7 +346,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.window:
         runner = build_runner(
-            shape, groups, device, dtype, args.arm, args.span, args.seed_state
+            shape,
+            groups,
+            device,
+            dtype,
+            args.arm,
+            args.span,
+            args.resident,
+            args.seed_state,
         )
         with on_device(device):
             for _ in range(args.warmup):
@@ -344,7 +366,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
     runner = build_runner(
-        shape, groups, device, dtype, args.arm, args.span, args.seed_state
+        shape,
+        groups,
+        device,
+        dtype,
+        args.arm,
+        args.span,
+        args.resident,
+        args.seed_state,
     )
     timed = measure(
         runner,
@@ -376,7 +405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             passes.append(one)
     after = compute_apps_query(smi_selector(ordinal))
 
-    print(f"arm          {args.arm} span {args.span}")
+    print(f"arm          {args.arm} span {args.span} resident {args.resident}")
     print(f"shape        {shape.describe()}")
     print(f"groups       {groups} fold {shape.heads // groups}")
     print(f"dtype        {args.dtype}")

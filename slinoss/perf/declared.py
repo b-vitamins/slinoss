@@ -100,6 +100,17 @@ step in the operator, but serial is not the same as latency bound: once the chun
 fetch is pipelined ahead of the rotation, the serial chain is arithmetic and the
 kernel saturates the bus. Both are held to a bandwidth like the rest.
 
+``start_passing_bwd_kernel`` is the backward one of those two fused with the
+chunk-start GEMM, declared DRAM-bound on the same grounds and knowingly under the
+bar. Measured on sm_86 at the model geometry it moves 176 MB in 474.9 us, 55.2% of
+the floor that traffic implies, against the 454 MB in 741.7 us and the 78.7% and
+99.3% of the two kernels it replaces. Deleting a round trip takes bytes out of the
+numerator, so the faster arm scores lower: the floor asks the right question of one
+kernel and the wrong one of two ways to compute the same thing. The arm total in
+``scripts/perf/profile_start_passing_bwd.py`` is what ranked them, and the
+percentage this entry fails is a statement about the denominator rather than about
+the kernel.
+
 Four entries are SERIAL-tiny, and only the first is unconditionally so.
 ``boundary_bwd_kernel`` on the single-partial path reads a fixed few rows per chunk
 rather than a pass over the sequence, so no shape makes that path large enough to

@@ -203,6 +203,7 @@ def start_chunk(
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
+    fenced: cutlass.Constexpr,
 ) -> None:
     """One chunk's contraction, from the staging passes to the store.
 
@@ -238,6 +239,10 @@ def start_chunk(
         rows: ``P``. Compile-time.
         dim: Columns contracted: ``3N``, or the width of one lane band of it.
             Compile-time.
+        fenced: Whether to separate the contraction from the store with a barrier.
+            Compile-time. Required of a caller whose ``dst`` overlaps ``sdy`` or
+            ``scrot``, since without it one warp stores its accumulator over an
+            operand another warp is still reading.
 
     Invariants:
         Every barrier here is reached by the whole block, so the body is safe to
@@ -296,6 +301,8 @@ def start_chunk(
         scrot.iterator, cute.make_layout((dim, chunk), stride=(1, ldb))
     )
     mma_gemm(tiled_mma, tid, acc, va, vb, False, False)
+    if cutlass.const_expr(fenced):
+        cute.arch.sync_threads()
     mma_store(tiled_mma, tid, acc, dst, (mpad, dim), rows)
 
 
@@ -408,6 +415,7 @@ def chunk_start_bwd_kernel(
                 chunk,
                 rows,
                 dim,
+                False,
             )
     else:
         start_chunk(
@@ -433,6 +441,7 @@ def chunk_start_bwd_kernel(
             chunk,
             rows,
             dim,
+            False,
         )
 
 

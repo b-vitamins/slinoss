@@ -48,11 +48,36 @@ The whole state at once is 120 and 120, which cannot fit 255 registers, and a
 spilled recurrence accumulator touched once per chunk would move exactly the bytes
 this kernel exists to delete. The band is not a tuning knob for anything else.
 
-Barriers. :func:`start_chunk` ends on the store into shared memory with no barrier
-after it, so one is emitted here before the recurrence reads the tile. The reverse
-direction needs none: the three barriers inside the next iteration's staging keep
-any thread from reaching that iteration's store while another is still reading the
-tile.
+Shared memory. The two GEMM operand tiles and the tile the recurrence reads share
+one region, because no chunk has both live at once: the contraction reads the
+operands and then writes its result, and the next chunk restages the operands only
+after the recurrence has read that result. At the model geometry that makes the
+recurrence's tile free and the block's footprint the unfused GEMM's 20,992 B, which
+is four resident blocks of the 101,376 B carveout against the two that 33,280 B
+allowed. Occupancy is what this kernel is short of, so the overlay is the point of
+it and not a saving.
+
+Barriers. Three per chunk, and the overlay is why two of them exist. One inside
+:func:`start_chunk` between the contraction and the store, or a warp writes its
+accumulator over an operand another warp is still reading. One after the store,
+before the recurrence reads the tile. One after the recurrence, before the next
+chunk's staging writes over what it just read -- the barriers inside the staging
+come after its writes and cannot stand in for this one.
+
+Measured on sm_86, bfloat16, no final-state cotangent, at the geometry above, both
+arms in one process under one floor fit, every figure twice:
+
+    arm    us/call       DRAM MB/call
+    pair   741.0  741.7  453.9  454.0
+    fused  474.9  474.9  176.5  176.8
+
+267 us and 277 MB a call, one call a layer. The fused kernel reaches 55.2% of the
+262 us floor its own DRAM traffic implies, where the recurrence it absorbed reached
+99.3% of its; ranking the arms by that percentage inverts them, and
+:data:`slinoss.perf.declared.DECLARED` carries the reading. The request stream is
+the 256 MB counted above, not the 176 MB crossing the bus, and the gap is the band
+re-reads L2 serves. What is left is 51.1% of the bus at 26.3% issue, 20.0% achieved
+occupancy of 25.0% theoretical, 152 registers, and no local memory.
 """
 
 import cutlass
@@ -67,12 +92,12 @@ from slinoss._cute import (
     cute_dtype,
     jit_launch,
     smem_bytes,
+    smem_capacity,
 )
 from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
     gram_tile,
     rotated_tile,
     start_chunk,
-    start_smem_bytes,
 )
 from slinoss.ops.so3ssd.cute.bwd.state_passing import StatePassingBwd
 from slinoss.ops.so3ssd.cute.common import (
@@ -103,6 +128,7 @@ from slinoss.ops.so3ssd.cute.mma import (
 from slinoss.ops.so3ssd.cute.table import stage_pad
 
 __all__ = [
+    "RESIDENT_MAX",
     "SPLIT",
     "fold_smem_bytes",
     "start_passing_backward",
@@ -110,6 +136,31 @@ __all__ = [
     "start_passing_bwd_kernel",
     "state_tile",
 ]
+
+RESIDENT_MAX: int = 3
+"""Blocks per SM the launch bound asks for, before the shared-memory budget cuts it.
+
+The chunk loop is serial and every iteration barriers three times, so a block spends
+most of its time waiting: measured on sm_86 at the model geometry with the tiles
+allocated separately, 42.1% of the issue slots stalled on ``long_scoreboard`` at
+36.4% of the bus and 20.8% issue, which is a kernel bounded by having eight warps per
+SM and not by the pipe. Residency is the only thing that covers it, and residency is
+what overlaying the recurrence's tile on the operands' bytes buys: 20,992 B a block
+at the model geometry, four blocks of it against the 101,376 B carveout.
+
+Four is what the tiles admit; three is what the register file prefers, because the
+bound caps a thread at ``65536 / (blocks * threads)`` registers and this kernel holds
+a GEMM accumulator and a recurrence accumulator at once. Measured on sm_86 at the
+model geometry, one call of the fused kernel:
+
+    blocks/SM   us    regs   occupancy theo/achieved
+    2          607.6   196   16.7% / 15.8%
+    3          473.6   152   25.0% / 19.5%
+    4          514.2   128   33.3% / 29.6%
+
+Nothing spills at any of the three, so the cost of asking for four is the scheduling
+the 24 registers buy and not local memory.
+"""
 
 SPLIT: int = 48
 """Columns of ``3N`` one block contracts and carries.
@@ -139,11 +190,38 @@ def state_tile(rows: int, span: int) -> Tile:
     return Tile((mma_rows(rows), span), (span, 1))
 
 
+def arena_words(chunk: int, rows: int, span: int, itemsize: int = 2) -> tuple[int, int]:
+    """Float32-word extent of the overlaid region, and the offset inside it.
+
+    The two GEMM operand tiles and the tile the recurrence reads are never live at
+    the same time: the contraction reads the operands and then writes its result,
+    and the next chunk restages the operands only after the recurrence has read
+    that result. So one region holds both, and the recurrence's tile costs nothing
+    at the shape the kernel is declared against -- which is what leaves room for the
+    residency :data:`RESIDENT_MAX` asks for.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        span: Band width, :data:`SPLIT`.
+        itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+
+    Returns:
+        ``(words, gram_words)``: the region's float32-word extent, and the offset at
+        which the rotated readout tile starts. Both are whole words because every
+        tile's row pitch is a multiple of :data:`SMEM_SEGMENT`.
+    """
+    gram = smem_bytes([(gram_tile(chunk, rows), itemsize)])
+    rotated = smem_bytes([(rotated_tile(chunk, span), itemsize)])
+    state = smem_bytes([(state_tile(rows, span), 4)])
+    return max(gram + rotated, state) // 4, gram // 4
+
+
 def fold_smem_bytes(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
     """Shared memory the kernel allocates, in bytes.
 
-    The staging tiles of the chunk-start GEMM at the band width, plus the float32
-    tile the recurrence reads.
+    The four small float32 tiles of the chunk-start GEMM, then the one region
+    :func:`arena_words` describes.
 
     Args:
         chunk: ``L``.
@@ -151,8 +229,15 @@ def fold_smem_bytes(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
         span: Band width, :data:`SPLIT`.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
     """
-    return start_smem_bytes(chunk, rows, span, itemsize) + smem_bytes(
-        [(state_tile(rows, span), 4)]
+    words, _ = arena_words(chunk, rows, span, itemsize)
+    return smem_bytes(
+        [
+            (trans_tile(chunk), 4),
+            (scalar_tile(chunk), 4),
+            (trans_tile(chunk), 4),
+            (table_tile(chunk, 1), 4),
+            (Tile((words,), (1,)), 4),
+        ]
     )
 
 
@@ -232,16 +317,24 @@ def start_passing_bwd_kernel(
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 1).layout(), 16)
-    scrot = smem.allocate_tensor(
-        gc.element_type, rotated_tile(chunk, span).layout(), SMEM_SEGMENT
-    )
-    sdy = smem.allocate_tensor(
-        gdy.element_type, gram_tile(chunk, rows).layout(), SMEM_SEGMENT
-    )
-    sdz = smem.allocate_tensor(cutlass.Float32, state_tile(rows, span).layout(), 16)
 
-    stage_pad(scrot, tid, threads, chunk, span, ldb)
-    stage_pad(sdy, tid, threads, chunk, rows, lda)
+    # One region, three views: the two GEMM operands, and the contraction's result
+    # over the same bytes. The pitches make every offset a whole float32 word and a
+    # whole 16-byte segment, which is the alignment both stagers and ``mma_store``
+    # restate on the pointer they are handed.
+    words, gwords = arena_words(chunk, rows, span, gdy.element_type.width // 8)
+    arena = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((words,), stride=(1,)), SMEM_SEGMENT
+    )
+    sdy = cute.make_tensor(
+        cute.recast_ptr(arena.iterator, dtype=gdy.element_type),
+        gram_tile(chunk, rows).layout(),
+    )
+    scrot = cute.make_tensor(
+        cute.recast_ptr(arena.iterator + gwords, dtype=gc.element_type),
+        rotated_tile(chunk, span).layout(),
+    )
+    sdz = cute.make_tensor(arena.iterator, state_tile(rows, span).layout())
 
     # The band's origin is a pointer offset: ``3N`` is the last mode at unit stride,
     # so the staging pass indexes the band's own columns and never learns that the
@@ -276,6 +369,11 @@ def start_passing_bwd_kernel(
 
     for step in cutlass.range(chunks):
         cidx = chunks - 1 - step
+        # Restaged every chunk, not once: the columns at or past each tile's data
+        # width are read as operands and never restaged by the stagers, and the
+        # previous chunk's result was written over them.
+        stage_pad(scrot, tid, threads, chunk, span, ldb)
+        stage_pad(sdy, tid, threads, chunk, rows, lda)
         start_chunk(
             gdy,
             gtrans,
@@ -299,6 +397,7 @@ def start_passing_bwd_kernel(
             chunk,
             rows,
             span,
+            True,
         )
         cute.arch.sync_threads()
 
@@ -326,6 +425,10 @@ def start_passing_bwd_kernel(
                 state[3 * k + j] = (
                     decayed * turned[j] + sdz[tile_row[k], tile_col[k] + j]
                 )
+        # The next chunk's staging writes over the tile just read, the two being one
+        # region, so the reads have to finish first. The barriers inside the staging
+        # come after its writes and cannot stand in for this one.
+        cute.arch.sync_threads()
 
     for k in cutlass.range_constexpr(vecs):
         for j in cutlass.range_constexpr(3):
@@ -356,11 +459,15 @@ def start_passing_bwd(
     span: cutlass.Constexpr,
     per_group: cutlass.Constexpr,
     has_dstate: cutlass.Constexpr,
+    resident: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`start_passing_bwd_kernel`.
 
     The grid is ``(H, 3N/span, B)``, head-fastest, so the ordering argument the
     unfused GEMM makes about ``C`` survives the fusion.
+
+    ``resident`` is the launch bound, computed from the tiles by the host entry
+    rather than chosen here; see :data:`RESIDENT_MAX`.
     """
     start_passing_bwd_kernel(
         gdy,
@@ -381,7 +488,12 @@ def start_passing_bwd(
         span,
         per_group,
         has_dstate,
-    ).launch(grid=(heads, bands, bsz), block=(threads, 1, 1), stream=stream)
+    ).launch(
+        grid=(heads, bands, bsz),
+        block=(threads, 1, 1),
+        min_blocks_per_mp=resident,
+        stream=stream,
+    )
 
 
 def start_passing_backward(
@@ -394,6 +506,7 @@ def start_passing_backward(
     dstate: Tensor | None = None,
     *,
     span: int = SPLIT,
+    resident: int | None = None,
 ) -> StatePassingBwd:
     """Form every chunk's start-state cotangent and pass it back through the scan.
 
@@ -413,6 +526,10 @@ def start_passing_backward(
         span: Band width. :data:`SPLIT` is the only value the register budget
             admits at every legal ``P``; it is an argument so a driver can price a
             wider one.
+        resident: Blocks per SM the launch bound asks for. Defaults to
+            :data:`RESIDENT_MAX` capped by the shared-memory budget; it is an
+            argument for the same reason ``span`` is, since the cap it puts on the
+            register file is what decides whether the residency is reached.
 
     Returns:
         A :class:`slinoss.ops.so3ssd.cute.bwd.state_passing.StatePassingBwd`. Both
@@ -451,10 +568,10 @@ def start_passing_backward(
             f"span must divide 3N={dim}, be a multiple of 3, and give a whole "
             f"number of {THREADS}-thread tiles of P*span/3, got span={span} P={rows}"
         )
-    assert_smem_fits(
-        f"start_passing_bwd[L{chunk_size}/P{rows}/span{span}]",
-        fold_smem_bytes(chunk_size, rows, span, dy.element_size()),
-    )
+    budget = fold_smem_bytes(chunk_size, rows, span, dy.element_size())
+    assert_smem_fits(f"start_passing_bwd[L{chunk_size}/P{rows}/span{span}]", budget)
+    asked = RESIDENT_MAX if resident is None else resident
+    blocks = min(asked, max(1, smem_capacity() // budget))
 
     dinc = torch.empty(
         bsz, heads, chunks, rows, dim, dtype=torch.float32, device=dy.device
@@ -495,6 +612,7 @@ def start_passing_backward(
             span,
             heads // groups,
             dstate is not None,
+            blocks,
         ),
     )
     return StatePassingBwd(dinc=dinc, dz0=dz0)

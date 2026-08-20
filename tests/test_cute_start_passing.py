@@ -33,6 +33,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
     start_smem_bytes,
 )
 from slinoss.ops.so3ssd.cute.bwd.start_passing import (
+    RESIDENT_MAX,
     SPLIT,
     fold_smem_bytes,
     start_passing_backward,
@@ -246,16 +247,19 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     """The budget is computed from the layouts, not from a guard constant.
 
     The band width is fixed, so the binding extent is ``L``: every staging tile is
-    proportional to it and the state tile is not. Two blocks per SM at the shape
-    the class is declared against is what keeps the DRAM pipe fed.
+    proportional to it and the state tile is not. The residency at the shape the
+    class is declared against is what this kernel is short of, so the budget has to
+    leave room for :data:`RESIDENT_MAX` blocks there.
     """
     assert fold_smem_bytes(MAX_CHUNK, 64, SPLIT) <= smem_capacity()
-    assert 2 * fold_smem_bytes(64, 64, SPLIT) <= smem_capacity()
-    # The state tile is the allocation the unfused GEMM does not carry, and it is
-    # what the band width is chosen against.
-    assert fold_smem_bytes(64, 64, SPLIT) - start_smem_bytes(64, 64, SPLIT) == (
-        64 * SPLIT * 4
-    )
+    assert RESIDENT_MAX * fold_smem_bytes(64, 64, SPLIT) <= smem_capacity()
+    # The recurrence's tile costs nothing at that shape: it is smaller than the two
+    # operand tiles it is overlaid on, so the fused block is the unfused GEMM's
+    # footprint and the residency comes for free.
+    assert fold_smem_bytes(64, 64, SPLIT) == start_smem_bytes(64, 64, SPLIT)
+    # A short chunk inverts that, and the region has to follow the larger of the two
+    # rather than the operands alone.
+    assert fold_smem_bytes(16, 64, SPLIT) > start_smem_bytes(16, 64, SPLIT)
 
 
 def test_rejects_a_band_the_launch_cannot_cover() -> None:

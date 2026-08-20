@@ -1,6 +1,6 @@
 """Host orchestrator for the CuTe backward.
 
-Two rematerializing launches, then five backward launches, in order:
+Two rematerializing launches, then four backward launches, in order:
 
 1. ``chunk_increment_fwd`` -- the forward's chunk increment, unit chunk rotation,
    and chunk decay, recomputed. Only the last two are read again; the increment
@@ -8,21 +8,22 @@ Two rematerializing launches, then five backward launches, in order:
    state.
 2. ``state_passing_fwd`` -- the forward's inter-chunk recurrence, in place over
    that buffer, leaving each chunk's start state where its increment was.
-3. ``chunk_start_bwd`` -- the readout half of every chunk-start state cotangent.
-   Skipped when ``dy`` is absent, in which case that half is identically zero.
-4. ``state_passing_bwd`` -- the reverse inter-chunk recurrence, in place over the
-   chunk-start cotangent, leaving each chunk's increment cotangent there.
-5. ``chunk_input_bwd`` -- ``dU``, the streaming input carry, and the log-scale and
+3. ``start_passing_bwd`` -- the readout half of every chunk-start state cotangent
+   and the reverse inter-chunk recurrence over it, in one launch that keeps that
+   cotangent in shared memory. With ``dy`` absent the readout half is identically
+   zero, and ``state_passing_bwd`` runs the recurrence alone in place over an
+   allocated buffer.
+4. ``chunk_input_bwd`` -- ``dU``, the streaming input carry, and the log-scale and
    closing-transition cotangents.
-6. ``chunk_vector_bwd`` -- ``dB``, ``dC``, ``dtrans``, ``dK``, and the streaming
+5. ``chunk_vector_bwd`` -- ``dB``, ``dC``, ``dtrans``, ``dK``, and the streaming
    vector carry.
-7. ``boundary_bwd`` -- the chunk-boundary rows of ``dU`` and ``dB``, and the
+6. ``boundary_bwd`` -- the chunk-boundary rows of ``dU`` and ``dB``, and the
    streaming terms.
 
 Nothing between the launches. No reshape, no cast, no staging copy: each kernel
-writes the layout the next one reads, two buffers are consumed in place rather
-than allocated twice, and every cotangent leaves in the layout the operator
-contract states.
+writes the layout the next one reads, the forward's increment buffer is consumed
+in place rather than allocated twice, and every cotangent leaves in the layout the
+operator contract states.
 
 The saved set is the operator's inputs and nothing derived, so the recompute is
 the forward by construction. The chunk-local prefixes do not appear here either:
@@ -44,8 +45,8 @@ from torch import Tensor
 from slinoss.ops.so3ssd.backward import SO3SSDGrads
 from slinoss.ops.so3ssd.cute.bwd.boundary import boundary_backward
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import chunk_input_backward
-from slinoss.ops.so3ssd.cute.bwd.chunk_start import chunk_start_backward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
+from slinoss.ops.so3ssd.cute.bwd.start_passing import start_passing_backward
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
 from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
 from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
@@ -131,20 +132,28 @@ def so3ssd_bwd_cute(
         increment.inc, increment.cquat, increment.cscale, z0
     )
 
-    # An absent dy leaves the readout half of the chunk-start cotangent
-    # identically zero. The buffer is still allocated because the reverse
-    # recurrence writes its result there, but has_dzstart drops the load and the
-    # add at compile time rather than running them against a zero fill.
-    has_dy = dy is not None
-    if has_dy:
-        dzstart = chunk_start_backward(dy, trans, C, chunk_size)
-    else:
-        dzstart = torch.empty(
-            bsz, heads, chunks, rows, dim, dtype=torch.float32, device=U.device
+    # The chunk-start cotangent never reaches memory: the fused launch contracts
+    # each chunk's readout cotangent into shared memory and the reverse recurrence
+    # consumes it there, which deletes a (B,H,C,P,3N) float32 round trip.
+    #
+    # An absent dy leaves the readout half of that cotangent identically zero, and
+    # with it the reason to fuse: the fused kernel would run its GEMM against
+    # zeros. That path keeps the recurrence alone over an allocated buffer, where
+    # has_dzstart drops the load and the add at compile time.
+    if dy is not None:
+        reverse = start_passing_backward(
+            dy, trans, C, increment.cquat, increment.cscale, chunk_size, dstate
         )
-    reverse = state_passing_backward(
-        dzstart, increment.cquat, increment.cscale, dstate, has_dzstart=has_dy
-    )
+    else:
+        reverse = state_passing_backward(
+            torch.empty(
+                bsz, heads, chunks, rows, dim, dtype=torch.float32, device=U.device
+            ),
+            increment.cquat,
+            increment.cscale,
+            dstate,
+            has_dzstart=False,
+        )
 
     # The chunk-input stage has work whatever dy is: the increment terms survive
     # an absent readout cotangent, so this is the one place a zero fill is
