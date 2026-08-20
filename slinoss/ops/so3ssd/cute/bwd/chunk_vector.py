@@ -181,24 +181,38 @@ is 64.1% of the warp cycles, issue-active 8.80%, memory speed-of-light 21.9%, te
 3.5%. Shared conflicts are 0.1556 per wavefront, load and store together, and the
 padding rule is held centrally.
 
-The allocator stops at the 255-register cap in every compile and spills 479.07 MB of
-local load and 443.35 MB of local store per launch, which fails the spill rule
-whatever the percentage says. The spill is a live set, not a loop form: recompiling
-with every device loop at trip count one raises the local traffic to 1,290.4 MB and
-the DRAM to 1,654.10 MB, and the register count and the footprint do not move.
-Neither does occupancy move with the tile count -- 255 registers and 8.330% at
-``3N 48`` and at ``3N 240`` alike -- and at ``3N 48``, one lane tile, the local
-traffic is 276.96 MB and the launch is 2,999.2 us against a 196.8 us floor.
+The allocator stops at the 255-register cap and spills 479.07 MB of local load and
+443.35 MB of local store per launch, which fails the spill rule whatever the
+percentage says. The fold is what spills, and only the fold. Holding ``P 64``,
+``3N 240`` and the code fixed and moving one extent::
 
-Closing the gap needs two resident blocks, which needs 50,688 B. The smallest arena
-at ``P 64`` is 53,648 B, at ``L 16`` and fold one, so no legal shape reaches it.
-Splitting the fold across blocks leaves 80,080 B. Splitting the kernel by output
-group would: the transition chart needs the five float32 ``L`` tiles, the table, the
-scratch and the score tile, and the state outputs need the two float32 fold sums and
-the four operand tiles, and neither half holds the other's. It costs a second read
-of ``dy``, ``U``, ``trans`` and ``K``, 324.86 MB at this configuration, for a floor
-of about 1,027 MB against today's 701.75. The other candidate is 256 threads per
-block, which is the atom tiling's shape and not this file's: at eight warps the M
+    L    fold   smem     regs   local MB   DRAM MB   GB/s    us/launch
+    16      1   53,648    205       0.00   1,507.72  214.8      7,018.1
+    32      1   64,848    255       0.00     935.91  200.8      4,661.1
+    64      1   91,344    255       0.00     654.49  114.6      5,711.7
+    32     18   71,504    255     398.46     693.58  137.1      5,060.0
+    64     18   93,392    255     922.42     985.73   82.3     11,982.6
+
+At fold one there is no local traffic at any ``L``, at 255 registers, with the lane
+tile in the grid and the ``L`` extents at their largest. At fold 18 there is, and it
+grows with ``L``. The register count is at the cap either way, so the cap is not the
+signal; what crosses a rolled fold iteration is. Unrolling the fold at trace time
+does not fix it and makes it worse, 1,290.4 MB, because the live ranges of eighteen
+inlined bodies overlap. Only taking the fold out of the block removes it, which is
+also the 13,312 B the arena needs.
+
+The lane tile is not implicated. At fold 18 and one lane tile the local traffic is
+276.96 MB, and the tile count moves neither the register count nor the footprint.
+
+Two resident blocks need 50,688 B and no legal shape at ``P 64`` reaches it: the
+smallest arena there is 53,648 B, at ``L 16`` and fold one. Taking the fold out of
+the block removes the 13,312 B accumulator that exists only above fold one and leaves
+80,080 B, so it does not reach it either; what it does reach is zero spill, which the
+table above prices at 2.10x on this shape. Beyond that, occupancy is worth what the
+one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident blocks,
+16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5% at
+``P 64`` where the same ``L`` holds one block. The remaining candidate is 256 threads
+per block, which is the atom tiling's shape and not this file's: at eight warps the M
 tile doubles and the same live set is 128,432 B, off the device. The declared class
 follows the traffic; the figures above are what the kernel reaches against it.
 """
