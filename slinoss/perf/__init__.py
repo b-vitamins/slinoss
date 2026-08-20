@@ -79,11 +79,14 @@ from slinoss.perf.memory import (
 from slinoss.perf.ncu import (
     NCU_TABLES,
     REQUIRED_METRICS,
+    SPILL_TABLE,
     KernelCounters,
     NcuPass,
     NcuTable,
+    SpillCounters,
     kernel_counters,
     run_ncu,
+    spill_counters,
 )
 from slinoss.perf.nsys import NsysKernel, NsysTrace, run_nsys
 from slinoss.perf.report import (
@@ -148,6 +151,7 @@ __all__ = [
     "NCU_TABLES",
     "REQUIRED_METRICS",
     "SERIAL_TINY",
+    "SPILL_TABLE",
     "STEP_BUCKETS",
     "SUM",
     "TENSOR_BOUND",
@@ -193,6 +197,7 @@ __all__ = [
     "Report",
     "SavedStorages",
     "SavedTensorProbe",
+    "SpillCounters",
     "Spread",
     "TFlopsPerSecond",
     "TensorCeiling",
@@ -235,6 +240,7 @@ __all__ = [
     "run_nsys",
     "saved_storage_bytes",
     "serial_verdict",
+    "spill_counters",
     "tensor_ceiling",
     "tensor_verdict",
     "write_report",
