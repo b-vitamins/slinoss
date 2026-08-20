@@ -2050,11 +2050,7 @@ def chunk_vector_bwd_kernel(
         # frame change the increment cotangent needs. Its own two cotangents are
         # read where the chart closes instead of here: nine live floats across the
         # source-token loop is nine the accumulators do not get.
-        # A plain range: the DSL preprocessor rewrites `range_constexpr` in a `for`
-        # statement only, so inside a comprehension it reaches the runtime stub and
-        # raises. Both unroll at trace time; only the statement form needs the
-        # marker.
-        aclast = tuple(stable[TABLE_AC, last, i] for i in range(9))
+        aclast = _mat_at(stable, TABLE_AC, last)
         lplast = slp[last]
 
         # Three staging passes back to back, so their global loads overlap rather
