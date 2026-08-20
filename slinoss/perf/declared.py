@@ -109,6 +109,20 @@ SERIAL-tiny is right for every shape the driver measures and stops being right
 somewhere above ``D`` 2048. Widening the workload past that needs the class
 revisited, not the floor lowered.
 
+A key is a source kernel and a verdict is an instantiated symbol, so a template
+parameter that changes a kernel's resource profile still gets its own line in the
+report without its own key here. ``conv1d_bwd_kernel`` is the case that shows it:
+the symbol NCU reports carries the dtype, the filter width, and the staging flag,
+so the audit judged ``<c10::BFloat16, 8, true>`` and ``<c10::BFloat16, 4, true>``
+separately and the width-8 failure was never averaged into the width-4 pass. A
+per-width key could not be added beside the generic one in any case:
+:func:`declared_class` raises on a symbol matching two keys, and every width
+matches the shorter name.
+
+What the single key does assert is that the class is a property of the kernel and
+not of an instantiation. Both widths are held to the same 85%, so a width that
+cannot reach it is a defect in that width rather than grounds for a second entry.
+
 ``reduce_rows_kernel`` is the same kind of tail, shared by the scan's parameter
 frontier and the fused mixer tail. Its row extent follows the sequence where the
 other two are bounded by their own grid, but so does the pass that produced the
