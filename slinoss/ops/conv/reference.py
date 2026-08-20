@@ -50,6 +50,7 @@ __all__ = [
     "causal_conv1d_ref",
     "causal_conv1d_update_ref",
     "check_cotangents",
+    "check_dx_out",
     "check_operands",
     "conv_output_shape",
     "conv_state_shape",
@@ -425,8 +426,39 @@ def check_cotangents(
     return d_head
 
 
+def check_dx_out(dx: Tensor, x: Tensor, dims: ConvDims) -> None:
+    """Validate a caller-supplied ``dx`` destination. Shared by every backend.
+
+    Shape, dtype, and device only. The layout rule belongs to the backend that
+    stores through the buffer: the kernels take a row pitch and hold ``dx`` to the
+    pitched contract, and the reference stores through ``copy_`` and holds it to
+    nothing. Checked before that rule, so a buffer of the wrong extent or dtype is
+    reported as such rather than as a stride.
+
+    Args:
+        dx: Destination for the activation gradient.
+        x: The forward's activations, whose dtype and device ``dx`` shares.
+        dims: Extents of the call.
+
+    Raises:
+        ValueError: If ``dx`` is not ``(B,T,D)``, or its dtype or device differs
+            from ``x``'s. A cross-device destination would be a silent staging copy
+            in the reference and an unaddressable store in a kernel.
+    """
+    want = (dims.batch, dims.seqlen, dims.channels)
+    if tuple(dx.shape) != want:
+        raise ValueError(f"dx must be {want}, got {tuple(dx.shape)}")
+    if dx.dtype != x.dtype:
+        raise ValueError(f"dx must be {x.dtype}, got {dx.dtype}")
+    if dx.device != x.device:
+        raise ValueError(f"dx must be on {x.device}, got {dx.device}")
+
+
 class ConvGrads(NamedTuple):
-    """Cotangents of the operator inputs. Every field is contiguous.
+    """Cotangents of the operator inputs.
+
+    Every field is contiguous except a ``dx`` the caller supplied, which carries the
+    layout it arrived with.
 
     A field is ``None`` exactly when the corresponding input was ``None``, which
     is what :class:`torch.autograd.Function` expects for an absent optional
@@ -434,7 +466,7 @@ class ConvGrads(NamedTuple):
 
     Attributes:
         dx: Shape ``(B,T,D)``, dtype of ``x``. Token-major at both output layouts,
-            because ``x`` is.
+            because ``x`` is. The buffer the call named, when it named one.
         dweight: Shape ``(D,W)``, dtype of ``weight``.
         dbias: Shape ``(D,)`` or ``None``.
         dinitial_state: Shape ``(B,W-1,D)`` or ``None``.
@@ -456,6 +488,7 @@ def causal_conv1d_bwd_ref(
     *,
     activation: bool = True,
     initial_state: Tensor | None = None,
+    dx: Tensor | None = None,
 ) -> ConvGrads:
     """Pullback of :func:`causal_conv1d_update_ref`, by autograd through it.
 
@@ -477,17 +510,24 @@ def causal_conv1d_bwd_ref(
         activation: The forward's activation flag.
         initial_state: The forward's incoming window, shape ``(B,W-1,D)``, or
             None.
+        dx: Destination for the activation gradient, shape ``(B,T,D)``, dtype and
+            device of ``x``, or None to allocate it. Written in full, so its
+            incoming contents are unread and nothing is accumulated into it. The
+            same parameter the native backend takes, so the two backends stay one
+            signature.
 
     Returns:
         A :class:`ConvGrads`.
 
     Raises:
-        ValueError: On a rank or shape mismatch, an empty ``x``, or a
-            non-positive ``W``.
+        ValueError: On a rank or shape mismatch, an empty ``x``, a non-positive
+            ``W``, or a ``dx`` outside :func:`check_dx_out`.
         TypeError: On an unsupported dtype.
     """
     dims = check_operands(x, weight, bias, initial_state)
     d_head = check_cotangents(dy, dfinal_state, dims)
+    if dx is not None:
+        check_dx_out(dx, x, dims)
 
     xl = x.detach().requires_grad_(True)
     wl = weight.detach().requires_grad_(True)
@@ -524,8 +564,14 @@ def causal_conv1d_bwd_ref(
         torch.zeros_like(leaf) if grad is None else grad.contiguous()
         for leaf, grad in zip(leaves, found)
     ]
+    grad_x = filled[0]
+    if dx is not None:
+        # A store into the caller's buffer, not a rebind: the caller reads the band
+        # it handed in, so returning the allocation would leave that band unwritten.
+        dx.copy_(grad_x)
+        grad_x = dx
     return ConvGrads(
-        dx=filled[0],
+        dx=grad_x,
         dweight=filled[1],
         dbias=filled[2] if bl is not None else None,
         dinitial_state=filled[-1] if sl is not None else None,

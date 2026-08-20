@@ -13,10 +13,11 @@ are token-major, ``(B,T,H*P)``, with head ``h`` at columns ``h*P`` through
 ``(h+1)*P``. So the tail is where the two orders meet, and the conversion is a
 store address rather than a pass: one head at one token is a contiguous run of
 ``P`` in both orders, so the warp's segment is one coalesced run either way and the
-only difference is which base it counts from. ``gate`` and the output cotangent are
-column bands of a projection, so both are pitched rather than contiguous; the
-kernels index them through a dynamic layout, which costs nothing, and the band's
-offset and pitch carry the alignment the producer padded them to.
+only difference is which base it counts from. ``gate``, the output cotangent, and the
+backward's ``dgate`` destination are column bands of a projection, so all three are
+pitched rather than contiguous; the kernels index them through a dynamic layout,
+which costs nothing, and the band's offset and pitch carry the alignment the
+producer padded them to.
 
 Parallel decomposition. The reduction runs over ``P`` and never crosses the head
 axis, so one ``(b, h, t)`` triple is one independent problem of length ``P``. One
@@ -89,7 +90,7 @@ from slinoss._cute import (
 )
 from slinoss._guard import check_dtypes, check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
-from slinoss.ops.mixer.reference import MixerTailGrads, tail_shape
+from slinoss.ops.mixer.reference import MixerTailGrads, check_dgate_dest, tail_shape
 
 __all__ = [
     "ROWS",
@@ -379,7 +380,7 @@ def mixer_tail_bwd_kernel(
         gweight: ``(H,P)`` norm scale, parameter dtype.
         gdy: ``(B,H,T,P)`` written, operand dtype.
         gdu: ``(B,H,T,P)`` written, operand dtype.
-        gdgate: ``(B,T,H*P)`` written, operand dtype.
+        gdgate: ``(B,T,H*P)`` written, operand dtype, pitched.
         gpartial: ``(SLOTS,tiles,H,P)`` float32, written with this block's
             contribution to both parameter gradients. Every element is written:
             a block whose rows are all out of range stores its zero
@@ -708,6 +709,7 @@ def mixer_tail_backward(
     weight: Tensor,
     *,
     eps: float,
+    dgate: Tensor | None = None,
 ) -> MixerTailGrads:
     """Pull the cotangent of the tail back to all five operands, in one launch.
 
@@ -715,6 +717,10 @@ def mixer_tail_backward(
     intermediate. Both parameter gradients are accumulated in the kernel's
     epilogue as one ``(H,P)`` row of tile partials; the cross-tile sum is a
     reduction over that buffer and reads no operand a second time.
+
+    A supplied ``dgate`` is stored into directly. The kernel's layouts are dynamic
+    except the trailing mode, so a destination at the projection's pitch is a store
+    address and costs no kernel variant.
 
     Args:
         dout: Cotangent of the output, ``(B,T,H*P)``, CUDA, pitched, dtype of
@@ -725,6 +731,10 @@ def mixer_tail_backward(
         d_skip: The forward's skip scale, ``(H,P)``.
         weight: The forward's norm scale, ``(H,P)``.
         eps: The epsilon the forward was called with.
+        dgate: Destination for the gate gradient, ``(B,T,H*P)``, pitched, carrying
+            the shape, dtype, and device the allocation would have had. Written in
+            full, never accumulated into and never zeroed first, and returned in the
+            result as this same object. ``None`` allocates one.
 
     Returns:
         A :class:`MixerTailGrads`.
@@ -732,8 +742,8 @@ def mixer_tail_backward(
     Raises:
         ValueError: On a shape mismatch, an empty operand, a non-positive
             ``eps``, a non-CUDA operand, a head-major operand that is not
-            contiguous, a ``gate`` or ``dout`` that is not pitched, or a ``P``
-            whose partial tile exceeds the shared-memory capacity.
+            contiguous, a ``gate``, ``dout`` or ``dgate`` that is not pitched, or a
+            ``P`` whose partial tile exceeds the shared-memory capacity.
         TypeError: On a dtype with no kernel path, or on a group that does not
             share one dtype.
     """
@@ -745,10 +755,13 @@ def mixer_tail_backward(
         )
     check_dtypes(((y, "y"), (dout, "dout")), KERNEL_DTYPES, "kernel dtypes", "group")
     check_pitched(((dout, "dout"),))
+    if dgate is not None:
+        check_dgate_dest(dgate, gate)
 
     dy = torch.empty_like(y)
     du = torch.empty_like(y)
-    dgate = torch.empty(bsz, seqlen, width, dtype=y.dtype, device=y.device)
+    if dgate is None:
+        dgate = torch.empty(bsz, seqlen, width, dtype=y.dtype, device=y.device)
     tokens = bsz * seqlen
     tiles = (tokens + ROWS - 1) // ROWS
     # Every element is written by the kernel, so the accumulator is initialized

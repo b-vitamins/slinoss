@@ -27,6 +27,11 @@ stride is that the base address and the row pitch both land on a sector, which t
 producer gets by padding its column offsets and its projection width; it is
 checked on the host so no alignment branch reaches the kernel.
 
+The backward's ``dparams`` destination is the same geometry on the store side. A
+caller may hand it one band of a wider gradient buffer, and the band's row pitch is
+read from the operand exactly as ``params``'s is, so the store needs no repack and
+the kernel needs no second addressing form.
+
 The backward is the same decomposition. One thread recovers its own biased
 parameter row, applies both Jacobians, stores its ten gradient columns, and then
 reduces them over the tile's tokens by warp shuffle. ``TILE_TOKENS`` divides the
@@ -77,6 +82,7 @@ from slinoss.ops.scanprep.reference import (
     ScanGrads,
     ScanParams,
     check_cotangents,
+    check_dparams_out,
     check_operands,
 )
 
@@ -296,7 +302,8 @@ def _pull_tokens(
             cotangent of a constant and is not read.
         gparams: ``(B,T,H*PARAM_COLS)`` projection slice the forward read.
         gbias: ``(H*PARAM_COLS,)`` float32 per-head bias, flattened.
-        gdparams: ``(B,T,H*PARAM_COLS)`` contiguous destination, activation dtype.
+        gdparams: ``(B,T,H*PARAM_COLS)`` destination, activation dtype. Contiguous or
+            one band of a wider buffer; the row pitch comes from the operand.
         gdbias: ``(B, tiles, H*PARAM_COLS)`` float32 partial, one row per block.
         bidx: Batch index.
         tidx: Token-tile index.
@@ -478,7 +485,7 @@ def scanprep_bwd_kernel(
         gdpack: ``(B,H,T,2,4)`` float32 cotangent of ``K``.
         gparams: ``(B,T,H*PARAM_COLS)`` projection slice the forward read.
         gbias: ``(H*PARAM_COLS,)`` float32 per-head bias, flattened.
-        gdparams: ``(B,T,H*PARAM_COLS)`` contiguous, written.
+        gdparams: ``(B,T,H*PARAM_COLS)`` at the operand's own row pitch, written.
         gdbias: ``(B, tiles, H*PARAM_COLS)`` float32 partial, written.
         seqlen: ``T``. Dynamic.
         w_max: The bound the forward used. Dynamic.
@@ -672,6 +679,7 @@ def scanprep_backward(
     *,
     heads: int,
     w_max: float,
+    dparams: Tensor | None = None,
 ) -> ScanGrads:
     """Pull both cotangents back to ``params`` and ``param_bias``.
 
@@ -686,16 +694,21 @@ def scanprep_backward(
             Jacobians are evaluated at ``params + param_bias``.
         heads: ``H``.
         w_max: The bound the forward used, in ``(0, pi)``.
+        dparams: Destination for the parameter gradient, or ``None`` to allocate one.
+            One band of the mixer's fused gradient buffer is what it is for; see
+            :func:`slinoss.ops.scanprep.reference.check_dparams_out`.
 
     Returns:
-        A :class:`slinoss.ops.scanprep.ScanGrads`. ``dparams`` is contiguous at
-        the activation dtype; ``dparam_bias`` is ``(H,PARAM_COLS)`` float32.
+        A :class:`slinoss.ops.scanprep.ScanGrads`. ``dparams`` is the supplied
+        destination when there is one and a contiguous allocation at the activation
+        dtype otherwise; ``dparam_bias`` is ``(H,PARAM_COLS)`` float32.
 
     Raises:
         ValueError: On a shape mismatch, a trailing stride other than one, a
             zero-token call, a non-float32 pinned cotangent, an off-CUDA or
             unaligned operand, or a ``w_max`` outside ``(0, pi)``.
-        TypeError: On a dtype with no kernel path.
+        TypeError: On a dtype with no kernel path, or a destination whose dtype is
+            not that of ``params``.
     """
     _check_w_max(w_max)
     dtype = _check_kernel_dtype(params)
@@ -703,6 +716,8 @@ def scanprep_backward(
     for tensor, name in ((dtrans, "dtrans"), (dK, "dK")):
         if tensor.dtype is not torch.float32:
             raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
+    if dparams is not None:
+        check_dparams_out(dparams, params, heads)
     # check_cotangents takes params only to shape-check against it, so the pitched
     # contract on it is this path's to state.
     check_pitched(((params, "params"),))
@@ -717,7 +732,8 @@ def scanprep_backward(
 
     tiles = -(-seqlen // TILE_TOKENS)
     width = heads * PARAM_COLS
-    dparams = torch.empty(bsz, seqlen, width, dtype=dtype, device=params.device)
+    if dparams is None:
+        dparams = torch.empty(bsz, seqlen, width, dtype=dtype, device=params.device)
     # Its own tensor, not a gradient doubling as scratch: every element is written
     # by the block that owns the row, and the launch-wide sum is the gradient.
     partial = torch.empty(bsz, tiles, width, dtype=torch.float32, device=params.device)

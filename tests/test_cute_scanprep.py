@@ -16,7 +16,8 @@ every width.
 shipped layout: the mixer runs one projection GEMM and hands out views. The sweep
 narrows it to its own allocation at the smallest legal row pitch, and one test keeps
 it at the projection pitch and demands bitwise equality, because a kernel that only
-handled one pitch would pass every other test here.
+handled one pitch would pass every other test here. The backward's ``dparams``
+destination is the same geometry on the store side and is checked the same way.
 """
 
 import pytest
@@ -56,6 +57,15 @@ Cotangents = tuple[Tensor, Tensor]
 FwdMutator = Callable[[Tensor, Tensor], Operands]
 BwdCase = tuple[Tensor, Tensor, Tensor]
 BwdMutator = Callable[[Tensor, Tensor, Tensor], BwdCase]
+Backward = Callable[..., ScanGrads]
+
+BACKWARDS = [
+    pytest.param(scanprep_backward, id="cute"),
+    pytest.param(scanprep_bwd_ref, id="reference"),
+]
+"""Both backends' backward. The gradient destination is one contract across them,
+and the reference's own tests run on the CPU, where the pitched-layout rule the
+destination is held to does not apply."""
 
 # (bsz, heads, seqlen). One block covers TILE_TOKENS tokens of one batch, so the
 # sweep is over T against that tile and over the head counts the tile arithmetic is
@@ -243,6 +253,25 @@ def _leaves(ops: Operands, *, double: bool) -> Operands:
 def _grad(tensor: Tensor) -> Tensor:
     assert tensor.grad is not None
     return tensor.grad
+
+
+def _band_dest(shape: Shape) -> Operands:
+    """A NaN-filled wider buffer and the ``dparams``-shaped band inside it.
+
+    The mixer's ``dproj``: the band sits at an aligned column offset with padding on
+    both sides, so its row pitch exceeds its row width and any write outside it lands
+    on a NaN column that is checked afterwards. float32 only, because what the store
+    addresses through is the row pitch and not the element width.
+    """
+    bsz, heads, seqlen = shape
+    width = heads * PARAM_COLS
+    wide = torch.full(
+        (bsz, seqlen, _align(width) + 2 * ALIGN_ELEMS),
+        float("nan"),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    return wide, wide[..., ALIGN_ELEMS : ALIGN_ELEMS + width]
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +489,33 @@ def test_backward_ignores_the_lane_three_cotangent() -> None:
     assert float(quiet.dparams.abs().max()) > 0.0
 
 
+@pytest.mark.parametrize("backward", BACKWARDS)
+def test_backward_writes_dparams_into_a_supplied_band(backward: Backward) -> None:
+    """A supplied destination is written in full and returned as itself.
+
+    The mixer's backward allocates one ``dproj`` and hands each operator its band, so
+    the gradient has to arrive at that pitch: a returned copy would be the second
+    full write of every gradient byte the band destination exists to remove. Values
+    are pinned against the default-allocation path, which is the same kernel reading
+    the same operands at a different destination pitch, and the columns outside the
+    band are pinned against the NaN they were filled with.
+    """
+    heads = ONE[1]
+    ops = _operands(ONE, seed=14)
+    cots = _cotangents(ONE, seed=15)
+    want = backward(*cots, *ops, heads=heads, w_max=W_MAX)
+    wide, dest = _band_dest(ONE)
+
+    got = backward(*cots, *ops, heads=heads, w_max=W_MAX, dparams=dest)
+    torch.cuda.synchronize()
+
+    assert got.dparams is dest
+    assert torch.equal(got.dparams, want.dparams)
+    assert torch.equal(got.dparam_bias, want.dparam_bias)
+    assert bool(wide[..., :ALIGN_ELEMS].isnan().all())
+    assert bool(wide[..., ALIGN_ELEMS + heads * PARAM_COLS :].isnan().all())
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     """The fast forward, backpropagated through, against the float64 reference.
@@ -635,6 +691,22 @@ def test_backward_rejects(
     dtrans, dK, params = mutate(*cots, ops[0])
     with pytest.raises(error, match=match):
         scanprep_backward(dtrans, dK, params, ops[1], heads=REJECT[1], w_max=W_MAX)
+
+
+@pytest.mark.parametrize("backward", BACKWARDS)
+def test_backward_rejects_a_misshaped_dparams_destination(backward: Backward) -> None:
+    """Shape before layout, on the one operand a caller supplies rather than gets.
+
+    The destination is one column short and starts one element into a sector, so a
+    check that ran the alignment first would report the alignment and bury the shape.
+    The rest of the destination's contract is the pitched-layout rule, whose table is
+    ``tests/test_guard.py``'s.
+    """
+    ops = _operands(REJECT, seed=16)
+    cots = _cotangents(REJECT, seed=17)
+    dest = _band_dest(REJECT)[1][..., 1:]
+    with pytest.raises(ValueError, match=r"dparams must be \(2, 8, 30\)"):
+        backward(*cots, *ops, heads=REJECT[1], w_max=W_MAX, dparams=dest)
 
 
 def test_backward_rejects_illegal_bound() -> None:

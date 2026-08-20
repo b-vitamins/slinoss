@@ -64,6 +64,12 @@ class ScanPrepBackward(Protocol):
 
     ``param_bias`` is present because the maps' Jacobians are evaluated at
     ``params + param_bias``.
+
+    ``dparams`` is where the parameter gradient is written: one band of the mixer's
+    single fused gradient buffer, or ``None`` for a fresh contiguous allocation. It is
+    on the backend rather than on :func:`slinoss.ops.scanprep.scanprep` because
+    :meth:`torch.autograd.Function.backward` is called by autograd and takes no
+    destination, so the mixer calls a backend's ``backward`` itself.
     """
 
     def __call__(
@@ -76,6 +82,7 @@ class ScanPrepBackward(Protocol):
         *,
         heads: int,
         w_max: float,
+        dparams: Tensor | None = None,
     ) -> ScanGrads: ...
 
 

@@ -27,6 +27,7 @@ from slinoss.ops.conv.reference import (
     causal_conv1d_bwd_ref,
     causal_conv1d_update_ref,
     check_cotangents,
+    check_dx_out,
     check_operands,
     conv_output_shape,
     conv_state_shape,
@@ -70,6 +71,10 @@ class ConvBackward(Protocol):
 
     No ``d_head``: the output layout reaches the backward only through ``dy``, and
     :func:`slinoss.ops.conv.reference.check_cotangents` reads it off there.
+
+    ``dx`` is the one out parameter. A caller that owns a band of a fused gradient
+    buffer names it and the backward stores there; an omitted ``dx`` is allocated.
+    Every backend takes it, because dispatch is through this one signature.
     """
 
     def __call__(
@@ -83,6 +88,7 @@ class ConvBackward(Protocol):
         *,
         activation: bool = True,
         initial_state: Tensor | None = None,
+        dx: Tensor | None = None,
     ) -> ConvGrads: ...
 
 
@@ -109,7 +115,8 @@ def _check_native(
     repacked or promoted.
 
     Both layout rules are the shared ones. The activation stream is one column band
-    of a fused projection, so a non-contiguous one carries
+    of a fused projection and its gradient is one band of that projection's
+    gradient, so a non-contiguous one carries
     :func:`slinoss._guard.check_pitched`: unit stride on the channel axis, and a row
     pitch the kernel takes as an argument. A contiguous one carries
     :func:`slinoss._guard.check_layout` instead, because the pitched rule's
@@ -220,6 +227,7 @@ def causal_conv1d_bwd_native(
     *,
     activation: bool = True,
     initial_state: Tensor | None = None,
+    dx: Tensor | None = None,
 ) -> ConvGrads:
     """Pullback of :func:`causal_conv1d_fwd_native` on the CUDA kernel.
 
@@ -231,10 +239,9 @@ def causal_conv1d_bwd_native(
     A head-major cotangent moves the kernel's ``dy`` load address and nothing else.
     ``dx`` is token-major because ``x`` is.
 
-    ``dx`` is allocated here and is therefore contiguous. The kernel writes it at a
-    caller-supplied row pitch, so a ``dx`` that is one band of a wider gradient
-    buffer is a legal store target; reaching that costs an out parameter this
-    signature does not have yet.
+    The kernel writes ``dx`` at the destination's own row pitch, so one band of a
+    wider gradient buffer is a legal store target and a caller that owns such a band
+    names it. An omitted ``dx`` is allocated here and is therefore contiguous.
 
     Args:
         dy: Cotangent of ``y``, shape ``(B,T,D)`` or ``(B, D//P, T, P)``,
@@ -248,9 +255,15 @@ def causal_conv1d_bwd_native(
         activation: The forward's activation flag.
         initial_state: The forward's incoming window, shape ``(B,W-1,D)``, or
             None.
+        dx: Destination for the activation gradient, shape ``(B,T,D)``, pitched,
+            dtype and device of ``x``, or None to allocate it. Held to the same
+            layout rule as ``x``, which for a strict band is the sector boundary.
+            The kernel writes every element, so it is neither zeroed nor accumulated
+            into and its incoming contents are unread.
 
     Returns:
-        A :class:`ConvGrads`.
+        A :class:`ConvGrads`. Its ``dx`` is the buffer the call named, when it named
+        one.
 
     Raises:
         ValueError: On a shape, layout, dtype, device, or width violation.
@@ -259,8 +272,10 @@ def causal_conv1d_bwd_native(
     """
     dims = check_operands(x, weight, bias, initial_state)
     check_cotangents(dy, dfinal_state, dims)
+    if dx is not None:
+        check_dx_out(dx, x, dims)
     _check_native(
-        (("x", x),),
+        (("x", x),) if dx is None else (("x", x), ("dx", dx)),
         (
             ("weight", weight),
             ("bias", bias),
@@ -272,9 +287,10 @@ def causal_conv1d_bwd_native(
         x.dtype,
     )
     module = _C.extension()
-    # new_empty, not empty_like: a pitched x is not dense, and empty_like's
-    # preserved format would be its stride pattern rather than a buffer.
-    dx = x.new_empty((dims.batch, dims.seqlen, dims.channels))
+    if dx is None:
+        # new_empty, not empty_like: a pitched x is not dense, and empty_like's
+        # preserved format would be its stride pattern rather than a buffer.
+        dx = x.new_empty((dims.batch, dims.seqlen, dims.channels))
     dinitial_state = None if initial_state is None else torch.empty_like(initial_state)
     parts = int(module.bwd_parts(dims.seqlen))
     dweight_parts = x.new_empty((parts, dims.width, dims.channels), dtype=torch.float32)

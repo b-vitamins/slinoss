@@ -326,3 +326,28 @@ def test_reference_backward_rejects_a_mismatched_cotangent() -> None:
     y, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
     with pytest.raises(ValueError, match="dout must be"):
         mixer_tail_bwd_ref(gate[:, :, :-1], y, u, gate, d_skip, weight, eps=EPS)
+
+
+def test_backward_writes_dgate_into_a_supplied_band() -> None:
+    """A supplied destination receives ``dgate`` in full, and only it moves.
+
+    The mixer allocates one ``dproj`` and hands each consumer the band its gradient
+    belongs in, so a destination is a column band of a wider buffer rather than a
+    buffer of its own. The wider buffer is NaN first: a write that spilled past the
+    band, or one that left a column of the band alone, lands as a NaN that the
+    comparison against the allocating call then catches.
+    """
+    y, u, gate, d_skip, weight = _operands(2, 3, 5, 8)
+    dout = _operands(2, 3, 5, 8, seed=7)[2]
+    pad, width = 16, 3 * 8
+    wide = torch.full((2, 5, width + 2 * pad), float("nan"), dtype=torch.float64)
+    band = wide[..., pad : pad + width]
+
+    got = mixer_tail_bwd_ref(dout, y, u, gate, d_skip, weight, eps=EPS, dgate=band)
+    want = mixer_tail_bwd_ref(dout, y, u, gate, d_skip, weight, eps=EPS)
+
+    assert got.dgate is band
+    assert bool(wide[..., :pad].isnan().all())
+    assert bool(wide[..., pad + width :].isnan().all())
+    for one, other, name in zip(got, want, NAMES, strict=True):
+        assert torch.equal(one, other), f"d{name}"

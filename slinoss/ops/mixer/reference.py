@@ -39,12 +39,14 @@ import torch
 from torch import Tensor
 from torch.nn.functional import silu
 
+from slinoss._guard import check_pitched
 from slinoss._precision import autocast_disabled, check_supported, pinned_dtype
 
 __all__ = [
     "MixerTailGrads",
     "as_head_major",
     "as_token_major",
+    "check_dgate_dest",
     "mixer_tail_bwd_ref",
     "mixer_tail_ref",
     "tail_shape",
@@ -175,7 +177,8 @@ class MixerTailGrads(NamedTuple):
     Attributes:
         dy: ``(B,H,T,P)``, dtype of ``y``.
         du: ``(B,H,T,P)``, dtype of ``u``.
-        dgate: ``(B,T,H*P)``, dtype of ``gate``.
+        dgate: ``(B,T,H*P)``, dtype of ``gate``. The destination the caller
+            supplied, when it supplied one, and not a copy of it.
         dd_skip: ``(H,P)``, dtype of ``d_skip``.
         dweight: ``(H,P)``, dtype of ``weight``.
     """
@@ -185,6 +188,42 @@ class MixerTailGrads(NamedTuple):
     dgate: Tensor
     dd_skip: Tensor
     dweight: Tensor
+
+
+def check_dgate_dest(dgate: Tensor, gate: Tensor) -> None:
+    """Hold a caller-supplied ``dgate`` destination to the allocation it replaces.
+
+    The mixer's backward allocates one ``dproj`` and hands each consumer the band its
+    gradient belongs in, so a destination is one column band of a wider buffer:
+    pitched rather than contiguous, and held to
+    :func:`slinoss._guard.check_pitched`. Shape and dtype come first, so a
+    wrong-shaped destination reports its shape rather than an alignment complaint.
+
+    Both backends call this, so the two refuse a destination under one wording.
+
+    Args:
+        dgate: The destination. Carries the shape, dtype, and device of ``gate``.
+        gate: The forward's gate, ``(B,T,H*P)``.
+
+    Raises:
+        ValueError: On a shape or device mismatch, or on a band whose offset or
+            pitch is not a multiple of :data:`slinoss._guard.SECTOR_BYTES`.
+        TypeError: On a dtype other than ``gate``'s.
+    """
+    want = tuple(gate.shape)
+    if tuple(dgate.shape) != want:
+        raise ValueError(f"dgate must be {want}, got {tuple(dgate.shape)}")
+    if dgate.dtype is not gate.dtype:
+        raise TypeError(
+            f"dgate is {dgate.dtype} and gate is {gate.dtype}; a destination "
+            f"carries the dtype of the gradient it holds"
+        )
+    if dgate.device != gate.device:
+        raise ValueError(f"dgate must be on {gate.device}, got {dgate.device}")
+    # The band rule is a device rule: a row that starts mid-sector fetches a sector
+    # it discards. This path also runs on CPU, where there is no sector to waste.
+    if dgate.device.type == "cuda":
+        check_pitched(((dgate, "dgate"),))
 
 
 def mixer_tail_bwd_ref(
@@ -197,6 +236,7 @@ def mixer_tail_bwd_ref(
     /,
     *,
     eps: float,
+    dgate: Tensor | None = None,
 ) -> MixerTailGrads:
     """Pullback of :func:`mixer_tail_ref`, by autograd through it.
 
@@ -213,22 +253,33 @@ def mixer_tail_bwd_ref(
         d_skip: The forward's skip scale, shape ``(H,P)``.
         weight: The forward's norm scale, shape ``(H,P)``.
         eps: The forward's epsilon.
+        dgate: Destination for the gate gradient, ``(B,T,H*P)``, carrying the shape,
+            dtype, and device the allocation would have had. Written in full, never
+            accumulated into and never zeroed first, and returned in the result as
+            this same object. ``None`` allocates one.
 
     Returns:
         A :class:`MixerTailGrads`.
 
     Raises:
-        ValueError: On a rank or shape mismatch, or a non-positive ``eps``.
+        ValueError: On a rank or shape mismatch, a non-positive ``eps``, or a
+            ``dgate`` destination that is not a legal band.
         TypeError: On an unsupported dtype.
     """
     bsz, heads, seqlen, rows = tail_shape(y, u, gate, d_skip, weight)
     want = (bsz, seqlen, heads * rows)
     if tuple(dout.shape) != want:
         raise ValueError(f"dout must be {want}, got {tuple(dout.shape)}")
+    if dgate is not None:
+        check_dgate_dest(dgate, gate)
 
     leaves = tuple(
         tensor.detach().requires_grad_(True) for tensor in (y, u, gate, d_skip, weight)
     )
     with torch.enable_grad():
         out = mixer_tail_ref(*leaves, eps=eps)
-    return MixerTailGrads(*torch.autograd.grad(out, leaves, dout))
+    grads = torch.autograd.grad(out, leaves, dout)
+    if dgate is not None:
+        dgate.copy_(grads[2])
+        return MixerTailGrads(grads[0], grads[1], dgate, grads[3], grads[4])
+    return MixerTailGrads(*grads)

@@ -19,6 +19,7 @@ import torch
 from torch import Tensor
 
 from slinoss import _C
+from slinoss._guard import ALIGN_BYTES
 
 if not torch.cuda.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
@@ -904,7 +905,7 @@ def test_the_backward_reads_and_writes_bands_of_the_projection() -> None:
     where the host rule on ``x`` lives, and covers the parameter gradients too:
     ``x`` is the operand the ``dweight`` sum contracts against, so a pitch honoured
     for ``dx`` and dropped there would show up in ``dweight`` alone. The store side
-    runs through the extension, because the backend allocates ``dx`` itself; the
+    runs through the extension, which is where the store contract is stated; the
     band's wider buffer is filled with NaN, so a store that ignored the pitch would
     both leave the band unwritten and land in a column the call does not own.
     """
@@ -943,6 +944,79 @@ def test_the_backward_reads_and_writes_bands_of_the_projection() -> None:
     assert_bitwise(band, want.dx)
     outside = torch.cat((wide[..., :PAD], wide[..., PAD + channels :]), dim=-1)
     assert bool(outside.isnan().all())
+
+
+def test_a_supplied_dx_is_the_store_target() -> None:
+    """The ``dx`` out parameter: the caller's band is the store target.
+
+    One fused buffer holds the gradient of the whole projection, so a consumer owns
+    a band of it and never a buffer of its own. The wider buffer is filled with NaN,
+    so a store into an allocation of the backend's own would leave the band NaN and
+    one that ignored the pitch would land in a column the call does not own. The
+    pitch moves a store address and no arithmetic, so the band matches the
+    allocating path bit for bit.
+    """
+    bsz, seqlen, channels, width = 2, 40, 8, 4
+    x, weight, bias, state = cuda_call(bsz, seqlen, channels, width)
+    dy, dstate = cotangents(bsz, seqlen, channels, width, seed=29)
+    want = causal_conv1d_bwd_native(dy, dstate, x, weight, bias, initial_state=state)
+    wide = x.new_full((bsz, seqlen, channels + 2 * PAD), float("nan"))
+    band = wide[..., PAD : PAD + channels]
+    got = causal_conv1d_bwd_native(
+        dy, dstate, x, weight, bias, initial_state=state, dx=band
+    )
+    assert got.dx is band
+    assert_bitwise(got.dx, want.dx)
+    outside = torch.cat((wide[..., :PAD], wide[..., PAD + channels :]), dim=-1)
+    assert bool(outside.isnan().all())
+
+
+def _vector_band(t: Tensor) -> Tensor:
+    """``t``'s shape as a band that starts one vector width into a wider buffer.
+
+    The offset a contiguous operand may carry and a strict band may not: the pitched
+    rule holds a band to :data:`slinoss._guard.SECTOR_BYTES`, twice the vector width,
+    so every row of this one overhangs into a sector nothing reads.
+    """
+    pad = ALIGN_BYTES // t.element_size()
+    width = int(t.shape[-1])
+    return t.new_empty((*t.shape[:-1], width + 2 * pad))[..., pad : pad + width]
+
+
+@pytest.mark.parametrize(
+    ("damage", "match"),
+    [
+        pytest.param(
+            lambda t: t.new_empty((*t.shape[:-1], int(t.shape[-1]) + 1)),
+            r"dx must be \(2, 40, 8\)",
+            id="shape",
+        ),
+        pytest.param(
+            lambda t: t.to(torch.bfloat16), "dx must be torch.float32", id="dtype"
+        ),
+        pytest.param(lambda t: t.cpu(), "dx must be on cuda", id="device"),
+        pytest.param(
+            _vector_band, "dx must start and step on a multiple of", id="boundary"
+        ),
+    ],
+)
+def test_an_illegal_supplied_dx_is_rejected(
+    damage: Callable[[Tensor], Tensor], match: str
+) -> None:
+    """The whole contract on a destination the caller owns.
+
+    Every row is a store the kernel would otherwise make into memory it cannot
+    address, or into a band whose rows each fetch a sector nothing reads. The order
+    is the reporting order: the shape, dtype, and device rules precede the layout
+    one, so a buffer that violates two is reported under the first.
+    """
+    bsz, seqlen, channels, width = 2, 40, 8, 4
+    x, weight, bias, state = cuda_call(bsz, seqlen, channels, width)
+    dy, dstate = cotangents(bsz, seqlen, channels, width, seed=31)
+    with pytest.raises(ValueError, match=match):
+        causal_conv1d_bwd_native(
+            dy, dstate, x, weight, bias, initial_state=state, dx=damage(x)
+        )
 
 
 def test_native_backend_is_registered_and_preferred() -> None:

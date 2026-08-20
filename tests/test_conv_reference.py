@@ -612,6 +612,24 @@ def test_backward_fills_an_unreachable_gradient_with_zeros() -> None:
     assert got.dinitial_state.shape == (bsz, 0, channels)
 
 
+def test_the_reference_honours_a_supplied_dx() -> None:
+    """The ``dx`` out parameter reaches both backends through one signature.
+
+    The registry dispatches every backend through one backward signature, so a
+    destination the native backend stores into is one the reference writes too. The
+    reference has no layout rule, so what is pinned is that the buffer handed in is
+    the buffer returned and that its values are the allocating path's.
+    """
+    bsz, seqlen, channels, width = 2, 6, 3, 4
+    x, weight, bias, state = make_call(bsz, seqlen, channels, width)
+    dy = torch.ones(bsz, seqlen, channels, dtype=torch.float64)
+    want = causal_conv1d_bwd_ref(dy, None, x, weight, bias, initial_state=state)
+    dx = torch.full_like(want.dx, float("nan"))
+    got = causal_conv1d_bwd_ref(dy, None, x, weight, bias, initial_state=state, dx=dx)
+    assert got.dx is dx
+    assert_bitwise(got.dx, want.dx)
+
+
 def test_absent_optional_inputs_get_no_gradient() -> None:
     x, weight, _, _ = make_call(2, 6, 3, 4, bias=False, state=False)
     dy = torch.ones_like(x)

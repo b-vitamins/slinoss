@@ -37,6 +37,7 @@ import torch
 from torch import Tensor
 from torch.nn.functional import softplus
 
+from slinoss._guard import check_pitched
 from slinoss._precision import (
     autocast_disabled,
     check_pinned,
@@ -54,6 +55,7 @@ __all__ = [
     "bounded_logscale",
     "bounded_rotvec",
     "check_cotangents",
+    "check_dparams_out",
     "check_operands",
     "pack_params",
     "scanprep_bwd_ref",
@@ -169,7 +171,9 @@ class ScanGrads(NamedTuple):
     """Gradients of :func:`scanprep_ref`.
 
     Attributes:
-        dparams: ``(B,T,H*PARAM_COLS)``, contiguous, dtype of ``params``.
+        dparams: ``(B,T,H*PARAM_COLS)``, dtype of ``params``. Contiguous when the
+            backward allocated it, and the caller's own tensor -- a pitched band of a
+            wider gradient buffer -- when the caller supplied one.
         dparam_bias: ``(H,PARAM_COLS)``, dtype of ``param_bias``.
     """
 
@@ -268,6 +272,7 @@ def scanprep_bwd_ref(
     *,
     heads: int,
     w_max: float,
+    dparams: Tensor | None = None,
 ) -> ScanGrads:
     """Pullback of :func:`scanprep_ref`, by autograd through it.
 
@@ -285,24 +290,33 @@ def scanprep_bwd_ref(
             are evaluated at ``params + param_bias``, so the bias is saved too.
         heads: ``H``.
         w_max: The forward's norm bound.
+        dparams: Destination for the parameter gradient, or ``None`` to allocate
+            one. See :func:`check_dparams_out` for the contract.
 
     Returns:
         A :class:`ScanGrads`.
 
     Raises:
-        ValueError: On a rank or shape mismatch, or a ``w_max`` outside
-            ``(0, pi)``.
-        TypeError: On an unsupported dtype.
+        ValueError: On a rank or shape mismatch, a ``w_max`` outside ``(0, pi)``, or
+            a destination off the pitched-layout contract.
+        TypeError: On an unsupported dtype, or a destination whose dtype is not that
+            of ``params``.
     """
     check_cotangents(dtrans, dK, params, param_bias, heads)
+    if dparams is not None:
+        check_dparams_out(dparams, params, heads)
     pl = params.detach().requires_grad_(True)
     cl = param_bias.detach().requires_grad_(True)
     with torch.enable_grad():
         out = scanprep_ref(pl, cl, heads=heads, w_max=w_max)
-    dparams, dparam_bias = torch.autograd.grad(
-        (out.trans, out.K), (pl, cl), (dtrans, dK)
-    )
-    return ScanGrads(dparams=dparams.contiguous(), dparam_bias=dparam_bias)
+    grad, dparam_bias = torch.autograd.grad((out.trans, out.K), (pl, cl), (dtrans, dK))
+    if dparams is None:
+        dparams = grad.contiguous()
+    else:
+        # Copy, not accumulate: the destination is a band of a buffer whose other
+        # columns belong to other operators, and no phase zeroed this band.
+        dparams.copy_(grad)
+    return ScanGrads(dparams=dparams, dparam_bias=dparam_bias)
 
 
 def check_cotangents(
@@ -353,3 +367,43 @@ def check_cotangents(
             f"dK must be {(bsz, heads, seqlen, 2, 4)}, got {tuple(dK.shape)}"
         )
     return bsz, seqlen
+
+
+def check_dparams_out(dparams: Tensor, params: Tensor, heads: int) -> None:
+    """Validate a caller-supplied destination for ``dparams``.
+
+    The mixer's backward allocates one ``(B,T,W)`` gradient buffer for the whole
+    fused projection and hands every operator the band it owns, so the destination is
+    pitched rather than contiguous: :func:`slinoss._guard.check_pitched` is the rule
+    it is held to, and the parameter band is a strict one, so the pitch owes the
+    sector rather than the vector width. Shared by both backends, for the same reason
+    as :func:`check_operands`.
+
+    The destination is written in full and never accumulated into, so nothing zeroes
+    it first.
+
+    Args:
+        dparams: The destination. Must carry the shape, dtype, and device the
+            allocated gradient would have had.
+        params: The forward's projection slice.
+        heads: ``H``.
+
+    Raises:
+        ValueError: On a shape or device mismatch, or a layout off the pitched
+            contract.
+        TypeError: On a dtype other than that of ``params``.
+    """
+    # Shape and dtype before layout: a misshaped destination reports its shape rather
+    # than an alignment its offset also violates.
+    want = (int(params.shape[0]), int(params.shape[1]), heads * PARAM_COLS)
+    if tuple(dparams.shape) != want:
+        raise ValueError(f"dparams must be {want}, got {tuple(dparams.shape)}")
+    if dparams.dtype is not params.dtype:
+        raise TypeError(
+            f"dparams must be {params.dtype} like params, got {dparams.dtype}"
+        )
+    if dparams.device != params.device:
+        raise ValueError(
+            f"dparams must be on {params.device} like params, got {dparams.device}"
+        )
+    check_pitched(((dparams, "dparams"),))

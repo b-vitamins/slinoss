@@ -61,6 +61,12 @@ class MixerBackward(Protocol):
 
     The five operands and nothing else: the norm scale, the gate, and the pre-norm
     value are all recomputed, so no forward intermediate crosses the boundary.
+
+    ``dgate`` is a destination rather than an allocation the backend makes. The
+    mixer's backward allocates one ``dproj`` and hands each consumer the band its
+    gradient belongs in, so a backend that allocated and let the caller assign would
+    write every gradient byte twice on a DRAM-bound path. It is written in full and
+    returned as the same object; ``None`` allocates one.
     """
 
     def __call__(
@@ -74,6 +80,7 @@ class MixerBackward(Protocol):
         /,
         *,
         eps: float,
+        dgate: Tensor | None = None,
     ) -> MixerTailGrads: ...
 
 

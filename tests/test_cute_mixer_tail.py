@@ -13,8 +13,9 @@ values at every width.
 
 ``gate``, the output, and the output's cotangent are token-major, ``(B,T,H*P)``,
 because in the block they are column bands of one projection. The parity sweep
-builds them contiguous, which is the ``H*P == W`` case; one test builds a real
-band of a wider buffer, which is the case the mixer hands over.
+builds them contiguous, which is the ``H*P == W`` case; two tests build a real band
+of a wider buffer, one on the read side and one as the backward's destination, which
+is the case the mixer hands over.
 """
 
 import pytest
@@ -354,6 +355,37 @@ def test_pitched_band_matches_the_contiguous_call(dtype: torch.dtype) -> None:
         assert torch.equal(got_grad, want_grad), name
 
 
+def test_backward_writes_dgate_into_a_supplied_band() -> None:
+    """A supplied destination receives ``dgate`` bit-for-bit, and only it moves.
+
+    The mixer allocates one ``dproj`` and hands the tail the band ``dgate`` belongs
+    in, so the store lands at the projection's pitch and no gradient byte is written
+    twice. Bit-identical to the allocating call: the pitch changes a store address
+    and nothing else. The wider buffer is NaN first, so a store that spilled past
+    the band or left a column of it unwritten lands as a NaN.
+    """
+    ops = _operands(2, 3, 40, 64, seed=21)
+    dout = _cotangent(2, 3, 40, 64, torch.float32, seed=22)
+    # One sector of padding, in columns: a band offset of only a vector width lands
+    # mid-sector, which is a refusal rather than a slower store.
+    pad = SECTOR_BYTES // ops[0].element_size()
+    width = 3 * 64
+    wide = torch.full(
+        (2, 40, width + 2 * pad), float("nan"), dtype=ops[0].dtype, device="cuda"
+    )
+    band = wide[..., pad : pad + width]
+
+    got = mixer_tail_backward(dout, *ops, eps=EPS, dgate=band)
+    want = mixer_tail_backward(dout, *ops, eps=EPS)
+    torch.cuda.synchronize()
+
+    assert got.dgate is band
+    assert bool(wide[..., :pad].isnan().all())
+    assert bool(wide[..., pad + width :].isnan().all())
+    for one, other, name in zip(got, want, NAMES, strict=True):
+        assert torch.equal(one, other), name
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     """The fast forward, backpropagated through, against the float64 reference.
@@ -466,6 +498,20 @@ def test_backward_rejects(
     )
     with pytest.raises(error, match=match):
         mixer_tail_backward(dout, *ops, eps=EPS)
+
+
+def test_backward_rejects_an_unaligned_dgate_destination() -> None:
+    """A destination band carries the sector rule every other band carries.
+
+    One column of padding starts every row of the band mid-sector, which is a
+    producer that handed out a band without padding the column offset. Shape, dtype
+    and device are the ones the allocation would have had, so the alignment clause
+    is the only thing left to refuse it.
+    """
+    ops = _operands(2, 2, 8, 64, seed=3)
+    dout = _cotangent(2, 2, 8, 64, torch.float32, seed=4)
+    with pytest.raises(ValueError, match=r"dgate must start and step on a multiple of"):
+        mixer_tail_backward(dout, *ops, eps=EPS, dgate=_band(dout, 1))
 
 
 def test_rejects_non_positive_eps() -> None:
