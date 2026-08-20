@@ -22,16 +22,46 @@ constexpr int kMaxWidth = 8;
 // how much of the machine one launch fills.
 constexpr int kTileT = 32;
 
-// Timesteps one backward block walks. Smaller than the forward tile because the
-// backward folds batch into the block's serial loop, so the time tile is the
-// only axis that supplies it blocks: the grid holds D*ceil(T/kBwdTileT) threads
-// whatever the batch is, where the forward gets a factor of B on top. Against
-// that, the tile is what amortizes the backward's overhang: a block walks
-// kBwdTileT + kWidth - 1 steps and loads both x and dy at each, so the loads per
-// owned timestep are (kWidth-1 + 2*(kBwdTileT+kWidth-1)) / kBwdTileT, and the
-// tile count is ceil(T/kBwdTileT). The tile count is not the partial count: see
-// kBwdTargetBlocks.
+// Timesteps one backward block walks at the narrow widths, and the base
+// bwd_tile_t scales from. Smaller than the forward tile because the backward folds
+// batch into the block's serial loop, so the time tile is the only axis that
+// supplies it blocks: the grid holds D*ceil(T/tile) threads whatever the batch is,
+// where the forward gets a factor of B on top. Against that, the tile is what
+// amortizes the backward's overhang: a block walks tile + kWidth - 1 steps and
+// loads both x and dy at each, so the loads per owned timestep are
+// (kWidth-1 + 2*(tile+kWidth-1)) / tile, and the tile count is ceil(T/tile). The
+// tile count is not the partial count: see kBwdTargetBlocks.
 constexpr int kBwdTileT = 16;
+
+// The tile the backward walks, which scales with the width. The overhang is
+// kWidth-1 steps, so at a fixed tile its share of the walk,
+// (kWidth-1)/(tile+kWidth-1), grows with the width: 30 percent at kWidth = 8
+// against 16 at kWidth = 4, which is the wide instantiation paying more
+// instructions for the same output. Scaling the tile with the width holds that
+// share fixed.
+//
+// It is also what takes the wide grid off a second wave. The walk holds
+// D*ceil(T/tile) threads, so at D = 768 and T = 2048 a 16-step tile is 3072 warps
+// of work against 2016 resident at six blocks an SM: 1.52 waves, and the tail
+// leaves a quarter of the machine idle for a whole second round. A 32-step tile is
+// 1536 warps. Its longer strip costs a resident block -- measured occupancy limit
+// five against six at the shorter tile, so 1680 warps resident and 0.91 waves --
+// and one round of 39 steps beats two rounds of 23. Measured at the wide shape in
+// bfloat16, 77.567 us against 80.447, and 150.589 against 170.973 on the scalar
+// path, which carries no strip and keeps six blocks.
+//
+// The strip is what sets that block count, and it is a threshold and not a slope:
+// the shared allocation is rounded up before it is divided into the SM's 102,400 B,
+// so 19,968 B a block left four resident and trimming it to 19,072 left five. The
+// trim is the dy stream's leading halo, which the fill never writes; see kDySpan.
+//
+// One step, not a ramp: the widths above 4 all carry an overhang the 16-step tile
+// cannot amortize, and a second step would cost the narrow arms their block count
+// for a share the wide arm already pays. Both values are a multiple of the vector
+// the staged fill forms, so no tile needs the fill's tail predicate.
+constexpr int bwd_tile_t(int width) {
+  return width <= 4 ? kBwdTileT : 2 * kBwdTileT;
+}
 
 // Time tiles one backward block covers, which is blockDim.y. The block is the
 // unit an SM's occupancy limits are quantized in: at 64 threads a block is two
@@ -176,8 +206,8 @@ void causal_conv1d_bwd(const std::optional<at::Tensor> &dy,
 // Number of partial slices the backward writes, which is its block count along
 // time. Bounded by kBwdTargetBlocks and the channel count, so it stops growing
 // with the sequence length; the channel count enters because the grid's channel
-// axis is what is left of the target.
-int64_t causal_conv1d_bwd_parts(int64_t seqlen, int64_t channels);
+// axis is what is left of the target, and the width because it sets the tile.
+int64_t causal_conv1d_bwd_parts(int64_t seqlen, int64_t channels, int64_t width);
 
 // Reduce the backward's partials into the parameter gradients.
 //

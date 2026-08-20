@@ -8,32 +8,43 @@
 // shape against the reduction's 2.752, and it is the reduction that class describes.
 // That reduction is a third kernel; its own block is at the end of this comment.
 //
-// Achieved fraction of the measured copy ceiling, on an RTX A6000 (sm_86) with
-// clocks unlocked, which the fleet denies locking, and with device 0 holding
-// nothing but the MPS daemon before and after each run. One run per shape, three
-// launches each:
+// Achieved fraction of the fitted DRAM time floor at each kernel's own traffic,
+// which is the gate the harness scores, with the per-launch median duration beside
+// it. One run per shape and dtype, three launches each:
 //
 //   scripts/perf/profile_op.py --op conv --shape <name> --mode step
 //
-//                        standard  wide  long  ragged
-//   bf16  forward            87.6  84.3  92.4    87.0
-//         backward, staged   81.6  62.5  88.1    80.5
-//   fp32  forward            94.1  91.3  96.9    93.4
-//         backward, scalar   96.8  83.1  95.5    96.6
+//                        standard      wide       long     ragged
+//   bf16  forward       101.5/32.9  91.8/48.1 100.4/60.8 101.6/32.2
+//         backward       95.8/47.8  78.4/77.6  97.1/91.4  95.6/47.5
+//   fp32  forward       101.1/61.0  96.2/89.0  99.6/119.7 102.0/60.4
+//         backward      100.2/103.2 93.0/150.6 100.4/201.3 100.6/101.6
 //
-// bwd_can_stage is false at four bytes, so bf16 takes the staged path here and fp32
-// the scalar one. The harness verdict is not this ratio: it scores against a fitted
-// floor carrying a 4.483 us latency constant, so it reads higher, and it is the gate.
-// On it the forward passes at every shape in both dtypes, 94.3 the lowest, and the
-// backward passes at standard, long, and ragged -- 90.6, 92.3, 89.3 bf16 and 100.3,
-// 97.3, 100.2 fp32 -- and fails at wide alone, 67.4 and 84.9.
+// Percent of floor, then microseconds a launch. The floor is c + bytes/B fitted in
+// the same process, c 4.10 to 5.10 us and B 682.7 to 685.1 GB/s across the eight
+// runs, so a figure above 100 is a kernel inside the fit's residual. bwd_can_stage
+// is false at four bytes, so bf16 takes the staged path here and fp32 the scalar
+// one. Measured on an RTX A6000 (sm_86), clocks unlocked because the host denies
+// locking, on a part holding no compute of its own but not exclusively held: these
+// durations are stamped, not quotable, and the counters below are contention-robust
+// where the durations are not.
 //
-// OPEN DEFECT: wide, W = 8, both dtypes. Nothing else here is under its floor; the
-// tiny shape's forward and backward carry no class. The staged row above reads 1.7 to
-// 2.6 points under the same code before kBwdTargetBlocks bounded the grid, because
-// the kernel now writes a smaller partial stack in the same time. The ratio charges
-// it for the byte it stopped writing, so duration is the invariant across that change
-// and duration fell: 102.25 to 96.446 us at long.
+// OPEN DEFECT: wide, W = 8, bfloat16. 78.4% against the 85.0% bar. Nothing else here
+// is under its floor -- the scalar path at the same shape passes at 93.0 -- and the
+// tiny shape's forward and backward carry no class.
+//
+// What limits it is memory parallelism at the fill, not traffic and not instructions.
+// Traffic is compulsory: 6 B a token-channel for x, dy and dx plus 0.28 B of
+// partials, 39.5 MB analytic against 38.7 MB measured out of DRAM, so there is no
+// byte to remove. Instructions are not the bound either: issue_active is 41.5%, which
+// puts the issue-limited time at 32.2 us against a 60.8 us floor. The kernel sits at
+// 499.5 GB/s of the 682.7 GB/s the copy sweep measured in the same process, 73%, and
+// the top stall is long_scoreboard at 40.9%, which on the staged path is the fill's
+// global loads alone: the walk issues none. The fill is a rolled loop of one 16 B
+// request a lane, so a warp holds one request in flight and the block cannot cover
+// the round trip with 20 of the SM's 48 warp slots. Raising the warps needs the
+// strip smaller, and the strip is what the tile bought; the untried lever is an
+// asynchronous fill, which adds requests in flight without adding registers.
 //
 // What held the backward down was request granularity, not traffic and not
 // occupancy. The scalar walk asks for one element per lane per step, 64 B a warp at
@@ -49,36 +60,43 @@
 // standard shape, interval [-17.65, -17.53] over 100 pairs at 96.5% coverage, and
 // -43.48 us at wide, [-45.37, -41.39].
 //
-// What binds after it, at W = 8: 74 registers cap theoretical occupancy at 50% and
-// achieved at 40.1%, and no one stall dominates -- wait 26.7%, long_scoreboard
-// 25.3%, issue_active 61.7%. The kernel has neither the warps to cover the strip's
-// round trip nor a single stall to remove, and its traffic is already compulsory:
-// 25.37 MB read a launch against 25.17 compulsory.
+// What bound it before the tile scaled with the width was the instruction count and
+// the tail wave, and both are measured. At a 16-step tile the W = 8 walk executed
+// 167.5 thread-instructions per owned element against 105.0 at W = 4 for the same
+// bytes, issue_active was 61.5%, and long_scoreboard had already fallen to 24.3%
+// with wait at 26.6%: the kernel had left memory latency and arrived at dependent
+// arithmetic, its issue-limited time 57.6 us within 9% of its 62.8 us floor. Cutting
+// the walk's per-step work took it to 21.99 M instructions from 32.92 M and 80.447 us
+// from 93.599, and the 32-step tile took it to 18.14 M and 77.567 us. The tap-axis
+// split that the earlier reading proposed would have raised instructions per element,
+// which is the axis that was binding, and is not taken.
 //
-// Occupancy is not the missing warps, though, which is measurable and measured: a
-// __launch_bounds__ of 8 blocks an SM holds the staged walk to 64 registers with
-// nothing spilled and takes achieved occupancy to 49.2%, and the kernel does not move,
-// 93.086 to 93.662 us against a 0.10% run-to-run spread. Clearing the floor there
-// needs the per-thread state under five arrays of length W, which means splitting the
-// tap axis across threads and combining dx through shared memory, not another
-// staging, scheduling, or occupancy change. Every lever measured and reverted is
-// recorded at the site it would have touched: the batch axis on grid.z, a
-// time-direction prefetch group, dropping wf, a launch bound of 8, an unrolled fill,
-// a hoisted per-column fill map, a lagged strip window in place of the register
-// window, and splitting the time tile across threads.
+// Occupancy at W = 8 is a shared memory limit and not a register one, which is
+// measurable and measured: registers allow six blocks an SM and the strip allows
+// five, and a __launch_bounds__ of 8 holds the staged walk to 64 registers with
+// nothing spilled, takes achieved occupancy to 49.2% at the 16-step tile, and does
+// not move the kernel, 93.086 against 93.662 us at a 0.10% run-to-run spread. The
+// wave count is not reachable by regridding either: waves are the warps of work over
+// the warps resident, so a 504-block regrid, seven blocks an SM and eight all leave
+// ceil(waves) at 2 and achieved occupancy near 38%. Only halving the warps of work
+// escapes, which is what the tile does. Every lever measured and reverted is recorded
+// at the site it would have touched: the batch axis on grid.z, a time-direction
+// prefetch group, dropping wf, a launch bound of 8, an unrolled fill, a hoisted
+// per-column fill map, a lagged strip window in place of the register window, and
+// splitting the time tile across threads.
 //
 // Compulsory byte count, per token per channel, at bfloat16 with W = 4:
 //
 //   forward   read x 2 B, write y 2 B: 4 B for 2W-1 = 7 flop, 1.75 flop/B.
 //   backward  read x 2 B, read dy 2 B, write dx 2 B, plus the partials at
-//             (W+1)*4/(kBwdTileT*B) = 0.31 B: 6.31 B for 4W+2 = 18 flop,
+//             (W+1)*4/(bwd_tile_t(W)*B) = 0.31 B: 6.31 B for 4W+2 = 18 flop,
 //             2.85 flop/B.
 //
 // Both kernels read past their tile: the forward re-reads W-1 activations for the
 // prologue, and the backward needs W-1 timesteps of both x and dy on either side of
 // its tile, because dx at u needs ds at u .. u+W-1. The staged path pays that once
-// per block rather than once per thread -- the strip spans 1.19x the block's owned
-// timesteps at W = 4 and 1.44x at W = 8 -- and the scalar path pays it per thread,
+// per block rather than once per thread -- the strip spans 1.14x the block's owned
+// timesteps at W = 4 and 1.16x at W = 8 -- and the scalar path pays it per thread,
 // which raises requested loads to 1.4x the compulsory reads at W = 4 and 2.2x at
 // W = 8. Neither appears in the count above: L2 absorbs the overlap, so requested
 // load bytes at the standard shape are 26.37 MB a launch against 18.92 MB out of
@@ -92,10 +110,10 @@
 // shared strip first and the walk then reads only shared memory; the fill is 16 B
 // lane requests over a flat slot index, so it is one 512 B request a warp whatever
 // the channel tile's relation to a head. The strip is
-// 2 * (kBwdTilesPerBlock*kBwdTileT + 2*(W-1)) * kMaxChannelsPerBlock elements of
-// input_t, 9728 B at W = 4 and 11776 B at W = 8, which caps the block count at 10
-// an SM and 8 against the 8 and 6 that 60 and 74 registers allow, so the strip does
-// not bind occupancy at either width.
+// (2*kBwdTilesPerBlock*tile + 3*(W-1)) * kMaxChannelsPerBlock elements of input_t,
+// where tile is bwd_tile_t(W): 9344 B at W = 4 and 19072 B at W = 8. Measured
+// occupancy limits, blocks an SM: 9 and 5 from the strip against 8 and 6 from the 58
+// and 79 registers, so the strip does not bind at W = 4 and is what binds at W = 8.
 //
 // The window arrays reach registers and not local memory, which a register count
 // alone does not show: every tap loop between an array's declaration and its uses is
@@ -104,8 +122,8 @@
 // store sectors 0, ptxas reporting no spill either way.
 //
 // No extent here follows a sequence length. The strip spans
-// kBwdTilesPerBlock*kBwdTileT = 32 timesteps plus 2*(W-1) of halo, the reduction's
-// shared array is kReduceRows floats, and both are tuning constants; T enters only
+// kBwdTilesPerBlock*bwd_tile_t(W) timesteps plus the halo, the reduction's shared
+// array is kReduceRows floats, and both are tuning constants; T enters only
 // through the grid, which kBwdTargetBlocks bounds. P enters only as the dy and y row
 // stride, so no P caps a caller's tile or chunk length either.
 //
@@ -452,7 +470,14 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
   // before the block are in it too: they are the first tile's incoming window,
   // and reading them from the strip is what leaves the walk with no global load
   // at all.
-  constexpr int kSpan = kBwdTilesPerBlock * kBwdTileT + 2 * (kWidth - 1);
+  constexpr int kTile = bwd_tile_t(kWidth);
+  constexpr int kSpan = kBwdTilesPerBlock * kTile + 2 * (kWidth - 1);
+  // Timesteps the cotangent's half of the strip holds. The kWidth-1 steps before
+  // the block belong to the x stream alone: they are the first tile's incoming
+  // window, and no ds in this block reads a cotangent from before its own tiles.
+  // Holding both streams at kSpan pads those rows in the dy half, and the pad is
+  // what puts the block over the shared memory a fifth resident block needs.
+  constexpr int kDySpan = kSpan - (kWidth - 1);
   constexpr int kVecCols = kMaxChannelsPerBlock / kVec;
   // The strip and the tap-gradient combine share one allocation. The combine runs
   // once, after the last walk, so the strip is dead by then, and the strip is the
@@ -462,7 +487,7 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
   // at the operand's own width, because widening the strip to float would double
   // it.
   constexpr int kStripFloats =
-      kStage ? (2 * kSpan * kMaxChannelsPerBlock *
+      kStage ? ((kSpan + kDySpan) * kMaxChannelsPerBlock *
                     static_cast<int>(sizeof(input_t)) +
                 3) /
                    4
@@ -515,9 +540,9 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
     // a tile past the end. That tile walks nothing. It still stages: the strip's
     // barriers are block-wide, and the columns a lane fills are not the column it
     // walks.
-    const int t0 = (group * kBwdTilesPerBlock + threadIdx.y) * kBwdTileT;
+    const int t0 = (group * kBwdTilesPerBlock + threadIdx.y) * kTile;
     const bool owns = live_channel && t0 < seqlen;
-    const int t1 = min(t0 + kBwdTileT, seqlen);
+    const int t1 = min(t0 + kTile, seqlen);
     // dx at index u needs ds at u .. u+W-1, so the walk runs W-1 steps past the
     // tile and recomputes those ds. The tile owns dx over [t0, t1) and, at
     // t0 = 0, the W-1 negative indices that are the gradient of the incoming
@@ -536,7 +561,7 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
     const int u_min = t0 == 0 ? -(kWidth - 1) : t0;
     // Strip geometry: the group's first timestep. Negative in the first group of
     // the sequence, where the incoming state stands in for x.
-    const int tstrip = group * kBwdTilesPerBlock * kBwdTileT - (kWidth - 1);
+    const int tstrip = group * kBwdTilesPerBlock * kTile - (kWidth - 1);
     if constexpr (!kStage) {
       // No barrier on this path, so a lane with no tile can leave the group
       // early. It may not leave the kernel: the combine below is block-wide.
@@ -619,8 +644,11 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
           } else {
             continue;
           }
+          // Row stream*kDySpan + step: the x stream starts at 0 and the dy
+          // stream at kDySpan, whose first written step is kWidth-1 and so lands
+          // at kSpan, one past the x stream's last row.
           *reinterpret_cast<int4 *>(
-              strip + (static_cast<long>(stream) * kSpan + step) *
+              strip + (static_cast<long>(stream) * kDySpan + step) *
                           kMaxChannelsPerBlock +
               col) = v;
         }
@@ -677,9 +705,10 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
       // none of them can reach: the tap gradient's ownership test, the bounds
       // test on a global load that cannot run past the end inside a tile, the
       // trailing window's cotangent, whose extended index is past every u this
-      // loop produces, and the window shifts themselves. kBwdTileT is a multiple
-      // of kMaxWidth, so a full tile unrolls by kWidth with no remainder and the
-      // shifts become register renames: 2*(kWidth-1) moves a step leave the loop,
+      // loop produces, and the window shifts themselves. Every bwd_tile_t is a
+      // multiple of kMaxWidth, so a full tile unrolls by kWidth with no remainder
+      // and the shifts become register renames: 2*(kWidth-1) moves a step leave
+      // the loop,
       // which is 14 of 114 executed instructions per step at kWidth = 8.
       //
       // Only the staged path can pay for that unroll. The scalar path carries the
@@ -695,10 +724,17 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
         if constexpr (kStage) {
           // A warp reads 32 consecutive elements of one strip row, which share 16
           // four-byte banks two lanes to a word: one transaction, no pad needed.
+          // The fill's store is not conflict free and the pad it would need is:
+          // a row is 128 B, exactly the 32 banks, so the eight lanes covering one
+          // row and the eight covering the next collide, and the counters read
+          // 3,150 to 24,896 shared store conflicts over three launches at a
+          // wavefront ratio of 0.012. Padding each row to break the alias costs
+          // (rows)*16 B of the strip, which is the resident block the trimmed
+          // strip just bought, so the conflict stands recorded and unfixed.
           const int s = (t - tstrip) * kMaxChannelsPerBlock + threadIdx.x;
           xc = static_cast<float>(strip[s]);
           dyc = dy != nullptr
-                    ? static_cast<float>(strip[kSpan * kMaxChannelsPerBlock + s])
+                    ? static_cast<float>(strip[kDySpan * kMaxChannelsPerBlock + s])
                     : 0.0f;
         } else {
           // t < t1 <= seqlen, so both streams are live: the zero-past-the-end
@@ -775,7 +811,7 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
           const int s = (t - tstrip) * kMaxChannelsPerBlock + threadIdx.x;
           xc = static_cast<float>(strip[s]);
           dyc = dy != nullptr
-                    ? static_cast<float>(strip[kSpan * kMaxChannelsPerBlock + s])
+                    ? static_cast<float>(strip[kDySpan * kMaxChannelsPerBlock + s])
                     : 0.0f;
         } else {
           // Past the sequence end both streams are zero rather than clamped: the
@@ -990,11 +1026,12 @@ struct BwdTimeAxis {
   int blocks;
 };
 
-BwdTimeAxis bwd_time_axis(int seqlen, int channels) {
-  const int tiles = (seqlen + kBwdTileT - 1) / kBwdTileT;
+BwdTimeAxis bwd_time_axis(int seqlen, int channels, int width) {
+  const int tile = bwd_tile_t(width);
+  const int tiles = (seqlen + tile - 1) / tile;
   const int groups = (tiles + kBwdTilesPerBlock - 1) / kBwdTilesPerBlock;
-  const int width = block_width(channels);
-  const int rows = (channels + width - 1) / width;
+  const int cols = block_width(channels);
+  const int rows = (channels + cols - 1) / cols;
   const int cap = (kBwdTargetBlocks + rows - 1) / rows;
   // Floor: a block takes on a second group only when a whole second group is
   // there for it. Rounding up instead would halve the grid just past the cap,
@@ -1162,7 +1199,7 @@ template <typename input_t> bool bwd_can_stage(const BwdArgs<input_t> &a) {
 template <typename input_t, int kWidth>
 void launch_bwd_width(const BwdArgs<input_t> &a) {
   const int threads = block_width(a.channels);
-  const BwdTimeAxis axis = bwd_time_axis(a.seqlen, a.channels);
+  const BwdTimeAxis axis = bwd_time_axis(a.seqlen, a.channels, kWidth);
   const dim3 block(threads, kBwdTilesPerBlock);
   const dim3 grid((a.channels + threads - 1) / threads, axis.blocks, 1);
   const auto stream = at::cuda::getCurrentCUDAStream();
@@ -1240,8 +1277,10 @@ void launch_reduce_parts(const at::Tensor &dweight_parts,
 
 } // namespace
 
-int64_t causal_conv1d_bwd_parts(int64_t seqlen, int64_t channels) {
-  return bwd_time_axis(static_cast<int>(seqlen), static_cast<int>(channels))
+int64_t causal_conv1d_bwd_parts(int64_t seqlen, int64_t channels,
+                                int64_t width) {
+  return bwd_time_axis(static_cast<int>(seqlen), static_cast<int>(channels),
+                       static_cast<int>(width))
       .blocks;
 }
 

@@ -150,7 +150,8 @@ void bwd(const std::optional<at::Tensor> &dy,
   expect_pitched(dx, "dx", {d.batch, d.seqlen, d.channels}, dtype, device);
   expect_optional(dfinal_state, "dfinal_state", window, dtype, device);
   expect_optional(dinitial_state, "dinitial_state", window, dtype, device);
-  const int64_t parts = slinoss::causal_conv1d_bwd_parts(d.seqlen, d.channels);
+  const int64_t parts =
+      slinoss::causal_conv1d_bwd_parts(d.seqlen, d.channels, d.width);
   expect(dweight_parts, "dweight_parts", {parts, d.width, d.channels},
          at::kFloat, device);
   expect_optional(dbias_parts, "dbias_parts", {parts, d.channels}, at::kFloat,
@@ -204,10 +205,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("dbias_parts"), py::arg("activation"),
         "Write dx, the incoming-state gradient, and the parameter-gradient "
         "partials, one slice per block along time.");
+  m.def("bwd_tile_t", &slinoss::bwd_tile_t, py::arg("width"),
+        "Timesteps one backward tile covers at a filter width. Scales with the "
+        "width so the overhang keeps a fixed share of the walk; BWD_TILE_T is "
+        "its value at the narrow widths.");
   m.def("bwd_parts", &slinoss::causal_conv1d_bwd_parts, py::arg("seqlen"),
-        py::arg("channels"),
-        "Number of partial slices the backward writes for a sequence length and "
-        "channel count. Bounded independently of the sequence length.");
+        py::arg("channels"), py::arg("width"),
+        "Number of partial slices the backward writes for a sequence length, "
+        "channel count, and filter width. Bounded independently of the sequence "
+        "length; the width enters because it sets the time tile.");
   m.def("bwd_reduce", &bwd_reduce, py::arg("dweight_parts"),
         py::arg("dbias_parts"), py::arg("dweight"), py::arg("dbias"),
         "Reduce the parameter-gradient partials into dweight, in the weight's "
