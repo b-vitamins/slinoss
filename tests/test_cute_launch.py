@@ -13,8 +13,8 @@ arguments sharing a descriptor gives an exact zero, and the launch goes through
 the shipped path, raw tensors into :func:`jit_launch`, not through a private
 helper.
 
-The pool is keyed on layout and not on address, so its axes are address freshness
-and borrow order. The executor is keyed on what shapes the generated code, so its
+The pool is keyed on layout and not on address, so its axes are address reuse and
+borrow order. The executor is keyed on what shapes the generated code, so its
 axis is dtype. Shape is not swept: it is a resolution axis for neither cache, and
 the kernels' own parity tests sweep it.
 """
@@ -107,26 +107,32 @@ def test_a_pooled_descriptor_reads_the_current_tensor_address() -> None:
     assert torch.equal(out, (a2 + 5.0) - b2)
 
 
-def test_a_recycled_address_is_not_reachable_through_a_pooled_descriptor() -> None:
-    """Freeing an argument and reallocating its address must not resurrect it.
+def test_one_address_under_two_layouts_does_not_share_a_descriptor() -> None:
+    """A second layout at one address must not reach the first layout's slot.
 
-    The caching allocator hands the identical block back for a same-size request
-    on the same stream, which is what makes a cache keyed on ``data_ptr()`` a
-    use-after-free. The pool key is ``(dtype, device, shape, stride)`` and holds
-    no address, so the recycled tensor is a plain cache hit on layout with the
-    base word re-read from it.
+    A freed allocation comes back for a same-size request, so a cache keyed on
+    ``data_ptr()`` can hit a descriptor built for a tensor that is gone, under
+    whatever layout the address now carries. The pool key is
+    ``(dtype, device, shape, stride)`` and holds no address, so two layouts are two
+    keys, and the base word is re-read from the live tensor on every borrow.
 
-    The recycling assertion is part of the test: without it the hazard is not
-    exercised and the rest of the test proves nothing.
+    The collision is built rather than waited for. The allocator orders its free
+    blocks by ``(size, ptr)`` and a request takes the lowest-address block of the
+    smallest fitting size, which is the block just freed only when no other segment
+    holds a free block of that size. Asserting the recycle therefore held in this
+    module alone and failed inside the suite, where earlier segments hold lower
+    ones, and a recycle that does not happen exercises nothing. Re-viewing a held
+    storage puts the second layout at the identical address with no allocator policy
+    in the loop, and the differing element width is what makes a stale hit visible:
+    those bytes as 128 floats and as 256 halves are not the same numbers.
     """
+    clear_dev_pool()
     a, b = _operands()
     _combine(a, b)
-    ptr = a.data_ptr()
-    del a
-    fresh = torch.full((N,), 7.0, dtype=torch.float32, device="cuda")
-    assert fresh.data_ptr() == ptr, "allocator did not recycle; hazard not exercised"
-    out = _combine(fresh, torch.zeros_like(fresh))
-    assert torch.equal(out, fresh)
+    half = a.view(torch.float16)
+    assert half.data_ptr() == a.data_ptr()
+    out = _combine(half, torch.zeros_like(half))
+    assert torch.equal(out, half)
 
 
 def test_repeated_launches_build_one_descriptor_per_argument() -> None:
@@ -134,9 +140,15 @@ def test_repeated_launches_build_one_descriptor_per_argument() -> None:
 
     This is the reuse the host-cost cut rests on, and it is also what says the
     borrows of the first launch were released: a launch that kept them would
-    take slots 3, 4 and 5. A length of its own keeps the count independent of
-    the other tests.
+    take slots 3, 4 and 5.
+
+    The count is of one key in a pool the whole process shares, so it is only the
+    count this test caused if the pool starts empty. A length of its own is not
+    enough: any launch anywhere under the same layout fills the same slots, and 64
+    is the default chunk length. Clearing first is what makes the number mean what
+    it is read as.
     """
+    clear_dev_pool()
     n = 64
     a = torch.arange(n, dtype=torch.float32, device="cuda")
     b = a * 3.0
