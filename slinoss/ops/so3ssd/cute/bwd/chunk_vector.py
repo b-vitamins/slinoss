@@ -334,6 +334,15 @@ region, and ``dy``, the increment cotangent, the raw and rotated forcing tiles a
 11,264 B of that gap at a second pass over ``U``, and the tile cannot narrow below 48
 columns. Occupancy at this width is a register problem.
 
+An arena under 50,688 B would also raise ``min_blocks_per_mp`` to two by the
+expression above, and that half of the plan is measured: the request alone takes the
+allocator to exactly 128 registers a thread and it spills, 11.80 MB of local load and
+11.80 MB of local store a launch with 368,556 of the 368,640 load sectors and all of
+the store sectors missing L1, at 3,413.2 us against 3,274.1 and 519.91 MB against
+515.74. Occupancy does not move, the arena still admitting one block. So the register
+ceiling a second block imposes is not free at this shape, and the arena and the
+register file would have to clear together for either to pay.
+
 The width also reaches a spill the depth cannot. At ``B 4 H 12 T 2048 L 64 P 48 3N 48
 G 12`` the fold is already one, and four warps still move 0.79 MB each of local load
 and store a launch, 75.4% and 100% of that past L1. Eight warps take the register
