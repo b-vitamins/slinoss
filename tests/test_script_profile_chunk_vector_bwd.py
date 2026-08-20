@@ -59,7 +59,7 @@ def test_local_sectors_separates_kernels() -> None:
                 launch_id="1", kernel="chunk_vector_bwd_kernel", values={metric: 40.0}
             ),
             NcuInvocation(
-                launch_id="2", kernel="vector_reduce_kernel", values={metric: 7.0}
+                launch_id="2", kernel="reduce_rows_kernel", values={metric: 7.0}
             ),
         ),
         missing_metrics=(),
@@ -67,15 +67,20 @@ def test_local_sectors_separates_kernels() -> None:
     got = module.local_sectors(one)
     assert got == {
         ("chunk_vector_bwd_kernel", metric): 140.0,
-        ("vector_reduce_kernel", metric): 7.0,
+        ("reduce_rows_kernel", metric): 7.0,
     }
 
 
 def test_kernel_regex_admits_the_reduce_pass() -> None:
-    """The narrowing regex matches both kernels the operator launches."""
+    """The narrowing regex matches both kernels the operator launches.
+
+    The two names are the mangled symbols NCU reports, truncated after the first
+    operand. A regex written against the Python function name would miss the
+    reduce pass, which is the failure this covers.
+    """
     import re
 
     module = load_driver()
     pattern = re.compile(module.KERNEL)
     assert pattern.search("kernel_cutlass_chunk_vector_bwd_kernel_tensorptrbf16_0")
-    assert pattern.search("kernel_cutlass_vector_reduce_kernel_tensorptrf32_0")
+    assert pattern.search("kernel_cutlass_reduce_rows_kernel_tensorptrf32_0")
