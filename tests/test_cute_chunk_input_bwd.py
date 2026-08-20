@@ -41,9 +41,11 @@ from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_backward, chunked_forward
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
+    LANE_MULTIPLE,
     ChunkInputBwd,
     chunk_input_backward,
     input_smem_bytes,
+    lblock,
 )
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
@@ -519,16 +521,24 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     keeps the pipe fed, and the resident set plus the phase arena is what that
     depends on. The widest legal ``(L, P, 3N)`` triple does not fit and is refused
     on the host; the widest that does is ``MAX_CHUNK`` at the standard row count.
+
+    ``3N`` is not one of the axes that moves the total. The three lane-dependent
+    tiles hold one lane block, so the footprint is flat in ``3N`` above the first
+    block that has to be split, and the widest state the config layer accepts still
+    runs two blocks deep.
     """
     assert 2 * input_smem_bytes(64, 48, 48) <= smem_capacity()
     assert input_smem_bytes(MAX_CHUNK, 48, 48) <= smem_capacity()
     assert input_smem_bytes(64, 128, 96) <= smem_capacity()
     assert input_smem_bytes(MAX_CHUNK, 128, 96) > smem_capacity()
-    # Every tile the arena holds scales with one of the three, so none of them is
-    # free: a budget that ignored an axis would compare equal on one of these.
+    # L and P scale every tile they appear in, so neither is free: a budget that
+    # ignored one would compare equal on one of these.
     assert input_smem_bytes(16, 48, 48) < input_smem_bytes(64, 48, 48)
     assert input_smem_bytes(64, 16, 48) < input_smem_bytes(64, 48, 48)
-    assert input_smem_bytes(64, 48, 48) < input_smem_bytes(64, 48, 96)
+    lane = lblock(64, 64, 240)
+    assert lane % LANE_MULTIPLE == 0 and 240 % lane == 0
+    assert input_smem_bytes(64, 64, 240) == input_smem_bytes(64, 64, lane)
+    assert 2 * input_smem_bytes(64, 64, 240) <= smem_capacity()
 
 
 def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
