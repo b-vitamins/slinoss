@@ -265,18 +265,47 @@
 namespace slinoss {
 namespace {
 
+// The activation runs in float at every operand width. kFast picks the hardware
+// exponential and reciprocal over the correctly-rounded ones, and it is set from
+// the operand width, not from a build flag.
+//
+// At two bytes an element the result is rounded to 8 mantissa bits before it is
+// stored or before it multiplies a two-byte cotangent. MUFU.EX2 carries at most
+// 2 + floor(1.16*|x|) ulp of float and MUFU.RCP under 2 ulp, so the pair is
+// bounded by about 2e-6 relative over the range a sigmoid argument can take,
+// which is 2000 times finer than the 2^-8 ulp it is rounded into: the stored
+// value is the same one the correctly-rounded pair would store, save where it
+// already sat on a rounding boundary, and the parity bound in the tests is one
+// ulp for exactly that reason. At four bytes the correctly-rounded pair stays.
+// The float32 bounds in the tests are counts of 2^-24 roundings with no room for
+// a second source of error, and the fast pair costs 5 instructions against 24.
+template <bool kFast>
 __device__ __forceinline__ float sigmoid_of(float s) {
   // exp(-s) overflows to inf for very negative s, and 1/inf is zero, so the
-  // saturated ends are exact rather than NaN.
-  return 1.0f / (1.0f + expf(-s));
+  // saturated ends are exact rather than NaN. Both intrinsics saturate the same
+  // way: EX2 returns inf on overflow and RCP returns zero on inf.
+  if constexpr (kFast) {
+    return __fdividef(1.0f, 1.0f + __expf(-s));
+  } else {
+    return 1.0f / (1.0f + expf(-s));
+  }
 }
 
-__device__ __forceinline__ float silu_of(float s) { return s * sigmoid_of(s); }
+template <bool kFast>
+__device__ __forceinline__ float silu_of(float s) {
+  return s * sigmoid_of<kFast>(s);
+}
 
+template <bool kFast>
 __device__ __forceinline__ float silu_grad_of(float s) {
-  const float g = sigmoid_of(s);
+  const float g = sigmoid_of<kFast>(s);
   return g * (1.0f + s * (1.0f - g));
 }
+
+// Operand widths that round the activation to fewer mantissa bits than the fast
+// pair's error, which is every width this kernel is instantiated at except float.
+template <typename input_t>
+constexpr bool kFastActivation = sizeof(input_t) == 2;
 
 // One extended-index read of the activation stream. Index u < 0 addresses the
 // incoming state, which holds the W-1 timesteps before the sequence; below that,
@@ -377,7 +406,8 @@ __global__ void conv1d_fwd_kernel(const input_t *__restrict__ x,
       acc += bias_of_channel;
       if (t + p < t1) {
         y[ybase + static_cast<long>(t + p) * y_rows] =
-            static_cast<input_t>(activation ? silu_of(acc) : acc);
+            static_cast<input_t>(
+                activation ? silu_of<kFastActivation<input_t>>(acc) : acc);
       }
     }
   }
@@ -502,8 +532,7 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
     // long. Each half walks its own kWidth-1 overhang, so steps per owned
     // timestep rise from 19/16 to 11/8 and issue_active with them, 61.8 percent
     // against 55.0: at compulsory traffic the extra instructions cost more than
-    // the extra warps buy. The wave count is not the binding resource.
-    const int tend = t1 - 1 + kWidth - 1;
+    // the extra warps buy.
     const int u_min = t0 == 0 ? -(kWidth - 1) : t0;
     // Strip geometry: the group's first timestep. Negative in the first group of
     // the sequence, where the incoming state stands in for x.
@@ -642,12 +671,99 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
       // group is not held: a pointer bumped per step is a dependence on the
       // address itself, and measured 160.87 us against 133.46 us at the wide
       // shape.
-      for (int t = t0; t <= tend; ++t) {
+      //
+      // The owned steps and the kWidth-1 overhang past them are separate loops.
+      // One loop with a test per step charges the owned steps for four things
+      // none of them can reach: the tap gradient's ownership test, the bounds
+      // test on a global load that cannot run past the end inside a tile, the
+      // trailing window's cotangent, whose extended index is past every u this
+      // loop produces, and the window shifts themselves. kBwdTileT is a multiple
+      // of kMaxWidth, so a full tile unrolls by kWidth with no remainder and the
+      // shifts become register renames: 2*(kWidth-1) moves a step leave the loop,
+      // which is 14 of 114 executed instructions per step at kWidth = 8.
+#pragma unroll kWidth
+      for (int t = t0; t < t1; ++t) {
         float xc;
         float dyc;
         if constexpr (kStage) {
           // A warp reads 32 consecutive elements of one strip row, which share 16
           // four-byte banks two lanes to a word: one transaction, no pad needed.
+          const int s = (t - tstrip) * kMaxChannelsPerBlock + threadIdx.x;
+          xc = static_cast<float>(strip[s]);
+          dyc = dy != nullptr
+                    ? static_cast<float>(strip[kSpan * kMaxChannelsPerBlock + s])
+                    : 0.0f;
+        } else {
+          // t < t1 <= seqlen, so both streams are live: the zero-past-the-end
+          // test belongs to the overhang and is not charged here.
+          xc = static_cast<float>(x[xbase + static_cast<long>(t) * x_pitch]);
+          dyc = dy != nullptr
+                    ? static_cast<float>(
+                          dy[dybase + static_cast<long>(t) * dy_rows])
+                    : 0.0f;
+        }
+
+#pragma unroll
+        for (int j = kWidth - 1; j > 0; --j) {
+          xw[j] = xw[j - 1];
+        }
+        xw[0] = xc;
+
+        float ds = dyc;
+        if (activation && dy != nullptr) {
+          float acc = 0.0f;
+#pragma unroll
+          for (int j = kWidth - 1; j >= 0; --j) {
+            acc = fmaf(wr[j], xw[j], acc);
+          }
+          ds *= silu_grad_of<kFastActivation<input_t>>(acc + bias_of_channel);
+        }
+
+        // The tile owns the parameter gradient over [t0, t1), which is this loop
+        // exactly.
+#pragma unroll
+        for (int j = 0; j < kWidth; ++j) {
+          dwacc[j] = fmaf(ds, xw[j], dwacc[j]);
+        }
+        dbacc += ds;
+
+#pragma unroll
+        for (int j = kWidth - 1; j > 0; --j) {
+          dsw[j] = dsw[j - 1];
+        }
+        dsw[0] = ds;
+
+        // u <= t1 - kWidth here, and the trailing window's cotangent lands at
+        // u >= seqlen - (kWidth-1), which needs t1 > seqlen: dfinal_state is the
+        // overhang's business and its test is not in this loop.
+        const int u = t - (kWidth - 1);
+        if (u >= u_min) {
+          float acc = 0.0f;
+#pragma unroll
+          for (int j = kWidth - 1; j >= 0; --j) {
+            acc = fmaf(wf[j], dsw[j], acc);
+          }
+          if (u >= 0) {
+            dx[dxbase + static_cast<long>(u) * dx_pitch] =
+                static_cast<input_t>(acc);
+          } else if (dinitial_state != nullptr) {
+            dinitial_state[sbase +
+                           static_cast<long>(u + kWidth - 1) * channels] =
+                static_cast<input_t>(acc);
+          }
+        }
+      }
+
+      // dx at index u needs ds at u .. u+kWidth-1, so the walk runs kWidth-1
+      // steps past the tile and recomputes those ds. Their tap gradient belongs
+      // to the next tile and is not accumulated here. The trip count is
+      // compile-time, so the shifts here are renames too.
+#pragma unroll
+      for (int k = 0; k < kWidth - 1; ++k) {
+        const int t = t1 + k;
+        float xc;
+        float dyc;
+        if constexpr (kStage) {
           const int s = (t - tstrip) * kMaxChannelsPerBlock + threadIdx.x;
           xc = static_cast<float>(strip[s]);
           dyc = dy != nullptr
@@ -680,17 +796,7 @@ conv1d_bwd_kernel(const input_t *__restrict__ dy,
           for (int j = kWidth - 1; j >= 0; --j) {
             acc = fmaf(wr[j], xw[j], acc);
           }
-          ds *= silu_grad_of(acc + bias_of_channel);
-        }
-
-        // The tile owns the parameter gradient over [t0, t1); the overhang past
-        // t1 belongs to the next tile and must not be counted twice.
-        if (t < t1) {
-#pragma unroll
-          for (int j = 0; j < kWidth; ++j) {
-            dwacc[j] = fmaf(ds, xw[j], dwacc[j]);
-          }
-          dbacc += ds;
+          ds *= silu_grad_of<kFastActivation<input_t>>(acc + bias_of_channel);
         }
 
 #pragma unroll
