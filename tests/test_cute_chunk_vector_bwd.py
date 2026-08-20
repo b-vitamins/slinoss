@@ -500,8 +500,14 @@ def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:
         assert torch.equal(getattr(first, name), getattr(second, name)), name
 
 
-@pytest.mark.parametrize("splits", [None, 1], ids=["one-head-a-block", "in-block-fold"])
-def test_the_wide_block_width_agrees_with_the_default(splits: int | None) -> None:
+@pytest.mark.parametrize(
+    ("chunk", "splits"),
+    [(64, None), (64, 1), (16, None)],
+    ids=["one-head-a-block", "in-block-fold", "padded-source-block"],
+)
+def test_the_wide_block_width_agrees_with_the_default(
+    chunk: int, splits: int | None
+) -> None:
     """Eight warps and four reach the same outputs, bitwise but for one column.
 
     Warps past the first four are absorbed by the atom tiling's N mode, so the tile,
@@ -520,16 +526,22 @@ def test_the_wide_block_width_agrees_with_the_default(splits: int | None) -> Non
     walks the group's heads in the block, which is the loop the accumulators sit
     across. Two lane tiles either way, so the two sums that cross lanes go through
     their slot closure at both widths.
+
+    ``L 16`` is the third case, for the extent the wide arm alone reads. The source
+    token block is a quarter of an M tile there, so the score tile carries pad rows
+    the store never writes, and the wide arm rereads that tile as its left operand
+    with the block rather than the padded extent as ``K``. A ``K`` mode over the pads
+    would sum shared memory nothing wrote into ``dC``.
     """
     inp = _make(1, 2, 128, 32, 32, torch.bfloat16, groups=1)
     dy = _cotangent(inp, torch.bfloat16)
-    want = _oracle(inp, dy, 64, dstate=_dstate(inp))
-    four = _run(inp, dy, want, 64, splits=splits, warps=WARPS)
-    eight = _run(inp, dy, want, 64, splits=splits, warps=WARPS_WIDE)
+    want = _oracle(inp, dy, chunk, dstate=_dstate(inp))
+    four = _run(inp, dy, want, chunk, splits=splits, warps=WARPS)
+    eight = _run(inp, dy, want, chunk, splits=splits, warps=WARPS_WIDE)
 
-    tag = f"cute-chunk-vector[W{WARPS_WIDE}/S{splits}]"
-    _compare(four, want, torch.bfloat16, f"cute-chunk-vector[W{WARPS}/S{splits}]")
-    _compare(eight, want, torch.bfloat16, tag)
+    case = f"L{chunk}/S{splits}"
+    _compare(four, want, torch.bfloat16, f"cute-chunk-vector[W{WARPS}/{case}]")
+    _compare(eight, want, torch.bfloat16, f"cute-chunk-vector[W{WARPS_WIDE}/{case}]")
     for name in ("dB", "dC", "carry_b", "dK"):
         assert torch.equal(getattr(four, name), getattr(eight, name)), name
     assert torch.equal(four.dtrans[..., :3], eight.dtrans[..., :3])
@@ -537,7 +549,7 @@ def test_the_wide_block_width_agrees_with_the_default(splits: int | None) -> Non
     # The width is the tiling's warp count, so an illegal count is refused where the
     # tiling is built rather than launched at a rounded one.
     with pytest.raises(ValueError, match="warps must be a multiple"):
-        _run(inp, dy, want, 64, splits=splits, warps=WARPS + 2)
+        _run(inp, dy, want, chunk, splits=splits, warps=WARPS + 2)
 
 
 def test_without_the_streaming_carry_in() -> None:
