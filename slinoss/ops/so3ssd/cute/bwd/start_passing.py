@@ -99,6 +99,27 @@ fusion's, because the width moves no bytes. What it does move is the barrier sta
 :func:`start_chunk`, and the chunk prefix behind one of them is warp 0's work, so a
 wider block waits wider. That is the next lever and it is not the width's.
 
+Row band. 360 blocks against 168 resident is 1.43 waves at three blocks an SM, and
+the 0.715 quantization efficiency of that wave count accounts for the whole of the
+39.0%-against-50.0% occupancy gap. Splitting ``P`` into bands as well as ``3N``
+doubles the grid and closes it, and the kernel is slower anyway:
+:func:`slinoss.ops.so3ssd.cute.mma.mma_rows` rounds the M extent back up to
+:data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_M`, so half of every contraction is
+padding, and ``trans``, ``C``, ``cquat`` and ``cscale`` are requested once per row
+band. Measured on sm_86 at the geometry above, eight warps, one NCU capture of three
+launches, event medians of three runs:
+
+    rows  blocks  us/launch  MB/launch  occ theo/ach  issue  tensor  l1tex  smem st
+    64       360      410.1     176.52  50.0%/39.0%  32.4%    7.5%  44.8%  5.21 M
+    32       720      454.5     199.03  66.7%/58.4%  48.3%   13.8%  66.4%  7.40 M
+    16      1440      738.2          -            -      -       -      -       -
+
+The 64-row line recaptures the width table's eight-warp line and lands 0.3% off it.
+Occupancy and issue both rose; the shared pipe and the bus took more than they gave.
+The class percentage rose with them, 64.0% to 64.9%, on a kernel 11% slower -- an arm
+:data:`slinoss.perf.declared.DECLARED` cannot be ranked by. The M mode has no atom
+narrower than 64 rows, so the band has no cheaper form and is not a lever.
+
 ``warps`` is a parameter and the default is four; nothing in the operator's backward
 passes it.
 """
