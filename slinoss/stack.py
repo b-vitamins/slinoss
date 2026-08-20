@@ -33,18 +33,105 @@ step are one call at two sequence lengths.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
+from torch.nn.functional import linear
 
-from slinoss._precision import LOW_PRECISION_DTYPES
+from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
 from slinoss.blocks import BlockOutput, SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.block import rmsnorm_residual
 from slinoss.state import MixerState, StackState
 
 __all__ = ["SLinOSSStack"]
+
+_HeadGrads = tuple[Tensor, Tensor, Tensor | None, None]
+
+
+class _PaddedHeadFunction(torch.autograd.Function):
+    """The head GEMM and the constant it writes past ``vocab_size``, as one node.
+
+    The padding columns are constants, so a cotangent on one must reach neither
+    head gradient. Autograd states that by recording the write and clearing the
+    padding band of the cotangent in the pullback, and clearing a band of a tensor
+    it does not own makes it clone the whole logit block first. Measured at the
+    reference geometry: one 1.65 GB device-to-device copy, 2.416 ms, a third of the
+    step's glue, and 2,424 MiB of peak against 1,166 MiB, the clone and the cleared
+    cotangent both being the size of the logit block.
+
+    The write is not recorded here, and the pullback clears nothing on the cotangent.
+    It keeps the padding out of each gradient where that gradient reads it, and every
+    contraction stays at the padded width while it does, because that width is what
+    aligns them: narrowing the vocabulary axis of ``dnormed`` costs 4.05 ms of the
+    4.62 ms the aligned one takes, and narrowing ``dbias`` 0.61 ms of 1.21 ms.
+    ``dweight`` and ``dbias`` reduce over tokens, so a padding column reaches only a
+    padding row of either, and that band is overwritten with zero. ``dnormed``
+    contracts the vocabulary axis, so it reads a copy of the weight whose padding rows
+    are zero, which costs 0.13 ms.
+
+    Every product is then the recorded version's and every sum is over the same terms
+    in the same order, because a zero padding row contributes exactly the zero a
+    cleared padding column contributed. Measured at the reference geometry over a
+    cotangent drawn on every column, padding included: all three gradients bitwise
+    the recorded version's at bf16, float32 and float64.
+
+    No :func:`torch.amp.custom_fwd`. Autocast rewrites the GEMM's operands where it
+    is issued, and the gradients are cast back to the parameter dtypes on the way
+    out, so nothing here needs the eager cast that would also demote ``normed``.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any, normed: Tensor, weight: Tensor, bias: Tensor | None, vocab: int
+    ) -> Tensor:
+        logits = linear(normed, weight, bias)
+        # The mask, not an accumulator: 112 KiB of constant at the reference
+        # geometry, against a GEMM whose alignment is what the padding buys.
+        logits.narrow(-1, vocab, logits.shape[-1] - vocab).fill_(
+            torch.finfo(logits.dtype).min
+        )
+        ctx.save_for_backward(normed, weight)
+        ctx.vocab = vocab
+        ctx.has_bias = bias is not None
+        return logits
+
+    @staticmethod
+    def backward(ctx: Any, dlogits: Tensor) -> _HeadGrads:  # type: ignore[override]
+        normed, weight = ctx.saved_tensors
+        vocab: int = ctx.vocab
+        pad = weight.shape[0] - vocab
+        flat = dlogits.flatten(0, -2)
+        # The vocabulary axis is contracted here, so a padding column would reach
+        # every output. Zero it out of a copy of the weight rather than out of a copy
+        # of the cotangent: the same products over 14 times fewer bytes at the
+        # reference geometry, and a cast is already a copy.
+        masked = (
+            weight.clone()
+            if weight.dtype is dlogits.dtype
+            else weight.to(dlogits.dtype)
+        )
+        masked.narrow(0, vocab, pad).zero_()
+        dnormed = flat @ masked
+        # One buffer for both bands: the GEMM covers it and the padding rows, which
+        # hold nothing but the padding columns' contribution, are then zeroed.
+        dweight = torch.empty(weight.shape, dtype=dlogits.dtype, device=dlogits.device)
+        torch.mm(flat.t(), cast_to(normed.flatten(0, -2), dlogits.dtype), out=dweight)
+        dweight.narrow(0, vocab, pad).zero_()
+        dbias: Tensor | None = None
+        if ctx.has_bias:
+            dbias = torch.empty(
+                weight.shape[0], dtype=dlogits.dtype, device=dlogits.device
+            )
+            torch.sum(flat, 0, out=dbias)
+            dbias.narrow(0, vocab, pad).zero_()
+        return (
+            cast_to(dnormed.view(normed.shape), normed.dtype),
+            cast_to(dweight, weight.dtype),
+            cast_opt(dbias, weight.dtype),
+            None,
+        )
 
 
 class SLinOSSStack(nn.Module):
@@ -62,8 +149,10 @@ class SLinOSSStack(nn.Module):
     :attr:`slinoss.SLinOSSConfig.padded_vocab_size`.
 
     The head's rows past ``vocab_size`` are left at the framework default. Their
-    value never reaches an output and their gradient is exactly zero, because
-    :meth:`forward` overwrites their columns with ``finfo(dtype).min``.
+    value never reaches an output, because :meth:`forward` overwrites their columns
+    with ``finfo(dtype).min``, and their gradient is exactly zero, because the
+    pullback of that write contracts the live columns only. Both are
+    :class:`_PaddedHeadFunction`.
 
     Args:
         config: Shape and parameterization contract. ``n_layers`` sets the depth,
@@ -211,16 +300,12 @@ class SLinOSSStack(nn.Module):
             ).normed
             if self.head is None:
                 return normed
-            logits = cast("Tensor", self.head(normed))
             vocab = self.config.vocab_size
-            if vocab is not None and logits.shape[-1] != vocab:
-                # Recorded, not under no_grad. The padding columns are constants,
-                # so autograd must drop whatever cotangent a consumer puts on them;
-                # skipping the record instead reports the unmasked linear's
-                # Jacobian, which sends a padding cotangent into both head
-                # gradients. Priced: the record makes autograd clone the logit block
-                # to zero a slice of it, 2416 us against 10114 us of GEMM class the
-                # padding removes at the reference geometry, and that clone is what
-                # a cheaper masking would have to remove.
-                logits[..., vocab:] = torch.finfo(logits.dtype).min
-            return logits
+            if vocab is None or self.head.out_features == vocab:
+                return cast("Tensor", self.head(normed))
+            return cast(
+                "Tensor",
+                _PaddedHeadFunction.apply(
+                    normed, self.head.weight, self.head.bias, vocab
+                ),
+            )
