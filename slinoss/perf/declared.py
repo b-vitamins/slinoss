@@ -116,8 +116,9 @@ the kernel.
 ``vector_reduce_kernel`` sums the per-head partials the vector backward emits once
 the head-sum depth is a grid axis. Its traffic is the partial buffer and nothing
 else, and that buffer follows the sequence, so it is held to a bandwidth rather than
-treated as a tail. Measured on sm_86 at the model geometry: 294.72 MB in 432.8 us,
-681.0 GB/s, 99.4% of the bus. The pass is at its own ceiling, so its cost is an
+treated as a tail. Measured on sm_86 at the model geometry: 152.77 MB in 221.5 us,
+689.8 GB/s, 102.7% of its copy floor, which is above the bus figure because part of
+the buffer is served from L2. The pass is at its own ceiling, so its cost is an
 argument about whether the partials should exist rather than about this kernel.
 
 Four entries are SERIAL-tiny, and only the first is unconditionally so.

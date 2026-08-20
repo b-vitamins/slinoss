@@ -117,8 +117,8 @@ def test_kernel_regex_admits_every_reduce_pass() -> None:
     The names are the mangled symbols NCU reports, truncated after the first
     operand. A regex written against the Python function name would miss a reduce
     pass, and a pass the regex drops leaves its cost out of the capture entirely
-    rather than failing: at the model geometry ``vector_reduce_kernel`` is 432.8 us
-    of a 3,811.3 us call, so a silent omission understates the operator by 11%.
+    rather than failing: at the model geometry ``vector_reduce_kernel`` is 221.5 us
+    of a 3,559.4 us call, so a silent omission understates the operator by 6%.
     """
     import re
 

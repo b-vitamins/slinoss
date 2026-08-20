@@ -133,8 +133,13 @@ reading this bar exists to catch. ``chunk_vector_bwd`` on sm_86 runs one residen
 block at 8.3% achieved occupancy at four warps and 16.6% at eight, and its measured
 share of its own DRAM floor sat between 12 and 31% across three shapes, both spill
 states and both widths, so no traffic figure separates it from a kernel that merely
-moves more bytes. Its arena is above the two-block ceiling at either width, so the
-50% bar is unreachable there until the arena falls.
+moves more bytes. The bar is unreachable there, and the arena is not what holds it:
+NCU reports ``launch__occupancy_limit_registers`` and
+``launch__occupancy_limit_shared_mem`` both at one block, and a second 256-thread
+block needs 128 registers a thread against 242 measured. Capping at 128 spills
+23.6 MB per launch and costs 4.2%, which fails the class outright, so no arena
+reduction buys a block. This kernel is held to the bar it cannot meet on purpose:
+the bar states what the multiprocessor has left, and the answer here is nothing.
 """
 
 BLOCK_FLOOR_EXEMPT_CLASSES: Final[frozenset[str]] = frozenset((SERIAL_TINY,))
