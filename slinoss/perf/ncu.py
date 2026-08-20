@@ -60,6 +60,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Final
 
+from slinoss.perf.tools import resolve_tool
 from slinoss.perf.units import (
     INVARIANT,
     MEDIAN,
@@ -551,20 +552,25 @@ def run_ncu(
     Args:
         table: The table to request.
         argv: The target command.
-        ncu: Path to the ``ncu`` binary.
+        ncu: Path to the ``ncu`` binary, or a bare name to resolve through
+            :func:`slinoss.perf.tools.resolve_tool`.
         extra: Additional NCU flags.
         cwd: Working directory for the target.
         timeout_s: Wall clock limit, or None.
 
     Returns:
-        The parsed pass.
+        The parsed pass. ``command`` carries the resolved binary, so the report
+        records which ``ncu`` produced the counters.
 
     Raises:
+        ToolNotFoundError: If ``ncu`` is a bare name on neither PATH nor any CUDA
+            bin directory. Raised before the target runs, so a missing profiler
+            costs no measurement.
         RuntimeError: If NCU exits nonzero. The message carries the tail of
             stderr, because NCU's own diagnostic names the cause and a bare exit
             code does not.
     """
-    command = ncu_command(table, argv, ncu=ncu, extra=extra)
+    command = ncu_command(table, argv, ncu=resolve_tool(ncu), extra=extra)
     done = subprocess.run(
         command,
         capture_output=True,

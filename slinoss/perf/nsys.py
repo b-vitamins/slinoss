@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Final
 
+from slinoss.perf.tools import resolve_tool
 from slinoss.perf.units import (
     MEDIAN,
     SUM,
@@ -327,7 +328,8 @@ def run_nsys(
         base: Output path. ``.nsys-rep`` is appended to the whole name, not
             substituted for its last suffix.
         label: What is being traced.
-        nsys: Path to the ``nsys`` binary.
+        nsys: Path to the ``nsys`` binary, or a bare name to resolve through
+            :func:`slinoss.perf.tools.resolve_tool`.
         trace: Value for ``--trace``.
         cwd: Working directory for the target.
         timeout_s: Wall clock limit for each of the two commands.
@@ -336,9 +338,15 @@ def run_nsys(
         The trace.
 
     Raises:
+        ToolNotFoundError: If ``nsys`` is a bare name on neither PATH nor any CUDA
+            bin directory. Raised before the profile runs, so a missing profiler
+            costs no measurement.
         RuntimeError: If either command exits nonzero. The message carries the
             tail of the tool's own diagnostic.
     """
+    # Resolved once: the stats pass must read the report the profile pass wrote,
+    # and two searches could pick two toolkits whose report formats differ.
+    binary = resolve_tool(nsys)
     # nsys appends the suffix to the whole name it was given, so the reader must
     # append too. `with_suffix` replaces everything after the last dot, which for a
     # base like `out/run.1-standard-step` reads `out/run.nsys-rep` and fails after
@@ -346,8 +354,8 @@ def run_nsys(
     report = base.with_name(base.name + ".nsys-rep")
     stdout = ""
     for command in (
-        nsys_profile_command(argv, base, nsys=nsys, trace=trace),
-        nsys_stats_command(report, nsys=nsys),
+        nsys_profile_command(argv, base, nsys=binary, trace=trace),
+        nsys_stats_command(report, nsys=binary),
     ):
         done = subprocess.run(
             command,
