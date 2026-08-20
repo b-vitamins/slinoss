@@ -48,6 +48,8 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     vector_smem_bytes,
     vector_splits,
 )
+from slinoss.ops.so3ssd.cute.common import WARPS
+from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE, mma_atoms
 from slinoss.ops.so3ssd.reference import from_heads
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
@@ -258,6 +260,7 @@ def _run(
     dB: Tensor | None = None,
     dC: Tensor | None = None,
     splits: int | None = None,
+    warps: int = WARPS,
 ) -> ChunkVectorBwd:
     """One launch, against the float32 inputs the oracle carries."""
     got = chunk_vector_backward(
@@ -278,6 +281,7 @@ def _run(
         dB=dB,
         dC=dC,
         splits=splits,
+        warps=warps,
     )
     torch.cuda.synchronize()
     return got
@@ -494,6 +498,46 @@ def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:
     second = _run(inp, dy, want, 64)
     for name in BOUNDS[torch.bfloat16]:
         assert torch.equal(getattr(first, name), getattr(second, name)), name
+
+
+@pytest.mark.parametrize("splits", [None, 1], ids=["one-head-a-block", "in-block-fold"])
+def test_the_wide_block_width_agrees_with_the_default(splits: int | None) -> None:
+    """Eight warps and four reach the same outputs, bitwise but for one column.
+
+    Warps past the first four are absorbed by the atom tiling's N mode, so the tile,
+    every M extent, every pitch and every K accumulation are the width's invariants:
+    ``dB``, ``dC``, the carry and ``dK`` are bitwise equal across the two widths.
+
+    ``dtrans``'s log-scale column is not, and the reason is the one reduction the
+    width reassociates. The offset term ends in a read-modify-write per accumulator
+    row by the leader of the quad that owns it, and a split N mode gives that row one
+    leader per warp group, so a row's columns are summed per group and the groups are
+    folded afterwards. Same terms, different association, so that column is held to
+    the float64 reference at both widths rather than to the other width, and no bound
+    moves for it.
+
+    Both head geometries: the default depth leaves one head to a block, and depth one
+    walks the group's heads in the block, which is the loop the accumulators sit
+    across. Two lane tiles either way, so the two sums that cross lanes go through
+    their slot closure at both widths.
+    """
+    inp = _make(1, 2, 128, 32, 32, torch.bfloat16, groups=1)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _oracle(inp, dy, 64, dstate=_dstate(inp))
+    four = _run(inp, dy, want, 64, splits=splits, warps=WARPS)
+    eight = _run(inp, dy, want, 64, splits=splits, warps=WARPS_WIDE)
+
+    tag = f"cute-chunk-vector[W{WARPS_WIDE}/S{splits}]"
+    _compare(four, want, torch.bfloat16, f"cute-chunk-vector[W{WARPS}/S{splits}]")
+    _compare(eight, want, torch.bfloat16, tag)
+    for name in ("dB", "dC", "carry_b", "dK"):
+        assert torch.equal(getattr(four, name), getattr(eight, name)), name
+    assert torch.equal(four.dtrans[..., :3], eight.dtrans[..., :3])
+
+    # The width is the tiling's warp count, so an illegal count is refused where the
+    # tiling is built rather than launched at a rounded one.
+    with pytest.raises(ValueError, match="warps must be a multiple"):
+        _run(inp, dy, want, 64, splits=splits, warps=WARPS + 2)
 
 
 def test_without_the_streaming_carry_in() -> None:
@@ -716,6 +760,14 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert smem_capacity() < 2 * vector_smem_bytes(64, 64, 240, 18, 32)
     assert vector_smem_bytes(96, 48, 240, 1, vblock(96, 48, 240, 1)) > smem_capacity()
     assert vector_smem_bytes(96, 64, 240, 1, vblock(96, 64, 240, 1)) > smem_capacity()
+    # The block width moves one extent and only one: the offset accumulator takes a
+    # row per warp group of the tiling, ``4 * L`` bytes, and the shape the class is
+    # declared against still holds one resident block at the wide width.
+    groups = mma_atoms(WARPS_WIDE)[1]
+    assert vector_smem_bytes(64, 64, 240, 1, 64, 2, groups) == (
+        vector_smem_bytes(64, 64, 240, 1, 64, 2, 1) + 4 * 64 * (groups - 1)
+    )
+    assert vector_smem_bytes(64, 64, 240, 1, 64, 2, groups) <= smem_capacity()
 
 
 def test_rejects_a_shape_the_carveout_cannot_hold() -> None:

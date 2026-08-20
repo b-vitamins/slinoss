@@ -269,6 +269,7 @@ from slinoss.ops.so3ssd.cute.common import (
     TABLE_AN,
     TABLE_AP,
     THREADS,
+    WARPS,
     Mat3,
     Vec3,
     mat3_add,
@@ -296,15 +297,18 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
+    MMA_INST,
     MMA_TILE_M,
     SMEM_SEGMENT,
     fp32_tile,
     make_mma,
     mma_acc,
     mma_areg,
+    mma_atoms,
     mma_coords,
     mma_gemm,
     mma_gemm_areg,
+    mma_groups,
     mma_rows,
     operand_tile,
     smem_pitch,
@@ -336,6 +340,7 @@ __all__ = [
     "forced_tile",
     "gradient_tile",
     "lane_block",
+    "offset_tile",
     "open_slots",
     "out_tile",
     "partial_bytes",
@@ -412,6 +417,27 @@ def lane_block(dim: int) -> int:
 def row_tile(chunk: int) -> Tile:
     """Per-token float32 scratch, ``(L, ROW_WORDS)``."""
     return Tile((chunk, ROW_WORDS), (ROW_WORDS, 1))
+
+
+def offset_tile(chunk: int, warp_groups: int = 1) -> Tile:
+    """Log-scale cotangent under accumulation, ``(warp_groups, L)`` float32.
+
+    The offset term's reduction over the state width ends in one read-modify-write
+    per accumulator row, by the leader of the quad that owns the row. A tiling that
+    splits the tile's N mode gives a row one such leader per warp group, in
+    different warps, with no barrier between them and no shuffle able to join them,
+    so each group gets a row of its own. Row 0 is the sum, and the rows above it are
+    folded into it once, before the reverse scan reads it.
+
+    Row-major with ``L`` innermost, so a pass over the tokens of one row is unit
+    stride and row 0 alone is a dense ``(L,)`` tile at the same address.
+
+    Args:
+        chunk: ``L``.
+        warp_groups: Warp groups the tiling splits the N mode into,
+            :func:`slinoss.ops.so3ssd.cute.mma.mma_groups`.
+    """
+    return Tile((warp_groups, chunk), (chunk, 1))
 
 
 def readout_tile(chunk: int, dim: int) -> Tile:
@@ -617,7 +643,13 @@ def arena(
 
 
 def vector_smem_bytes(
-    chunk: int, rows: int, dim: int, fold: int, span: int, itemsize: int = 2
+    chunk: int,
+    rows: int,
+    dim: int,
+    fold: int,
+    span: int,
+    itemsize: int = 2,
+    warp_groups: int = 1,
 ) -> int:
     """Shared memory the kernel allocates, in bytes.
 
@@ -631,6 +663,9 @@ def vector_smem_bytes(
         fold: Heads one block walks, ``H // G``.
         span: Source-token block, from :func:`vblock`.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+        warp_groups: Warp groups of the tiling, which is the only extent the block
+            width moves: :func:`offset_tile` takes a row per group and every other
+            tile is flat in the width. ``4 * L`` bytes per group past the first.
     """
     return smem_bytes(
         [
@@ -641,7 +676,7 @@ def vector_smem_bytes(
             (trans_tile(chunk), 4),
             (trans_tile(chunk), 4),
             (scalar_tile(chunk), 4),
-            (scalar_tile(chunk), 4),
+            (offset_tile(chunk, warp_groups), 4),
             (scalar_tile(chunk), 4),
             (table_tile(chunk, 3), 4),
             (row_tile(chunk), 4),
@@ -890,9 +925,16 @@ def _sum_over_n(value: Scalar) -> Scalar:
     """Sum one accumulator element over the four lanes that share its row.
 
     The atom gives the four lanes of an aligned quad the same accumulator row and
-    disjoint columns, so two butterfly rounds leave that row's partial column sum
-    in all four. Rows are disjoint across quads and across warps, so the
-    read-modify-write that follows is by one thread per row and needs no barrier.
+    disjoint columns, so two butterfly rounds leave that row's partial column sum in
+    all four. The atom's C layout is per warp, so the quad is the same four lanes at
+    every block width.
+
+    Rows are disjoint across quads and across the warps of one warp group, so within
+    a group the read-modify-write that follows is by one thread per row and needs no
+    barrier. Across warp groups a row is shared: the M mode is not partitioned by the
+    N atoms, so a tiling with more than one group gives every row one quad leader per
+    group. Each writes its own row of :func:`offset_tile` and the rows are summed
+    once, which is a reduction order the widths do not share.
 
     Args:
         value: The lane's contribution.
@@ -1328,8 +1370,12 @@ def chunk_vector_bwd_kernel(
         gdtap: ``(B,H,tiles*T,2,4)`` float32 ``dK`` or its slot buffer, written.
         seqlen: ``T``. Dynamic.
         chunks: ``C``. Dynamic. The row extent the carry's shard axis multiplies.
-        tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`.
-        threads: Block width. Compile-time.
+        tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`. Its warp count
+            is the block's: warps past the first four go to the tile's N mode, so
+            every M extent, every pitch and every staging pass is unchanged and the
+            two places the split shows are the readout term's left operand and the
+            offset term's owner count.
+        threads: Block width, ``32 *`` the tiling's warp count. Compile-time.
         chunk: ``L``. Compile-time.
         rows: ``P``. Compile-time.
         dim: ``3N``. Compile-time.
@@ -1356,6 +1402,9 @@ def chunk_vector_bwd_kernel(
     tile = lane_block(dim)
     tiles = dim // tile
     lanes = tile // 3
+    # Read off the tiling, not off ``threads``: the tiling is what decides how many
+    # threads own one accumulator row, and a second derivation of it could disagree.
+    wgroups = mma_groups(tiled_mma)
     mpad = mma_rows(chunk)
     spad = mma_rows(span)
     blocks = chunk // span
@@ -1376,7 +1425,9 @@ def chunk_vector_bwd_kernel(
     sdquat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     sdw = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
-    sdlp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
+    sdlp = smem.allocate_tensor(
+        cutlass.Float32, offset_tile(chunk, wgroups).layout(), 16
+    )
     sdls = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 3).layout(), 16)
     srow = smem.allocate_tensor(cutlass.Float32, row_tile(chunk).layout(), 16)
@@ -1397,6 +1448,10 @@ def chunk_vector_bwd_kernel(
         base, space.forcing, gradient_tile(chunk + 1, tile), cutlass.Float32
     )
     sumc = _tile_at(base, space.summed, gradient_tile(chunk, tile), cutlass.Float32)
+    # Row 0 of the offset accumulator, which is where its rows are summed and what the
+    # reverse scan reads. The scan takes a dense ``(L,)`` tile and must not learn that
+    # the tiling gave the term more than one owner.
+    vdlp = cute.make_tensor(sdlp.iterator, cute.make_layout((chunk,), stride=(1,)))
 
     # Every view a GEMM reads is a layout over a tile that never moves, so all of
     # them are built once and none is per head, per block, per tap or per lane tile.
@@ -1416,6 +1471,14 @@ def chunk_vector_bwd_kernel(
     # target token as K, so the stride-1 mode is M and the load transposes.
     vscore = cute.make_tensor(
         sscore.iterator, cute.make_layout((spad, mpad), stride=(1, lds))
+    )
+    # The same tile as the readout GEMM's left operand, target token as M and source
+    # token as K. The K extent is the block rather than the block rounded up: the pad
+    # columns of the store below are never written, and a K mode reads them into the
+    # sum where an M mode only reaches accumulator rows the store drops. Used at a
+    # tiling that splits the N mode, where the register reread is not available.
+    vscorem = cute.make_tensor(
+        sscore.iterator, cute.make_layout((mpad, span), stride=(lds, 1))
     )
 
     dcacc = mma_acc(tiled_mma, tid, (mpad, tile))
@@ -1438,7 +1501,16 @@ def chunk_vector_bwd_kernel(
     # lever, and moving all four inside both loops leaves the counters unchanged to
     # the sector.
     mfrag = cute.make_fragment_like(dmacc, elem)
+    # Built at both widths and read at one. The reread is contiguous in K only where
+    # the tiling keeps the tile's N mode whole; past that the wide arm below takes the
+    # same score out of ``sscore``, which the transpose stores anyway.
     fa_m = mma_areg(mfrag)
+
+    # Row of :func:`offset_tile` this thread's read-modify-write of the offset term
+    # belongs to. Element 0 of the accumulator sits in the tiling's first N tile, so
+    # its column names the warp group directly. Taken from the coordinates rather than
+    # from ``tid`` so the thread layout of the tiling is not restated here.
+    wgroup = 0 if cutlass.const_expr(wgroups == 1) else ccrd[0][1] // MMA_INST[1]
 
     # The lane tile and the head shard are grid axes, not loops. Every accumulator
     # above then sits between its hoisted allocation and its uses with a loop of the
@@ -1511,7 +1583,7 @@ def chunk_vector_bwd_kernel(
             chunk,
         )
         _fill_zero(srow, chunk * ROW_WORDS, tid, threads)
-        _fill_zero(sdlp, chunk, tid, threads)
+        _fill_zero(sdlp, wgroups * chunk, tid, threads)
         _fill_zero(sdw, 4 * chunk, tid, threads)
         cute.arch.sync_threads()
         chunk_prefixes(strans, slp, squat, tid, chunk)
@@ -1583,7 +1655,7 @@ def chunk_vector_bwd_kernel(
             expl = decay(slp[cutlass.min(m, last)])
             held = _sum_over_n(dcacc[i] * widen(scrot[m, d], elem))
             if tid % 4 == 0 and m < chunk:
-                sdlp[m] = sdlp[m] + 2.0 * expl * held
+                sdlp[wgroup, m] = sdlp[wgroup, m] + 2.0 * expl * held
             dcacc[i] = dcacc[i] * expl
 
         cute.arch.sync_threads()
@@ -1673,7 +1745,8 @@ def chunk_vector_bwd_kernel(
                     src = nbase + n
                     masked = dmacc[i] * decay(slp[cutlass.min(m, last)] - slp[src])
                     mfrag[i] = narrow(select(src <= m, masked, zero), elem)
-                mma_gemm_areg(tiled_mma, tid, dcacc, fa_m, vbrot, False)
+                if cutlass.const_expr(wgroups == 1):
+                    mma_gemm_areg(tiled_mma, tid, dcacc, fa_m, vbrot, False)
 
                 # The same score, transposed, for the forcing accumulator, which
                 # contracts over the target token the readout consumer holds as N.
@@ -1699,6 +1772,15 @@ def chunk_vector_bwd_kernel(
                     dbacc[i] = dbacc[i] * decay(lplast - slp[src])
                 cute.arch.sync_threads()
                 mma_gemm(tiled_mma, tid, dbacc, vscore, vcrot, False, False)
+                # The readout term of a split N mode, which cannot take the score out
+                # of the fragment that produced it. Its left operand is the tile the
+                # transpose above already published, so it needs no barrier of its own
+                # and it costs one more pass over that tile. It sits here rather than
+                # before the store because the store is what publishes the operand;
+                # the accumulator is untouched in between, so the K order the readout
+                # sums in is the order the register form sums in.
+                if cutlass.const_expr(wgroups != 1):
+                    mma_gemm(tiled_mma, tid, dcacc, vscorem, vbrot, True, False)
                 # The gradient overwrites the score it was built from, so the read
                 # has to be complete in every thread before the store begins.
                 cute.arch.sync_threads()
@@ -1799,13 +1881,18 @@ def chunk_vector_bwd_kernel(
                 )
                 for j in cutlass.range_constexpr(4):
                     sdrot[j, token] = dquat[j]
-                sdlp[token] = (
-                    sdlp[token]
+                # One thread per token, so the rows the tiling gave the offset term
+                # fold in here rather than needing a pass and a barrier of their own.
+                offset = vdlp[token]
+                for g in cutlass.range_constexpr(wgroups - 1):
+                    offset = offset + sdlp[g + 1, token]
+                vdlp[token] = (
+                    offset
                     + wlp * gdlp[bidx, hidx, cidx, token]
                     + select(closing, 2.0 * cscale * dclast, zero)
                 )
         cute.arch.sync_threads()
-        chunk_suffix(sdlp, sdls, tid, chunk)
+        chunk_suffix(vdlp, sdls, tid, chunk)
         quat_suffix_vjp(squat, sdrot, sdquat, tid, chunk)
         cute.arch.sync_threads()
 
@@ -1877,7 +1964,7 @@ def chunk_vector_bwd(
     groups: cutlass.Int32,
     stream: Stream,
     dtype: cutlass.Constexpr,
-    threads: cutlass.Constexpr,
+    warps: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     rows: cutlass.Constexpr,
     dim: cutlass.Constexpr,
@@ -1898,7 +1985,12 @@ def chunk_vector_bwd(
     tile so that no rolled loop sits between an accumulator's allocation and its uses,
     the shard so that the loop which remains there is short. The block count rises by
     their product.
+
+    The block width is the tiling's warp count and nothing else, so it is passed as
+    ``warps`` and the thread count is derived from it: two parameters would let the
+    launch geometry and the accumulator partition disagree.
     """
+    threads = warps * 32
     chunk_vector_bwd_kernel(
         gdy,
         gu,
@@ -1920,7 +2012,7 @@ def chunk_vector_bwd(
         gdtap,
         seqlen,
         chunks,
-        make_mma(dtype),
+        make_mma(dtype, warps),
         threads,
         chunk,
         rows,
@@ -2079,6 +2171,7 @@ def chunk_vector_backward(
     dB: Tensor | None = None,
     dC: Tensor | None = None,
     splits: int | None = None,
+    warps: int = WARPS,
 ) -> ChunkVectorBwd:
     """Differentiate the rowwise vectors and the transition parameters.
 
@@ -2128,6 +2221,14 @@ def chunk_vector_backward(
             block and writes the three summed outputs directly; above one the heads
             are shared out over that many blocks and a second launch closes the
             partials. The returned tensors are the full sums either way.
+        warps: Warps per block of the main kernel, a multiple of
+            :data:`slinoss.ops.so3ssd.cute.common.WARPS` at most
+            :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`. Warps past the first four
+            go to the atom tiling's N mode, so the tile, every M extent and every
+            pitch are the width's invariants and the footprint grows by ``4 * L``
+            bytes per warp group past the first. The source-token block is chosen at
+            the default width, so a shape that fits at four warps and not at eight is
+            refused rather than run at a narrower block.
 
     Returns:
         :class:`ChunkVectorBwd`.
@@ -2135,8 +2236,9 @@ def chunk_vector_backward(
     Raises:
         ValueError: On a layout, rank, shape or extent violation, on a destination
             that is not the band of its operand, on a shared-memory budget the
-            device cannot hold, on half a streaming pair, or on a ``splits`` that
-            does not divide the fold.
+            device cannot hold, on half a streaming pair, on a ``splits`` that
+            does not divide the fold, or on a ``warps`` that is not a legal block
+            width.
         TypeError: On an activation dtype with no tensor-core path.
     """
     activations: Named = ((dy, "dy"), (U, "U"), (B, "B"), (C, "C"))
@@ -2179,9 +2281,16 @@ def chunk_vector_backward(
         if tuple(tensor.shape) != shape:
             raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
 
+    # The N atoms of the tiling, which is the warp-group count the offset term takes a
+    # row of. Raises on an illegal width, so the block geometry is checked here rather
+    # than inside the trace.
+    wgroups = mma_atoms(warps)[1]
     budget = assert_smem_fits(
-        f"chunk_vector_bwd[L{chunk_size}/P{rows}/3N{dim}/fold{fold}/S{shards}]",
-        vector_smem_bytes(chunk_size, rows, dim, fold, span, dy.element_size()),
+        f"chunk_vector_bwd[L{chunk_size}/P{rows}/3N{dim}"
+        f"/fold{fold}/S{shards}/W{warps}]",
+        vector_smem_bytes(
+            chunk_size, rows, dim, fold, span, dy.element_size(), wgroups
+        ),
     )
 
     # After the operand guards, so a destination is measured against an operand that
@@ -2233,7 +2342,7 @@ def chunk_vector_backward(
         ),
         (
             cute_dtype(dtype),
-            THREADS,
+            warps,
             chunk_size,
             rows,
             dim,

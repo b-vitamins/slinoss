@@ -13,13 +13,16 @@ default drives; ``--window`` is the process NCU attaches to.
 per-block geometry. ``--groups`` sets ``G``, and the fold ``H // G`` with it, which
 is what decides whether the float32 readout sum is allocated at all. ``--splits``
 sets how many blocks that fold is shared over, which trades the in-block fold's
-local traffic against a workspace partial. The overrides rename the shape, so a
-figure taken under one cannot be read as a figure at the name it started from.
+local traffic against a workspace partial. ``--warps`` sets the block width, which
+is the lever on how many warps are resident per scheduler. The overrides rename the
+shape, so a figure taken under one cannot be read as a figure at the name it
+started from.
 
     python3 scripts/perf/profile_chunk_vector_bwd.py --shape standard
     python3 scripts/perf/profile_chunk_vector_bwd.py --rows 64 --lanes 80 --heads 18
     python3 scripts/perf/profile_chunk_vector_bwd.py --rows 64 --lanes 80 --heads 18 \
         --groups 1 --splits 6
+    python3 scripts/perf/profile_chunk_vector_bwd.py --shape standard --warps 8
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     partial_bytes,
     vector_splits,
 )
+from slinoss.ops.so3ssd.cute.common import WARPS
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import dram_floor_verdict, dram_time_floor
 from slinoss.perf.device import (
@@ -121,6 +125,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "to the operator's own choice.",
     )
     parser.add_argument(
+        "--warps",
+        type=int,
+        default=None,
+        help=f"Block width in warps. Defaults to {WARPS}, the operator's own.",
+    )
+    parser.add_argument(
         "--iters",
         type=int,
         default=1,
@@ -147,7 +157,8 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
 
     Returns:
         The shape. Unchanged, and under its own name, when no override was given.
-        ``--groups`` is not a field of the shape, so it renames it and nothing else.
+        ``--groups``, ``--splits`` and ``--warps`` are not fields of the shape, so
+        they rename it and nothing else.
 
     Raises:
         KeyError: If ``--shape`` is not one of
@@ -160,6 +171,8 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
         suffix += f"-g{args.groups}"
     if args.splits is not None:
         suffix += f"-s{args.splits}"
+    if args.warps is not None:
+        suffix += f"-w{args.warps}"
     if not suffix:
         return shape
     return dataclasses.replace(shape, name=f"{shape.name}{suffix}", **given)
@@ -171,6 +184,7 @@ def build_runner(
     device: torch.device,
     dtype: torch.dtype,
     splits: int | None = None,
+    warps: int = WARPS,
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the kernel.
 
@@ -192,12 +206,14 @@ def build_runner(
         dtype: Activation dtype.
         splits: Partial depth of the head sum. ``None`` leaves the choice to the
             operator, which is the configuration a step runs.
+        warps: Block width in warps.
 
     Returns:
         The callable, allocating its five outputs per call as the host entry does.
 
     Raises:
-        ValueError: If ``groups`` does not divide ``shape.heads``.
+        ValueError: If ``groups`` does not divide ``shape.heads``, or if ``warps``
+            is not a width the tiling admits.
     """
     if shape.heads % groups:
         raise ValueError(f"groups {groups} must divide heads {shape.heads}")
@@ -236,6 +252,7 @@ def build_runner(
             dchunk_scale,
             shape.chunk,
             splits=splits,
+            warps=warps,
         )
 
     return run
@@ -266,6 +283,8 @@ def target_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--groups", str(args.groups)]
     if args.splits is not None:
         argv += ["--splits", str(args.splits)]
+    if args.warps is not None:
+        argv += ["--warps", str(args.warps)]
     return argv
 
 
@@ -307,9 +326,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     shape = requested_shape(args)
     dtype = DTYPES[args.dtype]
     groups = shape.heads if args.groups is None else args.groups
+    warps = WARPS if args.warps is None else args.warps
 
     if args.window:
-        runner = build_runner(shape, groups, device, dtype, args.splits)
+        runner = build_runner(shape, groups, device, dtype, args.splits, warps)
         with on_device(device):
             for _ in range(args.warmup):
                 runner()
@@ -320,7 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
-    runner = build_runner(shape, groups, device, dtype, args.splits)
+    runner = build_runner(shape, groups, device, dtype, args.splits, warps)
     label = f"chunk_vector_bwd {shape.name}"
     timed = measure(
         runner,
@@ -367,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"groups       {groups} fold {fold}")
     print(f"splits       {shards} in-block fold {fold // shards}")
     print(f"workspace    {workspace / 1e6:.2f} MB of head-sum partials")
+    print(f"width        {warps} warps, {warps * 32} threads")
     print(f"dtype        {args.dtype}")
     print(f"clocks       {timed.clocks}")
     print(f"smi before   {before}")
