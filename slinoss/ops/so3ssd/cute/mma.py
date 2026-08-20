@@ -570,7 +570,9 @@ def mma_gemm_areg(
             A chained consumer of a wide tiling stages its left operand through
             shared memory and takes :func:`mma_gemm`.
     """
-    if mma_groups(tiled_mma) != 1:
+    # const_expr, not a bare test: the DSL preprocessor rejects a raise it cannot
+    # prove the Python interpreter takes, and the group count is trace-time.
+    if cutlass.const_expr(mma_groups(tiled_mma) != 1):
         raise ValueError(
             f"mma_gemm_areg needs one N group, got {mma_groups(tiled_mma)}"
         )
