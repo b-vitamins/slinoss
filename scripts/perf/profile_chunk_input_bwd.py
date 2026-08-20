@@ -20,13 +20,19 @@ adding a third quantity.
 ``--rows``, ``--lanes``, ``--heads`` and ``--chunk`` override the named shape's
 per-block geometry. :data:`slinoss.perf.workload.SHAPES` carries no entry at the
 layer geometry this operator is targeted at, ``P = 64``, ``N = 80``, ``L = 64``,
-``H = 18``, and the class has to be read there as well as at ``standard``. The
-override renames the shape, so a figure taken under one cannot be read as a
-figure at the name it started from.
+``H = 18``, ``G = 1``, and the class has to be read there as well as at
+``standard``. The override renames the shape, so a figure taken under one cannot be
+read as a figure at the name it started from.
+
+``--groups`` is separate: ``G`` is not a field of the shape, because it changes no
+extent of any block. It changes how many distinct addresses the blocks stage the
+forcing vectors and the readout from, hence what L2 absorbs, and the layer runs
+``G = 1``.
 
     python3 scripts/perf/profile_chunk_input_bwd.py --shape standard
     python3 scripts/perf/profile_chunk_input_bwd.py --shape standard --window
-    python3 scripts/perf/profile_chunk_input_bwd.py --rows 64 --lanes 80 --heads 18
+    python3 scripts/perf/profile_chunk_input_bwd.py \
+        --rows 64 --lanes 80 --heads 18 --groups 1
 """
 
 from __future__ import annotations
@@ -103,6 +109,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for field, helptext in GEOMETRY.items():
         parser.add_argument(f"--{field}", type=int, default=None, help=helptext)
     parser.add_argument(
+        "--groups",
+        type=int,
+        default=None,
+        help="Groups, G. Must divide H. Defaults to H, which is what "
+        "slinoss.perf.workload.make_inputs allocates.",
+    )
+    parser.add_argument(
         "--iters",
         type=int,
         default=1,
@@ -143,7 +156,7 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
 
 
 def build_runner(
-    shape: OpShape, device: torch.device, dtype: torch.dtype
+    shape: OpShape, device: torch.device, dtype: torch.dtype, groups: int
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the kernel.
 
@@ -152,24 +165,34 @@ def build_runner(
     the same generator rather than rematerialized through a forward.
 
     ``B`` and ``C`` come out of :func:`slinoss.perf.workload.make_inputs`
-    contiguous at ``(B,H,T,3N)``, so ``G == H`` and every head reads its own
-    forcing vectors. A grouped shape stages the same bytes per block from fewer
+    contiguous at ``(B,H,T,3N)``, so ``G == H`` there and every head reads its own
+    forcing vectors. ``groups`` takes the leading ``G`` heads of both, which leaves
+    the lane mode contiguous and is what the layer hands the kernel at
+    ``n_groups = G``. A grouped shape stages the same bytes per block from fewer
     distinct addresses, which changes what L2 absorbs and nothing the block does.
 
     Args:
         shape: The problem size.
         device: Where to allocate.
         dtype: Activation dtype.
+        groups: ``G``. Divides ``shape.heads``.
 
     Returns:
         The callable, allocating its five outputs per call as the host entry does.
+
+    Raises:
+        ValueError: If ``groups`` does not divide ``shape.heads``.
     """
+    if groups <= 0 or shape.heads % groups:
+        raise ValueError(f"groups {groups} does not divide heads {shape.heads}")
     inputs = make_inputs(shape, device, dtype=dtype, requires_grad=False)
     chunks = -(-shape.seq // shape.chunk)
     gen = torch.Generator(device=device).manual_seed(1)
     state = (shape.bsz, shape.heads, chunks, shape.rows, shape.d_state)
     dinc = torch.randn(*state, dtype=torch.float32, device=device, generator=gen)
     zstart = torch.randn(*state, dtype=torch.float32, device=device, generator=gen)
+    forcing = inputs.B[:, :groups]
+    readout = inputs.C[:, :groups]
 
     def run() -> None:
         chunk_input_backward(
@@ -177,8 +200,8 @@ def build_runner(
             inputs.U,
             inputs.trans,
             inputs.K,
-            inputs.B,
-            inputs.C,
+            forcing,
+            readout,
             dinc,
             zstart,
             shape.chunk,
@@ -204,7 +227,7 @@ def target_argv(args: argparse.Namespace) -> list[str]:
         "--warmup",
         str(args.warmup),
     ]
-    for field in GEOMETRY:
+    for field in (*GEOMETRY, "groups"):
         value = getattr(args, field)
         if value is not None:
             argv += [f"--{field}", str(value)]
@@ -246,9 +269,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = require_cuda(args.device)
     shape = requested_shape(args)
     dtype = DTYPES[args.dtype]
+    groups = shape.heads if args.groups is None else args.groups
 
     if args.window:
-        runner = build_runner(shape, device, dtype)
+        runner = build_runner(shape, device, dtype, groups)
         with on_device(device):
             for _ in range(args.warmup):
                 runner()
@@ -259,8 +283,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
-    runner = build_runner(shape, device, dtype)
-    label = f"chunk_input_bwd {shape.name}"
+    runner = build_runner(shape, device, dtype, groups)
+    label = f"chunk_input_bwd {shape.name} G={groups}"
     timed = measure(
         runner,
         label=label,
@@ -292,7 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             passes.append(one)
     after = compute_apps_query(smi_selector(ordinal))
 
-    print(f"shape        {shape.describe()}")
+    print(f"shape        {shape.describe()} G={groups}")
     print(f"dtype        {args.dtype}")
     print(f"clocks       {timed.clocks}")
     print(f"smi before   {before}")
