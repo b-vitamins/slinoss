@@ -22,6 +22,11 @@ element count from that one launch shape. The trailing ``numel % V`` elements do
 not fill a vector and are taken by the first warp of block 0, so the vector path
 carries no predicate.
 
+Those three numbers are the default geometry and what an untuned tree launches.
+:data:`ACT_CANDIDATES` is what else the same kernel is allowed to launch, and
+``scripts/perf/tune.py`` measures the set and records the winner per shape and
+part; see :mod:`slinoss.autotune`.
+
 Each vector crosses the boundary as one access, through a register fragment and
 :func:`cutlass.cute.autovec_copy`. ``V`` separate subscripts of the global tensor
 are ``V`` separate requests at a 16-byte lane stride, which is eight times the
@@ -49,6 +54,8 @@ measured bandwidth claimed here:
   ``dgate`` and ``dup``.
 """
 
+from typing import NamedTuple
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -65,12 +72,25 @@ from slinoss._cute import (
     silu_grad,
     widen,
 )
-from slinoss.ops.block.cute.norm import check_operand, fill_blocks
+from slinoss.autotune import Variants, register
+from slinoss.ops.block.cute.norm import (
+    FILL,
+    NORM_THREAD_CHOICES,
+    check_operand,
+    fill_blocks,
+    sm_count,
+)
 from slinoss.ops.block.reference import SwiGLUGrads
 
 __all__ = [
+    "ACT_CANDIDATES",
     "ACT_THREADS",
+    "BWD_VARIANTS",
+    "FWD_VARIANTS",
     "VECTOR_BYTES",
+    "VECTOR_BYTE_CHOICES",
+    "ActGeometry",
+    "act_blocks",
     "swiglu_backward",
     "swiglu_bwd",
     "swiglu_bwd_kernel",
@@ -85,6 +105,92 @@ ACT_THREADS = 256
 VECTOR_BYTES = 16
 """Bytes of one operand a thread covers per step: eight 16-bit or four 32-bit
 elements."""
+
+
+# ---------------------------------------------------------------------------
+# Launch geometry
+# ---------------------------------------------------------------------------
+#
+# The two constants above are the defaults and stay what an untuned tree launches.
+# What follows says which other geometries the same kernel is allowed to launch;
+# none of them changes the expression it evaluates, because the map is elementwise
+# and the geometry only says which thread reaches which element.
+
+
+class ActGeometry(NamedTuple):
+    """Launch geometry of a grid-strided elementwise kernel.
+
+    Attributes:
+        threads: Block width. A multiple of the warp size.
+        vector_bytes: Bytes of one operand a thread covers per step.
+        blocks_per_sm: Blocks per multiprocessor, or
+            :data:`slinoss.ops.block.cute.norm.FILL` for
+            :func:`slinoss.ops.block.cute.norm.fill_blocks`.
+    """
+
+    threads: int
+    vector_bytes: int
+    blocks_per_sm: int
+
+
+VECTOR_BYTE_CHOICES = (8, 16, 32)
+"""Bytes per operand per thread step a kernel is allowed to launch.
+
+Sixteen is one 128-bit access, the widest a single instruction covers, so eight
+halves the access width and thirty-two is two accesses per fragment. The wide one
+is a candidate because two accesses per step is also twice the memory-level
+parallelism per thread, which is the axis a grid-strided elementwise kernel is
+bound on; it is not a wider access."""
+
+ACT_CANDIDATES = tuple(
+    ActGeometry(threads=threads, vector_bytes=vector, blocks_per_sm=blocks)
+    for threads in NORM_THREAD_CHOICES
+    for vector in VECTOR_BYTE_CHOICES
+    for blocks in (FILL, 1, 2)
+)
+"""Every elementwise geometry, the full cross of the three axes."""
+
+FWD_VARIANTS = register(
+    Variants(
+        kernel="swiglu_fwd",
+        default=ActGeometry(
+            threads=ACT_THREADS, vector_bytes=VECTOR_BYTES, blocks_per_sm=FILL
+        ),
+        candidates=ACT_CANDIDATES,
+    )
+)
+"""Geometries of :func:`swiglu_fwd_kernel`."""
+
+BWD_VARIANTS = register(
+    Variants(
+        kernel="swiglu_bwd",
+        default=ActGeometry(
+            threads=ACT_THREADS, vector_bytes=VECTOR_BYTES, blocks_per_sm=FILL
+        ),
+        candidates=ACT_CANDIDATES,
+    )
+)
+"""Geometries of :func:`swiglu_bwd_kernel`."""
+
+
+def act_blocks(geometry: ActGeometry, index: int) -> int:
+    """Blocks a grid-strided elementwise launch uses.
+
+    Not capped at the vector count, unlike
+    :func:`slinoss.ops.block.cute.norm.grid_blocks`: a block past the vectors runs
+    an empty stride loop and costs a launch slot, and the tail is taken by block 0
+    whatever the grid.
+
+    Args:
+        geometry: The selected geometry.
+        index: CUDA device ordinal.
+
+    Returns:
+        The block count.
+    """
+    if geometry.blocks_per_sm == FILL:
+        return fill_blocks(geometry.threads, index)
+    return sm_count(index) * geometry.blocks_per_sm
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +450,10 @@ def swiglu_bwd(
 # ---------------------------------------------------------------------------
 
 
-def _vector_width(dtype: torch.dtype) -> int:
-    """Elements of ``dtype`` in :data:`VECTOR_BYTES`."""
-    return VECTOR_BYTES // dtype.itemsize
+def _vector_width(dtype: torch.dtype, vector_bytes: int = VECTOR_BYTES) -> int:
+    """Elements of ``dtype`` in ``vector_bytes``, which defaults to
+    :data:`VECTOR_BYTES`."""
+    return vector_bytes // dtype.itemsize
 
 
 def _check_operands(gate: Tensor, up: Tensor) -> int:
@@ -398,10 +505,15 @@ def swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
         TypeError: On a dtype with no kernel path, or on two operand dtypes.
     """
     count = _check_operands(gate, up)
+    index = gate.device.index
+    # Elementwise, so there is no trailing extent and nothing compile-time in the
+    # shape: the element count is the whole geometry and takes the bucketed axis,
+    # and the exact-width axis carries one.
+    geometry = FWD_VARIANTS.select(count, 1, gate.dtype.itemsize, index)
     out = torch.empty_like(up)
-    vec = _vector_width(gate.dtype)
+    vec = _vector_width(gate.dtype, geometry.vector_bytes)
     groups = count // vec
-    blocks = fill_blocks(ACT_THREADS, gate.device.index)
+    blocks = act_blocks(geometry, index)
     jit_launch(
         swiglu_fwd,
         (
@@ -410,10 +522,10 @@ def swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
             out.view(count),
             groups,
             count - groups * vec,
-            blocks * ACT_THREADS,
+            blocks * geometry.threads,
             blocks,
         ),
-        (vec, ACT_THREADS),
+        (vec, geometry.threads),
     )
     return out
 
@@ -450,11 +562,13 @@ def swiglu_backward(dout: Tensor, gate: Tensor, up: Tensor, /) -> SwiGLUGrads:
         )
     check_operand(dout, "dout")
 
+    index = gate.device.index
+    geometry = BWD_VARIANTS.select(count, 1, gate.dtype.itemsize, index)
     dgate = torch.empty_like(gate)
     dup = torch.empty_like(up)
-    vec = _vector_width(gate.dtype)
+    vec = _vector_width(gate.dtype, geometry.vector_bytes)
     groups = count // vec
-    blocks = fill_blocks(ACT_THREADS, gate.device.index)
+    blocks = act_blocks(geometry, index)
     jit_launch(
         swiglu_bwd,
         (
@@ -465,9 +579,9 @@ def swiglu_backward(dout: Tensor, gate: Tensor, up: Tensor, /) -> SwiGLUGrads:
             dup.view(count),
             groups,
             count - groups * vec,
-            blocks * ACT_THREADS,
+            blocks * geometry.threads,
             blocks,
         ),
-        (cute_dtype(gate.dtype), vec, ACT_THREADS),
+        (cute_dtype(gate.dtype), vec, geometry.threads),
     )
     return SwiGLUGrads(dgate=dgate, dup=dup)

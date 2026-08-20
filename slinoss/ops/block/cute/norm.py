@@ -130,6 +130,13 @@ memory. Achieved occupancy is 90.9 to 93.6 percent forward; backward it is 76.2 
 light is 73.8 to 74.1 and 85.2 to 85.8 percent respectively, so the wider shape is
 the one that saturates the bus.
 
+Every geometry quoted above is the default one, and it is what an untuned tree
+launches. :data:`NORM_CANDIDATES`, :data:`ROW_CANDIDATES` and
+:data:`DWEIGHT_CANDIDATES` are what else these kernels are allowed to launch, and
+``scripts/perf/tune.py`` measures the set and records the winner per shape and
+part; see :mod:`slinoss.autotune`. The figures above are not restated per
+geometry: a tuning record carries its own measurement.
+
 ``rmsnorm_dweight_kernel`` is the one kernel here whose traffic is not a sequence
 extent: ``4*D`` per block of the backward grid, so it grows with ``D`` alone. At both
 widths the bench covers it is SERIAL-tiny and held to a share of the step, 2.84 us at
@@ -139,7 +146,7 @@ measured ceiling, where bandwidth is the bound instead.
 """
 
 from functools import cache
-from typing import Any
+from typing import Any, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -162,23 +169,39 @@ from slinoss._cute import (
 )
 from slinoss._guard import check_dtypes, check_layout
 from slinoss._precision import KERNEL_DTYPES
+from slinoss.autotune import Variants, register
 from slinoss.ops.block.reference import NormResidual, NormResidualGrads, RMSNormGrads
 
 __all__ = [
     "BWD_SLOTS",
+    "BWD_VARIANTS",
+    "DWEIGHT_CANDIDATES",
     "DWEIGHT_COLS",
     "DWEIGHT_THREADS",
+    "DWEIGHT_VARIANTS",
+    "FILL",
     "FWD_SLOTS",
+    "FWD_VARIANTS",
     "LOOP_ROUNDS",
+    "NORM_BLOCK_CHOICES",
+    "NORM_CANDIDATES",
     "NORM_THREADS",
+    "NORM_THREAD_CHOICES",
     "ONE_ROUND",
+    "RESIDUAL_BWD_VARIANTS",
+    "RESIDUAL_FWD_VARIANTS",
+    "ROW_CANDIDATES",
     "SLOT_DOT",
     "SLOT_SUMSQ",
     "WARPS",
+    "DweightGeometry",
+    "NormGeometry",
+    "RowGeometry",
     "check_operand",
     "dweight_smem_bytes",
     "dweight_tile",
     "fill_blocks",
+    "grid_blocks",
     "norm_smem_bytes",
     "reduce_tile",
     "rmsnorm_backward",
@@ -246,11 +269,159 @@ because the grid is ``D / DWEIGHT_COLS`` blocks and cannot fill the device: the
 slots are the only other axis, and each one costs a dependent load."""
 
 
-def reduce_tile(slots: int, rounds: int) -> Tile:
+# ---------------------------------------------------------------------------
+# Launch geometry
+# ---------------------------------------------------------------------------
+#
+# The constants above are the defaults, which is what these kernels launched
+# before any of this was selectable, and every one of them is still what an
+# untuned tree launches. What follows says which other geometries the same kernel
+# is allowed to launch, so `scripts/perf/tune.py` can measure them and
+# `slinoss.autotune` can hand back the one that won. No candidate changes the
+# expression a kernel evaluates. The block reduction's summation order is fixed by
+# the geometry, as `rmsnorm_dweight_kernel` already documents, so two geometries
+# agree to the tolerance of a float32 reduction and not bit for bit.
+
+FILL = 0
+"""Sentinel ``blocks_per_sm`` standing for :func:`fill_blocks`.
+
+Zero rather than the number it resolves to, because that number is a property of
+the device and a record is shared by every device of one identity. Storing the
+rule keeps the default reproducing today's grid on a part with another
+resident-thread limit."""
+
+
+class NormGeometry(NamedTuple):
+    """Launch geometry of a grid-strided norm kernel.
+
+    Attributes:
+        threads: Block width. A multiple of the warp size that divides the
+            resident-thread limit.
+        blocks_per_sm: Blocks per multiprocessor, or :data:`FILL` for
+            :func:`fill_blocks`.
+    """
+
+    threads: int
+    blocks_per_sm: int
+
+
+class RowGeometry(NamedTuple):
+    """Launch geometry of a norm kernel whose grid is the row count.
+
+    One axis, because the grid is not a choice: :func:`rmsnorm_residual_fwd_kernel`
+    owns one row per block and a row reduction cannot cross a grid barrier.
+
+    Attributes:
+        threads: Block width. A multiple of the warp size.
+    """
+
+    threads: int
+
+
+class DweightGeometry(NamedTuple):
+    """Launch geometry of the weight-gradient reduction.
+
+    Attributes:
+        threads: Block width. A multiple of ``cols``.
+        cols: Columns one block owns, which also sets the grid to
+            ``ceil(D / cols)``.
+    """
+
+    threads: int
+    cols: int
+
+
+NORM_THREAD_CHOICES = (128, 256, 512, 1024)
+"""Block widths a norm kernel is allowed to launch.
+
+Warp multiples that divide the resident-thread limit on every architecture this
+runs on, which is what :func:`fill_blocks` needs. The interesting end is the wide
+one: the segment count per thread is ``ceil(D / threads)`` and the register
+footprint is linear in it, so at ``D = 8192`` a 256-thread block carries 32
+segments, pins the 255-register cap and spills, while a 1024-thread block carries
+8. The narrow end trades the opposite way, more resident warps against fewer loads
+in flight per thread."""
+
+NORM_BLOCK_CHOICES = (FILL, 1, 2)
+"""Blocks per multiprocessor a grid-strided norm kernel is allowed to launch.
+
+:data:`FILL` is the resident-thread limit over the block width. One and two are
+below it, which trades resident warps for a longer stride loop per block and a
+smaller partial buffer for the backward to reduce."""
+
+NORM_CANDIDATES = tuple(
+    NormGeometry(threads=threads, blocks_per_sm=blocks)
+    for threads in NORM_THREAD_CHOICES
+    for blocks in NORM_BLOCK_CHOICES
+)
+"""Every grid-strided norm geometry, the full cross of the two axes."""
+
+ROW_CANDIDATES = tuple(RowGeometry(threads=threads) for threads in NORM_THREAD_CHOICES)
+"""Every one-block-per-row norm geometry."""
+
+DWEIGHT_CANDIDATES = tuple(
+    DweightGeometry(threads=threads, cols=cols)
+    for threads in NORM_THREAD_CHOICES
+    for cols in (4, 8, 16)
+)
+"""Every weight-gradient reduction geometry.
+
+``cols`` spans half a 32-byte sector to two of them. Four wastes half of one
+sector per row segment and buys twice the grid; sixteen buys half the grid and
+twice the row slots per block. Each divides every width in
+:data:`NORM_THREAD_CHOICES`, which the kernel requires."""
+
+FWD_VARIANTS = register(
+    Variants(
+        kernel="rmsnorm_fwd",
+        default=NormGeometry(threads=NORM_THREADS, blocks_per_sm=FILL),
+        candidates=NORM_CANDIDATES,
+    )
+)
+"""Geometries of :func:`rmsnorm_fwd_kernel`."""
+
+RESIDUAL_FWD_VARIANTS = register(
+    Variants(
+        kernel="rmsnorm_residual_fwd",
+        default=RowGeometry(threads=NORM_THREADS),
+        candidates=ROW_CANDIDATES,
+    )
+)
+"""Geometries of :func:`rmsnorm_residual_fwd_kernel`."""
+
+BWD_VARIANTS = register(
+    Variants(
+        kernel="rmsnorm_bwd",
+        default=NormGeometry(threads=NORM_THREADS, blocks_per_sm=FILL),
+        candidates=NORM_CANDIDATES,
+    )
+)
+"""Geometries of :func:`rmsnorm_bwd_kernel`."""
+
+RESIDUAL_BWD_VARIANTS = register(
+    Variants(
+        kernel="rmsnorm_residual_bwd",
+        default=NormGeometry(threads=NORM_THREADS, blocks_per_sm=FILL),
+        candidates=NORM_CANDIDATES,
+    )
+)
+"""Geometries of :func:`rmsnorm_residual_bwd_kernel`."""
+
+DWEIGHT_VARIANTS = register(
+    Variants(
+        kernel="rmsnorm_dweight",
+        default=DweightGeometry(threads=DWEIGHT_THREADS, cols=DWEIGHT_COLS),
+        candidates=DWEIGHT_CANDIDATES,
+    )
+)
+"""Geometries of :func:`rmsnorm_dweight_kernel`."""
+
+
+def reduce_tile(slots: int, rounds: int, warps: int = WARPS) -> Tile:
     """Per-warp partials for ``slots`` block reductions over ``rounds`` buffers.
 
-    Flat rather than ``(rounds, slots, WARPS)``: round ``r`` slot ``s`` occupies
-    ``(r*slots + s)*WARPS`` onward, and one lane per warp writes one element, so
+    Flat rather than ``(rounds, slots, warps)``: round ``r`` slot ``s`` occupies
+    ``(r*slots + s)*warps`` onward, and one lane per warp writes one element, so
     consecutive warps of one slot land in consecutive banks.
 
     Args:
@@ -259,11 +430,13 @@ def reduce_tile(slots: int, rounds: int) -> Tile:
             caller that reduces per loop trip needs two, because with one the
             barrier that ends a reduction is also the only thing stopping the next
             trip's write from landing on a partial another warp has not read.
+        warps: Warps per block, the block width over the warp size. Defaults to
+            :data:`WARPS`, the warps of :data:`NORM_THREADS`.
 
     Returns:
         The tile.
     """
-    return Tile((rounds * slots * WARPS,), (1,))
+    return Tile((rounds * slots * warps,), (1,))
 
 
 def dweight_tile(threads: int) -> Tile:
@@ -283,17 +456,18 @@ def dweight_tile(threads: int) -> Tile:
     return Tile((threads,), (1,))
 
 
-def norm_smem_bytes(slots: int, rounds: int) -> int:
+def norm_smem_bytes(slots: int, rounds: int, warps: int = WARPS) -> int:
     """Shared memory a norm kernel holds, in bytes, from the tile layout.
 
     Args:
         slots: :data:`FWD_SLOTS` or :data:`BWD_SLOTS`.
         rounds: :data:`ONE_ROUND` or :data:`LOOP_ROUNDS`.
+        warps: Warps per block. Defaults to :data:`WARPS`.
 
     Returns:
         Total bytes.
     """
-    return smem_bytes([(reduce_tile(slots, rounds), 4)])
+    return smem_bytes([(reduce_tile(slots, rounds, warps), 4)])
 
 
 def dweight_smem_bytes(threads: int) -> int:
@@ -356,13 +530,36 @@ def fill_blocks(threads: int, index: int) -> int:
     return sm_count(index) * (threads_per_sm(index) // threads)
 
 
-def row_blocks(rows: int, index: int) -> int:
-    """Blocks a backward launch uses over ``rows`` rows.
+def grid_blocks(rows: int, geometry: NormGeometry, index: int) -> int:
+    """Blocks a grid-strided norm launch uses over ``rows`` rows.
 
-    :func:`fill_blocks` is the grid, and the row stride loop covers any row count
-    from it. Fewer rows than that caps the grid at the row count: a row reduction
-    cannot cross a grid barrier, so the row count is the whole available
-    parallelism at this decomposition.
+    The capacity is :func:`fill_blocks` at :data:`FILL` and the SM count times the
+    per-multiprocessor count otherwise. Fewer rows than the capacity caps the grid
+    at the row count: a row reduction cannot cross a grid barrier, so the row count
+    is the whole available parallelism at this decomposition.
+
+    Args:
+        rows: Rows on the flattened axis. At least one.
+        geometry: The selected geometry.
+        index: CUDA device ordinal.
+
+    Returns:
+        The block count, which is also the row stride.
+    """
+    capacity = (
+        fill_blocks(geometry.threads, index)
+        if geometry.blocks_per_sm == FILL
+        else sm_count(index) * geometry.blocks_per_sm
+    )
+    return min(rows, capacity)
+
+
+def row_blocks(rows: int, index: int) -> int:
+    """Blocks a norm launch uses over ``rows`` rows at the default geometry.
+
+    :func:`grid_blocks` of :data:`NORM_THREADS` and :data:`FILL`, which is what
+    every grid-strided norm kernel here launched before its geometry became
+    selectable and what it still launches with no tuning record.
 
     Args:
         rows: Rows on the flattened axis. At least one.
@@ -371,7 +568,9 @@ def row_blocks(rows: int, index: int) -> int:
     Returns:
         The block count, which is also the row stride.
     """
-    return min(rows, fill_blocks(NORM_THREADS, index))
+    return grid_blocks(
+        rows, NormGeometry(threads=NORM_THREADS, blocks_per_sm=FILL), index
+    )
 
 
 def _warp_offsets() -> tuple[int, ...]:
@@ -420,12 +619,14 @@ def _block_totals(
     second: Scalar,
     tid: cutlass.Int32,
     slots: cutlass.Constexpr,
+    warps: cutlass.Constexpr,
     base: Any,
 ) -> tuple[Scalar, Scalar]:
     """Sum one or two float32 accumulators across the block. Entered by the block.
 
-    One barrier. Every thread sums the ``WARPS`` partials itself out of shared
-    memory, which is eight broadcast loads and seven adds, rather than thread 0
+    One barrier. Every thread sums the ``warps`` partials itself out of shared
+    memory, which at the default block width is eight broadcast loads and seven
+    adds, rather than thread 0
     summing them into a slot the block then has to reach a second barrier to read.
     Every thread sums the same partials in the same order, so the totals agree bit
     for bit and :func:`_scale_of` stays a function of the row. Measured on sm_86 at
@@ -446,7 +647,9 @@ def _block_totals(
             ``slots`` exceeds one.
         tid: Thread index within the block.
         slots: :data:`FWD_SLOTS` or :data:`BWD_SLOTS`. Compile-time.
-        base: First element of this round's buffer, ``round * slots * WARPS``. A
+        warps: Warps per block, the block width over the warp size. Compile-time,
+            and the same value ``spart`` was allocated with.
+        base: First element of this round's buffer, ``round * slots * warps``. A
             caller that reduces per loop trip alternates it; see
             :func:`reduce_tile`.
 
@@ -466,17 +669,17 @@ def _block_totals(
     if lane == cute.arch.WARP_SIZE - 1:
         spart[base + warp] = total
         if cutlass.const_expr(slots > 1):
-            spart[base + WARPS + warp] = paired
+            spart[base + warps + warp] = paired
     cute.arch.sync_threads()
 
     summed = cutlass.Float32(0.0)
-    for index in cutlass.range_constexpr(WARPS):
+    for index in cutlass.range_constexpr(warps):
         summed = summed + spart[base + index]
     pair = summed
     if cutlass.const_expr(slots > 1):
         pair = cutlass.Float32(0.0)
-        for index in cutlass.range_constexpr(WARPS):
-            pair = pair + spart[base + WARPS + index]
+        for index in cutlass.range_constexpr(warps):
+            pair = pair + spart[base + warps + index]
     return summed, pair
 
 
@@ -728,9 +931,10 @@ def rmsnorm_fwd_kernel(
     """
     block, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
+    warps = threads // cute.arch.WARP_SIZE
     smem = cutlass.utils.SmemAllocator()
     spart = smem.allocate_tensor(
-        cutlass.Float32, reduce_tile(FWD_SLOTS, LOOP_ROUNDS).layout(), 16
+        cutlass.Float32, reduce_tile(FWD_SLOTS, LOOP_ROUNDS, warps).layout(), 16
     )
 
     dst = gy.element_type
@@ -755,7 +959,7 @@ def rmsnorm_fwd_kernel(
             ahead, gx, tid, cutlass.min(row + span, last), offsets, width, dtype
         )
         sumsq, _ = _block_totals(
-            spart, acc, acc, tid, FWD_SLOTS, round_of[0] * FWD_SLOTS * WARPS
+            spart, acc, acc, tid, FWD_SLOTS, warps, round_of[0] * FWD_SLOTS * warps
         )
         round_of[0] = 1 - round_of[0]
         scale = _scale_of(sumsq, eps, width)
@@ -806,9 +1010,10 @@ def rmsnorm_residual_fwd_kernel(
     """
     row, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
+    warps = threads // cute.arch.WARP_SIZE
     smem = cutlass.utils.SmemAllocator()
     spart = smem.allocate_tensor(
-        cutlass.Float32, reduce_tile(FWD_SLOTS, ONE_ROUND).layout(), 16
+        cutlass.Float32, reduce_tile(FWD_SLOTS, ONE_ROUND, warps).layout(), 16
     )
 
     src = gx.element_type
@@ -837,7 +1042,7 @@ def rmsnorm_residual_fwd_kernel(
             values[j] = value
         acc = acc + values[j] * values[j]
 
-    sumsq, _ = _block_totals(spart, acc, acc, tid, FWD_SLOTS, 0)
+    sumsq, _ = _block_totals(spart, acc, acc, tid, FWD_SLOTS, warps, 0)
     scale = _scale_of(sumsq, eps, width)
     for j in cutlass.range_constexpr(segments):
         col, _, masked = cols[j]
@@ -900,9 +1105,10 @@ def rmsnorm_bwd_kernel(
     """
     block, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
+    warps = threads // cute.arch.WARP_SIZE
     smem = cutlass.utils.SmemAllocator()
     spart = smem.allocate_tensor(
-        cutlass.Float32, reduce_tile(BWD_SLOTS, LOOP_ROUNDS).layout(), 16
+        cutlass.Float32, reduce_tile(BWD_SLOTS, LOOP_ROUNDS, warps).layout(), 16
     )
 
     zero = cutlass.Float32(0.0)
@@ -955,7 +1161,7 @@ def rmsnorm_bwd_kernel(
             False,
         )
         total, dotted = _block_totals(
-            spart, sumsq, dot, tid, BWD_SLOTS, round_of[0] * BWD_SLOTS * WARPS
+            spart, sumsq, dot, tid, BWD_SLOTS, warps, round_of[0] * BWD_SLOTS * warps
         )
         round_of[0] = 1 - round_of[0]
         scale = _scale_of(total, eps, width)
@@ -1052,9 +1258,10 @@ def rmsnorm_residual_bwd_kernel(
     """
     block, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
+    warps = threads // cute.arch.WARP_SIZE
     smem = cutlass.utils.SmemAllocator()
     spart = smem.allocate_tensor(
-        cutlass.Float32, reduce_tile(BWD_SLOTS, LOOP_ROUNDS).layout(), 16
+        cutlass.Float32, reduce_tile(BWD_SLOTS, LOOP_ROUNDS, warps).layout(), 16
     )
 
     zero = cutlass.Float32(0.0)
@@ -1118,7 +1325,13 @@ def rmsnorm_residual_bwd_kernel(
                 has_residual,
             )
             rowsq, rowdot = _block_totals(
-                spart, sumsq, dot, tid, BWD_SLOTS, round_of[0] * BWD_SLOTS * WARPS
+                spart,
+                sumsq,
+                dot,
+                tid,
+                BWD_SLOTS,
+                warps,
+                round_of[0] * BWD_SLOTS * warps,
             )
             round_of[0] = 1 - round_of[0]
             scale = _scale_of(rowsq, eps, width)
@@ -1492,6 +1705,8 @@ def rmsnorm_forward(x: Tensor, weight: Tensor, *, eps: float) -> Tensor:
         TypeError: On a dtype with no kernel path.
     """
     rows, width = _check_norm(x, weight, eps)
+    index = x.device.index
+    geometry = FWD_VARIANTS.select(rows, width, x.dtype.itemsize, index)
     out = torch.empty_like(x)
     jit_launch(
         rmsnorm_fwd,
@@ -1501,9 +1716,9 @@ def rmsnorm_forward(x: Tensor, weight: Tensor, *, eps: float) -> Tensor:
             out.view(rows, width),
             float(eps),
             rows,
-            row_blocks(rows, x.device.index),
+            grid_blocks(rows, geometry, index),
         ),
-        (cute_dtype(x.dtype), width, NORM_THREADS),
+        (cute_dtype(x.dtype), width, geometry.threads),
     )
     return out
 
@@ -1540,6 +1755,9 @@ def rmsnorm_residual_forward(
     rows, width = _check_norm(x, weight, eps)
     _check_stream(x, residual)
 
+    geometry = RESIDUAL_FWD_VARIANTS.select(
+        rows, width, x.dtype.itemsize, x.device.index
+    )
     normed = torch.empty_like(x)
     total = torch.empty(x.shape, dtype=torch.float32, device=x.device)
     stream = x if residual is None else residual
@@ -1554,7 +1772,7 @@ def rmsnorm_residual_forward(
             float(eps),
             rows,
         ),
-        (width, NORM_THREADS, residual is not None),
+        (width, geometry.threads, residual is not None),
     )
     return NormResidual(normed=normed, residual=total)
 
@@ -1576,11 +1794,16 @@ def _dweight_of(partial: Tensor, width: int) -> Tensor:
     Returns:
         ``(D,)`` float32.
     """
+    rows = int(partial.shape[0])
+    # Float32 partials, so the key's itemsize is fixed at four whatever the operand
+    # width. `rows` is the backward's grid, which is a device-sized extent: the
+    # geometry that wins here follows the geometry the backward chose.
+    geometry = DWEIGHT_VARIANTS.select(rows, width, 4, partial.device.index)
     dweight = torch.empty((width,), dtype=torch.float32, device=partial.device)
     jit_launch(
         rmsnorm_dweight,
-        (partial, dweight, partial.shape[0]),
-        (width, DWEIGHT_COLS, DWEIGHT_THREADS),
+        (partial, dweight, rows),
+        (width, geometry.cols, geometry.threads),
     )
     return dweight
 
@@ -1622,8 +1845,10 @@ def rmsnorm_backward(
     rows, width = _check_norm(x, weight, eps)
     _check_cotangent(dout, x, "dout")
 
+    index = x.device.index
+    geometry = BWD_VARIANTS.select(rows, width, x.dtype.itemsize, index)
     dx = torch.empty_like(x)
-    blocks = row_blocks(rows, x.device.index)
+    blocks = grid_blocks(rows, geometry, index)
     partial = torch.empty((blocks, width), dtype=torch.float32, device=x.device)
     jit_launch(
         rmsnorm_bwd,
@@ -1637,7 +1862,7 @@ def rmsnorm_backward(
             rows,
             blocks,
         ),
-        (cute_dtype(x.dtype), width, NORM_THREADS),
+        (cute_dtype(x.dtype), width, geometry.threads),
     )
     return RMSNormGrads(dx=dx, dweight=_dweight_of(partial, width))
 
@@ -1703,10 +1928,12 @@ def rmsnorm_residual_backward(
     if dnormed is None and dresidual is None:
         return NormResidualGrads(dx=None, dresidual=None, dweight=None)
 
+    index = x.device.index
+    geometry = RESIDUAL_BWD_VARIANTS.select(rows, width, x.dtype.itemsize, index)
     stream = x if residual is None else residual
     dx = torch.empty_like(x)
     dres_out = None if residual is None else torch.empty_like(stream)
-    blocks = row_blocks(rows, x.device.index)
+    blocks = grid_blocks(rows, geometry, index)
     partial = (
         None
         if dnormed is None
@@ -1740,7 +1967,7 @@ def rmsnorm_residual_backward(
             cute_dtype(x.dtype),
             cute_dtype(stream.dtype),
             width,
-            NORM_THREADS,
+            geometry.threads,
             residual is not None,
             dnormed is not None,
             dresidual is not None,
