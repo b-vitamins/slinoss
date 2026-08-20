@@ -62,6 +62,7 @@ DECLARED: Final[dict[str, str]] = {
     "chunk_input_bwd_kernel": DRAM_BOUND,
     "chunk_scan_fwd_kernel": DRAM_BOUND,
     "chunk_start_bwd_kernel": DRAM_BOUND,
+    "chunk_vector_bwd_kernel": DRAM_BOUND,
     "conv1d_bwd_kernel": DRAM_BOUND,
     "conv1d_fwd_kernel": DRAM_BOUND,
     "conv1d_reduce_parts_kernel": SERIAL_TINY,
