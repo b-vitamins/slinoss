@@ -153,6 +153,27 @@ traffic, and the class bar says nothing about that until the pipe is priced.
   48, every entry is aligned, and three `float4` replace nine scalar reads. The
   padding is what makes the vector form legal, and it is not free: it is a third more
   table bytes, against a shared budget the residency already binds.
+- Bound an arm against every floor at once, or the binding one stays hidden. At
+  `L 64 P 64 3N 240` the six contractions of `chunk_vector_bwd` count 34.12 G flop
+  over 2,304 blocks, 40% of the backward's 85.46 G. That puts its tensor floor at
+  304.7 us and its 70% bar at 435.3 us; its 515.81 MB of counted traffic puts its
+  DRAM floor at 889.8 us; and deleting every one of its 128.2 M shared wavefronts at
+  the measured marginal rate leaves 2,089.9 us. The shared pipe is the binding floor
+  by a factor of two over the next one, and it binds above the target. The kernel
+  runs at 9.1% of bf16 peak and 29.6% is what the budget asks for, so the arithmetic
+  is not the obstacle and neither is the traffic.
+- A pipe that binds while running at 44.6% of its own peak is two levers, not one,
+  and they multiply. The count is one; the utilization is the other, and it is what
+  the 0.41 marginal payback measures. Cutting the count without raising the
+  utilization pays 41 cents on the dollar and the floor stays at 2,089.9 us. The
+  cause of the low utilization is not the pipe: at 16.6% occupancy, eight warps of 48
+  slots, there are too few independent requests in flight to keep the MIO queue fed,
+  which is what `mio_throttle` at 35% reports. Occupancy cannot answer it here, being
+  register-capped at one block. Warp-level ILP can: issue a group of independent
+  shared loads, then the group's math, so the queue stays fed while the warp runs on.
+  That is the rule already stated below for global loads, never yet applied to shared
+  ones. Raising a pipe's utilization multiplies every count-cutting arm behind it, so
+  price it before spending another arm on the count.
 - `ldmatrix` reads per flop are set by the warp tiling, not by the instruction.
   The A operand is broadcast across the N warp groups and B across the M groups,
   so a `(warps_m, warps_n)` tiling of an `M*N*K` tile reads `warps_n*M*K +
