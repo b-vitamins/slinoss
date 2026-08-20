@@ -264,23 +264,25 @@ def test_the_ffn_output_weight_is_stored_transposed() -> None:
     torch.manual_seed(0)
     block = SLinOSSBlock(cfg)
     framework = nn.Linear(cfg.d_ffn, cfg.d_model, bias=cfg.bias)
-    weight = block.ffn_out_weight
-    assert weight.shape == (cfg.d_ffn, cfg.d_model)
-    assert weight.shape == framework.weight.t().shape
     assert block.ffn_out_bias is not None
     assert framework.bias is not None
-    assert block.ffn_out_bias.shape == framework.bias.shape
+    # Detached because every statistic below reads a leaf as a scalar.
+    weight = block.ffn_out_weight.detach()
+    bias = block.ffn_out_bias.detach()
+    ref_weight = framework.weight.detach()
+    ref_bias = framework.bias.detach()
+    assert weight.shape == (cfg.d_ffn, cfg.d_model)
+    assert weight.shape == ref_weight.t().shape
+    assert bias.shape == ref_bias.shape
     # A uniform's variance is a third of the square of its bound, so matching the
     # framework's variance over 2,048 samples pins the bound, and with it the axis
     # fan_in was read from. The relative standard error of the estimate is 2%; the
     # error it has to catch is a factor of d_ffn/d_model, which is 4.
-    assert float(weight.var()) == pytest.approx(float(framework.weight.var()), rel=0.1)
-    assert float(block.ffn_out_bias.var()) == pytest.approx(
-        float(framework.bias.var()), rel=0.2
-    )
+    assert float(weight.var()) == pytest.approx(float(ref_weight.var()), rel=0.1)
+    assert float(bias.var()) == pytest.approx(float(ref_bias.var()), rel=0.2)
     bound = cfg.d_ffn**-0.5
     assert float(weight.abs().max()) <= bound
-    assert float(block.ffn_out_bias.abs().max()) <= bound
+    assert float(bias.abs().max()) <= bound
 
 
 DECODE_SPLITS = [
