@@ -197,13 +197,17 @@ that query named another process the duration is a bound, not a rate.
 
 At the default configuration -- 11,520 blocks of 256 threads, five lane tiles, the
 fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
-515.74 MB of DRAM per launch in 3,274.1 us, 23.2% of the floor of those bytes, median
-of three runs whose spread is 0.13%.
-:func:`vector_reduce` closes the head sum in 221.5 us at 152.77 MB, 689.8 GB/s and
-102.7% of its own floor; the two lane-slot reductions add 43.4 and 23.5 us at 106.2%
-and 108.3%. The operator is 3,559.4 us a call, event-timed, and the main kernel is
-92.0% of it. Three of the four launches are at their bandwidth; the main kernel is
-the one that misses the 85% the class asks.
+515.74 MB of DRAM per launch in 2,186.3 us on device time, median of nine
+steady-state iterations spanning 2,126.9 to 2,202.5 us.
+:func:`vector_reduce` closes the head sum in 222.0 us at 152.77 MB and 102.7% of its
+own floor; the two lane-slot reductions add 44.2 and 23.0 us. Three of the four
+launches are at their bandwidth; the main kernel is the one that misses the 85% the
+class asks, and it is issue-bound rather than short of bandwidth.
+
+Read a duration here as device time under a tracer, not under a counter profiler.
+The same kernel measures 2,649.0 us under per-pass counter collection because the
+part clocks down to 1.406 GHz there against 1.8 GHz in a plain run. Cycles are the
+invariant across the two, 3.67 M for this kernel; a microsecond figure is not.
 
 That percentage is not a traffic problem, and at the shipped width it is not
 instruction supply either. 91,600 B and 242 registers a thread each admit one
