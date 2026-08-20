@@ -39,6 +39,10 @@ tokens. Its accumulator lives alongside the output accumulator, so an unsliced
 score at ``MAX_CHUNK`` would be four times the float32 register footprint of the
 output it feeds. The slice count is one at ``L`` up to 32 and ``L/32`` above it.
 
+Both contractions over ``3N`` are blocked over K in :data:`KBLOCK_MAX` passes for
+the same reason: an operand is copied whole into registers before it issues, so the
+unblocked form holds a live set proportional to ``3N``.
+
 The mask stays a mask and is not turned into a skip. Splitting both accumulators
 along M into :data:`MMA_TILE_M` row tiles makes a tile whose rows all precede a
 slice's first source token dead, which is a quarter of the diagonal work at ``L``
@@ -129,11 +133,13 @@ from slinoss.ops.so3ssd.cute.table import (
 )
 
 __all__ = [
+    "KBLOCK_MAX",
     "NBLOCK_MAX",
     "RESIDENT_MAX",
     "chunk_scan_forward",
     "chunk_scan_fwd",
     "chunk_scan_fwd_kernel",
+    "gemm_kblocks",
     "nblock",
     "readout_tile",
     "scan_smem_bytes",
@@ -144,6 +150,22 @@ NBLOCK_MAX: int = 32
 THREADS`` float32 per thread and is live alongside the output accumulator, so the
 cap bounds the pair independently of ``L``. Every legal chunk length is a power of
 two at or above 16, so this divides it exactly."""
+
+KBLOCK_MAX: int = 16
+"""K extent of one pass over a ``3N`` contraction.
+
+:func:`slinoss.ops.so3ssd.cute.mma.mma_gemm` copies a whole operand into registers
+before it issues, so an unblocked contraction holds ``mma_rows(L) * 3N`` and
+``N_extent * 3N`` operand elements live at once. That is the term in this body's
+live set that grows with ``3N``: at ``P`` 64, ``3N`` 240 and ``L`` 64 the pair is
+240 bytes a thread each, 120 registers of the architectural 255, and the allocator
+spills. Blocking K costs no arithmetic and no traffic -- the same ``ldmatrix`` and
+the same ``mma`` issue, against the same accumulator, in the same K order -- and it
+bounds the pair at ``KBLOCK_MAX / 3N`` of its unblocked size.
+
+Every legal ``3N`` is a multiple of 48 and every K extent must be a multiple of
+:data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_K`, so 16 and 48 are the only values
+that divide every geometry."""
 
 RESIDENT_MAX: int = 2
 """Ceiling on the blocks per SM the launch bound asks for.
@@ -219,6 +241,55 @@ def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
             (operand_tile(nblk + 1, rows), itemsize),
         ]
     )
+
+
+@cute.jit
+def gemm_kblocks(
+    tiled_mma: cute.TiledMma,
+    tid: cutlass.Int32,
+    acc: cute.Tensor,
+    va: cute.Tensor,
+    vb: cute.Tensor,
+    arows: cutlass.Constexpr,
+    brows: cutlass.Constexpr,
+    kdim: cutlass.Constexpr,
+    ldv: cutlass.Constexpr,
+) -> None:
+    """Accumulate ``va @ vb^T`` over K in :data:`KBLOCK_MAX` passes.
+
+    Args:
+        tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`.
+        tid: Thread index within the block.
+        acc: From :func:`slinoss.ops.so3ssd.cute.mma.mma_acc`. Updated in place.
+        va: Shared-memory view of shape ``(arows, kdim)``.
+        vb: Shared-memory view of shape ``(brows, kdim)``.
+        arows: M extent of ``va``.
+        brows: N extent of ``vb``.
+        kdim: K extent of both, the stride-1 mode of both.
+        ldv: Row pitch both views carry, in elements.
+
+    Invariants:
+        Operands are not swizzled and K is their stride-1 mode, so a K block is the
+        same view at an element offset. Blocks are visited in increasing K, which is
+        the order one unblocked call accumulates in, so the sum is unchanged.
+    """
+    kblk = min(KBLOCK_MAX, kdim)
+    assert kdim % kblk == 0
+    for k in cutlass.range_constexpr(kdim // kblk):
+        off = k * kblk
+        mma_gemm(
+            tiled_mma,
+            tid,
+            acc,
+            cute.make_tensor(
+                va.iterator + off, cute.make_layout((arows, kblk), stride=(ldv, 1))
+            ),
+            cute.make_tensor(
+                vb.iterator + off, cute.make_layout((brows, kblk), stride=(ldv, 1))
+            ),
+            True,
+            True,
+        )
 
 
 @cute.kernel
@@ -370,7 +441,7 @@ def chunk_scan_fwd_kernel(
 
     ycrd = mma_coords(tiled_mma, tid, (mpad, rows))
     acc = mma_acc(tiled_mma, tid, (mpad, rows))
-    mma_gemm(tiled_mma, tid, acc, va_crot, vb_z, True, True)
+    gemm_kblocks(tiled_mma, tid, acc, va_crot, vb_z, mpad, rows, dim, ldv)
     last = chunk - 1
     for i in cutlass.range_constexpr(cute.size(acc)):
         m, _ = ycrd[i]
@@ -435,7 +506,7 @@ def chunk_scan_fwd_kernel(
                 )
             cute.arch.sync_threads()
             sacc.fill(0.0)
-            mma_gemm(tiled_mma, tid, sacc, va_crot, vb_f, True, True)
+            gemm_kblocks(tiled_mma, tid, sacc, va_crot, vb_f, mpad, nblk, dim, ldv)
             for i in cutlass.range_constexpr(cute.size(sacc)):
                 m, r = scrd[i]
                 src = nbase + r
