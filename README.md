@@ -95,6 +95,17 @@ logits = model(ids)
 `vocab_size=None` drops the embedding and the head, and the stack then takes and
 returns `(B,T,d_model)` activations.
 
+The head is wider than `vocab_size`. All three of its GEMMs carry the output width
+on the mode that decides which kernel cuBLAS picks, so an unaligned width costs
+every one of them its wide load: 10.1 ms of the 59.3 ms the GEMM class takes in a
+456 ms step, measured at the shape above.
+`vocab_pad_multiple`, 8 by default, rounds the head up, so `logits` is
+`(B,T,cfg.padded_vocab_size)` and 50257 runs at 50264. The columns past
+`vocab_size` hold `finfo(dtype).min`, which is exactly zero under a softmax and
+below every reachable logit, so the loss, every gradient, every argmax and every
+sample are the unpadded ones. Set `vocab_pad_multiple=1` to keep the head at
+`vocab_size` and pay for it. The embedding is a gather and is never padded.
+
 Decode threads a `StackState`, which holds four carries per layer: the scan state,
 the convolution window, and the previous token's `B` and `U`, which the two-tap
 forcing needs. Every buffer is written in place, so a captured graph keeps its

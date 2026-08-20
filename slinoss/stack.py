@@ -219,8 +219,8 @@ class SLinOSSStack(nn.Module):
                 # skipping the record instead reports the unmasked linear's
                 # Jacobian, which sends a padding cotangent into both head
                 # gradients. Priced: the record makes autograd clone the logit block
-                # to zero a slice of it, 2448 us against 11288 us of GEMM saved at
-                # the reference geometry, and that clone is what a cheaper masking
-                # would have to remove.
+                # to zero a slice of it, 2416 us against 10114 us of GEMM class the
+                # padding removes at the reference geometry, and that clone is what
+                # a cheaper masking would have to remove.
                 logits[..., vocab:] = torch.finfo(logits.dtype).min
             return logits

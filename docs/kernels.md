@@ -40,6 +40,22 @@ a transposed score tile is not.
   on a DRAM-bound kernel. The achieved fraction cannot see that loss, since it
   divides measured bytes by measured time and both rise together, so the width of
   the tensor the band is cut from carries the requirement.
+- cuBLAS reads a GEMM's operand alignment off its extents, so an extent that is
+  not a whole number of operand-load elements costs the kernel its wide load and
+  half its MMA K-extent, not a predicated edge. At bf16 that unit is 8. A width
+  that appears on a gating mode of several stages takes all of them down together:
+  the head's output width is the forward's `N`, the input gradient's `K` and the
+  weight gradient's `M`. Census, one Ampere part, bf16, clocks unlocked, foreign
+  residents throughout so the durations are stamped and the comparison rests on the
+  ratios: at 8192 tokens, `d_model` 576 and a width of 50257 all three ran on
+  `cutlass_75_tensorop_bf16_s1688gemm_bf16_128x256_*_align1` at 47.8-48.4%,
+  58.2-59.5% and 64.0-65.4% of an in-process bf16 ceiling of 112.1-114.4 TFLOPS.
+  Widening to 50264 put the forward and the input gradient on
+  `s16816gemm ... align8`/`ldg8` and the weight gradient on `s1688gemm ... ldg8`,
+  which reach the ceiling inside its own run-to-run range: 1.84x, 1.83x and 1.65x,
+  10.1 ms of the class's 59.3 ms. Widths that are also whole tiles, 50304 and
+  50432, moved none of the three further, so the config rule is one operand load
+  and not one output tile.
 - A warp's global access is charged per request, not per sector. Lanes covering
   consecutive elements of one row fill the request; lanes strided by the warp
   width leave the last segment carrying `width mod 32` lanes and that fraction of
