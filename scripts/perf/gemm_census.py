@@ -220,8 +220,9 @@ def linear_maps(config: SLinOSSConfig) -> tuple[LinearMap, ...]:
         LinearMap("ffn_up", config.d_model, config.d_ffn, layers),
         LinearMap("ffn_out", config.d_ffn, config.d_model, layers, transposed=True),
     ]
-    if config.vocab_size is not None:
-        maps.append(LinearMap("head", config.d_model, config.vocab_size, 1))
+    padded_vocab = config.padded_vocab_size
+    if padded_vocab is not None:
+        maps.append(LinearMap("head", config.d_model, padded_vocab, 1))
     return tuple(maps)
 
 
@@ -735,8 +736,11 @@ def head_experiments(
 ) -> Iterator[Experiment]:
     """The head's three GEMMs, each against a form that pays for alignment.
 
-    The vocabulary is not a multiple of the alignment vector, so all three head
-    GEMMs land on an `align1` kernel. Three ways out are priced.
+    A vocabulary that is not a multiple of the alignment vector puts all three
+    head GEMMs on an `align1` kernel. Three ways out are priced from the raw
+    `vocab_size`, which is what the alignment is worth; the library takes the
+    third by default, so this measures a decision already made rather than an
+    open one.
 
     Splitting the forward at the aligned boundary leaves the aligned bulk on a
     wide-load kernel and finishes the remaining columns separately. It is
@@ -748,8 +752,9 @@ def head_experiments(
     backward GEMMs. One staged copy serves both, so the pair is measured together
     against the pair before, and the copy is inside the arm that pays for it.
 
-    Padding the vocabulary fixes all three at once, and is the caller's decision.
-    It is measured to price it and nothing else.
+    Padding the head's output width fixes all three at once, which is what
+    `SLinOSSConfig.vocab_pad_multiple` does. It is measured to price it and
+    nothing else.
 
     Args:
         config: Supplies `d_model` and `vocab_size`.
