@@ -1317,6 +1317,10 @@ def _tap_epilogue(
     readout vector is read. The tap term does not collapse, which is the only
     reason the raw forcing tile is staged.
 
+    ``brot`` is recomputed from ``atap`` and the raw vector, both already in
+    registers here, rather than read back out of the tile :func:`_rotate_rows`
+    wrote. The tile itself stays, because the GEMM takes it as an operand.
+
     The forcing sum is indexed by token rather than by row of the run: row ``t + 1``
     is token ``t``, so the current tap lands one row above the previous tap's and
     the previous tap of the chunk's first token lands on row 0, which is the carry.
@@ -1325,7 +1329,8 @@ def _tap_epilogue(
         gdtap: ``(B,H,tiles*T,2,4)`` float32 ``dK`` or its slot buffer, written at
             this tap.
         sdb: ``(span, pitch)`` float32 forcing gradient, the GEMM's output.
-        sbrot: ``(span, pitch)`` operand-dtype rotated forcing tile.
+        sbrot: ``(span, pitch)`` operand-dtype rotated forcing tile. Taken for its
+            element type, not read: the rotated vector is recomputed.
         sb: ``(span + 1, pitch)`` operand-dtype raw forcing tile.
         ssum: ``(L + 1, pitch)`` float32 forcing sum, accumulated.
         stable: ``(mats, L, 9)`` float32 transform table.
@@ -1366,15 +1371,25 @@ def _tap_epilogue(
         gsum = tuple(zero for _ in range(9))
         msum = tuple(zero for _ in range(9))
         act = mat3_transpose(_mat_at(stable, TABLE_AC, token))
-        atapt = mat3_transpose(_mat_at(stable, slot, token))
+        atap = _mat_at(stable, slot, token)
+        atapt = mat3_transpose(atap)
+        rotated = sbrot.element_type
         for rep in cutlass.range_constexpr(lanes // LANE_GROUP):
             col = 3 * (lane + rep * LANE_GROUP)
             dvec = (sdb[rs, col], sdb[rs, col + 1], sdb[rs, col + 2])
-            gsum = mat3_add(gsum, mat3_outer(dvec, _vec_at(sbrot, rs, col)))
-            msum = mat3_add(
-                msum,
-                mat3_outer(mat3_matvec(act, dvec), _vec_at(sb, rs + shift, col)),
+            bvec = _vec_at(sb, rs + shift, col)
+            # What _rotate_rows stored, recomputed from the table entry and the raw
+            # vector this thread already holds: nine FMA in place of a pass over the
+            # rotated tile. The round trip through the operand dtype is what makes
+            # this the stored bits rather than a value near them.
+            rot = mat3_matvec(atap, bvec)
+            brot = (
+                widen(narrow(rot[0], rotated), rotated),
+                widen(narrow(rot[1], rotated), rotated),
+                widen(narrow(rot[2], rotated), rotated),
             )
+            gsum = mat3_add(gsum, mat3_outer(dvec, brot))
+            msum = mat3_add(msum, mat3_outer(mat3_matvec(act, dvec), bvec))
             out = mat3_matvec(atapt, dvec)
             if cutlass.const_expr(exact):
                 for j in cutlass.range_constexpr(3):
