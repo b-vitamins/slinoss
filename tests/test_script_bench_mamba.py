@@ -1,12 +1,14 @@
 """The Mamba2 bench driver: its command line, its two group rows, and its output.
 
-``mamba-ssm`` is never imported. ``load_scan`` is the seam: every test that runs
-the driver replaces it with a stub taking Mamba2's six positional arguments and
-returning ``(batch, seqlen, nheads, headdim)`` differentiable in all five inputs,
-which is everything the driver requires of it. The absent-package path is driven
-by putting a module with no ``__path__`` under ``mamba_ssm`` in
-:data:`sys.modules`, so this file behaves the same whether or not the package is
-installed on the host.
+No test of the driver imports ``mamba-ssm``. ``load_scan`` is one seam: every test
+that runs the driver replaces it with a stub taking Mamba2's six positional
+arguments and returning ``(batch, seqlen, nheads, headdim)`` differentiable in all
+five inputs, which is everything the driver requires of it. ``parameter_counts``
+is the other, replaced by :func:`fabricated_params`, since counting a parameter
+builds the module. The absent-package path is driven by putting a module with no
+``__path__`` under ``mamba_ssm`` in :data:`sys.modules`, so this file behaves the
+same whether or not the package is installed on the host. One test outside the
+driver path counts the real parameters and skips when the package is absent.
 
 Every run is eight tokens, because what is under test is the driver and not either
 operator. The driver refuses any device a report cannot name, so every argv names a
@@ -37,13 +39,18 @@ from torch import Tensor
 
 from scripts.bench import bench_mamba
 from scripts.bench.bench_mamba import (
+    Parameters,
     compare_so3ssd,
     group_counts,
     load_scan,
     main,
     make_inputs,
+    mamba_arithmetic,
+    mapping_of,
+    parameter_counts,
     parse_args,
     runner,
+    so3ssd_arithmetic,
 )
 from slinoss.perf import timing
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
@@ -61,6 +68,10 @@ CUDA = torch.device("cuda")
 
 SMALL = OpShape("small", bsz=1, heads=2, seq=8, rows=16, lanes=16, chunk=4)
 """Two whole chunks at the smallest legal row and lane counts, over two heads."""
+
+PARAMS = OpShape("params", bsz=1, heads=2, seq=32, rows=16, lanes=16, chunk=16)
+"""The same layer at the shortest chunk a mixer config admits. :data:`SMALL` is
+four, which is under that floor, and a parameter count needs a config."""
 
 ITERS = 2
 """Timed iterations. Even, as the paired loop requires, and the fewest that yield
@@ -152,6 +163,18 @@ def small_by_name(name: str) -> OpShape:
     return SMALL
 
 
+def fabricated_params(shape: OpShape, groups: int) -> tuple[Parameters, Parameters]:
+    """Parameter counts no module was built for.
+
+    The real count instantiates both layers, which imports ``mamba_ssm.modules`` and
+    is what :func:`test_the_parameter_counts_come_from_the_two_shipped_modules`
+    covers. Every driver test replaces it, so the seam holds and the printed block is
+    a literal.
+    """
+    del shape, groups
+    return (Parameters("mamba2-stub", 11), Parameters("slinoss-stub", 13))
+
+
 @pytest.fixture(autouse=True)
 def pinned_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the clock probe every measurement takes, for every test here."""
@@ -176,6 +199,7 @@ def install(
     monkeypatch.setattr(bench_mamba, "device_info", lambda _index: fabricated_device())
     monkeypatch.setattr(bench_mamba, "SHAPES", (SMALL,))
     monkeypatch.setattr(bench_mamba, "shape_by_name", small_by_name)
+    monkeypatch.setattr(bench_mamba, "parameter_counts", fabricated_params)
     return fn
 
 
@@ -446,7 +470,7 @@ def test_main_reports_each_group_configuration_as_its_own_row(
         "bench-mamba-small-g2-forward.md",
     ]
     assert notes_of(both / "bench-mamba-small-g2-forward.json") == [
-        "small: B=1 H=2 T=8 P=16 N=16 3N=48 L=4",
+        "small: B=1 H=2 T=8 P=16 N=16 3N=48 L=4 G=1",
         "mamba2 ngroups=2 headdim=16 dstate=48",
         "mode=forward dtype=fp32",
         "iters=2 warmup=0",
@@ -507,6 +531,63 @@ def test_main_refuses_a_device_no_report_can_name(
 
 
 # ---------------------------------------------------------------------------
+# What the comparison holds equal
+# ---------------------------------------------------------------------------
+
+
+def test_the_mapping_equalizes_the_state_elements_a_head_carries() -> None:
+    mapped = mapping_of(SMALL, 2)
+    assert (mapped.headdim, mapped.dstate, mapped.ngroups, mapped.chunk) == (
+        16,
+        48,
+        2,
+        4,
+    )
+    # dstate is 3N and not N. Matching the lane count instead hands Mamba2 a third
+    # of the state, and a ratio measured against that is an artefact of the mapping.
+    assert mapped.dstate == SMALL.d_state == 3 * SMALL.lanes
+    assert mapped.state_elems == SMALL.rows * SMALL.d_state
+    # The group count moves the score's cost, not the state a head carries.
+    assert mapping_of(SMALL, 1).state_elems == mapped.state_elems
+
+
+def test_the_counted_flop_of_both_sides_puts_the_so3_operator_above_mamba() -> None:
+    theirs = mamba_arithmetic(SMALL, SMALL.heads)
+    ours = so3ssd_arithmetic(SMALL)
+    assert (theirs.label, ours.label) == ("mamba-g2", "so3ssd")
+    for count in (theirs, ours):
+        assert count.step_flop == count.forward_flop + count.backward_flop
+        # Both sides recompute in the backward, so it is the larger of the two.
+        assert count.backward_flop > count.forward_flop
+    # At equal state per head the SO(3) operator does the greater arithmetic: its
+    # score is per head where Mamba2 shares one across a group, and its forcing has
+    # two taps. The mapping is not neutral, and the counts state which way.
+    assert ours.step_flop > theirs.step_flop
+    # Only the score is shared across a group, so the group count moves their total
+    # and nothing else does.
+    assert mamba_arithmetic(SMALL, 1).step_flop < theirs.step_flop
+
+
+def test_the_parameter_counts_come_from_the_two_shipped_modules() -> None:
+    pytest.importorskip("mamba_ssm.modules.mamba2")
+    # Neither operator holds a parameter: both take tensors a projection produced.
+    # The comparable count is the layer's, so both layers are built, and built on
+    # the host: building on the device under measurement would leave two layers of
+    # parameters in its allocator.
+    before = torch.cuda.memory_allocated()
+    theirs, ours = parameter_counts(PARAMS, 1)
+    assert torch.cuda.memory_allocated() == before
+    assert (theirs.label, ours.label) == ("mamba2-g1", "slinoss-mixer")
+    assert theirs.elements > 0
+    assert ours.elements > 0
+    # Both layers project B and C per group, so a matched run compares two counts
+    # that moved together.
+    wider_theirs, wider_ours = parameter_counts(PARAMS, 2)
+    assert wider_theirs.elements > theirs.elements
+    assert wider_ours.elements > ours.elements
+
+
+# ---------------------------------------------------------------------------
 # compare_so3ssd
 # ---------------------------------------------------------------------------
 
@@ -518,7 +599,8 @@ def test_a_speedup_ratio_above_one_means_the_operator_beat_mamba(
     # The only test here that warms up. First-call cost on the SO(3) arm is two
     # orders above its warm cost and would decide the order of the medians.
     args = parse_args(argv(tmp_path, "--warmup", "1"))
-    _, row = compare_so3ssd(scan, SMALL, SMALL.heads, "forward", args, CUDA)
+    _, face = compare_so3ssd(scan, SMALL, SMALL.heads, "forward", args, CUDA)
+    row = face.row
     # Mamba2 is arm a, so the ratio is mamba over so3ssd: above one is the SO(3)
     # operator winning, and the delay is in the mamba arm.
     assert (row.a_label, row.b_label) == ("mamba-g2", "so3ssd-auto")
@@ -530,6 +612,15 @@ def test_a_speedup_ratio_above_one_means_the_operator_beat_mamba(
     # Two pairs cannot reach nominal coverage, so the row licenses nothing however
     # far apart the medians land.
     assert not row.resolves
+    # The arm medians are read out of the same loop as the verdict, so the slower
+    # arm is the slower arm in both.
+    mamba, ours = face.arms
+    assert (mamba.label, ours.label) == (row.a_label, row.b_label)
+    assert mamba.total_us > ours.total_us
+    assert 0.0 < mamba.forward_us <= mamba.total_us
+    # A forward builds no graph, so neither arm has a backward region to read.
+    assert mamba.backward_us is None
+    assert ours.backward_us is None
 
 
 def test_compare_so3ssd_reports_a_rate_and_a_region_for_each_arm(
@@ -537,22 +628,35 @@ def test_compare_so3ssd_reports_a_rate_and_a_region_for_each_arm(
 ) -> None:
     scan = install(monkeypatch)
     args = parse_args(argv(tmp_path))
-    report, row = compare_so3ssd(scan, SMALL, SMALL.heads, "forward", args, CUDA)
+    report, face = compare_so3ssd(scan, SMALL, SMALL.heads, "forward", args, CUDA)
     assert report.title == "bench: mamba g2 vs so3ssd small forward paired"
     assert [rate.label for rate in report.throughput] == ["mamba-g2", "so3ssd-auto"]
     assert all(rate.token_count == SMALL.token_count for rate in report.throughput)
-    assert report.comparisons == (row,)
+    assert report.comparisons == (face.row,)
     # Two prefixes, so the tree keeps the arms apart. One prefix would sum both
     # forwards into one region describing neither operator.
     assert report.budget is not None
     labels = set(report.budget.labels())
     assert {"mamba-g2.forward", "so3ssd-auto.forward"} <= labels
     assert not [label for label in labels if label.endswith(".backward")]
+    notes = report.notes
+    assert notes[0] == "small: B=1 H=2 T=8 P=16 N=16 3N=48 L=4 G=1"
+    # What was held equal is in the notes, so the ratio can be read against the
+    # geometry, the arithmetic and the parameter counts that produced it.
+    assert notes[1:7] == face.lines()
+    assert notes[1] == (
+        "mapping: headdim=16 dstate=48 ngroups=2 chunk_size=4, "
+        "768 state elements per head on both sides"
+    )
+    assert notes[2].startswith("mamba-g2 flop: forward ")
+    assert notes[3].startswith("so3ssd flop: forward ")
+    assert notes[4] == "parameters: mamba2-stub 11, slinoss-stub 13"
+    assert notes[5].startswith("mamba-g2: total ")
+    assert notes[6].startswith("so3ssd-auto: total ")
     # The two operators take different tensors, so the arms cannot share inputs
     # the way two backends of one operator do, and the peak belongs to neither.
-    assert report.notes == (
-        "small: B=1 H=2 T=8 P=16 N=16 3N=48 L=4",
-        "mamba2 ngroups=2 headdim=16 dstate=48",
+    assert notes[7:] == (
+        "so3ssd n_groups=1",
         "mode=forward dtype=fp32",
         "arm a=mamba-g2 b=so3ssd-auto, one loop, order swapped each iteration",
         "each arm holds its own inputs; the memory peak covers both",
@@ -562,8 +666,13 @@ def test_compare_so3ssd_reports_a_rate_and_a_region_for_each_arm(
     # A requested backend is named in the arm-b label, so the report says which
     # implementation the number belongs to.
     named = parse_args(argv(tmp_path, "--backend", "reference"))
-    _, named_row = compare_so3ssd(scan, SMALL, 1, "step", named, CUDA)
-    assert (named_row.a_label, named_row.b_label) == ("mamba-g1", "so3ssd-reference")
+    _, named_face = compare_so3ssd(scan, SMALL, 1, "step", named, CUDA)
+    assert (named_face.row.a_label, named_face.row.b_label) == (
+        "mamba-g1",
+        "so3ssd-reference",
+    )
+    # A step is the only mode with a backward to read, and both arms have one.
+    assert all(arm.backward_us is not None for arm in named_face.arms)
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +705,21 @@ def test_against_so3ssd_prints_a_rate_per_arm_and_one_verdict_per_configuration(
     )
     # Two pairs license nothing, so the driver must not print a winner.
     assert "beats" not in lines[6]
-    assert len(lines) == 7
+    # Under every verdict, what was held equal: the mapping, both counted flop
+    # totals, the parameter counts, and each arm's medians. A ratio printed alone
+    # cannot be judged.
+    assert [line[:2] for line in lines[7:]] == ["  "] * 6
+    block = [line[2:] for line in lines[7:]]
+    assert block[0].startswith("mapping: headdim=16 dstate=48 ngroups=1 chunk_size=4")
+    assert [line.split(":")[0] for line in block] == [
+        "mapping",
+        "mamba-g1 flop",
+        "so3ssd flop",
+        "parameters",
+        "mamba-g1",
+        "so3ssd-auto",
+    ]
+    assert len(lines) == 13
 
     # Every mode of every group configuration is its own paired report, so one
     # sweep cannot have the last configuration overwrite the rest.

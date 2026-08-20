@@ -340,7 +340,7 @@ def test_main_writes_the_markdown_and_the_json_and_says_where(
     assert capsys.readouterr().out.splitlines()[0] == f"wrote {md}"
     assert md.read_text().splitlines()[0] == "# dispersion: so3ssd tiny step"
     assert notes_of(base) == [
-        "- tiny: B=1 H=1 T=256 P=16 N=16 3N=48 L=64",
+        "- tiny: B=1 H=1 T=256 P=16 N=16 3N=48 L=64 G=1",
         "- mode=step dtype=fp32 backend=default",
         "- iters=1 warmup=0 repeat=2",
         # The stamp is the policy the run was handed, not the state of this host.

@@ -24,6 +24,12 @@ the floor that resolves anything.
 
     python3 scripts/bench/bench_mamba.py --shape standard --mode step \\
         --groups heads --against-so3ssd
+
+The comparison states what it holds equal. :func:`mapping_of` fixes the geometry,
+:func:`mamba_arithmetic` and :func:`so3ssd_arithmetic` count the GEMM flop of each
+side at it, and :func:`parameter_counts` counts the parameters of the two layers the
+two operators sit inside. All of it reaches the report notes and stdout, so the
+comparison can be judged instead of taken.
 """
 
 from __future__ import annotations
@@ -47,7 +53,7 @@ from slinoss.perf.memory import (
     reset_memory_peaks,
 )
 from slinoss.perf.report import Report, rate_table, write_report
-from slinoss.perf.timing import Throughput, measure, measure_paired, region
+from slinoss.perf.timing import Throughput, Timed, measure, measure_paired, region
 from slinoss.perf.workload import SHAPES, OpShape, shape_by_name
 from slinoss.perf.workload import forward_only as so3ssd_forward_only
 from slinoss.perf.workload import make_inputs as so3ssd_inputs
@@ -73,6 +79,273 @@ def load_scan() -> Callable[..., Any]:
     except ImportError as exc:
         raise SystemExit(f"bench_mamba needs mamba-ssm: {exc}") from exc
     return mamba_chunk_scan_combined
+
+
+class Mapping(NamedTuple):
+    """The geometry both operators are held at.
+
+    Attributes:
+        headdim: Mamba2's ``headdim``, the SO(3) ``P``.
+        dstate: Mamba2's ``dstate``, the SO(3) ``3N``.
+        ngroups: Mamba2's ``ngroups``.
+        chunk: Chunk length, both sides.
+        state_elems: State elements one head carries, ``headdim * dstate``. Equal on
+            both sides by construction, which is what the mapping fixes.
+    """
+
+    headdim: int
+    dstate: int
+    ngroups: int
+    chunk: int
+    state_elems: int
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        return (
+            f"mapping: headdim={self.headdim} dstate={self.dstate} "
+            f"ngroups={self.ngroups} chunk_size={self.chunk}, "
+            f"{self.state_elems:,} state elements per head on both sides"
+        )
+
+
+def mapping_of(shape: OpShape, groups: int) -> Mapping:
+    """Map one SO(3) shape onto Mamba2's four geometry arguments.
+
+    ``dstate = 3N``, so a head carries ``P * 3N`` state elements on both sides and
+    the chunk-state buffer is the same size in both. The alternative, ``dstate = N``,
+    matches the lane count instead and hands Mamba2 a third of the state, which
+    would make any win here an artefact of the mapping.
+
+    The mapping is not neutral. At equal state elements the SO(3) operator does more
+    arithmetic per element: its score is per head, because the rotation is, while
+    Mamba2 shares one ``C B^T`` across a group, and its forcing has two taps.
+    :func:`mamba_arithmetic` and :func:`so3ssd_arithmetic` count both sides so the
+    gap is visible.
+
+    Args:
+        shape: The SO(3) shape.
+        groups: Mamba2 group count. Equal to ``shape.groups`` for a matched run.
+
+    Returns:
+        The mapping.
+    """
+    return Mapping(
+        headdim=shape.rows,
+        dstate=shape.d_state,
+        ngroups=groups,
+        chunk=shape.chunk,
+        state_elems=shape.rows * shape.d_state,
+    )
+
+
+class Arithmetic(NamedTuple):
+    """GEMM flop of one operator call at one geometry. Counted, not measured.
+
+    Both state passings are omitted from both sides: each is ``2 * P * dstate`` per
+    chunk per head against ten times that per token, which is under one percent of
+    either total at any admitted chunk length.
+
+    Attributes:
+        label: Which side.
+        forward_flop: Flop of one forward call.
+        backward_flop: Flop of one backward call, including whatever that side
+            recomputes rather than saves.
+    """
+
+    label: str
+    forward_flop: int
+    backward_flop: int
+
+    @property
+    def step_flop(self) -> int:
+        """Forward plus backward."""
+        return self.forward_flop + self.backward_flop
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        return (
+            f"{self.label} flop: forward {self.forward_flop / 1e9:,.2f}G "
+            f"backward {self.backward_flop / 1e9:,.2f}G "
+            f"step {self.step_flop / 1e9:,.2f}G"
+        )
+
+
+def mamba_arithmetic(shape: OpShape, groups: int) -> Arithmetic:
+    """Count Mamba2's GEMM flop at one geometry.
+
+    Forward, from ``_mamba_chunk_scan_combined_fwd``: ``_chunk_state_fwd`` contracts
+    ``x`` against ``B`` over the chunk, ``_bmm_chunk_fwd`` forms ``C B^T`` once per
+    group, and ``_chunk_scan_fwd`` applies that score to ``x`` and adds ``C`` against
+    the incoming state.
+
+    Backward, from ``_mamba_chunk_scan_combined_bwd``: two forward kernels are
+    recomputed, and then ``_chunk_scan_bwd_dstates``, the two contractions inside
+    ``_chunk_scan_chunk_state_bwd_dx``, ``_chunk_state_bwd_db``,
+    ``_chunk_scan_bwd_dC``, ``_chunk_scan_bwd_dcb``, ``_chunk_scan_bwd_ddAcs_stable``
+    and two ``_bmm_chunk_bwd`` calls. Five contractions over ``P * dstate`` per token
+    per head, three over ``L * P``, three over ``L * dstate`` per token per group.
+
+    Args:
+        shape: The SO(3) shape the geometry is mapped from.
+        groups: Mamba2 group count.
+
+    Returns:
+        The count.
+    """
+    m = mapping_of(shape, groups)
+    lanes = shape.bsz * shape.heads * shape.seq
+    band = shape.bsz * groups * shape.seq
+    state = 2 * m.headdim * m.dstate
+    score = 2 * m.chunk * m.dstate
+    diagonal = 2 * m.chunk * m.headdim
+    return Arithmetic(
+        label=f"mamba-g{groups}",
+        forward_flop=lanes * (2 * state + diagonal) + band * score,
+        backward_flop=lanes * (5 * state + 3 * diagonal) + band * 3 * score,
+    )
+
+
+def so3ssd_arithmetic(shape: OpShape) -> Arithmetic:
+    """Count the SO(3) operator's GEMM flop at one geometry.
+
+    The terms are the sweep's, so there is one flop model for this operator and a
+    driver cannot carry a second. A rematerialized forward kernel counts against the
+    backward, which is where it runs.
+
+    Args:
+        shape: The SO(3) shape.
+
+    Returns:
+        The count.
+    """
+    from scripts.perf.chunk_sweep import flop_terms, geometry_of
+
+    lanes = shape.bsz * shape.heads * shape.seq
+    forward = sum(
+        term.flops(shape.chunk)
+        for term in flop_terms(geometry_of(shape))
+        if term.kernel.endswith("_fwd")
+    )
+    total = sum(term.flops(shape.chunk) for term in flop_terms(geometry_of(shape)))
+    return Arithmetic(
+        label="so3ssd",
+        forward_flop=lanes * forward,
+        backward_flop=lanes * (total - forward),
+    )
+
+
+class Parameters(NamedTuple):
+    """Parameters of one layer at the mapped geometry.
+
+    Attributes:
+        label: Which side.
+        elements: Parameter elements. Not ``count``, which is a tuple method.
+    """
+
+    label: str
+    elements: int
+
+
+def parameter_counts(shape: OpShape, groups: int) -> tuple[Parameters, Parameters]:
+    """Count the parameters of the two layers the two operators sit inside.
+
+    Neither operator holds a parameter: both take per-token tensors a projection
+    produced. The comparable count is therefore the layer's, and it is counted from
+    the shipped modules rather than derived, so it cannot drift from either.
+
+    ``d_model`` is ``H * P / 2``, the width that expands to the measured inner
+    dimension at Mamba2's default expansion and at this project's.
+
+    Both modules are built on the host. The count is a property of the layer, and
+    building on the device under measurement would put two layers of parameters into
+    its allocator.
+
+    Args:
+        shape: The SO(3) shape.
+        groups: Group count, both sides.
+
+    Returns:
+        Mamba2's count and the SO(3) mixer's, in that order.
+
+    Raises:
+        SystemExit: If ``mamba-ssm`` is not installed.
+    """
+    try:
+        from mamba_ssm.modules.mamba2 import Mamba2  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise SystemExit(f"bench_mamba needs mamba-ssm: {exc}") from exc
+
+    from slinoss.mixer import SLinOSSMixer
+    from slinoss.perf.workload import layer_config
+
+    m = mapping_of(shape, groups)
+    theirs = Mamba2(
+        d_model=shape.heads * shape.rows // 2,
+        d_state=m.dstate,
+        headdim=m.headdim,
+        ngroups=m.ngroups,
+        expand=2,
+        chunk_size=m.chunk,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    ours = SLinOSSMixer(
+        layer_config(shape, groups=groups), device="cpu", dtype=torch.float32
+    )
+    return (
+        Parameters(f"mamba2-g{groups}", sum(p.numel() for p in theirs.parameters())),
+        Parameters("slinoss-mixer", sum(p.numel() for p in ours.parameters())),
+    )
+
+
+class ArmTimes(NamedTuple):
+    """One arm's median durations inside a paired loop.
+
+    Attributes:
+        label: Arm label.
+        total_us: Median of the whole arm.
+        forward_us: Median of its forward region.
+        backward_us: Median of its backward region, or None in forward mode.
+    """
+
+    label: str
+    total_us: float
+    forward_us: float
+    backward_us: float | None
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        tail = "-" if self.backward_us is None else f"{self.backward_us:,.1f}"
+        return (
+            f"{self.label}: total {self.total_us:,.1f} us "
+            f"forward {self.forward_us:,.1f} us backward {tail} us"
+        )
+
+
+def arm_times(timed: Timed, label: str) -> ArmTimes:
+    """Read one arm's three medians out of a paired measurement.
+
+    Args:
+        timed: The paired loop.
+        label: The arm's region label. Its forward and backward are its children.
+
+    Returns:
+        The medians. The backward is None when the arm ran without gradients.
+
+    Raises:
+        KeyError: If the arm or its forward is not in the tree.
+    """
+    backward: float | None
+    try:
+        backward = float(timed.region(f"{label}.backward").spread.median_duration_us)
+    except KeyError:
+        backward = None
+    return ArmTimes(
+        label=label,
+        total_us=float(timed.region(label).spread.median_duration_us),
+        forward_us=float(timed.region(f"{label}.forward").spread.median_duration_us),
+        backward_us=backward,
+    )
 
 
 class MambaInputs(NamedTuple):
@@ -111,8 +384,8 @@ def make_inputs(
 ) -> MambaInputs:
     """Build Mamba2 inputs matching one SO(3) shape.
 
-    ``headdim`` is the SO(3) row count and ``dstate`` is its ``3N``, so the state
-    per head is the same size in both operators.
+    The geometry is :func:`mapping_of`: ``headdim`` is the SO(3) row count and
+    ``dstate`` is its ``3N``, so a head carries the same state in both operators.
     """
     gen = torch.Generator(device=device).manual_seed(seed)
 
@@ -260,6 +533,39 @@ def _saved(
     return probe.report(f"mamba {shape.name}", inputs.differentiable)
 
 
+class Faceoff(NamedTuple):
+    """One configuration's verdict together with what was held equal.
+
+    Attributes:
+        row: The verdict on the per-iteration differences.
+        mapping: The geometry both arms ran at.
+        flops: Mamba2's counted flop and the SO(3) operator's, in that order.
+        params: Both layers' parameter counts, in the same order.
+        arms: Both arms' medians, in the same order.
+    """
+
+    row: PairedRow
+    mapping: Mapping
+    flops: tuple[Arithmetic, Arithmetic]
+    params: tuple[Parameters, Parameters]
+    arms: tuple[ArmTimes, ArmTimes]
+
+    def lines(self) -> tuple[str, ...]:
+        """What was held equal and what each side paid for it.
+
+        Returns:
+            One line each for the mapping, the two flop counts, the parameter
+            counts, and the two arms' medians.
+        """
+        return (
+            self.mapping.describe(),
+            *(count.describe() for count in self.flops),
+            "parameters: "
+            + ", ".join(f"{p.label} {p.elements:,}" for p in self.params),
+            *(arm.describe() for arm in self.arms),
+        )
+
+
 def compare_so3ssd(
     scan: Callable[..., Any],
     shape: OpShape,
@@ -267,27 +573,36 @@ def compare_so3ssd(
     mode: str,
     args: argparse.Namespace,
     device: torch.device,
-) -> tuple[Report, PairedRow]:
+) -> tuple[Report, Faceoff]:
     """Measure the SO(3) operator against Mamba2 in one loop at one configuration.
 
     Mamba2 is the baseline arm, so ``speedup_ratio`` above one means the SO(3)
     operator is the faster of the two.
 
+    The geometry is :func:`mapping_of`, which equalizes the state elements per head
+    and not the arithmetic. The counted flop of both sides and the parameter counts
+    of both layers reach the notes, so the ratio can be read against what produced
+    it.
+
     Args:
         scan: ``mamba_chunk_scan_combined``.
         shape: The problem size. Both arms carry the same state size per head.
-        groups: Mamba2 group count.
+        groups: Mamba2 group count. The SO(3) arm uses the shape's own, so a run
+            with ``groups != shape.groups`` compares two group counts and says so.
         mode: ``forward`` or ``step``.
         args: Parsed command line.
         device: Device to time on.
 
     Returns:
-        The report and the verdict on the per-iteration differences.
+        The report and the face-off.
     """
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
     a_label = f"mamba-g{groups}"
     b_label = f"so3ssd-{args.backend or 'auto'}"
+    mapping = mapping_of(shape, groups)
+    flops = (mamba_arithmetic(shape, groups), so3ssd_arithmetic(shape))
+    params = parameter_counts(shape, groups)
     mamba = make_inputs(shape, groups, device, dtype=dtype, requires_grad=grads)
     ours = so3ssd_inputs(shape, device, dtype=dtype, requires_grad=grads)
     label = f"mamba g{groups} vs so3ssd {shape.name} {mode} paired"
@@ -310,6 +625,13 @@ def compare_so3ssd(
     )
     tree = budget(out.timed)
     assert_closed(tree)
+    face = Faceoff(
+        row=out.comparison,
+        mapping=mapping,
+        flops=flops,
+        params=params,
+        arms=(arm_times(out.timed, a_label), arm_times(out.timed, b_label)),
+    )
     report = Report(
         title=f"bench: {label}",
         device=device_info(device_ordinal(device)),
@@ -323,7 +645,8 @@ def compare_so3ssd(
         pool=pool_retention(label),
         notes=(
             shape.describe(),
-            f"mamba2 ngroups={groups} headdim={shape.rows} dstate={shape.d_state}",
+            *face.lines(),
+            f"so3ssd n_groups={shape.groups}",
             f"mode={mode} dtype={args.dtype}",
             f"arm a={a_label} b={b_label}, one loop, order swapped each iteration",
             # The two operators take different tensors, so the arms cannot share
@@ -334,7 +657,7 @@ def compare_so3ssd(
             f"timer={out.timed.timer} clocks={out.timed.clocks}",
         ),
     )
-    return report, out.comparison
+    return report, face
 
 
 def _run_comparisons(
@@ -351,11 +674,11 @@ def _run_comparisons(
         Process exit status.
     """
     rates: list[tuple[str, Throughput]] = []
-    verdicts: list[PairedRow] = []
+    verdicts: list[Faceoff] = []
     for shape in shapes:
         for groups in group_counts(shape, wanted):
             for mode in modes:
-                report, row = compare_so3ssd(scan, shape, groups, mode, args, device)
+                report, face = compare_so3ssd(scan, shape, groups, mode, args, device)
                 base = args.out.with_name(
                     f"{args.out.name}-{shape.name}-g{groups}-{mode}-paired"
                 )
@@ -364,13 +687,15 @@ def _run_comparisons(
                     (f"{shape.name}/g{groups}/{mode}/{rate.label}", rate)
                     for rate in report.throughput
                 ]
-                verdicts.append(row)
+                verdicts.append(face)
                 print(f"wrote {md}")
     print()
     print(rate_table(rates, width=52))
-    print()
-    for row in verdicts:
-        print(row.verdict())
+    for face in verdicts:
+        print()
+        print(face.row.verdict())
+        for line in face.lines():
+            print(f"  {line}")
     return 0
 
 
