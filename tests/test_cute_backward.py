@@ -295,6 +295,59 @@ def test_matches_the_reference_backward(case: Case) -> None:
         assert_max_rel(mine, theirs, bound, f"backward/{case.label}/{name}")
 
 
+WIDE_HEADS = 18
+WIDE_ROWS = 64
+WIDE_LANES = 80
+
+
+@pytest.mark.parametrize("groups", [1, WIDE_HEADS], ids=["folded", "ungrouped"])
+def test_holds_a_wide_state_at_the_full_chunk(groups: int) -> None:
+    """The driver launches at ``3N = 240``, ``P = 64``, ``L = 64``.
+
+    Every case above runs at ``L = 16`` and ``3N = 48``, where the shared-memory
+    live set is at its narrowest. That set grows with ``L``, ``P``, ``3N``, and the
+    number of heads a group feeds, and it is wider in the backward than in the
+    forward, so a shape the forward accepts is not a shape the backward can hold.
+    Both folds are here because one launch sums over the fold and its footprint is
+    the one that moves with it.
+
+    Finiteness rather than parity: parity is the cases above, and what this shape
+    reaches is the arena. Two chunks, because nothing here depends on the sequence
+    length.
+    """
+    torch.manual_seed(0)
+    seqlen = 128
+    inp = make_inputs(
+        bsz=1,
+        heads=WIDE_HEADS,
+        groups=groups,
+        seqlen=seqlen,
+        rows=WIDE_ROWS,
+        lanes=WIDE_LANES,
+        dtype=torch.float32,
+        device="cuda",
+        with_state=False,
+        streaming=False,
+    )
+    dy = torch.randn(1, WIDE_HEADS, seqlen, WIDE_ROWS, dtype=ACT, device="cuda")
+    got = so3ssd_bwd_cute(
+        dy,
+        None,
+        None,
+        None,
+        inp.U.to(ACT),
+        inp.trans,
+        inp.K,
+        inp.B.to(ACT),
+        inp.C.to(ACT),
+        64,
+    )
+    for name in ("dU", "dtrans", "dK", "dB", "dC"):
+        grad = getattr(got, name)
+        assert grad is not None, name
+        assert bool(grad.isfinite().all()), name
+
+
 # The dtype of a gradient is not a tolerance question: autograd raises when a
 # gradient's dtype does not match its leaf, so a stage that stores float32 where
 # the leaf is bfloat16 fails at the accumulation and never reaches a comparison.

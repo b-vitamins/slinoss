@@ -66,13 +66,12 @@ x = torch.randn(4, 2048, 576, device="cuda", dtype=torch.bfloat16)
 y = mixer(x)
 ```
 
-The backward kernels hold whole `3N` extents in shared memory, so `d_state`
-trades against `chunk_size` and `d_head`. Measured on a 101,376 B carveout:
-`3N = 48` fits at every `chunk_size` and `d_head`; `3N = 96` needs
-`chunk_size <= 32`, and `chunk_size = 16` at `d_head = 64`; `3N = 144` needs
-`chunk_size = 16`; `3N = 240` does not fit. The forward accepts every legal
-shape, so one the backward cannot hold raises from the backward rather than from
-the forward.
+The backward kernels walk the state in 48-lane blocks, so their shared-memory
+footprint does not grow with `3N` and the trade is `chunk_size` against `d_head`.
+Measured on a 101,376 B carveout, at every `3N`: `chunk_size` 16 and 32 fit at
+every `d_head`; `chunk_size = 64` fits to `d_head = 64`; `chunk_size = 128` does
+not fit. The forward accepts every legal shape, so one the backward cannot hold
+raises from the backward rather than from the forward.
 
 A whole model is `SLinOSSStack`, and one layer of it `SLinOSSBlock`: a fused
 pre-norm around the mixer, and a second around a SwiGLU FFN of width
