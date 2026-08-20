@@ -14,6 +14,9 @@ layouts:
     dgrad  dx(T,I) = dy(T,O)   @ W(O,I)     W is n-major            nn
     wgrad  dW(O,I) = dy(T,O)^T @ x(T,I)     neither is k-major      nt
 
+A map that stores its weight `(I,O)` instead swaps the first two cases and
+transposes the third, so the stored orientation is part of the role table.
+
 Recorded operand shapes do not separate these: `x @ W^T` and `dy @ W` reach the
 profiler as one pair of extents, and only the transpose case tells them apart. So
 the case is read off the kernel name, which is cuBLAS's own account of what it
@@ -46,7 +49,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Protocol, cast
 
 import torch
 from torch import Tensor
@@ -181,15 +184,17 @@ class LinearMap:
 
     Attributes:
         name: Call site, as the module tree names it.
-        fan_in: Columns of the weight, `I`.
-        fan_out: Rows of the weight, `O`.
+        fan_in: Contraction extent of the weight, `I`.
+        fan_out: Output extent of the weight, `O`.
         call_count: Applications per step.
+        transposed: Whether the weight is stored `(I,O)` rather than `(O,I)`.
     """
 
     name: str
     fan_in: int
     fan_out: int
     call_count: int
+    transposed: bool = False
 
 
 def linear_maps(config: SLinOSSConfig) -> tuple[LinearMap, ...]:
@@ -213,7 +218,7 @@ def linear_maps(config: SLinOSSConfig) -> tuple[LinearMap, ...]:
         LinearMap("out_proj", config.d_inner, config.d_model, layers),
         LinearMap("ffn_gate", config.d_model, config.d_ffn, layers),
         LinearMap("ffn_up", config.d_model, config.d_ffn, layers),
-        LinearMap("ffn_out", config.d_ffn, config.d_model, layers),
+        LinearMap("ffn_out", config.d_ffn, config.d_model, layers, transposed=True),
     ]
     if config.vocab_size is not None:
         maps.append(LinearMap("head", config.d_model, config.vocab_size, 1))
@@ -270,6 +275,17 @@ class GemmShape:
         return (self.m, self.n, self.k, self.layout)
 
     @property
+    def merge_key(self) -> tuple[str, int, int, int, str]:
+        """What makes two GEMMs one row.
+
+        The stage joins the shape, so a row stays one stage of one call site even
+        where cuBLAS runs the same kernel for another. Two rows over one key share
+        the kernel and the per-launch median and split the step total by their own
+        call counts.
+        """
+        return (self.stage, *self.key)
+
+    @property
     def flop_count(self) -> Count:
         """Floating-point operations in one launch."""
         return Count(2 * self.m * self.n * self.k)
@@ -278,27 +294,38 @@ class GemmShape:
 def gemm_shapes(config: SLinOSSConfig, tokens: int) -> tuple[GemmShape, ...]:
     """The three GEMMs of every linear map, merged where two share a shape.
 
-    Two call sites of one shape and one layout are one cuBLAS call and one
-    profiler row. The census reports them as one row and names both, since
-    nothing measurable separates them.
+    Two call sites of one shape, one layout and one stage are one cuBLAS call and
+    one profiler row. The census reports them as one row and names both, since
+    nothing measurable separates them. Two different stages on one shape stay two
+    rows: the stage is what the caller is reading the table for.
 
     Args:
         config: The geometry.
         tokens: `B*T`, the batch-flattened token count.
 
     Returns:
-        One entry per distinct GEMM.
+        One entry per distinct GEMM and stage.
     """
-    merged: dict[tuple[int, int, int, str], GemmShape] = {}
+    merged: dict[tuple[str, int, int, int, str], GemmShape] = {}
     for one in linear_maps(config):
         calls = one.call_count
+        # The stored orientation decides which operand is k-major in the two
+        # forward-shaped GEMMs and which way round the third comes out.
+        fwd_layout, dgrad_layout = (NN, TN) if one.transposed else (TN, NN)
+        rows, cols = (
+            (one.fan_in, one.fan_out) if one.transposed else (one.fan_out, one.fan_in)
+        )
         for shape in (
-            GemmShape(one.name, FWD, tokens, one.fan_out, one.fan_in, TN, calls),
-            GemmShape(one.name, DGRAD, tokens, one.fan_in, one.fan_out, NN, calls),
-            GemmShape(one.name, WGRAD, one.fan_out, one.fan_in, tokens, NT, calls),
+            GemmShape(
+                one.name, FWD, tokens, one.fan_out, one.fan_in, fwd_layout, calls
+            ),
+            GemmShape(
+                one.name, DGRAD, tokens, one.fan_in, one.fan_out, dgrad_layout, calls
+            ),
+            GemmShape(one.name, WGRAD, rows, cols, tokens, NT, calls),
         ):
-            found = merged.get(shape.key)
-            merged[shape.key] = (
+            found = merged.get(shape.merge_key)
+            merged[shape.merge_key] = (
                 shape
                 if found is None
                 else GemmShape(
@@ -464,7 +491,19 @@ class Launches:
         return "+".join(self.kernels)
 
 
-def observed(profiled: profile) -> dict[tuple[int, int, int, str], Launches]:
+class Profiled(Protocol):
+    """What a census reads off a finished profile: its operator events.
+
+    Named as a protocol rather than taken as :class:`torch.profiler.profile` so the
+    reader can be exercised against a recorded trace without a device.
+    """
+
+    def events(self) -> Sequence[Any] | None:
+        """Operator events, or nothing if the profile recorded none."""
+        ...
+
+
+def observed(profiled: Profiled) -> dict[tuple[int, int, int, str], Launches]:
     """Per-launch GEMM durations from a profile, keyed by extents and case.
 
     Every launch is kept rather than summed, so a row carries the dispersion of
@@ -480,7 +519,7 @@ def observed(profiled: profile) -> dict[tuple[int, int, int, str], Launches]:
         GEMM whose operand shapes were not recorded.
     """
     out: dict[tuple[int, int, int, str], Launches] = {}
-    for event in profiled.events():
+    for event in profiled.events() or ():
         if str(getattr(event, "name", "")) not in MATMUL_OPS:
             continue
         kernels = _launched(event)
@@ -503,7 +542,7 @@ class Census:
     """A profiled step's GEMMs, assigned to roles.
 
     Attributes:
-        rows: One per distinct GEMM.
+        rows: One per distinct GEMM and stage.
         unassigned: Lines describing device GEMM work no role claimed, and every
             disagreement between the role table and the trace.
     """
@@ -514,7 +553,7 @@ class Census:
 
 def census(
     shapes: Sequence[GemmShape],
-    profiled: profile,
+    profiled: Profiled,
     iters: int,
     ceiling: TensorCeiling,
 ) -> Census:
@@ -532,23 +571,33 @@ def census(
     seen = observed(profiled)
     rows: list[GemmRow] = []
     loose: list[str] = []
+    # One shape can be two roles: a weight stored transposed puts its dgrad on the
+    # shape another map's forward runs, and cuBLAS launches one kernel for both.
+    # The launch check is over the group, and each row scores the shared median
+    # against its own call count.
+    claims: dict[tuple[int, int, int, str], list[GemmShape]] = {}
     for shape in shapes:
-        found = seen.pop(shape.key, None)
+        claims.setdefault(shape.key, []).append(shape)
+    for key, group in claims.items():
+        named = "+".join(f"{one.label}.{one.stage}" for one in group)
+        found = seen.pop(key, None)
         if found is None:
-            loose.append(f"{shape.label}.{shape.stage}: no launch matched {shape.key}")
+            loose.append(f"{named}: no launch matched {key}")
             continue
-        expected = shape.call_count * iters
+        calls = sum(one.call_count for one in group)
+        expected = calls * iters
         if len(found.samples) != expected:
             loose.append(
-                f"{shape.label}.{shape.stage}: {len(found.samples)} launches, "
-                f"{expected} expected from {shape.call_count} calls over {iters} steps"
+                f"{named}: {len(found.samples)} launches, "
+                f"{expected} expected from {calls} calls over {iters} steps"
             )
         if len(found.kernels) > 1:
             loose.append(
-                f"{shape.label}.{shape.stage}: {len(found.kernels)} kernels under "
-                f"one key, {found.name}"
+                f"{named}: {len(found.kernels)} kernels under one key, {found.name}"
             )
-        rows.append(GemmRow.of(shape, found.name, found.samples, ceiling))
+        rows.extend(
+            GemmRow.of(one, found.name, found.samples, ceiling) for one in group
+        )
     for (m, n, k, tag), launches in seen.items():
         per_step = sum(launches.samples) / iters
         what = f"{m}x{n}x{k} {tag}" if m else tag[:56]
@@ -1044,6 +1093,26 @@ def run_experiments(
         torch.cuda.empty_cache()
 
 
+def algorithm(kernel: str) -> str:
+    """The kernel name with the launcher template around it removed.
+
+    What the row is read for is the tile, the stage count, the transpose case and
+    the alignment, and on a CUTLASS kernel those sit inside
+    `void cutlass::Kernel2<...>`, past the width a table can hold. The wrapper is
+    dropped rather than the tail truncated.
+
+    Args:
+        kernel: Kernel name as the profiler reports it.
+
+    Returns:
+        The innermost template argument, or the name unchanged.
+    """
+    head, _, rest = kernel.partition("<")
+    if not rest or not head.startswith("void "):
+        return kernel
+    return rest.rpartition(">")[0] or rest
+
+
 def print_rows(rows: Sequence[GemmRow], ceiling: TensorCeiling) -> None:
     """Print the census table and the class totals.
 
@@ -1069,7 +1138,7 @@ def print_rows(rows: Sequence[GemmRow], ceiling: TensorCeiling) -> None:
             f"{row.duration.spread_pct:6,.2f}% {row.step_duration_us:9,.1f} "
             f"{row.achieved_tflops:7,.1f} {row.ceiling_pct:6,.1f}%"
             f"{' ' if row.ceiling_pct >= floor else '*'} "
-            f"{','.join(row.ragged) or '-':7s} {row.kernel[:54]}"
+            f"{','.join(row.ragged) or '-':7s} {algorithm(row.kernel)}"
         )
     stages: dict[str, float] = {}
     for row in rows:
