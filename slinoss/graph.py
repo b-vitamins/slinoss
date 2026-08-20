@@ -222,9 +222,9 @@ def capture_decode(
     """Record one decode step of ``stack`` over ``state``.
 
     The step is one token per sequence, so the captured input is ``(B,1)`` and the
-    output is ``(B,1,vocab_size)``. ``state`` is advanced in place by every replay,
-    and is the state the graph holds: a replay against a different state is not
-    possible, since the graph records these addresses.
+    output is ``(B,1,padded_vocab_size)``. ``state`` is advanced in place by every
+    replay, and is the state the graph holds: a replay against a different state is
+    not possible, since the graph records these addresses.
 
     Sampling stays outside. It branches on the host, it draws from a generator whose
     state a replay would not advance, and it is not where the launches are.
