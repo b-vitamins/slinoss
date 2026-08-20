@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Annotated, Any, Final
 
 from slinoss.perf.budget import BucketDelta, BudgetReport
-from slinoss.perf.ceiling import Ceilings, ClassVerdict
+from slinoss.perf.ceiling import Ceilings, ClassVerdict, GeometryVerdict
 from slinoss.perf.device import DeviceInfo
 from slinoss.perf.dispersion import GrowthRow, PairedRow, RepeatRow
 from slinoss.perf.memory import MemoryPeaks, PoolRetention, SavedStorages
@@ -189,6 +189,9 @@ class Report:
         peaks: Allocator high-water marks.
         pool: What the launch-descriptor pool holds.
         verdicts: Per-kernel class verdicts.
+        geometry: Per-kernel launch-geometry verdicts, one per declared kernel the
+            capture held. Longer than ``verdicts`` whenever a kernel was left
+            without a class verdict, since neither geometry rule needs traffic.
         spills: Per-kernel local-memory sectors, from the spill pass the verdicts
             were judged with. Carried as a table and not only as a note, because a
             spill fails a class outright and the verdict it fails records the
@@ -214,6 +217,7 @@ class Report:
     peaks: MemoryPeaks | None = None
     pool: PoolRetention | None = None
     verdicts: tuple[ClassVerdict, ...] = ()
+    geometry: tuple[GeometryVerdict, ...] = ()
     spills: tuple[SpillCounters, ...] = ()
     deltas: tuple[BucketDelta, ...] = ()
     growth: tuple[GrowthRow, ...] = ()
@@ -407,6 +411,8 @@ def markdown(report: Report, *, require_agreement: bool = True) -> str:
         lines += _section("measured tensor ceiling", [report.ceilings.tensor])
     if report.verdicts:
         lines += _section("class verdicts", report.verdicts)
+    if report.geometry:
+        lines += _section("launch geometry", report.geometry)
     if report.spills:
         lines += _section("local memory", report.spills)
     if report.kernels:

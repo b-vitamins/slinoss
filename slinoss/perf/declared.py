@@ -23,6 +23,12 @@ rather than judged against a class this repo did not declare.
 law at the kernel's own traffic, and a register spill as a failure outright. A
 kernel whose traffic stays inside L2 gets no bandwidth verdict at all, because
 there the counters describe the cache.
+
+The same pass judges the two launch-geometry rules, which are not a class floor and
+do not go quiet with one. Every declared kernel gets a
+:class:`slinoss.perf.ceiling.GeometryVerdict` whatever its class and whatever its
+traffic did, so a kernel left without a bandwidth verdict for being inside L2 is
+still held to its occupancy and its grid.
 """
 
 from __future__ import annotations
@@ -37,9 +43,12 @@ from slinoss.perf.ceiling import (
     TENSOR_BOUND,
     ClassVerdict,
     DramTimeFloor,
+    GeometryVerdict,
     dram_floor_verdict,
+    geometry_verdict,
     serial_verdict,
 )
+from slinoss.perf.device import DeviceInfo
 from slinoss.perf.ncu import KernelCounters, SpillCounters
 from slinoss.perf.units import Bytes, Microseconds, pct_of
 
@@ -185,6 +194,10 @@ class FloorAudit:
         verdicts: One verdict per profiled kernel this repo compiles and can judge,
             in the order profiled. A verdict failed by the spill rule carries the
             percentage it achieved and ``passed`` False.
+        geometry: One launch-geometry verdict per profiled kernel this repo
+            compiles, in the order profiled. Every declared kernel appears, unlike
+            ``verdicts``: a geometry rule needs no traffic and no class the counters
+            can judge.
         unjudged: Symbols of profiled kernels this repo does not compile.
         spilled: Kernels the spill rule failed, whatever their percentage. A cached
             kernel appears here too: it has no verdict to fail, and a spill is a
@@ -194,9 +207,43 @@ class FloorAudit:
     """
 
     verdicts: tuple[ClassVerdict, ...]
+    geometry: tuple[GeometryVerdict, ...]
     unjudged: tuple[str, ...]
     spilled: tuple[str, ...]
     cached: tuple[str, ...]
+
+    @property
+    def failures(self) -> tuple[str, ...]:
+        """One line per rule a kernel failed, naming the rule and the margin.
+
+        The four rules are separate lines, so a kernel failing two produces two:
+        the spill rule and the class floor both bear on one percentage, and a
+        geometry rule bears on none of it.
+        """
+        out = [
+            f"{kernel}: touched local memory, which fails its class outright"
+            for kernel in self.spilled
+        ]
+        out += [
+            f"{one.kernel}: {one.declared} reached {one.achieved_pct:.2f}% "
+            f"against the {one.required_pct:.1f}% bar"
+            for one in self.verdicts
+            if not one.passed
+        ]
+        out += [
+            f"{one.kernel}: {one.detail}" for one in self.geometry if not one.passed
+        ]
+        return tuple(out)
+
+    @property
+    def passed(self) -> bool:
+        """Whether every judged kernel cleared every rule this audit applied.
+
+        An audit that judged nothing passes vacuously. What makes a class no driver
+        reaches a defect is the coverage rule in ``docs/measurement.md``, not this
+        property, which can only report on what a capture contained.
+        """
+        return not self.failures
 
 
 def floor_audit(
@@ -206,13 +253,19 @@ def floor_audit(
     spills: Sequence[SpillCounters],
     step_duration_us: Microseconds,
     capture_iters: int,
+    device: DeviceInfo,
 ) -> FloorAudit:
-    """Judge every profiled kernel against its class, at the floor and for spills.
+    """Judge every profiled kernel against its class, its geometry, and for spills.
 
     A DRAM-bound kernel is scored against the time floor at its own measured
     traffic rather than against the rate of the largest copy the device can run;
     see :func:`slinoss.perf.ceiling.dram_floor_verdict`. The bar in
     ``CLASS_FLOOR_PCT`` is the same 85%.
+
+    The occupancy and block-count rules are judged for every declared kernel, first
+    and unconditionally; see :func:`slinoss.perf.ceiling.geometry_verdict`. They
+    rest on the launch configuration and the warp census, so neither the traffic
+    nor the class can withhold them, and only SERIAL-tiny waives the block floor.
 
     A kernel in :data:`SPILL_FREE_CLASSES` that touched local memory fails,
     whatever its percentage. The percentage is still reported, because the
@@ -234,6 +287,9 @@ def floor_audit(
         step_duration_us: Measured per-iteration wall. The SERIAL-tiny divisor.
         capture_iters: Iterations the capture window contained. Divides a counter
             sum onto the same per-iteration footing as ``step_duration_us``.
+        device: The part the kernels ran on. Sets the block-count floor at twice
+            its multiprocessor count, so the bar is queried rather than written
+            down.
 
     Returns:
         The audit.
@@ -249,6 +305,7 @@ def floor_audit(
         raise ValueError(f"capture_iters must be positive, got {capture_iters}")
     by_kernel = {one.kernel: one for one in spills}
     verdicts: list[ClassVerdict] = []
+    geometry: list[GeometryVerdict] = []
     unjudged: list[str] = []
     spilled: list[str] = []
     cached: list[str] = []
@@ -257,6 +314,19 @@ def floor_audit(
         if declared is None:
             unjudged.append(one.kernel)
             continue
+        # Recorded before the cached exit, so a kernel with no bandwidth verdict
+        # still reports the geometry it ran at.
+        geometry.append(
+            geometry_verdict(
+                one.kernel,
+                declared=declared,
+                block_count=one.block_count,
+                thread_per_block_count=one.thread_per_block_count,
+                achieved_occupancy_pct=one.achieved_occupancy_pct,
+                theoretical_occupancy_pct=one.theoretical_occupancy_pct,
+                device=device,
+            )
+        )
         if declared in SPILL_FREE_CLASSES and one.kernel not in by_kernel:
             raise ValueError(
                 f"kernel {one.kernel!r} declares {declared} and carries no spill "
@@ -295,6 +365,7 @@ def floor_audit(
         verdicts.append(verdict)
     return FloorAudit(
         verdicts=tuple(verdicts),
+        geometry=tuple(geometry),
         unjudged=tuple(unjudged),
         spilled=tuple(spilled),
         cached=tuple(cached),

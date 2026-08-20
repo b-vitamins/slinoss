@@ -9,8 +9,8 @@ Layering, innermost first:
 - :mod:`slinoss.perf.budget` -- the closed tree over the measured total.
 - :mod:`slinoss.perf.dispersion` -- which dispersion statistic bounds a delta.
 - :mod:`slinoss.perf.memory` -- what autograd holds, and allocator peaks.
-- :mod:`slinoss.perf.ceiling` -- measured DRAM and tensor ceilings, and the
-  three kernel class verdicts.
+- :mod:`slinoss.perf.ceiling` -- measured DRAM and tensor ceilings, the three
+  kernel class verdicts, and the two launch-geometry rules.
 - :mod:`slinoss.perf.capture` -- the window an external profiler attaches to.
 - :mod:`slinoss.perf.ncu`, :mod:`slinoss.perf.nsys` -- the two profiler drivers.
 - :mod:`slinoss.perf.report` -- emission, gated by the three-way cross-check.
@@ -32,8 +32,10 @@ from slinoss.perf.budget import (
 )
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.ceiling import (
+    BLOCK_FLOOR_EXEMPT_CLASSES,
     CLASS_FLOOR_PCT,
     DRAM_BOUND,
+    MIN_OCCUPANCY_PCT,
     SERIAL_TINY,
     TENSOR_BOUND,
     Ceilings,
@@ -41,11 +43,13 @@ from slinoss.perf.ceiling import (
     CopySample,
     DramCeiling,
     DramTimeFloor,
+    GeometryVerdict,
     TensorCeiling,
     ceilings,
     dram_ceiling,
     dram_floor_verdict,
     dram_time_floor,
+    geometry_verdict,
     serial_verdict,
     tensor_ceiling,
     tensor_verdict,
@@ -140,12 +144,14 @@ from slinoss.perf.units import (
 )
 
 __all__ = [
+    "BLOCK_FLOOR_EXEMPT_CLASSES",
     "CLASS_FLOOR_PCT",
     "CONFIDENCE_PCT",
     "DRAM_BOUND",
     "INVARIANT",
     "MAX_TIMER_COVERAGE_PCT",
     "MEDIAN",
+    "MIN_OCCUPANCY_PCT",
     "MIN_RESOLVING_SAMPLES",
     "MODELLED",
     "NCU_TABLES",
@@ -173,6 +179,7 @@ __all__ = [
     "DramCeiling",
     "DramTimeFloor",
     "GBPerSecond",
+    "GeometryVerdict",
     "GrowthRow",
     "KernelCounters",
     "Mebibytes",
@@ -220,6 +227,7 @@ __all__ = [
     "dram_ceiling",
     "dram_floor_verdict",
     "dram_time_floor",
+    "geometry_verdict",
     "growth",
     "json_text",
     "kernel_counters",

@@ -17,6 +17,7 @@ import torch
 from slinoss.perf.ceiling import (
     CLASS_FLOOR_PCT,
     DRAM_BOUND,
+    MIN_OCCUPANCY_PCT,
     SERIAL_TINY,
     TENSOR_BOUND,
     CopySample,
@@ -24,12 +25,16 @@ from slinoss.perf.ceiling import (
     dram_ceiling,
     dram_floor_verdict,
     dram_time_floor,
+    geometry_verdict,
 )
 from slinoss.perf.declared import DECLARED, FloorAudit, floor_audit
+from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.ncu import KernelCounters, SpillCounters
 from slinoss.perf.units import (
     Bytes,
     Count,
+    Mebibytes,
+    Megahertz,
     Microseconds,
     Percent,
     Ratio,
@@ -48,6 +53,43 @@ L2_BYTES: Final = Bytes(6 << 20)
 
 OWNED: Final = "kernel_cutlass_chunk_scan_fwd_kernel_bf16_Ampere_0"
 """A DRAM-bound kernel under the symbol NCU reports."""
+
+SM_COUNT: Final = Count(84)
+"""Multiprocessors the fabricated part reports. Twice this is the block floor."""
+
+
+def device_record() -> DeviceInfo:
+    """A part to judge a launch geometry against.
+
+    Only ``sm_count`` reaches a verdict: the block floor is twice it. Every other
+    field is filled because the record demands them, and none is asserted.
+    """
+    return DeviceInfo(
+        name="Test Part",
+        capability="8.6",
+        sm_count=SM_COUNT,
+        warp_thread_count=Count(32),
+        max_threads_per_sm_count=Count(1536),
+        regs_per_sm_count=Count(65536),
+        smem_per_block_bytes=Bytes(49152),
+        smem_optin_per_block_bytes=Bytes(101376),
+        smem_per_sm_bytes=Bytes(102400),
+        l2_bytes=L2_BYTES,
+        total_memory_bytes=Bytes(51041271808),
+        clocks=ClockPolicy(
+            locked=False,
+            sm_clock_mhz=Megahertz(1740.0),
+            max_sm_clock_mhz=Megahertz(1800.0),
+            detail="fabricated",
+        ),
+        sharing=Contention(
+            probed=True,
+            foreign_process_count=Count(0),
+            foreign_memory_mib=Mebibytes(0.0),
+            utilization_pct=Percent(0.0),
+            detail="fabricated",
+        ),
+    )
 
 
 def law_us(moved_bytes: int) -> Microseconds:
@@ -270,8 +312,10 @@ def counters(kernel: str = OWNED) -> KernelCounters:
         register_per_thread_count=Count(168),
         static_smem_bytes=Bytes(0),
         dynamic_smem_bytes=Bytes(65536),
-        theoretical_occupancy_pct=Percent(37.5),
-        achieved_occupancy_pct=Percent(35.0),
+        # Over the occupancy bar, and 252 blocks is over the 168-block floor, so
+        # the fixture is clean on every rule and each test fails the one it names.
+        theoretical_occupancy_pct=Percent(75.0),
+        achieved_occupancy_pct=Percent(62.5),
         tensor_pipe_pct=Percent(0.0),
         inst_count=Count(1 << 22),
         active_thread_per_warp_ratio=Ratio(32.0),
@@ -327,6 +371,7 @@ def audit_one(
         spills=() if spill is None else (spill,),
         step_duration_us=Microseconds(step_duration_us),
         capture_iters=capture_iters,
+        device=device_record(),
     )
 
 
@@ -363,6 +408,7 @@ def audit_traffic(traffic: int, *, sectors: int = 0) -> FloorAudit:
         spills=(spill_record(sectors),),
         step_duration_us=Microseconds(5000.0),
         capture_iters=3,
+        device=device_record(),
     )
 
 
@@ -405,6 +451,7 @@ def test_the_audit_refuses_a_kernel_with_no_spill_record() -> None:
             spills=(spill_record(0, kernel="kernel_cutlass_swiglu_fwd_kernel_0"),),
             step_duration_us=Microseconds(5000.0),
             capture_iters=3,
+            device=device_record(),
         )
 
 
@@ -417,6 +464,7 @@ def test_the_audit_leaves_a_foreign_kernel_unjudged() -> None:
         spills=(),
         step_duration_us=Microseconds(5000.0),
         capture_iters=3,
+        device=device_record(),
     )
     assert audit.unjudged == (foreign,)
     assert audit.verdicts == ()
@@ -463,3 +511,147 @@ def test_the_audit_refuses_a_judgement_the_counters_cannot_make(
     monkeypatch.setitem(DECLARED, "chunk_scan_fwd_kernel", TENSOR_BOUND)
     with pytest.raises(ValueError, match="needs a flop count"):
         audit_one(spill_record(0))
+
+
+# ---------------------------------------------------------------------------
+# The launch-geometry rules
+# ---------------------------------------------------------------------------
+
+
+def audit_launch(one: KernelCounters, *, spill: SpillCounters | None) -> FloorAudit:
+    """Audit one kernel at an imposed launch geometry.
+
+    Args:
+        one: The counters, geometry included.
+        spill: The kernel's spill record, or None for a class that needs none.
+
+    Returns:
+        The audit.
+    """
+    return floor_audit(
+        (one,),
+        floor=synthetic_floor(*SWEEP),
+        spills=() if spill is None else (spill,),
+        step_duration_us=Microseconds(5000.0),
+        capture_iters=3,
+        device=device_record(),
+    )
+
+
+def test_the_occupancy_rule_fails_a_kernel_whose_class_floor_passes() -> None:
+    """One record, one counter changed, and the class verdict identical in both.
+
+    The two rules are independent and this is the direction that matters: a kernel
+    reaches a share of its own DRAM floor with whatever occupancy it happens to
+    have, so no bandwidth figure can fail a launch that leaves the multiprocessor
+    nothing to hide with. That is why the bar is not in ``CLASS_FLOOR_PCT``.
+    """
+    over = audit_one(spill_record(0))
+    under = audit_launch(
+        replace(counters(), achieved_occupancy_pct=Percent(8.33)),
+        spill=spill_record(0),
+    )
+    assert over.geometry[0].passed
+    assert over.passed
+    assert under.verdicts[0].passed
+    assert under.verdicts[0].achieved_pct == over.verdicts[0].achieved_pct
+    assert not under.passed
+    one = under.geometry[0]
+    assert (one.kernel, one.declared) == (OWNED, DRAM_BOUND)
+    assert one.required_occupancy_pct == MIN_OCCUPANCY_PCT
+    assert not one.occupancy_passed
+    assert one.block_floor_passed
+    # Which rule, by how much, at what geometry. All three in the verdict, and the
+    # audit's failure line carries it verbatim.
+    assert "achieved occupancy 8.33% is 41.67 points under the 50.0% bar" in one.detail
+    assert "252 blocks x 256 threads, theoretical occupancy 75.00%" in one.detail
+    assert under.failures == (f"{OWNED}: {one.detail}",)
+
+
+def test_the_block_floor_is_waived_by_serial_tiny_and_by_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One 128-block launch, judged under two declarations.
+
+    The floor is twice the multiprocessor count the part reports, so it comes off
+    the device record rather than out of a constant, and a part with a different SM
+    count moves it. The exemption is on this rule only: a kernel provably serial in
+    its own extent has no blocks to add, and a waived floor says so rather than
+    reading as a count that cleared.
+    """
+    thin = replace(counters(), block_count=Count(128))
+    failed = audit_launch(thin, spill=spill_record(0)).geometry[0]
+    assert failed.block_floor_count == 2 * SM_COUNT
+    assert not failed.block_floor_exempt
+    assert not failed.block_floor_passed
+    assert failed.occupancy_passed
+    assert not failed.passed
+    assert "128 blocks is 40 under the 168-block floor" in failed.detail
+    assert "twice the 84 multiprocessors" in failed.detail
+    monkeypatch.setitem(DECLARED, "chunk_scan_fwd_kernel", SERIAL_TINY)
+    waived = audit_launch(thin, spill=None)
+    one = waived.geometry[0]
+    assert one.block_floor_exempt
+    assert one.block_floor_passed
+    assert one.passed
+    assert "the 168-block floor is waived by SERIAL-tiny" in one.detail
+    assert waived.passed
+
+
+def test_a_kernel_with_no_bandwidth_verdict_still_carries_its_geometry() -> None:
+    """The geometry rules do not go quiet with the class floor.
+
+    Traffic inside L2 withholds the bandwidth verdict, and the grid and the warp
+    census are readable off the launch whatever the traffic did. A geometry verdict
+    that disappeared with the bandwidth one would leave a launch unjudged at exactly
+    the shape where it is cheapest to profile.
+    """
+    inside = audit_traffic(3 * L2_BYTES)
+    assert inside.cached == (OWNED,)
+    assert inside.verdicts == ()
+    assert len(inside.geometry) == 1
+    assert inside.geometry[0].kernel == OWNED
+    assert inside.geometry[0].passed
+
+
+def test_a_geometry_verdict_refuses_a_launch_extent_that_did_not_happen() -> None:
+    """A zero extent is a broken profile, not a geometry failure.
+
+    Reported as one, it would read as a kernel launching too few blocks, which is a
+    defect a lane would then go looking for in a kernel that ran fine.
+    """
+    for blocks, threads in ((Count(0), Count(256)), (Count(168), Count(0))):
+        with pytest.raises(ValueError, match="launch extent must be positive"):
+            geometry_verdict(
+                OWNED,
+                declared=DRAM_BOUND,
+                block_count=blocks,
+                thread_per_block_count=threads,
+                achieved_occupancy_pct=Percent(60.0),
+                theoretical_occupancy_pct=Percent(75.0),
+                device=device_record(),
+            )
+
+
+def test_every_rule_a_kernel_broke_reaches_a_failure_line_of_its_own() -> None:
+    """Three rules broken at once, three lines, in rule order.
+
+    The exit status a driver returns is this tuple being empty, so a rule whose
+    failure does not reach it is a rule with no gate behind it. The two geometry
+    rules share one line because one launch configuration decides both and the line
+    names each of them.
+    """
+    broken = replace(
+        counters(),
+        duration_us=Microseconds(4 * WINDOW_US),
+        block_count=Count(128),
+        achieved_occupancy_pct=Percent(8.33),
+    )
+    audit = audit_launch(broken, spill=spill_record(245_760))
+    assert not audit.passed
+    assert len(audit.failures) == 3
+    spill, floor, geometry = audit.failures
+    assert "touched local memory" in spill
+    assert f"{DRAM_BOUND} reached 23.62% against the 85.0% bar" in floor
+    assert "achieved occupancy 8.33%" in geometry
+    assert "128 blocks is 40 under" in geometry

@@ -15,6 +15,11 @@ run. The ninth pass is the local-memory one, and it is not optional: the spill
 rule fails a kernel whatever its percentage, so a pass that was never run must
 not read as clean.
 
+A failing audit exits nonzero. The class floor, the spill rule, the occupancy rule
+and the block-count floor are gates, so a violation is an exit status a sweep or a
+CI step can act on rather than a line in a file nobody read. The report is written
+either way: a refused emission would leave the failing measurement unreadable.
+
     python3 scripts/perf/profile_op.py --shape standard --mode step
 
 ``--op`` picks the operator, out of :data:`slinoss.perf.workload.OPS`. The report
@@ -245,10 +250,12 @@ def build_workload(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Measure, profile, cross-check, and emit.
+    """Measure, profile, cross-check, emit, and judge.
 
     Returns:
-        Process exit status.
+        Process exit status: zero when every kernel the capture held cleared every
+        rule the audit applied, one when any of them failed. A run that collected
+        no counters has nothing to judge and exits zero.
 
     Raises:
         RuntimeError: If the requested device is not a usable CUDA device.
@@ -348,6 +355,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             spills=spills,
             step_duration_us=timed.total.median_duration_us,
             capture_iters=args.iters,
+            # The part the ceilings were measured on, so the block floor and the
+            # denominators come from one device record.
+            device=limits.device,
         )
         if audit.unjudged:
             notes.append(
@@ -364,6 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "no dram verdict, per-launch traffic within L2 so the counters "
                 "describe the cache: " + ", ".join(audit.cached)
             )
+        notes += [f"audit failure: {line}" for line in audit.failures]
 
     report = Report(
         title=f"profile: {label}",
@@ -374,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ceilings=limits,
         kernels=kernels,
         verdicts=() if audit is None else audit.verdicts,
+        geometry=() if audit is None else audit.geometry,
         spills=spills,
         trace=trace,
         notes=tuple(notes),
@@ -385,6 +397,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"wrote {md}")
     print(f"wrote {js}")
+    if audit is not None and not audit.passed:
+        for line in audit.failures:
+            print(f"audit failure: {line}")
+        return 1
     return 0
 
 

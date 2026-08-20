@@ -32,6 +32,7 @@ from slinoss.perf.ceiling import (
     Ceilings,
     ClassVerdict,
     DramCeiling,
+    GeometryVerdict,
     TensorCeiling,
 )
 from slinoss.perf.declared import DECLARED, declared_class
@@ -357,6 +358,34 @@ def _spill(
     )
 
 
+def _geometry(
+    kernel: str,
+    *,
+    declared: str = DRAM_BOUND,
+    blocks: int = 252,
+    achieved: float = 62.5,
+    exempt: bool = False,
+) -> GeometryVerdict:
+    """One launch-geometry verdict, built without a device to query."""
+    occupancy_passed = achieved >= 50.0
+    floor_passed = exempt or blocks >= 168
+    return GeometryVerdict(
+        kernel=kernel,
+        declared=declared,
+        block_count=Count(blocks),
+        block_floor_count=Count(168),
+        thread_per_block_count=Count(256),
+        achieved_occupancy_pct=Percent(achieved),
+        required_occupancy_pct=Percent(50.0),
+        theoretical_occupancy_pct=Percent(75.0),
+        block_floor_exempt=exempt,
+        occupancy_passed=occupancy_passed,
+        block_floor_passed=floor_passed,
+        passed=occupancy_passed and floor_passed,
+        detail=f"{blocks} blocks x 256 threads",
+    )
+
+
 def _report(
     *,
     title: str = "full",
@@ -402,6 +431,13 @@ def _report(
                 required_pct=Percent(2.0),
                 passed=True,
             ),
+        ),
+        geometry=(
+            _geometry("scan"),
+            _geometry("norm", declared=SERIAL_TINY, blocks=12, exempt=True),
+            # `start` carries no class verdict and still carries a geometry one, so
+            # this table is one row longer than the verdicts above.
+            _geometry("start", blocks=96, achieved=8.33),
         ),
         spills=(
             _spill("scan"),
@@ -556,6 +592,7 @@ def test_markdown_renders_every_present_section() -> None:
         "## measured dram ceiling",
         "## measured tensor ceiling",
         "## class verdicts",
+        "## launch geometry",
         "## local memory",
         "## kernel counters",
         "## warp stalls",
@@ -637,6 +674,7 @@ def test_markdown_omits_absent_sections_and_never_prints_them_as_zero() -> None:
         "## measured dram ceiling",
         "## measured tensor ceiling",
         "## class verdicts",
+        "## launch geometry",
         "## local memory",
         "## kernel counters",
         "## warp stalls",

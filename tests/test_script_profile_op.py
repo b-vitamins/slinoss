@@ -98,7 +98,8 @@ charges it once per launch and a zero would hide that it is charged at all."""
 
 FLOOR_ACHIEVED_PCT = 88.0
 """Share of the floor the owned kernel reaches, by construction. Above the 85%
-bar, so the spill rule is the only thing that can fail the default fixture."""
+bar, and the fixture's launch geometry clears both geometry rules, so the default
+fixture passes every rule and each test breaks the one it names."""
 
 OWNED = "kernel_cutlass_chunk_scan_fwd_kernel_bf16_Ampere_0"
 """A profiled kernel under the symbol NCU reports. The declaration table matches
@@ -245,12 +246,17 @@ def counter_record(
     kernel: str = OWNED,
     read_bytes: int = FLOOR_READ_BYTES,
     write_bytes: int = FLOOR_WRITE_BYTES,
+    blocks: int = 336,
+    occupancy_pct: float = 62.5,
 ) -> KernelCounters:
     """Merged counters for one kernel, summing to ``duration_us``.
 
     The traffic and the duration are one rate, so the DRAM verdict reads off a
     record that does not contradict itself. The traffic is a parameter because the
     audit decides on it: below L2 there is no verdict to read.
+
+    The launch geometry is a parameter for the same reason. The defaults clear both
+    geometry rules, at four blocks per multiprocessor and occupancy over the bar.
     """
     return KernelCounters(
         kernel=kernel,
@@ -274,12 +280,12 @@ def counter_record(
         register_per_thread_count=Count(96),
         static_smem_bytes=Bytes(0),
         dynamic_smem_bytes=Bytes(65536),
-        theoretical_occupancy_pct=Percent(50.0),
-        achieved_occupancy_pct=Percent(47.0),
+        theoretical_occupancy_pct=Percent(75.0),
+        achieved_occupancy_pct=Percent(occupancy_pct),
         tensor_pipe_pct=Percent(72.0),
         inst_count=Count(1 << 20),
         active_thread_per_warp_ratio=Ratio(32.0),
-        block_count=Count(336),
+        block_count=Count(blocks),
         thread_per_block_count=Count(256),
         wave_per_sm_ratio=Ratio(4.0),
         issue_active_pct=Percent(12.0),
@@ -597,10 +603,11 @@ def test_a_spill_fails_a_dram_bound_kernel_whatever_percentage_it_reached(
 
     A spill moves the counted bytes as well as the duration, so the percentage
     stops ordering two configurations of one kernel by speed. The verdict therefore
-    keeps the figure it reached and fails anyway.
+    keeps the figure it reached and fails anyway, and the process exits nonzero on
+    it: a rule whose violation exits zero is a rule nothing enforces.
     """
     patch_externals(monkeypatch, spill_sector_count=1)
-    assert profile_op.main(argv_for(tmp_path / "prof")) == 0
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 1
     doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
     one = doc["verdicts"][0]
     assert one["kernel"] == OWNED
@@ -632,6 +639,43 @@ def test_a_kernel_whose_traffic_stays_inside_l2_gets_no_verdict(
     assert doc["verdicts"] == []
     text = (tmp_path / "prof-tiny-forward.md").read_text()
     assert "## class verdicts" not in text
+    # The bandwidth verdict is withheld; the geometry one is not, and the launch it
+    # reports is the one the counters carried.
+    assert [g["kernel"] for g in doc["geometry"]] == [OWNED]
+    assert "## launch geometry" in text
+
+
+def test_a_geometry_violation_fails_a_kernel_that_cleared_its_class_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One record over its bandwidth bar and under both geometry bars.
+
+    The class floor and the geometry rules are separate gates, and this is the one
+    that used to have nothing behind it: the kernel scores 88% of its own floor and
+    still leaves 41 warp slots in 48 idle on a grid that does not cover the part.
+    The report is written anyway, since a refused emission would leave the failing
+    measurement unreadable.
+    """
+    patch_externals(monkeypatch)
+
+    def thin_launch(_passes: Sequence[NcuPass]) -> tuple[KernelCounters, ...]:
+        return (counter_record(blocks=96, occupancy_pct=8.33),)
+
+    monkeypatch.setattr(profile_op, "kernel_counters", thin_launch)
+    assert profile_op.main(argv_for(tmp_path / "prof")) == 1
+    doc = json.loads((tmp_path / "prof-tiny-forward.json").read_text())
+    assert doc["verdicts"][0]["passed"] is True
+    one = doc["geometry"][0]
+    assert one["kernel"] == OWNED
+    assert (one["block_count"], one["block_floor_count"]) == (96, 168)
+    assert one["required_occupancy_pct"] == 50.0
+    assert (one["occupancy_passed"], one["block_floor_passed"]) == (False, False)
+    assert one["passed"] is False
+    # The verdict reaches the notes and stdout, so a sweep reading either sees which
+    # rule failed and not only that something did.
+    text = (tmp_path / "prof-tiny-forward.md").read_text()
+    assert f"audit failure: {OWNED}: {one['detail']}" in text
+    assert f"audit failure: {OWNED}: {one['detail']}" in capsys.readouterr().out
     assert "## kernel counters" in text
     assert (
         "no dram verdict, per-launch traffic within L2 so the counters describe "

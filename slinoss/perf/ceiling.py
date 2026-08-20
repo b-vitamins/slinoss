@@ -11,6 +11,15 @@ Two ceilings, matching the two kernel classes:
 - DRAM: a large device-to-device copy, counting a read and a write per byte.
 - Tensor: a large square GEMM in the operand dtype, counting ``2*M*N*K`` flop.
 
+The bars every kernel is held to live here beside the ceilings that divide them,
+and two of them divide nothing. :data:`MIN_OCCUPANCY_PCT` and the block floor on
+:attr:`slinoss.perf.device.DeviceInfo.block_floor_count` are launch-geometry rules:
+they are read off the launch configuration and the warp census rather than against
+a probe, and :class:`GeometryVerdict` carries them. A kernel passes on its class
+floor and fails on its geometry independently, which is the case
+``chunk_vector_bwd`` makes: one resident block of four warps hides no latency at
+any traffic figure.
+
 A kernel may read slightly above the copy ceiling if its read/write mix is
 friendlier than a copy's. That is a fact about the probe, not a licence to invent
 a higher number, and it is left visible rather than clamped.
@@ -78,9 +87,11 @@ from slinoss.perf.units import (
 )
 
 __all__ = [
+    "BLOCK_FLOOR_EXEMPT_CLASSES",
     "CLASS_FLOOR_PCT",
     "DRAM_BOUND",
     "L2_MULTIPLES",
+    "MIN_OCCUPANCY_PCT",
     "SERIAL_TINY",
     "TENSOR_BOUND",
     "Ceilings",
@@ -88,11 +99,13 @@ __all__ = [
     "CopySample",
     "DramCeiling",
     "DramTimeFloor",
+    "GeometryVerdict",
     "TensorCeiling",
     "ceilings",
     "dram_ceiling",
     "dram_floor_verdict",
     "dram_time_floor",
+    "geometry_verdict",
     "serial_verdict",
     "tensor_ceiling",
     "tensor_verdict",
@@ -108,6 +121,28 @@ CLASS_FLOOR_PCT: dict[str, Percent] = {
     SERIAL_TINY: Percent(2.0),
 }
 """What each class must clear. SERIAL-tiny is a ceiling on step share, not a floor."""
+
+MIN_OCCUPANCY_PCT: Final[Percent] = Percent(50.0)
+"""Achieved occupancy no kernel may run below, whatever its class.
+
+Occupancy is resident warps against warp slots, so it is what says how much
+latency the multiprocessor has left to hide. It is not a share of a ceiling and so
+does not belong in :data:`CLASS_FLOOR_PCT`: the two rules are independent, and a
+kernel far under this bar can still read high against a bandwidth. That is the
+reading this bar exists to catch. ``chunk_vector_bwd`` on sm_86 runs one resident
+block of four warps at 8.3% achieved occupancy, and its measured share of its own
+DRAM floor sat at 12 to 14% across three shapes and both spill states, so no
+traffic figure separates it from a kernel that merely moves more bytes.
+"""
+
+BLOCK_FLOOR_EXEMPT_CLASSES: Final[frozenset[str]] = frozenset((SERIAL_TINY,))
+"""Classes the block-count floor does not apply to.
+
+A kernel provably serial in its own extent has no blocks to add, and its bar is
+already a share of the step rather than a rate. Nothing exempts a kernel from the
+occupancy rule: the block count is a property of the shape the kernel was handed,
+and occupancy is a property of what the kernel does with a multiprocessor.
+"""
 
 _MIB = 1 << 20
 
@@ -648,4 +683,143 @@ def serial_verdict(kernel: str, share_of_step_pct: Percent) -> ClassVerdict:
         achieved_pct=share_of_step_pct,
         required_pct=limit,
         passed=share_of_step_pct <= limit,
+    )
+
+
+@dataclass(frozen=True)
+class GeometryVerdict(PerfRecord):
+    """Whether a kernel's launch geometry leaves the device latency to hide with.
+
+    Two rules, in one record because one launch configuration decides both and a
+    verdict naming one alone reads as though the other had been checked. Neither is
+    a share of a ceiling, so neither belongs in :class:`ClassVerdict`: a kernel
+    scores against a bandwidth with whatever geometry it happens to have, and the
+    two verdicts fail independently.
+
+    The geometry is judged whether or not the class floor could be. A launch whose
+    traffic stayed inside L2 gets no bandwidth verdict, and its grid and its
+    occupancy are measured all the same.
+
+    Attributes:
+        kernel: Kernel name.
+        declared: One of the three class names. It decides the block-count
+            exemption and nothing else here.
+        block_count: Blocks the launch requested.
+        block_floor_count: Fewest blocks the rule allows, twice the queried
+            multiprocessor count.
+        thread_per_block_count: Threads per block, so a block count is read
+            against the width it was traded against.
+        achieved_occupancy_pct: Resident warps against warp slots, measured.
+        required_occupancy_pct: The occupancy bar, :data:`MIN_OCCUPANCY_PCT`.
+        theoretical_occupancy_pct: Occupancy the launch configuration allows.
+            Reported beside the achieved figure because the two separate a
+            register or shared-memory limit from a grid that ran out of work.
+        block_floor_exempt: Whether the declared class waives the block floor.
+        occupancy_passed: Whether achieved occupancy reaches its bar.
+        block_floor_passed: Whether the block count reaches its floor, or is
+            exempt from it.
+        passed: Both of the above.
+        detail: Which rule failed, by how much, and at what geometry. A waived
+            block floor says so rather than reading as a pass on the count.
+    """
+
+    kernel: str
+    declared: str
+    block_count: Annotated[Count, INVARIANT]
+    block_floor_count: Annotated[Count, INVARIANT]
+    thread_per_block_count: Annotated[Count, INVARIANT]
+    achieved_occupancy_pct: Annotated[Percent, MEDIAN]
+    required_occupancy_pct: Annotated[Percent, MEDIAN]
+    theoretical_occupancy_pct: Annotated[Percent, MEDIAN]
+    block_floor_exempt: bool
+    occupancy_passed: bool
+    block_floor_passed: bool
+    passed: bool
+    detail: str
+
+
+def geometry_verdict(
+    kernel: str,
+    *,
+    declared: str,
+    block_count: Count,
+    thread_per_block_count: Count,
+    achieved_occupancy_pct: Percent,
+    theoretical_occupancy_pct: Percent,
+    device: DeviceInfo,
+) -> GeometryVerdict:
+    """Judge one kernel's launch geometry against the occupancy and block rules.
+
+    The block floor is :attr:`slinoss.perf.device.DeviceInfo.block_floor_count`,
+    twice the multiprocessor count the part reports. It is taken off the device
+    record rather than passed in as a number, so no caller can judge a kernel
+    against a floor the hardware did not set.
+
+    Args:
+        kernel: Kernel name.
+        declared: The class the kernel declares. Only
+            :data:`BLOCK_FLOOR_EXEMPT_CLASSES` changes the outcome.
+        block_count: Blocks in the grid, from the launch configuration.
+        thread_per_block_count: Threads per block, from the same.
+        achieved_occupancy_pct: Measured resident warps against warp slots.
+        theoretical_occupancy_pct: Occupancy the launch configuration allows.
+        device: The part the kernel ran on, which sets the block floor.
+
+    Returns:
+        The verdict.
+
+    Raises:
+        ValueError: If either launch extent is not positive. A launch with no
+            blocks or no threads did not happen, and judging one would report a
+            broken profile as a geometry failure.
+    """
+    if block_count <= 0 or thread_per_block_count <= 0:
+        raise ValueError(
+            f"kernel {kernel!r} reports {block_count} blocks of "
+            f"{thread_per_block_count} threads; a launch extent must be positive"
+        )
+    floor = device.block_floor_count
+    exempt = declared in BLOCK_FLOOR_EXEMPT_CLASSES
+    occupancy_passed = achieved_occupancy_pct >= MIN_OCCUPANCY_PCT
+    block_floor_passed = exempt or block_count >= floor
+    geometry = (
+        f"{block_count} blocks x {thread_per_block_count} threads, "
+        f"theoretical occupancy {theoretical_occupancy_pct:.2f}%"
+    )
+    reasons: list[str] = []
+    if not occupancy_passed:
+        reasons.append(
+            f"achieved occupancy {achieved_occupancy_pct:.2f}% is "
+            f"{MIN_OCCUPANCY_PCT - achieved_occupancy_pct:.2f} points under the "
+            f"{MIN_OCCUPANCY_PCT:.1f}% bar"
+        )
+    if not block_floor_passed:
+        reasons.append(
+            f"{block_count} blocks is {floor - block_count} under the "
+            f"{floor}-block floor, twice the {device.sm_count} multiprocessors "
+            f"the part reports"
+        )
+    if reasons:
+        detail = "; ".join(reasons) + f"; at {geometry}"
+    elif exempt and block_count < floor:
+        detail = (
+            f"occupancy clears its bar; the {floor}-block floor is waived by "
+            f"{declared}, at {geometry}"
+        )
+    else:
+        detail = f"occupancy and the block floor both clear, at {geometry}"
+    return GeometryVerdict(
+        kernel=kernel,
+        declared=declared,
+        block_count=block_count,
+        block_floor_count=floor,
+        thread_per_block_count=thread_per_block_count,
+        achieved_occupancy_pct=achieved_occupancy_pct,
+        required_occupancy_pct=MIN_OCCUPANCY_PCT,
+        theoretical_occupancy_pct=theoretical_occupancy_pct,
+        block_floor_exempt=exempt,
+        occupancy_passed=occupancy_passed,
+        block_floor_passed=block_floor_passed,
+        passed=occupancy_passed and block_floor_passed,
+        detail=detail,
     )
