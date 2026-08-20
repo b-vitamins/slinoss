@@ -639,6 +639,11 @@ def test_a_kernel_whose_traffic_stays_inside_l2_gets_no_verdict(
     assert doc["verdicts"] == []
     text = (tmp_path / "prof-tiny-forward.md").read_text()
     assert "## class verdicts" not in text
+    assert "## kernel counters" in text
+    assert (
+        "no dram verdict, per-launch traffic within L2 so the counters describe "
+        f"the cache: {OWNED}" in text
+    )
     # The bandwidth verdict is withheld; the geometry one is not, and the launch it
     # reports is the one the counters carried.
     assert [g["kernel"] for g in doc["geometry"]] == [OWNED]
@@ -676,11 +681,6 @@ def test_a_geometry_violation_fails_a_kernel_that_cleared_its_class_floor(
     text = (tmp_path / "prof-tiny-forward.md").read_text()
     assert f"audit failure: {OWNED}: {one['detail']}" in text
     assert f"audit failure: {OWNED}: {one['detail']}" in capsys.readouterr().out
-    assert "## kernel counters" in text
-    assert (
-        "no dram verdict, per-launch traffic within L2 so the counters describe "
-        f"the cache: {OWNED}" in text
-    )
 
 
 def test_naming_a_kernel_narrows_every_pass_and_drops_the_cross_check(
