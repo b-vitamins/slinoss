@@ -78,8 +78,8 @@ does not follow the trip count, so the two costs of the sum do not trade: at
 ``L 64 P 64 3N 240 G 1`` a call takes 10,615.9 us at depth one, rises to 12,260.9 at
 depth nine as the partials accumulate on top of a spill that has not moved, and falls
 to 8,101.9 at the full depth, where the loop's trip count is one and the spill is gone
-with it. The 1,135.3 MB of local traffic
-a launch and the 51.2 MB a head it divides into are a property of the loop existing.
+with it. The 1,135.3 MB of local traffic a launch and the 51.2 MB a head it divides
+into are a property of the loop existing.
 
 A shard owns a partial and not an output. At depth one the block writes the three
 outputs itself, after the last head, in shared memory throughout. Above one it writes
@@ -116,15 +116,16 @@ The float32 readout gradient of the epilogue aliases those five, none being live
 when it is.
 
 The source-token block is :func:`vblock`, one M tile of the atom where the budget
-allows it and half of one where it does not. Below one M tile all four warps still
-carry rows of every GEMM, because the transposed contractions round their M mode
+allows it and half of one where it does not. Below one M tile every warp still
+carries rows of every GEMM, because the transposed contractions round their M mode
 up to the tile.
 
 The budget bounds ``L``, ``P`` and the fold. It does not bound ``3N``, and this is
 still the widest live set in the tree. ``L 16`` and ``L 32`` fit at every ``P``,
 every fold and every ``3N``.
-``L 64`` fits to ``P 64`` at every fold, in 91,344 B at fold one and 93,392 B above
-it, whether ``3N`` is 48 or 240. ``L 64`` at ``P 128`` and ``L 128`` at every ``P``
+``L 64`` fits to ``P 64`` at every fold, in 91,600 B at fold one and 93,648 B above
+it at the shipped width and 256 B less at one warp group, whether ``3N`` is 48 or
+240. ``L 64`` at ``P 128`` and ``L 128`` at every ``P``
 are refused: the smallest live set at ``L 128`` is 120,528 B, above the capacity of
 every device the DSL reports. :func:`slinoss._cute.assert_smem_fits` refuses the
 rest rather than any path here degrading.
@@ -186,21 +187,26 @@ same process, ``c`` about 4.3 us and ``B`` about 685 GB/s at a worst residual of
 duration is stamped with the compute-apps query taken before and after it; where
 that query named another process the duration is a bound, not a rate.
 
-At the default configuration -- 11,520 blocks of 128 threads, five lane tiles, the
+At the default configuration -- 11,520 blocks of 256 threads, five lane tiles, the
 fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
-517.82 MB of DRAM per launch in 5,221.0 us, 14.6% of the floor of those bytes.
-:func:`vector_reduce` closes the head sum in 221.6 us at 152.85 MB, 689.5 GB/s and
-102.8% of its own floor; the two lane-slot reductions add 43.3 and 23.2 us at 107.0%
-and 109.5%. The operator is 5,517.3 us a call, event-timed, and the main kernel is
-94.6% of it. Three of the four launches are at their bandwidth; the main kernel is
+515.74 MB of DRAM per launch in 3,274.1 us, 23.2% of the floor of those bytes, median
+of three runs whose spread is 0.13%.
+:func:`vector_reduce` closes the head sum in 221.5 us at 152.77 MB, 689.8 GB/s and
+102.7% of its own floor; the two lane-slot reductions add 43.4 and 23.5 us at 106.2%
+and 108.3%. The operator is 3,559.4 us a call, event-timed, and the main kernel is
+92.0% of it. Three of the four launches are at their bandwidth; the main kernel is
 the one that misses the 85% the class asks.
 
-That percentage is not a traffic problem. 91,344 B admits one 128-thread block per
-multiprocessor: 8.3% theoretical occupancy, 8.3% achieved, one warp per scheduler and
-nothing to cover an instruction fetch or a barrier. ``no_instruction`` is 32.3% of the
-warp cycles, issue-active 18.68%, memory speed-of-light 44.9%, tensor 5.6%. Shared
-conflicts are 0.1612 per wavefront, load and store together, and the padding rule is
-held centrally. Local traffic is zero at every one of the three launches.
+That percentage is not a traffic problem, and at the shipped width it is not
+instruction supply either. 91,600 B and 242 registers a thread each admit one
+256-thread block per multiprocessor, ``launch__occupancy_limit_shared_mem`` and
+``launch__occupancy_limit_registers`` both reading 1: 16.7% theoretical occupancy,
+16.6% achieved, two warps a scheduler. ``mio_throttle`` leads the stalls at 35.0% of
+the warp cycles, issue-active is 29.2%, l1tex speed-of-light 76.3% and memory 75.6%
+against 21.6% of peak DRAM throughput, tensor 8.7%. The LSU shared pipe runs at
+44.59% of peak over 150.4 M load and store wavefronts and 34.7 M more from
+``ldmatrix``, at 0.1511 conflicts a wavefront, and the padding rule is held
+centrally. Local traffic is zero at every one of the three launches.
 
 Where the bytes are, measured rather than counted. The launch's DRAM splits 347.69 MB
 read and 319.73 MB write with float32 vector partials, against a write side the
@@ -214,19 +220,30 @@ group's two vectors is a device-traffic item, and only the head-sum partials and
 two float32 state buffers are.
 
 Narrowing the two vector partials from float32 to the activation width is what the
-measured split says to do, and it pays twice what its bytes are worth. Same device,
-same session, three runs each, the narrowed runs under strictly more foreign
-compute-apps contention than the float32 ones: the main launch goes from 668.40 MB and
-7,601.9 us to 515.36 MB and 5,202.4 us, 22.9% of the traffic for 31.6% of the time,
-and the closure from 294.82 MB and 433.2 us to 153.05 MB and 323.6 us. The call falls
-7,575.6 us to 5,584.9 us and the workspace 285.33 MB to 143.77 MB. The time is not the
-bytes: ``no_instruction`` falls 54.3% to 32.3%, issue-active rises 12.13% to 18.68%,
-and every speed-of-light rises with it, memory 30.6% to 44.9%. At 14.6% of its own
-floor the launch was never paying for those bytes at the bus; the store width was
-gating the front end. The mechanism is not established here. What is established is
-that the counter that moved is an issue counter, so a traffic argument does not
-predict this launch's time in either direction, and the remaining 283.12 MB of
-float32 ``dinc`` and ``zstart`` cannot be priced from its bytes either.
+measured split says to do, and what it pays depends on the width it is measured at.
+At four warps, three runs each on one device in one session with the narrowed runs
+under strictly more foreign compute-apps contention, the main launch goes from
+668.40 MB and 7,601.9 us to 515.36 MB and 5,202.4 us, 22.9% of the traffic for 31.6%
+of the time, and the closure from 294.82 MB and 433.2 us to 153.05 MB and 323.6 us.
+The call falls 7,575.6 us to 5,584.9 us and the workspace 285.33 MB to 143.77 MB. The
+time is not the bytes: ``no_instruction`` falls 54.3% to 32.3%, issue-active rises
+12.13% to 18.68%, and every speed-of-light rises with it, memory 30.6% to 44.9%. At
+14.6% of its own floor the launch was never paying for those bytes at the bus; the
+store width was gating the front end.
+
+At eight warps the same 141.56 MB comes off the main launch for 1% of its time,
+3,306.7 us and 656.85 MB against 3,274.1 and 515.74, which is inside the spread of
+three runs, and the call falls 3,811.3 us to 3,559.4 entirely inside the closure. The
+front end it was gating is no longer the constraint at that width, so the bytes are
+worth their bytes and no more. The mechanism of the four-warp figure is not
+established here. What is established is that the counter that moved there is an
+issue counter, so a traffic argument does not predict this launch's time in either
+direction, and the remaining 283.12 MB of float32 ``dinc`` and ``zstart`` cannot be
+priced from its bytes either. Narrowing those two would be DRAM-only whatever it
+paid: :func:`slinoss.ops.so3ssd.cute.table.stage_state` and
+:func:`slinoss.ops.so3ssd.cute.table.stage_matrix` narrow both to the operand width
+on the way into the one state tile, so their global width reaches no shared byte and
+no operand.
 
 The closure paid for it in class until it took the request back. ``vector_reduce`` read
 float32 at 680.5 GB/s and 100.4% of floor; one narrowed element a thread makes a warp's
@@ -261,8 +278,8 @@ extent, with the fold folded in the block::
 The three fold-one rows carry a float32 vector partial, so their DRAM column is
 141.56 MB high for the shipped width; the local column, which is what the table is
 for, does not depend on it. At fold one there is no local traffic at any ``L``, at 255
-registers, with the lane tile in the grid and the ``L`` extents at their largest. At fold 18 there is, and it
-grows with ``L``. The register count is at the cap either way, so the cap is not the
+registers, with the lane tile in the grid and the ``L`` extents at their largest. At
+fold 18 there is, and it grows with ``L``. The register count is at the cap either way, so the cap is not the
 signal; what crosses a rolled fold iteration is. Unrolling the fold at trace time
 does not fix it and makes it worse, 1,290.4 MB, because the live ranges of eighteen
 inlined bodies overlap. Only taking the fold out of the block removes it, and it does:
@@ -277,31 +294,45 @@ block drops the summed accumulator that exists only above fold one, but the spac
 alias and only 2,048 B of the 93,392 come back, so it does not reach it either. What
 it does reach is zero spill, worth 34.0% of the call. Beyond that, occupancy is worth
 what the one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident
-blocks,
-16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5% at
-``P 64`` where the same ``L`` holds one block.
+blocks, 16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5%
+at ``P 64`` where the same ``L`` holds one block.
 
 The other lever is the block width, and it is a parameter: ``warps`` selects the atom
 tiling and the thread count together, and eight is the default. The M mode of the tiling
 is pinned and the extra warps go to ``N`` at atom granularity, so the tile, the pitches
 and the staging passes are the width's invariants. Measured at both widths on the shape
-above, medians of three runs::
+above, medians of three runs, at both vector-partial widths::
 
-    warps  us/launch  MB/launch  GB/s  of 85%  regs  arena   occ theo/ach
-        4    7,029.2     667.01  95.0   13.9%   255  91,344   8.3% / 8.3%
-        8    3,306.7     656.85 198.6   29.2%   242  91,600  16.7% / 16.6%
+    warps  partial  us/launch  MB/launch  GB/s  of 85%  regs  arena   occ theo/ach
+        4      f32    7,029.2     667.01  95.0   13.9%   255  91,344   8.3% / 8.3%
+        8      f32    3,306.7     656.85 198.6   29.2%   242  91,600  16.7% / 16.6%
+        4     bf16    5,221.0     517.82  99.2   14.6%   255  91,344   8.3% / 8.3%
+        8     bf16    3,274.1     515.74 157.5   23.2%   242  91,600  16.7% / 16.6%
 
 Registers fall to 242, so 256 threads hold 61,952 of the 65,536 a multiprocessor has
-and the second warp per scheduler is available. ``no_instruction`` goes 52.8% to 1.0%
-and issue-active 12.5% to 28.8%: instruction supply was the whole of that gap. What
-takes its place is the shared-memory pipe, ``mio_throttle`` 34.7%, l1tex
-speed-of-light 75.5%, LSU shared wavefronts 44.1% of peak against 18.6%, with DRAM at
-27.2%, so the bar is still not the traffic. Local traffic stays zero, conflicts
-0.1511 per wavefront against 0.1612, instructions issued rise 1.1% for the readout
-term's reread, and the arena grows by the ``4 * L`` bytes a warp group past the first
-that :func:`offset_tile` takes -- one resident block at either width. Sixteen warps is
-refused by the register file before any tiling question: 512 threads admit 128
-registers a thread.
+and the second warp per scheduler is available. Across the float32 pair,
+``no_instruction`` goes 52.8% to 1.0% and issue-active 12.5% to 28.8%: instruction
+supply was the whole of that gap. What takes its place is the shared-memory pipe, and
+the shipped width's counters for it are in the measured record above. Local traffic
+stays zero at either width, conflicts 0.1511 per wavefront against 0.1612,
+instructions issued rise 1.1% for the readout term's reread, and the arena grows by
+the ``4 * L`` bytes a warp group past the first that :func:`offset_tile` takes -- one
+resident block at either width. Sixteen warps is refused by the register file before
+any tiling question: 512 threads admit 128 registers a thread.
+
+The same arithmetic refuses a second resident block at eight, and it is the register
+file that refuses it rather than the arena. Two 256-thread blocks need 128 registers a
+thread and 50,688 B of the 101,376 B carveout; three, which is what a 50% occupancy
+bar asks for, need 85 and 33,792 B. At 242 registers ``launch__occupancy_limit_registers``
+is 1 block, so no arena reaches a second block. Nor could the arena reach 50,688 B by
+aliasing: the source-token loop holds every tile live at once except ``sdrot``,
+``sdquat`` and ``sdls``, which are written and read inside the closing chart, so
+lifetime aliasing has 2,304 B in it and its floor is 89,296 B against a 40,912 B gap.
+The forcing sum outlives the head, the score and the tap gradient already share one
+region, and ``dy``, the increment cotangent, the raw and rotated forcing tiles and
+``U`` are each read by a GEMM of every tap. Halving the source-token block buys
+11,264 B of that gap at a second pass over ``U``, and the tile cannot narrow below 48
+columns. Occupancy at this width is a register problem.
 
 The width also reaches a spill the depth cannot. At ``B 4 H 12 T 2048 L 64 P 48 3N 48
 G 12`` the fold is already one, and four warps still move 0.79 MB each of local load
@@ -621,6 +652,10 @@ class Arena(NamedTuple):
     ``summed`` spans no words at ``fold == 1``, where the readout gradient goes
     straight to global and nothing reads the tile; its offset then aliases
     ``out``.
+
+    No further pair is disjoint. Every region below except ``readout`` is live across
+    the source-token loop, so the arena's extent is that loop's live set, and the
+    module docstring carries what the remaining 2,304 B of the resident set would buy.
 
     Attributes:
         forcing: The float32 forcing gradient, summed over taps, blocks and the
