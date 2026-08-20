@@ -96,6 +96,21 @@ logits = model(ids)
 `vocab_size=None` drops the embedding and the head, and the stack then takes and
 returns `(B,T,d_model)` activations.
 
+Decode threads a `StackState`, which holds four carries per layer: the scan state,
+the convolution window, and the previous token's `B` and `U`, which the two-tap
+forcing needs. Every buffer is written in place, so a captured graph keeps its
+addresses. Prefill and a single token are the same call at two sequence lengths.
+
+```python
+from slinoss import StackState
+
+state = StackState.allocate(cfg, 4, device="cuda", dtype=torch.bfloat16)
+logits = model(ids[:, :-1], state)   # prefill
+logits = model(ids[:, -1:], state)   # one token
+```
+
+Cast the module to the state's dtype rather than decoding under autocast.
+
 The operator is callable directly. `so3ssm` is the sequential reference and is
 float64-capable; `so3ssd` is the chunked, autograd-complete, CUDA-accelerated
 path.

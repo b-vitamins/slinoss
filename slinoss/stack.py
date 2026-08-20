@@ -17,6 +17,10 @@ wide.
 ``vocab_size`` decides both ends together. With it the stack takes token ids and
 returns logits; without it the stack takes and returns activations, and embeds
 into a larger model that owns those two layers.
+
+A :class:`slinoss.StackState` threads decode through the same loop: each block
+continues its own layer and advances it in place, so a prefill and a single-token
+step are one call at two sequence lengths.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.blocks import BlockOutput, SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.block import rmsnorm_residual
+from slinoss.state import MixerState, StackState
 
 __all__ = ["SLinOSSStack"]
 
@@ -122,12 +127,17 @@ class SLinOSSStack(nn.Module):
             self.norm_weight.data = self.norm_weight.data.to(torch.float32)
         return self
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Run every block over one sequence.
+    def forward(self, x: Tensor, state: StackState | None = None) -> Tensor:
+        """Run every block over one sequence, or continue one from ``state``.
+
+        With a state each block continues its own layer and advances it in place, so
+        prefill and decode are this method at two sequence lengths.
 
         Args:
             x: ``(B,T)`` integer token ids when ``vocab_size`` is set, otherwise
                 ``(B,T,d_model)`` activations in bf16/fp16/fp32.
+            state: Decode state for the whole stack, or None to run whole
+                sequences.
 
         Returns:
             ``(B,T,vocab_size)`` logits when ``vocab_size`` is set, otherwise
@@ -135,30 +145,45 @@ class SLinOSSStack(nn.Module):
             produces.
 
         Raises:
-            ValueError: On a rank the configured input form does not admit, or
-                from a consumer's guard on a device, shape, or layout its operand
-                rule refuses.
+            ValueError: On a rank the configured input form does not admit, on a
+                state whose depth is not this stack's, or from a consumer's guard
+                on a device, shape, or layout its operand rule refuses.
             TypeError: From a consumer's guard, on an unsupported dtype.
         """
-        if self.embedding is not None:
-            if x.ndim != 2:
-                raise ValueError(f"expected (B,T) token ids, got {tuple(x.shape)}")
-            hidden = self.embedding(x)
-        else:
-            if x.ndim != 3 or x.shape[-1] != self.config.d_model:
-                raise ValueError(
-                    f"expected (B,T,{self.config.d_model}), got {tuple(x.shape)}"
+        layers: tuple[MixerState | None, ...] = (
+            (None,) * len(self.blocks) if state is None else state.layers
+        )
+        if len(layers) != len(self.blocks):
+            raise ValueError(
+                f"state has depth {len(layers)} and the stack has "
+                f"{len(self.blocks)} layers"
+            )
+
+        # The embedding, the final norm and the head are outside every block, so the
+        # block's own grad gate does not cover them. See SLinOSSBlock.forward.
+        with torch.set_grad_enabled(state is None and torch.is_grad_enabled()):
+            if self.embedding is not None:
+                if x.ndim != 2:
+                    raise ValueError(f"expected (B,T) token ids, got {tuple(x.shape)}")
+                hidden = self.embedding(x)
+            else:
+                if x.ndim != 3 or x.shape[-1] != self.config.d_model:
+                    raise ValueError(
+                        f"expected (B,T,{self.config.d_model}), got {tuple(x.shape)}"
+                    )
+                hidden = x
+
+            residual: Tensor | None = None
+            for module, layer in zip(self.blocks, layers, strict=True):
+                out = cast(
+                    "BlockOutput",
+                    cast("SLinOSSBlock", module)(hidden, residual, layer),
                 )
-            hidden = x
+                hidden, residual = out.hidden, out.residual
 
-        residual: Tensor | None = None
-        for module in self.blocks:
-            out = cast("BlockOutput", cast("SLinOSSBlock", module)(hidden, residual))
-            hidden, residual = out.hidden, out.residual
-
-        normed = rmsnorm_residual(
-            hidden, residual, self.norm_weight, eps=self.config.norm_eps
-        ).normed
-        if self.head is None:
-            return normed
-        return cast("Tensor", self.head(normed))
+            normed = rmsnorm_residual(
+                hidden, residual, self.norm_weight, eps=self.config.norm_eps
+            ).normed
+            if self.head is None:
+                return normed
+            return cast("Tensor", self.head(normed))

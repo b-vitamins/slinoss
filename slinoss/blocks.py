@@ -35,6 +35,7 @@ from slinoss._precision import LOW_PRECISION_DTYPES
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import SLinOSSMixer
 from slinoss.ops.block import rmsnorm_residual, swiglu
+from slinoss.state import MixerState
 
 __all__ = ["BlockOutput", "SLinOSSBlock"]
 
@@ -136,13 +137,23 @@ class SLinOSSBlock(nn.Module):
                 weight.data = weight.data.to(torch.float32)
         return self
 
-    def forward(self, x: Tensor, residual: Tensor | None = None) -> BlockOutput:
-        """Run both branches over one sequence.
+    def forward(
+        self,
+        x: Tensor,
+        residual: Tensor | None = None,
+        state: MixerState | None = None,
+    ) -> BlockOutput:
+        """Run both branches over one sequence, or continue one from ``state``.
+
+        The composition is stated once for both paths. Only the mixer call differs:
+        with a state it is :meth:`slinoss.SLinOSSMixer.step`, which advances the
+        state in place.
 
         Args:
             x: ``(B,T,d_model)`` branch input, bf16/fp16/fp32.
             residual: ``(B,T,d_model)`` incoming stream, or None for the first
                 block of a stack. Float32 when it comes from another block.
+            state: This layer's decode state, or None to mix a whole sequence.
 
         Returns:
             A :class:`BlockOutput`.
@@ -152,11 +163,19 @@ class SLinOSSBlock(nn.Module):
                 its operand rule refuses.
             TypeError: From a consumer's guard, on an unsupported dtype.
         """
-        eps = self.config.norm_eps
-        pre = rmsnorm_residual(x, residual, self.mixer_norm_weight, eps=eps)
-        mixed = self.mixer(pre.normed)
-        post = rmsnorm_residual(mixed, pre.residual, self.ffn_norm_weight, eps=eps)
-        gated = swiglu(self.ffn_gate(post.normed), self.ffn_up(post.normed))
-        return BlockOutput(
-            hidden=cast("Tensor", self.ffn_out(gated)), residual=post.residual
-        )
+        # Decode takes no gradient. The mixer's step records nothing whatever the
+        # caller's grad mode, so a block that recorded the norms and the FFN around
+        # it would grow a graph per token that reaches no mixer parameter.
+        with torch.set_grad_enabled(state is None and torch.is_grad_enabled()):
+            eps = self.config.norm_eps
+            pre = rmsnorm_residual(x, residual, self.mixer_norm_weight, eps=eps)
+            mixed = (
+                self.mixer(pre.normed)
+                if state is None
+                else self.mixer.step(pre.normed, state)
+            )
+            post = rmsnorm_residual(mixed, pre.residual, self.ffn_norm_weight, eps=eps)
+            gated = swiglu(self.ffn_gate(post.normed), self.ffn_up(post.normed))
+            return BlockOutput(
+                hidden=cast("Tensor", self.ffn_out(gated)), residual=post.residual
+            )

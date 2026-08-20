@@ -30,6 +30,7 @@ from slinoss.ops.mixer import backends as tail_dispatch
 from slinoss.ops.scanprep import LS_COLUMN, PARAM_COLS, ROTVEC_COLUMNS, TAP_COLUMNS
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
+from slinoss.state import MixerState
 
 __all__ = [
     "DECAY_TAU_RANGE",
@@ -603,8 +604,10 @@ class SLinOSSMixer(nn.Module):
     :func:`slinoss._guard.check_pitched` holds a band to a device rule, so a CPU
     call raises from the first consumer that checks one.
 
-    No state argument: this module mixes a whole sequence, and no ``z0`` is
-    threaded.
+    :meth:`forward` mixes a whole sequence and threads no state. :meth:`step`
+    continues one: same composition, same backends, with the four carries
+    :class:`slinoss.state.MixerState` holds read at the front and written at the
+    back. It takes no gradient.
 
     Initialization is principled where the scale sets the recurrence and the
     framework default elsewhere. ``param_bias`` is inverted through both bounded
@@ -746,3 +749,88 @@ class SLinOSSMixer(nn.Module):
                 self.config,
             ),
         )
+
+    @torch.no_grad()
+    def step(self, x: Tensor, state: MixerState) -> Tensor:
+        """Mix ``T`` tokens continuing from ``state``, and advance ``state`` in place.
+
+        ``T = 1`` is a decode step and ``T > 1`` is a prefill. Both run the
+        composition :meth:`forward` runs, on the same backends, with the four carries
+        read at the front and written at the back, so stepping a sequence in any
+        partition from a zeroed state reproduces the whole-sequence result.
+
+        Not an autograd node. The backends are called directly, so no graph is
+        recorded whatever the caller's grad mode, and the four writes are in place:
+        a captured graph holds those addresses, and a rebound buffer leaves replay
+        writing memory no consumer reads.
+
+        Cast the module rather than run under autocast. Autocast makes the
+        projection's dtype the autocast dtype while the state keeps the parameter
+        dtype, and casting the state per step would allocate the buffers a graph is
+        supposed to own. The guard below reports that pair rather than the shape
+        error a narrowed carry would raise two operators later.
+
+        Args:
+            x: ``(B,T,d_model)``, in the state's activation dtype.
+            state: This layer's decode state, advanced by ``T`` tokens.
+
+        Returns:
+            ``(B,T,d_model)``, in the dtype the projections produce.
+
+        Raises:
+            ValueError: On a rank, width, batch, or dtype disagreement with
+                ``state``, or from a consumer's guard.
+            TypeError: From a consumer's guard, on an unsupported dtype.
+        """
+        cfg, layout = self.config, self.layout
+        if x.ndim != 3 or x.shape[2] != cfg.d_model:
+            raise ValueError(f"expected (B,T,{cfg.d_model}), got {tuple(x.shape)}")
+        if x.shape[0] != state.batch:
+            raise ValueError(
+                f"x holds batch {int(x.shape[0])} and state holds {state.batch}"
+            )
+        proj = linear(x, self.in_proj.weight, self.in_proj.bias)
+        if proj.dtype is not state.conv.dtype:
+            raise ValueError(
+                f"the projection is {proj.dtype} and the state is "
+                f"{state.conv.dtype}; cast the module, not the state"
+            )
+        picks = _resolve(proj)
+        conv = conv_dispatch.get(picks.conv).forward(
+            layout.value(proj),
+            _cast(self.conv_weight, proj.dtype),
+            _cast_opt(self.conv_bias, proj.dtype),
+            activation=True,
+            initial_state=state.conv,
+            d_head=cfg.d_head,
+        )
+        params = prep_dispatch.get(picks.prep).forward(
+            layout.params(proj), self.param_bias, heads=cfg.n_heads, w_max=cfg.w_max
+        )
+        scan = scan_dispatch.get(picks.scan).forward(
+            conv.y,
+            params.trans,
+            params.K,
+            layout.b(proj),
+            layout.c(proj),
+            cfg.chunk_size,
+            z0=state.ssm,
+            b_prev=state.b_prev,
+            u_prev=state.u_prev,
+        )
+        tail = tail_dispatch.get(picks.tail).forward(
+            scan.y,
+            conv.y,
+            layout.gate(proj),
+            self.d_skip,
+            self.norm_weight,
+            eps=cfg.norm_eps,
+        )
+        out = linear(tail, self.out_proj.weight, self.out_proj.bias)
+        # After every read: the scan starts from state.ssm itself, and the
+        # convolution's incoming window is state.conv.
+        state.conv.copy_(conv.state)
+        state.ssm.copy_(scan.state)
+        state.b_prev.copy_(scan.b_last)
+        state.u_prev.copy_(scan.u_last)
+        return out

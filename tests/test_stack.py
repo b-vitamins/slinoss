@@ -8,8 +8,13 @@ The parity half needs float64 and a device, and float64 has no kernel path, so i
 judges the composition against the reference backend. Whether the kernel norm
 matches that backend is a different question with its own file. The dtype halves do
 need a kernel, since the point of them is what a module-wide cast and autocast do
-to a norm weight and to the residual stream. The two guards are host arithmetic
-over ranks.
+to a norm weight and to the residual stream. The guards are host arithmetic over
+ranks, shapes and dtypes.
+
+The decode half is judged against this file's own whole-sequence call rather than
+against a second reference: what a split can get wrong is which of the four carries
+it threads, and the whole-sequence call is already ground truth for the composition
+by the time it is used that way.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from torch.nn.functional import cross_entropy, silu
 from slinoss.blocks import SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.stack import SLinOSSStack
+from slinoss.state import MixerState, StackState
 from tests.conftest import assert_max_rel
 
 STACK_CONFIG = SLinOSSConfig(
@@ -47,6 +53,15 @@ VOCAB = 17
 
 BATCH = 2
 SEQLEN = 40
+
+DECODE_TOL = 1e-14
+"""Bound on a split decode against one whole-sequence call, at float64.
+
+Measured: 3.3e-15 stepwise, 2.7e-15 chunked, 2.0e-15 prefill. Not bitwise, unlike
+the parity bound: a split restarts the scan's chunk prefixes at every boundary, so
+the two runs reduce the same recurrence in a different order. Stepwise is the worst
+of the three because it restarts the most often.
+"""
 
 PARITY_TOL = 1e-15
 """Bound on the stack against the pre-norm residual composition, at float64.
@@ -216,6 +231,109 @@ def test_norm_weights_stay_float32_through_a_module_cast() -> None:
     # A widening cast is left alone, so a float64 oracle stays float64 end to end.
     wide = SLinOSSStack(STACK_CONFIG).to(torch.float64)
     assert wide.norm_weight.dtype is torch.float64
+
+
+DECODE_SPLITS = [
+    pytest.param("stepwise", (1,) * SEQLEN, id="stepwise"),
+    pytest.param("chunked", (17, 23), id="chunked"),
+    pytest.param("prefill", (17, *(1,) * (SEQLEN - 17)), id="prefill"),
+]
+"""How the sequence is partitioned across calls. Every length sums to ``SEQLEN``.
+
+Three calling shapes, not three input values: single-token calls throughout, two
+multi-token calls, and the decode pattern of one multi-token call then single ones.
+``17`` against ``chunk_size = 16`` puts every boundary inside a chunk, so a
+continuation that only holds on chunk boundaries fails here.
+"""
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(("label", "splits"), DECODE_SPLITS)
+def test_a_split_decode_reproduces_the_whole_sequence(
+    cuda: torch.device, label: str, splits: tuple[int, ...]
+) -> None:
+    """A partitioned run against one whole-sequence call, at float64.
+
+    Four carries, and a decode that drops any of them still returns finite logits of
+    the right shape: without ``ssm`` the recurrence restarts at every boundary,
+    without ``b_prev`` and ``u_prev`` each continuation loses one token of the
+    two-tap forcing, and without ``conv`` it loses the tap window.
+    """
+    cfg = replace(STACK_CONFIG, vocab_size=VOCAB)
+    # Seeded: the parameters come from the global generator, and the bound below is
+    # the error of one draw. Unseeded, the splits would not be comparable either.
+    torch.manual_seed(0)
+    stack = SLinOSSStack(cfg, device=cuda).to(torch.float64)
+    ids = _tokens(VOCAB, cuda)
+    whole = stack(ids)
+
+    state = StackState.allocate(cfg, BATCH, device=cuda, dtype=torch.float64)
+    parts: list[Tensor] = []
+    offset = 0
+    for length in splits:
+        parts.append(stack(ids[:, offset : offset + length], state))
+        offset += length
+    assert offset == SEQLEN
+    assert_max_rel(torch.cat(parts, dim=1), whole, DECODE_TOL, f"decode {label}")
+
+
+@pytest.mark.cuda
+@pytest.mark.cute
+def test_a_step_advances_the_state_in_place_and_records_no_graph(
+    cuda: torch.device,
+) -> None:
+    """One bf16 step, at the kernel backends, through the buffers it was handed.
+
+    Two properties and one dtype, all of which a parity test at float64 misses. A
+    rebound buffer leaves a captured graph writing memory no consumer reads, and
+    that replays as a state frozen at its first token. A recorded graph is a leak
+    per step whose gradient reaches no mixer parameter, since the mixer's step
+    records nothing either way. And ``T = 1`` is the shape the chunked kernels are
+    least likely to admit: one partial chunk, no full one.
+    """
+    cfg = replace(STACK_CONFIG, vocab_size=VOCAB)
+    stack = SLinOSSStack(cfg, device=cuda).to(torch.bfloat16)
+    state = StackState.allocate(cfg, BATCH, device=cuda, dtype=torch.bfloat16)
+    layer = state.layers[0]
+    buffers = {
+        "conv": layer.conv,
+        "ssm": layer.ssm,
+        "b_prev": layer.b_prev,
+        "u_prev": layer.u_prev,
+    }
+    before = {name: buf.data_ptr() for name, buf in buffers.items()}
+
+    logits = stack(_tokens(VOCAB, cuda)[:, :1], state)
+
+    assert logits.shape == (BATCH, 1, VOCAB)
+    assert logits.dtype is torch.bfloat16
+    assert not logits.requires_grad
+    for name, buf in buffers.items():
+        assert buf.data_ptr() == before[name], name
+        assert bool(buf.isfinite().all()), name
+    assert bool(layer.ssm.any()), "the recurrent state was not written"
+
+
+def test_a_state_the_stack_cannot_use_is_named_where_it_enters() -> None:
+    """Depth, batch, and dtype, each reported before an operator sees it.
+
+    Unnamed, a short state runs the layers it has against the parameters of the
+    layers it does not, a mismatched batch surfaces as the convolution's window
+    shape, and a mismatched dtype surfaces two operators later as whichever operand
+    the kernel checked first.
+    """
+    cfg = replace(STACK_CONFIG, vocab_size=VOCAB)
+    stack = SLinOSSStack(cfg)
+    ids = torch.zeros(BATCH, 1, dtype=torch.long)
+    one = MixerState.allocate(cfg, BATCH, device="cpu", dtype=torch.float32)
+    with pytest.raises(ValueError, match="state has depth 1"):
+        stack(ids, StackState(layers=(one,)))
+    off_batch = StackState.allocate(cfg, BATCH + 1, device="cpu", dtype=torch.float32)
+    with pytest.raises(ValueError, match=f"state holds {BATCH + 1}"):
+        stack(ids, off_batch)
+    wide = StackState.allocate(cfg, BATCH, device="cpu", dtype=torch.float64)
+    with pytest.raises(ValueError, match="cast the module"):
+        stack(ids, wide)
 
 
 def test_the_input_form_follows_vocab_size() -> None:

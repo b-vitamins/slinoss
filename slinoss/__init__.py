@@ -4,14 +4,17 @@ from slinoss.blocks import BlockOutput, SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import SLinOSSMixer
 from slinoss.stack import SLinOSSStack
+from slinoss.state import MixerState, StackState
 
 __version__ = "0.1.0"
 
 __all__ = [
     "BlockOutput",
+    "MixerState",
     "SLinOSSBlock",
     "SLinOSSConfig",
     "SLinOSSMixer",
     "SLinOSSStack",
+    "StackState",
     "__version__",
 ]
