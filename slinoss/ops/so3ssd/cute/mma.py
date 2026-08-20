@@ -56,6 +56,7 @@ __all__ = [
     "mma_coords",
     "mma_gemm",
     "mma_gemm_areg",
+    "mma_offsets",
     "mma_rows",
     "mma_store",
     "operand_tile",
@@ -269,6 +270,30 @@ def mma_coords(
         Partitioned identity tensor, indexable in lockstep with the accumulator.
     """
     return tiled_mma.get_slice(tid).partition_C(cute.make_identity_tensor(shape_mn))
+
+
+def mma_offsets(
+    tiled_mma: cute.TiledMma, shape_mn: cutlass.Constexpr
+) -> tuple[tuple[int, int], ...]:
+    """Trace-time ``(m,n)`` offset of every accumulator element in the fragment.
+
+    A thread's coordinate is its own base plus these offsets, and the base is one
+    value for the whole fragment, so a residue of an offset is a trace-time constant
+    where a residue of the coordinate is not. An epilogue whose destination index is
+    a residue of the column uses this to keep that index static.
+
+    Not a ``@cute.jit`` function: it is layout algebra on thread zero's slice, whose
+    base is the origin, and it emits nothing.
+
+    Args:
+        tiled_mma: From :func:`make_mma`.
+        shape_mn: The same ``(M,N)`` passed to :func:`mma_acc`.
+
+    Returns:
+        One ``(m,n)`` pair of Python ints per element, in fragment order.
+    """
+    origin = tiled_mma.get_slice(0).partition_C(cute.make_identity_tensor(shape_mn))
+    return tuple((origin[i][0], origin[i][1]) for i in range(cute.size(origin.layout)))
 
 
 @cute.jit
