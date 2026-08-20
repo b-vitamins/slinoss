@@ -5,13 +5,15 @@ so the benchmarked path is the shipped path: :func:`slinoss.ops.so3ssd.so3ssd` a
 :func:`slinoss.ops.conv.causal_conv1d`, with no variant reachable from a script
 and not from the public API.
 
-Five shape vocabularies, because the five operators have five. The scan is indexed
+Six shape vocabularies, because the six operators have six. The scan is indexed
 by ``(B,H,T,P,N,L)``, the causal conv1d by ``(B,T,D,W)``, the parameter frontier by
-``(B,T,H,3N,G)``, the block by ``(B,T,d_model,d_ffn)`` and the fused tail by the
-scan shape plus the width of the projection its gate is a band of. One name denotes
-one layer measured in five places: the conv's ``D`` is the scan's ``H*P``, and the
-frontier, the block and the tail hold the scan shape itself and read their widths
-off the :class:`slinoss.config.SLinOSSConfig` it implies, so none can drift from it.
+``(B,T,H,3N,G)``, the block by ``(B,T,d_model,d_ffn)``, the fused tail by the
+scan shape plus the width of the projection its gate is a band of, and the loss by
+the token count and the vocabulary. One name denotes one layer measured in six
+places: the conv's ``D`` is the scan's ``H*P``, and the frontier, the block, the tail
+and the loss hold the scan shape itself and read their widths off the
+:class:`slinoss.config.SLinOSSConfig` it implies or off ``B*T``, so none can drift
+from it.
 
 ``trans`` and ``K`` are produced by the real parameter maps and then detached, so
 the numerical invariants hold on the benchmarked tensors -- ``ls <= 0`` and
@@ -46,6 +48,7 @@ from slinoss.ops.mixer import mixer_tail
 from slinoss.ops.scanprep import scanprep
 from slinoss.ops.scanprep.reference import PARAM_COLS, pack_params, scanprep_ref
 from slinoss.ops.so3ssd import so3ssd
+from slinoss.ops.xent import cross_entropy
 from slinoss.perf.timing import region
 from slinoss.perf.units import Count
 
@@ -63,6 +66,9 @@ __all__ = [
     "SHAPE_NAMES",
     "SO3SSD",
     "W_MAX",
+    "XENT",
+    "XENT_CLASSES",
+    "XENT_SHAPES",
     "BlockInputs",
     "BlockShape",
     "ConvInputs",
@@ -73,6 +79,8 @@ __all__ = [
     "OpShape",
     "PrepInputs",
     "PrepShape",
+    "XentInputs",
+    "XentShape",
     "block_forward_only",
     "block_shape_by_name",
     "block_step",
@@ -86,6 +94,7 @@ __all__ = [
     "make_inputs",
     "make_mixer_inputs",
     "make_prep_inputs",
+    "make_xent_inputs",
     "mixer_forward_only",
     "mixer_shape_by_name",
     "mixer_step",
@@ -94,6 +103,9 @@ __all__ = [
     "prep_step",
     "shape_by_name",
     "step",
+    "xent_forward_only",
+    "xent_shape_by_name",
+    "xent_step",
 ]
 
 W_MAX: Final = 3.0
@@ -104,7 +116,8 @@ CONV: Final = "conv"
 SCANPREP: Final = "scanprep"
 BLOCK: Final = "block"
 MIXER: Final = "mixer"
-OPS: Final[tuple[str, ...]] = (SO3SSD, CONV, SCANPREP, BLOCK, MIXER)
+XENT: Final = "xent"
+OPS: Final[tuple[str, ...]] = (SO3SSD, CONV, SCANPREP, BLOCK, MIXER, XENT)
 """Benchmarkable operators. The whole registry every driver dispatches on.
 
 Appended to, never reordered: the first entry is every driver's default, so moving
@@ -1418,5 +1431,231 @@ def mixer_step(
             )
         with region(f"{prefix}.backward"):
             torch.autograd.grad(out, targets, inputs.dout)
+
+    return run
+
+
+XENT_CLASSES: Final = 50257
+"""Vocabulary every loss benchmark scores against. GPT-2's.
+
+Odd, and that is the reason for it: the operand width is the padded width, so a
+vocabulary that divides the alignment would leave the pad columns the backward
+writes zero over unexercised."""
+
+
+@dataclass(frozen=True)
+class XentShape:
+    """One benchmarked loss size.
+
+    Attributes:
+        scan: The layer whose tokens this loss scores. The row count is its ``B*T``,
+            so a loss figure and a scan figure at one name were taken over the same
+            token count.
+    """
+
+    scan: OpShape
+
+    @property
+    def name(self) -> str:
+        """Shape name. The scan's, because it is the same layer."""
+        return self.scan.name
+
+    @property
+    def rows(self) -> int:
+        """Rows scored, ``B*T``. One block per row."""
+        return self.scan.bsz * self.scan.seq
+
+    @property
+    def classes(self) -> int:
+        """Classes the labels index."""
+        return XENT_CLASSES
+
+    @property
+    def width(self) -> int:
+        """Operand width: the vocabulary padded up to the projection alignment.
+
+        The head emits this width, so the loss reads it. Columns at or past
+        ``classes`` are pad the forward skips and the backward writes zero over.
+        """
+        return -(-XENT_CLASSES // PROJ_ALIGN) * PROJ_ALIGN
+
+    @property
+    def token_count(self) -> Count:
+        """Tokens per call, which is the row count."""
+        return Count(self.rows)
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        return (
+            f"{self.name}: B={self.scan.bsz} T={self.scan.seq} rows={self.rows} "
+            f"classes={self.classes} width={self.width}"
+        )
+
+
+XENT_SHAPES: Final[tuple[XentShape, ...]] = tuple(XentShape(s) for s in SHAPES)
+"""The standard loss sizes, one per entry of :data:`SHAPES` and the same names.
+
+The vocabulary is one number across all of them: it is a property of the tokenizer
+rather than of the layer geometry, and sweeping it would measure a different
+question."""
+
+
+def xent_shape_by_name(name: str) -> XentShape:
+    """Look up a standard loss shape.
+
+    Args:
+        name: Shape name.
+
+    Returns:
+        The shape.
+
+    Raises:
+        KeyError: If the name is not one of :data:`XENT_SHAPES`.
+    """
+    for shape in XENT_SHAPES:
+        if shape.name == name:
+            return shape
+    raise KeyError(f"no xent shape {name!r}; have {[s.name for s in XENT_SHAPES]}")
+
+
+class XentInputs(NamedTuple):
+    """Fused cross-entropy inputs at one shape.
+
+    ``logits`` is contiguous ``(rows, width)``, which is what a head writes once its
+    batch and token axes are flattened; that flattening is a view, so no copy is on
+    the measured path.
+
+    Attributes:
+        logits: ``(rows, width)`` operand, contiguous.
+        labels: ``(rows,)`` integer class indices, every entry in ``[0, classes)``.
+        dloss: 0-d float32 cotangent seed, preallocated so the backward measurement
+            contains no allocation of its own.
+    """
+
+    logits: Tensor
+    labels: Tensor
+    dloss: Tensor
+
+    @property
+    def differentiable(self) -> tuple[Tensor, ...]:
+        """The one tensor gradients are taken with respect to.
+
+        The labels are integers and the class count is not a tensor.
+        """
+        return (self.logits,)
+
+
+def make_xent_inputs(
+    shape: XentShape,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    label_dtype: torch.dtype = torch.int64,
+    requires_grad: bool = True,
+    seed: int = 0,
+) -> XentInputs:
+    """Build fused cross-entropy inputs at one shape.
+
+    Args:
+        shape: The problem size.
+        device: Where to allocate.
+        dtype: Dtype of ``logits``.
+        label_dtype: Dtype of ``labels``, int32 or int64.
+        requires_grad: Whether ``logits`` carries a gradient.
+        seed: Generator seed, so two runs benchmark the same numbers.
+
+    Returns:
+        The inputs.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    logits = torch.randn(
+        shape.rows, shape.width, dtype=dtype, device=device, generator=gen
+    )
+    labels = torch.randint(
+        shape.classes,
+        (shape.rows,),
+        dtype=label_dtype,
+        device=device,
+        generator=gen,
+    )
+    return XentInputs(
+        logits=logits.requires_grad_(requires_grad),
+        labels=labels,
+        # One, not a random draw: the loss is the graph's root in a real step, so
+        # its cotangent is exactly one and any other value scales a kernel input
+        # away from the measured case.
+        dloss=torch.ones((), dtype=torch.float32, device=device),
+    )
+
+
+def xent_forward_only(
+    inputs: XentInputs,
+    shape: XentShape,
+    *,
+    backend: str | None = None,
+    prefix: str = "xent",
+) -> Callable[[], None]:
+    """A callable that runs the loss forward under ``no_grad``.
+
+    Args:
+        inputs: Loss inputs.
+        shape: The problem size, for the class count.
+        backend: Backend name, or None for the fastest registered one.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+    """
+
+    def run() -> None:
+        with torch.no_grad(), region(f"{prefix}.forward"):
+            cross_entropy(
+                inputs.logits,
+                inputs.labels,
+                classes=shape.classes,
+                backend=backend,
+            )
+
+    return run
+
+
+def xent_step(
+    inputs: XentInputs,
+    shape: XentShape,
+    *,
+    backend: str | None = None,
+    wrt: Sequence[Tensor] | None = None,
+    prefix: str = "xent",
+) -> Callable[[], None]:
+    """A callable that runs the loss forward and backward.
+
+    Args:
+        inputs: Loss inputs. ``logits`` must require grad.
+        shape: The problem size, for the class count.
+        backend: Backend name, or None for the fastest registered one.
+        wrt: Tensors to differentiate with respect to. Defaults to ``logits``.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+
+    Raises:
+        ValueError: If no input requires grad, which would time a forward and
+            call it a step.
+    """
+    targets = tuple(inputs.differentiable if wrt is None else wrt)
+    if not any(t.requires_grad for t in targets):
+        raise ValueError("xent step needs at least one input requiring grad")
+
+    def run() -> None:
+        with region(f"{prefix}.forward"):
+            loss = cross_entropy(
+                inputs.logits,
+                inputs.labels,
+                classes=shape.classes,
+                backend=backend,
+            )
+        with region(f"{prefix}.backward"):
+            torch.autograd.grad(loss, targets, inputs.dloss)
 
     return run

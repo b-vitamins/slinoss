@@ -1,7 +1,7 @@
 """One operator, allocated at one shape, with the runner over it.
 
 Every driver needs the same three things from an operator: the shape record the
-report names, the inputs, and a region-labelled callable. The five families in
+report names, the inputs, and a region-labelled callable. The six families in
 :mod:`slinoss.perf.workload` do not share a signature, so the name is resolved to
 one of them here. A driver reaches every operator through one call, and a family
 lands in one place rather than in every driver.
@@ -27,6 +27,7 @@ from slinoss.perf.workload import (
     OPS,
     SCANPREP,
     SO3SSD,
+    XENT,
     block_forward_only,
     block_shape_by_name,
     block_step,
@@ -39,6 +40,7 @@ from slinoss.perf.workload import (
     make_inputs,
     make_mixer_inputs,
     make_prep_inputs,
+    make_xent_inputs,
     mixer_forward_only,
     mixer_shape_by_name,
     mixer_step,
@@ -47,6 +49,9 @@ from slinoss.perf.workload import (
     prep_step,
     shape_by_name,
     step,
+    xent_forward_only,
+    xent_shape_by_name,
+    xent_step,
 )
 
 __all__ = ["BenchShape", "OpArm", "op_arm"]
@@ -173,4 +178,14 @@ def op_arm(
             )
 
         return OpArm(mixer_shape, "mixer", mixer.differentiable, mixer_run)
+    if op == XENT:
+        xent_shape = xent_shape_by_name(shape_name)
+        xent = make_xent_inputs(xent_shape, device, dtype=dtype, requires_grad=grads)
+
+        def xent_run(backend: str | None, prefix: str) -> Callable[[], None]:
+            if grads:
+                return xent_step(xent, xent_shape, backend=backend, prefix=prefix)
+            return xent_forward_only(xent, xent_shape, backend=backend, prefix=prefix)
+
+        return OpArm(xent_shape, "xent", xent.differentiable, xent_run)
     raise ValueError(f"unknown op {op!r}; expected one of {OPS}")
