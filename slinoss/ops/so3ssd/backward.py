@@ -26,6 +26,7 @@ from torch.nn.functional import pad as _pad
 from slinoss._precision import autocast_disabled, pinned_dtype
 from slinoss.ops.so3ssd.reference import (
     as_lanes,
+    check_grad_band,
     chunk_pad,
     chunked_forward,
     from_heads,
@@ -40,20 +41,25 @@ __all__ = ["ChunkedBackward", "SO3SSDGrads", "chunked_backward", "so3ssd_bwd_ref
 
 
 class SO3SSDGrads(NamedTuple):
-    """Cotangents of the operator inputs. Every field is contiguous.
+    """Cotangents of the operator inputs.
+
+    Every field is contiguous except a ``dB`` or ``dC`` the caller supplied, which
+    carries the layout it arrived with.
 
     A field is ``None`` exactly when the corresponding input was ``None``, which
     is what :class:`torch.autograd.Function` expects for an absent optional
     argument.
 
     Attributes:
-        dU: Shape ``(B,H,T,P)``, dtype of ``U``.
+        dU: Shape ``(B,H,T,P)``, dtype of ``U``. Carries a ``dU_init`` seed as an
+            addend, never as a destination.
         dtrans: Shape ``(B,H,T,4)``, dtype of ``trans``.
         dK: Shape ``(B,H,T,2,4)``, dtype of ``K``. Lane 3 is exactly zero: the
             forward never reads it.
         dB: Shape ``(B,G,T,3N)``, dtype of ``B``. Summed over the heads of each
-            group.
-        dC: Shape ``(B,G,T,3N)``, dtype of ``C``. Summed like ``dB``.
+            group. The caller's destination itself when the call named one.
+        dC: Shape ``(B,G,T,3N)``, dtype of ``C``. Summed like ``dB``, and a named
+            destination like ``dB``.
         dz0: Shape ``(B,H,P,3N)`` or ``None``.
         db_prev: Shape ``(B,G,3N)`` or ``None``.
         du_prev: Shape ``(B,H,P)`` or ``None``.
@@ -138,6 +144,25 @@ def _scatter_last(t: Tensor, length: int) -> Tensor:
     return _pad(t[..., None], (length - 1, 0))
 
 
+def _store(dest: Tensor | None, grad: Tensor) -> Tensor:
+    """Put ``grad`` in ``dest``, or give it a buffer of its own.
+
+    Copy, never accumulate: a destination is one column band of a buffer whose other
+    columns belong to other operators, and no phase zeroed this band.
+
+    Args:
+        dest: The caller's destination, or ``None``.
+        grad: The gradient, already in the destination's dtype.
+
+    Returns:
+        ``dest`` itself when the call named one, else a contiguous buffer.
+    """
+    if dest is None:
+        return grad.contiguous()
+    dest.copy_(grad)
+    return dest
+
+
 def chunked_backward(
     dy: Tensor | None,
     dstate: Tensor | None,
@@ -153,6 +178,9 @@ def chunked_backward(
     z0: Tensor | None = None,
     b_prev: Tensor | None = None,
     u_prev: Tensor | None = None,
+    dB: Tensor | None = None,
+    dC: Tensor | None = None,
+    dU_init: Tensor | None = None,
 ) -> ChunkedBackward:
     """Differentiate the chunked factorization and keep every shared quantity.
 
@@ -173,6 +201,18 @@ def chunked_backward(
         z0: Initial state, shape ``(B,H,P,3N)``, pinned.
         b_prev: ``b_{-1}``, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}``, shape ``(B,H,P)``.
+        dB: Destination for the ``B`` cotangent, shape ``(B,G,T,3N)``, dtype and
+            device of ``B``, possibly pitched. Written in full, never accumulated
+            into and never zeroed first, and returned as this same object. ``None``
+            allocates a contiguous buffer. See
+            :func:`slinoss.ops.so3ssd.reference.check_grad_band`.
+        dC: Destination for the ``C`` cotangent, shape ``(B,G,T,3N)``, under the
+            contract of ``dB``.
+        dU_init: Addend for the ``U`` cotangent, shape ``(B,H,T,P)``, dtype and
+            device of ``U``, possibly pitched. Read and never written: the returned
+            ``dU`` is this plus the cotangent of ``U``, and ``dU`` stays a buffer
+            this function allocates. It joins the accumulation in the pinned working
+            dtype, so the sum narrows to ``U``'s dtype once instead of twice.
 
     Returns:
         A :class:`ChunkedBackward`.
@@ -185,6 +225,14 @@ def chunked_backward(
     fw = chunked_forward(
         U, trans, K, B, C, chunk_size, z0=z0, b_prev=b_prev, u_prev=u_prev
     )
+    # After the rematerializing forward, which validates the operands a caller's
+    # buffer is measured against.
+    if dB is not None:
+        check_grad_band(dB, B, "dB")
+    if dC is not None:
+        check_grad_band(dC, C, "dC")
+    if dU_init is not None:
+        check_grad_band(dU_init, U, "dU_init")
     dtype = pinned_dtype(U, trans, K, B, C)
     length = fw.length
     seqlen = fw.seqlen
@@ -331,6 +379,10 @@ def chunked_backward(
         dB_t = dB_t + _pad(dbshift_t[:, :, 1:], (0, 0, 0, 1))
         if du_last is not None:
             dU_t = dU_t + _pad(du_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
+        # The seed joins the accumulation rather than its result: one narrowing store
+        # of the total, instead of narrowing both addends and adding afterwards.
+        if dU_init is not None:
+            dU_t = dU_t + dU_init.to(dtype)
 
         dtrans_t = torch.cat(
             [_unchunk(dw, seqlen), _unchunk(dls, seqlen)[..., None]], dim=-1
@@ -342,6 +394,7 @@ def chunked_backward(
         # summed back over those heads. Identity when G == H.
         groups = int(B.shape[1])
         dB_g = from_heads(dB_t, groups)
+        dC_g = from_heads(_unchunk(dc_n.flatten(-2, -1), seqlen), groups)
         # b_last is a slice of the grouped B, not a per-head read of it, so its
         # cotangent lands after the group reduction. Added before it, one group's
         # cotangent would be counted once per head of that group.
@@ -357,10 +410,8 @@ def chunked_backward(
             dU=dU_t.to(U.dtype).contiguous(),
             dtrans=dtrans_t.to(trans.dtype).contiguous(),
             dK=dK_t.to(K.dtype).contiguous(),
-            dB=dB_g.to(B.dtype).contiguous(),
-            dC=from_heads(_unchunk(dc_n.flatten(-2, -1), seqlen), groups)
-            .to(C.dtype)
-            .contiguous(),
+            dB=_store(dB, dB_g.to(B.dtype)),
+            dC=_store(dC, dC_g.to(C.dtype)),
             dz0=None if z0 is None else acc.flatten(-2, -1).to(z0.dtype).contiguous(),
             db_prev=(
                 None
@@ -403,6 +454,9 @@ def so3ssd_bwd_ref(
     z0: Tensor | None = None,
     b_prev: Tensor | None = None,
     u_prev: Tensor | None = None,
+    dB: Tensor | None = None,
+    dC: Tensor | None = None,
+    dU_init: Tensor | None = None,
 ) -> SO3SSDGrads:
     """Cotangents of every input of :func:`slinoss.ops.so3ssd.reference.so3ssd_ref`.
 
@@ -423,14 +477,27 @@ def so3ssd_bwd_ref(
         z0: Initial state, shape ``(B,H,P,3N)``, pinned.
         b_prev: ``b_{-1}``, shape ``(B,G,3N)``.
         u_prev: ``u_{-1}``, shape ``(B,H,P)``.
+        dB: Destination for the ``B`` cotangent, shape ``(B,G,T,3N)``, dtype and
+            device of ``B``, possibly pitched. Written in full, never accumulated
+            into and never zeroed first, and returned as this same object. ``None``
+            allocates a contiguous buffer. See
+            :func:`slinoss.ops.so3ssd.reference.check_grad_band`.
+        dC: Destination for the ``C`` cotangent, shape ``(B,G,T,3N)``, under the
+            contract of ``dB``.
+        dU_init: Addend for the ``U`` cotangent, shape ``(B,H,T,P)``, dtype and
+            device of ``U``, possibly pitched. Read and never written: the returned
+            ``dU`` is this plus the cotangent of ``U``. Not a destination, and never
+            returned by identity.
 
     Returns:
         A :class:`SO3SSDGrads`.
 
     Raises:
-        ValueError: On a shape, contiguity, device, or pairing violation, or a
-            non-positive ``chunk_size``. Raised by the rematerializing forward.
-        TypeError: On an unsupported dtype, or a low-precision pinned tensor.
+        ValueError: On a shape, contiguity, device, or pairing violation, a
+            non-positive ``chunk_size``, or a caller's buffer off the pitched-layout
+            contract.
+        TypeError: On an unsupported dtype, a low-precision pinned tensor, or a
+            caller's buffer whose dtype is not that of the operand it belongs to.
     """
     return chunked_backward(
         dy,
@@ -446,4 +513,7 @@ def so3ssd_bwd_ref(
         z0=z0,
         b_prev=b_prev,
         u_prev=u_prev,
+        dB=dB,
+        dC=dC,
+        dU_init=dU_init,
     ).grads

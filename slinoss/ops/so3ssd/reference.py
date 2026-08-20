@@ -68,6 +68,7 @@ __all__ = [
     "TapGrads",
     "TransformTable",
     "as_lanes",
+    "check_grad_band",
     "chunk_pad",
     "chunked_forward",
     "deriv_coeffs",
@@ -709,6 +710,46 @@ def _check_inputs(
         check_supported(u_prev, "u_prev")
 
     return _Shapes(bsz, heads, groups, seqlen, rows, state_dim, state_dim // 3)
+
+
+def check_grad_band(t: Tensor, operand: Tensor, name: str) -> None:
+    """Hold a caller-supplied gradient buffer to the operand whose gradient it holds.
+
+    Three buffers cross the backward's boundary: the ``dB`` and ``dC`` destinations,
+    and the ``dU_init`` accumulate seed. Each carries the shape, dtype, and device of
+    one forward operand, and each may arrive as a column band of a wider tensor,
+    because the mixer's backward allocates one buffer for its fused projection's
+    gradient and hands every operator the band it owns. The layout rule is therefore
+    :func:`slinoss._guard.check_pitched` rather than contiguity: a row pitch above the
+    row width is legal, and contiguity is the case where the two agree.
+
+    Order is shape, then dtype, then device, then layout, so a buffer of the wrong
+    extent reports its extent rather than an alignment its offset also violates.
+
+    Args:
+        t: The caller's buffer.
+        operand: The forward operand it belongs to: ``B`` for ``dB``, ``C`` for
+            ``dC``, ``U`` for ``dU_init``.
+        name: What to report ``t`` under.
+
+    Raises:
+        ValueError: On a shape or device mismatch, or on a band with a strided
+            trailing axis, overlapping rows, or an offset or pitch off the boundary
+            :func:`slinoss._guard.check_pitched` holds it to.
+        TypeError: On a dtype other than ``operand``'s.
+    """
+    want = tuple(operand.shape)
+    if tuple(t.shape) != want:
+        raise ValueError(f"{name} must have shape {want}, got {tuple(t.shape)}")
+    if t.dtype is not operand.dtype:
+        raise TypeError(f"{name} must be {operand.dtype}, got {t.dtype}")
+    if t.device != operand.device:
+        raise ValueError(f"{name} must be on {operand.device}, got {t.device}")
+    # The pitched rule's alignment clause is a device rule -- a band row that starts
+    # mid-sector fetches a sector nobody reads -- and this path is the CPU oracle as
+    # well, so a host buffer is held to its shape and dtype alone.
+    if t.device.type == "cuda":
+        check_pitched(((t, name),))
 
 
 def _promote(t: Tensor, dtype: torch.dtype) -> Tensor:

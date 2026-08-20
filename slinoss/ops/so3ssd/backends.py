@@ -57,7 +57,20 @@ class ScanForward(Protocol):
 
 
 class ScanBackward(Protocol):
-    """Backward signature every backend implements."""
+    """Backward signature every backend implements.
+
+    ``dB`` and ``dC`` are destinations rather than allocations the backend makes. The
+    mixer's backward allocates one ``dproj`` and hands each consumer the band its
+    gradient belongs in, so a backend that allocated and let the caller assign would
+    write every gradient byte twice on a DRAM-bound path. Each is written in full and
+    returned as the same object; ``None`` allocates one.
+
+    ``dU_init`` is not a destination. It is a read-only addend: the returned ``dU`` is
+    it plus the cotangent of ``U``, and ``dU`` stays a buffer the backend allocates.
+    The mixer tail's ``du`` and the scan's ``dU`` both feed the conv's ``dy``, and the
+    scan builds ``dU`` by accumulation already, so seeding that accumulation replaces
+    a separate read-read-write over ``(B,H,T,P)`` and narrows the sum once.
+    """
 
     def __call__(
         self,
@@ -76,6 +89,9 @@ class ScanBackward(Protocol):
         z0: Tensor | None = None,
         b_prev: Tensor | None = None,
         u_prev: Tensor | None = None,
+        dB: Tensor | None = None,
+        dC: Tensor | None = None,
+        dU_init: Tensor | None = None,
     ) -> SO3SSDGrads: ...
 
 

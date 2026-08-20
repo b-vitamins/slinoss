@@ -489,3 +489,115 @@ def test_chunk_zero_carry_is_the_streaming_feedback(groups: int) -> None:
     assert bool(parts.carry_u.any()) and bool(parts.carry_b.any())
     assert torch.equal(parts.carry_u[:, :, 0], parts.grads.du_prev)
     assert torch.equal(parts.carry_b[:, :, 0], parts.grads.db_prev)
+
+
+# ---------------------------------------------------------------------------
+# Caller-supplied gradient buffers
+# ---------------------------------------------------------------------------
+#
+# The mixer's backward allocates one buffer for its fused projection's gradient and
+# hands each operator the band it owns, so ``dB`` and ``dC`` are store addresses
+# rather than allocations. ``dU_init`` is the opposite kind of parameter: an addend
+# folded into the accumulation that builds ``dU``, never written and never returned.
+
+
+def _nan_band(like: Tensor) -> tuple[Tensor, Tensor]:
+    """A ``(B,G,T,3N)`` destination that is one column band of a NaN-filled buffer.
+
+    Two groups of padding ahead of the band and one behind, so neither the offset nor
+    the pitch is the one a dedicated buffer would have, and a store that overruns the
+    band leaves a NaN behind to say so.
+
+    Args:
+        like: The operand whose gradient the band holds, ``(B,G,T,3N)``.
+
+    Returns:
+        The wide buffer, and the band view the call is handed.
+    """
+    bsz, groups, seqlen, dim = (int(d) for d in like.shape)
+    wide = torch.full(
+        (bsz, seqlen, groups + 3, dim),
+        float("nan"),
+        dtype=like.dtype,
+        device=like.device,
+    )
+    return wide, wide[:, :, 2 : 2 + groups].permute(0, 2, 1, 3)
+
+
+def test_db_and_dc_destinations_are_written_in_place(device: torch.device) -> None:
+    """The two destinations, as strict bands of a wider buffer.
+
+    Three claims at once: the result holds the buffers the call named, every gradient
+    is bit-identical to the allocating call, and the columns outside each band are
+    untouched. A destination is a store address and never a numerical choice.
+    """
+    _, fast = _pair(seqlen=32, seed=241, device=device)
+    cot = _cotangents(fast, 251)
+    want = so3ssd_bwd_ref(*cot, *fast.args(), 16, **fast.kw())
+
+    wide_b, dest_b = _nan_band(fast.B)
+    wide_c, dest_c = _nan_band(fast.C)
+    assert dest_b.stride(-2) > dest_b.shape[-1], "destination is not a strict band"
+    got = so3ssd_bwd_ref(*cot, *fast.args(), 16, **fast.kw(), dB=dest_b, dC=dest_c)
+
+    assert got.dB is dest_b and got.dC is dest_c
+    for name, a, b in zip(GRAD_NAMES, got, want):
+        assert a is not None and b is not None, name
+        assert torch.equal(a, b), name
+    groups = int(fast.B.shape[1])
+    for label, wide in (("dB", wide_b), ("dC", wide_c)):
+        assert not bool(torch.isnan(wide[:, :, 2 : 2 + groups]).any()), label
+        assert bool(torch.isnan(wide[:, :, :2]).all()), label
+        assert bool(torch.isnan(wide[:, :, 2 + groups :]).all()), label
+
+
+def test_du_init_accumulates_and_is_not_a_destination() -> None:
+    """``dU_init`` adds to ``dU`` and is left alone.
+
+    float64 is the pinned working dtype here, so the fold is exact and the sum is
+    asserted rather than bounded. A zero seed reproduces the unseeded call on all
+    eight fields: the seed reaches ``dU`` and nothing else.
+    """
+    _, fast = _pair(seqlen=33, seed=257)
+    cot = _cotangents(fast, 263)
+    plain = so3ssd_bwd_ref(*cot, *fast.args(), 16, **fast.kw())
+
+    seed = torch.randn_like(fast.U)
+    frozen = seed.clone()
+    seeded = so3ssd_bwd_ref(*cot, *fast.args(), 16, **fast.kw(), dU_init=seed)
+    assert seeded.dU is not seed, "the seed was returned as a destination"
+    assert torch.equal(seed, frozen), "the seed was written"
+    assert torch.equal(seeded.dU, plain.dU + seed)
+
+    zeroed = so3ssd_bwd_ref(
+        *cot, *fast.args(), 16, **fast.kw(), dU_init=torch.zeros_like(seed)
+    )
+    for name, a, b in zip(GRAD_NAMES, zeroed, plain):
+        assert a is not None and b is not None, name
+        assert torch.equal(a, b), name
+
+
+@pytest.mark.cuda
+def test_rejects_a_destination_band_off_the_sector_boundary() -> None:
+    """The one refusal a caller cannot read off the buffer it holds.
+
+    A wrong shape, dtype, or device is in the destination's own metadata. A band whose
+    offset misses the sector boundary is accepted by every store and costs DRAM
+    traffic no counter attributes, so the guard is the only signal it produces.
+
+    CUDA only: the alignment clause is a device rule and this path is the CPU oracle
+    as well.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    _, fast = _pair(seqlen=32, seed=269, device="cuda")
+    cot = _cotangents(fast, 271)
+    bsz, groups, seqlen, dim = (int(d) for d in fast.B.shape)
+    # Two float64 elements ahead of the band: 16 bytes, half a sector. The pitch is
+    # a legal multiple, so the offset clause is the only one under test.
+    wide = torch.empty(
+        bsz, seqlen, groups * dim + 8, dtype=fast.B.dtype, device=fast.B.device
+    )
+    band = wide[..., 2 : 2 + groups * dim].unflatten(-1, (groups, dim))
+    with pytest.raises(ValueError, match="dB must start and step on a multiple"):
+        so3ssd_bwd_ref(*cot, *fast.args(), 16, **fast.kw(), dB=band.permute(0, 2, 1, 3))
