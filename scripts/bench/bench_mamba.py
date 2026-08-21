@@ -290,12 +290,9 @@ def so3ssd_arithmetic(shape: OpShape) -> Arithmetic:
     from scripts.perf.chunk_sweep import flop_terms, geometry_of
 
     lanes = shape.bsz * shape.heads * shape.seq
-    forward = sum(
-        term.flops(shape.chunk)
-        for term in flop_terms(geometry_of(shape))
-        if term.kernel.endswith("_fwd")
-    )
-    total = sum(term.flops(shape.chunk) for term in flop_terms(geometry_of(shape)))
+    terms = flop_terms(geometry_of(shape), shape.chunk)
+    forward = sum(term.flop for term in terms if term.kernel.endswith("_fwd"))
+    total = sum(term.flop for term in terms)
     return Arithmetic(
         label="so3ssd",
         forward_flop=lanes * forward,

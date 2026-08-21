@@ -313,12 +313,63 @@ def arena_rows(
                     knob=kernel.knob(chunk, geo.rows, geo.dim),
                     smem_bytes=nbytes,
                     capacity_pct=100.0 * nbytes / capacity,
-                    resident=capacity // nbytes,
+                    resident=residency_at(nbytes, capacity),
                     floor_bytes=kernel.nbytes(chunk, HEAD_MULTIPLE, STATE_MULTIPLE),
                     refused_by=refusing_extent(kernel, chunk, geo, capacity),
                 )
             )
     return tuple(rows)
+
+
+def residency_at(nbytes: int, capacity: int) -> int:
+    """Blocks per SM a budget allows, against an explicit carveout.
+
+    :func:`slinoss._cute.smem_residency` queried against the device instead of an
+    argument, so ``--capacity`` still decides. ``capacity // nbytes`` is the wrong
+    divisor twice over: the capacity has one reservation subtracted already while
+    ``k`` blocks pay ``k`` of them, and a block is rounded to
+    :data:`slinoss._cute.SMEM_GRANULE` before it is divided into. It reads one block
+    high inside a band below each bar.
+
+    Args:
+        nbytes: Bytes one block's tiles add up to.
+        capacity: Carveout in bytes.
+
+    Returns:
+        Blocks the carveout holds, floor at one.
+    """
+    from slinoss._cute import SMEM_GRANULE, SMEM_RESERVED
+
+    carveout = capacity + SMEM_RESERVED
+    if nbytes <= 0:
+        return carveout
+    block = -(-(nbytes + SMEM_RESERVED) // SMEM_GRANULE) * SMEM_GRANULE
+    return max(1, carveout // block)
+
+
+def budget_at(blocks: int, capacity: int) -> int:
+    """Largest per-block budget that still admits ``blocks`` blocks per SM.
+
+    The exact inverse of :func:`residency_at`. ``capacity // blocks`` reads 512 B
+    high at two blocks on sm_86, which is enough to report a bar a kernel misses as
+    one it meets.
+
+    Args:
+        blocks: Blocks per SM asked for.
+        capacity: Carveout in bytes.
+
+    Returns:
+        Bytes one block's tiles may add up to.
+
+    Raises:
+        ValueError: If ``blocks`` is below one, which has no largest budget.
+    """
+    from slinoss._cute import SMEM_GRANULE, SMEM_RESERVED
+
+    if blocks < 1:
+        raise ValueError(f"blocks must be at least one, got {blocks}")
+    carveout = capacity + SMEM_RESERVED
+    return (carveout // blocks) // SMEM_GRANULE * SMEM_GRANULE - SMEM_RESERVED
 
 
 def legal_chunks(rows: Sequence[ArenaRow]) -> tuple[int, ...]:
@@ -588,52 +639,100 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
 
 
 class FlopTerm(NamedTuple):
-    """One kernel's arithmetic, per token per head, affine in ``L``.
+    """One launch's GEMM arithmetic at one chunk length, per token per head.
+
+    Not affine in ``L``. ``L`` is the M mode of every GEMM three of the five launches
+    issue, and M is the one mode the atom rounds up, so those three pay
+    ``mma_rows(L)`` where the algebra says ``L``: the work is flat in ``L`` below one
+    M tile and carries ``mma_rows(L) / L`` above it. A term is built at one ``L`` and
+    says nothing about another.
 
     Attributes:
-        kernel: Kernel the arithmetic runs in.
-        form: The GEMM form, as ``docs/kernels.md`` names it.
-        flat: The part independent of ``L``, in flop per token per head.
-        linear: The coefficient of ``L``, in flop per token per head per unit ``L``.
+        kernel: Launch the arithmetic runs in, as :mod:`slinoss.perf.coverage` names
+            it. A launch, not a source module: a term billed to a kernel that never
+            runs is arithmetic no profile can be scored against.
+        form: The GEMM forms, as ``docs/kernels.md`` names them.
+        flop: Flop per token per head, at the ``L`` the term was built at.
     """
 
     kernel: str
     form: str
-    flat: int
-    linear: int
-
-    def flops(self, chunk: int) -> int:
-        """Flop per token per head at one chunk length."""
-        return self.flat + self.linear * chunk
+    flop: int
 
 
-def flop_terms(geo: Geometry) -> tuple[FlopTerm, ...]:
-    """The arithmetic of one whole step, per token per head.
+def flop_terms(geo: Geometry, chunk: int) -> tuple[FlopTerm, ...]:
+    """The GEMM arithmetic of one whole step, per token per head, at one ``L``.
 
-    Only the score and the diagonal carry ``L``: both contract over the chunk, so
-    each token pays ``L``. The increment, the offset and the state terms contract
-    over ``P`` or ``3N`` and are flat.
+    Counted from the call sites: every ``mma_gemm``, ``mma_gemm_areg`` and
+    ``gemm_kblocks`` the operator issues, at ``2*M*N*K`` a call, with each loop's
+    trip count and each padded extent as the kernel executes it. K-blocking splits a
+    contraction and costs no arithmetic.
 
-    The coefficients reproduce the per-launch figures the kernels' own docstrings
-    state at ``standard``: 906 MFLOP for the increment, 2.87 GFLOP for the scan, 604
-    MFLOP for the start, 3.54 MFLOP per block for the input backward and 4.03 MFLOP
-    per block for the vector backward.
+    ``P`` and ``3N`` are kept apart. No launch pays them at one rate: the input
+    backward pays ``8*P`` a unit of ``L`` against ``4*3N``, and the vector backward
+    pays ``4*P`` a lane tile against ``8*3N``. A ``(P + 3N)`` coefficient is exact
+    only where the two are equal, which is ``standard`` and nothing else.
+
+    Every M mode is padded. The two passing kernels round ``P`` to ``mma_rows(P)``;
+    the scan and the two chunk-local backward kernels round ``L``. Padded rows are
+    zero-filled and their stores predicated, so the work is executed, not stored.
+
+    The vector backward's source-token block rounds to one M tile too, so the block
+    and its trip count multiply back to ``mma_rows(L)`` wherever the budget holds
+    :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.vblock` at the full block, which
+    is assumed here rather than queried: reading it needs the device's carveout, and
+    a flop model that moved with the host would not be one model. A shape forced to
+    the halved block doubles the two terms that carry it.
+
+    The vector backward also pays the lane tile. Its score contracts ``dy`` against
+    ``U`` over ``P``, carries no state extent, and the lane tile is a grid axis, so
+    each of ``3N // lane_block(3N)`` tiles recomputes the whole of it.
+
+    Verified against ``sm__inst_executed_pipe_tensor.sum``, one profiled launch a
+    kernel on an RTX A6000 at 4,096 flop a warp-level MMA. At ``acceptance`` and
+    ``L 64``: 61,440, 108,544, 30,720, 217,088 and 296,960 flop per token per head,
+    714,752 for the step, 105.39 GFLOP a step. The same counter holds
+    ``chunk_input_bwd`` to this form at ``L 32`` and reads 960 warp-inst under it at
+    ``L 128``, which is unexplained: above one M tile this is a bound.
 
     Args:
         geo: The geometry, for ``P`` and ``3N``.
+        chunk: ``L``. A coefficient of the padding, so a term is built at one and
+            carries no slope in it.
 
     Returns:
-        One term per kernel, in launch order.
+        One term per launch, in launch order.
     """
+    from slinoss.ops.so3ssd.cute.bwd.chunk_vector import lane_block
     from slinoss.ops.so3ssd.cute.mma import mma_rows
 
     p, d = geo.rows, geo.dim
+    # The padded M extent of the launches that tile ``P``, the padded M extent of the
+    # three that tile the chunk, and the lane tiles the vector backward's score is
+    # recomputed on.
+    mp, ml = mma_rows(p), mma_rows(chunk)
+    tiles = d // lane_block(d)
     return (
-        FlopTerm("increment_passing_fwd", "increment", 4 * p * d, 0),
-        FlopTerm("chunk_scan_fwd", "offset+score+diagonal", 2 * p * d, 4 * (p + d)),
-        FlopTerm("chunk_start_bwd", "offset transpose", 2 * d * mma_rows(p), 0),
-        FlopTerm("chunk_input_bwd", "all forms", 8 * p * d, 6 * (p + d)),
-        FlopTerm("chunk_vector_bwd", "all forms", 6 * p * d, 8 * (p + d)),
+        FlopTerm("increment_passing_fwd", "increment x2", 4 * mp * d),
+        FlopTerm(
+            "chunk_scan_fwd",
+            "offset+score+diagonal",
+            (2 * ml * p * d) // chunk + 4 * ml * d + 4 * ml * p,
+        ),
+        FlopTerm("start_passing_bwd", "offset transpose", 2 * mp * d),
+        FlopTerm(
+            "chunk_input_bwd",
+            "increment x2+score+dm+diagonal",
+            (8 * ml * p * d) // chunk + 4 * ml * d + 8 * ml * p,
+        ),
+        FlopTerm(
+            "chunk_vector_bwd",
+            "offset+score+readout+increment+forcing",
+            (6 * ml * p * d) // chunk
+            + 4 * ml * p * tiles
+            + 4 * ml * d
+            + (4 * ml * ml * d) // chunk,
+        ),
     )
 
 
@@ -689,7 +788,7 @@ def step_model(
     read = sum(t.nbytes for t in terms if t.side == "read")
     write = sum(t.nbytes for t in terms if t.side == "write")
     lanes = geo.bsz * geo.heads * geo.seqlen
-    flop = lanes * sum(t.flops(chunk) for t in flop_terms(geo))
+    flop = lanes * sum(t.flop for t in flop_terms(geo, chunk))
     return StepModel(
         chunk=chunk,
         read_bytes=read,
@@ -1314,7 +1413,7 @@ def print_arena(geo: Geometry, args: argparse.Namespace) -> None:
     print(f"computed  geometry {geo.describe()}")
     print(
         f"carveout {capacity:,} B   {RESIDENT_TARGET} resident blocks need "
-        f"{capacity // RESIDENT_TARGET:,} B   config admits L in "
+        f"{budget_at(RESIDENT_TARGET, capacity):,} B   config admits L in "
         f"[{MIN_CHUNK}, {MAX_CHUNK}]"
     )
     print()
@@ -1362,10 +1461,12 @@ def print_traffic(geo: Geometry, args: argparse.Namespace) -> None:
             f"{(read + write) / 1e6:10.2f}"
         )
     print()
-    print("arithmetic per token per head, affine in L")
-    print(f"{'kernel':26s} {'form':22s} {'flat':>10s} {'per_L':>10s}")
-    for flop in flop_terms(geo):
-        print(f"{flop.kernel:26s} {flop.form:22s} {flop.flat:10,d} {flop.linear:10,d}")
+    # Not affine in L: the padded M mode makes every coefficient a function of it,
+    # so the table is at one L and the step model below re-counts at each.
+    print(f"arithmetic per token per head at L={base}")
+    print(f"{'kernel':26s} {'form':40s} {'flop':>12s}")
+    for flop in flop_terms(geo, base):
+        print(f"{flop.kernel:26s} {flop.form:40s} {flop.flop:12,d}")
     print()
     print("step model over L")
     header = (

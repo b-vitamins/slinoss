@@ -5,8 +5,8 @@ kernel. The three computed modes are pure host arithmetic over the shipped layou
 functions and the shipped shapes, so every figure a test asserts is exact, and the
 one measured mode is left to the driver.
 
-The two tests that evaluate a real kernel budget need the CuTe layout modules and
-carry the ``cute`` mark; the rest need neither a device nor the DSL. Capacity is a
+The tests that evaluate a real kernel budget need the CuTe layout modules and carry
+the ``cute`` mark; the rest need neither a device nor the DSL. Capacity is a
 literal wherever a verdict depends on it: querying the device would make the
 verdicts a property of the host.
 """
@@ -28,27 +28,52 @@ from scripts.perf.chunk_sweep import (
     ArenaKernel,
     Geometry,
     arena_rows,
+    budget_at,
     flop_terms,
     geometry_of,
     legal_chunks,
     parse_args,
     prefix_probe,
     refusing_extent,
+    residency_at,
     resident_chunks,
     step_model,
     traffic_terms,
 )
+from slinoss._cute import smem_residency
 from slinoss.config import HEAD_MULTIPLE, MAX_CHUNK, MIN_CHUNK, STATE_MULTIPLE
 from slinoss.perf.workload import SHAPES, shape_by_name
 
 CUTE = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-"""The two tests that import the kernels' own layout functions."""
+"""The tests that import the kernels' own layout functions."""
 
 CAPACITY = 101376
 """The sm_86 opt-in carveout, as a literal. Every verdict here is judged against it."""
 
 ACCEPTANCE = Geometry(bsz=4, heads=18, groups=1, seqlen=2048, rows=64, dim=240)
 """The geometry the whole-step attribution defaults to."""
+
+COUNTED_FLOP: dict[str, int] = {
+    "increment_passing_fwd": 61_440,
+    "chunk_scan_fwd": 108_544,
+    "start_passing_bwd": 30_720,
+    "chunk_input_bwd": 217_088,
+    "chunk_vector_bwd": 296_960,
+}
+"""Flop per token per head at :data:`ACCEPTANCE` and ``L 64``, from the counter.
+
+``sm__inst_executed_pipe_tensor.sum`` a launch on an RTX A6000, at 4,096 flop a
+warp-level MMA over ``B*T*H = 147,456``, which is the counter over 36: 2,211,840,
+3,907,584, 1,105,920, 7,815,168 and 10,690,560 warp-inst. The counter is the whole
+GEMM census, no kernel in the tree emitting ``hfma``, ``hadd`` or ``hmul`` at all.
+
+Keyed by launch. ``chunk_start_bwd`` is not among them: the backward fused that GEMM
+into ``start_passing_bwd``, and :mod:`slinoss.perf.coverage` declares the fused-away
+name targeted.
+"""
+
+COUNTED_STEP = 714_752
+"""Sum of :data:`COUNTED_FLOP`. By hand, 25,731,072 warp-inst over 36."""
 
 
 def fixed(*, at_widths: int, at_floor: int) -> ArenaKernel:
@@ -190,7 +215,9 @@ def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> Non
     for row in rows:
         assert row.smem_bytes > 0
         assert row.capacity_pct == pytest.approx(100.0 * row.smem_bytes / CAPACITY)
-        assert row.resident == CAPACITY // row.smem_bytes
+        # The report must not claim a residency the launch bound will not ask
+        # for, so it is held against the launch's own helper, not to a divide.
+        assert row.resident == smem_residency(row.smem_bytes)
         # A verdict and its bytes cannot disagree: one is derived from the other.
         assert bool(row.refused_by) == (row.smem_bytes > CAPACITY)
         assert row.floor_bytes <= row.smem_bytes
@@ -203,6 +230,30 @@ def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> Non
     )
     short = {row.chunk for row in rows if row.resident < RESIDENT_TARGET}
     assert set(resident_chunks(rows, RESIDENT_TARGET)) == set(CANDIDATES) - short
+
+
+@CUTE
+@pytest.mark.cute
+def test_the_residency_bar_is_the_granular_one_not_the_capacity_divided() -> None:
+    # k blocks pay k reservations against a capacity that has one subtracted
+    # already, and each is rounded up to a granule. Both corrections are needed:
+    # a plain divide reads one block high in a 512 B band under the two-block
+    # bar, which is where every kernel in the tree sits.
+    assert budget_at(2, CAPACITY) == 50176
+    assert CAPACITY // 2 == 50688
+    assert residency_at(50176, CAPACITY) == 2
+    assert residency_at(50177, CAPACITY) == 1
+    assert residency_at(50688, CAPACITY) == 1
+    # Each bar is the largest budget that reaches it, so one byte more loses a
+    # block. One block is the floor and has no bar above it to fall from.
+    assert residency_at(budget_at(1, CAPACITY) + 1, CAPACITY) == 1
+    for blocks in (2, 3, 4, 5, 6):
+        budget = budget_at(blocks, CAPACITY)
+        assert residency_at(budget, CAPACITY) == blocks
+        assert residency_at(budget + 1, CAPACITY) == blocks - 1
+    # Against the launch bound, which queries the device for the same carveout.
+    for nbytes in (1, 4096, 33024, 50176, 50177, 101376):
+        assert residency_at(nbytes, CAPACITY) == smem_residency(nbytes)
 
 
 # ---------------------------------------------------------------------------
@@ -238,16 +289,74 @@ def test_no_global_memory_term_grows_with_the_chunk_length() -> None:
 
 @CUTE
 @pytest.mark.cute
-def test_the_arithmetic_is_affine_in_the_chunk_length() -> None:
-    terms = flop_terms(ACCEPTANCE)
+def test_the_arithmetic_is_the_counted_arithmetic_of_the_launches_that_run() -> None:
+    terms = flop_terms(ACCEPTANCE, 64)
+    assert {term.kernel: term.flop for term in terms} == COUNTED_FLOP
+    assert sum(term.flop for term in terms) == COUNTED_STEP
+    # Launch order, and the launch names: a term billed to a kernel that never runs
+    # is arithmetic no profile can be scored against.
+    assert [term.kernel for term in terms] == list(COUNTED_FLOP)
     for term in terms:
-        assert term.flat > 0
-        assert term.linear >= 0
-        assert term.flops(64) == term.flat + 64 * term.linear
-        assert term.flops(0) == term.flat
-    carries = {term.kernel for term in terms if term.linear > 0}
-    # Only the score and the diagonal contract over the chunk.
-    assert carries == {"chunk_scan_fwd", "chunk_input_bwd", "chunk_vector_bwd"}
+        assert term.flop > 0
+    lanes = ACCEPTANCE.bsz * ACCEPTANCE.heads * ACCEPTANCE.seqlen
+    assert lanes == 147_456
+    model = step_model(ACCEPTANCE, 64, dram_gbs=None, peak_tflops=None)
+    assert model.flop == lanes * COUNTED_STEP
+    # 105.39 GFLOP a step, not the 101.47 the collapsed model reported.
+    assert model.flop == 105_394_470_912
+
+
+@CUTE
+@pytest.mark.cute
+def test_no_kernel_pays_P_and_3N_at_one_rate() -> None:
+    # A ``(P + 3N)`` coefficient is symmetric under the swap and the operator is
+    # not: the input backward pays ``P`` twice for every once it pays ``3N``, and
+    # the vector backward pays ``3N`` twice. Both geometries are legal, ``3N``
+    # being a multiple of 48 and ``P`` of HEAD_MULTIPLE either way.
+    wide_state = Geometry(bsz=4, heads=18, groups=1, seqlen=2048, rows=48, dim=96)
+    wide_head = Geometry(bsz=4, heads=18, groups=1, seqlen=2048, rows=96, dim=48)
+    here = {term.kernel: term.flop for term in flop_terms(wide_state, 64)}
+    there = {term.kernel: term.flop for term in flop_terms(wide_head, 64)}
+    # By hand, not by helper: ``8*P*3N + 4*mma_rows(L)*3N + 8*mma_rows(L)*P``, at
+    # ``mma_rows(64) == 64``.
+    assert here["chunk_input_bwd"] == 8 * 48 * 96 + 4 * 64 * 96 + 8 * 64 * 48
+    assert there["chunk_input_bwd"] == 8 * 96 * 48 + 4 * 64 * 48 + 8 * 64 * 96
+    assert here["chunk_input_bwd"] != there["chunk_input_bwd"]
+    # ``6*P*3N + 4*mma_rows(L)*P*tiles + 8*mma_rows(L)*3N``: the vector backward's
+    # score carries no state extent and the lane tile is a grid axis, so ``3N``
+    # sets how many times it is recomputed. Two tiles at 96 against one at 48.
+    assert here["chunk_vector_bwd"] == 6 * 48 * 96 + 4 * 64 * 48 * 2 + 8 * 64 * 96
+    assert there["chunk_vector_bwd"] == 6 * 96 * 48 + 4 * 64 * 96 * 1 + 8 * 64 * 48
+    assert here["chunk_vector_bwd"] != there["chunk_vector_bwd"]
+    # The flat parts contract over ``P * 3N`` and are symmetric, so the asymmetry
+    # above is the L-linear part alone and nothing else.
+    for kernel in ("increment_passing_fwd", "chunk_scan_fwd", "start_passing_bwd"):
+        assert here[kernel] == there[kernel]
+
+
+@CUTE
+@pytest.mark.cute
+def test_the_padded_chunk_mode_holds_the_arithmetic_flat_below_one_M_tile() -> None:
+    # ``L`` is the M mode of every GEMM the scan and the two chunk-local backward
+    # kernels issue, and M is the one mode the atom rounds up, so a chunk under one
+    # M tile executes a whole tile of work. Counted, chunk_input_bwd runs 2,656
+    # tensor warp-inst a block at ``L 32`` where the unpadded form predicts 1,328.
+    per_block = {
+        chunk: next(
+            term.flop
+            for term in flop_terms(ACCEPTANCE, chunk)
+            if term.kernel == "chunk_input_bwd"
+        )
+        * chunk
+        for chunk in (32, 64)
+    }
+    assert per_block[32] == 2_656 * 4096
+    assert per_block[64] == 3_392 * 4096
+    # Twice the blocks at half the chunk against a block that shrank by less than
+    # half, so the per-token cost rises as the chunk falls. ``L 128`` is not pinned:
+    # the counter reads 8,768 warp-inst there against 9,728 from this form, and the
+    # 960 are unexplained.
+    assert per_block[32] // 32 > per_block[64] // 64
 
 
 def test_the_step_model_takes_the_larger_floor_and_omits_what_it_lacks() -> None:
@@ -269,7 +378,9 @@ def test_the_step_model_takes_the_larger_floor_and_omits_what_it_lacks() -> None
     assert dram_us == pytest.approx(timed.total_bytes / (1e3 * 685.22))
     assert tensor_us == pytest.approx(timed.flop / 112e6)
     assert timed.model_us == max(dram_us, tensor_us)
-    # Bytes fall and arithmetic rises with L, in both directions, monotonically.
+    # Bytes fall with L monotonically. Arithmetic does not rise with it: L is the M
+    # mode of three kernels and the atom rounds M up to one tile, so below 64 the
+    # work is flat in L and the per-token cost falls to a minimum at one tile.
     models = [
         step_model(ACCEPTANCE, chunk, dram_gbs=685.22, peak_tflops=112.0)
         for chunk in CANDIDATES
@@ -277,7 +388,8 @@ def test_the_step_model_takes_the_larger_floor_and_omits_what_it_lacks() -> None
     bytes_ = [model.total_bytes for model in models]
     flops = [model.flop for model in models]
     assert bytes_ == sorted(bytes_, reverse=True)
-    assert flops == sorted(flops)
+    assert flops != sorted(flops)
+    assert min(models, key=lambda model: model.flop).chunk == 64
 
 
 # ---------------------------------------------------------------------------
