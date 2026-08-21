@@ -84,18 +84,34 @@ Two adjacent triples base the lane at ``12*pair``, which is 4-byte aligned alway
 the pair-fragment form
 :func:`slinoss.ops.so3ssd.cute.fwd.chunk_scan.chunk_scan_fwd_kernel` stores ``y``
 through then applies. One cell is 3 STG.32 for 6 STG.16, and the float32 read of the
-increment tile is 3 LDS.64 for 6 LDS.32. Measured on sm_86 at the shape above, one
-launch against one launch: -1,105,920 LSU warp-instructions, -4,127,040 of all
-instructions once the addresses a cell no longer needs go with them, -5.09 MB, 367.9
-to 356.1 us, at 141 registers. Wavefronts per instruction double where the width does,
+increment tile is 3 LDS.64 for 6 LDS.32. Measured on sm_86 at the shape above, a
+deterministic counter pass for the instructions and three lock-held runs a side for the
+time: -1,105,920 LSU warp-instructions, -4,127,040 of all instructions once the
+addresses a cell no longer needs go with them, 369.1 to 356.1 us, 595,024 to 584,193
+active cycles, at 141 registers. Wavefronts per instruction double where the width does,
 so the wavefront count is unchanged and the deletion is in the instruction stream.
 
+Duration falls 3.52% against 1.82% of the active cycles, at a grid and a residency that
+did not move. The rest is the tail: 360 blocks over 252 slots leaves the second wave
+43% full, so ``sm__cycles_active.avg`` is dragged toward the SMs that take one block
+while the wall follows the SMs that take two. Cycles are the invariant for the
+instruction stream and not for the wall, even at fixed geometry.
+
+DRAM falls 3.57 MB and none of it is the store. Read bytes fall 3.94 MB while write
+bytes rise 0.65 MB, the L2 read lookup count is flat to 0.24% on a read stream this
+change does not touch, its hit rate rises 0.99 points, and the store's own sector count
+at L1 rises 5.9% on 48% fewer requests. L2 write lookups miss zero times at either
+width, so no partial sector is ever filled from DRAM and the wider store buys no
+coverage. The byte delta is a read hit rate downstream of the schedule.
+
 Four adjacent triples are legal by the same arithmetic, 8-byte aligned, conflict-free
-on the shared read, and slower: 396.2 us, and the 5.09 MB comes back. A warp's cells
-then span eight rows of the plane rather than four, so twice as many partly written
-sectors stay open at once, which is what
+on the shared read, and slower: 396.2 us against 356.1 at 644,410 active cycles, with
+the byte gain lost. A warp's cells then span eight rows of the plane rather than four,
+the store spread
 :func:`slinoss.ops.so3ssd.cute.fwd.chunk_scan.chunk_scan_fwd_kernel` walks M outermost
-to avoid. Two is the width that pays. One sector per payload sector still needs the
+to avoid; the sector account above does not establish that as the cause, and the
+duration is enough to refuse the width. Two is the width that pays. One sector per
+payload sector still needs the
 ``(3, P*N)`` planar layout the unfused recurrence priced and rejected, which moves the
 cost onto the consumer that wants ``3N`` contiguous.
 
