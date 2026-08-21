@@ -167,6 +167,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
+    MMA_TILE_K,
     MMA_TILE_N,
     SMEM_SEGMENT,
     make_mma,
@@ -320,6 +321,14 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
     slice. So the search returns the widest slice inside the residency, never the
     widest slice.
 
+    Dividing the chunk is necessary and not sufficient. A slice that divides ``L``
+    but not the atom's K extent splits the K loop across an MMA step, and the atom
+    reads its fragment whole, so the tail step reads operand columns the slice never
+    staged: at ``L=144`` an unconstrained search returns 18 and the launch produces
+    55,349 NaN in ``zstart`` with no error raised. Every power of two at or above 16
+    steps down to 16, so the config's power-of-two rule hid this; the guard admits
+    80, 112 and 144, which do not.
+
     Args:
         chunk: ``L``.
         rows: ``P``.
@@ -327,24 +336,31 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
 
     Returns:
-        A divisor of ``chunk``. Nothing wider than one MMA step reaches the
-        residency once the chunk-sized tiles are large enough, so the fallback is
-        :data:`slinoss.ops.so3ssd.cute.fwd.chunk_increment.KBLOCK_MAX` halved until
-        the carveout admits it.
+        A divisor of ``chunk`` and a multiple of
+        :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_K`. Nothing wider than one MMA
+        step reaches the residency once the chunk-sized tiles are large enough, so
+        the fallback is
+        :data:`slinoss.ops.so3ssd.cute.fwd.chunk_increment.KBLOCK_MAX`.
+
+    Raises:
+        ValueError: If no legal slice fits the carveout at this shape. The floor is
+            one MMA step, so there is nothing narrower to fall back to.
     """
-    kblk = chunk
+    kblk = chunk - chunk % MMA_TILE_K
     while kblk > KBLOCK_MAX:
         if chunk % kblk == 0:
             budget = fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk)
             if smem_residency(budget) >= RESIDENT_MAX:
                 return kblk
-        kblk //= 2
-    kblk = min(chunk, KBLOCK_MAX)
-    while (
-        kblk > 1
-        and fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk) > smem_capacity()
-    ):
-        kblk //= 2
+        kblk -= MMA_TILE_K
+    kblk = min(chunk - chunk % MMA_TILE_K, KBLOCK_MAX)
+    if fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk) > smem_capacity():
+        raise ValueError(
+            f"no legal K slice fits at chunk={chunk} rows={rows} span={span}: "
+            f"one MMA step of {kblk} needs "
+            f"{fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk)} B of "
+            f"shared memory, capacity is {smem_capacity()} B"
+        )
     return kblk
 
 

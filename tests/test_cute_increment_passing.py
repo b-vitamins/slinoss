@@ -28,6 +28,7 @@ from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.fwd.increment_passing import (
     SPLIT,
+    fused_kblock,
     increment_passing_forward,
 )
 from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K
@@ -284,3 +285,30 @@ def test_rejects_an_uncoverable_tiling(span: int, warps: int, message: str) -> N
         increment_passing_forward(
             inp.U, inp.trans, inp.K, inp.B, 64, span=span, warps=warps
         )
+
+
+# Every chunk `check_extents` admits, not only the powers of two `SLinOSSConfig`
+# happens to allow. The kernel's own guard is the wider surface: a driver, a
+# sweep, or a caller reaching past the config sees these lengths.
+GUARD_CHUNKS = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 240, 256]
+
+
+@pytest.mark.parametrize("chunk", GUARD_CHUNKS)
+def test_slice_is_always_a_whole_number_of_mma_steps(chunk: int) -> None:
+    """The chosen slice is a multiple of the atom's K extent, at every legal chunk.
+
+    A slice that divides the chunk but not ``MMA_TILE_K`` splits the K loop across
+    an MMA step. The atom reads its fragment whole, so the tail step reads operand
+    columns the slice never staged, and the kernel returns NaN with no error
+    raised: measured at ``L=144``, where the search returns 18, the launch produces
+    55,349 NaN in ``zstart`` and 30,720 in ``state``, while slice 16 at the same
+    shape is clean. Dividing the chunk is necessary and not sufficient.
+
+    Held here rather than left to the config's power-of-two rule, which hides it by
+    accident: every power of two at or above 16 halves down to 16, so the defect is
+    unreachable through the public mixer and reachable through the guard.
+    """
+    kblk = fused_kblock(chunk, 64, SPLIT)
+    assert kblk % MMA_TILE_K == 0, (chunk, kblk)
+    assert chunk % kblk == 0, (chunk, kblk)
+    assert kblk >= MMA_TILE_K, (chunk, kblk)
