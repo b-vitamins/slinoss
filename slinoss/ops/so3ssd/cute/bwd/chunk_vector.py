@@ -838,6 +838,18 @@ def gradient_tile(rows: int, dim: int) -> Tile:
     the store; a second rounding here would double the error on every term it
     feeds, including the two float32 outputs.
 
+    The accumulator store into it is two-way and no pitch clears it. A float32 pair
+    goes out eight bytes wide, so a phase is sixteen threads over four accumulator
+    rows and the bank pair is ``pitch // 2 * r + d // 2`` modulo sixteen: at 52 words
+    a row that is ``{0,10,4,14}`` against a column span of four, and two banks take
+    two rows each. Freedom needs the pitch congruent to eight or 24 words modulo 32,
+    an even count of 16-byte segments, and the run reads of :func:`_pass_row` need an
+    odd one. The operand-width score store escapes because a four-byte pair widens
+    the phase to eight rows, where the same pitch is a stride-four permutation.
+    Measured at ``standard``: 294,912 excess store wavefronts a launch from the
+    forcing gradient and 147,456 from the readout, which at one shared cycle a
+    wavefront over 84 multiprocessors bounds the defect at 2.9 us of 215.
+
     Args:
         rows: Rows to allocate.
         dim: ``3N``.
