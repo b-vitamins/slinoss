@@ -35,7 +35,12 @@ arms. The bar is 1.0x rather than 1.15x, and the arms are the shipped modules:
 ``mamba_ssm.modules.mamba2.Mamba2`` against :class:`slinoss.mixer.SLinOSSMixer`.
 
     python3 scripts/bench/bench_mamba.py --shape acceptance --groups one \\
-        --mode step --end-to-end
+        --mode step --end-to-end --mamba-chunk 256
+
+``--mamba-chunk`` reaches the layer arm as well as the operator arm. Both arms hold
+a chunk length that is an internal tiling parameter, and at the acceptance geometry
+the two optima differ by a factor of four, so a layer ratio taken at one shared
+length is not a ratio of two floors.
 
 Mamba2 has two forward paths and they are two different baselines. Its default,
 ``use_mem_eff_path=True``, calls ``mamba_split_conv1d_scan_combined``, which fuses
@@ -290,9 +295,12 @@ def so3ssd_arithmetic(shape: OpShape) -> Arithmetic:
     from scripts.perf.chunk_sweep import flop_terms, geometry_of
 
     lanes = shape.bsz * shape.heads * shape.seq
-    terms = flop_terms(geometry_of(shape), shape.chunk)
-    forward = sum(term.flop for term in terms if term.kernel.endswith("_fwd"))
-    total = sum(term.flop for term in terms)
+    forward = sum(
+        term.flop
+        for term in flop_terms(geometry_of(shape), shape.chunk)
+        if term.kernel.endswith("_fwd")
+    )
+    total = sum(term.flop for term in flop_terms(geometry_of(shape), shape.chunk))
     return Arithmetic(
         label="so3ssd",
         forward_flop=lanes * forward,
@@ -367,6 +375,7 @@ def make_mamba_block(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
     mem_eff_path: bool = True,
+    chunk: int | None = None,
 ) -> Any:
     """Build a Mamba2 layer at the mapped geometry.
 
@@ -378,6 +387,11 @@ def make_mamba_block(
         mem_eff_path: Whether the layer takes its fused forward. False runs the
             convolution, ``mamba_chunk_scan_combined`` and the gated norm as three
             calls, which is the path whose scan the first clause measures.
+        chunk: Chunk length for this layer's scan, or None for the shape's own.
+            The layer arm needs the same per-arm tiling the operator arm has:
+            Mamba2's library default is 256 while the SO(3) arena refuses
+            everything above 64, so a layer comparison at one shared length
+            scores the baseline off its own optimum.
 
     Returns:
         The layer.
@@ -390,7 +404,7 @@ def make_mamba_block(
         blocker = fused_path_blocker()
         if blocker is not None:
             raise SystemExit(f"--mamba-path fused is unavailable: {blocker}")
-    mapping = mapping_of(shape, groups)
+    mapping = mapping_of(shape, groups, chunk)
     return load_block()(
         d_model=d_model_of(shape),
         d_state=mapping.dstate,
@@ -717,7 +731,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Chunk length for the Mamba2 arm alone, overriding --chunk. Mamba2's "
         "library default is 256 and the SO(3) arena refuses everything above 64, so "
-        "a single shared length scores at least one arm off its own tiling optimum.",
+        "a single shared length scores at least one arm off its own tiling optimum. "
+        "Reaches both the operator arm and the --end-to-end layer arm.",
     )
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
@@ -946,6 +961,10 @@ class BlockFaceoff(NamedTuple):
         row: The verdict on the per-iteration differences.
         d_model: The width both layers ran at.
         path: Which Mamba2 forward path the baseline arm took.
+        chunk: The Mamba2 arm's chunk length.
+        so3_chunk: The SO(3) arm's chunk length. Unequal to ``chunk`` when each arm
+            was run at its own tiling optimum, which is the only way a layer ratio
+            is a ratio of two floors.
         params: Both layers' parameter counts, Mamba2 first.
         arms: Both arms' medians, in the same order.
     """
@@ -953,6 +972,8 @@ class BlockFaceoff(NamedTuple):
     row: PairedRow
     d_model: int
     path: str
+    chunk: int
+    so3_chunk: int
     params: tuple[Parameters, Parameters]
     arms: tuple[ArmTimes, ArmTimes]
 
@@ -960,8 +981,15 @@ class BlockFaceoff(NamedTuple):
         """What was held equal and what each side paid for it."""
         theirs, ours = self.params
         excess = 100.0 * (ours.elements - theirs.elements) / theirs.elements
+        tiling = (
+            f"chunk_size={self.chunk} on both arms"
+            if self.chunk == self.so3_chunk
+            else f"mamba2 chunk_size={self.chunk} against so3ssd L={self.so3_chunk}, "
+            f"per-arm tiling"
+        )
         return (
             f"iso d_model={self.d_model} on both arms, mamba2 path={self.path}",
+            tiling,
             "parameters: "
             + ", ".join(f"{p.label} {p.elements:,}" for p in self.params),
             f"the SO(3) layer carries {excess:+,.2f}% of Mamba2's parameters at "
@@ -1003,10 +1031,16 @@ def compare_block(
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
     path = "fused" if mem_eff_path else "unfused"
-    a_label = f"mamba2-block-{path}"
+    mchunk = mamba_chunk(shape, args.mamba_chunk)
+    a_label = f"mamba2-block-{path}{mamba_tag(shape, mchunk)}"
     b_label = "slinoss-mixer"
     theirs = make_mamba_block(
-        shape, groups, device=device, dtype=dtype, mem_eff_path=mem_eff_path
+        shape,
+        groups,
+        device=device,
+        dtype=dtype,
+        mem_eff_path=mem_eff_path,
+        chunk=mchunk,
     )
     ours = SLinOSSMixer(layer_config(shape, groups=groups), device=device, dtype=dtype)
     if not grads:
@@ -1035,6 +1069,8 @@ def compare_block(
         row=out.comparison,
         d_model=d_model_of(shape),
         path=path,
+        chunk=mchunk,
+        so3_chunk=shape.chunk,
         params=parameter_counts(shape, groups),
         arms=(arm_times(out.timed, a_label), arm_times(out.timed, b_label)),
     )
@@ -1200,7 +1236,7 @@ def _run_blocks(
                     )
                     base = args.out.with_name(
                         f"{args.out.name}-block-{face.path}-{shape.name}"
-                        f"-g{groups}-{mode}"
+                        f"-g{groups}{mamba_tag(shape, face.chunk)}-{mode}"
                     )
                     md, _ = write_report(report, base, require_agreement=False)
                     rates += [
