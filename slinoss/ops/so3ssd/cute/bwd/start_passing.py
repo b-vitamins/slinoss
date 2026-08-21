@@ -231,6 +231,8 @@ runs, one call:
     3          411.6
     4          439.3
 
+The four durations are at the float32 ``dinc`` width.
+
 One and two tie because both admit the register count the kernel wants and both fit
 two blocks of eight warps per SM; three is the first bound that fits a third.
 """
