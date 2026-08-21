@@ -15,6 +15,7 @@ from slinoss.ops.so3ssd.backward import (
     SO3SSDGrads,
     chunk_transition_cotangents,
     chunked_backward,
+    chunked_backward_fused,
     so3ssd_bwd_ref,
 )
 from slinoss.ops.so3ssd.interface import SO3SSDFunction, so3ssd
@@ -68,6 +69,7 @@ __all__ = [
     "chunk_pad",
     "chunk_transition_cotangents",
     "chunked_backward",
+    "chunked_backward_fused",
     "chunked_forward",
     "chunked_forward_fused",
     "deriv_coeffs",

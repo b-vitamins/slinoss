@@ -9,6 +9,12 @@ Every gradient is a dense GEMM or an elementwise map under the transposed decay
 mask. The one sequential piece is the reverse chunk recurrence, which carries a
 ``(B,H,P,3N)`` accumulator and runs once per chunk.
 
+:func:`chunked_backward_fused` is the adjoint of the one-tap factorization, and
+rematerializes :func:`slinoss.ops.so3ssd.reference.chunked_forward_fused` under the
+same rule. It differentiates one table column where :func:`chunked_backward`
+differentiates two, so the cotangent of that column splits back onto ``ap``, ``an``
+and ``ls`` instead of arriving on ``ap`` and ``an`` already separated.
+
 Correctness ground truth is float64 autograd through
 :func:`slinoss.ops.so3ssd.reference.so3ssm`, never this derivation. A hand-derived
 VJP shares its algebra with the code that implements it, so an algebra error
@@ -30,6 +36,7 @@ from slinoss.ops.so3ssd.reference import (
     check_grad_band,
     chunk_pad,
     chunked_forward,
+    chunked_forward_fused,
     from_heads,
     quat_exp_vjp,
     quat_prefix_scan_vjp,
@@ -44,6 +51,7 @@ __all__ = [
     "SO3SSDGrads",
     "chunk_transition_cotangents",
     "chunked_backward",
+    "chunked_backward_fused",
     "so3ssd_bwd_ref",
 ]
 
@@ -159,6 +167,35 @@ def _unchunk(t: Tensor, seqlen: int) -> Tensor:
 def _scatter_last(t: Tensor, length: int) -> Tensor:
     """``(B,H,C) -> (B,H,C,L)`` with ``t`` at ``l = L-1`` and zeros before it."""
     return _pad(t[..., None], (length - 1, 0))
+
+
+def _scatter_last_row(t: Tensor, length: int) -> Tensor:
+    """``(B,H,C,X) -> (B,H,C,L,X)`` with ``t`` at ``l = L-1`` and zeros before it."""
+    return _pad(t[..., None, :], (0, 0, length - 1, 0))
+
+
+def _unshift(t: Tensor, seqlen: int) -> Tensor:
+    """Cotangent of a shifted operand, onto its source: ``(B,H,C,L,X) -> (B,H,T,X)``.
+
+    Slot ``(c,l)`` of the shifted operand reads token ``c*L + l - 1``, so the
+    cotangent moves back one token and the head at ``(0,0)`` falls out as the
+    streaming carry.
+
+    The move runs over the padded axis and the slice to ``T`` comes after it, which
+    is the adjoint of shifting the padded sequence. At ``T mod L == n > 0`` slot
+    ``n`` of the tail chunk reads token ``T-1``, so slicing first would drop that
+    cotangent entirely. When ``L`` divides ``T`` the last slot has no successor and
+    the pad supplies its zero.
+
+    Args:
+        t: Cotangent of the shifted operand, ``(B,H,C,L,X)``.
+        seqlen: Unpadded ``T``.
+
+    Returns:
+        ``(B,H,T,X)``, in the dtype of ``t``.
+    """
+    flat = t.flatten(2, 3)
+    return _pad(flat[:, :, 1:], (0, 0, 0, 1))[:, :, :seqlen]
 
 
 class ChunkTransition(NamedTuple):
@@ -496,6 +533,302 @@ def chunked_backward(
             chunk_scale=chunk_scale,
             carry_u=carry_u,
             carry_b=carry_b,
+        )
+
+
+def chunked_backward_fused(
+    dy: Tensor | None,
+    dstate: Tensor | None,
+    db_last: Tensor | None,
+    du_last: Tensor | None,
+    U: Tensor,
+    trans: Tensor,
+    K: Tensor,
+    B: Tensor,
+    C: Tensor,
+    chunk_size: int,
+    *,
+    z0: Tensor | None = None,
+    b_prev: Tensor | None = None,
+    u_prev: Tensor | None = None,
+    dB: Tensor | None = None,
+    dC: Tensor | None = None,
+    dU_init: Tensor | None = None,
+) -> SO3SSDGrads:
+    """Differentiate the one-tap factorization. The derivation the kernels implement.
+
+    Same operator and same cotangents as :func:`chunked_backward`, which stays the
+    ground truth. Rematerializes
+    :func:`slinoss.ops.so3ssd.reference.chunked_forward_fused` and differentiates it
+    term by term, so the recompute is the forward by construction.
+
+    Three parts of the forward have no counterpart in the two-tap adjoint.
+
+    The fused column. ``Afuse_s = ap_s + e_s an_{s-1}`` with ``e_s = exp(2*ls_s)``,
+    so one 3x3 cotangent splits three ways:
+
+        dap_s     += dAfuse_s
+        dan_{s-1} += e_s dAfuse_s
+        dls_s     += 2 e_s <dAfuse_s, an_{s-1}>
+
+    the last a Frobenius inner product. ``dAfuse_0`` sends nothing to ``an`` and
+    nothing to ``ls``, because ``Afuse_0`` is ``ap_0`` alone; the shift source is
+    ``an[0..L-2]``, so ``an_{L-1}`` enters no column and takes no term. This is the
+    only route by which ``ls`` reaches the output other than through the log-scale
+    prefix, so ``dls`` is the reverse cumulative sum of ``dlp`` plus this.
+
+    The two residues. ``<crot_t, bnow_t> u_t`` is elementwise in ``t``, so it lands on
+    ``du`` as one product and on ``dbnow`` as one scale of ``crot``; the increment's
+    ``u_{L-1} (x) bnow_{L-1}`` lands on both at slot ``L-1`` only. ``dbnow`` has no
+    GEMM source at all, and it carries no increment weight: ``wgt_{L-1}`` is one.
+
+    The ragged tail. ``ushift`` and ``bshift`` are shifts of the padded sequence, so
+    their cotangents move back one token over the padded axis and are sliced to ``T``
+    afterwards. Slicing first drops slot ``T mod L`` of the tail chunk, which is where
+    the reindex put token ``T-1``. That term reaches ``state`` and never ``y``, so no
+    output parity constrains it.
+
+    Args:
+        dy: Cotangent of ``y``, shape ``(B,H,T,P)``. ``None`` is zero.
+        dstate: Cotangent of ``state``, shape ``(B,H,P,3N)``. ``None`` is zero.
+        db_last: Cotangent of ``b_last``, shape ``(B,G,3N)``. ``None`` is zero.
+        du_last: Cotangent of ``u_last``, shape ``(B,H,P)``. ``None`` is zero.
+        U: Input weights, shape ``(B,H,T,P)``.
+        trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
+        K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
+        B: Input vectors, shape ``(B,G,T,3N)``.
+        C: Output vectors, shape ``(B,G,T,3N)``.
+        chunk_size: Chunk length ``L``. Must match the forward.
+        z0: Initial state, shape ``(B,H,P,3N)``, pinned.
+        b_prev: ``b_{-1}``, shape ``(B,G,3N)``.
+        u_prev: ``u_{-1}``, shape ``(B,H,P)``.
+        dB: Destination for the ``B`` cotangent, shape ``(B,G,T,3N)``, dtype and
+            device of ``B``, possibly pitched. Written in full, never accumulated
+            into and never zeroed first, and returned as this same object. ``None``
+            allocates a contiguous buffer. See
+            :func:`slinoss.ops.so3ssd.reference.check_grad_band`.
+        dC: Destination for the ``C`` cotangent, shape ``(B,G,T,3N)``, under the
+            contract of ``dB``.
+        dU_init: Addend for the ``U`` cotangent, shape ``(B,H,T,P)``, dtype and
+            device of ``U``, possibly pitched. Read and never written.
+
+    Returns:
+        A :class:`SO3SSDGrads`.
+
+    Raises:
+        ValueError: On a shape, contiguity, device, or pairing violation, a
+            non-positive ``chunk_size``, or a caller's buffer off the pitched-layout
+            contract.
+        TypeError: On an unsupported dtype, a low-precision pinned tensor, or a
+            caller's buffer whose dtype is not that of the operand it belongs to.
+    """
+    fw = chunked_forward_fused(
+        U, trans, K, B, C, chunk_size, z0=z0, b_prev=b_prev, u_prev=u_prev
+    )
+    # After the rematerializing forward, which validates the operands a caller's
+    # buffer is measured against.
+    if dB is not None:
+        check_grad_band(dB, B, "dB")
+    if dC is not None:
+        check_grad_band(dC, C, "dC")
+    if dU_init is not None:
+        check_grad_band(dU_init, U, "dU_init")
+    dtype = pinned_dtype(U, trans, K, B, C)
+    length = fw.length
+    seqlen = fw.seqlen
+    n_chunks = int(fw.u.shape[2])
+
+    with autocast_disabled(U.device.type):
+        dy_c = (
+            torch.zeros_like(fw.u)
+            if dy is None
+            else chunk_pad(dy.to(dtype).contiguous(), length)
+        )
+        acc = (
+            torch.zeros_like(fw.state)
+            if dstate is None
+            else as_lanes(dstate.to(dtype).contiguous())
+        )
+
+        # y_off = exp(2*lp) * <crot, zstart>. Unchanged by the reindex.
+        expl = torch.exp(2.0 * fw.lprefix)[..., None]
+        gram = torch.einsum("bhclni,bhcpni->bhclp", fw.crot, fw.zstart)
+        dgram = dy_c * expl
+        dlp_off = 2.0 * expl[..., 0] * (dy_c * gram).sum(-1)
+        dcrot = torch.einsum("bhclp,bhcpni->bhclni", dgram, fw.zstart)
+        dzstart = torch.einsum("bhclp,bhclni->bhcpni", dgram, fw.crot)
+
+        # y_diag = (score * dmask) @ ushift + dnow * u. One score matrix, so one
+        # transposed-mask term; the residue beside it is elementwise in t.
+        dm = torch.einsum("bhclp,bhcrp->bhclr", dy_c, fw.ushift)
+        dushift = torch.einsum("bhclr,bhclp->bhcrp", fw.score * fw.dmask, dy_c)
+        dscore = dm * fw.dmask
+        # The strictly upper triangle of dmask is exactly zero, so the cotangent
+        # of the exponent is too: the causal mask needs no separate handling.
+        dexpo = dm * fw.score * fw.dmask
+        dlp_scan = 2.0 * (dexpo.sum(-1) - dexpo.sum(-2))
+        ddnow = (dy_c * fw.u).sum(-1)
+        du = fw.dnow[..., None] * dy_c
+
+        crot_f = fw.crot.flatten(-2, -1)
+        bnow_f = fw.bnow.flatten(-2, -1)
+        bfuse_f = fw.bfuse.flatten(-2, -1)
+
+        # Reverse chunk recurrence. zstart[c] feeds both the transition into
+        # chunk c+1 and y_off of chunk c, so its two cotangents meet here.
+        chunk_rot = fw.table.rot[..., -1, :, :]
+        chunk_scale = torch.exp(2.0 * fw.lprefix[..., -1])
+        dinc_rev: list[Tensor] = []
+        drot_rev: list[Tensor] = []
+        dscale_rev: list[Tensor] = []
+        for c in reversed(range(n_chunks)):
+            rot_c = chunk_rot[:, :, c]
+            scale_c = chunk_scale[:, :, c]
+            start_c = fw.zstart[:, :, c]
+            dinc_rev.append(acc)
+            trans_c = chunk_transition_cotangents(acc, start_c, rot_c, scale_c)
+            dscale_rev.append(trans_c.dchunk_scale)
+            drot_rev.append(trans_c.dchunk_rot)
+            acc = (
+                scale_c[..., None, None, None]
+                * torch.einsum("bhij,bhpni->bhpnj", rot_c, acc)
+                + dzstart[:, :, c]
+            )
+        dinc = torch.stack(dinc_rev[::-1], dim=2)
+        dchunk_rot = torch.stack(drot_rev[::-1], dim=2)
+        dchunk_scale = torch.stack(dscale_rev[::-1], dim=2)
+
+        # inc = R(Q_{L-1}) inc_local, one frame change per chunk.
+        dinc_local = torch.einsum("bhcij,bhcpni->bhcpnj", chunk_rot, dinc)
+        dchunk_rot = dchunk_rot + torch.einsum(
+            "bhcpni,bhcpnj->bhcij", dinc, as_lanes(fw.inc_local)
+        )
+        dinc_local_f = dinc_local.flatten(-2, -1)
+
+        # inc_local = (ushift * wgt)^T @ bfuse + outer(u_{L-1}, bnow_{L-1}). The
+        # weight rides ushift, size P, not bfuse, size 3N. The rank-one residue
+        # carries no weight at all: wgt_{L-1} is one.
+        duw = torch.einsum("bhcpd,bhcrd->bhcrp", dinc_local_f, bfuse_f)
+        dbfuse_f = torch.einsum("bhcpd,bhcrp->bhcrd", dinc_local_f, fw.ushift * fw.wgt)
+        dushift = dushift + duw * fw.wgt
+        dexpw = (duw * fw.ushift).sum(-1) * fw.wgt[..., 0]
+        du = du + _scatter_last_row(
+            torch.einsum("bhcpd,bhcd->bhcp", dinc_local_f, bnow_f[..., -1, :]), length
+        )
+
+        # score = crot @ bfuse^T and dnow = <crot, bnow>. bnow reaches the output
+        # through the two residues alone, so its cotangent is not a GEMM.
+        dcrot_f = dcrot.flatten(-2, -1) + dscore @ bfuse_f + ddnow[..., None] * bnow_f
+        dbfuse_f = dbfuse_f + dscore.transpose(-1, -2) @ crot_f
+        dbnow_f = ddnow[..., None] * crot_f + _scatter_last_row(
+            torch.einsum("bhcpd,bhcp->bhcd", dinc_local_f, fw.u[..., -1, :]), length
+        )
+
+        # lp reaches the output through dmask, wgt, chunk_scale, and exp(2*lp).
+        # wgt and chunk_scale both differentiate the last token of the chunk.
+        dlp_scan = dlp_scan - 2.0 * dexpw
+        dlp_scan = dlp_scan + _scatter_last(2.0 * dexpw.sum(-1), length)
+        dlp_off = dlp_off + _scatter_last(2.0 * chunk_scale * dchunk_scale, length)
+        dlp = dlp_scan + dlp_off
+
+        # Rowwise change of basis. The 3x3 operand is shared by all N lanes, so
+        # its cotangent is a lane reduction and the vector cotangent is a matvec.
+        dcrot_n = as_lanes(dcrot_f)
+        dbnow_n = as_lanes(dbnow_f)
+        dbfuse_n = as_lanes(dbfuse_f)
+        dac = torch.einsum("bhclni,bhclnj->bhclij", dcrot_n, as_lanes(fw.c))
+        dan = torch.einsum("bhclni,bhclnj->bhclij", dbnow_n, as_lanes(fw.b))
+        dafuse = torch.einsum("bhclni,bhclnj->bhclij", dbfuse_n, as_lanes(fw.bshift))
+        dc_n = torch.einsum("bhclij,bhclni->bhclnj", fw.table.ac, dcrot_n)
+        db_n = torch.einsum("bhclij,bhclni->bhclnj", fw.table.an, dbnow_n)
+        dbs_n = torch.einsum("bhclij,bhclni->bhclnj", fw.afuse, dbfuse_n)
+
+        # Afuse_s = ap_s + step_s * an_{s-1}, the split that defines this path. The
+        # previous tap takes the cotangent whole, the now-tap of the token before takes
+        # it scaled by the step decay, and the decay takes the Frobenius pairing. Slot
+        # 0 has no predecessor inside the chunk and so feeds neither of the last two;
+        # the shift source is an[0..L-2], so an_{L-1} enters no column and takes
+        # nothing here. Injecting the previous chunk's an_{L-1} at s = 0 is wrong
+        # rather than redundant: that tap sits in the previous chunk's frame.
+        dap = dafuse
+        dan = dan + _pad(
+            fw.step[..., 1:, None, None] * dafuse[..., 1:, :, :], (0, 0, 0, 0, 0, 1)
+        )
+        dls_step = (
+            2.0
+            * fw.step
+            * _pad(
+                (dafuse[..., 1:, :, :] * fw.table.an[..., :-1, :, :]).sum((-2, -1)),
+                (1, 0),
+            )
+        )
+
+        # Table composition: ac = R^T, ap = ac Kprev, an = ac Kcurr.
+        kprev = tap_matrix(fw.tap[..., 0, :], fw.w)
+        kcurr = tap_matrix(fw.tap[..., 1, :], fw.w)
+        act = fw.table.ac.transpose(-1, -2)
+        dac = dac + dap @ kprev.transpose(-1, -2) + dan @ kcurr.transpose(-1, -2)
+        gprev = tap_matrix_vjp(act @ dap, fw.tap[..., 0, :], fw.w)
+        gcurr = tap_matrix_vjp(act @ dan, fw.tap[..., 1, :], fw.w)
+        dtap = torch.stack([gprev.tap, gcurr.tap], dim=-2)
+
+        drot = dac.transpose(-1, -2) + _pad(
+            dchunk_rot[..., None, :, :], (0, 0, 0, 0, length - 1, 0)
+        )
+        dquat = quat_prefix_scan_vjp(rot_matrix_vjp(drot, fw.qprefix), fw.qprefix)
+        dw = gprev.w + gcurr.w + quat_exp_vjp(dquat, fw.w)
+        # The prefix route plus the fused column's own ls term. Only this path has a
+        # second one; every other cotangent of ls arrives through lp.
+        dls = dlp.flip(-1).cumsum(-1).flip(-1) + dls_step
+
+        # The shifted operands are shifts of the padded sequence, so their cotangents
+        # move back one token before the slice to T, not after it.
+        dU_t = _unchunk(du, seqlen) + _unshift(dushift, seqlen)
+        dB_t = _unchunk(db_n.flatten(-2, -1), seqlen) + _unshift(
+            dbs_n.flatten(-2, -1), seqlen
+        )
+        if du_last is not None:
+            dU_t = dU_t + _pad(du_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
+        # The seed joins the accumulation rather than its result: one narrowing store
+        # of the total, instead of narrowing both addends and adding afterwards.
+        if dU_init is not None:
+            dU_t = dU_t + dU_init.to(dtype)
+
+        dtrans_t = torch.cat(
+            [_unchunk(dw, seqlen), _unchunk(dls, seqlen)[..., None]], dim=-1
+        )
+        # Lane 3 of K is a hard zero in the forward, so it is a hard zero here.
+        dK_t = _pad(_unchunk(dtap, seqlen), (0, 1))
+
+        # B and C are read by every head of their group, so their cotangents are
+        # summed back over those heads. Identity when G == H.
+        groups = int(B.shape[1])
+        dB_g = from_heads(dB_t, groups)
+        dC_g = from_heads(_unchunk(dc_n.flatten(-2, -1), seqlen), groups)
+        # b_last is a slice of the grouped B, not a per-head read of it, so its
+        # cotangent lands after the group reduction.
+        if db_last is not None:
+            dB_g = dB_g + _pad(db_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
+
+        return SO3SSDGrads(
+            dU=dU_t.to(U.dtype).contiguous(),
+            dtrans=dtrans_t.to(trans.dtype).contiguous(),
+            dK=dK_t.to(K.dtype).contiguous(),
+            dB=_store(dB, dB_g.to(B.dtype)),
+            dC=_store(dC, dC_g.to(C.dtype)),
+            dz0=None if z0 is None else acc.flatten(-2, -1).to(z0.dtype).contiguous(),
+            db_prev=(
+                None
+                if b_prev is None
+                else from_heads(dbs_n[:, :, 0, 0].flatten(-2, -1), groups)
+                .to(b_prev.dtype)
+                .contiguous()
+            ),
+            du_prev=(
+                None
+                if u_prev is None
+                else dushift[:, :, 0, 0, :].to(u_prev.dtype).contiguous()
+            ),
         )
 
 
