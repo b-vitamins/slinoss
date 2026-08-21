@@ -117,7 +117,7 @@ from slinoss._cute import (
     narrow,
     select,
     smem_bytes,
-    smem_capacity,
+    smem_residency,
 )
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
@@ -686,7 +686,7 @@ def chunk_scan_fwd(
     :data:`RESIDENT_MAX`. The bound is computed rather than chosen, so it asks for no
     register cut that occupancy cannot spend.
     """
-    resident = min(RESIDENT_MAX, smem_capacity() // scan_smem_bytes(chunk, rows, dim))
+    resident = min(RESIDENT_MAX, smem_residency(scan_smem_bytes(chunk, rows, dim)))
     chunk_scan_fwd_kernel(
         gu,
         gtrans,
