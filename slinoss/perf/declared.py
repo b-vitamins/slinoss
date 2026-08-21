@@ -76,6 +76,7 @@ DECLARED: Final[dict[str, str]] = {
     "conv1d_bwd_kernel": DRAM_BOUND,
     "conv1d_fwd_kernel": DRAM_BOUND,
     "conv1d_reduce_parts_kernel": SERIAL_TINY,
+    "increment_passing_fwd_kernel": DRAM_BOUND,
     "mixer_tail_bwd_kernel": DRAM_BOUND,
     "mixer_tail_fwd_kernel": DRAM_BOUND,
     "reduce_rows_kernel": SERIAL_TINY,
@@ -112,6 +113,16 @@ kernel and the wrong one of two ways to compute the same thing. The arm total in
 ``scripts/perf/profile_start_passing_bwd.py`` is what ranked them, and the
 percentage this entry fails is a statement about the denominator rather than about
 the kernel.
+
+``increment_passing_fwd_kernel`` is the forward mirror of that fusion and is under
+the bar for the same reason. Measured on sm_86 at the acceptance shape it moves
+187.98 MB in 401.3 us, 69.7% of the floor that traffic implies, against the 522.83 MB
+in 787.0 us and the 96.6% and 99.4% of ``chunk_increment_fwd_kernel`` and
+``state_passing_fwd_kernel``. Those two keys stay because both kernels stay: they are
+the A/B arm of ``scripts/perf/profile_increment_passing_fwd.py``, which the forward
+no longer launches. At 64.3% of peak bandwidth the launch is no longer on the bus,
+and 21.8% of its stalls are barriers, so what it is held to next is the staging
+rather than the traffic.
 
 ``vector_reduce_kernel`` sums the per-head partials the vector backward emits once
 the head-sum depth is a grid axis. Its traffic is the partial buffer and nothing

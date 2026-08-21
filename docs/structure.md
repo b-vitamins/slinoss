@@ -74,9 +74,9 @@ slinoss/
         table.py    the 3x3 transform table and every staging helper
         prefix.py   both chunk-local prefixes and their adjoints
         guard.py    this operator's dtype sets and shape checks
-        forward.py  the driver that sequences the three forward launches
+        forward.py  the driver that sequences the two forward launches
         backward.py the driver that sequences the seven backward launches
-        fwd/        chunk_increment, state_passing, chunk_scan
+        fwd/        increment_passing, chunk_scan, and the pair the first fused
         bwd/        chunk_start, state_passing, chunk_input, chunk_vector, boundary
     scanprep/     parameter maps: rotation vector, log-scale, taps
     mixer/        fused rowwise mixer tail

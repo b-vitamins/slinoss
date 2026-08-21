@@ -43,7 +43,7 @@ none, so `L` cannot refuse them. At the geometry above, against a 101,376 B carv
 
 | kernel | `L 16` | `L 32` | `L 64` | `L 128` | `L 256` |
 | --- | --- | --- | --- | --- | --- |
-| `chunk_increment_fwd` | 12,688 | 25,232 | 19,600 | 28,816 | 47,248 |
+| `increment_passing_fwd` | 14,592 | 16,896 | 32,912 | 30,720 | 49,152 |
 | `chunk_scan_fwd` | 68,752 | 73,872 | 79,504 | 122,512 | 208,528 |
 | `chunk_start_bwd` | 11,392 | 22,784 | 45,568 | 91,136 | 182,272 |
 | `chunk_input_bwd` | 42,416 | 44,528 | 48,752 | 89,968 | 172,400 |
@@ -54,6 +54,12 @@ Legal `L` is 16, 32, 64. `L 128` is refused by `chunk_vector_bwd` and
 `chunk_scan_fwd`; `L 256` exceeds `MAX_CHUNK` and is refused by four of the five.
 No `L` reaches two resident blocks in every kernel: `chunk_scan_fwd` and
 `chunk_vector_bwd` hold one block at every legal `L`.
+
+`increment_passing_fwd` is the one row where `L` enters twice. Its band is fixed at 48
+columns of `3N`, so the chunk-sized tiles grow with `L` and the K slice takes whatever
+the residency has left: 16 at `L 16`, 32 at `L 32`, 64 at `L 64`, and back to 32 at
+`L 128`, where the wide slice would drop the launch to one block. Three blocks is what
+it holds at every legal `L` and what the measured 3.00 blocks per SM confirms.
 
 The two refusals are not the same kind. `chunk_scan_fwd` is refused by `3N`: its
 `mma_rows(L) x 3N` operand tile is 63,488 B of the 122,512 at `L 128`, and slicing that
@@ -87,6 +93,11 @@ Per kernel, microseconds per step over 13 calls:
 | `state_passing_bwd` | 21,863 | 10,984 | 5,478 |
 | `chunk_scan_fwd` | 15,454 | 11,661 | 8,723 |
 | `chunk_start_bwd` | 13,020 | 6,510 | 3,265 |
+
+The `state_passing_fwd` and `chunk_increment_fwd` rows are the unfused pair, which the
+forward no longer launches: `increment_passing_fwd` replaced both. Measured at `L 64`
+on the same part, the pair costs 787.0 us a call against the fused launch's 401.3, and
+10.32 ms of a step against 5.38.
 
 Every kernel but one falls with `L`, at or near the `1/L` the byte model predicts.
 `chunk_vector_bwd` rises: 1.59x from `L 32` to `L 64` against 1.46x more arithmetic and

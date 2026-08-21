@@ -1,17 +1,16 @@
 """What the chunk-boundary prologue costs at the model geometry, both ways.
 
-The forward's ``chunk_increment_fwd`` and ``state_passing_fwd`` produce ``cquat``,
-``cscale`` and ``zstart``, and the backward reads all three. Holding them across the
-step deletes the two launches that would rebuild them there and pays in live
-activation. The trade has two units, device time and allocator bytes, and neither is
-readable off the other, so both are measured here in one process at the geometry the
-stack trains at.
+The forward's ``increment_passing_fwd`` produces ``cquat``, ``cscale`` and
+``zstart``, and the backward reads all three. Holding them across the step deletes
+the launch that would rebuild them there and pays in live activation. The trade has
+two units, device time and allocator bytes, and neither is readable off the other,
+so both are measured here in one process at the geometry the stack trains at.
 
     python3 scripts/perf/profile_prologue.py
 
 The policy is not a flag. Which one the tree holds is read off the launch counts: a
-step that launches ``state_passing_fwd`` twice per layer is rematerializing, and one
-that launches it once per layer is not. A driver that took the policy as a flag
+step that launches ``increment_passing_fwd`` twice per layer is rematerializing, and
+one that launches it once per layer is not. A driver that took the policy as a flag
 would label whichever tree it was pointed at.
 
 Peak allocated bytes is what the memory side is judged on, not the saved-set total.
@@ -39,6 +38,17 @@ Per-launch time does not move: ``state_passing_fwd`` 428.8 us against 429.1,
 make the surviving ones faster, which is why the whole win is readable off the launch
 counts alone.
 
+Both arms above predate the fusion of the increment into the recurrence, so their
+prologue is two launches a layer where the tree now makes one. The trade is unchanged
+in kind: the fusion halves the time term and moves no byte of the memory term. Same
+geometry, same part, both trees measured in one session, two repeats each, saving all
+three either way. The pair: step 207.625 and 208.072 ms, prologue 10.314 and 10.325 ms
+per step over 26 launches, 4.98% of device time. Fused: step 202.839 and 203.393 ms,
+prologue 5.357 and 5.398 ms over 13 launches at 412.0 and 415.2 us a call, 2.64%. Peak
+allocated 11,187.88 MiB, peak reserved 11,328.00 MiB, and the saved set 419 storages
+over 7,227.12 MiB, all three the same to the byte in both trees: the increment buffer
+the fusion deleted was never live at the instant the peak is taken.
+
 The retained tensors are 1,755.6 MiB of the 1,911.89 MiB the peak rose by: 13 layers
 of ``zstart`` at 135.00 MiB, ``cquat`` at 0.036, ``cscale`` at 0.009. The remaining
 156.3 MiB is not a tensor. The peak is a maximum over a step and the two policies do
@@ -46,13 +56,10 @@ not reach it at the same instant, which is the reason the memory side is measure
 rather than added up. The saved set rose by less than either figure, 5,687.65 MiB
 over 386 storages to 7,227.12 MiB over 419.
 
-Saving less is not available. ``state_passing_fwd`` consumes the increment buffer
-that ``chunk_increment_fwd`` alone produces, so saving ``cquat`` and ``cscale``
-without ``zstart`` deletes neither launch and buys nothing for its 0.045 MiB. Saving
-``zstart`` without them pays the whole 1,755 MiB and still launches
-``chunk_increment_fwd`` for the two transitions, so it returns 5.57 ms of the 10.39 ms
-the backward's two launches cost. Both partial policies are dominated, so the choice
-is the two arms above and nothing between them.
+Saving less is not available, and the fusion is what settles it: one launch produces
+all three, so any subset leaves that launch in the backward and returns none of its
+time for whatever share of the 1,755 MiB the subset holds. Every partial policy is
+dominated, so the choice is the two arms above and nothing between them.
 """
 
 from __future__ import annotations
@@ -76,7 +83,7 @@ from slinoss.perf.memory import SavedTensorProbe, memory_peaks, reset_memory_pea
 from slinoss.perf.timing import measure
 from slinoss.perf.units import mib_from_bytes, pct_of
 
-PROLOGUE = ("chunk_increment_fwd", "state_passing_fwd")
+PROLOGUE = ("increment_passing_fwd",)
 """Kernels the recompute policy relaunches inside the backward."""
 
 BOUNDARY = ("chunk_start_bwd", "state_passing_bwd")

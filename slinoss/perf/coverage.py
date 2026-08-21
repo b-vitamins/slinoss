@@ -24,8 +24,8 @@ it does not, which is the one thing this module cannot decide from the operator 
 and the mode alone. Everything else is required, so an absence is a defect.
 
 A kernel no arm launches at any shape is declared :data:`TARGETED` and carries the
-driver that does launch it. That is the whole escape hatch: two entries, both named
-in the report, neither excused from anything but :func:`unreachable`.
+driver that does launch it. That is the whole escape hatch: four entries, every one
+named in the report, none excused from anything but :func:`unreachable`.
 
 The table is data, not an import: naming a kernel here pulls in neither the operator
 packages nor the DSL, so the completeness test runs on a host with no GPU.
@@ -107,15 +107,13 @@ class OpCoverage:
 COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
     ("so3ssd", "forward"): OpCoverage(
         required=(
-            "chunk_increment_fwd_kernel",
-            "state_passing_fwd_kernel",
+            "increment_passing_fwd_kernel",
             "chunk_scan_fwd_kernel",
         )
     ),
     ("so3ssd", "step"): OpCoverage(
         required=(
-            "chunk_increment_fwd_kernel",
-            "state_passing_fwd_kernel",
+            "increment_passing_fwd_kernel",
             "chunk_scan_fwd_kernel",
             "start_passing_bwd_kernel",
             "chunk_input_bwd_kernel",
@@ -190,9 +188,10 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
 Read off the launch sites, not off a capture: a table derived from what a profiler
 happened to report could not detect a missing launch, which is what it exists for.
 
-The two forward kernels recur in ``so3ssd``'s step because the backward recomputes
-the chunk increment and the forward recurrence rather than saving them, so the step
-holds each of them twice. ``reduce_rows_kernel`` is shared by four arms: the
+The forward kernels recur in ``so3ssd``'s step when the backward recomputes the chunk
+prologue rather than reading a saved one, so the step can hold one of them twice. One
+key either way: a capture merges the launches of one symbol into one counter row.
+``reduce_rows_kernel`` is shared by four arms: the
 frontier's parameter-bias reduction, the fused tail's two parameter slots, the
 loss's mean, and the vector backward's slot close. Only the last is conditional.
 
@@ -231,6 +230,21 @@ TARGETED: Final[tuple[Targeted, ...]] = (
         "ranked against and is declared here until it is deleted",
     ),
     Targeted(
+        "chunk_increment_fwd_kernel",
+        "scripts/perf/profile_increment_passing_fwd.py --arm pair",
+        "the forward fused this GEMM into increment_passing_fwd, so the operator no "
+        "longer launches it on any path; it survives as the arm the fusion is "
+        "ranked against and is declared here until it is deleted",
+    ),
+    Targeted(
+        "state_passing_fwd_kernel",
+        "scripts/perf/profile_increment_passing_fwd.py --arm pair",
+        "the forward recurrence now runs inside increment_passing_fwd over a shared "
+        "increment, so nothing launches the standalone pass over an increment "
+        "buffer; it survives as the other half of the arm the fusion is ranked "
+        "against",
+    ),
+    Targeted(
         "state_passing_bwd_kernel",
         "scripts/perf/profile_start_passing_bwd.py --arm pair",
         "the operator launches the recurrence alone only when dy is absent, which "
@@ -246,10 +260,15 @@ the kernel, and every entry is a line in the report so the excuse is read every 
 the audit runs. An entry whose kernel an arm does launch is a contradiction the
 completeness test refuses.
 
-Neither entry is a shape condition, which is why neither is a :class:`Conditional`:
-one kernel is off the operator's path entirely and the other is on a path no arm
-here takes. A kernel that some shapes launch and others do not belongs in
-``conditional`` instead, where it is judged whenever the capture holds it."""
+No entry is a shape condition, which is why none is a :class:`Conditional`: three
+kernels are off the operator's path entirely, two of them displaced by the forward's
+fusion and one by the backward's, and the fourth is on a path no arm here takes. A
+kernel that some shapes launch and others do not belongs in ``conditional`` instead,
+where it is judged whenever the capture holds it.
+
+A displaced kernel stays declared while it is still the arm a fusion is ranked
+against. Deleting it deletes the comparison, so the entry is what keeps the losing
+arm runnable rather than remembered."""
 
 
 def coverage_of(op: str, mode: str) -> OpCoverage:

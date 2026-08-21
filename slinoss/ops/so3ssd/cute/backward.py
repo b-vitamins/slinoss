@@ -22,10 +22,10 @@ Three quantities cross the chunk boundary rather than a token boundary and none 
 the four kernels can rebuild one: the chunk-start state and the two chunk
 transitions. A caller holding the forward's ``prologue`` passes it and no forward
 kernel runs here. A caller without one -- a direct call, or a forward whose
-intermediates were freed -- gets ``chunk_increment_fwd`` and ``state_passing_fwd``
-run again to rebuild all three, which is two launches and one
-``(B,H,C,P,3N)`` float32 buffer. Both paths read the same three tensors from that
-point on, and the rebuild is the forward's own code, so they cannot disagree.
+intermediates were freed -- gets ``increment_passing_fwd`` run again to rebuild all
+three, which is one launch and no intermediate buffer. Both paths read the same
+three tensors from that point on, and the rebuild is the forward's own code, so they
+cannot disagree.
 
 The chunk-local prefixes cross no boundary and appear on neither path: each kernel
 recomputes them from ``trans``, so they never reach global memory and no two
@@ -49,8 +49,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_input import chunk_input_backward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
 from slinoss.ops.so3ssd.cute.bwd.start_passing import start_passing_backward
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
-from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
-from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
+from slinoss.ops.so3ssd.cute.fwd.increment_passing import increment_passing_forward
 from slinoss.ops.so3ssd.cute.guard import check_cotangents, check_shapes
 from slinoss.ops.so3ssd.reference import ScanPrologue, check_grad_band
 
@@ -103,7 +102,7 @@ def so3ssd_bwd_cute(
             Read only. The returned ``dU`` is it plus the cotangent of ``U``.
         prologue: The matching forward's
             :class:`slinoss.ops.so3ssd.reference.ScanPrologue`, read and never
-            written, or None to rebuild it with two forward launches. Supplying one
+            written, or None to rebuild it with one forward launch. Supplying one
             the forward did not produce at this ``chunk_size`` and these inputs
             gives wrong gradients and raises nothing: the shapes agree.
 
@@ -132,20 +131,17 @@ def so3ssd_bwd_cute(
     bsz, heads, _, seqlen, rows, dim = shape
     chunks = -(-seqlen // chunk_size)
 
-    # Rebuild the chunk boundary only when the caller kept none of it. The two
-    # launches cost more than every other host-side term here put together, and
-    # both paths leave the same three read-only tensors.
+    # Rebuild the chunk boundary only when the caller kept none of it. The launch
+    # costs more than every other host-side term here put together, and both paths
+    # leave the same three read-only tensors.
     if prologue is None:
-        increment = chunk_increment_forward(
-            U, trans, K, B, chunk_size, u_prev=u_prev, b_prev=b_prev
-        )
-        passing = state_passing_forward(
-            increment.inc, increment.cquat, increment.cscale, z0
+        rebuilt = increment_passing_forward(
+            U, trans, K, B, chunk_size, z0=z0, u_prev=u_prev, b_prev=b_prev
         )
         prologue = ScanPrologue(
-            zstart=passing.zstart,
-            cquat=increment.cquat,
-            cscale=increment.cscale,
+            zstart=rebuilt.zstart,
+            cquat=rebuilt.cquat,
+            cscale=rebuilt.cscale,
         )
 
     # The chunk-start cotangent never reaches memory: the fused launch contracts

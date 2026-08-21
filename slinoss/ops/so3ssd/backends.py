@@ -125,7 +125,7 @@ register(
 def _register_cute() -> None:
     """Register the CuTe backend if this host can run it.
 
-    Both directions are kernel trees: three launches forward, five backward. The
+    Both directions are kernel trees: two launches forward, five backward. The
     backward reads the chunk boundary the forward left rather than rebuilding it, so a
     training step on this backend touches no torch fallback and launches no forward
     kernel twice.

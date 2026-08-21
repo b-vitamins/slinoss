@@ -154,8 +154,8 @@ class ArenaKernel(NamedTuple):
 def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
     """Every kernel on the CuTe path that allocates shared memory.
 
-    Both state passings and the boundary allocate none, so ``L`` cannot refuse them
-    and they do not appear.
+    The backward's state passing and the boundary allocate none, so ``L`` cannot
+    refuse them and they do not appear.
 
     Args:
         fold: Heads one vector-backward block walks. A fold above one adds the
@@ -168,8 +168,12 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
     from slinoss.ops.so3ssd.cute.bwd.chunk_input import input_smem_bytes, lblock
     from slinoss.ops.so3ssd.cute.bwd.chunk_start import start_smem_bytes
     from slinoss.ops.so3ssd.cute.bwd.chunk_vector import vblock, vector_smem_bytes
-    from slinoss.ops.so3ssd.cute.fwd.chunk_increment import increment_smem_bytes, kblock
     from slinoss.ops.so3ssd.cute.fwd.chunk_scan import nblock, scan_smem_bytes
+    from slinoss.ops.so3ssd.cute.fwd.increment_passing import (
+        SPLIT,
+        fused_kblock,
+        fused_smem_bytes,
+    )
 
     def vector(f: int) -> ArenaKernel:
         return ArenaKernel(
@@ -180,9 +184,16 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
 
     entries = [
         ArenaKernel(
-            name="chunk_increment_fwd",
-            nbytes=increment_smem_bytes,
-            knob=lambda c, p, d: f"kblk={kblock(c, p, d)}",
+            name="increment_passing_fwd",
+            # The band width is fixed, so the arena follows ``L`` and ``P`` alone:
+            # the band is what makes the operand tiles independent of ``3N``. The
+            # slice is the widest the residency admits, which is where ``L`` enters
+            # twice, once through the chunk-sized tiles and once through the slice
+            # the budget left for them.
+            nbytes=lambda c, p, d: fused_smem_bytes(
+                c, p, SPLIT, kblk=fused_kblock(c, p, SPLIT)
+            ),
+            knob=lambda c, p, d: f"span={SPLIT} kblk={fused_kblock(c, p, SPLIT)}",
         ),
         ArenaKernel(
             name="chunk_scan_fwd",
@@ -371,7 +382,7 @@ def _scaling(fn: Callable[[int], int], chunk: int) -> str:
 def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
     """Every global-memory term of one whole step of one operator call.
 
-    Eight launches: the forward's three, then the backward's five. No forward kernel
+    Seven launches: the forward's two, then the backward's five. No forward kernel
     appears twice; the backward reads the chunk start states the forward left.
 
     ``U`` and ``B`` are read over ``L + 1`` rows per chunk: the two-tap forcing at a
@@ -435,25 +446,24 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
     def edge_band(c: int) -> int:
         return g.bsz * g.groups * g.chunks(c) * g.dim * g.itemsize
 
-    increment: tuple[Term, ...] = (
+    # The fused prologue's increment never reaches memory, so ``inc`` appears on
+    # neither side. Every band of one head rereads ``U``, ``trans``, and ``K``, and
+    # that duplication is not counted: these are compulsory bytes, and the bands of
+    # one head are co-resident by the launch order, so the rereads are L2 traffic
+    # rather than DRAM traffic. Which they are on the part is a measurement, and
+    # ``scripts/perf/profile_increment_passing_fwd.py`` is where it is taken.
+    prologue: tuple[Term, ...] = (
         ("U", "read", rowwise_shifted),
         ("trans", "read", trans),
         ("K", "read", taps),
         ("B", "read", band_shifted),
-        ("inc", "write", buffer),
+        ("zstart", "write", buffer),
+        ("state", "write", state),
         ("cquat", "write", cquat),
         ("cscale", "write", cscale),
     )
-    passing: tuple[Term, ...] = (
-        ("inc", "read", buffer),
-        ("cquat", "read", cquat),
-        ("cscale", "read", cscale),
-        ("zstart", "write", buffer),
-        ("state", "write", state),
-    )
     launches: tuple[tuple[str, tuple[Term, ...]], ...] = (
-        ("chunk_increment_fwd", increment),
-        ("state_passing_fwd", passing),
+        ("increment_passing_fwd", prologue),
         (
             "chunk_scan_fwd",
             (
@@ -591,7 +601,7 @@ def flop_terms(geo: Geometry) -> tuple[FlopTerm, ...]:
 
     p, d = geo.rows, geo.dim
     return (
-        FlopTerm("chunk_increment_fwd", "increment", 4 * p * d, 0),
+        FlopTerm("increment_passing_fwd", "increment", 4 * p * d, 0),
         FlopTerm("chunk_scan_fwd", "offset+score+diagonal", 2 * p * d, 4 * (p + d)),
         FlopTerm("chunk_start_bwd", "offset transpose", 2 * d * mma_rows(p), 0),
         FlopTerm("chunk_input_bwd", "all forms", 8 * p * d, 6 * (p + d)),

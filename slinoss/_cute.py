@@ -26,7 +26,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterable, Sequence
-from typing import Any, NamedTuple, Protocol
+from typing import Any, Final, NamedTuple, Protocol
 
 import cutlass
 import cutlass.cute as cute
@@ -38,6 +38,7 @@ from cutlass.utils import get_smem_capacity_in_bytes
 
 __all__ = [
     "LOG2_E",
+    "SMEM_RESERVED",
     "TWO_LOG2_E",
     "CacheEvents",
     "Compiled",
@@ -70,6 +71,7 @@ __all__ = [
     "silu_grad",
     "smem_bytes",
     "smem_capacity",
+    "smem_residency",
     "use_payload",
     "widen",
 ]
@@ -763,6 +765,39 @@ def smem_capacity() -> int:
         Capacity in bytes.
     """
     return get_smem_capacity_in_bytes()
+
+
+SMEM_RESERVED: Final = 1024
+"""Shared memory the driver reserves per block, in bytes, on every supported arch.
+
+Not part of :func:`smem_capacity`, which reports what one block may allocate:
+the reservation is already subtracted there. It reappears once a second block is
+asked for, because each block pays it, and it is what makes the residency divisor
+larger than the tiles.
+"""
+
+
+def smem_residency(nbytes: int) -> int:
+    """Blocks per SM a shared-memory budget allows, at least one.
+
+    ``smem_capacity() // nbytes`` is the wrong divisor and reads one block too
+    high near a boundary: the capacity has one reservation subtracted from it
+    already, and ``k`` blocks pay ``k`` of them. Measured on sm_86, a 34,304 B
+    arena computes as three by that formula and runs as two, which cost a lane 25%.
+
+    Args:
+        nbytes: Bytes one block's tiles add up to. Zero or less yields the
+            occupancy limit no shared memory implies, which is not a limit at all,
+            so the caller's own cap decides.
+
+    Returns:
+        Blocks the carveout holds, floor at one. One is returned for a budget that
+        does not fit at all; :func:`assert_smem_fits` is what refuses that.
+    """
+    carveout = smem_capacity() + SMEM_RESERVED
+    if nbytes <= 0:
+        return carveout
+    return max(1, carveout // (nbytes + SMEM_RESERVED))
 
 
 def assert_smem_fits(name: str, nbytes: int) -> int:

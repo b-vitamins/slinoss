@@ -1,38 +1,39 @@
 """Host orchestrator for the CuTe forward.
 
-Three launches, in order:
+Two launches, in order:
 
-1. ``chunk_increment_fwd`` -- every chunk's local increment, its unit chunk
-   rotation, and its chunk decay.
-2. ``state_passing_fwd`` -- the inter-chunk recurrence, in place over the increment
-   buffer, leaving each chunk's start state where its increment was.
-3. ``chunk_scan_fwd`` -- every token's output, from the chunk-local score matrix and
+1. ``increment_passing_fwd`` -- every chunk's local increment, and the inter-chunk
+   recurrence over it, leaving each chunk's start state, the unit chunk rotation,
+   and the chunk decay.
+2. ``chunk_scan_fwd`` -- every token's output, from the chunk-local score matrix and
    the chunk start state.
 
+The increment was a third launch, writing a ``(B,H,C,P,3N)`` float32 buffer the
+recurrence read back and overwrote. Fused, it reaches shared memory and stops
+there.
+
 Nothing between the launches and nothing after them. No reshape, no cast, no zero
-fill, no staging copy: each kernel writes the layout the next one reads, the
-increment buffer is reused as the start-state buffer rather than allocated twice,
-and the segment carry-out is written by the increment kernel rather than sliced out
-of the inputs here. A step that appeared here would be glue on the hot path, and
-glue on the hot path is the defect this file exists to make visible.
+fill, no staging copy: the first kernel writes the layout the second reads, and the
+segment carry-out is written by that kernel rather than sliced out of the inputs
+here. A step that appeared here would be glue on the hot path, and glue on the hot
+path is the defect this file exists to make visible.
 
 The chunk-local prefixes do not appear here either. Each kernel recomputes them from
-``trans``, so they never reach global memory and the three kernels cannot disagree
+``trans``, so they never reach global memory and the two kernels cannot disagree
 about them.
 
 The chunk-start state and the two chunk transitions leave with the result. The
-backward reads all three and the first two launches are what produce them, so the
-alternative is running those launches again there. Nothing writes them after the
-second launch, so returning them costs no launch, no copy, and no store.
+backward reads all three and the first launch is what produces them, so the
+alternative is running it again there. Nothing writes them after it, so returning
+them costs no launch, no copy, and no store.
 """
 
 from __future__ import annotations
 
 from torch import Tensor
 
-from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_scan import chunk_scan_forward
-from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
+from slinoss.ops.so3ssd.cute.fwd.increment_passing import increment_passing_forward
 from slinoss.ops.so3ssd.reference import ScanPrologue, SO3SSDResult
 
 __all__ = ["so3ssd_fwd_cute"]
@@ -83,11 +84,8 @@ def so3ssd_fwd_cute(
         TypeError: On an activation dtype with no tensor-core path, or a
             low-precision float32-pinned operand.
     """
-    increment = chunk_increment_forward(
-        U, trans, K, B, chunk_size, u_prev=u_prev, b_prev=b_prev
-    )
-    passing = state_passing_forward(
-        increment.inc, increment.cquat, increment.cscale, z0
+    prologue = increment_passing_forward(
+        U, trans, K, B, chunk_size, z0=z0, u_prev=u_prev, b_prev=b_prev
     )
     y = chunk_scan_forward(
         U,
@@ -95,19 +93,19 @@ def so3ssd_fwd_cute(
         K,
         B,
         C,
-        passing.zstart,
+        prologue.zstart,
         chunk_size,
         u_prev=u_prev,
         b_prev=b_prev,
     )
     return SO3SSDResult(
         y=y,
-        state=passing.state,
-        b_last=increment.b_last,
-        u_last=increment.u_last,
+        state=prologue.state,
+        b_last=prologue.b_last,
+        u_last=prologue.u_last,
         prologue=ScanPrologue(
-            zstart=passing.zstart,
-            cquat=increment.cquat,
-            cscale=increment.cscale,
+            zstart=prologue.zstart,
+            cquat=prologue.cquat,
+            cscale=prologue.cscale,
         ),
     )
