@@ -500,6 +500,10 @@ def mat3_outer(u: Vec3, v: Vec3) -> Mat3:
 
     One term of a parameter-gradient reduction, which accumulates
     ``sum_n outer(dv_n, v_n)`` over the lane dimension.
+
+    ``mat3_add(acc, mat3_outer(u, v))`` lowers to nine FFMA with no FMUL and no
+    FADD: the backend contracts the multiply into the add. An explicit fused
+    spelling would emit the same nine instructions.
     """
     return (
         u[0] * v[0],
@@ -520,7 +524,7 @@ def mat3_transpose(a: Mat3) -> Mat3:
 
 
 def mat3_matvec(a: Mat3, v: Vec3) -> Vec3:
-    """Row-major 3x3 matrix times 3-vector. Nine FMAs."""
+    """Row-major 3x3 matrix times 3-vector. Three FMUL and six FFMA."""
     return (
         a[0] * v[0] + a[1] * v[1] + a[2] * v[2],
         a[3] * v[0] + a[4] * v[1] + a[5] * v[2],
