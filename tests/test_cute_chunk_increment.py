@@ -21,7 +21,7 @@ if not torch.cuda.is_available():
 
 from collections.abc import Callable
 
-from slinoss._cute import smem_capacity
+from slinoss._cute import smem_budget, smem_residency
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.fwd import chunk_increment
@@ -191,11 +191,17 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     measured on sm_86, one resident block per SM less costs the increment 5 us of 62
     at the standard shape. So the budget is held to :data:`TARGET_BLOCKS`, not to
     the capacity, at every legal chunk length and not only at the widest.
+
+    Asked through :func:`smem_residency`, never by multiplying or dividing the
+    capacity. Each block pays a reservation the capacity has already subtracted
+    once, and its total is rounded up to an allocation granule, so both of those
+    arithmetics read high: the divided form puts the four-block bar 768 B above the
+    truth and lands on a budget that is itself only three blocks.
     """
     for chunk in (MMA_TILE_K, 64, MAX_CHUNK):
         for rows, dim in ((16, 48), (48, 48), (64, 96)):
             nbytes = increment_smem_bytes(chunk, rows, dim)
-            assert TARGET_BLOCKS * nbytes <= smem_capacity(), (chunk, rows, dim)
+            assert smem_residency(nbytes) >= TARGET_BLOCKS, (chunk, rows, dim)
     assert increment_smem_bytes(64, 16, 48) < increment_smem_bytes(MAX_CHUNK, 64, 96)
 
 
@@ -209,7 +215,11 @@ def test_slice_is_the_atom_k_extent_at_every_legal_shape() -> None:
     to enforce it.
     """
     assert KBLOCK_MAX == MMA_TILE_K
-    budget = smem_capacity() // TARGET_BLOCKS
+    budget = smem_budget(TARGET_BLOCKS)
+    # The budget the search enforces has to be worth the residency it is named for.
+    # Dividing the capacity gives 25,344 B, which is a three-block arena, so the
+    # search would have admitted a slice that costs the block it exists to protect.
+    assert smem_residency(budget) == TARGET_BLOCKS
     for chunk in (MMA_TILE_K, 64, MAX_CHUNK):
         for rows, dim in ((16, 48), (48, 48), (64, 96)):
             kblk = kblock(chunk, rows, dim)
@@ -230,7 +240,7 @@ def test_slice_narrows_only_when_the_widest_one_would_cost_a_block(
     nothing. This is what makes the ceiling safe to widen again.
     """
     monkeypatch.setattr(chunk_increment, "KBLOCK_MAX", 2 * MMA_TILE_K)
-    budget = smem_capacity() // TARGET_BLOCKS
+    budget = smem_budget(TARGET_BLOCKS)
     wide = increment_smem_bytes(MAX_CHUNK, 64, 96, kblk=2 * MMA_TILE_K)
     assert wide > budget
     assert kblock(MAX_CHUNK, 64, 96) == MMA_TILE_K

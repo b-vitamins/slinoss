@@ -80,8 +80,8 @@ from slinoss._cute import (
     cute_dtype,
     decay,
     jit_launch,
+    smem_budget,
     smem_bytes,
-    smem_capacity,
 )
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AN,
@@ -247,6 +247,11 @@ def kblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     The loop stays because it is what holds the budget: widen the ceiling or add a
     chunk-sized tile and it selects again.
 
+    The bar comes from :func:`smem_budget`, not from a divided capacity. Each block
+    pays a reservation the capacity has already subtracted once and its total is
+    rounded up to an allocation granule, so dividing reads 768 B high here and
+    yields a bar that is itself only three blocks.
+
     Args:
         chunk: ``L``.
         rows: ``P``.
@@ -258,7 +263,7 @@ def kblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
         or below :data:`KBLOCK_MAX`. The floor binds before the budget does when no
         legal slice fits, and :func:`chunk_increment_forward` raises there.
     """
-    budget = smem_capacity() // TARGET_BLOCKS
+    budget = smem_budget(TARGET_BLOCKS)
     kblk = min(chunk, KBLOCK_MAX)
     while kblk > MMA_TILE_K:
         if increment_smem_bytes(chunk, rows, dim, itemsize, kblk=kblk) <= budget:
