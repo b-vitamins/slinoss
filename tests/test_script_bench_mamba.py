@@ -40,12 +40,15 @@ from torch import Tensor
 from scripts.bench import bench_mamba
 from scripts.bench.bench_mamba import (
     Parameters,
+    chunk_variants,
     compare_so3ssd,
     group_counts,
     load_scan,
     main,
     make_inputs,
     mamba_arithmetic,
+    mamba_chunk,
+    mamba_tag,
     mapping_of,
     parameter_counts,
     parse_args,
@@ -466,6 +469,58 @@ def test_seq_variants_move_only_the_sequence_length() -> None:
         )
     with pytest.raises(ValueError, match="must be positive"):
         seq_variants(SMALL, [0])
+
+
+# ---------------------------------------------------------------------------
+# chunk_variants and the per-arm chunk
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_variants_move_only_the_chunk_length() -> None:
+    # No lengths means the shape's own, so the default command is unchanged.
+    assert chunk_variants(SMALL, ()) == (SMALL,)
+    variants = chunk_variants(SMALL, [4, 16])
+    assert [v.chunk for v in variants] == [4, 16]
+    # L reaches the name, so two lengths write two reports.
+    assert [v.name for v in variants] == ["small-l4", "small-l16"]
+    for got in variants:
+        assert (got.bsz, got.heads, got.seq, got.rows, got.lanes, got.groups) == (
+            SMALL.bsz,
+            SMALL.heads,
+            SMALL.seq,
+            SMALL.rows,
+            SMALL.lanes,
+            SMALL.groups,
+        )
+    # A non-power-of-two is refused here rather than after the inputs are allocated.
+    with pytest.raises(ValueError, match="power of two"):
+        chunk_variants(SMALL, [48])
+
+
+def test_the_mamba_arm_takes_its_own_chunk_and_says_so_only_when_it_differs() -> None:
+    assert mamba_chunk(SMALL, None) == SMALL.chunk
+    assert mamba_chunk(SMALL, 256) == 256
+    with pytest.raises(ValueError, match="power of two"):
+        mamba_chunk(SMALL, 48)
+    # Iso-chunk is the matched run, and its labels are what they were before per-arm
+    # tiling existed. A differing length has to reach the label, or two runs that
+    # differ only in it would collide on one report name.
+    assert mamba_tag(SMALL, SMALL.chunk) == ""
+    assert mamba_tag(SMALL, 256) == "-l256"
+
+
+def test_the_mamba_flop_follows_the_arm_that_chunk_was_given_to() -> None:
+    # The score and the diagonal terms are linear in the chunk, so a sweep that left
+    # the count at the shape's own default would report one flop for four tilings.
+    own = mamba_arithmetic(SMALL, SMALL.heads)
+    assert mamba_arithmetic(SMALL, SMALL.heads, SMALL.chunk) == own
+    assert (
+        mamba_arithmetic(SMALL, SMALL.heads, 2 * SMALL.chunk).step_flop > own.step_flop
+    )
+    # The mapping states both tilings, because the ratio is read off that line.
+    assert (
+        "chunk_size=8 against L=4, per-arm tiling" in mapping_of(SMALL, 1, 8).describe()
+    )
 
 
 def test_main_holds_one_shape_at_each_requested_sequence_length(

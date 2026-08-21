@@ -50,6 +50,18 @@ The comparison states what it holds equal. :func:`mapping_of` fixes the geometry
 side at it, and :func:`parameter_counts` counts the parameters of the two layers the
 two operators sit inside. All of it reaches the report notes and stdout, so the
 comparison can be judged instead of taken.
+
+Chunk length is an internal tiling parameter of both implementations and not a
+model hyperparameter, so the two arms need not share one. ``--chunk`` moves both,
+``--mamba-chunk`` moves the Mamba2 arm alone. The second exists because Mamba2's
+library default is 256 while the SO(3) arena refuses everything above 64: holding
+both at one length scores at least one arm off its own optimum, and a bar measured
+there is not that arm's floor. Pinning one arm and sweeping the other also makes
+the pinned arm an in-loop normalizer, so a ratio taken across two runs is a ratio
+of two ratios and carries no session-to-session drift.
+
+    python3 scripts/bench/bench_mamba.py --shape acceptance --groups one \\
+        --mode step --against-so3ssd --chunk 64 --mamba-chunk 256
 """
 
 from __future__ import annotations
@@ -125,7 +137,9 @@ class Mapping(NamedTuple):
         headdim: Mamba2's ``headdim``, the SO(3) ``P``.
         dstate: Mamba2's ``dstate``, the SO(3) ``3N``.
         ngroups: Mamba2's ``ngroups``.
-        chunk: Chunk length, both sides.
+        chunk: Mamba2's ``chunk_size``.
+        so3_chunk: The SO(3) ``L``. Equal to ``chunk`` unless the two arms were
+            deliberately run at their own tiling.
         state_elems: State elements one head carries, ``headdim * dstate``. Equal on
             both sides by construction, which is what the mapping fixes.
     """
@@ -134,18 +148,29 @@ class Mapping(NamedTuple):
     dstate: int
     ngroups: int
     chunk: int
+    so3_chunk: int
     state_elems: int
+
+    @property
+    def iso_chunk(self) -> bool:
+        """Whether both arms tile at one chunk length."""
+        return self.chunk == self.so3_chunk
 
     def describe(self) -> str:
         """One line for a report note."""
+        tiling = (
+            f"chunk_size={self.chunk}"
+            if self.iso_chunk
+            else f"chunk_size={self.chunk} against L={self.so3_chunk}, per-arm tiling"
+        )
         return (
             f"mapping: headdim={self.headdim} dstate={self.dstate} "
-            f"ngroups={self.ngroups} chunk_size={self.chunk}, "
+            f"ngroups={self.ngroups} {tiling}, "
             f"{self.state_elems:,} state elements per head on both sides"
         )
 
 
-def mapping_of(shape: OpShape, groups: int) -> Mapping:
+def mapping_of(shape: OpShape, groups: int, chunk: int | None = None) -> Mapping:
     """Map one SO(3) shape onto Mamba2's four geometry arguments.
 
     ``dstate = 3N``, so a head carries ``P * 3N`` state elements on both sides and
@@ -162,6 +187,7 @@ def mapping_of(shape: OpShape, groups: int) -> Mapping:
     Args:
         shape: The SO(3) shape.
         groups: Mamba2 group count. Equal to ``shape.groups`` for a matched run.
+        chunk: Mamba2's chunk length, or None for the shape's own.
 
     Returns:
         The mapping.
@@ -170,7 +196,8 @@ def mapping_of(shape: OpShape, groups: int) -> Mapping:
         headdim=shape.rows,
         dstate=shape.d_state,
         ngroups=groups,
-        chunk=shape.chunk,
+        chunk=shape.chunk if chunk is None else chunk,
+        so3_chunk=shape.chunk,
         state_elems=shape.rows * shape.d_state,
     )
 
@@ -207,7 +234,9 @@ class Arithmetic(NamedTuple):
         )
 
 
-def mamba_arithmetic(shape: OpShape, groups: int) -> Arithmetic:
+def mamba_arithmetic(
+    shape: OpShape, groups: int, chunk: int | None = None
+) -> Arithmetic:
     """Count Mamba2's GEMM flop at one geometry.
 
     Forward, from ``_mamba_chunk_scan_combined_fwd``: ``_chunk_state_fwd`` contracts
@@ -225,11 +254,14 @@ def mamba_arithmetic(shape: OpShape, groups: int) -> Arithmetic:
     Args:
         shape: The SO(3) shape the geometry is mapped from.
         groups: Mamba2 group count.
+        chunk: Mamba2's chunk length, or None for the shape's own. The score and the
+            diagonal terms are both linear in it, so a chunk sweep that left this at
+            the shape's default would report one flop for four tilings.
 
     Returns:
         The count.
     """
-    m = mapping_of(shape, groups)
+    m = mapping_of(shape, groups, chunk)
     lanes = shape.bsz * shape.heads * shape.seq
     band = shape.bsz * groups * shape.seq
     state = 2 * m.headdim * m.dstate
@@ -675,6 +707,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "shape's own. The named shapes differ in H, P, N, L and G as well as T, so "
         "a table over the names is five geometries and not a sweep in T.",
     )
+    parser.add_argument(
+        "--chunk",
+        action="append",
+        type=int,
+        help="Chunk length to hold each shape at, on both arms. Repeatable. "
+        "Defaults to the shape's own. Powers of two only.",
+    )
+    parser.add_argument(
+        "--mamba-chunk",
+        type=int,
+        default=None,
+        help="Chunk length for the Mamba2 arm alone, overriding --chunk. Mamba2's "
+        "library default is 256 and the SO(3) arena refuses everything above 64, so "
+        "a single shared length scores at least one arm off its own tiling optimum.",
+    )
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
@@ -764,12 +811,80 @@ def seq_variants(shape: OpShape, lengths: Sequence[int]) -> tuple[OpShape, ...]:
     )
 
 
+def chunk_variants(shape: OpShape, lengths: Sequence[int]) -> tuple[OpShape, ...]:
+    """One copy of a shape per requested chunk length.
+
+    Only ``L`` moves, and it moves on both arms unless ``--mamba-chunk`` overrides
+    the Mamba2 one. ``L`` reaches the shape name and therefore the report file name,
+    so two lengths write two reports.
+
+    Args:
+        shape: The named shape.
+        lengths: Chunk lengths, or empty for the shape's own.
+
+    Returns:
+        The shapes to measure, in the order requested.
+
+    Raises:
+        ValueError: If a length is not a positive power of two. The config admits no
+            other, so a non-power-of-two would be refused after the inputs were
+            allocated rather than here.
+    """
+    if not lengths:
+        return (shape,)
+    for chunk in lengths:
+        if chunk < 1 or chunk & (chunk - 1):
+            raise ValueError(f"a chunk length must be a power of two, got {chunk}")
+    return tuple(
+        replace(shape, name=f"{shape.name}-l{chunk}", chunk=chunk) for chunk in lengths
+    )
+
+
+def mamba_chunk(shape: OpShape, override: int | None) -> int:
+    """Chunk length the Mamba2 arm runs at.
+
+    Args:
+        shape: The shape, carrying the shared default.
+        override: ``--mamba-chunk``, or None for the shape's own.
+
+    Returns:
+        The length.
+
+    Raises:
+        ValueError: If the override is not a positive power of two.
+    """
+    if override is None:
+        return shape.chunk
+    if override < 1 or override & (override - 1):
+        raise ValueError(f"a chunk length must be a power of two, got {override}")
+    return override
+
+
+def mamba_tag(shape: OpShape, chunk: int) -> str:
+    """Label suffix naming the Mamba2 arm's own chunk length, when it has one.
+
+    Empty at iso-chunk, so a matched run's arm label and report name are what they
+    were before per-arm tiling existed. Non-empty otherwise, because two runs that
+    differ only in the Mamba2 chunk would otherwise carry one label and the second
+    report would overwrite the first.
+
+    Args:
+        shape: The shape, carrying the shared length.
+        chunk: The Mamba2 arm's length.
+
+    Returns:
+        ``-l<chunk>`` when the two differ, else the empty string.
+    """
+    return "" if chunk == shape.chunk else f"-l{chunk}"
+
+
 def _saved(
     scan: Callable[..., Any],
     shape: OpShape,
     groups: int,
     device: torch.device,
     dtype: torch.dtype,
+    chunk: int,
 ) -> SavedStorages:
     """Probe what Mamba2's graph holds for one forward and backward.
 
@@ -780,7 +895,7 @@ def _saved(
     probe = SavedTensorProbe()
     with probe:
         measure(
-            runner(scan, inputs, shape.chunk, grads=True),
+            runner(scan, inputs, chunk, grads=True),
             label=f"mamba {shape.name} saved",
             iters=1,
             warmup=0,
@@ -984,10 +1099,11 @@ def compare_so3ssd(
     """
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
-    a_label = f"mamba-g{groups}"
+    mchunk = mamba_chunk(shape, args.mamba_chunk)
+    a_label = f"mamba-g{groups}{mamba_tag(shape, mchunk)}"
     b_label = f"so3ssd-{args.backend or 'auto'}"
-    mapping = mapping_of(shape, groups)
-    flops = (mamba_arithmetic(shape, groups), so3ssd_arithmetic(shape))
+    mapping = mapping_of(shape, groups, mchunk)
+    flops = (mamba_arithmetic(shape, groups, mchunk), so3ssd_arithmetic(shape))
     params = parameter_counts(shape, groups)
     mamba = make_inputs(shape, groups, device, dtype=dtype, requires_grad=grads)
     ours = so3ssd_inputs(shape, device, dtype=dtype, requires_grad=grads)
@@ -995,7 +1111,7 @@ def compare_so3ssd(
     reset_memory_peaks(device)
     out = measure_paired(
         a_label,
-        runner(scan, mamba, shape.chunk, grads=grads, prefix=a_label),
+        runner(scan, mamba, mchunk, grads=grads, prefix=a_label),
         b_label,
         (
             so3ssd_step(ours, shape.chunk, backend=args.backend, prefix=b_label)
@@ -1033,6 +1149,14 @@ def compare_so3ssd(
             shape.describe(),
             *face.lines(),
             f"so3ssd n_groups={shape.groups}",
+            # Only when the arms tile differently. At iso-chunk the mapping line
+            # already carries the one length, and a note restating it would say
+            # nothing.
+            *(
+                ()
+                if mchunk == shape.chunk
+                else (f"mamba chunk_size={mchunk} against so3ssd L={shape.chunk}",)
+            ),
             f"mode={mode} dtype={args.dtype}",
             f"arm a={a_label} b={b_label}, one loop, order swapped each iteration",
             # The two operators take different tensors, so the arms cannot share
@@ -1117,8 +1241,9 @@ def _run_comparisons(
         for groups in group_counts(shape, wanted):
             for mode in modes:
                 report, face = compare_so3ssd(scan, shape, groups, mode, args, device)
+                tag = mamba_tag(shape, mamba_chunk(shape, args.mamba_chunk))
                 base = args.out.with_name(
-                    f"{args.out.name}-{shape.name}-g{groups}-{mode}-paired"
+                    f"{args.out.name}-{shape.name}-g{groups}{tag}-{mode}-paired"
                 )
                 md, _ = write_report(report, base, require_agreement=False)
                 rates += [
@@ -1152,7 +1277,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     dtype = DTYPES[args.dtype]
     named = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]
     shapes = [
-        variant for shape in named for variant in seq_variants(shape, args.seq or ())
+        tiled
+        for shape in named
+        for variant in seq_variants(shape, args.seq or ())
+        for tiled in chunk_variants(variant, args.chunk or ())
     ]
     modes = MODES if args.mode == "both" else (args.mode,)
     wanted = args.groups or ["heads", "one"]
@@ -1169,13 +1297,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         for groups in group_counts(shape, wanted):
             for mode in modes:
                 grads = mode == "step"
+                mchunk = mamba_chunk(shape, args.mamba_chunk)
                 inputs = make_inputs(
                     shape, groups, device, dtype=dtype, requires_grad=grads
                 )
                 label = f"mamba {shape.name} g{groups} {mode}"
                 reset_memory_peaks(device)
                 timed = measure(
-                    runner(scan, inputs, shape.chunk, grads=grads),
+                    runner(scan, inputs, mchunk, grads=grads),
                     label=label,
                     iters=args.iters,
                     warmup=args.warmup,
@@ -1190,23 +1319,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     device=info,
                     budget=tree,
                     throughput=(rate,),
-                    saved=_saved(scan, shape, groups, device, dtype) if grads else None,
+                    saved=(
+                        _saved(scan, shape, groups, device, dtype, mchunk)
+                        if grads
+                        else None
+                    ),
                     peaks=peaks,
                     pool=pool_retention(label),
                     notes=(
                         shape.describe(),
                         f"mamba2 ngroups={groups} headdim={shape.rows} "
-                        f"dstate={shape.d_state}",
+                        f"dstate={shape.d_state}"
+                        # The shape line already prints L, so name the tiling only
+                        # when the arm was given one the shape does not carry.
+                        + ("" if mchunk == shape.chunk else f" chunk_size={mchunk}"),
                         f"mode={mode} dtype={args.dtype}",
                         f"iters={args.iters} warmup={args.warmup}",
                         f"timer={timed.timer} clocks={timed.clocks}",
                     ),
                 )
+                tag = mamba_tag(shape, mchunk)
                 base = args.out.with_name(
-                    f"{args.out.name}-{shape.name}-g{groups}-{mode}"
+                    f"{args.out.name}-{shape.name}-g{groups}{tag}-{mode}"
                 )
                 md, _ = write_report(report, base, require_agreement=False)
-                rows.append((f"{shape.name}/g{groups}/{mode}", rate))
+                rows.append((f"{shape.name}/g{groups}{tag}/{mode}", rate))
                 print(f"wrote {md}")
     print()
     print(rate_table(rows, width=28))
