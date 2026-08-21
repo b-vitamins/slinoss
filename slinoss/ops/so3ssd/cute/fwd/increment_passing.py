@@ -73,21 +73,31 @@ store takes a :func:`slinoss._cute.narrow`; I4 pins float32 to the recurrence, n
 the copy a later GEMM reads, and that GEMM narrows the copy on the way into shared
 memory whatever width it arrives at.
 
-The store's sector ratio is the same at either width and neither is one sector per
-payload sector. A thread owns three contiguous elements and adjacent threads own
-adjacent triples, so each of the three subscript stores is one warp request over 32
-elements at stride 3: 384 B touched for 128 B of payload at float32, 192 for 64 at
-the operand dtype, three sectors per payload sector both times. The narrowing halves
-the sectors and leaves the request count and the ratio alone. The ratio does not reach
-DRAM: the measured write is 144.71 MB against a 141.56 MB payload at float32 and 74.34
-against 70.78 at the operand dtype, so L2 coalesces the stride away either way. The
-pair-fragment form
+The store's sector ratio was three sectors per payload sector at either dtype while a
+thread owned one triple. Each of the three subscript stores was one warp request over
+32 elements at stride 3, 384 B touched for 128 B of payload at float32 and 192 for 64
+at the operand dtype, and the narrowing halved the sectors while leaving the request
+count and the ratio alone. A triple at two bytes bases the lane at ``6*lane`` bytes,
+4-byte aligned on even lanes only, so no vector store was legal there.
+
+Two adjacent triples base the lane at ``12*pair``, which is 4-byte aligned always, and
+the pair-fragment form
 :func:`slinoss.ops.so3ssd.cute.fwd.chunk_scan.chunk_scan_fwd_kernel` stores ``y``
-through is not available here: a triple at two bytes puts the lane's base at ``6*lane``
-bytes, which is 4-byte aligned on even lanes only, so a two-element vector store has
-no legal alignment. Closing the ratio needs the ``(3, P*N)`` planar layout the
-unfused recurrence priced and rejected, which moves the cost onto the consumer that
-wants ``3N`` contiguous.
+through then applies. One cell is 3 STG.32 for 6 STG.16, and the float32 read of the
+increment tile is 3 LDS.64 for 6 LDS.32. Measured on sm_86 at the shape above, one
+launch against one launch: -1,105,920 LSU warp-instructions, -4,127,040 of all
+instructions once the addresses a cell no longer needs go with them, -5.09 MB, 367.9
+to 356.1 us, at 141 registers. Wavefronts per instruction double where the width does,
+so the wavefront count is unchanged and the deletion is in the instruction stream.
+
+Four adjacent triples are legal by the same arithmetic, 8-byte aligned, conflict-free
+on the shared read, and slower: 396.2 us, and the 5.09 MB comes back. A warp's cells
+then span eight rows of the plane rather than four, so twice as many partly written
+sectors stay open at once, which is what
+:func:`slinoss.ops.so3ssd.cute.fwd.chunk_scan.chunk_scan_fwd_kernel` walks M outermost
+to avoid. Two is the width that pays. One sector per payload sector still needs the
+``(3, P*N)`` planar layout the unfused recurrence priced and rejected, which moves the
+cost onto the consumer that wants ``3N`` contiguous.
 
 The chunk transition is emitted by the ``sidx == 0`` band alone: every band computes
 the same prefix from the same ``trans``, so one writer is enough and the others read
@@ -189,6 +199,19 @@ A multiple of 3, so a band holds whole 3-vectors, and of
 covers. 48 is the smallest width satisfying both, and every legal ``3N`` is a
 multiple of it, so one width divides every shape.
 """
+
+
+def _alignment(nbytes: int) -> int:
+    """Largest power of two dividing ``nbytes``.
+
+    An access width claim has to be a power of two, and a cell of three or six
+    elements is neither. Six bytes claims two, twelve claims four, twenty-four claims
+    eight, which is what each cell's base is actually aligned to.
+
+    Args:
+        nbytes: Bytes in one cell. Positive.
+    """
+    return nbytes & -nbytes
 
 
 def state_tile(rows: int, span: int) -> Tile:
@@ -396,7 +419,18 @@ def increment_passing_fwd_kernel(
     slices = chunk // kblk
     mpad = mma_rows(rows)
     lanes = span // 3
-    vecs = rows * lanes // threads
+    # Adjacent 3-vectors per cell, where the block width admits the pairing. One triple
+    # at two bytes bases the lane at ``6*lane`` bytes, which is 4-byte aligned on even
+    # lanes only; a pair of adjacent triples bases it at ``12*pair``, always 4-byte
+    # aligned, so the ``zstart`` store and the shared read of the increment each take
+    # one width up. Four triples are legal and measured slower; the module docstring
+    # holds the numbers and the reason. The recurrence below is written over a cell and
+    # is the same code at either width; at ``wide == 1`` every access is the scalar one
+    # again, which is what keeps a shape the pairing does not divide legal without a
+    # second body.
+    wide = 2 if (rows * lanes) % (2 * threads) == 0 else 1
+    unit = 3 * wide
+    cells = rows * lanes // (wide * threads)
     lda = smem_pitch(mpad)
     ldb = smem_pitch(span)
 
@@ -427,6 +461,16 @@ def increment_passing_fwd_kernel(
         forced_tile(kblk, span).layout(),
     )
     sinc = cute.make_tensor(arena.iterator, state_tile(rows, span).layout())
+    # The recurrence reads a whole cell, so it addresses the tile by cell rather than
+    # by row and column. The layout is compact row-major and ``unit`` divides both the
+    # pitch and the extent, so the two views agree by construction.
+    scell = cute.zipped_divide(
+        cute.make_tensor(
+            arena.iterator.align(_alignment(4 * unit)),
+            cute.make_layout((mpad * span,), stride=(1,)),
+        ),
+        (unit,),
+    )
 
     # The band's origin is a pointer offset: ``3N`` is the last mode at unit stride,
     # so the staging pass indexes the band's own columns and never learns that the
@@ -435,22 +479,25 @@ def increment_passing_fwd_kernel(
     bandprev = cute.make_tensor(gbprev.iterator + sidx * span, gbprev.layout)
 
     acc = mma_acc(tiled_mma, tid, (mpad, span))
-    state = cute.make_fragment((3 * vecs,), cutlass.Float32)
+    state = cute.make_fragment((unit * cells,), cutlass.Float32)
     elem = gzstart.element_type
+    finc = cute.make_fragment((unit,), cutlass.Float32)
+    fz = cute.make_fragment((unit,), elem)
 
-    # One 3-vector's coordinates in the tile and in the ``(P,3N)`` plane. The band
-    # index is dynamic and the vector index is not, so these are hoisted out of the
-    # chunk loop rather than recomputed inside it.
-    tile_row = []
-    tile_col = []
+    # One cell's index in the tile and in the ``(P,3N)`` plane, counted in cells and not
+    # in elements, so neither consumer divides by ``unit`` at run time. The band index
+    # is dynamic and the cell index is not, so these are hoisted out of the chunk loop
+    # rather than recomputed inside it.
+    scols = span // unit
+    zcols = dim // unit
+    slot = []
     plane = []
-    for k in cutlass.range_constexpr(vecs):
+    for k in cutlass.range_constexpr(cells):
         owned = tid + k * threads
-        row = owned // lanes
-        lane = owned - row * lanes
-        tile_row.append(row)
-        tile_col.append(3 * lane)
-        plane.append(row * dim + sidx * span + 3 * lane)
+        row = owned // (lanes // wide)
+        cell = owned - row * (lanes // wide)
+        slot.append(row * scols + cell)
+        plane.append(row * zcols + sidx * scols + cell)
 
     # The segment carry-out. Every block walks the last chunk, so the writer is
     # chosen by band rather than found: the first band copies ``u`` and each band
@@ -472,12 +519,12 @@ def increment_passing_fwd_kernel(
             if d < span:
                 gblast[bidx, gidx, sidx * span + d] = band[bidx, gidx, tlast, d]
 
-    for k in cutlass.range_constexpr(vecs):
-        for j in cutlass.range_constexpr(3):
+    for k in cutlass.range_constexpr(cells):
+        for j in cutlass.range_constexpr(unit):
             if cutlass.const_expr(has_z0):
-                state[3 * k + j] = gz0[bidx, hidx, plane[k] + j]
+                state[unit * k + j] = gz0[bidx, hidx, unit * plane[k] + j]
             else:
-                state[3 * k + j] = cutlass.Float32(0.0)
+                state[unit * k + j] = cutlass.Float32(0.0)
 
     # Two views of one staging tile, one row of pitch apart. The current tap reads
     # token t0+lbase+k, the previous one reads t0+lbase+k-1.
@@ -610,33 +657,49 @@ def increment_passing_fwd_kernel(
         # The matrix is one per chunk for every 3-vector the thread carries, and the
         # transpose the backward's mirror needs is not this direction's.
         mat = rot_hom(quat)
-        for k in cutlass.range_constexpr(vecs):
-            carried = (state[3 * k], state[3 * k + 1], state[3 * k + 2])
+        # A sub-tensor taken at a dynamic index reports its iterator as aligned to one
+        # element whatever the parent claimed, and cute.autovec_copy caps the access at
+        # the iterator's claim, so the cell's own alignment is restated here.
+        zcell = cute.zipped_divide(
+            cute.make_tensor(
+                gzstart[bidx, hidx, cidx, None].iterator.align(
+                    _alignment(unit * (elem.width // 8))
+                ),
+                cute.make_layout((rows * dim,), stride=(1,)),
+            ),
+            (unit,),
+        )
+        for k in cutlass.range_constexpr(cells):
+            cute.autovec_copy(scell[(None, slot[k])], finc)
             # The state entering the chunk is the accumulator before this chunk's
-            # increment enters it, so the store precedes the update.
-            for j in cutlass.range_constexpr(3):
-                gzstart[bidx, hidx, cidx, plane[k] + j] = narrow(carried[j], elem)
+            # increment enters it, so the narrowed copy is filled and stored before the
+            # update overwrites what it holds.
+            for j in cutlass.range_constexpr(unit):
+                fz[j] = narrow(state[unit * k + j], elem)
+            cute.autovec_copy(fz, zcell[(None, plane[k])])
             # The scale multiplies the state alone, then the sum is rotated once.
             # The increment is in the chunk-local frame, so it shares the rotation
-            # rather than needing its own.
-            turned = mat3_matvec(
-                mat,
-                (
-                    decayed * carried[0] + sinc[tile_row[k], tile_col[k]],
-                    decayed * carried[1] + sinc[tile_row[k], tile_col[k] + 1],
-                    decayed * carried[2] + sinc[tile_row[k], tile_col[k] + 2],
-                ),
-            )
-            for j in cutlass.range_constexpr(3):
-                state[3 * k + j] = turned[j]
+            # rather than needing its own. One matrix serves every triple in the cell.
+            for h in cutlass.range_constexpr(wide):
+                base = unit * k + 3 * h
+                turned = mat3_matvec(
+                    mat,
+                    (
+                        decayed * state[base] + finc[3 * h],
+                        decayed * state[base + 1] + finc[3 * h + 1],
+                        decayed * state[base + 2] + finc[3 * h + 2],
+                    ),
+                )
+                for j in cutlass.range_constexpr(3):
+                    state[base + j] = turned[j]
         # The next chunk's staging writes over the tile just read, the two being one
         # region, so the reads have to finish first. The barriers inside the staging
         # come after its writes and cannot stand in for this one.
         cute.arch.sync_threads()
 
-    for k in cutlass.range_constexpr(vecs):
-        for j in cutlass.range_constexpr(3):
-            gstate[bidx, hidx, plane[k] + j] = state[3 * k + j]
+    for k in cutlass.range_constexpr(cells):
+        for j in cutlass.range_constexpr(unit):
+            gstate[bidx, hidx, unit * plane[k] + j] = state[unit * k + j]
 
 
 @cute.jit
