@@ -399,7 +399,6 @@ from slinoss.ops.so3ssd.cute.common import (
     TABLE_AP,
     THREADS,
     Mat3,
-    Vec3,
     mat3_add,
     mat3_matvec,
     mat3_mul,
@@ -514,6 +513,14 @@ One thread holds one 3-vector, which is what the rowwise transforms and the oute
 products need and what an accumulator fragment cannot give: the atom hands a thread
 two adjacent columns, and a 3-vector straddles that pair. The group must divide the
 lanes of a lane tile, 16 at every shape that tiles, and stay inside a warp.
+
+A thread takes an adjacent RUN of ``N / LANE_GROUP`` lanes, not every
+``LANE_GROUP``-th lane. Three components times four adjacent lanes is twelve
+adjacent columns, so a thread's whole share of a row is one vector access per
+16-byte segment instead of three scalars a lane: twelve accesses fall to three at
+each of six sites in the two epilogues. The strided map cannot be widened at any
+layout of the trailing axis, component-major included, because a strided thread
+holds three columns and then a gap whichever axis is contiguous.
 
 The group is priced by its butterfly. A rowwise epilogue reduces nine floats over
 the group, so a pass issues ``9 * log2(group)`` shuffles per tuple, and a run of
@@ -1354,20 +1361,183 @@ def _mat_of(mats: tuple[Mat3, ...], step: int) -> Mat3:
     return mats[step]
 
 
-def _vec_at(src: cute.Tensor, row: cutlass.Int32, col: cutlass.Int32) -> Vec3:
-    """One lane's 3-vector of a shared tile, widened to float32.
+def _pass_row(group: cutlass.Int32) -> cutlass.Int32:
+    """Row a thread group takes on a rowwise pass, permuted for the vector width.
+
+    A run access is 16 bytes on the float32 tiles, so a phase is eight threads,
+    which is two thread groups. The run's segment index is
+    ``segments * row + 3 * lane + k``; ``3 * lane`` modulo eight is ``{0,3,6,1}``
+    and two rows one apart differ by ``segments`` modulo eight, which
+    :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch` makes odd, so consecutive rows
+    put the two groups of a phase on the same banks. Rows four apart differ by
+    ``4 * segments`` modulo eight, which is four for every odd segment count, and
+    ``{0,3,6,1} + 4`` is that set's complement, so the phase is conflict-free at
+    every pitch the pitch function can return.
+
+    A bijection on each aligned block of eight groups, and ``per_pass`` is a
+    multiple of eight at both block widths, so a warp covers the same row set at
+    the same step. Every other access of a pass is indexed by the row alone -- the
+    table entry, the nine-word scratch, the tap and transition rows, the ``dK``
+    store -- so each keeps its address set and its conflict profile.
 
     Args:
-        src: Shared tile.
-        row: Row.
-        col: First of the three columns.
+        group: ``tid // LANE_GROUP + step * per_pass``.
     """
-    elem = src.element_type
-    return (
-        widen(src[row, col], elem),
-        widen(src[row, col + 1], elem),
-        widen(src[row, col + 2], elem),
-    )
+    low = group % 8
+    return group - low + low // 2 + 4 * (low % 2)
+
+
+def _run_vec(width: int, itemsize: int) -> int:
+    """Elements one access covers over a run of ``width`` adjacent columns.
+
+    The largest power of two that divides the run and fits a 16-byte segment. A run
+    is ``3 * N / LANE_GROUP`` elements, twelve at every legal shape, so this is four
+    at either element width and a run is three accesses.
+
+    Args:
+        width: Elements of the run.
+        itemsize: Bytes per element.
+    """
+    vec = 1
+    while 2 * vec * itemsize <= SMEM_SEGMENT and width % (2 * vec) == 0:
+        vec *= 2
+    return vec
+
+
+def _runs(tile: cute.Tensor, vec: int) -> cute.Tensor:
+    """View a row-major tile in units of ``vec`` adjacent elements.
+
+    :func:`slinoss.ops.so3ssd.cute.table.paired` at a width the staging pass has no
+    use for: a rowwise epilogue thread owns a whole run of ``N / LANE_GROUP`` lanes
+    rather than a pair, so the run is six accesses fewer at four elements than at
+    two. Widening that function instead is an edit to the file the staging pass
+    owns.
+
+    Args:
+        tile: ``(rows, pitch)`` shared tile, unit stride on the columns and a pitch
+            from :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`.
+        vec: Elements an access covers, from :func:`_run_vec`.
+
+    Returns:
+        The retiled view. Element ``(None, (r, k))`` is elements ``vec * k`` through
+        ``vec * k + vec - 1`` of row ``r``, statically shaped, which is what lets
+        :func:`cutlass.cute.autovec_copy` pick one access rather than ``vec``.
+
+    Invariants:
+        The pitch is a whole number of 16-byte segments, so a row starts on a
+        16-byte boundary, and a run offset is ``width * lane`` elements with
+        ``vec`` dividing ``width``. The claim is restated on the iterator because a
+        tile arriving as a parameter reports one element whatever its allocation
+        asked for, and ``autovec_copy`` caps the access at the claim.
+    """
+    base = tile.iterator.align(vec * (tile.element_type.width // 8))
+    return cute.zipped_divide(cute.make_tensor(base, tile.layout), (1, vec))
+
+
+def _run_at(row: cute.Tensor, vec: int) -> cute.Tensor:
+    """View one contiguous global row in units of ``vec`` adjacent elements.
+
+    Args:
+        row: ``(3N,)`` unit-stride view of one row of a global tensor.
+        vec: Elements an access covers, from :func:`_run_vec`.
+
+    Invariants:
+        The lane origin and the row stride are both multiples of 16 bytes -- ``3N``
+        is a multiple of 48 and a pitched band's stride lands on a segment -- and a
+        run offset is a multiple of ``vec``.
+    """
+    base = row.iterator.align(vec * (row.element_type.width // 8))
+    return cute.zipped_divide(cute.make_tensor(base, row.layout), (vec,))
+
+
+def _run_vals(frag: cute.Tensor, vec: int, width: int) -> tuple[Scalar, ...]:
+    """A run fragment's elements in column order, widened to float32.
+
+    Args:
+        frag: ``(width // vec, vec)`` fragment filled by :func:`_read_run`.
+        vec: Elements an access covers.
+        width: Elements of the run.
+    """
+    elem = frag.element_type
+    return tuple(widen(frag[i // vec, i % vec], elem) for i in range(width))
+
+
+@cute.jit
+def _read_run(
+    words: cute.Tensor,
+    frag: cute.Tensor,
+    row: cutlass.Int32,
+    lane: cutlass.Int32,
+    accs: cutlass.Constexpr,
+) -> None:
+    """Read a thread's whole column run of one row.
+
+    Args:
+        words: A tile from :func:`_runs`.
+        frag: ``(accs, vec)`` fragment of the tile's element type.
+        row: Row of the tile.
+        lane: Lane group of the thread. Its run starts at access ``accs * lane``.
+        accs: Accesses the run takes. Compile-time.
+    """
+    for k in cutlass.range_constexpr(accs):
+        cute.autovec_copy(words[(None, (row, accs * lane + k))], frag[(k, None)])
+
+
+@cute.jit
+def _write_run(
+    row: cute.Tensor,
+    frag: cute.Tensor,
+    lane: cutlass.Int32,
+    accs: cutlass.Constexpr,
+    vals: tuple[Scalar, ...],
+) -> None:
+    """Write a run of float32 values to one global row, narrowed here.
+
+    Args:
+        row: A row from :func:`_run_at`.
+        frag: ``(accs, vec)`` fragment of the row's element type.
+        lane: Lane group of the thread.
+        accs: Accesses the run takes. Compile-time.
+        vals: The run's values in column order, float32.
+    """
+    elem = frag.element_type
+    vec = len(vals) // accs
+    for k in cutlass.range_constexpr(accs):
+        for j in cutlass.range_constexpr(vec):
+            frag[k, j] = narrow(vals[vec * k + j], elem)
+        cute.autovec_copy(frag[(k, None)], row[(None, accs * lane + k)])
+
+
+@cute.jit
+def _add_run(
+    words: cute.Tensor,
+    frag: cute.Tensor,
+    row: cutlass.Int32,
+    lane: cutlass.Int32,
+    accs: cutlass.Constexpr,
+    vals: tuple[Scalar, ...],
+) -> None:
+    """Add a run of float32 values into a float32 row, read-modify-write.
+
+    One vector read and one vector write an access, in place of one scalar pair an
+    element. A ``(row, column)`` of either destination is reached by one thread of
+    the block between two barriers, so batching the run reorders nothing against
+    another thread.
+
+    Args:
+        words: A float32 tile from :func:`_runs`.
+        frag: ``(accs, vec)`` float32 fragment.
+        row: Row of the tile.
+        lane: Lane group of the thread.
+        accs: Accesses the run takes. Compile-time.
+        vals: The run's addends in column order.
+    """
+    vec = len(vals) // accs
+    _read_run(words, frag, row, lane, accs)
+    for k in cutlass.range_constexpr(accs):
+        for j in cutlass.range_constexpr(vec):
+            frag[k, j] = frag[k, j] + vals[vec * k + j]
+        cute.autovec_copy(frag[(k, None)], words[(None, (row, accs * lane + k))])
 
 
 @cute.jit
@@ -1578,9 +1748,26 @@ def _tap_epilogue(
     exact = span % per_pass == 0
     lane = tid % LANE_GROUP
     zero = cutlass.Float32(0.0)
+    rotated = sbrot.element_type
+
+    # A thread owns a run of adjacent lanes, so its three-vectors are one adjacent
+    # column run and each of the three tiles it touches is read at vector width. The
+    # strided map this replaced gave a thread every fourth lane, which is three
+    # scalar accesses a lane at either layout of the trailing axis.
+    width = 3 * (lanes // LANE_GROUP)
+    fvec = _run_vec(width, 4)
+    ovec = _run_vec(width, sb.element_type.width // 8)
+    faccs = width // fvec
+    oaccs = width // ovec
+    grad = _runs(sdb, fvec)
+    total = _runs(ssum, fvec)
+    raws = _runs(sb, ovec)
+    dfrag = cute.make_fragment((faccs, fvec), sdb.element_type)
+    bfrag = cute.make_fragment((oaccs, ovec), sb.element_type)
+    sfrag = cute.make_fragment((faccs, fvec), ssum.element_type)
 
     for step in cutlass.range_constexpr(-(-span // per_pass)):
-        r = tid // LANE_GROUP + step * per_pass
+        r = _pass_row(tid // LANE_GROUP + step * per_pass)
         # Clamped rather than branched: a row past the run reads real data whose
         # every use below is predicated away.
         rs = cutlass.min(r, span - 1)
@@ -1591,11 +1778,14 @@ def _tap_epilogue(
         act = _mat_of(acrow, step)
         atap = _mat_at(stable, slot, token)
         atapt = mat3_transpose(atap)
-        rotated = sbrot.element_type
-        for rep in cutlass.range_constexpr(lanes // LANE_GROUP):
-            col = 3 * (lane + rep * LANE_GROUP)
-            dvec = (sdb[rs, col], sdb[rs, col + 1], sdb[rs, col + 2])
-            bvec = _vec_at(sb, rs + shift, col)
+        _read_run(grad, dfrag, rs, lane, faccs)
+        _read_run(raws, bfrag, rs + shift, lane, oaccs)
+        dvals = _run_vals(dfrag, fvec, width)
+        bvals = _run_vals(bfrag, ovec, width)
+        outs: list[Scalar] = []
+        for rep in cutlass.range_constexpr(width // 3):
+            dvec = (dvals[3 * rep], dvals[3 * rep + 1], dvals[3 * rep + 2])
+            bvec = (bvals[3 * rep], bvals[3 * rep + 1], bvals[3 * rep + 2])
             # What _rotate_rows stored, recomputed from the table entry and the raw
             # vector this thread already holds: nine FMA in place of a pass over the
             # rotated tile. The round trip through the operand dtype is what makes
@@ -1608,14 +1798,12 @@ def _tap_epilogue(
             )
             gsum = mat3_add(gsum, mat3_outer(dvec, brot))
             msum = mat3_add(msum, mat3_outer(mat3_matvec(act, dvec), bvec))
-            out = mat3_matvec(atapt, dvec)
-            if cutlass.const_expr(exact):
-                for j in cutlass.range_constexpr(3):
-                    ssum[token + shift, col + j] += out[j]
-            else:
-                if inside:
-                    for j in cutlass.range_constexpr(3):
-                        ssum[token + shift, col + j] += out[j]
+            outs.extend(mat3_matvec(atapt, dvec))
+        if cutlass.const_expr(exact):
+            _add_run(total, sfrag, token + shift, lane, faccs, tuple(outs))
+        else:
+            if inside:
+                _add_run(total, sfrag, token + shift, lane, faccs, tuple(outs))
         gsum = _sum_over_lanes(gsum)
         msum = _sum_over_lanes(msum)
         keep = lane == 0
@@ -1708,26 +1896,54 @@ def _readout_epilogue(
     lane = tid % LANE_GROUP
     zero = cutlass.Float32(0.0)
 
+    # One adjacent column run a thread, as in :func:`_tap_epilogue`. The destination
+    # run is adjacent in ``dC`` too, so the store goes out at vector width whether it
+    # lands in global memory or in the fold's accumulator.
+    width = 3 * (lanes // LANE_GROUP)
+    fvec = _run_vec(width, 4)
+    ovec = _run_vec(width, scrot.element_type.width // 8)
+    gvec = _run_vec(width, out.width // 8)
+    faccs = width // fvec
+    oaccs = width // ovec
+    gaccs = width // gvec
+    grad = _runs(sdc, fvec)
+    rots = _runs(scrot, ovec)
+    total = _runs(ssum, fvec)
+    dfrag = cute.make_fragment((faccs, fvec), sdc.element_type)
+    cfrag = cute.make_fragment((oaccs, ovec), scrot.element_type)
+    ofrag = cute.make_fragment((gaccs, gvec), out)
+    sfrag = cute.make_fragment((faccs, fvec), ssum.element_type)
+
     for step in cutlass.range_constexpr(-(-chunk // per_pass)):
-        token = tid // LANE_GROUP + step * per_pass
+        token = _pass_row(tid // LANE_GROUP + step * per_pass)
         ts = cutlass.min(token, chunk - 1)
         inside = token < chunk
         gsum = tuple(zero for _ in range(9))
         act = mat3_transpose(_mat_at(stable, TABLE_AC, ts))
-        for rep in cutlass.range_constexpr(lanes // LANE_GROUP):
-            col = 3 * (lane + rep * LANE_GROUP)
-            dvec = (sdc[ts, col], sdc[ts, col + 1], sdc[ts, col + 2])
-            gsum = mat3_add(gsum, mat3_outer(dvec, _vec_at(scrot, ts, col)))
-            dc = mat3_matvec(act, dvec)
-            keep = ts < valid
-            if cutlass.const_expr(not exact):
-                keep = keep & inside
-            if keep:
-                for j in cutlass.range_constexpr(3):
-                    if cutlass.const_expr(fold == 1):
-                        gdc[bidx, gidx, sbase + t0 + ts, col + j] = narrow(dc[j], out)
-                    else:
-                        ssum[ts, col + j] += dc[j]
+        _read_run(grad, dfrag, ts, lane, faccs)
+        _read_run(rots, cfrag, ts, lane, oaccs)
+        dvals = _run_vals(dfrag, fvec, width)
+        cvals = _run_vals(cfrag, ovec, width)
+        dcs: list[Scalar] = []
+        for rep in cutlass.range_constexpr(width // 3):
+            dvec = (dvals[3 * rep], dvals[3 * rep + 1], dvals[3 * rep + 2])
+            crot = (cvals[3 * rep], cvals[3 * rep + 1], cvals[3 * rep + 2])
+            gsum = mat3_add(gsum, mat3_outer(dvec, crot))
+            dcs.extend(mat3_matvec(act, dvec))
+        keep = ts < valid
+        if cutlass.const_expr(not exact):
+            keep = keep & inside
+        if keep:
+            if cutlass.const_expr(fold == 1):
+                _write_run(
+                    _run_at(gdc[bidx, gidx, sbase + t0 + ts, None], gvec),
+                    ofrag,
+                    lane,
+                    gaccs,
+                    tuple(dcs),
+                )
+            else:
+                _add_run(total, sfrag, ts, lane, faccs, tuple(dcs))
         gsum = _sum_over_lanes(gsum)
         # One word a lane, a group of words a round, as in :func:`_tap_epilogue`.
         for word in cutlass.range_constexpr(-(-ROW_WORDS // LANE_GROUP)):
@@ -2182,7 +2398,10 @@ def chunk_vector_bwd_kernel(
                     _mat_at(
                         stable,
                         TABLE_AC,
-                        nbase + cutlass.min(tid // LANE_GROUP + s * taprows, span - 1),
+                        nbase
+                        + cutlass.min(
+                            _pass_row(tid // LANE_GROUP + s * taprows), span - 1
+                        ),
                     )
                 )
                 for s in range(-(-span // taprows))
