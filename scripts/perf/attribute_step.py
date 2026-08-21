@@ -63,8 +63,8 @@ MAX_COVERAGE_PCT = 102.0
 """Most of the bracketing interval the rows may sum to.
 
 One stream, so the kernels cannot overlap and their sum cannot exceed the interval
-they run in. Two percent of slack for the profiler's own per-kernel cost, which
-lands inside the profiled interval and not in the one it is compared against.
+they run in. The interval is recorded inside the profiled run and not against a
+separate one, so the slack covers event placement alone.
 """
 
 
@@ -219,9 +219,13 @@ def device_rows(profiled: profile, iters: int) -> list[tuple[str, float, float]]
 def event_us(step: Callable[[], object], iters: int, device: torch.device) -> float:
     """Microseconds per call, from a device event pair around ``iters`` calls.
 
-    The profiler is not the reference for how long the step takes. This is what the
-    per-kernel rows are checked against: they cover an interval, and a sum over them
-    that exceeds it is double counting rather than a slower step.
+    The profiler is not the reference for how long the step takes, so this is called
+    once outside it to report that. It is called a second time inside it, because a
+    sum over the rows is only a fraction of an interval the rows themselves ran in.
+    Compared against a separately timed run the sum can exceed the interval, and the
+    complement is then the difference between two runs and not idle time: measured on
+    an A6000 at 13 layers the complement ranged from +903 us to -346 us per step over
+    six runs of the same tree.
 
     Args:
         step: The callable to time.
@@ -262,19 +266,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         step()
     wall = event_us(step, args.iters, device)
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profiled:
-        for _ in range(args.iters):
-            step()
-        torch.cuda.synchronize(device)
+        bracket = event_us(step, args.iters, device)
 
     rows = device_rows(profiled, args.iters)
     total = sum(us for _, us, _ in rows)
     if total <= 0.0:
         raise ValueError("the profile recorded no device work")
-    coverage = 100.0 * total / wall
+    coverage = 100.0 * total / bracket
     if coverage > MAX_COVERAGE_PCT:
         raise ValueError(
             f"the {len(rows)} device rows sum to {total:,.3f} us per iteration inside "
-            f"an interval of {wall:,.3f} us, which is {coverage:,.2f}% of it; a row is "
+            f"an interval of {bracket:,.3f} us, which is {coverage:,.2f}% of it; a row is "
             f"counted twice"
         )
     by_class: dict[str, float] = {}
@@ -289,8 +291,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(
         f"device time {total / 1000.0:,.3f} ms per iteration over {len(rows)} kernels, "
-        f"{coverage:,.2f}% of the {wall / 1000.0:,.3f} ms the step takes unprofiled"
+        f"{coverage:,.2f}% of the {bracket / 1000.0:,.3f} ms interval they ran in"
     )
+    print(f"step time {wall / 1000.0:,.3f} ms per iteration, unprofiled")
     print()
     for label, us in sorted(by_class.items(), key=lambda entry: -entry[1]):
         print(f"{label:12s} {us / 1000.0:10,.3f} ms  {100.0 * us / total:6,.2f}%")
