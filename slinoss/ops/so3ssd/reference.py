@@ -39,6 +39,12 @@ same causal mask:
 Four dense real GEMMs and a separable scalar mask. No complex arithmetic and no
 interleaved storage.
 
+:func:`chunked_forward_fused` collapses the two taps to one. Reindexing the
+now-tap of token ``s-1`` onto slot ``s`` factors the common decay out, so a single
+table column ``Afuse_s = ap_s + exp(2*ls_s) * an_{s-1}`` carries both taps against
+one operand ``b_{s-1}``, and what the reindex leaves over is two rank-one residues
+rather than a GEMM. Same operator, four GEMMs per chunk instead of seven.
+
 Value invariants -- ``ls <= 0`` and ``|w| < pi`` -- are the parameterization's
 job, not this module's. Nothing here scans a tensor to validate a numerical
 range and nothing here clamps.
@@ -64,6 +70,7 @@ from slinoss.config import HEAD_MULTIPLE, LANE_MULTIPLE
 
 __all__ = [
     "ChunkedForward",
+    "FusedForward",
     "SO3SSDResult",
     "ScanPrologue",
     "TapGrads",
@@ -72,8 +79,10 @@ __all__ = [
     "check_grad_band",
     "chunk_pad",
     "chunked_forward",
+    "chunked_forward_fused",
     "deriv_coeffs",
     "from_heads",
+    "pad_time",
     "quat_conj",
     "quat_exp",
     "quat_exp_vjp",
@@ -640,11 +649,32 @@ def as_lanes(t: Tensor) -> Tensor:
     return t.unflatten(-1, (-1, 3))
 
 
+def pad_time(t: Tensor, length: int) -> Tensor:
+    """Zero-pad the token axis up to a multiple of ``L``, leaving it flat.
+
+    Args:
+        t: Time-major tensor, shape ``(B,H,T,...)``.
+        length: Chunk length ``L``.
+
+    Returns:
+        Shape ``(B,H,ceil(T/L)*L,...)``. ``t`` itself when ``L`` divides ``T``.
+    """
+    tail = (-t.shape[2]) % length
+    if tail:
+        t = _pad(t, (0, 0) * (t.ndim - 3) + (0, tail))
+    return t
+
+
 def chunk_pad(t: Tensor, length: int) -> Tensor:
     """``(B,H,T,...) -> (B,H,ceil(T/L),L,...)``, zero-padding a ragged tail.
 
-    A zero-padded token is an exact no-op: ``w = 0`` and ``ls = 0`` give the
-    identity transition while a zero tap kills the forcing.
+    Under the two-tap factorization of :func:`chunked_forward` a zero-padded token
+    is an exact no-op: ``w = 0`` and ``ls = 0`` give the identity transition while
+    a zero tap kills the forcing. The one-tap factorization of
+    :func:`chunked_forward_fused` reindexes each now-tap onto the following slot,
+    so there a pad slot carries the last real token's forcing and the shifted
+    operands are built by :func:`pad_time` before the shift rather than padded
+    after it.
 
     Args:
         t: Time-major tensor, shape ``(B,H,T,...)``.
@@ -653,10 +683,7 @@ def chunk_pad(t: Tensor, length: int) -> Tensor:
     Returns:
         The chunked tensor, shape ``(B,H,ceil(T/L),L,...)``.
     """
-    tail = (-t.shape[2]) % length
-    if tail:
-        t = _pad(t, (0, 0) * (t.ndim - 3) + (0, tail))
-    return t.unflatten(2, (-1, length))
+    return pad_time(t, length).unflatten(2, (-1, length))
 
 
 def _check_inputs(
@@ -1122,6 +1149,273 @@ def chunked_forward(
         bprv=bprv,
         score_now=score_now,
         score_prv=score_prv,
+        dmask=dmask,
+        wgt=wgt,
+        inc_local=inc_local,
+        zstart=zstart,
+        state=state,
+        y=y,
+        y_off=y_off,
+    )
+
+
+class FusedForward(NamedTuple):
+    """Every chunk-local intermediate of the one-tap factorization.
+
+    Produced by :func:`chunked_forward_fused`. Time is chunked: an axis pair
+    ``(C,L)`` replaces ``T``. ``d`` denotes the flattened ``3N``.
+
+    Attributes:
+        length: Chunk length ``L``.
+        seqlen: Unpadded ``T``, for slicing the tail off the output.
+        lprefix: Chunk-local log-scale prefix ``lp``, ``(B,H,C,L)``.
+        step: Per-token decay ``exp(2*ls_s)``, ``(B,H,C,L)``. The factor the fused
+            column carries.
+        u: ``U`` chunked, ``(B,H,C,L,P)``. Zero past the ragged tail.
+        ushift: ``u_{t-1}`` over the padded sequence, ``(B,H,C,L,P)``. Slot ``n`` of
+            a ragged tail chunk holds ``u_{T-1}``, not zero.
+        b: ``B`` chunked, ``(B,H,C,L,3N)``. Zero past the ragged tail.
+        bshift: ``b_{t-1}`` over the padded sequence, ``(B,H,C,L,3N)``. Slot ``n``
+            of a ragged tail chunk holds ``b_{T-1}``, not zero.
+        table: The per-token 3x3 transforms of the two-tap form.
+        afuse: ``ap_s + exp(2*ls_s) * an_{s-1}``, ``(B,H,C,L,3,3)``. Replaces
+            ``table.ap`` in the table a kernel reads; column ``s = 0`` is ``ap_0``.
+        crot: ``R(Q_t)^T c_t``, ``(B,H,C,L,N,3)``.
+        bnow: ``R(Q_t)^T Kcurr_t b_t``, ``(B,H,C,L,N,3)``. Only the two residues
+            read it, at one slot each.
+        bfuse: ``Afuse_s b_{s-1}``, ``(B,H,C,L,N,3)``. The single score operand.
+        dnow: ``<crot_t, bnow_t>``, ``(B,H,C,L)``. The diagonal residue, equal to
+            ``<c_t, Kcurr_t b_t>``: both frames cancel.
+        score: ``<crot_t, bfuse_s>``, ``(B,H,C,L,L)``. Unmasked.
+        dmask: ``exp(2*(lp_t - lp_s)) * [s <= t]``, ``(B,H,C,L,L)``. Unchanged from
+            the two-tap form.
+        wgt: ``exp(2*(lp_{L-1} - lp_s))``, ``(B,H,C,L,1)``.
+        inc_local: Chunk increment before the frame change, ``(B,H,C,P,3N)``.
+        zstart: State entering each chunk, ``(B,H,C,P,N,3)``.
+        state: State after the last token, ``(B,H,P,N,3)``.
+        y: Output in the pinned dtype, tail already sliced, ``(B,H,T,P)``.
+        y_off: The ``zstart`` half of ``y``, still chunked, ``(B,H,C,L,P)``.
+    """
+
+    length: int
+    seqlen: int
+    lprefix: Tensor
+    step: Tensor
+    u: Tensor
+    ushift: Tensor
+    b: Tensor
+    bshift: Tensor
+    table: TransformTable
+    afuse: Tensor
+    crot: Tensor
+    bnow: Tensor
+    bfuse: Tensor
+    dnow: Tensor
+    score: Tensor
+    dmask: Tensor
+    wgt: Tensor
+    inc_local: Tensor
+    zstart: Tensor
+    state: Tensor
+    y: Tensor
+    y_off: Tensor
+
+
+def chunked_forward_fused(
+    U: Tensor,
+    trans: Tensor,
+    K: Tensor,
+    B: Tensor,
+    C: Tensor,
+    chunk_size: int,
+    *,
+    z0: Tensor | None = None,
+    b_prev: Tensor | None = None,
+    u_prev: Tensor | None = None,
+) -> FusedForward:
+    """Evaluate the one-tap factorization and keep every intermediate.
+
+    Same operator as :func:`chunked_forward`, four dense GEMMs per chunk instead of
+    seven. Reindexing the now-tap of token ``s-1`` onto slot ``s`` gives both taps
+    the same operand ``b_{s-1}``, the same weight ``u_{s-1}``, and the same causal
+    mask, so one column of the table carries both:
+
+        Afuse_s  = ap_s + exp(2*ls_s) * an_{s-1},        Afuse_0 = ap_0
+        y_diag_t = <crot_t, bnow_t> u_t
+                   + sum_{s<=t} dmask[t,s] <crot_t, Afuse_s b_{s-1}> u_{s-1}
+        inc      = sum_s wgt_s * u_{s-1} (x) (Afuse_s b_{s-1})
+                   + u_{L-1} (x) bnow_{L-1}
+
+    The two residues are what the reindex leaves over: row ``t = s-1`` is outside
+    the mask, and slot ``L`` is outside the chunk. Neither is a GEMM.
+
+    ``Afuse_0`` takes no ``an`` term. The previous chunk's ``an_{L-1}`` lives in the
+    previous chunk's frame and its contribution already arrives through ``zstart``,
+    so injecting it is wrong, not redundant.
+
+    The shifted operands are built from the zero-padded sequence rather than
+    zero-padded after the shift. At ``T mod L == n > 0`` the reindex puts the last
+    real token's now-tap in slot ``n``, and padding the shift would put a zero
+    there. That term reaches ``state`` only, because pad columns enter rows
+    ``t >= n`` alone and the tail slice discards those, so ``y`` cannot see the
+    difference.
+
+    A zero-padded token is therefore not a no-op here. ``u`` and ``b`` are zero past
+    the tail, ``ushift`` and ``bshift`` are not, and a pad token's table row is the
+    one an identity rotation and zero taps produce.
+
+    Args:
+        U: Input weights, shape ``(B,H,T,P)``.
+        trans: ``(w_x, w_y, w_z, ls)`` per token, shape ``(B,H,T,4)``, pinned.
+        K: Per-tap ``(kr, g, h, 0)``, shape ``(B,H,T,2,4)``, pinned.
+        B: Input vectors, shape ``(B,G,T,3N)``. Grouped: head ``h`` reads group
+            ``h // (H // G)``.
+        C: Output vectors, shape ``(B,G,T,3N)``. Grouped like ``B``.
+        chunk_size: Chunk length ``L``.
+        z0: Initial state, shape ``(B,H,P,3N)``, pinned. Zero if omitted.
+        b_prev: ``b_{-1}`` for a streaming split, shape ``(B,G,3N)``.
+        u_prev: ``u_{-1}`` for a streaming split, shape ``(B,H,P)``.
+
+    Returns:
+        A :class:`FusedForward`.
+
+    Raises:
+        ValueError: On a shape, contiguity, device, or pairing violation, or a
+            non-positive ``chunk_size``.
+        TypeError: On an unsupported dtype, or a low-precision pinned tensor.
+    """
+    shapes = _check_inputs(U, trans, K, B, C, z0, b_prev, u_prev)
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    dtype = pinned_dtype(U, trans, K, B, C)
+    device = U.device
+    length = chunk_size
+
+    with autocast_disabled(device.type):
+        u = _promote(U, dtype)
+        bvec = to_heads(_promote(B, dtype), shapes.heads)
+        cvec = to_heads(_promote(C, dtype), shapes.heads)
+        bhead = (
+            torch.zeros(
+                shapes.bsz,
+                shapes.heads,
+                1,
+                shapes.state_dim,
+                dtype=dtype,
+                device=device,
+            )
+            if b_prev is None
+            else to_heads(_promote(b_prev, dtype), shapes.heads)[:, :, None]
+        )
+        uhead = (
+            torch.zeros(
+                shapes.bsz, shapes.heads, 1, shapes.rows, dtype=dtype, device=device
+            )
+            if u_prev is None
+            else _promote(u_prev, dtype)[:, :, None]
+        )
+        # Shift the padded sequence. Padding the shift puts zero in slot n of the
+        # tail chunk, where the reindex puts the last real token's now-tap.
+        bshift = torch.cat([bhead, pad_time(bvec, length)[:, :, :-1]], dim=2)
+        ushift = torch.cat([uhead, pad_time(u, length)[:, :, :-1]], dim=2)
+
+        w = chunk_pad(_promote(trans[..., :3], dtype), length)
+        ls = chunk_pad(_promote(trans[..., 3:], dtype), length)[..., 0]
+        lprefix = torch.cumsum(ls, dim=-1)
+        tap = chunk_pad(_promote(K[..., :3].flatten(-2, -1), dtype), length).unflatten(
+            -1, (2, 3)
+        )
+        u_c = chunk_pad(u, length)
+        ushift_c = chunk_pad(ushift, length)
+        b_c = chunk_pad(bvec, length)
+        bshift_c = chunk_pad(bshift, length)
+        c_c = chunk_pad(cvec, length)
+        n_chunks = int(w.shape[2])
+
+        quat = quat_exp(w)
+        qprefix = quat_prefix_scan(quat)
+        table = transform_table(w, tap, qprefix)
+        step = torch.exp(2.0 * ls)
+        # I3 holds: ls <= 0 puts both this factor and dmask in (0,1], so the fused
+        # column is a product of two decays and never underflow times overflow.
+        an_shift = torch.cat(
+            [torch.zeros_like(table.an[..., :1, :, :]), table.an[..., :-1, :, :]],
+            dim=-3,
+        )
+        afuse = table.ap + step[..., None, None] * an_shift
+
+        crot = torch.einsum("bhclij,bhclnj->bhclni", table.ac, as_lanes(c_c))
+        bnow = torch.einsum("bhclij,bhclnj->bhclni", table.an, as_lanes(b_c))
+        bfuse = torch.einsum("bhclij,bhclnj->bhclni", afuse, as_lanes(bshift_c))
+        crot_f = crot.flatten(-2, -1)
+        bnow_f = bnow.flatten(-2, -1)
+        bfuse_f = bfuse.flatten(-2, -1)
+
+        causal = torch.ones(length, length, dtype=torch.bool, device=device).tril()
+        dmask = torch.exp(
+            (2.0 * (lprefix[..., :, None] - lprefix[..., None, :])).masked_fill(
+                ~causal, -float("inf")
+            )
+        )
+        score = crot_f @ bfuse_f.transpose(-1, -2)
+        # Rotation-free: R(Q_t) is orthogonal, so this is <c_t, Kcurr_t b_t> and the
+        # residue needs neither the quaternion prefix nor the chunk-local frame.
+        dnow = (crot_f * bnow_f).sum(-1)
+        y_diag = (score * dmask) @ ushift_c + dnow[..., None] * u_c
+
+        wgt = torch.exp(2.0 * (lprefix[..., -1:] - lprefix))[..., None]
+        inc_local = (
+            torch.einsum("bhclp,bhcld->bhcpd", ushift_c * wgt, bfuse_f)
+            + u_c[..., -1, :, None] * bnow_f[..., -1, None, :]
+        )
+        chunk_rot = table.rot[..., -1, :, :]
+        inc = torch.einsum("bhcij,bhcpnj->bhcpni", chunk_rot, as_lanes(inc_local))
+        chunk_scale = torch.exp(2.0 * lprefix[..., -1])
+
+        state = (
+            torch.zeros(
+                shapes.bsz,
+                shapes.heads,
+                shapes.rows,
+                shapes.lanes,
+                3,
+                dtype=dtype,
+                device=device,
+            )
+            if z0 is None
+            else as_lanes(_promote(z0, dtype))
+        )
+        starts = []
+        for c in range(n_chunks):
+            starts.append(state)
+            state = (
+                chunk_scale[:, :, c, None, None, None]
+                * torch.einsum("bhij,bhpnj->bhpni", chunk_rot[:, :, c], state)
+                + inc[:, :, c]
+            )
+        zstart = torch.stack(starts, dim=2)
+
+        y_off = torch.exp(2.0 * lprefix)[..., None] * torch.einsum(
+            "bhclni,bhcpni->bhclp", crot, zstart
+        )
+        y = (y_diag + y_off).flatten(2, 3)[:, :, : shapes.seqlen]
+
+    return FusedForward(
+        length=length,
+        seqlen=shapes.seqlen,
+        lprefix=lprefix,
+        step=step,
+        u=u_c,
+        ushift=ushift_c,
+        b=b_c,
+        bshift=bshift_c,
+        table=table,
+        afuse=afuse,
+        crot=crot,
+        bnow=bnow,
+        bfuse=bfuse,
+        dnow=dnow,
+        score=score,
         dmask=dmask,
         wgt=wgt,
         inc_local=inc_local,
