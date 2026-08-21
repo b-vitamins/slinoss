@@ -44,7 +44,7 @@ from typing import NamedTuple
 
 from torch import Tensor
 
-from slinoss._cute import smem_capacity
+from slinoss._cute import smem_capacity, smem_residency
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import (
     ChunkedBackward,
@@ -54,6 +54,7 @@ from slinoss.ops.so3ssd import (
 )
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
     LANE_MULTIPLE,
+    RESIDENT_MIN,
     ChunkInputBwd,
     chunk_input_backward,
     input_smem_bytes,
@@ -635,6 +636,36 @@ def test_the_block_width_follows_the_lane_extent(
     got = input_threads(chunk, rows, dim)
     assert got == want, (chunk, rows, dim)
     assert input_smem_bytes(chunk, rows, dim, warps=got // 32) <= smem_capacity()
+
+
+def test_the_lane_extent_reaches_the_residency_it_is_chosen_for() -> None:
+    """A block taken for residency reaches it, or the widest that fits is taken instead.
+
+    ``smem_capacity() // RESIDENT_MIN`` is the wrong budget and sits 512 B above the
+    residency-2 cliff on sm_86: the capacity has one
+    :data:`slinoss._cute.SMEM_RESERVED` subtracted already and two blocks pay two.
+    Inside that band a narrower block was returned for a residency it does not reach,
+    and the lane extent was banked across blocks for nothing. ``L=32 P=80 3N=96`` at
+    four warps is such a shape: 48 costs 50,448 B and runs one block deep, so the
+    contract asks for 96 at 70,416 B, which is one block deep and one lane block.
+    """
+    chunk, rows, dim, warps = 32, 80, 96, 4
+    lblk = lblock(chunk, rows, dim, warps=warps)
+    nbytes = input_smem_bytes(chunk, rows, dim, lblk=lblk, warps=warps)
+    assert nbytes <= smem_capacity()
+    if smem_residency(nbytes) < RESIDENT_MIN:
+        assert lblk == dim, (lblk, nbytes)
+
+
+def test_refuses_a_shape_no_lane_block_fits() -> None:
+    """The narrowest block overflowing the carveout is an error, not a return value.
+
+    :func:`lblock` promises a block that fits. ``L=16 P=224 3N=48`` has one candidate,
+    48, and it needs 101,616 B of a 101,376 B carveout, so there is nothing to return
+    and the caller cannot tell a fitting block from an overflowing one by its width.
+    """
+    with pytest.raises(ValueError, match="no lane block"):
+        lblock(16, 224, 48, warps=4)
 
 
 def test_the_two_block_widths_differ_only_in_warp_reduction_order() -> None:

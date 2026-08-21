@@ -175,6 +175,16 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
         fused_smem_bytes,
     )
 
+    def input_knob(chunk: int, rows: int, dim: int) -> str:
+        # The map asks about chunk lengths the kernel refuses, and at those there is no
+        # lane block to name: ``lblock`` returns a block that fits or raises. The bytes
+        # column still reports the narrowest block's cost, which is what the refusal is
+        # judged on.
+        try:
+            return f"lblk={lblock(chunk, rows, dim)}"
+        except ValueError:
+            return "lblk=none"
+
     def vector(f: int) -> ArenaKernel:
         return ArenaKernel(
             name=f"chunk_vector_bwd/fold{f}",
@@ -208,7 +218,7 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
         ArenaKernel(
             name="chunk_input_bwd",
             nbytes=input_smem_bytes,
-            knob=lambda c, p, d: f"lblk={lblock(c, p, d)}",
+            knob=input_knob,
         ),
     ]
     entries.extend(vector(f) for f in dict.fromkeys((1, fold)))

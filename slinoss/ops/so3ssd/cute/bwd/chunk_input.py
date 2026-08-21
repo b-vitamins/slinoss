@@ -228,6 +228,7 @@ from slinoss._cute import (
     shuffle_xor,
     smem_bytes,
     smem_capacity,
+    smem_residency,
     widen,
 )
 from slinoss.ops.so3ssd.cute.common import (
@@ -363,6 +364,40 @@ def tblock(chunk: int) -> int:
     return min(chunk, TBLOCK_MAX)
 
 
+def _lane_block(
+    chunk: int, rows: int, dim: int, itemsize: int, warps: int
+) -> tuple[int, int]:
+    """Lane block the carveout admits, and the bytes it costs.
+
+    Split from :func:`lblock` so a shape no block fits has a cost to report. The byte
+    query is total over shapes and answers what a refused shape would need;
+    :func:`lblock` is the caller that refuses it.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        dim: ``3N``.
+        itemsize: Bytes per operand element.
+        warps: Warps per block.
+
+    Returns:
+        The widest candidate held :data:`RESIDENT_MIN` deep, else the widest held once,
+        else the narrowest candidate paired with a cost above the carveout.
+    """
+    costs = [
+        (blk, input_smem_bytes(chunk, rows, dim, itemsize, lblk=blk, warps=warps))
+        for blk in range(dim, 0, -LANE_MULTIPLE)
+        if dim % blk == 0
+    ]
+    for candidate in costs:
+        if smem_residency(candidate[1]) >= RESIDENT_MIN:
+            return candidate
+    for candidate in costs:
+        if candidate[1] <= smem_capacity():
+            return candidate
+    return costs[-1]
+
+
 def lblock(
     chunk: int, rows: int, dim: int, itemsize: int = 2, *, warps: int = WARPS
 ) -> int:
@@ -402,21 +437,28 @@ def lblock(
 
     Returns:
         The widest divisor of ``3N`` that is a multiple of :data:`LANE_MULTIPLE` and
-        whose block fits :data:`RESIDENT_MIN` times in the device's carveout, or the
-        widest that fits once when none does, or :data:`LANE_MULTIPLE` when even that
-        does not fit. The last case is what
-        :func:`slinoss.ops.so3ssd.cute.guard.assert_smem_fits` reports on.
+        whose block the carveout holds :data:`RESIDENT_MIN` deep, or the widest that
+        fits once when none is held that deep. Residency is asked of
+        :func:`slinoss._cute.smem_residency` rather than of
+        ``capacity // RESIDENT_MIN``, which reads one block too high in the 512 B below
+        the cliff because every resident block pays
+        :data:`slinoss._cute.SMEM_RESERVED` and the capacity has one of them subtracted
+        already. Both passes compare a block against a budget it has been shown to
+        meet, so what is returned is a block that fits.
+
+    Raises:
+        ValueError: If no candidate fits at all. A width cannot carry the refusal: the
+            caller cannot tell a block that fits from one that overflows by its value,
+            and every caller of this function goes on to launch at what it returns.
     """
-    legal = [blk for blk in range(dim, 0, -LANE_MULTIPLE) if dim % blk == 0]
-    capacity = smem_capacity()
-    for budget in (capacity // RESIDENT_MIN, capacity):
-        for blk in legal:
-            if (
-                input_smem_bytes(chunk, rows, dim, itemsize, lblk=blk, warps=warps)
-                <= budget
-            ):
-                return blk
-    return legal[-1]
+    blk, nbytes = _lane_block(chunk, rows, dim, itemsize, warps)
+    if nbytes > smem_capacity():
+        raise ValueError(
+            f"chunk_input_bwd has no lane block that fits at L={chunk} P={rows} "
+            f"3N={dim}: the narrowest, {blk}, needs {nbytes} B and the carveout is "
+            f"{smem_capacity()} B"
+        )
+    return blk
 
 
 def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
@@ -442,12 +484,14 @@ def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     and the wide form spills 139 MB.
 
     Three shapes for, two against, and the lane count separates them with nothing left
-    over. What the lane count does not decide is whether the wide arena fits at all:
-    :data:`LANE_MULTIPLE` is ``3N`` itself at ``3N = 48``, so :func:`lblock` has one
-    candidate there and returns it whether or not it fits, and at ``L = 128, P = 64``
-    the wide form's 102,496 B overflows a 101,376 B carveout that the narrow form's
-    89,968 B clears. Fitting is checked here rather than left to the host guard, which
-    would refuse the launch instead of narrowing it.
+    over. What the lane count does not decide is whether the wide arena fits at all: at
+    ``L = 128, P = 64`` the wide form's 102,496 B overflows a 101,376 B carveout that
+    the narrow form's 89,968 B clears. Fitting is checked here rather than left to the
+    host guard, which would refuse the launch instead of narrowing it, and it is checked
+    at the whole lane extent ahead of :func:`lblock` rather than at the block that
+    function returns: the wide form is taken only at one lane block, so a whole extent
+    the wide arena cannot hold refuses the width whatever a narrower block would cost,
+    and asking first is also what keeps :func:`lblock`'s overflow error off this path.
 
     Args:
         chunk: ``L``.
@@ -463,13 +507,13 @@ def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
         the two and so decides its own lane extent; where it holds ``3N`` whole the
         narrow one does too.
     """
-    lblk = lblock(chunk, rows, dim, itemsize, warps=WARPS_WIDE)
-    if dim != lblk:
-        return THREADS
     bytes_wide = input_smem_bytes(
-        chunk, rows, dim, itemsize, lblk=lblk, warps=WARPS_WIDE
+        chunk, rows, dim, itemsize, lblk=dim, warps=WARPS_WIDE
     )
-    return THREADS_WIDE if bytes_wide <= smem_capacity() else THREADS
+    if bytes_wide > smem_capacity():
+        return THREADS
+    lblk = lblock(chunk, rows, dim, itemsize, warps=WARPS_WIDE)
+    return THREADS_WIDE if lblk == dim else THREADS
 
 
 def input_tile(chunk: int, rows: int) -> Tile:
@@ -629,14 +673,16 @@ def arena(
         rows: ``P``.
         dim: ``3N``.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
-        lblk: Lane extent of the three lane-dependent tiles. Defaults to
-            :func:`lblock`, which passes it explicitly to ask what a candidate would
-            cost.
+        lblk: Lane extent of the three lane-dependent tiles. Defaults to the block
+            :func:`_lane_block` admits, which passes it explicitly to ask what a
+            candidate would cost. Taken from there rather than from :func:`lblock` so a
+            shape no block fits reports its floor cost instead of raising: the launch
+            guard is :func:`lblock`, and a legality map wants the number.
         warps: Warps per block. Above :data:`slinoss.ops.so3ssd.cute.mma.WARPS` the
             diagonal GEMM needs its left operand in shared memory.
     """
     if lblk is None:
-        lblk = lblock(chunk, rows, dim, itemsize)
+        lblk = _lane_block(chunk, rows, dim, itemsize, WARPS)[0]
     forced = _words(forced_tile(chunk, lblk), itemsize)
     local = _words(local_tile(rows, lblk), itemsize)
     readout = forced
@@ -694,9 +740,9 @@ def input_smem_bytes(
         rows: ``P``.
         dim: ``3N``.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
-        lblk: Lane extent of the three lane-dependent tiles. Defaults to
-            :func:`lblock`, which passes it explicitly to ask what a candidate would
-            cost.
+        lblk: Lane extent of the three lane-dependent tiles. Defaults to the block
+            :func:`_lane_block` admits. Total over shapes: where no block fits, the
+            narrowest one's cost is reported and the refusal is :func:`lblock`'s.
         warps: Warps per block. Only the two per-warp scratch tiles carry it.
     """
     words = arena(chunk, rows, dim, itemsize, lblk=lblk, warps=warps).words
