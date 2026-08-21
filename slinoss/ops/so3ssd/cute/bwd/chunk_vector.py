@@ -1566,6 +1566,43 @@ def _add_run(
 
 
 @cute.jit
+def _store_run(
+    row: cute.Tensor,
+    words: cute.Tensor,
+    ofrag: cute.Tensor,
+    sfrag: cute.Tensor,
+    src: cutlass.Int32,
+    run: cutlass.Int32,
+    accs: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
+) -> None:
+    """Narrow one run of a float32 shared row into one run of a global row.
+
+    A float32 access covers ``vec`` elements and an output access covers
+    ``accs * vec``, the two widths differing because the segment holds twice as many
+    narrowed elements as float32 ones. The narrowing is elementwise on the same
+    float32 values in the same order as a scalar store, so the result is unchanged.
+
+    Args:
+        row: A row from :func:`_run_at`, in units of ``accs * vec`` elements.
+        words: A float32 tile from :func:`_runs`, in units of ``vec`` elements.
+        ofrag: ``(accs * vec,)`` fragment of the row's element type.
+        sfrag: ``(accs, vec)`` float32 fragment.
+        src: Row of ``words``.
+        run: Run of ``row``.
+        accs: Float32 accesses one output access covers. Compile-time.
+        vec: Elements a float32 access covers. Compile-time.
+    """
+    elem = ofrag.element_type
+    for k in cutlass.range_constexpr(accs):
+        cute.autovec_copy(words[(None, (src, accs * run + k))], sfrag[(k, None)])
+    for k in cutlass.range_constexpr(accs):
+        for j in cutlass.range_constexpr(vec):
+            ofrag[vec * k + j] = narrow(sfrag[k, j], elem)
+    cute.autovec_copy(ofrag, row[(None, run)])
+
+
+@cute.jit
 def _fill_zero(
     dst: cute.Tensor, total: cutlass.Constexpr, tid: cutlass.Int32, threads: int
 ) -> None:
@@ -2678,20 +2715,60 @@ def chunk_vector_bwd_kernel(
     # The shard's two sums for this lane tile, rounded once: the narrowing is here at
     # one shard and at the reduction above one, never twice. Row t+1 of the forcing sum
     # is token t and row 0 is the row the boundary kernel owns.
-    total = chunk * tile
+    #
+    # One access per run of adjacent lanes and not one per lane. The scalar form
+    # indexed a four-mode global tensor once an element, so every element paid the
+    # whole coordinate: three stride products, the widen and the carry. A run pays
+    # the coordinate once and covers a 16-byte segment, which is the form
+    # :func:`_readout_epilogue` already stores through.
+    fvec = _run_vec(tile, 4)
+    ovec = _run_vec(tile, out.width // 8)
+    oaccs = ovec // fvec
+    bwords = _runs(sumb, fvec)
+    cwords = _runs(sumc, fvec)
+    ofrag = cute.make_fragment((ovec,), out)
+    sfrag = cute.make_fragment((oaccs, fvec), cutlass.Float32)
+    runs = tile // ovec
+    total = chunk * runs
     for step in cutlass.range_constexpr(-(-total // threads)):
         i = tid + step * threads
         if i < total:
-            t = i // tile
-            c = i - t * tile
+            t = i // runs
+            r = i - t * runs
             if t < valid:
-                gdbj[bidx, gidx, sbase + t0 + t, c] = narrow(sumb[t + 1, c], out)
+                _store_run(
+                    _run_at(gdbj[bidx, gidx, sbase + t0 + t, None], ovec),
+                    bwords,
+                    ofrag,
+                    sfrag,
+                    t + 1,
+                    r,
+                    oaccs,
+                    fvec,
+                )
                 if cutlass.const_expr(fold > 1):
-                    gdcj[bidx, gidx, sbase + t0 + t, c] = narrow(sumc[t, c], out)
-    for step in cutlass.range_constexpr(-(-tile // threads)):
-        c = tid + step * threads
-        if c < tile:
-            gcarryj[bidx, gidx, cbase + cidx, c] = sumb[0, c]
+                    _store_run(
+                        _run_at(gdcj[bidx, gidx, sbase + t0 + t, None], ovec),
+                        cwords,
+                        ofrag,
+                        sfrag,
+                        t,
+                        r,
+                        oaccs,
+                        fvec,
+                    )
+    # The carry is float32 at both ends, so its run is the float32 one and it needs
+    # no narrowing fragment.
+    kruns = tile // fvec
+    kfrag = cute.make_fragment((fvec,), cutlass.Float32)
+    for step in cutlass.range_constexpr(-(-kruns // threads)):
+        r = tid + step * threads
+        if r < kruns:
+            cute.autovec_copy(bwords[(None, (0, r))], kfrag)
+            cute.autovec_copy(
+                kfrag,
+                _run_at(gcarryj[bidx, gidx, cbase + cidx, None], fvec)[(None, r)],
+            )
 
 
 @cute.jit
