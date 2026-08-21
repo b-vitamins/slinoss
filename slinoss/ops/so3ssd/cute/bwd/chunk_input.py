@@ -188,15 +188,15 @@ the increment staging pass and three 64-bit base pointers. Eliminating the eight
 the two state tensors to the chunk's plane, so what remained was not addressed by
 removing coordinates, and what removed it was the live range and not the addresses.
 
-Block width is a bound at some shapes and not at others. At four warps occupancy is
-16.7% theoretical against 16.3
+Block width is a bound at some shapes and not at others, and :func:`input_threads`
+picks between the two forms. At four warps occupancy is 16.7% theoretical against 16.3
 to 16.5% achieved at ``L = 64``, with ``launch__occupancy_limit_registers`` and
 ``launch__occupancy_limit_shared_mem`` both two; ``long`` gets one block, 8.3% against
 8.3%, its shared-memory limit reading one, because a 128-row M tile puts its arena at
 79,952 B and the lane block is the only lever :func:`lblock` has. Eight warps widen the
 tiling in N, not in M, so the chunk's row count is untouched and a thread's accumulator
-halves. What that costs is the diagonal GEMM's rereadable left operand, which the wide
-form stages through shared memory instead.
+halves. What that costs is the diagonal GEMM's rereadable left operand, and where it
+pays is stated at :func:`input_threads`.
 
 ``long`` is the one shape whose bound is still instruction fetch: ``no_instruction``
 52.9% at a 7.96% issue rate and 15.0% of ``dram__throughput``, with one lane tile and
@@ -259,6 +259,8 @@ from slinoss.ops.so3ssd.cute.guard import (
 from slinoss.ops.so3ssd.cute.mma import (
     MMA_TILE_K,
     SMEM_SEGMENT,
+    THREADS_WIDE,
+    WARPS_WIDE,
     fp32_tile,
     make_mma,
     mma_acc,
@@ -415,6 +417,59 @@ def lblock(
             ):
                 return blk
     return legal[-1]
+
+
+def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
+    """Block width for a shape, narrow or wide.
+
+    The wide form doubles the warps and halves every per-thread accumulator. It also
+    costs the diagonal GEMM its rereadable left operand: at two N groups a thread's
+    consecutive N steps are two atoms apart, so the masked score goes through shared
+    memory instead of staying in registers. That is about a fifth more work on the LSU
+    issue port, against twice the warp slots. The lane extent decides which side wins.
+
+    One lane block, and the wide form pays. The score accumulator is built once, its
+    staging aliases a tile that is already dead, and four warps leave the issue port
+    far from saturated. Against the narrow form at locked clocks on sm_86, in kernel
+    cycles: 0.409 at ``L = 128, P = 48, 3N = 48``, where the narrow form gets one
+    block per SM and runs its port at 18%; 0.882 at ``L = 64, P = 48, 3N = 48``;
+    0.921 at that shape with a ragged tail.
+
+    More than one lane block, and it refuses. The score is banked across blocks, the
+    staging is restaged every tap, and the added port work outruns the occupancy:
+    1.137 at ``3N = 96`` and 1.048 at ``3N = 240``. The second is the shape the
+    DRAM-bound class is declared against, where the narrow form spills nothing at all
+    and the wide form spills 139 MB.
+
+    Three shapes for, two against, and the lane count separates them with nothing left
+    over. What the lane count does not decide is whether the wide arena fits at all:
+    :data:`LANE_MULTIPLE` is ``3N`` itself at ``3N = 48``, so :func:`lblock` has one
+    candidate there and returns it whether or not it fits, and at ``L = 128, P = 64``
+    the wide form's 102,496 B overflows a 101,376 B carveout that the narrow form's
+    89,968 B clears. Fitting is checked here rather than left to the host guard, which
+    would refuse the launch instead of narrowing it.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        dim: ``3N``.
+        itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+
+    Returns:
+        :data:`slinoss.ops.so3ssd.cute.mma.THREADS_WIDE` when the wide form's own lane
+        block holds ``3N`` whole and its arena fits the carveout,
+        :data:`slinoss.ops.so3ssd.cute.common.THREADS` otherwise. The block is asked of
+        the wide form rather than the narrow one because the wide arena is the larger of
+        the two and so decides its own lane extent; where it holds ``3N`` whole the
+        narrow one does too.
+    """
+    lblk = lblock(chunk, rows, dim, itemsize, warps=WARPS_WIDE)
+    if dim != lblk:
+        return THREADS
+    bytes_wide = input_smem_bytes(
+        chunk, rows, dim, itemsize, lblk=lblk, warps=WARPS_WIDE
+    )
+    return THREADS_WIDE if bytes_wide <= smem_capacity() else THREADS
 
 
 def input_tile(chunk: int, rows: int) -> Tile:
@@ -1469,7 +1524,7 @@ def chunk_input_backward(
     u_prev: Tensor | None = None,
     b_prev: Tensor | None = None,
     du_init: Tensor | None = None,
-    threads: int = THREADS,
+    threads: int | None = None,
 ) -> ChunkInputBwd:
     """Differentiate the forcing input and the closing transition of every chunk.
 
@@ -1499,7 +1554,10 @@ def chunk_input_backward(
             ``dU`` pays one read rather than a pass of its own.
         threads: Block width, a multiple of 128 at most
             ``32 * slinoss.ops.so3ssd.cute.mma.WARPS_WIDE``. The wide form halves
-            every per-thread accumulator and adds two per-warp scratch rows.
+            every per-thread accumulator and adds two per-warp scratch rows. None
+            takes :func:`input_threads`, the measured choice for the shape; an
+            explicit width overrides it and is what an A/B against that choice
+            passes.
 
     Returns:
         :class:`ChunkInputBwd`.
@@ -1536,6 +1594,8 @@ def chunk_input_backward(
         if tuple(tensor.shape) != state:
             raise ValueError(f"{name} must be {state}, got {tuple(tensor.shape)}")
 
+    if threads is None:
+        threads = input_threads(chunk_size, rows, dim, dy.element_size())
     nwarps = threads // 32
     lblk = lblock(chunk_size, rows, dim, dy.element_size(), warps=nwarps)
     budget = assert_smem_fits(

@@ -57,8 +57,11 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
     ChunkInputBwd,
     chunk_input_backward,
     input_smem_bytes,
+    input_threads,
     lblock,
 )
+from slinoss.ops.so3ssd.cute.common import THREADS
+from slinoss.ops.so3ssd.cute.mma import THREADS_WIDE
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
@@ -295,8 +298,13 @@ def _run(
     want: Oracle,
     chunk: int,
     du_init: Tensor | None = None,
+    threads: int | None = None,
 ) -> ChunkInputBwd:
-    """One launch, against the state buffers the oracle carries."""
+    """One launch, against the state buffers the oracle carries.
+
+    ``threads`` defaults to the dispatched width, so every other test in this file
+    runs whichever form the shape gets in production.
+    """
     got = chunk_input_backward(
         dy,
         inp.U,
@@ -310,6 +318,7 @@ def _run(
         u_prev=inp.u_prev,
         b_prev=inp.b_prev,
         du_init=du_init,
+        threads=threads,
     )
     torch.cuda.synchronize()
     return got
@@ -596,6 +605,64 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert lane % LANE_MULTIPLE == 0 and 240 % lane == 0
     assert input_smem_bytes(64, 64, 240) == input_smem_bytes(64, 64, lane)
     assert 2 * input_smem_bytes(64, 64, 240) <= smem_capacity()
+
+
+# (L, P, 3N) and the width the shape gets. The wide form is taken where one lane block
+# holds the whole lane extent and refused where the extent is banked across blocks: 3N =
+# 48 is one block at every row count here, 96 and 240 are two and five. The last row is
+# refused for the other reason -- one lane block, but 102,496 B of a 101,376 B carveout,
+# which the narrow form clears at 89,968 B.
+WIDTHS: list[tuple[int, int, int, int]] = [
+    (64, 48, 48, THREADS_WIDE),
+    (MAX_CHUNK, 48, 48, THREADS_WIDE),
+    (64, 64, 96, THREADS),
+    (64, 64, 240, THREADS),
+    (MAX_CHUNK, 64, 48, THREADS),
+]
+
+
+@pytest.mark.parametrize(("chunk", "rows", "dim", "want"), WIDTHS)
+def test_the_block_width_follows_the_lane_extent(
+    chunk: int, rows: int, dim: int, want: int
+) -> None:
+    """The dispatch reads the lane count, and its choice fits the carveout.
+
+    The width is not free to pick: the wide form's arena carries two more scratch rows
+    and, at one lane block, a staged copy of the masked score. A predicate that widened
+    a shape whose arena then did not fit would be refused on the host instead of run, so
+    the budget is asserted at the width the dispatch actually returns.
+    """
+    got = input_threads(chunk, rows, dim)
+    assert got == want, (chunk, rows, dim)
+    assert input_smem_bytes(chunk, rows, dim, warps=got // 32) <= smem_capacity()
+
+
+def test_the_two_block_widths_differ_only_in_warp_reduction_order() -> None:
+    """Both forms compute the same function, and the wide one reduces over more warps.
+
+    The wide form routes the masked score through shared memory rather than rereading
+    the fragment, which puts two barriers and a staged tile on a path that had neither,
+    so a width the dispatch selects has to be held to the width it replaces rather than
+    to the reference alone: a race there lands well inside the reference bounds on most
+    elements and nowhere near bitwise on the rest.
+
+    ``dU`` and ``carry_u`` are exact. Every element of both is one thread's own float32
+    accumulation over an unchanged K order, and widening the tiling splits N, so no
+    element changes hands and no sum changes order. The three reductions are not exact:
+    they cross the warps through the epilogue's scratch rows, and eight partial sums do
+    not add in the order four do. 1e-6 is three orders inside their reference bounds and
+    two above the measured 2.3e-7, and it is not a tolerance any other test shares.
+    """
+    inp = _make(2, 4, 128, 16, 16, torch.bfloat16, groups=2)
+    dy = _cotangent(inp, torch.bfloat16)
+    want = _oracle(inp, dy, 64, dstate=_dstate(inp))
+    assert input_threads(64, 16, 48) == THREADS_WIDE
+    wide = _run(inp, dy, want, 64, threads=THREADS_WIDE)
+    narrow = _run(inp, dy, want, 64, threads=THREADS)
+    for name in ("dU", "carry_u"):
+        assert torch.equal(getattr(wide, name), getattr(narrow, name)), name
+    for name in ("dlogp", "dchunk_rot", "dchunk_scale"):
+        assert_max_rel(getattr(wide, name), getattr(narrow, name), 1e-6, f"wide.{name}")
 
 
 def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
