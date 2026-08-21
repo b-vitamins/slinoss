@@ -7,6 +7,11 @@ splits onto ``ap``, ``an`` and ``ls``; the two rank-one residues, which are the 
 route to ``bnow``; and the ragged tail, where the shift cotangent has to move over
 the padded axis before it is sliced.
 
+The fused column also reattributes cotangent mass from ``lp`` to ``ls``, so the two
+records disagree on ``dlogp`` by construction. That is asserted in both directions
+here, because it is the one difference between the forms that no gradient parity can
+see and that a kernel conversion can drop silently.
+
 Everything else in the derivation -- the offset term, the reverse chunk recurrence,
 the table composition, the group reduction -- is shared with the two-tap backward
 and tested there. Nothing here re-sweeps it.
@@ -20,7 +25,11 @@ import pytest
 import torch
 from torch import Tensor
 
-from slinoss.ops.so3ssd import chunked_backward_fused, so3ssd_bwd_ref
+from slinoss.ops.so3ssd import (
+    chunked_backward,
+    chunked_backward_fused,
+    so3ssd_bwd_ref,
+)
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs
 
 # float64 analytic VJP against float64 analytic VJP. The two forms reassociate the
@@ -120,13 +129,66 @@ def test_fused_backward_matches_the_two_tap_backward(name: str) -> None:
     chunk, inp = _inputs(name, seed=307)
     cot = _cotangents(inp, 311)
     want = so3ssd_bwd_ref(*cot, *inp.args(), chunk, **inp.kw())
-    got = chunked_backward_fused(*cot, *inp.args(), chunk, **inp.kw())
+    got = chunked_backward_fused(*cot, *inp.args(), chunk, **inp.kw()).grads
     for grad_name, mine, theirs in zip(GRAD_NAMES, got, want):
         if theirs is None:
             assert mine is None, f"{grad_name} {name}: expected no gradient"
             continue
         assert mine is not None, f"{grad_name} {name}: missing gradient"
         assert_max_rel(mine, theirs, BWD_REL, f"fused {grad_name} {name}")
+
+
+def _revcumsum(t: Tensor) -> Tensor:
+    """Reverse cumulative sum over the last axis, the prefix-to-scale adjoint."""
+    return t.flip(-1).cumsum(-1).flip(-1)
+
+
+@pytest.mark.parametrize("name", tuple(_CASES))
+def test_the_two_records_split_the_log_scale_cotangent_differently(name: str) -> None:
+    """``dlogp`` disagrees between the records and the assembled ``dls`` agrees.
+
+    The reindex moves ``exp(2*ls)`` out of the diagonal mask and the increment weight,
+    both functions of ``lp``, into the table column, a function of ``ls``. So it is a
+    reattribution, and the two factorizations necessarily disagree on where the mass
+    sits while agreeing on the total.
+
+    This is asserted because the disagreement is otherwise invisible and O(1). A
+    kernel that emits the fused ``dlogp`` while its consumer still assembles ``dls``
+    as ``revcumsum(dlogp)`` alone drops that mass onto ``dtrans[..., 3]`` and passes
+    every test that does not look at the log scale. The failing assertion here is
+    the one that names the cause.
+
+    Both directions are checked. Only asserting the agreement would be satisfied by
+    a fused path that had quietly folded ``dls_step`` back into ``dlogp``, which is
+    the shape the kernels cannot implement: the two terms are formed by different
+    launches.
+    """
+    chunk, inp = _inputs(name, seed=307)
+    cot = _cotangents(inp, 311)
+    two = chunked_backward(*cot, *inp.args(), chunk, **inp.kw())
+    fused = chunked_backward_fused(*cot, *inp.args(), chunk, **inp.kw())
+
+    # ls reaches the output through lp alone in the two-tap form, so its step term is
+    # not merely small. Exactly zero, or the field means something else.
+    assert not bool(two.dls_step.any()), f"{name}: two-tap dls_step is not zero"
+
+    assert_max_rel(
+        _revcumsum(fused.dlogp) + fused.dls_step,
+        _revcumsum(two.dlogp) + two.dls_step,
+        BWD_REL,
+        f"dls {name}",
+    )
+
+    # The reattributed mass, against the quantity it is taken from. Held to a floor
+    # ten orders above the agreement bound, so this separates a reattribution from
+    # reassociation roundoff without pinning a geometry-dependent ratio.
+    scale = float(two.dlogp.abs().max())
+    moved = float((fused.dlogp - two.dlogp).abs().max())
+    assert scale > 0.0, f"{name}: the case has no log-prefix cotangent to split"
+    assert moved > 1e-3 * scale, (
+        f"{name}: dlogp moved by only {moved / scale:.3e} of its own scale, so the "
+        "fused path is not reattributing and one of the two records is wrong"
+    )
 
 
 def test_afuse_split_matches_autograd() -> None:
@@ -189,7 +251,7 @@ def test_state_cotangent_reaches_the_last_token_through_the_pad_slot(name: str) 
     dstate = _cotangents(inp, 317)[1]
     args, kw = inp.args(), inp.kw()
     want = so3ssd_bwd_ref(None, dstate, None, None, *args, chunk, **kw)
-    got = chunked_backward_fused(None, dstate, None, None, *args, chunk, **kw)
+    got = chunked_backward_fused(None, dstate, None, None, *args, chunk, **kw).grads
 
     assert float(got.dU[:, :, -1].abs().max()) > 0.0, "the reindexed term is missing"
     assert float(got.dB[:, :, -1].abs().max()) > 0.0, "the reindexed term is missing"

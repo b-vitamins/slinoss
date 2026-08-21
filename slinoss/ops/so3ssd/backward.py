@@ -13,7 +13,11 @@ mask. The one sequential piece is the reverse chunk recurrence, which carries a
 rematerializes :func:`slinoss.ops.so3ssd.reference.chunked_forward_fused` under the
 same rule. It differentiates one table column where :func:`chunked_backward`
 differentiates two, so the cotangent of that column splits back onto ``ap``, ``an``
-and ``ls`` instead of arriving on ``ap`` and ``an`` already separated.
+and ``ls`` instead of arriving on ``ap`` and ``an`` already separated. That third
+term is the whole difference between the two records: the reindex moves cotangent
+mass off ``dlogp`` and onto ``dls_step``, so the two functions return the same
+``grads`` and different ``dlogp``. Both return a :class:`ChunkedBackward`, so a
+kernel stage can be measured against whichever factorization it implements.
 
 Correctness ground truth is float64 autograd through
 :func:`slinoss.ops.so3ssd.reference.so3ssm`, never this derivation. A hand-derived
@@ -124,8 +128,17 @@ class ChunkedBackward(NamedTuple):
             scale, ``(B,H,C,L)``. Where the split falls is a consequence of which
             stage holds which operand, so both halves are named and neither is
             derivable from the other.
-        dlogp: The sum of the two, ``(B,H,C,L)``. The reverse cumulative sum of
-            this over the chunk is the log-scale cotangent.
+        dlogp: The sum of the two, ``(B,H,C,L)``. With ``dls_step``, the reverse
+            cumulative sum of this over the chunk is the log-scale cotangent.
+        dls_step: The part of the log-scale cotangent that does not arrive through
+            the prefix, ``(B,H,C,L)``. Identically zero out of
+            :func:`chunked_backward`, where ``ls`` reaches the output through
+            ``lp`` alone. Nonzero out of :func:`chunked_backward_fused`, where the
+            fused column ``Afuse_s = ap_s + exp(2*ls_s) an_{s-1}`` gives ``ls`` a
+            second route. The reindex moves that mass off ``dlogp``, so the two
+            functions disagree on ``dlogp`` field-for-field and agree on
+            ``revcumsum(dlogp) + dls_step``. A stage oracle that reads ``dlogp``
+            alone is therefore specific to one factorization.
         dchunk_rot: Cotangent of each chunk's closing rotation matrix,
             ``(B,H,C,3,3)``, row-major.
         dchunk_scale: Cotangent of each chunk's closing scale, ``(B,H,C)``.
@@ -151,6 +164,7 @@ class ChunkedBackward(NamedTuple):
     dlogp_scan: Tensor
     dlogp_off: Tensor
     dlogp: Tensor
+    dls_step: Tensor
     dchunk_rot: Tensor
     dchunk_scale: Tensor
     chunk_rot: Tensor
@@ -460,6 +474,10 @@ def chunked_backward(
         )
         dquat = quat_prefix_scan_vjp(rot_matrix_vjp(drot, fw.qprefix), fw.qprefix)
         dw = gprev.w + gcurr.w + quat_exp_vjp(dquat, fw.w)
+        # Here ls reaches the output through lp and nothing else, so the prefix
+        # route is the whole cotangent and the step term of ChunkedBackward is
+        # zero. The one-tap column is what makes it nonzero.
+        dls_step = torch.zeros_like(dlp)
         dls = dlp.flip(-1).cumsum(-1).flip(-1)
 
         dU_t = _unchunk(du, seqlen)
@@ -527,6 +545,7 @@ def chunked_backward(
             dlogp_scan=dlp_scan,
             dlogp_off=dlp_off,
             dlogp=dlp,
+            dls_step=dls_step,
             dchunk_rot=dchunk_rot,
             dchunk_scale=dchunk_scale,
             chunk_rot=chunk_rot,
@@ -554,7 +573,7 @@ def chunked_backward_fused(
     dB: Tensor | None = None,
     dC: Tensor | None = None,
     dU_init: Tensor | None = None,
-) -> SO3SSDGrads:
+) -> ChunkedBackward:
     """Differentiate the one-tap factorization. The derivation the kernels implement.
 
     Same operator and same cotangents as :func:`chunked_backward`, which stays the
@@ -613,7 +632,12 @@ def chunked_backward_fused(
             device of ``U``, possibly pitched. Read and never written.
 
     Returns:
-        A :class:`SO3SSDGrads`.
+        A :class:`ChunkedBackward`, under the field contract of
+        :func:`chunked_backward`. ``grads`` matches that function's to the working
+        dtype; ``dlogp`` does not, and is not meant to. The reindex moves mass from
+        ``dlogp`` to ``dls_step``, which is zero there and nonzero here, so the two
+        agree on ``revcumsum(dlogp) + dls_step`` and on nothing finer. A kernel that
+        emits ``dlogp`` must be measured against the factorization it implements.
 
     Raises:
         ValueError: On a shape, contiguity, device, or pairing violation, a
@@ -810,7 +834,12 @@ def chunked_backward_fused(
         if db_last is not None:
             dB_g = dB_g + _pad(db_last.to(dtype)[:, :, None], (0, 0, seqlen - 1, 0))
 
-        return SO3SSDGrads(
+        # Token 0 of each chunk carries into the previous chunk's last token, so
+        # its two shift cotangents are the rows that cross a chunk boundary. Chunk
+        # 0's rows have no previous chunk and are the streaming feedback instead.
+        carry_u = dushift[:, :, :, 0, :]
+        carry_b = from_heads(dbs_n[:, :, :, 0].flatten(-2, -1), groups)
+        grads = SO3SSDGrads(
             dU=dU_t.to(U.dtype).contiguous(),
             dtrans=dtrans_t.to(trans.dtype).contiguous(),
             dK=dK_t.to(K.dtype).contiguous(),
@@ -820,15 +849,29 @@ def chunked_backward_fused(
             db_prev=(
                 None
                 if b_prev is None
-                else from_heads(dbs_n[:, :, 0, 0].flatten(-2, -1), groups)
-                .to(b_prev.dtype)
-                .contiguous()
+                else carry_b[:, :, 0].to(b_prev.dtype).contiguous()
             ),
             du_prev=(
                 None
                 if u_prev is None
-                else dushift[:, :, 0, 0, :].to(u_prev.dtype).contiguous()
+                else carry_u[:, :, 0].to(u_prev.dtype).contiguous()
             ),
+        )
+        return ChunkedBackward(
+            grads=grads,
+            dzstart=dzstart.flatten(-2, -1),
+            dinc=dinc.flatten(-2, -1),
+            dz0=acc.flatten(-2, -1),
+            dlogp_scan=dlp_scan,
+            dlogp_off=dlp_off,
+            dlogp=dlp,
+            dls_step=dls_step,
+            dchunk_rot=dchunk_rot,
+            dchunk_scale=dchunk_scale,
+            chunk_rot=chunk_rot,
+            chunk_scale=chunk_scale,
+            carry_u=carry_u,
+            carry_b=carry_b,
         )
 
 
