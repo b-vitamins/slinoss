@@ -2692,7 +2692,9 @@ def chunk_vector_bwd_kernel(
     gdcj = _lane_view(gdc, joff)
     gcarryj = _lane_view(gcarry, joff)
 
-    cute.arch.sync_threads()
+    # No barrier ahead of the zero fill. Everything above this point is an allocation
+    # or an index, so the fill is the block's first shared access and there is nothing
+    # for a barrier to fence; the fill's own reader is several barriers further on.
     _fill_zero(sumb, (chunk + 1) * ldf, tid, threads)
     if cutlass.const_expr(fold > 1):
         _fill_zero(sumc, chunk * ldf, tid, threads)
@@ -2707,7 +2709,13 @@ def chunk_vector_bwd_kernel(
     # statement, and the body is four hundred lines.
     for hstep in cutlass.range(fold, unroll=1):
         hidx = (gidx * splits + sidx) * fold + hstep
-        cute.arch.sync_threads()
+        # Loop-carried only. This is the write-after-read fence between the previous
+        # head's reads of the per-head tiles and this head's staging of them, so a
+        # shard of one head has nothing for it to order: the zero fill above targets
+        # the forcing sum, which no tile staged below overlaps, and the barrier under
+        # the staging publishes it.
+        if cutlass.const_expr(fold > 1):
+            cute.arch.sync_threads()
         stage_chunk(
             gtrans[bidx, hidx, None, None],
             gtap[bidx, hidx, None, None, None],
@@ -2900,7 +2908,16 @@ def chunk_vector_bwd_kernel(
                 for s in range(-(-span // taprows))
             )
             for tap in cutlass.range_constexpr(2):
-                cute.arch.sync_threads()
+                # First tap only. What this publishes is the pair of staged tiles
+                # above, which the second tap has already read. The write the second
+                # tap would need it for is ``sbrot``, whose readers are the two
+                # products below, and both are already separated from it by the
+                # barrier that publishes the tap gradient. The cross-thread hazard
+                # that does cross the taps is the forcing sum's read-modify-write,
+                # the two taps landing on different rows of it, and the barrier below
+                # covers that.
+                if cutlass.const_expr(tap == 0):
+                    cute.arch.sync_threads()
                 _rotate_rows(
                     sb,
                     sbrot,
@@ -3171,8 +3188,11 @@ def chunk_vector_bwd_kernel(
                             gdtrans[bidx, hidx, trow, j] = sdw[j, token] + dexp[j]
                         gdtrans[bidx, hidx, trow, 3] = sdls[token]
 
-    cute.arch.sync_threads()
-
+    # No barrier between the fold and the two sums below. The last write to either sum
+    # is a tap epilogue's and a readout epilogue's, and every path from there to here
+    # crosses the barriers that close the chart, so a barrier at this point orders a
+    # pair the ones inside the fold have already ordered.
+    #
     # The shard's two sums for this lane tile, rounded once: the narrowing is here at
     # one shard and at the reduction above one, never twice. Row t+1 of the forcing sum
     # is token t and row 0 is the row the boundary kernel owns.
