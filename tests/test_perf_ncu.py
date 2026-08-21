@@ -857,12 +857,14 @@ def test_rules_keep_a_local_estimate_apart_from_a_kernel_estimate() -> None:
 # ---------------------------------------------------------------------------
 
 SOURCE_METRICS: Final[tuple[str, ...]] = (
-    # Not the order SOURCE_TABLE requests them in. NCU orders this header itself.
-    "smsp__pcsamp_sample_count",
+    # NCU orders this header itself, and not as SOURCE_TABLE requests it. Copied
+    # from a source page collected on this fleet, because the order decides which
+    # metric a misaligned row reads.
     "inst_executed",
     "memory_access_size_type",
     "memory_l1_wavefronts_shared",
     "memory_l1_wavefronts_shared_ideal",
+    "smsp__pcsamp_sample_count",
     *(pcsamp_metric(reason) for reason in STALL_REASONS),
 )
 
@@ -987,18 +989,60 @@ NO_LINE_SOURCE_CSV: Final = "\n".join(
     )
 )
 
-RAGGED_SOURCE_CSV: Final = "\n".join(
+SHORT_SOURCE_CSV: Final = "\n".join(
     (
         f'"File Path","{CVB_PATH}"',
         '"Function Name","chunk_vector_bwd_kernel"',
         _source_header(),
-        # A line row one cell short of the header, as NCU prints it when the last
-        # requested metric has no value for the line.
+        # A line row one cell short of the header.
         _source_row(
             "1163", "    return sview[row, col]", "", "", samples=34, inst=100
         ).rsplit(",", 1)[0],
         _source_row(
             "", "", "0x0000000000008000", "LDS.U.32 R4, [R8]", inst=100, size=32
+        ),
+    )
+)
+
+SPB_PATH: Final = "/lane/slinoss/ops/so3ssd/cute/bwd/start_passing.py"
+
+# The text cell as NCU wrote it for line 245 of that file, verbatim from a source
+# page collected on this fleet. The line opens a docstring, so the text carries
+# three quotes of its own, which NCU wraps and does not escape: `csv` closes the
+# cell on them and the comma inside the docstring opens another, so the row arrives
+# one cell wider than its header.
+_SPLIT_TEXT: Final = (
+    '""""Blocks per SM the launch bound asks for, '
+    'before the shared-memory budget cuts it."'
+)
+
+SPLIT_SOURCE_CSV: Final = "\n".join(
+    (
+        f'"File Path","{SPB_PATH}"',
+        '"Function Name","start_passing_bwd_kernel"',
+        _source_header(),
+        _source_row(
+            "245",
+            "PLACEHOLDER",
+            "-",
+            "-",
+            samples=7,
+            inst=11520,
+            size=64,
+            wavefronts=23040,
+            ideal=23040,
+            mio_throttle=4,
+        ).replace('"PLACEHOLDER"', _SPLIT_TEXT),
+        _source_row(
+            "",
+            "",
+            "0x7f5c012a5390",
+            "STS.64 [R22+0x700], R16",
+            samples=7,
+            inst=11520,
+            size=64,
+            wavefronts=23040,
+            ideal=23040,
         ),
     )
 )
@@ -1132,15 +1176,30 @@ def test_a_source_page_with_no_correlated_line_names_the_missing_lineinfo() -> N
         parse_source_csv(NO_LINE_SOURCE_CSV)
 
 
-def test_a_line_row_short_of_the_header_keeps_its_pass() -> None:
-    # NCU can print a line row missing its trailing cells. Dropping the row would
-    # cost the whole pass, which is an hour of collection, so an absent cell reads
-    # as zero.
-    got = parse_source_csv(RAGGED_SOURCE_CSV)
+def test_a_split_text_cell_does_not_shift_the_columns_right_of_it() -> None:
+    # The failure this pins: decoded against the header's own indices, the row NCU
+    # split reads the ideal wavefront count as the sample count, which put line 245
+    # of start_passing.py at the head of the attribution with 23,040 samples
+    # against the 36,323 the launch took.
+    got = parse_source_csv(SPLIT_SOURCE_CSV)
     (one,) = got.lines
-    assert one.line == 1163
-    assert one.lsu_inst_count == 100
-    assert one.stall_samples[STALL_REASONS[-1]] == 0
+    assert one.line == 245
+    assert one.sample_count == 7
+    assert one.shared_wavefront_count == 23_040
+    assert one.stall_samples["mio_throttle"] == 4
+    # The cell the samples were read out of, one place left of them.
+    assert one.shared_wavefront_ideal_count == 23_040
+    # The first stall column, which a shift fills with the sample count.
+    assert one.stall_samples["barrier"] == 0
+    assert one.lsu_inst_count == 11_520
+
+
+def test_a_source_row_short_of_its_header_is_refused_by_width() -> None:
+    # A short row is missing data at a column the row does not name, so every
+    # index past it decodes something else. The collection is already on disk when
+    # the parse runs, so refusing costs a re-import and not a pass.
+    with pytest.raises(ValueError, match="25 cells against a 26-cell header"):
+        parse_source_csv(SHORT_SOURCE_CSV)
 
 
 def test_a_kernel_with_no_shared_traffic_decodes_under_its_own_header() -> None:

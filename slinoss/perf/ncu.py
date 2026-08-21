@@ -1699,6 +1699,45 @@ def _source_columns(header: Sequence[str]) -> tuple[dict[str, int], int]:
     return columns, sass[1] if len(sass) > 1 else -1
 
 
+def _aligned_row(row: Sequence[str], fields: int) -> list[str]:
+    """One source-page row restored to the width of the header it was printed under.
+
+    NCU wraps the high-level source text in quotes and does not escape the quotes
+    inside it, so ``csv`` closes the cell on the text's own quote and every comma
+    after that opens another. The row arrives wider than its header, and every
+    column right of the text decodes one place off per extra comma. Measured on a
+    source page for ``start_passing_bwd_kernel``: line 245 of ``start_passing.py``
+    opens a docstring and holds one comma, and its shared-wavefront ideal read as
+    the PC sample count, 23,040 against 36,323 samples over the whole launch.
+
+    The extra cells are rejoined into the high-level text, which is the only
+    free-text column before the metric block. SASS is the other free-text column
+    and carries no quote, so a row cannot split there.
+
+    Args:
+        row: The row as ``csv.reader`` returned it.
+        fields: Cells in the header of the block the row belongs to.
+
+    Returns:
+        A row of exactly ``fields`` cells.
+
+    Raises:
+        ValueError: If the row is short of the header. Short is missing data at a
+            column the row does not name, so no index past it can be trusted; the
+            report is on disk before the parse runs, so this costs a re-import and
+            not a collection.
+    """
+    extra = len(row) - fields
+    if extra < 0:
+        raise ValueError(
+            f"ncu source row has {len(row)} cells against a {fields}-cell header, "
+            f"so a column is missing and the rest decode shifted: {list(row[:4])}"
+        )
+    if extra == 0:
+        return list(row)
+    return [row[0], ",".join(row[1 : 2 + extra]), *row[2 + extra :]]
+
+
 def parse_source_csv(
     text: str, *, report: str = "", command: Sequence[str] = ()
 ) -> SourcePass:
@@ -1728,10 +1767,11 @@ def parse_source_csv(
 
     Raises:
         ValueError: If the output holds no source block, if the header is missing a
-            metric :data:`SOURCE_TABLE` requested, or if no instruction correlated
-            to a line. The last is the profile that has always been silent here:
-            the target was built without line information, and for a CuTe DSL
-            kernel that means it ran without ``CUTE_DSL_LINEINFO=1``.
+            metric :data:`SOURCE_TABLE` requested, if a row is short of its header
+            -- see :func:`_aligned_row` -- or if no instruction correlated to a
+            line. The last is the profile that has always been silent here: the
+            target was built without line information, and for a CuTe DSL kernel
+            that means it ran without ``CUTE_DSL_LINEINFO=1``.
     """
     reader = csv.reader(io.StringIO(text))
     required = (_SRC_INST, _SRC_SAMPLES, *(pcsamp_metric(r) for r in STALL_REASONS))
@@ -1770,18 +1810,13 @@ def parse_source_csv(
                 )
             line = 0
             continue
-        if not columns or len(row) <= sass_column:
+        if not columns or not any(cell.strip() for cell in row):
             continue
+        row = _aligned_row(row, fields)
         number = row[columns[_LINE_NO]].strip()
         if number.isdigit():
             line = int(number)
-            # A row can arrive short of the header when a metric has no value for
-            # the line. Pad it, because an absent cell reads as zero and a ragged
-            # row would otherwise drop the whole pass.
-            aggregate[(kernel, path, line)] = (
-                list(row) + [""] * (fields - len(row)),
-                columns,
-            )
+            aggregate[(kernel, path, line)] = (row, columns)
             continue
         if not row[columns[_ADDRESS]].strip().startswith("0x"):
             continue
