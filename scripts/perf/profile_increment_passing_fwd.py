@@ -11,6 +11,13 @@ narrowed to both kernels so the printed blocks add up to the arm.
     python3 scripts/perf/profile_increment_passing_fwd.py --arm fused \
         --shape acceptance
     python3 scripts/perf/profile_increment_passing_fwd.py --sweep --shape acceptance
+    CUTE_DSL_LINEINFO=1 python3 scripts/perf/profile_increment_passing_fwd.py \
+        --source --shape acceptance
+
+``--source`` ranks the kernel's own source lines by instruction count. It needs
+``CUTE_DSL_LINEINFO=1`` in the environment, which the profiled target inherits;
+without it NCU correlates nothing and the pass raises rather than printing an empty
+table.
 
 ``--sweep`` is the tiling curve, and it runs in one process on purpose: the SM clock
 moves with what else is on the part, so rows measured in separate processes are not
@@ -18,6 +25,20 @@ comparable to each other. The pair is timed first and again last, which brackets
 drift across the fused rows between two readings of the same baseline. Each row
 carries the arena it allocates and the blocks per SM that arena permits, since
 residency is what feeds the DRAM pipe and shared memory is what bounds it.
+
+No initial state and no streaming carry-in, because that is the variant a step
+compiles. :func:`slinoss.perf.workload.step` calls
+:func:`slinoss.ops.so3ssd.so3ssd` with five positional tensors and no keyword, so
+:class:`slinoss.ops.so3ssd.interface.SO3SSDFunction` hands
+:func:`slinoss.ops.so3ssd.cute.forward.so3ssd_fwd_cute` ``z0=None``,
+``u_prev=None`` and ``b_prev=None``, and the launch is
+``has_z0=False has_prev=False``. The backward's rebuild at
+:func:`slinoss.ops.so3ssd.cute.backward.so3ssd_bwd_cute` is the only other caller
+and a step never reaches it: the forward saved the prologue. ``has_z0`` and
+``has_prev`` are constexpr, so each is a separate compiled kernel and not a flag on
+one: a counter crosses between this driver and ``scripts/perf/profile_op.py --mode
+step`` only while the variant line below matches. ``--seed-state`` selects the
+seeded kernel; nothing here reaches the streaming one.
 
 Two byte counts are printed. ``issued`` charges every per-head operand once per band
 of the state, which is what the blocks request. ``unique`` charges it once, which is
@@ -65,9 +86,11 @@ from slinoss.perf.ncu import (
     SPILL_TABLE,
     NcuPass,
     NcuTable,
+    SourcePass,
     SpillCounters,
     kernel_counters,
     run_ncu,
+    run_source,
     spill_counters,
 )
 from slinoss.perf.timing import measure, on_device
@@ -192,8 +215,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--seed-state",
-        action="store_true",
-        help="Supply an initial state, the has_z0 variant.",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Supply an initial state, the has_z0 variant. Off by default because a "
+        "step supplies none; the module docstring says why.",
     )
     parser.add_argument(
         "--iters",
@@ -216,6 +241,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="0",
         help="Comma-separated launch bounds to cross the sweep with. 0 means the "
         "default the arena permits.",
+    )
+    parser.add_argument(
+        "--source",
+        action="store_true",
+        help="Rank the kernel's own source lines by instruction count instead of "
+        "collecting the counter tables. Needs CUTE_DSL_LINEINFO=1 in this "
+        "environment, which the target inherits.",
+    )
+    parser.add_argument(
+        "--source-top",
+        type=int,
+        default=24,
+        help="Source lines to print, hottest first.",
+    )
+    parser.add_argument(
+        "--report",
+        default="increment_passing_fwd",
+        help="Where the source pass writes its NCU report.",
     )
     parser.add_argument(
         "--window",
@@ -447,9 +490,22 @@ def target_argv(args: argparse.Namespace) -> list[str]:
             argv += [f"--{field}", str(value)]
     if args.resident is not None:
         argv += ["--resident", str(args.resident)]
-    if args.seed_state:
-        argv += ["--seed-state"]
+    # Spelled either way rather than only when true, so the child cannot pick up a
+    # different default and compile a different kernel than the one reported.
+    argv += ["--seed-state" if args.seed_state else "--no-seed-state"]
     return argv
+
+
+def variant_line(seed_state: bool) -> str:
+    """The compile-time variant, as the ``variant`` report row.
+
+    Two constexpr flags select the kernel. ``has_prev`` is always false here: the
+    driver supplies no streaming carry-in, and neither does a step.
+
+    Args:
+        seed_state: Whether an initial state is supplied.
+    """
+    return f"variant      has_z0={seed_state} has_prev=False"
 
 
 def analytic_bytes(
@@ -521,6 +577,7 @@ def run_sweep(args: argparse.Namespace, shape: OpShape, device: torch.device) ->
     rows = sweep_tilings(shape, itemsize, residents)
     floor = dram_time_floor(device)
     print(f"shape        {shape.describe()}  {args.dtype}")
+    print(variant_line(args.seed_state))
     print(
         f"floor        c={floor.fixed_duration_us:.3f} us "
         f"B={floor.asymptotic_gbs:.2f} GB/s l2={floor.l2_bytes} B"
@@ -559,6 +616,70 @@ def run_sweep(args: argparse.Namespace, shape: OpShape, device: torch.device) ->
             continue
         time_one("fused", one, f"fused-{index:02d}")
     time_one("pair", baseline, "pair-after")
+    return 0
+
+
+def print_source(passed: SourcePass, top: int) -> None:
+    """Print the per-line attribution, hottest line first.
+
+    Ranked by instruction count rather than by LSU count, because the discriminant
+    is total instructions: an arm that moves work off the port and onto another pipe
+    has been measured to lose. The LSU column is beside it, not instead of it.
+
+    The file column is the entry module on every row whatever file the line is
+    really in, which is an NVVM property and not a defect here; see
+    :func:`slinoss.perf.ncu.parse_source_csv`. Intersect the line numbers with the
+    location set of the modules the kernel traces before naming a site.
+
+    Args:
+        passed: The collected pass.
+        top: Rows to print.
+    """
+    attributed = sum(one.inst_count for one in passed.lines)
+    lsu = sum(one.lsu_inst_count for one in passed.lines)
+    excess = sum(one.shared_wavefront_excess_count for one in passed.lines)
+    print(f"source       {passed.report}")
+    print(f"  files      {sorted({one.file for one in passed.lines})}")
+    print(
+        f"  attributed {attributed:,} inst  {lsu:,} LSU  "
+        f"excess shared wavefronts {excess:,}"
+    )
+    print(f"  unattributed {passed.unattributed_inst_count:,} inst")
+    for one in sorted(passed.lines, key=lambda row: -row.inst_count)[:top]:
+        reason, samples = max(
+            one.stall_samples.items(), key=lambda item: item[1], default=("", 0)
+        )
+        print(
+            f"  line {one.line:5d} inst {one.inst_count:11,} "
+            f"lsu {one.lsu_inst_count:10,} "
+            f"wf {one.shared_wavefront_count:,}/"
+            f"{one.shared_wavefront_ideal_count:,} "
+            f"samples {one.sample_count:,} top {reason} {samples:,}"
+        )
+        codes = " ".join(f"{name} {n:,}" for name, n in one.opcode_inst.items())
+        widths = " ".join(f"{bits}b {n:,}" for bits, n in one.access_bit_inst.items())
+        if codes or widths:
+            print(f"               {codes}   [{widths}]")
+
+
+def run_source_mode(args: argparse.Namespace) -> int:
+    """Collect the source pass and print it.
+
+    Args:
+        args: The parsed command line.
+
+    Returns:
+        Process exit status.
+    """
+    passed = run_source(
+        target_argv(args),
+        report=args.report,
+        ncu=args.ncu,
+        extra=("--kernel-name", f"regex:{KERNELS[args.arm]}"),
+    )
+    print(f"arm          {args.arm}")
+    print(variant_line(args.seed_state))
+    print_source(passed, args.source_top)
     return 0
 
 
@@ -625,6 +746,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.sweep:
         return run_sweep(args, shape, device)
 
+    if args.source:
+        return run_source_mode(args)
+
     ordinal = device_ordinal(device)
     info = device_info(ordinal)
     before = compute_apps_query(smi_selector(ordinal))
@@ -662,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     after = compute_apps_query(smi_selector(ordinal))
 
     print(f"arm          {args.arm}")
+    print(variant_line(args.seed_state))
     if args.arm == "fused":
         print(f"tiling       {one.describe()}")
     print(f"shape        {shape.describe()}")
