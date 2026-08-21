@@ -690,8 +690,11 @@ def flop_terms(geo: Geometry, chunk: int) -> tuple[FlopTerm, ...]:
 
     Verified against ``sm__inst_executed_pipe_tensor.sum``, one profiled launch a
     kernel on an RTX A6000 at 4,096 flop a warp-level MMA. At ``acceptance`` and
-    ``L 64``: 61,440, 108,544, 30,720, 217,088 and 296,960 flop per token per head,
-    714,752 for the step, 105.39 GFLOP a step. The same counter holds
+    ``L 64``: 30,720, 69,632, 30,720, 217,088 and 296,960 flop per token per head,
+    645,120 for the step, 95.13 GFLOP a step. The two forward taps fused into one
+    column, so the increment pass pays one contraction where it paid two, and the
+    scan pays one score and one diagonal where it paid two of each. The same counter
+    holds
     ``chunk_input_bwd`` to this form at ``L 32`` and reads 960 warp-inst under it at
     ``L 128``, which is unexplained: above one M tile this is a bound.
 
@@ -713,11 +716,11 @@ def flop_terms(geo: Geometry, chunk: int) -> tuple[FlopTerm, ...]:
     mp, ml = mma_rows(p), mma_rows(chunk)
     tiles = d // lane_block(d)
     return (
-        FlopTerm("increment_passing_fwd", "increment x2", 4 * mp * d),
+        FlopTerm("increment_passing_fwd", "increment", 2 * mp * d),
         FlopTerm(
             "chunk_scan_fwd",
             "offset+score+diagonal",
-            (2 * ml * p * d) // chunk + 4 * ml * d + 4 * ml * p,
+            (2 * ml * p * d) // chunk + 2 * ml * d + 2 * ml * p,
         ),
         FlopTerm("start_passing_bwd", "offset transpose", 2 * mp * d),
         FlopTerm(

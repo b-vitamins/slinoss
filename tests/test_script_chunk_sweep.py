@@ -54,8 +54,8 @@ ACCEPTANCE = Geometry(bsz=4, heads=18, groups=1, seqlen=2048, rows=64, dim=240)
 """The geometry the whole-step attribution defaults to."""
 
 COUNTED_FLOP: dict[str, int] = {
-    "increment_passing_fwd": 61_440,
-    "chunk_scan_fwd": 108_544,
+    "increment_passing_fwd": 30_720,
+    "chunk_scan_fwd": 69_632,
     "start_passing_bwd": 30_720,
     "chunk_input_bwd": 217_088,
     "chunk_vector_bwd": 296_960,
@@ -63,17 +63,21 @@ COUNTED_FLOP: dict[str, int] = {
 """Flop per token per head at :data:`ACCEPTANCE` and ``L 64``, from the counter.
 
 ``sm__inst_executed_pipe_tensor.sum`` a launch on an RTX A6000, at 4,096 flop a
-warp-level MMA over ``B*T*H = 147,456``, which is the counter over 36: 2,211,840,
-3,907,584, 1,105,920, 7,815,168 and 10,690,560 warp-inst. The counter is the whole
+warp-level MMA over ``B*T*H = 147,456``, which is the counter over 36: 1,105,920,
+2,506,752, 1,105,920, 7,815,168 and 10,690,560 warp-inst. The counter is the whole
 GEMM census, no kernel in the tree emitting ``hfma``, ``hadd`` or ``hmul`` at all.
+
+The first two are post-fusion. One forcing column replaced two in the increment
+pass, and one score column and one diagonal replaced two of each in the scan, so
+those two counters halved every term but the scan's chunk offset.
 
 Keyed by launch. ``chunk_start_bwd`` is not among them: the backward fused that GEMM
 into ``start_passing_bwd``, and :mod:`slinoss.perf.coverage` declares the fused-away
 name targeted.
 """
 
-COUNTED_STEP = 714_752
-"""Sum of :data:`COUNTED_FLOP`. By hand, 25,731,072 warp-inst over 36."""
+COUNTED_STEP = 645_120
+"""Sum of :data:`COUNTED_FLOP`. By hand, 23,224,320 warp-inst over 36."""
 
 
 def fixed(*, at_widths: int, at_floor: int) -> ArenaKernel:
@@ -302,8 +306,9 @@ def test_the_arithmetic_is_the_counted_arithmetic_of_the_launches_that_run() -> 
     assert lanes == 147_456
     model = step_model(ACCEPTANCE, 64, dram_gbs=None, peak_tflops=None)
     assert model.flop == lanes * COUNTED_STEP
-    # 105.39 GFLOP a step, not the 101.47 the collapsed model reported.
-    assert model.flop == 105_394_470_912
+    # 95.13 GFLOP a step. The forward tap fusion took 10.26 GFLOP off the 105.39 the
+    # two-tap tree paid, which is 9.74% of the step's arithmetic.
+    assert model.flop == 95_126_814_720
 
 
 @CUTE
