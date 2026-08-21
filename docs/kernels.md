@@ -96,9 +96,12 @@ a transposed score tile is not.
   carveout, since the 48 KiB default is not the budget. Never hardcode an
   architecture string.
 - It buys them only up to half the carveout. On a 101,376 B carveout that is
-  50,688 B; past it the second resident block is gone, so the spending stops
-  buying occupancy and starts costing it. Count the tapped region and the operand
-  tiles, not the accumulators alone.
+  50,176 B, bisected; past it the second resident block is gone, so the spending
+  stops buying occupancy and starts costing it. Count the tapped region and the
+  operand tiles, not the accumulators alone. Ask `smem_budget` for the bar rather
+  than dividing the capacity: each block pays a reservation the capacity has
+  already subtracted once, and the total is rounded up to an allocation granule,
+  so a divided capacity reads high and admits an arena that runs a block short.
 - Past that point the grid is the remaining lever on latency hiding, and on a kernel
   pinned by both registers and shared memory it is not a lever on occupancy.
   `chunk_vector_bwd` is the standing example: at `P = 64` no legal chunk size reaches

@@ -69,6 +69,7 @@ __all__ = [
     "sigmoid",
     "silu",
     "silu_grad",
+    "smem_budget",
     "smem_bytes",
     "smem_capacity",
     "smem_residency",
@@ -777,6 +778,16 @@ larger than the tiles.
 """
 
 
+SMEM_GRANULE: Final = 128
+"""Granularity the hardware allocates shared memory at, in bytes.
+
+One block's total, tiles plus :data:`SMEM_RESERVED`, is rounded up to this before
+the carveout is divided by it. Skipping the rounding reads the residency one block
+high inside a band below each bar: 85 B wide at three blocks on sm_86 and 42 B at
+six, and exact at one, two, four and five, which is why the error survived.
+"""
+
+
 def smem_residency(nbytes: int) -> int:
     """Blocks per SM a shared-memory budget allows, at least one.
 
@@ -784,6 +795,10 @@ def smem_residency(nbytes: int) -> int:
     high near a boundary: the capacity has one reservation subtracted from it
     already, and ``k`` blocks pay ``k`` of them. Measured on sm_86, a 34,304 B
     arena computes as three by that formula and runs as two, which cost a lane 25%.
+
+    The reservation alone is not the whole correction. Bisected on sm_86, 33,024 B
+    holds three blocks and 33,040 B holds two, so the bar sits below the
+    reservation-only arithmetic by whatever :data:`SMEM_GRANULE` rounding adds.
 
     Args:
         nbytes: Bytes one block's tiles add up to. Zero or less yields the
@@ -797,7 +812,33 @@ def smem_residency(nbytes: int) -> int:
     carveout = smem_capacity() + SMEM_RESERVED
     if nbytes <= 0:
         return carveout
-    return max(1, carveout // (nbytes + SMEM_RESERVED))
+    block = -(-(nbytes + SMEM_RESERVED) // SMEM_GRANULE) * SMEM_GRANULE
+    return max(1, carveout // block)
+
+
+def smem_budget(blocks: int) -> int:
+    """Largest per-block tile budget that still admits ``blocks`` blocks per SM.
+
+    The exact inverse of :func:`smem_residency`: the returned budget computes as
+    ``blocks`` and one byte more computes as fewer. ``smem_capacity() // blocks``
+    is the wrong budget for the same two reasons that divisor is wrong, and it
+    reads high -- 512 B at two blocks on sm_86, enough to cost the block it was
+    sizing for.
+
+    Args:
+        blocks: Blocks per SM asked for.
+
+    Returns:
+        Bytes one block's tiles may add up to.
+
+    Raises:
+        ValueError: If ``blocks`` is below one. Zero has no largest budget, and a
+            caller asking for it has a bug that a huge return value would hide.
+    """
+    if blocks < 1:
+        raise ValueError(f"blocks must be at least one, got {blocks}")
+    carveout = smem_capacity() + SMEM_RESERVED
+    return (carveout // blocks) // SMEM_GRANULE * SMEM_GRANULE - SMEM_RESERVED
 
 
 def assert_smem_fits(name: str, nbytes: int) -> int:
