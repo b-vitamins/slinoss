@@ -116,9 +116,10 @@ from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
     build_table,
     stage_pad,
+    stage_raw,
     stage_rotated,
     stage_trans,
-    stage_weighted,
+    weight_rows,
 )
 
 __all__ = [
@@ -269,8 +270,11 @@ def start_chunk(
     cute.arch.sync_threads()
 
     # Both passes issue their global loads before either consumes one, so the two
-    # reads overlap rather than serializing on one latency each.
-    stage_weighted(gdy, sdy, slp, bidx, hidx, t0, valid, tid, threads, chunk, rows)
+    # reads overlap rather than serializing on one latency each. dy goes in
+    # unweighted and is scaled in place, one segment an access on each side, where
+    # the fused pass carried one element an access with the weight inside it.
+    stage_raw(gdy, sdy, bidx, hidx, t0, valid, tid, threads, chunk, rows)
+    weight_rows(sdy, slp, valid, tid, threads, chunk, rows)
     stage_rotated(
         gc,
         gc,

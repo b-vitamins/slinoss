@@ -88,6 +88,7 @@ from slinoss.ops.so3ssd.cute.common import (
     rot_hom,
     tap_matrix,
 )
+from slinoss.ops.so3ssd.cute.mma import SMEM_SEGMENT
 
 __all__ = [
     "LANE_PAIR",
@@ -97,12 +98,14 @@ __all__ = [
     "stage_chunk",
     "stage_matrix",
     "stage_pad",
+    "stage_raw",
     "stage_rotated",
     "stage_shifted",
     "stage_state",
     "stage_trans",
     "stage_weighted",
     "store_pair",
+    "weight_rows",
 ]
 
 PREFETCH: int = 4
@@ -433,6 +436,215 @@ def stage_weighted(
             else:
                 if tid + (group * PREFETCH + step) * threads < total:
                     sdst[r, p] = out
+
+
+def _segment_run(itemsize: int, width: int) -> int:
+    """Elements per access: the widest whole run of ``width`` inside one segment.
+
+    Args:
+        itemsize: Bytes per element, the same at both ends of the copy.
+        width: Elements a row carries.
+
+    Returns:
+        A power of two at most ``SMEM_SEGMENT // itemsize``, dividing ``width``. One
+        where ``width`` is odd, which is the scalar access the run generalizes.
+    """
+    run = SMEM_SEGMENT // itemsize
+    while run > 1 and width % run != 0:
+        run //= 2
+    return run
+
+
+def _wide_row(row: cute.Tensor, run: cutlass.Constexpr) -> cute.Tensor:
+    """View one contiguous row in units of ``run`` adjacent elements.
+
+    :func:`_paired_row` at a run the caller sizes, and over a shared row as well as
+    a global one.
+
+    Args:
+        row: Unit-stride view of one row, global or shared.
+        run: Elements per access, from :func:`_segment_run`.
+
+    Returns:
+        The retiled view. Element ``(None, k)`` is elements ``run * k`` through
+        ``run * k + run - 1``.
+
+    Invariants:
+        Both ends are aligned to ``run`` elements, so the claim on the iterator
+        holds; it is restated for the reason given in :func:`paired`. A shared row
+        starts at a whole :data:`slinoss.ops.so3ssd.cute.mma.SMEM_SEGMENT` because
+        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch` returns an odd multiple of
+        one, and a global row starts at a multiple of ``run`` because ``run`` divides
+        the row extent.
+    """
+    base = row.iterator.align(run * (row.element_type.width // 8))
+    return cute.zipped_divide(cute.make_tensor(base, row.layout), (run,))
+
+
+@cute.jit
+def stage_raw(
+    gsrc: cute.Tensor,
+    sdst: cute.Tensor,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    t0: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+) -> None:
+    """Stage one chunk of a ``(T, P)`` tensor unweighted, one segment an access.
+
+    The load half of :func:`stage_weighted`, with :func:`weight_rows` as the other:
+    row ``r`` holds ``gsrc[t0+r]`` at the source dtype, and the decay and the
+    pad-row zeros arrive afterwards. Nothing here reads the chunk-local prefix, so
+    the pass can be issued ahead of the scan that fills it and its latency covered
+    by that scan; the fused pass orders the whole read behind the scan for no
+    dependence.
+
+    A step carries one whole :data:`slinoss.ops.so3ssd.cute.mma.SMEM_SEGMENT` of
+    adjacent elements, one access on each side, where the fused pass carries one
+    element. At ``L=64 P=64`` and 256 threads that is 2 global loads and 2 shared
+    stores a thread a chunk against 16 of each, and the source elements a thread
+    holds live are ``PREFETCH``-bounded as everywhere else in this file.
+
+    A 2-byte store puts two threads in one 4-byte bank word and is conflicted
+    whatever the address; the segment store cannot be, and a phase of eight threads
+    covers eight distinct segments modulo eight wherever a row is a whole multiple
+    of eight segments.
+
+    Args:
+        gsrc: ``(B,H,T,P)`` operand-dtype source, contiguous. ``width`` is its last
+            extent, so a row is one run of ``width`` elements.
+        sdst: Tile of at least ``chunk`` rows at ``gsrc``'s element type, written
+            over ``width`` columns. Columns at or past ``width`` are the caller's
+            business, through :func:`stage_pad`.
+        bidx: Batch index.
+        hidx: Head index.
+        t0: First token of the chunk.
+        valid: Tokens of the chunk that exist. Rows at or past it hold row
+            ``valid - 1``'s data until :func:`weight_rows` zeroes them.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        width: Columns that carry data, ``P``. Compile-time.
+    """
+    src = gsrc.element_type
+    run = _segment_run(src.width // 8, width)
+    runs = width // run
+    total = chunk * runs
+    steps = -(-total // threads)
+    exact = total % threads == 0
+
+    loads = cute.make_fragment((min(PREFETCH, steps), run), src)
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        count = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // runs
+            col = i - r * runs
+            # One clamp bounds the read; weight_rows drops the pad rows, so no
+            # select is needed at the source dtype here.
+            token = cutlass.min(r, valid - 1)
+            cute.autovec_copy(
+                _wide_row(gsrc[bidx, hidx, t0 + token, None], run)[(None, col)],
+                loads[(step, None)],
+            )
+            held.append((r, col))
+
+        for step in cutlass.range_constexpr(count):
+            r, col = held[step]
+            dst = _wide_row(sdst[r, None], run)[(None, col)]
+            if cutlass.const_expr(exact):
+                cute.autovec_copy(loads[(step, None)], dst)
+            else:
+                if tid + (group * PREFETCH + step) * threads < total:
+                    cute.autovec_copy(loads[(step, None)], dst)
+
+
+@cute.jit
+def weight_rows(
+    sdst: cute.Tensor,
+    slp: cute.Tensor,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+) -> None:
+    """Scale a staged chunk in place by the chunk-local decay, one segment an access.
+
+    The scale half of :func:`stage_weighted`, over what :func:`stage_raw` left in
+    shared memory. The arithmetic is that pass's term for term: one widen of the
+    element, one select against the pad row, one multiply by
+    :func:`slinoss._cute.decay` of the row's prefix, one narrow. A round trip
+    through shared memory at the tile's own element type is exact, so the result is
+    bit-identical to the fused pass.
+
+    The decay is one evaluation an access rather than one an element, because a run
+    lies within one row: at ``L=64 P=64`` and 256 threads, 2 exponentials a thread a
+    chunk against 16.
+
+    The thread-to-element map is :func:`stage_raw`'s, so a thread reads back the
+    elements it wrote and the two passes are coherent with or without a barrier
+    between them.
+
+    Args:
+        sdst: The tile :func:`stage_raw` wrote, read and written over ``width``
+            columns.
+        slp: ``(L,)`` float32 chunk-local log-scale prefix.
+        valid: Tokens of the chunk that exist. Rows at or past it are zeroed.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        width: Columns that carry data, ``P``. Compile-time.
+
+    Invariants:
+        ``exp(2*lp) <= 1`` by I1 and comes from the prefix itself, never from a
+        ratio of two exponentials (I3). Zeroing the float32 input rather than the
+        product keeps the pad rows exactly zero whatever the prefix holds there.
+    """
+    elem = sdst.element_type
+    zero = cutlass.Float32(0.0)
+    run = _segment_run(elem.width // 8, width)
+    runs = width // run
+    total = chunk * runs
+    steps = -(-total // threads)
+    exact = total % threads == 0
+
+    vals = cute.make_fragment((min(PREFETCH, steps), run), elem)
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        count = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // runs
+            col = i - r * runs
+            cute.autovec_copy(
+                _wide_row(sdst[r, None], run)[(None, col)], vals[(step, None)]
+            )
+            # The prefix read joins the load phase: its latency is the run's.
+            held.append((r, col, r < valid, decay(slp[r])))
+
+        for step in cutlass.range_constexpr(count):
+            r, col, keep, factor = held[step]
+            for j in cutlass.range_constexpr(run):
+                got = select(keep, widen(vals[step, j], elem), zero)
+                vals[step, j] = narrow(got * factor, elem)
+            dst = _wide_row(sdst[r, None], run)[(None, col)]
+            if cutlass.const_expr(exact):
+                cute.autovec_copy(vals[(step, None)], dst)
+            else:
+                if tid + (group * PREFETCH + step) * threads < total:
+                    cute.autovec_copy(vals[(step, None)], dst)
 
 
 @cute.jit
