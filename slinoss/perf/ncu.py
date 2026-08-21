@@ -192,11 +192,11 @@ STALL_REASONS: Final[tuple[str, ...]] = (
 The family also carries ``selected``, which is not a stall; the issue rate it
 describes is ``issue_active_pct``. The two sub-breakdowns ``long_scoreboard`` and
 ``mio_throttle`` expose per pipe are absent, because they double-count their
-parent. The family does partition warp-active cycles once ``selected`` is counted:
-measured on this fleet the stall reasons sum to 82.79 percent and ``selected`` to
-17.02 percent, 99.81 together. ``selected`` is the issue rate divided by warps per
-scheduler, so a stall share is read against the issue rate rather than as a
-duration.
+parent. The reasons partition warp-active cycles once ``selected`` is counted with
+them: measured on this fleet the family sums to 82.79 percent and ``selected`` to
+17.02 percent on ``chunk_input_bwd_kernel``, 99.81 percent together, where
+``selected`` is the issue rate divided by warps per scheduler. A total is derivable,
+and the family's own sum is short by exactly the cycles that issued.
 """
 
 
