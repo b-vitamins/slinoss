@@ -3,36 +3,61 @@
 Three of the four GEMM forms, over one rowwise change of basis into the
 chunk-local frame:
 
-    crot_t = Ac_t c_t
-    bn_r   = An_r b_r
-    bp_r   = Ap_r b_{r-1}
+    crot_t  = Ac_t c_t
+    bfuse_s = Afuse_s b_{s-1}
+    bnow_t  = An_t b_t
 
     y_off(t,p)  = exp(2*lp_t) * <crot_t, zstart_p>
-    score(t,r)  = <crot_t, b*_r>
-    dmask(t,r)  = exp(2*(lp_t - lp_r)) * [r <= t]
-    y_diag(t,p) = sum_r score_now(t,r) dmask(t,r) u(r,p)
-                + sum_r score_prv(t,r) dmask(t,r) u(r-1,p)
+    score(t,s)  = <crot_t, bfuse_s>
+    dmask(t,s)  = exp(2*(lp_t - lp_s)) * [s <= t]
+    dnow_t      = <crot_t, bnow_t>
+    y_diag(t,p) = sum_s score(t,s) dmask(t,s) u(s-1,p) + dnow_t * u(t,p)
 
     y = y_diag + y_off
 
+One score column, not two. ``Afuse_s = Ap_s + exp(2*ls_s) An_{s-1}`` carries both
+taps of every source token in one column, because the mask satisfies
+``dmask(t,s-1) = dmask(t,s) exp(2*ls_s)`` and that factor is a per-column constant
+(I3: the raw per-step decay, never a ratio of prefix exponentials). The identity
+has no later column to fold ``s == t`` into, so the now-tap of a token's own step
+stays behind as the diagonal residue ``dnow_t * u(t,p)``, one scalar per token
+against a GEMM column. Score and diagonal both halve: ``2pd + 4pL + 4dL``
+multiply-accumulates a chunk become ``2pd + 2pL + 2dL``.
+
 One float32 accumulator per output tile carries all of it. The offset term runs
 first, alone, so the per-row factor ``exp(2*lp_t)`` applies to it and not to the
-diagonal terms; the diagonal GEMMs then accumulate on top. Both taps land in the
-same accumulator rather than concatenating along K, and both reuse one pair of
-shared tiles.
+diagonal terms; the diagonal GEMM then accumulates on top, and the residue lands
+in the store epilogue, after both.
 
 I6. The decay mask multiplies the float32 score accumulator in registers and is
 narrowed once into the operand dtype. Folding it into either bfloat16 operand would
 round the mask itself, and the mask spans the whole dynamic range of the chunk
 decay. The causal half is a select against exact zero rather than a masked
-exponential, so no infinity is formed (I3).
+exponential, so no infinity is formed (I3). ``Afuse``'s own factor is folded in
+float32, inside the table, before the operand narrowing, so the fused column
+carries one rounding where the two taps carried one each.
 
 The narrowed score never reaches shared memory. The score GEMM's C fragment is the
 diagonal GEMM's A fragment thread for thread, two N atoms of the atom's C tile
 being one K atom of its A tile, so the score is retiled in registers by
 :func:`slinoss.ops.so3ssd.cute.mma.mma_areg`. That removes a score tile from the
-shared budget and, per tap, one scalar store per accumulator element, one
+shared budget and, per slice, one scalar store per accumulator element, one
 ``ldmatrix``, and one barrier.
+
+The residue is not a GEMM operand. Staging ``bnow`` as a second ``(L, 3N)`` tile
+costs a rotate-and-stage pass -- three paired global reads, nine broadcast table
+words and three paired shared stores per pair, ``7.5N`` memory instructions a
+token -- and then a second diagonal GEMM against it, which is the whole win.
+Reduced in registers instead: ``THREADS // L`` threads share a token, each folds
+``An_t`` into its own run of ``b_t`` pairs against the resident ``crot_t``, and one
+butterfly over those lanes finishes it. ``9 * tpt + 3N`` memory instructions a
+token, 258 against 600 at ``3N`` 240. The residue is also the more accurate half of
+the diagonal: it never narrows to the operand dtype, where the score does.
+
+The residue's ``u`` factor is read in the store epilogue rather than staged. The
+row and column it needs are the ones the store already computes, so one clamped
+pair index serves both, and the rows it reads are the rows this block staged a pass
+earlier, 6 KB at ``standard``, served by L1 rather than DRAM.
 
 Score slicing. The score is computed in column slices of :func:`nblock` source
 tokens. Its accumulator lives alongside the output accumulator, so an unsliced
@@ -47,23 +72,27 @@ unblocked form holds a live set proportional to ``3N``.
 The mask stays a mask and is not turned into a skip. Splitting both accumulators
 along M into :data:`MMA_TILE_M` row tiles makes a tile whose rows all precede a
 slice's first source token dead, which is a quarter of the diagonal work at ``L``
-128, and the split is what lets it be dropped. Measured on sm_86 that is slower:
-209.6 us against 201.4, with 48.3 M instructions against 41.6 M. The work dropped
-is tensor-pipe work, and the tensor pipe is 35% utilized at ``L`` 128 while the
-body issues at 36%, so an instruction is worth more than a multiply-accumulate
-here; the per-tile operand loads and the branch cost more than the tiles save.
-Hoisting the shared operand load out of the row-tile loop recovers 1 point of the
-16. Nothing in this body is short of arithmetic.
+128, and the split is what lets it be dropped. Measured on sm_86 over the two-tap
+body, so the absolutes are that body's, that is slower: 209.6 us against 201.4,
+with 48.3 M instructions against 41.6 M. The work dropped is tensor-pipe work, and
+the tensor pipe is 35% utilized at ``L`` 128 while the body issues at 36%, so an
+instruction is worth more than a multiply-accumulate here; the per-tile operand
+loads and the branch cost more than the tiles save. Hoisting the shared operand load
+out of the row-tile loop recovers 1 point of the 16. Fusion halves the work the
+split would drop and leaves the instructions it would add, so it only widens the
+gap. Nothing in this body is short of arithmetic.
 
 The readout basis is staged once per chunk and stays resident: it is the A operand
-of the offset and the score GEMM. The forcing tile is not, because the two taps need
-different table slots and different source tokens; it is restaged per tap, and it
-doubles as the chunk-start state tile for the offset GEMM, which is why it is
-allocated at the wider of ``P`` and the slice width. Neither the rotated forcing
-nor the rotated readout reaches global memory.
+of the offset and the score GEMM, and the residue reduces against it. The forcing
+tile is restaged per score slice, and it doubles as the chunk-start state tile for
+the offset GEMM, which is why it is allocated at the wider of ``P`` and the slice
+width. Neither the rotated forcing nor the rotated readout reaches global memory.
 
-DRAM-bound. Analytic traffic at ``standard`` is about 61 MB against 2.87 GFLOP, so
-47 flop/byte against a ridge point of 165.
+DRAM-bound. Analytic traffic at ``standard`` is about 61 MB, which fusion leaves
+alone: the fused column reads ``b`` once for the score and once for the residue
+where the two taps read it once each, and the residue's second read of ``u`` is L1
+served. The arithmetic it runs against falls 2.87 GFLOP to 1.71, so this body sits
+at 28 flop/byte against a ridge point of 165 where the two-tap body sat at 47.
 
 Grid mode order. ``b`` and ``c`` are per group and everything else is per head, so
 the ``H // G`` heads of one ``(batch, chunk)`` read one pair of ``(L, 3N)`` slabs.
@@ -86,19 +115,30 @@ change, so the output is bit-identical. At ``H == G`` there is nothing to share 
 the order is neutral: cycles move -1.85%, +0.89%, +0.19% and +0.55% at ``standard``,
 ``ragged``, ``wide`` and ``long``, and DRAM bytes move under 0.1% at all four.
 
-Residency 2 is out of reach at ``3N`` 240 and the arena is why. 79,504 B against the
+Residency 2 is out of reach at ``3N`` 240 and the arena is why. 79,616 B against the
 50,176 B a second block needs, of which the two ``(L, 3N)`` operand tiles are
-63,488 B; deleting every float32 tile in the arena still lands at 68,240 B. Both
+63,488 B; deleting every float32 tile in the arena still lands at 68,096 B. Both
 operand tiles are live from the offset GEMM to the last diagonal GEMM, and the
 forcing tile already shares its rows with the state. Slicing K to shrink them makes
 ``3N`` the outer loop, and because the score's C fragment is the diagonal GEMM's A
-fragment in registers, every ``(slice, tap)`` score accumulator is then live at once:
-64 float32 against 16, on a body already at the register ceiling.
+fragment in registers, every slice's score accumulator is then live at once: 32
+float32 against 16, on a body already at the register ceiling. Fusion moves the
+arena by +112 B here and +144 B at ``standard``, the shifted forcing tile losing the
+row the second tap needed and the residue tile taking a float32 word per token, so
+no residency bar moves in either direction.
 
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so the rows past the sequence are zero in every
 operand tile, and the store is predicated on the token existing. The rows the M
 mode was rounded up by are zeroed by the same predicate.
+
+One fused column is not zero past the sequence, and it is invisible here rather than
+absent. At ``T mod L == n > 0`` token ``n`` stages ``ls`` as zero, so its factor is
+one and ``Afuse_n`` is the last real token's ``An_{n-1}``. That column enters rows
+``t >= n`` alone, which the store predicate drops, so ``y`` cannot see it; a kernel
+that also wrote a state quantity would, and this one writes ``y`` alone. The staging
+predicate zeroes the column's vector in any case, so both readings of the pad row
+give the same output.
 """
 
 import cutlass
@@ -116,14 +156,17 @@ from slinoss._cute import (
     jit_launch,
     narrow,
     select,
+    shuffle_xor,
     smem_bytes,
     smem_residency,
+    widen,
 )
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
+    TABLE_AFUSE,
     TABLE_AN,
-    TABLE_AP,
     THREADS,
+    mat3_matvec,
     scalar_tile,
     table_tile,
     tap_tile,
@@ -151,13 +194,17 @@ from slinoss.ops.so3ssd.cute.mma import (
     mma_coords,
     mma_gemm,
     mma_gemm_areg,
+    mma_offsets,
     mma_rows,
     operand_tile,
     smem_pitch,
 )
 from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
+    LANE_PAIR,
+    PREFETCH,
     build_table,
+    paired,
     stage_chunk,
     stage_rotated,
     stage_shifted,
@@ -175,6 +222,7 @@ __all__ = [
     "gemm_kblocks",
     "nblock",
     "readout_tile",
+    "scan_dnow",
     "scan_smem_bytes",
 ]
 
@@ -289,9 +337,10 @@ def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
             (scalar_tile(chunk), 4),
             (trans_tile(chunk), 4),
             (table_tile(chunk, 3), 4),
+            (scalar_tile(chunk), 4),
             (readout_tile(chunk, dim), itemsize),
             (operand_tile(max(rows, nblk), dim), itemsize),
-            (operand_tile(nblk + 1, rows), itemsize),
+            (operand_tile(nblk, rows), itemsize),
         ]
     )
 
@@ -377,6 +426,132 @@ def gemm_kblocks(
         )
 
 
+@cute.jit
+def scan_dnow(
+    gb: cute.Tensor,
+    scrot: cute.Tensor,
+    stable: cute.Tensor,
+    sdnow: cute.Tensor,
+    bidx: cutlass.Int32,
+    gidx: cutlass.Int32,
+    t0: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+) -> None:
+    """Reduce the diagonal residue ``dnow_t = <crot_t, An_t b_t>``, one per token.
+
+    The term tap fusion leaves behind. It is one scalar per token, so it is
+    contracted in registers against the resident rotated readout rather than through
+    a staged operand tile and a fifth GEMM: ``threads // L`` threads share a token,
+    each takes its own run of that token's pairs, and a butterfly over those lanes
+    finishes the row.
+
+    Args:
+        gb: ``(B,G,T,3N)`` operand-dtype input vectors.
+        scrot: Rotated readout tile, ``(mma_rows(L), pitch)``, already staged.
+        stable: ``(mats, L, 9)`` float32 transform table, already built.
+        sdnow: ``(L,)`` float32, written. One value per chunk-local token.
+        bidx: Batch index.
+        gidx: Group index, ``h // (H // G)``. The table is per head and the vector
+            per group, as in :func:`slinoss.ops.so3ssd.cute.table.stage_rotated`.
+        t0: First token of the chunk.
+        valid: Tokens of the chunk that exist.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        lanes: ``N``. Compile-time.
+
+    Invariants:
+        ``lanes`` is a multiple of 16 and ``L`` a power of two from 16 up, so the
+        threads per token divide both the block width and a row's pair count, and a
+        token's lanes never cross a warp. Nothing is loaded under a predicate: the
+        indices are clamped, for the reason given in ``stage_rotated``.
+
+        The readout row is read at the unclamped token and rows past ``valid`` are
+        zero there, so a pad token reduces to exactly zero whatever the clamped
+        source row and table row hold.
+
+        Every lane of a token holds the same sum after the butterfly, so the store is
+        unpredicated: which lane the ISA lets win cannot change the value.
+    """
+    src = gb.element_type
+    elem = scrot.element_type
+    wide = 3 * LANE_PAIR
+    pairs = lanes // LANE_PAIR
+    tpt = min(pairs, max(1, threads // chunk))
+    assert pairs % tpt == 0 and threads % tpt == 0
+    ppt = pairs // tpt
+    span = threads // tpt
+    passes = -(-chunk // span)
+    exact = chunk % span == 0
+    depth = max(1, PREFETCH // LANE_PAIR)
+
+    bwords = paired(gb[bidx, gidx, None, None])
+    cwords = paired(scrot)
+    loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
+    reads = cute.make_fragment((3, LANE_PAIR), elem)
+    sub = tid % tpt
+
+    for base in cutlass.range_constexpr(passes):
+        raw = base * span + tid // tpt
+        token = cutlass.min(raw, chunk - 1) if cutlass.const_expr(not exact) else raw
+        # One clamp bounds the table read and the global read together, as in
+        # ``stage_rotated``: ``valid`` is at most the chunk.
+        tsafe = cutlass.min(token, valid - 1)
+        # Nine words per token, not per pair: both of a pair's 3-vectors take the
+        # same matrix, and every pair of the token takes it too.
+        mat = tuple(stable[TABLE_AN, tsafe, entry] for entry in range(9))
+        total = cutlass.Float32(0.0)
+        for group in cutlass.range_constexpr(-(-ppt // depth)):
+            width = min(depth, ppt - group * depth)
+            held = []
+            for step in cutlass.range_constexpr(width):
+                pair = (group * depth + step) * tpt + sub
+                for k in cutlass.range_constexpr(3):
+                    cute.autovec_copy(
+                        bwords[(None, (t0 + tsafe, 3 * pair + k))],
+                        loads[(3 * step + k, None)],
+                    )
+                held.append(pair)
+
+            for step in cutlass.range_constexpr(width):
+                pair = held[step]
+                for k in cutlass.range_constexpr(3):
+                    cute.autovec_copy(
+                        cwords[(None, (token, 3 * pair + k))], reads[(k, None)]
+                    )
+                got = tuple(
+                    widen(loads[3 * step + j // LANE_PAIR, j % LANE_PAIR], src)
+                    for j in range(wide)
+                )
+                out = tuple(
+                    widen(reads[j // LANE_PAIR, j % LANE_PAIR], elem)
+                    for j in range(wide)
+                )
+                for half in cutlass.range_constexpr(LANE_PAIR):
+                    o = 3 * half
+                    rot = mat3_matvec(mat, (got[o], got[o + 1], got[o + 2]))
+                    total = (
+                        total
+                        + out[o] * rot[0]
+                        + out[o + 1] * rot[1]
+                        + out[o + 2] * rot[2]
+                    )
+
+        reach = 1
+        while reach < tpt:
+            total = total + shuffle_xor(total, reach)
+            reach *= 2
+        if cutlass.const_expr(exact):
+            sdnow[token] = total
+        else:
+            if raw < chunk:
+                sdnow[token] = total
+
+
 @cute.kernel
 def chunk_scan_fwd_kernel(
     gu: cute.Tensor,
@@ -449,6 +624,7 @@ def chunk_scan_fwd_kernel(
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 3).layout(), 16)
+    sdnow = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     scrot = smem.allocate_tensor(
         gc.element_type, readout_tile(chunk, dim).layout(), SMEM_SEGMENT
     )
@@ -456,7 +632,7 @@ def chunk_scan_fwd_kernel(
         gb.element_type, operand_tile(max(rows, nblk), dim).layout(), SMEM_SEGMENT
     )
     su = smem.allocate_tensor(
-        gu.element_type, operand_tile(nblk + 1, rows).layout(), SMEM_SEGMENT
+        gu.element_type, operand_tile(nblk, rows).layout(), SMEM_SEGMENT
     )
 
     t0 = cidx * chunk
@@ -476,7 +652,9 @@ def chunk_scan_fwd_kernel(
     cute.arch.sync_threads()
     chunk_prefixes(strans, slp, squat, tid, chunk)
     cute.arch.sync_threads()
-    build_table(strans, stap, squat, stable, tid, threads, chunk, 3)
+    # The fused column, so the first slot is TABLE_AFUSE rather than TABLE_AP. The
+    # second slot still holds ``An``, which the diagonal residue reduces against.
+    build_table(strans, stap, squat, stable, tid, threads, chunk, 3, True)
     cute.arch.sync_threads()
 
     # The readout basis is the A operand of the offset and the score GEMM, so it is
@@ -506,6 +684,14 @@ def chunk_scan_fwd_kernel(
     stage_state(gz[bidx, hidx, cidx, None, None], sbz, tid, threads, rows, dim)
     cute.arch.sync_threads()
 
+    # Before the accumulators exist, so the peak live set is still the slice loop's.
+    # It reads the readout tile and the table, both published by the barrier above,
+    # and the barrier below publishes ``sdnow`` to the store epilogue.
+    scan_dnow(
+        gb, scrot, stable, sdnow, bidx, gidx, t0, valid, tid, threads, chunk, lanes
+    )
+    cute.arch.sync_threads()
+
     va_crot = cute.make_tensor(
         scrot.iterator, cute.make_layout((mpad, dim), stride=(ldv, 1))
     )
@@ -515,12 +701,10 @@ def chunk_scan_fwd_kernel(
     vb_f = cute.make_tensor(
         sbz.iterator, cute.make_layout((nblk, dim), stride=(ldv, 1))
     )
-    # Two views of one staging tile, one row of pitch apart: the current tap reads
-    # token t0+nbase+k, the previous one reads t0+nbase+k-1.
-    vb_unow = cute.make_tensor(
-        su.iterator + ldu, cute.make_layout((rows, nblk), stride=(1, ldu))
-    )
-    vb_uprv = cute.make_tensor(
+    # The shifted forcing: row k of the tile is token t0+nbase+k-1, which is the
+    # source the fused column's tap acts on. The tile is one row narrower than the
+    # slice, because the token's own forcing is the residue's, not this operand's.
+    vb_ushift = cute.make_tensor(
         su.iterator, cute.make_layout((rows, nblk), stride=(1, ldu))
     )
 
@@ -543,71 +727,66 @@ def chunk_scan_fwd_kernel(
     sfrag = cute.make_fragment_like(sacc, elem)
     fa_score = mma_areg(sfrag)
     # The slice body is emitted once, never unrolled. Unrolling folds every
-    # score-epilogue index into an immediate, but ptxas then schedules all
-    # ``2 * slices`` copies against one register file: at ``L`` 128 that is 257
-    # registers of demand against the architectural 255, and the two integer
-    # addresses it evicts cost 73,728 local load and 49,152 local store sectors a
-    # launch. Measured on sm_86, dropping the unroll at ``L`` 128 runs 212.1 us
-    # against 242.0 us unrolled. It does not by itself make the body spill-free:
+    # score-epilogue index into an immediate, but ptxas then schedules every slice's
+    # copies against one register file: measured on the two-tap body at ``L`` 128
+    # that was 257 registers of demand against the architectural 255, and the two
+    # integer addresses it evicted cost 73,728 local load and 49,152 local store
+    # sectors a launch, 242.0 us unrolled against 212.1 us here. Fusion halves the
+    # copies an unrolled form would hold live; the refusal is not re-measured, so it
+    # stands on the two-tap figures. It does not by itself make the body spill-free:
     # the slice width does, and :data:`NBLOCK_LONG` records that measurement.
     for s in cutlass.range(slices):
         nbase = s * nblk
-        for tap in cutlass.range_constexpr(2):
-            cute.arch.sync_threads()
-            stage_rotated(
-                gb,
-                gbprev,
-                sbz,
-                stable,
-                slp,
-                bidx,
-                gidx,
-                t0,
-                nbase,
-                valid,
-                tid,
-                TABLE_AN if tap == 0 else TABLE_AP,
-                tap,
-                threads,
-                nblk,
-                lanes,
-                has_prev,
-                False,
-            )
-            if cutlass.const_expr(tap == 0):
-                stage_shifted(
-                    gu,
-                    guprev,
-                    su,
-                    bidx,
-                    hidx,
-                    t0,
-                    nbase,
-                    valid,
-                    tid,
-                    threads,
-                    nblk,
-                    rows,
-                    has_prev,
-                )
-            cute.arch.sync_threads()
-            sacc.fill(0.0)
-            gemm_kblocks(tiled_mma, tid, sacc, va_crot, vb_f, mpad, nblk, dim, ldv)
-            for i in cutlass.range_constexpr(cute.size(sacc)):
-                m, r = scrd[i]
-                src = nbase + r
-                # I6: the mask lands on the float32 accumulator, then one narrowing
-                # into the operand. I3: one exponential of a log difference.
-                masked = sacc[i] * decay(slp[cutlass.min(m, last)] - slp[src])
-                sfrag[i] = narrow(select(m >= src, masked, zero), elem)
-            mma_gemm_areg(
-                tiled_mma,
-                tid,
-                acc,
-                fa_score,
-                vb_unow if tap == 0 else vb_uprv,
-                False,
-            )
+        cute.arch.sync_threads()
+        stage_rotated(
+            gb,
+            gbprev,
+            sbz,
+            stable,
+            slp,
+            bidx,
+            gidx,
+            t0,
+            nbase,
+            valid,
+            tid,
+            TABLE_AFUSE,
+            1,
+            threads,
+            nblk,
+            lanes,
+            has_prev,
+            False,
+        )
+        # ``span`` one below the slice width: the pass fills ``span + 1`` rows and
+        # only the shifted view survives fusion, so it stops at the slice's last
+        # source token rather than one past it.
+        stage_shifted(
+            gu,
+            guprev,
+            su,
+            bidx,
+            hidx,
+            t0,
+            nbase,
+            valid,
+            tid,
+            threads,
+            nblk - 1,
+            rows,
+            has_prev,
+        )
+        cute.arch.sync_threads()
+        sacc.fill(0.0)
+        gemm_kblocks(tiled_mma, tid, sacc, va_crot, vb_f, mpad, nblk, dim, ldv)
+        for i in cutlass.range_constexpr(cute.size(sacc)):
+            m, r = scrd[i]
+            src = nbase + r
+            # I6: the mask lands on the float32 accumulator, then one narrowing
+            # into the operand. I3: one exponential of a log difference.
+            masked = sacc[i] * decay(slp[cutlass.min(m, last)] - slp[src])
+            sfrag[i] = narrow(select(m >= src, masked, zero), elem)
+        mma_gemm_areg(tiled_mma, tid, acc, fa_score, vb_ushift, False)
 
     # mma_store's predicated path, inlined because both of its bounds are dynamic
     # here: the row count is min(L, T - t0) and the destination row is offset by t0.
@@ -623,6 +802,16 @@ def chunk_scan_fwd_kernel(
     )
     vy = cute.zipped_divide(flat, (MMA_PAIR,))
     fy = cute.make_fragment((MMA_PAIR,), out)
+    # The residue's forcing factor, over the same flat pair index as the store. Both
+    # tensors are ``(B,H,T,P)`` contiguous, so one clamped index serves both: the
+    # clamp only moves rows the store drops.
+    usrc = gu.element_type
+    ufrom = cute.make_tensor(
+        gu[bidx, hidx, None, None].iterator.align(MMA_PAIR * (usrc.width // 8)),
+        cute.make_layout((seqlen * rows,), stride=(1,)),
+    )
+    vu = cute.zipped_divide(ufrom, (MMA_PAIR,))
+    fu = cute.make_fragment((MMA_PAIR,), usrc)
     # Row-band order rather than accumulator order. M is the accumulator's second
     # mode, so its flat order alternates between bands :data:`MMA_TILE_M` apart and
     # holds twice as many rows' sectors open at once; walking M outermost closes each
@@ -635,19 +824,44 @@ def chunk_scan_fwd_kernel(
     band = 2 * MMA_PAIR
     mits = mpad // MMA_TILE_M
     nits = cute.size(acc) // (band * mits)
+    # A thread's row is a property of the M tile and the column pair alone, so the
+    # residue's per-row factor is one read per ``(m_it, q)`` rather than one per pair.
+    # ``mma_offsets`` is what says so: it is the atom's own C map at trace time, where
+    # the coordinate itself is dynamic.
+    offs = mma_offsets(tiled_mma, (mpad, rows))
+    assert all(
+        offs[q * MMA_PAIR + band * (m_it + mits * n_it)][0]
+        == offs[q * MMA_PAIR + band * m_it][0]
+        for m_it in range(mits)
+        for q in range(band // MMA_PAIR)
+        for n_it in range(nits)
+    ), "the atom's C map ties a thread's row to the N tile"
+    dnow = tuple(
+        tuple(
+            sdnow[cutlass.min(ycrd[q * MMA_PAIR + band * m_it][0], last)]
+            for q in range(band // MMA_PAIR)
+        )
+        for m_it in range(mits)
+    )
     for m_it in cutlass.range_constexpr(mits):
         for n_it in cutlass.range_constexpr(nits):
             for q in cutlass.range_constexpr(band // MMA_PAIR):
                 i = q * MMA_PAIR + band * (m_it + mits * n_it)
                 m, n = ycrd[i]
+                # One index for the load and the store. The clamp is what bounds the
+                # load: an M mode rounded up past the sequence would otherwise read
+                # off the end of ``u``, and every row it moves is a row the predicate
+                # drops. ``rows`` and ``n`` are both even, so the pair index is exact.
+                pair = (cutlass.min(t0 + m, seqlen - 1) * rows + n) // MMA_PAIR
+                cute.autovec_copy(vu[(None, pair)], fu)
                 # Filled before the predicate: a value produced inside a dynamic
                 # branch is not readable after it. The fill is free on the rows the
-                # predicate drops. ``rows`` and ``n`` are both even, so the flat index
-                # of the pair is exact.
+                # predicate drops.
                 for j in cutlass.range_constexpr(MMA_PAIR):
-                    fy[j] = narrow(acc[i + j], out)
+                    resid = dnow[m_it][q] * widen(fu[j], usrc)
+                    fy[j] = narrow(acc[i + j] + resid, out)
                 if m < valid:
-                    cute.autovec_copy(fy, vy[(None, ((t0 + m) * rows + n) // MMA_PAIR)])
+                    cute.autovec_copy(fy, vy[(None, pair)])
 
 
 @cute.jit
