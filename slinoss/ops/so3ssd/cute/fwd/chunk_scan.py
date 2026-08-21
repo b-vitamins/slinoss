@@ -65,6 +65,36 @@ nor the rotated readout reaches global memory.
 DRAM-bound. Analytic traffic at ``standard`` is about 61 MB against 2.87 GFLOP, so
 47 flop/byte against a ridge point of 165.
 
+Grid mode order. ``b`` and ``c`` are per group and everything else is per head, so
+the ``H // G`` heads of one ``(batch, chunk)`` read one pair of ``(L, 3N)`` slabs.
+Head is the fastest-varying grid mode because CUDA dispatches x first: the heads
+sharing a slab are then consecutive blocks and the second one reads it from L2. With
+chunk in x they sit ``chunks * B`` blocks apart, are never co-resident, and each head
+re-reads both slabs from DRAM. Measured on sm_86 at ``B`` 4, ``H`` 18, ``T`` 2048,
+``P`` 64, ``3N`` 240, ``L`` 64 and ``G`` 1, where ``H // G`` is 18, one launch at
+1.7934 GHz:
+
+    grid            cycles      DRAM read   DRAM write   L2 read hit
+    (chunks,B,H)    1,173,300   309.98 MB   63.31 MB     20.62%
+    (H,B,chunks)      988,061   176.17 MB   50.43 MB     54.93%
+
+The base read 141.94 MB of ``b`` and ``c`` against a 7.86 MB compulsory footprint, an
+18.05x re-read equal to ``H // G``, and 133.81 MB of it is gone. The write falls too,
+by 12.87 MB at an unchanged local sector count: the read pressure was evicting dirty
+spill lines to DRAM before they were overwritten. The map from block to data does not
+change, so the output is bit-identical. At ``H == G`` there is nothing to share and
+the order is neutral: cycles move -1.85%, +0.89%, +0.19% and +0.55% at ``standard``,
+``ragged``, ``wide`` and ``long``, and DRAM bytes move under 0.1% at all four.
+
+Residency 2 is out of reach at ``3N`` 240 and the arena is why. 79,504 B against the
+50,176 B a second block needs, of which the two ``(L, 3N)`` operand tiles are
+63,488 B; deleting every float32 tile in the arena still lands at 68,240 B. Both
+operand tiles are live from the offset GEMM to the last diagonal GEMM, and the
+forcing tile already shares its rows with the state. Slicing K to shrink them makes
+``3N`` the outer loop, and because the score's C fragment is the diagonal GEMM's A
+fragment in registers, every ``(slice, tap)`` score accumulator is then live at once:
+64 float32 against 16, on a body already at the register ceiling.
+
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so the rows past the sequence are zero in every
 operand tile, and the store is predicated on the token existing. The rows the M
@@ -336,7 +366,7 @@ def chunk_scan_fwd_kernel(
 ) -> None:
     """Write one chunk of the output.
 
-    One block per ``(chunk, batch, head)``.
+    One block per ``(chunk, batch, head)``, dispatched head first.
 
     Args:
         gu: ``(B,H,T,P)`` operand-dtype input weights.
@@ -365,7 +395,7 @@ def chunk_scan_fwd_kernel(
         ``H``.
     """
     tid, _, _ = cute.arch.thread_idx()
-    cidx, bidx, hidx = cute.arch.block_idx()
+    hidx, bidx, cidx = cute.arch.block_idx()
 
     # gb and gc are grouped; the state, the weights, the table, and the output are
     # per head. The branch is trace-time, so the ungrouped shape emits no divide.
@@ -644,7 +674,7 @@ def chunk_scan_fwd(
         per_group,
         has_prev,
     ).launch(
-        grid=(chunks, bsz, heads),
+        grid=(heads, bsz, chunks),
         block=(threads, 1, 1),
         min_blocks_per_mp=resident,
         stream=stream,
