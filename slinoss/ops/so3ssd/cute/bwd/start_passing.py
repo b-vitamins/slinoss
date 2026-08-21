@@ -108,7 +108,52 @@ spilled at either width. The percentage rises with the time here, unlike the
 fusion's, because the width moves no bytes. What it does move is the barrier stall,
 12.8% to 22.3%: three barriers a chunk in this kernel and four more inside
 :func:`start_chunk`, and the chunk prefix behind one of them is warp 0's work, so a
-wider block waits wider. That is the next lever and it is not the width's.
+wider block waits wider.
+
+Staging. Everything from here down is at the shipped ``dinc`` width.
+:func:`slinoss.ops.so3ssd.cute.table.stage_weighted` carried one element an access
+with the decay inside it: at ``L=64 P=64`` and 256 threads, 16 global loads, 16
+shared stores, 16 prefix reads and 16 exponentials a thread a chunk.
+:func:`slinoss.ops.so3ssd.cute.table.stage_raw` and
+:func:`slinoss.ops.so3ssd.cute.table.weight_rows` split it at one 16-byte segment an
+access and cost 2 of each. Measured on sm_86, eight warps, resident 3, one NCU
+capture of one launch:
+
+    counter                  before        after    delta
+    sm__inst_executed    78,966,720   51,471,360   -34.8%
+    pipe_lsu             13,262,400    9,391,680   -29.2%
+    op_global_ld          2,615,040    1,324,800   -49.3%
+    op_shared_ld          4,377,600    3,087,360   -29.5%
+    op_shared_st          3,306,240    2,016,000   -39.0%
+    registers                    80           70
+    barrier stall             23.9%        34.9%
+    long_scoreboard           15.5%        11.8%
+
+42 accesses a thread a chunk go, 4 more than the two halves account for: the
+toolchain forwards the raw store into the scale pass's read and drops both, so the
+split pays no round trip. Paired against the fused pass in one process with the
+order swapped, 16 pairs a trial and three trials: -20.5%, -19.9% and -19.8% of the
+call, 48 of 48 pairs negative. The pass had been priced on its LSU port term and its
+exponentials, and what dominated it was the per-element narrow, select and index
+arithmetic.
+
+The barrier stall is not a lever. Nothing behind the first barrier of
+:func:`start_chunk` depends on the chunk prefix scan -- the ``dy`` load needs the
+token index and the valid count and nothing else, and the scan is warp 0's alone, so
+seven warps of eight wait on it. Both forms of issuing that load ahead of the scan
+were measured, both bitwise clean, neither faster. Staging unweighted through shared
+and scaling in place after the scan restores the store and the load the forwarding
+had dropped, +368,640 LSU and +1,584,390 shared wavefronts, and costs +2.9% to
++4.3% of the call over three paired trials. Holding the loaded fragment in registers
+across the scan instead moves no memory-pipe count at all and costs 2 registers, 70
+to 72; it does not resolve, at paired medians -0.9%, +0.5% and -0.3% with 11, 6 and
+9 of 16 pairs agreeing in sign. It does move the stall it was aimed at, barrier
+34.9% to 28.1%, and long_scoreboard rises 11.8% to 15.2% in exchange. The block's
+critical path is the serial scan, so a warp that reaches the barrier earlier only
+waits there longer. What that leaves is the scan itself: ``chunk_prefix_bwd_kernel``
+already writes ``slp`` and ``squat`` to global, and reading them here rather than
+rescanning the transitions once per lane band would delete the warp-serial region
+and both barriers around it.
 
 Row band. 360 blocks against 168 resident is 1.43 waves at three blocks an SM, and
 the 0.715 quantization efficiency of that wave count accounts for the whole of the
@@ -220,10 +265,13 @@ model geometry, one call of the fused kernel:
 Nothing spills at any of the three, so the cost of asking for four is the scheduling
 the 24 registers buy and not local memory.
 
-Three is also what the wide block prefers, and there the bound is the whole of it:
-at eight warps the cap is 85 registers at three blocks and 128 at two, and the
-kernel wants 80. Measured on sm_86 at the model geometry, medians of three event
-runs, one call:
+Three is also what the wide block prefers, and there the bound is the whole of it.
+sm_86 allocates registers in granules of 256 a warp out of a 65,536-register file,
+so the cap at eight warps is that quotient floored to a granule: 80 registers a
+thread at three blocks, 128 at two, 64 at four. The staged split takes the kernel
+from 80 to 70, which admits a fragment held across the chunk prefix scan and still
+does not admit four blocks. Measured on sm_86 at the model geometry, medians of three
+event runs, one call:
 
     blocks/SM   us
     1          492.5
