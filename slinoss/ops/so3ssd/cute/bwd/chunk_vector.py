@@ -102,10 +102,15 @@ default configuration that is 640 blocks where the loop form launched 128, on an
 84-multiprocessor part.
 
 What crosses a lane tile is the transition chart: ``dtrans`` and ``dK`` are sums over
-lanes. A loop accumulated them in the row one block owned; separate blocks cannot,
-so each tile writes its own float32 slot row and :func:`close_slots` sums the slots
-in a second launch. At one tile there are no slots and the store is the output
-itself, which is the whole of the difference between the two modes.
+lanes. A loop accumulated them in the row one block owned; separate blocks cannot.
+``dK`` leaves its epilogue in registers, so each tile writes its own float32 slot row
+and :func:`close_slots` sums the slots in a second launch. ``dtrans`` does not go that
+way. Every map between the rotation cotangent and it is linear, so the sum may cross
+them: each tile publishes :data:`PART_WORDS` words a token, increments an arrival
+counter, and the tile that reads the last value sums the slots and runs the maps once,
+which pays the two warp-serial scans and the exponential's adjoint on one tile of
+``tiles`` and deletes a launch. At one tile there are no slots, no counter and no
+published words, and the store is the output itself.
 
 Shared memory is one resident set and one phase arena. Resident: ``trans``, ``K``,
 the two chunk-local prefixes, the three-slot transform table, the nine-float
@@ -135,9 +140,11 @@ every device the DSL reports. :func:`slinoss._cute.assert_smem_fits` refuses the
 rest rather than any path here degrading.
 
 The largest ``L`` this layout admits is 64, at one resident block, at ``P 64`` and at
-``P 48`` alike. Two resident blocks of 128 threads need 50,688 B of the 101,376 B
-carveout, and no legal shape at ``P 64`` reaches it: the smallest arena there is
-54,224 B, at ``L 16`` and fold one. Splitting the fold across blocks removes the one
+``P 48`` alike. Two resident blocks of 128 threads need 50,176 B each, which is
+:func:`slinoss._cute.smem_budget` at two and not half the 101,376 B capacity: the
+capacity has one driver reservation subtracted from it and two blocks pay two. No
+legal shape at ``P 64`` reaches that bar: the smallest arena there is 54,224 B, at
+``L 16`` and fold one. Splitting the fold across blocks removes the one
 accumulator that exists only above fold one, 13,312 B of the 95,696, and leaves
 82,384 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
 the two float32 fold sums, the output tile and the aliased float32 readout -- which
@@ -170,11 +177,17 @@ group, there are five tiles and the split is what the tile count costs::
                 + dchunk_rot 0.08 + dchunk_scale 0.01     = 64.97 -> 324.86 MB
     once          B 3.99 + C 3.93 + dinc 70.78 + zstart 70.78 r,
                   dB 3.93 + dC 3.93 + carry_b 0.12 w      =           157.43 MB
-    slot rows     dtrans 2.36 + dK 4.72 written and read back per tile,
-                  then 7.08 written out once               =           77.85 MB
+    chart words   dtrans 4.72 published and read back per tile,
+                  then 2.36 written out once              =           49.55 MB
+    slot rows     dK 4.72 written and read back per tile,
+                  then 4.72 written out once              =           51.90 MB
 
-560.19 MB, and the slot rows are 14.16 MB more than the loop form's
-read-modify-write of the same two outputs, 2.5%. ``U`` dominates the per-tile term
+583.79 MB. The chart words are 23.60 MB more than the four-word slot rows they
+replaced, all of it the read-back, and the read-back is the term the table overstates:
+the tiles of one chunk are consecutive blocks in ``x``, so they publish and are summed
+inside one L2 residency. Measured at the acceptance shape, the producer's
+``dram__bytes_read.sum`` moves +0.011 MB for 23.6 MB of published words, so L2 serves
+the whole of the read-back. ``U`` dominates the per-tile term
 because its tile is one atom M tile whatever the ``span``, so a ``span 32`` shape
 reads it twice. ``dinc`` and ``zstart`` are ``(B, H, C, P, 3N)`` at the operand width
 and together are 25% of the total. The three write terms are the depth-one form. At
@@ -312,7 +325,7 @@ zero local sectors at the shipped depth.
 The lane tile is not implicated. At fold 18 and one lane tile the local traffic is
 276.96 MB, and the tile count moves neither the register count nor the footprint.
 
-Two resident blocks need 50,688 B and no legal shape at ``P 64`` reaches it: the
+Two resident blocks need 50,176 B and no legal shape at ``P 64`` reaches it: the
 smallest arena there is 53,648 B, at ``L 16`` and fold one. Taking the fold out of the
 block drops the summed accumulator that exists only above fold one, but the spaces
 alias and only 2,048 B of the 93,392 come back, so it does not reach it either. What
@@ -365,19 +378,19 @@ parameter, not two.
 
 The same arithmetic refuses a second resident block at eight, and it is the register
 file that refuses it rather than the arena. Two 256-thread blocks need 128 registers a
-thread and 50,688 B of the 101,376 B carveout; three, which is what a 50% occupancy
-bar asks for, need 85 and 33,792 B. At 242 registers ``launch__occupancy_limit_registers``
-is 1 block, so no arena reaches a second block. Nor could the arena reach 50,688 B by
+thread and 50,176 B of tiles each; three, which is what a 50% occupancy bar asks for,
+need 85 and 33,024 B. At 242 registers ``launch__occupancy_limit_registers`` is 1
+block, so no arena reaches a second block. Nor could the arena reach 50,176 B by
 aliasing: the source-token loop holds every tile live at once except ``sdrot``,
 ``sdquat`` and ``sdls``, which are written and read inside the closing chart, so
-lifetime aliasing has 2,304 B in it and its floor is 89,296 B against a 40,912 B gap.
+lifetime aliasing has 2,304 B in it and its floor is 89,296 B against a 41,424 B gap.
 The forcing sum outlives the head, the score and the tap gradient already share one
 region, and ``dy``, the increment cotangent, the raw and rotated forcing tiles and
 ``U`` are each read by a GEMM of every tap. Halving the source-token block buys
 11,264 B of that gap at a second pass over ``U``, and the tile cannot narrow below 48
 columns. Occupancy at this width is a register problem.
 
-An arena under 50,688 B would also raise ``min_blocks_per_mp`` to two by the
+An arena under 50,176 B would also raise ``min_blocks_per_mp`` to two by the
 expression above, and that half of the plan is measured: the request alone takes the
 allocator to exactly 128 registers a thread and it spills, 11.80 MB of local load and
 11.80 MB of local store a launch with 368,556 of the 368,640 load sectors and all of
@@ -399,6 +412,7 @@ from typing import NamedTuple
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from torch import Tensor
 
 from slinoss._cute import (
@@ -414,6 +428,7 @@ from slinoss._cute import (
     shuffle_xor,
     smem_bytes,
     smem_capacity,
+    smem_residency,
     widen,
 )
 from slinoss._reduce import reduce_partials
@@ -485,6 +500,7 @@ __all__ = [
     "LANE_BLOCK",
     "LANE_GROUP",
     "PARTIAL_REQUEST_BYTES",
+    "PART_WORDS",
     "PREFIX_WARPS",
     "RESIDENT_MAX",
     "ROW_WORDS",
@@ -533,7 +549,7 @@ a multiple of 48 and 96 does not divide 240.
 
 The cut is along a mode the six contractions carry as N or M, never as K, so no
 partial sum crosses a tile. What crosses is the transition chart: ``dtrans`` and
-``dK`` are sums over lanes, so a tile past the first accumulates into them."""
+``dK`` are sums over lanes, so every tile contributes a term to them."""
 
 LANE_GROUP: int = 4
 """Threads that cooperate on one token in a rowwise epilogue.
@@ -613,6 +629,23 @@ is LSU warp instructions, which a conflict does not add to and the round count d
 Every round holds at every ``L``: the chunk length sets how many lanes the
 ``token < chunk`` guard leaves active, and masking lanes off removes accesses
 rather than colliding them."""
+
+PART_WORDS: int = 8
+"""Float32 words a lane tile publishes per token when the state width is tiled.
+
+Four for the quaternion prefix cotangent, one for the log-scale offset term, three
+for the tap's own transition term. What crosses the sum over lane tiles at the point
+the chart closes, and the point is chosen for this count: the four maps that remain
+-- both suffix scans, the exponential's adjoint and the tap sum -- are all linear, so
+the sum may cross them, and every map already run is a contraction, so running one
+more before the sum widens what crosses it. Nine words would cross before
+``mat3_mul``, twelve before the readout epilogue's own sum; four cross after
+``quat_exp_vjp``, which is what the slot form published and cost the two warp-serial
+scans on every tile.
+
+``dK`` is not here. It leaves the epilogue in registers through
+:func:`_sum_over_lanes` and never reaches shared memory, so its lane sum is still a
+slot buffer and a second launch."""
 
 PREFIX_WARPS: int = 4
 """Warps per block of :func:`chunk_prefix_bwd_kernel`.
@@ -965,6 +998,7 @@ def vector_smem_bytes(
                 ),
                 4,
             ),
+            (Tile((TABLE_QUAD,), (1,)), 4),
         ]
     )
 
@@ -1112,12 +1146,17 @@ class Slots(NamedTuple):
     """One output and the slot rows the grid writes it through.
 
     Two of this kernel's axes are grid axes over the terms of a sum: the lane tile
-    over ``dtrans`` and ``dK``, which are sums over lanes, and the head shard over
-    ``dB``, ``dC`` and the carry, which are sums over the heads of a group. The blocks
-    holding the terms are concurrent and none can see the others' partials. Each such
-    output gains a slot axis immediately outside its row axis: a block writes row
-    ``slot * rows + local``, and one second launch sums the ``slots`` copies of a row
-    into the output's own.
+    over ``dK``, which is a sum over lanes, and the head shard over ``dB``, ``dC`` and
+    the carry, which are sums over the heads of a group. The blocks holding the terms
+    are concurrent and none can see the others' partials. Each such output gains a slot
+    axis immediately outside its row axis: a block writes row ``slot * rows + local``,
+    and one second launch sums the ``slots`` copies of a row into the output's own.
+
+    ``dtrans`` is the sum this does not close. Its remaining maps are linear, so its
+    partials are summed inside the producing launch under an arrival counter and it
+    needs no slot buffer at all. That is cheaper wherever it is available and it is
+    available only there: a slot row's partial has already had every map run on it, so
+    nothing but a second launch can finish it.
 
     At ``slots == 1`` there is no buffer and ``dest`` is the output. The row index is
     the same expression either way, ``slot`` being zero, so the kernel body does not
@@ -1131,8 +1170,8 @@ class Slots(NamedTuple):
     the slab count.
 
     Which second launch closes a buffer follows its output's layout, not its axis.
-    ``dtrans`` and ``dK`` are contiguous, so :func:`close_slots` views them as
-    ``(S, R, W)`` and :func:`slinoss._reduce.reduce_partials` sums the rows.
+    ``dK`` is contiguous, so :func:`close_slots` views it as ``(S, R, W)`` and
+    :func:`slinoss._reduce.reduce_partials` sums the rows.
     ``dB`` and ``dC`` are bands that may be pitched in their last mode, where no such
     view exists, so :func:`vector_reduce` sums them by mode instead; it takes the
     carry with them, the three sharing one launch.
@@ -1615,6 +1654,70 @@ def _store_run(
         for j in cutlass.range_constexpr(vec):
             ofrag[vec * k + j] = narrow(sfrag[k, j], elem)
     cute.autovec_copy(ofrag, row[(None, run)])
+
+
+def _load_cg(ptr: cute.Pointer) -> cutlass.Float32:
+    """One float32 from L2, bypassing L1.
+
+    ``ld.global.cg``. There is no wrapper for it in the DSL, so it is inline asm:
+    ``toint`` gives the address the ``l`` constraint takes, which is how the vendor's
+    own distributed primitives pass a pointer to asm. Marked as having side effects so
+    the load is not hoisted out of the branch that established that the data exists.
+
+    Args:
+        ptr: Global float32 address.
+
+    Returns:
+        The value.
+
+    Invariants:
+        The publishing store is another block's and L1 is not coherent across
+        multiprocessors, so a plain load may read a line the store never touched. The
+        acquire fence orders the reader's own accesses; nothing in the memory model
+        makes it invalidate that line. Assembles to ``LDG.E.STRONG.GPU`` on sm_86,
+        where the fence in turn assembles to ``MEMBAR.ALL.GPU`` and ``CCTL.IVALL``:
+        the qualifier is what the model guarantees, the invalidate is what one ptxas
+        chose.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [ptr.toint().ir_value()],
+            "ld.global.cg.f32 $0, [$1];",
+            "=f,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _sum_slots(
+    part: cute.Tensor, word: int, token: cutlass.Int32, tiles: int
+) -> cutlass.Float32:
+    """Sum one published chart word over the lane tiles, lowest slot first.
+
+    Args:
+        part: ``(tiles * PART_WORDS, L)`` float32 view of one ``(batch, head, chunk)``
+            of the chart partials, slot outside word.
+        word: Word of :data:`PART_WORDS`. Compile-time.
+        token: Token within the chunk.
+        tiles: Lane tiles. Compile-time.
+
+    Returns:
+        The sum.
+
+    Invariants:
+        Ascending slot index, so the sum is the same term order whichever tile
+        arrives last. The tile's own slot is read back rather than taken from shared
+        memory for the same reason: one order, not one order per arriver.
+    """
+    total = cutlass.Float32(0.0)
+    for slot in range(tiles):
+        total = total + _load_cg(
+            part.iterator + part.layout((slot * PART_WORDS + word, token))
+        )
+    return total
 
 
 @cute.jit
@@ -2226,6 +2329,8 @@ def chunk_vector_bwd_kernel(
     gcarry: cute.Tensor,
     gdtrans: cute.Tensor,
     gdtap: cute.Tensor,
+    gpart: cute.Tensor,
+    gcount: cute.Tensor,
     seqlen: cutlass.Int32,
     chunks: cutlass.Int32,
     tiled_mma: cute.TiledMma,
@@ -2245,11 +2350,13 @@ def chunk_vector_bwd_kernel(
     two vector sums and the carry outlive the fold and belong to the block's own shard
     and lane tile.
 
-    Two outputs a block does not own alone, and they part company on which axis takes
-    them. ``dtrans`` and ``dK`` are sums over lanes, so a lane tile past the first
-    writes its own slot row; ``dB``, ``dC`` and the carry are sums over the heads of a
-    group, so a shard past the first writes its own. Both row offsets are zero at one
-    copy, where the destination is the output itself.
+    Two axes carry outputs a block does not own alone. ``dB``, ``dC`` and the carry are
+    sums over the heads of a group, so a shard past the first writes its own slot row,
+    the offset being zero at one shard where the destination is the output itself.
+    ``dtrans`` and ``dK`` are sums over lanes. ``dK`` takes a slot row on the same
+    convention. ``dtrans`` does not: every map between the rotation cotangent and it is
+    linear, so each tile publishes :data:`PART_WORDS` words a token to ``gpart`` and
+    the tile that arrives last sums them and runs the maps once.
 
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
@@ -2279,8 +2386,15 @@ def chunk_vector_bwd_kernel(
             ``gdb``.
         gcarry: ``(B,G,splits*C,3N)`` float32 carry or its shard buffer, written with
             the forcing gradient of the token before the chunk's first.
-        gdtrans: ``(B,H,tiles*T,4)`` float32 ``dtrans`` or its slot buffer, written.
+        gdtrans: ``(B,H,T,4)`` float32 ``dtrans``, written by the lane tile that
+            closes the chart. Never a slot buffer: the chart's sum over lane tiles is
+            closed here.
         gdtap: ``(B,H,tiles*T,2,4)`` float32 ``dK`` or its slot buffer, written.
+        gpart: ``(B,H,C,tiles*PART_WORDS,L)`` float32 chart partials, written by every
+            lane tile and read back by the one that arrives last. A rank-matched
+            placeholder at one tile, where nothing crosses.
+        gcount: ``(B,H,C)`` int32 arrival counters, zero at entry. A placeholder at
+            one tile.
         seqlen: ``T``. Dynamic.
         chunks: ``C``. Dynamic. The row extent the carry's shard axis multiplies.
         tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`. Its warp count
@@ -2308,6 +2422,12 @@ def chunk_vector_bwd_kernel(
         staging predicate or masked by the score, and every store is predicated.
         ``fold * splits`` divides ``H``, and one head reaches exactly one block, so no
         row of any output is written twice.
+
+        Which lane tile closes the chart depends on arrival order and is not
+        reproducible. What it sums is: :func:`_sum_slots` reads the slots of a word in
+        ascending slot index and the affine terms enter after the sum, so the term
+        order is one order for every arriver and a rerun at one shape reproduces
+        ``dtrans`` bit for bit. ``gcount`` must be zero at entry.
     """
     tid, _, _ = cute.arch.thread_idx()
     xidx, bidx, gidx = cute.arch.block_idx()
@@ -2350,6 +2470,12 @@ def chunk_vector_bwd_kernel(
     space = arena(chunk, rows, dim, fold, span, elem.width // 8)
     base = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((space.words,), stride=(1,)), 16
+    )
+    # The arrival counter's returned value, broadcast to the block. Last so that no
+    # segment-aligned tile moves, and four words rather than one so the budget counts
+    # it exactly under 16-byte alignment.
+    sflag = smem.allocate_tensor(
+        cutlass.Int32, cute.make_layout((TABLE_QUAD,), stride=(1,)), 16
     )
     sdy = _tile_at(base, space.out, out_tile(chunk, rows), elem)
     sstate = _tile_at(base, space.state, state_tile(rows, tile), elem)
@@ -2468,7 +2594,9 @@ def chunk_vector_bwd_kernel(
     # axis of the carry is the chunk rather than the token.
     sbase = sidx * seqlen
     cbase = sidx * chunks
-    first = jstep == 0
+    # Word base of this tile's chart slot. The slot axis sits outside the word axis so
+    # a slot's words are a contiguous ``PART_WORDS * L`` record.
+    prow = jstep * PART_WORDS
     gbj = _lane_view(gb, joff)
     gbprevj = _lane_view(gbprev, joff)
     gcj = _lane_view(gc, joff)
@@ -2477,11 +2605,6 @@ def chunk_vector_bwd_kernel(
     gdbj = _lane_view(gdb, joff)
     gdcj = _lane_view(gdc, joff)
     gcarryj = _lane_view(gcarry, joff)
-    # The chunk-input stage's half of the log-scale cotangent is the head's, not
-    # the lane tile's, so a later tile must not add it a second time.
-    wlp = cutlass.Float32(1.0)
-    if cutlass.const_expr(tiles > 1):
-        wlp = select(first, cutlass.Float32(1.0), zero)
 
     cute.arch.sync_threads()
     _fill_zero(sumb, (chunk + 1) * ldf, tid, threads)
@@ -2810,36 +2933,28 @@ def chunk_vector_bwd_kernel(
         )
         cute.arch.sync_threads()
 
+        # This head and chunk's chart slots, every tile's. A layout, so the slice is
+        # free and the placeholder at one tile is indexed in range.
+        vpart = gpart[bidx, hidx, cidx, None, None]
+
         # The rotation cotangent is complete, so the transition chart closes: one
-        # 3x3 product per token, the chunk-transition cotangent on the last token,
-        # then the two reverse scans the chunk-local prefixes owe.
+        # 3x3 product per token and the prefix adjoint it feeds.
         #
-        # The transition's own two cotangents are read here rather than before the
-        # source-token loop, where they would sit live in eleven registers across
-        # the widest phase of the kernel. Both are the head's, so a tiled state
-        # width takes them on its first lane tile and adds zero on the rest.
-        dclose = tuple(gdrot[bidx, hidx, cidx, i // 3, i % 3] for i in range(9))
-        dclast = gdscale[bidx, hidx, cidx]
-        cscale = decay(slp[last])
-        if cutlass.const_expr(tiles > 1):
-            dclose = tuple(select(first, v, zero) for v in dclose)
-            dclast = select(first, dclast, zero)
+        # Everything from the product to ``dtrans`` is linear in that cotangent, so the
+        # sum over lane tiles commutes with all of it. A tiled state width runs the
+        # product and the rotation's own adjoint here, publishes the :data:`PART_WORDS`
+        # words that remain, and the tile that arrives last runs the rest once on the
+        # sum: two warp-serial scans, the exponential's adjoint and the store are paid
+        # by one tile of ``tiles`` instead of every one, and the slot closure launch
+        # goes with them. Eight words cross the sum where four crossed it before, which
+        # is the price of moving the maps rather than the sum.
         for step in cutlass.range_constexpr(-(-chunk // threads)):
             token = tid + step * threads
             if token < chunk:
                 gsum = tuple(srow[token, k] for k in range(ROW_WORDS))
                 dac = mat3_mul(gsum, _mat_at(stable, TABLE_AC, token))
-                closing = token == last
-                drot = tuple(
-                    select(
-                        closing,
-                        dac[3 * (k % 3) + k // 3] + dclose[k],
-                        dac[3 * (k % 3) + k // 3],
-                    )
-                    for k in range(9)
-                )
                 dquat = rot_hom_vjp(
-                    drot,
+                    tuple(dac[3 * (k % 3) + k // 3] for k in range(9)),
                     (
                         squat[0, token],
                         squat[1, token],
@@ -2847,43 +2962,105 @@ def chunk_vector_bwd_kernel(
                         squat[3, token],
                     ),
                 )
-                for j in cutlass.range_constexpr(4):
-                    sdrot[j, token] = dquat[j]
                 # One thread per token, so the rows the tiling gave the offset term
                 # fold in here rather than needing a pass and a barrier of their own.
                 offset = vdlp[token]
                 for g in cutlass.range_constexpr(wgroups - 1):
                     offset = offset + sdlp[g + 1, token]
-                vdlp[token] = (
-                    offset
-                    + wlp * gdlp[bidx, hidx, cidx, token]
-                    + select(closing, 2.0 * cscale * dclast, zero)
-                )
-        cute.arch.sync_threads()
-        chunk_suffix(vdlp, sdls, tid, chunk)
-        quat_suffix_vjp(squat, sdrot, sdquat, tid, chunk)
+                if cutlass.const_expr(tiles > 1):
+                    for j in cutlass.range_constexpr(4):
+                        vpart[prow + j, token] = dquat[j]
+                    vpart[prow + 4, token] = offset
+                    for j in cutlass.range_constexpr(3):
+                        vpart[prow + 5 + j, token] = sdw[j, token]
+                else:
+                    for j in cutlass.range_constexpr(4):
+                        sdrot[j, token] = dquat[j]
+                    vdlp[token] = offset
         cute.arch.sync_threads()
 
-        for step in cutlass.range_constexpr(-(-chunk // threads)):
-            token = tid + step * threads
-            if token < chunk:
-                dexp = quat_exp_vjp(
-                    (
-                        sdquat[0, token],
-                        sdquat[1, token],
-                        sdquat[2, token],
-                        sdquat[3, token],
-                    ),
-                    (strans[0, token], strans[1, token], strans[2, token]),
+        # The barrier above orders the block's publishing stores at block scope; the
+        # fence carries them to device scope before the counter moves. So a tile that
+        # reads ``tiles - 1`` reads every slot's words. One thread increments and the
+        # second barrier broadcasts what it read: the branch below is block-uniform,
+        # which is what makes the barriers inside it legal.
+        run = True
+        if cutlass.const_expr(tiles > 1):
+            if tid == 0:
+                cute.arch.fence_acq_rel_gpu()
+                sflag[0] = cute.arch.atomic_add(
+                    gcount.iterator + gcount.layout((bidx, hidx, cidx)),
+                    cutlass.Int32(1),
+                    sem="acq_rel",
+                    scope="gpu",
                 )
-                if token < valid:
-                    # Both halves are sums over lanes, so a tiled state width writes
-                    # one slot row per tile and :func:`close_slots` sums them. The
-                    # expression is the token's own row at one tile.
-                    trow = jbase + t0 + token
-                    for j in cutlass.range_constexpr(3):
-                        gdtrans[bidx, hidx, trow, j] = sdw[j, token] + dexp[j]
-                    gdtrans[bidx, hidx, trow, 3] = sdls[token]
+            cute.arch.sync_threads()
+            run = sflag[0] == tiles - 1
+        if run:
+            # The transition's own two cotangents and the chunk-input stage's half of
+            # the log-scale cotangent are affine in the sum, so they enter after it and
+            # are read by this tile alone. The rotation term passes through the same
+            # adjoint the tiles' terms did, which is what lets it be added after:
+            # ``rot_hom_vjp(dac + dclose, q) == rot_hom_vjp(dac, q)
+            # + rot_hom_vjp(dclose, q)``.
+            dclose = tuple(gdrot[bidx, hidx, cidx, i // 3, i % 3] for i in range(9))
+            dclast = gdscale[bidx, hidx, cidx]
+            cscale = decay(slp[last])
+            for step in cutlass.range_constexpr(-(-chunk // threads)):
+                token = tid + step * threads
+                if token < chunk:
+                    closing = token == last
+                    dq = rot_hom_vjp(
+                        dclose,
+                        (
+                            squat[0, token],
+                            squat[1, token],
+                            squat[2, token],
+                            squat[3, token],
+                        ),
+                    )
+                    # A fresh name: a tuple bound inside a dynamic ``if`` under a name
+                    # the kernel already holds a scalar under is a structure change to
+                    # the DSL, and the trace fails.
+                    if cutlass.const_expr(tiles > 1):
+                        psum = tuple(
+                            _sum_slots(vpart, word, token, tiles)
+                            for word in range(PART_WORDS)
+                        )
+                    else:
+                        psum = (*(sdrot[j, token] for j in range(4)), vdlp[token])
+                    for j in cutlass.range_constexpr(4):
+                        sdrot[j, token] = psum[j] + select(closing, dq[j], zero)
+                    vdlp[token] = (
+                        psum[4]
+                        + gdlp[bidx, hidx, cidx, token]
+                        + select(closing, 2.0 * cscale * dclast, zero)
+                    )
+                    if cutlass.const_expr(tiles > 1):
+                        for j in cutlass.range_constexpr(3):
+                            sdw[j, token] = psum[5 + j]
+            cute.arch.sync_threads()
+            chunk_suffix(vdlp, sdls, tid, chunk)
+            quat_suffix_vjp(squat, sdrot, sdquat, tid, chunk)
+            cute.arch.sync_threads()
+
+            for step in cutlass.range_constexpr(-(-chunk // threads)):
+                token = tid + step * threads
+                if token < chunk:
+                    dexp = quat_exp_vjp(
+                        (
+                            sdquat[0, token],
+                            sdquat[1, token],
+                            sdquat[2, token],
+                            sdquat[3, token],
+                        ),
+                        (strans[0, token], strans[1, token], strans[2, token]),
+                    )
+                    if token < valid:
+                        trow = t0 + token
+                        for j in cutlass.range_constexpr(3):
+                            gdtrans[bidx, hidx, trow, j] = sdw[j, token] + dexp[j]
+                        gdtrans[bidx, hidx, trow, 3] = sdls[token]
 
     cute.arch.sync_threads()
 
@@ -2968,6 +3145,8 @@ def chunk_vector_bwd(
     gcarry: cute.Tensor,
     gdtrans: cute.Tensor,
     gdtap: cute.Tensor,
+    gpart: cute.Tensor,
+    gcount: cute.Tensor,
     seqlen: cutlass.Int32,
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
@@ -3022,6 +3201,8 @@ def chunk_vector_bwd(
         gcarry,
         gdtrans,
         gdtap,
+        gpart,
+        gcount,
         seqlen,
         chunks,
         make_mma(dtype, warps),
@@ -3087,7 +3268,10 @@ def vector_reduce_kernel(
     ninety consecutive blocks holding 1.1 MB of partials, which L2 holds; the last
     shard of a token block could sum them from there for an arrival counter and a
     fence, deleting this launch and most of its DRAM read. That epilogue is in the
-    producer's device body, not here.
+    producer's device body, not here. It is what closes the transition chart, where the
+    counter costs two barriers and the sum reads back eight words a token; here it
+    would close a destination at the activation width, which is the shadow buffer
+    above, so the two are not the same arm.
 
     Args:
         gpb: ``(B,G,splits*T,3N)`` ``dB`` partials at the activation width.
@@ -3384,8 +3568,27 @@ def chunk_vector_backward(
     # heads of a group. Nothing else needs a partial row: every other output spans the
     # state width and belongs to one head, so one block owns it.
     tiles = dim // lane_block(dim)
-    held = (open_slots(dtrans, tiles), open_slots(dK, tiles, axis=-3))
+    held = open_slots(dK, tiles, axis=-3)
     shared = tuple(open_slots(out, shards) for out in (dB, dC, carry_b))
+    # The chart partials the lane tiles publish and the arrival counter that closes
+    # them: :data:`PART_WORDS` words a token a tile, 23.59 MB at the acceptance shape,
+    # freed on return with the prefixes. ``dtrans`` takes no slot buffer and no second
+    # launch, the chart closing in whichever tile arrives last.
+    #
+    # The counter is zeroed rather than counted by generation: the fill is 9.2 kB and
+    # its cost is visible, where a reset bug in a monotone counter is not. At one tile
+    # both are placeholders of the same rank and dtype, so the launch key is the same
+    # and the leading modes still index in range.
+    chart = torch.empty(
+        bsz,
+        heads,
+        chunks,
+        tiles * PART_WORDS if tiles > 1 else 1,
+        chunk_size if tiles > 1 else 1,
+        dtype=torch.float32,
+        device=device,
+    )
+    arrived = torch.zeros(bsz, heads, chunks, dtype=torch.int32, device=device)
     # The two chunk-local transition prefixes, scanned once per (batch, head, chunk)
     # rather than once per lane tile. Freed on return with the partials: 5 * L float32
     # a chunk, 2.95 MB at the acceptance shape.
@@ -3421,8 +3624,10 @@ def chunk_vector_backward(
             shared[0].dest,
             shared[1].dest,
             shared[2].dest,
-            held[0].dest,
-            held[1].dest,
+            dtrans,
+            held.dest,
+            chart,
+            arrived,
             seqlen,
             chunks,
             bsz,
@@ -3438,11 +3643,10 @@ def chunk_vector_backward(
             fold,
             shards,
             has_prev,
-            min(RESIDENT_MAX, max(1, smem_capacity() // budget)),
+            min(RESIDENT_MAX, smem_residency(budget)),
         ),
     )
-    for slots in held:
-        close_slots(slots)
+    close_slots(held)
     if shards > 1:
         jit_launch(
             vector_reduce,
