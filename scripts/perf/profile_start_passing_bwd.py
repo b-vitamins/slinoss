@@ -329,7 +329,10 @@ def analytic_bytes(
     if arm == "fused":
         bands = -(-shape.d_state // span)
         per_head = dy + trans + transition
-        rest = plane + state
+        # The fused store is the only write of the pair that narrows: ``dinc`` goes
+        # to its GEMM consumers, while the pair's ``dzstart`` is read back by the
+        # recurrence and overwritten in place, so all three of its planes are float32.
+        rest = plane // 4 * itemsize + state
         return (
             Bytes(bands * per_head + readout * shape.heads + rest),
             Bytes(per_head + readout * groups + rest),

@@ -40,6 +40,12 @@ The pair timed before the tiling sweep and again after it read 800.8 and 788.0 u
 the factor of two resolves by two orders of magnitude. At 64.3% of peak bandwidth the
 launch is off the bus, where both kernels it replaces sat at 89.5% and 92.2%.
 
+Those figures were taken with a float32 ``zstart``. At the activation dtype the same
+launch reads 46.41 MB, writes 74.34 MB, and takes 368.2 us: -67.33 MB and -31.2 us,
+both arms in one process at 1.78 GHz. Off the bus the deleted bytes buy 0.32 of the
+time they would take at peak bandwidth, against 0.61 in ``chunk_scan_fwd``, which
+reads the same plane and is still on it.
+
 The curve the sweep priced, medians of thirty launches, four warps then eight: at
 :data:`SPLIT` columns, 517.1, 408.1, 395.3 and 583.2, 442.4, 421.9 us at slices 16,
 32, 64; at the whole 240 columns, 749.1, 746.0, 675.8 and 547.8, 442.4, 430.6. A wider
@@ -60,15 +66,28 @@ read and ``zstart`` is store-only: no load in the chunk loop can alias a store i
 it, and the loop's global reads are the operand stages, which the staging helpers
 already issue before either is consumed.
 
-``zstart`` is float32 and is written in one place, the scalar store into ``gzstart``
-inside the recurrence of :func:`increment_passing_fwd_kernel`. Narrowing that buffer
-is that one line plus the ``dtype`` of the allocation in
-:func:`increment_passing_forward`: the carried state stays float32 either way, so a
-narrower destination takes a :func:`slinoss._cute.narrow` at the store, and a
-subscript store at two bytes an element moves four sectors per payload sector, which
-is why :func:`slinoss.ops.so3ssd.cute.fwd.chunk_scan.chunk_scan_fwd_kernel` stores
-``y`` through a pair fragment. Nothing else in this kernel reads the destination's
-dtype.
+``zstart`` is stored at the activation dtype and written in one place, the scalar
+store into ``gzstart`` inside the recurrence of
+:func:`increment_passing_fwd_kernel`. The carried state is float32 either way, so the
+store takes a :func:`slinoss._cute.narrow`; I4 pins float32 to the recurrence, not to
+the copy a later GEMM reads, and that GEMM narrows the copy on the way into shared
+memory whatever width it arrives at.
+
+The store's sector ratio is the same at either width and neither is one sector per
+payload sector. A thread owns three contiguous elements and adjacent threads own
+adjacent triples, so each of the three subscript stores is one warp request over 32
+elements at stride 3: 384 B touched for 128 B of payload at float32, 192 for 64 at
+the operand dtype, three sectors per payload sector both times. The narrowing halves
+the sectors and leaves the request count and the ratio alone. The ratio does not reach
+DRAM: the measured write is 144.71 MB against a 141.56 MB payload at float32 and 74.34
+against 70.78 at the operand dtype, so L2 coalesces the stride away either way. The
+pair-fragment form
+:func:`slinoss.ops.so3ssd.cute.fwd.chunk_scan.chunk_scan_fwd_kernel` stores ``y``
+through is not available here: a triple at two bytes puts the lane's base at ``6*lane``
+bytes, which is 4-byte aligned on even lanes only, so a two-element vector store has
+no legal alignment. Closing the ratio needs the ``(3, P*N)`` planar layout the
+unfused recurrence priced and rejected, which moves the cost onto the consumer that
+wants ``3N`` contiguous.
 
 The chunk transition is emitted by the ``sidx == 0`` band alone: every band computes
 the same prefix from the same ``trans``, so one writer is enough and the others read
@@ -90,6 +109,7 @@ from slinoss._cute import (
     cute_dtype,
     decay,
     jit_launch,
+    narrow,
     smem_bytes,
     smem_capacity,
     smem_residency,
@@ -331,8 +351,9 @@ def increment_passing_fwd_kernel(
         gz0: ``(B,H,3*P*N)`` float32 initial state. Read only when ``has_z0``; the
             zero-start variant is handed ``gstate`` here so the signature has one
             form.
-        gzstart: ``(B,H,C,3*P*N)`` float32, written with the state entering each
-            chunk.
+        gzstart: ``(B,H,C,3*P*N)`` at the activation dtype, written with the state
+            entering each chunk. Write only, and narrowed on the store: its one
+            consumer is a GEMM that would narrow it on the way into shared memory.
         gstate: ``(B,H,3*P*N)`` float32, written with the state after the last
             chunk.
         gcquat: ``(B,H,C,4)`` float32, written with the unit chunk rotation.
@@ -415,6 +436,7 @@ def increment_passing_fwd_kernel(
 
     acc = mma_acc(tiled_mma, tid, (mpad, span))
     state = cute.make_fragment((3 * vecs,), cutlass.Float32)
+    elem = gzstart.element_type
 
     # One 3-vector's coordinates in the tile and in the ``(P,3N)`` plane. The band
     # index is dynamic and the vector index is not, so these are hoisted out of the
@@ -593,7 +615,7 @@ def increment_passing_fwd_kernel(
             # The state entering the chunk is the accumulator before this chunk's
             # increment enters it, so the store precedes the update.
             for j in cutlass.range_constexpr(3):
-                gzstart[bidx, hidx, cidx, plane[k] + j] = carried[j]
+                gzstart[bidx, hidx, cidx, plane[k] + j] = narrow(carried[j], elem)
             # The scale multiplies the state alone, then the sum is rotated once.
             # The increment is in the chunk-local frame, so it shares the rotation
             # rather than needing its own.
@@ -701,8 +723,8 @@ class IncrementPassing(NamedTuple):
     """Result of the fused increment and recurrence.
 
     Attributes:
-        zstart: ``(B,H,C,P,3N)`` float32 state entering each chunk. A fresh buffer:
-            the increment it was formed from never exists in memory.
+        zstart: ``(B,H,C,P,3N)`` state entering each chunk, at the activation dtype.
+            A fresh buffer: the increment it was formed from never exists in memory.
         state: ``(B,H,P,3N)`` float32 state after the last chunk.
         cquat: ``(B,H,C,4)`` float32 unit chunk rotation, scalar-first.
         cscale: ``(B,H,C)`` float32 chunk decay ``exp(2*lp_{L-1})``.
@@ -819,7 +841,7 @@ def increment_passing_forward(
 
     chunks = -(-seqlen // chunk_size)
     opts = {"dtype": torch.float32, "device": U.device}
-    zstart = torch.empty(bsz, heads, chunks, rows, dim, **opts)
+    zstart = torch.empty(bsz, heads, chunks, rows, dim, dtype=dtype, device=U.device)
     state = torch.empty(bsz, heads, rows, dim, **opts)
     cquat = torch.empty(bsz, heads, chunks, 4, **opts)
     cscale = torch.empty(bsz, heads, chunks, **opts)

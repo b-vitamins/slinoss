@@ -481,6 +481,9 @@ def analytic_bytes(
     taps = tokens * shape.heads * 2 * 4 * 4
     forcing = tokens * shape.d_state * itemsize
     plane = lead * chunks * shape.rows * shape.d_state * 4
+    # The fused arm stores ``zstart`` at the activation dtype. The pair cannot: its
+    # ``zstart`` is a view of the float32 increment buffer the recurrence read.
+    stored = lead * chunks * shape.rows * shape.d_state * itemsize
     state = lead * shape.rows * shape.d_state * 4
     transition = lead * chunks * 4 * 4 + lead * chunks * 4
     carry = shape.bsz * shape.groups * shape.d_state * itemsize
@@ -490,11 +493,12 @@ def analytic_bytes(
     if arm == "fused":
         bands = -(-shape.d_state // span)
         return (
-            Bytes(bands * per_head + forcing * shape.heads + plane + written),
-            Bytes(per_head + forcing * shape.groups + plane + written),
+            Bytes(bands * per_head + forcing * shape.heads + stored + written),
+            Bytes(per_head + forcing * shape.groups + stored + written),
         )
     # Three passes over the plane: the increment writes it, the recurrence reads it,
-    # and the recurrence writes zstart over it.
+    # and the recurrence writes zstart over it. All three are float32, because the
+    # pair's zstart is a view of the increment buffer the recurrence read.
     return (
         Bytes(per_head + forcing * shape.heads + 3 * plane + written),
         Bytes(per_head + forcing * shape.groups + 3 * plane + written),

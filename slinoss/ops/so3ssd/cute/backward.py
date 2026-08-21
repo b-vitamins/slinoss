@@ -151,16 +151,16 @@ def so3ssd_bwd_cute(
     # An absent dy leaves the readout half of that cotangent identically zero, and
     # with it the reason to fuse: the fused kernel would run its GEMM against
     # zeros. That path keeps the recurrence alone over an allocated buffer, where
-    # has_dzstart drops the load and the add at compile time.
+    # has_dzstart drops the load and the add at compile time. Nothing reads that
+    # buffer before the recurrence writes it, so it carries the dtype its consumers
+    # want rather than the recurrence's own.
     if dy is not None:
         reverse = start_passing_backward(
             dy, trans, C, prologue.cquat, prologue.cscale, chunk_size, dstate
         )
     else:
         reverse = state_passing_backward(
-            torch.empty(
-                bsz, heads, chunks, rows, dim, dtype=torch.float32, device=U.device
-            ),
+            torch.empty(bsz, heads, chunks, rows, dim, dtype=U.dtype, device=U.device),
             prologue.cquat,
             prologue.cscale,
             dstate,

@@ -230,6 +230,37 @@ def test_increment_passing_matches_reference(
     assert torch.equal(out.b_last, inp.B[:, :, seqlen - 1])
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_the_start_state_carries_the_activation_dtype(dtype: torch.dtype) -> None:
+    """``zstart`` is stored at the operand width; ``state`` stays float32.
+
+    I4 pins float32 to the recurrence, which carries the state in registers and
+    returns it, not to the per-chunk copy: that copy is read by one GEMM per chunk,
+    which narrows it into shared memory whatever width it arrives at, so the store
+    narrows instead. A copy at any other width reaches
+    :func:`slinoss.ops.so3ssd.cute.guard.check_stored` at every consumer.
+
+    Chunk 0's copy is the initial state before any increment enters it, so the store
+    is checked bitwise against the narrowing of ``z0`` rather than under a tolerance.
+    """
+    inp = _make(2, 2, 2, 128, 16, 16, True, True, dtype)
+    assert inp.z0 is not None
+    out = increment_passing_forward(
+        inp.U,
+        inp.trans,
+        inp.K,
+        inp.B,
+        64,
+        z0=inp.z0,
+        u_prev=inp.u_prev,
+        b_prev=inp.b_prev,
+    )
+    torch.cuda.synchronize()
+    assert out.zstart.dtype is dtype
+    assert out.state.dtype is torch.float32
+    assert torch.equal(out.zstart[:, :, 0], inp.z0.to(dtype))
+
+
 # (span, warps, message). Everything else the host entry rejects is a guard shared
 # with the unfused increment and is tested there; what is only here is the band
 # width and the block width it has to partition.

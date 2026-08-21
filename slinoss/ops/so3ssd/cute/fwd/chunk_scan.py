@@ -138,6 +138,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_pitched,
     check_rows,
     check_shapes,
+    check_stored,
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
@@ -406,7 +407,7 @@ def chunk_scan_fwd_kernel(
         gtap: ``(B,H,T,2,4)`` float32 per-tap ``(kr, g, h, 0)``.
         gb: ``(B,G,T,3N)`` operand-dtype input vectors.
         gc: ``(B,G,T,3N)`` operand-dtype readout vectors.
-        gz: ``(B,H,C,P,3N)`` float32 chunk-start states.
+        gz: ``(B,H,C,P,3N)`` chunk-start states at the operand dtype.
         guprev: ``(B,H,P)`` streaming ``u_{-1}``, or a placeholder.
         gbprev: ``(B,G,3N)`` streaming ``b_{-1}``, or a placeholder.
         gy: ``(B,H,T,P)`` operand-dtype output, written.
@@ -738,8 +739,9 @@ def chunk_scan_forward(
             agree. ``G`` divides ``H``; head ``h`` reads group ``h // (H // G)``.
         C: ``(B,G,T,3N)``, the dtype of ``U``, pitched. A second band of the same
             projection, grouped like ``B``.
-        zstart: ``(B,H,C,P,3N)`` float32, contiguous. Every chunk's start state, as
-            :func:`slinoss.ops.so3ssd.cute.fwd.state_passing.state_passing_forward`
+        zstart: ``(B,H,C,P,3N)``, the dtype of ``U``, contiguous. Every chunk's start
+            state, as
+            :func:`slinoss.ops.so3ssd.cute.fwd.increment_passing.increment_passing_forward`
             writes it; chunk 0 holds ``z0`` or zero, so no chunk is a special case.
         chunk_size: ``L``. A multiple of 16.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, the dtype of ``U``. Paired with
@@ -750,7 +752,9 @@ def chunk_scan_forward(
         ``(B,H,T,P)`` output in the dtype of ``U``, contiguous.
 
     Raises:
-        ValueError: On a layout, rank, shape, extent, or pairing violation.
+        ValueError: On a layout, rank, shape, extent, or pairing violation, on a
+            float32-pinned operand that is not float32, or on a stored state that is
+            not at the activation dtype.
         TypeError: On an activation dtype with no tensor-core path.
     """
     # ``B`` and ``C`` are bands and the rest is not, so the layout rule splits while
@@ -762,11 +766,13 @@ def chunk_scan_forward(
         activations = (*activations, (u_prev, "u_prev"), (b_prev, "b_prev"))
         dense = (*dense, (u_prev, "u_prev"), (b_prev, "b_prev"))
 
-    pinned: Named = ((trans, "trans"), (K, "K"), (zstart, "zstart"))
-    check_layout((*dense, *pinned))
+    pinned: Named = ((trans, "trans"), (K, "K"))
+    stored: Named = ((zstart, "zstart"),)
+    check_layout((*dense, *pinned, *stored))
     check_pitched(((B, "B"), (C, "C")))
     dtype = check_operands(activations)
     check_pinned(pinned)
+    check_stored(stored, dtype)
     bsz, heads, groups, seqlen, rows, dim = check_shapes(
         U, trans, K, (B, "B"), (C, "C")
     )

@@ -11,7 +11,7 @@ Per token, at a fixed geometry:
 
 | quantity | scaling in `L` | terms |
 | --- | --- | --- |
-| chunk-state buffers | `1/L` | `inc`, `zstart`, `dinc`, `dzstart` at `(B,H,C,P,3N)` fp32 |
+| chunk-state buffers | `1/L` | `(B,H,C,P,3N)`: `zstart` and `dinc` at the activation dtype, `dzstart` fp32 |
 | chunk scalars | `1/L` | `cquat`, `cscale`, `carry_u`, `carry_b`, `dchunk_rot`, `dchunk_scale` |
 | shifted spans | `(L+1)/L` | `U` and `B`, one extra row per chunk for the previous tap |
 | token operands | flat | `dy`, `C`, `trans`, `K`, `y`, `dU`, `dB`, `dC`, `dtrans`, `dK` |

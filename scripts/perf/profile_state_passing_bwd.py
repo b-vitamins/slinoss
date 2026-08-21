@@ -148,7 +148,12 @@ def requested_shape(args: argparse.Namespace) -> OpShape:
 
 
 def build_runner(
-    shape: OpShape, device: torch.device, *, seed_state: bool, readout: bool
+    shape: OpShape,
+    device: torch.device,
+    *,
+    seed_state: bool,
+    readout: bool,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> Callable[[], None]:
     """Allocate one input set and return the callable that launches the kernel.
 
@@ -164,11 +169,16 @@ def build_runner(
     recurrence cannot grow the buffer past float32 range over a measurement's worth
     of launches.
 
+    Its width follows ``readout``, which is the only thing that decides whether the
+    recurrence reads it: float32 where it does, the activation dtype where the buffer
+    is output-only and its consumers stage it at their operand width.
+
     Args:
         shape: The problem size.
         device: Where to allocate.
         seed_state: Supply the final-state cotangent.
         readout: Whether ``dzstart`` carries the readout cotangent on entry.
+        dtype: Activation dtype the output-only variant stores at.
 
     Returns:
         The callable. Allocates ``dz0`` per call as the host entry does.
@@ -176,10 +186,17 @@ def build_runner(
     gen = torch.Generator(device=device).manual_seed(1)
     chunks = -(-shape.seq // shape.chunk)
 
-    def randn(*size: int) -> torch.Tensor:
-        return torch.randn(*size, dtype=torch.float32, device=device, generator=gen)
+    def randn(*size: int, dt: torch.dtype = torch.float32) -> torch.Tensor:
+        return torch.randn(*size, dtype=dt, device=device, generator=gen)
 
-    dzstart = randn(shape.bsz, shape.heads, chunks, shape.rows, shape.d_state)
+    dzstart = randn(
+        shape.bsz,
+        shape.heads,
+        chunks,
+        shape.rows,
+        shape.d_state,
+        dt=torch.float32 if readout else dtype,
+    )
     cquat = randn(shape.bsz, shape.heads, chunks, 4)
     cquat = cquat / cquat.norm(dim=-1, keepdim=True)
     cscale = randn(shape.bsz, shape.heads, chunks).sigmoid()
@@ -241,17 +258,26 @@ def local_sectors(one: NcuPass) -> dict[str, float]:
     return out
 
 
-def analytic_bytes(shape: OpShape, *, seed_state: bool, readout: bool) -> Bytes:
-    """Traffic one launch moves, operand by operand, every tensor float32.
+def analytic_bytes(
+    shape: OpShape,
+    *,
+    seed_state: bool,
+    readout: bool,
+    itemsize: int = 2,
+) -> Bytes:
+    """Traffic one launch moves, operand by operand.
 
     ``dzstart`` is read and written over once, the readout variant deciding the
     read; ``dz0`` is written; the two chunk transitions are read once per chunk and
-    head. Nothing is read twice, so this is the floor's byte count.
+    head. Nothing is read twice, so this is the floor's byte count. Every tensor is
+    float32 except an output-only ``dzstart``, which the kernel stores at the width
+    its consumers stage it from.
 
     Args:
         shape: The problem size.
         seed_state: Whether the final-state cotangent is read.
         readout: Whether ``dzstart`` is read as well as written.
+        itemsize: Bytes per element of an output-only ``dzstart``.
 
     Returns:
         Bytes moved per launch.
@@ -259,7 +285,8 @@ def analytic_bytes(shape: OpShape, *, seed_state: bool, readout: bool) -> Bytes:
     chunks = -(-shape.seq // shape.chunk)
     lead = shape.bsz * shape.heads
     state = lead * shape.rows * shape.d_state * 4
-    total = state * chunks * (2 if readout else 1)
+    plane = lead * shape.rows * shape.d_state * (4 if readout else itemsize)
+    total = plane * chunks * (2 if readout else 1)
     total += state
     total += state if seed_state else 0
     total += lead * chunks * 4 * 4

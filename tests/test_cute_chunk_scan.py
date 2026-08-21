@@ -23,9 +23,8 @@ from collections.abc import Callable
 from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
-from slinoss.ops.so3ssd.cute.fwd.chunk_increment import chunk_increment_forward
 from slinoss.ops.so3ssd.cute.fwd.chunk_scan import chunk_scan_forward, scan_smem_bytes
-from slinoss.ops.so3ssd.cute.fwd.state_passing import state_passing_forward
+from slinoss.ops.so3ssd.cute.fwd.increment_passing import increment_passing_forward
 from tests.conftest import (
     ScanInputs,
     assert_max_rel,
@@ -133,7 +132,7 @@ def test_chunk_scan_matches_reference(
     """The output matches a float64 forward given the same chunk-start state."""
     inp = _make(bsz, heads, seqlen, rows, lanes, streaming, dtype)
     ref = _reference(inp, chunk)
-    zstart = ref.zstart.flatten(-2, -1).float().contiguous()
+    zstart = ref.zstart.flatten(-2, -1).to(dtype).contiguous()
     out = chunk_scan_forward(
         inp.U,
         inp.trans,
@@ -158,22 +157,29 @@ def test_chunk_scan_matches_reference(
 
 
 def test_composes_with_the_real_chunk_start_state() -> None:
-    """The three forward kernels agree about the state between them.
+    """The two forward kernels agree about the state between them.
 
     The parity cases above hand the kernel the reference's state, so they would
-    still pass if the increment emitted its state in a different frame, if the
+    still pass if the prologue emitted its state in a different frame, if the
     recurrence wrote a different chunk index, or if the lane order disagreed. Run
     end to end, with more than one chunk and a nonzero initial state, none of those
-    survive.
+    survive. The producer is the fused prologue, which is what the forward launches
+    and what stores the state at the width this kernel reads.
     """
     inp = _make(2, 2, 200, 48, 16, True, torch.bfloat16)
     chunk = 64
     ref = _reference(inp, chunk)
-    inc = chunk_increment_forward(
-        inp.U, inp.trans, inp.K, inp.B, chunk, u_prev=inp.u_prev, b_prev=inp.b_prev
-    )
     assert inp.z0 is not None
-    passed = state_passing_forward(inc.inc, inc.cquat, inc.cscale, inp.z0)
+    passed = increment_passing_forward(
+        inp.U,
+        inp.trans,
+        inp.K,
+        inp.B,
+        chunk,
+        z0=inp.z0,
+        u_prev=inp.u_prev,
+        b_prev=inp.b_prev,
+    )
     out = chunk_scan_forward(
         inp.U,
         inp.trans,
@@ -187,9 +193,10 @@ def test_composes_with_the_real_chunk_start_state() -> None:
     )
     torch.cuda.synchronize()
     # Same bound as bfloat16 parity. The two producers add their own error, but the
-    # state they hand over is float32 and the chunk decay attenuates it, so the
-    # residual stays inside one bfloat16 half-ulp: 2.9e-3 measured against 3.8e-3
-    # for this kernel alone.
+    # recurrence that produces the state carries float32 and only its store narrows,
+    # to the width this kernel would have narrowed it to anyway, and the chunk decay
+    # attenuates it. So the residual stays inside one bfloat16 half-ulp: 2.9e-3
+    # measured against 3.8e-3 for this kernel alone.
     assert_max_rel(out, ref.y, BOUNDS[torch.bfloat16], "cute-scan-composed.y")
 
 
@@ -228,7 +235,7 @@ def test_reads_bands_of_the_fused_projection() -> None:
         u_dtype=torch.bfloat16,
         bc_dtype=torch.bfloat16,
     )
-    zstart = _reference(inp, 64).zstart.flatten(-2, -1).float().contiguous()
+    zstart = _reference(inp, 64).zstart.flatten(-2, -1).bfloat16().contiguous()
     want = chunk_scan_forward(inp.U, inp.trans, inp.K, inp.B, inp.C, zstart, 64)
     got = chunk_scan_forward(
         inp.U,
@@ -246,8 +253,8 @@ def test_reads_bands_of_the_fused_projection() -> None:
 Operands = dict[str, torch.Tensor]
 
 # The shared host guard is covered through the chunk increment. What is reachable
-# only here is the second readout vector, ``P`` as an N extent, and the shape of
-# the chunk-start state.
+# only here is the second readout vector, ``P`` as an N extent, and the shape and
+# dtype of the chunk-start state.
 REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     (lambda a: a.update(C=a["C"].float()), TypeError, "C has dtype"),
     (lambda a: a.update(C=a["C"][..., :48].contiguous()), ValueError, "C must be"),
@@ -256,6 +263,7 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
         ValueError,
         "zstart",
     ),
+    (lambda a: a.update(zstart=a["zstart"].float()), ValueError, "zstart must be"),
 ]
 
 
@@ -273,7 +281,7 @@ def test_rejects_a_bad_operand(
         "K": inp.K,
         "B": inp.B,
         "C": inp.C,
-        "zstart": torch.zeros(2, 2, 2, 16, 96, device="cuda"),
+        "zstart": torch.zeros(2, 2, 2, 16, 96, dtype=torch.bfloat16, device="cuda"),
     }
     mutate(args)
     with pytest.raises(exc, match=match):
@@ -294,6 +302,6 @@ def test_rejects_a_head_width_the_atom_cannot_cover() -> None:
     The fix for an illegal extent is the shape, never a padding path.
     """
     inp = _make(2, 2, 128, 24, 16, False, torch.bfloat16)
-    zstart = torch.zeros(2, 2, 2, 24, 48, device="cuda")
+    zstart = torch.zeros(2, 2, 2, 24, 48, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="P must be a multiple of 16"):
         chunk_scan_forward(inp.U, inp.trans, inp.K, inp.B, inp.C, zstart, 64)

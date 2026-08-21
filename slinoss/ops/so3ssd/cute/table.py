@@ -108,7 +108,7 @@ __all__ = [
 PREFETCH: int = 4
 """Staging steps whose global loads are issued before any of them is consumed.
 
-Bounds the load phase at ``3 * PREFETCH`` live float32 registers while keeping
+Bounds the load phase at ``3 * PREFETCH`` live source elements while keeping
 ``3 * PREFETCH`` loads outstanding per thread, which is what covers one global
 latency. One is the serial form: load, transform, store, wait, repeat.
 
@@ -150,7 +150,7 @@ kernel and the staging stores share them with the operand stores; separating the
 two needs source-level counters.
 
 A step carries twice the elements, so both paired passes take ``PREFETCH //
-LANE_PAIR`` steps per group and the live float32 count and the elements in flight
+LANE_PAIR`` steps per group and the live element count and the elements in flight
 are the ones :data:`PREFETCH` states.
 
 ``lanes`` is even at every legal shape:
@@ -661,26 +661,27 @@ def stage_state(
     width: cutlass.Constexpr,
     dim: cutlass.Constexpr,
 ) -> None:
-    """Narrow a chunk-start state into an operand tile.
+    """Stage a chunk-start state into an operand tile.
 
-    The state is float32 by I4 and every GEMM operand is low precision, so the
-    narrowing happens here, once, on the way into shared memory. The chunk-start
-    state is read by one contraction per chunk and never written, so there is no
-    accumulation for the narrowing to compound through.
+    Both callers hand this a state the producing recurrence already stored at the
+    operand dtype, so the conversion below is width-preserving there. It is kept
+    because it is the only thing that would have to change to stage a float32 state,
+    and because the chunk-start state is read by one contraction per chunk and never
+    written, so there is no accumulation for a narrowing to compound through.
 
-    ``(P, 3N)`` is one contiguous float32 run and the loop walks it at the block
-    stride, so a warp covers 1,024 contiguous bytes per step and no index arithmetic
-    survives. The steps run in groups of :data:`PREFETCH`, loads first, so the
-    group's loads overlap: this is the largest single read in the operator and a
-    serial step-by-step form pays one global latency per element per thread.
+    ``(P, 3N)`` is one contiguous run and the loop walks it at the block stride, so a
+    warp covers 64 contiguous elements per step and no index arithmetic survives. The
+    steps run in groups of :data:`PREFETCH`, loads first, so the group's loads
+    overlap: this is the largest single read in the operator and a serial
+    step-by-step form pays one global latency per element per thread.
 
-    A step carries :data:`LANE_PAIR` adjacent columns, which is one eight-byte read
-    and one four-byte write in place of two of each. The port issues one access per
-    two cycles whatever its width, so the pair halves the cost of the pass.
+    A step carries :data:`LANE_PAIR` adjacent columns, which is one read and one write
+    of the pair's width in place of two of each. The port issues one access per two
+    cycles whatever its width, so the pair halves the cost of the pass.
 
     Args:
-        gz: ``(P, 3N)`` float32 view of the chunk-start state for one
-            ``(chunk, batch, head)``.
+        gz: ``(P, 3N)`` view of the chunk-start state for one
+            ``(chunk, batch, head)``, at the operand dtype or float32.
         sz: Operand-dtype tile of at least ``width`` rows, written over ``dim``
             columns. The rest of the pitch is outside every view.
         tid: Thread index within the block.
@@ -760,7 +761,8 @@ def stage_matrix(
     reason given in :func:`stage_rotated`.
 
     Args:
-        gv: ``(B,H,C,P,3N)`` float32 source. Read at ``[bidx, hidx, cidx]``.
+        gv: ``(B,H,C,P,3N)`` source at the operand dtype or float32, widened on the
+            read. Read at ``[bidx, hidx, cidx]``.
         dst: Operand-dtype tile of at least ``rows`` rows, written over ``3N``
             columns. The rest of the pitch is outside every view.
         sfp32: Float32 tile of the same extents, written only when ``keep_fp32``.

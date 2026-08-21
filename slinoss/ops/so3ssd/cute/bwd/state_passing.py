@@ -30,7 +30,9 @@ launch is exact: no tail tile, no bounds predicate, no padding path.
 ``c`` is written and the launch is a bijection from threads onto 3-vectors, so
 only the thread that owns a 3-vector ever touches its three elements and the
 alias is entirely intra-thread. The backward carries one ``(B,H,C,P,3N)`` buffer
-instead of two.
+instead of two. The alias survives a narrowed store because both sides are the same
+tensor: the store carries whatever width the buffer has, and the read side of the
+alias only exists when that width is float32.
 
 The chunk loop is a one-deep software pipeline, the mirror of the forward's:
 chunk ``c-1`` is fetched, then chunk ``c`` is stored, then chunk ``c`` is
@@ -62,9 +64,9 @@ starts the accumulator at zero; an absent ``dzstart`` -- which is what an absent
 filled it never launched -- drops both its load and its add. Neither is
 multiplied by zero at runtime.
 
-DRAM-bound, and at the floor. Every tensor is float32 and touched once. At ``B=4
-H=18 T=2048 P=64 3N=240 L=64``, so ``C=32``, with ``dzstart`` present and ``dstate``
-absent, per launch:
+DRAM-bound, and at the floor. Every tensor is touched once, and float32 in the
+configuration counted here. At ``B=4 H=18 T=2048 P=64 3N=240 L=64``, so ``C=32``,
+with ``dzstart`` present and ``dstate`` absent, per launch:
 
     dzstart  4*18*32*64*240*4  = 141.56 MB read
     dinc     4*18*32*64*240*4  = 141.56 MB written over it
@@ -84,6 +86,12 @@ and 427.9 us, 99.6% and 99.3% of the floor, 673.7 GB/s achieved and 92.4% of DRA
 speed-of-light. ``long_scoreboard`` is 58.6% of stalls and ``lg_throttle`` 35.9% at
 14.9% issue: warps waiting on a saturated bus. Fewer bytes is the only lever this
 kernel has left, and the ``dzstart`` round trip is 98% of them.
+
+An absent ``dzstart`` is the configuration the operator actually launches, and it
+has neither half of that round trip: the load is compiled out, and the store lands
+at the dtype the consumers read, 70.78 MB rather than 141.56 MB at a 16-bit operand.
+That leaves 75.25 MB against 287.59 MB, so the count above bounds this kernel rather
+than describing its production launch.
 
 The serialization is not what bounds it. One thread carries one 3-vector through the
 whole reverse chain, but the chain is ``C`` rotations over ``B*H*P*N`` independent
@@ -112,14 +120,20 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from slinoss._cute import Stream, jit_launch
+from slinoss._cute import Stream, jit_launch, narrow
 from slinoss.ops.so3ssd.cute.common import (
     THREADS,
     mat3_matvec,
     mat3_transpose,
     rot_hom,
 )
-from slinoss.ops.so3ssd.cute.guard import Named, check_layout, check_pinned
+from slinoss.ops.so3ssd.cute.guard import (
+    OPERAND_DTYPES,
+    Named,
+    check_dtypes,
+    check_layout,
+    check_pinned,
+)
 
 __all__ = [
     "StatePassingBwd",
@@ -144,10 +158,11 @@ def state_passing_bwd_kernel(
     """Run the reverse chunk recurrence and overwrite ``dzstart`` with ``dinc``.
 
     Args:
-        gdzstart: ``(B,H,C,3*P*N)`` float32. Read as the cotangent of each
-            chunk's start state, written as the cotangent of each chunk's
-            increment in the global frame. Read only when ``has_dzstart``; the
-            store is unconditional.
+        gdzstart: ``(B,H,C,3*P*N)``. Read as the cotangent of each chunk's start
+            state, written as the cotangent of each chunk's increment in the global
+            frame. Read only when ``has_dzstart``; the store is unconditional and
+            narrows to the buffer's own width. float32 when ``has_dzstart``, since
+            the recurrence then reads it; at the consumer's dtype when not.
         gcquat: ``(B,H,C,4)`` float32 unit chunk rotations.
         gcscale: ``(B,H,C)`` float32 chunk decays, ``exp(2*lp_{L-1})``.
         gdstate: ``(B,H,3*P*N)`` float32 cotangent of the final state. Read only
@@ -188,6 +203,7 @@ def state_passing_bwd_kernel(
             gdzstart[bidx, hidx, last, base + 2],
         )
     dzx, dzy, dzz = readout
+    elem = gdzstart.element_type
     qw = gcquat[bidx, hidx, last, 0]
     qx = gcquat[bidx, hidx, last, 1]
     qy = gcquat[bidx, hidx, last, 2]
@@ -214,9 +230,9 @@ def state_passing_bwd_kernel(
         pqz = gcquat[bidx, hidx, prv, 3]
         pdecayed = gcscale[bidx, hidx, prv]
 
-        gdzstart[bidx, hidx, chunk, base] = ax
-        gdzstart[bidx, hidx, chunk, base + 1] = ay
-        gdzstart[bidx, hidx, chunk, base + 2] = az
+        gdzstart[bidx, hidx, chunk, base] = narrow(ax, elem)
+        gdzstart[bidx, hidx, chunk, base + 1] = narrow(ay, elem)
+        gdzstart[bidx, hidx, chunk, base + 2] = narrow(az, elem)
         # One rotation, then the scale, then the readout cotangent. The forward
         # scales the state alone and rotates the sum; transposing that order puts
         # the scale outside the rotation here.
@@ -280,8 +296,9 @@ class StatePassingBwd(NamedTuple):
     """Result of the reverse chunk recurrence.
 
     Attributes:
-        dinc: ``(B,H,C,P,3N)`` float32 cotangent of each chunk's increment, in
-            the global frame. Aliases the ``dzstart`` buffer that was passed in.
+        dinc: ``(B,H,C,P,3N)`` cotangent of each chunk's increment, in the global
+            frame, at the dtype of the buffer that was passed in. Aliases that
+            buffer.
         dz0: ``(B,H,P,3N)`` float32 cotangent of the initial state. Present
             whether or not the forward carried one, because the chunk-increment
             adjoint has no use for it and the operator's own gradient contract
@@ -303,10 +320,12 @@ def state_passing_backward(
     """Run the reverse inter-chunk recurrence in place over ``dzstart``.
 
     Args:
-        dzstart: ``(B,H,C,P,3N)`` float32, contiguous. The cotangent of each
-            chunk's start state. Consumed: on return this buffer holds ``dinc``.
-            With ``has_dzstart`` false it is output-only and its contents on
-            entry are never read.
+        dzstart: ``(B,H,C,P,3N)``, contiguous. The cotangent of each chunk's start
+            state. Consumed: on return this buffer holds ``dinc``. float32 with
+            ``has_dzstart``, because the recurrence then reads it. With
+            ``has_dzstart`` false it is output-only, its contents on entry are never
+            read, and it may carry any dtype the kernel can store: float32 or a
+            tensor-core operand dtype, which is what its consumers read it at.
         cquat: ``(B,H,C,4)`` float32, contiguous. Unit chunk rotations
             ``Q_{L-1}``, scalar-first. The same tensor the forward consumed.
         cscale: ``(B,H,C)`` float32, contiguous. Chunk decays
@@ -322,14 +341,21 @@ def state_passing_backward(
         A :class:`StatePassingBwd`. ``dinc`` is a view of ``dzstart``.
 
     Raises:
-        ValueError: On a dtype, device, layout, rank, or shape mismatch, or on a
-            ``(P, 3N)`` pair the exact launch cannot cover.
+        ValueError: On a device, layout, rank, or shape mismatch, on a float32-pinned
+            operand that is not float32, or on a ``(P, 3N)`` pair the exact launch
+            cannot cover.
+        TypeError: On an output-only ``dzstart`` at a dtype no kernel stores.
     """
-    pinned: Named = ((dzstart, "dzstart"), (cquat, "cquat"), (cscale, "cscale"))
+    pinned: Named = ((cquat, "cquat"), (cscale, "cscale"))
     if dstate is not None:
         pinned = (*pinned, (dstate, "dstate"))
-    check_layout(pinned)
-    check_pinned(pinned)
+    stored: Named = ((dzstart, "dzstart"),)
+    check_layout((*stored, *pinned))
+    if has_dzstart:
+        check_pinned((*stored, *pinned))
+    else:
+        check_pinned(pinned)
+        check_dtypes(stored, (torch.float32, *OPERAND_DTYPES), "storable state dtypes")
     if dzstart.ndim != 5 or cquat.ndim != 4 or cscale.ndim != 3:
         raise ValueError(
             "expected (B,H,C,P,3N), (B,H,C,4) and (B,H,C), got "
@@ -355,9 +381,9 @@ def state_passing_backward(
             )
         seed = dstate
 
-    # The trailing (P,3N) pair is one flat run of 3*P*N floats, so the thread
+    # The trailing (P,3N) pair is one flat run of 3*P*N elements, so the thread
     # that owns 3-vector v owns exactly elements 3v..3v+2 of it. No index
-    # arithmetic, and a warp covers 384 contiguous bytes.
+    # arithmetic, and a warp covers 96 contiguous elements.
     tiles = rows * dim // 3 // THREADS
     jit_launch(
         state_passing_bwd,

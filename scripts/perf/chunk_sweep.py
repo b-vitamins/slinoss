@@ -419,6 +419,14 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
     def buffer(c: int) -> int:
         return g.bsz * g.heads * g.chunks(c) * g.rows * g.dim * 4
 
+    # A (B,H,C,P,3N) state a recurrence stored rather than reads: the store narrows
+    # to the width its GEMM consumers stage it at. Only zstart is one on this arm.
+    # The shipped backward's fused launch writes dinc at this width too; the unfused
+    # chunk-start pair modelled below overwrites dzstart in place, so both are
+    # float32 there.
+    def stored(c: int) -> int:
+        return g.bsz * g.heads * g.chunks(c) * g.rows * g.dim * g.itemsize
+
     def cquat(c: int) -> int:
         return g.bsz * g.heads * g.chunks(c) * 4 * 4
 
@@ -457,7 +465,7 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
         ("trans", "read", trans),
         ("K", "read", taps),
         ("B", "read", band_shifted),
-        ("zstart", "write", buffer),
+        ("zstart", "write", stored),
         ("state", "write", state),
         ("cquat", "write", cquat),
         ("cscale", "write", cscale),
@@ -472,7 +480,7 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
                 ("K", "read", taps),
                 ("B", "read", band_shifted),
                 ("C", "read", band),
-                ("zstart", "read", buffer),
+                ("zstart", "read", stored),
                 ("y", "write", rowwise),
             ),
         ),
@@ -505,7 +513,7 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
                 ("B_tap", "read", band),
                 ("C", "read", band),
                 ("dinc", "read", buffer),
-                ("zstart", "read", buffer),
+                ("zstart", "read", stored),
                 ("dU", "write", rowwise),
                 ("carry_u", "write", carry_u),
                 ("dlogp", "write", dlogp),
@@ -523,7 +531,7 @@ def traffic_terms(geo: Geometry, chunk: int) -> tuple[TrafficTerm, ...]:
                 ("trans", "read", trans),
                 ("K", "read", taps),
                 ("dinc", "read", buffer),
-                ("zstart", "read", buffer),
+                ("zstart", "read", stored),
                 ("dlogp", "read", dlogp),
                 ("dchunk_rot", "read", dchunk_rot),
                 ("dchunk_scale", "read", cscale),

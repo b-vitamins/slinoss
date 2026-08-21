@@ -189,8 +189,8 @@ def build_runner(
     chunks = -(-shape.seq // shape.chunk)
     gen = torch.Generator(device=device).manual_seed(1)
     state = (shape.bsz, shape.heads, chunks, shape.rows, shape.d_state)
-    dinc = torch.randn(*state, dtype=torch.float32, device=device, generator=gen)
-    zstart = torch.randn(*state, dtype=torch.float32, device=device, generator=gen)
+    dinc = torch.randn(*state, dtype=dtype, device=device, generator=gen)
+    zstart = torch.randn(*state, dtype=dtype, device=device, generator=gen)
     forcing = inputs.B[:, :groups]
     readout = inputs.C[:, :groups]
 

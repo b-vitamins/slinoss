@@ -56,6 +56,11 @@ not reach it at the same instant, which is the reason the memory side is measure
 rather than added up. The saved set rose by less than either figure, 5,687.65 MiB
 over 386 storages to 7,227.12 MiB over 419.
 
+Every figure above was measured with a float32 ``zstart``. It is stored at the
+activation dtype now, so the retained tensor is 67.50 MiB a layer and the memory side
+of the trade is half what is printed here. The time side is unchanged: the policy
+deletes launches and the launch count does not follow a width.
+
 Saving less is not available, and the fusion is what settles it: one launch produces
 all three, so any subset leaves that launch in the backward and returns none of its
 time for whatever share of the 1,755 MiB the subset holds. Every partial policy is

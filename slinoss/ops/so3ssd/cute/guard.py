@@ -44,6 +44,7 @@ __all__ = [
     "check_pitched",
     "check_rows",
     "check_shapes",
+    "check_stored",
     "check_stream",
 ]
 
@@ -77,6 +78,33 @@ def check_pinned(named: Named) -> None:
     for tensor, name in named:
         if tensor.dtype is not torch.float32:
             raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
+
+
+def check_stored(named: Named, dtype: torch.dtype) -> None:
+    """Check a state buffer the recurrence wrote against the activation dtype.
+
+    I4 pins float32 to the recurrence that produces a state, not to the copy a
+    later GEMM reads. A buffer a recurrence only ever writes leaves it once and is
+    narrowed on the way into shared memory by
+    :func:`slinoss.ops.so3ssd.cute.table.stage_state`, so carrying it at the
+    operand width is the same rounding one launch earlier and half the traffic. The
+    dtype has to be the activation's rather than a fixed 16-bit width: pre-rounding
+    to the width the consumer narrows to anyway is idempotent, and pre-rounding to
+    a wider one is a second rounding the fp16 bound does not have room for.
+
+    A buffer the recurrence reads is not this case, and neither is one a non-GEMM
+    epilogue reads: ``inc`` feeds the forward recurrence and stays float32.
+
+    Args:
+        named: ``(tensor, name)`` pairs holding the stored states.
+        dtype: The activation dtype, from :func:`check_operands`.
+
+    Raises:
+        ValueError: If a stored state is not at the activation dtype.
+    """
+    for tensor, name in named:
+        if tensor.dtype is not dtype:
+            raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
 
 
 def check_shapes(

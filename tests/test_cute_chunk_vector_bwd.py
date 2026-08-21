@@ -6,8 +6,9 @@ rounding of the inputs is inside both paths and the residual is the kernel's own
 arithmetic: the float32 table, the float32 accumulators, and the one narrowing of
 each operand on its way into shared memory.
 
-Four float32 inputs come from the reference rather than from a generator.
-``dinc`` and ``zstart`` are what the two stages ahead of this one hand over, and
+Five inputs come from the reference rather than from a generator.
+``dinc`` and ``zstart`` are what the two stages ahead of this one hand over, at the
+operand dtype because their producers narrow on the store, and
 ``dlogp``, ``dchunk_rot`` and ``dchunk_scale`` are the chunk-input stage's three
 closing cotangents, which this kernel consumes and never recomputes. A fabricated
 set would not compose the chunks.
@@ -155,7 +156,7 @@ def _dbl(t: Tensor | None) -> Tensor | None:
 
 class Oracle(NamedTuple):
     """The float64 values the five outputs are checked against, and the five
-    float32 inputs the kernel takes from the stages ahead of it.
+    inputs the kernel takes from the stages ahead of it.
 
     Attributes:
         dB: ``(B,G,T,3N)``, already corrected for the boundary rows this kernel
@@ -164,8 +165,9 @@ class Oracle(NamedTuple):
         carry_b: ``(B,G,C,3N)``.
         dtrans: ``(B,H,T,4)``.
         dK: ``(B,H,T,2,4)``.
-        dinc: ``(B,H,C,P,3N)`` float32, the recurrence carry in the global frame.
-        zstart: ``(B,H,C,P,3N)`` float32, the state entering each chunk.
+        dinc: ``(B,H,C,P,3N)`` at the operand dtype, the recurrence carry in the
+            global frame.
+        zstart: ``(B,H,C,P,3N)`` at the operand dtype, the state entering each chunk.
         dlogp: ``(B,H,C,L)`` float32, the chunk-input stage's log-scale half.
         dchunk_rot: ``(B,H,C,3,3)`` float32.
         dchunk_scale: ``(B,H,C)`` float32.
@@ -246,8 +248,8 @@ def _oracle(
         carry_b=ref.carry_b,
         dtrans=ref.grads.dtrans,
         dK=ref.grads.dK,
-        dinc=ref.dinc.float().contiguous(),
-        zstart=fw.zstart.flatten(-2, -1).float().contiguous(),
+        dinc=ref.dinc.to(U.dtype).contiguous(),
+        zstart=fw.zstart.flatten(-2, -1).to(U.dtype).contiguous(),
         dlogp=ref.dlogp_scan.float().contiguous(),
         dchunk_rot=ref.dchunk_rot.float().contiguous(),
         dchunk_scale=ref.dchunk_scale.float().contiguous(),
@@ -264,7 +266,7 @@ def _run(
     splits: int | None = None,
     warps: int = WARPS,
 ) -> ChunkVectorBwd:
-    """One launch, against the float32 inputs the oracle carries."""
+    """One launch, against the inputs the oracle carries."""
     got = chunk_vector_backward(
         dy,
         inp.U,
@@ -915,9 +917,9 @@ def _call(args: Operands, chunk: int = 64) -> ChunkVectorBwd:
 
 REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     # The rows this kernel owns are the ones no shared rule covers: the cotangent
-    # checked against ``U`` rather than against itself, the two float32 state
-    # buffers whose chunk count is derived and not passed, the three closing
-    # cotangents from the stage ahead, and the streaming pair.
+    # checked against ``U`` rather than against itself, the two state buffers whose
+    # chunk count is derived and not passed, the three closing cotangents from the
+    # stage ahead, and the streaming pair.
     (
         lambda a: a.update(dy=_t(a["dy"])[:, :, :-1].contiguous()),
         ValueError,
@@ -951,10 +953,12 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     (lambda a: a.update(b_prev=None), ValueError, "supplied together"),
     (lambda a: a.update(u_prev=None), ValueError, "supplied together"),
     # One row per shared rule this kernel is the first to reach on an operand of
-    # its own: ``U`` shares a dtype group with ``dy``, ``B`` and ``C``, and every
-    # cotangent from a stage ahead is pinned by I4 and read as a dense tile.
+    # its own: ``U`` shares a dtype group with ``dy``, ``B`` and ``C``, the three
+    # closing cotangents are pinned by I4, and the two state buffers follow the
+    # activation dtype instead. All are read as dense tiles.
     (lambda a: a.update(U=_t(a["U"]).half()), TypeError, "one dtype per call"),
     (lambda a: a.update(dlogp=_t(a["dlogp"]).double()), ValueError, "float32"),
+    (lambda a: a.update(zstart=_t(a["zstart"]).float()), ValueError, "zstart must be"),
     (
         lambda a: a.update(zstart=_t(a["zstart"]).transpose(-1, -2)),
         ValueError,
@@ -1027,16 +1031,16 @@ def test_rejects_an_extent_the_atom_cannot_cover(
 ) -> None:
     """The fix for an illegal extent is the shape, never a padding path.
 
-    The float32 inputs are zeros here rather than reference output. The reference
-    refuses ``P = 24`` and ``3N = 24`` itself, so no pipeline can produce a matching
-    set, and the extent check runs before any element is read.
+    The non-activation inputs are zeros here rather than reference output. The
+    reference refuses ``P = 24`` and ``3N = 24`` itself, so no pipeline can produce a
+    matching set, and the extent check runs before any element is read.
     """
     seqlen = 128
     chunks = -(-seqlen // chunk)
     inp = _make(2, 2, seqlen, rows, lanes, torch.bfloat16, groups=groups)
     dy = _cotangent(inp, torch.bfloat16)
     state = torch.zeros(
-        2, 2, chunks, rows, 3 * lanes, dtype=torch.float32, device="cuda"
+        2, 2, chunks, rows, 3 * lanes, dtype=torch.bfloat16, device="cuda"
     )
     dlogp = torch.zeros(2, 2, chunks, chunk, dtype=torch.float32, device="cuda")
     drot = torch.zeros(2, 2, chunks, 3, 3, dtype=torch.float32, device="cuda")

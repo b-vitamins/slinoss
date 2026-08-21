@@ -77,12 +77,21 @@ and quaternion tiles of the prologue and the float32 shift tile of the epilogue
 alias the last three, neither being live when the other is.
 
 DRAM-bound. Analytic traffic at ``standard`` is ``dy 9.44 + U 9.58 + trans 1.57 +
-K 3.15 + B 19.02 + C 9.44 + dinc 14.16 + zstart 14.16 + dU 9.44 + carry_u 0.29 +
-dlogp 0.39 + dchunk_rot 0.06 + dchunk_scale 0.01 = 90.70 MB`` against ``1536 *
-3.54 MFLOP = 5.44 GFLOP``, so 60.0 flop/byte against a ridge point of 164: memory
-bound by a factor of nearly three. A supplied ``du_init`` adds one read of 9.44 MB
-at that shape, against the 28.32 MB a caller-side add of the same tensor would
-cost.
+K 3.15 + B 19.02 + C 9.44 + dinc 7.08 + zstart 7.08 + dU 9.44 + carry_u 0.29 +
+dlogp 0.39 + dchunk_rot 0.06 + dchunk_scale 0.01 = 76.54 MB`` against ``1536 *
+3.54 MFLOP = 5.44 GFLOP``, so 71.1 flop/byte against a ridge point of 164: memory
+bound by a factor of over two. ``dinc`` and ``zstart`` are two of the three reads
+that are not activations and the only two at the operand width rather than float32:
+each is a state a recurrence stored, and this kernel and ``chunk_vector_bwd`` are
+its only readers. A supplied ``du_init`` adds one read of 9.44 MB at that shape,
+against the 28.32 MB a caller-side add of the same tensor would cost.
+
+Every measurement in the rest of this docstring was taken with those two at float32.
+Narrowing them is -95.9 us on this launch at the acceptance shape, 861.9 to 766.0,
+with the measured read falling 484.33 MB to 257.79 MB: 226.54 MB against the 141.56
+the two planes account for, because a float32 plane at this kernel's lane blocking
+also costs sectors the narrow one does not. Local load and store traffic is zero on
+both sides, so none of it is spill.
 
 The class is met at ``3N = 240 H = 18`` and at ``wide``, and not at the other three
 shapes. Measured on an RTX A6000, sm_86, clocks not locked, 2026-08-21, one launch per
@@ -176,7 +185,7 @@ sectors per launch per word per thread that made 167 words loaded and 40 stored,
 which 14 were reloaded on each of the ten trips: the eight per-step element offsets of
 the increment staging pass and three 64-bit base pointers. Eliminating the eight left
 81 loaded and 27 stored, about five words per trip. The three pointers survive slicing
-the two float32 tensors to the chunk's plane, so what remained was not addressed by
+the two state tensors to the chunk's plane, so what remained was not addressed by
 removing coordinates, and what removed it was the live range and not the addresses.
 
 Neither bound is occupancy or block width. Occupancy is 16.7% theoretical against 16.3
@@ -244,6 +253,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_pitched,
     check_rows,
     check_shapes,
+    check_stored,
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
@@ -708,8 +718,8 @@ def chunk_input_bwd_kernel(
         gb: ``(B,G,T,3N)`` operand-dtype forcing vectors.
         gbprev: ``(B,G,3N)`` streaming ``b_{-1}``. Read only when ``has_prev``.
         gc: ``(B,G,T,3N)`` operand-dtype output vectors.
-        gdinc: ``(B,H,C,P,3N)`` float32 increment cotangent, global frame.
-        gz: ``(B,H,C,P,3N)`` float32 chunk-start state.
+        gdinc: ``(B,H,C,P,3N)`` operand-dtype increment cotangent, global frame.
+        gz: ``(B,H,C,P,3N)`` operand-dtype chunk-start state.
         gduinit: ``(B,H,T,P)`` operand-dtype addend for ``dU``. Read only when
             ``has_seed``.
         gdu: ``(B,H,T,P)`` operand-dtype, written with ``dU`` except at the chunk's
@@ -759,6 +769,10 @@ def chunk_input_bwd_kernel(
     slices = chunk // tblk
     elem = gdy.element_type
     out = gdu.element_type
+    # The two chunk-plane states are read by the epilogue below rather than by a
+    # stager, so this pass widens them itself.
+    dinc_elem = gdinc.element_type
+    state_elem = gz.element_type
     zero = cutlass.Float32(0.0)
 
     ldu = smem_pitch(rows)
@@ -917,7 +931,7 @@ def chunk_input_bwd_kernel(
         for s in range(slices)
     ]
 
-    # The chunk's plane of both float32 increment tensors, sliced once, as every other
+    # The chunk's plane of both stored state tensors, sliced once, as every other
     # stager here takes its argument. The five-dimensional form measured three 64-bit
     # local slots reloaded at the top of every lane-block trip, but slicing removed
     # neither: the counters were sector-identical, 6,156,288 loads either way at
@@ -994,10 +1008,12 @@ def chunk_input_bwd_kernel(
                 # The increment cotangent, into the chunk-local frame and into the two
                 # products it feeds. One matrix for the whole chunk, so its nine
                 # entries are a broadcast read and the pass is one 3-vector per thread
-                # per step: six coalesced float32 reads, nine FMA for the frame change,
-                # twelve for the products. Only the operand copy narrows (I4). The two
-                # products are over the whole lane extent and are taken on the tap that
-                # stages the block first, so the chunk-start state is read once.
+                # per step: six coalesced reads widened to float32, nine FMA for the
+                # frame change, twelve for the products. Both reads are of a state a
+                # recurrence stored at the operand width, so the widening is free of
+                # accuracy and the arithmetic below is float32 (I4). The two products
+                # are over the whole lane extent and are taken on the tap that stages
+                # the block first, so the chunk-start state is read once.
                 total = rows * lanes
                 steps = -(-total // threads)
                 exact = total % threads == 0
@@ -1026,9 +1042,9 @@ def chunk_input_bwd_kernel(
                             n = i - p * lanes
                         d0 = l0 + 3 * n
                         got = (
-                            pdinc[p, d0],
-                            pdinc[p, d0 + 1],
-                            pdinc[p, d0 + 2],
+                            widen(pdinc[p, d0], dinc_elem),
+                            widen(pdinc[p, d0 + 1], dinc_elem),
+                            widen(pdinc[p, d0 + 2], dinc_elem),
                         )
                         if cutlass.const_expr(tap == 0):
                             held.append(
@@ -1036,7 +1052,11 @@ def chunk_input_bwd_kernel(
                                     p,
                                     n,
                                     got,
-                                    (pz[p, d0], pz[p, d0 + 1], pz[p, d0 + 2]),
+                                    (
+                                        widen(pz[p, d0], state_elem),
+                                        widen(pz[p, d0 + 1], state_elem),
+                                        widen(pz[p, d0 + 2], state_elem),
+                                    ),
                                 )
                             )
                         else:
@@ -1395,11 +1415,12 @@ def chunk_input_backward(
         B: ``(B,G,T,3N)``, the dtype of ``dy``, pitched. ``G`` divides ``H``; head
             ``h`` reads group ``h // (H // G)``.
         C: ``(B,G,T,3N)``, the dtype of ``dy``, pitched.
-        dinc: ``(B,H,C,P,3N)`` float32 increment cotangent in the global frame,
-            contiguous, from
+        dinc: ``(B,H,C,P,3N)`` increment cotangent in the global frame, the dtype
+            of ``dy``, contiguous, from
             :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward`.
-        zstart: ``(B,H,C,P,3N)`` float32 chunk-start state, contiguous, from the
-            forward's inter-chunk recurrence. Read, never written.
+        zstart: ``(B,H,C,P,3N)`` chunk-start state, the dtype of ``dy``,
+            contiguous, from the forward's inter-chunk recurrence. Read, never
+            written.
         chunk_size: ``L``. A multiple of 16.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, or None.
         b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, or None.
@@ -1413,15 +1434,19 @@ def chunk_input_backward(
 
     Raises:
         ValueError: On a layout, rank, shape or extent violation, on a shared-memory
-            budget the device cannot hold, or on half a streaming pair.
+            budget the device cannot hold, on half a streaming pair, on a
+            float32-pinned operand that is not float32, or on a stored state that is
+            not at the activation dtype.
         TypeError: On an activation dtype with no tensor-core path.
     """
     activations: Named = ((dy, "dy"), (U, "U"), (B, "B"), (C, "C"))
-    pinned: Named = ((trans, "trans"), (K, "K"), (dinc, "dinc"), (zstart, "zstart"))
-    check_layout(((dy, "dy"), (U, "U"), *pinned))
+    pinned: Named = ((trans, "trans"), (K, "K"))
+    stored: Named = ((dinc, "dinc"), (zstart, "zstart"))
+    check_layout(((dy, "dy"), (U, "U"), *pinned, *stored))
     check_pitched(((B, "B"), (C, "C")))
     dtype = check_operands(activations)
     check_pinned(pinned)
+    check_stored(stored, dtype)
     bsz, heads, groups, seqlen, rows, dim = check_shapes(
         U, trans, K, (B, "B"), (C, "C")
     )

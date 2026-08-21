@@ -105,9 +105,12 @@ wrong, not the kernel.
 3. A segment decay is never factored as `exp(2*lp_t) * exp(-2*lp_s)`. It is
    formed as `exp(2*(lp_t - lp_s))` from the log difference. Underflow times
    overflow is how NaN gets in.
-4. `trans`, `K`, the per-step quaternions, both chunk-local prefixes, the 3x3
-   table, and `z` are float32 everywhere, including under autocast. Only `U`,
-   `B`, `C`, `Y`, the score matrix, and GEMM operands are low precision.
+4. `trans`, `K`, the per-step quaternions, both chunk-local prefixes, and the 3x3
+   table are float32 everywhere, including under autocast. Only `U`, `B`, `C`,
+   `Y`, the score matrix, and GEMM operands are low precision. `z` is float32 in
+   the recurrence that produces it and in the state the operator returns; the
+   chunk-start copy the next GEMM reads is stored at the operand dtype, because
+   that GEMM narrows it on the way into shared memory either way.
 5. Quaternion prefix products are renormalized once per chunk after the scan.
    Rotation error enters the rotation matrix squared; unit-norm drift is not
    tolerated. The projection in the backward is the adjoint of this and is not
@@ -156,6 +159,10 @@ tolerance.
 
 The trailing `3N` is `N` 3-vectors in lane-major order: element `3n+i` is
 component `i` of 3-vector `n`.
+
+The `z` row is the state the operator takes and returns. The `(B,H,C,P,3N)`
+chunk-start state and its cotangent are not on that boundary and are not float32:
+they carry the activation dtype, per invariant 4.
 
 `B` and `C` are grouped: head `h` reads group `h // (H // G)`, so `G` divides
 `H`, and `G == H` is the ungrouped case rather than a separate signature. The

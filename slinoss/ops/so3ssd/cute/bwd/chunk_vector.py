@@ -147,12 +147,12 @@ DRAM-bound. Analytic traffic at ``standard``, operand by operand, with ``U`` and
 ``B`` at the ``L + 1`` rows per chunk their shifted span reads::
 
     reads   dy 9.44 + U 9.58 + B 9.58 + C 9.44 + trans 1.57 + K 3.15
-          + dinc 14.16 + zstart 14.16 + dlogp 0.39 + dchunk_rot 0.06
-          + dchunk_scale 0.01                                        = 71.53 MB
+          + dinc 7.08 + zstart 7.08 + dlogp 0.39 + dchunk_rot 0.06
+          + dchunk_scale 0.01                                        = 57.37 MB
     writes  dB 9.44 + dC 9.44 + dtrans 1.57 + dK 3.15 + carry_b 0.29 = 23.89 MB
 
-95.42 MB against ``1536 * 4.03 MFLOP = 6.19 GFLOP``, so 64.9 flop/byte against a
-ridge point of 164: memory bound by a factor of 2.5. That table is the ``span 64``
+81.26 MB against ``1536 * 4.03 MFLOP = 6.19 GFLOP``, so 76.2 flop/byte against a
+ridge point of 164: memory bound by a factor of 2.2. That table is the ``span 64``
 form. A shape whose budget forces ``span 32`` doubles the ``U`` term, since the
 ``U`` tile is one atom M tile whatever the block, and raises the intensity to 108
 flop/byte at the default configuration, still under the ridge.
@@ -168,18 +168,25 @@ group, there are five tiles and the split is what the tile count costs::
 
     per tile x5   dy 18.87 + U 38.34 + trans 2.36 + K 4.72 + dlogp 0.59
                 + dchunk_rot 0.08 + dchunk_scale 0.01     = 64.97 -> 324.86 MB
-    once          B 3.99 + C 3.93 + dinc 141.56 + zstart 141.56 r,
-                  dB 3.93 + dC 3.93 + carry_b 0.12 w      =           298.99 MB
+    once          B 3.99 + C 3.93 + dinc 70.78 + zstart 70.78 r,
+                  dB 3.93 + dC 3.93 + carry_b 0.12 w      =           157.43 MB
     slot rows     dtrans 2.36 + dK 4.72 written and read back per tile,
                   then 7.08 written out once               =           77.85 MB
 
-701.75 MB, and the slot rows are 14.16 MB more than the loop form's
-read-modify-write of the same two outputs, 2.1%. ``U`` dominates the per-tile term
+560.19 MB, and the slot rows are 14.16 MB more than the loop form's
+read-modify-write of the same two outputs, 2.5%. ``U`` dominates the per-tile term
 because its tile is one atom M tile whatever the ``span``, so a ``span 32`` shape
-reads it twice. ``dinc`` and ``zstart`` are float32 ``(B, H, C, P, 3N)`` and together
-are 40% of the total. The three write terms are the depth-one form. At the shipped
-depth they are :func:`partial_bytes` instead, 143.77 MB, which is the largest single
-item in the launch and the whole of what the closure reads.
+reads it twice. ``dinc`` and ``zstart`` are ``(B, H, C, P, 3N)`` at the operand width
+and together are 25% of the total. The three write terms are the depth-one form. At
+the shipped depth they are :func:`partial_bytes` instead, 143.77 MB, which is the
+largest single item in the launch and the whole of what the closure reads.
+
+Every measurement in the rest of this docstring was taken with ``dinc`` and ``zstart``
+at float32, which is 141.56 MB a launch more than the shipped kernel reads and puts
+the shipped-depth analytic total at 837.5 MB rather than 696.0 MB. Narrowing them
+takes the counted read from 336.60 MB to 195.01 MB, the full 141.60, and the launch
+from 1,855.1 us to 1,837.4: -17.7 us for 17% of the traffic, which is the ratio a
+launch this far off its byte floor converts at.
 
 That total is an upper bound and the launch does not pay it. 837.5 MB analytic at the
 shipped depth against 515.81 MB of DRAM counted, 62% over. The 321.7 MB of daylight is
@@ -234,7 +241,7 @@ reads stands against 370 MB of requests for ``dy``, ``U``, ``trans``, ``K``, ``d
 and it serves the lane-tile and group re-reads at 1.21x compulsory. So neither the
 five-fold re-read of the per-token operands nor the eighteen-fold re-read of the
 group's two vectors is a device-traffic item, and only the head-sum partials and the
-two float32 state buffers are.
+two state buffers are. Both have since been narrowed to the operand width.
 
 Narrowing the two vector partials from float32 to the activation width is what the
 measured split says to do, and what it pays depends on the width it is measured at.
@@ -255,12 +262,12 @@ front end it was gating is no longer the constraint at that width, so the bytes 
 worth their bytes and no more. The mechanism of the four-warp figure is not
 established here. What is established is that the counter that moved there is an
 issue counter, so a traffic argument does not predict this launch's time in either
-direction, and the remaining 283.12 MB of float32 ``dinc`` and ``zstart`` cannot be
-priced from its bytes either. Narrowing those two would be DRAM-only whatever it
-paid: :func:`slinoss.ops.so3ssd.cute.table.stage_state` and
-:func:`slinoss.ops.so3ssd.cute.table.stage_matrix` narrow both to the operand width
-on the way into the one state tile, so their global width reaches no shared byte and
-no operand.
+direction, and the 141.56 MB the narrowed ``dinc`` and ``zstart`` take off the read
+side cannot be priced from its bytes either. That narrowing is DRAM-only:
+:func:`slinoss.ops.so3ssd.cute.table.stage_state` and
+:func:`slinoss.ops.so3ssd.cute.table.stage_matrix` already narrowed both to the
+operand width on the way into the one state tile, so the global width reaches no
+shared byte and no operand, and no extent in the tables below follows it.
 
 The closure paid for it in class until it took the request back. ``vector_reduce`` read
 float32 at 680.5 GB/s and 100.4% of floor; one narrowed element a thread makes a warp's
@@ -420,6 +427,7 @@ from slinoss.ops.so3ssd.cute.guard import (
     check_pitched,
     check_rows,
     check_shapes,
+    check_stored,
     check_stream,
 )
 from slinoss.ops.so3ssd.cute.mma import (
@@ -2010,8 +2018,8 @@ def chunk_vector_bwd_kernel(
         gb: ``(B,G,T,3N)`` operand-dtype forcing vectors.
         gbprev: ``(B,G,3N)`` streaming ``b_{-1}``. Read only when ``has_prev``.
         gc: ``(B,G,T,3N)`` operand-dtype readout vectors.
-        gdinc: ``(B,H,C,P,3N)`` float32 increment cotangent, global frame.
-        gz: ``(B,H,C,P,3N)`` float32 chunk-start state.
+        gdinc: ``(B,H,C,P,3N)`` operand-dtype increment cotangent, global frame.
+        gz: ``(B,H,C,P,3N)`` operand-dtype chunk-start state.
         gdlp: ``(B,H,C,L)`` float32 diagonal and increment half of the log-scale
             cotangent, from the chunk-input stage.
         gdrot: ``(B,H,C,3,3)`` float32 closing-rotation cotangent, row-major, from
@@ -2947,11 +2955,11 @@ def chunk_vector_backward(
         B: ``(B,G,T,3N)``, the dtype of ``dy``, pitched. ``G`` divides ``H``; head
             ``h`` reads group ``h // (H // G)``.
         C: ``(B,G,T,3N)``, the dtype of ``dy``, pitched.
-        dinc: ``(B,H,C,P,3N)`` float32 increment cotangent in the global frame,
-            contiguous, from
+        dinc: ``(B,H,C,P,3N)`` increment cotangent in the global frame, the dtype of
+            ``dy``, contiguous, from
             :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward`.
-        zstart: ``(B,H,C,P,3N)`` float32 chunk-start state, contiguous, held from the
-            forward, or rebuilt when the boundary did not cross.
+        zstart: ``(B,H,C,P,3N)`` chunk-start state, the dtype of ``dy``, contiguous,
+            held from the forward, or rebuilt when the boundary did not cross.
         dlogp: ``(B,H,C,L)`` float32, contiguous, from
             :func:`slinoss.ops.so3ssd.cute.bwd.chunk_input.chunk_input_backward`.
         dchunk_rot: ``(B,H,C,3,3)`` float32, contiguous, from the same.
@@ -2990,24 +2998,25 @@ def chunk_vector_backward(
         ValueError: On a layout, rank, shape or extent violation, on a destination
             that is not the band of its operand, on a shared-memory budget the
             device cannot hold, on half a streaming pair, on a ``splits`` that
-            does not divide the fold, or on a ``warps`` that is not a legal block
-            width.
+            does not divide the fold, on a ``warps`` that is not a legal block
+            width, on a float32-pinned operand that is not float32, or on a stored
+            state that is not at the activation dtype.
         TypeError: On an activation dtype with no tensor-core path.
     """
     activations: Named = ((dy, "dy"), (U, "U"), (B, "B"), (C, "C"))
     pinned: Named = (
         (trans, "trans"),
         (K, "K"),
-        (dinc, "dinc"),
-        (zstart, "zstart"),
         (dlogp, "dlogp"),
         (dchunk_rot, "dchunk_rot"),
         (dchunk_scale, "dchunk_scale"),
     )
-    check_layout(((dy, "dy"), (U, "U"), *pinned))
+    stored: Named = ((dinc, "dinc"), (zstart, "zstart"))
+    check_layout(((dy, "dy"), (U, "U"), *pinned, *stored))
     check_pitched(((B, "B"), (C, "C")))
     dtype = check_operands(activations)
     check_pinned(pinned)
+    check_stored(stored, dtype)
     bsz, heads, groups, seqlen, rows, dim = check_shapes(
         U, trans, K, (B, "B"), (C, "C")
     )

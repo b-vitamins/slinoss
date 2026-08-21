@@ -6,9 +6,9 @@ rounding of the inputs is inside both paths and the residual is the kernel's own
 arithmetic: the float32 table, the float32 accumulators, and the one narrowing of
 each operand on its way into shared memory.
 
-The two float32 inputs, ``dinc`` and ``zstart``, come from the reference: they are
-what the two stages ahead of this one hand over, and a fabricated pair would not
-compose the chunks. ``dinc`` is the reverse chunk recurrence's carry in the global
+The two state buffers, ``dinc`` and ``zstart``, come from the reference at the
+operand dtype: they are what the two stages ahead of this one hand over, and a
+fabricated pair would not compose the chunks. ``dinc`` is the reverse chunk recurrence's carry in the global
 frame, exactly as
 :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward` leaves it.
 
@@ -159,8 +159,8 @@ def _dbl(t: Tensor | None) -> Tensor | None:
 
 
 class Oracle(NamedTuple):
-    """The float64 values the five outputs are checked against, and the two
-    float32 inputs the kernel takes from the stages ahead of it.
+    """The float64 values the five outputs are checked against, and the two state
+    buffers the kernel takes from the stages ahead of it.
 
     Attributes:
         dU: ``(B,H,T,P)``, already corrected for the boundary rows this kernel
@@ -169,8 +169,9 @@ class Oracle(NamedTuple):
         dlogp: ``(B,H,C,L)``, the reference's ``dlogp_scan``.
         dchunk_rot: ``(B,H,C,3,3)``.
         dchunk_scale: ``(B,H,C)``, evaluated at ``dinc`` and ``zstart`` below.
-        dinc: ``(B,H,C,P,3N)`` float32, the recurrence carry in the global frame.
-        zstart: ``(B,H,C,P,3N)`` float32, the state entering each chunk.
+        dinc: ``(B,H,C,P,3N)`` at the operand dtype, the recurrence carry in the
+            global frame.
+        zstart: ``(B,H,C,P,3N)`` at the operand dtype, the state entering each chunk.
     """
 
     dU: Tensor
@@ -275,8 +276,8 @@ def _oracle(
         b_prev=b_prev,
         u_prev=u_prev,
     )
-    dinc = ref.dinc.float().contiguous()
-    zstart = fw.zstart.flatten(-2, -1).float().contiguous()
+    dinc = ref.dinc.to(U.dtype).contiguous()
+    zstart = fw.zstart.flatten(-2, -1).to(U.dtype).contiguous()
     return Oracle(
         dU=_expected_du(ref.grads.dU, ref.carry_u, chunk),
         carry_u=ref.carry_u,
@@ -295,7 +296,7 @@ def _run(
     chunk: int,
     du_init: Tensor | None = None,
 ) -> ChunkInputBwd:
-    """One launch, against the float32 inputs the oracle carries."""
+    """One launch, against the state buffers the oracle carries."""
     got = chunk_input_backward(
         dy,
         inp.U,
@@ -321,22 +322,28 @@ def _run(
 # itself a low-precision GEMM, so the error is that dtype's epsilon carried through
 # two contractions, of length ``L`` and ``3N``. ``dlogp`` and ``dchunk_rot`` are
 # reductions of those same fragments, so they inherit the error rather than
-# compounding it. ``dchunk_scale`` contracts only the two float32 state buffers.
+# compounding it. ``dchunk_scale`` contracts only the two state buffers.
 #
 #              bfloat16   float16
 # dU           4.509e-3   6.864e-4
-# carry_u      4.220e-3   1.871e-4
-# dlogp        3.971e-3   2.808e-4
-# dchunk_rot   3.445e-3   1.796e-4
-# dchunk_scale 5.237e-6   1.416e-7
+# carry_u      4.220e-3   1.860e-4
+# dlogp        3.447e-3   2.807e-4
+# dchunk_rot   4.631e-3   3.388e-4
+# dchunk_scale 5.079e-6   1.908e-7
 #
 # Worst measured over every shape and every test in this file, read off a
-# ``--tolerance-report`` run. Every bound below is about twice its figure.
+# ``--tolerance-report`` run. Every bound below is 1.2 to 2.2 times its figure.
 # ``dchunk_scale`` is three orders tighter than the rest because it contracts two
-# float32 operands and nothing else, and its oracle contracts the same pair, so what
-# is left is the accumulation; its worst case is ``MAX_CHUNK``, the longest one. Against the nearest comparable bfloat16 shape the float16 column
-# runs 5 to 19 times tighter, which brackets the factor of eight between the two
-# significands, so the two dtypes do not share a bound.
+# operands and nothing else and its oracle contracts the same pair, so what is left
+# is the accumulation; its worst case is ``MAX_CHUNK``, the longest one.
+# ``dchunk_rot`` is the closest to its bound of the five: its transition term
+# contracts that same pair, but its increment term contracts ``inc_local`` too, so
+# its oracle stays the reference's own value and the pair's rounding is inside the
+# residual. That is where narrowing the pair to the operand dtype is paid for: 1.3x
+# in bfloat16 and 1.9x in float16 on ``dchunk_rot``, under 2x on ``dchunk_scale``,
+# and nothing measurable on the other three. Against the nearest comparable bfloat16
+# shape the float16 column runs 3 to 16 times tighter, which brackets the factor of
+# eight between the two significands, so the two dtypes do not share a bound.
 BOUNDS: dict[torch.dtype, dict[str, float]] = {
     torch.bfloat16: {
         "dU": 8e-3,
@@ -653,8 +660,8 @@ def _call(args: Operands, chunk: int = 64) -> ChunkInputBwd:
 
 REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     # The rows this kernel owns are the ones no shared rule covers: the cotangent
-    # checked against ``U`` rather than against itself, the two float32 state
-    # buffers whose chunk count is derived and not passed, and the streaming pair.
+    # checked against ``U`` rather than against itself, the two state buffers whose
+    # chunk count is derived and not passed, and the streaming pair.
     (
         lambda a: a.update(dy=_t(a["dy"])[:, :, :-1].contiguous()),
         ValueError,
@@ -682,9 +689,10 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     ),
     # One row per shared rule this kernel is the first to reach on an operand of
     # its own: ``U`` shares a dtype group with ``dy``, ``B`` and ``C``, and the two
-    # float32 state buffers are pinned by I4 and read as dense tiles.
+    # state buffers follow the activation dtype and are read as dense tiles. The
+    # float32 case is the one that was legal before the buffers were narrowed.
     (lambda a: a.update(U=_t(a["U"]).half()), TypeError, "one dtype per call"),
-    (lambda a: a.update(dinc=_t(a["dinc"]).double()), ValueError, "dinc must be"),
+    (lambda a: a.update(dinc=_t(a["dinc"]).float()), ValueError, "dinc must be"),
     (
         lambda a: a.update(zstart=_t(a["zstart"]).transpose(-1, -2)),
         ValueError,
@@ -734,7 +742,7 @@ def test_rejects_an_extent_the_atom_cannot_cover(
 ) -> None:
     """The fix for an illegal extent is the shape, never a padding path.
 
-    The two float32 state buffers are zeros here rather than reference output. The
+    The two state buffers are zeros here rather than reference output. The
     reference refuses ``P = 24`` and ``3N = 24`` itself, so no pipeline can produce
     a matching pair, and the extent check runs before any element is read.
     """
@@ -747,7 +755,7 @@ def test_rejects_an_extent_the_atom_cannot_cover(
         -(-seqlen // chunk),
         rows,
         3 * lanes,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device="cuda",
     )
     with pytest.raises(ValueError, match=match):

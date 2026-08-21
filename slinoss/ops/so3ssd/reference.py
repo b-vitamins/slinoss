@@ -515,8 +515,10 @@ class ScanPrologue(NamedTuple):
     perturb the forward's own outputs.
 
     Attributes:
-        zstart: Chunk-start state, shape ``(B,H,C,P,3N)``, float32, contiguous,
-            over ``C`` chunks.
+        zstart: Chunk-start state, shape ``(B,H,C,P,3N)``, contiguous, over ``C``
+            chunks. The dtype is the producing backend's: float32 where the
+            recurrence stores it wide, the activation dtype where it narrows on the
+            store.
         cquat: Unit chunk rotation, shape ``(B,H,C,4)``, float32, contiguous.
         cscale: Chunk decay ``exp(2*lp_{L-1})``, shape ``(B,H,C)``, float32,
             contiguous.

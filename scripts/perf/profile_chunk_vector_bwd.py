@@ -280,8 +280,8 @@ def build_runner(
         return torch.randn(*size, dtype=dt, device=device, generator=gen)
 
     state = (shape.bsz, shape.heads, chunks, shape.rows, shape.d_state)
-    dinc = randn(*state)
-    zstart = randn(*state)
+    dinc = randn(*state, dt=dtype)
+    zstart = randn(*state, dt=dtype)
     dlogp = randn(shape.bsz, shape.heads, chunks, shape.chunk)
     dchunk_rot = randn(shape.bsz, shape.heads, chunks, 3, 3)
     dchunk_scale = randn(shape.bsz, shape.heads, chunks)

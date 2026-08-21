@@ -32,9 +32,14 @@ Traffic at ``B=4 H=18 T=2048 P=64 3N=240 L=64``, ``G=1``, five bands, against th
     C        4*2048*240*2      =   3.93 MB read
     cquat    5*4*18*32*4*4     =   0.23 MB read
     cscale   5*4*18*32*4       =   0.06 MB read
-    dinc     4*18*32*64*240*4  = 141.56 MB written
+    dinc     4*18*32*64*240*2  =  70.78 MB written
     dz0      4*18*64*240*4     =   4.42 MB written
-                                 256.34 MB
+                                 185.56 MB
+
+``dinc`` is written at the operand width, not float32. Its two consumers narrow it
+to that width on the way into shared memory whatever it arrives at, so the store
+here is the same rounding two launches earlier; ``dz0`` is a gradient of ``z0`` and
+stays float32.
 
 The five bands of one head are dispatched 18 blocks apart and the whole grid is
 360 blocks against 168 resident, so the bands sharing a head's ``dy`` are
@@ -64,6 +69,12 @@ before the recurrence reads the tile. One after the recurrence, before the next
 chunk's staging writes over what it just read -- the barriers inside the staging
 come after its writes and cannot stand in for this one.
 
+Every measurement in the rest of this docstring was taken with a float32 ``dinc``
+store, which is 70.78 MB a launch more than the shipped one writes. The arm ranking
+and the stall reasons are what they are read for; the absolute byte and time figures
+are that width's. At the acceptance shape the narrowing takes the counted write from
+146.93 MB to 76.72 MB and the launch from 410.3 us to 350.4, -59.9 us for -70.21 MB.
+
 Measured on sm_86, bfloat16, no final-state cotangent, at the geometry above, both
 arms in one process under one floor fit, every figure twice:
 
@@ -75,8 +86,8 @@ arms in one process under one floor fit, every figure twice:
 262 us floor its own DRAM traffic implies, where the recurrence it absorbed reached
 99.3% of its; ranking the arms by that percentage inverts them, and
 :data:`slinoss.perf.declared.DECLARED` carries the reading. The request stream is
-the 256 MB counted above, not the 176 MB crossing the bus, and the gap is the band
-re-reads L2 serves. What is left is 51.1% of the bus at 26.3% issue, 20.0% achieved
+the 256 MB the count above comes to at that width, not the 176 MB crossing the bus,
+and the gap is the band re-reads L2 serves. What is left is 51.1% of the bus at 26.3% issue, 20.0% achieved
 occupancy of 25.0% theoretical, 152 registers, and no local memory.
 
 Block width. Occupancy is what is left, and the width buys it without buying bytes:
@@ -137,6 +148,7 @@ from slinoss._cute import (
     assert_smem_fits,
     cute_dtype,
     jit_launch,
+    narrow,
     smem_bytes,
     smem_capacity,
 )
@@ -336,8 +348,9 @@ def start_passing_bwd_kernel(
         gdstate: ``(B,H,3*P*N)`` float32 cotangent of the final state. Read only
             when ``has_dstate``; the zero-seed variant is handed ``gdz0`` here so
             the signature has one form.
-        gdinc: ``(B,H,C,3*P*N)`` float32, written with the cotangent of each
-            chunk's increment in the global frame.
+        gdinc: ``(B,H,C,3*P*N)``, written with the cotangent of each chunk's
+            increment in the global frame. Write only, so it carries the operand
+            dtype its consumers read it at and the store narrows to it.
         gdz0: ``(B,H,3*P*N)`` float32, written with the cotangent of the initial
             state.
         seqlen: ``T``. Dynamic.
@@ -370,6 +383,7 @@ def start_passing_bwd_kernel(
     mpad = mma_rows(rows)
     lanes = span // 3
     vecs = rows * lanes // threads
+    dinc_elem = gdinc.element_type
     lda = smem_pitch(mpad)
     ldb = smem_pitch(span)
 
@@ -477,7 +491,7 @@ def start_passing_bwd_kernel(
             # The increment cotangent is the accumulator before this chunk's
             # readout term enters it, so the store precedes the update.
             for j in cutlass.range_constexpr(3):
-                gdinc[bidx, hidx, cidx, plane[k] + j] = carried[j]
+                gdinc[bidx, hidx, cidx, plane[k] + j] = narrow(carried[j], dinc_elem)
             # One rotation, then the scale, then the readout cotangent: the forward
             # scales the state alone and rotates the sum, and transposing that
             # order puts the scale outside the rotation.
@@ -653,9 +667,13 @@ def start_passing_backward(
     asked = RESIDENT_MAX if resident is None else resident
     blocks = min(asked, max(1, smem_capacity() // budget))
 
-    dinc = torch.empty(
-        bsz, heads, chunks, rows, dim, dtype=torch.float32, device=dy.device
-    )
+    # dinc leaves this launch and is read by two GEMM kernels that narrow it to the
+    # operand width on the way into shared memory, so it is stored at that width
+    # here: the same rounding one launch earlier and half the traffic. Under float16
+    # the store also flushes what float32 held as a subnormal: at the acceptance
+    # shape the smallest nonzero element is 2.537e-09 and 9.325e-07 of them are
+    # below float16's smallest subnormal, so they reach the consumer as zero.
+    dinc = torch.empty(bsz, heads, chunks, rows, dim, dtype=dtype, device=dy.device)
     dz0 = torch.empty(bsz, heads, rows, dim, dtype=torch.float32, device=dy.device)
     if dstate is None:
         seed = dz0

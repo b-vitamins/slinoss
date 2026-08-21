@@ -229,9 +229,10 @@ def test_fused_matches_the_unfused_pair(
 
     Both paths run the same GEMM over the same staged tiles and the same reverse
     recurrence in the same order; the fused one keeps ``dzstart`` in shared memory
-    instead of writing it to DRAM and reading it back. Both stores are float32, so
-    the two results are equal bit for bit and a tolerance would hide a real
-    divergence in the band indexing.
+    instead of writing it to DRAM and reading it back. Both recurrences carry
+    float32 and the fused store narrows the same value the unfused pair leaves wide,
+    so the two results are equal bit for bit under one rounding and a tolerance
+    would hide a real divergence in the band indexing.
     """
     inp = _make(bsz, heads, seqlen, rows, lanes, dtype, groups)
     wide = _double(inp)
@@ -243,7 +244,8 @@ def test_fused_matches_the_unfused_pair(
     got = start_passing_backward(dy, inp.trans, inp.C, cquat, cscale, CHUNK, dstate)
     torch.cuda.synchronize()
 
-    assert torch.equal(got.dinc, want.dinc)
+    assert got.dinc.dtype is dtype
+    assert torch.equal(got.dinc, want.dinc.to(dtype))
     assert torch.equal(got.dz0, want.dz0)
 
 
