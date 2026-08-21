@@ -154,6 +154,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "capture window. Emits nothing.",
     )
     parser.add_argument(
+        "--time-only",
+        action="store_true",
+        help="Measure the call wall and stop, launching no profiler. For an A/B "
+        "across several shapes, where the counter tables are read once at the shape "
+        "the verdict rests on rather than at every shape.",
+    )
+    parser.add_argument(
         "--atomic-probe",
         action="store_true",
         help="Price a float32 atomic close against the head-sum round trip instead "
@@ -492,6 +499,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ordinal = device_ordinal(device)
     before = compute_apps_query(smi_selector(ordinal))
+
+    if args.time_only:
+        runner = build_runner(shape, groups, device, dtype, args.splits, warps)
+        timed = measure(
+            runner,
+            label=f"chunk_vector_bwd {shape.name}",
+            iters=args.event_iters,
+            warmup=args.warmup,
+            device=device,
+        )
+        print(f"shape        {shape.describe()}")
+        print(f"width        {warps} warps, dtype {args.dtype}")
+        print(f"clocks       {timed.clocks}")
+        print(f"smi before   {before}")
+        print(f"smi after    {compute_apps_query(smi_selector(ordinal))}")
+        print(
+            f"call wall    med={timed.total.median_duration_us:.1f} us "
+            f"min={timed.total.min_duration_us:.1f} "
+            f"max={timed.total.max_duration_us:.1f} "
+            f"resolution={timed.total.resolution_pct:.2f}%"
+        )
+        return 0
 
     if args.atomic_probe:
         print(f"shape        {shape.describe()}")
