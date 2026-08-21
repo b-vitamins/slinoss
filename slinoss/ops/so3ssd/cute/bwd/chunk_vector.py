@@ -476,6 +476,7 @@ from slinoss.ops.so3ssd.cute.table import (
     stage_rotated,
     stage_shifted,
     stage_state,
+    stage_trans,
     store_pair,
 )
 from slinoss.ops.so3ssd.reference import check_grad_band
@@ -484,6 +485,7 @@ __all__ = [
     "LANE_BLOCK",
     "LANE_GROUP",
     "PARTIAL_REQUEST_BYTES",
+    "PREFIX_WARPS",
     "RESIDENT_MAX",
     "ROW_WORDS",
     "TABLE_PITCH",
@@ -492,6 +494,8 @@ __all__ = [
     "ChunkVectorBwd",
     "Slots",
     "arena",
+    "chunk_prefix_bwd",
+    "chunk_prefix_bwd_kernel",
     "chunk_vector_backward",
     "chunk_vector_bwd",
     "chunk_vector_bwd_kernel",
@@ -609,6 +613,17 @@ is LSU warp instructions, which a conflict does not add to and the round count d
 Every round holds at every ``L``: the chunk length sets how many lanes the
 ``token < chunk`` guard leaves active, and masking lanes off removes accesses
 rather than colliding them."""
+
+PREFIX_WARPS: int = 4
+"""Warps per block of :func:`chunk_prefix_bwd_kernel`.
+
+Only the first warp scans; the rest cover the staging and the store, each at most
+``4 * L`` float32 wide. Four is the narrowest width that fills the warp slots:
+shared memory is 2,304 B a block and registers are few, so the resident block count
+is capped at sixteen by the hardware and only four warps a block reach the
+forty-eight slots :data:`slinoss.perf.ceiling.MIN_OCCUPANCY_PCT` is read against.
+The idle warps cost issue slots the kernel does not use, its bound being the
+warp-serial scan and the transport."""
 
 RESIDENT_MAX: int = 2
 """Blocks per SM the launch asks for, before the shared-memory budget lowers it.
@@ -1649,6 +1664,49 @@ def _fill_zero(
 
 
 @cute.jit
+def _copy_words(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    total: cutlass.Constexpr,
+    tid: cutlass.Int32,
+    threads: int,
+) -> None:
+    """Copy a dense float32 run between two spaces, one segment a thread a step.
+
+    Either end may be global or shared. Both runs are dense and segment-aligned, so
+    the copy is one access a thread a step and the direction is the caller's.
+
+    Args:
+        src: Dense float32 tile or row of at least ``total`` elements.
+        dst: Dense float32 tile or row of at least ``total`` elements.
+        total: Elements to copy. Compile-time, and a multiple of
+            :data:`TABLE_QUAD` because
+            :func:`slinoss.ops.so3ssd.cute.guard.check_extents` holds ``L`` to a
+            multiple of 16.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+
+    Invariants:
+        The alignment claim is restated on both iterators, because a tile arriving
+        as a parameter reports one element whatever its allocation asked for and
+        ``autovec_copy`` caps the access at the claim. A global run's origin is a
+        whole number of ``L``-element or ``4L``-element records, and ``L`` is a
+        multiple of 16, so a record starts on a segment.
+    """
+    quads = total // TABLE_QUAD
+    unit = cute.make_layout((quads, TABLE_QUAD), stride=(TABLE_QUAD, 1))
+    from_words = cute.make_tensor(src.iterator.align(SMEM_SEGMENT), unit)
+    to_words = cute.make_tensor(dst.iterator.align(SMEM_SEGMENT), unit)
+    for step in cutlass.range_constexpr(-(-quads // threads)):
+        q = tid + step * threads
+        if cutlass.const_expr(quads % threads == 0):
+            cute.autovec_copy(from_words[(q, None)], to_words[(q, None)])
+        else:
+            if q < quads:
+                cute.autovec_copy(from_words[(q, None)], to_words[(q, None)])
+
+
+@cute.jit
 def _rotate_rows(
     src: cute.Tensor,
     dst: cute.Tensor,
@@ -2043,12 +2101,118 @@ def _readout_epilogue(
 
 
 @cute.kernel
+def chunk_prefix_bwd_kernel(
+    gtrans: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
+    seqlen: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    fold: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
+) -> None:
+    """Scan one chunk's transition prefixes to global memory.
+
+    One block per ``(chunk, head shard, batch, group)``, walking the ``fold`` heads
+    of its shard. :func:`chunk_vector_bwd_kernel` reads the result instead of
+    rescanning it, which is what this launch exists for: the scan depends on the
+    head and the chunk and not on the lane tile, so the fused form ran it
+    ``3N / lane_block(3N)`` times for one answer.
+
+    The scan is a warp-serial pass over ``L / 32`` tokens a lane followed by two
+    shuffle reductions, so nothing in the block hides it. Moving it here does not
+    delete instructions; it deletes the repeats and the barrier that fenced them.
+
+    Args:
+        gtrans: ``(B,H,T,4)`` float32 transition parameters.
+        gslp: ``(B,H,C,L)`` float32, written with the inclusive log-scale scan.
+        gsquat: ``(B,H,C,4,L)`` float32, written with the inclusive quaternion
+            prefix product, component-major.
+        seqlen: ``T``. Dynamic.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        fold: Heads of a shard this block walks. Compile-time.
+        splits: Shards the heads of a group are cut into. Compile-time, and the
+            same value :func:`chunk_vector_bwd_kernel` decodes with, so the two
+            launches agree on which head a shard holds.
+    """
+    tid, _, _ = cute.arch.thread_idx()
+    xidx, bidx, gidx = cute.arch.block_idx()
+
+    cidx = xidx // splits
+    sidx = xidx - cidx * splits
+    t0 = cidx * chunk
+    valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
+
+    smem = cutlass.utils.SmemAllocator()
+    strans = smem.allocate_tensor(
+        cutlass.Float32, trans_tile(chunk).layout(), SMEM_SEGMENT
+    )
+    slp = smem.allocate_tensor(
+        cutlass.Float32, scalar_tile(chunk).layout(), SMEM_SEGMENT
+    )
+    squat = smem.allocate_tensor(
+        cutlass.Float32, trans_tile(chunk).layout(), SMEM_SEGMENT
+    )
+
+    for hstep in cutlass.range(fold, unroll=1):
+        hidx = (gidx * splits + sidx) * fold + hstep
+        cute.arch.sync_threads()
+        stage_trans(
+            gtrans[bidx, hidx, None, None], strans, t0, valid, tid, threads, chunk
+        )
+        cute.arch.sync_threads()
+        chunk_prefixes(strans, slp, squat, tid, chunk)
+        cute.arch.sync_threads()
+        # Staged through shared rather than stored from the scan: the scan holds its
+        # result in one warp, so a direct store would be one scalar access a token a
+        # component from 32 lanes instead of one segment a thread from the block.
+        _copy_words(slp, gslp[bidx, hidx, cidx, None], chunk, tid, threads)
+        _copy_words(
+            squat, gsquat[bidx, hidx, cidx, None, None], 4 * chunk, tid, threads
+        )
+
+
+@cute.jit
+def chunk_prefix_bwd(
+    gtrans: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
+    seqlen: cutlass.Int32,
+    chunks: cutlass.Int32,
+    bsz: cutlass.Int32,
+    groups: cutlass.Int32,
+    stream: Stream,
+    warps: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    fold: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
+) -> None:
+    """Launch :func:`chunk_prefix_bwd_kernel`.
+
+    The grid is :func:`chunk_vector_bwd`'s with the lane-tile factor removed, so it
+    is ``dim // lane_block(dim)`` times smaller and every block of the main launch
+    finds its own prefix already written.
+    """
+    threads = warps * 32
+    chunk_prefix_bwd_kernel(
+        gtrans, gslp, gsquat, seqlen, threads, chunk, fold, splits
+    ).launch(
+        grid=(chunks * splits, bsz, groups),
+        block=(threads, 1, 1),
+        stream=stream,
+    )
+
+
+@cute.kernel
 def chunk_vector_bwd_kernel(
     gdy: cute.Tensor,
     gu: cute.Tensor,
     guprev: cute.Tensor,
     gtrans: cute.Tensor,
     gtap: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
     gb: cute.Tensor,
     gbprev: cute.Tensor,
     gc: cute.Tensor,
@@ -2093,6 +2257,10 @@ def chunk_vector_bwd_kernel(
         guprev: ``(B,H,P)`` streaming ``u_{-1}``. Read only when ``has_prev``.
         gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
         gtap: ``(B,H,T,2,4)`` float32 ``(kr, g, h, 0)`` per tap.
+        gslp: ``(B,H,C,L)`` float32 inclusive log-scale scan, from
+            :func:`chunk_prefix_bwd_kernel`.
+        gsquat: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product, from
+            the same, component-major.
         gb: ``(B,G,T,3N)`` operand-dtype forcing vectors.
         gbprev: ``(B,G,3N)`` streaming ``b_{-1}``. Read only when ``has_prev``.
         gc: ``(B,G,T,3N)`` operand-dtype readout vectors.
@@ -2342,11 +2510,18 @@ def chunk_vector_bwd_kernel(
             threads,
             chunk,
         )
+        # Read, not rescanned. The scan is warp-serial and depends on the head and
+        # the chunk alone, so the fused form ran it once a lane tile for one answer
+        # and fenced it with a barrier of its own.
+        # :func:`chunk_prefix_bwd_kernel` runs it once and this loads 5 * L words
+        # alongside the staging loads already in flight, which closes the barrier.
+        _copy_words(gslp[bidx, hidx, cidx, None], slp, chunk, tid, threads)
+        _copy_words(
+            gsquat[bidx, hidx, cidx, None, None], squat, 4 * chunk, tid, threads
+        )
         _fill_zero(srow, chunk * ROW_WORDS, tid, threads)
         _fill_zero(sdlp, wgroups * chunk, tid, threads)
         _fill_zero(sdw, 4 * chunk, tid, threads)
-        cute.arch.sync_threads()
-        chunk_prefixes(strans, slp, squat, tid, chunk)
         cute.arch.sync_threads()
         build_table(strans, stap, squat, stable, tid, threads, chunk, 3)
         cute.arch.sync_threads()
@@ -2778,6 +2953,8 @@ def chunk_vector_bwd(
     guprev: cute.Tensor,
     gtrans: cute.Tensor,
     gtap: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
     gb: cute.Tensor,
     gbprev: cute.Tensor,
     gc: cute.Tensor,
@@ -2830,6 +3007,8 @@ def chunk_vector_bwd(
         guprev,
         gtrans,
         gtap,
+        gslp,
+        gsquat,
         gb,
         gbprev,
         gc,
@@ -3070,6 +3249,12 @@ def chunk_vector_backward(
     store being one more rounding on the same path. At one copy of either there is no
     buffer and the kernel stores the output directly.
 
+    A third workspace, unconditional: ``(B,H,C,L)`` and ``(B,H,C,4,L)`` float32 hold
+    the two chunk-local transition prefixes, which :func:`chunk_prefix_bwd` scans once
+    a ``(batch, head, chunk)`` before the main launch reads them. The main grid carries
+    a lane-tile axis the scan does not depend on, so the fused form ran the scan
+    ``3N / lane_block(3N)`` times for one answer.
+
     Args:
         dy: ``(B,H,T,P)`` cotangent of ``y``, one of
             :data:`slinoss.ops.so3ssd.cute.guard.OPERAND_DTYPES`, contiguous. A
@@ -3201,6 +3386,20 @@ def chunk_vector_backward(
     tiles = dim // lane_block(dim)
     held = (open_slots(dtrans, tiles), open_slots(dK, tiles, axis=-3))
     shared = tuple(open_slots(out, shards) for out in (dB, dC, carry_b))
+    # The two chunk-local transition prefixes, scanned once per (batch, head, chunk)
+    # rather than once per lane tile. Freed on return with the partials: 5 * L float32
+    # a chunk, 2.95 MB at the acceptance shape.
+    prefix_lp = torch.empty(
+        bsz, heads, chunks, chunk_size, dtype=torch.float32, device=device
+    )
+    prefix_q = torch.empty(
+        bsz, heads, chunks, 4, chunk_size, dtype=torch.float32, device=device
+    )
+    jit_launch(
+        chunk_prefix_bwd,
+        (trans, prefix_lp, prefix_q, seqlen, chunks, bsz, groups),
+        (PREFIX_WARPS, chunk_size, fold, shards),
+    )
     jit_launch(
         chunk_vector_bwd,
         (
@@ -3209,6 +3408,8 @@ def chunk_vector_backward(
             U if u_prev is None else u_prev,
             trans,
             K,
+            prefix_lp,
+            prefix_q,
             B,
             B if b_prev is None else b_prev,
             C,

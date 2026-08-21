@@ -70,6 +70,7 @@ DECLARED: Final[dict[str, str]] = {
     "boundary_bwd_kernel": SERIAL_TINY,
     "chunk_increment_fwd_kernel": DRAM_BOUND,
     "chunk_input_bwd_kernel": DRAM_BOUND,
+    "chunk_prefix_bwd_kernel": SERIAL_TINY,
     "chunk_scan_fwd_kernel": DRAM_BOUND,
     "chunk_start_bwd_kernel": DRAM_BOUND,
     "chunk_vector_bwd_kernel": DRAM_BOUND,
@@ -132,7 +133,7 @@ treated as a tail. Measured on sm_86 at the model geometry: 152.77 MB in 221.5 u
 the buffer is served from L2. The pass is at its own ceiling, so its cost is an
 argument about whether the partials should exist rather than about this kernel.
 
-Four entries are SERIAL-tiny, and only the first is unconditionally so.
+Five entries are SERIAL-tiny, and only the first is unconditionally so.
 ``boundary_bwd_kernel`` on the single-partial path reads a fixed few rows per chunk
 rather than a pass over the sequence, so no shape makes that path large enough to
 hold to a bandwidth. That is a property of the kernel and belongs here. Its
@@ -150,6 +151,19 @@ the second, which means the second's declaration has a range. Measured on sm_86:
 SERIAL-tiny is right for every shape the driver measures and stops being right
 somewhere above ``D`` 2048. Widening the workload past that needs the class
 revisited, not the floor lowered.
+
+``chunk_prefix_bwd_kernel`` scans one chunk's transition prefixes once per
+``(batch, head, chunk)`` so that ``chunk_vector_bwd_kernel`` reads them instead of
+rescanning them once per lane tile. Its extent is a scan and not a pass: one warp
+carries a serial dependence over the chunk's tokens, and the other three warps of the
+block only stage and store. Its traffic does follow the sequence, ``5 * L`` float32 a
+chunk, so the bandwidth reading is the one to state rather than the one to hold it to.
+A bandwidth is the wrong bar for a launch whose residue is a serial chain and one
+launch overhead, and the step share is the right one. Measured on sm_86 at
+``L 64 P 64 3N 240 G 1``: 7.8-8.1 us over 2,304 blocks of 128 threads, 2,367,744 B
+read, issuing at 49.9-50.3%, with half of every warp's active cycles at the barrier
+that is warp 0's serial chain. Under 0.3% of the backward step, and the fused form it replaced
+ran the same scan ``3N / lane_block(3N)`` times for one answer.
 
 A key is a source kernel and a verdict is an instantiated symbol, so a template
 parameter that changes a kernel's resource profile still gets its own line in the

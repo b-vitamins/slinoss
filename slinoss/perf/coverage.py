@@ -117,6 +117,7 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
             "chunk_scan_fwd_kernel",
             "start_passing_bwd_kernel",
             "chunk_input_bwd_kernel",
+            "chunk_prefix_bwd_kernel",
             "chunk_vector_bwd_kernel",
             "boundary_bwd_kernel",
         ),
