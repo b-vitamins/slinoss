@@ -1168,15 +1168,19 @@ class FusedForward(NamedTuple):
     Attributes:
         length: Chunk length ``L``.
         seqlen: Unpadded ``T``, for slicing the tail off the output.
+        w: Rotation vectors, ``(B,H,C,L,3)``.
         lprefix: Chunk-local log-scale prefix ``lp``, ``(B,H,C,L)``.
         step: Per-token decay ``exp(2*ls_s)``, ``(B,H,C,L)``. The factor the fused
             column carries.
+        tap: Tap parameters, ``(B,H,C,L,2,3)``.
         u: ``U`` chunked, ``(B,H,C,L,P)``. Zero past the ragged tail.
         ushift: ``u_{t-1}`` over the padded sequence, ``(B,H,C,L,P)``. Slot ``n`` of
             a ragged tail chunk holds ``u_{T-1}``, not zero.
         b: ``B`` chunked, ``(B,H,C,L,3N)``. Zero past the ragged tail.
         bshift: ``b_{t-1}`` over the padded sequence, ``(B,H,C,L,3N)``. Slot ``n``
             of a ragged tail chunk holds ``b_{T-1}``, not zero.
+        c: ``C`` chunked, ``(B,H,C,L,3N)``.
+        qprefix: Chunk-local quaternion prefix ``Q_t``, ``(B,H,C,L,4)``.
         table: The per-token 3x3 transforms of the two-tap form.
         afuse: ``ap_s + exp(2*ls_s) * an_{s-1}``, ``(B,H,C,L,3,3)``. Replaces
             ``table.ap`` in the table a kernel reads; column ``s = 0`` is ``ap_0``.
@@ -1199,12 +1203,16 @@ class FusedForward(NamedTuple):
 
     length: int
     seqlen: int
+    w: Tensor
     lprefix: Tensor
     step: Tensor
+    tap: Tensor
     u: Tensor
     ushift: Tensor
     b: Tensor
     bshift: Tensor
+    c: Tensor
+    qprefix: Tensor
     table: TransformTable
     afuse: Tensor
     crot: Tensor
@@ -1403,12 +1411,16 @@ def chunked_forward_fused(
     return FusedForward(
         length=length,
         seqlen=shapes.seqlen,
+        w=w,
         lprefix=lprefix,
         step=step,
+        tap=tap,
         u=u_c,
         ushift=ushift_c,
         b=b_c,
         bshift=bshift_c,
+        c=c_c,
+        qprefix=qprefix,
         table=table,
         afuse=afuse,
         crot=crot,
