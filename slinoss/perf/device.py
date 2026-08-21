@@ -28,7 +28,7 @@ import subprocess
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Annotated, cast
+from typing import Annotated, Final, cast
 
 import torch
 
@@ -43,6 +43,7 @@ from slinoss.perf.units import (
 )
 
 __all__ = [
+    "FOREIGN_MIB_FLOOR",
     "ClockPolicy",
     "ComputeAppsQuery",
     "ContendedDevice",
@@ -349,6 +350,33 @@ class Contention(PerfRecord):
         """True only if the probe ran and found nothing else on the device."""
         return self.probed and self.foreign_process_count == 0
 
+    def quiet(self, *, ceiling_pct: float, mib_floor: float) -> bool:
+        """True if nothing on the device can move an absolute duration.
+
+        Exclusive is stricter than the measurement needs and stricter than the
+        fleet allows. An idle interpreter with a CUDA context open is one foreign
+        process forever, and requiring the count to be zero makes the gate
+        unopenable rather than safe. What moves a duration is somebody else's
+        kernels, which utilization reads, and somebody else's residency, which a
+        context too small to hold a workload's tensors does not have.
+
+        Args:
+            ceiling_pct: Highest utilization this may report.
+            mib_floor: Most foreign device memory this may report. Above it the
+                probe is dirty however idle the device reads, because a resident
+                workload evicts and can start at any time.
+
+        Returns:
+            Whether the probe is clean. A probe that did not run never is.
+        """
+        return (
+            self.probed
+            and self.utilization_pct <= ceiling_pct
+            and (
+                self.foreign_process_count == 0 or self.foreign_memory_mib <= mib_floor
+            )
+        )
+
     @property
     def stamp(self) -> str:
         """One-line sharing state for a report header."""
@@ -439,11 +467,22 @@ class ContendedDevice(RuntimeError):
     """A run required an idle device and the device did not become idle."""
 
 
+FOREIGN_MIB_FLOOR: Final[float] = 512.0
+"""Foreign device memory the gate treats as holding no workload.
+
+A bare CUDA context plus driver overhead is tens of MiB on this fleet; the jobs
+that actually move a duration hold thousands. The floor sits between the two,
+nearer the small side, so an idle context does not hold the gate shut and a
+resident workload does.
+"""
+
+
 def await_exclusive(
     ordinal: int = 0,
     *,
     samples: int = 5,
     ceiling_pct: float = 5.0,
+    mib_floor: float = FOREIGN_MIB_FLOOR,
     interval_s: float = 2.0,
     timeout_s: float = 600.0,
     probe: ContentionProbe = contention,
@@ -457,7 +496,10 @@ def await_exclusive(
     probe was added to exclude. ``samples`` consecutive clean probes are required
     and the count resets on any dirty one. Utilization is checked separately from
     the process count because a process may hold memory without running kernels,
-    and because the count cannot attribute residency.
+    and because the count cannot attribute residency. The count is not checked at
+    all: an interpreter with a context open is one foreign process for as long as
+    it lives, so what it holds decides whether it counts. See
+    :meth:`Contention.quiet`.
 
     Contention is waited out rather than stamped whenever the number being taken
     is an absolute duration. One foreign process on this fleet moved the same
@@ -470,6 +512,8 @@ def await_exclusive(
         ordinal: Torch device ordinal, resolved to a driver selector by the probe.
         samples: Consecutive clean probes required.
         ceiling_pct: Highest utilization a clean probe may report.
+        mib_floor: Foreign device memory a clean probe may report. See
+            :data:`FOREIGN_MIB_FLOOR` and :meth:`Contention.quiet`.
         interval_s: Delay between probes.
         timeout_s: Longest total wait before raising.
         probe: Injected contention probe. Tests supply their own.
@@ -492,14 +536,16 @@ def await_exclusive(
     clean = 0
     while True:
         last = probe(ordinal)
-        idle = last.exclusive and last.utilization_pct <= ceiling_pct
+        idle = last.quiet(ceiling_pct=ceiling_pct, mib_floor=mib_floor)
         clean = clean + 1 if idle else 0
         if clean >= samples:
             return last
         if clock() >= deadline:
             raise ContendedDevice(
                 f"device did not idle for {samples} consecutive probes inside "
-                f"{timeout_s:.0f}s: {last.stamp} ({last.detail})"
+                f"{timeout_s:.0f}s, holding the gate shut at foreign memory above "
+                f"{mib_floor:,.0f} MiB or utilization above {ceiling_pct:.0f}%: "
+                f"{last.stamp} ({last.detail})"
             )
         sleep(interval_s)
 

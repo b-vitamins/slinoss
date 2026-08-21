@@ -59,6 +59,7 @@ from slinoss.perf.ceiling import (
     tensor_verdict,
 )
 from slinoss.perf.device import (
+    FOREIGN_MIB_FLOOR,
     ClockPolicy,
     ContendedDevice,
     Contention,
@@ -164,6 +165,7 @@ __all__ = [
     "CLASS_FLOOR_PCT",
     "CONFIDENCE_PCT",
     "DRAM_BOUND",
+    "FOREIGN_MIB_FLOOR",
     "INVARIANT",
     "LSU_OPCODES",
     "MAX_TIMER_COVERAGE_PCT",

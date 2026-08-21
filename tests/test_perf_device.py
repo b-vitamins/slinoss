@@ -35,6 +35,7 @@ from slinoss.perf.ceiling import (
     tensor_verdict,
 )
 from slinoss.perf.device import (
+    FOREIGN_MIB_FLOOR,
     ClockPolicy,
     ComputeAppsQuery,
     ContendedDevice,
@@ -599,6 +600,76 @@ def test_await_exclusive_does_not_accept_a_probe_that_did_not_run() -> None:
             interval_s=1.0,
             timeout_s=3.0,
             probe=clock.probing(_state(probed=False)),
+            sleep=clock.sleep,
+            clock=clock.read,
+        )
+
+
+def _squatter(*, mib: float, utilization: float = 0.0) -> Contention:
+    """One foreign context holding ``mib`` and running nothing."""
+    return Contention(
+        probed=True,
+        foreign_process_count=Count(1),
+        foreign_memory_mib=Mebibytes(mib),
+        utilization_pct=Percent(utilization),
+        detail="injected",
+    )
+
+
+def test_await_exclusive_admits_a_context_too_small_to_hold_a_workload() -> None:
+    # The failure this closes: one foreign interpreter with a CUDA context open, 28
+    # MiB, nothing running, on both devices. A nonzero count disqualified every
+    # probe whatever its size, so the gate could not open and the absolute it
+    # guards could not be taken at all. What perturbs an absolute duration is
+    # somebody else's kernels, and 28 MiB holds no workload's tensors.
+    clock = _Clock()
+    got = await_exclusive(
+        0,
+        probe=clock.probing(_squatter(mib=28.0)),
+        sleep=clock.sleep,
+        clock=clock.read,
+    )
+    assert clock.probe_count == 5
+    # The state returned is the state seen. A gate that opened on a shared device
+    # must not stamp the run as exclusive.
+    assert not got.exclusive
+    assert got.stamp == "shared with 1 process holding 28 MiB at 0% utilization"
+
+
+def test_the_gate_floor_admits_a_bare_context_and_refuses_a_workload() -> None:
+    # The floor is a bare context plus driver overhead and nothing more. One MiB
+    # over it and the gate holds shut, so relaxing the count did not relax what the
+    # gate is for.
+    clock = _Clock()
+    at = await_exclusive(
+        0,
+        probe=clock.probing(_squatter(mib=FOREIGN_MIB_FLOOR)),
+        sleep=clock.sleep,
+        clock=clock.read,
+    )
+    assert at.foreign_memory_mib == FOREIGN_MIB_FLOOR
+    over = _Clock()
+    with pytest.raises(ContendedDevice, match=f"above {FOREIGN_MIB_FLOOR:,.0f} MiB"):
+        await_exclusive(
+            0,
+            interval_s=1.0,
+            timeout_s=3.0,
+            probe=over.probing(_squatter(mib=FOREIGN_MIB_FLOOR + 1.0)),
+            sleep=over.sleep,
+            clock=over.read,
+        )
+
+
+def test_a_small_context_running_kernels_still_holds_the_gate_shut() -> None:
+    # Size is not the whole test. A process can hold almost nothing and still be
+    # launching kernels, and those kernels are what the absolute would carry.
+    clock = _Clock()
+    with pytest.raises(ContendedDevice, match="at 70% utilization"):
+        await_exclusive(
+            0,
+            interval_s=1.0,
+            timeout_s=3.0,
+            probe=clock.probing(_squatter(mib=28.0, utilization=70.0)),
             sleep=clock.sleep,
             clock=clock.read,
         )
