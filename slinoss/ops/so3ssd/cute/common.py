@@ -53,6 +53,7 @@ __all__ = [
     "SINC_HALF_D",
     "TABLE_AC",
     "TABLE_AC_SOLE",
+    "TABLE_AFUSE",
     "TABLE_AN",
     "TABLE_AP",
     "THREADS",
@@ -160,6 +161,19 @@ TABLE_AC_SOLE: int = 0
 A second name rather than a silent reuse of :data:`TABLE_AC`, because at one slot
 the order stops being a prefix of the three-slot order and an index that means two
 things at two slot counts is how a wrong matrix gets read.
+"""
+
+TABLE_AFUSE: int = 0
+"""``Afuse_t = Ap_t + exp(2*ls_t) An_{t-1}``, applied to ``b_{t-1}``.
+
+The same slot as :data:`TABLE_AP`, holding the one-tap column instead of the
+previous tap alone. Which one is there is fixed at trace time by ``build_table``'s
+``fused`` flag, never at runtime. A second name for the same index because the
+operand is the same but the matrix is not, and a kernel that reads ``Ap`` out of a
+fused table computes a different operator.
+
+``An`` keeps its own slot under fusion: the diagonal residue ``<crot_t, An_t b_t>``
+still needs it, per token rather than as a GEMM operand.
 """
 
 

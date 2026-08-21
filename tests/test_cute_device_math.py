@@ -34,10 +34,11 @@ from slinoss._cute import (
     smem_capacity,
 )
 from slinoss.config import MAX_CHUNK, MIN_CHUNK
-from slinoss.ops.so3ssd import chunked_forward
+from slinoss.ops.so3ssd import chunked_forward, chunked_forward_fused
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
     TABLE_AC_SOLE,
+    TABLE_AFUSE,
     TABLE_AN,
     TABLE_AP,
     THREADS,
@@ -81,6 +82,7 @@ def _probe_kernel(
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     mats: cutlass.Constexpr,
+    fused: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     cidx, bidx, hidx = cute.arch.block_idx()
@@ -108,7 +110,7 @@ def _probe_kernel(
     cute.arch.sync_threads()
     chunk_prefixes(strans, slp, squat, tid, chunk)
     cute.arch.sync_threads()
-    build_table(strans, stap, squat, stable, tid, threads, chunk, mats)
+    build_table(strans, stap, squat, stable, tid, threads, chunk, mats, fused)
     cute.arch.sync_threads()
 
     for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
@@ -146,14 +148,30 @@ def _probe_launch(
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     mats: cutlass.Constexpr,
+    fused: cutlass.Constexpr,
 ) -> None:
     _probe_kernel(
-        gtrans, gtap, olp, oquat, otable, oend, oscale, seqlen, threads, chunk, mats
+        gtrans,
+        gtap,
+        olp,
+        oquat,
+        otable,
+        oend,
+        oscale,
+        seqlen,
+        threads,
+        chunk,
+        mats,
+        fused,
     ).launch(grid=(chunks, bsz, heads), block=(threads, 1, 1))
 
 
 def _run_probe(
-    trans: torch.Tensor, tap: torch.Tensor, chunk: int, mats: int = 3
+    trans: torch.Tensor,
+    tap: torch.Tensor,
+    chunk: int,
+    mats: int = 3,
+    fused: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Launch the probe and return ``(lp, quat, table, cquat, cscale)``."""
     bsz, heads, seqlen, _ = trans.shape
@@ -179,6 +197,7 @@ def _run_probe(
         THREADS,
         chunk,
         mats,
+        fused,
     )
     torch.cuda.synchronize()
     return olp, oquat, otable, oend, oscale
@@ -325,6 +344,86 @@ def test_padded_tail_is_identity() -> None:
     )
     assert torch.count_nonzero(table[0, 0, 1, TABLE_AP, tail:]) == 0
     assert torch.count_nonzero(table[0, 0, 1, TABLE_AN, tail:]) == 0
+
+
+@pytest.mark.parametrize(("bsz", "heads", "seqlen", "chunk"), SHAPES)
+def test_fused_slot_matches_the_reference_column(
+    bsz: int, heads: int, seqlen: int, chunk: int
+) -> None:
+    """``fused`` writes the reference's one-tap column into the first slot.
+
+    The failure mode is the reindex: an off-by-one in the shift, a factor taken from
+    the prefix instead of the step, or the term landing in the wrong slot. Compared
+    against ``chunked_forward_fused``, which is the authority for that column, at the
+    same bound the table itself is held to, since the arithmetic is one extra
+    rotation and one extra tap matrix in float32.
+    """
+    inp = make_inputs(
+        bsz=bsz,
+        heads=heads,
+        seqlen=seqlen,
+        rows=16,
+        lanes=16,
+        dtype=torch.float32,
+        device="cuda",
+        w_scale=2.0,
+        ls_bias=LS_BIAS,
+    )
+    table = _run_probe(inp.trans, inp.K, chunk, fused=True)[2]
+    # The column depends on ``trans`` and ``K`` alone, so the streaming operands are
+    # left off rather than widened.
+    want = chunked_forward_fused(
+        inp.U.double(),
+        inp.trans.double(),
+        inp.K.double(),
+        inp.B.double(),
+        inp.C.double(),
+        chunk,
+    ).afuse
+
+    assert_max_rel(
+        table[:, :, :, TABLE_AFUSE].unflatten(-1, (3, 3)),
+        want,
+        6e-6,
+        "cute-device.fused.afuse",
+    )
+
+
+def test_fused_column_boundaries_are_the_reindex_edges() -> None:
+    """Token 0 takes no shifted term, and the pad slot of a ragged tail takes one.
+
+    Two edges, one launch. ``Afuse_0 == Ap_0`` bitwise: the previous chunk's
+    ``An_{L-1}`` is in the previous chunk's frame and arrives through the carried
+    state, so injecting it moves ``y``. Slot ``valid`` is the opposite error: the
+    reindex puts the last real token's ``An`` there, and zeroing it as a pad row
+    leaves ``y`` at roundoff while moving ``state`` by O(1), so no y-only assertion
+    can see it.
+    """
+    chunk = 64
+    seqlen = 100
+    inp = make_inputs(
+        bsz=1,
+        heads=1,
+        seqlen=seqlen,
+        rows=16,
+        lanes=16,
+        dtype=torch.float32,
+        device="cuda",
+        w_scale=2.0,
+        ls_bias=LS_BIAS,
+    )
+    plain = _run_probe(inp.trans, inp.K, chunk)[2]
+    table = _run_probe(inp.trans, inp.K, chunk, fused=True)[2]
+    tail = seqlen - chunk
+
+    assert torch.equal(table[:, :, :, TABLE_AFUSE, 0], plain[:, :, :, TABLE_AP, 0])
+    # The pad token's log scale stages as zero, so the factor is one and the slot is
+    # the previous token's An exactly.
+    assert torch.equal(
+        table[0, 0, 1, TABLE_AFUSE, tail], plain[0, 0, 1, TABLE_AN, tail - 1]
+    )
+    assert torch.count_nonzero(table[0, 0, 1, TABLE_AFUSE, tail]) > 0
+    assert torch.count_nonzero(table[0, 0, 1, TABLE_AFUSE, tail + 1 :]) == 0
 
 
 def test_reduced_slot_tables_match_the_three_slot_matrices() -> None:

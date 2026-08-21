@@ -445,11 +445,13 @@ def build_table(
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     mats: cutlass.Constexpr = 3,
+    fused: cutlass.Constexpr = False,
 ) -> None:
     """Compose the ``(mats, L, 9)`` transform table in shared memory.
 
     Args:
-        strans: ``(4, L)`` float32 staged transition parameters.
+        strans: ``(4, L)`` float32 staged transition parameters, ``(w, ls)``
+            component-major.
         stap: ``(8, L)`` float32 staged tap parameters. Unread at ``mats == 1``,
             which is the point of that slot count, so a caller there may pass any
             tile of the right dtype.
@@ -457,13 +459,28 @@ def build_table(
         stable: ``(mats, L, 9)`` float32, written. Slots are
             :data:`slinoss.ops.so3ssd.cute.common.TABLE_AP`, ``TABLE_AN``, and,
             when ``mats`` is three, ``TABLE_AC``. At ``mats == 1`` the sole slot is
-            ``TABLE_AC_SOLE``.
+            ``TABLE_AC_SOLE``. At ``fused`` the first slot is ``TABLE_AFUSE``.
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
         mats: Slots to write, 1, 2 or 3. Compile-time, and must match the ``mats``
             the tile was allocated at. One writes ``Ac`` alone and computes neither
             tap matrix, so it also reads neither ``stap`` nor ``strans``.
+        fused: Write the one-tap column ``Afuse_t = Ap_t + exp(2*ls_t) An_{t-1}``
+            into the first slot instead of ``Ap_t``. Compile-time. Ignored at
+            ``mats == 1``, which builds no tap matrix. The second slot still holds
+            ``An_t``, which the diagonal residue needs.
+
+    Invariants:
+        ``Afuse_0 == Ap_0``: the previous chunk's ``An_{L-1}`` lives in the previous
+        chunk's frame and its contribution arrives through the carried state, so
+        injecting it here is wrong rather than redundant.
+
+        A pad token's row is the one an identity rotation and zero taps produce, so
+        ``Afuse`` past ``valid`` is zero. Slot ``valid`` itself is not: ``ls`` stages
+        as zero there, making the factor one, and the term is the last real token's
+        ``An``. That row is load-bearing under fusion and must not be predicated
+        away.
     """
     for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
         token = tid + step * threads
@@ -491,8 +508,43 @@ def build_table(
                     ac,
                     tap_matrix((stap[4, token], stap[5, token], stap[6, token]), wvec),
                 )
+                first = ap
+                if cutlass.const_expr(fused):
+                    # ``An_{t-1}`` is recomputed from the staged parameters of token
+                    # ``t-1`` rather than read back out of the slot this pass is
+                    # still writing. A read-back needs a barrier between the two
+                    # halves of the table, and barrier is the top stall of every
+                    # kernel that builds one. The recompute is one rotation and one
+                    # tap matrix per token, O(L) against an O(L*N) launch.
+                    #
+                    # Clamped rather than branched: token 0 reads its own row and the
+                    # factor below discards it.
+                    prev = cutlass.max(token - 1, 0)
+                    acp = mat3_transpose(
+                        rot_hom(
+                            (
+                                squat[0, prev],
+                                squat[1, prev],
+                                squat[2, prev],
+                                squat[3, prev],
+                            )
+                        )
+                    )
+                    anp = mat3_mul(
+                        acp,
+                        tap_matrix(
+                            (stap[4, prev], stap[5, prev], stap[6, prev]),
+                            (strans[0, prev], strans[1, prev], strans[2, prev]),
+                        ),
+                    )
+                    # I3: the raw per-step decay, never a ratio of prefixes, so
+                    # ``ls <= 0`` puts it in ``(0, 1]``.
+                    scale = select(
+                        token > 0, decay(strans[3, token]), cutlass.Float32(0.0)
+                    )
+                    first = tuple(ap[e] + scale * anp[e] for e in range(9))
                 for entry in cutlass.range_constexpr(9):
-                    stable[TABLE_AP, token, entry] = ap[entry]
+                    stable[TABLE_AP, token, entry] = first[entry]
                     stable[TABLE_AN, token, entry] = an[entry]
                 if cutlass.const_expr(mats == 3):
                     for entry in cutlass.range_constexpr(9):
