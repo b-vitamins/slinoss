@@ -27,10 +27,11 @@ nothing.
 
 The K extent is the whole chunk, one GEMM and no slice loop, so every tile in
 :func:`start_smem_bytes` is proportional to ``L``. Against the 101,376 B carveout:
-``L=64`` at ``P=64, 3N=240`` is 45,568 B and two blocks per SM, ``L=128`` is
-91,136 B and one, ``L=192`` is 136,704 B and refused. At ``3N=48`` the same
+``L=64`` at ``P=64, 3N=240`` is 46,336 B and two blocks per SM, ``L=128`` is
+92,672 B and one, ``L=192`` is 139,008 B and refused. At ``3N=48`` the same
 progression is four, two, and one. This is the only kernel on the chunk-start path
-whose footprint follows ``L``.
+whose footprint follows ``L``. The table's padded pitch costs ``12 * L`` bytes of
+that and changes no residency at any shape the bench covers.
 
 Dispatch order. The grid is head-fastest. ``C`` is per group, so at ``G < H`` the
 ``H // G`` blocks sharing one group's readout tile have to be co-resident for L2 to
@@ -114,6 +115,7 @@ from slinoss.ops.so3ssd.cute.mma import (
 )
 from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
+    TABLE_PITCH,
     build_table,
     stage_pad,
     stage_raw,
@@ -173,7 +175,7 @@ def start_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
             (trans_tile(chunk), 4),
             (scalar_tile(chunk), 4),
             (trans_tile(chunk), 4),
-            (table_tile(chunk, 1), 4),
+            (table_tile(chunk, 1, TABLE_PITCH), 4),
             (rotated_tile(chunk, dim), itemsize),
             (gram_tile(chunk, rows), itemsize),
         ]
@@ -222,7 +224,9 @@ def start_chunk(
         strans: ``(L,4)`` float32 transition tile.
         slp: ``(L,)`` float32 log-decay prefix tile.
         squat: ``(L,4)`` float32 quaternion prefix tile.
-        stable: ``(L,9)`` float32 transform table, ``Ac`` alone.
+        stable: ``(1,L,TABLE_PITCH)`` float32 transform table, ``Ac`` alone. Allocated
+            at :data:`slinoss.ops.so3ssd.cute.table.TABLE_PITCH`, so the caller's
+            allocation and the readers below must state that pitch together.
         scrot: ``(L,pitch)`` operand-dtype rotated readout tile. Padded columns
             are zero on entry and are not restaged here.
         sdy: ``(mpad,pitch)`` operand-dtype weighted cotangent tile, same.
@@ -266,7 +270,9 @@ def start_chunk(
 
     # mats == 1 writes Ac alone and reads neither the tap tile nor strans, so the
     # transition tile stands in for the tap tile that is never allocated.
-    build_table(strans, strans, squat, stable, tid, threads, chunk, 1)
+    build_table(
+        strans, strans, squat, stable, tid, threads, chunk, 1, pitch=TABLE_PITCH
+    )
     cute.arch.sync_threads()
 
     # Both passes issue their global loads before either consumes one, so the two
@@ -294,6 +300,8 @@ def start_chunk(
         lanes,
         False,
         False,
+        False,
+        TABLE_PITCH,
     )
     cute.arch.sync_threads()
 
@@ -376,7 +384,9 @@ def chunk_start_bwd_kernel(
     strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 1).layout(), 16)
+    stable = smem.allocate_tensor(
+        cutlass.Float32, table_tile(chunk, 1, TABLE_PITCH).layout(), SMEM_SEGMENT
+    )
     scrot = smem.allocate_tensor(
         gc.element_type, rotated_tile(chunk, dim).layout(), SMEM_SEGMENT
     )

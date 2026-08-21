@@ -57,8 +57,8 @@ Shared memory. The two GEMM operand tiles and the tile the recurrence reads shar
 one region, because no chunk has both live at once: the contraction reads the
 operands and then writes its result, and the next chunk restages the operands only
 after the recurrence has read that result. At the model geometry that makes the
-recurrence's tile free and the block's footprint the unfused GEMM's 20,992 B, which
-is four resident blocks of the 101,376 B carveout against the two that 33,280 B
+recurrence's tile free and the block's footprint the unfused GEMM's 21,760 B, which
+is four resident blocks of the 101,376 B carveout against the two that 34,048 B
 allowed. Occupancy is what this kernel is short of, so the overlay is the point of
 it and not a saving.
 
@@ -95,7 +95,7 @@ Block width. Occupancy is what is left, and the width buys it without buying byt
 at atom granularity and both accumulators halve at unchanged shared bytes. The GEMM
 accumulator goes from ``mpad*span/128`` to ``mpad*span/256`` and the recurrence's
 from ``rows*lanes/128`` to half that, which takes the kernel from 152 registers to
-80 and lets the same 20,992 B block hold three resident blocks of eight warps rather
+80 and lets the same 21,760 B block hold three resident blocks of eight warps rather
 than three of four. Measured on sm_86 at the geometry above, one call, medians of
 three event runs and one NCU capture of three launches each:
 
@@ -229,7 +229,7 @@ from slinoss.ops.so3ssd.cute.mma import (
     mma_rows,
     smem_pitch,
 )
-from slinoss.ops.so3ssd.cute.table import stage_pad
+from slinoss.ops.so3ssd.cute.table import TABLE_PITCH, stage_pad
 
 __all__ = [
     "RESIDENT_MAX",
@@ -249,7 +249,7 @@ most of its time waiting: measured on sm_86 at the model geometry with the tiles
 allocated separately, 42.1% of the issue slots stalled on ``long_scoreboard`` at
 36.4% of the bus and 20.8% issue, which is a kernel bounded by having eight warps per
 SM and not by the pipe. Residency is the only thing that covers it, and residency is
-what overlaying the recurrence's tile on the operands' bytes buys: 20,992 B a block
+what overlaying the recurrence's tile on the operands' bytes buys: 21,760 B a block
 at the model geometry, four blocks of it against the 101,376 B carveout.
 
 Four is what the tiles admit; three is what the register file prefers, because the
@@ -358,7 +358,7 @@ def fold_smem_bytes(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
             (trans_tile(chunk), 4),
             (scalar_tile(chunk), 4),
             (trans_tile(chunk), 4),
-            (table_tile(chunk, 1), 4),
+            (table_tile(chunk, 1, TABLE_PITCH), 4),
             (Tile((words,), (1,)), 4),
         ]
     )
@@ -441,7 +441,9 @@ def start_passing_bwd_kernel(
     strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 1).layout(), 16)
+    stable = smem.allocate_tensor(
+        cutlass.Float32, table_tile(chunk, 1, TABLE_PITCH).layout(), SMEM_SEGMENT
+    )
 
     # One region, three views: the two GEMM operands, and the contraction's result
     # over the same bytes. The pitches make every offset a whole float32 word and a
