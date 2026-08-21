@@ -85,9 +85,9 @@ at that shape, against the 28.32 MB a caller-side add of the same tensor would
 cost.
 
 The class is met at ``3N = 240 H = 18`` and at ``wide``, and not at the other three
-shapes. Measured on an RTX A6000, sm_86, clocks not locked, 2026-08-20, one launch per
+shapes. Measured on an RTX A6000, sm_86, clocks not locked, 2026-08-21, one launch per
 profile, against a copy time law fitted in the same process at the same clocks: fixed
-cost 4.25 to 4.94 us, asymptote 683.3 to 685.5 GB/s, worst residual 1.45%. Durations
+cost 4.17 to 5.01 us, asymptote 683.0 to 684.6 GB/s, worst residual 2.13%. Durations
 are ``gpu__time_duration.sum``, and the device probe names the part by UUID. Every
 profile in the table below ran with foreign processes resident on the device in both
 brackets, so every duration is stamped rather than quoted. The per-launch counters are
@@ -95,21 +95,21 @@ what the verdicts rest on: they are deterministic in the launch, and the sector 
 repeat exactly across profiles where the wall does not.
 
     shape         blocks  us/launch      MB  GB/s  class  dominant stall
-    standard        1536      235.7  108.02   458  68.9%  long_sb    25.0%
-    ragged          1536      231.8  106.65   460  69.1%  long_sb    24.2%
-    wide            1536      524.4  307.85   587  86.7%  long_sb    47.7%
-    long            1536     1762.3  183.56   104  15.5%  no_instr   52.8%
-    3N=240 H=18     2304      964.4  574.89   596  87.4%  long_sb    29.2%
+    standard        1536      235.1  101.46   432  65.1%  long_sb    27.6%
+    ragged          1536      231.1  100.19   434  65.6%  long_sb    26.8%
+    wide            1536      449.7  259.27   577  85.3%  long_sb    38.8%
+    long            1536     1653.6  181.19   110  16.3%  no_instr   52.9%
+    3N=240 H=18     2304      871.3  506.24   581  85.6%  long_sb    20.6%
 
 ``class`` is the fitted floor over the duration, against a bar of 85%. It falls when a
 change removes bytes, because the floor falls with them; the duration is the figure to
 read across the rows. The last row is the acceptance shape,
-``B=4 H=18 T=2048 P=64 3N=240 L=64`` at one group: 87.4% of the floor,
-``dram__throughput`` 81.6%, 25.68% issue, 255 registers, 48,752 B of shared memory,
-16.7% theoretical occupancy against 16.4% achieved, 0.1231 shared bank conflicts per
-wavefront, and SOL 52.5% sm against 83.0% memory.
+``B=4 H=18 T=2048 P=64 3N=240 L=64`` at one group: 85.6% of the floor,
+``dram__throughput`` 80.6%, 28.21% issue, 254 registers, 48,752 B of shared memory,
+16.7% theoretical occupancy against 16.4% achieved, 0.1236 shared bank conflicts per
+wavefront, and SOL 56.3% sm against 80.9% memory.
 
-Five changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
+Six changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
 with the device to itself in both brackets. Traffic after each, at that shape:
 
 - The two forcing-cotangent GEMMs accumulate into the output fragment. The increment
@@ -139,6 +139,17 @@ with the device to itself in both brackets. Traffic after each, at that shape:
   and the only one that cost a shape: ``wide`` went 505.6 us to 524.4 us on a different
   specialization, ``G != H``, whose spill loads rose 2,064,384 to 2,752,512 while every
   other shape's fell.
+- The increment's outer-product GEMM and its ``mrotp`` epilogue run below the forcing
+  GEMM instead of above it. Issued first, that accumulator is live across every other
+  GEMM in the body; issued last it dies inside its own statement group, and the
+  allocation that spilled at the acceptance shape stops spilling there. 584.10 MB to
+  506.24 MB, and 962.5 us to 871.3 us, both brackets in one session. The pre-arm
+  bracket reads 9.21 MB above the 574.89 MB the fifth change recorded, which is the
+  294,912 extra spill sectors -- eight words per thread -- that this toolchain
+  allocates and the earlier one did not. ``wide`` fell with it, 507.2 us to 449.7 us
+  as its spill went 103.02 MB to 66.06 MB. ``standard`` and ``ragged`` did not move,
+  and neither did their spill. ``long`` rose 0.8% on an unchanged 4,030,464 sectors
+  that land in L1 less often, 1,134,600 hits to 905,528.
 
 Registers sit at the 255 architectural cap at every shape and the kernel spills at
 every shape: 761,856 sectors per launch each way at ``standard`` and ``ragged``,
@@ -149,15 +160,24 @@ stores at the acceptance shape, so the spill is device traffic: 127.40 MB of the
 under 30 KB of the 128 KB unified cache for data, against their own streaming global
 staging, so a local line does not survive to its reload.
 
+That paragraph is the state before the sixth change, and the acceptance shape has
+left it: 254 registers, no local sector either way, 506.24 MB. The spill survives
+everywhere else, per launch each way at the same date as the table above: 540,672 at
+``standard`` and ``ragged``, 1,376,256 and 688,128 at ``wide``, 2,015,232 at ``long``.
+So the cap is not what the spill tracks. A live range is: the increment accumulator
+is the only one in the lane-loop body that dies inside the body, and where the body's
+order lets it die the allocation fits.
+
 What the spill holds is loop-invariant address arithmetic, not the accumulators. Read
-off the SASS at the acceptance shape, the frame is 160 B and both rolled lane loops
-carry no store at all: every ``STL`` is in the prologue or between the taps, and the
-``LDL`` cluster sits at the top of each loop body. At 36,864 sectors per launch per
-word per thread that made 167 words loaded and 40 stored, of which 14 were reloaded on
-each of the ten trips: the eight per-step element offsets of the increment staging pass
-and three 64-bit base pointers. Eliminating the eight leaves 81 loaded and 27 stored,
-about five words per trip. The three pointers survive slicing the two float32 tensors
-to the chunk's plane, so what remains is not addressed by removing coordinates.
+off the SASS at the acceptance shape before the sixth change, the frame was 160 B and
+both rolled lane loops carried no store at all: every ``STL`` was in the prologue or
+between the taps, and the ``LDL`` cluster sat at the top of each loop body. At 36,864
+sectors per launch per word per thread that made 167 words loaded and 40 stored, of
+which 14 were reloaded on each of the ten trips: the eight per-step element offsets of
+the increment staging pass and three 64-bit base pointers. Eliminating the eight left
+81 loaded and 27 stored, about five words per trip. The three pointers survive slicing
+the two float32 tensors to the chunk's plane, so what remained was not addressed by
+removing coordinates, and what removed it was the live range and not the addresses.
 
 Neither bound is occupancy or block width. Occupancy is 16.7% theoretical against 16.3
 to 16.5% achieved at ``L = 64``, with ``launch__occupancy_limit_registers`` and
@@ -170,13 +190,13 @@ accumulator holds ``M*N/threads`` elements whatever
 chunk to 128 rows.
 
 ``long`` is the one shape whose bound is still instruction fetch: ``no_instruction``
-52.8% at an 8.08% issue rate and 14.3% of ``dram__throughput``, with one lane tile and
+52.9% at a 7.96% issue rate and 15.0% of ``dram__throughput``, with one lane tile and
 four target-token slices unrolled over a 128-row M tile. The lane loop's remedy applies
 to the slice loop unchanged, and is not taken here because the score bank is a list of
 fragments a trace-time index addresses, which a dynamic trip count cannot. ``standard``
-and ``ragged`` are latency-bound instead, ``long_scoreboard`` 25.0% and 24.2% at issue
-rates of 29.1% and 29.8%, with one lane tile and 48.76 MB of their 108.02 MB in the
-spill.
+and ``ragged`` are latency-bound instead, ``long_scoreboard`` 27.6% and 26.8% at issue
+rates of 27.42% and 27.48%, with one lane tile and 34.60 MB of their 101.46 and 100.19
+MB in the spill.
 """
 
 from typing import NamedTuple
@@ -1054,12 +1074,31 @@ def chunk_input_bwd_kernel(
                                     )
             cute.arch.sync_threads()
 
+            # sum_d b_tap(r,d) dinc_local(p,d), the increment's contribution to the
+            # forcing cotangent, accumulated unweighted into the output fragment. No
+            # accumulator of its own: the fragment carries nothing else until the
+            # diagonal GEMM below the lane loop, and the weight is a function of the
+            # source token alone, so weighting the finished sum over lane blocks is the
+            # same sum as weighting each block's part. The epilogue that applies it then
+            # runs once per tap rather than once per lane block.
+            for k in cutlass.range_constexpr(lsteps):
+                mma_gemm(tiled_mma, tid, target, vforced[k], vlocal_n[k], True, True)
+
             # sum_p u_tap(r,p) dinc_local(p,d), the other half of the increment's outer
             # product. The element's matrix row is the accumulator column modulo three,
             # so it lands in the rotated basis at the static ``dres`` slot and costs
             # three multiply-adds rather than three selects and nine. The column is
             # block-local and the block starts on a lane triple, so the residue is the
             # same one the whole lane extent would give.
+            #
+            # Below the forcing GEMM, not above it. This accumulator is the only one in
+            # the body that dies inside the body, and issued first it was live across
+            # the forcing and score GEMMs as well: that allocation spilled 3,133,440
+            # local load and 1,142,784 local store sectors per launch at the acceptance
+            # shape, 136.84 MB of the 584.10 MB moved, which this order removes
+            # outright. Nothing between the two writes shared memory and no barrier
+            # separates them, so the order is free; both read ``sdinc``, which the
+            # staging pass above finished before the barrier.
             dloc = mma_acc(tiled_mma, tid, (mpad, lblk))
             for k in cutlass.range_constexpr(ksteps):
                 mma_gemm(tiled_mma, tid, dloc, vu[k], vlocal_k[k], True, False)
@@ -1071,16 +1110,6 @@ def chunk_input_bwd_kernel(
                     forced = widen(sbu[m, base + j], elem)
                     slot = 3 * dres[i] + j
                     mrotp[slot] = mrotp[slot] + weighted * forced
-
-            # sum_d b_tap(r,d) dinc_local(p,d), the increment's contribution to the
-            # forcing cotangent, accumulated unweighted into the output fragment. No
-            # accumulator of its own: the fragment carries nothing else until the
-            # diagonal GEMM below the lane loop, and the weight is a function of the
-            # source token alone, so weighting the finished sum over lane blocks is the
-            # same sum as weighting each block's part. The epilogue that applies it then
-            # runs once per tap rather than once per lane block.
-            for k in cutlass.range_constexpr(lsteps):
-                mma_gemm(tiled_mma, tid, target, vforced[k], vlocal_n[k], True, True)
 
             if cutlass.const_expr(banked):
                 for s in cutlass.range_constexpr(slices):
