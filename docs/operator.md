@@ -68,6 +68,42 @@ The chunk increment and the inter-chunk recurrence are
 
 The state passing over chunks is the only serial dimension left.
 
+## One-tap form
+
+Reindexing the previous-tap column onto its own token collapses the two taps to
+one. Both taps then read the same operand `b_{r-1}`, the same weight `u_{r-1}`,
+and the same mask, so one table column carries both:
+
+    Afuse_r    = Ap_r + exp(2*ls_r) * An_{r-1},   Afuse_0 = Ap_0
+    Bfuse_r    = Afuse_r b_{r-1}
+    diagonal:  Y_diag = (mask * (Cr @ Bfuse^T)) @ U_shift + dnow * U
+    increment: inc_local = (U_shift * wgt)^T @ Bfuse + outer(U_{L-1}, Bn_{L-1})
+
+with `dnow_t = <Cr_t, Bn_t>`. The mask is unchanged and the table width is
+unchanged -- the column that held `Ap` holds `Afuse` -- and a chunk costs four
+dense GEMMs instead of seven.
+
+What the reindex leaves over is rank-one, not a GEMM: row `t = r-1` falls outside
+the mask, and slot `L` falls outside the chunk. The diagonal leftover is
+rotation-free, because `R(Q_t)` is orthogonal and the two frames cancel:
+`<Cr_t, Bn_t>` equals `<c_t, K_curr(b_t)>`, the same dot product with the tap
+applied in the token's own frame, measured to 6.9e-16 relative. It needs neither
+the quaternion prefix nor the chunk-local frame and is orderable before the scan.
+
+`Afuse_0` takes no `An` term. The previous chunk's `An_{L-1}` is in the previous
+chunk's frame and its contribution already arrives through `zstart`, so injecting
+it is wrong rather than redundant: `y` moves by 2.3e-01.
+
+Padding is asymmetric here. Under two taps a zero-padded token is an exact no-op,
+since `w = 0` and `ls = 0` give the identity transition and a zero tap kills the
+forcing. That contract is retracted for this path: slot `n = T mod L` of a ragged
+tail chunk carries the last real token's now-tap. `U` and `B` are zero past the
+tail, `U_shift` and `B_shift` are built by shifting the padded sequence rather
+than by padding the shift, and the pad token's table row is materialized rather
+than predicated away. Padding the shift leaves `y` at roundoff and moves `state`
+by O(1), because a pad column enters rows `t >= n` alone and the tail slice
+discards those.
+
 ## Adjoint
 
 The backward saves the chunk boundary and nothing else derived. Every other
@@ -104,7 +140,10 @@ wrong, not the kernel.
    domain. Average active threads per warp stays at 32.00.
 3. A segment decay is never factored as `exp(2*lp_t) * exp(-2*lp_s)`. It is
    formed as `exp(2*(lp_t - lp_s))` from the log difference. Underflow times
-   overflow is how NaN gets in.
+   overflow is how NaN gets in. The one-tap form multiplies the mask by a second
+   factor, so the now-tap's effective decay is `mask(t,r) * exp(2*ls_r)`: both lie
+   in `(0,1]` by invariant 1 and neither comes from a reciprocal, so the product
+   is a decay and the rule stands.
 4. `trans`, `K`, the per-step quaternions, both chunk-local prefixes, and the 3x3
    table are float32 everywhere, including under autocast. Only `U`, `B`, `C`,
    `Y`, the score matrix, and GEMM operands are low precision. `z` is float32 in
@@ -115,8 +154,14 @@ wrong, not the kernel.
    Rotation error enters the rotation matrix squared; unit-norm drift is not
    tolerated. The projection in the backward is the adjoint of this and is not
    optional either.
-6. The score decay mask is applied to the float32 accumulator after the GEMM,
-   never folded into a bfloat16 operand.
+6. The score decay mask is applied to the float32 accumulator after the GEMM. It
+   is indexed by both the row and the column, so folding it into an operand means
+   splitting it as `exp(2*lp_t) * exp(-2*lp_r)`, which invariant 3 refuses: what
+   this bounds is the factorization, not the operand dtype. A single-index factor
+   is a different quantity. The one-tap form folds `exp(2*ls_r)` into the float32
+   table column `Afuse` and thence into a bfloat16 operand, at no measurable cost:
+   against the two-tap form the operand-rounding error ratio scatters 0.6x to 1.9x
+   over ten shapes and five seeds, with no shape holding a sign.
 
 ## Tensor contracts
 
