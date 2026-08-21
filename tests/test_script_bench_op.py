@@ -630,7 +630,8 @@ def test_the_exit_status_says_whether_a_null_comparison_resolved_anything(
     assert lines[6] == (
         "so3ssd tiny forward paired: so3ssd-auto-b beats so3ssd-auto-a by "
         "10.000 us (9.091%, speedup_ratio 1.100); the interval "
-        "[-10.000, -10.000] us at 99.219% coverage over 8 pairs excludes zero"
+        "[-10.000, -10.000] us at 99.219% coverage over 8 pairs excludes zero; "
+        "position 0.000 us removed"
     )
     assert lines[7] == (
         "both arms ran the same backend and ['so3ssd tiny forward paired'] still "
@@ -646,7 +647,7 @@ def test_the_exit_status_says_whether_a_null_comparison_resolved_anything(
     assert lines[6] == (
         "so3ssd tiny forward paired: no difference measured between so3ssd-auto-a "
         "and so3ssd-auto-b; the interval [0.000, 0.000] us at 99.219% coverage "
-        "over 8 pairs does not exclude zero"
+        "over 8 pairs does not exclude zero; position 0.000 us removed"
     )
     assert len(lines) == 7
 

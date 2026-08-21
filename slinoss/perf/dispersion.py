@@ -133,20 +133,32 @@ class PairedRow(PerfRecord):
     excursion, a cache eviction, or another tenant arriving hits both arms of a
     pair and cancels out of the difference. Nothing between runs enters at all.
 
-    The interval on that median is two of the differences themselves, so the
-    verdict is a comparison against zero in the unit the differences are measured
-    in. A speedup is claimed only when the whole interval sits on one side of
-    zero.
+    One cost does not cancel that way. Whichever arm runs second in an iteration
+    pays for the first one having just run, and the loop swaps that order every
+    iteration, so the cost enters half the differences with one sign and half with
+    the other. Pooled, the differences are then two clusters with a hole between
+    them, and the interval on their median reaches from one cluster to the other:
+    it is the order's width, not the arms' difference, and it refuses a difference
+    every pair agrees on. The two orders are differenced against each other
+    instead, which is what ``position_duration_us`` is, and it is taken out of
+    every pair before the median and the interval are read.
+
+    The interval on that median is two of the corrected differences themselves, so
+    the verdict is a comparison against zero in the unit the differences are
+    measured in. A speedup is claimed only when the whole interval sits on one side
+    of zero.
 
     Attributes:
         label: What was compared.
         a_label: The baseline arm.
         b_label: The arm under test.
         sample_count: Pairs. One per iteration.
-        a_median_duration_us: Median of the baseline arm.
-        b_median_duration_us: Median of the arm under test.
-        delta_median_duration_us: Median of ``b - a`` over the pairs. Negative
-            means the arm under test is faster.
+        a_median_duration_us: Median of the baseline arm, as measured. Each arm ran
+            first in half the iterations, so both medians carry the same half of
+            the position cost and their ratio is already free of it.
+        b_median_duration_us: Median of the arm under test, as measured.
+        delta_median_duration_us: Median of ``b - a`` over the pairs, with the
+            position cost removed. Negative means the arm under test is faster.
         delta_low_duration_us: Lower bound of the interval on that median.
         delta_high_duration_us: Upper bound of the interval on that median.
         coverage_pct: Exact coverage of that interval. Short of
@@ -155,6 +167,12 @@ class PairedRow(PerfRecord):
         delta_pct: The median difference over the baseline median.
         speedup_ratio: Baseline median over the median under test. Above one means
             faster.
+        position_duration_us: What the launch order was worth, removed from every
+            pair. Half the difference between the two orders' median differences.
+            Zero when only one order was measured. Larger in magnitude than
+            ``delta_median_duration_us`` means the loop measured the order more
+            strongly than the arms, which the corrected interval accounts for but
+            which is worth reading before quoting the result.
         resolves: True only if the interval reaches nominal coverage and excludes
             zero. This is the only field that licenses a claim.
     """
@@ -171,6 +189,7 @@ class PairedRow(PerfRecord):
     coverage_pct: Annotated[Percent, MEDIAN]
     delta_pct: Annotated[Percent, MEDIAN]
     speedup_ratio: Annotated[Ratio, MEDIAN]
+    position_duration_us: Annotated[Microseconds, MEDIAN]
     resolves: bool
 
     def verdict(self) -> str:
@@ -187,10 +206,12 @@ class PairedRow(PerfRecord):
             f"[{self.delta_low_duration_us:,.3f}, {self.delta_high_duration_us:,.3f}]"
             f" us at {self.coverage_pct:,.3f}% coverage over {self.sample_count} pairs"
         )
+        order = f"; position {self.position_duration_us:,.3f} us removed"
         if not self.resolves:
             return (
                 f"{self.label}: no difference measured between {self.a_label} and "
                 f"{self.b_label}; the interval {interval} does not exclude zero"
+                f"{order}"
             )
         faster, slower = (
             (self.b_label, self.a_label)
@@ -202,7 +223,31 @@ class PairedRow(PerfRecord):
             f"{abs(self.delta_median_duration_us):,.3f} us "
             f"({abs(self.delta_pct):,.3f}%, speedup_ratio "
             f"{self.speedup_ratio:,.3f}); the interval {interval} excludes zero"
+            f"{order}"
         )
+
+
+def _position(deltas: Sequence[Microseconds]) -> Microseconds:
+    """What the launch order is worth, from the differences alone.
+
+    The loop that produced the differences swapped which arm ran first every
+    iteration, so the even ones carry the cost of running second with one sign and
+    the odd ones with the other. Their mean is free of it and half their difference
+    is it. Which parity is which order sets only the sign, so the correction below
+    is right either way round.
+
+    Args:
+        deltas: The per-pair differences, in measurement order.
+
+    Returns:
+        The position cost, signed as the even differences carry it. Zero when there
+        is only one parity to read, which is one pair.
+    """
+    even = deltas[0::2]
+    odd = deltas[1::2]
+    if not even or not odd:
+        return Microseconds(0.0)
+    return Microseconds(0.5 * (median(even) - median(odd)))
 
 
 def paired(
@@ -213,6 +258,12 @@ def paired(
     b_samples: Sequence[Microseconds],
 ) -> PairedRow:
     """Judge two arms measured in the same iterations.
+
+    The samples are taken to come from a loop that alternates which arm runs first,
+    as :func:`slinoss.perf.timing.measure_paired` does, so the position cost is
+    estimated from the two parities and removed from every pair. A loop that does
+    not alternate estimates it at nothing but the noise between its two halves, so
+    the correction costs such a caller nothing beyond that.
 
     Args:
         label: What was compared.
@@ -245,7 +296,12 @@ def paired(
             f"paired needs a nonzero median in each arm, got {a_median} for "
             f"{a_label!r} and {b_median} for {b_label!r}"
         )
-    deltas = [Microseconds(b - a) for a, b in zip(a_samples, b_samples)]
+    raw = [Microseconds(b - a) for a, b in zip(a_samples, b_samples)]
+    position = _position(raw)
+    deltas = [
+        Microseconds(delta - position if index % 2 == 0 else delta + position)
+        for index, delta in enumerate(raw)
+    ]
     low, high, coverage = median_ci(deltas)
     return PairedRow(
         label=label,
@@ -260,6 +316,7 @@ def paired(
         coverage_pct=coverage,
         delta_pct=pct_of(median(deltas), a_median),
         speedup_ratio=ratio_of(a_median, b_median),
+        position_duration_us=position,
         # An interval straddling zero is consistent with no difference at all, so
         # the sign of the median it contains licenses nothing.
         resolves=coverage >= CONFIDENCE_PCT and (low > 0.0 or high < 0.0),

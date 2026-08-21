@@ -9,7 +9,10 @@ the same samples.
 The paired series is the point of :func:`slinoss.perf.dispersion.paired`: an arm
 drifting by 62 percent of its own median still resolves a 0.69 percent difference
 against the other arm, because the drift is common to the pair and cancels out of
-the difference.
+the difference. The position series is the case that drift argument does not cover.
+A cost that follows the launch order rather than the arm is not common to the pair,
+it splits the differences into one cluster per order, and pooling them puts the
+interval across the gap between the two.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from slinoss.perf.units import (
     MIN_RESOLVING_SAMPLES,
     Microseconds,
     Spread,
+    median_ci,
 )
 
 
@@ -231,9 +235,12 @@ def test_pairing_resolves_a_delta_far_below_either_arm_own_floor() -> None:
     assert row.coverage_pct == 97.8515625
     assert row.delta_low_duration_us == 1.0
     assert row.delta_high_duration_us == 1.0
+    # Both launch orders read the same difference, so there is nothing to remove
+    # and the correction is exactly zero.
+    assert row.position_duration_us == 0.0
 
 
-def test_an_interval_straddling_zero_resolves_nothing() -> None:
+def test_a_pure_position_effect_resolves_nothing() -> None:
     flat = us(*([100.0] * 8))
     alternating = us(105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0)
     row = paired("scan", "a", flat, "b", alternating)
@@ -241,20 +248,65 @@ def test_an_interval_straddling_zero_resolves_nothing() -> None:
     assert row.b_median_duration_us == 100.0
     assert row.delta_median_duration_us == 0.0
     assert row.speedup_ratio == 1.0
-    # The two arms swing 10 us against each other in both directions, so the
-    # interval covers zero and the median inside it means nothing.
-    assert row.delta_low_duration_us == -5.0
-    assert row.delta_high_duration_us == 5.0
+    # The swing follows the launch order and nothing else: 5 us one way in the
+    # iterations that ran a first, 5 us the other way in the iterations that ran b
+    # first. That is the whole of the difference, so once it is removed the two
+    # arms cost the same to the last bit.
+    assert row.position_duration_us == 5.0
+    assert row.delta_low_duration_us == 0.0
+    assert row.delta_high_duration_us == 0.0
     assert not row.resolves
     # The verdict names no arm and prints no ratio, so it cannot be quoted as a
-    # result.
+    # result. It does print what the order was worth.
     line = row.verdict()
     assert line == (
         "scan: no difference measured between a and b; the interval "
-        "[-5.000, 5.000] us at 99.219% coverage over 8 pairs does not exclude zero"
+        "[0.000, 0.000] us at 99.219% coverage over 8 pairs does not exclude zero; "
+        "position 5.000 us removed"
     )
     assert "beats" not in line
     assert "speedup" not in line
+
+
+def test_a_difference_smaller_than_the_position_effect_still_resolves() -> None:
+    # The arm under test costs 6 us more, and whichever arm runs second pays 18.5 us
+    # on top of that. Ten pairs: the iterations that ran a first read +24.5 and the
+    # iterations that ran b first read -12.5, two clusters 37 us apart with nothing
+    # between them.
+    a = us(*([100.0, 118.5] * 5))
+    b = us(*([124.5, 106.0] * 5))
+    raw = [Microseconds(y - x) for x, y in zip(a, b)]
+    assert set(raw) == {24.5, -12.5}
+    # Pooled, those differences are one sample list with a hole in the middle. The
+    # interval on their median is two of them, so it reaches from one cluster to the
+    # other, covers zero, and refuses a difference that every pair agrees on.
+    low, high, _ = median_ci(raw)
+    assert low == -12.5 and high == 24.5
+    row = paired("scan", "a", a, "b", b)
+    # Split by launch order the position term enters the two halves with opposite
+    # signs, so it cancels in their mean and is what is left of their difference.
+    assert row.position_duration_us == 18.5
+    assert row.delta_median_duration_us == 6.0
+    assert row.delta_low_duration_us == 6.0
+    assert row.delta_high_duration_us == 6.0
+    assert row.resolves
+    # Each arm ran first half the time, so the two medians already carry the same
+    # half of the position cost and the ratio never needed the correction.
+    assert row.a_median_duration_us == 109.25
+    assert row.b_median_duration_us == 115.25
+    assert row.speedup_ratio == pytest.approx(109.25 / 115.25)
+    assert row.delta_pct == pytest.approx(600.0 / 109.25)
+
+
+def test_one_pair_admits_no_position_estimate() -> None:
+    # One iteration ran one order, so there is no second order to difference it
+    # against and the correction cannot be estimated. It is reported as zero rather
+    # than guessed, and one pair resolves nothing anyway.
+    row = paired("scan", "a", us(100.0), "b", us(90.0))
+    assert row.position_duration_us == 0.0
+    assert row.delta_median_duration_us == -10.0
+    assert row.coverage_pct < CONFIDENCE_PCT
+    assert not row.resolves
 
 
 def test_a_consistent_difference_below_nominal_coverage_resolves_nothing() -> None:
