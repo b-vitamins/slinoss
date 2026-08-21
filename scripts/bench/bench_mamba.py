@@ -28,6 +28,23 @@ the floor that resolves anything.
 ``--seq`` holds one shape's geometry and varies its sequence length, which the six
 names cannot: they differ in five other extents as well.
 
+``--end-to-end`` measures the second acceptance clause instead of the first. The
+first compares the scan operators at iso state dimension; the second compares the
+whole layer at iso ``d_model``, so norm, projections and convolution are inside both
+arms. The bar is 1.0x rather than 1.15x, and the arms are the shipped modules:
+``mamba_ssm.modules.mamba2.Mamba2`` against :class:`slinoss.mixer.SLinOSSMixer`.
+
+    python3 scripts/bench/bench_mamba.py --shape acceptance --groups one \\
+        --mode step --end-to-end
+
+Mamba2 has two forward paths and they are two different baselines. Its default,
+``use_mem_eff_path=True``, calls ``mamba_split_conv1d_scan_combined``, which fuses
+the projection split, the convolution, the scan and the gated norm; that is what a
+Mamba2 user runs. Setting it False runs the convolution, then the
+``mamba_chunk_scan_combined`` of the first clause, then a separate gated norm. Both
+are measured, because a ratio against the unfused path is not a ratio against
+Mamba2.
+
 The comparison states what it holds equal. :func:`mapping_of` fixes the geometry,
 :func:`mamba_arithmetic` and :func:`so3ssd_arithmetic` count the GEMM flop of each
 side at it, and :func:`parameter_counts` counts the parameters of the two layers the
@@ -83,6 +100,22 @@ def load_scan() -> Callable[..., Any]:
     except ImportError as exc:
         raise SystemExit(f"bench_mamba needs mamba-ssm: {exc}") from exc
     return mamba_chunk_scan_combined
+
+
+def load_block() -> Any:
+    """Import Mamba2's layer module.
+
+    Returns:
+        The ``Mamba2`` class.
+
+    Raises:
+        SystemExit: If ``mamba-ssm`` is not installed.
+    """
+    try:
+        from mamba_ssm.modules.mamba2 import Mamba2  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise SystemExit(f"bench_mamba needs mamba-ssm: {exc}") from exc
+    return Mamba2
 
 
 class Mapping(NamedTuple):
@@ -250,6 +283,179 @@ class Parameters(NamedTuple):
     elements: int
 
 
+def d_model_of(shape: OpShape) -> int:
+    """The residual-stream width both layers are held at.
+
+    Read off the SO(3) layer's own config rather than recomputed. The second
+    acceptance clause is stated at iso ``d_model``, so the equality it rests on has
+    one definition and the Mamba2 arm is built from that one. A second copy of
+    ``H * P / 2`` here could drift from the layer while the clause still read as iso.
+
+    Args:
+        shape: The SO(3) shape.
+
+    Returns:
+        ``d_model``.
+
+    Raises:
+        ValueError: If ``H*P`` is odd, so no integer width expands to it.
+    """
+    from slinoss.perf.workload import layer_config
+
+    return layer_config(shape, groups=shape.groups).d_model
+
+
+def fused_path_blocker() -> str | None:
+    """Report why Mamba2's fused forward cannot run, if it cannot.
+
+    ``mamba_split_conv1d_scan_combined`` calls ``causal_conv1d`` unconditionally and
+    has no fallback, so the fused path raises ``TypeError`` on a ``None`` handle
+    rather than degrading. The unfused path guards the same handle and falls back to
+    ``nn.Conv1d``. Probe the handle instead of the package: what decides is the
+    symbol ``ssd_combined`` bound at import.
+
+    Returns:
+        A one-line reason, or ``None`` if the fused path is callable.
+    """
+    try:
+        from mamba_ssm.ops.triton import (  # type: ignore[import-not-found]
+            ssd_combined,
+        )
+    except ImportError as exc:
+        return f"mamba-ssm is not importable: {exc}"
+    if getattr(ssd_combined, "causal_conv1d_fwd_function", None) is None:
+        return (
+            "the causal_conv1d package is absent, so "
+            "mamba_split_conv1d_scan_combined calls a None handle"
+        )
+    return None
+
+
+def make_mamba_block(
+    shape: OpShape,
+    groups: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    mem_eff_path: bool = True,
+) -> Any:
+    """Build a Mamba2 layer at the mapped geometry.
+
+    Args:
+        shape: The SO(3) shape.
+        groups: Mamba2 group count.
+        device: Where to allocate.
+        dtype: Parameter dtype.
+        mem_eff_path: Whether the layer takes its fused forward. False runs the
+            convolution, ``mamba_chunk_scan_combined`` and the gated norm as three
+            calls, which is the path whose scan the first clause measures.
+
+    Returns:
+        The layer.
+
+    Raises:
+        SystemExit: If ``mamba-ssm`` is not installed, or if the fused path is
+            asked for and cannot run here.
+    """
+    if mem_eff_path:
+        blocker = fused_path_blocker()
+        if blocker is not None:
+            raise SystemExit(f"--mamba-path fused is unavailable: {blocker}")
+    mapping = mapping_of(shape, groups)
+    return load_block()(
+        d_model=d_model_of(shape),
+        d_state=mapping.dstate,
+        headdim=mapping.headdim,
+        ngroups=mapping.ngroups,
+        expand=2,
+        chunk_size=mapping.chunk,
+        use_mem_eff_path=mem_eff_path,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def block_runner(
+    module: Any,
+    x: Tensor,
+    dy: Tensor,
+    *,
+    grads: bool,
+    prefix: str,
+) -> Callable[[], None]:
+    """Build the timed callable for one layer.
+
+    The backward differentiates with respect to the input and every parameter,
+    which is the gradient set a training step forms. Restricting it to the input
+    would drop both projections' weight gradients, and those are the largest GEMMs
+    in either layer.
+
+    Args:
+        module: The layer, already on the device.
+        x: ``(B,T,d_model)`` input, requiring grad in step mode.
+        dy: ``(B,T,d_model)`` cotangent seed.
+        grads: Whether to run the backward.
+        prefix: Region label prefix.
+
+    Returns:
+        The callable.
+
+    Raises:
+        ValueError: If a step is asked for and nothing requires grad, which would
+            time a forward and call it a step.
+    """
+    if not grads:
+
+        def run_forward() -> None:
+            with torch.no_grad(), region(f"{prefix}.forward"):
+                module(x)
+
+        return run_forward
+
+    targets = (x, *(p for p in module.parameters() if p.requires_grad))
+    if not any(t.requires_grad for t in targets):
+        raise ValueError(f"{prefix} step needs at least one tensor requiring grad")
+
+    def run_step() -> None:
+        with region(f"{prefix}.forward"):
+            y = module(x)
+        with region(f"{prefix}.backward"):
+            torch.autograd.grad(y, targets, dy)
+
+    return run_step
+
+
+def block_stream(
+    shape: OpShape,
+    device: torch.device,
+    *,
+    dtype: torch.dtype,
+    requires_grad: bool,
+    seed: int = 0,
+) -> tuple[Tensor, Tensor]:
+    """The residual-stream input and cotangent both layers are fed.
+
+    One seed, so the two arms see the same numbers. Each arm needs its own leaf to
+    accumulate into, so the input is drawn once and cloned per arm by the caller.
+
+    Args:
+        shape: The SO(3) shape.
+        device: Where to allocate.
+        dtype: Activation dtype.
+        requires_grad: Whether the input is a differentiable leaf.
+        seed: Generator seed.
+
+    Returns:
+        The input and the cotangent, both ``(B,T,d_model)``.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    size = (shape.bsz, shape.seq, d_model_of(shape))
+    with torch.no_grad():
+        x = torch.randn(*size, dtype=dtype, device=device, generator=gen)
+        dy = torch.randn(*size, dtype=dtype, device=device, generator=gen)
+    return x.requires_grad_(requires_grad), dy
+
+
 def parameter_counts(shape: OpShape, groups: int) -> tuple[Parameters, Parameters]:
     """Count the parameters of the two layers the two operators sit inside.
 
@@ -274,24 +480,14 @@ def parameter_counts(shape: OpShape, groups: int) -> tuple[Parameters, Parameter
     Raises:
         SystemExit: If ``mamba-ssm`` is not installed.
     """
-    try:
-        from mamba_ssm.modules.mamba2 import Mamba2  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise SystemExit(f"bench_mamba needs mamba-ssm: {exc}") from exc
-
     from slinoss.mixer import SLinOSSMixer
     from slinoss.perf.workload import layer_config
 
-    m = mapping_of(shape, groups)
-    theirs = Mamba2(
-        d_model=shape.heads * shape.rows // 2,
-        d_state=m.dstate,
-        headdim=m.headdim,
-        ngroups=m.ngroups,
-        expand=2,
-        chunk_size=m.chunk,
-        device="cpu",
-        dtype=torch.float32,
+    # ``use_mem_eff_path`` selects a forward and allocates nothing, so the count is
+    # the same either way. Ask for the unfused path so a host without
+    # ``causal_conv1d`` can still count parameters.
+    theirs = make_mamba_block(
+        shape, groups, device=torch.device("cpu"), mem_eff_path=False
     )
     ours = SLinOSSMixer(
         layer_config(shape, groups=groups), device="cpu", dtype=torch.float32
@@ -501,6 +697,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="SO(3) backend for the comparison arm. Default is the fastest one.",
     )
+    parser.add_argument(
+        "--end-to-end",
+        action="store_true",
+        help=(
+            "Measure the whole Mamba2 layer against the whole SO(3) mixer at iso "
+            "d_model, which is the second acceptance clause and a 1.0x bar. Needs "
+            "an even --iters."
+        ),
+    )
+    parser.add_argument(
+        "--mamba-path",
+        choices=["fused", "unfused", "both"],
+        default="both",
+        help="Which Mamba2 forward the end-to-end baseline takes. `fused` is its "
+        "default mem-eff path and what a Mamba2 user runs; `unfused` runs the "
+        "convolution, the scan of the first clause, and the gated norm as three "
+        "calls. They are two different baselines, so both are measured by default.",
+    )
     parser.add_argument("--out", type=Path, default=Path("out/bench-mamba"))
     return parser.parse_args(argv)
 
@@ -608,6 +822,136 @@ class Faceoff(NamedTuple):
         )
 
 
+class BlockFaceoff(NamedTuple):
+    """One layer comparison's verdict together with what was held equal.
+
+    No flop count. Mamba2 holds its convolution in an ``nn.Conv1d`` and the SO(3)
+    mixer holds its own as a bare parameter, so a count that walked submodules would
+    charge one side for a kernel it did not charge the other. An asymmetric flop
+    model is worse than none, and the clause is stated in throughput.
+
+    Attributes:
+        row: The verdict on the per-iteration differences.
+        d_model: The width both layers ran at.
+        path: Which Mamba2 forward path the baseline arm took.
+        params: Both layers' parameter counts, Mamba2 first.
+        arms: Both arms' medians, in the same order.
+    """
+
+    row: PairedRow
+    d_model: int
+    path: str
+    params: tuple[Parameters, Parameters]
+    arms: tuple[ArmTimes, ArmTimes]
+
+    def lines(self) -> tuple[str, ...]:
+        """What was held equal and what each side paid for it."""
+        theirs, ours = self.params
+        excess = 100.0 * (ours.elements - theirs.elements) / theirs.elements
+        return (
+            f"iso d_model={self.d_model} on both arms, mamba2 path={self.path}",
+            "parameters: "
+            + ", ".join(f"{p.label} {p.elements:,}" for p in self.params),
+            f"the SO(3) layer carries {excess:+,.2f}% of Mamba2's parameters at "
+            f"the same d_model",
+            *(arm.describe() for arm in self.arms),
+        )
+
+
+def compare_block(
+    shape: OpShape,
+    groups: int,
+    mode: str,
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    mem_eff_path: bool,
+) -> tuple[Report, BlockFaceoff]:
+    """Measure the whole Mamba2 layer against the whole SO(3) mixer in one loop.
+
+    This is the second acceptance clause. Both arms hold the same ``d_model`` and
+    the same residual-stream input values, and both include the projections, the
+    convolution and the norm. Mamba2 is the baseline arm, so ``speedup_ratio``
+    above one means the SO(3) mixer is the faster of the two, and the bar is one.
+
+    Args:
+        shape: The problem size.
+        groups: Mamba2 group count.
+        mode: ``forward`` or ``step``.
+        args: Parsed command line.
+        device: Device to time on.
+        mem_eff_path: Whether the Mamba2 arm takes its fused forward.
+
+    Returns:
+        The report and the face-off.
+    """
+    from slinoss.mixer import SLinOSSMixer
+    from slinoss.perf.workload import layer_config
+
+    dtype = DTYPES[args.dtype]
+    grads = mode == "step"
+    path = "fused" if mem_eff_path else "unfused"
+    a_label = f"mamba2-block-{path}"
+    b_label = "slinoss-mixer"
+    theirs = make_mamba_block(
+        shape, groups, device=device, dtype=dtype, mem_eff_path=mem_eff_path
+    )
+    ours = SLinOSSMixer(layer_config(shape, groups=groups), device=device, dtype=dtype)
+    if not grads:
+        theirs.requires_grad_(False)
+        ours.requires_grad_(False)
+    x, dy = block_stream(shape, device, dtype=dtype, requires_grad=grads)
+    # One draw, one clone per arm: the same numbers, and a leaf each so neither
+    # arm's backward accumulates into the other's.
+    their_x = x.detach().clone().requires_grad_(grads)
+    our_x = x.detach().clone().requires_grad_(grads)
+    label = f"mamba2 block {path} vs slinoss mixer {shape.name} {mode} paired"
+    reset_memory_peaks(device)
+    out = measure_paired(
+        a_label,
+        block_runner(theirs, their_x, dy, grads=grads, prefix=a_label),
+        b_label,
+        block_runner(ours, our_x, dy, grads=grads, prefix=b_label),
+        label=label,
+        iters=args.iters,
+        warmup=args.warmup,
+        device=device,
+    )
+    tree = budget(out.timed)
+    assert_closed(tree)
+    face = BlockFaceoff(
+        row=out.comparison,
+        d_model=d_model_of(shape),
+        path=path,
+        params=parameter_counts(shape, groups),
+        arms=(arm_times(out.timed, a_label), arm_times(out.timed, b_label)),
+    )
+    report = Report(
+        title=f"bench: {label}",
+        device=device_info(device_ordinal(device)),
+        budget=tree,
+        throughput=tuple(
+            Throughput.of(name, shape.token_count, out.timed.region(name).spread)
+            for name in (a_label, b_label)
+        ),
+        comparisons=(out.comparison,),
+        peaks=memory_peaks(label, device),
+        pool=pool_retention(label),
+        notes=(
+            shape.describe(),
+            *face.lines(),
+            f"so3ssd n_groups={shape.groups} mamba2 ngroups={groups}",
+            f"mode={mode} dtype={args.dtype}",
+            f"arm a={a_label} b={b_label}, one loop, order swapped each iteration",
+            "both arms differentiate the input and every parameter",
+            "each arm holds its own leaf of one draw; the memory peak covers both",
+            f"iters={args.iters} warmup={args.warmup}",
+            f"timer={out.timed.timer} clocks={out.timed.clocks}",
+        ),
+    )
+    return report, face
+
+
 def compare_so3ssd(
     scan: Callable[..., Any],
     shape: OpShape,
@@ -702,6 +1046,58 @@ def compare_so3ssd(
     return report, face
 
 
+def _run_blocks(
+    shapes: Sequence[OpShape],
+    modes: Sequence[str],
+    wanted: Sequence[str],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> int:
+    """Run every layer comparison and print the verdicts.
+
+    Returns:
+        Process exit status.
+    """
+    paths = (
+        (True, False) if args.mamba_path == "both" else (args.mamba_path == "fused",)
+    )
+    blocker = fused_path_blocker()
+    if blocker is not None and args.mamba_path == "both":
+        # Skipping is right only for ``both``, which asks for whatever runs. An
+        # explicit ``--mamba-path fused`` must fail, not silently measure the other
+        # path under the fused label.
+        print(f"skipping the fused Mamba2 path: {blocker}")
+        paths = (False,)
+    rates: list[tuple[str, Throughput]] = []
+    verdicts: list[BlockFaceoff] = []
+    for shape in shapes:
+        for groups in group_counts(shape, wanted):
+            for mode in modes:
+                for mem_eff in paths:
+                    report, face = compare_block(
+                        shape, groups, mode, args, device, mem_eff_path=mem_eff
+                    )
+                    base = args.out.with_name(
+                        f"{args.out.name}-block-{face.path}-{shape.name}"
+                        f"-g{groups}-{mode}"
+                    )
+                    md, _ = write_report(report, base, require_agreement=False)
+                    rates += [
+                        (f"{shape.name}/g{groups}/{mode}/{rate.label}", rate)
+                        for rate in report.throughput
+                    ]
+                    verdicts.append(face)
+                    print(f"wrote {md}")
+    print()
+    print(rate_table(rates, width=52))
+    for face in verdicts:
+        print()
+        print(face.row.verdict())
+        for line in face.lines():
+            print(f"  {line}")
+    return 0
+
+
 def _run_comparisons(
     scan: Callable[..., Any],
     shapes: Sequence[OpShape],
@@ -760,6 +1156,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     modes = MODES if args.mode == "both" else (args.mode,)
     wanted = args.groups or ["heads", "one"]
+    if args.end_to_end:
+        return _run_blocks(shapes, modes, wanted, args, device)
     if args.against_so3ssd:
         return _run_comparisons(scan, shapes, modes, wanted, args, device)
     info = device_info(device_ordinal(device))
