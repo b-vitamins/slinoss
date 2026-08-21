@@ -149,6 +149,19 @@ spills. The residue is not attributed to a site, because the counters are per
 kernel and the staging stores share them with the operand stores; separating the
 two needs source-level counters.
 
+The pattern the pairing leaves is two-way wherever a warp's 32 linear indices straddle
+a row. At a 48-column bf16 tile the pair stride is 28 four-byte words, so 24 pairs of
+one row and eight of the next take banks ``0..23`` and ``28..31, 0..3``. A map of eight
+rows by four pairs a warp clears it: ``28 * r`` modulo 32 over eight rows is a
+stride-four permutation and four consecutive pairs tile it exactly. It converts to zero,
+by an identity and not by a close call. The remap costs the global read its contiguity
+-- a warp goes from 128 adjacent bytes and four sectors to eight rows of 16 bytes and
+eight sectors -- so it trades one extra shared wavefront on the store for four extra
+sectors on the load, and both pipes run at 128 bytes a cycle, so it is one cycle for one
+cycle at every geometry. At ``chunk_vector_bwd``, ``standard``, source-level counters put
+the store side at 245,760 excess wavefronts a launch over 20 program counters; the same
+census puts the load side at 983,040 added sectors. 1.6 us each of 215.
+
 A step carries twice the elements, so both paired passes take ``PREFETCH //
 LANE_PAIR`` steps per group and the live element count and the elements in flight
 are the ones :data:`PREFETCH` states.

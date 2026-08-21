@@ -838,6 +838,18 @@ def gradient_tile(rows: int, dim: int) -> Tile:
     the store; a second rounding here would double the error on every term it
     feeds, including the two float32 outputs.
 
+    The accumulator store into it is two-way and no pitch clears it. A float32 pair
+    goes out eight bytes wide, so a phase is sixteen threads over four accumulator
+    rows and the bank pair is ``pitch // 2 * r + d // 2`` modulo sixteen: at 52 words
+    a row that is ``{0,10,4,14}`` against a column span of four, and two banks take
+    two rows each. Freedom needs the pitch congruent to eight or 24 words modulo 32,
+    an even count of 16-byte segments, and the run reads of :func:`_pass_row` need an
+    odd one. The operand-width score store escapes because a four-byte pair widens
+    the phase to eight rows, where the same pitch is a stride-four permutation.
+    Measured at ``standard``: 294,912 excess store wavefronts a launch from the
+    forcing gradient and 147,456 from the readout, which at one shared cycle a
+    wavefront over 84 multiprocessors bounds the defect at 2.9 us of 215.
+
     Args:
         rows: Rows to allocate.
         dim: ``3N``.
@@ -2692,7 +2704,9 @@ def chunk_vector_bwd_kernel(
     gdcj = _lane_view(gdc, joff)
     gcarryj = _lane_view(gcarry, joff)
 
-    cute.arch.sync_threads()
+    # No barrier ahead of the zero fill. Everything above this point is an allocation
+    # or an index, so the fill is the block's first shared access and there is nothing
+    # for a barrier to fence; the fill's own reader is several barriers further on.
     _fill_zero(sumb, (chunk + 1) * ldf, tid, threads)
     if cutlass.const_expr(fold > 1):
         _fill_zero(sumc, chunk * ldf, tid, threads)
@@ -2707,7 +2721,13 @@ def chunk_vector_bwd_kernel(
     # statement, and the body is four hundred lines.
     for hstep in cutlass.range(fold, unroll=1):
         hidx = (gidx * splits + sidx) * fold + hstep
-        cute.arch.sync_threads()
+        # Loop-carried only. This is the write-after-read fence between the previous
+        # head's reads of the per-head tiles and this head's staging of them, so a
+        # shard of one head has nothing for it to order: the zero fill above targets
+        # the forcing sum, which no tile staged below overlaps, and the barrier under
+        # the staging publishes it.
+        if cutlass.const_expr(fold > 1):
+            cute.arch.sync_threads()
         stage_chunk(
             gtrans[bidx, hidx, None, None],
             gtap[bidx, hidx, None, None, None],
@@ -2900,7 +2920,16 @@ def chunk_vector_bwd_kernel(
                 for s in range(-(-span // taprows))
             )
             for tap in cutlass.range_constexpr(2):
-                cute.arch.sync_threads()
+                # First tap only. What this publishes is the pair of staged tiles
+                # above, which the second tap has already read. The write the second
+                # tap would need it for is ``sbrot``, whose readers are the two
+                # products below, and both are already separated from it by the
+                # barrier that publishes the tap gradient. The cross-thread hazard
+                # that does cross the taps is the forcing sum's read-modify-write,
+                # the two taps landing on different rows of it, and the barrier below
+                # covers that.
+                if cutlass.const_expr(tap == 0):
+                    cute.arch.sync_threads()
                 _rotate_rows(
                     sb,
                     sbrot,
@@ -3171,8 +3200,11 @@ def chunk_vector_bwd_kernel(
                             gdtrans[bidx, hidx, trow, j] = sdw[j, token] + dexp[j]
                         gdtrans[bidx, hidx, trow, 3] = sdls[token]
 
-    cute.arch.sync_threads()
-
+    # No barrier between the fold and the two sums below. The last write to either sum
+    # is a tap epilogue's and a readout epilogue's, and every path from there to here
+    # crosses the barriers that close the chart, so a barrier at this point orders a
+    # pair the ones inside the fold have already ordered.
+    #
     # The shard's two sums for this lane tile, rounded once: the narrowing is here at
     # one shard and at the reduction above one, never twice. Row t+1 of the forcing sum
     # is token t and row 0 is the row the boundary kernel owns.
