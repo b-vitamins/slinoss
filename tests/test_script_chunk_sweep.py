@@ -113,7 +113,10 @@ def test_parse_args_defaults_the_acceptance_sweep_and_takes_every_mode() -> None
     assert default.peak_tflops is None
     for name in MODES:
         assert parse_args(["--mode", name]).mode == name
-    assert MODES == ("arena", "traffic", "numerics", "step")
+    assert MODES == ("arena", "traffic", "numerics", "step", "op")
+    # The op mode pairs against a fixed length, so the default has to be one the
+    # acceptance arena admits or every pair loses its baseline arm.
+    assert default.op_ref == 64
     args = parse_args(
         [
             "--mode",

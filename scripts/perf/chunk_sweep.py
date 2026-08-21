@@ -1,13 +1,14 @@
 """Chunk length as a free parameter: what refuses it, what it costs, what it buys.
 
 ``L`` is not tuned. It is pinned by the shared-memory arena of two kernels, and every
-other consequence of the choice follows from that. Four modes separate the questions
+other consequence of the choice follows from that. Five modes separate the questions
 so that a computed row and a measured row never share a table::
 
     python3 scripts/perf/chunk_sweep.py --mode arena
     python3 scripts/perf/chunk_sweep.py --mode traffic
     python3 scripts/perf/chunk_sweep.py --mode numerics
     python3 scripts/perf/chunk_sweep.py --mode step
+    python3 scripts/perf/chunk_sweep.py --mode op
 
 ``arena`` is the legality map. The shipped layout functions are evaluated at each
 candidate ``L`` against the device's carveout and against half of it, which is what
@@ -34,6 +35,15 @@ float64 oracle, which separates the prefix error from the operand error. Measure
 ``step`` is the whole-step time at each legal ``L``, with the per-kernel attribution
 and a parity check against the reference at the same ``L``, so a faster wrong answer
 is caught.
+
+``op`` is the same question on the arm the acceptance bar is scored on: the operator
+alone, no layer around it. A length that wins a whole step is ranked against a
+denominator the bar does not read, so the two modes can disagree and the ``op`` one
+settles the bar. Each length is paired inside one loop against a fixed reference
+length over the same input tensors, so the ranking rests on per-iteration
+differences and not on two medians taken minutes apart::
+
+    python3 scripts/perf/chunk_sweep.py --mode op --chunks 16 32 64 --op-ref 64
 """
 
 from __future__ import annotations
@@ -49,7 +59,7 @@ from slinoss.config import HEAD_MULTIPLE, MAX_CHUNK, MIN_CHUNK, STATE_MULTIPLE
 from slinoss.ops.so3ssd.reference import SO3SSDResult
 from slinoss.perf.workload import OpShape, shape_by_name
 
-MODES = ("arena", "traffic", "numerics", "step")
+MODES = ("arena", "traffic", "numerics", "step", "op")
 
 CANDIDATES: tuple[int, ...] = (16, 32, 64, 128, 256)
 """Chunk lengths the sweep asks about.
@@ -1038,6 +1048,154 @@ def step_rows(
 
 
 # ---------------------------------------------------------------------------
+# Op alone
+# ---------------------------------------------------------------------------
+
+
+class OpRow(NamedTuple):
+    """One chunk length measured against a fixed reference length in one loop.
+
+    Attributes:
+        chunk: ``L`` of the arm under test.
+        ref_chunk: ``L`` of the baseline arm, held fixed across the sweep.
+        ref_us: Median of the baseline arm over the pairs.
+        chunk_us: Median of the arm under test over the pairs.
+        delta_us: Median of ``chunk - ref`` over the pairs. Negative means the
+            length under test is the faster of the two.
+        speedup_ratio: Baseline median over the median under test. Above one means
+            the length under test is faster.
+        resolves: Whether the paired interval excludes zero at nominal coverage.
+            The only field that licenses a claim.
+        forward_us: Forward region of the arm under test.
+        backward_us: Backward region of the arm under test.
+        cute_us: Device time in this package's own kernels, from the profiled pass.
+        parity_rel: Largest relative departure of the CuTe forward from the
+            reference at this chunk length.
+        foreign_processes: Compute processes on the device other than this one, at
+            probe time. Above zero makes the row contaminated.
+    """
+
+    chunk: int
+    ref_chunk: int
+    ref_us: float
+    chunk_us: float
+    delta_us: float
+    speedup_ratio: float
+    resolves: bool
+    forward_us: float
+    backward_us: float
+    cute_us: float
+    parity_rel: float
+    foreign_processes: int
+
+
+def op_rows(
+    args: argparse.Namespace,
+    geo: Geometry,
+    shape: OpShape,
+    chunks: Sequence[int],
+    device: torch.device,
+) -> tuple[tuple[OpRow, ...], dict[int, tuple[tuple[str, float, float], ...]]]:
+    """Measure the operator alone at each chunk length, paired against one reference.
+
+    The acceptance bar is scored on the operator alone, not on a whole step, so a
+    chunk length ranked in a whole-step harness is ranked against a different
+    denominator. This measures the arm the bar reads.
+
+    Both arms are the same operator over the same input tensors at two chunk
+    lengths, run in one loop with the order swapped every iteration. A bare
+    microsecond taken at one length and compared against a bare microsecond taken
+    at another carries the session systematic; a paired difference does not, so the
+    ranking rests on the pairs and not on the medians.
+
+    ``chunk == ref`` is the null test of the instrument: the same length in both
+    arms must not resolve.
+
+    Args:
+        args: The command line. ``--op-ref`` fixes the baseline length.
+        geo: The operator geometry the parity check runs at.
+        shape: The shape the timed arms run at. Its own ``L`` is ignored; the sweep
+            sets it on both arms.
+        chunks: Chunk lengths to measure.
+        device: Where to measure.
+
+    Returns:
+        One row per chunk length, and the per-kernel rows keyed by chunk length.
+    """
+    from dataclasses import replace
+
+    from torch.profiler import ProfilerActivity, profile
+
+    from scripts.perf.attribute_step import device_rows
+    from slinoss.perf.device import contention, device_ordinal
+    from slinoss.perf.timing import measure_paired
+    from slinoss.perf.workload import make_inputs
+    from slinoss.perf.workload import step as op_step
+
+    ref = args.op_ref
+    index = max(device_ordinal(device), 0)
+    checked = Geometry(
+        bsz=args.parity_batch,
+        heads=geo.heads,
+        groups=geo.groups,
+        seqlen=args.parity_seq,
+        rows=geo.rows,
+        dim=geo.dim,
+    )
+    # The five differentiable inputs depend on B, H, T, P, G and 3N only, so one
+    # draw serves every chunk length and both arms read the same numbers.
+    inputs = make_inputs(replace(shape, chunk=ref), device, requires_grad=True)
+    rows: list[OpRow] = []
+    kernels: dict[int, tuple[tuple[str, float, float], ...]] = {}
+    for chunk in chunks:
+        rel = parity(checked, chunk, device, seed=args.seed)
+        a_label, b_label = f"ref{ref}", f"test{chunk}"
+        out = measure_paired(
+            a_label,
+            op_step(inputs, ref, backend=args.backend, prefix=a_label),
+            b_label,
+            op_step(inputs, chunk, backend=args.backend, prefix=b_label),
+            label=f"op/L{ref}-vs-L{chunk}",
+            iters=args.iters,
+            warmup=args.warmup,
+            device=device,
+        )
+        under = op_step(inputs, chunk, backend=args.backend, prefix=b_label)
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        ) as profiled:
+            for _ in range(args.profile_iters):
+                under()
+            torch.cuda.synchronize(device)
+        table = tuple(device_rows(profiled, args.profile_iters))
+        kernels[chunk] = table
+        probe = contention(index)
+        row = out.comparison
+        rows.append(
+            OpRow(
+                chunk=chunk,
+                ref_chunk=ref,
+                ref_us=float(row.a_median_duration_us),
+                chunk_us=float(row.b_median_duration_us),
+                delta_us=float(row.delta_median_duration_us),
+                speedup_ratio=float(row.speedup_ratio),
+                resolves=bool(row.resolves),
+                forward_us=float(
+                    out.timed.region(f"{b_label}.forward").spread.median_duration_us
+                ),
+                backward_us=float(
+                    out.timed.region(f"{b_label}.backward").spread.median_duration_us
+                ),
+                cute_us=sum(us for name, us, _ in table if "kernel_cutlass_" in name),
+                parity_rel=rel,
+                foreign_processes=int(probe.foreign_process_count),
+            )
+        )
+        torch.cuda.empty_cache()
+    return tuple(rows), kernels
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1084,6 +1242,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=6)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--profile-iters", type=int, default=1)
+    parser.add_argument(
+        "--op-ref",
+        type=int,
+        default=64,
+        help="Baseline chunk length the op mode pairs every other length against. "
+        "Held fixed across the sweep so it doubles as the drift monitor.",
+    )
+    parser.add_argument(
+        "--backend",
+        default=None,
+        help="Operator backend for the op mode. Default is the fastest registered.",
+    )
     parser.add_argument("--rows", type=int, default=12, help="Kernels listed.")
     parser.add_argument("--probe-seq", type=int, default=1024)
     parser.add_argument("--probe-heads", type=int, default=2)
@@ -1292,6 +1462,55 @@ def print_step(geo: Geometry, args: argparse.Namespace) -> None:
             print(f"{name[:64]:64s} {us:12,.1f} {calls:8,.1f}")
 
 
+def print_op(geo: Geometry, args: argparse.Namespace) -> None:
+    """Print the measured operator alone at each legal chunk length.
+
+    Raises:
+        ValueError: If the baseline length is refused at this geometry, which would
+            leave every pair without a baseline arm.
+    """
+    from slinoss.perf.device import device_info, device_ordinal
+
+    shape = shape_by_name(args.shape)
+    device = resolve_device(args.device)
+    capacity = resolve_capacity(args.capacity)
+    admitted = legal_chunks(arena_rows(geo, [*args.chunks, args.op_ref], capacity))
+    if args.op_ref not in admitted:
+        raise ValueError(
+            f"--op-ref {args.op_ref} is refused at this geometry; the baseline arm "
+            f"has to run for any pair to mean anything. Admitted: {list(admitted)}"
+        )
+    asked = [c for c in args.chunks if c in admitted]
+    refused = [c for c in args.chunks if c not in admitted]
+    info = device_info(max(device_ordinal(device), 0))
+    print(f"measured  {info.name}  clocks {info.clocks.detail}")
+    print(f"geometry {geo.describe()}  op alone, no layer")
+    print(f"baseline arm L={args.op_ref}, paired inside every iteration")
+    if refused:
+        print(f"not measured, refused at this geometry: {refused}")
+    print()
+    rows, kernels = op_rows(args, geo, shape, asked, device)
+    print(
+        f"{'L':>5s} {'ref_us':>12s} {'test_us':>12s} {'delta_us':>12s} "
+        f"{'ratio':>8s} {'resolves':>9s} {'fwd_us':>11s} {'bwd_us':>11s} "
+        f"{'cute_us':>11s} {'parity_rel':>12s} {'foreign':>8s}"
+    )
+    for row in rows:
+        print(
+            f"{row.chunk:5d} {row.ref_us:12,.1f} {row.chunk_us:12,.1f} "
+            f"{row.delta_us:12,.1f} {row.speedup_ratio:8.4f} "
+            f"{row.resolves!s:>9s} {row.forward_us:11,.1f} "
+            f"{row.backward_us:11,.1f} {row.cute_us:11,.1f} "
+            f"{row.parity_rel:12.3e} {row.foreign_processes:8d}"
+        )
+    for chunk in asked:
+        print()
+        print(f"per-kernel at L={chunk}")
+        print(f"{'kernel':64s} {'us/iter':>12s} {'calls':>8s}")
+        for name, us, calls in kernels[chunk][: args.rows]:
+            print(f"{name[:64]:64s} {us:12,.1f} {calls:8,.1f}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one mode.
 
@@ -1302,11 +1521,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status.
 
     Raises:
-        ValueError: If a requested chunk length is not a positive power of two. No
-            layout function and no config accepts one.
+        ValueError: If a requested chunk length is not a positive power of two, since
+            no layout function and no config accepts one, or if the op mode's
+            baseline length is refused at this geometry.
     """
     args = parse_args(argv)
-    for chunk in args.chunks:
+    for chunk in (*args.chunks, args.op_ref):
         if chunk <= 0 or chunk & (chunk - 1):
             raise ValueError(f"chunk lengths must be powers of two, got {chunk}")
     geo = geometry_of(shape_by_name(args.shape))
@@ -1316,6 +1536,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_traffic(geo, args)
     elif args.mode == "numerics":
         print_numerics(geo, args)
+    elif args.mode == "op":
+        print_op(geo, args)
     else:
         print_step(geo, args)
     return 0
