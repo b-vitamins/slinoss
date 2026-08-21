@@ -37,9 +37,12 @@ from slinoss.perf.ceiling import (
 from slinoss.perf.device import (
     ClockPolicy,
     ComputeAppsQuery,
+    ContendedDevice,
     Contention,
+    ContentionProbe,
     DeviceInfo,
     SmiQuery,
+    await_exclusive,
     clock_policy,
     compute_apps_query,
     contention,
@@ -491,6 +494,119 @@ def test_contention_reads_a_non_numeric_field_as_zero() -> None:
     assert got.foreign_process_count == 1
     assert got.foreign_memory_mib == 0.0
     assert got.utilization_pct == 0.0
+
+
+def _state(
+    *, foreign: int = 0, utilization: float = 0.0, probed: bool = True
+) -> Contention:
+    """One injected sharing state for the gate."""
+    return Contention(
+        probed=probed,
+        foreign_process_count=Count(foreign),
+        foreign_memory_mib=Mebibytes(1024.0 * foreign),
+        utilization_pct=Percent(utilization),
+        detail="injected",
+    )
+
+
+class _Clock:
+    """A monotonic clock that only advances when the gate sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.probe_count = 0
+
+    def read(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def probing(self, *states: Contention) -> ContentionProbe:
+        """A probe yielding one state per call, holding the last one forever."""
+        queued = list(states)
+
+        def probe(ordinal: int) -> Contention:
+            self.probe_count += 1
+            return queued.pop(0) if len(queued) > 1 else queued[0]
+
+        return probe
+
+
+def test_await_exclusive_waits_out_contention_and_returns_the_clean_probe() -> None:
+    # Both rejection reasons, one probe each: a device with foreign processes, and
+    # a device the probe found no process on that is nonetheless 40% busy. The
+    # second is why utilization is checked at all -- a container's processes are
+    # not always visible, and the count alone would call that device idle.
+    clock = _Clock()
+    got = await_exclusive(
+        0,
+        interval_s=2.0,
+        probe=clock.probing(
+            _state(foreign=2, utilization=100.0),
+            _state(utilization=40.0),
+            _state(),
+        ),
+        sleep=clock.sleep,
+        clock=clock.read,
+    )
+    assert got.exclusive
+    assert got.utilization_pct == 0.0
+    # Two rejected, then five consecutive clean ones. Fewer would mean the gate
+    # returned on a point sample.
+    assert clock.probe_count == 7
+    assert clock.now == 12.0
+
+
+def test_await_exclusive_resets_its_run_on_one_busy_probe() -> None:
+    # The failure this gate exists to stop: a foreign job between two of its own
+    # kernels reads idle, so a run of clean probes that is broken once must start
+    # over rather than carry its count forward.
+    clock = _Clock()
+    idle, busy = _state(), _state(foreign=1, utilization=90.0)
+    await_exclusive(
+        0,
+        probe=clock.probing(idle, idle, idle, idle, busy, idle),
+        sleep=clock.sleep,
+        clock=clock.read,
+    )
+    assert clock.probe_count == 10
+
+
+def test_await_exclusive_refuses_a_device_that_stays_busy() -> None:
+    clock = _Clock()
+    with pytest.raises(ContendedDevice, match="did not idle for 5"):
+        await_exclusive(
+            0,
+            interval_s=10.0,
+            timeout_s=30.0,
+            probe=clock.probing(_state(foreign=3, utilization=88.0)),
+            sleep=clock.sleep,
+            clock=clock.read,
+        )
+    # Refused rather than measured, and the message carries the state so the
+    # refusal names who held the device.
+    assert clock.now == 30.0
+
+
+def test_await_exclusive_does_not_accept_a_probe_that_did_not_run() -> None:
+    # Unknown is not idle. A gate that reads a failed probe as clean is worse than
+    # no gate: it stamps the run as having waited for a device it never saw.
+    clock = _Clock()
+    with pytest.raises(ContendedDevice, match="sharing unknown"):
+        await_exclusive(
+            0,
+            interval_s=1.0,
+            timeout_s=3.0,
+            probe=clock.probing(_state(probed=False)),
+            sleep=clock.sleep,
+            clock=clock.read,
+        )
+
+
+def test_await_exclusive_refuses_a_sample_count_that_is_not_a_gate() -> None:
+    with pytest.raises(ValueError, match="samples must be positive"):
+        await_exclusive(0, samples=0)
 
 
 def test_contention_defaults_to_this_process_id() -> None:

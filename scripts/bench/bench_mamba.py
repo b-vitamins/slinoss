@@ -81,7 +81,12 @@ import torch
 from torch import Tensor
 
 from slinoss.perf.budget import assert_closed, budget
-from slinoss.perf.device import device_info, device_ordinal, require_cuda
+from slinoss.perf.device import (
+    await_exclusive,
+    device_info,
+    device_ordinal,
+    require_cuda,
+)
 from slinoss.perf.dispersion import PairedRow
 from slinoss.perf.memory import (
     SavedStorages,
@@ -774,6 +779,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "convolution, the scan of the first clause, and the gated norm as three "
         "calls. They are two different baselines, so both are measured by default.",
     )
+    parser.add_argument(
+        "--require-idle",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Wait up to SECONDS for the device to read idle on five consecutive "
+        "probes before measuring, and refuse to measure if it does not. A foreign "
+        "process moves a median by more than 2x on this fleet without moving the "
+        "spread, so a contended run reports as reproducible.",
+    )
     parser.add_argument("--out", type=Path, default=Path("out/bench-mamba"))
     return parser.parse_args(argv)
 
@@ -1306,6 +1321,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = parse_args(argv)
     device = require_cuda(args.device)
+    if args.require_idle is not None:
+        # Before the first compile, so a wait does not sit between two arms of one
+        # paired loop and desynchronize their warm state.
+        await_exclusive(device_ordinal(device), timeout_s=args.require_idle)
     scan = load_scan()
     dtype = DTYPES[args.dtype]
     named = [shape_by_name(n) for n in (args.shape or [s.name for s in SHAPES])]

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Annotated, cast
@@ -44,9 +45,12 @@ from slinoss.perf.units import (
 __all__ = [
     "ClockPolicy",
     "ComputeAppsQuery",
+    "ContendedDevice",
     "Contention",
+    "ContentionProbe",
     "DeviceInfo",
     "SmiQuery",
+    "await_exclusive",
     "clock_policy",
     "compute_apps_query",
     "contention",
@@ -426,6 +430,78 @@ def contention(
             f"utilization.gpu={utilization} memory.used={memory}"
         ),
     )
+
+
+ContentionProbe = Callable[[int], Contention]
+
+
+class ContendedDevice(RuntimeError):
+    """A run required an idle device and the device did not become idle."""
+
+
+def await_exclusive(
+    ordinal: int = 0,
+    *,
+    samples: int = 5,
+    ceiling_pct: float = 5.0,
+    interval_s: float = 2.0,
+    timeout_s: float = 600.0,
+    probe: ContentionProbe = contention,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Contention:
+    """Block until one device reads idle on consecutive probes.
+
+    A point sample is not a gate. A foreign job between two of its own kernels
+    reads exclusive once, so one clean probe admits exactly the contention the
+    probe was added to exclude. ``samples`` consecutive clean probes are required
+    and the count resets on any dirty one. Utilization is checked separately from
+    the process count because a process may hold memory without running kernels,
+    and because the count cannot attribute residency.
+
+    Contention is waited out rather than stamped whenever the number being taken
+    is an absolute duration. One foreign process on this fleet moved the same
+    median by 2.33x while run-to-run scatter stayed at 0.1% either way, so the
+    spread that rejects every other bad sample reports the contended run as
+    reproducible. A paired delta inside one process cancels the common-mode part
+    of that; a standalone baseline and a cross-implementation ratio do not.
+
+    Args:
+        ordinal: Torch device ordinal, resolved to a driver selector by the probe.
+        samples: Consecutive clean probes required.
+        ceiling_pct: Highest utilization a clean probe may report.
+        interval_s: Delay between probes.
+        timeout_s: Longest total wait before raising.
+        probe: Injected contention probe. Tests supply their own.
+        sleep: Injected delay.
+        clock: Injected monotonic clock, in seconds.
+
+    Returns:
+        The last probe, clean by construction.
+
+    Raises:
+        ValueError: If ``samples`` is not positive.
+        ContendedDevice: If the device did not read clean ``samples`` times in a
+            row inside ``timeout_s``, naming the last state seen. Refusing to run
+            is the point: the alternative is an absolute duration that carries
+            somebody else's kernels and reports as reproducible.
+    """
+    if samples <= 0:
+        raise ValueError(f"samples must be positive, got {samples}")
+    deadline = clock() + timeout_s
+    clean = 0
+    while True:
+        last = probe(ordinal)
+        idle = last.exclusive and last.utilization_pct <= ceiling_pct
+        clean = clean + 1 if idle else 0
+        if clean >= samples:
+            return last
+        if clock() >= deadline:
+            raise ContendedDevice(
+                f"device did not idle for {samples} consecutive probes inside "
+                f"{timeout_s:.0f}s: {last.stamp} ({last.detail})"
+            )
+        sleep(interval_s)
 
 
 @dataclass(frozen=True)

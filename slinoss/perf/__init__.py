@@ -60,8 +60,10 @@ from slinoss.perf.ceiling import (
 )
 from slinoss.perf.device import (
     ClockPolicy,
+    ContendedDevice,
     Contention,
     DeviceInfo,
+    await_exclusive,
     clock_policy,
     contention,
     device_info,
@@ -189,6 +191,7 @@ __all__ = [
     "Ceilings",
     "ClassVerdict",
     "ClockPolicy",
+    "ContendedDevice",
     "Contention",
     "CopySample",
     "Count",
@@ -238,6 +241,7 @@ __all__ = [
     "agreement",
     "assert_closed",
     "assert_nonzero",
+    "await_exclusive",
     "budget",
     "call_region",
     "ceilings",
