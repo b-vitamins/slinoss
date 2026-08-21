@@ -592,6 +592,36 @@ class Timed(PerfRecord):
         return self.total.resolves(delta_pct)
 
 
+def _prime(fn: Callable[[], object], device: torch.device, iters: int) -> None:
+    """Run the warmup with a recorder active, into a recorder that is discarded.
+
+    Whatever the timed loop does on its first iteration and never again -- taking
+    the recording branch of :func:`region`, constructing the first timer of every
+    region, aliasing and hooking in :func:`call_region` -- is paid by the first
+    sample unless it has already happened. In :func:`measure_paired` the first
+    iteration always runs the A arm first, so the whole of that one-off cost lands
+    on one arm; it read as a 33.057% spread on a baseline whose own dispersion is
+    a few tenths of a percent. A warmup that leaves the recorder inactive does not
+    warm the thing being warmed.
+
+    The samples are never resolved. This recorder exists to make the path warm,
+    and reading it would need a synchronize the caller performs afterwards anyway.
+
+    Args:
+        fn: The callable being measured.
+        device: The device the regions run on.
+        iters: Warmup iterations.
+    """
+    recorder = RegionRecorder(device)
+    token = _ACTIVE.set(recorder)
+    try:
+        for _ in range(iters):
+            with recorder.iteration():
+                fn()
+    finally:
+        _ACTIVE.reset(token)
+
+
 def measure(
     fn: Callable[[], object],
     *,
@@ -603,9 +633,10 @@ def measure(
 ) -> Timed:
     """Run ``fn`` and report the median and spread of its duration.
 
-    Warmup calls run with no recorder active, so :func:`region` inside them costs
-    a context-variable read and records nothing. The whole call runs with ``device``
-    current, so the events, the synchronize, and the work are on one device.
+    Warmup calls run with a recorder active and their samples are discarded, so
+    the first timed iteration is not the first call to enter the timing machinery;
+    see :func:`_prime`. The whole call runs with ``device`` current, so the
+    events, the synchronize, and the work are on one device.
 
     Args:
         fn: The callable to measure. Takes no arguments.
@@ -634,8 +665,8 @@ def measure(
     with on_device(device):
         if is_cuda:
             _check_current_device(device)
-        for _ in range(warmup):
-            fn()
+        if warmup:
+            _prime(fn, device, warmup)
         if is_cuda:
             torch.cuda.synchronize(device)
         recorder = RegionRecorder(device)
@@ -718,7 +749,10 @@ def measure_paired(
         iters: Timed iterations. Even, so the order swap balances. Each iteration
             yields one sample per arm.
         warmup: Untimed iterations first. Its parity does not matter: the swap
-            balances over the timed iterations however many precede them.
+            balances over the timed iterations however many precede them. At
+            least one, or the timing machinery's one-off cost is paid by the
+            first timed iteration, which always runs ``a`` first; the swap cannot
+            balance a cost that happens once.
         device: Device to time on.
         clocks: Clock policy to stamp. Probed if omitted on a CUDA device.
 

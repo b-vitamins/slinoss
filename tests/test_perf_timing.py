@@ -112,10 +112,32 @@ def test_measure_on_cpu_records_sibling_regions() -> None:
     # per-iteration boundary. Nothing here asserts a lower bound, because a loop
     # whose body is cheaper than its own boundary reads low and is right.
     assert 0.0 < timed.timer_coverage_pct <= MAX_TIMER_COVERAGE_PCT
-    # Warmup calls run with no recorder active, so they reach neither count.
+    # Warmup calls record into a recorder that is discarded, so they reach
+    # neither count.
     warmed = measure(siblings, label="step", iters=2, warmup=3, device=CPU)
     assert warmed.total.sample_count == 2
     assert [t.spread.sample_count for t in warmed.regions] == [2, 2]
+
+
+def test_warmup_enters_the_recording_path() -> None:
+    # A warmup that runs with no recorder active leaves the first timed iteration
+    # as the first call ever to take the recording branch and construct a timer,
+    # so that iteration carries the construction. In a paired loop the first
+    # iteration always runs the A arm first, so the whole one-off cost lands on
+    # one arm: it read as a 33.057% spread on a baseline whose own dispersion is
+    # a few tenths of a percent. Warmup must therefore be warm in the same sense
+    # the timed loop is, and must still contribute no sample.
+    seen: list[bool] = []
+
+    def body() -> None:
+        seen.append(active_recorder() is not None)
+        with region("step.work"):
+            time.sleep(SLEEP_S)
+
+    timed = measure(body, label="step", iters=2, warmup=3, device=CPU)
+    assert seen == [True] * 5
+    assert timed.total.sample_count == 2
+    assert timed.region("step.work").spread.sample_count == 2
 
 
 def test_measure_rejects_bad_counts() -> None:
