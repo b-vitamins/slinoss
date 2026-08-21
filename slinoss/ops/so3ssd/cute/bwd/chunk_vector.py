@@ -354,6 +354,12 @@ and **149** at eight, both with zero local sectors, and 305,280,000 against
 327,778,560 instructions issued, the 7.4% rise being the readout term's reread. Duration
 went 1,933,632 to 1,696,480 ns, **1.14x** for the one measured doubling.
 
+The eight-warp register figure has since fallen to **120** a thread, measured at the
+acceptance shape on the current tree, so the headroom to the 255-bar is 135 and not 106.
+It is headroom and not slack: the arena admits one block whatever the count, so nothing
+buys occupancy with it, and what a held operand costs there is priced at the one place
+that spends it.
+
 Registers fall to 242, so 256 threads hold 61,952 of the 65,536 a multiprocessor has
 and the second warp per scheduler is available. Across the float32 pair,
 ``no_instruction`` goes 52.8% to 1.0% and issue-active 12.5% to 28.8%: instruction
@@ -476,6 +482,7 @@ from slinoss.ops.so3ssd.cute.mma import (
     mma_gemm,
     mma_gemm_areg,
     mma_groups,
+    mma_matrices,
     mma_offsets,
     mma_rows,
     operand_tile,
@@ -1810,6 +1817,85 @@ def _copy_words(
 
 
 @cute.jit
+def _hold_b(
+    tiled_mma: cute.TiledMma,
+    tid: cutlass.Int32,
+    vb: cute.Tensor,
+    b_k_major: cutlass.Constexpr,
+) -> cute.Tensor:
+    """Load one right operand's fragment, for reuse across several products.
+
+    :func:`slinoss.ops.so3ssd.cute.mma.mma_gemm` loads both operands on every call,
+    so a tile several products read pays one ``ldmatrix`` set per product. The
+    barrier between the products is what stops the compiler from merging the loads:
+    it fences shared memory, so the second load cannot be proved redundant. Splitting
+    the load from the product moves the proof to the caller, which is where the
+    invariant that licenses it lives.
+
+    Args:
+        tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`.
+        tid: Thread index within the block.
+        vb: Shared-memory view of shape ``(N,K)``.
+        b_k_major: Whether ``vb``'s K mode is the stride-1 mode.
+
+    Returns:
+        Register-backed B fragment for :func:`_gemm_bheld`, ``N * K / 32`` elements
+        of ``vb``'s dtype a thread.
+
+    Invariants:
+        A held fragment is only the tile's value while no thread writes the tile. A
+        write between the load and a use is a stale operand and no barrier catches
+        it, so the caller must own that range.
+    """
+    thr = tiled_mma.get_slice(tid)
+    fb = tiled_mma.make_fragment_B(thr.partition_B(vb))
+    atom = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(not b_k_major, mma_matrices(tiled_mma)),
+        vb.element_type,
+    )
+    copy = cute.make_tiled_copy_B(atom, tiled_mma)
+    slc = copy.get_slice(tid)
+    cute.copy(copy, slc.partition_S(vb), slc.retile(fb))
+    return fb
+
+
+@cute.jit
+def _gemm_bheld(
+    tiled_mma: cute.TiledMma,
+    tid: cutlass.Int32,
+    acc: cute.Tensor,
+    va: cute.Tensor,
+    a_k_major: cutlass.Constexpr,
+    fb: cute.Tensor,
+) -> None:
+    """Accumulate ``va @ vb^T`` into ``acc`` with B already in registers.
+
+    The mirror of :func:`slinoss.ops.so3ssd.cute.mma.mma_gemm_areg`, which holds the
+    left operand instead. No group restriction applies: the B fragment is the
+    tiling's own partition of a shared tile, not a reread of a C fragment, so a
+    split N mode partitions it rather than scattering it.
+
+    Args:
+        tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`. The same one
+            that produced ``fb``.
+        tid: Thread index within the block.
+        acc: From :func:`slinoss.ops.so3ssd.cute.mma.mma_acc`. Updated in place.
+        va: Shared-memory view of shape ``(M,K)``.
+        a_k_major: Whether ``va``'s K mode is the stride-1 mode.
+        fb: From :func:`_hold_b`, over the same K extent ``va`` carries.
+    """
+    thr = tiled_mma.get_slice(tid)
+    fa = tiled_mma.make_fragment_A(thr.partition_A(va))
+    atom = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(not a_k_major, 4), va.element_type
+    )
+    copy = cute.make_tiled_copy_A(atom, tiled_mma)
+    slc = copy.get_slice(tid)
+    cute.copy(copy, slc.partition_S(va), slc.retile(fa))
+    cute.gemm(tiled_mma, acc, fa, fb, acc)
+
+
+@cute.jit
 def _rotate_rows(
     src: cute.Tensor,
     dst: cute.Tensor,
@@ -2738,6 +2824,29 @@ def chunk_vector_bwd_kernel(
         )
         cute.arch.sync_threads()
 
+        # The forcing product's right operand, loaded once a head. The rotated readout
+        # tile is written once above this point and read by that product at every tap
+        # of every source-token block, and nothing in the loop below writes it. Held
+        # rather than reloaded: the barriers inside the loop fence shared memory, so
+        # the compiler cannot prove the second load of an unwritten tile redundant, and
+        # the invariant that it is redundant is not expressible to it. Bit-identical by
+        # construction, the held fragment being the bits the reload would have
+        # returned. The tile carries the lane extent, so a tiling of the lane block
+        # cannot hoist the load further out than this.
+        #
+        # The increment cotangent is the other operand of this shape and is *not* held,
+        # measured rather than reasoned. Both hold the same 1,013,760 LSU warp
+        # instructions off the launch, and the difference is what the allocator charges
+        # for the live range: 145 registers a thread for this one against 180 for that
+        # one and 190 for the pair, on a 120-register base, at the acceptance shape and
+        # eight warps. Only this one keeps ``sm__inst_executed.sum`` falling with the
+        # LSU count, -658,944 against +1,294,848 for the increment tile and +2,953,728
+        # for the pair. Its use sits inside the score product's live range, where the
+        # B fragment of the score and the narrowed score itself are both live, and the
+        # pressure there converts a deleted shared load into more than two moves. A
+        # held operand is not free, and the price is the range and not the bytes.
+        fb_crot = _hold_b(tiled_mma, tid, vcrot, False)
+
         for nstep in cutlass.range_constexpr(blocks):
             nbase = nstep * span
             stage_shifted(
@@ -2856,7 +2965,7 @@ def chunk_vector_bwd_kernel(
                     src = nbase + cutlass.min(r, span - 1)
                     dbacc[i] = dbacc[i] * decay(lplast - slp[src])
                 cute.arch.sync_threads()
-                mma_gemm(tiled_mma, tid, dbacc, vscore, vcrot, False, False)
+                _gemm_bheld(tiled_mma, tid, dbacc, vscore, False, fb_crot)
                 # The readout term of a split N mode, which cannot take the score out
                 # of the fragment that produced it. Its left operand is the tile the
                 # transpose above already published, so it needs no barrier of its own
