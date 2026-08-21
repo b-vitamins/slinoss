@@ -324,6 +324,38 @@ def gemm_kblocks(
         Operands are not swizzled and K is their stride-1 mode, so a K block is the
         same view at an element offset. Blocks are visited in increasing K, which is
         the order one unblocked call accumulates in, so the sum is unchanged.
+
+    Refused:
+        Rolling the loop into IR. The unrolled form emits 15 bodies at ``3N`` 240
+        and spills 3,133,440 local sectors a launch, so code size reads as the
+        lever. Two toolchain facts and one measurement close it.
+
+        A dynamic offset added to a shared iterator loses the alignment proof
+        ``ldmatrix`` requires. Under ``cutlass.range`` the copy in
+        :func:`slinoss.ops.so3ssd.cute.mma.mma_gemm` fails IR verification with
+        ``'cute.copy' op src ptr alignment (16 bits) does not meet requirement (128
+        bits) of atom '!cute_nvgpu.atom.ldsm<val_type = bf16, num_matrices = 4,
+        n>'``. An offset added to an iterator carries no stride to reduce the
+        alignment against, so the pointer type falls to one element; a tile index
+        into a divided layout keeps the guarantee, because the divided mode's
+        stride is static. ``.align(SMEM_SEGMENT)`` on the offset iterator
+        re-asserts it and compiles, and the assertion holds at every legal
+        geometry: the pitch is a multiple of 16 bytes and a K block is 32.
+
+        ``cutlass.range`` over a trace-time-constant trip count is unrolled back by
+        the backend. Every counter comes out bit-identical to the unrolled form,
+        registers and local sectors included. Code size needs the explicit
+        ``cutlass.range(n, unroll=k)``.
+
+        The response to unroll depth is not monotone. Measured on sm_86 at ``P``
+        64, ``3N`` 240 and ``L`` 64 against this form, interleaved in one process:
+        depth 1 costs 9.5 us, depth 3 saves 22.2 us, depth 15 saves 1.8 us. Depth 1
+        cuts local traffic 76.5% and pays it back in ``short_scoreboard``, 2.5% to
+        6.1%; depth 3 cuts the same traffic and holds the stall at 2.5%. At ``3N``
+        96 this form does not spill at all and depth 3 costs 13.7% of the cycles, so
+        the win is a function of the spill and needs a geometry gate. The spill is
+        4% of this body's traffic once the state buffers narrow, and the exposed
+        memory latency it trades against is 40%.
     """
     kblk = min(KBLOCK_MAX, kdim)
     assert kdim % kblk == 0
