@@ -27,14 +27,22 @@ one thread per token, so those accesses are unit stride across the warp. The
 prefix scan is the exception: it gives lane ``l`` a block of ``ceil(L/32)``
 consecutive tokens, so its reads are strided by that block size. At every legal
 chunk size that block is at most four words, which the compiler vectorizes into
-one wide load, so the pattern is conflict-free by construction. Both
-``l1tex__data_bank_conflicts_pipe_lsu_mem_shared`` counters read zero at the chunk
-sizes the bench covers, 64 and 128. That construction is what bounds
-``MAX_CHUNK`` at 128: at 256 the block is eight words, wider than any shared
-vector load, so the access splits and the argument no longer holds.
-The 3x3 table is token-major with the nine entries innermost; a nine-word stride
-is coprime with the 32 banks, so the build stores conflict-free, and every read
-of it during application is a broadcast.
+one wide load, so the pattern is conflict-free by construction, at the chunk sizes
+the bench covers, 64 and 128. That construction is what bounds ``MAX_CHUNK`` at
+128: at 256 the block is eight words, wider than any shared vector load, so the
+access splits and the argument no longer holds. The
+``l1tex__data_bank_conflicts_pipe_lsu_mem_shared`` counters do not read zero for a
+whole kernel: what they count is the GEMM operand staging and the per-element
+reads, not this staging.
+
+The 3x3 table is token-major with the nine entries innermost, at a pitch the
+kernel chooses; :data:`slinoss.ops.so3ssd.cute.table.TABLE_PITCH` states the
+trade. At the natural pitch of nine the stride is coprime with the 32 banks, so
+the build's scalar stores are a bank permutation. At a pitch that is a whole
+number of 16-byte segments the entry is segment-aligned, so both the build's
+stores and the application's reads go at vector width, and each is conflict-free
+by its own argument. Every read during application is a broadcast at either
+pitch.
 """
 
 from __future__ import annotations
@@ -177,8 +185,8 @@ still needs it, per token rather than as a GEMM operand.
 """
 
 
-def table_tile(chunk: int, mats: int = 3) -> Tile:
-    """3x3 transform table: ``(mats, L, 9)``, nine entries innermost.
+def table_tile(chunk: int, mats: int = 3, pitch: int = 9) -> Tile:
+    """3x3 transform table: ``(mats, L, pitch)``, nine entries innermost.
 
     Slot order is :data:`TABLE_AP`, :data:`TABLE_AN`, :data:`TABLE_AC`. Entry
     ``3*r + c`` of a slot is row ``r`` column ``c``.
@@ -189,13 +197,26 @@ def table_tile(chunk: int, mats: int = 3) -> Tile:
     that reads out but does not force holds ``Ac`` alone, at
     :data:`TABLE_AC_SOLE`, and computes neither tap matrix.
 
+    A pitch past nine pads the entry so that it starts on a segment boundary and
+    can be read at vector width; the padding words are never written and never read
+    for their value. The coordinates do not move for it, so a producer or consumer
+    that indexes ``[slot, token, entry]`` reaches the same value at any pitch.
+    :data:`slinoss.ops.so3ssd.cute.table.TABLE_PITCH` is the padded pitch, and
+    :func:`slinoss.ops.so3ssd.cute.table.mat_at` is what reads it.
+
     Args:
         chunk: ``L``.
         mats: Slots to allocate, 1, 2 or 3. Two omits ``Ac``; one is ``Ac`` only.
+        pitch: Float32 words a token's entry occupies, at least nine.
+
+    Raises:
+        ValueError: If ``mats`` is not 1, 2 or 3, or ``pitch`` is under nine.
     """
     if mats not in (1, 2, 3):
         raise ValueError(f"table needs 1, 2 or 3 matrices, got {mats}")
-    return Tile((mats, chunk, 9), (9 * chunk, 9, 1))
+    if pitch < 9:
+        raise ValueError(f"table entry needs nine words, got pitch {pitch}")
+    return Tile((mats, chunk, pitch), (pitch * chunk, pitch, 1))
 
 
 # ---------------------------------------------------------------------------

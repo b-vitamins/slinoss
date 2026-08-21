@@ -29,10 +29,13 @@ Cost. Building one token is one quaternion exponential, one rotation matrix, two
 tap matrices, and two 3x3 products: order 120 FMA. Applying it is ``9*N`` FMA per
 tap. The build amortizes from ``N = 16``, which is the smallest legal lane count.
 
-Table storage is ``(mats, L, 9)`` float32, nine entries innermost. The build
-stores nine words at a nine-word stride, and nine is coprime with the 32 banks,
-so the store pattern is a bank permutation. Every read during application is a
-broadcast. Neither needs a swizzle.
+Table storage is ``(mats, L, pitch)`` float32, nine entries innermost, at a pitch
+the kernel chooses. At the natural pitch of nine the build's stores are a bank
+permutation, nine being coprime with the 32 banks, and the nine entries are read one
+at a time. At :data:`TABLE_PITCH` the entry is three whole segments, so a read is
+three loads rather than nine and the build's stores take a four-way conflict
+instead. Every read during application is a broadcast, and neither pitch needs a
+swizzle.
 
 Staging is transposed on the way in: global ``(L, 4)`` and ``(L, 8)`` become
 shared ``(4, L)`` and ``(8, L)``. One thread owns one token here and in the build,
@@ -93,7 +96,10 @@ from slinoss.ops.so3ssd.cute.mma import SMEM_SEGMENT
 __all__ = [
     "LANE_PAIR",
     "PREFETCH",
+    "TABLE_PITCH",
+    "TABLE_QUAD",
     "build_table",
+    "mat_at",
     "paired",
     "stage_chunk",
     "stage_matrix",
@@ -132,6 +138,28 @@ residual is service time for a working set that does not fit, not an issue order
 the scheduler had left uncovered. Register pressure is not the refusal either --
 ``standard`` runs at 220 registers with 35 spare and no spill, and converts least
 of the three."""
+
+TABLE_QUAD: int = SMEM_SEGMENT // 4
+"""Float32 words in one 16-byte shared-memory segment."""
+
+TABLE_PITCH: int = 3 * TABLE_QUAD
+"""Padded float32 pitch of one transform-table entry: nine words in three segments.
+
+At the natural pitch of nine the token stride is 36 bytes, so only every fourth
+entry starts on a segment boundary and no entry can be read at vector width. At
+twelve the stride is 48 bytes, every entry is aligned, and three 16-byte loads cover
+a row exactly: :func:`mat_at` reads nine words in three instructions rather than
+nine.
+
+The cost is a third more table bytes, ``mats * L * 12`` against ``mats * L * 9``,
+and a four-way conflict on the build's stores in place of none: nine is coprime with
+the 32 banks so a nine-word stride permutes them, while ``12 * token`` modulo 32
+takes eight values. The build stores each entry once a block and every application
+reads it once an element, so the trade is decided by the reads.
+
+Adopt it per kernel, by passing this pitch to
+:func:`slinoss.ops.so3ssd.cute.common.table_tile` and to the readers. A kernel whose
+table is at the natural pitch is unaffected."""
 
 LANE_PAIR: int = 2
 """Adjacent 3-vectors one thread transforms and stores per step.
@@ -671,8 +699,9 @@ def build_table(
     chunk: cutlass.Constexpr,
     mats: cutlass.Constexpr = 3,
     fused: cutlass.Constexpr = False,
+    pitch: cutlass.Constexpr = 9,
 ) -> None:
-    """Compose the ``(mats, L, 9)`` transform table in shared memory.
+    """Compose the ``(mats, L, pitch)`` transform table in shared memory.
 
     Args:
         strans: ``(4, L)`` float32 staged transition parameters, ``(w, ls)``
@@ -681,7 +710,7 @@ def build_table(
             which is the point of that slot count, so a caller there may pass any
             tile of the right dtype.
         squat: ``(4, L)`` float32 quaternion prefix, already renormalized.
-        stable: ``(mats, L, 9)`` float32, written. Slots are
+        stable: ``(mats, L, pitch)`` float32, written. Slots are
             :data:`slinoss.ops.so3ssd.cute.common.TABLE_AP`, ``TABLE_AN``, and,
             when ``mats`` is three, ``TABLE_AC``. At ``mats == 1`` the sole slot is
             ``TABLE_AC_SOLE``. At ``fused`` the first slot is ``TABLE_AFUSE``.
@@ -695,6 +724,9 @@ def build_table(
             into the first slot instead of ``Ap_t``. Compile-time. Ignored at
             ``mats == 1``, which builds no tap matrix. The second slot still holds
             ``An_t``, which the diagonal residue needs.
+        pitch: The table's float32 pitch, as passed to
+            :func:`slinoss.ops.so3ssd.cute.common.table_tile`. Compile-time.
+            :data:`TABLE_PITCH` buys the vector-width store.
 
     Invariants:
         ``Afuse_0 == Ap_0``: the previous chunk's ``An_{L-1}`` lives in the previous
@@ -721,8 +753,7 @@ def build_table(
                 )
             )
             if cutlass.const_expr(mats == 1):
-                for entry in cutlass.range_constexpr(9):
-                    stable[TABLE_AC_SOLE, token, entry] = ac[entry]
+                _store_mat(stable, TABLE_AC_SOLE, token, ac, pitch)
             else:
                 wvec = (strans[0, token], strans[1, token], strans[2, token])
                 ap = mat3_mul(
@@ -768,12 +799,10 @@ def build_table(
                         token > 0, decay(strans[3, token]), cutlass.Float32(0.0)
                     )
                     first = tuple(ap[e] + scale * anp[e] for e in range(9))
-                for entry in cutlass.range_constexpr(9):
-                    stable[TABLE_AP, token, entry] = first[entry]
-                    stable[TABLE_AN, token, entry] = an[entry]
+                _store_mat(stable, TABLE_AP, token, first, pitch)
+                _store_mat(stable, TABLE_AN, token, an, pitch)
                 if cutlass.const_expr(mats == 3):
-                    for entry in cutlass.range_constexpr(9):
-                        stable[TABLE_AC, token, entry] = ac[entry]
+                    _store_mat(stable, TABLE_AC, token, ac, pitch)
 
 
 @cute.jit
@@ -1114,6 +1143,132 @@ def stage_matrix(
                         store_pair(words32, frag32, p, col, out)
 
 
+def _table_quads(stable: cute.Tensor, slot: cutlass.Constexpr, token: cutlass.Int32):
+    """One table entry retiled into 16-byte segments, and the segment count.
+
+    The alignment claim is restated on the sliced row rather than taken from the
+    allocation, for the reason :func:`paired` gives: a tile arriving as a parameter
+    reports one element whatever its allocation asked for, so the claim has to be
+    made where the row is known.
+
+    Args:
+        stable: ``(mats, L, pitch)`` float32 table, ``pitch`` a multiple of
+            :data:`TABLE_QUAD`.
+        slot: Table slot. Compile-time.
+        token: Chunk-local token, already bounded by ``L``.
+
+    Returns:
+        The retiled row, and the segments nine words span.
+    """
+    row = stable[slot, token, None]
+    quads = cute.zipped_divide(
+        cute.make_tensor(row.iterator.align(SMEM_SEGMENT), row.layout),
+        (TABLE_QUAD,),
+    )
+    # Three segments cover nine words. A pitch wider than that pads further and is
+    # neither written nor read for it.
+    return quads, -(-9 // TABLE_QUAD)
+
+
+def _store_mat(
+    stable: cute.Tensor,
+    slot: cutlass.Constexpr,
+    token: cutlass.Int32,
+    mat: tuple[Scalar, ...],
+    pitch: cutlass.Constexpr = 9,
+) -> None:
+    """Write one 3x3 into a table slot.
+
+    Three 16-byte shared stores at a pitch that is a whole number of segments, nine
+    scalar ones otherwise. Conflict-free either way, by the argument
+    :func:`mat_at` gives for the read: nine is coprime with the 32 banks, and a
+    segment store is serviced in phases of eight threads whose segment index is a
+    bijection on consecutive tokens.
+
+    The padding words are written zero rather than left alone. A vector store covers
+    the whole segment, so the alternative is to put an uninitialized register into
+    shared memory, and the build is ``O(L)`` against an ``O(L*N)`` launch.
+
+    Args:
+        stable: ``(mats, L, pitch)`` float32 table, written at ``[slot, token]``.
+        slot: Table slot. Compile-time.
+        token: Chunk-local token, already bounded by ``L``.
+        mat: The nine entries in row-major order.
+        pitch: The table's float32 pitch. Compile-time.
+    """
+    # Undecorated, and a plain branch and ``range`` for the reason :func:`mat_at`
+    # gives.
+    if pitch % TABLE_QUAD != 0:
+        for entry in range(9):
+            stable[slot, token, entry] = mat[entry]
+        return
+    quads, span = _table_quads(stable, slot, token)
+    frag = cute.make_fragment((span, TABLE_QUAD), cutlass.Float32)
+    zero = cutlass.Float32(0.0)
+    for i in range(span * TABLE_QUAD):
+        frag[i // TABLE_QUAD, i % TABLE_QUAD] = mat[i] if i < 9 else zero
+    for quad in range(span):
+        cute.autovec_copy(frag[(quad, None)], quads[(None, quad)])
+
+
+def mat_at(
+    stable: cute.Tensor,
+    slot: cutlass.Constexpr,
+    token: cutlass.Int32,
+    pitch: cutlass.Constexpr = 9,
+) -> Mat3:
+    """One transform-table entry as a 3x3, row-major.
+
+    Three 16-byte shared loads at :data:`TABLE_PITCH`, nine scalar ones at the
+    natural pitch of nine. The alignment claim is restated on the sliced iterator
+    rather than taken from the allocation, for the reason :func:`paired` gives: a
+    tile arriving as a parameter reports one element whatever its allocation asked
+    for, so the claim has to be made where the row is known.
+
+    Undecorated, so the slice and the retile are trace-time algebra and every
+    fragment index is compile-time, which is what keeps the fragment in registers.
+    A plain branch and a plain ``range``: the preprocessor rewrites ``const_expr``
+    and ``range_constexpr`` only inside a decorated body, so either would reach the
+    runtime stub here and raise. The pitch is compile-time, so the branch is taken
+    during the trace regardless.
+
+    Conflict-free at every map the callers use. A load at vector width is serviced in
+    four phases of eight threads, so the unit is the segment and the modulus is 8
+    rather than 32: eight threads on consecutive tokens take segment ``3 * token + q``
+    modulo 8, a bijection, and threads sharing a token share an address and broadcast.
+
+    Args:
+        stable: ``(mats, L, pitch)`` float32 table from
+            :func:`slinoss.ops.so3ssd.cute.common.table_tile`.
+        slot: Table slot. Compile-time.
+        token: Chunk-local token, already bounded by ``L``.
+        pitch: The table's float32 pitch. Compile-time.
+
+    Returns:
+        Entries 0 through 8. At the padded pitch the three padding words ride the
+        third load and are dropped.
+    """
+    if pitch % TABLE_QUAD != 0:
+        held = [stable[slot, token, entry] for entry in range(9)]
+    else:
+        quads, span = _table_quads(stable, slot, token)
+        frag = cute.make_fragment((span, TABLE_QUAD), cutlass.Float32)
+        for quad in range(span):
+            cute.autovec_copy(quads[(None, quad)], frag[(quad, None)])
+        held = [frag[i // TABLE_QUAD, i % TABLE_QUAD] for i in range(9)]
+    return (
+        held[0],
+        held[1],
+        held[2],
+        held[3],
+        held[4],
+        held[5],
+        held[6],
+        held[7],
+        held[8],
+    )
+
+
 @cute.jit
 def _store_rotated(
     words: cute.Tensor,
@@ -1127,12 +1282,13 @@ def _store_rotated(
     slot: cutlass.Constexpr,
     scaled: cutlass.Constexpr,
     transposed: cutlass.Constexpr = False,
+    pitch: cutlass.Constexpr = 9,
 ) -> None:
     """Transform one pair of 3-vectors by one table slot and store both.
 
     Both vectors of the pair sit in one row, so they take the same matrix and the
-    same scale: the nine table words and the one scale word are read once and
-    applied twice, which halves the table reads per element.
+    same scale: the table entry and the one scale word are read once and applied
+    twice, which halves the table reads per element.
 
     Args:
         words: The destination tile through :func:`paired`, written at row ``row``,
@@ -1149,21 +1305,12 @@ def _store_rotated(
             widened to float32 and already zeroed if the row carries no token.
         slot: Table slot. Compile-time.
         scaled: Whether to multiply by ``sscale[token]``. Compile-time.
-        transposed: Apply the slot's transpose. Compile-time: the nine reads are
-            the same nine and the permutation happens during the trace, so the
-            emitted matvec is unchanged.
+        transposed: Apply the slot's transpose. Compile-time: the reads are the same
+            reads and the permutation happens during the trace, so the emitted
+            matvec is unchanged.
+        pitch: The table's float32 pitch. Compile-time.
     """
-    mat = (
-        stable[slot, token, 0],
-        stable[slot, token, 1],
-        stable[slot, token, 2],
-        stable[slot, token, 3],
-        stable[slot, token, 4],
-        stable[slot, token, 5],
-        stable[slot, token, 6],
-        stable[slot, token, 7],
-        stable[slot, token, 8],
-    )
+    mat = mat_at(stable, slot, token, pitch)
     if cutlass.const_expr(transposed):
         mat = mat3_transpose(mat)
     out = mat3_matvec(mat, (vecs[0], vecs[1], vecs[2])) + mat3_matvec(
@@ -1196,6 +1343,7 @@ def stage_rotated(
     has_prev: cutlass.Constexpr,
     scaled: cutlass.Constexpr,
     transposed: cutlass.Constexpr = False,
+    pitch: cutlass.Constexpr = 9,
 ) -> None:
     """Transform a run of tokens by one table slot into a shared operand tile.
 
@@ -1228,7 +1376,7 @@ def stage_rotated(
         gvprev: ``(B,G,3N)`` streaming ``v_{-1}``. Read only when ``has_prev`` and
             ``back`` is 1.
         dst: Operand-dtype tile of at least ``span`` rows, written.
-        stable: ``(mats, L, 9)`` float32 transform table.
+        stable: ``(mats, L, pitch)`` float32 transform table.
         sscale: ``(L,)`` float32 per-token scale. Read only when ``scaled``.
         bidx: Batch index.
         gidx: Group index, ``h // (H // G)``. The transform table is per head and
@@ -1247,6 +1395,9 @@ def stage_rotated(
         scaled: Whether to apply ``sscale``. Compile-time.
         transposed: Apply the slot's transpose rather than the slot. Compile-time,
             and free: it permutes an index triple during the trace.
+        pitch: The table's float32 pitch, as passed to
+            :func:`slinoss.ops.so3ssd.cute.common.table_tile`. Compile-time.
+            :data:`TABLE_PITCH` buys the vector-width table read.
 
     Invariants:
         ``lanes`` is even and ``dst`` is pitched by
@@ -1336,6 +1487,7 @@ def stage_rotated(
                     slot,
                     scaled,
                     transposed,
+                    pitch,
                 )
             else:
                 if tid + (group * depth + step) * threads < total:
@@ -1351,4 +1503,5 @@ def stage_rotated(
                         slot,
                         scaled,
                         transposed,
+                        pitch,
                     )

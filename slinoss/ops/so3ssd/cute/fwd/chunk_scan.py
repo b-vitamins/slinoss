@@ -203,7 +203,9 @@ from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
     LANE_PAIR,
     PREFETCH,
+    TABLE_PITCH,
     build_table,
+    mat_at,
     paired,
     stage_chunk,
     stage_rotated,
@@ -336,7 +338,7 @@ def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
             (tap_tile(chunk), 4),
             (scalar_tile(chunk), 4),
             (trans_tile(chunk), 4),
-            (table_tile(chunk, 3), 4),
+            (table_tile(chunk, 3, TABLE_PITCH), 4),
             (scalar_tile(chunk), 4),
             (readout_tile(chunk, dim), itemsize),
             (operand_tile(max(rows, nblk), dim), itemsize),
@@ -529,9 +531,9 @@ def scan_dnow(
         # Row first, then the pair claim: see ``_row_pairs``. One row view a pass
         # against three accesses a pair, so the address arithmetic is not the cost.
         bwords = _row_pairs(gb[bidx, gidx, t0 + tsafe, None])
-        # Nine words per token, not per pair: both of a pair's 3-vectors take the
-        # same matrix, and every pair of the token takes it too.
-        mat = tuple(stable[TABLE_AN, tsafe, entry] for entry in range(9))
+        # One entry per token, not per pair: both of a pair's 3-vectors take the same
+        # matrix, and every pair of the token takes it too.
+        mat = mat_at(stable, TABLE_AN, tsafe, TABLE_PITCH)
         total = cutlass.Float32(0.0)
         for group in cutlass.range_constexpr(-(-ppt // depth)):
             width = min(depth, ppt - group * depth)
@@ -651,7 +653,9 @@ def chunk_scan_fwd_kernel(
     stap = smem.allocate_tensor(cutlass.Float32, tap_tile(chunk).layout(), 16)
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 3).layout(), 16)
+    stable = smem.allocate_tensor(
+        cutlass.Float32, table_tile(chunk, 3, TABLE_PITCH).layout(), SMEM_SEGMENT
+    )
     sdnow = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     scrot = smem.allocate_tensor(
         gc.element_type, readout_tile(chunk, dim).layout(), SMEM_SEGMENT
@@ -682,7 +686,7 @@ def chunk_scan_fwd_kernel(
     cute.arch.sync_threads()
     # The fused column, so the first slot is TABLE_AFUSE rather than TABLE_AP. The
     # second slot still holds ``An``, which the diagonal residue reduces against.
-    build_table(strans, stap, squat, stable, tid, threads, chunk, 3, True)
+    build_table(strans, stap, squat, stable, tid, threads, chunk, 3, True, TABLE_PITCH)
     cute.arch.sync_threads()
 
     # The readout basis is the A operand of the offset and the score GEMM, so it is
@@ -708,6 +712,8 @@ def chunk_scan_fwd_kernel(
         lanes,
         False,
         False,
+        False,
+        TABLE_PITCH,
     )
     stage_state(gz[bidx, hidx, cidx, None, None], sbz, tid, threads, rows, dim)
     cute.arch.sync_threads()
@@ -785,6 +791,8 @@ def chunk_scan_fwd_kernel(
             lanes,
             has_prev,
             False,
+            False,
+            TABLE_PITCH,
         )
         # ``span`` one below the slice width: the pass fills ``span + 1`` rows and
         # only the shifted view survives fusion, so it stops at the slice's last
