@@ -626,8 +626,8 @@ def print_source(passed: SourcePass, top: int) -> None:
     is total instructions: an arm that moves work off the port and onto another pipe
     has been measured to lose. The LSU column is beside it, not instead of it.
 
-    The file column is the entry module on every row whatever file the line is
-    really in, which is an NVVM property and not a defect here; see
+    The module column is the traced entry module on every row and not the file the
+    line is in, which is an NVVM property; see
     :func:`slinoss.perf.ncu.parse_source_csv`. Intersect the line numbers with the
     location set of the modules the kernel traces before naming a site.
 
@@ -639,7 +639,7 @@ def print_source(passed: SourcePass, top: int) -> None:
     lsu = sum(one.lsu_inst_count for one in passed.lines)
     excess = sum(one.shared_wavefront_excess_count for one in passed.lines)
     print(f"source       {passed.report}")
-    print(f"  files      {sorted({one.file for one in passed.lines})}")
+    print(f"  modules    {sorted({one.entry_module for one in passed.lines})}")
     print(
         f"  attributed {attributed:,} inst  {lsu:,} LSU  "
         f"excess shared wavefronts {excess:,}"

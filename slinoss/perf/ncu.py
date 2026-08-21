@@ -1587,10 +1587,11 @@ class SourceLine:
 
     Attributes:
         kernel: Kernel name, from the source page's ``Function Name``.
-        file: The file NCU named. For a CuTe DSL kernel this is the entry module
-            on every line whatever file the line is really in; see
-            :func:`parse_source_csv`.
-        line: Line number, one-based.
+        entry_module: The file NCU named for the block, which for a CuTe DSL kernel
+            is the traced entry module and not the file the line is in. It is not
+            per-file attribution: see :func:`parse_source_csv`.
+        line: Line number, one-based, in a file this record does not name. Records
+            merge when two traced files share a line number.
         inst_count: Warp-instructions executed at this line, every pipe.
         lsu_inst_count: Those whose opcode is in :data:`LSU_OPCODES`.
         opcode_inst: Opcode class to warp-instructions executed, every pipe. The
@@ -1608,7 +1609,7 @@ class SourceLine:
     """
 
     kernel: str
-    file: str
+    entry_module: str
     line: int
     inst_count: int
     lsu_inst_count: int
@@ -1637,7 +1638,9 @@ class SourcePass:
     Attributes:
         report: The report the lines were read from.
         command: The argv that collected it.
-        lines: One record per correlated source line, by descending LSU count.
+        lines: One record per correlated source line, by descending LSU count. Keyed
+            by kernel, entry module and line number, which is not one file's line:
+            see :func:`parse_source_csv`.
         unattributed_inst_count: Warp-instructions on instructions NCU printed
             under no line. Nonzero means the attribution does not cover the kernel
             and the shortfall is this large, which a table of lines alone would
@@ -1749,12 +1752,17 @@ def parse_source_csv(
     instructions correlated to it. An instruction row is attributed to the last
     line number seen, which is the order NCU prints.
 
-    One warning about the file, for CuTe DSL kernels specifically. NVVM emits a
-    single ``.file`` for the whole module while preserving the line number of every
-    traced file, so every line of a DSL kernel is reported against the entry module
-    and ``file`` is only trustworthy for a single-file kernel. The line numbers
-    themselves are sound. Resolving them needs the MLIR location set, which is not
-    in the report.
+    The line-attributed view cannot be made unambiguous, and address is the only
+    key that is. NVVM emits one ``.file`` for the whole module while preserving the
+    line number of every traced file, so a record carries a line number whose file
+    is unknown, and two traced files that share a line number merge into one record.
+    Measured on a source page for ``start_passing_bwd_kernel``, whose block NCU
+    named ``start_passing.py``: line 214 of that file is an ``import`` statement and
+    carries 80,640 warp-instructions, line 245 opens a docstring, and line 262 is a
+    row of a table inside one. Resolving a line needs the MLIR location set, which
+    is not in the report. Intersect a line number with the location sets of the
+    modules the kernel traces before naming a site, and rank by
+    :attr:`SourceLine.opcode_inst` rather than by line where a site is in doubt.
 
     Args:
         text: Stdout of :func:`import_command` with ``page="source"`` and
@@ -1865,7 +1873,7 @@ def parse_source_csv(
         out.append(
             SourceLine(
                 kernel=key[0],
-                file=key[1],
+                entry_module=key[1],
                 line=key[2],
                 inst_count=inst.get(key, 0),
                 lsu_inst_count=lsu.get(key, 0),
@@ -1877,7 +1885,7 @@ def parse_source_csv(
                 stall_samples=stalls,
             )
         )
-    out.sort(key=lambda one: (-one.lsu_inst_count, one.file, one.line))
+    out.sort(key=lambda one: (-one.lsu_inst_count, one.entry_module, one.line))
     return SourcePass(
         report=report,
         command=tuple(command),

@@ -1129,7 +1129,9 @@ def test_the_source_page_attributes_each_instruction_to_a_line_or_to_none() -> N
         # block's Function Name is part of the key.
         ("vector_reduce_kernel", 1163),
     ]
-    assert all(one.file == CVB_PATH for one in got.lines)
+    # One path on every record, and it is the block's entry module rather than the
+    # file the line is in.
+    assert all(one.entry_module == CVB_PATH for one in got.lines)
     mat = got.lines[1]
     # Opcode class without its modifiers, predicate prefix stripped. The histogram
     # covers every pipe and the LSU count covers one, because the integer work is
