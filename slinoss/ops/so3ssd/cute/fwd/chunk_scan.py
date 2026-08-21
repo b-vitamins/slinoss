@@ -426,6 +426,32 @@ def gemm_kblocks(
         )
 
 
+def _row_pairs(row: cute.Tensor) -> cute.Tensor:
+    """View one contiguous global row in units of :data:`LANE_PAIR` elements.
+
+    Args:
+        row: ``(3N,)`` unit-stride view of one token's vectors.
+
+    Returns:
+        The retiled view. Element ``(None, k)`` is elements ``LANE_PAIR * k``
+        through ``LANE_PAIR * k + LANE_PAIR - 1``.
+
+    Invariants:
+        ``3N`` is a multiple of 48 and ``LANE_PAIR`` divides 48, so a row offset is a
+        whole number of pairs and every access is aligned to ``LANE_PAIR``.
+
+        The row index is applied before the claim, not after. A claim survives only
+        the offsets that are a compile-time multiple of it, and on a ``(T,3N)`` view
+        the row stride ``3N`` is dynamic, so ``row * 3N`` is not provably a whole
+        number of pairs however the extents are constrained. ``autovec_copy`` then
+        issues ``LANE_PAIR`` accesses where one would do. This is why
+        :func:`slinoss.ops.so3ssd.cute.table.paired` takes a shared tile, whose pitch
+        is static, and never a global view.
+    """
+    base = row.iterator.align(LANE_PAIR * (row.element_type.width // 8))
+    return cute.zipped_divide(cute.make_tensor(base, row.layout), (LANE_PAIR,))
+
+
 @cute.jit
 def scan_dnow(
     gb: cute.Tensor,
@@ -489,7 +515,6 @@ def scan_dnow(
     exact = chunk % span == 0
     depth = max(1, PREFETCH // LANE_PAIR)
 
-    bwords = paired(gb[bidx, gidx, None, None])
     cwords = paired(scrot)
     loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
     reads = cute.make_fragment((3, LANE_PAIR), elem)
@@ -501,6 +526,9 @@ def scan_dnow(
         # One clamp bounds the table read and the global read together, as in
         # ``stage_rotated``: ``valid`` is at most the chunk.
         tsafe = cutlass.min(token, valid - 1)
+        # Row first, then the pair claim: see ``_row_pairs``. One row view a pass
+        # against three accesses a pair, so the address arithmetic is not the cost.
+        bwords = _row_pairs(gb[bidx, gidx, t0 + tsafe, None])
         # Nine words per token, not per pair: both of a pair's 3-vectors take the
         # same matrix, and every pair of the token takes it too.
         mat = tuple(stable[TABLE_AN, tsafe, entry] for entry in range(9))
@@ -512,7 +540,7 @@ def scan_dnow(
                 pair = (group * depth + step) * tpt + sub
                 for k in cutlass.range_constexpr(3):
                     cute.autovec_copy(
-                        bwords[(None, (t0 + tsafe, 3 * pair + k))],
+                        bwords[(None, 3 * pair + k)],
                         loads[(3 * step + k, None)],
                     )
                 held.append(pair)
