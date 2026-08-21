@@ -110,7 +110,25 @@ PREFETCH: int = 4
 
 Bounds the load phase at ``3 * PREFETCH`` live float32 registers while keeping
 ``3 * PREFETCH`` loads outstanding per thread, which is what covers one global
-latency. One is the serial form: load, transform, store, wait, repeat."""
+latency. One is the serial form: load, transform, store, wait, repeat.
+
+Eight does not convert, and the reason bounds what depth can ever buy here. Every
+group loop below is a ``range_constexpr``, so a staging pass is already one
+straight-line block and the depth sets the emission order alone: doubling it
+leaves ``sm__inst_executed`` at 69,306,624 with every per-pipe count identical.
+Measured on sm_86, one process, bit-exact at all six shapes, 4 -> 8:
+
+    shape       registers    local sectors  cycles              long_scoreboard
+    standard    220 -> 220   0 -> 0         172,595 -> 172,105  41.24 -> 40.93
+    wide        255 -> 255   0 -> 0         298,842 -> 298,741  33.63 -> 32.80
+    acceptance  255 -> 255   3,133,440 both 987,700 -> 992,270  31.66 -> 29.90
+
+The memory stall falls between 0.3 and 1.8 points and the duration does not
+follow: acceptance moves 4.1 us of 577 and resolves in no rep of four. The
+residual is service time for a working set that does not fit, not an issue order
+the scheduler had left uncovered. Register pressure is not the refusal either --
+``standard`` runs at 220 registers with 35 spare and no spill, and converts least
+of the three."""
 
 LANE_PAIR: int = 2
 """Adjacent 3-vectors one thread transforms and stores per step.
@@ -138,7 +156,22 @@ are the ones :data:`PREFETCH` states.
 ``lanes`` is even at every legal shape:
 :func:`slinoss.ops.so3ssd.cute.guard.check_extents` requires ``3N`` to be a multiple
 of 3 and of :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_N`, so ``3N`` is a multiple
-of 48 and ``lanes`` a multiple of 16."""
+of 48 and ``lanes`` a multiple of 16.
+
+The ``pairs = extent // LANE_PAIR`` divisor below sits on the address chain feeding
+a global load, one division per step, and it cannot become an induction variable.
+The row index advances by a constant per step only when ``threads`` is a multiple of
+``pairs``, and that condition holds only where ``pairs`` is a power of two and the
+division is already a shift. At 128 threads:
+
+    helper           pairs         geometries
+    stage_rotated    lanes // 2    8, 16 are shifts; 40 leaves 128 % 40 = 8
+    stage_state      dim // 2      24, 48, 120 divide 128 in no case
+    stage_shifted    width // 2    32 is a shift; 24 leaves 128 % 24 = 8
+
+So the rewrite is available at exactly the geometries where it removes nothing, and
+absent at every geometry that pays a magic multiply. Enabling it needs a different
+thread-to-element map, which gives up the contiguity the pairing exists for."""
 
 
 def paired(tile: cute.Tensor) -> cute.Tensor:
