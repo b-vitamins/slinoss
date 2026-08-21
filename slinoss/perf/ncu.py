@@ -192,8 +192,11 @@ STALL_REASONS: Final[tuple[str, ...]] = (
 The family also carries ``selected``, which is not a stall; the issue rate it
 describes is ``issue_active_pct``. The two sub-breakdowns ``long_scoreboard`` and
 ``mio_throttle`` expose per pipe are absent, because they double-count their
-parent. The reasons do not partition warp-active cycles -- measured on this fleet
-they sum to 87 to 93 percent -- so no total is derived from them.
+parent. The family does partition warp-active cycles once ``selected`` is counted:
+measured on this fleet the stall reasons sum to 82.79 percent and ``selected`` to
+17.02 percent, 99.81 together. ``selected`` is the issue rate divided by warps per
+scheduler, so a stall share is read against the issue rate rather than as a
+duration.
 """
 
 
@@ -1590,8 +1593,10 @@ class SourceLine:
         line: Line number, one-based.
         inst_count: Warp-instructions executed at this line, every pipe.
         lsu_inst_count: Those whose opcode is in :data:`LSU_OPCODES`.
-        opcode_inst: Opcode class to warp-instructions executed, over
-            :data:`LSU_OPCODES` only.
+        opcode_inst: Opcode class to warp-instructions executed, every pipe. The
+            integer and logic classes are the ones the LSU subset hides: on
+            ``chunk_vector_bwd_kernel`` the LSU port carries 17.60 percent of the
+            stream and ``sm__inst_executed_pipe_alu.sum`` carries 32.98 percent.
         access_bit_inst: Access width in bits to warp-instructions executed of
             that width. Only memory instructions carry a width.
         shared_wavefront_count: Shared-memory wavefronts this line's instructions
@@ -1648,6 +1653,22 @@ class SourcePass:
     def lsu_inst_count(self) -> Count:
         """LSU warp-instructions over every attributed line."""
         return Count(sum(one.lsu_inst_count for one in self.lines))
+
+    @property
+    def opcode_inst(self) -> Mapping[str, Count]:
+        """Opcode class to warp-instructions executed, over the whole window.
+
+        Descending by count, so the head of the mapping is the kernel's instruction
+        budget in the order it has to be spent.
+        """
+        total: dict[str, int] = {}
+        for one in self.lines:
+            for opcode, count in one.opcode_inst.items():
+                total[opcode] = total.get(opcode, 0) + count
+        return {
+            opcode: Count(count)
+            for opcode, count in sorted(total.items(), key=lambda kv: (-kv[1], kv[0]))
+        }
 
 
 _LINE_NO: Final = "Line No"
@@ -1774,11 +1795,11 @@ def parse_source_csv(
         if matched is None:
             continue
         opcode = matched.group(1).partition(".")[0]
+        opcodes.setdefault(key, {})
+        opcodes[key][opcode] = opcodes[key].get(opcode, 0) + count
         if opcode not in LSU_OPCODES:
             continue
         lsu[key] = lsu.get(key, 0) + count
-        opcodes.setdefault(key, {})
-        opcodes[key][opcode] = opcodes[key].get(opcode, 0) + count
         width = (
             row[columns[_SRC_ACCESS_SIZE]].strip()
             if _SRC_ACCESS_SIZE in columns

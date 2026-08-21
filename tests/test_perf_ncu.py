@@ -1087,9 +1087,11 @@ def test_the_source_page_attributes_each_instruction_to_a_line_or_to_none() -> N
     ]
     assert all(one.file == CVB_PATH for one in got.lines)
     mat = got.lines[1]
-    # Opcode class without its modifiers, predicate prefix stripped, and the
-    # arithmetic on the same line left out of the LSU count.
-    assert mat.opcode_inst == {"LDS": 200}
+    # Opcode class without its modifiers, predicate prefix stripped. The histogram
+    # covers every pipe and the LSU count covers one, because the integer work is
+    # what an LSU-only census hides: it is a third of the instruction stream in the
+    # two kernels that dominate the backward, and it issues at half the FMA rate.
+    assert mat.opcode_inst == {"IADD3": 100, "LDS": 200}
     assert mat.inst_count == 300
     assert mat.lsu_inst_count == 200
     assert mat.access_bit_inst == {32: 200}
@@ -1114,6 +1116,12 @@ def test_the_source_page_attributes_each_instruction_to_a_line_or_to_none() -> N
     # An instruction NCU printed under no line is the shortfall in the table, not
     # a row to drop.
     assert got.unattributed_inst_count == 8
+    # The window aggregate crosses kernels: LDS is 200 from one and 60 from the
+    # other. Descending, because the head of the mapping is the instruction budget
+    # in the order it has to be spent, and a pipe's share is only readable against
+    # the whole stream.
+    assert got.opcode_inst == {"SHFL": 300, "LDS": 260, "IADD3": 100, "STS": 50}
+    assert list(got.opcode_inst) == ["SHFL", "LDS", "IADD3", "STS"]
 
 
 def test_a_source_page_with_no_correlated_line_names_the_missing_lineinfo() -> None:
