@@ -335,6 +335,12 @@ compare to each other and not to it::
         4     bf16    5,221.0     517.82  99.2   14.6%   255  91,344   8.3% / 8.3%
         8     bf16    3,274.1     515.74 157.5   23.2%   242  91,600  16.7% / 16.6%
 
+The register column above predates the merge and is stale. Reprofiled at the acceptance
+shape on the merged tree, one ptxas probe at each width: **236** registers at four warps
+and **149** at eight, both with zero local sectors, and 305,280,000 against
+327,778,560 instructions issued, the 7.4% rise being the readout term's reread. Duration
+went 1,933,632 to 1,696,480 ns, **1.14x** for the one measured doubling.
+
 Registers fall to 242, so 256 threads hold 61,952 of the 65,536 a multiprocessor has
 and the second warp per scheduler is available. Across the float32 pair,
 ``no_instruction`` goes 52.8% to 1.0% and issue-active 12.5% to 28.8%: instruction
@@ -343,8 +349,19 @@ the shipped width's counters for it are in the measured record above. Local traf
 stays zero at either width, conflicts 0.1511 per wavefront against 0.1612,
 instructions issued rise 1.1% for the readout term's reread, and the arena grows by
 the ``4 * L`` bytes a warp group past the first that :func:`offset_tile` takes -- one
-resident block at either width. Sixteen warps is refused by the register file before
-any tiling question: 512 threads admit 128 registers a thread.
+resident block at either width.
+
+Sixteen warps is refused, but not by the register file, and the earlier claim here that
+512 threads admit only 128 registers a thread was the wrong reason. Registers fall with
+the width because a warp group splits the N mode of one tile, so every accumulator is
+``M * N / threads`` elements and halves: the measured 236 to 149 across one doubling
+projects 94 to 106 at sixteen, inside the 128 bar, and the arena at four groups is
+94,416 B inside the 101,376 B carveout. What refuses it is number theory. Four groups
+need ``MMA_TILE_N`` 32, and ``3N`` at 240 factors as ``2^4 * 3 * 5``, whose divisors
+include no multiple of 32. ``M`` is pinned at the span, which is ``L``, and ``K`` is
+refused by :func:`slinoss.ops.so3ssd.cute.mma.mma_atoms`, which replicates the
+accumulator across it. Adding groups and widening the tile's warp count are the same
+parameter, not two.
 
 The same arithmetic refuses a second resident block at eight, and it is the register
 file that refuses it rather than the arena. Two 256-thread blocks need 128 registers a
@@ -1554,20 +1571,44 @@ def _fill_zero(
 ) -> None:
     """Zero a dense shared tile, padding included.
 
+    One :data:`TABLE_QUAD`-word segment a thread a step. A thread's four words are
+    adjacent and a step's threads cover ``TABLE_QUAD * threads`` adjacent words, so
+    the step count falls by four and the wavefront count is unchanged: a warp covered
+    128 B in one access and now covers 512 B in four. The widest fill at
+    ``L 64/P 64/3N 240`` goes fourteen steps to four.
+
     Args:
-        dst: Shared float32 tile whose storage is dense.
+        dst: Shared float32 tile whose storage is dense and segment-aligned.
         total: Elements the tile spans, padding included. Compile-time.
         tid: Thread index within the block.
         threads: Block width. Compile-time.
+
+    Invariants:
+        The claim is restated on the iterator because a tile arriving as a parameter
+        reports one element whatever its allocation asked for, and ``autovec_copy``
+        caps the access at the claim. ``total`` is a multiple of :data:`TABLE_QUAD`
+        at every legal shape -- a float32 pitch is an odd multiple of four words, and
+        :func:`slinoss.ops.so3ssd.cute.guard.check_extents` holds ``L`` to a multiple
+        of 16 -- so the scalar tail below is dead code and traces away.
     """
-    flat = cute.make_tensor(dst.iterator, cute.make_layout((total,), stride=(1,)))
-    for step in cutlass.range_constexpr(-(-total // threads)):
-        i = tid + step * threads
-        if cutlass.const_expr(total % threads == 0):
-            flat[i] = 0.0
+    quads = total // TABLE_QUAD
+    zero = cute.make_fragment((TABLE_QUAD,), cutlass.Float32)
+    zero.fill(0.0)
+    words = cute.make_tensor(
+        dst.iterator.align(SMEM_SEGMENT),
+        cute.make_layout((quads, TABLE_QUAD), stride=(TABLE_QUAD, 1)),
+    )
+    for step in cutlass.range_constexpr(-(-quads // threads)):
+        q = tid + step * threads
+        if cutlass.const_expr(quads % threads == 0):
+            cute.autovec_copy(zero, words[(q, None)])
         else:
-            if i < total:
-                flat[i] = 0.0
+            if q < quads:
+                cute.autovec_copy(zero, words[(q, None)])
+    if cutlass.const_expr(total % TABLE_QUAD):
+        flat = cute.make_tensor(dst.iterator, cute.make_layout((total,), stride=(1,)))
+        if tid < total - quads * TABLE_QUAD:
+            flat[quads * TABLE_QUAD + tid] = 0.0
 
 
 @cute.jit
@@ -2463,7 +2504,9 @@ def chunk_vector_bwd_kernel(
                 # of a warp's quads stride four banks apart, so the store is
                 # conflict-free by the pitch. The pad rows the source-token M mode
                 # was rounded up by are never written and reach only the
-                # accumulator rows the store below drops.
+                # accumulator rows the store below drops. The pair of columns reaches
+                # its one bank word in one 32-bit store because ptxas merges it; no
+                # shared store in this kernel is narrower than 32 bits.
                 for i in cutlass.range_constexpr(cute.size(dmacc)):
                     m, n = mcrd[i]
                     sscore[m, n] = mfrag[i]
@@ -2526,6 +2569,11 @@ def chunk_vector_bwd_kernel(
         # The readout accumulator is final. It goes to shared memory because its
         # three columns per token are held by two threads, and the transform and
         # the outer product below need all three in one.
+        # One store per element and not one per adjacent-column pair: ptxas already
+        # merges the pair. Measured on the SASS source page at the acceptance shape,
+        # base against a paired-store arm, both at 102 PCs of 32-bit ``STS``, 28 of
+        # ``STS.64``, 17 of ``STS.128``, zero of any 16-bit form, and identical to the
+        # wavefront. The arm moved no counter at all.
         for i in cutlass.range_constexpr(cute.size(dcacc)):
             m, d = ccrd[i]
             sdc[m, d] = dcacc[i]
