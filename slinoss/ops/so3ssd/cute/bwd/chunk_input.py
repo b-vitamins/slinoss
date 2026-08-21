@@ -188,15 +188,15 @@ the increment staging pass and three 64-bit base pointers. Eliminating the eight
 the two state tensors to the chunk's plane, so what remained was not addressed by
 removing coordinates, and what removed it was the live range and not the addresses.
 
-Neither bound is occupancy or block width. Occupancy is 16.7% theoretical against 16.3
+Block width is a bound at some shapes and not at others. At four warps occupancy is
+16.7% theoretical against 16.3
 to 16.5% achieved at ``L = 64``, with ``launch__occupancy_limit_registers`` and
 ``launch__occupancy_limit_shared_mem`` both two; ``long`` gets one block, 8.3% against
 8.3%, its shared-memory limit reading one, because a 128-row M tile puts its arena at
-79,952 B and the lane block is the only lever :func:`lblock` has. A thread's
-accumulator holds ``M*N/threads`` elements whatever
-:data:`slinoss.ops.so3ssd.cute.common.WARPS` is, and raising it raises
-:data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_M` with it, which would round a 64-token
-chunk to 128 rows.
+79,952 B and the lane block is the only lever :func:`lblock` has. Eight warps widen the
+tiling in N, not in M, so the chunk's row count is untouched and a thread's accumulator
+halves. What that costs is the diagonal GEMM's rereadable left operand, which the wide
+form stages through shared memory instead.
 
 ``long`` is the one shape whose bound is still instruction fetch: ``no_instruction``
 52.9% at a 7.96% issue rate and 15.0% of ``dram__throughput``, with one lane tile and
@@ -343,9 +343,11 @@ RESIDENT_MAX: int = 3
 """Blocks per SM the launch asks for, before the shared-memory budget lowers it.
 
 The budget lowers it to two at ``L = 64`` and to one at ``L = 128``, and two is also
-what the register file allows: the kernel sits at the 255-register architectural cap
-and spills, so a third block is unreachable whatever this asks for.
-``launch__occupancy_limit_registers`` reads two on sm_86 at every shape profiled. The
+what the register file allows: at four warps the kernel sits at the 255-register
+architectural cap and spills, and at eight it lands at 128 registers over twice the
+threads, which is the same 32,768 registers a block.
+``launch__occupancy_limit_registers`` reads two on sm_86 at every shape and both widths
+profiled, so a third block is unreachable whatever this asks for. The
 cap is not derived from shared memory alone because a shape whose arena is small
 enough for three blocks still would not get them."""
 
@@ -359,7 +361,9 @@ def tblock(chunk: int) -> int:
     return min(chunk, TBLOCK_MAX)
 
 
-def lblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
+def lblock(
+    chunk: int, rows: int, dim: int, itemsize: int = 2, *, warps: int = WARPS
+) -> int:
     """Lane extent held in shared memory at once.
 
     The three tiles that carry the lane dimension are the rotated forcing vectors,
@@ -392,6 +396,7 @@ def lblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
         rows: ``P``.
         dim: ``3N``.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+        warps: Warps per block, which the two per-warp scratch tiles carry.
 
     Returns:
         The widest divisor of ``3N`` that is a multiple of :data:`LANE_MULTIPLE` and
@@ -404,7 +409,10 @@ def lblock(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     capacity = smem_capacity()
     for budget in (capacity // RESIDENT_MIN, capacity):
         for blk in legal:
-            if input_smem_bytes(chunk, rows, dim, itemsize, lblk=blk) <= budget:
+            if (
+                input_smem_bytes(chunk, rows, dim, itemsize, lblk=blk, warps=warps)
+                <= budget
+            ):
                 return blk
     return legal[-1]
 
@@ -473,8 +481,8 @@ def shift_tile(chunk: int, rows: int) -> Tile:
     return fp32_tile(mma_rows(chunk), rows)
 
 
-def warp_tile(chunk: int) -> Tile:
-    """Per-warp log-scale scratch, ``(WARPS, pitch)``.
+def warp_tile(chunk: int, warps: int = WARPS) -> Tile:
+    """Per-warp log-scale scratch, ``(warps, pitch)``.
 
     One row per warp because the ``dexpo`` reduction is over the accumulator's M
     mode, whose rows are split across warps: a single row would be four warps
@@ -482,17 +490,22 @@ def warp_tile(chunk: int) -> Tile:
 
     Args:
         chunk: ``L``.
+        warps: Warps per block. :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE`
+            doubles the rows, which is the only shared cost of the wide form.
     """
-    return Tile((WARPS, chunk), (smem_pitch(chunk, 4), 1))
+    return Tile((warps, chunk), (smem_pitch(chunk, 4), 1))
 
 
-def reduce_tile() -> Tile:
-    """Block-reduction scratch, ``(REDUCTIONS, WARPS)``.
+def reduce_tile(warps: int = WARPS) -> Tile:
+    """Block-reduction scratch, ``(REDUCTIONS, warps)``.
 
     One word per warp per reduced value, which is what lets the epilogue reduce
     eleven float32 with no barrier of its own between them.
+
+    Args:
+        warps: Warps per block.
     """
-    return Tile((REDUCTIONS, WARPS), (WARPS, 1))
+    return Tile((REDUCTIONS, warps), (warps, 1))
 
 
 class Arena(NamedTuple):
@@ -513,6 +526,9 @@ class Arena(NamedTuple):
         trans: ``trans`` staging. Prologue only.
         tap: ``K`` staging. Prologue only.
         quat: Quaternion prefix staging. Prologue only.
+        score: The wide form's staged score, below the lane loop. Equal to
+            :attr:`local` where the increment cotangent is restaged every tap, and
+            its own words where it is not.
         words: Float32 words the arena spans.
     """
 
@@ -524,6 +540,7 @@ class Arena(NamedTuple):
     trans: int
     tap: int
     quat: int
+    score: int
     words: int
 
 
@@ -542,7 +559,13 @@ def _words(tile: Tile, itemsize: int) -> int:
 
 
 def arena(
-    chunk: int, rows: int, dim: int, itemsize: int = 2, *, lblk: int | None = None
+    chunk: int,
+    rows: int,
+    dim: int,
+    itemsize: int = 2,
+    *,
+    lblk: int | None = None,
+    warps: int = WARPS,
 ) -> Arena:
     """Lay the phase-shared tiles out in one allocation.
 
@@ -554,6 +577,8 @@ def arena(
         lblk: Lane extent of the three lane-dependent tiles. Defaults to
             :func:`lblock`, which passes it explicitly to ask what a candidate would
             cost.
+        warps: Warps per block. Above :data:`slinoss.ops.so3ssd.cute.mma.WARPS` the
+            diagonal GEMM needs its left operand in shared memory.
     """
     if lblk is None:
         lblk = lblock(chunk, rows, dim, itemsize)
@@ -561,6 +586,26 @@ def arena(
     local = _words(local_tile(rows, lblk), itemsize)
     readout = forced
     cotangent = _words(cotangent_tile(chunk, rows), itemsize)
+    tail = max(
+        local + readout + cotangent,
+        _words(shift_tile(chunk, rows), 4),
+        16 * chunk,
+    )
+    # The wide form's diagonal GEMM stages its left operand below the lane loop. At
+    # more than one lane block the increment cotangent is restaged every tap, so the
+    # staging aliases it and costs nothing; at one block it is staged on the first tap
+    # and read on the second, so the staging takes its own words.
+    staged = (
+        _words(operand_tile(mma_rows(chunk), tblock(chunk)), itemsize)
+        if warps > WARPS
+        else 0
+    )
+    if staged and dim // lblk == 1:
+        score = forced + tail
+        tail = tail + staged
+    else:
+        score = forced
+        tail = max(tail, staged)
     return Arena(
         forced=0,
         local=forced,
@@ -570,17 +615,19 @@ def arena(
         trans=forced,
         tap=forced + 4 * chunk,
         quat=forced + 12 * chunk,
-        words=forced
-        + max(
-            local + readout + cotangent,
-            _words(shift_tile(chunk, rows), 4),
-            16 * chunk,
-        ),
+        score=score,
+        words=forced + tail,
     )
 
 
 def input_smem_bytes(
-    chunk: int, rows: int, dim: int, itemsize: int = 2, *, lblk: int | None = None
+    chunk: int,
+    rows: int,
+    dim: int,
+    itemsize: int = 2,
+    *,
+    lblk: int | None = None,
+    warps: int = WARPS,
 ) -> int:
     """Shared memory the kernel allocates, in bytes.
 
@@ -595,14 +642,15 @@ def input_smem_bytes(
         lblk: Lane extent of the three lane-dependent tiles. Defaults to
             :func:`lblock`, which passes it explicitly to ask what a candidate would
             cost.
+        warps: Warps per block. Only the two per-warp scratch tiles carry it.
     """
-    words = arena(chunk, rows, dim, itemsize, lblk=lblk).words
+    words = arena(chunk, rows, dim, itemsize, lblk=lblk, warps=warps).words
     return smem_bytes(
         [
             (scalar_tile(chunk), 4),
             (scalar_tile(chunk), 4),
-            (warp_tile(chunk), 4),
-            (reduce_tile(), 4),
+            (warp_tile(chunk, warps), 4),
+            (reduce_tile(warps), 4),
             (table_tile(chunk, 3), 4),
             (input_tile(chunk, rows), itemsize),
             (Tile((words,), (1,)), 4),
@@ -777,13 +825,15 @@ def chunk_input_bwd_kernel(
 
     ldu = smem_pitch(rows)
     ldv = smem_pitch(lblk)
-    where = arena(chunk, rows, dim, lblk=lblk)
+    nwarps = threads // 32
+    one_group = nwarps == WARPS
+    where = arena(chunk, rows, dim, lblk=lblk, warps=nwarps)
 
     smem = cutlass.utils.SmemAllocator()
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     swgt = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
-    sdlp = smem.allocate_tensor(cutlass.Float32, warp_tile(chunk).layout(), 16)
-    sred = smem.allocate_tensor(cutlass.Float32, reduce_tile().layout(), 16)
+    sdlp = smem.allocate_tensor(cutlass.Float32, warp_tile(chunk, nwarps).layout(), 16)
+    sred = smem.allocate_tensor(cutlass.Float32, reduce_tile(nwarps).layout(), 16)
     stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 3).layout(), 16)
     su = smem.allocate_tensor(elem, input_tile(chunk, rows).layout(), SMEM_SEGMENT)
     pool = smem.allocate_tensor(
@@ -794,6 +844,13 @@ def chunk_input_bwd_kernel(
     sdinc = _tile_at(pool, where.local, local_tile(rows, lblk), elem)
     sc = _tile_at(pool, where.readout, forced_tile(chunk, lblk), elem)
     sdy = _tile_at(pool, where.cotangent, cotangent_tile(chunk, rows), elem)
+    # The wide form only, where the score fragment cannot be reread as an A operand.
+    # The view drops the pitch's padding, so the K mode is the stride-1 mode of an
+    # ``(M,K)`` operand.
+    sscore = _tile_at(pool, where.score, operand_tile(mpad, tblk), elem)
+    vscore = cute.make_tensor(
+        sscore.iterator, cute.make_layout((mpad, tblk), stride=(smem_pitch(tblk), 1))
+    )
     sshift = _tile_at(pool, where.shift, shift_tile(chunk, rows), cutlass.Float32)
     strans = _tile_at(pool, where.trans, trans_tile(chunk), cutlass.Float32)
     stap = _tile_at(pool, where.tap, tap_tile(chunk), cutlass.Float32)
@@ -814,9 +871,9 @@ def chunk_input_bwd_kernel(
         threads,
         chunk,
     )
-    for step in cutlass.range_constexpr(-(-(WARPS * chunk) // threads)):
+    for step in cutlass.range_constexpr(-(-(nwarps * chunk) // threads)):
         i = tid + step * threads
-        if i < WARPS * chunk:
+        if i < nwarps * chunk:
             sdlp[i // chunk, i - (i // chunk) * chunk] = zero
 
     cute.arch.sync_threads()
@@ -1181,7 +1238,7 @@ def chunk_input_bwd_kernel(
             # a layout and costs nothing per slice.
             dmacc = mma_acc(tiled_mma, tid, (mpad, tblk))
             sfrag = cute.make_fragment_like(dmacc, elem)
-            fa_score = mma_areg(sfrag)
+            fa_score = mma_areg(sfrag) if one_group else sfrag
             for k in cutlass.range_constexpr(ksteps):
                 mma_gemm(tiled_mma, tid, dmacc, vu[k], vb_dy[k], True, True)
             for i in cutlass.range_constexpr(cute.size(dmacc)):
@@ -1201,7 +1258,18 @@ def chunk_input_bwd_kernel(
                 column = _sum_over_m(masked * dmacc[i])
                 if tid % 32 < 4:
                     sdlp[warp, token] = sdlp[warp, token] + column
-            mma_gemm_areg(tiled_mma, tid, target, fa_score, vdiag, False)
+            if cutlass.const_expr(one_group):
+                mma_gemm_areg(tiled_mma, tid, target, fa_score, vdiag, False)
+            else:
+                # At two N groups a thread's consecutive N steps are two atoms apart,
+                # so the fragment cannot be reread as a K-contiguous A operand. The
+                # score goes through shared memory instead. The first barrier covers
+                # the lane loop's last read of the aliased tile and the previous
+                # slice's ldmatrix; the second covers this slice's store.
+                cute.arch.sync_threads()
+                cute.autovec_copy(sfrag, tiled_mma.get_slice(tid).partition_C(vscore))
+                cute.arch.sync_threads()
+                mma_gemm(tiled_mma, tid, target, vscore, vdiag, True, False)
 
     # Both fragments are final, so the log-scale sum over the target token, the carry
     # and the shift all read them in place.
@@ -1247,7 +1315,7 @@ def chunk_input_bwd_kernel(
         token = tid + step * threads
         if token < chunk:
             summed = zero
-            for w in cutlass.range_constexpr(WARPS):
+            for w in cutlass.range_constexpr(nwarps):
                 summed = summed + sdlp[w, token]
             # The scatter lands on the chunk's last slot whether or not it carries a
             # token, because the increment weight differentiates the padded prefix
@@ -1341,7 +1409,7 @@ def chunk_input_bwd(
         gdrot,
         gdscale,
         seqlen,
-        make_mma(dtype),
+        make_mma(dtype, threads // 32),
         threads,
         chunk,
         rows,
@@ -1401,6 +1469,7 @@ def chunk_input_backward(
     u_prev: Tensor | None = None,
     b_prev: Tensor | None = None,
     du_init: Tensor | None = None,
+    threads: int = THREADS,
 ) -> ChunkInputBwd:
     """Differentiate the forcing input and the closing transition of every chunk.
 
@@ -1428,6 +1497,9 @@ def chunk_input_backward(
             pitched, or None. Read only. The epilogue adds it to the float32 sum
             before the one narrowing, so a caller with a gradient already bound for
             ``dU`` pays one read rather than a pass of its own.
+        threads: Block width, a multiple of 128 at most
+            ``32 * slinoss.ops.so3ssd.cute.mma.WARPS_WIDE``. The wide form halves
+            every per-thread accumulator and adds two per-warp scratch rows.
 
     Returns:
         :class:`ChunkInputBwd`.
@@ -1464,10 +1536,13 @@ def chunk_input_backward(
         if tuple(tensor.shape) != state:
             raise ValueError(f"{name} must be {state}, got {tuple(tensor.shape)}")
 
-    lblk = lblock(chunk_size, rows, dim, dy.element_size())
+    nwarps = threads // 32
+    lblk = lblock(chunk_size, rows, dim, dy.element_size(), warps=nwarps)
     budget = assert_smem_fits(
-        f"chunk_input_bwd[L{chunk_size}/P{rows}/3N{dim}/lane{lblk}]",
-        input_smem_bytes(chunk_size, rows, dim, dy.element_size(), lblk=lblk),
+        f"chunk_input_bwd[L{chunk_size}/P{rows}/3N{dim}/lane{lblk}/W{nwarps}]",
+        input_smem_bytes(
+            chunk_size, rows, dim, dy.element_size(), lblk=lblk, warps=nwarps
+        ),
     )
 
     device = dy.device
@@ -1506,7 +1581,7 @@ def chunk_input_backward(
         ),
         (
             cute_dtype(dtype),
-            THREADS,
+            threads,
             chunk_size,
             rows,
             dim,
