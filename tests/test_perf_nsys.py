@@ -1,4 +1,4 @@
-"""Nsight Systems driver: command construction, the duration unit, and the trace.
+"""Nsight Systems: command construction, the duration unit, the trace, the timeline.
 
 The profiler binary is absent on this host and on the verification fleet, so no
 test launches ``nsys``. Every pure function is driven with fixture text held in
@@ -20,12 +20,20 @@ from typing import Final
 import pytest
 
 from slinoss.perf.nsys import (
+    GpuEvent,
     duration_scale_ns,
+    events_within,
     nsys_profile_command,
+    nsys_report_texts,
     nsys_stats_command,
+    occupancy,
+    parse_gpu_events,
     parse_gpu_trace,
+    parse_nvtx_projection,
+    repeat_windows,
     run_nsys,
 )
+from slinoss.perf.units import Microseconds
 
 TARGET: Final[tuple[str, ...]] = (
     "python3",
@@ -386,3 +394,239 @@ def test_run_nsys_raises_on_either_failed_command(
     )
     with pytest.raises(RuntimeError, match="no CUDA device present"):
         run_nsys(TARGET, tmp_path / "profile-op", nsys="/opt/nsight/nsys")
+
+
+# ---------------------------------------------------------------------------
+# The timeline
+#
+# parse_gpu_trace answers what a kernel costs. These answer where the step went,
+# which needs the start times: a sum of durations cannot say whether the device
+# was executing between two launches.
+# ---------------------------------------------------------------------------
+
+TIMELINE_CSV: Final = f"""{PREAMBLE}{TRACE_HEADER}
+1719050000,20000,1204,512,1,1,256,1,1,104,0.048,0.033,,,,,"NVIDIA RTX A6000 (0)",1,,7,{CHUNK}
+1719000000,10000,1201,512,1,1,256,1,1,104,0.048,0.033,,,,,"NVIDIA RTX A6000 (0)",1,,7,{CHUNK}
+1719005000,10000,1209,108,1,1,128,1,1,56,0.000,0.064,,,,,"NVIDIA RTX A6000 (0)",1,,20,{CPASYNC}
+"""
+
+MICROSECOND_TIMELINE_CSV: Final = """Start (us),Duration (us),Strm,Name
+1719000.000,41.28,7,so3ssd_chunk_fwd
+"""
+
+NO_START_COLUMN_CSV: Final = """First (ns),Duration (ns),Name
+1719000000,41280,so3ssd_chunk_fwd
+"""
+
+
+def test_parse_gpu_events_reads_the_start_column_in_its_own_unit() -> None:
+    # A microsecond start read as nanoseconds puts every event 1000x too early and
+    # every gap 1000x too small, which reads as a device that never waited.
+    events = parse_gpu_events(MICROSECOND_TIMELINE_CSV)
+    assert [e.start_us for e in events] == pytest.approx([1719000.0])
+    assert events[0].end_us == pytest.approx(1719041.28)
+    assert events[0].stream == "7"
+
+
+def test_parse_gpu_events_orders_the_timeline_by_start() -> None:
+    # NSYS emits rows in correlation-id order, not start order, and every window
+    # and gap below depends on the order being the timeline's.
+    events = parse_gpu_events(TIMELINE_CSV)
+    assert [e.start_us for e in events] == pytest.approx(
+        [1719000.0, 1719005.0, 1719050.0]
+    )
+    assert [e.name for e in events] == [CHUNK, CPASYNC, CHUNK]
+    assert [e.stream for e in events] == ["7", "20", "7"]
+
+
+def test_parse_gpu_events_rejects_output_it_cannot_read() -> None:
+    with pytest.raises(ValueError, match="no cuda_gpu_trace header in nsys output"):
+        parse_gpu_events(NO_HEADER_CSV)
+    with pytest.raises(ValueError, match="no 'start' column"):
+        parse_gpu_events(NO_START_COLUMN_CSV)
+    # An empty window is a capture range that never opened, not a device that idled.
+    with pytest.raises(ValueError, match="the capture range never opened"):
+        parse_gpu_events(EMPTY_WINDOW_CSV)
+
+
+def test_occupancy_unions_the_streams_rather_than_summing_them() -> None:
+    # Two streams overlap here: 1719000-1719010 on stream 7 and 1719005-1719015 on
+    # stream 20, then 1719050-1719070 on stream 7. Busy is 15 + 20 = 35 us over a
+    # 70 us span. A sum of durations would report 40 us busy, which exceeds the
+    # window's own occupancy and can exceed the window itself.
+    got = occupancy("step", parse_gpu_events(TIMELINE_CSV))
+    assert got.label == "step"
+    assert got.span_us == pytest.approx(70.0)
+    assert got.busy_us == pytest.approx(35.0)
+    assert got.sum_duration_us == pytest.approx(40.0)
+    assert got.idle_us == pytest.approx(35.0)
+    assert got.idle_pct == pytest.approx(50.0)
+    assert got.busy_us + got.idle_us == pytest.approx(got.span_us)
+    assert got.event_count == 3
+    # One gap, 1719015 to 1719050. The overlap is not a second gap.
+    assert got.gap_count == 1
+    assert got.max_gap_us == pytest.approx(35.0)
+
+
+def test_occupancy_refuses_an_empty_window() -> None:
+    # Zero idle over zero span reads as a device that never waited.
+    with pytest.raises(ValueError, match=r"occupancy\('step'\) needs at least one"):
+        occupancy("step", ())
+
+
+def test_events_within_selects_by_start_so_windows_tile() -> None:
+    # By overlap instead, an event straddling a boundary would land in both windows
+    # and its duration would be counted twice.
+    events = parse_gpu_events(TIMELINE_CSV)
+    first = events_within(events, 1719000.0, 1719020.0)
+    second = events_within(events, 1719020.0001, 1719100.0)
+    assert [e.name for e in first] == [CHUNK, CPASYNC]
+    assert [e.name for e in second] == [CHUNK]
+    assert len(first) + len(second) == len(events)
+    assert events_within(events, 1719100.0, 1719200.0) == ()
+
+
+# ---------------------------------------------------------------------------
+# NVTX projection
+#
+# The column set is NSYS 2023.3's own. Eight of its columns end in "Start" or
+# "Duration", which is why the parser matches on two needles rather than a prefix.
+# The first row is NSYS's synthetic root: no name, no orig columns, and every
+# device operation of the run counted into it.
+# ---------------------------------------------------------------------------
+
+NVTX_PREAMBLE: Final = """Generating '/tmp/nsys-report-9f31.sqlite'
+[1/1] Executing 'nvtx_gpu_proj_trace' stats report
+
+ ** NVTX GPU Projection Trace (nvtx_gpu_proj_trace):
+"""
+
+NVTX_HEADER: Final = (
+    "Name,Projected Start (ns),Projected Duration (ns),Orig Start (ns),"
+    "Orig Duration (ns),Style,PID,TID,NumGPUOps,Lvl,NumChild,RangeId,ParentId,"
+    "RangeStack"
+)
+
+NVTX_CSV: Final = f"""{NVTX_PREAMBLE}{NVTX_HEADER}
+,10758298,33981358,,,,295239,295820,164,,0,,,
+so3ssd-auto,14739612,1031280,14108904,3554743,PushPop,295239,295239,2,0,0,2,,:2
+mamba-g1,8895767,1177902,8450530,5597874,PushPop,295239,295239,5,0,0,1,,:1
+"""
+
+NVTX_NOTHING_PROJECTED_CSV: Final = f"""{NVTX_PREAMBLE}{NVTX_HEADER}
+mamba-g1,,,8450530,5597874,PushPop,295239,295239,0,0,0,1,,:1
+"""
+
+
+def test_parse_nvtx_projection_reads_the_projected_columns_not_the_orig_ones() -> None:
+    # Both intervals are kept and neither is read for the other. The projected span
+    # is device time, the orig span is the pushing thread's push to its pop, and
+    # which is larger says which side the range is bound by.
+    spans = parse_nvtx_projection(NVTX_CSV)
+    assert [s.name for s in spans] == ["mamba-g1", "so3ssd-auto"]  # by projected start
+    mamba = spans[0]
+    assert mamba.start_us == pytest.approx(8895.767)
+    assert mamba.duration_us == pytest.approx(1177.902)
+    assert mamba.end_us == pytest.approx(10073.669)
+    assert mamba.host_start_us == pytest.approx(8450.530)
+    assert mamba.host_duration_us == pytest.approx(5597.874)
+    assert mamba.host_end_us == pytest.approx(14048.404)
+    # The projection is per thread, so this count is the launches the pushing thread
+    # made and not the launches the range enclosed. Five here against the 164 the
+    # run made: a PyTorch backward runs on the autograd engine's own thread.
+    assert mamba.gpu_op_count == 5
+    # NSYS's synthetic root carries no name and every operation of the run. Kept, it
+    # would be a third arm holding both of the real ones.
+    assert all(s.name for s in spans)
+    assert len(spans) == 2
+
+
+def test_parse_nvtx_projection_rejects_output_it_cannot_read() -> None:
+    with pytest.raises(ValueError, match="no nvtx_gpu_proj_trace header"):
+        parse_nvtx_projection(NO_HEADER_CSV)
+    with pytest.raises(ValueError, match="no 'projected\\+start' column"):
+        parse_nvtx_projection(GPU_TRACE_CSV)
+    # A range that projected nothing means NVTX went untraced or the pushes fell
+    # outside the capture window. Both are broken runs, not empty ones.
+    with pytest.raises(ValueError, match="projected no NVTX range onto the device"):
+        parse_nvtx_projection(NVTX_NOTHING_PROJECTED_CSV)
+
+
+# ---------------------------------------------------------------------------
+# Repetition windows
+# ---------------------------------------------------------------------------
+
+
+def event(name: str, start_us: float, duration_us: float) -> GpuEvent:
+    """One timeline event, for the segmentation tests."""
+    return GpuEvent(
+        name=name,
+        start_us=Microseconds(start_us),
+        duration_us=Microseconds(duration_us),
+    )
+
+
+def loop_timeline(count: int, *, stride: float = 100.0) -> tuple[GpuEvent, ...]:
+    """``count`` repetitions of a two-kernel step, one per ``stride``."""
+    return tuple(
+        event(name, i * stride + offset, 10.0)
+        for i in range(count)
+        for name, offset in ((CHUNK, 0.0), (CPASYNC, 20.0))
+    )
+
+
+def test_repeat_windows_cuts_the_timeline_by_repetition_not_by_gap() -> None:
+    # The gap inside a step (10 to 20) is smaller than the gap between two steps
+    # (30 to 100) here, but a step whose largest gap fell at its own boundary would
+    # be mis-cut by a gap rule, and the idle it holds would be charged to the loop.
+    windows = repeat_windows(loop_timeline(3), 3)
+    assert [[e.name for e in w] for w in windows] == [[CHUNK, CPASYNC]] * 3
+    assert [w[0].start_us for w in windows] == pytest.approx([0.0, 100.0, 200.0])
+    assert occupancy("step", windows[1]).span_us == pytest.approx(30.0)
+
+
+def test_repeat_windows_rejects_a_timeline_that_is_not_the_loop_it_was_told() -> None:
+    with pytest.raises(ValueError, match="needs a positive count"):
+        repeat_windows(loop_timeline(2), 0)
+    # An extra operation is compilation, an allocator fill, or another arm sharing
+    # the window. Divided anyway, it would shift every later window by one launch.
+    with pytest.raises(ValueError, match="5 device operations do not divide into 2"):
+        repeat_windows((*loop_timeline(2), event(CHUNK, 500.0, 10.0)), 2)
+    # Equal counts and unequal sequences: the segmentation would line up two
+    # different steps and the per-step median would be of a mixture.
+    odd = (*loop_timeline(1), event(CHUNK, 100.0, 10.0), event(CHUNK, 120.0, 10.0))
+    with pytest.raises(
+        ValueError, match=r"repetition 1 launched .* where repetition 0"
+    ):
+        repeat_windows(odd, 2)
+
+
+def test_nsys_report_texts_profiles_once_for_every_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # One profile, then one export per report. Profiling per report would give the
+    # GPU trace and the NVTX projection two different runs, and every cross-check
+    # between them would then be between two timelines.
+    fake = FakeRun((0, PROFILE_LOG, ""), (0, GPU_TRACE_CSV, ""), (0, NVTX_CSV, ""))
+    monkeypatch.setattr(subprocess, "run", fake)
+    base = tmp_path / "run.acceptance"
+    texts = nsys_report_texts(
+        TARGET,
+        base,
+        ("cuda_gpu_trace", "nvtx_gpu_proj_trace"),
+        nsys="/opt/nsight/nsys",
+        trace="cuda,nvtx",
+    )
+    assert [command[1] for command in fake.commands] == ["profile", "stats", "stats"]
+    assert [command[3] for command in fake.commands[1:]] == [
+        "cuda_gpu_trace",
+        "nvtx_gpu_proj_trace",
+    ]
+    report = str(tmp_path / "run.acceptance.nsys-rep")
+    assert all(command[-1] == report for command in fake.commands[1:])
+    assert set(texts) == {"cuda_gpu_trace", "nvtx_gpu_proj_trace"}
+    assert parse_gpu_events(texts["cuda_gpu_trace"])[0].name == CHUNK
+    assert parse_nvtx_projection(texts["nvtx_gpu_proj_trace"])[0].name == "mamba-g1"
+    monkeypatch.setattr(subprocess, "run", FakeRun((3, "", DIAGNOSTIC)))
+    with pytest.raises(RuntimeError, match="profile exited 3"):
+        nsys_report_texts(TARGET, base, ("cuda_gpu_trace",), nsys="/opt/nsight/nsys")
