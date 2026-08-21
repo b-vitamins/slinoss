@@ -17,6 +17,19 @@ attaches to.
     python3 scripts/perf/profile_start_passing_bwd.py --arm pair --rows 64 \
         --lanes 80 --heads 18 --groups 1
 
+The final-state cotangent is supplied by default, because that is the variant a step
+compiles: :class:`slinoss.ops.so3ssd.interface.SO3SSDFunction` leaves
+``set_materialize_grads`` on, so autograd hands the backward a zero-filled ``dstate``
+for a ``state`` output nothing read, and ``has_dstate`` is true whatever the caller
+wanted. ``--no-seed-state`` selects the zero-seed variant, which is a different
+compiled kernel and not a flag on the same one. At the acceptance shape the two differ
+by 34,560 global-load instructions a launch and by whether the launch spills: the
+zero-seed variant wants 81 registers against the 80 the cap at three blocks allows and
+pays 368,640 local-load sectors, and the seeded one wants 80 and pays none. Both were
+read at 78,966,720 and 13,262,400 instructions against the same figures inside
+``scripts/perf/profile_op.py --mode step``, to the instruction, so a counter crosses
+between the two drivers only while the variant line below matches.
+
 Two byte counts are printed. ``issued`` charges every per-head operand once per lane
 band and the readout band once per head, which is what the blocks request.
 ``unique`` charges each of them once, which is what DRAM owes if L2 holds them
@@ -119,8 +132,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--seed-state",
-        action="store_true",
-        help="Supply a final-state cotangent, the has_dstate variant.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Supply a final-state cotangent, the has_dstate variant. On by "
+        "default because a step always supplies one; the module docstring says why.",
     )
     parser.add_argument(
         "--iters",
@@ -292,13 +307,14 @@ def target_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--groups", str(args.groups)]
     if args.resident is not None:
         argv += ["--resident", str(args.resident)]
-    if args.seed_state:
-        argv += ["--seed-state"]
+    # Named either way: the default is on, so an absent flag would leave the window
+    # process free to drift from the driver if the default ever moves again.
+    argv += ["--seed-state" if args.seed_state else "--no-seed-state"]
     return argv
 
 
 def analytic_bytes(
-    shape: OpShape, groups: int, span: int, itemsize: int, arm: str
+    shape: OpShape, groups: int, span: int, itemsize: int, arm: str, seed_state: bool
 ) -> tuple[Bytes, Bytes]:
     """Traffic one call of the arm moves, operand by operand.
 
@@ -312,6 +328,9 @@ def analytic_bytes(
         span: Lane band width.
         itemsize: Bytes per activation element.
         arm: ``fused`` or ``pair``.
+        seed_state: Whether a final-state cotangent is read. One pass of the state
+            buffer, charged once whatever the band count: a band reads its own
+            columns of it.
 
     Returns:
         ``(issued, unique)``. The first charges a shared operand once per block that
@@ -325,6 +344,7 @@ def analytic_bytes(
     readout = tokens * shape.d_state * itemsize
     plane = lead * chunks * shape.rows * shape.d_state * 4
     state = lead * shape.rows * shape.d_state * 4
+    seed = state if seed_state else 0
     transition = lead * chunks * 4 * 4 + lead * chunks * 4
     if arm == "fused":
         bands = -(-shape.d_state // span)
@@ -332,12 +352,12 @@ def analytic_bytes(
         # The fused store is the only write of the pair that narrows: ``dinc`` goes
         # to its GEMM consumers, while the pair's ``dzstart`` is read back by the
         # recurrence and overwritten in place, so all three of its planes are float32.
-        rest = plane // 4 * itemsize + state
+        rest = plane // 4 * itemsize + state + seed
         return (
             Bytes(bands * per_head + readout * shape.heads + rest),
             Bytes(per_head + readout * groups + rest),
         )
-    common = dy + trans + 3 * plane + state + transition
+    common = dy + trans + 3 * plane + state + seed + transition
     return (
         Bytes(common + readout * shape.heads),
         Bytes(common + readout * groups),
@@ -405,7 +425,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     floor = dram_time_floor(device)
     issued, unique = analytic_bytes(
-        shape, groups, args.span, torch.finfo(dtype).bits // 8, args.arm
+        shape,
+        groups,
+        args.span,
+        torch.finfo(dtype).bits // 8,
+        args.arm,
+        args.seed_state,
     )
     del runner
 
@@ -430,6 +455,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"arm          {args.arm} span {args.span} warps {args.warps} "
         f"resident {args.resident}"
     )
+    print(f"variant      has_dstate={args.seed_state}")
     print(f"shape        {shape.describe()}")
     print(f"groups       {groups} fold {shape.heads // groups}")
     print(f"dtype        {args.dtype}")
