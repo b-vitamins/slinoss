@@ -1,6 +1,7 @@
 """Chunk increment and the inter-chunk recurrence, in one launch.
 
-    inc_c(P,span) = (u*wgt)^T Bn + (ushift*wgt)^T Bp
+    Afuse_s       = Ap_s + exp(2*ls_s) An_{s-1},   Afuse_0 = Ap_0
+    inc_c(P,span) = (ushift*wgt)^T Bfuse + u_{L-1} (x) bnow_{L-1}
     zstart_c      = s_c,    s_{c+1} = R(Q_c) (a_c s_c + inc_c)
 
 The two kernels this replaces passed ``inc`` through DRAM: the increment wrote a
@@ -15,11 +16,35 @@ are both a fifth of the model geometry's full width and both fit the register fi
 at once. Every band recomputes the chunk-local prefixes and the transform table
 from ``trans``, exactly as the unfused pair's kernels each did.
 
-Both forcing taps are staged before either contracts. The unfused increment holds
-one forcing tile and restages it between the two taps, which costs four barriers a
-K slice; at a band width the second tile is free, because the arena is sized by the
-float32 tile the recurrence reads and not by the operands, so the fused form stages
-both and pays two.
+One forcing tap, not two. Reindexing the now-tap of token ``s-1`` onto slot ``s``
+gives both taps the operand ``b_{s-1}``, the weight ``u_{s-1}`` and the scale
+``wgt_s``, so one table column carries both and one GEMM replaces two: the
+contraction cost is ``2pd`` where it was ``4pd``.
+:func:`slinoss.ops.so3ssd.cute.table.build_table` writes that column at ``fused``.
+What the reindex leaves over is the now-tap of the chunk's last slot, which has no
+slot to move to. It is a rank-one ``u_{L-1} (x) bnow_{L-1}``, two vectors at one
+token rather than a contraction, so it is produced as one row and folded into the
+accumulator elementwise in the recurrence below.
+
+The second forcing tile was not free at the slice the tiling sweep chose. The arena
+is the larger of the operands and the float32 result, and at ``L 64 P 64 span 48``
+two operand tiles are 23,696 B against the result's 12,288, so the second tile cost
+7,168 B and deleting it returns them. The operands stop sizing the arena only at
+``368*kblk + 144 <= 12,288``, which is ``kblk <= 32``; the shipped slice is 64.
+
+Barriers are unchanged, two a K slice and seven a chunk at one slice. The pair is
+the write-after-read before the stage and the read-after-write after it, and it
+guards the tile the GEMM reads rather than how many tiles there are.
+
+Fusion measured on sm_86 at the shape below, bf16, both arms in one process with the
+order swapped every iteration: -57.9 us a launch and -13.9%, the median of 40 pairs a
+trial over three trials, the interval [-60.4, -55.2] clear of zero at 96.2% coverage.
+The instruction stream is the part of that no other tenant can move: 70,942,844 to
+59,424,284 instructions, the LSU port carrying 13,225,328 to 10,103,408, tensor
+warp-instructions 2,211,840 to 1,105,920, and the excess shared wavefronts 5,162,400 to
+1,658,880. Registers go 141 to 146 with no spill either side. The arena goes 32,912 to
+25,952 B at residency 3 both ways: the next bar is 24,576 B, and four blocks of 128
+threads cap a thread at 128 registers, so the 6,960 returned bytes buy no block.
 
 The rotation stays factored out of the increment and out of the state. The GEMM
 accumulates in the chunk-local frame, the recurrence adds the scaled state to it
@@ -31,7 +56,8 @@ Arena. The two GEMM operand tiles and the float32 tile the recurrence reads are
 never live at once: the contraction reads the operands, the store writes the
 result, and the next chunk restages the operands only after the recurrence has read
 that result. One region holds all three, which is what leaves room for
-:data:`RESIDENT_MAX` blocks per SM.
+:data:`RESIDENT_MAX` blocks per SM. The residue row is outside it, because the store
+writes the whole region and the recurrence reads the residue after that store.
 
 Measured on sm_86 at ``B 4 H 18 T 2048 P 64 3N 240 L 64 G 1``, bf16, clocks unlocked,
 both arms in one process: 401.3 us and 187.98 MB a launch against the pair's 787.0 us
@@ -139,10 +165,11 @@ from slinoss._cute import (
     smem_bytes,
     smem_capacity,
     smem_residency,
+    widen,
 )
 from slinoss.ops.so3ssd.cute.common import (
+    TABLE_AFUSE,
     TABLE_AN,
-    TABLE_AP,
     WARPS,
     mat3_matvec,
     rot_hom,
@@ -170,6 +197,7 @@ from slinoss.ops.so3ssd.cute.mma import (
     MMA_TILE_K,
     MMA_TILE_N,
     SMEM_SEGMENT,
+    fp32_tile,
     make_mma,
     mma_acc,
     mma_atoms,
@@ -180,6 +208,7 @@ from slinoss.ops.so3ssd.cute.mma import (
 )
 from slinoss.ops.so3ssd.cute.prefix import chunk_endpoint, chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
+    LANE_PAIR,
     build_table,
     stage_chunk,
     stage_pad,
@@ -197,6 +226,7 @@ __all__ = [
     "increment_passing_forward",
     "increment_passing_fwd",
     "increment_passing_fwd_kernel",
+    "residue_tile",
     "state_tile",
 ]
 
@@ -256,10 +286,11 @@ def state_tile(rows: int, span: int) -> Tile:
     return Tile((mma_rows(rows), span), (span, 1))
 
 
-def arena_words(
-    kblk: int, rows: int, span: int, itemsize: int = 2
-) -> tuple[int, int, int]:
-    """Float32-word extent of the overlaid region, and the offsets inside it.
+def arena_words(kblk: int, rows: int, span: int, itemsize: int = 2) -> tuple[int, int]:
+    """Float32-word extent of the overlaid region, and the offset inside it.
+
+    One forcing tile, not two: the fused column contracts the shifted operand both
+    taps share.
 
     Args:
         kblk: K extent of one slice.
@@ -268,16 +299,32 @@ def arena_words(
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
 
     Returns:
-        ``(words, bn_words, bp_words)``: the region's float32-word extent, and the
-        offsets at which the two forcing tiles start. Every offset is a whole word
-        and a whole :data:`slinoss.ops.so3ssd.cute.mma.SMEM_SEGMENT`, because every
-        tile's row pitch is a multiple of the segment.
+        ``(words, forced_words)``: the region's float32-word extent, and the offset
+        at which the forcing tile starts. The offset is a whole word and a whole
+        :data:`slinoss.ops.so3ssd.cute.mma.SMEM_SEGMENT`, because every tile's row
+        pitch is a multiple of the segment.
     """
     weights = smem_bytes([(input_tile(kblk, rows), itemsize)])
     forced = smem_bytes([(forced_tile(kblk, span), itemsize)])
     state = smem_bytes([(state_tile(rows, span), 4)])
-    words = max(weights + 2 * forced, state) // 4
-    return words, weights // 4, (weights + forced) // 4
+    words = max(weights + forced, state) // 4
+    return words, weights // 4
+
+
+def residue_tile(span: int) -> Tile:
+    """Rank-one residue vector the recurrence folds in, ``(1, pitch)`` float32.
+
+    One row of the band, holding ``An_{L-1} b_{L-1}`` over this block's columns. Not
+    an operand, so I4's float32 applies and the pitch is the float32 one; at one row
+    the pitch carries only padding, and it is taken from
+    :func:`slinoss.ops.so3ssd.cute.mma.fp32_tile` anyway because
+    :func:`slinoss.ops.so3ssd.cute.table.paired` states the pitch rule as an
+    invariant of every tile it views.
+
+    Args:
+        span: Band width, :data:`SPLIT`.
+    """
+    return fp32_tile(1, span)
 
 
 def fused_smem_bytes(
@@ -285,8 +332,8 @@ def fused_smem_bytes(
 ) -> int:
     """Shared memory the kernel allocates, in bytes.
 
-    The six chunk-sized float32 tiles of the increment, then the one region
-    :func:`arena_words` describes. Computed from the layouts, so there is one
+    The six chunk-sized float32 tiles of the increment, the residue row, then the one
+    region :func:`arena_words` describes. Computed from the layouts, so there is one
     description of the budget.
 
     Args:
@@ -296,7 +343,7 @@ def fused_smem_bytes(
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
         kblk: K extent of one slice.
     """
-    words, _, _ = arena_words(kblk, rows, span, itemsize)
+    words, _ = arena_words(kblk, rows, span, itemsize)
     return smem_bytes(
         [
             (trans_tile(chunk), 4),
@@ -305,6 +352,7 @@ def fused_smem_bytes(
             (scalar_tile(chunk), 4),
             (trans_tile(chunk), 4),
             (table_tile(chunk, 2), 4),
+            (residue_tile(span), 4),
             (Tile((words,), (1,)), 4),
         ]
     )
@@ -436,6 +484,10 @@ def increment_passing_fwd_kernel(
         ``rows`` is free: M is rounded up in shared memory, zero-filled, and the
         store predicated. ``|R(Q_c)| == 1`` and ``a_c`` lies in ``(0, 1]`` by I1, so
         the recurrence cannot grow.
+
+        ``kblk`` dividing ``chunk`` is what makes the fused stage's one-past-``valid``
+        row legal: a slice never reaches past the chunk, so the table index the widened
+        keep admits is at most ``chunk - 1``.
     """
     tid, _, _ = cute.arch.thread_idx()
     # Head is the fastest grid mode, as in the unfused GEMM: the ``H // G`` blocks
@@ -463,6 +515,11 @@ def increment_passing_fwd_kernel(
     wide = 2 if (rows * lanes) % (2 * threads) == 0 else 1
     unit = 3 * wide
     cells = rows * lanes // (wide * threads)
+    # The residue row is ``lanes // LANE_PAIR`` threads' work, so the warps past it
+    # have no task. Branched around rather than run empty: the guard is warp-uniform,
+    # so it costs no divergence, and the pass it skips is three global reads, ten
+    # table reads and eighteen FMA a thread.
+    reswarps = min(threads, 32 * -(-(lanes // LANE_PAIR) // 32))
     lda = smem_pitch(mpad)
     ldb = smem_pitch(span)
 
@@ -473,10 +530,13 @@ def increment_passing_fwd_kernel(
     swgt = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 2).layout(), 16)
+    # Outside the arena: the store below writes the whole region, and the recurrence
+    # reads this row after that store.
+    sres = smem.allocate_tensor(cutlass.Float32, residue_tile(span).layout(), 16)
 
-    # One region, four views: the three GEMM operands, and the contraction's result
+    # One region, three views: the two GEMM operands, and the contraction's result
     # over the same bytes.
-    words, bnwords, bpwords = arena_words(kblk, rows, span, gu.element_type.width // 8)
+    words, fwords = arena_words(kblk, rows, span, gu.element_type.width // 8)
     arena = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((words,), stride=(1,)), SMEM_SEGMENT
     )
@@ -484,12 +544,8 @@ def increment_passing_fwd_kernel(
         cute.recast_ptr(arena.iterator, dtype=gu.element_type),
         input_tile(kblk, rows).layout(),
     )
-    sbn = cute.make_tensor(
-        cute.recast_ptr(arena.iterator + bnwords, dtype=gb.element_type),
-        forced_tile(kblk, span).layout(),
-    )
-    sbp = cute.make_tensor(
-        cute.recast_ptr(arena.iterator + bpwords, dtype=gb.element_type),
+    sbfuse = cute.make_tensor(
+        cute.recast_ptr(arena.iterator + fwords, dtype=gb.element_type),
         forced_tile(kblk, span).layout(),
     )
     sinc = cute.make_tensor(arena.iterator, state_tile(rows, span).layout())
@@ -500,6 +556,14 @@ def increment_passing_fwd_kernel(
         cute.make_tensor(
             arena.iterator.align(_alignment(4 * unit)),
             cute.make_layout((mpad * span,), stride=(1,)),
+        ),
+        (unit,),
+    )
+    # The residue in the same units, so a cell's column index serves both views.
+    rescell = cute.zipped_divide(
+        cute.make_tensor(
+            sres.iterator.align(_alignment(4 * unit)),
+            cute.make_layout((span,), stride=(1,)),
         ),
         (unit,),
     )
@@ -514,7 +578,11 @@ def increment_passing_fwd_kernel(
     state = cute.make_fragment((unit * cells,), cutlass.Float32)
     elem = gzstart.element_type
     finc = cute.make_fragment((unit,), cutlass.Float32)
+    fres = cute.make_fragment((unit,), cutlass.Float32)
     fz = cute.make_fragment((unit,), elem)
+    # ``u`` at the chunk's last token, one value per cell: the residue's left factor is
+    # a row index and the recurrence's cells are addressed by row.
+    fu = cute.make_fragment((cells,), cutlass.Float32)
 
     # One cell's index in the tile and in the ``(P,3N)`` plane, counted in cells and not
     # in elements, so neither consumer divides by ``unit`` at run time. The band index
@@ -524,12 +592,18 @@ def increment_passing_fwd_kernel(
     zcols = dim // unit
     slot = []
     plane = []
+    col = []
+    rowof = []
     for k in cutlass.range_constexpr(cells):
         owned = tid + k * threads
         row = owned // (lanes // wide)
         cell = owned - row * (lanes // wide)
         slot.append(row * scols + cell)
         plane.append(row * zcols + sidx * scols + cell)
+        # ``scols == lanes // wide``, so the cell index within a row is already the
+        # residue row's cell index and needs no second divide.
+        col.append(cell)
+        rowof.append(row)
 
     # The segment carry-out. Every block walks the last chunk, so the writer is
     # chosen by band rather than found: the first band copies ``u`` and each band
@@ -558,19 +632,14 @@ def increment_passing_fwd_kernel(
             else:
                 state[unit * k + j] = cutlass.Float32(0.0)
 
-    # Two views of one staging tile, one row of pitch apart. The current tap reads
-    # token t0+lbase+k, the previous one reads t0+lbase+k-1.
-    va_now = cute.make_tensor(
-        su.iterator + lda, cute.make_layout((mpad, kblk), stride=(1, lda))
-    )
+    # The fused tap's weight is ``u`` at the token before the slot, which is rows
+    # ``0..kblk-1`` of the staging tile. Row ``kblk`` is the slice's own last token and
+    # is read only by the residue, at the last slice.
     va_prv = cute.make_tensor(
         su.iterator, cute.make_layout((mpad, kblk), stride=(1, lda))
     )
-    vbn = cute.make_tensor(
-        sbn.iterator, cute.make_layout((span, kblk), stride=(1, ldb))
-    )
-    vbp = cute.make_tensor(
-        sbp.iterator, cute.make_layout((span, kblk), stride=(1, ldb))
+    vbfuse = cute.make_tensor(
+        sbfuse.iterator, cute.make_layout((span, kblk), stride=(1, ldb))
     )
 
     last = chunk - 1
@@ -584,8 +653,7 @@ def increment_passing_fwd_kernel(
         # previous chunk's result was written over them. ``su`` runs to its full
         # pitch because its M mode is the rounded extent: columns P..mpad-1 are read
         # as zero rows.
-        stage_pad(sbn, tid, threads, kblk, span, ldb)
-        stage_pad(sbp, tid, threads, kblk, span, ldb)
+        stage_pad(sbfuse, tid, threads, kblk, span, ldb)
         stage_pad(su, tid, threads, kblk + 1, rows, lda)
         stage_chunk(
             gtrans[bidx, hidx, None, None],
@@ -602,7 +670,7 @@ def increment_passing_fwd_kernel(
         chunk_prefixes(strans, slp, squat, tid, chunk)
         cute.arch.sync_threads()
 
-        build_table(strans, stap, squat, stable, tid, threads, chunk, 2)
+        build_table(strans, stap, squat, stable, tid, threads, chunk, 2, fused=True)
         for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
             token = tid + step * threads
             if token < chunk:
@@ -636,39 +704,29 @@ def increment_passing_fwd_kernel(
                 rows,
                 has_prev,
             )
+            # ``valid + 1``, not ``valid``. The staging helper zeroes rows at or past
+            # the token count it is handed, and slot ``valid`` of a ragged tail chunk
+            # is load-bearing: ``ls`` stages as zero there so ``Afuse_valid`` is the
+            # last real token's ``An``, the operand is that token's ``b``, and the
+            # weight is one because ``lp`` is flat past the sequence. Zeroing it as a
+            # pad row leaves ``y`` at roundoff and moves ``state`` by O(1). The
+            # shifted-token read stays in bounds: the clamp becomes
+            # ``min(lbase + r, valid)``, which is at most ``chunk - 1`` because
+            # ``kblk`` divides ``chunk``, so the table index and the global token both
+            # hold.
             stage_rotated(
                 band,
                 bandprev,
-                sbn,
+                sbfuse,
                 stable,
                 swgt,
                 bidx,
                 gidx,
                 t0,
                 lbase,
-                valid,
+                valid + 1,
                 tid,
-                TABLE_AN,
-                0,
-                threads,
-                kblk,
-                lanes,
-                has_prev,
-                True,
-            )
-            stage_rotated(
-                band,
-                bandprev,
-                sbp,
-                stable,
-                swgt,
-                bidx,
-                gidx,
-                t0,
-                lbase,
-                valid,
-                tid,
-                TABLE_AP,
+                TABLE_AFUSE,
                 1,
                 threads,
                 kblk,
@@ -677,8 +735,55 @@ def increment_passing_fwd_kernel(
                 True,
             )
             cute.arch.sync_threads()
-            mma_gemm(tiled_mma, tid, acc, va_now, vbn, False, False)
-            mma_gemm(tiled_mma, tid, acc, va_prv, vbp, False, False)
+            mma_gemm(tiled_mma, tid, acc, va_prv, vbfuse, False, False)
+
+        # The rank-one residue, one row and one column vector at slot ``L-1``. The
+        # reindex that fused the taps has no slot to move that token's now-tap to, and
+        # ``wgt_{L-1}`` is ``exp(0)``, so the row carries no weight and ``scaled`` is
+        # false rather than a multiply by one.
+        #
+        # A ragged tail cancels it instead of needing a case. Slot ``L-1`` of a tail
+        # chunk is a pad token, so ``chunk - 1 < valid`` is false and the helper's own
+        # keep predicate zeroes the row, while ``u`` there is zero for the same reason;
+        # the last real token's residue arrives through slot ``valid`` of the fused
+        # operand above. Confirmed against
+        # :func:`slinoss.ops.so3ssd.reference.chunked_forward_fused`, which forms the
+        # same two terms over a padded chunk and whose explicit residue is likewise
+        # zero there.
+        #
+        # Written before the barrier below and read after the next one, so the store's
+        # own pair publishes it and the residue adds no barrier. It is outside the
+        # arena, so that store cannot reach it.
+        #
+        # ``TABLE_AN`` is read whatever ``fused`` selects: the flag chooses the first
+        # column and ``An`` is a second one. Converting the last unfused caller in the
+        # tree retires the flag, not the ``An`` column, which this read needs.
+        if tid < reswarps:
+            stage_rotated(
+                band,
+                bandprev,
+                sres,
+                stable,
+                swgt,
+                bidx,
+                gidx,
+                t0,
+                last,
+                valid,
+                tid,
+                TABLE_AN,
+                0,
+                threads,
+                1,
+                lanes,
+                has_prev,
+                False,
+            )
+        # ``u`` at the chunk's last token, from the row the shifted stage fills past the
+        # slice. Read here because the store below writes over the whole arena, and
+        # zero on a ragged tail because the stage zeroes rows past the sequence.
+        for k in cutlass.range_constexpr(cells):
+            fu[k] = widen(su[kblk, rowof[k]], gu.element_type)
 
         # The store writes over the operands the contraction just read, the two
         # being one region.
@@ -703,6 +808,7 @@ def increment_passing_fwd_kernel(
         )
         for k in cutlass.range_constexpr(cells):
             cute.autovec_copy(scell[(None, slot[k])], finc)
+            cute.autovec_copy(rescell[(None, col[k])], fres)
             # The state entering the chunk is the accumulator before this chunk's
             # increment enters it, so the narrowed copy is filled and stored before the
             # update overwrites what it holds.
@@ -712,14 +818,20 @@ def increment_passing_fwd_kernel(
             # The scale multiplies the state alone, then the sum is rotated once.
             # The increment is in the chunk-local frame, so it shares the rotation
             # rather than needing its own. One matrix serves every triple in the cell.
+            # The residue is in that frame too, and it is one FMA a component here
+            # against a second ``L x span`` operand tile and a second contraction.
             for h in cutlass.range_constexpr(wide):
                 base = unit * k + 3 * h
                 turned = mat3_matvec(
                     mat,
                     (
-                        decayed * state[base] + finc[3 * h],
-                        decayed * state[base + 1] + finc[3 * h + 1],
-                        decayed * state[base + 2] + finc[3 * h + 2],
+                        decayed * state[base] + finc[3 * h] + fu[k] * fres[3 * h],
+                        decayed * state[base + 1]
+                        + finc[3 * h + 1]
+                        + fu[k] * fres[3 * h + 1],
+                        decayed * state[base + 2]
+                        + finc[3 * h + 2]
+                        + fu[k] * fres[3 * h + 2],
                     ),
                 )
                 for j in cutlass.range_constexpr(3):
@@ -876,8 +988,8 @@ def increment_passing_forward(
             :data:`SPLIT` and faster at the whole width, so the default is four and
             a driver pricing a wide band raises it.
         kblk: K extent of one slice, a divisor of ``chunk_size``. None takes
-            :func:`fused_kblock`. A wider slice is two more operand tiles against
-            one fewer barrier pair per chunk.
+            :func:`fused_kblock`. A wider slice widens both operand tiles against one
+            fewer barrier pair per chunk.
         resident: Blocks per SM the launch bound asks for. Defaults to
             :data:`RESIDENT_MAX` capped by the shared-memory budget.
 
