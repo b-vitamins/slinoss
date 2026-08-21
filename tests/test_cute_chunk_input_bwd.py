@@ -12,6 +12,13 @@ compose the chunks. ``dinc`` is the reverse chunk recurrence's carry in the glob
 frame, exactly as
 :func:`slinoss.ops.so3ssd.cute.bwd.state_passing.state_passing_backward` leaves it.
 
+``dchunk_scale`` contracts that pair and nothing else, so its oracle is
+:func:`slinoss.ops.so3ssd.backward.chunk_transition_cotangents` on the two buffers
+this file hands over, not on the reference's own float64 copies of them. The
+reference's reverse chunk recurrence calls that same function, so float64 autograd
+through the reference is still the authority; what changes is which pair the
+authority is evaluated at, which is the docstring contract above.
+
 ``dU`` here is not the operator's ``dU``. The chunk-boundary rows carry the diagonal
 term alone, because the shifted term at those rows belongs to the next chunk's first
 token and
@@ -39,7 +46,12 @@ from torch import Tensor
 
 from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
-from slinoss.ops.so3ssd import chunked_backward, chunked_forward
+from slinoss.ops.so3ssd import (
+    ChunkedBackward,
+    chunk_transition_cotangents,
+    chunked_backward,
+    chunked_forward,
+)
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
     LANE_MULTIPLE,
     ChunkInputBwd,
@@ -156,7 +168,7 @@ class Oracle(NamedTuple):
         carry_u: ``(B,H,C,P)``.
         dlogp: ``(B,H,C,L)``, the reference's ``dlogp_scan``.
         dchunk_rot: ``(B,H,C,3,3)``.
-        dchunk_scale: ``(B,H,C)``.
+        dchunk_scale: ``(B,H,C)``, evaluated at ``dinc`` and ``zstart`` below.
         dinc: ``(B,H,C,P,3N)`` float32, the recurrence carry in the global frame.
         zstart: ``(B,H,C,P,3N)`` float32, the state entering each chunk.
     """
@@ -183,6 +195,42 @@ def _expected_du(dU: Tensor, carry_u: Tensor, chunk: int) -> Tensor:
         rows = torch.arange(1, chunks, device=want.device) * chunk - 1
         want[:, :, rows, :] -= carry_u[:, :, 1:, :]
     return want
+
+
+def _expected_dchunk_scale(
+    ref: ChunkedBackward, dinc: Tensor, zstart: Tensor
+) -> Tensor:
+    """``dchunk_scale`` off the two state buffers the kernel is handed.
+
+    ``dchunk_scale`` contracts ``dinc`` and ``zstart`` and nothing else, so the
+    rounding of the pair the kernel reads is the whole of its error unless the
+    reference contracts that same pair. ``ref.dchunk_scale`` contracts the float64
+    values instead, which charges the kernel for its own inputs. Reduction order
+    follows the reference, which calls this per chunk.
+
+    Args:
+        ref: The float64 reference backward, for the transition's other two operands.
+        dinc: ``(B,H,C,P,3N)``, as handed to the kernel.
+        zstart: ``(B,H,C,P,3N)``, as handed to the kernel.
+
+    Returns:
+        ``(B,H,C)`` float64.
+    """
+    lanes = int(dinc.shape[-1]) // 3
+    dinc_d = dinc.double().unflatten(-1, (lanes, 3))
+    zstart_d = zstart.double().unflatten(-1, (lanes, 3))
+    return torch.stack(
+        [
+            chunk_transition_cotangents(
+                dinc_d[:, :, c],
+                zstart_d[:, :, c],
+                ref.chunk_rot[:, :, c],
+                ref.chunk_scale[:, :, c],
+            ).dchunk_scale
+            for c in range(int(dinc_d.shape[2]))
+        ],
+        dim=2,
+    )
 
 
 def _oracle(
@@ -227,14 +275,16 @@ def _oracle(
         b_prev=b_prev,
         u_prev=u_prev,
     )
+    dinc = ref.dinc.float().contiguous()
+    zstart = fw.zstart.flatten(-2, -1).float().contiguous()
     return Oracle(
         dU=_expected_du(ref.grads.dU, ref.carry_u, chunk),
         carry_u=ref.carry_u,
         dlogp=ref.dlogp_scan,
         dchunk_rot=ref.dchunk_rot,
-        dchunk_scale=ref.dchunk_scale,
-        dinc=ref.dinc.float().contiguous(),
-        zstart=fw.zstart.flatten(-2, -1).float().contiguous(),
+        dchunk_scale=_expected_dchunk_scale(ref, dinc, zstart),
+        dinc=dinc,
+        zstart=zstart,
     )
 
 
@@ -278,13 +328,13 @@ def _run(
 # carry_u      4.220e-3   1.871e-4
 # dlogp        3.971e-3   2.808e-4
 # dchunk_rot   3.445e-3   1.796e-4
-# dchunk_scale 5.161e-6   1.407e-7
+# dchunk_scale 5.237e-6   1.416e-7
 #
 # Worst measured over every shape and every test in this file, read off a
 # ``--tolerance-report`` run. Every bound below is about twice its figure.
 # ``dchunk_scale`` is three orders tighter than the rest because it contracts two
-# float32 operands and nothing else; its worst case is ``MAX_CHUNK``, the longest
-# accumulation. Against the nearest comparable bfloat16 shape the float16 column
+# float32 operands and nothing else, and its oracle contracts the same pair, so what
+# is left is the accumulation; its worst case is ``MAX_CHUNK``, the longest one. Against the nearest comparable bfloat16 shape the float16 column
 # runs 5 to 19 times tighter, which brackets the factor of eight between the two
 # significands, so the two dtypes do not share a bound.
 BOUNDS: dict[torch.dtype, dict[str, float]] = {

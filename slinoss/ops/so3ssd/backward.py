@@ -38,7 +38,14 @@ from slinoss.ops.so3ssd.reference import (
     tap_matrix_vjp,
 )
 
-__all__ = ["ChunkedBackward", "SO3SSDGrads", "chunked_backward", "so3ssd_bwd_ref"]
+__all__ = [
+    "ChunkTransition",
+    "ChunkedBackward",
+    "SO3SSDGrads",
+    "chunk_transition_cotangents",
+    "chunked_backward",
+    "so3ssd_bwd_ref",
+]
 
 
 class SO3SSDGrads(NamedTuple):
@@ -114,6 +121,13 @@ class ChunkedBackward(NamedTuple):
         dchunk_rot: Cotangent of each chunk's closing rotation matrix,
             ``(B,H,C,3,3)``, row-major.
         dchunk_scale: Cotangent of each chunk's closing scale, ``(B,H,C)``.
+        chunk_rot: Each chunk's closing rotation matrix, ``(B,H,C,3,3)``,
+            row-major. A forward quantity, named here because it is the third
+            operand of :func:`chunk_transition_cotangents`: without it a stage
+            oracle cannot evaluate that contraction on the buffers a kernel is
+            handed, only on the ones this function chose.
+        chunk_scale: Each chunk's closing scale, ``(B,H,C)``. The other operand of
+            the same contraction, under the contract of ``chunk_rot``.
         carry_u: The ``u_{t-1}`` cotangent of each chunk's first token,
             ``(B,H,C,P)``, which belongs to the previous chunk's last token.
             Index 0 is ``grads.du_prev``.
@@ -131,6 +145,8 @@ class ChunkedBackward(NamedTuple):
     dlogp: Tensor
     dchunk_rot: Tensor
     dchunk_scale: Tensor
+    chunk_rot: Tensor
+    chunk_scale: Tensor
     carry_u: Tensor
     carry_b: Tensor
 
@@ -143,6 +159,53 @@ def _unchunk(t: Tensor, seqlen: int) -> Tensor:
 def _scatter_last(t: Tensor, length: int) -> Tensor:
     """``(B,H,C) -> (B,H,C,L)`` with ``t`` at ``l = L-1`` and zeros before it."""
     return _pad(t[..., None], (length - 1, 0))
+
+
+class ChunkTransition(NamedTuple):
+    """One chunk transition's two cotangents.
+
+    Produced by :func:`chunk_transition_cotangents`.
+
+    Attributes:
+        dchunk_rot: ``(B,H,3,3)``, row-major. The transition's share of the closing
+            rotation's cotangent. A partial: the increment's frame change reaches
+            the same matrix and its term is added by the caller.
+        dchunk_scale: ``(B,H)``. The whole cotangent of the closing scale, which
+            nothing else produces.
+    """
+
+    dchunk_rot: Tensor
+    dchunk_scale: Tensor
+
+
+def chunk_transition_cotangents(
+    dinc: Tensor, zstart: Tensor, chunk_rot: Tensor, chunk_scale: Tensor
+) -> ChunkTransition:
+    """Differentiate ``chunk_scale * R(chunk_rot) zstart`` in its two parameters.
+
+    One chunk, no ``C`` axis: the reverse chunk recurrence calls this per chunk and
+    the reduction order follows from that. A stage oracle calls it on the state
+    buffers a kernel was handed, so that the kernel is not charged for the rounding
+    of its own inputs. Both outputs contract the same operand pair and nothing else,
+    so a low-precision ``dinc`` or ``zstart`` moves them by that dtype's epsilon.
+
+    Args:
+        dinc: Cotangent of the chunk's increment, ``(B,H,P,N,3)``.
+        zstart: The state entering the chunk, ``(B,H,P,N,3)``.
+        chunk_rot: The chunk's closing rotation matrix, ``(B,H,3,3)``, row-major.
+        chunk_scale: The chunk's closing scale, ``(B,H)``.
+
+    Returns:
+        A :class:`ChunkTransition`. Both fields take the promoted dtype of the
+        operands.
+    """
+    return ChunkTransition(
+        dchunk_rot=chunk_scale[..., None, None]
+        * torch.einsum("bhpni,bhpnj->bhij", dinc, zstart),
+        dchunk_scale=(dinc * torch.einsum("bhij,bhpnj->bhpni", chunk_rot, zstart)).sum(
+            (-3, -2, -1)
+        ),
+    )
 
 
 def _store(dest: Tensor | None, grad: Tensor) -> Tensor:
@@ -291,15 +354,9 @@ def chunked_backward(
             scale_c = chunk_scale[:, :, c]
             start_c = fw.zstart[:, :, c]
             dinc_rev.append(acc)
-            dscale_rev.append(
-                (acc * torch.einsum("bhij,bhpnj->bhpni", rot_c, start_c)).sum(
-                    (-3, -2, -1)
-                )
-            )
-            drot_rev.append(
-                scale_c[..., None, None]
-                * torch.einsum("bhpni,bhpnj->bhij", acc, start_c)
-            )
+            trans_c = chunk_transition_cotangents(acc, start_c, rot_c, scale_c)
+            dscale_rev.append(trans_c.dchunk_scale)
+            drot_rev.append(trans_c.dchunk_rot)
             acc = (
                 scale_c[..., None, None, None]
                 * torch.einsum("bhij,bhpni->bhpnj", rot_c, acc)
@@ -435,6 +492,8 @@ def chunked_backward(
             dlogp=dlp,
             dchunk_rot=dchunk_rot,
             dchunk_scale=dchunk_scale,
+            chunk_rot=chunk_rot,
+            chunk_scale=chunk_scale,
             carry_u=carry_u,
             carry_b=carry_b,
         )
