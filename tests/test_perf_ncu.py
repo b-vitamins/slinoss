@@ -989,6 +989,14 @@ NO_LINE_SOURCE_CSV: Final = "\n".join(
     )
 )
 
+# The whole page NCU prints when the report holds no line information: this one
+# warning, no header, no block. Collected on this fleet by importing a report taken
+# without CUTE_DSL_LINEINFO=1; the instantiated signature is elided.
+NO_LINEINFO_SOURCE_CSV: Final = (
+    "==WARNING== No lineinfo available to show CUDA-C source related to "
+    "'kernel_cutlass_start_passing_bwd_kernel_tensorptrbf16gmemalign16oi64i64i641_0'."
+)
+
 SHORT_SOURCE_CSV: Final = "\n".join(
     (
         f'"File Path","{CVB_PATH}"',
@@ -1176,6 +1184,16 @@ def test_a_source_page_with_no_correlated_line_names_the_missing_lineinfo() -> N
     # from a build flag, so the message has to name the variable.
     with pytest.raises(ValueError, match="CUTE_DSL_LINEINFO=1"):
         parse_source_csv(NO_LINE_SOURCE_CSV)
+
+
+def test_a_page_with_no_block_at_all_names_the_lineinfo_and_not_the_page() -> None:
+    # The failure this pins: the same cause arrives as a page holding nothing but
+    # NCU's warning, and reporting that as page='source' sends the caller to
+    # re-import a page it already asked for.
+    with pytest.raises(
+        ValueError, match=r"start_passing_bwd_kernel.*CUTE_DSL_LINEINFO=1"
+    ):
+        parse_source_csv(NO_LINEINFO_SOURCE_CSV)
 
 
 def test_a_split_text_cell_does_not_shift_the_columns_right_of_it() -> None:

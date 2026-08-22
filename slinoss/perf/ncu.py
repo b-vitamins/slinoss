@@ -1682,6 +1682,27 @@ _FUNCTION_NAME: Final = "Function Name"
 
 _OPCODE = re.compile(r"^\s*(?:@!?P\d+\s+)?([A-Z][A-Z0-9_.]*)")
 
+_NO_LINEINFO: Final = (
+    "the target carries no line information, and a CuTe DSL kernel needs "
+    "CUTE_DSL_LINEINFO=1 in the environment the target runs in"
+)
+"""The one cause behind both empty source pages, stated once.
+
+A page can arrive empty two ways and the cause is the same. NCU prints its own
+warning and nothing else when the report holds no line information at all, and
+prints blocks with no line row in them when it holds some but not for this
+kernel.
+"""
+
+_NO_LINEINFO_WARNING = re.compile(r"No lineinfo available to show[^']*'([^']*)'")
+"""NCU's warning for a source page it imported no source for.
+
+Measured: importing ``page="source"`` from a report collected without
+``CUTE_DSL_LINEINFO=1`` prints this one line and no header, so the page holds no
+block and the width-based read of it cannot tell the case apart from a page
+imported without ``--page source``. The capture group is the instantiated symbol.
+"""
+
 
 def _int(cell: str) -> int:
     value = _number(cell)
@@ -1777,9 +1798,9 @@ def parse_source_csv(
         ValueError: If the output holds no source block, if the header is missing a
             metric :data:`SOURCE_TABLE` requested, if a row is short of its header
             -- see :func:`_aligned_row` -- or if no instruction correlated to a
-            line. The last is the profile that has always been silent here: the
-            target was built without line information, and for a CuTe DSL kernel
-            that means it ran without ``CUTE_DSL_LINEINFO=1``.
+            line. The last two forms of an empty page are the profile that has
+            always been silent here, and both name ``CUTE_DSL_LINEINFO=1``; only a
+            page with no source rows at all is reported as the wrong page.
     """
     reader = csv.reader(io.StringIO(text))
     required = (_SRC_INST, _SRC_SAMPLES, *(pcsamp_metric(r) for r in STALL_REASONS))
@@ -1853,12 +1874,15 @@ def parse_source_csv(
             bits = int(width)
             widths[key][bits] = widths[key].get(bits, 0) + count
     if blocks == 0:
+        named = _NO_LINEINFO_WARNING.search(text)
+        if named is not None:
+            raise ValueError(
+                f"ncu imported no source for {named.group(1)}; {_NO_LINEINFO}"
+            )
         raise ValueError("no source block in ncu output; import with page='source'")
     if not aggregate:
         raise ValueError(
-            "ncu correlated no instruction to a source line; the target carries no "
-            "line information, and a CuTe DSL kernel needs CUTE_DSL_LINEINFO=1 in "
-            "the environment the target runs in"
+            f"ncu correlated no instruction to a source line; {_NO_LINEINFO}"
         )
     out: list[SourceLine] = []
     for key, (row, cols) in aggregate.items():
