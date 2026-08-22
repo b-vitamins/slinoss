@@ -257,6 +257,13 @@ instructions, and the class bar says nothing about that.
       port         73.0%         54.6%        55.06%
 
   The three reduction tails beside it are DRAM-bound and issue almost nothing.
+  **Every column above is pre-tap-fusion and none of them is the current base.**
+  The fusion cut the kernel's `SHFL` to 7,257,600, so the 11,197,440 row overstates
+  it by 1.54x; do not size an arm against that row. Summing the offset term's row
+  before crossing the quad then took it to 5,414,400. The 7,257,600 closes to the
+  instruction against a five-site model: three 9-word `_sum_over_lanes` at
+  18 `SHFL` per warp each, the offset term at 24, and the two suffix scans at 0.75
+  combined, over 92,160 warps.
 - A census is complete only when it closes against the counter with nothing left
   over. The first two columns above left 506,880 instructions, 5.5 per warp,
   unnamed, and an unnamed row is a place a wrong conclusion hides. It resolved into
@@ -412,10 +419,19 @@ instructions, and the class bar says nothing about that.
   382 warp-instructions per warp of `ISETP`, `SEL` and `IMNMX`, 27.5% of the integer
   work, with only 3 per warp of all integer work under a predicate. Correct, and
   worth knowing before attributing that count to indexing.
-- A cross-lane reduction costs more than its shuffle. `SHF.L.U32` appears exactly
-  once per `SHFL.BFLY` -- 10,506,240 of each -- because the lane mask is computed in
-  the ALU. A butterfly step is 16.934 ps on the port plus 4.234 ps on the ALU, not
-  16.934.
+- A cross-lane reduction costs more than its shuffle only when its reach is
+  dynamic. Where the mask is computed in the ALU, `SHF.L.U32` appears once per
+  `SHFL.BFLY` and a butterfly step is 16.934 ps on the port plus 4.234 ps on the
+  ALU. **A `const_expr` run emits neither**: `chunk_vector_bwd`'s quad butterfly
+  lowers to `SHFL.BFLY PT, Rd, Ra, 0x1, 0x1f`, reach and clamp both immediates, and
+  deleting 1,843,200 of those `SHFL` moved `SHF.L.U32` by exactly zero. The earlier
+  1:1 reading and its 10,506,240 pair were a pre-fusion count on a kernel whose runs
+  are all compile-time. Check the operand form before pricing the companion.
+- A per-warp instruction deletion does not carry a rate across shapes. The arm
+  above deletes 20 `SHFL` per warp at every shape, verified per warp, and converts
+  at 17.0 us per million at `acceptance`, 8.1 at `wide` and **0.0 at `standard`** --
+  a null with the interval closed on zero. Price an arm on the shape it is claimed
+  for.
 - No global load inside a divergent branch, and none inside a `cutlass.range`
   loop that also transforms what it loads: neither can be unrolled or hoisted,
   so both serialize on one global latency per step. Split load from transform --
