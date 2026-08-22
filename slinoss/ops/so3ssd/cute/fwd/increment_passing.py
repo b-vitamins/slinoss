@@ -209,6 +209,7 @@ from slinoss.ops.so3ssd.cute.mma import (
 from slinoss.ops.so3ssd.cute.prefix import chunk_endpoint, chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
     LANE_PAIR,
+    TABLE_PITCH,
     build_table,
     stage_chunk,
     stage_pad,
@@ -218,6 +219,7 @@ from slinoss.ops.so3ssd.cute.table import (
 
 __all__ = [
     "RESIDENT_MAX",
+    "SLICE_PITCH",
     "SPLIT",
     "IncrementPassing",
     "arena_words",
@@ -236,6 +238,23 @@ RESIDENT_MAX: int = 3
 The bound caps a thread at ``65536 / (blocks * threads)`` registers, and this kernel
 holds a GEMM accumulator and the recurrence's state at once, so the residency and
 the register count trade against each other rather than both being free.
+"""
+
+SLICE_PITCH: int = 9
+"""Table pitch :func:`fused_kblock` prices the budget at: the unpadded one.
+
+The pad :data:`slinoss.ops.so3ssd.cute.table.TABLE_PITCH` carries is
+``2 * L * 3 * 4`` B, 3,072 at ``L=128``, enough to push the widest resident slice off
+:data:`RESIDENT_MAX` and leave the fallback the narrowest slice. The slice is worth
+more than the pad. Measured on sm_86 at ``L=128 P=48 span=48``, where slices 16 and
+32 allocate the same 34,000 B and hold the same two blocks: slice 32 runs 336.9 us
+against slice 16's 422.9 us, and the pad at a matched slice and residency is worth
+-9.9 us. So the search prices the slice as if the table were unpadded, and the pad
+comes out of the residency.
+
+At ``L=64`` the pad is 1,536 B, the budget goes 25,952 to 27,488 B at ``P=64``, and
+the residency stays at three, so ``L=128`` is the only shape the bench covers where
+the pad costs a block.
 """
 
 SPLIT: int = 48
@@ -328,7 +347,13 @@ def residue_tile(span: int) -> Tile:
 
 
 def fused_smem_bytes(
-    chunk: int, rows: int, span: int, itemsize: int = 2, *, kblk: int = KBLOCK_MAX
+    chunk: int,
+    rows: int,
+    span: int,
+    itemsize: int = 2,
+    *,
+    kblk: int = KBLOCK_MAX,
+    pitch: int = TABLE_PITCH,
 ) -> int:
     """Shared memory the kernel allocates, in bytes.
 
@@ -342,6 +367,9 @@ def fused_smem_bytes(
         span: Band width, :data:`SPLIT`.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
         kblk: K extent of one slice.
+        pitch: Float32 words a table token occupies. The launch allocates
+            :data:`slinoss.ops.so3ssd.cute.table.TABLE_PITCH`; :data:`SLICE_PITCH` is
+            what the slice search prices.
     """
     words, _ = arena_words(kblk, rows, span, itemsize)
     return smem_bytes(
@@ -351,7 +379,7 @@ def fused_smem_bytes(
             (scalar_tile(chunk), 4),
             (scalar_tile(chunk), 4),
             (trans_tile(chunk), 4),
-            (table_tile(chunk, 2), 4),
+            (table_tile(chunk, 2, pitch), 4),
             (residue_tile(span), 4),
             (Tile((words,), (1,)), 4),
         ]
@@ -361,13 +389,19 @@ def fused_smem_bytes(
 def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
     """Widest K slice that still holds :data:`RESIDENT_MAX` blocks on one SM.
 
-    A wider slice is one barrier pair per chunk fewer and is monotonically faster
-    while the residency holds, and the residency is worth more than the slice.
-    Measured on sm_86 at ``L=64 P=64 span=48``, both directions of that trade:
-    slice 64 at residency 3 runs 395.3 us against slice 16's 517.1 us, and the
+    A wider slice is one barrier pair per chunk fewer, and the residency is worth more
+    than the slice. Measured on sm_86 at ``L=64 P=64 span=48``, both directions of that
+    trade: slice 64 at residency 3 runs 395.3 us against slice 16's 517.1 us, and the
     whole-width band, which reaches residency 1, costs 430.6 us at its own widest
     slice. So the search returns the widest slice inside the residency, never the
     widest slice.
+
+    Width is not monotone inside a residency. Measured at ``L=128 P=48 span=48`` at
+    residency 2, slice 32 runs 336.9 us against slice 64's 363.5 us, so the widest
+    resident slice is the rule and not the optimum.
+
+    The budget is priced at :data:`SLICE_PITCH`, which is not the pitch the launch
+    allocates.
 
     Dividing the chunk is necessary and not sufficient. A slice that divides ``L``
     but not the atom's K extent splits the K loop across an MMA step, and the atom
@@ -397,7 +431,9 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
     kblk = chunk - chunk % MMA_TILE_K
     while kblk > KBLOCK_MAX:
         if chunk % kblk == 0:
-            budget = fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk)
+            budget = fused_smem_bytes(
+                chunk, rows, span, itemsize, kblk=kblk, pitch=SLICE_PITCH
+            )
             if smem_residency(budget) >= RESIDENT_MAX:
                 return kblk
         kblk -= MMA_TILE_K
@@ -529,7 +565,9 @@ def increment_passing_fwd_kernel(
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     swgt = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     squat = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
-    stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 2).layout(), 16)
+    stable = smem.allocate_tensor(
+        cutlass.Float32, table_tile(chunk, 2, TABLE_PITCH).layout(), SMEM_SEGMENT
+    )
     # Outside the arena: the store below writes the whole region, and the recurrence
     # reads this row after that store.
     sres = smem.allocate_tensor(cutlass.Float32, residue_tile(span).layout(), 16)
@@ -670,7 +708,18 @@ def increment_passing_fwd_kernel(
         chunk_prefixes(strans, slp, squat, tid, chunk)
         cute.arch.sync_threads()
 
-        build_table(strans, stap, squat, stable, tid, threads, chunk, 2, fused=True)
+        build_table(
+            strans,
+            stap,
+            squat,
+            stable,
+            tid,
+            threads,
+            chunk,
+            2,
+            fused=True,
+            pitch=TABLE_PITCH,
+        )
         for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
             token = tid + step * threads
             if token < chunk:
@@ -733,6 +782,7 @@ def increment_passing_fwd_kernel(
                 lanes,
                 has_prev,
                 True,
+                pitch=TABLE_PITCH,
             )
             cute.arch.sync_threads()
             mma_gemm(tiled_mma, tid, acc, va_prv, vbfuse, False, False)
@@ -778,6 +828,7 @@ def increment_passing_fwd_kernel(
                 lanes,
                 has_prev,
                 False,
+                pitch=TABLE_PITCH,
             )
         # ``u`` at the chunk's last token, from the row the shifted stage fills past the
         # slice. Read here because the store below writes over the whole arena, and
