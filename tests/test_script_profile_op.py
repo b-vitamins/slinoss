@@ -43,6 +43,7 @@ import pytest
 import torch
 
 from scripts.perf import profile_op
+from slinoss import _C
 from slinoss.perf.ceiling import (
     DRAM_BOUND,
     SERIAL_TINY,
@@ -901,6 +902,12 @@ def test_step_mode_measures_the_backward_too(
     assert "mode=step dtype=bf16 backend=auto" in text
 
 
+# patch_externals replaces the profilers, not the workload, so the event bench
+# still dispatches a real conv and the extension has to be built for this one.
+@pytest.mark.skipif(
+    not _C.is_available(),
+    reason=f"{_C.EXTENSION} is not built; run {_C.BUILD_COMMAND}",
+)
 def test_the_conv_operator_profiles_the_conv_and_names_it_in_the_report(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
