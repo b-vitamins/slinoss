@@ -55,6 +55,7 @@ from scripts.bench.bench_mamba import (
     runner,
     seq_variants,
     so3ssd_arithmetic,
+    unbuilt_stage_blocker,
 )
 from slinoss.perf import timing
 from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
@@ -631,6 +632,17 @@ def test_main_refuses_a_device_no_report_can_name(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="'cuda' is not a usable cuda device"):
         main(argv(tmp_path, iters=1))
+
+
+def test_a_stage_with_no_kernel_refuses_the_comparison() -> None:
+    # The failure mode this guards is silent: every stage has a reference path, so an
+    # unbuilt extension produces a slower arm and not an error, and the ratio is then
+    # a number about the build. Only the scan and the convolution have host kernels
+    # to be missing, so the host path names the other two and no more.
+    host = unbuilt_stage_blocker(torch.device("cpu"))
+    assert host is not None
+    assert "build_ext" in host
+    assert unbuilt_stage_blocker(torch.device("cuda")) is None
 
 
 # ---------------------------------------------------------------------------

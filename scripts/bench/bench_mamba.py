@@ -373,6 +373,59 @@ def fused_path_blocker() -> str | None:
     return None
 
 
+def unbuilt_stage_blocker(device: torch.device) -> str | None:
+    """Report which layer stages have no kernel registered for this device.
+
+    Every stage of the mixer dispatches, and a reference path exists for all of them
+    so the layer runs wherever torch runs. That fallback is not a degradation to note
+    afterwards, it is a different program: the convolution's reference is an
+    ``unfold``, a ``cat`` and a reduction over the tap axis, which moves the window
+    count's multiple of the band's bytes and costs several times the rest of the
+    layer put together.
+
+    A kernel backend registers only when what it needs imported, so an unbuilt
+    extension shows up as a slower arm and not as an error. This turns it into one.
+
+    What is checked is registration for the device type, not the resolution at one
+    dtype. A stage whose kernel declares no instantiation for the requested dtype
+    falls back for a reason no build changes, and float32 is such a case on the scan.
+
+    Args:
+        device: The device the comparison runs on.
+
+    Returns:
+        A one-line reason naming every stage with no kernel for the device, or
+        ``None`` if every stage has one.
+    """
+    from slinoss.ops.conv import backends as conv_dispatch
+    from slinoss.ops.mixer import backends as tail_dispatch
+    from slinoss.ops.scanprep import backends as prep_dispatch
+    from slinoss.ops.so3ssd import backends as scan_dispatch
+
+    stages = (
+        ("conv", conv_dispatch),
+        ("scanprep", prep_dispatch),
+        ("so3ssd", scan_dispatch),
+        ("mixer", tail_dispatch),
+    )
+    absent = [
+        label
+        for label, registry in stages
+        if not any(
+            registry.get(name).name != "reference"
+            and device.type in registry.get(name).device_types
+            for name in registry.names()
+        )
+    ]
+    if not absent:
+        return None
+    return (
+        f"no {device.type} kernel is registered for {', '.join(absent)}, so the arm "
+        f"would run a reference path; build the extensions with "
+        f"`python3 setup.py build_ext --inplace` before comparing"
+    )
+
+
 def make_mamba_block(
     shape: OpShape,
     groups: int,
@@ -1336,6 +1389,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     modes = MODES if args.mode == "both" else (args.mode,)
     wanted = args.groups or ["heads", "one"]
+    unbuilt = unbuilt_stage_blocker(device)
+    if unbuilt is not None:
+        # Not a warning. A ratio against Mamba2's kernels taken with one of these
+        # stages on its reference path is a number about the build and not about
+        # either implementation.
+        raise SystemExit(unbuilt)
     if args.end_to_end:
         return _run_blocks(shapes, modes, wanted, args, device)
     if args.against_so3ssd:

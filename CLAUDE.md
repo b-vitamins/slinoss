@@ -30,6 +30,14 @@ guix shell -m manifest.scm -- pyright
 
 Use `python3`, never `python`.
 
+Build the CUDA extensions before measuring anything. Every stage has a reference
+path and dispatch falls back to it silently, so an unbuilt tree runs a slower
+program and reports it as this one's.
+
+```
+guix shell -m manifest.scm -- python3 setup.py build_ext --inplace
+```
+
 Guix package name mappings: `requests` -> `python-requests`, `sklearn` ->
 `python-scikit-learn`, `yaml` -> `python-pyyaml`.
 
