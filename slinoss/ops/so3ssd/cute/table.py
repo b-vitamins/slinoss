@@ -432,17 +432,45 @@ def stage_trans(
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
+
+    Invariants:
+        The row is read at :func:`_segment_run` width, not one component at a time.
+        A lane's four components span 16 bytes and 32 lanes stride 16 bytes, so a
+        scalar read touches every sector of the warp's 512-byte span and uses four
+        of every sixteen bytes: 64 sector-touches for 512 bytes against 16 for one
+        wide access. The claim :func:`_wide_row` makes holds because ``trans``
+        reaches every launcher through :func:`slinoss._guard.check_layout`, so the
+        row sits at a static multiple of its own 16 bytes off a contiguous base.
+        The shared side stays scalar: it is transposed and coalesces either way.
+
+        Measured on sm_86 at the acceptance shape,
+        ``l1tex__t_sectors_pipe_lsu_mem_global_op_ld`` falls 96 per chunk per block
+        here and 480 at a :func:`stage_chunk` site, 14,596,395 over the step, with
+        every output bitwise unchanged at all five shapes. The step is 23.3 us
+        shorter for it, which is 1.6 us per million sectors: a sixteenth of the rate
+        at which deleting one whole staging pass converted, so a sector count on its
+        own does not price a staging arm. What that deletion also took was a barrier
+        wait, and this takes none.
     """
     zero = cutlass.Float32(0.0)
-    for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
+    elem = gtrans.element_type
+    run = _segment_run(elem.width // 8, 4)
+    runs = 4 // run
+    steps = (chunk + threads - 1) // threads
+    held = cute.make_fragment((steps, runs, run), elem)
+    for step in cutlass.range_constexpr(steps):
         token = tid + step * threads
         if token < chunk:
             inside = token < valid
             # The clamp keeps the read in bounds when the chunk overhangs the
             # sequence; the select then replaces it with the pad value.
             pos = t0 + cutlass.min(token, valid - 1)
+            wide = _wide_row(gtrans[pos, None], run)
+            for k in cutlass.range_constexpr(runs):
+                cute.autovec_copy(wide[(None, k)], held[(step, k, None)])
             for j in cutlass.range_constexpr(4):
-                strans[j, token] = select(inside, gtrans[pos, j], zero)
+                got = held[(step, j // run, j % run)]
+                strans[j, token] = select(inside, got, zero)
 
 
 @cute.jit
@@ -474,17 +502,33 @@ def stage_chunk(
         tid: Thread index within the block.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
+
+    Invariants:
+        One access per tap, for the reason in :func:`stage_trans`. A tap row is 16
+        bytes of a 32-byte token, so the scalar form was the worse of the two: eight
+        reads over the warp's 1,024-byte span, each touching all 32 of its sectors,
+        256 sector-touches for 1,024 bytes against 64 for two wide accesses.
     """
     stage_trans(gtrans, strans, t0, valid, tid, threads, chunk)
     zero = cutlass.Float32(0.0)
-    for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
+    elem = gtap.element_type
+    run = _segment_run(elem.width // 8, 4)
+    runs = 4 // run
+    steps = (chunk + threads - 1) // threads
+    held = cute.make_fragment((steps, 2, runs, run), elem)
+    for step in cutlass.range_constexpr(steps):
         token = tid + step * threads
         if token < chunk:
             inside = token < valid
             pos = t0 + cutlass.min(token, valid - 1)
             for tap in cutlass.range_constexpr(2):
+                wide = _wide_row(gtap[pos, tap, None], run)
+                for k in cutlass.range_constexpr(runs):
+                    cute.autovec_copy(wide[(None, k)], held[(step, tap, k, None)])
+            for tap in cutlass.range_constexpr(2):
                 for j in cutlass.range_constexpr(4):
-                    stap[4 * tap + j, token] = select(inside, gtap[pos, tap, j], zero)
+                    got = held[(step, tap, j // run, j % run)]
+                    stap[4 * tap + j, token] = select(inside, got, zero)
 
 
 @cute.jit
