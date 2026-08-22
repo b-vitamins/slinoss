@@ -8,25 +8,41 @@ chunk, in one block per ``(chunk, batch, head)``. The reference terms are ``du``
 Five contractions, all of them dense real GEMMs off the one atom, all indexed by
 the source token first:
 
-    D_tap(r,d)   = sum_p  u_tap(r,p) dinc_local(p,d)
-    duw_tap(r,p) = sum_d  b_tap(r,d) dinc_local(p,d)
-    score(r,t)   = sum_d  b_tap(r,d) crot(t,d)
-    dm(r,t)      = sum_p  u_tap(r,p) dy(t,p)
-    ddiag(r,p)   = sum_t  Smasked(r,t) dy(t,p)
+    D(r,d)     = sum_p  ushift(r,p)  dinc_local(p,d)
+    duw(r,p)   = sum_d  bfuse(r,d)   dinc_local(p,d)
+    score(r,t) = sum_d  bfuse(r,d)   crot(t,d)
+    dm(r,t)    = sum_p  ushift(r,p)  dy(t,p)
+    ddiag(r,p) = sum_t  Smasked(r,t) dy(t,p)
 
-with ``u_tap`` and ``b_tap`` the current tap at ``t`` and the previous tap at
-``t-1``, ``Smasked = score * dmask``, and ``dinc_local = Ac_{L-1} dinc`` the
-increment cotangent carried back into the chunk-local frame. ``ddiag`` and ``duw``
-accumulate into one pair of fragments, so the current tap's pair is ``du`` and the
-previous tap's is ``dushift``.
+with ``ushift(r) = u_{r-1}``, ``bfuse(r) = Afuse_r b_{r-1}`` the one-tap column
+``Afuse_r = Ap_r + exp(2 ls_r) An_{r-1}``, ``Smasked = score * dmask``, and
+``dinc_local = Ac_{L-1} dinc`` the increment cotangent carried back into the
+chunk-local frame. One tap, so five GEMMs and not ten, and ``ddiag`` and ``duw``
+accumulate into the one fragment ``dushift``.
+
+What the second tap carried is two residues, neither a GEMM:
+
+    dnow(t)  = sum_d crot(t,d) bnow(t,d)
+    dures(p) = sum_d dinc_local(p,d) bnow(L-1,d)
+
+with ``bnow(t) = An_t b_t``. ``dnow`` is the diagonal's ``s == t`` term, whose mask
+is ``dmask(t,t) = 1``; ``dures`` closes the increment, whose weight is
+``wgt(L-1) = 1``. Each contracts the whole lane extent for one token or one row, so
+each is a lane reduction accumulated across lane blocks rather than a GEMM. Neither
+carries a log scale, which is why ``dlogp`` below has one inner product and not two.
+
+The two forms that keep the two-tap ``dlogp`` -- hold ``score_now`` as well, or build
+``dbfuse`` here -- both need ``bnow`` staged as a full ``L x 3N`` GEMM operand and
+both restore the second ``B`` pass: 0.642 and 0.783 of the two-tap MAC count against
+0.500 for this one. The relocated mass belongs to ``chunk_vector_bwd``'s ``dls_step``
+instead, and the two kernels' forms are therefore coupled.
 
 The score is built transposed relative to the forward's. That is what makes the
 masked score the left operand of the diagonal GEMM with no shared-memory round
 trip: its N mode is the target token and the diagonal GEMM contracts over the
 target token, so :func:`slinoss.ops.so3ssd.cute.mma.mma_areg` rereads the fragment
-in place. It removes a score tile, one ``ldmatrix`` and one barrier per slice, and
-it is what lets the two ``B`` passes below fuse. ``dm`` is transposed with it,
-because the two are multiplied elementwise.
+in place. It removes a score tile, one ``ldmatrix`` and one barrier per slice.
+``dm`` is transposed with it, because the two are multiplied elementwise.
 
 The cost of the transpose is the direction of the ``dexpo`` reduction. Summed over
 the source token it is now a reduction over the accumulator's M mode, whose rows
@@ -34,28 +50,35 @@ are disjoint across warps, so it goes through one scratch row per warp and is
 summed over warps at the store. Over the N mode it would have been two shuffles
 and no scratch.
 
-One pass over ``B`` per tap. Every contraction that reads a tap's forcing vector
-runs while that tap is staged, so ``B`` is read twice rather than four times: 19.0
-MB against 38.0 MB at ``standard``, on a kernel whose floor is its traffic. The
-price is that the increment cotangent, the readout and the output cotangent are
-live at once. The block is 42,832 B at ``standard`` and 48,752 B at every ``3N``
-once :func:`lblock` slices the lane extent, and the carveout holds either two deep;
-both read off the device as ``launch__shared_mem_per_block_dynamic`` on sm_86.
+Two passes over ``B``. Every contraction that reads the fused column runs while that
+column is staged, which is one pass; the ``dnow`` residue reads the same lane block
+back one token offset, which is the second. 19.0 MB either way at ``standard``, on a
+kernel whose floor is its traffic. What fusion does remove is the second pass over
+the increment cotangent and over ``C``, which the two-tap form restaged per tap
+wherever the lane extent was sliced. The price of the fused column is that the
+increment cotangent, the readout and the output cotangent are live at once. The block
+is 43,280 B at ``standard`` and 49,264 B at every ``3N`` once :func:`lblock` slices
+the lane extent, and the carveout holds either two deep; both read off the device as
+``launch__shared_mem_per_block_dynamic`` on sm_86.
 
-``dU`` is ``du(t) + dushift(t+1)``, the second term one row behind, which is why
-``dushift`` goes through a float32 tile before the store. The chunk's last valid
-token gets ``du`` alone: its ``dushift`` partner lives in the next chunk and
-:func:`slinoss.ops.so3ssd.cute.bwd.boundary.boundary_backward` adds it there.
-``carry_u`` is row 0 of ``dushift``, the cotangent that crosses into the previous
-chunk.
+``dU`` is ``ddiag(t) + dushift(t+1)``, the second term one row behind, which is why
+``dushift`` goes through a float32 tile before the store. The last slot has no row
+above it and takes ``dures`` instead. On a ragged chunk the partner of the last valid
+token is the first padded row, which the fused column fills with ``bnow`` of that
+token, so the bound on the shift is the chunk and not ``valid``.
+:func:`slinoss.ops.so3ssd.cute.bwd.boundary.boundary_backward` still owns the term
+that crosses into the next chunk. ``carry_u`` is row 0 of ``dushift``, the cotangent
+that crosses into the previous chunk, and ``Afuse_0 = Ap_0`` makes it the same
+expression the two-tap form gave.
 
 The log-scale term is
-``dlogp(t) = 2 * (sum_r dexpo(r,t) - <u(t),du(t)> - <ushift(t),dushift(t)>)``
+``dlogp(t) = 2 * (sum_r dexpo(r,t) - <ushift(t),dushift(t)>)``
 plus ``2 * sum_r dexpw(r)`` at the chunk's last slot, which is what the reference's
-``_scatter_last`` writes and holds whether or not that slot carries a token. The
-sum of ``dexpo`` over the target token is never formed: it equals the two inner
-products against the finished fragments, so it costs one lane reduction rather than
-a second pass over the score.
+``_scatter_last`` writes and holds whether or not that slot carries a token. One
+inner product, not two: the current tap's own terms are the two residues and neither
+depends on a log scale. The sum of ``dexpo`` over the target token is never formed:
+it equals that inner product against the finished fragment, so it costs one lane
+reduction rather than a second pass over the score.
 
 The chunk-transition pair factors through the same frame change. With
 ``X = chunk_scale * zstart + inc_local``,
@@ -64,23 +87,30 @@ The chunk-transition pair factors through the same frame change. With
 
 because ``dinc = R dinc_local`` and ``R`` comes out of the sum, so the increment
 never has to be rematerialized: its half of the outer product is
-``sum_r wgt(r) sum_n D_tap(r,3n+i) b_tap(r,3n+j)``, read off the ``D`` fragment in
+``sum_r wgt(r) sum_n D(r,3n+i) bfuse(r,3n+j)``, read off the ``D`` fragment in
 its epilogue. ``dchunk_scale`` is ``sum <dinc_local, zstart>`` for the same reason.
 Both are eleven float32 block reductions and ten stores per block.
 
 Shared memory is one resident set and one phase arena. Resident: the log-scale
-prefix, the increment weight, the per-warp log-scale scratch, the reduction
-scratch, the three-slot transform table, and the shifted ``U`` tile that serves
-both taps. The arena holds the forcing tile, restaged per tap, then the increment
-cotangent, the readout and the output cotangent, staged once; the ``trans``, ``K``
-and quaternion tiles of the prologue and the float32 shift tile of the epilogue
-alias the last three, neither being live when the other is.
+prefix, the increment weight, the two residues, the per-warp log-scale scratch, the
+reduction scratch, the three-slot transform table, and the shifted ``U`` tile. The
+two residues are resident and not in the arena because each is written inside the
+lane loop and read in the epilogue, where the arena holds the shift tile. The arena
+holds the fused column, the increment cotangent, the readout and the output
+cotangent, all four staged once per lane block; the ``trans``, ``K`` and quaternion
+tiles of the prologue and the float32 shift tile of the epilogue alias the last
+three, neither being live when the other is. The shift tile overlaps the output
+cotangent by 768 float32 words at the acceptance shape, so the diagonal residue is
+taken into a fragment before the shift is written rather than at the store.
 
 DRAM-bound. Analytic traffic at ``standard`` is ``dy 9.44 + U 9.58 + trans 1.57 +
 K 3.15 + B 19.02 + C 9.44 + dinc 7.08 + zstart 7.08 + dU 9.44 + carry_u 0.29 +
 dlogp 0.39 + dchunk_rot 0.06 + dchunk_scale 0.01 = 76.54 MB`` against ``1536 *
-3.54 MFLOP = 5.44 GFLOP``, so 71.1 flop/byte against a ridge point of 164: memory
-bound by a factor of over two. ``dinc`` and ``zstart`` are two of the three reads
+1.77 MFLOP = 2.72 GFLOP``, so 35.5 flop/byte against a ridge point of 164: memory
+bound by a factor of over four. The GEMM count is the fused one, exactly half the
+two-tap form's ``3.54 MFLOP`` per block, and the traffic is unchanged at one lane
+block, so fusion moved this shape further from its ridge, not nearer.
+``dinc`` and ``zstart`` are two of the three reads
 that are not activations and the only two at the operand width rather than float32:
 each is a state a recurrence stored, and this kernel and ``chunk_vector_bwd`` are
 its only readers. A supplied ``du_init`` adds one read of 9.44 MB at that shape,
@@ -110,6 +140,10 @@ repeat exactly across profiles where the wall does not.
     long            1536     1653.6  181.19   110  16.3%  no_instr   52.9%
     3N=240 H=18     2304      871.3  506.24   581  85.6%  long_sb    20.6%
 
+That table is the two-tap form. It was taken before the fusion and is not retaken:
+the shapes are unchanged, but a single absolute duration on this host is a stamp of
+its own launch and not a rate, so the fused form is priced by paired delta instead.
+
 ``class`` is the fitted floor over the duration, against a bar of 85%. It falls when a
 change removes bytes, because the floor falls with them; the duration is the figure to
 read across the rows. The last row is the acceptance shape,
@@ -117,6 +151,37 @@ read across the rows. The last row is the acceptance shape,
 ``dram__throughput`` 80.6%, 28.21% issue, 254 registers, 48,752 B of shared memory,
 16.7% theoretical occupancy against 16.4% achieved, 0.1236 shared bank conflicts per
 wavefront, and SOL 56.3% sm against 80.9% memory.
+
+What the fusion is worth, measured as a paired delta of the one-tap launch against the
+two-tap one in a single process with the launch order swapped every iteration, 240
+pairs, 2026-08-22, ``dinc`` and ``zstart`` at bfloat16:
+
+    shape       delta us  interval          null   position  smem B   local ld/st
+    standard      -28.160 [-29.184,-27.136] -0.512  -16.896  49,664   0 / 0
+    wide          -45.064 [-46.088,-45.048]  0.000   11.256  74,080   0 / 0
+    acceptance    -86.024 [-87.032,-86.008]  0.512    9.224  49,264   3,723,264 / 921,600
+
+``null`` is the same machinery run with the two-tap launch on both sides, which is what
+establishes the channel: its band is 0.5 to 1.5 us against signals of 28 to 86, so the
+durations above are read rather than inferred from counters. ``position`` is the
+launch-order cost the pairing removes from every pair; at ``standard`` it is 60% of the
+delta, which is why an unpaired bracket at that shape cannot resolve this arm.
+
+``sm__inst_executed_pipe_tensor`` at the acceptance shape is 7,815,168 in the two-tap
+form and 3,907,584 in the one-tap one, exactly half, which is the five-GEMM count above
+counted off the device. ``smsp__sass_thread_inst_executed_op_ffma_pred_on`` falls 14.70%
+with it, 832,555,008 to 710,166,528: less than half, because the two residues are FFMA
+where the tap they replace was tensor.
+
+The two-tap form's own local traffic is 344,064 sectors each way at ``standard`` and
+983,040 loaded against 491,520 stored at ``wide``; the fused form has none at either,
+and 9.50% and 33.36% less device traffic. At the acceptance shape the direction
+reverses: the two-tap form spills nothing there and the fused form spills 3,723,264
+sectors loaded and 921,600 stored, 148.63 MB, while device traffic rises 0.23%, from
+281.13 MB to 281.77 MB. So the spill is absorbed by L1 and L2 and does not reach DRAM,
+and the launch is 11.3% shorter with it. Registers are at the 255 cap on both sides at
+``wide`` and at acceptance and at 128 on both sides at ``standard``, so the spill
+tracks the live range and not the cap, as below.
 
 Six changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
 with the device to itself in both brackets. Traffic after each, at that shape:
@@ -169,13 +234,17 @@ stores at the acceptance shape, so the spill is device traffic: 127.40 MB of the
 under 30 KB of the 128 KB unified cache for data, against their own streaming global
 staging, so a local line does not survive to its reload.
 
-That paragraph is the state before the sixth change, and the acceptance shape has
-left it: 254 registers, no local sector either way, 506.24 MB. The spill survives
-everywhere else, per launch each way at the same date as the table above: 540,672 at
-``standard`` and ``ragged``, 1,376,256 and 688,128 at ``wide``, 2,015,232 at ``long``.
-So the cap is not what the spill tracks. A live range is: the increment accumulator
-is the only one in the lane-loop body that dies inside the body, and where the body's
-order lets it die the allocation fits.
+That paragraph is the state before the sixth change, and in the two-tap form the
+acceptance shape had left it: 254 registers, no local sector either way, 506.24 MB.
+The spill survived everywhere else, per launch each way at the same date as the table
+above: 540,672 at ``standard`` and ``ragged``, 1,376,256 and 688,128 at ``wide``,
+2,015,232 at ``long``. So the cap is not what the spill tracks. A live range is: the
+increment accumulator is the only one in the lane-loop body that dies inside the body,
+and where the body's order lets it die the allocation fits. The one-tap form moved the
+spill again in both directions at once, and by the same rule: it holds the fused column
+where the two-tap form held one transition at a time, which lengthens the live ranges of
+the acceptance shape's five lane blocks and shortens them at ``standard`` and ``wide``,
+where the whole extent is one block.
 
 What the spill holds is loop-invariant address arithmetic, not the accumulators. Read
 off the SASS at the acceptance shape before the sixth change, the frame was 160 B and
@@ -193,7 +262,7 @@ picks between the two forms. At four warps occupancy is 16.7% theoretical agains
 to 16.5% achieved at ``L = 64``, with ``launch__occupancy_limit_registers`` and
 ``launch__occupancy_limit_shared_mem`` both two; ``long`` gets one block, 8.3% against
 8.3%, its shared-memory limit reading one, because a 128-row M tile puts its arena at
-79,952 B and the lane block is the only lever :func:`lblock` has. Eight warps widen the
+80,656 B and the lane block is the only lever :func:`lblock` has. Eight warps widen the
 tiling in N, not in M, so the chunk's row count is untouched and a thread's accumulator
 halves. What that costs is the diagonal GEMM's rereadable left operand, and where it
 pays is stated at :func:`input_threads`.
@@ -233,8 +302,8 @@ from slinoss._cute import (
 )
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
+    TABLE_AFUSE,
     TABLE_AN,
-    TABLE_AP,
     THREADS,
     WARPS,
     mat3_matvec,
@@ -286,6 +355,7 @@ from slinoss.ops.so3ssd.reference import check_grad_band
 
 __all__ = [
     "LANE_MULTIPLE",
+    "LANE_THREADS",
     "REDUCTIONS",
     "RESIDENT_MAX",
     "RESIDENT_MIN",
@@ -327,6 +397,18 @@ LANE_MULTIPLE: int = 48
 product and the K mode of two other contractions, and 3 divides it because the frame
 change and the rotation cotangent both work on whole lane triples. ``3N`` is a
 multiple of both for the same reasons, so this always divides ``3N``."""
+
+LANE_THREADS: int = 16
+"""Threads that cooperate on one row of the two lane reductions of the epilogue.
+
+Sixteen and not the lane count itself. The two reductions -- the diagonal residue's
+per-token inner product and the increment residue's per-row one -- sum over the lane
+extent, and a butterfly needs the cooperating threads to be a power-of-two-aligned run
+within one warp. The lane count is a multiple of 16 and can be 48 or 80, neither of
+which is a power of two, so the thread block is cut by this instead: sixteen adjacent
+lanes of one warp, four butterfly rounds, and ``lanes // LANE_THREADS`` steps per
+thread. ``chunk`` and ``P`` are both multiples of ``threads // LANE_THREADS`` at every
+legal shape, so the row mapping is exact and needs no predicate."""
 
 RESIDENT_MIN: int = 2
 """Blocks per SM :func:`lblock` sizes the lane block for.
@@ -408,21 +490,21 @@ def lblock(
     lane-dependent part of the block, and at ``3N = 240`` they are 95,232 B of a
     101,376 B carveout, so the block does not fit at all. Slicing them bounds the
     footprint by the lane block instead of by ``3N``: at ``L = 64``, ``P = 64`` the
-    block is 48,752 B at every ``3N``, against 104,048 B at ``3N = 192`` and
-    122,480 B at ``3N = 240`` unsliced.
+    block is 49,264 B at every ``3N``, against 104,560 B at ``3N = 192`` and
+    122,992 B at ``3N = 240`` unsliced.
 
     What the slicing costs is the contraction structure, not traffic. The lane extent
     is a K mode for the forcing cotangent and the score, so both accumulate across
-    blocks; the score's accumulator therefore stays live over the whole lane loop.
-    The tap loop is outside the lane loop, which is what holds that to one score
-    rather than two, and the price is that the increment cotangent and the readout are
-    staged once per tap when there is more than one lane block.
+    blocks; the score's accumulator therefore stays live over the whole lane loop. One
+    tap, so that is one score and not two, and what a second lane block costs is a
+    second staging of the increment cotangent and the readout rather than a second
+    score.
 
-    What slicing buys is shared bytes and the occupancy they decide: 48,752 B at
-    ``wide``, which reads 16.5% achieved occupancy and an
-    ``launch__occupancy_limit_shared_mem`` of two, against 67,184 B unsliced, which one
+    What slicing buys is shared bytes and the occupancy they decide: 49,264 B at
+    ``wide`` in the narrow form, which reads 16.4% achieved occupancy and an
+    ``launch__occupancy_limit_shared_mem`` of two, against 67,696 B unsliced, which one
     128-thread block per SM holds to 8.3%; and at ``3N = 240`` a kernel that launches at
-    all against 122,480 B that does not. The pairwise durations this docstring used to
+    all against 122,992 B that does not. The pairwise durations this docstring used to
     carry, sliced against unsliced at each shape, were taken through a device probe that
     named the part by torch ordinal rather than by driver index, so which of them ran
     uncontended is not established and none is quoted. They are not retaken: the sliced
@@ -478,15 +560,30 @@ def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     0.921 at that shape with a ragged tail.
 
     More than one lane block, and it refuses. The score is banked across blocks, the
-    staging is restaged every tap, and the added port work outruns the occupancy:
-    1.137 at ``3N = 96`` and 1.048 at ``3N = 240``. The second is the shape the
-    DRAM-bound class is declared against, where the narrow form spills nothing at all
-    and the wide form spills 139 MB.
+    staging is restaged with the increment cotangent, and the added port work outruns
+    the occupancy: 1.137 at ``3N = 96`` and 1.048 at ``3N = 240``, both taken in the
+    two-tap form. The second is the shape the DRAM-bound class is declared against,
+    where the narrow form spills nothing at all and the wide form spills 139 MB.
+
+    ``3N = 96`` has since crossed to the wide form and the 1.137 does not apply to it,
+    because it is no longer a two-lane-block shape. The one-tap form's two residues put
+    512 B into the resident set, which takes the eight-warp arena at a 48-block from
+    50,016 B to 50,528 B against the 50,176 B a second resident block admits, so
+    :func:`_lane_block`'s first pass finds no candidate held two deep and the second
+    returns the whole extent. That makes ``lblk == dim`` and this function takes the
+    wide form. Occupancy is unchanged by the trade, eight warps once against four warps
+    twice, 16.58% achieved against 16.39%, and what the single block buys is the second
+    staging pass: the launch spills 983,040 sectors loaded and 491,520 stored in the
+    two-tap narrow form and none in the one-tap wide one, moves 33.36% less device
+    traffic, and is 45.064 us shorter over 1536 blocks, interval [-46.088, -45.048] at
+    240 pairs against a null band of 1.024 us. ``3N = 240`` is unaffected: its whole
+    extent needs 122,992 B, so the fallback there returns a 48-block and the width
+    stays narrow.
 
     Three shapes for, two against, and the lane count separates them with nothing left
     over. What the lane count does not decide is whether the wide arena fits at all: at
-    ``L = 128, P = 64`` the wide form's 102,496 B overflows a 101,376 B carveout that
-    the narrow form's 89,968 B clears. Fitting is checked here rather than left to the
+    ``L = 128, P = 64`` the wide form's 103,264 B overflows a 101,376 B carveout that
+    the narrow form's 90,736 B clears. Fitting is checked here rather than left to the
     host guard, which would refuse the launch instead of narrowing it, and it is checked
     at the whole lane extent ahead of :func:`lblock` rather than at the block that
     function returns: the wide form is taken only at one lane block, so a whole extent
@@ -617,7 +714,7 @@ class Arena(NamedTuple):
     block, not ``3N``, which is what bounds the whole allocation.
 
     Attributes:
-        forced: The rotated forcing tile, restaged once per lane block per tap.
+        forced: The fused forcing column, restaged once per lane block.
         local: The increment cotangent in the chunk-local frame, one lane block.
         readout: The rotated readout, one lane block.
         cotangent: The output cotangent.
@@ -626,8 +723,8 @@ class Arena(NamedTuple):
         tap: ``K`` staging. Prologue only.
         quat: Quaternion prefix staging. Prologue only.
         score: The wide form's staged score, below the lane loop. Equal to
-            :attr:`local` where the increment cotangent is restaged every tap, and
-            its own words where it is not.
+            :attr:`local` where more than one lane block restages the increment
+            cotangent, and its own words where one block holds it live throughout.
         words: Float32 words the arena spans.
     """
 
@@ -692,10 +789,10 @@ def arena(
         _words(shift_tile(chunk, rows), 4),
         16 * chunk,
     )
-    # The wide form's diagonal GEMM stages its left operand below the lane loop. At
-    # more than one lane block the increment cotangent is restaged every tap, so the
-    # staging aliases it and costs nothing; at one block it is staged on the first tap
-    # and read on the second, so the staging takes its own words.
+    # The wide form's diagonal GEMM stages its left operand below the lane loop. At more
+    # than one lane block the increment cotangent is restaged per block and is dead by
+    # then, so the staging aliases it and costs nothing; at one block it is staged once
+    # and read to the end of the loop, so the staging takes its own words.
     staged = (
         _words(operand_tile(mma_rows(chunk), tblock(chunk)), itemsize)
         if warps > WARPS
@@ -750,6 +847,8 @@ def input_smem_bytes(
         [
             (scalar_tile(chunk), 4),
             (scalar_tile(chunk), 4),
+            (scalar_tile(chunk), 4),
+            (Tile((rows,), (1,)), 4),
             (warp_tile(chunk, warps), 4),
             (reduce_tile(warps), 4),
             (table_tile(chunk, 3), 4),
@@ -806,6 +905,23 @@ def _sum_over_n(value: cutlass.Float32) -> cutlass.Float32:
     """
     value = value + shuffle_xor(value, 1)
     return value + shuffle_xor(value, 2)
+
+
+def _sum_over_lanes(value: cutlass.Float32) -> cutlass.Float32:
+    """Sum one row's contribution over the :data:`LANE_THREADS` threads sharing it.
+
+    Four butterfly rounds over a 16-aligned run of one warp, so the total lands in all
+    sixteen and the accumulation that follows is by one of them. Not
+    :func:`_sum_over_n`: those threads are the atom's quad, these are the run the two
+    residue reductions map a row onto, which no accumulator layout decides.
+
+    Args:
+        value: The thread's contribution.
+    """
+    value = value + shuffle_xor(value, 1)
+    value = value + shuffle_xor(value, 2)
+    value = value + shuffle_xor(value, 4)
+    return value + shuffle_xor(value, 8)
 
 
 def _sum_over_m(value: cutlass.Float32) -> cutlass.Float32:
@@ -919,9 +1035,11 @@ def chunk_input_bwd_kernel(
     elem = gdy.element_type
     out = gdu.element_type
     # The two chunk-plane states are read by the epilogue below rather than by a
-    # stager, so this pass widens them itself.
+    # stager, so this pass widens them itself. ``b`` too: the two residues of the
+    # one-tap form need the current tap's forcing vector, which no tile carries.
     dinc_elem = gdinc.element_type
     state_elem = gz.element_type
+    b_elem = gb.element_type
     zero = cutlass.Float32(0.0)
 
     ldu = smem_pitch(rows)
@@ -933,6 +1051,12 @@ def chunk_input_bwd_kernel(
     smem = cutlass.utils.SmemAllocator()
     slp = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
     swgt = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
+    # The two residues of the one-tap form, both reductions over the whole lane extent
+    # and so both accumulated across lane blocks. Resident rather than in the arena:
+    # each is written inside the lane loop and read in the epilogue, where the arena
+    # holds the shift tile.
+    sdnow = smem.allocate_tensor(cutlass.Float32, scalar_tile(chunk).layout(), 16)
+    sdures = smem.allocate_tensor(cutlass.Float32, Tile((rows,), (1,)).layout(), 16)
     sdlp = smem.allocate_tensor(cutlass.Float32, warp_tile(chunk, nwarps).layout(), 16)
     sred = smem.allocate_tensor(cutlass.Float32, reduce_tile(nwarps).layout(), 16)
     stable = smem.allocate_tensor(cutlass.Float32, table_tile(chunk, 3).layout(), 16)
@@ -988,7 +1112,14 @@ def chunk_input_bwd_kernel(
             # identity transition, so the prefix flattens past valid and the last
             # slot's weight is the last token's weight.
             swgt[token] = decay(slp[last] - slp[token])
-    build_table(strans, stap, squat, stable, tid, threads, chunk, 3)
+            sdnow[token] = zero
+    for step in cutlass.range_constexpr(-(-rows // threads)):
+        row = tid + step * threads
+        if row < rows:
+            sdures[row] = zero
+    # The one-tap column: Afuse_t = Ap_t + exp(2*ls_t) An_{t-1}, applied to b_{t-1}. An
+    # keeps its own slot, which the two residues below read per token.
+    build_table(strans, stap, squat, stable, tid, threads, chunk, 3, True)
     cute.arch.sync_threads()
 
     # The closing transition, read once per block. Ac is R(Q)^T, so its transpose is
@@ -1012,7 +1143,9 @@ def chunk_input_bwd_kernel(
         gdy, gdy, sdy, bidx, hidx, t0, 1, valid, tid, threads, mpad - 1, rows, False
     )
 
-    du = mma_acc(tiled_mma, tid, (mpad, rows))
+    # One output fragment, not two. The one-tap form's diagonal and increment both act
+    # on the shifted forcing vector, and the current tap's cotangent is the two residues
+    # below: a per-token scalar and a per-row one, neither of them a GEMM.
     dushift = mma_acc(tiled_mma, tid, (mpad, rows))
     wcrd = mma_coords(tiled_mma, tid, (mpad, rows))
     # The lane extent is the score's K mode. Sliced, a slice's score is complete only
@@ -1021,6 +1154,17 @@ def chunk_input_bwd_kernel(
     # Unsliced it is complete where it is produced and one accumulator serves every
     # slice, which is 16. The banked form is taken only when it is needed.
     banked = ltiles > 1
+    # One row past the tokens that exist, capped at the chunk. Slot ``valid`` of the
+    # fused column is ``An_{valid-1}``, so staged against this bound the row holds
+    # ``bnow_{valid-1}``: the increment's rank-one residue for a ragged chunk, and the
+    # shifted partner of ``dU`` at its last valid token. At a full chunk it is the chunk
+    # and the staging is unchanged.
+    vplus = cutlass.min(valid + 1, cutlass.Int32(chunk))
+    # The two residue reductions. Sixteen threads to a row, so ``trows`` rows or tokens
+    # are in flight per step and each thread walks ``lanes // LANE_THREADS`` lanes.
+    trows = threads // LANE_THREADS
+    noff = tid % LANE_THREADS
+    nrow = tid // LANE_THREADS
     score = [
         mma_acc(tiled_mma, tid, (mpad, tblk)) for _ in range(slices if banked else 1)
     ]
@@ -1098,287 +1242,350 @@ def chunk_input_bwd_kernel(
     pdinc = gdinc[bidx, hidx, cidx, None, None]
     pz = gz[bidx, hidx, cidx, None, None]
 
-    # The two taps differ by the table slot, by which token the forcing vector comes
-    # from, and by which row of the shifted tile pairs with an output row. The tap loop
-    # is outside the lane loop because the score's K mode is the lane extent: one score
-    # per slice serves both taps this way, two would be needed the other way round. The
-    # price is that the increment cotangent and the readout are restaged per tap
-    # whenever there is more than one lane block, and at one block they are not.
-    for tap in cutlass.range_constexpr(2):
-        vu = [
-            cute.make_tensor(
-                su.iterator + tap * ldu + k * MMA_TILE_K,
-                cute.make_layout((mpad, MMA_TILE_K), stride=(ldu, 1)),
-            )
-            for k in range(ksteps)
-        ]
-        target = dushift if tap == 0 else du
-        restage = tap == 0 or ltiles > 1
-        if cutlass.const_expr(banked):
-            for s in cutlass.range_constexpr(slices):
-                score[s].fill(0.0)
+    # One tap. The fused column carries the previous tap and the shifted current one at
+    # once, so the forcing vector always comes from ``t-1`` and the table slot is always
+    # :data:`slinoss.ops.so3ssd.cute.common.TABLE_AFUSE`. There is no tap loop, so the
+    # increment cotangent and the readout are staged once per lane block at every lane
+    # extent, and the chunk-start state is read once whatever ``ltiles`` is.
+    #
+    # What the second tap used to carry is two residues, both below the GEMMs: the
+    # diagonal's ``s == t`` term ``<crot_t, bnow_t> u_t`` and the increment's closing
+    # rank-one term ``u_{L-1} (x) bnow_{L-1}``. Neither is a GEMM.
+    vu = [
+        cute.make_tensor(
+            su.iterator + k * MMA_TILE_K,
+            cute.make_layout((mpad, MMA_TILE_K), stride=(ldu, 1)),
+        )
+        for k in range(ksteps)
+    ]
 
-        for lt in cutlass.range(ltiles, unroll=1):
-            l0 = lt * lblk
-            cute.arch.sync_threads()
-            stage_rotated(
-                _lane_slice(gb, l0),
-                _lane_slice(gbprev, l0),
-                sbu,
-                stable,
-                swgt,
-                bidx,
-                gidx,
-                t0,
-                0,
-                valid,
-                tid,
-                TABLE_AP if tap == 0 else TABLE_AN,
-                1 - tap,
-                threads,
-                mpad,
-                lanes,
-                has_prev,
-                False,
-            )
-            if cutlass.const_expr(restage):
-                stage_rotated(
-                    _lane_slice(gc, l0),
-                    _lane_slice(gc, l0),
-                    sc,
-                    stable,
-                    swgt,
-                    bidx,
-                    gidx,
-                    t0,
-                    0,
-                    valid,
-                    tid,
-                    TABLE_AC,
-                    0,
-                    threads,
-                    mpad,
-                    lanes,
-                    False,
-                    False,
-                )
+    for lt in cutlass.range(ltiles, unroll=1):
+        l0 = lt * lblk
+        cute.arch.sync_threads()
+        # ``vplus`` and not ``valid``: one row past the tokens that exist, whose fused
+        # matrix is the last real token's ``An``, so the row is ``bnow_{valid-1}``. On a
+        # ragged chunk that row is the increment's closing term and the shifted partner
+        # of the last valid token's ``dU``; the unconditional residue below carries the
+        # zero it leaves at slot ``L-1``.
+        stage_rotated(
+            _lane_slice(gb, l0),
+            _lane_slice(gbprev, l0),
+            sbu,
+            stable,
+            swgt,
+            bidx,
+            gidx,
+            t0,
+            0,
+            vplus,
+            tid,
+            TABLE_AFUSE,
+            1,
+            threads,
+            mpad,
+            lanes,
+            has_prev,
+            False,
+        )
+        stage_rotated(
+            _lane_slice(gc, l0),
+            _lane_slice(gc, l0),
+            sc,
+            stable,
+            swgt,
+            bidx,
+            gidx,
+            t0,
+            0,
+            valid,
+            tid,
+            TABLE_AC,
+            0,
+            threads,
+            mpad,
+            lanes,
+            False,
+            False,
+        )
 
-                # The increment cotangent, into the chunk-local frame and into the two
-                # products it feeds. One matrix for the whole chunk, so its nine
-                # entries are a broadcast read and the pass is one 3-vector per thread
-                # per step: six coalesced reads widened to float32, nine FMA for the
-                # frame change, twelve for the products. Both reads are of a state a
-                # recurrence stored at the operand width, so the widening is free of
-                # accuracy and the arithmetic below is float32 (I4). The two products
-                # are over the whole lane extent and are taken on the tap that stages
-                # the block first, so the chunk-start state is read once.
-                total = rows * lanes
-                steps = -(-total // threads)
-                exact = total % threads == 0
-                # A block is a whole number of lanes wide, so a step advances the flat
-                # index by a whole number of rows: the lane a thread reads is the same
-                # at every step and the row moves by a trace-time constant. Derived
-                # from the flat index instead, each step carries its own element offset
-                # and the eight of them are loop-invariant, outlive the whole lane loop
-                # and are spilled: measured eight local words reloaded at the top of
-                # every trip. Affine, they share one base and one row stride.
-                affine = exact and threads % lanes == 0
-                prow = tid // lanes
-                pcol = tid - prow * lanes
-                for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
-                    count = min(PREFETCH, steps - group * PREFETCH)
-                    held = []
-                    for step in cutlass.range_constexpr(count):
-                        if cutlass.const_expr(affine):
-                            p = prow + (group * PREFETCH + step) * (threads // lanes)
-                            n = pcol
-                        else:
-                            i = tid + (group * PREFETCH + step) * threads
-                            if cutlass.const_expr(not exact):
-                                i = cutlass.min(i, total - 1)
-                            p = i // lanes
-                            n = i - p * lanes
-                        d0 = l0 + 3 * n
-                        got = (
+        # The increment cotangent, into the chunk-local frame and into the two
+        # products it feeds. One matrix for the whole chunk, so its nine
+        # entries are a broadcast read and the pass is one 3-vector per thread
+        # per step: six coalesced reads widened to float32, nine FMA for the
+        # frame change, twelve for the products. Both reads are of a state a
+        # recurrence stored at the operand width, so the widening is free of
+        # accuracy and the arithmetic below is float32 (I4).
+        total = rows * lanes
+        steps = -(-total // threads)
+        exact = total % threads == 0
+        # A block is a whole number of lanes wide, so a step advances the flat
+        # index by a whole number of rows: the lane a thread reads is the same
+        # at every step and the row moves by a trace-time constant. Derived
+        # from the flat index instead, each step carries its own element offset
+        # and the eight of them are loop-invariant, outlive the whole lane loop
+        # and are spilled: measured eight local words reloaded at the top of
+        # every trip. Affine, they share one base and one row stride.
+        affine = exact and threads % lanes == 0
+        prow = tid // lanes
+        pcol = tid - prow * lanes
+        for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+            count = min(PREFETCH, steps - group * PREFETCH)
+            held = []
+            for step in cutlass.range_constexpr(count):
+                if cutlass.const_expr(affine):
+                    p = prow + (group * PREFETCH + step) * (threads // lanes)
+                    n = pcol
+                else:
+                    i = tid + (group * PREFETCH + step) * threads
+                    if cutlass.const_expr(not exact):
+                        i = cutlass.min(i, total - 1)
+                    p = i // lanes
+                    n = i - p * lanes
+                d0 = l0 + 3 * n
+                held.append(
+                    (
+                        p,
+                        n,
+                        (
                             widen(pdinc[p, d0], dinc_elem),
                             widen(pdinc[p, d0 + 1], dinc_elem),
                             widen(pdinc[p, d0 + 2], dinc_elem),
-                        )
-                        if cutlass.const_expr(tap == 0):
-                            held.append(
-                                (
-                                    p,
-                                    n,
-                                    got,
-                                    (
-                                        widen(pz[p, d0], state_elem),
-                                        widen(pz[p, d0 + 1], state_elem),
-                                        widen(pz[p, d0 + 2], state_elem),
-                                    ),
-                                )
-                            )
-                        else:
-                            held.append((p, n, got, None))
+                        ),
+                        (
+                            widen(pz[p, d0], state_elem),
+                            widen(pz[p, d0 + 1], state_elem),
+                            widen(pz[p, d0 + 2], state_elem),
+                        ),
+                    )
+                )
 
-                    for step in cutlass.range_constexpr(count):
-                        p, n, got, state = held[step]
-                        local = mat3_matvec(aclast, got)
-                        # A stride-3 store, so the eight threads of a phase touch
-                        # three segments each. The kernel measures 0.0900 shared bank
-                        # conflicts per wavefront at ``standard`` with
-                        # ``mio_throttle`` at 3.7% against ``long_scoreboard`` at
-                        # 27.4%, so this is not what bounds it and the staging order
-                        # stays as `table.py` writes every other rotated tile.
-                        for j in cutlass.range_constexpr(3):
-                            sdinc[p, 3 * n + j] = narrow(local[j], elem)
-                        if cutlass.const_expr(tap == 0):
-                            if cutlass.const_expr(not exact):
-                                # A clamped step repeats the last element, so its store
-                                # repeats a correct value and only the reductions need
-                                # the zero. Zeroing the state zeroes both of them.
-                                live = tid + (group * PREFETCH + step) * threads < total
-                                state = tuple(
-                                    select(live, state[j], zero) for j in range(3)
-                                )
-                            # The closing scale rides the state rather than the finished
-                            # sum, because the rotation cotangent's other half comes
-                            # from the forcing product below and is not scaled.
-                            scaled = tuple(cscale * state[j] for j in range(3))
-                            for j in cutlass.range_constexpr(3):
-                                dscale = dscale + local[j] * state[j]
-                                for i in cutlass.range_constexpr(3):
-                                    mrot[3 * i + j] = (
-                                        mrot[3 * i + j] + local[i] * scaled[j]
-                                    )
-            cute.arch.sync_threads()
-
-            # sum_d b_tap(r,d) dinc_local(p,d), the increment's contribution to the
-            # forcing cotangent, accumulated unweighted into the output fragment. No
-            # accumulator of its own: the fragment carries nothing else until the
-            # diagonal GEMM below the lane loop, and the weight is a function of the
-            # source token alone, so weighting the finished sum over lane blocks is the
-            # same sum as weighting each block's part. The epilogue that applies it then
-            # runs once per tap rather than once per lane block.
-            for k in cutlass.range_constexpr(lsteps):
-                mma_gemm(tiled_mma, tid, target, vforced[k], vlocal_n[k], True, True)
-
-            # sum_p u_tap(r,p) dinc_local(p,d), the other half of the increment's outer
-            # product. The element's matrix row is the accumulator column modulo three,
-            # so it lands in the rotated basis at the static ``dres`` slot and costs
-            # three multiply-adds rather than three selects and nine. The column is
-            # block-local and the block starts on a lane triple, so the residue is the
-            # same one the whole lane extent would give.
-            #
-            # Below the forcing GEMM, not above it. This accumulator is the only one in
-            # the body that dies inside the body, and issued first it was live across
-            # the forcing and score GEMMs as well: that allocation spilled 3,133,440
-            # local load and 1,142,784 local store sectors per launch at the acceptance
-            # shape, 136.84 MB of the 584.10 MB moved, which this order removes
-            # outright. Nothing between the two writes shared memory and no barrier
-            # separates them, so the order is free; both read ``sdinc``, which the
-            # staging pass above finished before the barrier.
-            dloc = mma_acc(tiled_mma, tid, (mpad, lblk))
-            for k in cutlass.range_constexpr(ksteps):
-                mma_gemm(tiled_mma, tid, dloc, vu[k], vlocal_k[k], True, False)
-            for i in cutlass.range_constexpr(cute.size(dloc)):
-                m, d = dcrd[i]
-                base = d - d % 3
-                weighted = dloc[i] * swgt[cutlass.min(m, last)]
+            for step in cutlass.range_constexpr(count):
+                p, n, got, state = held[step]
+                local = mat3_matvec(aclast, got)
+                # A stride-3 store, so the eight threads of a phase touch
+                # three segments each. The kernel measures 0.0900 shared bank
+                # conflicts per wavefront at ``standard`` with
+                # ``mio_throttle`` at 3.7% against ``long_scoreboard`` at
+                # 27.4%, so this is not what bounds it and the staging order
+                # stays as `table.py` writes every other rotated tile.
                 for j in cutlass.range_constexpr(3):
-                    forced = widen(sbu[m, base + j], elem)
-                    slot = 3 * dres[i] + j
-                    mrotp[slot] = mrotp[slot] + weighted * forced
+                    sdinc[p, 3 * n + j] = narrow(local[j], elem)
+                if cutlass.const_expr(not exact):
+                    # A clamped step repeats the last element, so its store
+                    # repeats a correct value and only the reductions need
+                    # the zero. Zeroing the state zeroes both of them.
+                    live = tid + (group * PREFETCH + step) * threads < total
+                    state = tuple(select(live, state[j], zero) for j in range(3))
+                # The closing scale rides the state rather than the finished
+                # sum, because the rotation cotangent's other half comes
+                # from the forcing product below and is not scaled.
+                scaled = tuple(cscale * state[j] for j in range(3))
+                for j in cutlass.range_constexpr(3):
+                    dscale = dscale + local[j] * state[j]
+                    for i in cutlass.range_constexpr(3):
+                        mrot[3 * i + j] = mrot[3 * i + j] + local[i] * scaled[j]
+        cute.arch.sync_threads()
 
-            if cutlass.const_expr(banked):
-                for s in cutlass.range_constexpr(slices):
-                    for k in cutlass.range_constexpr(lsteps):
-                        mma_gemm(
-                            tiled_mma,
-                            tid,
-                            score[s],
-                            vforced[k],
-                            vreadout[s][k],
-                            True,
-                            True,
-                        )
+        # sum_d bfuse(r,d) dinc_local(p,d), the increment's contribution to the
+        # forcing cotangent, accumulated unweighted into the output fragment. No
+        # accumulator of its own: the fragment carries nothing else until the
+        # diagonal GEMM below the lane loop, and the weight is a function of the
+        # source token alone, so weighting the finished sum over lane blocks is the
+        # same sum as weighting each block's part. The epilogue that applies it then
+        # runs once per launch rather than once per lane block.
+        for k in cutlass.range_constexpr(lsteps):
+            mma_gemm(tiled_mma, tid, dushift, vforced[k], vlocal_n[k], True, True)
 
-        # The increment weight, on the finished sum over lane blocks, and the exponent's
-        # forcing term with it. The fragment holds only the increment product here, so
-        # this is the whole of what the weight applies to.
-        for i in cutlass.range_constexpr(cute.size(target)):
-            m, p = wcrd[i]
-            weighted = target[i] * swgt[cutlass.min(m, last)]
-            dexpw = dexpw + weighted * widen(su[m + tap, p], elem)
-            target[i] = weighted
+        # sum_p ushift(r,p) dinc_local(p,d), the other half of the increment's outer
+        # product. The element's matrix row is the accumulator column modulo three,
+        # so it lands in the rotated basis at the static ``dres`` slot and costs
+        # three multiply-adds rather than three selects and nine. The column is
+        # block-local and the block starts on a lane triple, so the residue is the
+        # same one the whole lane extent would give.
+        #
+        # Below the forcing GEMM, not above it. This accumulator is the only one in
+        # the body that dies inside the body, and issued first it was live across
+        # the forcing and score GEMMs as well: that allocation spilled 3,133,440
+        # local load and 1,142,784 local store sectors per launch at the acceptance
+        # shape, 136.84 MB of the 584.10 MB moved, which this order removes
+        # outright. Nothing between the two writes shared memory and no barrier
+        # separates them, so the order is free; both read ``sdinc``, which the
+        # staging pass above finished before the barrier.
+        dloc = mma_acc(tiled_mma, tid, (mpad, lblk))
+        for k in cutlass.range_constexpr(ksteps):
+            mma_gemm(tiled_mma, tid, dloc, vu[k], vlocal_k[k], True, False)
+        for i in cutlass.range_constexpr(cute.size(dloc)):
+            m, d = dcrd[i]
+            base = d - d % 3
+            weighted = dloc[i] * swgt[cutlass.min(m, last)]
+            for j in cutlass.range_constexpr(3):
+                forced = widen(sbu[m, base + j], elem)
+                slot = 3 * dres[i] + j
+                mrotp[slot] = mrotp[slot] + weighted * forced
 
-        for s in cutlass.range_constexpr(slices):
-            tbase = s * tblk
-            acc = score[s] if banked else score[0]
-            if cutlass.const_expr(not banked):
-                # One lane block, so the forcing tile and the readout still hold it
-                # and the slice's score is taken here rather than banked.
-                acc.fill(0.0)
+        if cutlass.const_expr(banked):
+            for s in cutlass.range_constexpr(slices):
                 for k in cutlass.range_constexpr(lsteps):
                     mma_gemm(
-                        tiled_mma, tid, acc, vforced[k], vreadout[s][k], True, True
+                        tiled_mma,
+                        tid,
+                        score[s],
+                        vforced[k],
+                        vreadout[s][k],
+                        True,
+                        True,
                     )
-            vb_dy = [
-                cute.make_tensor(
-                    sdy.iterator + tbase * ldu + k * MMA_TILE_K,
-                    cute.make_layout((tblk, MMA_TILE_K), stride=(ldu, 1)),
-                )
-                for k in range(ksteps)
-            ]
-            vdiag = cute.make_tensor(
-                sdy.iterator + tbase * ldu,
-                cute.make_layout((rows, tblk), stride=(1, ldu)),
-            )
-            # Allocated here, not before the lane loop: neither is live inside it, and
-            # the lane loop is where the pressure peaks. The narrowed score is the A
-            # operand of the diagonal GEMM, so its view is built with it; the retile is
-            # a layout and costs nothing per slice.
-            dmacc = mma_acc(tiled_mma, tid, (mpad, tblk))
-            sfrag = cute.make_fragment_like(dmacc, elem)
-            fa_score = mma_areg(sfrag) if one_group else sfrag
-            for k in cutlass.range_constexpr(ksteps):
-                mma_gemm(tiled_mma, tid, dmacc, vu[k], vb_dy[k], True, True)
-            for i in cutlass.range_constexpr(cute.size(dmacc)):
-                m, n = scrd[i]
-                token = tbase + n
-                # I6: the mask lands on the float32 accumulator, then one narrowing
-                # into the operand. I3: one exponential of a log difference. The clamp
-                # only feeds rows the M mode was rounded up by, whose operands the
-                # stagers zeroed.
-                masked = acc[i] * decay(slp[token] - slp[cutlass.min(m, last)])
-                masked = select(token >= m, masked, zero)
-                sfrag[i] = narrow(masked, elem)
-                # The exponent's cotangent, summed over the source token, which is
-                # this accumulator's M mode. Its other sum, over the target token, is
-                # the pair of inner products the epilogue takes against the finished
-                # fragments, so the score is never revisited.
-                column = _sum_over_m(masked * dmacc[i])
-                if tid % 32 < 4:
-                    sdlp[warp, token] = sdlp[warp, token] + column
-            if cutlass.const_expr(one_group):
-                mma_gemm_areg(tiled_mma, tid, target, fa_score, vdiag, False)
-            else:
-                # At two N groups a thread's consecutive N steps are two atoms apart,
-                # so the fragment cannot be reread as a K-contiguous A operand. The
-                # score goes through shared memory instead. The first barrier covers
-                # the lane loop's last read of the aliased tile and the previous
-                # slice's ldmatrix; the second covers this slice's store.
-                cute.arch.sync_threads()
-                cute.autovec_copy(sfrag, tiled_mma.get_slice(tid).partition_C(vscore))
-                cute.arch.sync_threads()
-                mma_gemm(tiled_mma, tid, target, vscore, vdiag, True, False)
 
-    # Both fragments are final, so the log-scale sum over the target token, the carry
-    # and the shift all read them in place.
-    for i in cutlass.range_constexpr(cute.size(du)):
+        # The diagonal's ``s == t`` residue, ``dnow_t = <crot_t, An_t b_t>``, one scalar
+        # per token. Not a GEMM: every other term of row ``t`` comes from the fused
+        # column, and this one contracts the lane extent against a single token's
+        # current-tap forcing vector. Sixteen threads to a token, four butterfly rounds,
+        # one accumulation into the resident tile per lane block, so the sum over the
+        # whole lane extent is the sum of the blocks'.
+        #
+        # The token loop is outside the lane loop so the nine table entries are read once
+        # per token. ``An`` is the zero matrix at a padded token, which is what bounds the
+        # clamped read of ``b``: the row it repeats contributes nothing.
+        for ts in cutlass.range_constexpr(chunk // trows):
+            token = nrow + ts * trows
+            anow = tuple(stable[TABLE_AN, token, e] for e in range(9))
+            tsafe = cutlass.min(token, valid - 1)
+            diag = zero
+            for q in cutlass.range_constexpr(lanes // LANE_THREADS):
+                n = noff + q * LANE_THREADS
+                d0 = l0 + 3 * n
+                bnow = mat3_matvec(
+                    anow,
+                    (
+                        widen(gb[bidx, gidx, t0 + tsafe, d0], b_elem),
+                        widen(gb[bidx, gidx, t0 + tsafe, d0 + 1], b_elem),
+                        widen(gb[bidx, gidx, t0 + tsafe, d0 + 2], b_elem),
+                    ),
+                )
+                for j in cutlass.range_constexpr(3):
+                    diag = diag + widen(sc[token, 3 * n + j], elem) * bnow[j]
+            diag = _sum_over_lanes(diag)
+            if noff == 0:
+                sdnow[token] = sdnow[token] + diag
+
+        # The increment's closing residue, ``u_{L-1} (x) An_{L-1} b_{L-1}``, whose weight
+        # is one by construction, so it is added below the weight epilogue rather than
+        # inside it. Two contractions: the forcing cotangent's last row, one scalar per
+        # output row, and the rotation cotangent's share, which the residue owes in the
+        # same form the forcing GEMM's epilogue does. ``An_{L-1}`` is the zero matrix on a
+        # ragged chunk, where slot ``L-1`` carries no token, so the residue vanishes there
+        # and the clamped read needs no predicate.
+        #
+        # The lane loop is outermost so the matrix-vector runs once per lane instead of
+        # once per lane and row, and the nine rotation terms are taken against the row sum
+        # rather than per row. ``su[L]`` is the last token's forcing vector.
+        anlast = tuple(stable[TABLE_AN, last, e] for e in range(9))
+        tlast = cutlass.min(cutlass.Int32(last), valid - 1)
+        pres = cute.make_fragment((rows // trows,), cutlass.Float32)
+        pres.fill(0.0)
+        for q in cutlass.range_constexpr(lanes // LANE_THREADS):
+            n = noff + q * LANE_THREADS
+            d0 = l0 + 3 * n
+            bnow = mat3_matvec(
+                anlast,
+                (
+                    widen(gb[bidx, gidx, t0 + tlast, d0], b_elem),
+                    widen(gb[bidx, gidx, t0 + tlast, d0 + 1], b_elem),
+                    widen(gb[bidx, gidx, t0 + tlast, d0 + 2], b_elem),
+                ),
+            )
+            wsum = [zero, zero, zero]
+            for ps in cutlass.range_constexpr(rows // trows):
+                p = nrow + ps * trows
+                ulast = widen(su[chunk, p], elem)
+                for i in cutlass.range_constexpr(3):
+                    loc = widen(sdinc[p, 3 * n + i], elem)
+                    pres[ps] = pres[ps] + loc * bnow[i]
+                    wsum[i] = wsum[i] + loc * ulast
+            for i in cutlass.range_constexpr(3):
+                for j in cutlass.range_constexpr(3):
+                    mrot[3 * i + j] = mrot[3 * i + j] + wsum[i] * bnow[j]
+        for ps in cutlass.range_constexpr(rows // trows):
+            summed = _sum_over_lanes(pres[ps])
+            if noff == 0:
+                row = nrow + ps * trows
+                sdures[row] = sdures[row] + summed
+
+    # The increment weight, on the finished sum over lane blocks, and the exponent's
+    # forcing term with it. The fragment holds only the increment product here, so
+    # this is the whole of what the weight applies to.
+    for i in cutlass.range_constexpr(cute.size(dushift)):
         m, p = wcrd[i]
-        held = _sum_over_n(
-            du[i] * widen(su[m + 1, p], elem) + dushift[i] * widen(su[m, p], elem)
+        weighted = dushift[i] * swgt[cutlass.min(m, last)]
+        dexpw = dexpw + weighted * widen(su[m, p], elem)
+        dushift[i] = weighted
+
+    for s in cutlass.range_constexpr(slices):
+        tbase = s * tblk
+        acc = score[s] if banked else score[0]
+        if cutlass.const_expr(not banked):
+            # One lane block, so the forcing tile and the readout still hold it
+            # and the slice's score is taken here rather than banked.
+            acc.fill(0.0)
+            for k in cutlass.range_constexpr(lsteps):
+                mma_gemm(tiled_mma, tid, acc, vforced[k], vreadout[s][k], True, True)
+        vb_dy = [
+            cute.make_tensor(
+                sdy.iterator + tbase * ldu + k * MMA_TILE_K,
+                cute.make_layout((tblk, MMA_TILE_K), stride=(ldu, 1)),
+            )
+            for k in range(ksteps)
+        ]
+        vdiag = cute.make_tensor(
+            sdy.iterator + tbase * ldu,
+            cute.make_layout((rows, tblk), stride=(1, ldu)),
         )
+        # Allocated here, not before the lane loop: neither is live inside it, and
+        # the lane loop is where the pressure peaks. The narrowed score is the A
+        # operand of the diagonal GEMM, so its view is built with it; the retile is
+        # a layout and costs nothing per slice.
+        dmacc = mma_acc(tiled_mma, tid, (mpad, tblk))
+        sfrag = cute.make_fragment_like(dmacc, elem)
+        fa_score = mma_areg(sfrag) if one_group else sfrag
+        for k in cutlass.range_constexpr(ksteps):
+            mma_gemm(tiled_mma, tid, dmacc, vu[k], vb_dy[k], True, True)
+        for i in cutlass.range_constexpr(cute.size(dmacc)):
+            m, n = scrd[i]
+            token = tbase + n
+            # I6: the mask lands on the float32 accumulator, then one narrowing
+            # into the operand. I3: one exponential of a log difference. The clamp
+            # only feeds rows the M mode was rounded up by, whose operands the
+            # stagers zeroed.
+            masked = acc[i] * decay(slp[token] - slp[cutlass.min(m, last)])
+            masked = select(token >= m, masked, zero)
+            sfrag[i] = narrow(masked, elem)
+            # The exponent's cotangent, summed over the source token, which is
+            # this accumulator's M mode. Its other sum, over the target token, is
+            # the pair of inner products the epilogue takes against the finished
+            # fragments, so the score is never revisited.
+            column = _sum_over_m(masked * dmacc[i])
+            if tid % 32 < 4:
+                sdlp[warp, token] = sdlp[warp, token] + column
+        if cutlass.const_expr(one_group):
+            mma_gemm_areg(tiled_mma, tid, dushift, fa_score, vdiag, False)
+        else:
+            # At two N groups a thread's consecutive N steps are two atoms apart,
+            # so the fragment cannot be reread as a K-contiguous A operand. The
+            # score goes through shared memory instead. The first barrier covers
+            # the lane loop's last read of the aliased tile and the previous
+            # slice's ldmatrix; the second covers this slice's store.
+            cute.arch.sync_threads()
+            cute.autovec_copy(sfrag, tiled_mma.get_slice(tid).partition_C(vscore))
+            cute.arch.sync_threads()
+            mma_gemm(tiled_mma, tid, dushift, vscore, vdiag, True, False)
+
+    # The fragment is final, so the log-scale sum over the source token, the carry and
+    # the shift all read it in place. One term, not two: the diagonal residue's factor is
+    # ``D(t,t) = 1`` and the increment residue's weight is ``wgt_{L-1} = 1``, so neither
+    # carries a log scale and the current tap contributes nothing here.
+    for i in cutlass.range_constexpr(cute.size(dushift)):
+        m, p = wcrd[i]
+        held = _sum_over_n(dushift[i] * widen(su[m, p], elem))
         if tid % 4 == 0 and m < chunk:
             sdlp[warp, m] = sdlp[warp, m] - held
         if m == 0:
@@ -1386,7 +1593,7 @@ def chunk_input_bwd_kernel(
 
     # Out of this thread's rotated basis, where slot ``a`` holds component
     # ``(lphase + a) % 3``. Eighteen selects once, against three per accumulator
-    # element per lane block per tap in the component basis.
+    # element per lane block in the component basis.
     for k in cutlass.range_constexpr(3):
         for j in cutlass.range_constexpr(3):
             rolled = select(
@@ -1425,18 +1632,37 @@ def chunk_input_bwd_kernel(
                 summed + select(token == last, total_expw, zero)
             )
 
+    # The diagonal residue, into a fragment of the output's shape and not into the store
+    # below, because the shift tile aliases the output cotangent: at the acceptance shape
+    # the two overlap by 768 float32 words, so ``sdy`` is gone once ``sshift`` is written.
+    # A fragment and not an arena move, which would cost 5,120 B at ``P = 128``. Live only
+    # here, where the lane loop's pressure is over.
+    ddiag = cute.make_fragment_like(dushift)
+    for i in cutlass.range_constexpr(cute.size(ddiag)):
+        m, p = wcrd[i]
+        ddiag[i] = sdnow[cutlass.min(m, last)] * widen(sdy[m, p], elem)
+    # The two tiles alias and have different pitches and element widths, so a thread's
+    # own store does not cover the element another thread has still to read. The last
+    # barrier above this is inside the block reductions, which run before the read.
+    cute.arch.sync_threads()
+
     for i in cutlass.range_constexpr(cute.size(dushift)):
         m, p = wcrd[i]
         sshift[m, p] = dushift[i]
     cute.arch.sync_threads()
 
-    for i in cutlass.range_constexpr(cute.size(du)):
+    for i in cutlass.range_constexpr(cute.size(ddiag)):
         m, p = wcrd[i]
-        # The row above, clamped and then corrected, never predicated. The last valid
-        # token's partner is the next chunk's first row and belongs to the boundary
-        # kernel, so it reads zero here.
+        # The row above, clamped and then replaced, never predicated. Inside the chunk the
+        # partner is the next row of the shifted fragment, which on a ragged chunk is the
+        # first padded row and carries the last valid token's current tap: the bound is the
+        # chunk and not ``valid``, because slot ``valid`` of the fused column is
+        # ``An_{valid-1}``. At the last slot there is no row above and the increment's
+        # closing residue takes its place. ``m + 1 < chunk`` and ``m == L-1`` are exact
+        # complements inside the stored range ``m < valid <= L``, so one select delivers
+        # both.
         above = sshift[cutlass.min(m + 1, mpad - 1), p]
-        held = du[i] + select(m + 1 < valid, above, zero)
+        held = ddiag[i] + select(m + 1 < chunk, above, sdures[p])
         if m < valid:
             # The seed joins the float32 sum ahead of the one narrowing, so a seeded
             # dU carries no rounding a bare one does not, and it costs one read

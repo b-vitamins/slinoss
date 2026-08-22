@@ -24,6 +24,14 @@ downstream.
 ``dtrans`` and ``dK`` are complete: every producer of the rotation, log-scale and
 tap cotangents is inside this kernel, ``dlogp`` included, so both are checked
 against the reference's whole gradient.
+
+The oracle is :func:`slinoss.ops.so3ssd.chunked_backward_fused`, the adjoint of the
+one-tap factorization the kernel implements. The two factorizations return the same
+``grads`` and different ``dlogp``, so the ``dlogp`` this stage is handed and the
+``dls_step`` it adds are both specific to the fused record; only the operator
+gradients are shared. :func:`test_matches_autograd_through_the_forward` keeps the
+two-tap forward, that being the operator's definition and independent of either
+derivation.
 """
 
 import pytest
@@ -40,7 +48,11 @@ from torch import Tensor
 
 from slinoss._cute import smem_capacity
 from slinoss.config import MAX_CHUNK
-from slinoss.ops.so3ssd import chunked_backward, chunked_forward
+from slinoss.ops.so3ssd import (
+    chunked_backward_fused,
+    chunked_forward,
+    chunked_forward_fused,
+)
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     ChunkVectorBwd,
     chunk_vector_backward,
@@ -216,7 +228,7 @@ def _oracle(
     """
     U, trans, K, B, C = inp.args()
     z0, b_prev, u_prev = _dbl(inp.z0), _dbl(inp.b_prev), _dbl(inp.u_prev)
-    fw = chunked_forward(
+    fw = chunked_forward_fused(
         U.double(),
         trans.double(),
         K.double(),
@@ -227,7 +239,7 @@ def _oracle(
         b_prev=b_prev,
         u_prev=u_prev,
     )
-    ref = chunked_backward(
+    ref = chunked_backward_fused(
         _dbl(dy),
         dstate,
         None,

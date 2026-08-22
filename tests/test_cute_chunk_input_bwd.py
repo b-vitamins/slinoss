@@ -30,6 +30,14 @@ kernel that wrote those rows itself fails here rather than double-counting downs
 cotangent. The other half has another producer, so no autograd quantity names this
 one alone and its oracle is the reference backward, which ``test_backward`` holds to
 float64 ``gradcheck``.
+
+The oracle is :func:`slinoss.ops.so3ssd.backward.chunked_backward_fused`, the
+one-tap factorization this kernel implements. The two factorizations agree on every
+operator gradient and disagree on ``dlogp_scan`` field for field: the fused column
+gives ``ls`` a route that does not pass through the log-scale prefix, so mass moves
+off ``dlogp`` and onto ``dls_step``, which
+:func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_backward` supplies. A
+two-tap oracle fails a correct kernel here.
 """
 
 import pytest
@@ -49,7 +57,7 @@ from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import (
     ChunkedBackward,
     chunk_transition_cotangents,
-    chunked_backward,
+    chunked_backward_fused,
     chunked_forward,
 )
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
@@ -265,7 +273,7 @@ def _oracle(
         b_prev=b_prev,
         u_prev=u_prev,
     )
-    ref = chunked_backward(
+    ref = chunked_backward_fused(
         _dbl(dy),
         dstate,
         None,
@@ -335,14 +343,20 @@ def _run(
 # compounding it. ``dchunk_scale`` contracts only the two state buffers.
 #
 #              bfloat16   float16
-# dU           4.509e-3   6.864e-4
+# dU           4.136e-3   4.335e-4
 # carry_u      4.220e-3   1.860e-4
-# dlogp        3.447e-3   2.807e-4
-# dchunk_rot   4.631e-3   3.388e-4
-# dchunk_scale 5.079e-6   1.908e-7
+# dlogp        2.784e-3   2.774e-4
+# dchunk_rot   7.508e-3   2.772e-4
+# dchunk_scale 5.079e-6   2.769e-7
 #
 # Worst measured over every shape and every test in this file, read off a
 # ``--tolerance-report`` run. Every bound below is 1.2 to 2.2 times its figure.
+#
+# The one-tap column moved two of the ten. ``dchunk_rot`` in bfloat16 rose 1.62x, to
+# 7.508e-3 at ``1x1x256/L128/P64/N16``: the fused column is ``Ap + e An``, so the two
+# transitions are summed before the contraction that the two-tap form ran against each
+# of them separately. ``dchunk_scale`` in float16 rose 1.45x, to 2.769e-7. The other
+# eight fell or held.
 # ``dchunk_scale`` is three orders tighter than the rest because it contracts two
 # operands and nothing else and its oracle contracts the same pair, so what is left
 # is the accumulation; its worst case is ``MAX_CHUNK``, the longest one.
@@ -358,16 +372,16 @@ BOUNDS: dict[torch.dtype, dict[str, float]] = {
     torch.bfloat16: {
         "dU": 8e-3,
         "carry_u": 8e-3,
-        "dlogp": 7e-3,
-        "dchunk_rot": 6e-3,
+        "dlogp": 5e-3,
+        "dchunk_rot": 9.5e-3,
         "dchunk_scale": 1e-5,
     },
     torch.float16: {
-        "dU": 1.2e-3,
+        "dU": 8e-4,
         "carry_u": 4e-4,
         "dlogp": 5e-4,
         "dchunk_rot": 4e-4,
-        "dchunk_scale": 3e-7,
+        "dchunk_scale": 4e-7,
     },
 }
 """No bound reaches ``1e-2``, so none needs a justification beyond the measured
@@ -611,12 +625,21 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
 # (L, P, 3N) and the width the shape gets. The wide form is taken where one lane block
 # holds the whole lane extent and refused where the extent is banked across blocks: 3N =
 # 48 is one block at every row count here, 96 and 240 are two and five. The last row is
-# refused for the other reason -- one lane block, but 102,496 B of a 101,376 B carveout,
-# which the narrow form clears at 89,968 B.
+# refused for the other reason -- one lane block, but 103,264 B of a 101,376 B carveout,
+# which the narrow form clears at 90,736 B.
+#
+# ``L=64 P=64 3N=96`` is two blocks and still takes the wide form, through the
+# residency fallback rather than the lane count. The wide arena at a 48-block is
+# 50,528 B and residency two admits 50,176 B, so no candidate is held two deep and
+# :func:`lblock` returns the widest that fits, the whole 96 at 74,080 B, which is one
+# lane block. The one-tap column moved that shape across the cliff: the two-tap form
+# cost 50,016 B at the same block and cleared it by 160 B. 3N = 240 is unaffected --
+# its whole extent needs 129,376 B, so the fallback there returns a 48-block and the
+# width stays narrow.
 WIDTHS: list[tuple[int, int, int, int]] = [
     (64, 48, 48, THREADS_WIDE),
     (MAX_CHUNK, 48, 48, THREADS_WIDE),
-    (64, 64, 96, THREADS),
+    (64, 64, 96, THREADS_WIDE),
     (64, 64, 240, THREADS),
     (MAX_CHUNK, 64, 48, THREADS),
 ]
@@ -646,8 +669,8 @@ def test_the_lane_extent_reaches_the_residency_it_is_chosen_for() -> None:
     :data:`slinoss._cute.SMEM_RESERVED` subtracted already and two blocks pay two.
     Inside that band a narrower block was returned for a residency it does not reach,
     and the lane extent was banked across blocks for nothing. ``L=32 P=80 3N=96`` at
-    four warps is such a shape: 48 costs 50,448 B and runs one block deep, so the
-    contract asks for 96 at 70,416 B, which is one block deep and one lane block.
+    four warps is such a shape: 48 costs 50,896 B and runs one block deep, so the
+    contract asks for 96 at 70,864 B, which is one block deep and one lane block.
     """
     chunk, rows, dim, warps = 32, 80, 96, 4
     lblk = lblock(chunk, rows, dim, warps=warps)
@@ -661,7 +684,7 @@ def test_refuses_a_shape_no_lane_block_fits() -> None:
     """The narrowest block overflowing the carveout is an error, not a return value.
 
     :func:`lblock` promises a block that fits. ``L=16 P=224 3N=48`` has one candidate,
-    48, and it needs 101,616 B of a 101,376 B carveout, so there is nothing to return
+    48, and it needs 102,576 B of a 101,376 B carveout, so there is nothing to return
     and the caller cannot tell a fitting block from an overflowing one by its width.
     """
     with pytest.raises(ValueError, match="no lane block"):
