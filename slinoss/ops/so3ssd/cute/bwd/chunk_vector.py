@@ -272,11 +272,12 @@ one under the same counter passes. Cycles are the invariant; a duration is not.
 Stamp the clock from ``gpc__cycles_elapsed.avg.per_second`` beside any duration.
 
 That percentage is not a traffic problem, and at the shipped width it is not
-instruction supply either. 93,904 B and 154 registers a thread each admit one
+instruction supply either. 95,408 B and 132 registers a thread each admit one
 256-thread block per multiprocessor, ``launch__occupancy_limit_shared_mem`` and
 ``launch__occupancy_limit_registers`` both reading 1: 16.7% theoretical occupancy,
-16.6% achieved, two warps a scheduler. ``mio_throttle`` leads the stalls, issue-active
-is 30.7%, and DRAM runs at 26.6% of peak against tensor at 13.9%. What the launch
+16.5% achieved, two warps a scheduler. After the tap fusion ``barrier`` leads the
+stalls at 17.3% against ``mio_throttle`` at 15.3%, issue-active is 36.4%, and DRAM
+runs at 36.5% of peak against tensor at 10.8%. What the launch
 spends its cycles on is the LSU issue port, which carries 66.80 M warp instructions
 and occupies 48.4% of the port's peak issue rate: read ``l1tex__throughput`` as that
 occupancy and not as a bandwidth, since it measures equal to
