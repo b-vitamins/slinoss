@@ -153,8 +153,10 @@ somewhere above ``D`` 2048. Widening the workload past that needs the class
 revisited, not the floor lowered.
 
 ``chunk_prefix_bwd_kernel`` scans one chunk's transition prefixes once per
-``(batch, head, chunk)`` so that ``chunk_vector_bwd_kernel`` reads them instead of
-rescanning them once per lane tile. Its extent is a scan and not a pass: one warp
+``(batch, head, chunk)`` so that ``chunk_vector_bwd_kernel`` and
+``start_passing_bwd_kernel`` read them instead of rescanning them once per lane tile.
+Two consumers read one workspace, so the launch is hoisted to the host orchestrator
+rather than owned by either. Its extent is a scan and not a pass: one warp
 carries a serial dependence over the chunk's tokens, and the other three warps of the
 block only stage and store. Its traffic does follow the sequence, ``5 * L`` float32 a
 chunk, so the bandwidth reading is the one to state rather than the one to hold it to.

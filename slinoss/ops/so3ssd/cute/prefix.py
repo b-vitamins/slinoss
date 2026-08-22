@@ -7,9 +7,14 @@ Two quantities, one per token of a chunk:
   renormalized once after the scan (I5).
 
 Both are shared by all ``N`` lanes and all ``P`` rows of the chunk, so one warp
-computes them and the block reads them from shared memory. They never cross a
-kernel boundary and never touch global memory: every kernel that needs them,
-forward or backward, recomputes them from ``trans``.
+computes them and the block reads them from shared memory.
+
+They cross no kernel boundary. Three of the kernels that need them recompute them
+from ``trans`` with the scans here; two read them from global instead, written once
+per ``(batch, head, chunk)`` by
+:func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_prefix_bwd_kernel`, because
+they would otherwise be rescanned once per lane band. Either way one chunk's
+prefixes have one value, so no two kernels can disagree about them.
 
 Structure. Lane ``l`` of warp 0 owns ``seg = ceil(L/32)`` consecutive tokens and
 runs them serially, then the lane totals are combined by a shuffle scan of
