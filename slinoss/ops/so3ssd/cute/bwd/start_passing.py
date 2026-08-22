@@ -310,7 +310,7 @@ from slinoss._cute import (
     jit_launch,
     narrow,
     smem_bytes,
-    smem_capacity,
+    smem_residency,
 )
 from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
     gram_tile,
@@ -938,7 +938,7 @@ def start_passing_backward(
         f"start_passing_bwd[L{chunk_size}/P{rows}/span{span}/W{warps}]", budget
     )
     asked = RESIDENT_MAX if resident is None else resident
-    blocks = min(asked, max(1, smem_capacity() // budget))
+    blocks = min(asked, smem_residency(budget))
 
     # dinc leaves this launch and is read by two GEMM kernels that narrow it to the
     # operand width on the way into shared memory, so it is stored at that width
