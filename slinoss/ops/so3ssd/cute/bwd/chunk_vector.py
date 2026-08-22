@@ -2479,6 +2479,33 @@ def _readout_epilogue(
     above one accumulates in float32 instead, because a shard's ``dC`` is a sum over
     the heads it walks and the reference rounds the head sum once.
 
+    The lane sum closes after the two 3x3 products and the tap adjoint, not before.
+    Every term of :func:`tap_matrix_vjp` is degree one in its first argument, and the
+    rest of what it and the products read -- ``stap`` rows 4 to 6, ``strans`` rows 0 to
+    2, and the two transform matrices -- is indexed by ``ts`` alone, hence uniform
+    across a butterfly group and commuting with the sum. ``keep`` is ``ts``-derived and
+    uniform for the same reason, so a shuffle under it cannot diverge. Six outputs cost
+    12 SHFL a warp where nine inputs cost 18: 30 a warp against 36. Measured at
+    acceptance, SHFL 5,425,920 -> 4,872,960, exactly the -552,960 predicted, with
+    ``smsp__inst_executed_pipe_lsu`` and MIO down the same count and global store
+    sectors, shared wavefronts, 140 registers and 16.48% occupancy all unmoved.
+    ``sm__inst_executed`` fell 1,198,080, 2.17x the prediction, because
+    :func:`_sum_over_lanes` spends one FADD with every shuffle: three fewer reduced
+    components delete 12 instructions a warp, not 6. Paired against the two-butterfly
+    form at acceptance on a contended device, four rounds of 400 pairs read -8.704,
+    -8.440, -12.288 and -8.960 us, every interval excluding zero, against same-run null
+    controls of +0.752, 0, 0 and +3.584 us, none of them negative.
+
+    The reassociation is not bitwise and what moves is bounded. ``dB``, ``dC`` and
+    ``carry_b`` are bitwise: none reads ``drs``. ``dtrans[..., 3]`` is bitwise too,
+    because ``dw`` reaches only rows 0 to 2 of ``sdw`` and row 3 rides ``sdls``, and so
+    is the ``t-1`` tap ``dK[..., 0, :]``, which this pass does not write. ``dtrans[...,
+    0:3]`` and ``dK[..., 1, 0:3]`` move, at 5.3e-07 of the field's own magnitude at
+    worst over the acceptance, wide and standard shapes. Under ``--tolerance-report``
+    the 30-row table is unchanged to four figures in every row but one,
+    ``2x2x128/L32/P16/N16/float16`` ``dtrans`` at 1.536e-04 -> 1.537e-04 against a
+    3.0e-04 bound. No bound was widened and no accumulation narrowed.
+
     Args:
         gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, written when ``fold``
             is one.
@@ -2607,24 +2634,27 @@ def _readout_epilogue(
         else:
             if inside:
                 _add_run(bwords, bsfrag, ts + 1, lane, faccs, tuple(dbs))
-        gsum = _sum_over_lanes(gsum)
-        drs = _sum_over_lanes(drs)
-        # The lane sum is what the two 3x3 products take, so they run once a token
-        # rather than once a lane.
-        gsum = mat3_add(gsum, mat3_mul(drs, ant))
+        # Both 3x3 products and the tap adjoint are linear in ``drs``, and every other
+        # operand they take is indexed by ``ts`` alone and so is uniform across the
+        # group. They therefore run on this lane's partial, and one butterfly reduces
+        # their six outputs rather than its nine inputs: 30 SHFL a warp against 36.
+        # The arithmetic count does not move. The block sat under ``lane == 0``, which
+        # every warp enters, so it already issued warp-wide.
+        dtap, dw = tap_matrix_vjp(
+            mat3_mul(act, drs),
+            (stap[4, ts], stap[5, ts], stap[6, ts]),
+            (strans[0, ts], strans[1, ts], strans[2, ts]),
+        )
+        gsum = _sum_over_lanes(mat3_add(gsum, mat3_mul(drs, ant)))
+        taps = _sum_over_lanes(dtap + dw)
         if keep & (lane == 0):
-            dtap, dw = tap_matrix_vjp(
-                mat3_mul(act, drs),
-                (stap[4, ts], stap[5, ts], stap[6, ts]),
-                (strans[0, ts], strans[1, ts], strans[2, ts]),
-            )
             for j in cutlass.range_constexpr(3):
-                sdk[j, ts] += dtap[j]
+                sdk[j, ts] += taps[j]
                 # The tap epilogue's ``t-1`` half is folded in ahead of this pass's own
-                # term, which is the order the single buffer summed in, so no bit moves.
-                # Rows past ``valid`` miss the fold and reach no output: every read of
-                # ``sdw`` past this point is under ``token < valid``.
-                sdw[j, ts] = sdw[j, ts] + sdw2[j, ts] + dw[j]
+                # term, which is the order the single buffer summed in, so no bit moves
+                # in the fold. Rows past ``valid`` miss it and reach no output: every
+                # read of ``sdw`` past this point is under ``token < valid``.
+                sdw[j, ts] = sdw[j, ts] + sdw2[j, ts] + taps[3 + j]
         # One word a lane, a group of words a round, as in :func:`_tap_epilogue`.
         for word in cutlass.range_constexpr(-(-ROW_WORDS // LANE_GROUP)):
             base = word * LANE_GROUP
