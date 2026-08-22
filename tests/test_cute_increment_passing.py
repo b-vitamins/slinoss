@@ -24,11 +24,15 @@ pytest.importorskip("cutlass.cute", reason="CuTe DSL not installed")
 if not torch.cuda.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
 
+from slinoss._cute import smem_residency
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
+from slinoss.ops.so3ssd.cute.fwd import increment_passing
 from slinoss.ops.so3ssd.cute.fwd.increment_passing import (
+    RESIDENT_MAX,
     SPLIT,
     fused_kblock,
+    fused_smem_bytes,
     increment_passing_forward,
 )
 from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K
@@ -312,3 +316,48 @@ def test_slice_is_always_a_whole_number_of_mma_steps(chunk: int) -> None:
     assert kblk % MMA_TILE_K == 0, (chunk, kblk)
     assert chunk % kblk == 0, (chunk, kblk)
     assert kblk >= MMA_TILE_K, (chunk, kblk)
+
+
+# (chunk, rows). One per residency the shipped budget reaches at ``SPLIT``: three
+# blocks at ``L=64``, two at ``L=128``, one at ``L=256``.
+RESIDENCIES = [(64, 48), (64, 64), (128, 48), (256, 48)]
+
+
+@pytest.mark.parametrize(("chunk", "rows"), RESIDENCIES)
+@pytest.mark.parametrize("asked", [None, RESIDENT_MAX + 2])
+def test_the_launch_bound_never_asks_more_blocks_than_shared_memory_holds(
+    monkeypatch: pytest.MonkeyPatch, chunk: int, rows: int, asked: int | None
+) -> None:
+    """The block count the bound asks for is clamped to the shared budget.
+
+    ``min_blocks_per_mp`` caps a thread at ``65536 / (blocks * threads)`` registers
+    whether or not the shared memory admits that many blocks, so a bound above the
+    budget buys no residency and pays the register cap anyway. Measured on sm_86 at
+    ``L=128 P=48 span=48``, where the budget holds two blocks: an unclamped bound of
+    three compiles to 168 registers and spills 147,456 local load and 147,456 local
+    store sectors a launch, against 236 registers and zero at two, and a bound of
+    four to 128 registers and 469,248 local load sectors.
+
+    Both ways in are covered. :data:`RESIDENT_MAX` is a constant a later tiling sweep
+    may raise, and ``resident`` is a caller's number; neither reaches the launch
+    without the clamp.
+
+    The launcher is replaced rather than run, because what is under test is the
+    argument and not the kernel.
+    """
+    captured: list[int] = []
+    monkeypatch.setattr(
+        increment_passing,
+        "jit_launch",
+        lambda fn, dynamic, static: captured.append(static[-1]),
+    )
+    inp = _make(1, 1, 1, chunk, rows, 16, False, False, torch.bfloat16)
+    increment_passing_forward(inp.U, inp.trans, inp.K, inp.B, chunk, resident=asked)
+    kblk = fused_kblock(chunk, rows, SPLIT, inp.U.element_size())
+    held = smem_residency(
+        fused_smem_bytes(chunk, rows, SPLIT, inp.U.element_size(), kblk=kblk)
+    )
+    assert len(captured) == 1, captured
+    # Equality and not an upper bound: a count below the residency caps registers for
+    # a block the SM would have run, which is the same defect in the other direction.
+    assert captured == [min(asked or RESIDENT_MAX, held)], (chunk, rows, held, kblk)
