@@ -57,6 +57,9 @@ from slinoss.ops.so3ssd.cute.mma import (
 )
 from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
+    LANE_PAIR,
+    ROT_RUN,
+    _rot_run,
     build_table,
     stage_chunk,
     stage_matrix,
@@ -637,3 +640,36 @@ def test_shared_memory_budget_fits_the_queried_capacity(
     # which is a two-way conflict on every row.
     unit = SMEM_SEGMENT // 4
     assert (fp32_tile(rows, dim).stride[0] // unit) % 2 == 1
+
+
+def test_the_run_width_divides_the_row_and_never_lengthens_the_pass() -> None:
+    """The width gate is a static decision no shape test reaches.
+
+    A width that does not divide ``lanes`` makes a ragged final run, and a width that
+    costs the pass a step is a regression the parity gate cannot see, so both are
+    checked over every geometry the tree reaches: the two block widths, a full chunk,
+    a half chunk, the one-row residue passes, and every legal ``lanes``.
+
+    The step count is derived from the pass geometry rather than from
+    :func:`_rot_run`'s own expression. On a tie the narrow width wins, since the wide
+    one would take the same step with half the lanes holding work.
+
+    ``lanes`` 6 and 18 are outside the shape contract, which requires a multiple of
+    16. They are here because the gate takes ``lanes`` from the caller and its
+    divisibility guard is otherwise unreachable.
+    """
+    for threads in (128, 256):
+        for span in (1, 32, 64, MAX_CHUNK):
+            for lanes in (*range(16, 256, 16), 6, 18):
+                run = _rot_run(threads, span, lanes)
+                other = ROT_RUN if run == LANE_PAIR else LANE_PAIR
+                where = f"[T{threads}/S{span}/L{lanes}]"
+                assert run in (LANE_PAIR, ROT_RUN), where
+                assert lanes % run == 0, where
+                if lanes % other != 0:
+                    continue
+                steps = -(-(span * (lanes // run)) // threads)
+                rival = -(-(span * (lanes // other)) // threads)
+                assert steps <= rival, where
+                if steps == rival:
+                    assert run == LANE_PAIR, where
