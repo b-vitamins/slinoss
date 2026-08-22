@@ -738,6 +738,65 @@ def increment_passing_fwd_kernel(
         for s in cutlass.range_constexpr(slices):
             lbase = s * kblk
             cute.arch.sync_threads()
+            # The rank-one residue, one row and one column vector at slot ``L-1``. The
+            # reindex that fused the taps has no slot to move that token's now-tap to,
+            # and ``wgt_{L-1}`` is ``exp(0)``, so the row carries no weight and
+            # ``scaled`` is false rather than a multiply by one.
+            #
+            # A ragged tail cancels it instead of needing a case. Slot ``L-1`` of a tail
+            # chunk is a pad token, so ``chunk - 1 < valid`` is false and the helper's
+            # own keep predicate zeroes the row, while ``u`` there is zero for the same
+            # reason; the last real token's residue arrives through slot ``valid`` of
+            # the fused operand below. Confirmed against
+            # :func:`slinoss.ops.so3ssd.reference.chunked_forward_fused`, which forms
+            # the same two terms over a padded chunk and whose explicit residue is
+            # likewise zero there.
+            #
+            # Staged ahead of the operands rather than after the loop. ``sres`` is
+            # outside the arena and the barrier above already published ``stable``, so
+            # the position is legal, and the residue's global load then covers under the
+            # operand staging and the contraction instead of standing in front of the
+            # arena's write-after-read barrier, whose stall is 32.28% of this kernel's
+            # ``barrier`` class. Measured on sm_86, paired, 320 pairs a shape, bitwise
+            # identical at every one: -9.73 us at ``B=4 H=18 T=2048 P=64 N=80 L=64``,
+            # -2.56 at ``B=4 H=12 T=2048 P=48 N=16``, -1.02 at ``P=64 N=32``, -3.07 at
+            # the ragged shape, and +0.00 unresolved at the one-head shape. ``L=128``,
+            # where the guard below sends the residue back, reads -0.01 in the same loop
+            # and is the null control on the instrument.
+            #
+            # Only at one slice. At more than one the same move costs time and the
+            # counters do not say why: measured at ``L=128``, four slices, it is +5.12 us
+            # on the last slice and +4.61 on the first, while registers fall 236 to 216
+            # with no spill either side and both ``barrier`` and ``long_scoreboard`` fall
+            # -- neither a register nor a stall effect, so the position stays where it
+            # was measured to belong.
+            #
+            # ``TABLE_AN`` is read whatever ``fused`` selects: the flag chooses the
+            # first column and ``An`` is a second one. Converting the last unfused
+            # caller in the tree retires the flag, not the ``An`` column, which this
+            # read needs.
+            if cutlass.const_expr(slices == 1) and tid < reswarps:
+                stage_rotated(
+                    band,
+                    bandprev,
+                    sres,
+                    stable,
+                    swgt,
+                    bidx,
+                    gidx,
+                    t0,
+                    last,
+                    valid,
+                    tid,
+                    TABLE_AN,
+                    0,
+                    threads,
+                    1,
+                    lanes,
+                    has_prev,
+                    False,
+                    pitch=TABLE_PITCH,
+                )
             stage_shifted(
                 gu,
                 guprev,
@@ -787,28 +846,10 @@ def increment_passing_fwd_kernel(
             cute.arch.sync_threads()
             mma_gemm(tiled_mma, tid, acc, va_prv, vbfuse, False, False)
 
-        # The rank-one residue, one row and one column vector at slot ``L-1``. The
-        # reindex that fused the taps has no slot to move that token's now-tap to, and
-        # ``wgt_{L-1}`` is ``exp(0)``, so the row carries no weight and ``scaled`` is
-        # false rather than a multiply by one.
-        #
-        # A ragged tail cancels it instead of needing a case. Slot ``L-1`` of a tail
-        # chunk is a pad token, so ``chunk - 1 < valid`` is false and the helper's own
-        # keep predicate zeroes the row, while ``u`` there is zero for the same reason;
-        # the last real token's residue arrives through slot ``valid`` of the fused
-        # operand above. Confirmed against
-        # :func:`slinoss.ops.so3ssd.reference.chunked_forward_fused`, which forms the
-        # same two terms over a padded chunk and whose explicit residue is likewise
-        # zero there.
-        #
+        # The same residue at more than one slice, in the position the measurement kept.
         # Written before the barrier below and read after the next one, so the store's
-        # own pair publishes it and the residue adds no barrier. It is outside the
-        # arena, so that store cannot reach it.
-        #
-        # ``TABLE_AN`` is read whatever ``fused`` selects: the flag chooses the first
-        # column and ``An`` is a second one. Converting the last unfused caller in the
-        # tree retires the flag, not the ``An`` column, which this read needs.
-        if tid < reswarps:
+        # own pair publishes it and the residue adds no barrier of its own.
+        if cutlass.const_expr(slices > 1) and tid < reswarps:
             stage_rotated(
                 band,
                 bandprev,
