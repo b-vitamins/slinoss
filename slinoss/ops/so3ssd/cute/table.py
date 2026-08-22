@@ -141,7 +141,13 @@ follow: acceptance moves 4.1 us of 577 and resolves in no rep of four. The
 residual is service time for a working set that does not fit, not an issue order
 the scheduler had left uncovered. Register pressure is not the refusal either --
 ``standard`` runs at 220 registers with 35 spare and no spill, and converts least
-of the three."""
+of the three.
+
+Divided by the run, not a fixed count of loads. A flat pass at :func:`_flat_run` width
+reaches one step in flight, and restoring two there is a regression at equal registers:
+what covers a latency is the elements the group holds, and the wide access already
+holds them. A stall share does not price it either way, since deleting instructions
+shrinks the denominator every share is taken over."""
 
 TABLE_QUAD: int = SMEM_SEGMENT // 4
 """Float32 words in one 16-byte shared-memory segment."""
@@ -623,6 +629,37 @@ def _segment_run(itemsize: int, width: int) -> int:
     return run
 
 
+def _flat_run(itemsize: int, threads: int, rows: int, width: int) -> int:
+    """The run width a flat ``(rows, width)`` copy uses at one geometry.
+
+    :func:`_segment_run` bounds a run to one segment; this narrows it to the point
+    where narrowing starts costing steps, which is :func:`_rot_run`'s second condition
+    without its first. A flat copy applies nothing across a run, so unlike
+    :func:`stage_rotated` there is no run-wide transform for a ragged tail to repeat,
+    and the only reason to prefer the narrow width at an equal step count is that its
+    thread-to-element map leaves no idle lanes.
+
+    Args:
+        itemsize: Bytes per element at the wider of the two ends. A run must sit inside
+            one segment at both, and only the wider end binds.
+        threads: Block width.
+        rows: Rows the pass fills.
+        width: Elements a row carries.
+
+    Returns:
+        The narrowest run attaining the fewest steps, a divisor of ``width``, at least
+        :data:`LANE_PAIR` wherever ``width`` is even.
+    """
+    run = _segment_run(itemsize, width)
+    steps = -(-(rows * (width // run)) // threads)
+    while run > LANE_PAIR:
+        half = run // 2
+        if -(-(rows * (width // half)) // threads) > steps:
+            break
+        run = half
+    return run
+
+
 def _wide_row(row: cute.Tensor, run: cutlass.Constexpr) -> cute.Tensor:
     """View one contiguous row in units of ``run`` adjacent elements.
 
@@ -1052,11 +1089,11 @@ def stage_shifted(
     touched: they are the caller's business, through :func:`stage_pad`, because
     they never change and a per-slice restage would rewrite the same zeros.
 
-    The pass runs in groups of ``PREFETCH // LANE_PAIR`` steps, loads first, on
-    clamped indices with a select afterwards, for the reason given in
-    :func:`stage_rotated`. This is the longest staging pass in the operator:
-    ``(span + 1) * width`` elements at :data:`LANE_PAIR` elements per thread per
-    step, which is one read and one write per step at either end.
+    The pass runs in groups of ``PREFETCH // run`` steps, loads first, on clamped
+    indices with a select afterwards, for the reason given in :func:`stage_rotated`.
+    This is the longest staging pass in the operator: ``(span + 1) * width`` elements
+    at :func:`_flat_run` elements per thread per step, which is one read and one write
+    per step at either end.
 
     Args:
         gu: ``(B,H,T,P)`` operand-dtype source.
@@ -1075,31 +1112,40 @@ def stage_shifted(
         has_prev: Whether ``guprev`` was supplied. Compile-time.
 
     Invariants:
-        ``width`` is ``P`` or a lane tile of ``3N``, so it is even:
+        Nothing is applied across a run: the shift is a row index and the zero-fill a
+        per-element select, so the run width is free and :func:`_flat_run` takes it,
+        as it is in :func:`stage_raw` over the same geometry. The 3-vector store
+        :data:`LANE_PAIR` argues from and the twelve-component run :data:`ROT_RUN`
+        argues from are both absent here.
+
+        ``width`` is ``P`` or a lane tile of ``3N``, so it is a multiple of 8:
         :func:`slinoss.ops.so3ssd.cute.guard.check_rows` holds ``P`` to a multiple of
-        16 and a lane tile is a multiple of 48. ``su`` is pitched by
-        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`, which is what
-        :data:`LANE_PAIR` rests on. The pair predicate is reachable where the element
-        predicate was not: pairing halves the extent, so an extent that was a
-        multiple of the block width need not stay one.
+        16 and a lane tile is a multiple of 48. A global row is therefore a whole
+        number of 16-byte segments, and ``su`` is pitched by
+        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`, an odd multiple of one, so
+        both ends of a run access are aligned to it at every width the helper returns.
+
+        The run predicate is reachable where the element predicate was not: widening
+        divides the extent, so an extent that was a multiple of the block width need
+        not stay one.
     """
     src = gu.element_type
     zero = cutlass.Float32(0.0)
-    pairs = width // LANE_PAIR
-    total = (span + 1) * pairs
+    wide = max(src.width, su.element_type.width) // 8
+    run = _flat_run(wide, threads, span + 1, width)
+    runs = width // run
+    total = (span + 1) * runs
     steps = -(-total // threads)
     exact = total % threads == 0
-    depth = max(1, PREFETCH // LANE_PAIR)
+    depth = max(1, PREFETCH // run)
 
-    words = paired(su)
-    frag = cute.make_fragment((1, LANE_PAIR), su.element_type)
-    loads = cute.make_fragment((depth, LANE_PAIR), src)
+    words = paired(su, run)
+    frag = cute.make_fragment((1, run), su.element_type)
+    loads = cute.make_fragment((depth, run), src)
     # The false arm aliases the current fragment, which is never read under it: every
     # use of the carry fragment sits under the same compile-time flag.
     prior = (
-        cute.make_fragment((depth, LANE_PAIR), src)
-        if cutlass.const_expr(has_prev)
-        else loads
+        cute.make_fragment((depth, run), src) if cutlass.const_expr(has_prev) else loads
     )
 
     for group in cutlass.range_constexpr(-(-steps // depth)):
@@ -1109,16 +1155,16 @@ def stage_shifted(
             i = tid + (group * depth + step) * threads
             if cutlass.const_expr(not exact):
                 i = cutlass.min(i, total - 1)
-            r = i // pairs
-            p = i - r * pairs
+            r = i // runs
+            p = i - r * runs
             token = lbase + r - 1
             # token < valid implies t0 + token < seqlen, so clamping the token
             # bounds the read above; the row before the sequence bounds it below.
             gbase = t0 + cutlass.min(token, valid - 1)
-            row = _paired_row(gu[bidx, hidx, cutlass.max(gbase, 0), None])
+            row = _paired_row(gu[bidx, hidx, cutlass.max(gbase, 0), None], run)
             cute.autovec_copy(row[(None, p)], loads[(step, None)])
             if cutlass.const_expr(has_prev):
-                back = _paired_row(guprev[bidx, hidx, None])
+                back = _paired_row(guprev[bidx, hidx, None], run)
                 cute.autovec_copy(back[(None, p)], prior[(step, None)])
             keep = token < valid
             if cutlass.const_expr(not has_prev):
@@ -1129,11 +1175,11 @@ def stage_shifted(
             r, p, keep, at_start = held[step]
             # The select is float32 because there is one select helper; the
             # operand round trip through float32 is exact at every operand width.
-            got = tuple(widen(loads[step, j], src) for j in range(LANE_PAIR))
+            got = tuple(widen(loads[step, j], src) for j in range(run))
             if cutlass.const_expr(has_prev):
                 got = tuple(
                     select(at_start, widen(prior[step, j], src), got[j])
-                    for j in range(LANE_PAIR)
+                    for j in range(run)
                 )
             out = tuple(select(keep, value, zero) for value in got)
             if cutlass.const_expr(exact):
@@ -1199,9 +1245,10 @@ def stage_state(
     overlap: this is the largest single read in the operator and a serial
     step-by-step form pays one global latency per element per thread.
 
-    A step carries :data:`LANE_PAIR` adjacent columns, which is one read and one write
-    of the pair's width in place of two of each. The port issues one access per two
-    cycles whatever its width, so the pair halves the cost of the pass.
+    A step carries :func:`_flat_run` adjacent columns, which is one read and one write
+    of the run's width in place of one of each per element. The port issues one access
+    per two cycles whatever its width, so the run divides the cost of the pass by its
+    own length.
 
     Args:
         gz: ``(P, 3N)`` view of the chunk-start state for one
@@ -1214,21 +1261,25 @@ def stage_state(
         dim: ``3N``. Compile-time.
 
     Invariants:
-        ``dim`` is a multiple of 48 or a lane tile of one, so it is even, and ``sz`` is
-        pitched by :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`: both ends of a pair
-        access are aligned to :data:`LANE_PAIR` elements. Each element is narrowed on
-        its own, so the pair does not associate anything.
+        ``dim`` is a multiple of 48 or a lane tile of one, so it is a multiple of 8,
+        and ``sz`` is pitched by
+        :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`: both ends of a run access are
+        aligned to it at every width :func:`_flat_run` returns, the source bound by
+        the wider of the two element types. Each element is narrowed on its own, so
+        the run does not associate anything.
     """
     src = gz.element_type
-    pairs = dim // LANE_PAIR
-    total = width * pairs
+    wide = max(src.width, sz.element_type.width) // 8
+    run = _flat_run(wide, threads, width, dim)
+    runs = dim // run
+    total = width * runs
     steps = -(-total // threads)
     exact = total % threads == 0
-    depth = max(1, PREFETCH // LANE_PAIR)
+    depth = max(1, PREFETCH // run)
 
-    words = paired(sz)
-    frag = cute.make_fragment((1, LANE_PAIR), sz.element_type)
-    loads = cute.make_fragment((depth, LANE_PAIR), src)
+    words = paired(sz, run)
+    frag = cute.make_fragment((1, run), sz.element_type)
+    loads = cute.make_fragment((depth, run), src)
 
     for group in cutlass.range_constexpr(-(-steps // depth)):
         count = min(depth, steps - group * depth)
@@ -1237,16 +1288,16 @@ def stage_state(
             i = tid + (group * depth + step) * threads
             if cutlass.const_expr(not exact):
                 i = cutlass.min(i, total - 1)
-            p = i // pairs
-            col = i - p * pairs
+            p = i // runs
+            col = i - p * runs
             cute.autovec_copy(
-                _paired_row(gz[p, None])[(None, col)], loads[(step, None)]
+                _paired_row(gz[p, None], run)[(None, col)], loads[(step, None)]
             )
             held.append((p, col))
 
         for step in cutlass.range_constexpr(count):
             p, col = held[step]
-            out = tuple(loads[step, j] for j in range(LANE_PAIR))
+            out = tuple(loads[step, j] for j in range(run))
             if cutlass.const_expr(exact):
                 _store_run(words, frag, p, col, out)
             else:
