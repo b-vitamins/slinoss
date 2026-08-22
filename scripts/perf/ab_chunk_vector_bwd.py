@@ -8,7 +8,8 @@ than the launch order is worth.
 ``--census`` collects :data:`slinoss.perf.ncu.SOURCE_TABLE` and reads its source
 page at instruction granularity. Address is the only unambiguous key on a CuTe DSL
 kernel, so the site map is keyed by it and the line number beside it is the block's,
-not a file's.
+not a file's. It prints the opcode census, then the barrier-phase partition, then
+the site map ranked per stall reason.
 
 ``--pair`` measures two host wrappers in one
 :func:`slinoss.perf.timing.measure_paired` loop over one allocated input set, and
@@ -410,6 +411,79 @@ def print_opcodes(sites: Sequence[Site], launches: int) -> None:
         )
 
 
+def print_phases(sites: Sequence[Site], launches: int, reason: str) -> None:
+    """Partition the site map by block-wide barrier and print each phase.
+
+    A ``BAR.SYNC`` closes the region that ends at it, so phase ``k`` is every
+    instruction from barrier ``k-1`` to barrier ``k`` in address order, the barrier
+    included, and the last phase is whatever follows the last barrier.
+
+    The sites must be sorted by address first: the source page is ordered by line
+    number and one ``.file`` covers the whole module, so page order interleaves every
+    traced file and puts a helper's body thousands of lines away from its call site.
+    Address order is the binary's own, which is what a barrier delimits.
+
+    This is the instrument a barrier arm needs and the stall share is not. A stall
+    fraction says how long the warps that reached a barrier waited; the sample share
+    says what fraction of the launch the phase behind it holds, which is what a
+    deletion or a redistribution is priced against.
+
+    Args:
+        sites: Every instruction of the window.
+        launches: Launches in the window, the divisor onto a per-launch footing.
+        reason: Stall reason to carry per phase.
+    """
+    for kernel in sorted({one.kernel for one in sites}):
+        held = sorted(
+            (one for one in sites if one.kernel == kernel),
+            key=lambda one: int(one.address, 16),
+        )
+        if sum(1 for one in held if one.opcode == "BAR") < 2:
+            continue
+        phases: list[list[Site]] = [[]]
+        for one in held:
+            phases[-1].append(one)
+            if one.opcode == "BAR":
+                phases.append([])
+        if not phases[-1]:
+            phases.pop()
+        inst = sum(one.inst_count for one in held)
+        samples = sum(one.sample_count for one in held)
+        stalled = sum(one.stall_samples.get(reason, 0) for one in held)
+        print(f"phases       {kernel}  {len(phases)} regions, {reason}")
+        print(
+            f"  ph  first address   sites   bar line  "
+            f"inst/launch   inst%     samples  samp%  {reason}%  of ph%  top opcodes"
+        )
+        for index, phase in enumerate(phases, start=1):
+            counted = sum(one.inst_count for one in phase)
+            sampled = sum(one.sample_count for one in phase)
+            waited = sum(one.stall_samples.get(reason, 0) for one in phase)
+            closes = phase[-1].line if phase[-1].opcode == "BAR" else 0
+            ranked: dict[str, int] = {}
+            for one in phase:
+                ranked[one.opcode] = ranked.get(one.opcode, 0) + one.inst_count
+            top = " ".join(
+                f"{code}:{100.0 * count / max(counted, 1):.0f}"
+                for code, count in sorted(ranked.items(), key=lambda kv: -kv[1])[:5]
+            )
+            print(
+                f"  {index:2d}  {phase[0].address} {len(phase):6d} {closes:9d} "
+                f"{counted / launches:12,.0f} "
+                f"{100.0 * counted / inst:6.2f} "
+                f"{sampled:11,d} "
+                f"{100.0 * sampled / max(samples, 1):6.2f} "
+                f"{100.0 * waited / max(stalled, 1):7.2f} "
+                f"{100.0 * waited / max(sampled, 1):7.2f}  {top}"
+            )
+        print(
+            f"  total                {len(held):6d}           "
+            f"{inst / launches:12,.0f} "
+            f"{100.0:6.2f} {samples:11,d} {100.0:6.2f} {100.0:7.2f} "
+            f"{100.0 * stalled / max(samples, 1):7.2f}"
+        )
+
+
 def print_sites(sites: Sequence[Site], reason: str, top: int, launches: int) -> None:
     """Print the site map, ranked by one stall reason's not-issued samples.
 
@@ -509,6 +583,7 @@ def run_census(args: argparse.Namespace, device: torch.device) -> int:
     print(f"report       {written}")
     print(f"kernels      {kernels}")
     print_opcodes(sites, args.iters)
+    print_phases(sites, args.iters, "barrier")
     for one in reasons:
         print_sites(sites, one, args.top, args.iters)
     return 0
