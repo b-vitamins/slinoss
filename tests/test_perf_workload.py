@@ -121,6 +121,30 @@ def test_standard_shapes_satisfy_the_operator_constraints() -> None:
         shape_by_name("huge")
 
 
+def test_every_standard_chunk_fits_the_backward_shared_budget() -> None:
+    # A declared chunk the operator cannot allocate is not a slow shape, it is a
+    # raise: every caller reading shape.chunk and dispatching to CuTe fails at that
+    # name. `long` shipped chunk=128, which needs 142,736 B against 101,376.
+    pytest.importorskip("cutlass.cute", reason="CuTe DSL not installed")
+    from slinoss._cute import smem_capacity
+    from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
+        vblock,
+        vector_smem_bytes,
+        vector_splits,
+    )
+    from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE, mma_atoms
+
+    capacity = smem_capacity()
+    wgroups = mma_atoms(WARPS_WIDE)[1]
+    for shape in SHAPES:
+        fold = shape.heads // shape.groups // vector_splits(shape.heads // shape.groups)
+        span = vblock(shape.chunk, shape.rows, shape.d_state, fold, 2, wgroups)
+        need = vector_smem_bytes(
+            shape.chunk, shape.rows, shape.d_state, fold, span, 2, wgroups
+        )
+        assert need <= capacity, f"{shape.name} needs {need} B of {capacity}"
+
+
 def test_the_acceptance_shape_is_the_layer_the_whole_step_is_attributed_at() -> None:
     # The attribution driver's defaults and this shape are one geometry stated
     # twice; a drift between them would report a sweep at widths the headline

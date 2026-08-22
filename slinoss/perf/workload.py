@@ -176,7 +176,7 @@ SHAPES: Final[tuple[OpShape, ...]] = (
         "standard", bsz=4, heads=12, seq=2048, rows=48, lanes=16, chunk=64, groups=12
     ),
     OpShape("wide", bsz=4, heads=12, seq=2048, rows=64, lanes=32, chunk=64, groups=12),
-    OpShape("long", bsz=2, heads=12, seq=8192, rows=48, lanes=16, chunk=128, groups=12),
+    OpShape("long", bsz=2, heads=12, seq=8192, rows=48, lanes=16, chunk=64, groups=12),
     OpShape(
         "ragged", bsz=4, heads=12, seq=2004, rows=48, lanes=16, chunk=64, groups=12
     ),
@@ -195,7 +195,14 @@ defaults to -- ``d_model 576``, ``expand 2``, so ``H*P`` is 1,152 -- and it take
 ``G = 1``, which is the configuration default and the one that shares ``B`` and
 ``C`` across all eighteen heads. It is the only name whose fold ``H // G`` is above
 one, so it is the only one that reaches the cross-head reduction in
-:mod:`slinoss.ops.so3ssd.cute.bwd.chunk_vector`."""
+:mod:`slinoss.ops.so3ssd.cute.bwd.chunk_vector`.
+
+``long`` varies the sequence length, not the chunk. It carried ``chunk=128`` and
+that geometry does not run: ``chunk_vector_bwd`` needs 142,736 B of shared at
+``L128/P48/3N48`` against a 101,376 B capacity, so every caller reading
+``shape.chunk`` and dispatching to the CuTe backend raised. ``chunk=64`` needs
+92,816 B. Every chunk here must clear
+:func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.vector_smem_bytes`."""
 
 
 def shape_by_name(name: str) -> OpShape:
