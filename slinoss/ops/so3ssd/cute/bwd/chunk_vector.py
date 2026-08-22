@@ -2472,7 +2472,8 @@ def _readout_epilogue(
     and this pass walks the chunk, so at ``L`` above the run it is the wrong rows;
     accumulating the term in the run's own pass instead needs an ``L`` by lane-tile
     float32 accumulator, which is 13,312 B against a 7,456 B gap. The read is 6,144 B
-    per head, chunk and lane tile, on a launch whose class is the register file.
+    per head, chunk and lane tile, on a launch whose limiter is shared capacity, so the
+    accumulator is the expensive half of that trade and the read is the cheap one.
 
     One head writes its shard's ``dC`` row in the destination's own dtype. A fold
     above one accumulates in float32 instead, because a shard's ``dC`` is a sum over
