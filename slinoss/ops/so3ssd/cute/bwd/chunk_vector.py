@@ -3266,6 +3266,30 @@ def chunk_vector_bwd_kernel(
         # the staging publishes it.
         if cutlass.const_expr(fold > 1):
             cute.arch.sync_threads()
+        # Issued here and waited three barriers down. Neither pass reads the transform
+        # table, so neither has to follow the build, and both go global to shared with
+        # no register in between: the barrier above is the write-after-read fence their
+        # destinations need, nothing between here and the wait reads either tile, and
+        # the build plus the two barriers under it are the cover their runs get.
+        stage_shifted(
+            gdy,
+            gdy,
+            sdy,
+            bidx,
+            hidx,
+            t0,
+            1,
+            valid,
+            tid,
+            threads,
+            mpad - 1,
+            rows,
+            False,
+            True,
+        )
+        stage_state(
+            gzj[bidx, hidx, cidx, None, None], sstate, tid, threads, rows, tile, True
+        )
         stage_chunk(
             gtrans[bidx, hidx, None, None],
             gtap[bidx, hidx, None, None, None],
@@ -3311,11 +3335,10 @@ def chunk_vector_bwd_kernel(
         aclast = _mat_at(stable, TABLE_AC, last)
         lplast = slp[last]
 
-        # Three staging passes back to back, so their global loads overlap rather
-        # than serializing. The readout basis is the M mode of two GEMMs and the K
-        # mode of a third, so it is staged once; ``slp`` is passed as its scale tile
-        # and left unread, the per-token exponential belonging to the offset term
-        # alone.
+        # The readout basis is the M mode of two GEMMs and the K mode of a third, so it
+        # is staged once; ``slp`` is passed as its scale tile and left unread, the
+        # per-token exponential belonging to the offset term alone. This pass reads the
+        # table, so it is the one staging pass that cannot precede the build.
         stage_rotated(
             gcj,
             gcj,
@@ -3336,29 +3359,10 @@ def chunk_vector_bwd_kernel(
             False,
             False,
         )
-        stage_shifted(
-            gdy,
-            gdy,
-            sdy,
-            bidx,
-            hidx,
-            t0,
-            1,
-            valid,
-            tid,
-            threads,
-            mpad - 1,
-            rows,
-            False,
-            True,
-        )
-        stage_state(
-            gzj[bidx, hidx, cidx, None, None], sstate, tid, threads, rows, tile, True
-        )
-        # Both passes above issue global to shared without a register in between, so
-        # their runs are in flight here and the wait is what makes them this thread's.
-        # One wait for the pair: the second pass's issues are the first's cover, which
-        # the register form got from ordering its loads ahead of its stores instead.
+        # One wait for all three groups. The two hoisted passes have had the table build
+        # and its barriers under them, so their runs are in flight or retired by here;
+        # this one has only its own issues, and the wait is what makes every run this
+        # thread's.
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
