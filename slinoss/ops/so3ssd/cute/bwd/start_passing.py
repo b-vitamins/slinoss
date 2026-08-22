@@ -36,6 +36,10 @@ Traffic at ``B=4 H=18 T=2048 P=64 3N=240 L=64``, ``G=1``, five bands, against th
     dz0      4*18*64*240*4     =   4.42 MB written
                                  185.56 MB
 
+The ``trans`` line is the rescanning arm's. The shipped arm reads the prefixes
+instead and reads no transitions at all, so it moves 173.77 MB and 14.75 MB of
+prefix records in their place. See the prefix source below.
+
 ``dinc`` is written at the operand width, not float32. Its two consumers narrow it
 to that width on the way into shared memory whatever it arrives at, so the store
 here is the same rounding two launches earlier; ``dz0`` is a gradient of ``z0`` and
@@ -156,8 +160,8 @@ Prefix source. So the scan goes instead of the wait.
 :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_prefix_bwd_kernel` writes both
 prefixes to global once per ``(batch, head, chunk)``, and
 :func:`slinoss.ops.so3ssd.cute.bwd.chunk_start.start_loaded` reads ``5 * L`` words of
-them alongside the transition staging rather than rescanning: one barrier where the
-scan needed two, and no warp-serial region between them. ``scanned`` keeps the rescan
+them in the staging pass rather than rescanning: one barrier where the scan needed
+two, and no warp-serial region between them. ``scanned`` keeps the rescan
 reachable and the two are asserted bitwise equal, the global tensors holding the
 output of the same :func:`slinoss.ops.so3ssd.cute.prefix.chunk_prefixes` code
 including its renormalization. The producer is not new work: it already runs ahead of
@@ -165,75 +169,104 @@ including its renormalization. The producer is not new work: it already runs ahe
 :func:`slinoss.ops.so3ssd.cute.backward.so3ssd_bwd_cute` hoists that one launch
 rather than adding a second.
 
-What that buys depends on ``P``, and the arm regresses at ``P`` 48. Measured on sm_86,
-the read against the rescan, 300 order-swapped pairs a shape in one process, medians,
-launch-order position estimated from the two parities and removed, coverage 95.69%:
+The transitions go with the scan. ``strans`` is the scan's operand and nothing
+else's: :func:`slinoss.ops.so3ssd.cute.table.build_table` at ``mats == 1`` composes
+``Ac`` from the quaternion prefix alone, and neither :func:`start_chunk` nor the chunk
+loop below reads that tile. So the read arm stages ``4 * L`` fewer float32 a chunk a
+block than the rescan rather than ``5 * L`` more, and at the acceptance geometry it
+reads no transitions at all.
 
-    shape        P   3N  bands  blocks   regs    lim  delta us        interval     pos
-    tiny        16   48      1       1  56->55  4->4    0.000  [ 0.00,  0.03]   -1.02
-    standard    48   48      1      48  69->67  3->3   +3.072  [ 3.07,  3.20]   +0.00
-    ragged      48   48      1      48  69->67  3->3   +2.584  [ 2.47,  3.56]   -2.54
-    long        48   48      1      24  87->80  2->2    0.000  [ 0.00,  0.00]   +0.00
-    wide        64   96      2      96  68->64  3->4   -7.680  [-8.70, -7.68]   -0.51
-    acceptance  64  240      5     360  68->64  3->4  -23.552  [-23.6, -23.6]   +0.00
+Measured on sm_86, the read against the rescan, 1000 order-swapped pairs a shape,
+medians, launch-order position estimated from the two parities and removed, coverage
+95.37%, two reps a row. ``null`` is the widest of a read-against-read and a
+rescan-against-rescan control run in the same session at the same shape:
 
-``lim`` is ``launch__occupancy_limit_registers``. ``tiny`` and ``long`` do not resolve;
-the other four do, on a device measured at 0-9% utilization, since a co-tenant moves
-absolute duration and blows the launch-order term.
+    shape        P   3N  bands  blocks   rep0 us   rep1 us  delta pct     null
+    tiny        16   48      1       1    -2.048     +0.512  -15.4/+0.7   0.000
+    standard    48   48      1      48   -10.752    -10.184  -11.3       +0.512
+    ragged      48   48      1      48    -9.776    -10.240  -11.0       -0.512
+    long        48   48      1      24   -28.672    -30.208  -12.6       -0.512
+    wide        64   96      2      96   -11.264    -12.288   -9.0       -0.512
+    acceptance  64  240      5     360   -25.088    -26.112   -8.5       +0.512
+    P80 probe   80   48      1      48   -11.832    -10.752   -9.3       -0.512
 
-The sign follows ``P``, and neither the band count nor the machine fill is what sets
-it. Three added geometries hold each candidate fixed while ``P`` moves, all at
-``L=64``, ``G=H`` and 21,760 shared bytes:
+Every row but ``tiny`` resolves in both reps, agrees within 1.536 us across them, and
+no null control leaves one timer granule. ``tiny`` is one block and 13 us, both
+readings are within two granules of zero, and they disagree in sign: the arm is not
+measurable at that shape and is reported as such. Utilization from co-tenants ran
+0-100% through the session, which is why every row carries its own two controls run
+back to back with it rather than a quiet-device claim.
 
-    probe               P   3N  bands  blocks   regs    lim  delta us   delta pct
-    B8 H12 N16 (fill)  48   48      1      96  69->67  3->3   +1.072      +0.902
-    B1 H12 N32 (band)  48   96      2      24  71->69  3->3   +0.512      +0.568
-    B4 H12 N16 (P64)   64   48      1      48  64->64  4->4   -5.120      -5.435
-
-``fill`` regresses with 96 blocks over 84 SMs, so machine fill is not it. ``band``
-regresses with two bands sharing every record, so amortization is not it. ``P64`` wins
-with both arms at 64 registers and both at the same occupancy limit, so the residency
-step is not it either: the arm wins where nothing about the occupancy changed.
+Staging them anyway is what made the arm regress at one band, and the reading that
+regression got is worth recording because it was wrong twice. It read +2.096 us at
+``standard`` and +7.9 at the ``P`` 80 probe with the staging left in, which no
+computed predicate separates from the wins: the sign followed neither the band count
+(a two-band probe regressed) nor the machine fill (a 96-block probe regressed) nor
+the exact fill of the M mode (a ``P`` 32 probe won at ``mma_rows`` 64, the same tile
+``P`` 48 pads into), and the residency step it correlates with cannot be the
+mechanism at 48 blocks over 84 multiprocessors, where achieved
+``sm__warps_active.avg.pct_of_peak`` is 16.66% in both arms and no residency limit
+binds. Ordered by ``P`` the sign alternates, which is a lookup and not a rule.
 
 The residency step is real but secondary. Forcing the read arm back to three blocks
 with a dead shared allocation, at unchanged geometry, registers and instruction count,
-splits the acceptance win: the read still beats the rescan by 16.896 us [-16.90,
--16.90] at three blocks against three, and the fourth block is the remaining 4.888 us.
-Those sum to 21.784 against a 21.720 us total, 0.064 us apart, and the null control --
-the rescan arm with and without the same dead allocation -- reads 0.512 us, one timer
-granule. So 78% of that shape's win is the deleted serial region and 22% is the block,
-and a fourth block on this kernel is a gain, not the loss a residency sweep of the
-rescanning form reported.
+splits the acceptance win of the form that still staged the transitions: the read
+still beat the rescan by 16.896 us [-16.90, -16.90] at three blocks against three,
+and the fourth block was the remaining 4.888 us. Those sum to 21.784 against a
+21.720 us total, 0.064 us apart, and the null control -- the rescan arm with and
+without the same dead allocation -- read 0.512 us, one timer granule. So 78% of that
+shape's win was the deleted serial region and 22% the block, and a fourth block on
+this kernel is a gain, not the loss a residency sweep of the rescanning form reported.
+That 22% is not what the shipped arm rests on: widening
+:func:`slinoss.ops.so3ssd.cute.table.stage_rotated`'s run put both arms at 64
+registers and four blocks at ``acceptance``, so the register difference is gone there,
+and the paired win is a granule larger than it was with the step present.
 
 The workspace read is at its floor. Its footprint is ``5 * L`` float32 a chunk, 1.97 MB
 a launch at ``P`` 48 and 2.95 MB at acceptance. Counted by difference against the
 rescan, the read is 3 requests and 40 sectors a chunk a block at ``L=64`` and 5 and 80
 at ``L=128``, which is 1,280 B and 2,560 B of sectors for 1,280 B and 2,560 B of
-payload: over-fetch is zero and no rearrangement can lower it. At one band the DRAM
-read rises by the payload exactly, 1.96 MB of 1.97 and 3.91 of 3.93, because nothing
-reuses a record; at acceptance it rises 4.00 MB against 14.75 MB requested, so L2
-supplies 73% there. Running the producer inside both arms, as the tree does, leaves the
-one-band regression where it was, so it is not a cold-workspace artifact of timing the
-consumer alone.
+payload: over-fetch is zero and no rearrangement can lower it. What it replaces was
+not at its floor. :func:`slinoss.ops.so3ssd.cute.table.stage_trans` reads a
+token-major ``(T,4)`` row one component at a time and costs 128 sectors a chunk a
+block for 1,024 B of payload, a fourfold over-fetch, so the two do not trade byte for
+byte: global load sectors fall 135,168 a launch at ``standard``, 1.479 M to 1.344 M,
+where the payload counts predict a rise of 12,288.
 
-What remains at ``P`` 48 is the read's exposed latency and a barrier the block waits on
-longer for it. Deleting the scan cuts the barrier stall 31.4% at ``P`` 64, 17.02 M to
-11.68 M warp-cycles, against a long_scoreboard rise of 0.65 M; at ``P`` 48 the barrier
-does not fall at all, 16.29 M to 17.22 M, and long_scoreboard rises 1.36 M for the same
-three requests. Spill is 0 local sectors in all four arms and ``sm__cycles_active``
-tracks the paired result, 86,776 to 88,861 at ``P`` 48 and 86,865 to 80,970 at ``P``
-64. The only work available to cover a ``5 * L`` word read is the two ``stage_pad``
-passes and ``stage_trans``; the next global staging, ``dy`` and ``C``, sits two
-barriers later because ``build_table`` reads ``squat`` on entry. Issuing both runs
-ahead of ``stage_trans`` rather than behind it is worth -3.024 us at ``fill``, -2.560
-at ``band``, -2.024 at ``ragged`` and -0.512 at ``acceptance``, and nothing at
-``standard`` or ``wide``; it halves the ``standard`` long_scoreboard rise, 2.67 M to
-1.36 M. Every figure above and in the tables is that ordering. Nor is this an
-instruction arm. LSU falls 7 warp-inst a chunk a block and XU 2, both exactly, while
-``smsp__inst_executed`` rises 0.92% and 1.64 M warp-inst move from the ALU pipe to the
-FMA pipe, so no count predicts the sign. Registers, spill and shared bytes are read off
-the loaded form; the occupancy figures in the row-band table below are the rescanning
-form's.
+What the arm buys is the barrier, not the bus. At ``standard``, per launch, averaged
+over two NCU launches: barrier stall 16.43 M to 10.61 M warp-cycles, -35.4%;
+long_scoreboard 12.61 M to 12.83 M, +1.8%; ``smsp__warps_active`` 57.48 M to 51.73 M;
+``issue_active`` 24.38% to 26.49%; ``sm__cycles_active`` 85,160 to 76,800, which tracks
+the paired -11.3%. Requests fall 132,480 to 124,800, ``48 * 32 * 5`` exactly. Registers
+68 to 67, shared bytes 21,760 either way, zero local spill sectors, and achieved
+``sm__warps_active.avg.pct_of_peak`` 16.66% in both arms, so no occupancy term moves at
+that shape. DRAM read rises, 20.94 MB to 21.31 MB: the records are not reused at one
+band and the transitions were L2-served, so the bus gets slightly worse while the
+launch gets 11% shorter. An arm on this kernel is not priced by DRAM bytes.
+
+Nor is it occupancy, and that was checked where it could have been. At acceptance both
+arms report 64 registers, ``launch__occupancy_limit_registers`` 4,
+``sm__maximum_warps_per_active_cycle_pct`` 66.67 and 21,760 shared bytes, with achieved
+``sm__warps_active.avg.pct_of_peak`` 54.44% against 53.85%; the arm is -25.088 and
+-26.112 us there anyway. Its sectors and requests are ``360 * 32 * 88`` and
+``360 * 32 * 5`` to the counter's last digit, 11.935 M to 10.921 M and 1.048 M to
+990,720, shared store wavefronts fall 5.057 M to 4.957 M, and DRAM read rises again,
+42.98 MB to 44.36 MB. So one mechanism carries every shape: the sectors the staging was
+fetching and the barrier the block reached them through.
+
+Two forms of covering the read's latency are refused, both measured on the form that
+still staged the transitions. Serving the record from cache -- the same code with a
+zero chunk stride, so every chunk reads one resident record and the outputs are wrong
+by construction -- was worth 8.2 us at ``standard`` and 15.1 at the ``P`` 80 probe,
+which is what put the staging beside it under suspicion. Fetching the record a chunk
+ahead into two register fragments, so the whole of :func:`start_chunk` stands over the
+load, moved nothing at one band, +2.560 us at ``standard`` against +2.056, and cost
+the arm its largest wins: the fragments are 8 registers, the read arm at ``wide`` and
+``acceptance`` sat at exactly 64 before the staging widen, the four-block bar at eight
+warps, and the 8 took
+``acceptance`` from -23.040 to +3.584. The cost was the sector count, which a prefetch
+reorders and does not lower. The occupancy figures in the row-band table below are the
+rescanning form's.
 
 Row band. 360 blocks against 168 resident is 1.43 waves at three blocks an SM, and
 the 0.715 quantization efficiency of that wave count accounts for the whole of the
@@ -670,19 +703,7 @@ def start_passing_bwd_kernel(
             )
         else:
             start_loaded(
-                gtrans,
-                gslp,
-                gsquat,
-                strans,
-                slp,
-                squat,
-                seqlen,
-                cidx,
-                bidx,
-                hidx,
-                tid,
-                threads,
-                chunk,
+                gslp, gsquat, slp, squat, cidx, bidx, hidx, tid, threads, chunk
             )
         start_chunk(
             gdy,

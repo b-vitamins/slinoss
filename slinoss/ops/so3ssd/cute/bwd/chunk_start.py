@@ -267,13 +267,10 @@ def start_scanned(
 
 @cute.jit
 def start_loaded(
-    gtrans: cute.Tensor,
     gslp: cute.Tensor,
     gsquat: cute.Tensor,
-    strans: cute.Tensor,
     slp: cute.Tensor,
     squat: cute.Tensor,
-    seqlen: cutlass.Int32,
     cidx: cutlass.Int32,
     bidx: cutlass.Int32,
     hidx: cutlass.Int32,
@@ -281,23 +278,27 @@ def start_loaded(
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
 ) -> None:
-    """Stage one chunk's transitions and read the two prefixes already scanned.
+    """Read one chunk's two prefixes, already scanned, into shared memory.
 
     The scan :func:`start_scanned` runs is warp 0's alone, so the rest of the block
     waits at its barrier. Reading the result of
     :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_prefix_bwd_kernel`
-    instead makes the prefixes ``5 * L`` more words of the staging pass, which
-    leaves one barrier where the scan needed two.
+    instead makes the prefixes ``5 * L`` words of the staging pass, which leaves one
+    barrier where the scan needed two.
+
+    The transitions do not come with them. Only the scan reads ``strans``:
+    :func:`slinoss.ops.so3ssd.cute.table.build_table` at ``mats == 1`` composes
+    ``Ac`` from the quaternion prefix alone, and nothing else in :func:`start_chunk`
+    or in a chunk-serial caller's loop touches that tile. So the read arm stages
+    ``4 * L`` fewer words a chunk than the rescan rather than ``5 * L`` more, and the
+    tile it leaves unwritten is the slot ``build_table`` is documented to ignore.
 
     Args:
-        gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
         gslp: ``(B,H,C,L)`` float32 inclusive log-scale scan.
         gsquat: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product,
             component-major and renormalized once.
-        strans: ``(4,L)`` float32 transition tile, written.
         slp: ``(L,)`` float32 log-decay prefix tile, written.
         squat: ``(4,L)`` float32 quaternion prefix tile, written.
-        seqlen: ``T``. Dynamic.
         cidx: Chunk. Dynamic.
         bidx: Batch index. Dynamic.
         hidx: Head index. Dynamic.
@@ -310,14 +311,8 @@ def start_loaded(
         code, renormalization included, so the tiles this fills are bitwise what
         the rescan would have written.
     """
-    t0 = cidx * chunk
-    valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
-    # Both runs are issued ahead of the transition loads rather than behind them:
-    # nothing below reads either before the barrier, so the staging pass covers the
-    # workspace latency instead of queueing behind it.
     _read_run(gslp[bidx, hidx, cidx, None], slp, chunk, tid, threads)
     _read_run(gsquat[bidx, hidx, cidx, None, None], squat, 4 * chunk, tid, threads)
-    stage_trans(gtrans[bidx, hidx, None, None], strans, t0, valid, tid, threads, chunk)
     cute.arch.sync_threads()
 
 
