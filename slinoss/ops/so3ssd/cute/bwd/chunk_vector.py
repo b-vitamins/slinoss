@@ -1057,7 +1057,14 @@ def vector_smem_bytes(
     )
 
 
-def vblock(chunk: int, rows: int, dim: int, fold: int, itemsize: int = 2) -> int:
+def vblock(
+    chunk: int,
+    rows: int,
+    dim: int,
+    fold: int,
+    itemsize: int = 2,
+    warp_groups: int = 1,
+) -> int:
     """Source-token block: one M tile of the atom, or half of one to fit.
 
     ``min(L, MMA_TILE_M)`` is the block every mode of every GEMM is happiest at,
@@ -1077,6 +1084,11 @@ def vblock(chunk: int, rows: int, dim: int, fold: int, itemsize: int = 2) -> int
         dim: ``3N``.
         fold: Heads one block walks, ``H // G``.
         itemsize: Bytes per operand element.
+        warp_groups: Warp groups of the tiling, as
+            :func:`vector_smem_bytes` takes it. The default is not the width the
+            operator ships: a caller that launches must pass the width's own group
+            count, or the budget this reads is short by ``4 * L`` bytes a group and
+            the block it returns is one the launch cannot allocate.
 
     Returns:
         The block. A shape that fits at neither candidate is refused by
@@ -1085,7 +1097,7 @@ def vblock(chunk: int, rows: int, dim: int, fold: int, itemsize: int = 2) -> int
     span = min(chunk, MMA_TILE_M)
     floor = min(chunk, MMA_TILE_M // 2)
     if span > floor:
-        budget = vector_smem_bytes(chunk, rows, dim, fold, span, itemsize)
+        budget = vector_smem_bytes(chunk, rows, dim, fold, span, itemsize, warp_groups)
         if budget > smem_capacity():
             span = floor
     return span
@@ -3881,7 +3893,11 @@ def chunk_vector_backward(
     check_rows(rows)
     shards = vector_splits(heads // groups, splits)
     fold = heads // groups // shards
-    span = vblock(chunk_size, rows, dim, fold, dy.element_size())
+    # The N atoms of the tiling, which is the warp-group count the offset term takes a
+    # row of. Raises on an illegal width, so the block geometry is checked here rather
+    # than inside the trace. Ahead of the span, which prices the same rows.
+    wgroups = mma_atoms(warps)[1]
+    span = vblock(chunk_size, rows, dim, fold, dy.element_size(), wgroups)
     check_extents(chunk_size, dim, span)
     has_prev = check_stream(u_prev, b_prev, (bsz, heads, groups, rows, dim))
 
@@ -3899,10 +3915,6 @@ def chunk_vector_backward(
         if tuple(tensor.shape) != shape:
             raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
 
-    # The N atoms of the tiling, which is the warp-group count the offset term takes a
-    # row of. Raises on an illegal width, so the block geometry is checked here rather
-    # than inside the trace.
-    wgroups = mma_atoms(warps)[1]
     budget = assert_smem_fits(
         f"chunk_vector_bwd[L{chunk_size}/P{rows}/3N{dim}"
         f"/fold{fold}/S{shards}/W{warps}]",
