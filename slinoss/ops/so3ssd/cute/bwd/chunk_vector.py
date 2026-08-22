@@ -572,6 +572,7 @@ __all__ = [
     "out_tile",
     "partial_bytes",
     "partial_pack",
+    "prefix_smem_bytes",
     "quad_table_tile",
     "readout_tile",
     "row_tile",
@@ -1071,6 +1072,26 @@ def vector_smem_bytes(
                 4,
             ),
             (Tile((TABLE_QUAD,), (1,)), 4),
+        ]
+    )
+
+
+def prefix_smem_bytes(chunk: int) -> int:
+    """Shared memory :func:`chunk_prefix_bwd_kernel` allocates, in bytes.
+
+    The same tiles that kernel allocates, in the same order, so the budget has one
+    description here rather than one at the launch and one in the kernel body. Flat in
+    every extent but ``L``: the scan depends on the head and the chunk alone, so no
+    tile spans the state width, the fold or the shard.
+
+    Args:
+        chunk: ``L``.
+    """
+    return smem_bytes(
+        [
+            (trans_tile(chunk), 4),
+            (scalar_tile(chunk), 4),
+            (trans_tile(chunk), 4),
         ]
     )
 
@@ -2663,8 +2684,13 @@ def chunk_prefix_bwd(
     is ``dim // lane_block(dim)`` times smaller and every block of the main launch
     finds its own prefix already written.
 
+    The budget is checked here rather than at the caller: this launch is the one place
+    ``chunk`` reaches these tiles, and an unchecked launch fails at the driver instead
+    of at the guard. 2,304 B at ``L 64``, flat in every other extent, so no shape the
+    tree admits can reach the capacity.
     """
     threads = warps * 32
+    assert_smem_fits(f"chunk_prefix_bwd[L{chunk}]", prefix_smem_bytes(chunk))
     chunk_prefix_bwd_kernel(
         gtrans, gslp, gsquat, seqlen, threads, chunk, fold, splits
     ).launch(
