@@ -713,6 +713,33 @@ Nine words do not fit one to a lane below a group of nine, so the scratch row is
 stored in ``ceil(ROW_WORDS / LANE_GROUP)`` rounds of ``LANE_GROUP`` words, against
 a pass count that falls by the same factor the group does."""
 
+DIAG_SPLIT: int = 2
+"""Threads a destination in the two rowwise contractions of the source-token pass.
+
+The diagonal cotangent and the increment's closing rank-one are each ``rows`` deep
+with a serial float accumulation, and each has one destination a token or a lane, so
+one thread a destination left the whole chain on ``span`` or ``tile`` of ``threads``
+while the rest of the block stood at the pass's barrier.
+
+Two rather than the full :data:`LANE_GROUP`. The loop's prologue and its closing
+butterfly are paid once a warp whatever the depth, so a wider split buys chain depth
+at a fixed instruction cost that rises with the warps it wakes, and past two the fee
+outruns the latency it deletes.
+
+A thread takes an adjacent SEGMENT of the contracted mode, never a stride of the
+split, for the reason :data:`LANE_GROUP` gives: the mode is adjacent in shared memory
+and is read eight elements to an ``LDS.128``, so a stride of the split costs four
+times the shared loads and loses outright."""
+
+DIAG_CHAINS: int = 2
+"""Independent accumulator chains a thread holds in those two contractions.
+
+Float addition does not reassociate, so one chain issues one FFMA every latency and
+leaves the pipe idle between. A chain costs one FADD to close and nothing to carry,
+where a wider thread split costs a warp's prologue. ``DIAG_SPLIT * DIAG_CHAINS`` must
+divide ``rows``, which follows from ``rows`` being a multiple of
+:data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_N`."""
+
 ROW_WORDS: int = 9
 """Float32 scratch per token: the 3x3 rotation cotangent, summed over ``N``.
 
@@ -1463,11 +1490,30 @@ def _sum_over_n(value: Scalar) -> Scalar:
     return value + shuffle_xor(value, 2)
 
 
+def _sum_over_split(value: Scalar, width: int) -> Scalar:
+    """Sum one float over the ``width`` adjacent lanes that share its destination.
+
+    A butterfly over an aligned group, which is what :func:`_sum_over_n` runs at a
+    quad. Undecorated: the round count is compile-time and the loop is unrolled
+    during the trace.
+
+    Args:
+        value: The lane's partial over the segment it holds.
+        width: Lanes a group. A power of two, at most the warp.
+
+    Returns:
+        The group's sum, in every lane of the group.
+    """
+    out = value
+    reach = 1
+    while reach < width:
+        out = out + shuffle_xor(out, reach)
+        reach *= 2
+    return out
+
+
 def _sum_over_lanes(vals: tuple[Scalar, ...]) -> tuple[Scalar, ...]:
     """Sum a tuple of floats over the :data:`LANE_GROUP` lanes of one token.
-
-    Undecorated: the round count is compile-time and the loop is unrolled during
-    the trace.
 
     Args:
         vals: One value per component, this lane's partial.
@@ -1475,12 +1521,7 @@ def _sum_over_lanes(vals: tuple[Scalar, ...]) -> tuple[Scalar, ...]:
     Returns:
         The group's sum, in every lane of the group.
     """
-    out = vals
-    reach = 1
-    while reach < LANE_GROUP:
-        out = tuple(v + shuffle_xor(v, reach) for v in out)
-        reach *= 2
-    return out
+    return tuple(_sum_over_split(v, LANE_GROUP) for v in vals)
 
 
 def _mat_sub(a: Mat3, b: Mat3) -> Mat3:
@@ -3469,15 +3510,35 @@ def chunk_vector_bwd_kernel(
             # eight ran a ``rows``-deep contraction of the clamped row and stored
             # nothing. Testing the destination first deletes that, bitwise: under the
             # predicate the clamp is the identity.
-            for step in cutlass.range_constexpr(-(-span // threads)):
-                r = tid + step * threads
+            #
+            # :data:`DIAG_SPLIT` threads a token and :data:`DIAG_CHAINS` chains in
+            # each, not one thread and one chain: the depth falls by their product and
+            # the block's idle warps take a quarter of the row each. Both constants
+            # carry the arithmetic that set them.
+            seg = rows // (DIAG_SPLIT * DIAG_CHAINS)
+            for step in cutlass.range_constexpr(-(-span * DIAG_SPLIT // threads)):
+                i = tid + step * threads
+                r = i // DIAG_SPLIT
+                c = i - r * DIAG_SPLIT
                 if r < span:
-                    dnow = zero
-                    for p in cutlass.range_constexpr(rows):
-                        dnow = dnow + widen(sdy[nbase + r, p], elem) * widen(
-                            su[r + 1, p], elem
-                        )
-                    sdnow[nbase + r] = dnow
+                    parts = [zero] * DIAG_CHAINS
+                    for k in cutlass.range_constexpr(DIAG_CHAINS):
+                        q0 = (c * DIAG_CHAINS + k) * seg
+                        for p in cutlass.range_constexpr(seg):
+                            parts[k] = parts[k] + widen(
+                                sdy[nbase + r, q0 + p], elem
+                            ) * widen(su[r + 1, q0 + p], elem)
+                    dnow = parts[0]
+                    for k in cutlass.range_constexpr(DIAG_CHAINS - 1):
+                        dnow = dnow + parts[k + 1]
+                    # Ahead of the store's predicate, not under it: the butterfly's
+                    # partner is the lane the predicate drops, and a shuffle from an
+                    # inactive lane has no value. The whole group shares ``r``, so the
+                    # predicate above it is uniform across the group and every partner
+                    # is live here.
+                    dnow = _sum_over_split(dnow, DIAG_SPLIT)
+                    if c == 0:
+                        sdnow[nbase + r] = dnow
 
             # The increment's closing rank-one, token L-1's alone. In the two-tap form
             # it was the last row of the current tap's increment product, whose weight
@@ -3489,15 +3550,29 @@ def chunk_vector_bwd_kernel(
             if cutlass.const_expr(nstep == blocks - 1):
                 # Predicated for the same reason the diagonal above is: the
                 # destination is one lane of ``tile`` and the block has ``threads``.
-                for step in cutlass.range_constexpr(-(-tile // threads)):
-                    d = tid + step * threads
+                # Split and chained for the same reason too, one lane of ``tile`` on
+                # 256 threads leaving even fewer warps awake than one token does. The
+                # state operand's contracted mode is its pitched one, so only the
+                # forcing row's reads are adjacent; the segment map costs nothing there
+                # and is what the row needs.
+                for step in cutlass.range_constexpr(-(-tile * DIAG_SPLIT // threads)):
+                    i = tid + step * threads
+                    d = i // DIAG_SPLIT
+                    c = i - d * DIAG_SPLIT
                     if d < tile:
-                        ures = zero
-                        for p in cutlass.range_constexpr(rows):
-                            ures = ures + widen(sstate[p, d], elem) * widen(
-                                su[span, p], elem
-                            )
-                        sdures[0, d] = ures
+                        parts = [zero] * DIAG_CHAINS
+                        for k in cutlass.range_constexpr(DIAG_CHAINS):
+                            q0 = (c * DIAG_CHAINS + k) * seg
+                            for p in cutlass.range_constexpr(seg):
+                                parts[k] = parts[k] + widen(
+                                    sstate[q0 + p, d], elem
+                                ) * widen(su[span, q0 + p], elem)
+                        ures = parts[0]
+                        for k in cutlass.range_constexpr(DIAG_CHAINS - 1):
+                            ures = ures + parts[k + 1]
+                        ures = _sum_over_split(ures, DIAG_SPLIT)
+                        if c == 0:
+                            sdures[0, d] = ures
 
             _rotate_rows(
                 sb,
