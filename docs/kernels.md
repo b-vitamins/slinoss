@@ -116,12 +116,34 @@ a transposed score tile is not.
   `SLinOSSConfig` accepts.
 - The shared-memory budget is computed from the layouts and asserted against the
   queried capacity by a test. No guard or slop constants.
-- Bank conflicts are a bug, not a tradeoff. Conflict freedom comes from the
-  pitch: every shared tile is allocated at an odd number of 16-byte units, a
-  power-of-two pitch being the worst case. `smem_pitch` in `ops/so3ssd/cute/mma.py`
-  is the one implementation; a hand-picked pitch is a defect. The pitch depends
-  on the element size, so a float32 tile takes `fp32_tile`, not the operand
-  pitch.
+- The pitch is the conflict rule, and it has two sides that no single pitch
+  clears. Write `Ps` for a tile's pitch in 16-byte units. A 16-byte phase is
+  eight lanes over eight consecutive rows, so its segment index is `r * Ps mod 8`,
+  a bijection exactly when `Ps` is odd; `Ps` a multiple of 4 makes it 4-way and a
+  multiple of 8 makes it 8-way, which is what makes a power-of-two pitch the worst
+  case. An 8-byte phase is sixteen lanes, four rows of four pairs, so its
+  pair-bank index is `2 * Ps * r + k mod 16` and that is a bijection exactly when
+  `Ps = 2 mod 4`. The two conditions are disjoint. `smem_pitch` in
+  `ops/so3ssd/cute/mma.py` picks odd and is the one implementation; a hand-picked
+  pitch is still a defect. The tree measures both sides at the acceptance shape.
+  Every one of the 329 `LDSM.16.M88.4` sites is at conflict degree exactly 1.0000
+  over 43.83 M wavefronts, and so are the 42 `STS.128` sites over 6.27 M. The
+  `STS.64` that `table.py`'s run store emits is two-way in all five kernels that
+  carry conflicts, 8.15 M excess wavefronts, predicted degree 2.0 against measured
+  1.92 to 1.99 in four of them and 1.59 in `chunk_scan_fwd`. Flipping to `2 * odd`
+  buys at most that 8.15 M and pays 43.83 M in `LDSM` alone, so the odd pitch is
+  optimal by 5.4x on the counted term and the two-way residual is a priced tradeoff
+  rather than a defect. Price it before removing it: see the shared wavefront entry
+  under "The LSU port". `gradient_tile` in `bwd/chunk_vector.py` carries the same
+  arithmetic at the site that pays the most of it. The pitch depends on the element
+  size, so a float32 tile takes `fp32_tile`, not the operand pitch.
+- The rest of the conflict class is the thread map, not the pitch, and the pitch
+  cannot reach it. The same opcode at the same width reads clean in one kernel and
+  conflicted in another -- `STS.32` is 1.0000 in `chunk_input_bwd` and
+  `increment_passing_fwd` and 1.3247 in `chunk_vector_bwd`, `LDS.16` is 1.0000 in
+  `chunk_vector_bwd` and 1.3967 in `chunk_input_bwd` -- so 9.13 M of the tree's
+  17.28 M excess wavefronts is which lane reads which row at a particular site.
+  Attribute a conflict to a site before attributing it to the pitch.
 - No kernel launches fewer blocks than twice the SM count unless it is provably
   serial, documented as such, and measured under 2% of step time.
 
@@ -263,14 +285,31 @@ instructions, and the class bar says nothing about that.
   in `SASS` rather than by inference, then attribute every access to it by base
   register and check that the parts sum to the whole.
 - Shared wavefronts are a second-order term, not the currency. They set how long a
-  conflicted access occupies the pipe, so a conflict is still a bug, but removing
-  wavefronts without removing instructions does not move an issue-bound kernel:
-  3.3 M excess wavefronts out of 128 M, from an `STS.64` pitch defect, price at
-  roughly nothing while the port binds. The earlier reading of this kernel derived a
-  marginal 102.4 k wavefronts per microsecond and a 0.41 payback ratio from two
-  landed arms. Both arms removed instructions as well as wavefronts, and the
-  instruction count alone accounts for their microseconds. The ratio was a wrong
-  denominator, not a property of the hardware.
+  conflicted access occupies the pipe, so a conflict costs pipe time, but removing
+  wavefronts without removing instructions does not move an issue-bound kernel. The
+  tree census at the acceptance shape reads 17.28 M excess wavefronts out of
+  137.2 M, 12.6%, on five kernels and zero on the rest: `chunk_vector_bwd` 7.61 M,
+  `chunk_input_bwd` 5.01 M, `increment_passing_fwd` 1.66 M, `start_passing_bwd`
+  1.66 M, `chunk_scan_fwd` 1.34 M. The bank-conflict counters in the `shared` table
+  put the same class at 18.55 M over 138.5 M wavefronts, two instruments agreeing to
+  7%. Every access is 2 to 8 bytes wide except 0.74 M on one `LDS.128` group. Rank
+  the class by absolute wavefronts, never by the conflicts-per-wavefront rate: the
+  rate ranks it backwards, `start_passing_bwd` holding the tree's worst rate at
+  0.257 and its fifth largest count.
+- Pipe occupancy is not exposure, and a wavefront rate cannot price a conflict.
+  17.28 M excess wavefronts is 109 us at the tree's own 6.32 us per million, which
+  is 3.2% of the step and would be worth an arm. The sample shares refuse it. Sites
+  carrying the excess hold 2.4% to 4.2% of their kernel's PC samples, and of
+  `short_scoreboard` -- the stall a shared-memory latency produces -- they hold
+  0.00% in four of the five kernels and 0.03% in `chunk_vector_bwd`, whose own
+  conflicting sites stall on `barrier` and `mio_throttle` instead at 7.19% and 5.55%
+  of those reasons. One site in the tree clears a 0.5% sample floor. The occupancy
+  is real and hidden: nothing waits on it, so deleting it returns a fraction of the
+  109 us that no measurement here can resolve from zero. The earlier reading of this
+  kernel derived a marginal 102.4 k wavefronts per microsecond and a 0.41 payback
+  ratio from two landed arms. Both arms removed instructions as well as
+  wavefronts, and the instruction count alone accounts for their microseconds. The
+  ratio was a wrong denominator, not a property of the hardware.
 - A width change is therefore worth more than the wavefront law allows, not less.
   Folding four scalar `LDS` into one `LDS.128` leaves the wavefront count invariant
   and deletes three instructions of four. Two adjacent bfloat16 accesses pack into
