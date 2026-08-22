@@ -145,12 +145,14 @@ def test_a_full_capture_passes_and_two_instantiations_of_one_kernel_count_once()
     assert verdict.judged_count == len(entry.required)
     assert verdict.missing == ()
     assert f"every one of the {len(entry.required)} kernels" in verdict.detail
-    # Both conditionals are absent, and that is reported with the condition rather
-    # than failed: the benchmarked standard shape has one lane tile and one head per
-    # group, so neither launch happens there.
-    assert verdict.absent == ("reduce_rows_kernel", "vector_reduce_kernel")
-    assert "reduce_rows_kernel absent: 3N above one lane tile" in verdict.detail
-    assert "vector_reduce_kernel absent: a head-sum depth above one" in verdict.detail
+    # Every conditional is absent from a required-only capture, and that is reported
+    # with the condition rather than failed. Read off the table rather than spelled
+    # out: naming the kernels here would fail this test, which is about counting
+    # instantiations, whenever the table gains or loses a conditional.
+    assert entry.conditional, "a table with no conditional makes the rest vacuous"
+    assert verdict.absent == tuple(c.kernel for c in entry.conditional)
+    for cond in entry.conditional:
+        assert f"{cond.kernel} absent: {cond.condition}" in verdict.detail
     # Present, each is judged and counted, and the report says nothing about it. The
     # two conditions are separate shape properties, so one can hold without the other.
     conditional = [symbol(c.kernel) for c in entry.conditional]
