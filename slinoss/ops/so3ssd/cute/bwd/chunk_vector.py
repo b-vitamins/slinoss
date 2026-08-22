@@ -3433,7 +3433,14 @@ def chunk_vector_bwd_kernel(
         _fill_zero(sdw, 4 * chunk, tid, threads)
         _fill_zero(sdk, 4 * chunk, tid, threads)
         cute.arch.sync_threads()
-        build_table(strans, stap, squat, stable, tid, threads, chunk, 3, True)
+        # At the pitch the tile was allocated at, not the signature's default. The
+        # table is :func:`quad_table_tile`, so a slot's row is a whole segment and
+        # the build writes three of them where the default wrote nine scalars; the
+        # default also leaves the padding word of each row unwritten, and
+        # :func:`_mat_at` reads the whole segment.
+        build_table(
+            strans, stap, squat, stable, tid, threads, chunk, 3, True, TABLE_PITCH
+        )
         cute.arch.sync_threads()
 
         # The closing transition, read once per head. Ac is R(Q)^T, so it is the
