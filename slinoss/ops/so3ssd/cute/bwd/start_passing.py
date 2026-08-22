@@ -137,23 +137,103 @@ call, 48 of 48 pairs negative. The pass had been priced on its LSU port term and
 exponentials, and what dominated it was the per-element narrow, select and index
 arithmetic.
 
-The barrier stall is not a lever. Nothing behind the first barrier of
-:func:`start_chunk` depends on the chunk prefix scan -- the ``dy`` load needs the
-token index and the valid count and nothing else, and the scan is warp 0's alone, so
-seven warps of eight wait on it. Both forms of issuing that load ahead of the scan
-were measured, both bitwise clean, neither faster. Staging unweighted through shared
-and scaling in place after the scan restores the store and the load the forwarding
-had dropped, +368,640 LSU and +1,584,390 shared wavefronts, and costs +2.9% to
+The barrier stall was not a lever while the scan stayed. Nothing behind the first
+barrier of :func:`start_chunk` depends on the chunk prefix scan -- the ``dy`` load
+needs the token index and the valid count and nothing else, and the scan is warp 0's
+alone, so seven warps of eight wait on it. Both forms of issuing that load ahead of
+the scan were measured, both bitwise clean, neither faster. Staging unweighted through
+shared and scaling in place after the scan restores the store and the load the
+forwarding had dropped, +368,640 LSU and +1,584,390 shared wavefronts, and costs +2.9% to
 +4.3% of the call over three paired trials. Holding the loaded fragment in registers
 across the scan instead moves no memory-pipe count at all and costs 2 registers, 70
 to 72; it does not resolve, at paired medians -0.9%, +0.5% and -0.3% with 11, 6 and
 9 of 16 pairs agreeing in sign. It does move the stall it was aimed at, barrier
 34.9% to 28.1%, and long_scoreboard rises 11.8% to 15.2% in exchange. The block's
 critical path is the serial scan, so a warp that reaches the barrier earlier only
-waits there longer. What that leaves is the scan itself: ``chunk_prefix_bwd_kernel``
-already writes ``slp`` and ``squat`` to global, and reading them here rather than
-rescanning the transitions once per lane band would delete the warp-serial region
-and both barriers around it.
+waits there longer.
+
+Prefix source. So the scan goes instead of the wait.
+:func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_prefix_bwd_kernel` writes both
+prefixes to global once per ``(batch, head, chunk)``, and
+:func:`slinoss.ops.so3ssd.cute.bwd.chunk_start.start_loaded` reads ``5 * L`` words of
+them alongside the transition staging rather than rescanning: one barrier where the
+scan needed two, and no warp-serial region between them. ``scanned`` keeps the rescan
+reachable and the two are asserted bitwise equal, the global tensors holding the
+output of the same :func:`slinoss.ops.so3ssd.cute.prefix.chunk_prefixes` code
+including its renormalization. The producer is not new work: it already runs ahead of
+``chunk_vector_bwd`` at the same grid and block, so
+:func:`slinoss.ops.so3ssd.cute.backward.so3ssd_bwd_cute` hoists that one launch
+rather than adding a second.
+
+What that buys depends on ``P``, and the arm regresses at ``P`` 48. Measured on sm_86,
+the read against the rescan, 300 order-swapped pairs a shape in one process, medians,
+launch-order position estimated from the two parities and removed, coverage 95.69%:
+
+    shape        P   3N  bands  blocks   regs    lim  delta us        interval     pos
+    tiny        16   48      1       1  56->55  4->4    0.000  [ 0.00,  0.03]   -1.02
+    standard    48   48      1      48  69->67  3->3   +3.072  [ 3.07,  3.20]   +0.00
+    ragged      48   48      1      48  69->67  3->3   +2.584  [ 2.47,  3.56]   -2.54
+    long        48   48      1      24  87->80  2->2    0.000  [ 0.00,  0.00]   +0.00
+    wide        64   96      2      96  68->64  3->4   -7.680  [-8.70, -7.68]   -0.51
+    acceptance  64  240      5     360  68->64  3->4  -23.552  [-23.6, -23.6]   +0.00
+
+``lim`` is ``launch__occupancy_limit_registers``. ``tiny`` and ``long`` do not resolve;
+the other four do, on a device measured at 0-9% utilization, since a co-tenant moves
+absolute duration and blows the launch-order term.
+
+The sign follows ``P``, and neither the band count nor the machine fill is what sets
+it. Three added geometries hold each candidate fixed while ``P`` moves, all at
+``L=64``, ``G=H`` and 21,760 shared bytes:
+
+    probe               P   3N  bands  blocks   regs    lim  delta us   delta pct
+    B8 H12 N16 (fill)  48   48      1      96  69->67  3->3   +1.072      +0.902
+    B1 H12 N32 (band)  48   96      2      24  71->69  3->3   +0.512      +0.568
+    B4 H12 N16 (P64)   64   48      1      48  64->64  4->4   -5.120      -5.435
+
+``fill`` regresses with 96 blocks over 84 SMs, so machine fill is not it. ``band``
+regresses with two bands sharing every record, so amortization is not it. ``P64`` wins
+with both arms at 64 registers and both at the same occupancy limit, so the residency
+step is not it either: the arm wins where nothing about the occupancy changed.
+
+The residency step is real but secondary. Forcing the read arm back to three blocks
+with a dead shared allocation, at unchanged geometry, registers and instruction count,
+splits the acceptance win: the read still beats the rescan by 16.896 us [-16.90,
+-16.90] at three blocks against three, and the fourth block is the remaining 4.888 us.
+Those sum to 21.784 against a 21.720 us total, 0.064 us apart, and the null control --
+the rescan arm with and without the same dead allocation -- reads 0.512 us, one timer
+granule. So 78% of that shape's win is the deleted serial region and 22% is the block,
+and a fourth block on this kernel is a gain, not the loss a residency sweep of the
+rescanning form reported.
+
+The workspace read is at its floor. Its footprint is ``5 * L`` float32 a chunk, 1.97 MB
+a launch at ``P`` 48 and 2.95 MB at acceptance. Counted by difference against the
+rescan, the read is 3 requests and 40 sectors a chunk a block at ``L=64`` and 5 and 80
+at ``L=128``, which is 1,280 B and 2,560 B of sectors for 1,280 B and 2,560 B of
+payload: over-fetch is zero and no rearrangement can lower it. At one band the DRAM
+read rises by the payload exactly, 1.96 MB of 1.97 and 3.91 of 3.93, because nothing
+reuses a record; at acceptance it rises 4.00 MB against 14.75 MB requested, so L2
+supplies 73% there. Running the producer inside both arms, as the tree does, leaves the
+one-band regression where it was, so it is not a cold-workspace artifact of timing the
+consumer alone.
+
+What remains at ``P`` 48 is the read's exposed latency and a barrier the block waits on
+longer for it. Deleting the scan cuts the barrier stall 31.4% at ``P`` 64, 17.02 M to
+11.68 M warp-cycles, against a long_scoreboard rise of 0.65 M; at ``P`` 48 the barrier
+does not fall at all, 16.29 M to 17.22 M, and long_scoreboard rises 1.36 M for the same
+three requests. Spill is 0 local sectors in all four arms and ``sm__cycles_active``
+tracks the paired result, 86,776 to 88,861 at ``P`` 48 and 86,865 to 80,970 at ``P``
+64. The only work available to cover a ``5 * L`` word read is the two ``stage_pad``
+passes and ``stage_trans``; the next global staging, ``dy`` and ``C``, sits two
+barriers later because ``build_table`` reads ``squat`` on entry. Issuing both runs
+ahead of ``stage_trans`` rather than behind it is worth -3.024 us at ``fill``, -2.560
+at ``band``, -2.024 at ``ragged`` and -0.512 at ``acceptance``, and nothing at
+``standard`` or ``wide``; it halves the ``standard`` long_scoreboard rise, 2.67 M to
+1.36 M. Every figure above and in the tables is that ordering. Nor is this an
+instruction arm. LSU falls 7 warp-inst a chunk a block and XU 2, both exactly, while
+``smsp__inst_executed`` rises 0.92% and 1.64 M warp-inst move from the ALU pipe to the
+FMA pipe, so no count predicts the sign. Registers, spill and shared bytes are read off
+the loaded form; the occupancy figures in the row-band table below are the rescanning
+form's.
 
 Row band. 360 blocks against 168 resident is 1.43 waves at three blocks an SM, and
 the 0.715 quantization efficiency of that wave count accounts for the whole of the
@@ -182,6 +262,8 @@ fastest. The narrow width stays reachable because the driver prices both under o
 floor fit and the two are asserted bitwise equal.
 """
 
+from typing import NamedTuple
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -201,7 +283,10 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
     gram_tile,
     rotated_tile,
     start_chunk,
+    start_loaded,
+    start_scanned,
 )
+from slinoss.ops.so3ssd.cute.bwd.chunk_vector import PREFIX_WARPS, chunk_prefix_bwd
 from slinoss.ops.so3ssd.cute.bwd.state_passing import StatePassingBwd
 from slinoss.ops.so3ssd.cute.common import (
     mat3_matvec,
@@ -234,6 +319,8 @@ from slinoss.ops.so3ssd.cute.table import TABLE_PITCH, stage_pad
 __all__ = [
     "RESIDENT_MAX",
     "SPLIT",
+    "ChunkPrefixes",
+    "chunk_prefix_backward",
     "fold_smem_bytes",
     "start_passing_backward",
     "start_passing_bwd",
@@ -294,6 +381,61 @@ covers. 48 is the smallest width satisfying both, and every legal ``3N`` is a
 multiple of it, so one width divides every shape. The module docstring carries why
 a wider band does not fit the register file.
 """
+
+
+class ChunkPrefixes(NamedTuple):
+    """The two chunk-local transition prefixes, in global memory.
+
+    Attributes:
+        lp: ``(B,H,C,L)`` float32 inclusive log-scale scan.
+        q: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product,
+            component-major and renormalized once (I5).
+    """
+
+    lp: Tensor
+    q: Tensor
+
+
+def chunk_prefix_backward(trans: Tensor, chunk_size: int, groups: int) -> ChunkPrefixes:
+    """Scan every chunk's transition prefixes to global memory.
+
+    One pass over ``trans`` for the launches that read the prefixes instead of
+    rescanning them: :func:`start_passing_bwd_kernel` and
+    :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_bwd_kernel`. Both
+    read the same two tensors, so neither can disagree with the other about a
+    prefix.
+
+    Args:
+        trans: ``(B,H,T,4)`` float32, contiguous. ``(w_x, w_y, w_z, ls)``.
+        chunk_size: ``L``. A multiple of 16.
+        groups: ``G``, the grid's slowest mode. Divides ``H``.
+
+    Returns:
+        A :class:`ChunkPrefixes`. ``5 * L`` float32 a chunk, 2.95 MB at the
+        acceptance shape.
+
+    Raises:
+        ValueError: If ``groups`` does not divide ``H``.
+    """
+    bsz, heads, seqlen, _ = trans.shape
+    if groups < 1 or heads % groups:
+        raise ValueError(f"groups must divide H={heads}, got {groups}")
+    chunks = -(-seqlen // chunk_size)
+    device = trans.device
+    lp = torch.empty(bsz, heads, chunks, chunk_size, dtype=torch.float32, device=device)
+    q = torch.empty(
+        bsz, heads, chunks, 4, chunk_size, dtype=torch.float32, device=device
+    )
+    # The kernel's head index is ``(gidx * splits + sidx) * fold + hstep``, so the
+    # covered set is ``H`` exactly when ``splits * fold == H // G``. Pinning the fold
+    # to one head a block gives that at every shape and does not inherit
+    # ``chunk_vector_bwd``'s sharding, where a missing head would be silent.
+    jit_launch(
+        chunk_prefix_bwd,
+        (trans, lp, q, seqlen, chunks, bsz, groups),
+        (PREFIX_WARPS, chunk_size, 1, heads // groups),
+    )
+    return ChunkPrefixes(lp=lp, q=q)
 
 
 def state_tile(rows: int, span: int) -> Tile:
@@ -368,6 +510,8 @@ def fold_smem_bytes(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
 def start_passing_bwd_kernel(
     gdy: cute.Tensor,
     gtrans: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
     gc: cute.Tensor,
     gcquat: cute.Tensor,
     gcscale: cute.Tensor,
@@ -384,6 +528,7 @@ def start_passing_bwd_kernel(
     span: cutlass.Constexpr,
     per_group: cutlass.Constexpr,
     has_dstate: cutlass.Constexpr,
+    scanned: cutlass.Constexpr,
 ) -> None:
     """Contract each chunk's readout cotangent and run the reverse recurrence.
 
@@ -392,6 +537,10 @@ def start_passing_bwd_kernel(
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
         gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
+        gslp: ``(B,H,C,L)`` float32 inclusive log-scale scan, from
+            :func:`chunk_prefix_backward`. Read only when not ``scanned``.
+        gsquat: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product,
+            component-major, from the same. Read only when not ``scanned``.
         gc: ``(B,G,T,3N)`` operand-dtype output vectors.
         gcquat: ``(B,H,C,4)`` float32 unit chunk rotations.
         gcscale: ``(B,H,C)`` float32 chunk decays, ``exp(2*lp_{L-1})``.
@@ -413,6 +562,10 @@ def start_passing_bwd_kernel(
         span: Band width, :data:`SPLIT`. Compile-time.
         per_group: ``H // G``, heads sharing one ``c``. Compile-time.
         has_dstate: Whether a final-state cotangent is supplied. Compile-time.
+        scanned: Whether to rescan the chunk prefixes from ``gtrans`` in warp 0
+            rather than read ``gslp`` and ``gsquat``. Compile-time. The rescan is
+            the arm the read is priced against; the module docstring carries what
+            it measured.
 
     Invariants:
         ``span`` divides ``dim``, 3 divides ``span``, and ``threads`` divides
@@ -501,9 +654,38 @@ def start_passing_bwd_kernel(
         # previous chunk's result was written over them.
         stage_pad(scrot, tid, threads, chunk, span, ldb)
         stage_pad(sdy, tid, threads, chunk, rows, lda)
+        if cutlass.const_expr(scanned):
+            start_scanned(
+                gtrans,
+                strans,
+                slp,
+                squat,
+                seqlen,
+                cidx,
+                bidx,
+                hidx,
+                tid,
+                threads,
+                chunk,
+            )
+        else:
+            start_loaded(
+                gtrans,
+                gslp,
+                gsquat,
+                strans,
+                slp,
+                squat,
+                seqlen,
+                cidx,
+                bidx,
+                hidx,
+                tid,
+                threads,
+                chunk,
+            )
         start_chunk(
             gdy,
-            gtrans,
             band,
             sdz,
             strans,
@@ -566,6 +748,8 @@ def start_passing_bwd_kernel(
 def start_passing_bwd(
     gdy: cute.Tensor,
     gtrans: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
     gc: cute.Tensor,
     gcquat: cute.Tensor,
     gcscale: cute.Tensor,
@@ -586,6 +770,7 @@ def start_passing_bwd(
     span: cutlass.Constexpr,
     per_group: cutlass.Constexpr,
     has_dstate: cutlass.Constexpr,
+    scanned: cutlass.Constexpr,
     resident: cutlass.Constexpr,
 ) -> None:
     """Launch :func:`start_passing_bwd_kernel`.
@@ -604,6 +789,8 @@ def start_passing_bwd(
     start_passing_bwd_kernel(
         gdy,
         gtrans,
+        gslp,
+        gsquat,
         gc,
         gcquat,
         gcscale,
@@ -620,6 +807,7 @@ def start_passing_bwd(
         span,
         per_group,
         has_dstate,
+        scanned,
     ).launch(
         grid=(heads, bands, bsz),
         block=(threads, 1, 1),
@@ -637,8 +825,10 @@ def start_passing_backward(
     chunk_size: int,
     dstate: Tensor | None = None,
     *,
+    prefixes: ChunkPrefixes | None = None,
     span: int = SPLIT,
     warps: int = WARPS_WIDE,
+    scanned: bool = False,
     resident: int | None = None,
 ) -> StatePassingBwd:
     """Form every chunk's start-state cotangent and pass it back through the scan.
@@ -656,6 +846,10 @@ def start_passing_backward(
         cscale: ``(B,H,C)`` float32, contiguous. Chunk decays ``exp(2*lp_{L-1})``.
         chunk_size: ``L``. A multiple of 16.
         dstate: ``(B,H,P,3N)`` float32, contiguous. Zero seed if omitted.
+        prefixes: The two chunk-local prefixes from
+            :func:`chunk_prefix_backward`, or None to run that pass here. A caller
+            whose next launch reads them too supplies them, so the pass runs once
+            for both. Ignored under ``scanned``, which reads neither.
         span: Band width. :data:`SPLIT` is the only value the register budget
             admits at every legal ``P``; it is an argument so a driver can price a
             wider one.
@@ -665,6 +859,10 @@ def start_passing_backward(
             four go to the tile's N mode, which halves both accumulators at
             unchanged shared bytes and unchanged traffic; see the module docstring
             for what that is worth.
+        scanned: Whether warp 0 rescans the chunk prefixes from ``trans`` instead
+            of the block reading them from ``prefixes``. Same result bitwise, and
+            it exists to price the read against the rescan under one floor fit.
+            Not a tuning knob.
         resident: Blocks per SM the launch bound asks for. Defaults to
             :data:`RESIDENT_MAX` capped by the shared-memory budget; it is an
             argument for the same reason ``span`` is, since the cap it puts on the
@@ -676,8 +874,9 @@ def start_passing_backward(
         chunk-start cotangent this fuses away never exists in memory.
 
     Raises:
-        ValueError: On a layout, rank, shape, or extent violation, on a band width
-            the launch cannot cover exactly, or on a ``warps`` that is not a legal
+        ValueError: On a layout, rank, shape, or extent violation, on a supplied
+            prefix that is not the shape the scan writes, on a band width the
+            launch cannot cover exactly, or on a ``warps`` that is not a legal
             block width.
         TypeError: On an activation dtype with no tensor-core path.
     """
@@ -736,11 +935,35 @@ def start_passing_backward(
     else:
         seed = dstate
 
+    # A rescanning launch reads neither tensor, so it takes the two it is handed
+    # whatever they hold: the kernel's own compile-time branch drops the loads, and
+    # allocating a workspace nothing reads would be 2.95 MB at the acceptance shape.
+    if scanned:
+        prefix_lp, prefix_q = trans, trans
+    else:
+        held = (
+            chunk_prefix_backward(trans, chunk_size, groups)
+            if prefixes is None
+            else prefixes
+        )
+        want = (
+            (held.lp, "prefixes.lp", (bsz, heads, chunks, chunk_size)),
+            (held.q, "prefixes.q", (bsz, heads, chunks, 4, chunk_size)),
+        )
+        for tensor, name, shape in want:
+            if tuple(tensor.shape) != shape:
+                raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
+        check_layout(((held.lp, "prefixes.lp"), (held.q, "prefixes.q")))
+        check_pinned(((held.lp, "prefixes.lp"), (held.q, "prefixes.q")))
+        prefix_lp, prefix_q = held.lp, held.q
+
     jit_launch(
         start_passing_bwd,
         (
             dy,
             trans,
+            prefix_lp,
+            prefix_q,
             C,
             cquat,
             cscale,
@@ -762,6 +985,7 @@ def start_passing_backward(
             span,
             heads // groups,
             dstate is not None,
+            scanned,
             blocks,
         ),
     )

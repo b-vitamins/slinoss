@@ -4,7 +4,9 @@ Two authorities, because the fusion makes two claims. A float64
 ``chunked_backward`` says the kernel computes ``dinc`` and ``dz0``. The unfused
 pair says the fusion is not an approximation of itself: every arithmetic step is
 the same in the same order and only the storage of the intermediate moved, so the
-two agree bit for bit.
+two agree bit for bit. The rescanning arm is the same kind of claim about the chunk
+prefixes: reading them from global moves where they are computed and nothing else,
+so it is held to bitwise equality too.
 
 Operands are built in float32 and cast to the operand dtype, then the reference
 runs on an exact float64 upcast of those same cast tensors, so the low-precision
@@ -37,6 +39,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
 from slinoss.ops.so3ssd.cute.bwd.start_passing import (
     RESIDENT_MAX,
     SPLIT,
+    chunk_prefix_backward,
     fold_smem_bytes,
     start_passing_backward,
 )
@@ -315,6 +318,67 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     # A short chunk inverts that, and the region has to follow the larger of the two
     # rather than the operands alone.
     assert fold_smem_bytes(16, 64, SPLIT) > start_smem_bytes(16, 64, SPLIT)
+
+
+@pytest.mark.parametrize(
+    ("bsz", "heads", "seqlen", "rows", "lanes", "groups", "dtype", "with_dstate"),
+    [case for case in SHAPES if case.id in ("ragged-three", "grouped-two-bands")],
+)
+def test_read_prefixes_match_the_rescan(
+    bsz: int,
+    heads: int,
+    seqlen: int,
+    rows: int,
+    lanes: int,
+    groups: int | None,
+    dtype: torch.dtype,
+    with_dstate: bool,
+) -> None:
+    """Reading the prefixes from global reproduces the rescan bit for bit.
+
+    ``chunk_prefix_bwd`` runs the same :func:`chunk_prefixes` code the rescan runs,
+    renormalization included, so the two tiles hold the same bits and every step
+    after them is the same arithmetic in the same order. A tolerance here would
+    admit a wrong index: the failure mode is a chunk or a head read off the wrong
+    record, which moves a value rather than perturbing one.
+
+    Two shapes, one per index mode the read has to get right: a ragged tail, whose
+    last chunk is short, and a group shared by two heads, which is the only case
+    where the record's head stride is not the block's own.
+    """
+    inp = _make(bsz, heads, seqlen, rows, lanes, dtype, groups)
+    wide = _double(inp)
+    dy, dstate = _seeds(inp, rows, lanes, with_dstate, dtype)
+    cquat, cscale = _transition(chunked_forward(*wide.args(), CHUNK, **wide.kw()))
+
+    args = (dy, inp.trans, inp.C, cquat, cscale, CHUNK, dstate)
+    want = start_passing_backward(*args, scanned=True)
+    got = start_passing_backward(*args)
+    torch.cuda.synchronize()
+
+    assert torch.equal(got.dinc, want.dinc)
+    assert torch.equal(got.dz0, want.dz0)
+
+
+def test_prefix_scan_covers_every_head() -> None:
+    """Every head of a folded launch is scanned, not only the first of its group.
+
+    The kernel's head index is ``(gidx * splits + sidx) * fold + hstep``, so the
+    covered set is ``H`` only when ``splits * fold`` is ``H // G``. A fold that
+    misses a head leaves that head's records at whatever
+    :func:`torch.empty` returned and raises nothing, so the check is against one
+    launch per head rather than against a value bound.
+    """
+    heads, groups = 4, 2
+    inp = _make(2, heads, 128, 16, 16, torch.bfloat16, groups)
+    whole = chunk_prefix_backward(inp.trans, CHUNK, groups)
+    for head in range(heads):
+        alone = chunk_prefix_backward(
+            inp.trans[:, head : head + 1].contiguous(), CHUNK, 1
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(whole.lp[:, head : head + 1], alone.lp), f"lp head {head}"
+        assert torch.equal(whole.q[:, head : head + 1], alone.q), f"q head {head}"
 
 
 def test_rejects_a_band_the_launch_cannot_cover() -> None:

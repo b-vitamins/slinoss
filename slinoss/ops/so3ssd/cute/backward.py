@@ -1,17 +1,19 @@
 """Host orchestrator for the CuTe backward.
 
-Four backward launches, in order:
+Five backward launches, in order:
 
-1. ``start_passing_bwd`` -- the readout half of every chunk-start state cotangent
+1. ``chunk_prefix_bwd`` -- the two chunk-local transition prefixes, scanned once
+   per ``(batch, head, chunk)`` into a ``5 * L`` float32 workspace a chunk.
+2. ``start_passing_bwd`` -- the readout half of every chunk-start state cotangent
    and the reverse inter-chunk recurrence over it, in one launch that keeps that
    cotangent in shared memory. With ``dy`` absent the readout half is identically
    zero, and ``state_passing_bwd`` runs the recurrence alone in place over an
    allocated buffer.
-2. ``chunk_input_bwd`` -- ``dU``, the streaming input carry, and the log-scale and
+3. ``chunk_input_bwd`` -- ``dU``, the streaming input carry, and the log-scale and
    closing-transition cotangents.
-3. ``chunk_vector_bwd`` -- ``dB``, ``dC``, ``dtrans``, ``dK``, and the streaming
+4. ``chunk_vector_bwd`` -- ``dB``, ``dC``, ``dtrans``, ``dK``, and the streaming
    vector carry.
-4. ``boundary_bwd`` -- the chunk-boundary rows of ``dU`` and ``dB``, and the
+5. ``boundary_bwd`` -- the chunk-boundary rows of ``dU`` and ``dB``, and the
    streaming terms.
 
 Nothing between the launches. No reshape, no cast, no staging copy: each kernel
@@ -27,9 +29,11 @@ three, which is one launch and no intermediate buffer. Both paths read the same
 three tensors from that point on, and the rebuild is the forward's own code, so they
 cannot disagree.
 
-The chunk-local prefixes cross no boundary and appear on neither path: each kernel
-recomputes them from ``trans``, so they never reach global memory and no two
-kernels can disagree about them.
+The chunk-local prefixes cross no boundary, so nothing about them depends on which
+path supplied the three that do. ``chunk_prefix_bwd`` scans them once and the two
+launches that would otherwise rescan them per lane band read them instead, from one
+pair of tensors, so no two kernels can disagree about a prefix. ``chunk_input_bwd``
+rescans, and the workspace is not handed to it.
 
 The three caller-owned buffers cross straight to the kernel that fills them.
 ``dB`` and ``dC`` reach ``chunk_vector_bwd``'s store and ``dU_init`` reaches
@@ -47,7 +51,10 @@ from slinoss.ops.so3ssd.backward import SO3SSDGrads
 from slinoss.ops.so3ssd.cute.bwd.boundary import boundary_backward
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import chunk_input_backward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
-from slinoss.ops.so3ssd.cute.bwd.start_passing import start_passing_backward
+from slinoss.ops.so3ssd.cute.bwd.start_passing import (
+    chunk_prefix_backward,
+    start_passing_backward,
+)
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
 from slinoss.ops.so3ssd.cute.fwd.increment_passing import increment_passing_forward
 from slinoss.ops.so3ssd.cute.guard import check_cotangents, check_shapes
@@ -128,7 +135,7 @@ def so3ssd_bwd_cute(
     ):
         if buffer is not None:
             check_grad_band(buffer, operand, name)
-    bsz, heads, _, seqlen, rows, dim = shape
+    bsz, heads, groups, seqlen, rows, dim = shape
     chunks = -(-seqlen // chunk_size)
 
     # Rebuild the chunk boundary only when the caller kept none of it. The launch
@@ -144,6 +151,10 @@ def so3ssd_bwd_cute(
             cscale=rebuilt.cscale,
         )
 
+    # One scan of the two chunk-local prefixes for the two launches that read them.
+    # The workspace outlives both, so it is allocated here rather than inside either.
+    prefixes = chunk_prefix_backward(trans, chunk_size, groups)
+
     # The chunk-start cotangent never reaches memory: the fused launch contracts
     # each chunk's readout cotangent into shared memory and the reverse recurrence
     # consumes it there, which deletes a (B,H,C,P,3N) float32 round trip.
@@ -156,7 +167,14 @@ def so3ssd_bwd_cute(
     # want rather than the recurrence's own.
     if dy is not None:
         reverse = start_passing_backward(
-            dy, trans, C, prologue.cquat, prologue.cscale, chunk_size, dstate
+            dy,
+            trans,
+            C,
+            prologue.cquat,
+            prologue.cscale,
+            chunk_size,
+            dstate,
+            prefixes=prefixes,
         )
     else:
         reverse = state_passing_backward(
@@ -206,6 +224,8 @@ def so3ssd_bwd_cute(
         b_prev=b_prev,
         dB=dB,
         dC=dC,
+        prefix_lp=prefixes.lp,
+        prefix_q=prefixes.q,
     )
     stream = boundary_backward(
         inputs.carry_u,

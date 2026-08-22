@@ -116,6 +116,7 @@ from slinoss.ops.so3ssd.cute.mma import (
 from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes
 from slinoss.ops.so3ssd.cute.table import (
     TABLE_PITCH,
+    TABLE_QUAD,
     build_table,
     stage_pad,
     stage_raw,
@@ -131,6 +132,8 @@ __all__ = [
     "gram_tile",
     "rotated_tile",
     "start_chunk",
+    "start_loaded",
+    "start_scanned",
     "start_smem_bytes",
 ]
 
@@ -183,9 +186,144 @@ def start_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
 
 
 @cute.jit
+def _read_run(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    total: cutlass.Constexpr,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+) -> None:
+    """Copy a dense float32 run from global to shared, one segment a thread a step.
+
+    Args:
+        src: Dense float32 global row of at least ``total`` elements.
+        dst: Dense float32 shared tile of at least ``total`` elements.
+        total: Elements to copy. Compile-time, and a multiple of
+            :data:`slinoss.ops.so3ssd.cute.table.TABLE_QUAD` because
+            :func:`slinoss.ops.so3ssd.cute.guard.check_extents` holds ``L`` to a
+            multiple of 16.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+
+    Invariants:
+        The alignment claim is restated on both iterators, because a tile arriving
+        as a parameter reports one element whatever its allocation asked for and
+        ``autovec_copy`` caps the access at the claim. The global run's origin is a
+        whole number of ``L``-element or ``4L``-element records and ``L`` is a
+        multiple of 16, so a record starts on a segment.
+    """
+    quads = total // TABLE_QUAD
+    unit = cute.make_layout((quads, TABLE_QUAD), stride=(TABLE_QUAD, 1))
+    from_words = cute.make_tensor(src.iterator.align(SMEM_SEGMENT), unit)
+    to_words = cute.make_tensor(dst.iterator.align(SMEM_SEGMENT), unit)
+    for step in cutlass.range_constexpr(-(-quads // threads)):
+        q = tid + step * threads
+        if cutlass.const_expr(quads % threads == 0):
+            cute.autovec_copy(from_words[(q, None)], to_words[(q, None)])
+        else:
+            if q < quads:
+                cute.autovec_copy(from_words[(q, None)], to_words[(q, None)])
+
+
+@cute.jit
+def start_scanned(
+    gtrans: cute.Tensor,
+    strans: cute.Tensor,
+    slp: cute.Tensor,
+    squat: cute.Tensor,
+    seqlen: cutlass.Int32,
+    cidx: cutlass.Int32,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+) -> None:
+    """Stage one chunk's transitions and rescan the two prefixes from them.
+
+    Two barriers: the scan reads what the staging wrote, and
+    :func:`start_chunk` reads what the scan wrote.
+
+    Args:
+        gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
+        strans: ``(4,L)`` float32 transition tile, written.
+        slp: ``(L,)`` float32 log-decay prefix tile, written.
+        squat: ``(4,L)`` float32 quaternion prefix tile, written.
+        seqlen: ``T``. Dynamic.
+        cidx: Chunk. Dynamic.
+        bidx: Batch index. Dynamic.
+        hidx: Head index. Dynamic.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+    """
+    t0 = cidx * chunk
+    valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
+    stage_trans(gtrans[bidx, hidx, None, None], strans, t0, valid, tid, threads, chunk)
+    cute.arch.sync_threads()
+    chunk_prefixes(strans, slp, squat, tid, chunk)
+    cute.arch.sync_threads()
+
+
+@cute.jit
+def start_loaded(
+    gtrans: cute.Tensor,
+    gslp: cute.Tensor,
+    gsquat: cute.Tensor,
+    strans: cute.Tensor,
+    slp: cute.Tensor,
+    squat: cute.Tensor,
+    seqlen: cutlass.Int32,
+    cidx: cutlass.Int32,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+) -> None:
+    """Stage one chunk's transitions and read the two prefixes already scanned.
+
+    The scan :func:`start_scanned` runs is warp 0's alone, so the rest of the block
+    waits at its barrier. Reading the result of
+    :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_prefix_bwd_kernel`
+    instead makes the prefixes ``5 * L`` more words of the staging pass, which
+    leaves one barrier where the scan needed two.
+
+    Args:
+        gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
+        gslp: ``(B,H,C,L)`` float32 inclusive log-scale scan.
+        gsquat: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product,
+            component-major and renormalized once.
+        strans: ``(4,L)`` float32 transition tile, written.
+        slp: ``(L,)`` float32 log-decay prefix tile, written.
+        squat: ``(4,L)`` float32 quaternion prefix tile, written.
+        seqlen: ``T``. Dynamic.
+        cidx: Chunk. Dynamic.
+        bidx: Batch index. Dynamic.
+        hidx: Head index. Dynamic.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+
+    Invariants:
+        ``gslp`` and ``gsquat`` hold the output of the same :func:`chunk_prefixes`
+        code, renormalization included, so the tiles this fills are bitwise what
+        the rescan would have written.
+    """
+    t0 = cidx * chunk
+    valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
+    # Both runs are issued ahead of the transition loads rather than behind them:
+    # nothing below reads either before the barrier, so the staging pass covers the
+    # workspace latency instead of queueing behind it.
+    _read_run(gslp[bidx, hidx, cidx, None], slp, chunk, tid, threads)
+    _read_run(gsquat[bidx, hidx, cidx, None, None], squat, 4 * chunk, tid, threads)
+    stage_trans(gtrans[bidx, hidx, None, None], strans, t0, valid, tid, threads, chunk)
+    cute.arch.sync_threads()
+
+
+@cute.jit
 def start_chunk(
     gdy: cute.Tensor,
-    gtrans: cute.Tensor,
     gc: cute.Tensor,
     dst: cute.Tensor,
     strans: cute.Tensor,
@@ -208,22 +346,24 @@ def start_chunk(
     dim: cutlass.Constexpr,
     fenced: cutlass.Constexpr,
 ) -> None:
-    """One chunk's contraction, from the staging passes to the store.
+    """One chunk's contraction, from the table build to the store.
 
     Split out of :func:`chunk_start_bwd_kernel` so the block-per-chunk launch and
-    the chunk-serial launch run the same body rather than two copies of it.
+    the chunk-serial launch run the same body rather than two copies of it. The
+    prefixes are the caller's, because the two forms of getting them --
+    :func:`start_scanned` and :func:`start_loaded` -- cost different barriers and
+    the choice is the launch's.
 
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
-        gtrans: ``(B,H,T,4)`` float32 ``(w_x, w_y, w_z, ls)``.
         gc: ``(B,G,T,3N)`` operand-dtype output vectors. A caller contracting one
             lane band hands over a view whose origin is that band's first column.
         dst: Float32 ``(P,dim)`` destination, row-major and contiguous, already
             sliced to this chunk. Global for the launch that writes ``dzstart``,
             shared for the launch that consumes it on chip.
-        strans: ``(L,4)`` float32 transition tile.
-        slp: ``(L,)`` float32 log-decay prefix tile.
-        squat: ``(L,4)`` float32 quaternion prefix tile.
+        strans: ``(4,L)`` float32 transition tile, filled.
+        slp: ``(L,)`` float32 log-decay prefix tile, filled.
+        squat: ``(4,L)`` float32 quaternion prefix tile, filled.
         stable: ``(1,L,TABLE_PITCH)`` float32 transform table, ``Ac`` alone. Allocated
             at :data:`slinoss.ops.so3ssd.cute.table.TABLE_PITCH`, so the caller's
             allocation and the readers below must state that pitch together.
@@ -251,9 +391,10 @@ def start_chunk(
 
     Invariants:
         Every barrier here is reached by the whole block, so the body is safe to
-        call inside a loop whose trip count is uniform. On entry no thread may
-        still be reading ``sdy`` or ``scrot`` from a previous call; the three
-        barriers ahead of the staging passes give that.
+        call inside a loop whose trip count is uniform. On entry ``strans``,
+        ``slp`` and ``squat`` hold this chunk's transitions and prefixes and a
+        barrier has published them, and no thread may still be reading ``sdy`` or
+        ``scrot`` from a previous call.
     """
     lanes = dim // 3
     mpad = mma_rows(rows)
@@ -262,11 +403,6 @@ def start_chunk(
 
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
-
-    stage_trans(gtrans[bidx, hidx, None, None], strans, t0, valid, tid, threads, chunk)
-    cute.arch.sync_threads()
-    chunk_prefixes(strans, slp, squat, tid, chunk)
-    cute.arch.sync_threads()
 
     # mats == 1 writes Ac alone and reads neither the tap tile nor strans, so the
     # transition tile stands in for the tap tile that is never allocated.
@@ -406,9 +542,21 @@ def chunk_start_bwd_kernel(
         # the arm prices the launch a fused kernel would have to make.
         for step in cutlass.range(chunks):
             cur = chunks - 1 - step
+            start_scanned(
+                gtrans,
+                strans,
+                slp,
+                squat,
+                seqlen,
+                cur,
+                bidx,
+                hidx,
+                tid,
+                threads,
+                chunk,
+            )
             start_chunk(
                 gdy,
-                gtrans,
                 gc,
                 gdz[bidx, hidx, cur, None, None],
                 strans,
@@ -432,9 +580,21 @@ def chunk_start_bwd_kernel(
                 False,
             )
     else:
+        start_scanned(
+            gtrans,
+            strans,
+            slp,
+            squat,
+            seqlen,
+            cidx,
+            bidx,
+            hidx,
+            tid,
+            threads,
+            chunk,
+        )
         start_chunk(
             gdy,
-            gtrans,
             gc,
             gdz[bidx, hidx, cidx, None, None],
             strans,

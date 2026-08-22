@@ -3822,6 +3822,8 @@ def chunk_vector_backward(
     dC: Tensor | None = None,
     splits: int | None = None,
     warps: int = WARPS_WIDE,
+    prefix_lp: Tensor | None = None,
+    prefix_q: Tensor | None = None,
 ) -> ChunkVectorBwd:
     """Differentiate the rowwise vectors and the transition parameters.
 
@@ -3891,6 +3893,12 @@ def chunk_vector_backward(
             both widths; that column sums a row's state width group by group, which
             measured 7.8e-08 of the reference magnitude against the column's own
             1.4e-03 residual.
+        prefix_lp: ``(B,H,C,L)`` float32 inclusive log-scale scan, from
+            :func:`slinoss.ops.so3ssd.cute.bwd.start_passing.chunk_prefix_backward`,
+            or None to run that pass here. Supplied by a caller whose earlier launch
+            reads it too, so the scan runs once for both.
+        prefix_q: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product,
+            component-major, under the contract of ``prefix_lp``. Both or neither.
 
     Returns:
         :class:`ChunkVectorBwd`.
@@ -3997,19 +4005,32 @@ def chunk_vector_backward(
     )
     arrived = torch.zeros(bsz, heads, chunks, dtype=torch.int32, device=device)
     # The two chunk-local transition prefixes, scanned once per (batch, head, chunk)
-    # rather than once per lane tile. Freed on return with the partials: 5 * L float32
-    # a chunk, 2.95 MB at the acceptance shape.
-    prefix_lp = torch.empty(
-        bsz, heads, chunks, chunk_size, dtype=torch.float32, device=device
-    )
-    prefix_q = torch.empty(
-        bsz, heads, chunks, 4, chunk_size, dtype=torch.float32, device=device
-    )
-    jit_launch(
-        chunk_prefix_bwd,
-        (trans, prefix_lp, prefix_q, seqlen, chunks, bsz, groups),
-        (PREFIX_WARPS, chunk_size, fold, shards),
-    )
+    # rather than once per lane tile. A caller whose earlier launch reads them hands
+    # them over and the scan runs once for both; otherwise they are allocated here and
+    # freed on return with the partials, 5 * L float32 a chunk, 2.95 MB at the
+    # acceptance shape.
+    if prefix_lp is None or prefix_q is None:
+        prefix_lp = torch.empty(
+            bsz, heads, chunks, chunk_size, dtype=torch.float32, device=device
+        )
+        prefix_q = torch.empty(
+            bsz, heads, chunks, 4, chunk_size, dtype=torch.float32, device=device
+        )
+        jit_launch(
+            chunk_prefix_bwd,
+            (trans, prefix_lp, prefix_q, seqlen, chunks, bsz, groups),
+            (PREFIX_WARPS, chunk_size, fold, shards),
+        )
+    else:
+        supplied: Named = ((prefix_lp, "prefix_lp"), (prefix_q, "prefix_q"))
+        check_layout(supplied)
+        check_pinned(supplied)
+        for tensor, name, shape in (
+            (prefix_lp, "prefix_lp", (bsz, heads, chunks, chunk_size)),
+            (prefix_q, "prefix_q", (bsz, heads, chunks, 4, chunk_size)),
+        ):
+            if tuple(tensor.shape) != shape:
+                raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
     jit_launch(
         chunk_vector_bwd,
         (
