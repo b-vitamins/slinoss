@@ -389,17 +389,32 @@ compare to each other and not to it::
         4     bf16    5,221.0     517.82  99.2   14.6%   255  91,344   8.3% / 8.3%
         8     bf16    3,274.1     515.74 157.5   23.2%   242  91,600  16.7% / 16.6%
 
-The register column above predates the merge and is stale. Reprofiled at the acceptance
-shape on the merged tree, one ptxas probe at each width: **236** registers at four warps
-and **149** at eight, both with zero local sectors, and 305,280,000 against
-327,778,560 instructions issued, the 7.4% rise being the readout term's reread. Duration
-went 1,933,632 to 1,696,480 ns, **1.14x** for the one measured doubling.
+The register column above predates the merge and is stale, and so were the 236, 149 and
+120 figures that stood here for the same quantity. Measured on the current tree, one
+ptxas probe a row, with zero local load and store sectors in every row: no configuration
+of this kernel spills. ``occ_R`` and ``occ_S`` are
+``launch__occupancy_limit_registers`` and ``launch__occupancy_limit_shared_mem``, in
+blocks::
 
-The eight-warp register figure has since fallen to **120** a thread, measured at the
-acceptance shape on the current tree, so the headroom to the 255-bar is 135 and not 106.
-It is headroom and not slack: the arena admits one block whatever the count, so nothing
-buys occupancy with it, and what a held operand costs there is priced at the one place
-that spends it.
+    shape        warps  regs  smem dyn   occ_R  occ_S
+    tiny             4   191    80,720      2      1
+    tiny             8   110    80,976      2      1
+    standard         4   213    92,560      2      1
+    standard         8   126    92,816      2      1
+    ragged           4   213    92,560      2      1
+    ragged           8   126    92,816      2      1
+    wide             4   228    98,480      2      1
+    wide             8   133    98,736      1      1
+    acceptance       4   232    98,480      2      1
+    acceptance       8   140    98,736      1      1
+    long           4/8  unreachable: L 128 needs 142,224 B against 101,376
+
+Eight is the shipped width, so **140** is the shipped count and 232 is a four-warp
+probe. ``occ_S`` is 1 in all ten rows while ``occ_R`` admits two in eight of them, so
+shared capacity is the limiter at every reachable shape and the register file ties it
+only at the two widest. Register headroom is therefore headroom and not slack: nothing
+buys occupancy with it, and what a held operand costs is priced at the one place that
+spends it.
 
 Registers fall to 242, so 256 threads hold 61,952 of the 65,536 a multiprocessor has
 and the second warp per scheduler is available. Across the float32 pair,
@@ -423,28 +438,46 @@ refused by :func:`slinoss.ops.so3ssd.cute.mma.mma_atoms`, which replicates the
 accumulator across it. Adding groups and widening the tile's warp count are the same
 parameter, not two.
 
-The same arithmetic refuses a second resident block at eight, and it is the register
-file that refuses it rather than the arena. Two 256-thread blocks need 128 registers a
-thread and 50,176 B of tiles each; three, which is what a 50% occupancy bar asks for,
-need 85 and 33,024 B. At 242 registers ``launch__occupancy_limit_registers`` is 1
-block, so no arena reaches a second block. Nor could the arena reach 50,176 B by
-aliasing: the source-token loop holds every tile live at once except ``sdrot``,
-``sdquat`` and ``sdls``, which are written and read inside the closing chart, so
-lifetime aliasing has 2,304 B in it and its floor is 89,296 B against a 41,424 B gap.
-The forcing sum outlives the head, the score and the tap gradient already share one
-region, and ``dy``, the increment cotangent, the raw and rotated forcing tiles and
-``U`` are each read by a GEMM of every tap. Halving the source-token block buys
-11,264 B of that gap at a second pass over ``U``, and the tile cannot narrow below 48
-columns. Occupancy at this width is a register problem.
+A second resident block at eight is refused by shared capacity, not by the register
+file. The claim that stood here, that ``launch__occupancy_limit_registers`` is 1 at 242
+registers so no arena reaches a second block, is false: that counter reads 2 in eight of
+the ten rows above and shared reads 1 in all ten. Its companion record, that requesting
+``min_blocks_per_mp = 2`` takes the allocator to exactly 128 registers a thread and
+spills 11.80 MB each way, does not reproduce either. The request now yields 120
+registers, zero local sectors and 2.7% more instructions.
 
-An arena under 50,176 B would also raise ``min_blocks_per_mp`` to two by the
-expression above, and that half of the plan is measured: the request alone takes the
-allocator to exactly 128 registers a thread and it spills, 11.80 MB of local load and
-11.80 MB of local store a launch with 368,556 of the 368,640 load sectors and all of
-the store sectors missing L1, at 3,413.2 us against 3,274.1 and 519.91 MB against
-515.74. Occupancy does not move, the arena still admitting one block. So the register
-ceiling a second block imposes is not free at this shape, and the arena and the
-register file would have to clear together for either to pay.
+The residency class is closed, and closed on arithmetic rather than on a mechanism. The
+prize is real and it is the largest the operator has: isolated on this kernel's own body
+by dead allocation at fixed geometry with instruction and register counts held identical,
+residency 1 to 2 is **-34.8%** of cycles at ``P 16`` and -33.4% at ``P 32``, against an
+inert 512 B control that moves cycles 0.009%, replicating inside 0.11%. That is -560 to
+-600 us at the acceptance shape.
+
+It is unreachable. The residency-2 bar is **50,176 B**, measured to the 128 B granule:
+50,160 B reads two blocks and 50,288 B reads one. The five GEMM operands and the
+transform table are all live across one barrier interval, and they pass the bar with no
+staging buffer allocated at all::
+
+    sdy     out       9,216   A of the score GEMM
+    su      input     9,360   B of the score GEMM and of the increment GEMM
+    sstate  state     7,168   B of the increment GEMM
+    sbrot   forced    7,168   B of the readout GEMM
+    sscore  tapped   13,312   destination of the score transpose, A of the forcing GEMM
+    stable            9,216   read by :func:`_rotate_rows` in the same iteration
+                     55,440   B against a 50,176 B bar
+
+That floor is split-invariant, so no phase split reaches it, and separating any two of
+those GEMMs writes an operand to global at 566 MB and about 944 us against a 600 us
+prize. Aliasing does not reach it either: the source-token loop holds every tile live at
+once except ``sdrot``, ``sdquat`` and ``sdls``, which are written and read inside the
+closing chart, so lifetime aliasing has 2,304 B in it. ``L`` is dead as a lever in both
+directions, :func:`mma_rows` pinning M to ``MMA_TILE_M`` at every ``L``: ``L 16`` triples
+the instruction count, 923,019,264 against 311,030,784, and ``L 128`` does not fit.
+Registers cannot buy the bytes: the cap at residency 2 is 128 and forcing it yields 120,
+so 8 spare registers are 8,192 B against the 48,560 B by which the shipped arena passes
+the bar, 5.9x underwater.
+
+Occupancy at this width is a shared-capacity problem and it has no lever.
 
 The width also reaches a spill the depth cannot. At ``B 4 H 12 T 2048 L 64 P 48 3N 48
 G 12`` the fold is already one, and four warps still move 0.79 MB each of local load
@@ -2198,6 +2231,13 @@ def _tap_epilogue(
     stall is a lower bound on its price. Barrier samples rising on a launch that got
     shorter is the same effect from the other side: a warp that no longer waits here
     waits at the next barrier instead.
+
+    The barrier counter is not a barrier instrument on this kernel at all, and the
+    residency isolation above shows it from a third direction: making the second block
+    resident raises ``barrier`` 37%, ``mio_throttle`` 53% and ``math_pipe_throttle`` 40%
+    while elapsed cycles fall a third, because twice the warps are resident to be
+    stalled and issue-active cycles are conserved. Price a barrier arm on cycles or
+    duration against a control, never on the counter's own share.
 
     Nothing else moved. Registers 138 -> 140, local sectors zero on both, achieved
     occupancy 16.50% -> 16.48%, global store sectors and store requests bit-identical,
