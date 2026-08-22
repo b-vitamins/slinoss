@@ -26,6 +26,7 @@ from scripts.perf.chunk_sweep import (
     RESIDENT_TARGET,
     SHIFTED,
     ArenaKernel,
+    ArenaRow,
     Geometry,
     arena_rows,
     budget_at,
@@ -211,6 +212,33 @@ def test_a_refusal_names_the_extent_that_narrowing_would_relieve() -> None:
     assert refusing_extent(both, 64, ACCEPTANCE, CAPACITY) == "rows+dim"
 
 
+def test_a_width_the_launch_falls_back_from_refuses_nothing() -> None:
+    # Three kernels get a row per block width. Two of them narrow the block when the
+    # wide arena does not fit, so a wide row over capacity is not a verdict on ``L``
+    # and must not remove the length or the residency the narrow block does reach.
+    def row(name: str, *, nbytes: int, refused: str, binding: bool) -> ArenaRow:
+        return ArenaRow(
+            kernel=name,
+            chunk=64,
+            knob="-",
+            smem_bytes=nbytes,
+            capacity_pct=100.0 * nbytes / CAPACITY,
+            resident=residency_at(nbytes, CAPACITY),
+            floor_bytes=nbytes,
+            refused_by=refused,
+            binding=binding,
+        )
+
+    narrow = row("k/w4", nbytes=40_000, refused="", binding=True)
+    wide = row("k/w8", nbytes=2 * CAPACITY, refused="rows+dim", binding=False)
+    assert legal_chunks([narrow, wide]) == (64,)
+    assert resident_chunks([narrow, wide], RESIDENT_TARGET) == (64,)
+    # The same row binding does refuse it, so the filter is the flag and not the name.
+    binds = wide._replace(binding=True)
+    assert legal_chunks([narrow, binds]) == ()
+    assert resident_chunks([narrow, binds], RESIDENT_TARGET) == ()
+
+
 @CUTE
 @pytest.mark.cute
 def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> None:
@@ -227,12 +255,14 @@ def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> Non
         assert row.floor_bytes <= row.smem_bytes
         assert (row.refused_by == "chunk") == (row.floor_bytes > CAPACITY)
     fitting = {row.chunk for row in rows} - {
-        row.chunk for row in rows if row.refused_by
+        row.chunk for row in rows if row.refused_by and row.binding
     }
     assert legal_chunks(rows) == tuple(
         sorted(c for c in fitting if MIN_CHUNK <= c <= MAX_CHUNK)
     )
-    short = {row.chunk for row in rows if row.resident < RESIDENT_TARGET}
+    short = {
+        row.chunk for row in rows if row.resident < RESIDENT_TARGET and row.binding
+    }
     assert set(resident_chunks(rows, RESIDENT_TARGET)) == set(CANDIDATES) - short
 
 

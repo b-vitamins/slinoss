@@ -151,14 +151,19 @@ class ArenaKernel(NamedTuple):
     """One kernel's shared-memory budget as a function of the three extents.
 
     Attributes:
-        name: Kernel name, with the fold appended where the budget depends on it.
+        name: Kernel name, with the fold and the block width appended where the
+            budget depends on them.
         nbytes: ``(chunk, rows, dim) -> bytes``, the shipped layout function.
         knob: ``(chunk, rows, dim) -> str``, the slice width that layout chose.
+        binding: Whether excess over capacity here refuses the chunk length. False
+            for a block width the launch falls back from, since the narrower width
+            is still available and the length still runs.
     """
 
     name: str
     nbytes: Callable[[int, int, int], int]
     knob: Callable[[int, int, int], str]
+    binding: bool = True
 
 
 def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
@@ -167,39 +172,78 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
     The backward's state passing and the boundary allocate none, so ``L`` cannot
     refuse them and they do not appear.
 
+    Three kernels pick their own block width, and the width moves the arena: the
+    score staging on the scan, the per-warp scratch on the input backward, and the
+    offset row per warp group on the vector backward. Their choosers cannot be
+    called here, because they query the live device for the carveout and the
+    residency, which would defeat ``--capacity``, and because the input
+    backward's raises at the chunk lengths this map deliberately asks about. So
+    both widths get a row and the reader takes the one the kernel would pick.
+
     Args:
         fold: Heads one vector-backward block walks. A fold above one adds the
             cross-head accumulator to that kernel's arena, so both folds appear
             when they differ.
 
     Returns:
-        One entry per kernel, forward launches first.
+        One entry per kernel and block width, forward launches first.
     """
     from slinoss.ops.so3ssd.cute.bwd.chunk_input import input_smem_bytes, lblock
     from slinoss.ops.so3ssd.cute.bwd.chunk_start import start_smem_bytes
     from slinoss.ops.so3ssd.cute.bwd.chunk_vector import vblock, vector_smem_bytes
+    from slinoss.ops.so3ssd.cute.common import WARPS
     from slinoss.ops.so3ssd.cute.fwd.chunk_scan import nblock, scan_smem_bytes
     from slinoss.ops.so3ssd.cute.fwd.increment_passing import (
         SPLIT,
         fused_kblock,
         fused_smem_bytes,
     )
+    from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE, mma_atoms
 
-    def input_knob(chunk: int, rows: int, dim: int) -> str:
-        # The map asks about chunk lengths the kernel refuses, and at those there is no
-        # lane block to name: ``lblock`` returns a block that fits or raises. The bytes
-        # column still reports the narrowest block's cost, which is what the refusal is
-        # judged on.
-        try:
-            return f"lblk={lblock(chunk, rows, dim)}"
-        except ValueError:
-            return "lblk=none"
+    widths = tuple(dict.fromkeys((WARPS, WARPS_WIDE)))
 
-    def vector(f: int) -> ArenaKernel:
+    def scan(w: int) -> ArenaKernel:
+        # ``scan_threads`` takes the narrow width whenever the wide arena does not
+        # fit, so only the narrow row can refuse a length.
         return ArenaKernel(
-            name=f"chunk_vector_bwd/fold{f}",
-            nbytes=lambda c, p, d: vector_smem_bytes(c, p, d, f, vblock(c, p, d, f)),
+            name=f"chunk_scan_fwd/w{w}",
+            nbytes=lambda c, p, d: scan_smem_bytes(c, p, d, warps=w),
+            knob=lambda c, p, d: f"nblk={nblock(c)}",
+            binding=w == WARPS,
+        )
+
+    def inputs(w: int) -> ArenaKernel:
+        def knob(chunk: int, rows: int, dim: int) -> str:
+            # The map asks about chunk lengths the kernel refuses, and at those there
+            # is no lane block to name: ``lblock`` returns a block that fits or
+            # raises. The bytes column still reports the narrowest block's cost,
+            # which is what the refusal is judged on.
+            try:
+                return f"lblk={lblock(chunk, rows, dim, warps=w)}"
+            except ValueError:
+                return "lblk=none"
+
+        # ``input_threads`` falls back the same way, so the narrow row binds here too.
+        return ArenaKernel(
+            name=f"chunk_input_bwd/w{w}",
+            nbytes=lambda c, p, d: input_smem_bytes(c, p, d, warps=w),
+            knob=knob,
+            binding=w == WARPS,
+        )
+
+    def vector(f: int, w: int) -> ArenaKernel:
+        # The N atoms of the tiling, as :func:`vector_backward` derives them, because
+        # the offset term takes one row per warp group. This launch does not fall
+        # back: its own docstring refuses a shape that fits at four warps and not at
+        # eight rather than narrowing the block, so the wide row is the binding one.
+        groups = mma_atoms(w)[1]
+        return ArenaKernel(
+            name=f"chunk_vector_bwd/fold{f}/w{w}",
+            nbytes=lambda c, p, d: vector_smem_bytes(
+                c, p, d, f, vblock(c, p, d, f), warp_groups=groups
+            ),
             knob=lambda c, p, d: f"span={vblock(c, p, d, f)}",
+            binding=w == WARPS_WIDE,
         )
 
     entries = [
@@ -215,23 +259,17 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
             ),
             knob=lambda c, p, d: f"span={SPLIT} kblk={fused_kblock(c, p, SPLIT)}",
         ),
-        ArenaKernel(
-            name="chunk_scan_fwd",
-            nbytes=scan_smem_bytes,
-            knob=lambda c, p, d: f"nblk={nblock(c)}",
-        ),
+    ]
+    entries.extend(scan(w) for w in widths)
+    entries.append(
         ArenaKernel(
             name="chunk_start_bwd",
             nbytes=start_smem_bytes,
             knob=lambda c, p, d: "-",
-        ),
-        ArenaKernel(
-            name="chunk_input_bwd",
-            nbytes=input_smem_bytes,
-            knob=input_knob,
-        ),
-    ]
-    entries.extend(vector(f) for f in dict.fromkeys((1, fold)))
+        )
+    )
+    entries.extend(inputs(w) for w in widths)
+    entries.extend(vector(f, w) for f in dict.fromkeys((1, fold)) for w in widths)
     return tuple(entries)
 
 
@@ -251,6 +289,8 @@ class ArenaRow(NamedTuple):
             excess: ``chunk`` when the narrowest widths already exceed capacity,
             ``dim`` or ``rows`` when narrowing that one alone suffices, ``rows+dim``
             when neither alone does.
+        binding: Whether a refusal here refuses the chunk length, from
+            :class:`ArenaKernel`.
     """
 
     kernel: str
@@ -261,6 +301,7 @@ class ArenaRow(NamedTuple):
     resident: int
     floor_bytes: int
     refused_by: str
+    binding: bool = True
 
 
 def refusing_extent(
@@ -316,6 +357,7 @@ def arena_rows(
                     resident=residency_at(nbytes, capacity),
                     floor_bytes=kernel.nbytes(chunk, HEAD_MULTIPLE, STATE_MULTIPLE),
                     refused_by=refusing_extent(kernel, chunk, geo, capacity),
+                    binding=kernel.binding,
                 )
             )
     return tuple(rows)
@@ -375,13 +417,16 @@ def budget_at(blocks: int, capacity: int) -> int:
 def legal_chunks(rows: Sequence[ArenaRow]) -> tuple[int, ...]:
     """Chunk lengths every kernel fits and the config admits.
 
+    A row for a block width the launch falls back from cannot refuse a length, so
+    only binding rows are read.
+
     Args:
         rows: The legality map.
 
     Returns:
         The admitted lengths, ascending.
     """
-    refused = {row.chunk for row in rows if row.refused_by}
+    refused = {row.chunk for row in rows if row.refused_by and row.binding}
     return tuple(
         sorted(
             chunk
@@ -394,6 +439,9 @@ def legal_chunks(rows: Sequence[ArenaRow]) -> tuple[int, ...]:
 def resident_chunks(rows: Sequence[ArenaRow], target: int) -> tuple[int, ...]:
     """Chunk lengths at which every kernel reaches ``target`` resident blocks.
 
+    Binding rows only, so the width the launch would fall back from does not decide
+    a residency the launch will not have.
+
     Args:
         rows: The legality map.
         target: Blocks required.
@@ -401,7 +449,7 @@ def resident_chunks(rows: Sequence[ArenaRow], target: int) -> tuple[int, ...]:
     Returns:
         The lengths, ascending.
     """
-    short = {row.chunk for row in rows if row.resident < target}
+    short = {row.chunk for row in rows if row.resident < target and row.binding}
     return tuple(sorted({row.chunk for row in rows} - short))
 
 
@@ -1419,6 +1467,7 @@ def print_arena(geo: Geometry, args: argparse.Namespace) -> None:
         f"{budget_at(RESIDENT_TARGET, capacity):,} B   config admits L in "
         f"[{MIN_CHUNK}, {MAX_CHUNK}]"
     )
+    print("a width the launch falls back from is reported and does not refuse a length")
     print()
     print(
         f"{'kernel':26s} {'L':>5s} {'knob':>10s} {'bytes':>10s} {'cap_pct':>8s} "
@@ -1427,6 +1476,8 @@ def print_arena(geo: Geometry, args: argparse.Namespace) -> None:
     for row in rows:
         admitted = MIN_CHUNK <= row.chunk <= MAX_CHUNK
         verdict = row.refused_by or ("" if admitted else "config")
+        if verdict and not row.binding:
+            verdict = f"{verdict} (falls back)"
         print(
             f"{row.kernel:26s} {row.chunk:5d} {row.knob:>10s} "
             f"{row.smem_bytes:10,d} {row.capacity_pct:8.2f} {row.resident:9d} "
