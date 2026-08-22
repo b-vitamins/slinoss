@@ -113,6 +113,19 @@ which pays the two warp-serial scans and the exponential's adjoint on one tile o
 ``tiles`` and deletes a launch. At one tile there are no slots, no counter and no
 published words, and the store is the output itself.
 
+The block's whole width waits on the increment. On the acceptance shape it is the
+largest single barrier site in the kernel: the shared read that broadcasts the
+returned count carried 9,365 of 33,198 ``barrier`` samples, 4.36% of all samples and
+817 cycles a block, and it is fully exposed because one block is resident and all
+eight warps wait at the same barrier. A device fence ahead of the increment cost
+30.3% of that. The fence lowered to the ``MEMBAR.ALL.GPU``, ``ERRBAR`` and
+``CCTL.IVALL`` triple the ``acq_rel`` increment lowers to anyway, back to back with
+only address arithmetic between the two triples, so deleting it removed 34,560 warp
+instructions a launch, took the site to 6,527 samples, and measured -22.016 us at
+acceptance and -3.328 at ``wide`` bitwise clean, interval excluding zero over 600
+pairs against a null control that did not. A sample share converted to time at 1.10x
+here. At one tile there is no increment and the shapes measured exactly zero.
+
 Shared memory is one resident set and one phase arena. Resident: ``trans``, ``K``,
 the two chunk-local prefixes, the three-slot transform table, the nine-float
 per-token scratch, the log-scale and quaternion cotangents, and the rotated
@@ -3347,15 +3360,20 @@ def chunk_vector_bwd_kernel(
                     vdlp[token] = offset
         cute.arch.sync_threads()
 
-        # The barrier above orders the block's publishing stores at block scope; the
-        # fence carries them to device scope before the counter moves. So a tile that
-        # reads ``tiles - 1`` reads every slot's words. One thread increments and the
-        # second barrier broadcasts what it read: the branch below is block-uniform,
-        # which is what makes the barriers inside it legal.
+        # The barrier above orders the block's publishing stores at block scope, which
+        # puts them in the increment's happens-before set; the increment's own
+        # ``acq_rel`` at gpu scope carries them to device scope. So a tile that reads
+        # ``tiles - 1`` reads every slot's words, with no separate fence: a fence here
+        # lowers to the same MEMBAR.ALL.GPU, ERRBAR and CCTL.IVALL the atomic already
+        # lowers to, with no memory instruction between the two triples, so it is the
+        # same fence twice. The acquire half needs no cache reasoning either, since
+        # :func:`_sum_slots` reads the slots with ``ld.global.cg``, past L1.
+        # One thread increments and the second barrier broadcasts what it read: the
+        # branch below is block-uniform, which is what makes the barriers inside it
+        # legal.
         run = True
         if cutlass.const_expr(tiles > 1):
             if tid == 0:
-                cute.arch.fence_acq_rel_gpu()
                 sflag[0] = cute.arch.atomic_add(
                     gcount.iterator + gcount.layout((bidx, hidx, cidx)),
                     cutlass.Int32(1),
