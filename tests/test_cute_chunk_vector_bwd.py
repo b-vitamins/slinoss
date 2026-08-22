@@ -415,17 +415,15 @@ def test_grouped_vectors_sum_over_their_heads(groups: int) -> None:
 
     ``G == 1`` is the only case where every head contributes to one ``B``/``C``
     pair, and it is the case a missing reduction silently passes at ``G == H``. An
-    intermediate ``G`` takes the same head fold, so it is not swept. At this fold
-    the default depth leaves one head to a block, so what is under test is the
-    closure rather than the in-block loop;
-    :func:`test_the_head_shard_closure_sums_every_head` sweeps the depth that runs
-    both.
+    intermediate ``G`` takes the same head fold, so it is not swept. At the default
+    depth the block walks the fold itself, so what is under test is the in-block loop
+    and the register fold sum carried across it;
+    :func:`test_the_head_shard_closure_sums_every_head` sweeps the depths that put a
+    closure in the path instead.
 
-    The shape is also where the budget halves the source-token block, at ``G == 1``
-    only, so it is the case that runs two blocks in the tap loop and the case where
-    the halving and the second lane tile interact: the forcing sum is per lane tile
-    and per group, and it has to be rezeroed on the tile boundary but not on the
-    head boundary.
+    Two lane tiles at ``3N 96``, so it is also the case where the head loop and the
+    tile boundary interact: the forcing sum is per lane tile and per group, and it has
+    to be rezeroed on the tile boundary but not on the head boundary.
     """
     inp = _make(2, 4, 128, 64, 32, torch.bfloat16, groups=groups)
     dy = _cotangent(inp, torch.bfloat16)
@@ -442,9 +440,9 @@ def test_holds_the_widest_state_the_mixer_configures(groups: int) -> None:
     launch path every narrower state takes rather than a second one, and the arena
     costs what it costs at ``3N = 48``. The geometry is the one the throughput
     targets are stated at: ``d_head 64``, ``L 64``, ``N 80``, ``H 18``. At ``G == 1``
-    the fold is shared over the default depth and the budget halves the source-token
-    block as well, so the two sums that cross lanes are accumulated over five lane
-    tiles while the forcing sum crosses one shard's heads and two source blocks.
+    one block walks all eighteen heads and the source-token block stays at the full M
+    tile, so the two sums that cross lanes are accumulated over five lane tiles while
+    the register fold sum crosses the whole fold in one block.
     """
     inp = _make(1, 18, 128, 64, 80, torch.bfloat16, groups=groups)
     dy = _cotangent(inp, torch.bfloat16)
@@ -476,14 +474,16 @@ def test_the_partial_depth_takes_only_divisors_of_the_fold() -> None:
     """A depth that does not divide the fold is refused, not rounded.
 
     A ragged depth would leave one block walking fewer heads than the shard stride
-    covers and the closure summing rows no producer wrote. The default is the fold
-    itself, which is the measured optimum and the only depth with no rolled head
-    loop at all.
+    covers and the closure summing rows no producer wrote. The default is one at every
+    fold: it is the only depth with no partial workspace and no reduction launch, and
+    the fold sum costs no shared memory since it moved to registers, so the block over
+    source tokens stays at 64 whatever the fold.
     """
     assert vector_splits(1) == 1
-    assert vector_splits(18) == 18
-    assert vector_splits(7) == 7
+    assert vector_splits(18) == 1
+    assert vector_splits(7) == 1
     assert vector_splits(18, 9) == 9
+    assert vector_splits(18, 18) == 18
     for bad in (0, -1, 4, 12):
         with pytest.raises(ValueError, match="divisor of the fold"):
             vector_splits(18, bad)
@@ -564,8 +564,8 @@ def test_the_lane_slot_closure_reproduces_bit_for_bit() -> None:
 
 @pytest.mark.parametrize(
     ("chunk", "splits"),
-    [(64, None), (64, 1), (16, None)],
-    ids=["one-head-a-block", "in-block-fold", "padded-source-block"],
+    [(64, None), (64, 2), (16, None)],
+    ids=["in-block-fold", "one-head-a-block", "padded-source-block"],
 )
 def test_the_wide_block_width_agrees_with_the_default(
     chunk: int, splits: int | None
@@ -584,10 +584,13 @@ def test_the_wide_block_width_agrees_with_the_default(
     the float64 reference at both widths rather than to the other width, and no bound
     moves for it.
 
-    Both head geometries: the default depth leaves one head to a block, and depth one
-    walks the group's heads in the block, which is the loop the accumulators sit
-    across. Two lane tiles either way, so the two sums that cross lanes go through
-    their slot closure at both widths.
+    Both head geometries: the default depth walks the group's heads in the block,
+    which is the loop the register fold sum sits across, and the full depth leaves one
+    head to a block. The fold sum is the one accumulator whose thread-to-column cover
+    the width changes, since a pass is ``threads / LANE_GROUP`` tokens wide: four warps
+    cover ``L 64`` in two passes and eight in one, so the two widths exercise both
+    fragment extents and are still held to being bitwise equal. Two lane tiles either
+    way, so the two sums that cross lanes go through their slot closure at both widths.
 
     ``L 16`` is the third case, for the extent the wide arm alone reads. The source
     token block is a quarter of an M tile there, so the score tile carries pad rows
@@ -794,21 +797,24 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
 
     The block over source tokens is what the budget buys: the full atom tile at
     the shape the DRAM-bound class is declared against, and half of it where the
-    row count or the head fold would overflow the carveout. Halving the block
-    doubles the ``U`` traffic and leaves the kernel memory bound either way, so the
+    row count would overflow the carveout. Halving the block doubles the ``U``
+    traffic and leaves the kernel memory bound either way, so the
     choice is the budget's and not the caller's. The widest legal ``L`` does not fit
     at any ``P`` and is refused on the host.
 
-    ``3N`` is not one of the axes the budget scales with. Every tile that spans the
-    state width spans one lane tile of it, so the arena is flat in ``3N`` and the
-    widest state the mixer configures costs what the narrowest does.
+    Neither ``3N`` nor the fold is an axis the budget scales with. Every tile that
+    spans the state width spans one lane tile of it, so the arena is flat in ``3N``;
+    the readout gradient's fold sum is a register fragment and not a region, so the
+    arena is flat in the fold too. That second flatness is what keeps the block at 64
+    below the fold: the 13,312 B a shared fold sum took is more than the carveout has
+    spare at that block, so every depth under the fold used to demote it to 32.
     """
     assert vblock(64, 48, 48, 1) == 64
     assert vector_smem_bytes(64, 48, 48, 1, 64) <= smem_capacity()
-    # The default head width halves the block, and the halved budget fits.
-    assert vblock(64, 64, 48, 12) == 32
-    assert vector_smem_bytes(64, 64, 48, 12, 32) <= smem_capacity()
-    assert vector_smem_bytes(64, 64, 48, 12, 64) > smem_capacity()
+    # The fold no longer halves the block, and the full budget fits at every depth.
+    assert vblock(64, 64, 48, 12) == 64
+    assert vector_smem_bytes(64, 64, 48, 12, 64) <= smem_capacity()
+    assert vector_smem_bytes(64, 64, 48, 12, 64) == vector_smem_bytes(64, 64, 48, 1, 64)
     # ``MAX_CHUNK`` overflows at the narrowest ``P`` and ``3N``, so no shape saves
     # it and the halved block does not either.
     assert vector_smem_bytes(MAX_CHUNK, 16, 48, 1, vblock(MAX_CHUNK, 16, 48, 1)) > (
@@ -819,19 +825,19 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert vector_smem_bytes(32, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 1, 32)
     assert vector_smem_bytes(64, 16, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 1, 32)
     assert vector_smem_bytes(64, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 1, 64)
-    assert vector_smem_bytes(64, 48, 48, 1, 32) < vector_smem_bytes(64, 48, 48, 2, 32)
-    # The fourth is flat, and the state width the acceptance geometry asks for fits
-    # at the full block and at the widest fold the mixer configures.
+    # The other two are flat, and the state width and the fold the acceptance geometry
+    # asks for both fit at the full block.
+    assert vector_smem_bytes(64, 48, 48, 1, 32) == vector_smem_bytes(64, 48, 48, 2, 32)
     assert vector_smem_bytes(64, 48, 48, 1, 32) == vector_smem_bytes(64, 48, 240, 1, 32)
     assert vblock(64, 64, 240, 1) == 64
     assert vector_smem_bytes(64, 64, 240, 1, 64) <= smem_capacity()
-    assert vblock(64, 64, 240, 18) == 32
-    assert vector_smem_bytes(64, 64, 240, 18, 32) <= smem_capacity()
+    assert vblock(64, 64, 240, 18) == 64
+    assert vector_smem_bytes(64, 64, 240, 18, 64) <= smem_capacity()
     # ``L 64`` is the largest chunk the layout admits, at one resident block at both
     # row counts. The next legal chunk overflows at fold one and the halved block,
     # which is the cheapest corner it has, so no fold or block saves it.
     assert smem_capacity() < 2 * vector_smem_bytes(64, 48, 240, 1, 64)
-    assert smem_capacity() < 2 * vector_smem_bytes(64, 64, 240, 18, 32)
+    assert smem_capacity() < 2 * vector_smem_bytes(64, 64, 240, 18, 64)
     assert vector_smem_bytes(96, 48, 240, 1, vblock(96, 48, 240, 1)) > smem_capacity()
     assert vector_smem_bytes(96, 64, 240, 1, vblock(96, 64, 240, 1)) > smem_capacity()
     # The block width moves one extent and only one: the offset accumulator takes a
@@ -1020,12 +1026,10 @@ def test_rejects_a_bad_operand(
         # 48 is a multiple of 16 and so clears the atom's K extent; what it fails is
         # the source-token block, which is this kernel's own tiling and not the
         # atom's. It fails only where the budget halves that block, since the full
-        # block is the chunk itself, and since the arena is flat in ``3N`` the only
-        # axes that reach the halving are ``P`` and the in-block fold. The depth is
-        # pinned to one for that reason: at the default depth this fold is one block
-        # to a head, the arena is the unhalved one and the shape is legal. The public
-        # config admits only powers of two, so no reachable configuration hits this;
-        # the check is what keeps that true.
+        # block is the chunk itself, and the arena is flat in ``3N`` and in the fold,
+        # so ``P`` is the only axis that reaches the halving: 128 rows is what puts
+        # this arena over the carveout. The public config admits only powers of two,
+        # so no reachable configuration hits this; the check is what keeps that true.
         (48, 128, 16, 1, 1, "K slice"),
         # ``P`` is the N mode of the two increment contractions here, unlike the
         # kernels where it is only a row count, so it carries the atom's constraint.

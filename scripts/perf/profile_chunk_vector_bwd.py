@@ -17,9 +17,11 @@ readable against the workspace and closure figures the default mode prints.
 
 ``--rows``, ``--lanes``, ``--heads`` and ``--chunk`` override the named shape's
 per-block geometry. ``--groups`` sets ``G``, and the fold ``H // G`` with it, which
-is what decides whether the float32 readout sum is allocated at all. ``--splits``
-sets how many blocks that fold is shared over, which trades the in-block fold's
-local traffic against a workspace partial. ``--warps`` sets the block width, which
+is what decides whether the readout gradient's fold sum is held at all. ``--splits``
+sets how many blocks that fold is shared over, which trades the in-block fold's loop
+against a workspace partial and a closing launch. It is the only way to reach
+``vector_reduce_kernel``: the shipped depth is one, so an operator call never emits a
+partial. ``--warps`` sets the block width, which
 is the lever on how many warps are resident per scheduler; it defaults to the width
 the operator ships. The overrides rename the shape, so a figure taken under one
 cannot be read as a figure at the name it started from.
@@ -373,7 +375,9 @@ def atomic_price(
         shape: The named shape, after any geometry override.
         groups: ``G``.
         device: A CUDA device.
-        splits: Partial depth. ``None`` takes the fold, which is the shipped depth.
+        splits: Partial depth. ``None`` takes the whole fold, which is not the shipped
+            depth: the close it prices exists only above depth one, and the deepest
+            fold is the contention an atomic would have to beat.
         order: One of :data:`ATOMIC_ORDERS`.
         iters: Timed iterations.
         warmup: Untimed iterations first.
@@ -386,7 +390,8 @@ def atomic_price(
     """
     if order not in ATOMIC_ORDERS:
         raise ValueError(f"order must be one of {ATOMIC_ORDERS}, got {order!r}")
-    fold = vector_splits(shape.heads // groups, splits)
+    whole = shape.heads // groups
+    fold = whole if splits is None else vector_splits(whole, splits)
     rows = shape.bsz * groups * shape.seq
     dest = torch.zeros((rows, shape.d_state), dtype=torch.float32, device=device)
     src = torch.ones((rows * fold, shape.d_state), dtype=torch.float32, device=device)

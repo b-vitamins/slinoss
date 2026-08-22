@@ -68,21 +68,56 @@ the moment that tap's reduction is, which keeps the scratch at nine floats per
 token rather than twenty-seven.
 
 ``dB``, ``dC`` and the carry are sums over the heads sharing a group, and the fold
-``H // G`` is cut into :func:`vector_splits` shards, one block to a shard. The fold is
-one at ``standard`` and eighteen at the default configuration, and the depth is the
-fold: one head to a block.
+``H // G`` may be cut into :func:`vector_splits` shards, one block to a shard. The fold
+is one at ``standard`` and eighteen at the default configuration, and the depth is one:
+a block walks the whole fold and writes the three outputs itself.
 
-A head a block walks past the first is a rolled iteration between an accumulator's
-allocation and its uses, which is what defeats register promotion. What that costs
-does not follow the trip count, so the two costs of the sum do not trade: at
-``L 64 P 64 3N 240 G 1`` and the shipped width a call takes 4,301.8 us at depth one,
-holds between 4,033.5 and 4,262.9 from depth two to depth nine as the partials
-accumulate on top of a spill that has not moved, and falls to 3,493.9 at the full
-depth, where the loop's trip count is one and the spill is gone with it. One counter
-pass at each end of the sweep: 255 registers, 144.51 MB of local loads and 8.52 MB of
-local stores at depth one, against 242 registers and no local traffic at all at the
-full depth. The local traffic is a property of the loop existing. That sweep is the
-two-tap form and is not retaken; the one-tap form's own price is a paired delta below.
+A depth above one costs a launch, and the launch is what it loses on. A block that
+walks the fold holds the readout gradient's sum across the loop in the register
+fragment :func:`_fold_frag`, twelve float32 a thread and no shared memory at all, and
+it reads and writes the same operands a block walking one head does.
+
+Depth one is worth -41.5 us plus or minus 1.5 at ``L 64 P 64 3N 240 G 1`` and the
+shipped width, on a paired wall against the full depth over 3,000 pairs. The interval
+is [-41.472, -41.472] and excludes zero, replicated across independent runs; the two
+null controls bounding the position bias read +1.536 and -1.024.
+``sm__cycles_active`` agrees in sign at -8.67%, 231,083,593 against 211,057,167 over
+six launches a side. The effect needs an idle device to be visible at all: the same
+wrapper reads 1,589 to 1,617 us idle and 4,065 to 4,075 us beside a foreign job, so
+41 us is 2.6% of the one and 1.0% of the other. An earlier attempt to price the depth
+by differencing per-kernel duration sums across separate profiler processes reported
+-62.0 us and is withdrawn; that method credits the deleted launch in full and charges
+the loop nothing.
+
+The gain is the second launch ceasing to exist and the traffic that went with it, not
+the loop. DRAM over both kernels falls 552.97 MB to 296.92 MB, -46%: the full depth
+pays 197.88 MB read and 201.21 MB written here plus 143.78 MB read and 10.10 MB
+written in :func:`vector_reduce`, and depth one pays 230.72 MB read and 66.20 MB
+written with no second kernel at all. Instructions move the other way, +4.12% for the
+loop, 273,740,544 against 285,024,640, and that fee is already inside the -41.5.
+
+The register form is separately worth nothing in time. Holding the fold sum in
+registers rather than shared, at the full depth on both sides, measures [0.000, 0.000]
+over 3,000 pairs with every output bitwise, replicated. Its whole value is the
+13,312 B it frees, which is what makes depth one reachable at a source-token block of
+64.
+
+Registers are 238 a thread at depth one against 142 at the full depth, 17 under the
+cap, with zero local load and zero local store sectors at both. The arena is 99,760 B
+at either depth and both occupancy limits read one block.
+
+Depth one changes the summation order, so the two summed outputs move at the default
+configuration: 806,644 of 1,966,080 elements of ``dB`` at 1.600e+01 maximum absolute
+difference and 807,928 of ``dC`` at 8.000e+00, both inside the declared bounds, with
+``carry_b``, ``dtrans`` and ``dK`` bitwise. At fold one every output is bitwise, so
+only the default configuration is reached: it is the one shape whose fold exceeds one.
+
+What used to refuse the shallow depth was neither the fee nor the bytes. The readout
+gradient's float32 fold accumulator was 13,312 B of shared memory, allocated only above
+fold one, and that is the amount that put a source-token block of 64 over the carveout:
+every depth below the fold took :func:`vblock` to 32, which is a second pass over ``U``
+and costs more than the launch the depth deletes. The accumulator is registers now, the
+arena is flat in the fold, and the block stays at 64 at every depth.
 
 A shard owns a partial and not an output. At depth one the block writes the three
 outputs itself, after the last head, in shared memory throughout. Above one it writes
@@ -130,12 +165,13 @@ here. At one tile there is no increment and the shapes measured exactly zero.
 Shared memory is one resident set and one phase arena. Resident: ``trans``, ``K``,
 the two chunk-local prefixes, the three-slot transform table, the nine-float
 per-token scratch, the log-scale and quaternion cotangents, and the rotated
-readout. The arena holds the two float32 sums that outlive a head, one region per
+readout. The arena holds the float32 forcing sum that outlives a head, one region per
 tap holding either the float32 forcing gradient or the narrowed score, and five
 operand tiles: the output cotangent, one tile that carries the chunk-start state and
 then the increment cotangent, the raw and rotated forcing tiles and the ``U`` tile.
 The float32 readout gradient of the epilogue aliases those five, none being live
-when it is.
+when it is. The readout gradient's sum over the fold has no region: it is the register
+fragment :func:`_fold_frag` holds.
 
 The source-token block is :func:`vblock`, one M tile of the atom where the budget
 allows it and half of one where it does not. Below one M tile every warp still
@@ -145,10 +181,14 @@ up to the tile.
 The budget bounds ``L``, ``P`` and the fold. It does not bound ``3N``, and this is
 still the widest live set in the tree. ``L 16`` and ``L 32`` fit at every ``P``,
 every fold and every ``3N``.
-``L 64`` fits to ``P 64`` at every fold, in 98,736 B at fold one and 100,784 B above
-it at the shipped width and 256 B less at one warp group, whether ``3N`` is 48 or
-240. The table's segment-aligned pitch costs ``36 * L`` B of each figure, 2,304 B at
-``L 64``, and it does not scale with the fold. ``L 64`` at ``P 128`` and ``L 128`` at
+``L 64`` fits to ``P 64`` at every fold, in 98,736 B at the shipped width and 256 B
+less at one warp group, whether ``3N`` is 48 or 240 and whatever the fold. The fold was
+an axis of that figure until the readout gradient's fold sum moved to registers: a
+shared region for it is 13,312 B, which took ``L 64`` at ``P 64`` and any fold above one
+to 112,048 B, over the carveout, and :func:`vblock` then halved the source-token block
+at every depth below the fold.
+The table's segment-aligned pitch costs ``36 * L`` B of each figure, 2,304 B at
+``L 64``, and it does not scale with the fold either. ``L 64`` at ``P 128`` and ``L 128`` at
 every ``P``
 are refused: the smallest live set at ``L 128`` is 127,920 B, above the capacity of
 every device the DSL reports. :func:`slinoss._cute.assert_smem_fits` refuses the
@@ -163,12 +203,12 @@ The largest ``L`` this layout admits is 64, at one resident block, at ``P 64`` a
 ``P 48`` alike. Two resident blocks of 128 threads need 50,176 B each, which is
 :func:`slinoss._cute.smem_budget` at two and not half the 101,376 B capacity: the
 capacity has one driver reservation subtracted from it and two blocks pay two. No
-legal shape at ``P 64`` reaches that bar: the smallest arena there is 54,768 B, at
-``L 16`` and fold one. Splitting the fold across blocks removes the one
-accumulator that exists only above fold one, 13,312 B of the 100,528, and leaves
-87,216 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
-the two float32 fold sums, the output tile and the aliased float32 readout -- which
-is why 128 is refused and why grid-izing the lane tile does not unpin it.
+legal shape at ``P 64`` reaches that bar: the smallest arena there is 55,600 B, at
+``L 16``. Splitting the fold across blocks buys parallelism and not occupancy, and no
+longer buys a byte either: the accumulator that existed only above fold one is a
+register fragment. Three extents scale with ``L`` -- the float32 forcing sum, the
+output tile and the aliased float32 readout -- which is why 128 is refused and why
+grid-izing the lane tile does not unpin it.
 
 DRAM-bound. Analytic traffic at ``standard``, operand by operand, with ``U`` and
 ``B`` at the ``L + 1`` rows per chunk their shifted span reads::
@@ -210,19 +250,20 @@ inside one L2 residency. Measured at the acceptance shape, the producer's
 the whole of the read-back. ``U`` dominates the per-tile term
 because its tile is one atom M tile whatever the ``span``, so a ``span 32`` shape
 reads it twice. ``dinc`` and ``zstart`` are ``(B, H, C, P, 3N)`` at the operand width
-and together are 25% of the total. The three write terms are the depth-one form. At
-the shipped depth they are :func:`partial_bytes` instead, 143.77 MB, which is the
-largest single item in the launch and the whole of what the closure reads.
+and together are 25% of the total. The three write terms are the shipped depth's, which
+is one. A depth above one replaces them with :func:`partial_bytes`, 143.77 MB at the
+full depth, the largest single item in that launch and the whole of what its closure
+reads.
 
 Every measurement in the rest of this docstring was taken with ``dinc`` and ``zstart``
 at float32, which is 141.56 MB a launch more than the shipped kernel reads and puts
-the shipped-depth analytic total at 837.5 MB rather than 696.0 MB. Narrowing them
+the full-depth analytic total at 837.5 MB rather than 696.0 MB. Narrowing them
 takes the counted read from 336.60 MB to 195.01 MB, the full 141.60, and the launch
 from 1,855.1 us to 1,837.4: -17.7 us for 17% of the traffic, which is the ratio a
 launch this far off its byte floor converts at.
 
 That total is an upper bound and the launch does not pay it. 837.5 MB analytic at the
-shipped depth against 515.81 MB of DRAM counted, 62% over. The 321.7 MB of daylight is
+full depth against 515.81 MB of DRAM counted, 62% over. The 321.7 MB of daylight is
 the size of the per-tile re-read term, 259.89 MB, and the lane tile is the innermost
 axis of ``x``, so the five tiles of a token block run back to back and L2 serves the
 repeats. Score this kernel against its counted traffic, never against the table.
@@ -250,16 +291,17 @@ predicts the wrong pipe and gets the sign wrong.
 
 Measured, the bar is missed, and the distance is latency and not traffic. Every
 counter below is from one profile of this kernel on an RTX A6000, ``sm_86``, 84
-multiprocessors, one profiled launch per counter pass at the shipped depth and six for
-the extent table below, clocks unlocked because
+multiprocessors, one profiled launch per counter pass, clocks unlocked because
 locking is denied on this fleet. A floor is ``c + bytes / B`` on a fit taken in the
 same process, ``c`` about 4.3 us and ``B`` about 685 GB/s at a worst residual of
 0.40%, and ``bytes`` is the analytic traffic above unless stated otherwise. A
 duration is stamped with the compute-apps query taken before and after it; where
 that query named another process the duration is a bound, not a rate.
 
-At the default configuration -- 11,520 blocks of 256 threads, five lane tiles, the
-fold of 18 cut into eighteen shards, one head to a block -- the main kernel moves
+Every counter in the rest of this section was taken at the full depth -- 11,520 blocks
+of 256 threads, five lane tiles, the fold of 18 cut into eighteen shards, one head to a
+block -- which is not the shipped depth and is where this kernel's traffic and issue
+record was built. There the main kernel moves
 515.74 MB of DRAM per launch in 1,851.8 us on device time at 1.7969 GHz, median of
 five steady-state launches in each of two A/B blocks, 3,285,344 active cycles at a
 0.59% spread.
@@ -267,6 +309,14 @@ five steady-state launches in each of two A/B blocks, 3,285,344 active cycles at
 own floor; the two lane-slot reductions add 44.2 and 23.0 us. Three of the four
 launches are at their bandwidth; the main kernel is the one that misses the 85% the
 class asks, and it is issue-bound rather than short of bandwidth.
+
+At the shipped depth the same shape is 640 blocks and one launch fewer, and the main
+kernel moves 296.92 MB across the pair at 238 registers, 99,760 B of arena and a
+source-token block of 64. Its class figure falls with the bytes and not with the time:
+22.8% of memory speed-of-light against 38.1%. The paragraphs below read as the record of
+what this kernel's cycles go on, which the depth does not move -- issue-active 36.0%
+against 37.3%, one resident block either way -- and not as the shipped launch's own
+byte or duration figures.
 
 Read a microsecond figure here against the clock it was taken at. The part boosts
 between 1.4 and 1.9 GHz with contention from other processes on the device, and the
@@ -335,46 +385,32 @@ us off the float32 pass it replaces, at 56 registers against 96, no local traffi
 the same bits: the shard order is the launch geometry's and the vector width does not
 enter it.
 
-The depth is what took it there, and not by cutting traffic. At depth one the same
-kernel is 11,376.9 us over 640 blocks, moves 775.81 MB, and spills 536.74 MB of local
-load and 344.06 MB of local store a launch, 94.9% and 99.9% of that past L1. Depth one
-carries no workspace at all, 819.1 MB of operator DRAM against 1,005.3 MB at the full
-depth when the vector partials were float32, and still lost by 34.0% of the call: what
-the depth buys is 18x the blocks and no spill, so the traffic sum is not what it is
-chosen against. At the narrowed partial the full depth wins on both, 711.5 MB.
+The in-block fold spills nothing, at any ``L``, and this is where the record of it
+being the whole reason for the depth used to sit. That record read 536.74 MB of local
+load and 344.06 MB of local store a launch at depth one over 640 blocks, against zero
+at the full depth, and a table of it growing with ``L``. It no longer reproduces. The
+fold of 18 walked in the block, one profiled launch a counter pass at ``P 64 3N 240``
+and the shipped width::
 
-The allocator stops at the 255-register cap at either depth. The fold is what spills,
-and only the fold. Holding ``P 64``, ``3N 240`` and the code fixed and moving one
-extent, with the fold folded in the block::
+    L    smem    regs   local sectors   DRAM MB   GB/s   us/launch   blocks
+    16   55,664   210         0            689.10  140.0    4,923.2    2,560
+    32   68,656   220         0            404.92  158.4    2,556.3    1,280
+    64   98,736   238         0            264.45  165.3    1,600.1      640
 
-    L    fold   smem     regs   local MB   DRAM MB   GB/s    us/launch
-    16      1   53,648    205       0.00   1,507.72  214.8      7,018.1
-    32      1   64,848    255       0.00     935.91  200.8      4,661.1
-    64      1   91,344    255       0.00     654.49  114.6      5,711.7
-    32     18   71,504    255     398.46     693.58  137.1      5,060.0
-    64     18   93,392    255     922.42     985.73   82.3     11,982.6
+``l1tex__t_sectors_pipe_lsu_mem_local_op_ld`` and ``_st``, hit and miss summed: zero at
+every row, zero at the full depth, and zero at the depths of 2, 3, 6 and 9 between them.
+The register count rises with ``L`` and stays under the 255 cap. Two changes retired the
+spill: the one-tap fusion took the count 145 to 132 at fold one, and the readout
+gradient's fold sum left a 13,312 B shared region for the twelve-word float32 fragment
+:func:`_fold_frag`. So the depth is chosen on the pass and the loop alone, which is the
+sweep in the head of this docstring.
 
-The three fold-one rows carry a float32 vector partial, so their DRAM column is
-141.56 MB high for the shipped width; the local column, which is what the table is
-for, does not depend on it. At fold one there is no local traffic at any ``L``, at 255
-registers, with the lane tile in the grid and the ``L`` extents at their largest. At
-fold 18 there is, and it grows with ``L``. The register count is at the cap either way, so the cap is not the
-signal; what crosses a rolled fold iteration is. Unrolling the fold at trace time
-does not fix it and makes it worse, 1,290.4 MB, because the live ranges of eighteen
-inlined bodies overlap. Only taking the fold out of the block removes it, and it does:
-zero local sectors at the shipped depth.
-
-The lane tile is not implicated. At fold 18 and one lane tile the local traffic is
-276.96 MB, and the tile count moves neither the register count nor the footprint.
-
-Two resident blocks need 50,176 B and no legal shape at ``P 64`` reaches it: the
-smallest arena there is 53,648 B, at ``L 16`` and fold one. Taking the fold out of the
-block drops the summed accumulator that exists only above fold one, but the spaces
-alias and only 2,048 B of the 93,392 come back, so it does not reach it either. What
-it does reach is zero spill, worth 34.0% of the call. Beyond that, occupancy is worth
-what the one shape that fits shows: ``L 16`` at ``P 48`` is 47,728 B, two resident
-blocks, 16.5% achieved against 8.3%, and 71.5% of memory speed-of-light against 45.5%
-at ``P 64`` where the same ``L`` holds one block.
+What survives of that table is its one occupancy datum, and it is about ``P`` and not
+about the fold. Two resident blocks are out of reach at ``P 64`` for the reason the
+budget paragraph above gives. ``L 16`` at ``P 48`` is the one legal shape that does
+fit two, 49,680 B at 128 threads against the 50,176 B bar, and it reads 16.5% achieved
+occupancy against 8.3% and 71.5% of memory speed-of-light against 45.5% at ``P 64``,
+where the same ``L`` holds one block.
 
 The other lever is the block width, and it is a parameter: ``warps`` selects the atom
 tiling and the thread count together, and eight is the default. The M mode of the tiling
@@ -416,6 +452,11 @@ shared capacity is the limiter at every reachable shape and the register file ti
 only at the two widest. Register headroom is therefore headroom and not slack: nothing
 buys occupancy with it, and what a held operand costs is priced at the one place that
 spends it.
+
+The rows above were taken at the full head-sum depth, one head to a block. The shipped
+depth is one, and the fold loop it runs instead spends registers: **238** a thread at
+the acceptance shape, so ``occ_R`` is 1 there too and shared capacity is the limiter in
+every row without exception. Zero local sectors at either depth.
 
 Registers fall to 242, so 256 threads hold 61,952 of the 65,536 a multiprocessor has
 and the second warp per scheduler is available. Across the float32 pair,
@@ -942,10 +983,10 @@ def gradient_tile(rows: int, dim: int) -> Tile:
 class Arena(NamedTuple):
     """Float32-word offsets of the phase-shared tiles inside the one arena.
 
-    The tiles below overlap in address and not in time. The three float32 tiles
-    come first and alias nothing: two of them are live across the whole fold and
-    the third carries one tap. The five operand tiles follow, and the readout
-    gradient of the epilogue aliases all five, none being live when it is.
+    The tiles below overlap in address and not in time. The two float32 tiles come
+    first and alias nothing: one is live across the whole fold and the other carries
+    one tap. The five operand tiles follow, and the readout gradient of the epilogue
+    aliases all five, none being live when it is.
 
     ``state`` holds the chunk-start state through the offset contraction and the
     increment cotangent for the rest of a head's pass. One tile rather than two:
@@ -953,9 +994,13 @@ class Arena(NamedTuple):
     written, and the barrier that separates them is the one the source-token loop
     needs anyway.
 
-    ``summed`` spans no words at ``fold == 1``, where the readout gradient goes
-    straight to global and nothing reads the tile; its offset then aliases
-    ``out``.
+    The readout gradient's sum over the fold has no region here. It is the register
+    fragment :func:`_fold_frag` holds, which is legal because the epilogue's cover of
+    the tile is invariant across fold iterations: a thread owns the same run of the
+    same token at every head. A shared region for it is 13,312 B, and that is exactly
+    what put the source-token block of 64 over the carveout at every depth below the
+    fold -- the demotion to 32 that follows costs 1.8 times the launch the depth
+    deletes.
 
     No further pair is disjoint. Every region below except ``readout`` is live across
     the source-token loop, so the arena's extent is that loop's live set, and the
@@ -969,7 +1014,6 @@ class Arena(NamedTuple):
             the narrowed score of that same tap, which the forcing GEMM has finished
             reading before the gradient it writes exists. The region is the wider of
             the two.
-        summed: The float32 readout gradient summed over the fold.
         out: The output cotangent, ``dy``.
         state: The chunk-start state, then the increment cotangent in the
             chunk-local frame.
@@ -982,7 +1026,6 @@ class Arena(NamedTuple):
 
     forcing: int
     tapped: int
-    summed: int
     out: int
     state: int
     raw: int
@@ -1012,13 +1055,15 @@ def arena(
     """Lay the phase-shared tiles out in one allocation.
 
     Every tile that spans the state width spans :func:`lane_block` of it, so this is
-    flat in ``3N`` above the first lane tile.
+    flat in ``3N`` above the first lane tile, and flat in the fold as well: the
+    readout gradient's fold sum is the register fragment :func:`_fold_frag` holds, so
+    no region here is conditional on the depth.
 
     Args:
         chunk: ``L``.
         rows: ``P``.
         dim: ``3N``.
-        fold: Heads one block walks, ``H // G``.
+        fold: Heads one block walks, ``H // G``. Read by no term below.
         span: Source-token block, from :func:`vblock`.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
     """
@@ -1028,17 +1073,15 @@ def arena(
         _words(gradient_tile(span, tile), 4),
         _words(score_tile(chunk, span), itemsize),
     )
-    summed = _words(gradient_tile(chunk, tile), 4) if fold > 1 else 0
     out = _words(out_tile(chunk, rows), itemsize)
     state = _words(state_tile(rows, tile), itemsize)
     raw = _words(shifted_tile(span, tile), itemsize)
     forced = _words(forced_tile(span, tile), itemsize)
     inp = _words(shifted_tile(mma_rows(span), rows), itemsize)
-    base = forcing + tapped + summed
+    base = forcing + tapped
     return Arena(
         forcing=0,
         tapped=forcing,
-        summed=forcing + tapped,
         out=base,
         state=base + out,
         raw=base + out + state,
@@ -1178,33 +1221,38 @@ def vblock(
 def vector_splits(fold: int, splits: int | None = None) -> int:
     """Partial depth of the head sum: shards the fold ``H // G`` is cut into.
 
-    The whole fold by default, one head to a block. The two costs of the sum look
-    like they trade -- a block that walks more heads spills, a sum cut into more
-    shards writes more partials -- but they do not, because the spill does not
-    follow the trip count. One rolled iteration is enough to sink the accumulators
-    to local memory, and every head then pays that traffic whatever the loop's
-    extent, so every depth between the two ends carries the full spill and its own
-    partials as well. Measured at ``B 4 H 18 T 2048 L 64 P 64 3N 240 G 1`` and the
-    shipped width, event medians of three, clocks unlocked, MB the workspace:
+    One by default: a block walks the whole fold and writes the three summed outputs
+    itself, so there is no workspace and no closing launch. A depth above one buys
+    nothing that pays for the launch it costs. Counter sums at
+    ``B 4 H 18 T 2048 L 64 P 64 3N 240 G 1`` and the shipped width, one profiled launch
+    a counter pass, clocks unlocked, microseconds a launch and MB the workspace:
 
-        depth      1       2       3       6       9      18
-        us     4,301.8 4,165.6 4,033.5 4,160.0 4,262.9 3,493.9
+        depth        1       2       3       6       9      18
+        producer 1,583.9 1,707.8 1,653.4 1,632.5 1,563.0 1,423.0
+        closure       --    37.5    48.8    84.4   118.0   222.2
+        slots      43.5    44.4    44.3    44.4    43.7    44.2
+        total    1,627.4 1,789.7 1,746.5 1,761.3 1,724.7 1,689.4
         MB        0.00   15.97   23.96   47.92   71.88  143.77
 
-    So the depth is the fold unless a caller has a reason of its own, and the
-    workspace that costs is linear in it. The full depth is the only one that clears
-    the spill, and it wins by 807.9 us over the depth that carries no workspace at
-    all; the four between the ends span 5.7% and none of them reaches either end.
-    The ordering is set by the spill and not by the workspace, so narrowing the
-    partial cannot reorder it, and the depth that deletes the workspace is the one
-    that also divides the grid by the fold.
+    Both ends twice, the four between them once. Depth one wins by 62.0 us over the
+    full depth, -45.9 and -78.1 across the two pairs, and every depth between the two
+    loses to both: the closure is linear in the depth and the producer is not monotone
+    in it. The four middle producers sit inside a 9% band whose own pass spread reaches
+    14%, so this instrument separates the ends and does not order the middle.
+
+    Nothing here follows a spill: local traffic is zero at every depth. The producer
+    pays 160.9 us for the loop at depth one and takes 130.3 MB off its own DRAM, worth
+    -31 to -44 us at the rate a deleted byte converts at on this tree, so what orders
+    the depths is the closure's launch and not the traffic. A caller with a reason of
+    its own can still ask for a depth: the workspace is linear in it, and
+    :func:`vector_reduce_kernel` is reachable no other way.
 
     Args:
         fold: ``H // G``, the heads sharing a group.
-        splits: The depth. ``None`` takes the fold.
+        splits: The depth. ``None`` takes one.
 
     Returns:
-        The depth. One where the fold is one, and never above the fold.
+        The depth. One by default, and never above the fold.
 
     Raises:
         ValueError: If ``splits`` is not a positive divisor of the fold. A depth that
@@ -1212,7 +1260,7 @@ def vector_splits(fold: int, splits: int | None = None) -> int:
             the reduction reading rows no producer wrote.
     """
     if splits is None:
-        return fold
+        return 1
     if splits < 1 or fold % splits:
         raise ValueError(f"splits must be a positive divisor of the fold {fold}")
     return splits
@@ -1736,6 +1784,41 @@ def _add_run(
         for j in cutlass.range_constexpr(vec):
             frag[k, j] = frag[k, j] + vals[vec * k + j]
         cute.autovec_copy(frag[(k, None)], words[(None, (row, accs * lane + k))])
+
+
+def _fold_frag(threads: int, chunk: int, lanes: int, fold: int) -> cute.Tensor:
+    """The readout gradient's sum over the fold, in registers.
+
+    :func:`_readout_epilogue` covers the ``(L, tile)`` gradient by giving thread
+    ``tid`` of pass ``step`` the run of ``3 * lanes / LANE_GROUP`` adjacent columns at
+    lane ``tid % LANE_GROUP`` of token ``_pass_row(tid // LANE_GROUP + step *
+    per_pass)``. Both coordinates depend on ``tid`` and ``step`` alone, so the cover is
+    the same disjoint cover at every head of the shard and a thread may hold its own
+    runs across the fold instead of reading them back out of shared memory. That is
+    the whole of why the sum needs no region in :func:`arena`, and the region it needed
+    is 13,312 B -- the exact amount that put a source-token block of 64 over the
+    carveout at every depth below the fold.
+
+    Twelve float32 a thread at every legal shape and one pass, twenty-four at the
+    narrow block width where a pass covers half the chunk.
+
+    Args:
+        threads: Block width.
+        chunk: ``L``.
+        lanes: ``N`` of one lane tile.
+        fold: Heads one block walks. One holds no sum: the epilogue stores each head's
+            run straight to the output, so the fragment is a single dead access there
+            rather than a live run.
+
+    Returns:
+        The ``(passes * accs, vec)`` fragment, indexed ``[step * accs + k, j]`` by the
+        pass, the access within the run and the element within the access.
+    """
+    width = 3 * (lanes // LANE_GROUP)
+    vec = _run_vec(width, 4)
+    accs = width // vec
+    passes = -(-chunk // (threads // LANE_GROUP))
+    return cute.make_fragment((passes * accs if fold > 1 else 1, vec), cutlass.Float32)
 
 
 @cute.jit
@@ -2391,7 +2474,7 @@ def _readout_epilogue(
     gdc: cute.Tensor,
     gb: cute.Tensor,
     sdc: cute.Tensor,
-    ssum: cute.Tensor,
+    csum: cute.Tensor,
     bsum: cute.Tensor,
     scrot: cute.Tensor,
     stable: cute.Tensor,
@@ -2410,6 +2493,7 @@ def _readout_epilogue(
     t0: cutlass.Int32,
     valid: cutlass.Int32,
     tid: cutlass.Int32,
+    hstep: cutlass.Int32,
     threads: cutlass.Constexpr,
     chunk: cutlass.Constexpr,
     lanes: cutlass.Constexpr,
@@ -2444,7 +2528,11 @@ def _readout_epilogue(
 
     One head writes its shard's ``dC`` row in the destination's own dtype. A fold
     above one accumulates in float32 instead, because a shard's ``dC`` is a sum over
-    the heads it walks and the reference rounds the head sum once.
+    the heads it walks and the reference rounds the head sum once. The accumulator is
+    :func:`_fold_frag`, held in registers across the fold, and the last head of the
+    shard narrows it and stores it from here: the run this pass owns is the run it
+    owned at every earlier head, so no other thread and no other pass can reach it and
+    the store needs neither a barrier nor a pass of its own.
 
     The lane sum closes after the two 3x3 products and the tap adjoint, not before.
     Every term of :func:`tap_matrix_vjp` is degree one in its first argument, and the
@@ -2474,12 +2562,12 @@ def _readout_epilogue(
     3.0e-04 bound. No bound was widened and no accumulation narrowed.
 
     Args:
-        gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, written when ``fold``
-            is one.
+        gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, written by the head that
+            completes the sum.
         gb: ``(B,G,T,tile)`` lane view of the operand-dtype forcing vectors.
         sdc: ``(mma_rows(L), pitch)`` float32 readout gradient.
-        ssum: ``(L, pitch)`` float32 readout sum over the fold, accumulated when
-            ``fold`` is above one and untouched otherwise.
+        csum: The float32 readout sum over the fold, from :func:`_fold_frag`.
+            Accumulated when ``fold`` is above one and untouched otherwise.
         bsum: ``(L + 1, pitch)`` float32 forcing sum, accumulated at row ``t + 1``.
         scrot: ``(mma_rows(L), pitch)`` operand-dtype rotated readout.
         stable: ``(mats, L, TABLE_PITCH)`` float32 transform table, fused.
@@ -2503,6 +2591,7 @@ def _readout_epilogue(
         t0: First token of the chunk.
         valid: Tokens of the chunk that exist.
         tid: Thread index within the block.
+        hstep: Head within the shard. The last one stores the fold sum.
         threads: Block width. Compile-time.
         chunk: ``L``. Compile-time.
         lanes: ``N``. Compile-time.
@@ -2526,14 +2615,13 @@ def _readout_epilogue(
     gaccs = width // gvec
     grad = _runs(sdc, fvec)
     rots = _runs(scrot, ovec)
-    total = _runs(ssum, fvec)
     bwords = _runs(bsum, fvec)
     dfrag = cute.make_fragment((faccs, fvec), sdc.element_type)
     cfrag = cute.make_fragment((oaccs, ovec), scrot.element_type)
     bfrag = cute.make_fragment((oaccs, ovec), gb.element_type)
     ofrag = cute.make_fragment((gaccs, gvec), out)
-    sfrag = cute.make_fragment((faccs, fvec), ssum.element_type)
     bsfrag = cute.make_fragment((faccs, fvec), bsum.element_type)
+    closes = hstep == fold - 1
 
     # One row, so the read is hoisted: every token of the pass reads the same three
     # vectors and only ``L-1`` uses them.
@@ -2585,8 +2673,8 @@ def _readout_epilogue(
         keep = ts < valid
         if cutlass.const_expr(not exact):
             keep = keep & inside
-        if keep:
-            if cutlass.const_expr(fold == 1):
+        if cutlass.const_expr(fold == 1):
+            if keep:
                 _write_run(
                     _run_at(gdc[bidx, gidx, sbase + t0 + ts, None], gvec),
                     ofrag,
@@ -2594,8 +2682,24 @@ def _readout_epilogue(
                     gaccs,
                     tuple(dcs),
                 )
-            else:
-                _add_run(total, sfrag, ts, lane, faccs, tuple(dcs))
+        else:
+            # The addends arrive in head order at every access, which is the order the
+            # shared accumulator this replaced summed in, so no bit of ``dC`` moves.
+            if keep:
+                for k in cutlass.range_constexpr(faccs):
+                    for j in cutlass.range_constexpr(fvec):
+                        held = csum[step * faccs + k, j]
+                        csum[step * faccs + k, j] = held + dcs[fvec * k + j]
+            if keep & closes:
+                _write_run(
+                    _run_at(gdc[bidx, gidx, sbase + t0 + ts, None], gvec),
+                    ofrag,
+                    lane,
+                    gaccs,
+                    tuple(
+                        csum[step * faccs + i // fvec, i % fvec] for i in range(width)
+                    ),
+                )
         if cutlass.const_expr(exact):
             _add_run(bwords, bsfrag, ts + 1, lane, faccs, tuple(dbs))
         else:
@@ -2981,7 +3085,6 @@ def chunk_vector_bwd_kernel(
     sumb = _tile_at(
         base, space.forcing, gradient_tile(chunk + 1, tile), cutlass.Float32
     )
-    sumc = _tile_at(base, space.summed, gradient_tile(chunk, tile), cutlass.Float32)
     # Row 0 of the offset accumulator, which is where its rows are summed and what the
     # reverse scan reads. The scan takes a dense ``(L,)`` tile and must not learn that
     # the tiling gave the term more than one owner.
@@ -3103,17 +3206,22 @@ def chunk_vector_bwd_kernel(
     # or an index, so the fill is the block's first shared access and there is nothing
     # for a barrier to fence; the fill's own reader is several barriers further on.
     _fill_zero(sumb, (chunk + 1) * ldf, tid, threads)
-    if cutlass.const_expr(fold > 1):
-        _fill_zero(sumc, chunk * ldf, tid, threads)
 
-    # The heads of one shard, rolled. Unrolling it at trace time does not promote the
-    # accumulators: at fold 18 local traffic rose from 1,135.3 MB to 1,290.4 MB a
-    # launch, and a call went from 12,260.9 us to 13,596.7 at fold 2 and 11,530.8 to
-    # 12,297.2 at fold 3. The depth is what cuts the spill, not the loop form. At one
-    # head, which is the default depth, the unrolled form has no body to duplicate and
-    # drops the loop instead, worth 562 us a call; taking that would mean the body
-    # written twice, since the loop form cannot be selected at trace time from one
-    # statement, and the body is four hundred lines.
+    # The readout gradient's sum over the fold, one run a pass a thread. Zeroed here
+    # and stored by the epilogue's last head, so nothing between the two touches
+    # shared memory for it and the 13,312 B a shared region took is not spent.
+    csum = _fold_frag(threads, chunk, lanes, fold)
+    if cutlass.const_expr(fold > 1):
+        csum.fill(0.0)
+
+    # The heads of one shard, rolled. Unrolling it at trace time was refused on a spill
+    # -- local traffic 1,135.3 MB to 1,290.4 MB a launch at fold 18, a call 12,260.9 us
+    # to 13,596.7 at fold 2 and 11,530.8 to 12,297.2 at fold 3 -- and that spill no
+    # longer reproduces at any depth, so what refuses it now is the source: the body is
+    # four hundred lines and the loop form cannot be selected at trace time from one
+    # statement, so an unrolled arm means it written twice. At one head in the block,
+    # which is what ``standard`` runs and what the full depth gives, the unrolled form
+    # has no body to duplicate and drops the loop instead, worth 562 us a call.
     for hstep in cutlass.range(fold, unroll=1):
         hidx = (gidx * splits + sidx) * fold + hstep
         # Loop-carried only. This is the write-after-read fence between the previous
@@ -3487,7 +3595,7 @@ def chunk_vector_bwd_kernel(
             gdcj,
             gbj,
             sdc,
-            sumc,
+            csum,
             sumb,
             scrot,
             stable,
@@ -3506,6 +3614,7 @@ def chunk_vector_bwd_kernel(
             t0,
             valid,
             tid,
+            hstep,
             threads,
             chunk,
             lanes,
@@ -3711,9 +3820,11 @@ def chunk_vector_bwd_kernel(
     # crosses the barriers that close the chart, so a barrier at this point orders a
     # pair the ones inside the fold have already ordered.
     #
-    # The shard's two sums for this lane tile, rounded once: the narrowing is here at
+    # The shard's forcing sum for this lane tile, rounded once: the narrowing is here at
     # one shard and at the reduction above one, never twice. Row t+1 of the forcing sum
-    # is token t and row 0 is the row the boundary kernel owns.
+    # is token t and row 0 is the row the boundary kernel owns. The readout sum has no
+    # pass here at any fold: at one head the epilogue stores it and above one the
+    # epilogue's last head does, from the register fragment that carries it.
     #
     # One access per run of adjacent lanes and not one per lane. The scalar form
     # indexed a four-mode global tensor once an element, so every element paid the
@@ -3724,7 +3835,6 @@ def chunk_vector_bwd_kernel(
     ovec = _run_vec(tile, out.width // 8)
     oaccs = ovec // fvec
     bwords = _runs(sumb, fvec)
-    cwords = _runs(sumc, fvec)
     ofrag = cute.make_fragment((ovec,), out)
     sfrag = cute.make_fragment((oaccs, fvec), cutlass.Float32)
     runs = tile // ovec
@@ -3745,17 +3855,6 @@ def chunk_vector_bwd_kernel(
                     oaccs,
                     fvec,
                 )
-                if cutlass.const_expr(fold > 1):
-                    _store_run(
-                        _run_at(gdcj[bidx, gidx, sbase + t0 + t, None], ovec),
-                        cwords,
-                        ofrag,
-                        sfrag,
-                        t,
-                        r,
-                        oaccs,
-                        fvec,
-                    )
     # The carry is float32 at both ends, so its run is the float32 one and it needs
     # no narrowing fragment.
     kruns = tile // fvec

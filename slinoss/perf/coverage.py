@@ -24,7 +24,7 @@ it does not, which is the one thing this module cannot decide from the operator 
 and the mode alone. Everything else is required, so an absence is a defect.
 
 A kernel no arm launches at any shape is declared :data:`TARGETED` and carries the
-driver that does launch it. That is the whole escape hatch: four entries, every one
+driver that does launch it. That is the whole escape hatch: five entries, every one
 named in the report, none excused from anything but :func:`unreachable`.
 
 The table is data, not an import: naming a kernel here pulls in neither the operator
@@ -120,16 +120,7 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
             "chunk_prefix_bwd_kernel",
             "chunk_vector_bwd_kernel",
             "boundary_bwd_kernel",
-        ),
-        conditional=(
-            Conditional(
-                "vector_reduce_kernel",
-                "a head-sum depth above one: the vector backward shares a group's "
-                "heads over that many blocks and a second launch closes the partials, "
-                "and at H // G == 1 the depth is one and the kernel writes the summed "
-                "outputs directly",
-            ),
-        ),
+        )
     ),
     ("conv", "forward"): OpCoverage(required=("conv1d_fwd_kernel",)),
     ("conv", "step"): OpCoverage(
@@ -190,11 +181,11 @@ key either way: a capture merges the launches of one symbol into one counter row
 frontier's parameter-bias reduction, the fused tail's two parameter slots, the
 loss's mean, and the vector backward's slot close. Only the last is conditional.
 
-The step's two conditionals are separate shape properties and can differ. The slot
-close follows the lane count, which the state width sets; ``vector_reduce_kernel``
-follows the head-sum depth, which ``H // G`` sets. The benchmarked standard shape has
-one lane tile and one head per group, so both are absent there and the acceptance
-shape launches both.
+The step's one conditional is a shape property: the slot close follows the lane count,
+which the state width sets. The benchmarked standard shape has one lane tile, so it is
+absent there and the acceptance shape launches it. ``vector_reduce_kernel`` was the
+second until the head-sum depth became one at every shape, which took it off the
+operator's path and into :data:`TARGETED`.
 
 ``rmsnorm_dweight_kernel`` appears once in ``block``'s step and is launched twice
 there, by the plain norm's backward and by the residual norm's. One key, because a
@@ -246,6 +237,13 @@ TARGETED: Final[tuple[Targeted, ...]] = (
         "is a caller differentiating the carried state and not the sequence; every "
         "arm in COVERAGE differentiates the output",
     ),
+    Targeted(
+        "vector_reduce_kernel",
+        "scripts/perf/profile_chunk_vector_bwd.py --shape acceptance --splits 18",
+        "the head-sum depth is one at every shape, so the vector backward walks the "
+        "group's heads in the block and writes the summed outputs itself; only a "
+        "caller passing a depth above one emits partials for this launch to close",
+    ),
 )
 """Declared kernels reached by a targeted driver rather than by a benchmarked arm.
 
@@ -257,9 +255,11 @@ completeness test refuses.
 
 No entry is a shape condition, which is why none is a :class:`Conditional`: three
 kernels are off the operator's path entirely, two of them displaced by the forward's
-fusion and one by the backward's, and the fourth is on a path no arm here takes. A
-kernel that some shapes launch and others do not belongs in ``conditional`` instead,
-where it is judged whenever the capture holds it.
+fusion and one by the backward's, and the other two are on paths no arm here takes,
+one needing a caller that differentiates the carried state alone and one a caller that
+asks for a head-sum depth above the shipped one. A kernel that some shapes launch and
+others do not belongs in ``conditional`` instead, where it is judged whenever the
+capture holds it.
 
 A displaced kernel stays declared while it is still the arm a fusion is ranked
 against. Deleting it deletes the comparison, so the entry is what keeps the losing

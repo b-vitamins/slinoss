@@ -19,6 +19,8 @@ from slinoss.perf.coverage import (
     COVERAGE,
     MODES,
     TARGETED,
+    Conditional,
+    OpCoverage,
     coverage_of,
     coverage_verdict,
     tree_provenance,
@@ -28,7 +30,7 @@ from slinoss.perf.declared import DECLARED
 from slinoss.perf.workload import OPS
 
 SCAN_STEP = ("so3ssd", "step")
-"""The one arm with conditional kernels, so it exercises both branches."""
+"""The largest arm, so a shortfall of one is a shortfall out of many."""
 
 
 def symbol(key: str) -> str:
@@ -148,21 +150,37 @@ def test_a_full_capture_passes_and_two_instantiations_of_one_kernel_count_once()
     assert verdict.judged_count == len(entry.required)
     assert verdict.missing == ()
     assert f"every one of the {len(entry.required)} kernels" in verdict.detail
-    # Every conditional is absent from a required-only capture, and that is reported
-    # with the condition rather than failed. Read off the table rather than spelled
-    # out: naming the kernels here would fail this test, which is about counting
-    # instantiations, whenever the table gains or loses a conditional.
-    assert entry.conditional, "a table with no conditional makes the rest vacuous"
-    assert verdict.absent == tuple(c.kernel for c in entry.conditional)
-    for cond in entry.conditional:
-        assert f"{cond.kernel} absent: {cond.condition}" in verdict.detail
-    # Present, each is judged and counted, and the report says nothing about it. The
-    # two conditions are separate shape properties, so one can hold without the other.
-    conditional = [symbol(c.kernel) for c in entry.conditional]
-    both = coverage_verdict(*SCAN_STEP, [*judged, *conditional])
-    assert both.absent == ()
-    assert both.judged_count == len(entry.required) + len(conditional)
+
+
+def test_a_conditional_kernel_is_reported_absent_and_counted_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch no table entry currently takes, and the reason it stays.
+
+    Every shape-dependent launch has since been either deleted or moved behind a
+    :data:`TARGETED` driver, so no arm declares a conditional and the live table
+    cannot exercise this. The rule is what a shape-dependent launch would be judged
+    by, so it is pinned against a synthetic entry rather than deleted with the last
+    instance and rewritten from scratch at the next one.
+    """
+    condition = "a shape property long enough to read as one in the report"
+    entry = coverage_of(*SCAN_STEP)
+    monkeypatch.setitem(
+        COVERAGE,
+        SCAN_STEP,
+        OpCoverage(entry.required, (Conditional("reduce_rows_kernel", condition),)),
+    )
+    judged = [symbol(k) for k in entry.required]
+    # Absent from a required-only capture: reported with the condition, not failed.
+    absent = coverage_verdict(*SCAN_STEP, judged)
+    assert absent.passed is True
+    assert absent.absent == ("reduce_rows_kernel",)
+    assert f"reduce_rows_kernel absent: {condition}" in absent.detail
+    # Present: judged, counted, and the report says nothing about it.
+    both = coverage_verdict(*SCAN_STEP, [*judged, symbol("reduce_rows_kernel")])
     assert both.passed is True
+    assert both.absent == ()
+    assert both.judged_count == len(entry.required) + 1
 
 
 def test_judging_a_kernel_the_arm_does_not_declare_fails_the_table_not_the_kernel() -> (
