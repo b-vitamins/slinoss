@@ -249,6 +249,43 @@ and the launch is 11.3% shorter with it. Registers are at the 255 cap on both si
 ``wide`` and at acceptance and at 128 on both sides at ``standard``, so the spill
 tracks the live range and not the cap, as below.
 
+Both of those last two claims are wrong. The frame at the acceptance shape is 80 B, 20
+dwords of which 19 are loaded, across 39 sites, 19 ``LDL`` and 20 ``STL``. The cubin has
+one backward branch, the lane loop, ``0x6da0`` to ``0xd470``, 1,646 instructions over
+five trips. Twelve slots, ``+0x00`` to ``+0x2c``, are stored once in the prologue and
+reloaded once per trip; seven, ``+0x30`` to ``+0x48``, are stored in the prologue and
+loaded once after the loop exits; ``+0x08`` alone is zeroed in the prologue and round
+trips once per trip. That is 67 ``LDL`` and 24 ``STL`` a thread, and at four sectors a
+word over 9,216 warps it closes on the counters exactly, 2,469,888 loaded and 884,736
+stored. What the slots hold is address arithmetic: the shared store base of
+:func:`stage_rotated` and four 64-bit global element-offset bases for the lane-sliced
+reads. The per-trip advance is not among them, it is in the uniform datapath,
+``UIADD3 UR10, UR10, 0x60``. The whole spill is 838,656 warp-instructions, 0.797% of
+``sm__inst_executed``.
+
+The live set is not what puts it there. ``min_blocks_per_mp`` emits ``nvvm.minctasm``,
+and dropping that one directive, at the same 255 registers, the same 49,264 B and the
+same residency two, takes the frame to 16 B, the local sectors to 737,280 each way, and
+device traffic from 211.56 MB read and 43.98 MB written to 195.16 MB and 26.59 MB. So
+33.79 MB of the launch's 255.54 MB is spill that does reach DRAM, 13.2% of it, and
+deleting it is worth 11.776 us of 596.99 us, 1.973%, over 600 order-swapped pairs
+against a 1.536 us null, bitwise on all five outputs. Instructions rise 221,184 doing
+it, so the win is traffic and not issue. ``standard`` agrees: 294,912 sectors each way
+gone, 3.072 us of 154.62 us, 1.987%.
+
+The frame is a ptxas artifact one register wide. Re-assembling the dumped PTX,
+``.minnctapersm`` absent gives 16 B and present at either 1 or 2 gives 80 B, all three
+at 255 registers; ``.minnctapersm 2`` with ``.maxnreg 254`` gives 16 B at 254, which
+still holds two blocks of 128 threads inside 65,536. So the cure is one register of
+headroom under the architectural cap and it is orthogonal to the residency ask.
+``nvvm.maxnreg`` is in the DSL's NVVM backend and not in its ``LaunchConfig``, so at
+4.4.2 the only reachable lever is dropping the ask, and that lever is refused. At
+``wide`` the ask is the license that lets ptxas take 255 registers; without it ptxas
+takes 105 and rematerialises 393,216 instructions, 18.944 us of 272.38 us, 6.955%.
+Nothing the trace can compute separates the two: ``wide`` and acceptance carry the same
+256-register budget and the same 255 allocated, and spill 0 B and 80 B. Reopen this when
+``LaunchConfig`` carries a register cap, not before.
+
 Six changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
 with the device to itself in both brackets. Traffic after each, at that shape:
 
