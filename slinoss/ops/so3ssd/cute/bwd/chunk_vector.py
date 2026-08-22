@@ -2265,6 +2265,7 @@ def _tap_epilogue(
     dfrag = cute.make_fragment((faccs, fvec), sdb.element_type)
     bfrag = cute.make_fragment((oaccs, ovec), sb.element_type)
     sfrag = cute.make_fragment((faccs, fvec), ssum.element_type)
+    kfrag = cute.make_fragment((1, 4), gdtap.element_type)
 
     for step in cutlass.range_constexpr(steps):
         r = _pass_row(tid // LANE_GROUP + step * per_pass)
@@ -2341,10 +2342,16 @@ def _tap_epilogue(
             sdw[3, token] += 2.0 * dstep
             if token < valid:
                 krow = jbase + t0 + token
-                for j in cutlass.range_constexpr(3):
-                    gdtap[bidx, hidx, krow, 0, j] = dtap[j]
-                # Lane 3 of K is a hard zero in the forward, so it is one here.
-                gdtap[bidx, hidx, krow, 0, 3] = zero
+                # One access a row, on :func:`chunk_vector_bwd_kernel`'s account. Lane 3
+                # of K is a hard zero in the forward, so it is one here and the run is
+                # the whole row.
+                _write_run(
+                    _run_at(gdtap[bidx, hidx, krow, 0, None], 4),
+                    kfrag,
+                    0,
+                    1,
+                    (dtap[0], dtap[1], dtap[2], zero),
+                )
 
         # Everything above is indexed by the row's own token, everything below by the
         # row before it, and a pass holds adjacent tokens on adjacent thread groups. The
@@ -2750,6 +2757,33 @@ def chunk_vector_bwd_kernel(
     convention. ``dtrans`` does not: every map between the rotation cotangent and it is
     linear, so each tile publishes :data:`PART_WORDS` words a token to ``gpart`` and
     the tile that arrives last sums them and runs the maps once.
+
+    Both chart rows leave in one access. ``dtrans`` is four float32 a token and ``dK``
+    is four a tap, and both destinations are allocated whole, so a row's offset is a
+    compile-time multiple of 16 B and the run is one ``STG.E.128``. Three sites: this
+    kernel's ``dK`` slot-one and ``dtrans`` stores, and :func:`_tap_epilogue`'s
+    slot-zero store. Component-wise they cost one L1 sector request an element a lane,
+    four where the row needs one, and the lane stride is 32 B for ``dK`` and 16 B for
+    ``dtrans`` so no two lanes share a sector either.
+
+    Measured on an A6000 at the acceptance shape, bitwise on all five outputs, base
+    against arm: global store sectors 15,939,072 -> 11,294,208, -29.14%; store
+    requests 1,112,832 -> 753,408, -32.30%; LSU warp instructions -359,424. L2 traffic
+    does not move, read -0.53% and write +0.001%, and DRAM read and write stay within
+    0.05%: the L1 sectors were never bytes. A four-byte store covering four of a
+    sector's thirty-two does not make L2 read that sector -- L2 has byte enables -- so
+    what the run buys is L1 sector requests and nothing downstream of them. Registers
+    140, local sectors zero, occupancy 16.48% all unchanged.
+
+    It buys no time worth claiming. Six paired runs on a contended device, three of
+    them excluding zero and all six negative in position, put it at -2.048 to -3.048
+    us on a 1,820 us launch, 0.1%, against a null band of the same width on identical
+    code. So a store class is not priced by its sectors here: -29% of them converted at
+    0.44 us a million, and the 359,424 deleted LSU warp instructions converted at 5.7
+    us a million against the tree's 14.31. A global store is fire-and-forget -- no warp
+    waits on the sector -- so deleting sectors on a launch that is latency-bound at 38%
+    issue returns the issue slots of the deleted instructions and nothing else. Kept
+    for the counters and for costing nothing, not for the microseconds.
 
     Args:
         gdy: ``(B,H,T,P)`` operand-dtype cotangent of ``y``.
@@ -3429,6 +3463,9 @@ def chunk_vector_bwd_kernel(
         # This head and chunk's chart slots, every tile's. A layout, so the slice is
         # free and the placeholder at one tile is indexed in range.
         vpart = gpart[bidx, hidx, cidx, None, None]
+        # The two chart rows' run fragments, hoisted out of the passes below.
+        tapfrag = cute.make_fragment((1, 4), gdtap.element_type)
+        trfrag = cute.make_fragment((1, 4), gdtrans.element_type)
 
         # The rotation cotangent is complete, so the transition chart closes: one
         # 3x3 product per token and the prefix adjoint it feeds.
@@ -3452,10 +3489,14 @@ def chunk_vector_bwd_kernel(
             if token < chunk:
                 if token < valid:
                     krow = jbase + t0 + token
-                    for j in cutlass.range_constexpr(3):
-                        gdtap[bidx, hidx, krow, 1, j] = sdk[j, token]
                     # Lane 3 of K is a hard zero in the forward, so it is one here.
-                    gdtap[bidx, hidx, krow, 1, 3] = zero
+                    _write_run(
+                        _run_at(gdtap[bidx, hidx, krow, 1, None], 4),
+                        tapfrag,
+                        0,
+                        1,
+                        (sdk[0, token], sdk[1, token], sdk[2, token], zero),
+                    )
                 gsum = tuple(srow[token, k] for k in range(ROW_WORDS))
                 dac = mat3_mul(gsum, _mat_at(stable, TABLE_AC, token))
                 dquat = rot_hom_vjp(
@@ -3568,12 +3609,21 @@ def chunk_vector_bwd_kernel(
                     )
                     if token < valid:
                         trow = t0 + token
-                        for j in cutlass.range_constexpr(3):
-                            gdtrans[bidx, hidx, trow, j] = sdw[j, token] + dexp[j]
                         # The fused column's own log-scale term is not reverse-scanned:
                         # ``e_t`` multiplies one slot of one token, where the offset
                         # term rides the prefix every later token carries.
-                        gdtrans[bidx, hidx, trow, 3] = sdls[token] + sdw[3, token]
+                        _write_run(
+                            _run_at(gdtrans[bidx, hidx, trow, None], 4),
+                            trfrag,
+                            0,
+                            1,
+                            (
+                                sdw[0, token] + dexp[0],
+                                sdw[1, token] + dexp[1],
+                                sdw[2, token] + dexp[2],
+                                sdls[token] + sdw[3, token],
+                            ),
+                        )
 
     # No barrier between the fold and the two sums below. The last write to either sum
     # is a tap epilogue's and a readout epilogue's, and every path from there to here
