@@ -286,7 +286,27 @@ Nothing the trace can compute separates the two: ``wide`` and acceptance carry t
 256-register budget and the same 255 allocated, and spill 0 B and 80 B. Reopen this when
 ``LaunchConfig`` carries a register cap, not before.
 
-Six changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
+The frame is 0 B without that lever. It grew to 88 B, 22 slots, and the seventh change
+below deletes all of them by rolling one loop. What the twelve reloaded slots hold is
+still address arithmetic, and the live set is still what puts them there, but the phase
+that owns the peak is the post-barrier tail and not the staging pass: read off the
+disassembly one live range to a definition, the body count climbs from 162 at the loop
+top to 384 at ``0xd190``, and the growth is entirely in loads, 39 to 138, and in float
+accumulators, 20 to 108, while integers stay flat at 137 to 148. 106 of those 108 floats
+are ``dushift`` 32, the two score slices 32, ``mrot`` and ``mrotp`` 18 and ``dloc`` 24,
+so the float term is the operator's shape. The loads are not: the ``dnow`` residue's lane
+loop alone hands ptxas 24 independent global loads and 24 shared ones with nothing
+between them, and at the cap it hoists them and pays for them out of the frame.
+
+Two things the sweep says that the live-set bound does not. Rolling the closing residue's
+lane loop instead gives 16 B, and rolling both gives 16 B: the allocator is not monotone
+in the pressure cut, so one compile of ``cuobjdump -res-usage`` per variant is the
+instrument and the bound is only the routing. And two arms that the bound and a
+predecessor's reading both nominated do nothing at all -- a smaller prefetch group in the
+staging pass, and promoting ``pres`` out of a fragment allocated inside the dynamic lane
+loop -- because neither touches a register at ``0xd190``.
+
+Seven changes took that shape from 3528.2 us and 1700.54 MB, the before figure taken
 with the device to itself in both brackets. Traffic after each, at that shape:
 
 - The two forcing-cotangent GEMMs accumulate into the output fragment. The increment
@@ -327,6 +347,29 @@ with the device to itself in both brackets. Traffic after each, at that shape:
   as its spill went 103.02 MB to 66.06 MB. ``standard`` and ``ragged`` did not move,
   and neither did their spill. ``long`` rose 0.8% on an unchanged 4,030,464 sectors
   that land in L1 less often, 1,134,600 hits to 905,528.
+- The ``dnow`` residue's lane loop is rolled, ``unroll=1``. The frame goes 88 B to 0 B
+  and the local sectors 2,617,344 loaded and 995,328 stored to none, at the same 255
+  registers and the same 49,264 B of shared. ``sm__inst_executed`` rises 5.10%,
+  107,965,440 to 113,472,000, which is the rolled trip's own address arithmetic and
+  branch at 16 warp-instructions a trip against a predicted 8; ``pipe_lsu`` falls 4.34%,
+  ``mio_throttle`` 14.7% to 7.0% and the issue rate 33.05% to 35.21%. ``dram__bytes``
+  falls 16.0%, 278.67 MB to 234.11 MB. No other shape moves: the frame stays 16 B at
+  ``standard`` and ``long`` in bf16 and 8 B in fp16, 0 B at ``tiny`` and ``wide``, and
+  ``wide`` gains 30 registers of headroom, 255 to 225.
+
+The seventh change is the only one whose time is below this tree's instruments. Three
+NCU brackets read -13.5, -8.1 and -9.5 us on a 565 us launch, agreeing in sign and
+disagreeing 42% in magnitude, and the order-swapped event pair returns -1.024 to
+-2.560 us against a null of -2.560 to -3.112 us at 1200 pairs, so the null is wider than
+the result and the paired clock does not resolve it. The device was contended for every
+bracket. What is measured is the counters, and the byte credit prices at the tree's
+0.334 us/MB: 44.56 MB is 14.9 us, which brackets the NCU readings. The 1.17 us/MB this
+docstring's own sixth change implies over-predicts by 8 to 14 times, because a local
+sector is an L1TEX request and not a DRAM byte -- 109.2 MB left L1 and 64.6 MB of it was
+L2-resident -- and because that rate came from an arm that moved instructions as well as
+bytes. The mechanism is in the stall partition: ``mio_throttle`` falls 7.7 points and
+``long_scoreboard`` rises 4.4, so the freed queue slots go to exposed global latency
+rather than to issue.
 
 Registers sit at the 255 architectural cap at every shape and the kernel spills at
 every shape: 761,856 sectors per launch each way at ``standard`` and ``ragged``,
@@ -1649,7 +1692,14 @@ def chunk_input_bwd_kernel(
             anow = tuple(stable[TABLE_AN, token, e] for e in range(9))
             tsafe = cutlass.min(token, valid - 1)
             diag = zero
-            for q in cutlass.range_constexpr(lanes // lthreads):
+            # Rolled, and it is the whole spill. Unrolled this loop hands ptxas 24
+            # independent global loads and 24 shared ones with nothing between them,
+            # and at the 255-register cap it hoists them all: the frame was 88 B of
+            # loop-invariant address arithmetic, twelve words reloaded at the top of
+            # every trip. Rolled it is 0 B at the acceptance shape, and the trip's
+            # own address arithmetic is the fee. Rolling the closing residue's lane
+            # loop as well is worse, 16 B, so it is one loop and not both.
+            for q in cutlass.range(lanes // lthreads, unroll=1):
                 n = noff + q * lthreads
                 d0 = l0 + 3 * n
                 bnow = mat3_matvec(
