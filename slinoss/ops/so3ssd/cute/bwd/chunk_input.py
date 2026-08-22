@@ -2089,7 +2089,7 @@ def chunk_input_backward(
             heads // groups,
             has_prev,
             du_init is not None,
-            min(RESIDENT_MAX, max(1, smem_capacity() // budget)),
+            min(RESIDENT_MAX, smem_residency(budget)),
         ),
     )
     return ChunkInputBwd(
