@@ -255,7 +255,9 @@ def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> Non
         assert row.floor_bytes <= row.smem_bytes
         assert (row.refused_by == "chunk") == (row.floor_bytes > CAPACITY)
     fitting = {row.chunk for row in rows} - {
-        row.chunk for row in rows if row.refused_by and row.binding
+        row.chunk
+        for row in rows
+        if row.binding and (row.refused_by or row.refused_slice)
     }
     assert legal_chunks(rows) == tuple(
         sorted(c for c in fitting if MIN_CHUNK <= c <= MAX_CHUNK)
@@ -264,6 +266,46 @@ def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> Non
         row.chunk for row in rows if row.resident < RESIDENT_TARGET and row.binding
     }
     assert set(resident_chunks(rows, RESIDENT_TARGET)) == set(CANDIDATES) - short
+
+
+@CUTE
+@pytest.mark.cute
+def test_a_length_every_arena_fits_is_still_refused_by_a_k_slice_that_misses() -> None:
+    """The two refusals are on two axes, and the arena alone is not the map.
+
+    ``L = 48`` fits every kernel's carveout at every shipped shape and does not run.
+    Three launches cap a block at 32 and 48 does not divide it: ``chunk_scan_fwd``
+    its score columns, ``chunk_input_bwd`` its target tokens, ``chunk_vector_bwd``
+    its source tokens. Reading only the byte column reported 48 as legal, and the
+    operator raised from
+    :func:`slinoss.ops.so3ssd.cute.guard.check_extents` on the first launch.
+    """
+    rows = arena_rows(ACCEPTANCE, [48, 64, 80], CAPACITY)
+    missed = {
+        (row.kernel, row.chunk, row.slice_width)
+        for row in rows
+        if row.refused_slice and row.binding
+    }
+    assert missed == {
+        ("chunk_scan_fwd/w4", 48, 32),
+        ("chunk_input_bwd/w4", 48, 32),
+        ("chunk_input_bwd/w4", 80, 32),
+        ("chunk_vector_bwd/fold1/w8", 80, 32),
+        ("chunk_vector_bwd/fold18/w8", 80, 32),
+    }
+    fits = {(row.kernel, row.chunk) for row in rows if row.smem_bytes <= CAPACITY}
+    # Every L = 48 refusal fits its arena, so the byte column acquits what the
+    # slice refuses and the arena axis alone cannot produce this answer.
+    assert {(k, c) for k, c, _ in missed if c == 48} <= fits
+    # At L = 80 the two axes disagree in both directions on the same length: the
+    # target-token block misses at a width that fits, the source-token block
+    # misses at a width that does not.
+    assert ("chunk_input_bwd/w4", 80) in fits
+    assert ("chunk_vector_bwd/fold18/w8", 80) not in fits
+    assert 48 not in legal_chunks(rows)
+    assert 64 in legal_chunks(rows)
+    # A row that declares no slice divides nothing and refuses nothing.
+    assert all(row.slice_width > 0 for row in rows)
 
 
 @CUTE

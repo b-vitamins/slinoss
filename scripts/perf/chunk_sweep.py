@@ -1,7 +1,7 @@
 """Chunk length as a free parameter: what refuses it, what it costs, what it buys.
 
 ``L`` is not tuned. It is pinned by the shared-memory arena of two kernels, and every
-other consequence of the choice follows from that. Five modes separate the questions
+other consequence of the choice follows from that. The modes separate the questions
 so that a computed row and a measured row never share a table::
 
     python3 scripts/perf/chunk_sweep.py --mode arena
@@ -147,6 +147,22 @@ def geometry_of(shape: OpShape) -> Geometry:
 # ---------------------------------------------------------------------------
 
 
+def whole_chunk(chunk: int, rows: int, dim: int) -> int:
+    """The K slice of a launch that contracts a whole chunk in one pass.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``. Unused; the signature is
+            :attr:`ArenaKernel.slice_of`'s.
+        dim: ``3N``. Unused.
+
+    Returns:
+        ``chunk``, which divides itself, so such a launch refuses no length.
+    """
+    del rows, dim
+    return chunk
+
+
 class ArenaKernel(NamedTuple):
     """One kernel's shared-memory budget as a function of the three extents.
 
@@ -155,6 +171,10 @@ class ArenaKernel(NamedTuple):
             budget depends on them.
         nbytes: ``(chunk, rows, dim) -> bytes``, the shipped layout function.
         knob: ``(chunk, rows, dim) -> str``, the slice width that layout chose.
+        slice_of: ``(chunk, rows, dim) -> int``, the K slice this launch hands
+            :func:`slinoss.ops.so3ssd.cute.guard.check_extents`. That guard refuses
+            a chunk the slice does not divide, and the refusal is independent of the
+            carveout: a length can fit every arena and still not run.
         binding: Whether excess over capacity here refuses the chunk length. False
             for a block width the launch falls back from, since the narrower width
             is still available and the length still runs.
@@ -163,6 +183,7 @@ class ArenaKernel(NamedTuple):
     name: str
     nbytes: Callable[[int, int, int], int]
     knob: Callable[[int, int, int], str]
+    slice_of: Callable[[int, int, int], int] = whole_chunk
     binding: bool = True
 
 
@@ -188,7 +209,11 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
     Returns:
         One entry per kernel and block width, forward launches first.
     """
-    from slinoss.ops.so3ssd.cute.bwd.chunk_input import input_smem_bytes, lblock
+    from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
+        input_smem_bytes,
+        lblock,
+        tblock,
+    )
     from slinoss.ops.so3ssd.cute.bwd.chunk_start import start_smem_bytes
     from slinoss.ops.so3ssd.cute.bwd.chunk_vector import vblock, vector_smem_bytes
     from slinoss.ops.so3ssd.cute.common import WARPS
@@ -209,6 +234,7 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
             name=f"chunk_scan_fwd/w{w}",
             nbytes=lambda c, p, d: scan_smem_bytes(c, p, d, warps=w),
             knob=lambda c, p, d: f"nblk={nblock(c)}",
+            slice_of=lambda c, p, d: nblock(c),
             binding=w == WARPS,
         )
 
@@ -228,6 +254,9 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
             name=f"chunk_input_bwd/w{w}",
             nbytes=lambda c, p, d: input_smem_bytes(c, p, d, warps=w),
             knob=knob,
+            # The lane block is a grid axis and reaches no ``check_extents``; the
+            # target-token slice is the K mode this launch declares.
+            slice_of=lambda c, p, d: tblock(c),
             binding=w == WARPS,
         )
 
@@ -243,6 +272,7 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
                 c, p, d, f, vblock(c, p, d, f), warp_groups=groups
             ),
             knob=lambda c, p, d: f"span={vblock(c, p, d, f)}",
+            slice_of=lambda c, p, d: vblock(c, p, d, f),
             binding=w == WARPS_WIDE,
         )
 
@@ -258,6 +288,7 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
                 c, p, SPLIT, kblk=fused_kblock(c, p, SPLIT)
             ),
             knob=lambda c, p, d: f"span={SPLIT} kblk={fused_kblock(c, p, SPLIT)}",
+            slice_of=lambda c, p, d: fused_kblock(c, p, SPLIT),
         ),
     ]
     entries.extend(scan(w) for w in widths)
@@ -291,6 +322,11 @@ class ArenaRow(NamedTuple):
             when neither alone does.
         binding: Whether a refusal here refuses the chunk length, from
             :class:`ArenaKernel`.
+        slice_width: The K slice this launch declares, from
+            :attr:`ArenaKernel.slice_of`. Zero on a row that declares none, which
+            divides nothing and refuses nothing. A slice that does not divide the
+            chunk refuses the length whatever the carveout, so this is independent
+            of ``refused_by`` and both are read.
     """
 
     kernel: str
@@ -302,6 +338,12 @@ class ArenaRow(NamedTuple):
     floor_bytes: int
     refused_by: str
     binding: bool = True
+    slice_width: int = 0
+
+    @property
+    def refused_slice(self) -> bool:
+        """Whether :func:`slinoss.ops.so3ssd.cute.guard.check_extents` refuses here."""
+        return self.slice_width > 0 and self.chunk % self.slice_width != 0
 
 
 def refusing_extent(
@@ -358,6 +400,7 @@ def arena_rows(
                     floor_bytes=kernel.nbytes(chunk, HEAD_MULTIPLE, STATE_MULTIPLE),
                     refused_by=refusing_extent(kernel, chunk, geo, capacity),
                     binding=kernel.binding,
+                    slice_width=kernel.slice_of(chunk, geo.rows, geo.dim),
                 )
             )
     return tuple(rows)
@@ -415,10 +458,15 @@ def budget_at(blocks: int, capacity: int) -> int:
 
 
 def legal_chunks(rows: Sequence[ArenaRow]) -> tuple[int, ...]:
-    """Chunk lengths every kernel fits and the config admits.
+    """Chunk lengths every kernel fits, declares a dividing K slice for, and the
+    config admits.
 
     A row for a block width the launch falls back from cannot refuse a length, so
     only binding rows are read.
+
+    Two refusals, on two axes. The arena refusal moves with the carveout; the K
+    slice refusal does not, and reading only the first reported ``L = 48`` as legal
+    at every shape while ``chunk_scan_fwd`` refuses it at a slice of 32.
 
     Args:
         rows: The legality map.
@@ -426,7 +474,11 @@ def legal_chunks(rows: Sequence[ArenaRow]) -> tuple[int, ...]:
     Returns:
         The admitted lengths, ascending.
     """
-    refused = {row.chunk for row in rows if row.refused_by and row.binding}
+    refused = {
+        row.chunk
+        for row in rows
+        if row.binding and (row.refused_by or row.refused_slice)
+    }
     return tuple(
         sorted(
             chunk
@@ -1468,20 +1520,23 @@ def print_arena(geo: Geometry, args: argparse.Namespace) -> None:
         f"[{MIN_CHUNK}, {MAX_CHUNK}]"
     )
     print("a width the launch falls back from is reported and does not refuse a length")
+    print("kslice is the K slice check_extents is given; it must divide L")
     print()
     print(
         f"{'kernel':26s} {'L':>5s} {'knob':>10s} {'bytes':>10s} {'cap_pct':>8s} "
-        f"{'resident':>9s} {'floor_bytes':>12s}  refused_by"
+        f"{'resident':>9s} {'floor_bytes':>12s} {'kslice':>7s}  refused_by"
     )
     for row in rows:
         admitted = MIN_CHUNK <= row.chunk <= MAX_CHUNK
         verdict = row.refused_by or ("" if admitted else "config")
+        if row.refused_slice:
+            verdict = f"{verdict} kslice".strip()
         if verdict and not row.binding:
             verdict = f"{verdict} (falls back)"
         print(
             f"{row.kernel:26s} {row.chunk:5d} {row.knob:>10s} "
             f"{row.smem_bytes:10,d} {row.capacity_pct:8.2f} {row.resident:9d} "
-            f"{row.floor_bytes:12,d}  {verdict}"
+            f"{row.floor_bytes:12,d} {row.slice_width:7d}  {verdict}"
         )
     print()
     print(f"legal L: {list(legal_chunks(rows))}")
@@ -1676,14 +1731,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status.
 
     Raises:
-        ValueError: If a requested chunk length is not a positive power of two, since
-            no layout function and no config accepts one, or if the op mode's
+        ValueError: If a requested chunk length is not a positive multiple of the
+            atom's K extent, which no layout function accepts, or if the op mode's
             baseline length is refused at this geometry.
     """
+    from slinoss.ops.so3ssd.cute.mma import MMA_TILE_K
+
     args = parse_args(argv)
     for chunk in (*args.chunks, args.op_ref):
-        if chunk <= 0 or chunk & (chunk - 1):
-            raise ValueError(f"chunk lengths must be powers of two, got {chunk}")
+        if chunk <= 0 or chunk % MMA_TILE_K:
+            raise ValueError(
+                f"chunk lengths must be positive multiples of {MMA_TILE_K}, got {chunk}"
+            )
     geo = geometry_of(shape_by_name(args.shape))
     if args.mode == "arena":
         print_arena(geo, args)
