@@ -345,7 +345,6 @@ from slinoss.ops.so3ssd.cute.mma import (
     mma_acc,
     mma_atoms,
     mma_rows,
-    smem_pitch,
 )
 from slinoss.ops.so3ssd.cute.table import TABLE_PITCH, stage_pad
 
@@ -620,8 +619,6 @@ def start_passing_bwd_kernel(
     lanes = span // 3
     vecs = rows * lanes // threads
     dinc_elem = gdinc.element_type
-    lda = smem_pitch(mpad)
-    ldb = smem_pitch(span)
 
     smem = cutlass.utils.SmemAllocator()
     strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
@@ -682,11 +679,15 @@ def start_passing_bwd_kernel(
 
     for step in cutlass.range(chunks):
         cidx = chunks - 1 - step
-        # Restaged every chunk, not once: the columns at or past each tile's data
-        # width are read as operands and never restaged by the stagers, and the
-        # previous chunk's result was written over them.
-        stage_pad(scrot, tid, threads, chunk, span, ldb)
-        stage_pad(sdy, tid, threads, chunk, rows, lda)
+        # Restaged every chunk, not once, because the state view is the same bytes
+        # and the previous chunk's result was written over them. Bounded by ``mpad``
+        # and not by the pitch: the operand views below are built at extents ``mpad``
+        # and ``span``, so the columns from there to the pitch are read by nothing,
+        # and only the M round-up ``rows .. mpad-1`` has to hold zero. At
+        # ``rows == mpad`` that leaves no pad and the call is a trace-time no-op.
+        # ``scrot``'s pad is outside its view's ``span`` extent at every shape, so it
+        # is not staged at all.
+        stage_pad(sdy, tid, threads, chunk, rows, mpad)
         if cutlass.const_expr(scanned):
             start_scanned(
                 gtrans,
