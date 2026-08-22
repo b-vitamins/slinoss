@@ -144,7 +144,7 @@ up to the tile.
 The budget bounds ``L``, ``P`` and the fold. It does not bound ``3N``, and this is
 still the widest live set in the tree. ``L 16`` and ``L 32`` fit at every ``P``,
 every fold and every ``3N``.
-``L 64`` fits to ``P 64`` at every fold, in 95,408 B at fold one and 97,456 B above
+``L 64`` fits to ``P 64`` at every fold, in 98,736 B at fold one and 100,784 B above
 it at the shipped width and 256 B less at one warp group, whether ``3N`` is 48 or
 240. The table's segment-aligned pitch costs ``36 * L`` B of each figure, 2,304 B at
 ``L 64``, and it does not scale with the fold. ``L 64`` at ``P 128`` and ``L 128`` at
@@ -153,8 +153,10 @@ are refused: the smallest live set at ``L 128`` is 127,920 B, above the capacity
 every device the DSL reports. :func:`slinoss._cute.assert_smem_fits` refuses the
 rest rather than any path here degrading. The one-tap form's ``dls_step`` slot raised
 every figure in this paragraph by 1,488 B at ``L 64``, 848 B at ``L 32`` and 528 B at
-``L 16``, and moved neither :func:`vblock`'s choice nor a residency at any shape: every
-legal shape stays legal and every refused one stays refused.
+``L 16``, and the ``t-1`` deposit buffers :func:`_tap_epilogue` writes raised them by
+a further ``52 * L`` B, 3,328 B at ``L 64``. Neither moved :func:`vblock`'s choice or
+a residency at any shape: every legal shape stays legal and every refused one stays
+refused.
 
 The largest ``L`` this layout admits is 64, at one resident block, at ``P 64`` and at
 ``P 48`` alike. Two resident blocks of 128 threads need 50,176 B each, which is
@@ -162,8 +164,8 @@ The largest ``L`` this layout admits is 64, at one resident block, at ``P 64`` a
 capacity has one driver reservation subtracted from it and two blocks pay two. No
 legal shape at ``P 64`` reaches that bar: the smallest arena there is 54,768 B, at
 ``L 16`` and fold one. Splitting the fold across blocks removes the one
-accumulator that exists only above fold one, 13,312 B of the 97,200, and leaves
-83,888 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
+accumulator that exists only above fold one, 13,312 B of the 100,528, and leaves
+87,216 B, so it buys parallelism and not occupancy. Four extents scale with ``L`` --
 the two float32 fold sums, the output tile and the aliased float32 readout -- which
 is why 128 is refused and why grid-izing the lane tile does not unpin it.
 
@@ -1058,6 +1060,8 @@ def vector_smem_bytes(
             (gradient_tile(1, lane_block(dim)), 4),
             (quad_table_tile(chunk, 3), 4),
             (row_tile(chunk), 4),
+            (row_tile(chunk), 4),
+            (trans_tile(chunk), 4),
             (readout_tile(chunk, lane_block(dim)), itemsize),
             (
                 Tile(
@@ -2093,7 +2097,9 @@ def _tap_epilogue(
     stap: cute.Tensor,
     strans: cute.Tensor,
     srow: cute.Tensor,
+    srow2: cute.Tensor,
     sdw: cute.Tensor,
+    sdw2: cute.Tensor,
     sdk: cute.Tensor,
     bidx: cutlass.Int32,
     hidx: cutlass.Int32,
@@ -2115,7 +2121,7 @@ def _tap_epilogue(
 
         dbs         = Afuse(t)^T dbfuse            into the forcing sum, row t
         srow[t]    += D Ap(t)^T
-        srow[t-1]  += e_t D An(t-1)^T
+        srow2[t-1]  = e_t D An(t-1)^T
         dKprev(t)   = tap_matrix_vjp(Ac(t)^T D, ...)
         dKcurr(t-1)+= e_t tap_matrix_vjp(Ac(t-1)^T D, ...)
         dls_step(t) = 2 e_t <An(t-1), D>
@@ -2133,11 +2139,49 @@ def _tap_epilogue(
     closure, so no raw readout vector is read. The tap terms do not collapse, which
     is the only reason the raw forcing tile is staged.
 
-    ``t-1`` is a destination two threads of one pass reach, so the deposits split
-    into a group indexed by the row's own token and a group indexed by the row
-    before it, fenced from each other. The chunk's first token is predicated out of
-    the second group rather than left to ``e_0 = 0``: the clamp would put two
-    threads on row 0 at once.
+    ``t-1`` is a destination two threads of one pass reach, so the deposits split into
+    a group indexed by the row's own token and a group indexed by the row before it.
+    The second group writes its own buffers, ``srow2`` and ``sdw2``, so the two groups
+    share no address and the pass needs no barrier between them. Two barriers a step
+    go: the one between the halves and the one closing the step. The chunk's first
+    token is predicated out of the second group rather than left to ``e_0 = 0``: the
+    clamp would put two threads on row 0 at once.
+
+    The second group's deposits are stores, not read-modify-writes. Each destination
+    row is written by the thread group holding token ``r + 1``, ``_pass_row`` is a
+    bijection on each aligned block of eight groups so the group range of a pass is
+    permuted and not duplicated, and the runs of successive blocks are disjoint, so
+    row ``r`` of ``srow2`` and ``sdw2`` is reached exactly once a head. Six shared
+    loads and six adds a warp go with the read half.
+
+    ``sdk`` needs no split: the second group is its only writer here.
+
+    The buffers are summed into ``srow`` and ``sdw`` by :func:`_readout_epilogue`,
+    which already stands behind a barrier of its own, so the sum is a deletion and not
+    a move. It is folded ahead of that pass's own deposit, which keeps the term order
+    the single buffer had and the result bit-identical.
+
+    Measured on an A6000 at the acceptance shape, where ``steps`` is one and the
+    barrier at the end of a step never lowers: -22.016 and -20.992 us over 400 pairs
+    each, bitwise on all five outputs, against a +0.512 us null control interleaved in
+    the same run. The launch executes 820,224 more instructions than the single-buffer
+    form and 311,040 more ``STS``, so the win is latency and not instruction count.
+
+    Its own barrier stall priced it at -4.7 us, 4.6x under: that barrier carried 1.89%
+    of the launch's barrier stall, rank 17 of 18, 0.26% of its PC samples. The stall
+    partition says why. ``mio_throttle`` fell 27,093 -> 21,436 samples and
+    ``short_scoreboard`` 6,765 -> 4,337, together -3.87% of the launch's samples, while
+    ``barrier`` itself ROSE 29,039 -> 32,036. A fence between two shared-heavy halves
+    is paid by the instructions on both sides of it, which queue against a full MIO
+    pipe in two serialized bursts instead of one interleaved stream; the fence's own
+    stall is a lower bound on its price. Barrier samples rising on a launch that got
+    shorter is the same effect from the other side: a warp that no longer waits here
+    waits at the next barrier instead.
+
+    Nothing else moved. Registers 138 -> 140, local sectors zero on both, achieved
+    occupancy 16.50% -> 16.48%, global store sectors and store requests bit-identical,
+    DRAM read and write within 0.06%. ``smsp__issue_active`` 37.47% -> 38.19% is the
+    whole win: the same warps issue denser.
 
     The forcing sum is indexed by token rather than by row of the run: row ``t + 1``
     is token ``t``, so the fused column's ``dB`` at token ``t-1`` lands on row ``t``
@@ -2154,10 +2198,16 @@ def _tap_epilogue(
         stable: ``(mats, L, TABLE_PITCH)`` float32 transform table, fused.
         stap: ``(8, L)`` float32 tap parameters, component-major.
         strans: ``(4, L)`` float32 ``(w, ls)``, component-major.
-        srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated.
-        sdw: ``(4, L)`` float32 cotangent of ``strans``, accumulated. Row 3 is the
-            fused column's own ``dls``, which is the cotangent of the component
-            ``strans`` holds there.
+        srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated at the row's
+            own token.
+        srow2: ``(L, ROW_WORDS)`` float32 rotation scratch, stored at the row before
+            the pass's own token. Row ``L-1`` is never reached and is zeroed by the
+            caller.
+        sdw: ``(4, L)`` float32 cotangent of ``strans``, accumulated at the row's own
+            token. Row 3 is the fused column's own ``dls``, which is the cotangent of
+            the component ``strans`` holds there.
+        sdw2: ``(4, L)`` float32 cotangent of ``strans``, stored at the row before the
+            pass's own token. Rows 0 to 2 only; row 3 has no ``t-1`` contributor.
         sdk: ``(4, L)`` float32 current-tap cotangent, accumulated. Not stored
             through: that tap has a contributor from token ``t+1``'s pass and one
             from the readout epilogue, so no single pass holds the whole of it.
@@ -2276,9 +2326,9 @@ def _tap_epilogue(
                 gdtap[bidx, hidx, krow, 0, 3] = zero
 
         # Everything above is indexed by the row's own token, everything below by the
-        # row before it, and a pass holds adjacent tokens on adjacent thread groups.
-        cute.arch.sync_threads()
-
+        # row before it, and a pass holds adjacent tokens on adjacent thread groups. The
+        # two groups write disjoint buffers, so no barrier separates them and none
+        # closes the step.
         back = token > 0
         if cutlass.const_expr(not exact):
             back = back & inside
@@ -2287,10 +2337,10 @@ def _tap_epilogue(
             rows = back & (lane < ROW_WORDS - base)
             held = _spread(gprev[base : base + LANE_GROUP], lane)
             if rows:
-                srow[prev, base + lane] += held
+                srow2[prev, base + lane] = held
         if keep & back:
             # Its cotangent carries ``e_t`` already, so nothing is scaled on the way
-            # out: every deposit here is a bare add.
+            # out: every deposit here is a bare store or a bare add.
             dtapp, dwp = tap_matrix_vjp(
                 mprev,
                 (stap[4, prev], stap[5, prev], stap[6, prev]),
@@ -2298,9 +2348,7 @@ def _tap_epilogue(
             )
             for j in cutlass.range_constexpr(3):
                 sdk[j, prev] += dtapp[j]
-                sdw[j, prev] += dwp[j]
-        if cutlass.const_expr(step + 1 < steps):
-            cute.arch.sync_threads()
+                sdw2[j, prev] = dwp[j]
 
 
 @cute.jit
@@ -2315,7 +2363,9 @@ def _readout_epilogue(
     stap: cute.Tensor,
     strans: cute.Tensor,
     srow: cute.Tensor,
+    srow2: cute.Tensor,
     sdw: cute.Tensor,
+    sdw2: cute.Tensor,
     sdk: cute.Tensor,
     sdnow: cute.Tensor,
     sdures: cute.Tensor,
@@ -2372,8 +2422,14 @@ def _readout_epilogue(
         stable: ``(mats, L, TABLE_PITCH)`` float32 transform table, fused.
         stap: ``(8, L)`` float32 tap parameters, component-major.
         strans: ``(4, L)`` float32 ``(w, ls)``, component-major.
-        srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated.
-        sdw: ``(4, L)`` float32 rotation-vector cotangent, accumulated.
+        srow: ``(L, ROW_WORDS)`` float32 rotation scratch, accumulated. This pass folds
+            ``srow2`` into it and adds its own term, in that order.
+        srow2: ``(L, ROW_WORDS)`` float32 rotation scratch, the tap epilogue's ``t-1``
+            half. Read here and not written.
+        sdw: ``(4, L)`` float32 rotation-vector cotangent, accumulated. This pass folds
+            rows 0 to 2 of ``sdw2`` into it and adds its own term, in that order.
+        sdw2: ``(4, L)`` float32 rotation-vector cotangent, the tap epilogue's ``t-1``
+            half. Rows 0 to 2 are read here; row 3 is unused.
         sdk: ``(4, L)`` float32 current-tap cotangent, accumulated.
         sdnow: ``(L,)`` float32 diagonal cotangent, one scalar a token.
         sdures: ``(1, tile)`` float32 increment's closing rank-one at token ``L-1``.
@@ -2495,7 +2551,11 @@ def _readout_epilogue(
             )
             for j in cutlass.range_constexpr(3):
                 sdk[j, ts] += dtap[j]
-                sdw[j, ts] += dw[j]
+                # The tap epilogue's ``t-1`` half is folded in ahead of this pass's own
+                # term, which is the order the single buffer summed in, so no bit moves.
+                # Rows past ``valid`` miss the fold and reach no output: every read of
+                # ``sdw`` past this point is under ``token < valid``.
+                sdw[j, ts] = sdw[j, ts] + sdw2[j, ts] + dw[j]
         # One word a lane, a group of words a round, as in :func:`_tap_epilogue`.
         for word in cutlass.range_constexpr(-(-ROW_WORDS // LANE_GROUP)):
             base = word * LANE_GROUP
@@ -2504,7 +2564,9 @@ def _readout_epilogue(
                 rows = rows & inside
             held = _spread(gsum[base : base + LANE_GROUP], lane)
             if rows:
-                srow[ts, base + lane] += held
+                srow[ts, base + lane] = (
+                    srow[ts, base + lane] + srow2[ts, base + lane] + held
+                )
 
 
 @cute.kernel
@@ -2600,6 +2662,7 @@ def chunk_prefix_bwd(
     The grid is :func:`chunk_vector_bwd`'s with the lane-tile factor removed, so it
     is ``dim // lane_block(dim)`` times smaller and every block of the main launch
     finds its own prefix already written.
+
     """
     threads = warps * 32
     chunk_prefix_bwd_kernel(
@@ -2783,6 +2846,12 @@ def chunk_vector_bwd_kernel(
         cutlass.Float32, quad_table_tile(chunk, 3).layout(), SMEM_SEGMENT
     )
     srow = smem.allocate_tensor(cutlass.Float32, row_tile(chunk).layout(), 16)
+    # The tap epilogue's ``t-1`` deposits, split off ``srow`` and rows 0 to 2 of
+    # ``sdw`` so that pass carries no barrier between its two halves. Written once a
+    # row per head, not accumulated: see :func:`_tap_epilogue`. Row 3 of the second
+    # is unused and costs 256 B against keeping the index expressions of ``sdw``.
+    srow2 = smem.allocate_tensor(cutlass.Float32, row_tile(chunk).layout(), 16)
+    sdw2 = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     scrot = smem.allocate_tensor(elem, readout_tile(chunk, tile).layout(), SMEM_SEGMENT)
     space = arena(chunk, rows, dim, fold, span, elem.width // 8)
     base = smem.allocate_tensor(
@@ -2968,6 +3037,16 @@ def chunk_vector_bwd_kernel(
             gsquat[bidx, hidx, cidx, None, None], squat, 4 * chunk, tid, threads
         )
         _fill_zero(srow, chunk * ROW_WORDS, tid, threads)
+        # Not a fill. Every other row of the split pair is stored through exactly once
+        # a head, so only the last token's -- which no ``t-1`` deposit reaches -- needs
+        # a value, and one thread writes the twelve words. A full fill of the two would
+        # be 144 predicated segment stores a block, 0.56 a warp, on a launch whose
+        # class is warp instructions.
+        if tid == 0:
+            for k in cutlass.range_constexpr(ROW_WORDS):
+                srow2[chunk - 1, k] = zero
+            for j in cutlass.range_constexpr(3):
+                sdw2[j, chunk - 1] = zero
         _fill_zero(sdlp, wgroups * chunk, tid, threads)
         _fill_zero(sdw, 4 * chunk, tid, threads)
         _fill_zero(sdk, 4 * chunk, tid, threads)
@@ -3262,7 +3341,9 @@ def chunk_vector_bwd_kernel(
                 stap,
                 strans,
                 srow,
+                srow2,
                 sdw,
+                sdw2,
                 sdk,
                 bidx,
                 hidx,
@@ -3300,7 +3381,9 @@ def chunk_vector_bwd_kernel(
             stap,
             strans,
             srow,
+            srow2,
             sdw,
+            sdw2,
             sdk,
             sdnow,
             sdures,
