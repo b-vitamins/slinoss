@@ -28,7 +28,14 @@ from slinoss.perf.ceiling import (
     geometry_verdict,
 )
 from slinoss.perf.declared import DECLARED, FloorAudit, floor_audit
-from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
+from slinoss.perf.device import (
+    FOREIGN_MIB_FLOOR,
+    ClockPolicy,
+    Contention,
+    DeviceInfo,
+    contention,
+    device_ordinal,
+)
 from slinoss.perf.ncu import KernelCounters, SpillCounters
 from slinoss.perf.units import (
     Bytes,
@@ -235,8 +242,21 @@ def test_the_floor_agrees_with_the_single_point_ceiling_at_its_footprint() -> No
     iteration counts. The largest footprint dominates the fit, so this is the one
     place the two probes are pinned together; the small end is not, and
     ``max_residual_pct`` is where that shows.
+
+    That 0.11% was measured on an idle device, and the two probes here run at
+    different moments, so a foreign workload arriving between them moves them
+    apart by far more than the tolerance while the code under test is unchanged.
+    The gate is the same quiet probe ``await_exclusive`` uses. Skipping on a
+    shared device is the honest form: the assertion is only meaningful where its
+    tolerance was calibrated, and widening it to survive contention would stop it
+    catching the defect it exists for.
     """
     device = torch.device("cuda")
+    shared = contention(device_ordinal(device))
+    if not shared.quiet(ceiling_pct=5.0, mib_floor=FOREIGN_MIB_FLOOR):
+        pytest.skip(
+            f"device is shared, so the two probes are not comparable: {shared.stamp}"
+        )
     floor = dram_time_floor(device, iters=5, warmup=2)
     largest = floor.copies[-1]
     ceiling = dram_ceiling(
