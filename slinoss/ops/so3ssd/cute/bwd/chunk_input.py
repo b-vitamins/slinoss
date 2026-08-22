@@ -370,6 +370,7 @@ __all__ = [
     "forced_tile",
     "input_smem_bytes",
     "input_tile",
+    "lane_threads",
     "lblock",
     "local_tile",
     "reduce_tile",
@@ -399,16 +400,14 @@ change and the rotation cotangent both work on whole lane triples. ``3N`` is a
 multiple of both for the same reasons, so this always divides ``3N``."""
 
 LANE_THREADS: int = 16
-"""Threads that cooperate on one row of the two lane reductions of the epilogue.
+"""Widest run :func:`lane_threads` may cut the block into for the lane reductions.
 
 Sixteen and not the lane count itself. The two reductions -- the diagonal residue's
 per-token inner product and the increment residue's per-row one -- sum over the lane
 extent, and a butterfly needs the cooperating threads to be a power-of-two-aligned run
-within one warp. The lane count is a multiple of 16 and can be 48 or 80, neither of
-which is a power of two, so the thread block is cut by this instead: sixteen adjacent
-lanes of one warp, four butterfly rounds, and ``lanes // LANE_THREADS`` steps per
-thread. ``chunk`` and ``P`` are both multiples of ``threads // LANE_THREADS`` at every
-legal shape, so the row mapping is exact and needs no predicate."""
+within one warp. The lane count is a multiple of :data:`LANE_MULTIPLE` thirds, so it is
+a multiple of 16 and every power of two to 16 divides it; the run width is therefore
+bounded by the row mapping and not by the lane extent."""
 
 RESIDENT_MIN: int = 2
 """Blocks per SM :func:`lblock` sizes the lane block for.
@@ -576,9 +575,10 @@ def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     staging pass: the launch spills 983,040 sectors loaded and 491,520 stored in the
     two-tap narrow form and none in the one-tap wide one, moves 33.36% less device
     traffic, and is 45.064 us shorter over 1536 blocks, interval [-46.088, -45.048] at
-    240 pairs against a null band of 1.024 us. ``3N = 240`` is unaffected: its whole
-    extent needs 122,992 B, so the fallback there returns a 48-block and the width
-    stays narrow.
+    240 pairs against a null band of 1.024 us. ``3N = 240`` is unaffected: the wide
+    form's whole extent needs 129,376 B against a 101,376 B carveout, so the width
+    stays narrow and :func:`lblock` returns a 48-block. 122,992 B is the narrow form's
+    figure at that extent and does not decide this width.
 
     Three shapes for, two against, and the lane count separates them with nothing left
     over. What the lane count does not decide is whether the wide arena fits at all: at
@@ -611,6 +611,56 @@ def input_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
         return THREADS
     lblk = lblock(chunk, rows, dim, itemsize, warps=WARPS_WIDE)
     return THREADS_WIDE if lblk == dim else THREADS
+
+
+def lane_threads(chunk: int, rows: int, threads: int) -> int:
+    """Threads that cooperate on one row of the two residue lane reductions.
+
+    The two residues -- the diagonal's per-token inner product and the increment's
+    per-row one -- each reduce the lane extent for one row. Cutting the block into runs
+    of ``run`` threads puts ``threads // run`` rows in flight and needs ``log2(run)``
+    butterfly rounds per row, over a row loop of ``chunk * run // threads`` steps. Total
+    rounds are the product, ``run log2(run) chunk / threads``, so the narrowest run that
+    maps rows exactly is the cheapest: at ``acceptance`` a run of 2 costs one round where
+    16 costs 32. The lane work per thread is the residue's row count times
+    ``lanes / threads`` at every run, the two factors of ``run`` cancelling, so what the
+    cut moves is the butterfly count and nothing else.
+
+    The only constraint is the row mapping. ``threads // run`` rows must divide both
+    ``L`` and ``P``, or a step walks off the tile and the mapping needs a predicate the
+    reduction cannot carry. The lane extent never constrains it: a lane block is a
+    multiple of :data:`LANE_MULTIPLE`, so the lanes are a multiple of 16 and every power
+    of two to :data:`LANE_THREADS` divides them.
+
+    Measured at ``acceptance``, where this returns 2 against a hardcoded 16. The two
+    butterflies are 320 ``SHFL`` per warp over the launch at a run of 16 and 10 at a run
+    of 2, and the counter falls by exactly that 310: 4,999,680 to 2,142,720 warp
+    instructions. ``short_scoreboard``, which the ``FADD`` dependent on each round sits
+    in, halves with it, 18.7% to 9.4%. The launch is 83.7 to 94.2 us shorter over 2304
+    blocks, 11.15% to 12.30%, over three paired runs of 240 order-swapped pairs each
+    against a null band of 2.048 us; the run-to-run spread is the device's, every run
+    having been taken beside a foreign process, and the ratio is quoted as a range for
+    that reason. What pays is the MIO class and not the register file: registers stay
+    pinned at 255 and spill rises 12%, while shared loads fall 25.7% and the whole MIO
+    class 27.3%.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        threads: Block width.
+
+    Returns:
+        The narrowest power of two whose row mapping divides both extents, at most
+        :data:`LANE_THREADS`. Falls back to :data:`LANE_THREADS`, which every legal shape
+        admits, when no narrower run maps.
+    """
+    run = 1
+    while run <= LANE_THREADS:
+        held = threads // run
+        if chunk % held == 0 and rows % held == 0:
+            return run
+        run *= 2
+    return LANE_THREADS
 
 
 def input_tile(chunk: int, rows: int) -> Tile:
@@ -907,21 +957,24 @@ def _sum_over_n(value: cutlass.Float32) -> cutlass.Float32:
     return value + shuffle_xor(value, 2)
 
 
-def _sum_over_lanes(value: cutlass.Float32) -> cutlass.Float32:
-    """Sum one row's contribution over the :data:`LANE_THREADS` threads sharing it.
+def _sum_over_lanes(value: cutlass.Float32, run: int) -> cutlass.Float32:
+    """Sum one row's contribution over the ``run`` threads sharing it.
 
-    Four butterfly rounds over a 16-aligned run of one warp, so the total lands in all
-    sixteen and the accumulation that follows is by one of them. Not
+    ``log2(run)`` butterfly rounds over a ``run``-aligned run of one warp, so the total
+    lands in all of them and the accumulation that follows is by one. Not
     :func:`_sum_over_n`: those threads are the atom's quad, these are the run the two
-    residue reductions map a row onto, which no accumulator layout decides.
+    residue reductions map a row onto, which no accumulator layout decides. A run of one
+    is the identity: that thread already holds the whole lane extent.
 
     Args:
         value: The thread's contribution.
+        run: Cooperating threads. A power of two, at most 32, compile-time.
     """
-    value = value + shuffle_xor(value, 1)
-    value = value + shuffle_xor(value, 2)
-    value = value + shuffle_xor(value, 4)
-    return value + shuffle_xor(value, 8)
+    mask = 1
+    while mask < run:
+        value = value + shuffle_xor(value, mask)
+        mask *= 2
+    return value
 
 
 def _sum_over_m(value: cutlass.Float32) -> cutlass.Float32:
@@ -1160,11 +1213,14 @@ def chunk_input_bwd_kernel(
     # shifted partner of ``dU`` at its last valid token. At a full chunk it is the chunk
     # and the staging is unchanged.
     vplus = cutlass.min(valid + 1, cutlass.Int32(chunk))
-    # The two residue reductions. Sixteen threads to a row, so ``trows`` rows or tokens
-    # are in flight per step and each thread walks ``lanes // LANE_THREADS`` lanes.
-    trows = threads // LANE_THREADS
-    noff = tid % LANE_THREADS
-    nrow = tid // LANE_THREADS
+    # The two residue reductions. ``lthreads`` threads to a row, so ``trows`` rows or
+    # tokens are in flight per step and each thread walks ``lanes // lthreads`` lanes.
+    # The lane work per thread is the product and is fixed; what the cut moves is the
+    # butterfly count, which is the row loop's trip count times ``log2(lthreads)``.
+    lthreads = lane_threads(chunk, rows, threads)
+    trows = threads // lthreads
+    noff = tid % lthreads
+    nrow = tid // lthreads
     score = [
         mma_acc(tiled_mma, tid, (mpad, tblk)) for _ in range(slices if banked else 1)
     ]
@@ -1439,20 +1495,22 @@ def chunk_input_bwd_kernel(
         # The diagonal's ``s == t`` residue, ``dnow_t = <crot_t, An_t b_t>``, one scalar
         # per token. Not a GEMM: every other term of row ``t`` comes from the fused
         # column, and this one contracts the lane extent against a single token's
-        # current-tap forcing vector. Sixteen threads to a token, four butterfly rounds,
-        # one accumulation into the resident tile per lane block, so the sum over the
-        # whole lane extent is the sum of the blocks'.
+        # current-tap forcing vector. :func:`lane_threads` threads to a token,
+        # ``log2`` of that many butterfly rounds, one accumulation into the resident tile
+        # per lane block, so the sum over the whole lane extent is the sum of the blocks'.
         #
-        # The token loop is outside the lane loop so the nine table entries are read once
-        # per token. ``An`` is the zero matrix at a padded token, which is what bounds the
-        # clamped read of ``b``: the row it repeats contributes nothing.
+        # The token loop encloses the lane loop so the nine table entries are read once
+        # per token, which is the second thing a narrow run buys: at one token in flight
+        # per thread the table is read once per lane block, not once per token step.
+        # ``An`` is the zero matrix at a padded token, which is what bounds the clamped
+        # read of ``b``: the row it repeats contributes nothing.
         for ts in cutlass.range_constexpr(chunk // trows):
             token = nrow + ts * trows
             anow = tuple(stable[TABLE_AN, token, e] for e in range(9))
             tsafe = cutlass.min(token, valid - 1)
             diag = zero
-            for q in cutlass.range_constexpr(lanes // LANE_THREADS):
-                n = noff + q * LANE_THREADS
+            for q in cutlass.range_constexpr(lanes // lthreads):
+                n = noff + q * lthreads
                 d0 = l0 + 3 * n
                 bnow = mat3_matvec(
                     anow,
@@ -1464,7 +1522,7 @@ def chunk_input_bwd_kernel(
                 )
                 for j in cutlass.range_constexpr(3):
                     diag = diag + widen(sc[token, 3 * n + j], elem) * bnow[j]
-            diag = _sum_over_lanes(diag)
+            diag = _sum_over_lanes(diag, lthreads)
             if noff == 0:
                 sdnow[token] = sdnow[token] + diag
 
@@ -1483,8 +1541,8 @@ def chunk_input_bwd_kernel(
         tlast = cutlass.min(cutlass.Int32(last), valid - 1)
         pres = cute.make_fragment((rows // trows,), cutlass.Float32)
         pres.fill(0.0)
-        for q in cutlass.range_constexpr(lanes // LANE_THREADS):
-            n = noff + q * LANE_THREADS
+        for q in cutlass.range_constexpr(lanes // lthreads):
+            n = noff + q * lthreads
             d0 = l0 + 3 * n
             bnow = mat3_matvec(
                 anlast,
@@ -1506,7 +1564,7 @@ def chunk_input_bwd_kernel(
                 for j in cutlass.range_constexpr(3):
                     mrot[3 * i + j] = mrot[3 * i + j] + wsum[i] * bnow[j]
         for ps in cutlass.range_constexpr(rows // trows):
-            summed = _sum_over_lanes(pres[ps])
+            summed = _sum_over_lanes(pres[ps], lthreads)
             if noff == 0:
                 row = nrow + ps * trows
                 sdures[row] = sdures[row] + summed

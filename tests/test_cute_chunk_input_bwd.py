@@ -62,11 +62,13 @@ from slinoss.ops.so3ssd import (
 )
 from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
     LANE_MULTIPLE,
+    LANE_THREADS,
     RESIDENT_MIN,
     ChunkInputBwd,
     chunk_input_backward,
     input_smem_bytes,
     input_threads,
+    lane_threads,
     lblock,
 )
 from slinoss.ops.so3ssd.cute.common import THREADS
@@ -678,6 +680,47 @@ def test_the_lane_extent_reaches_the_residency_it_is_chosen_for() -> None:
     assert nbytes <= smem_capacity()
     if smem_residency(nbytes) < RESIDENT_MIN:
         assert lblk == dim, (lblk, nbytes)
+
+
+# (L, P, threads) and the run :func:`lane_threads` cuts the block into. One row per
+# distinct outcome rather than per shape: the narrowest run the mapping admits, an
+# intermediate, and the fallback, which is what the hardcoded form used at every shape.
+#
+# ``P`` and the width separate them, not ``L``. A run of one needs ``threads`` rows to
+# divide both extents and no row here reaches it; ``P = 64`` admits 64 rows, so the narrow
+# width maps a run of two and the wide one a run of four, and ``P = 48`` admits 16 and no
+# more at either width.
+RUNS: list[tuple[int, int, int, int]] = [
+    (64, 64, THREADS, 2),
+    (MAX_CHUNK, 64, THREADS, 2),
+    (64, 64, THREADS_WIDE, 4),
+    (64, 48, THREADS_WIDE, LANE_THREADS),
+    (MAX_CHUNK, 48, THREADS_WIDE, LANE_THREADS),
+]
+
+
+@pytest.mark.parametrize(("chunk", "rows", "threads", "want"), RUNS)
+def test_the_lane_run_is_the_widest_the_row_mapping_admits(
+    chunk: int, rows: int, threads: int, want: int
+) -> None:
+    """The run maps rows exactly, lies in one warp, and no narrower run maps.
+
+    Three failures, and only the first corrupts a result. A run whose ``threads // run``
+    rows do not divide ``L`` or ``P`` walks a row step off the tile. A run that is not a
+    power of two, or one over 32, breaks the butterfly, which needs an aligned run inside
+    one warp. A run wider than the narrowest legal one is silent: total rounds go as
+    ``run log2(run)``, so a run twice as wide costs more than twice the butterflies and
+    changes nothing else, which is why minimality is asserted and not only legality.
+    """
+    got = lane_threads(chunk, rows, threads)
+    assert got == want, (chunk, rows, threads)
+    assert got & (got - 1) == 0, got
+    assert got <= LANE_THREADS <= 32
+    held = threads // got
+    assert chunk % held == 0 and rows % held == 0, (held, chunk, rows)
+    if got > 1:
+        loose = threads // (got // 2)
+        assert chunk % loose or rows % loose, (got // 2, loose)
 
 
 def test_refuses_a_shape_no_lane_block_fits() -> None:
