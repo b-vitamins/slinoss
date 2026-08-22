@@ -22,12 +22,14 @@ from scripts.perf.chunk_sweep import (
     CANDIDATES,
     FLAT,
     INVERSE,
+    LAUNCH_METRICS,
     MODES,
     RESIDENT_TARGET,
     SHIFTED,
     ArenaKernel,
     ArenaRow,
     Geometry,
+    OccupancyRow,
     arena_rows,
     budget_at,
     flop_terms,
@@ -143,7 +145,15 @@ def test_parse_args_defaults_the_acceptance_sweep_and_takes_every_mode() -> None
     assert default.peak_tflops is None
     for name in MODES:
         assert parse_args(["--mode", name]).mode == name
-    assert MODES == ("arena", "traffic", "numerics", "step", "op")
+    assert MODES == (
+        "arena",
+        "traffic",
+        "numerics",
+        "step",
+        "op",
+        "occupancy",
+        "launch",
+    )
     # The op mode pairs against a fixed length, so the default has to be one the
     # acceptance arena admits or every pair loses its baseline arm.
     assert default.op_ref == 64
@@ -306,6 +316,44 @@ def test_a_length_every_arena_fits_is_still_refused_by_a_k_slice_that_misses() -
     assert 64 in legal_chunks(rows)
     # A row that declares no slice divides nothing and refuses nothing.
     assert all(row.slice_width > 0 for row in rows)
+
+
+def test_an_occupancy_row_names_the_resource_that_sets_its_residency() -> None:
+    """The arena mode cannot reach this verdict, so the counter row has to.
+
+    Host arithmetic over the layout functions prices shared memory and is blind to the
+    register file. A length that frees enough shared memory for a second block and
+    still runs one is the case the two columns exist to separate, and a report that
+    printed only the shared limit would call that a residency step.
+    """
+
+    def occ(smem_limit: int, register_limit: int) -> OccupancyRow:
+        return OccupancyRow(
+            kernel="k",
+            chunk=32,
+            smem_bytes=48_000,
+            registers=168,
+            smem_limit=smem_limit,
+            register_limit=register_limit,
+            waves=8.57,
+            blocks=2880,
+            threads=256,
+        )
+
+    assert occ(2, 3).resident == 2
+    assert occ(2, 3).bound_by == "smem"
+    assert occ(3, 2).resident == 2
+    assert occ(3, 2).bound_by == "regs"
+    assert occ(2, 2).bound_by == "both"
+    # The counters are requested in print order and carry no duration: a launch
+    # configuration is not a measurement of time and must not be read as one.
+    assert LAUNCH_METRICS[:4] == (
+        "launch__shared_mem_per_block",
+        "launch__registers_per_thread",
+        "launch__occupancy_limit_shared_mem",
+        "launch__occupancy_limit_registers",
+    )
+    assert not any("time" in metric for metric in LAUNCH_METRICS)
 
 
 @CUTE

@@ -9,6 +9,7 @@ so that a computed row and a measured row never share a table::
     python3 scripts/perf/chunk_sweep.py --mode numerics
     python3 scripts/perf/chunk_sweep.py --mode step
     python3 scripts/perf/chunk_sweep.py --mode op
+    python3 scripts/perf/chunk_sweep.py --mode occupancy
 
 ``arena`` is the legality map. The shipped layout functions are evaluated at each
 candidate ``L`` against the device's carveout and against half of it, which is what
@@ -44,11 +45,24 @@ length over the same input tensors, so the ranking rests on per-iteration
 differences and not on two medians taken minutes apart::
 
     python3 scripts/perf/chunk_sweep.py --mode op --chunks 16 32 64 --op-ref 64
+
+``occupancy`` is the launch configuration each kernel actually got, per ``L``, from
+NCU. The ``arena`` mode's residency is host arithmetic over the layout functions and
+knows nothing about registers; the occupancy limit a launch is bound by can be either.
+The mode reports both limits side by side, so a residency step the arena predicts is
+confirmed or refused by the counter that decides it. Launch counters, not durations:
+they are properties of the configuration and a contended device does not move them::
+
+    python3 scripts/perf/chunk_sweep.py --mode occupancy --chunks 16 32 64
+
+``launch`` is that mode's target and runs one forward and backward at ``--op-ref``
+inside a capture window. It prints nothing and exists to be profiled.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -59,13 +73,19 @@ from slinoss.config import HEAD_MULTIPLE, MAX_CHUNK, MIN_CHUNK, STATE_MULTIPLE
 from slinoss.ops.so3ssd.reference import SO3SSDResult
 from slinoss.perf.workload import OpShape, shape_by_name
 
-MODES = ("arena", "traffic", "numerics", "step", "op")
+MODES = ("arena", "traffic", "numerics", "step", "op", "occupancy", "launch")
 
-CANDIDATES: tuple[int, ...] = (16, 32, 64, 128, 256)
+CANDIDATES: tuple[int, ...] = (16, 32, 48, 64, 80, 96, 128, 256)
 """Chunk lengths the sweep asks about.
 
-Powers of two, since :class:`slinoss.config.SLinOSSConfig` admits no other, spanning
-:data:`slinoss.config.MIN_CHUNK` to one doubling past
+Multiples of :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_K`, which is the operator's
+own rule: ``L`` is the K mode of the chunk-local contractions and
+:func:`slinoss.ops.so3ssd.cute.guard.check_extents` admits any multiple of 16 that
+its K slice also divides. :class:`slinoss.config.SLinOSSConfig` is stricter and takes
+powers of two only, so the four non-powers here reach the operator modes and not
+``step``; a length the config refuses raises there, naming the config.
+
+The range spans :data:`slinoss.config.MIN_CHUNK` to one doubling past
 :data:`slinoss.config.MAX_CHUNK`. The last entry is outside the config's range and is
 reported rather than omitted: whether the arithmetic or the range refuses it first is
 the question the mode exists to answer.
@@ -1398,6 +1418,169 @@ def op_rows(
 
 
 # ---------------------------------------------------------------------------
+# Occupancy
+# ---------------------------------------------------------------------------
+
+
+LAUNCH_METRICS: tuple[str, ...] = (
+    "launch__shared_mem_per_block",
+    "launch__registers_per_thread",
+    "launch__occupancy_limit_shared_mem",
+    "launch__occupancy_limit_registers",
+    "launch__waves_per_multiprocessor",
+    "launch__grid_size",
+    "launch__block_size",
+)
+"""The launch configuration, in the order the report prints it.
+
+No duration and no rate. Each of these is a property of the configuration the driver
+accepted, so a contended device moves none of them and one launch of each kernel
+measures them exactly. ``launch__shared_mem_per_block`` is the total the SM reserves,
+static and dynamic together, which is the number the occupancy limit is computed from.
+
+The two ``occupancy_limit`` counters are blocks per multiprocessor and are the only
+statement of which resource binds: the arena mode's residency is arithmetic over the
+layout functions and cannot see a register count.
+"""
+
+
+class OccupancyRow(NamedTuple):
+    """One kernel's launch configuration at one chunk length.
+
+    Attributes:
+        kernel: Demangled kernel name.
+        chunk: ``L``.
+        smem_bytes: Shared memory per block the SM reserved, static plus dynamic.
+        registers: Registers per thread.
+        smem_limit: Blocks per multiprocessor the shared memory admits.
+        register_limit: Blocks per multiprocessor the register file admits.
+        resident: The smaller of the two, which is the residency the launch gets
+            unless a third limit binds below both.
+        waves: Waves per multiprocessor. Below one the grid does not fill the device
+            and a residency step buys nothing.
+        blocks: Blocks in the grid.
+        threads: Threads per block.
+    """
+
+    kernel: str
+    chunk: int
+    smem_bytes: int
+    registers: int
+    smem_limit: int
+    register_limit: int
+    waves: float
+    blocks: int
+    threads: int
+
+    @property
+    def resident(self) -> int:
+        """Blocks per multiprocessor both named limits admit."""
+        return min(self.smem_limit, self.register_limit)
+
+    @property
+    def bound_by(self) -> str:
+        """Which named resource sets the residency, or ``both`` on a tie."""
+        if self.smem_limit < self.register_limit:
+            return "smem"
+        if self.register_limit < self.smem_limit:
+            return "regs"
+        return "both"
+
+
+def occupancy_rows(
+    args: argparse.Namespace, chunks: Sequence[int]
+) -> tuple[OccupancyRow, ...]:
+    """Collect the launch configuration of every kernel at each chunk length.
+
+    One NCU pass per chunk length over a single forward and backward. The target is
+    this script's own ``launch`` mode, so the profiled program is the same operator
+    call the timing modes measure and not a second construction of it.
+
+    A kernel launched more than once in the region contributes one row: these
+    counters are invariant across the launches of one kernel at one shape, and the
+    first is taken rather than a median so that a disagreement is not averaged away.
+
+    Args:
+        args: The command line. ``--ncu`` names the profiler, ``--shape`` the
+            geometry, ``--backend`` the operator arm.
+        chunks: Chunk lengths to profile.
+
+    Returns:
+        One row per kernel per chunk length, in NCU's launch order.
+
+    Raises:
+        RuntimeError: If a pass returns no row carrying the launch counters, which
+            means the capture window stayed empty and the report would be silent
+            about it.
+    """
+    from slinoss.perf.ncu import NcuTable, run_ncu
+
+    table = NcuTable("launch", LAUNCH_METRICS)
+    rows: list[OccupancyRow] = []
+    for chunk in chunks:
+        target = [
+            args.python,
+            "scripts/perf/chunk_sweep.py",
+            "--mode",
+            "launch",
+            "--shape",
+            args.shape,
+            "--op-ref",
+            str(chunk),
+            "--device",
+            args.device,
+        ]
+        if args.backend:
+            target += ["--backend", args.backend]
+        one = run_ncu(table, target, ncu=args.ncu)
+        if one.missing_metrics:
+            raise RuntimeError(
+                f"ncu returned no value for {list(one.missing_metrics)} at L={chunk}; "
+                f"command {' '.join(one.command)}"
+            )
+        seen: set[str] = set()
+        for launch in one.invocations:
+            if launch.kernel in seen:
+                continue
+            seen.add(launch.kernel)
+            values = launch.values
+            rows.append(
+                OccupancyRow(
+                    kernel=launch.kernel,
+                    chunk=chunk,
+                    smem_bytes=round(values["launch__shared_mem_per_block"]),
+                    registers=round(values["launch__registers_per_thread"]),
+                    smem_limit=round(values["launch__occupancy_limit_shared_mem"]),
+                    register_limit=round(values["launch__occupancy_limit_registers"]),
+                    waves=values["launch__waves_per_multiprocessor"],
+                    blocks=round(values["launch__grid_size"]),
+                    threads=round(values["launch__block_size"]),
+                )
+            )
+    return tuple(rows)
+
+
+def run_launch(args: argparse.Namespace) -> None:
+    """Run one forward and backward at ``--op-ref`` inside the capture window.
+
+    The profiler's target. Warmup and compilation happen before the window opens, so
+    a JIT launch never enters a counter.
+    """
+    from slinoss.perf.capture import profiler_window
+    from slinoss.perf.workload import make_inputs, shape_by_name
+    from slinoss.perf.workload import step as op_step
+
+    device = resolve_device(args.device)
+    shape = shape_by_name(args.shape)
+    inputs = make_inputs(shape, device, requires_grad=True)
+    once = op_step(inputs, args.op_ref, backend=args.backend, prefix="launch")
+    once()
+    torch.cuda.synchronize(device)
+    with profiler_window(device):
+        once()
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1468,6 +1651,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--parity-seq", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--ncu",
+        default="ncu",
+        help="Path to ncu, or a bare name resolved through the CUDA bin directories.",
+    )
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="Interpreter the occupancy mode profiles its own launch mode with.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1721,6 +1914,45 @@ def print_op(geo: Geometry, args: argparse.Namespace) -> None:
             print(f"{name[:64]:64s} {us:12,.1f} {calls:8,.1f}")
 
 
+def print_occupancy(geo: Geometry, args: argparse.Namespace) -> None:
+    """Print the launch configuration of every kernel at each legal chunk length.
+
+    Raises:
+        ValueError: If no requested length is admitted at this geometry, which would
+            leave nothing to profile.
+    """
+    capacity = resolve_capacity(args.capacity)
+    admitted = legal_chunks(arena_rows(geo, args.chunks, capacity))
+    asked = [c for c in args.chunks if c in admitted]
+    refused = [c for c in args.chunks if c not in admitted]
+    if not asked:
+        raise ValueError(
+            f"no requested length is admitted at this geometry; refused: {refused}"
+        )
+    print("measured  launch counters only, no duration and no rate")
+    print(f"geometry {geo.describe()}  op alone, no layer")
+    print(
+        f"carveout {capacity:,} B   {RESIDENT_TARGET} resident blocks need "
+        f"{budget_at(RESIDENT_TARGET, capacity):,} B"
+    )
+    if refused:
+        print(f"not profiled, refused at this geometry: {refused}")
+    print()
+    rows = occupancy_rows(args, asked)
+    print(
+        f"{'kernel':52s} {'L':>5s} {'smem_B':>9s} {'regs':>5s} {'smem_lim':>9s} "
+        f"{'reg_lim':>8s} {'resident':>9s} {'bound_by':>9s} {'waves':>8s} "
+        f"{'blocks':>8s} {'threads':>8s}"
+    )
+    for row in rows:
+        print(
+            f"{row.kernel[:52]:52s} {row.chunk:5d} {row.smem_bytes:9,d} "
+            f"{row.registers:5d} {row.smem_limit:9d} {row.register_limit:8d} "
+            f"{row.resident:9d} {row.bound_by:>9s} {row.waves:8.2f} "
+            f"{row.blocks:8,d} {row.threads:8d}"
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one mode.
 
@@ -1752,6 +1984,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_numerics(geo, args)
     elif args.mode == "op":
         print_op(geo, args)
+    elif args.mode == "occupancy":
+        print_occupancy(geo, args)
+    elif args.mode == "launch":
+        run_launch(args)
     else:
         print_step(geo, args)
     return 0
