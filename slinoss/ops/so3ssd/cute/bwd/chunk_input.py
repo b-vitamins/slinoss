@@ -173,6 +173,72 @@ counted off the device. ``smsp__sass_thread_inst_executed_op_ffma_pred_on`` fall
 with it, 832,555,008 to 710,166,528: less than half, because the two residues are FFMA
 where the tap they replace was tensor.
 
+The two log-scale reductions are entered once per destination word, not once per
+accumulator element. The exponent's cotangent is summed over the source token into
+``sdlp[warp, token]`` and the shift inner product over the target token into
+``sdlp[warp, m]``, so the fragment elements that share a destination sum in a register
+and cross the lanes once: at the acceptance shape 16 score elements enter as 8 columns
+and 32 output elements as 2 rows, at ``standard`` 8 as 4 and 12 as 2. Both sums are
+linear, so the collapse is exact in the reals and a reassociation in float32.
+
+Counted off the source page at the acceptance shape, per launch: ``SHFL`` 2,142,720 to
+1,147,392, ``LDS`` 9,556,992 to 9,133,056, ``STS`` 3,117,312 to 2,693,376, ``FADD``
+3,674,880 to 2,255,616, and the launch 109,368,576 to 105,200,640, -3.81%. ``FFMA``
+rises 589,824 and ``FMUL`` falls by the same, the register pre-sum folding a multiply
+into an accumulate, so the FMA pipe count does not move. Static ``SHFL`` sites fall 215
+to 107 and static ``FADD`` sites 363 to 209, which is the per-warp count: 108 shuffles
+and 154 adds. At ``standard`` three of those counts close exactly against the fragment
+arithmetic, ``SHFL`` -540,672, ``STS`` -221,184 and ``FADD`` -761,856, and the launch
+falls 6.27%. Registers, shared bytes, both occupancy limits and achieved occupancy hold
+at every shape. Spill moves in both directions and neither decides a delta: unchanged at
+2,469,888 sectors loaded and 884,736 stored at acceptance, up 20% at ``standard`` and
+``ragged``, down 89.5% at ``standard`` in the narrow form, zero at ``tiny`` and ``wide``
+on both sides. The 3,723,264 and 921,600 below is the fusion arm's own bracket; this
+toolchain reads the smaller pair on both sides of this one.
+
+Paired against the per-element form with the launch order swapped every iteration, 1000
+pairs, 2026-08-22, every run stamped with foreign processes on the device:
+
+    shape       delta us  interval            null   position  base us   arm us
+    tiny         -0.072   [-0.072,-0.072]            -0.072      12.288   12.288
+    standard    -16.384   [-16.384,-16.384]  +2.024   0.000     174.080  157.696
+    ragged      -16.384   [-16.384,-16.384]          +1.024     174.080  157.696
+    wide        -32.256   [-32.256,-32.256]          -1.536     324.608  292.864
+    acceptance  -31.232   [-31.232,-31.232]  -2.048  -6.656     622.592  589.824
+    acceptance  -33.280   [-33.280,-33.280]          -6.656     647.168  611.328
+
+The two acceptance rows are one arm measured twice, 6% apart. ``tiny`` is inside the
+null band and reads as no change. Predicted -18 us at acceptance from 8.82 us per million
+MIO instructions, the rate the lane-run arm on this kernel converted at, and delivered
+1.8x that. Two terms were missing. The prediction counted the shuffles, the adds and the
+``sdlp`` round trip and not the address arithmetic and the branch each deleted entry
+carried, so the deletion is 1.47x what it priced. And the chain deleted is dependent,
+``SHFL`` into ``FADD``: ``FADD``'s ``short_scoreboard`` share falls 55.45% to 41.12% and
+its sample share 7.45% to 4.81%, which a flat rate over an instruction class cannot
+carry.
+
+``dlogp`` is the only output that moves and it is not bitwise, the reassociation being
+inside its two sums: worst absolute disagreement against the per-element form 2.808e-3
+at acceptance over 125,713 of 147,456 words. Nothing moves that a bound reads. Of the 48
+rows of a ``--tolerance-report`` run against the float64 oracle, 47 are identical to the
+per-element form's; ``dlogp``'s worst relative error is 2.784e-3 in bfloat16 and 2.774e-4
+in float16 against bounds of 5e-3 and 5e-4, to four figures what the table at
+:data:`BOUNDS` in the test file records; the row that moves is ``wide.dlogp``, 8.743e-8
+to 9.772e-8 against 1e-6. ``dU``, ``carry_u``, ``dchunk_rot`` and ``dchunk_scale`` are
+bit-identical at every shape. This kernel is not bit-stable across its own block widths
+and was not before: at ``standard`` the per-element form disagrees with itself at 128
+against 256 threads on ``dU`` by 1.0 over 266 words, on ``dchunk_rot`` by 2.441e-4 and on
+``dchunk_scale`` by 3.052e-5, and the arm reproduces every one of those counts and
+maxima.
+
+The two residue reductions are the same defect at a size that does not pay.
+:func:`_sum_over_lanes` is entered once per lane block where its destination needs the
+whole lane extent, five blocks at the acceptance shape against one destination, so
+hoisting the partial sum out of the lane loop would delete 10 ``SHFL``, 8 ``LDS`` and 8
+``STS`` per warp, 239,616 instructions, about 1.8 us at this arm's own conversion and
+inside the 2 us null band. It also puts ``chunk // trows`` and ``rows // trows`` float32
+live across a dynamic loop on a launch already at the 255-register cap. Refused on both.
+
 The two-tap form's own local traffic is 344,064 sectors each way at ``standard`` and
 983,040 loaded against 491,520 stored at ``wide``; the fused form has none at either,
 and 9.50% and 33.36% less device traffic. At the acceptance shape the direction
@@ -745,8 +811,13 @@ def warp_tile(chunk: int, warps: int = WARPS) -> Tile:
 def reduce_tile(warps: int = WARPS) -> Tile:
     """Block-reduction scratch, ``(REDUCTIONS, warps)``.
 
-    One word per warp per reduced value, which is what lets the epilogue reduce
-    eleven float32 with no barrier of its own between them.
+    One word per warp per reduced value, so no reduction reuses another's slot and
+    the epilogue adds no barrier of its own between them. It does not follow that
+    the launch pays one:
+    :func:`slinoss._cute.block_reduce_add` carries its own ``sync_threads``, so the
+    eleven calls below pay eleven, 26 ``BAR`` per warp at the acceptance shape of
+    which eleven are theirs. Collapsing them needs the helper split into a staging
+    half and a summing half, which is an edit to that helper and not to this tile.
 
     Args:
         warps: Warps per block.
@@ -1236,6 +1307,25 @@ def chunk_input_bwd_kernel(
     doff = mma_offsets(tiled_mma, (mpad, lblk))
     dres = tuple((off[1] - doff[0][1]) % 3 for off in doff)
     lphase = dcrd[0][1] % 3
+    # Accumulator elements grouped by the word the two log-scale reductions write.
+    # ``scols`` groups the score fragment by target token, whose destination is
+    # ``sdlp[warp, token]``; ``wrows`` groups the output fragment by source token, whose
+    # destination is ``sdlp[warp, m]``. A thread's coordinate is its own base plus a
+    # trace-time offset and the base is one value per fragment, so elements sharing an
+    # offset share the destination and the grouping is static. Both reductions are
+    # linear, so the elements of a group sum in a register and the butterfly is entered
+    # once per destination instead of once per element: at ``acceptance`` 8 entries
+    # against 16 for the score and 2 against 32 for the output.
+    soff = mma_offsets(tiled_mma, (mpad, tblk))
+    scols = tuple(
+        tuple(i for i in range(len(soff)) if soff[i][1] == col)
+        for col in dict.fromkeys(off[1] for off in soff)
+    )
+    woff = mma_offsets(tiled_mma, (mpad, rows))
+    wrows = tuple(
+        tuple(i for i in range(len(woff)) if woff[i][0] == row)
+        for row in dict.fromkeys(off[0] for off in woff)
+    )
     # Fragments, not values: the lane loop is dynamic, and a fragment written across it
     # needs no loop-carried argument. Every index into both is trace-time, so they
     # promote to registers.
@@ -1607,21 +1697,30 @@ def chunk_input_bwd_kernel(
         fa_score = mma_areg(sfrag) if one_group else sfrag
         for k in cutlass.range_constexpr(ksteps):
             mma_gemm(tiled_mma, tid, dmacc, vu[k], vb_dy[k], True, True)
-        for i in cutlass.range_constexpr(cute.size(dmacc)):
-            m, n = scrd[i]
+        # Column-major over the fragment, one group of ``scols`` at a time. The
+        # exponent's cotangent is summed over the source token, which is this
+        # accumulator's M mode, and its destination is one word per target token: the
+        # rows a thread holds at one column sum in a register and cross the lanes once.
+        # Its other sum, over the target token, is the pair of inner products the
+        # epilogue takes against the finished fragments, so the score is never
+        # revisited.
+        for g in cutlass.range_constexpr(len(scols)):
+            group = scols[g]
+            _, n = scrd[group[0]]
             token = tbase + n
-            # I6: the mask lands on the float32 accumulator, then one narrowing
-            # into the operand. I3: one exponential of a log difference. The clamp
-            # only feeds rows the M mode was rounded up by, whose operands the
-            # stagers zeroed.
-            masked = acc[i] * decay(slp[token] - slp[cutlass.min(m, last)])
-            masked = select(token >= m, masked, zero)
-            sfrag[i] = narrow(masked, elem)
-            # The exponent's cotangent, summed over the source token, which is
-            # this accumulator's M mode. Its other sum, over the target token, is
-            # the pair of inner products the epilogue takes against the finished
-            # fragments, so the score is never revisited.
-            column = _sum_over_m(masked * dmacc[i])
+            summed = zero
+            for e in cutlass.range_constexpr(len(group)):
+                i = group[e]
+                m, _ = scrd[i]
+                # I6: the mask lands on the float32 accumulator, then one narrowing
+                # into the operand. I3: one exponential of a log difference. The clamp
+                # only feeds rows the M mode was rounded up by, whose operands the
+                # stagers zeroed.
+                masked = acc[i] * decay(slp[token] - slp[cutlass.min(m, last)])
+                masked = select(token >= m, masked, zero)
+                sfrag[i] = narrow(masked, elem)
+                summed = summed + masked * dmacc[i]
+            column = _sum_over_m(summed)
             if tid % 32 < 4:
                 sdlp[warp, token] = sdlp[warp, token] + column
         if cutlass.const_expr(one_group):
@@ -1641,11 +1740,21 @@ def chunk_input_bwd_kernel(
     # the shift all read it in place. One term, not two: the diagonal residue's factor is
     # ``D(t,t) = 1`` and the increment residue's weight is ``wgt_{L-1} = 1``, so neither
     # carries a log scale and the current tap contributes nothing here.
-    for i in cutlass.range_constexpr(cute.size(dushift)):
-        m, p = wcrd[i]
-        held = _sum_over_n(dushift[i] * widen(su[m, p], elem))
+    # Row-major over the fragment, one group of ``wrows`` at a time. The inner product
+    # is over the output's N mode and its destination is one word per source token, so
+    # the columns a thread holds in one row sum in a register and cross the quad once.
+    for g in cutlass.range_constexpr(len(wrows)):
+        group = wrows[g]
+        m, _ = wcrd[group[0]]
+        rowsum = zero
+        for e in cutlass.range_constexpr(len(group)):
+            _, p = wcrd[group[e]]
+            rowsum = rowsum + dushift[group[e]] * widen(su[m, p], elem)
+        held = _sum_over_n(rowsum)
         if tid % 4 == 0 and m < chunk:
             sdlp[warp, m] = sdlp[warp, m] - held
+    for i in cutlass.range_constexpr(cute.size(dushift)):
+        m, p = wcrd[i]
         if m == 0:
             gcarry[bidx, hidx, cidx, p] = dushift[i]
 
