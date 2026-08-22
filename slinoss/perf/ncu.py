@@ -442,6 +442,15 @@ Shared so that a pass added later cannot quietly profile under a locked clock or
 cold cache; the module docstring says why neither is optional.
 """
 
+_OWNED_FLAGS: Final[frozenset[str]] = frozenset(
+    flag for flag in (*_FIXED_FLAGS, "--metrics") if flag.startswith("-")
+)
+"""The flags a caller may not pass, because :func:`ncu_command` sets them.
+
+``ncu`` does not take the last value of a repeated option: it exits 1 without
+profiling. Measured with ``--target-processes`` given twice.
+"""
+
 
 def ncu_command(
     table: NcuTable,
@@ -459,18 +468,26 @@ def ncu_command(
         table: The table to request.
         argv: The target command, already split.
         ncu: Path to the ``ncu`` binary.
-        extra: Additional NCU flags, inserted before the target.
+        extra: Additional NCU flags, inserted before the target. A flag in
+            :data:`_OWNED_FLAGS` is refused rather than passed.
 
     Returns:
         The full argv.
 
     Raises:
-        ValueError: If the table requests no metrics or the target is empty.
+        ValueError: If the table requests no metrics, the target is empty, or
+            ``extra`` repeats a flag this function already sets.
     """
     if not table.metrics:
         raise ValueError(f"table {table.name!r} requests no metrics")
     if not argv:
         raise ValueError("ncu needs a target command")
+    repeated = [one for one in extra if one.partition("=")[0] in _OWNED_FLAGS]
+    if repeated:
+        raise ValueError(
+            f"extra repeats {repeated[0]}, which every pass here sets; ncu refuses a "
+            f"repeated option and exits 1 without profiling"
+        )
     return [
         ncu,
         *_FIXED_FLAGS,

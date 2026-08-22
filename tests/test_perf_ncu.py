@@ -224,6 +224,16 @@ def test_ncu_command_needs_metrics_and_a_target() -> None:
         ncu_command(DRAM, ())
 
 
+def test_ncu_command_refuses_an_extra_flag_it_already_sets() -> None:
+    # The failure this pins: a caller narrowing the target repeats a flag the fixed
+    # set owns, ncu exits 1 without profiling, and the message it exits with names
+    # the option and not the caller that duplicated it.
+    with pytest.raises(ValueError, match="repeats --target-processes"):
+        ncu_command(DRAM, TARGET, extra=("--target-processes", "application-only"))
+    with pytest.raises(ValueError, match="repeats --replay-mode"):
+        ncu_command(DRAM, TARGET, extra=("--replay-mode=application",))
+
+
 # ---------------------------------------------------------------------------
 # Fixture text
 #
