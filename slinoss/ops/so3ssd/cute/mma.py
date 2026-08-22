@@ -150,11 +150,20 @@ def mma_rows(extent: int) -> int:
 
 
 def smem_pitch(width: int, itemsize: int = 2) -> int:
-    """Row pitch in elements for a bank-conflict-free shared-memory tile.
+    """Row pitch in elements for a shared-memory tile, conflict-free at 16 bytes.
 
     The pitch is rounded up to a whole number of 16-byte segments and then forced
-    odd. An even count puts two or eight threads of a phase in the same segment; an
-    odd count spreads them over all eight.
+    odd. A 16-byte phase is eight threads over eight consecutive rows, so its
+    segment index is ``r * Ps mod 8`` for a pitch of ``Ps`` segments: odd is a
+    bijection, a multiple of 4 is 4-way and a multiple of 8 is 8-way.
+
+    Odd is not conflict-free at every width. An 8-byte phase is sixteen threads,
+    four rows of four pairs, so its pair-bank index is ``2 * Ps * r + k mod 16``,
+    which is a bijection only when ``Ps = 2 mod 4``. That condition and the odd one
+    are disjoint, so no pitch clears both. Odd concedes a measured two-way on every
+    8-byte access and is optimal by 5.4x on the counted term: the tree's ``ldmatrix``
+    reads and 16-byte stores hold 50.1 M wavefronts at degree exactly 1.0 against
+    8.15 M of 8-byte excess. ``docs/kernels.md`` carries the census and the refusal.
 
     Args:
         width: Elements that must fit in a row.
