@@ -1366,12 +1366,16 @@ def _tile_at(base: cute.Tensor, words: int, tile: Tile, elem: object) -> cute.Te
 
 
 def _sum_over_n(value: Scalar) -> Scalar:
-    """Sum one accumulator element over the four lanes that share its row.
+    """Sum one accumulator row's partial over the four lanes that share the row.
 
     The atom gives the four lanes of an aligned quad the same accumulator row and
     disjoint columns, so two butterfly rounds leave that row's partial column sum in
     all four. The atom's C layout is per warp, so the quad is the same four lanes at
     every block width.
+
+    Entered once per accumulator row, not once per element: the caller sums the
+    columns one lane holds of a row before crossing the quad, which is the same terms
+    over one butterfly instead of one a column.
 
     Rows are disjoint across quads and across the warps of one warp group, so within
     a group the read-modify-write that follows is by one thread per row and needs no
@@ -1381,7 +1385,7 @@ def _sum_over_n(value: Scalar) -> Scalar:
     once, which is a reduction order the widths do not share.
 
     Args:
-        value: The lane's contribution.
+        value: The lane's partial over the columns it holds of one row.
     """
     value = value + shuffle_xor(value, 1)
     return value + shuffle_xor(value, 2)
@@ -3026,20 +3030,30 @@ def chunk_vector_bwd_kernel(
         # after the reduction that needs the unscaled value.
         dcacc.fill(0.0)
         mma_gemm(tiled_mma, tid, dcacc, vdy, vstate, True, False)
-        # One store per row, not one per element. The row's contributions are summed
-        # in a register in fragment order and the tile is zeroed before the head, so
-        # the sum the row receives is the one the per-element form left there:
-        # ``0 + p0`` is ``p0``, and every later addition is in the same order and the
-        # same association.
+        # One butterfly and one store per row, not one per element. The quad sum is
+        # linear, so summing a row's columns in a register first and crossing the quad
+        # once is the same terms: the group is one accumulator row, and
+        # :func:`_sum_over_n` is entered ``len(crows)`` times a head where the
+        # per-element form entered it once an element. At ``(mpad, tile)`` over eight
+        # warps the fragment is two rows of six columns, so 4 ``SHFL`` a warp against
+        # 24. The scale is uniform over the row and leaves with the sum for the same
+        # reason.
+        #
+        # Measured at ``acceptance``: ``SHFL`` 7,257,600 -> 5,414,400 launch-wide
+        # (-20 a warp, to the instruction), ``FADD`` -21 a warp, MIO and LSU each
+        # -2,396,160, 31.2 to 32.3 us shorter over three paired runs of 240 to 480
+        # order-swapped pairs. ``SHF`` does not move: the reach is an immediate here,
+        # so the quad butterfly carries no ALU mask. Only the reduction order of
+        # ``dtrans[..., 3]`` changes, by 9.2e-9 relative, and no tolerance moved.
         for group in crows:
             m, _ = ccrd[group[0]]
             expl = decay(slp[cutlass.min(m, last)])
-            term = zero
+            part = zero
             for i in group:
                 _, d = ccrd[i]
-                held = _sum_over_n(dcacc[i] * widen(scrot[m, d], elem))
-                term = term + 2.0 * expl * held
+                part = part + dcacc[i] * widen(scrot[m, d], elem)
                 dcacc[i] = dcacc[i] * expl
+            term = 2.0 * expl * _sum_over_n(part)
             if tid % 4 == 0 and m < chunk:
                 sdlp[wgroup, m] = sdlp[wgroup, m] + term
 
