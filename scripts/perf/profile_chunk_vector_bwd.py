@@ -247,9 +247,10 @@ def build_runner(
     """Allocate one input set and return the callable that launches the kernel.
 
     ``dinc`` and ``zstart`` are the state-passing backward's outputs and ``dlogp``,
-    ``dchunk_rot`` and ``dchunk_scale`` the chunk-input backward's. Their values do
-    not reach a counter, so they are drawn from a generator rather than
-    rematerialized through the two stages that produce them.
+    ``dchunk_rot``, ``dchunk_scale`` and ``dscore`` the chunk-input backward's. Their
+    values do not reach a counter, so they are drawn from a generator rather than
+    rematerialized through the two stages that produce them. The record's extent does
+    reach one, and it is the extent the operator ships.
 
     ``B`` and ``C`` come out of :func:`slinoss.perf.workload.make_inputs` at the
     shape's own ``G``, so an override reallocates them at ``(B,G,T,3N)`` rather than
@@ -287,6 +288,7 @@ def build_runner(
     dlogp = randn(shape.bsz, shape.heads, chunks, shape.chunk)
     dchunk_rot = randn(shape.bsz, shape.heads, chunks, 3, 3)
     dchunk_scale = randn(shape.bsz, shape.heads, chunks)
+    dscore = randn(shape.bsz, shape.heads, chunks, shape.chunk, shape.chunk, dt=dtype)
     if groups == shape.groups:
         vecb, vecc = inputs.B, inputs.C
     else:
@@ -308,6 +310,7 @@ def build_runner(
             dchunk_rot,
             dchunk_scale,
             shape.chunk,
+            dscore=dscore,
             splits=splits,
             warps=warps,
         )

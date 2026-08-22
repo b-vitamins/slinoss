@@ -13,6 +13,12 @@ operand dtype because their producers narrow on the store, and
 closing cotangents, which this kernel consumes and never recomputes. A fabricated
 set would not compose the chunks.
 
+``dscore`` comes from that stage's own launch instead, through :func:`_record`. It
+is the masked score this kernel reads rather than forms, and the stage that writes
+it is the only ground truth for it: a record narrowed from float64 is a different
+operand than the one the operator hands over, and the whole point of the record is
+that the two kernels agree on it bit for bit.
+
 ``dB`` here is not the operator's ``dB``. The chunk-boundary rows carry the
 current tap alone, because the previous tap at those rows belongs to the next
 chunk's first token and
@@ -53,6 +59,7 @@ from slinoss.ops.so3ssd import (
     chunked_forward,
     chunked_forward_fused,
 )
+from slinoss.ops.so3ssd.cute.bwd.chunk_input import chunk_input_backward
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
     ChunkVectorBwd,
     chunk_vector_backward,
@@ -268,6 +275,27 @@ def _oracle(
     )
 
 
+def _record(inp: ScanInputs, dy: Tensor, want: Oracle, chunk: int) -> Tensor:
+    """The masked score the chunk-input stage publishes for these operands.
+
+    A function of ``dy``, ``U``, ``trans`` and the streaming ``u_{-1}`` alone, so the
+    cotangents that launch is also handed do not reach it.
+    """
+    return chunk_input_backward(
+        dy,
+        inp.U,
+        inp.trans,
+        inp.K,
+        inp.B,
+        inp.C,
+        want.dinc,
+        want.zstart,
+        chunk,
+        u_prev=inp.u_prev,
+        b_prev=inp.b_prev,
+    ).dscore
+
+
 def _run(
     inp: ScanInputs,
     dy: Tensor,
@@ -277,8 +305,14 @@ def _run(
     dC: Tensor | None = None,
     splits: int | None = None,
     warps: int = WARPS,
+    dscore: Tensor | None = None,
 ) -> ChunkVectorBwd:
-    """One launch, against the inputs the oracle carries."""
+    """One launch, against the inputs the oracle carries.
+
+    ``dscore`` defaults to a real chunk-input launch. A caller testing a shape this
+    stage refuses before it reads the record supplies zeros instead, which is one
+    fewer compile of a kernel that is not the one under test.
+    """
     got = chunk_vector_backward(
         dy,
         inp.U,
@@ -292,6 +326,7 @@ def _run(
         want.dchunk_rot,
         want.dchunk_scale,
         chunk,
+        dscore=_record(inp, dy, want, chunk) if dscore is None else dscore,
         u_prev=inp.u_prev,
         b_prev=inp.b_prev,
         dB=dB,
@@ -862,8 +897,11 @@ def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
     inp = _make(1, 1, MAX_CHUNK, 16, 16, torch.bfloat16)
     dy = _cotangent(inp, torch.bfloat16)
     want = _oracle(inp, dy, MAX_CHUNK, dstate=_dstate(inp))
+    record = torch.zeros(
+        1, 1, 1, MAX_CHUNK, MAX_CHUNK, dtype=torch.bfloat16, device="cuda"
+    )
     with pytest.raises(ValueError, match="chunk_vector_bwd"):
-        _run(inp, dy, want, MAX_CHUNK)
+        _run(inp, dy, want, MAX_CHUNK, dscore=record)
 
 
 Operands = dict[str, Tensor | None]
@@ -892,6 +930,7 @@ def _ok(chunk: int = 64) -> Operands:
         "dlogp": want.dlogp,
         "dchunk_rot": want.dchunk_rot,
         "dchunk_scale": want.dchunk_scale,
+        "dscore": _record(inp, dy, want, chunk),
         "u_prev": inp.u_prev,
         "b_prev": inp.b_prev,
         "dB": None,
@@ -926,6 +965,7 @@ def _call(args: Operands, chunk: int = 64) -> ChunkVectorBwd:
         _t(args["dchunk_rot"]),
         _t(args["dchunk_scale"]),
         chunk,
+        dscore=_t(args["dscore"]),
         u_prev=args["u_prev"],
         b_prev=args["b_prev"],
         dB=args["dB"],
@@ -936,8 +976,8 @@ def _call(args: Operands, chunk: int = 64) -> ChunkVectorBwd:
 REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
     # The rows this kernel owns are the ones no shared rule covers: the cotangent
     # checked against ``U`` rather than against itself, the two state buffers whose
-    # chunk count is derived and not passed, the three closing cotangents from the
-    # stage ahead, and the streaming pair.
+    # chunk count is derived and not passed, the three closing cotangents and the
+    # score record from the stage ahead, and the streaming pair.
     (
         lambda a: a.update(dy=_t(a["dy"])[:, :, :-1].contiguous()),
         ValueError,
@@ -967,6 +1007,11 @@ REJECTIONS: list[tuple[Callable[[Operands], None], type[Exception], str]] = [
         lambda a: a.update(dchunk_scale=_t(a["dchunk_scale"])[:, :, :-1].contiguous()),
         ValueError,
         "dchunk_scale must be",
+    ),
+    (
+        lambda a: a.update(dscore=_t(a["dscore"])[..., :-16].contiguous()),
+        ValueError,
+        "dscore must be",
     ),
     (lambda a: a.update(b_prev=None), ValueError, "supplied together"),
     (lambda a: a.update(u_prev=None), ValueError, "supplied together"),
@@ -1061,6 +1106,9 @@ def test_rejects_an_extent_the_atom_cannot_cover(
     dlogp = torch.zeros(2, 2, chunks, chunk, dtype=torch.float32, device="cuda")
     drot = torch.zeros(2, 2, chunks, 3, 3, dtype=torch.float32, device="cuda")
     dscale = torch.zeros(2, 2, chunks, dtype=torch.float32, device="cuda")
+    record = torch.zeros(
+        2, 2, chunks, chunk, chunk, dtype=torch.bfloat16, device="cuda"
+    )
     with pytest.raises(ValueError, match=match):
         chunk_vector_backward(
             dy,
@@ -1075,6 +1123,7 @@ def test_rejects_an_extent_the_atom_cannot_cover(
             drot,
             dscale,
             chunk,
+            dscore=record,
             u_prev=inp.u_prev,
             b_prev=inp.b_prev,
             splits=splits,

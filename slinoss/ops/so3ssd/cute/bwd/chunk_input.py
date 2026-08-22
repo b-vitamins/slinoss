@@ -1119,6 +1119,7 @@ def chunk_input_bwd_kernel(
     gdlp: cute.Tensor,
     gdrot: cute.Tensor,
     gdscale: cute.Tensor,
+    gdscore: cute.Tensor,
     gcount: cute.Tensor,
     seqlen: cutlass.Int32,
     tiled_mma: cute.TiledMma,
@@ -1156,6 +1157,13 @@ def chunk_input_bwd_kernel(
             the log-scale-prefix cotangent, every slot including the padded ones.
         gdrot: ``(B,H,C,3,3)`` float32, written with the closing rotation cotangent.
         gdscale: ``(B,H,C)`` float32, written with the closing scale cotangent.
+        gdscore: ``(B,H,C,L,L)`` operand-dtype, written with the masked score of the
+            other product this fragment carries, target token by source token. Not a
+            cotangent: it is the record
+            :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_bwd` reads
+            in place of forming it once per lane tile. The mask, the factor and both
+            operands are already here, so the publish is one multiply, one select,
+            one narrow and one store an element.
         gcount: ``(B,H,C)`` int32, written with zero. Not read here: it is the arrival
             counter :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_bwd`
             closes its lane sums on, and this grid holds one block per element of it, so
@@ -1737,6 +1745,18 @@ def chunk_input_bwd_kernel(
         dmacc = mma_acc(tiled_mma, tid, (mpad, tblk))
         sfrag = cute.make_fragment_like(dmacc, elem)
         fa_score = mma_areg(sfrag) if one_group else sfrag
+        # One address for the record's whole slice, not one an element. Both bases are
+        # this thread's own and common to the fragment, so ``soff`` addresses every
+        # element of it at trace time and the store carries an immediate. Unread at a
+        # shape whose M mode is rounded up past the record's own extent, where the pad
+        # rows have to be dropped and the store takes the dynamic source token under a
+        # predicate instead.
+        grec = cute.make_tensor(
+            gdscore[bidx, hidx, cidx, None, None].iterator
+            + (tbase + scrd[0][1] - soff[0][1]) * chunk
+            + (scrd[0][0] - soff[0][0]),
+            cute.make_layout((mpad, tblk), stride=(1, chunk)),
+        )
         for k in cutlass.range_constexpr(ksteps):
             mma_gemm(tiled_mma, tid, dmacc, vu[k], vb_dy[k], True, True)
         # Column-major over the fragment, one group of ``scols`` at a time. The
@@ -1758,10 +1778,25 @@ def chunk_input_bwd_kernel(
                 # into the operand. I3: one exponential of a log difference. The clamp
                 # only feeds rows the M mode was rounded up by, whose operands the
                 # stagers zeroed.
-                masked = acc[i] * decay(slp[token] - slp[cutlass.min(m, last)])
-                masked = select(token >= m, masked, zero)
+                factor = decay(slp[token] - slp[cutlass.min(m, last)])
+                causal = token >= m
+                masked = select(causal, acc[i] * factor, zero)
                 sfrag[i] = narrow(masked, elem)
                 summed = summed + masked * dmacc[i]
+                # The same mask and the same factor on the other product of this
+                # fragment pair, which is the record ``chunk_vector_bwd`` reads
+                # instead of forming it once a lane tile. One multiply, one select,
+                # one narrow and one store an element; no second exponential and no
+                # reread of either operand.
+                published = narrow(select(causal, dmacc[i] * factor, zero), elem)
+                if cutlass.const_expr(mpad == chunk):
+                    grec[soff[i][0], soff[i][1]] = published
+                else:
+                    # The record carries the source tokens that exist. The rows the M
+                    # mode was rounded up by reach no column of it, and the consumer
+                    # zeroes the pad rows of its own tile.
+                    if m < chunk:
+                        gdscore[bidx, hidx, cidx, token, m] = published
             column = _sum_over_m(summed)
             if tid % 32 < 4:
                 sdlp[warp, token] = sdlp[warp, token] + column
@@ -1909,6 +1944,7 @@ def chunk_input_bwd(
     gdlp: cute.Tensor,
     gdrot: cute.Tensor,
     gdscale: cute.Tensor,
+    gdscore: cute.Tensor,
     gcount: cute.Tensor,
     seqlen: cutlass.Int32,
     chunks: cutlass.Int32,
@@ -1950,6 +1986,7 @@ def chunk_input_bwd(
         gdlp,
         gdrot,
         gdscale,
+        gdscore,
         gcount,
         seqlen,
         make_mma(dtype, threads // 32),
@@ -1989,6 +2026,13 @@ class ChunkInputBwd(NamedTuple):
         dchunk_rot: ``(B,H,C,3,3)`` float32 cotangent of each chunk's closing
             rotation, row-major.
         dchunk_scale: ``(B,H,C)`` float32 cotangent of each chunk's closing scale.
+        dscore: ``(B,H,C,L,L)`` masked score in the activation dtype, target token by
+            source token, not a cotangent. The record
+            :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_backward`
+            takes in place of forming the same product once per lane tile. Both
+            products of the pair are in this kernel's fragment and the mask and the
+            factor are already applied to the other one, so the record leaves here
+            for one multiply, one select, one narrow and one store an element.
         arrived: ``(B,H,C)`` int32 zeros, not a cotangent. The arrival counter
             :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_backward`
             closes its lane sums on, filled here because this grid is one block per
@@ -2000,6 +2044,7 @@ class ChunkInputBwd(NamedTuple):
     dlogp: Tensor
     dchunk_rot: Tensor
     dchunk_scale: Tensor
+    dscore: Tensor
     arrived: Tensor
 
 
@@ -2108,6 +2153,12 @@ def chunk_input_backward(
         bsz, heads, chunks, 3, 3, dtype=torch.float32, device=device
     )
     dchunk_scale = torch.empty(bsz, heads, chunks, dtype=torch.float32, device=device)
+    # The masked score, 18.87 MB at the acceptance shape. Held by the caller across
+    # the vector stage and freed there: the alternative is the vector stage forming
+    # it once per lane tile, which is five times at that shape for one answer.
+    dscore = torch.empty(
+        bsz, heads, chunks, chunk_size, chunk_size, dtype=dtype, device=device
+    )
     arrived = torch.empty(bsz, heads, chunks, dtype=torch.int32, device=device)
     jit_launch(
         chunk_input_bwd,
@@ -2128,6 +2179,7 @@ def chunk_input_backward(
             dlogp,
             dchunk_rot,
             dchunk_scale,
+            dscore,
             arrived,
             seqlen,
             chunks,
@@ -2154,5 +2206,6 @@ def chunk_input_backward(
         dlogp=dlogp,
         dchunk_rot=dchunk_rot,
         dchunk_scale=dchunk_scale,
+        dscore=dscore,
         arrived=arrived,
     )

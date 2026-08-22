@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import inspect
 import io
 import re
 import subprocess
@@ -39,6 +40,7 @@ from typing import Final, NamedTuple
 import torch
 from torch import Tensor
 
+from slinoss.ops.so3ssd.cute.bwd.chunk_input import chunk_input_backward
 from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
 from slinoss.perf.capture import profiler_window
 from slinoss.perf.device import clock_policy, contention, device_ordinal, require_cuda
@@ -190,6 +192,27 @@ def build_runner(
     dlogp = randn(shape.bsz, shape.heads, chunks, shape.chunk)
     dchunk_rot = randn(shape.bsz, shape.heads, chunks, 3, 3)
     dchunk_scale = randn(shape.bsz, shape.heads, chunks)
+    # The masked score, from this tree's chunk-input stage, which is where the operator
+    # gets it. Randomizing it the way the cotangents above are randomized would make
+    # the pair's parity a comparison against a made-up record instead of the identity
+    # test it has to be. The record is a function of ``dy``, ``U`` and ``trans`` alone,
+    # so the random cotangents that stage is also handed do not reach it. Only the entry
+    # whose signature admits it gets one: a baseline predating the record forms the same
+    # product itself, and running the stage for it would compile a second kernel and
+    # hold a buffer the arm under test wants.
+    extra: dict[str, Tensor] = {}
+    if "dscore" in inspect.signature(entry).parameters:
+        extra["dscore"] = chunk_input_backward(
+            inputs.dy,
+            inputs.U,
+            inputs.trans,
+            inputs.K,
+            inputs.B,
+            inputs.C,
+            dinc,
+            zstart,
+            shape.chunk,
+        ).dscore
 
     def call() -> object:
         return entry(
@@ -207,6 +230,7 @@ def build_runner(
             shape.chunk,
             splits=splits,
             warps=warps,
+            **extra,
         )
 
     def run() -> None:

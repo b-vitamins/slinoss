@@ -72,7 +72,9 @@ behind, so the two taps read one staging pass through two views;
 the whole chunk, keeping the float32 result beside the narrowed operand when the
 consumer needs both widths; and :func:`stage_weighted` scales a ``(T, P)`` tensor
 by the chunk-local decay on its way in, which every backward operand that carries
-the weight rather than its partner needs.
+the weight rather than its partner needs. :func:`stage_score` has one caller and
+is here for the run helpers rather than for a second one: the segment width, the
+retiling and the alignment claim are this module's and are not exported.
 """
 
 import cutlass
@@ -107,6 +109,7 @@ __all__ = [
     "stage_pad",
     "stage_raw",
     "stage_rotated",
+    "stage_score",
     "stage_shifted",
     "stage_state",
     "stage_trans",
@@ -810,6 +813,97 @@ def weight_rows(
             else:
                 if tid + (group * PREFETCH + step) * threads < total:
                     cute.autovec_copy(vals[(step, None)], dst)
+
+
+@cute.jit
+def stage_score(
+    gsrc: cute.Tensor,
+    sdst: cute.Tensor,
+    nbase: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    pad: cutlass.Constexpr,
+) -> None:
+    """Stage a column block of an ``(L, L)`` record into a tile, one segment an access.
+
+    The record is dense in its second mode and the tile is dense in its columns, so
+    a run of adjacent source tokens is one access at either end and the pass is one
+    load and one store a thread a step. No transform: the producer wrote the value
+    the consumer reads, so a round trip is bits.
+
+    Args:
+        gsrc: ``(L, L)`` slice of the record at this block's ``(batch, head,
+            chunk)``, the tile's element type. Row is the target token, column the
+            source token.
+        sdst: Tile of at least ``rows + pad`` rows at ``gsrc``'s element type,
+            written over ``span`` columns. Columns at or past ``span`` are the
+            caller's business.
+        nbase: First source token of the block. A multiple of ``span``.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        rows: Target tokens the record carries, ``L``. Compile-time.
+        span: Source tokens of the block. Compile-time.
+        pad: Rows past ``rows`` to zero, the M mode's rounding. Compile-time, and
+            zero at every shipped shape, where the trace drops the fill.
+
+    Invariants:
+        ``L`` is a multiple of 16 and ``span`` divides it, so a record row starts on
+        a 16-byte segment and so does the column offset: the alignment claim
+        :func:`_wide_row` restates holds at both ends for every run dividing 8. The
+        pad rows reach the K extent of the consumer's transposed view, so a shape
+        with ``mma_rows(L) > L`` needs them zeroed and not left stale.
+    """
+    elem = sdst.element_type
+    zero = cutlass.Float32(0.0)
+    run = _segment_run(elem.width // 8, span)
+    runs = span // run
+    total = rows * runs
+    steps = -(-total // threads)
+    exact = total % threads == 0
+    # The column offset in units of the run. Both terms are exact: ``span`` is a
+    # multiple of the run and ``nbase`` a multiple of ``span``.
+    coff = nbase // run
+
+    loads = cute.make_fragment((min(PREFETCH, steps), run), elem)
+
+    for group in cutlass.range_constexpr(-(-steps // PREFETCH)):
+        count = min(PREFETCH, steps - group * PREFETCH)
+        held = []
+        for step in cutlass.range_constexpr(count):
+            i = tid + (group * PREFETCH + step) * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // runs
+            col = i - r * runs
+            cute.autovec_copy(
+                _wide_row(gsrc[r, None], run)[(None, coff + col)],
+                loads[(step, None)],
+            )
+            held.append((r, col))
+
+        for step in cutlass.range_constexpr(count):
+            r, col = held[step]
+            dst = _wide_row(sdst[r, None], run)[(None, col)]
+            if cutlass.const_expr(exact):
+                cute.autovec_copy(loads[(step, None)], dst)
+            else:
+                if tid + (group * PREFETCH + step) * threads < total:
+                    cute.autovec_copy(loads[(step, None)], dst)
+
+    if cutlass.const_expr(pad != 0):
+        zeros = cute.make_fragment((1, run), elem)
+        for j in cutlass.range_constexpr(run):
+            zeros[0, j] = narrow(zero, elem)
+        for step in cutlass.range_constexpr(-(-(pad * runs) // threads)):
+            i = tid + step * threads
+            if i < pad * runs:
+                r = i // runs
+                cute.autovec_copy(
+                    zeros[(0, None)],
+                    _wide_row(sdst[rows + r, None], run)[(None, i - r * runs)],
+                )
 
 
 @cute.jit

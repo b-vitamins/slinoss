@@ -220,6 +220,7 @@ def so3ssd_bwd_cute(
         inputs.dchunk_rot,
         inputs.dchunk_scale,
         chunk_size,
+        dscore=inputs.dscore,
         u_prev=u_prev,
         b_prev=b_prev,
         dB=dB,

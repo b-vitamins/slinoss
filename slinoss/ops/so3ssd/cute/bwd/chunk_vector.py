@@ -500,11 +500,11 @@ It is unreachable. The residency-2 bar is **50,176 B**, measured to the 128 B gr
 transform table are all live across one barrier interval, and they pass the bar with no
 staging buffer allocated at all::
 
-    sdy     out       9,216   A of the score GEMM
-    su      input     9,360   B of the score GEMM and of the increment GEMM
-    sstate  state     7,168   B of the increment GEMM
+    sdy     out       9,216   A of the offset GEMM, read by the diagonal
+    su      input     9,360   A of the increment GEMM, read by the diagonal
+    sstate  state     7,168   B of the offset and increment GEMMs
     sbrot   forced    7,168   B of the readout GEMM
-    sscore  tapped   13,312   destination of the score transpose, A of the forcing GEMM
+    sscore  tapped   13,312   staged record, A of the forcing and readout GEMMs
     stable            9,216   read by :func:`_rotate_rows` in the same iteration
                      55,440   B against a 50,176 B bar
 
@@ -591,11 +591,9 @@ from slinoss.ops.so3ssd.cute.mma import (
     fp32_tile,
     make_mma,
     mma_acc,
-    mma_areg,
     mma_atoms,
     mma_coords,
     mma_gemm,
-    mma_gemm_areg,
     mma_groups,
     mma_matrices,
     mma_offsets,
@@ -611,6 +609,7 @@ from slinoss.ops.so3ssd.cute.table import (
     stage_chunk,
     stage_matrix,
     stage_rotated,
+    stage_score,
     stage_shifted,
     stage_state,
     stage_trans,
@@ -918,11 +917,11 @@ def shifted_tile(span: int, width: int) -> Tile:
 def score_tile(chunk: int, span: int) -> Tile:
     """Narrowed score tile, ``(mma_rows(L), pitch of mma_rows(span))``.
 
-    The masked score, target token by source token, on its way from the readout
-    orientation to the forcing one. Both modes are rounded up: the target token is
-    the M mode of the GEMM that writes it and the K mode of the GEMM that reads it,
-    and the source token is the read's M mode, which the transposed
-    ``ldmatrix`` needs a whole atom tile of whatever the source-token block is.
+    The masked score, target token by source token, staged from the record
+    :func:`slinoss.ops.so3ssd.cute.bwd.chunk_input.chunk_input_bwd` publishes. Both
+    modes are rounded up because each is the M mode of one of the two GEMMs that
+    read the tile, and the transposed ``ldmatrix`` needs a whole atom tile of
+    whatever the source-token block is.
 
     Args:
         chunk: ``L``.
@@ -967,9 +966,8 @@ def gradient_tile(rows: int, dim: int) -> Tile:
     a row that is ``{0,10,4,14}`` against a column span of four, and two banks take
     two rows each. Freedom needs the pitch congruent to eight or 24 words modulo 32,
     an even count of 16-byte segments, and the run reads of :func:`_pass_row` need an
-    odd one. The operand-width score store escapes because a four-byte pair widens
-    the phase to eight rows, where the same pitch is a stride-four permutation.
-    Measured at ``standard``: 294,912 excess store wavefronts a launch from the
+    odd one. The staged score escapes because its store is one 16-byte segment a
+    thread. Measured at ``standard``: 294,912 excess store wavefronts a launch from the
     forcing gradient and 147,456 from the readout, which at one shared cycle a
     wavefront over 84 multiprocessors bounds the defect at 2.9 us of 215.
 
@@ -1011,9 +1009,10 @@ class Arena(NamedTuple):
             fold. Row ``t + 1`` is token ``t`` and row 0 is the row that crosses
             the chunk boundary.
         tapped: The float32 forcing gradient of one tap, the GEMM's own output, and
-            the narrowed score of that same tap, which the forcing GEMM has finished
-            reading before the gradient it writes exists. The region is the wider of
-            the two.
+            the staged score of that same tap. Both GEMMs finish reading the score
+            before the gradient that overwrites it exists, and the epilogue finishes
+            reading the gradient before the next block's score is staged over it.
+            The region is the wider of the two.
         out: The output cotangent, ``dy``.
         state: The chunk-start state, then the increment cotangent in the
             chunk-local frame.
@@ -2866,6 +2865,7 @@ def chunk_vector_bwd_kernel(
     gdlp: cute.Tensor,
     gdrot: cute.Tensor,
     gdscale: cute.Tensor,
+    gdscore: cute.Tensor,
     gdb: cute.Tensor,
     gdc: cute.Tensor,
     gcarry: cute.Tensor,
@@ -2951,6 +2951,12 @@ def chunk_vector_bwd_kernel(
             the chunk-input stage.
         gdscale: ``(B,H,C)`` float32 closing-scale cotangent, from the chunk-input
             stage.
+        gdscore: ``(B,H,C,L,L)`` operand-dtype masked score, target token by source
+            token, from the chunk-input stage. Read, never written. That stage holds
+            both products of the pair in one fragment and applies this mask and this
+            factor to the other one, so the record costs it four instructions an
+            element and costs this kernel one staging pass a source block instead of
+            a GEMM, an exponential and a mask per lane tile.
         gdb: ``(B,G,splits*T,3N)`` ``dB`` or its shard buffer, written, under the
             output's own dtype either way. At one shard it is the output; above one it
             is the partial :func:`vector_reduce` sums.
@@ -3110,24 +3116,13 @@ def chunk_vector_bwd_kernel(
         sscore.iterator, cute.make_layout((spad, mpad), stride=(1, lds))
     )
     # The same tile as the readout GEMM's left operand, target token as M and source
-    # token as K. The K extent is the block rather than the block rounded up: the pad
-    # columns of the store below are never written, and a K mode reads them into the
-    # sum where an M mode only reaches accumulator rows the store drops. Used at a
-    # tiling that splits the N mode, where the register reread is not available.
+    # token as K. The K extent is the block rather than the block rounded up: the
+    # staging never writes the pad columns, and a K mode reads them into the sum where
+    # an M mode only reaches accumulator rows the store drops.
     vscorem = cute.make_tensor(
         sscore.iterator, cute.make_layout((mpad, span), stride=(lds, 1))
     )
 
-    dcacc = mma_acc(tiled_mma, tid, (mpad, tile))
-    ccrd = mma_coords(tiled_mma, tid, (mpad, tile))
-    dmacc = mma_acc(tiled_mma, tid, (mpad, span))
-    mcrd = mma_coords(tiled_mma, tid, (mpad, span))
-    dbacc = mma_acc(tiled_mma, tid, (spad, tile))
-    bcrd = mma_coords(tiled_mma, tid, (spad, tile))
-    # The narrowed score is the A operand of the GEMM that rereads it in place.
-    # Fragment and view are built once: the retile is a layout, so nothing here is
-    # per-tap work.
-    #
     # These accumulators reach registers only when both loops below have a trip count
     # of one. Every accumulator allocation is hoisted to the kernel entry, and a
     # rolled loop between the allocation and its uses defeats register promotion, so
@@ -3135,13 +3130,12 @@ def chunk_vector_bwd_kernel(
     # ``P = 64``, ``L = 64``, span 64, fold one, at 255 registers and 91,344 B of
     # shared memory in both runs: one lane tile moves no local traffic at all, and
     # five lane tiles move 1,892.16 MB per call. The declaration site is not the
-    # lever, and moving all four inside both loops leaves the counters unchanged to
-    # the sector.
-    mfrag = cute.make_fragment_like(dmacc, elem)
-    # Built at both widths and read at one. The reread is contiguous in K only where
-    # the tiling keeps the tile's N mode whole; past that the wide arm below takes the
-    # same score out of ``sscore``, which the transpose stores anyway.
-    fa_m = mma_areg(mfrag)
+    # lever, and moving them inside both loops leaves the counters unchanged to the
+    # sector.
+    dcacc = mma_acc(tiled_mma, tid, (mpad, tile))
+    ccrd = mma_coords(tiled_mma, tid, (mpad, tile))
+    dbacc = mma_acc(tiled_mma, tid, (spad, tile))
+    bcrd = mma_coords(tiled_mma, tid, (spad, tile))
 
     # Row of :func:`offset_tile` this thread's read-modify-write of the offset term
     # belongs to. Element 0 of the accumulator sits in the tiling's first N tile, so
@@ -3385,10 +3379,9 @@ def chunk_vector_bwd_kernel(
         # one and 190 for the pair, on a 120-register base, at the acceptance shape and
         # eight warps. Only this one keeps ``sm__inst_executed.sum`` falling with the
         # LSU count, -658,944 against +1,294,848 for the increment tile and +2,953,728
-        # for the pair. Its use sits inside the score product's live range, where the
-        # B fragment of the score and the narrowed score itself are both live, and the
-        # pressure there converts a deleted shared load into more than two moves. A
-        # held operand is not free, and the price is the range and not the bytes.
+        # for the pair. The pressure at the use converts a deleted shared load into
+        # more than two moves. A held operand is not free, and the price is the range
+        # and not the bytes.
         fb_crot = _hold_b(tiled_mma, tid, vcrot, False)
 
         for nstep in cutlass.range_constexpr(blocks):
@@ -3423,9 +3416,28 @@ def chunk_vector_bwd_kernel(
                 rows,
                 has_prev,
             )
-            # The staged pair above is published here. One forcing column, so the
-            # rotation, the score and the three products below run once a block where
-            # the two-tap form ran each of them twice.
+            # The masked score, read rather than formed. Its value does not depend on
+            # the lane tile, so the fused form ran a GEMM, an exponential an element
+            # and a transpose store ``tiles`` times for one answer;
+            # :func:`slinoss.ops.so3ssd.cute.bwd.chunk_input.chunk_input_bwd_kernel`
+            # already holds the same product against the same mask and publishes it.
+            # Beside the two passes above so the three sets of global loads overlap,
+            # and the barrier below publishes all three. The tile it lands in aliases
+            # the forcing gradient, whose last read is the epilogue of the previous
+            # iteration, closed by the barrier at the end of that iteration.
+            stage_score(
+                gdscore[bidx, hidx, cidx, None, None],
+                sscore,
+                nbase,
+                tid,
+                threads,
+                chunk,
+                span,
+                mpad - chunk,
+            )
+            # The staged tiles above are published here. One forcing column, so the
+            # rotation and the three products below run once a block where the two-tap
+            # form ran each of them twice.
             cute.arch.sync_threads()
 
             # The diagonal cotangent, one scalar a token. In the two-tap form the
@@ -3486,64 +3498,29 @@ def chunk_vector_bwd_kernel(
 
             # One view of the staged run: the fused column's forcing input is the row
             # before its own token, which is row r.
-            vun = cute.make_tensor(
-                su.iterator,
-                cute.make_layout((span, rows), stride=(ldu, 1)),
-            )
             vum = cute.make_tensor(
                 su.iterator,
                 cute.make_layout((spad, rows), stride=(ldu, 1)),
             )
 
-            # The score, target token by source token, into the readout
-            # accumulator. I6: the mask lands on the float32 accumulator, then
-            # one narrowing into the operand. I3: one exponential of a log
-            # difference.
-            dmacc.fill(0.0)
-            mma_gemm(tiled_mma, tid, dmacc, vdy, vun, True, True)
-            for i in cutlass.range_constexpr(cute.size(dmacc)):
-                m, n = mcrd[i]
-                src = nbase + n
-                masked = dmacc[i] * decay(slp[cutlass.min(m, last)] - slp[src])
-                mfrag[i] = narrow(select(src <= m, masked, zero), elem)
-            if cutlass.const_expr(wgroups == 1):
-                mma_gemm_areg(tiled_mma, tid, dcacc, fa_m, vbrot, False)
-
-            # The same score, transposed, for the forcing accumulator, which
-            # contracts over the target token the readout consumer holds as N.
-            # A fragment cannot be reread across its M mode, so the transpose
-            # is a store and a transposed ``ldmatrix``: the pair of adjacent
-            # columns a thread holds lands in one bank word, and the eight rows
-            # of a warp's quads stride four banks apart, so the store is
-            # conflict-free by the pitch. The pad rows the source-token M mode
-            # was rounded up by are never written and reach only the
-            # accumulator rows the store below drops. The pair of columns reaches
-            # its one bank word in one 32-bit store because ptxas merges it; no
-            # shared store in this kernel is narrower than 32 bits.
-            for i in cutlass.range_constexpr(cute.size(dmacc)):
-                m, n = mcrd[i]
-                sscore[m, n] = mfrag[i]
-
             # The increment term opens the forcing accumulator, because its
-            # weight is per source token and the score term's is not. It runs
-            # between the score's store and the barrier that publishes it.
+            # weight is per source token and the score term's is not.
             dbacc.fill(0.0)
             mma_gemm(tiled_mma, tid, dbacc, vum, vstate, True, False)
             for i in cutlass.range_constexpr(cute.size(dbacc)):
                 r, _ = bcrd[i]
                 src = nbase + cutlass.min(r, span - 1)
                 dbacc[i] = dbacc[i] * decay(lplast - slp[src])
-            cute.arch.sync_threads()
+            # No barrier here. The one this pass had published the score's transpose
+            # store; the staged record is published by the barrier at the top of the
+            # iteration and nothing between them writes a tile either GEMM below
+            # reads.
             _gemm_bheld(tiled_mma, tid, dbacc, vscore, False, fb_crot)
-            # The readout term of a split N mode, which cannot take the score out
-            # of the fragment that produced it. Its left operand is the tile the
-            # transpose above already published, so it needs no barrier of its own
-            # and it costs one more pass over that tile. It sits here rather than
-            # before the store because the store is what publishes the operand;
-            # the accumulator is untouched in between, so the K order the readout
-            # sums in is the order the register form sums in.
-            if cutlass.const_expr(wgroups != 1):
-                mma_gemm(tiled_mma, tid, dcacc, vscorem, vbrot, True, False)
+            # Both terms take the score out of shared memory, at either warp-group
+            # count: the fragment the register form reread is not produced here any
+            # more. One more pass over the tile the staging published, and the K order
+            # is the tile's own either way.
+            mma_gemm(tiled_mma, tid, dcacc, vscorem, vbrot, True, False)
             # The gradient overwrites the score it was built from, so the read
             # has to be complete in every thread before the store begins.
             cute.arch.sync_threads()
@@ -3886,6 +3863,7 @@ def chunk_vector_bwd(
     gdlp: cute.Tensor,
     gdrot: cute.Tensor,
     gdscale: cute.Tensor,
+    gdscore: cute.Tensor,
     gdb: cute.Tensor,
     gdc: cute.Tensor,
     gcarry: cute.Tensor,
@@ -3943,6 +3921,7 @@ def chunk_vector_bwd(
         gdlp,
         gdrot,
         gdscale,
+        gdscore,
         gdb,
         gdc,
         gcarry,
@@ -4157,6 +4136,7 @@ def chunk_vector_backward(
     dchunk_scale: Tensor,
     chunk_size: int,
     *,
+    dscore: Tensor,
     u_prev: Tensor | None = None,
     b_prev: Tensor | None = None,
     dB: Tensor | None = None,
@@ -4169,10 +4149,10 @@ def chunk_vector_backward(
 ) -> ChunkVectorBwd:
     """Differentiate the rowwise vectors and the transition parameters.
 
-    The three cotangents this takes from the chunk-input stage are consumed, never
-    recomputed: ``dlogp`` is that stage's half of the log-scale cotangent, and the
-    closing rotation and scale are one contraction over the chunk-start state that
-    stage already ran.
+    What this takes from the chunk-input stage is consumed, never recomputed:
+    ``dlogp`` is that stage's half of the log-scale cotangent, the closing rotation
+    and scale are one contraction over the chunk-start state that stage already ran,
+    and ``dscore`` is the masked score it forms anyway.
 
     Two workspaces, both allocated here and freed on return, and both holding one
     partial row per block of a sum whose terms separate blocks cannot share. Above one
@@ -4211,6 +4191,12 @@ def chunk_vector_backward(
         dchunk_rot: ``(B,H,C,3,3)`` float32, contiguous, from the same.
         dchunk_scale: ``(B,H,C)`` float32, contiguous, from the same.
         chunk_size: ``L``. A multiple of 16.
+        dscore: ``(B,H,C,L,L)`` masked score, target token by source token, the dtype
+            of ``dy``, contiguous, from the same. Read, never written. That stage
+            forms this product to mask and scale the other half of its own pair, so
+            the record costs it four instructions an element; forming it here costs a
+            GEMM, an exponential an element and a transpose store per lane tile, for
+            a value no lane tile depends on.
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, or None.
         b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, or None.
         dB: Destination for the ``B`` cotangent, with the shape, dtype and device of
@@ -4268,7 +4254,7 @@ def chunk_vector_backward(
         (dchunk_rot, "dchunk_rot"),
         (dchunk_scale, "dchunk_scale"),
     )
-    stored: Named = ((dinc, "dinc"), (zstart, "zstart"))
+    stored: Named = ((dinc, "dinc"), (zstart, "zstart"), (dscore, "dscore"))
     check_layout(((dy, "dy"), (U, "U"), *pinned, *stored))
     check_pitched(((B, "B"), (C, "C")))
     dtype = check_operands(activations)
@@ -4303,6 +4289,9 @@ def chunk_vector_backward(
     for tensor, name, shape in closing:
         if tuple(tensor.shape) != shape:
             raise ValueError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
+    record = (bsz, heads, chunks, chunk_size, chunk_size)
+    if tuple(dscore.shape) != record:
+        raise ValueError(f"dscore must be {record}, got {tuple(dscore.shape)}")
 
     budget = assert_smem_fits(
         f"chunk_vector_bwd[L{chunk_size}/P{rows}/3N{dim}"
@@ -4410,6 +4399,7 @@ def chunk_vector_backward(
             dlogp,
             dchunk_rot,
             dchunk_scale,
+            dscore,
             shared[0].dest,
             shared[1].dest,
             shared[2].dest,
