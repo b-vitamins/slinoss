@@ -223,6 +223,27 @@ instructions, and the class bar says nothing about that.
   520 us against LSU's 1,439 because it issues at four times the width. So no
   integer-reduction arm can be rank 1 while the port is where it is. Rank by pipe
   occupancy, then by instruction count within the limiting pipe.
+- Pipe occupancy ranks the classes; it does not decide whether a given deletion pays.
+  Barrier phase does. A deletion taken from a phase every warp must clear before
+  anything else proceeds pays at 1:1 in that phase's own time share, not at the
+  kernel's average cycles an instruction; a deletion taken from a phase where warps
+  already wait pays nothing, and the compiler will refill the freed slot for free.
+  Measured on `start_passing_bwd`: deleting 2.18M instructions wholly ahead of the
+  first barrier bought 4.07 us a million while *adding* 115,200 LSU instructions, and
+  ptxas answered by re-materializing 483,840 shared accesses into the barrier-wait
+  window at no cost. The same deletion re-partitioned the schedule across two later
+  barriers, shedding 6.45M instructions there without losing one LSU instruction. So a
+  pre-barrier deletion is a global re-scheduling event, not a local subtraction from
+  one phase's issue slots, and an instruction-count arm is unpriced until it names its
+  phase.
+- Do not sum the port floors and compare the sum to the wall. The pipes are separate
+  units and overlap, so the binding constraint is the largest floor plus the issue-port
+  floor of one instruction a subpartition a cycle. The `start_passing_bwd` pad-stage
+  arm falsified the sum directly: it cut the summed floor by 10.1 us and the wall by
+  14.9 to 18.1, and the summed floor rose from 94.6% to 96.3% of the wall while the
+  kernel got faster. Read at the max, `chunk_vector_bwd` sits at 2.35x its 568.0 us LSU
+  floor and `start_passing_bwd` at 2.7x its 94.0 us one, so both have room that no port
+  arithmetic forbids.
 - Deleting work off a pipe that is not the limiter is unpriced, not free money. The
   measured conversion of freed cycles to time, 83-93%, was established on the
   limiting pipe only. A candidate that moves work from one idle pipe to another idle

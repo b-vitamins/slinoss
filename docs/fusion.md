@@ -28,6 +28,13 @@ Five are easy to miss: `reduce_rows`, which is `close_slots` on `dK`, and four
 both bars at once, `chunk_vector_bwd` and `chunk_scan_fwd`. One kernel spills at the
 architectural register cap, `chunk_input_bwd`, 148.63 MB a launch.
 
+The table is the census as taken. Two of its rows no longer launch: `reduce_rows` was
+deleted by closing `dK`'s slots in the arriving tile, and `vector_reduce` by walking
+the head-sum fold in the block. Eleven device operations remain. Both closures were
+paid for in registers on the kernel that absorbed them -- `chunk_vector_bwd` reads 238
+now, 17 under the cap, with local sectors still 0 -- and `start_passing_bwd` reads 74
+after its pad-stage deletion. Nothing else in the table has been re-measured since.
+
 ## The regime, which decides whether deleted bytes are worth anything
 
 A deleted byte converts at 0.334 of its time at the bus only on a kernel near its
@@ -123,8 +130,11 @@ innermost, and the producer's `dram__bytes_read.sum` moves +0.011 MB for 23.6 MB
 published words. At seventeen words the ninety consecutive blocks of one chunk hold
 1.96 MB of chart against a 6 MB L2, where nine words hold 1.04 MB. Both resident.
 
-Cost, at the 1:1 instruction conversion this kernel has three confirmations of
-(311,145,984 warp-instructions to 1,706.7 us, 5.485 us a million). **The publish is
+Cost, at the flat instruction conversion this kernel was then credited with,
+5.485 us a million. **That conversion is refuted and the figure below is left as the
+prediction it was, not as a rate to reuse**: the deletion rate on this kernel is
+pipe-dependent and runs 1.042 us a million off the FMA port against 8 to 30 off the
+LSU. **The publish is
 now a wash.** Before `120eb0f` the slot row went out one component at a time and
 eight more words a token would have cost 0.18 M; that commit made both dK taps one
 `STG.E.128` each, so publishing them into the chart instead of into the slot buffer
@@ -152,6 +162,11 @@ own store.
 duration, because NCU's `gpu__time_duration` runs 2.8x under to 1.6x over here and
 has disagreed in sign. Corroboration only: 42.8 and 43.2 us on that counter, 43.8
 and 44.2 us event-timed in `slinoss/_reduce.py` and `bwd/chunk_vector.py`.
+
+Built as `f2e09b0`. It delivered **-25.1 us**, outside the band on the unfavourable
+side: -23.6 for the pass and launch on merged master, -1.5 for the arrival counter's
+zero fill riding the epilogue branch. The pass did not collect its DRAM floor. Price
+the next closure at the delivered rate, not at 0.334 us a megabyte.
 
 ### Two refusals, re-checked against today's arenas
 
@@ -184,17 +199,31 @@ de-fusion, not carried as a fusion.
 
 ## What the census closes
 
-The reachable total is **-40.3 us for rank 1 and -1.9 for rank 3, -42.2 us**, or
--212.2 with the `vector_reduce` arm. Against a -2,068 us gap that is
-2.0% and 10.3%. The arithmetic settles the class: `07bbb05` and
-`7cc2a03` consumed the tree's fusable adjacencies, and what is left is one closure
-and one tail. Seven boundaries are dead, five of them on shared capacity or grid
-shape, which no register environment can reach.
+The reachable total was **-40.3 us for rank 1 and -1.9 for rank 3, -42.2 us**, or
+-212.2 with the `vector_reduce` arm. Both were built. The closure delivered -25.1 and
+the `vector_reduce` fold delivered **-41.5**, not the -170 the byte arithmetic implied,
+so the census over-predicted the class by 3.4x and the error was entirely in pricing a
+deleted launch at its DRAM floor. What the census got right is which boundaries are
+dead: seven of them, five on shared capacity or grid shape, which no register
+environment reaches.
 
-Fusion is no longer the class to work. `chunk_vector_bwd` is 41% of the step at
-46.36% of memory speed-of-light, 37.25% issue, one resident block on both bars, and
-it converts instruction deletion 1:1 -- every 1% of its 311,145,984 instructions is
--17 us. The remaining gap is inside that kernel, not between kernels.
+Fusion is no longer the class to work. The remaining gap is inside `chunk_vector_bwd`,
+not between kernels. Two figures the census used to route there are since refuted and
+must not be reused. It does **not** convert instruction deletion 1:1: the rate is
+pipe-dependent, 1.042 us a million off the FMA port against 8 to 30 off the LSU, and a
+cost probe that deleted two thirds of the kernel's 3x3 arithmetic bought 13.8 us. And
+its wall is 1,332.99 us against 273,740,544 instructions, not 1,706.7 against
+311,145,984 -- `7cc2a03` had already taken the difference when the census was written.
+
+The bound on the kernel is its **largest** port floor, the LSU at 568.0 us, not the sum
+of its floors. Summing floors is not a bound because the pipes overlap, and an arm on
+`start_passing_bwd` proved it: the arm cut that kernel's summed floor by 10.1 us and
+its wall by 18.1, and the summed floor rose as a fraction of the wall while the kernel
+got faster. So `chunk_vector_bwd` runs at 2.35x its largest floor with roughly 765 us
+above every port, and the class that pays there is latency on the serial critical path.
+The discriminant is which barrier phase a deletion sits in: work deleted from a phase
+every warp must clear pays at 1:1 in that phase's own share, while work deleted from a
+wait-dominated phase pays nothing and the compiler will refill the slot for free.
 
 ## Provenance
 
@@ -204,4 +233,6 @@ against `scripts/perf/profile_target.py --op so3ssd --shape acceptance --mode st
 Device 0 at 68-100% utilization with 41,056-45,422 MiB foreign resident throughout,
 so **every wall-clock absolute here is contaminated 1.6-2.2x**. Instruction,
 register, shared-byte, occupancy-limit, sector and grid counts are contention-immune
-and are what the refusals rest on. No arm was built and no delta was measured.
+and are what the refusals rest on. No arm was built and no delta was measured at the
+time; the two arms the census named have since been built and their delivered figures
+are recorded against their predictions above.
