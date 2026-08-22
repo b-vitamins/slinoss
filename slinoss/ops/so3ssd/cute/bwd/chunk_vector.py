@@ -3367,6 +3367,16 @@ def chunk_vector_bwd_kernel(
     # has no body to duplicate and drops the loop instead, worth 562 us a call.
     for hstep in cutlass.range(fold, unroll=1):
         hidx = (gidx * splits + sidx) * fold + hstep
+        # The per-token tail's only global load, issued a whole head iteration above
+        # its consumer. That pass admits ``chunk`` of ``threads`` threads and holds no
+        # other long-latency operand, so left in place the round trip is uncovered and
+        # is most of what the pass costs; here every stage below stands in front of it.
+        # An out-of-range step reads ``last`` and discards it, which keeps the access
+        # in bounds without a predicate.
+        glp = tuple(
+            gdlp[bidx, hidx, cidx, cutlass.min(tid + s * threads, last)]
+            for s in range(-(-chunk // threads))
+        )
         # Loop-carried only. This is the write-after-read fence between the previous
         # head's reads of the per-head tiles and this head's staging of them, so a
         # shard of one head has nothing for it to order: the zero fill above targets
@@ -3975,15 +3985,20 @@ def chunk_vector_bwd_kernel(
                         sdrot[j, token] = psum[j] + select(closing, dq[j], zero)
                     vdlp[token] = (
                         psum[4]
-                        + gdlp[bidx, hidx, cidx, token]
+                        + glp[step]
                         + select(closing, 2.0 * cscale * dclast, zero)
                     )
                     if cutlass.const_expr(tiles > 1):
                         for j in cutlass.range_constexpr(4):
                             sdw[j, token] = psum[5 + j]
             cute.arch.sync_threads()
+            # Two independent warp-serial scans, one warp each rather than warp 0
+            # twice. ``tid ^ 32`` is the whole change: it maps warp 1 onto lanes 0-31
+            # and every other warp above the guard, since flipping bit 5 of a thread
+            # past 63 leaves a higher bit set. The shuffles inside are warp-relative,
+            # so neither scan's arithmetic or order moves.
             chunk_suffix(vdlp, sdls, tid, chunk)
-            quat_suffix_vjp(squat, sdrot, sdquat, tid, chunk)
+            quat_suffix_vjp(squat, sdrot, sdquat, tid ^ 32, chunk)
             cute.arch.sync_threads()
 
             for step in cutlass.range_constexpr(-(-chunk // threads)):
