@@ -20,11 +20,18 @@ if not torch.cuda.is_available():
 
 from collections.abc import Callable
 
-from slinoss._cute import smem_capacity
+from slinoss._cute import smem_capacity, smem_residency
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
-from slinoss.ops.so3ssd.cute.fwd.chunk_scan import chunk_scan_forward, scan_smem_bytes
+from slinoss.ops.so3ssd.cute.common import THREADS
+from slinoss.ops.so3ssd.cute.fwd.chunk_scan import (
+    chunk_scan_forward,
+    scan_smem_bytes,
+    scan_threads,
+    score_tile,
+)
 from slinoss.ops.so3ssd.cute.fwd.increment_passing import increment_passing_forward
+from slinoss.ops.so3ssd.cute.mma import THREADS_WIDE, WARPS_WIDE
 from tests.conftest import (
     ScanInputs,
     assert_max_rel,
@@ -53,7 +60,10 @@ LS_BIAS = -4.0
 # - the streaming split, the only way the previous tap reaches a token before the
 #   sequence;
 # - two ``N``, because the lane stride loop is per-thread;
-# - both operand dtypes, because each is a different MMA atom.
+# - both operand dtypes, because each is a different MMA atom;
+# - the eight-warp block, where the score goes through shared memory instead of the
+#   register retile and the residue runs on half the block. ``3N`` 240 is what
+#   :func:`scan_threads` widens, so this is the shape that reaches that path.
 SHAPES = [
     pytest.param(
         2, 2, 256, 64, 48, 16, True, torch.bfloat16, id="two-slices-streaming"
@@ -61,6 +71,7 @@ SHAPES = [
     pytest.param(2, 2, 200, 64, 64, 32, False, torch.bfloat16, id="ragged-wide"),
     pytest.param(1, 1, 256, MAX_CHUNK, 16, 16, True, torch.bfloat16, id="four-slices"),
     pytest.param(2, 2, 48, 16, 16, 16, True, torch.float16, id="padded-m-fp16"),
+    pytest.param(1, 1, 128, 64, 64, 80, False, torch.bfloat16, id="wide-block"),
 ]
 
 
@@ -209,6 +220,38 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     nbytes = scan_smem_bytes(MAX_CHUNK, 64, 96)
     assert nbytes <= smem_capacity()
     assert scan_smem_bytes(64, 48, 48) < nbytes
+    # The wide arena is the narrow one plus one staged score slice, and nothing else
+    # moves with the block width. A budget that forgot the tile would launch a kernel
+    # whose allocator runs past the carveout it was checked against.
+    for chunk, rows, dim in ((64, 64, 240), (MAX_CHUNK, 48, 48)):
+        narrow = scan_smem_bytes(chunk, rows, dim)
+        wide = scan_smem_bytes(chunk, rows, dim, warps=WARPS_WIDE)
+        assert wide - narrow == 2 * score_tile(chunk).words
+
+
+def test_the_block_width_follows_the_arena_and_not_the_chunk_length() -> None:
+    """Eight warps only where the narrow arena already holds one block.
+
+    The wide form buys a second warp per scheduler and pays a score tile, a barrier
+    and a shared round trip a slice. Where the narrow arena leaves room for another
+    block the tile takes it back, which is a worse trade than the one being bought:
+    measured on sm_86, ``L`` 128 ``P`` 48 ``3N`` 48 loses 36.3% of the launch that
+    way. Where the arena already holds one block the bytes cost no residency.
+    """
+    # The narrow arena pins one block, so the tile is free of residency.
+    assert smem_residency(scan_smem_bytes(64, 64, 240)) == 1
+    assert scan_threads(64, 64, 240) == THREADS_WIDE
+    # Every other shipped geometry keeps its second or third block, so it keeps the
+    # narrow form; ``L`` 128 is the case that would fall from two blocks to one.
+    assert smem_residency(scan_smem_bytes(MAX_CHUNK, 48, 48)) == 2
+    assert smem_residency(scan_smem_bytes(MAX_CHUNK, 48, 48, warps=WARPS_WIDE)) == 1
+    for chunk, rows, dim in ((MAX_CHUNK, 48, 48), (64, 48, 48), (64, 16, 48)):
+        assert scan_threads(chunk, rows, dim) == THREADS
+    # A geometry pinned to one block whose wide arena would overflow the carveout
+    # stays narrow rather than asking for a tile there is no room for.
+    assert smem_residency(scan_smem_bytes(64, 96, 240)) == 1
+    assert scan_smem_bytes(64, 96, 240, warps=WARPS_WIDE) > smem_capacity()
+    assert scan_threads(64, 96, 240) == THREADS
 
 
 def test_reads_bands_of_the_fused_projection() -> None:

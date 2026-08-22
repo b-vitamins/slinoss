@@ -37,12 +37,14 @@ exponential, so no infinity is formed (I3). ``Afuse``'s own factor is folded in
 float32, inside the table, before the operand narrowing, so the fused column
 carries one rounding where the two taps carried one each.
 
-The narrowed score never reaches shared memory. The score GEMM's C fragment is the
-diagonal GEMM's A fragment thread for thread, two N atoms of the atom's C tile
-being one K atom of its A tile, so the score is retiled in registers by
-:func:`slinoss.ops.so3ssd.cute.mma.mma_areg`. That removes a score tile from the
-shared budget and, per slice, one scalar store per accumulator element, one
-``ldmatrix``, and one barrier.
+The narrowed score reaches shared memory at one block width only. At four warps the
+score GEMM's C fragment is the diagonal GEMM's A fragment thread for thread, two N
+atoms of the atom's C tile being one K atom of its A tile, so the score is retiled in
+registers by :func:`slinoss.ops.so3ssd.cute.mma.mma_areg`. That removes a score tile
+from the shared budget and, per slice, one scalar store per accumulator element, one
+``ldmatrix``, and one barrier. At eight warps the second warp group takes half the N
+mode of every tile, the fragment stops being a K-contiguous A operand, and the score
+goes through a staged tile instead. :func:`scan_threads` prices that trade.
 
 The residue is not a GEMM operand. Staging ``bnow`` as a second ``(L, 3N)`` tile
 costs a rotate-and-stage pass -- three paired global reads, nine broadcast table
@@ -115,7 +117,7 @@ change, so the output is bit-identical. At ``H == G`` there is nothing to share 
 the order is neutral: cycles move -1.85%, +0.89%, +0.19% and +0.55% at ``standard``,
 ``ragged``, ``wide`` and ``long``, and DRAM bytes move under 0.1% at all four.
 
-Residency 2 is out of reach at ``3N`` 240 and the arena is why. 79,616 B against the
+Residency 2 is out of reach at ``3N`` 240 and the arena is why. 81,920 B against the
 50,176 B a second block needs, of which the two ``(L, 3N)`` operand tiles are
 63,488 B; deleting every float32 tile in the arena still lands at 68,096 B. Both
 operand tiles are live from the offset GEMM to the last diagonal GEMM, and the
@@ -126,6 +128,20 @@ float32 against 16, on a body already at the register ceiling. Fusion moves the
 arena by +112 B here and +144 B at ``standard``, the shifted forcing tile losing the
 row the second tap needed and the residue tile taking a float32 word per token, so
 no residency bar moves in either direction.
+
+Block width. That arena is what pays for the second warp group. One block per SM
+fills 8.1% of the warp slots, and where the shared budget has already conceded the
+second block a score tile costs no residency: 81,920 B and 87,040 B are both one
+block. Measured on sm_86 at ``B`` 4, ``H`` 18, ``T`` 2048, ``P`` 64, ``3N`` 240 and
+``L`` 64, one launch an arm in one profile: warps per scheduler 3.90 to 7.76, issue
+23.9% to 30.6%, ``not_selected`` 0 to 20.8 M warp-cycles, 255 registers with 9,216
+local load and 9,216 local store instructions to 222 with none, LSU 9.32 M to
+11.05 M warp-inst as ``ldmatrix`` doubles against an A operand now broadcast to two
+N groups, tensor unchanged at 2,506,752. Paired in one process over 200 alternations
+with the launch order swapped, 466.9 us against 402.9 us: -64.8 us, interval
+[-65.3, -64.3], 1.159x. Where the narrow arena still holds two or three blocks the
+tile takes one back and the trade inverts, by 36.3% at ``L`` 128 and 2.9% at
+``standard``. :func:`scan_threads` is that gate.
 
 A ragged tail needs no separate path. ``stage_chunk`` stages the pad as a zero tap
 and the identity transition, so the rows past the sequence are zero in every
@@ -158,6 +174,7 @@ from slinoss._cute import (
     select,
     shuffle_xor,
     smem_bytes,
+    smem_capacity,
     smem_residency,
     widen,
 )
@@ -166,6 +183,7 @@ from slinoss.ops.so3ssd.cute.common import (
     TABLE_AFUSE,
     TABLE_AN,
     THREADS,
+    WARPS,
     mat3_matvec,
     scalar_tile,
     table_tile,
@@ -188,12 +206,15 @@ from slinoss.ops.so3ssd.cute.mma import (
     MMA_PAIR,
     MMA_TILE_M,
     SMEM_SEGMENT,
+    THREADS_WIDE,
+    WARPS_WIDE,
     make_mma,
     mma_acc,
     mma_areg,
     mma_coords,
     mma_gemm,
     mma_gemm_areg,
+    mma_groups,
     mma_offsets,
     mma_rows,
     operand_tile,
@@ -226,6 +247,8 @@ __all__ = [
     "readout_tile",
     "scan_dnow",
     "scan_smem_bytes",
+    "scan_threads",
+    "score_tile",
 ]
 
 NBLOCK_MAX: int = 32
@@ -291,7 +314,11 @@ two, so this constant follows the live set and is not a fixed property of the SM
 
 Whether it binds is a property of the tile widths, not of ``L``: at ``P`` 48 and
 ``3N`` 48 the budget allows three and this is what refuses the third, while at the
-wider readout and the longer chunk the budget allows two on its own."""
+wider readout and the longer chunk the budget allows two on its own.
+
+A four-warp measurement. The wide block of :func:`scan_threads` is taken only where
+the arena allows one block, so this ceiling never binds there; that form lands at 222
+registers with no spill on its own."""
 
 
 def nblock(chunk: int) -> int:
@@ -319,7 +346,23 @@ def readout_tile(chunk: int, dim: int) -> Tile:
     return operand_tile(mma_rows(chunk), dim)
 
 
-def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
+def score_tile(chunk: int) -> Tile:
+    """Staged score tile, ``(mma_rows(L), pitch)`` over one column slice.
+
+    Allocated at :data:`slinoss.ops.so3ssd.cute.mma.WARPS_WIDE` alone, where the
+    register retile is illegal and the diagonal GEMM reads its A operand from
+    shared memory. One slice, not the whole ``L x L``: the score is consumed
+    slice by slice.
+
+    Args:
+        chunk: ``L``.
+    """
+    return operand_tile(mma_rows(chunk), nblock(chunk))
+
+
+def scan_smem_bytes(
+    chunk: int, rows: int, dim: int, itemsize: int = 2, warps: int = WARPS
+) -> int:
     """Shared memory the kernel allocates, in bytes.
 
     The same tiles :func:`chunk_scan_fwd_kernel` allocates, in the same order.
@@ -330,21 +373,76 @@ def scan_smem_bytes(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
         rows: ``P``.
         dim: ``3N``.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+        warps: Warps per block. Past :data:`slinoss.ops.so3ssd.cute.common.WARPS`
+            the score is staged, which is the one term the block width moves.
     """
     nblk = nblock(chunk)
-    return smem_bytes(
-        [
-            (trans_tile(chunk), 4),
-            (tap_tile(chunk), 4),
-            (scalar_tile(chunk), 4),
-            (trans_tile(chunk), 4),
-            (table_tile(chunk, 3, TABLE_PITCH), 4),
-            (scalar_tile(chunk), 4),
-            (readout_tile(chunk, dim), itemsize),
-            (operand_tile(max(rows, nblk), dim), itemsize),
-            (operand_tile(nblk, rows), itemsize),
-        ]
-    )
+    tiles = [
+        (trans_tile(chunk), 4),
+        (tap_tile(chunk), 4),
+        (scalar_tile(chunk), 4),
+        (trans_tile(chunk), 4),
+        (table_tile(chunk, 3, TABLE_PITCH), 4),
+        (scalar_tile(chunk), 4),
+        (readout_tile(chunk, dim), itemsize),
+        (operand_tile(max(rows, nblk), dim), itemsize),
+        (operand_tile(nblk, rows), itemsize),
+    ]
+    if warps != WARPS:
+        tiles.append((score_tile(chunk), itemsize))
+    return smem_bytes(tiles)
+
+
+def scan_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
+    """Block width for a geometry.
+
+    Eight warps where the narrow arena has already spent the whole carveout on one
+    block, four warps otherwise. The choice is the arena's, not ``L``'s.
+
+    A second warp group subdivides the N mode of every tile, which is what makes
+    the score's C fragment stop being the diagonal GEMM's A fragment: the wide form
+    pays a score tile, one barrier and one shared round trip a slice. Where the
+    narrow form is already pinned to one resident block that buys the second warp
+    per scheduler for those bytes; where it holds two blocks it would give one back,
+    and the same warps arrive with none of the round trip.
+
+    Narrow arenas on sm_86, at the shipped 101,376 B carveout, against the paired
+    delta the wide form measures at that geometry over 200 alternations:
+
+        L    P    3N    narrow   blocks   wide      delta
+        64   16   48    26,112   3        31,232    +0.6%
+        64   48   48    29,952   3        35,072    +2.9%
+        64   64   96    45,056   2        50,176    -2.7%
+        128  48   48    49,152   2        55,296    +36.3%
+        64   64   240   81,920   1        87,040    -13.9%
+
+    Only the last takes the wide form. ``L`` 128 is the near case and is refused by
+    5,120 B: its score tile is 6,144 B against the 1,024 B of headroom the two-block
+    bar leaves it, and losing that block costs a third of the launch.
+
+    Banked, not taken: ``P`` 64 ``3N`` 96 keeps both blocks and still measures 4.6 us
+    faster wide, resolving. That is not the lever this gate prices -- there the
+    second warp group arrives at an unchanged residency -- so the win has no account
+    here and taking it on the residency-preserving rule would also take ``P`` 16
+    ``3N`` 48, which measures 1.3 us slower.
+
+    Args:
+        chunk: ``L``.
+        rows: ``P``.
+        dim: ``3N``.
+        itemsize: Bytes per operand element.
+
+    Returns:
+        :data:`slinoss.ops.so3ssd.cute.mma.THREADS_WIDE` or
+        :data:`slinoss.ops.so3ssd.cute.common.THREADS`.
+    """
+    narrow_bytes = scan_smem_bytes(chunk, rows, dim, itemsize)
+    if smem_residency(narrow_bytes) > 1:
+        return THREADS
+    wide_bytes = scan_smem_bytes(chunk, rows, dim, itemsize, warps=WARPS_WIDE)
+    if wide_bytes > smem_capacity():
+        return THREADS
+    return THREADS_WIDE
 
 
 @cute.jit
@@ -488,7 +586,9 @@ def scan_dnow(
         t0: First token of the chunk.
         valid: Tokens of the chunk that exist.
         tid: Thread index within the block.
-        threads: Block width. Compile-time.
+        threads: Threads the reduction is partitioned over. Compile-time. The scan
+            passes :data:`slinoss.ops.so3ssd.cute.common.THREADS` at every block
+            width, so the float32 summation order does not move with the width.
         chunk: ``L``. Compile-time.
         lanes: ``N``. Compile-time.
 
@@ -647,6 +747,10 @@ def chunk_scan_fwd_kernel(
     mpad = mma_rows(chunk)
     ldv = smem_pitch(dim)
     ldu = smem_pitch(rows)
+    one_group = mma_groups(tiled_mma) == 1
+    # The arena and the MMA are sized from the same width, so a launch that widened
+    # one and not the other would run off the tile it never allocated.
+    assert one_group == (threads == THREADS), "the arena must match the block width"
 
     smem = cutlass.utils.SmemAllocator()
     strans = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
@@ -666,6 +770,19 @@ def chunk_scan_fwd_kernel(
     su = smem.allocate_tensor(
         gu.element_type, operand_tile(nblk, rows).layout(), SMEM_SEGMENT
     )
+    # Last, so the narrow arena is byte for byte the arena it was before the wide
+    # form existed. Dedicated rather than aliased onto a staging tile: both operand
+    # tiles are live across the diagonal GEMM that reads this one. Unbound at one N
+    # group, where the score stays in registers and no tile exists to view.
+    vscore = None
+    if cutlass.const_expr(not one_group):
+        sscore = smem.allocate_tensor(
+            gc.element_type, score_tile(chunk).layout(), SMEM_SEGMENT
+        )
+        vscore = cute.make_tensor(
+            sscore.iterator,
+            cute.make_layout((mpad, nblk), stride=(smem_pitch(nblk), 1)),
+        )
 
     t0 = cidx * chunk
     valid = cutlass.min(cutlass.Int32(chunk), seqlen - t0)
@@ -721,9 +838,32 @@ def chunk_scan_fwd_kernel(
     # Before the accumulators exist, so the peak live set is still the slice loop's.
     # It reads the readout tile and the table, both published by the barrier above,
     # and the barrier below publishes ``sdnow`` to the store epilogue.
-    scan_dnow(
-        gb, scrot, stable, sdnow, bidx, gidx, t0, valid, tid, threads, chunk, lanes
-    )
+    #
+    # The reduction partition is :data:`THREADS`, whatever the block width. It is
+    # ``threads // L`` threads to a token and a butterfly over them, so a wider block
+    # would regroup the partial sums and the float32 total would change value. The
+    # extra warp group sits this pass out: the block width is a scheduling arm and
+    # its output is bit-identical either way.
+    if cutlass.const_expr(one_group):
+        scan_dnow(
+            gb, scrot, stable, sdnow, bidx, gidx, t0, valid, tid, THREADS, chunk, lanes
+        )
+    else:
+        if tid < THREADS:
+            scan_dnow(
+                gb,
+                scrot,
+                stable,
+                sdnow,
+                bidx,
+                gidx,
+                t0,
+                valid,
+                tid,
+                THREADS,
+                chunk,
+                lanes,
+            )
     cute.arch.sync_threads()
 
     va_crot = cute.make_tensor(
@@ -756,10 +896,11 @@ def chunk_scan_fwd_kernel(
     elem = gc.element_type
     scrd = mma_coords(tiled_mma, tid, (mpad, nblk))
     sacc = mma_acc(tiled_mma, tid, (mpad, nblk))
-    # The narrowed score is the A operand of the diagonal GEMM. Fragment and view
-    # are built once: the retile is a layout, so nothing here is per-slice work.
+    # The narrowed score is the A operand of the diagonal GEMM: in registers at one
+    # N group, through ``sscore`` at two. Fragment and retile are built once, so
+    # nothing here is per-slice work either way.
     sfrag = cute.make_fragment_like(sacc, elem)
-    fa_score = mma_areg(sfrag)
+    fa_score = mma_areg(sfrag) if one_group else sfrag
     # The slice body is emitted once, never unrolled. Unrolling folds every
     # score-epilogue index into an immediate, but ptxas then schedules every slice's
     # copies against one register file: measured on the two-tap body at ``L`` 128
@@ -822,7 +963,17 @@ def chunk_scan_fwd_kernel(
             # into the operand. I3: one exponential of a log difference.
             masked = sacc[i] * decay(slp[cutlass.min(m, last)] - slp[src])
             sfrag[i] = narrow(select(m >= src, masked, zero), elem)
-        mma_gemm_areg(tiled_mma, tid, acc, fa_score, vb_ushift, False)
+        if cutlass.const_expr(one_group):
+            mma_gemm_areg(tiled_mma, tid, acc, fa_score, vb_ushift, False)
+        else:
+            # At two N groups a thread's consecutive N steps are two atoms apart, so
+            # the fragment cannot be reread as a K-contiguous A operand. The score
+            # goes through shared memory instead. One barrier, not two: the previous
+            # slice's ``ldmatrix`` of this tile is already two barriers back, at the
+            # top of this iteration.
+            cute.autovec_copy(sfrag, tiled_mma.get_slice(tid).partition_C(vscore))
+            cute.arch.sync_threads()
+            mma_gemm(tiled_mma, tid, acc, vscore, vb_ushift, True, False)
 
     # mma_store's predicated path, inlined because both of its bounds are dynamic
     # here: the row count is min(L, T - t0) and the destination row is offset by t0.
@@ -930,6 +1081,9 @@ def chunk_scan_fwd(
     partition shapes are and because the group index folds away at ``G == H``.
     Batch, head, chunk count, and sequence length are dynamic.
 
+    ``threads`` sets the tiled MMA's warp count and the arena together, so both read
+    the width from one place. :func:`scan_threads` is what chooses it.
+
     The launch carries a residency bound. Without one the register allocator spends
     218 per thread on this body and the residency is whatever that leaves; with one
     the thread cap follows the residency the shared-memory budget allows, so the
@@ -937,7 +1091,10 @@ def chunk_scan_fwd(
     :data:`RESIDENT_MAX`. The bound is computed rather than chosen, so it asks for no
     register cut that occupancy cannot spend.
     """
-    resident = min(RESIDENT_MAX, smem_residency(scan_smem_bytes(chunk, rows, dim)))
+    warps = threads // 32
+    resident = min(
+        RESIDENT_MAX, smem_residency(scan_smem_bytes(chunk, rows, dim, warps=warps))
+    )
     chunk_scan_fwd_kernel(
         gu,
         gtrans,
@@ -949,7 +1106,7 @@ def chunk_scan_fwd(
         gbprev,
         gy,
         seqlen,
-        make_mma(dtype),
+        make_mma(dtype, warps),
         threads,
         chunk,
         rows,
@@ -975,6 +1132,7 @@ def chunk_scan_forward(
     *,
     u_prev: Tensor | None = None,
     b_prev: Tensor | None = None,
+    threads: int | None = None,
 ) -> Tensor:
     """Write the output of every token.
 
@@ -997,6 +1155,9 @@ def chunk_scan_forward(
         u_prev: ``(B,H,P)`` streaming ``u_{-1}``, the dtype of ``U``. Paired with
             ``b_prev``.
         b_prev: ``(B,G,3N)`` streaming ``b_{-1}``, the dtype of ``U``.
+        threads: Block width. ``None`` takes :func:`scan_threads`, the measured
+            choice for the geometry; an explicit width overrides it and is what an
+            A/B against that choice passes.
 
     Returns:
         ``(B,H,T,P)`` output in the dtype of ``U``, contiguous.
@@ -1035,9 +1196,13 @@ def chunk_scan_forward(
     if tuple(zstart.shape) != want:
         raise ValueError(f"zstart must be {want}, got {tuple(zstart.shape)}")
 
+    itemsize = U.element_size()
+    width = (
+        scan_threads(chunk_size, rows, dim, itemsize) if threads is None else threads
+    )
     assert_smem_fits(
-        f"chunk_scan[L{chunk_size}/P{rows}/3N{dim}]",
-        scan_smem_bytes(chunk_size, rows, dim, U.element_size()),
+        f"chunk_scan[L{chunk_size}/P{rows}/3N{dim}/T{width}]",
+        scan_smem_bytes(chunk_size, rows, dim, itemsize, warps=width // 32),
     )
 
     Y = torch.empty(bsz, heads, seqlen, rows, dtype=dtype, device=U.device)
@@ -1065,7 +1230,7 @@ def chunk_scan_forward(
         ),
         (
             cute_dtype(dtype),
-            THREADS,
+            width,
             chunk_size,
             rows,
             dim,
