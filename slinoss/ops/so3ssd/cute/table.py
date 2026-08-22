@@ -79,6 +79,7 @@ retiling and the alignment claim are this module's and are not exported.
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
 
 from slinoss._cute import Scalar, decay, narrow, select, widen
 from slinoss.ops.so3ssd.cute.common import (
@@ -686,6 +687,46 @@ def _wide_row(row: cute.Tensor, run: cutlass.Constexpr) -> cute.Tensor:
     return cute.zipped_divide(cute.make_tensor(base, row.layout), (run,))
 
 
+def _async_atom(elem, run: cutlass.Constexpr) -> cute.CopyAtom:
+    """The ``cp.async`` atom that carries one ``run`` of ``elem`` global to shared.
+
+    ``cp.async`` moves a run global to shared without staging it in registers and
+    without an intervening dependence, so a flat pass costs one instruction per run
+    where the register form costs a load, a dependent store, the registers that hold
+    the run between them, and the round trip through float32 that the store's select
+    and narrow impose on every element.
+
+    ``LoadCacheMode.ALWAYS`` is ``cp.async.ca``, the only mode legal at every run
+    width: ``LoadCacheMode.GLOBAL``, ``cp.async.cg``, is refused below 16 bytes by both
+    the ``static_assert`` in CUTLASS's ``copy_sm80.hpp`` and the DSL's own check. It is
+    also the faster of the two at the widths where both are legal, and the choice is a
+    measurement rather than a derivation: a staged row is read once by the block that
+    stages it, so L1 residency ought to be worth nothing to it, and the mode that
+    bypasses L1 is nonetheless the slower one.
+
+    Args:
+        elem: Element type, the same at both ends. ``cp.async`` cannot convert, so a
+            pass whose ends differ in width has no async form.
+        run: Elements per copy. Compile-time. ``run * elem.width`` must be 32, 64 or
+            128 bits, which is what :func:`_segment_run` and :func:`_flat_run` give.
+
+    Returns:
+        The atom, for :func:`cutlass.cute.copy` with a rank-1 global source run and a
+        rank-1 shared destination run.
+
+    Invariants:
+        The caller owns the completion. An issued copy is visible to the issuing thread
+        only after :func:`cutlass.cute.arch.cp_async_wait_group` retires its group, and
+        to the block only after a barrier past that wait. A pass that issues here and
+        is read without both is a stale tile, not a race.
+    """
+    return cute.make_copy_atom(
+        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+        elem,
+        num_bits_per_copy=run * elem.width,
+    )
+
+
 @cute.jit
 def stage_raw(
     gsrc: cute.Tensor,
@@ -862,6 +903,7 @@ def stage_score(
     rows: cutlass.Constexpr,
     span: cutlass.Constexpr,
     pad: cutlass.Constexpr,
+    asynch: cutlass.Constexpr = False,
 ) -> None:
     """Stage a column block of an ``(L, L)`` record into a tile, one segment an access.
 
@@ -884,6 +926,10 @@ def stage_score(
         span: Source tokens of the block. Compile-time.
         pad: Rows past ``rows`` to zero, the M mode's rounding. Compile-time, and
             zero at every shipped shape, where the trace drops the fill.
+        asynch: Issue the pass as ``cp.async`` and commit one group, leaving the wait
+            and the publishing barrier to the caller. Compile-time. The pad fill is
+            not part of the group: it writes shared from a register constant, has no
+            global source, and runs ahead of the issues so the group closes last.
 
     Invariants:
         ``L`` is a multiple of 16 and ``span`` divides it, so a record row starts on
@@ -902,6 +948,42 @@ def stage_score(
     # The column offset in units of the run. Both terms are exact: ``span`` is a
     # multiple of the run and ``nbase`` a multiple of ``span``.
     coff = nbase // run
+
+    # Ahead of the copy, so an asynchronous pass commits its group last and nothing
+    # after the commit touches the destination. The fill's rows are past the copy's,
+    # so the order between them is free.
+    if cutlass.const_expr(pad != 0):
+        zeros = cute.make_fragment((1, run), elem)
+        for j in cutlass.range_constexpr(run):
+            zeros[0, j] = narrow(zero, elem)
+        for step in cutlass.range_constexpr(-(-(pad * runs) // threads)):
+            i = tid + step * threads
+            if i < pad * runs:
+                r = i // runs
+                cute.autovec_copy(
+                    zeros[(0, None)],
+                    _wide_row(sdst[rows + r, None], run)[(None, i - r * runs)],
+                )
+
+    if cutlass.const_expr(asynch and gsrc.element_type.width == elem.width):
+        atom = _async_atom(elem, run)
+        for step in cutlass.range_constexpr(steps):
+            i = tid + step * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // runs
+            col = i - r * runs
+            got = _wide_row(gsrc[r, None], run)[(None, coff + col)]
+            put = _wide_row(sdst[r, None], run)[(None, col)]
+            if cutlass.const_expr(exact):
+                cute.copy(atom, got, put)
+            else:
+                # Past the extent the clamped destination is a run another step owns,
+                # so the issue goes rather than a predicate zeroing that run.
+                if tid + step * threads < total:
+                    cute.copy(atom, got, put)
+        cute.arch.cp_async_commit_group()
+        return
 
     loads = cute.make_fragment((min(PREFETCH, steps), run), elem)
 
@@ -928,19 +1010,6 @@ def stage_score(
             else:
                 if tid + (group * PREFETCH + step) * threads < total:
                     cute.autovec_copy(loads[(step, None)], dst)
-
-    if cutlass.const_expr(pad != 0):
-        zeros = cute.make_fragment((1, run), elem)
-        for j in cutlass.range_constexpr(run):
-            zeros[0, j] = narrow(zero, elem)
-        for step in cutlass.range_constexpr(-(-(pad * runs) // threads)):
-            i = tid + step * threads
-            if i < pad * runs:
-                r = i // runs
-                cute.autovec_copy(
-                    zeros[(0, None)],
-                    _wide_row(sdst[rows + r, None], run)[(None, i - r * runs)],
-                )
 
 
 @cute.jit
@@ -1075,6 +1144,7 @@ def stage_shifted(
     span: cutlass.Constexpr,
     width: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
+    asynch: cutlass.Constexpr = False,
 ) -> None:
     """Stage a run of tokens of a ``(T, P)`` tensor into a tile, one row behind.
 
@@ -1110,6 +1180,13 @@ def stage_shifted(
         span: Tokens of the run. Compile-time.
         width: Columns that carry data, ``P``. Compile-time.
         has_prev: Whether ``guprev`` was supplied. Compile-time.
+        asynch: Issue the pass as ``cp.async`` and commit one group, leaving the wait
+            and the publishing barrier to the caller. Compile-time, and a request
+            rather than an instruction: the register form stands wherever the async
+            one cannot express the pass, which is a carry select, having two sources
+            against the copy's one, and a width change, ``cp.async`` having no
+            conversion. The zero-fill past the sequence is the copy's own predicate
+            there, performed by the hardware in place of a select on a loaded value.
 
     Invariants:
         Nothing is applied across a run: the shift is a row index and the zero-fill a
@@ -1138,6 +1215,37 @@ def stage_shifted(
     steps = -(-total // threads)
     exact = total % threads == 0
     depth = max(1, PREFETCH // run)
+
+    if cutlass.const_expr(
+        asynch and not has_prev and src.width == su.element_type.width
+    ):
+        atom = _async_atom(su.element_type, run)
+        # One predicate element per copy element: the DSL sizes it by the atom's value
+        # layout, not by the access. The run is uniform in it, the shift being a row.
+        keeps = cute.make_fragment((run,), cutlass.Boolean)
+        for step in cutlass.range_constexpr(steps):
+            i = tid + step * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            r = i // runs
+            p = i - r * runs
+            token = lbase + r - 1
+            gbase = t0 + cutlass.min(token, valid - 1)
+            keep = (token < valid) & (gbase >= 0)
+            for j in cutlass.range_constexpr(run):
+                keeps[j] = keep
+            got = _wide_row(gu[bidx, hidx, cutlass.max(gbase, 0), None], run)
+            put = _wide_row(su[r, None], run)
+            if cutlass.const_expr(exact):
+                cute.copy(atom, got[(None, p)], put[(None, p)], pred=keeps)
+            else:
+                # Not the copy's predicate. A false predicate zeroes the destination,
+                # and past the extent the clamped destination is a run another step
+                # owns, so the issue itself has to go.
+                if tid + step * threads < total:
+                    cute.copy(atom, got[(None, p)], put[(None, p)], pred=keeps)
+        cute.arch.cp_async_commit_group()
+        return
 
     words = paired(su, run)
     frag = cute.make_fragment((1, run), su.element_type)
@@ -1230,6 +1338,7 @@ def stage_state(
     threads: cutlass.Constexpr,
     width: cutlass.Constexpr,
     dim: cutlass.Constexpr,
+    asynch: cutlass.Constexpr = False,
 ) -> None:
     """Stage a chunk-start state into an operand tile.
 
@@ -1259,6 +1368,10 @@ def stage_state(
         threads: Block width. Compile-time.
         width: Rows to fill, ``P``. Compile-time.
         dim: ``3N``. Compile-time.
+        asynch: Issue the pass as ``cp.async`` and commit one group, leaving the wait
+            and the publishing barrier to the caller. Compile-time, and honoured only
+            where the two element widths agree, ``cp.async`` having no conversion.
+            There is no predicate: the pass has no clamp and no zero row.
 
     Invariants:
         ``dim`` is a multiple of 48 or a lane tile of one, so it is a multiple of 8,
@@ -1276,6 +1389,24 @@ def stage_state(
     steps = -(-total // threads)
     exact = total % threads == 0
     depth = max(1, PREFETCH // run)
+
+    if cutlass.const_expr(asynch and src.width == sz.element_type.width):
+        atom = _async_atom(sz.element_type, run)
+        for step in cutlass.range_constexpr(steps):
+            i = tid + step * threads
+            if cutlass.const_expr(not exact):
+                i = cutlass.min(i, total - 1)
+            p = i // runs
+            col = i - p * runs
+            got = _wide_row(gz[p, None], run)
+            put = _wide_row(sz[p, None], run)
+            if cutlass.const_expr(exact):
+                cute.copy(atom, got[(None, col)], put[(None, col)])
+            else:
+                if tid + step * threads < total:
+                    cute.copy(atom, got[(None, col)], put[(None, col)])
+        cute.arch.cp_async_commit_group()
+        return
 
     words = paired(sz, run)
     frag = cute.make_fragment((1, run), sz.element_type)

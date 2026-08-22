@@ -3309,8 +3309,16 @@ def chunk_vector_bwd_kernel(
             mpad - 1,
             rows,
             False,
+            True,
         )
-        stage_state(gzj[bidx, hidx, cidx, None, None], sstate, tid, threads, rows, tile)
+        stage_state(
+            gzj[bidx, hidx, cidx, None, None], sstate, tid, threads, rows, tile, True
+        )
+        # Both passes above issue global to shared without a register in between, so
+        # their runs are in flight here and the wait is what makes them this thread's.
+        # One wait for the pair: the second pass's issues are the first's cover, which
+        # the register form got from ordering its loads ahead of its stores instead.
+        cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
         # The offset term, and the log-scale cotangent it carries. The scale is
@@ -3400,6 +3408,7 @@ def chunk_vector_bwd_kernel(
                 span,
                 tile,
                 has_prev,
+                True,
             )
             stage_shifted(
                 gu,
@@ -3415,6 +3424,7 @@ def chunk_vector_bwd_kernel(
                 spad,
                 rows,
                 has_prev,
+                True,
             )
             # The masked score, read rather than formed. Its value does not depend on
             # the lane tile, so the fused form ran a GEMM, an exponential an element
@@ -3434,10 +3444,17 @@ def chunk_vector_bwd_kernel(
                 chunk,
                 span,
                 mpad - chunk,
+                True,
             )
             # The staged tiles above are published here. One forcing column, so the
             # rotation and the three products below run once a block where the two-tap
-            # form ran each of them twice.
+            # form ran each of them twice. The three passes above are asynchronous
+            # where their element widths agree and the streaming carry is absent, so
+            # the loads are in flight across all three and each one's issues cover the
+            # next's; the wait retires the group for this thread before the barrier
+            # retires it for the block, and is a no-op where every pass took the
+            # register form, no group having been committed.
+            cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
             # The diagonal cotangent, one scalar a token. In the two-tap form the
