@@ -3350,16 +3350,21 @@ def chunk_vector_bwd_kernel(
             # always the row before its own, so the entry has no home there and the
             # contraction runs here. Row ``r + 1`` of the shifted forcing input is
             # token ``nbase + r``, and a pad token's row is zero at both ends.
+            # Predicated, not clamped. The clamp idiom the staging passes use wastes
+            # at most one partial pass, but here the destination is one token and the
+            # block has ``threads``, so at ``span 64`` on 256 threads six warps of
+            # eight ran a ``rows``-deep contraction of the clamped row and stored
+            # nothing. Testing the destination first deletes that, bitwise: under the
+            # predicate the clamp is the identity.
             for step in cutlass.range_constexpr(-(-span // threads)):
                 r = tid + step * threads
-                rs = cutlass.min(r, span - 1)
-                dnow = zero
-                for p in cutlass.range_constexpr(rows):
-                    dnow = dnow + widen(sdy[nbase + rs, p], elem) * widen(
-                        su[rs + 1, p], elem
-                    )
                 if r < span:
-                    sdnow[nbase + rs] = dnow
+                    dnow = zero
+                    for p in cutlass.range_constexpr(rows):
+                        dnow = dnow + widen(sdy[nbase + r, p], elem) * widen(
+                            su[r + 1, p], elem
+                        )
+                    sdnow[nbase + r] = dnow
 
             # The increment's closing rank-one, token L-1's alone. In the two-tap form
             # it was the last row of the current tap's increment product, whose weight
@@ -3369,16 +3374,17 @@ def chunk_vector_bwd_kernel(
             # ``L - 1`` for both: at a ragged length that row of ``U`` is zero and the
             # term is the padded slot's.
             if cutlass.const_expr(nstep == blocks - 1):
+                # Predicated for the same reason the diagonal above is: the
+                # destination is one lane of ``tile`` and the block has ``threads``.
                 for step in cutlass.range_constexpr(-(-tile // threads)):
                     d = tid + step * threads
-                    ds = cutlass.min(d, tile - 1)
-                    ures = zero
-                    for p in cutlass.range_constexpr(rows):
-                        ures = ures + widen(sstate[p, ds], elem) * widen(
-                            su[span, p], elem
-                        )
                     if d < tile:
-                        sdures[0, ds] = ures
+                        ures = zero
+                        for p in cutlass.range_constexpr(rows):
+                            ures = ures + widen(sstate[p, d], elem) * widen(
+                                su[span, p], elem
+                            )
+                        sdures[0, d] = ures
 
             _rotate_rows(
                 sb,
