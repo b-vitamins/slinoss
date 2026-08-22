@@ -403,6 +403,30 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
     The budget is priced at :data:`SLICE_PITCH`, which is not the pitch the launch
     allocates.
 
+    When nothing reaches the bound the search takes the floor, one MMA step, which is
+    the narrowest legal slice. That fallback is not the optimum and no rule priced on
+    shared bytes can find the optimum, because the objective is register pressure and
+    the arena is blind to it. The arena is
+    ``max(368*kblk + 144, mma_rows(rows)*span*4)``, so wherever the float32 result
+    sizes it a band of slices allocates byte-identical shared memory and holds the
+    same blocks. Four such configurations at ``span`` :data:`SPLIT`, all at two
+    blocks, all byte-identical across the widening, measured on sm_86:
+
+        L=160 P=48  39,376 B  16: 255 regs, no spill    32: 240 regs, no spill
+        L=224 P=48  50,128 B  16: 255 regs, no spill    32: 255 regs, 256 sectors
+        L=144 P=80  48,976 B  16: 254 regs, 128 sectors 48: 255 regs, 2,640 sectors
+        L= 64 P=192 47,824 B  16: 255 regs, 160 sectors 64: 254 regs, no spill
+
+    The optimum is 32, 16, neither and 64. The slice loop is unrolled, so widening
+    trades copies of the slice body against what stays live across the whole extent,
+    and which way that lands is decided inside the register allocator. A search over
+    the byte-free band would take the spill at ``L=224``. So the fallback stands, and
+    it is unreachable at every bench shape: the loop returns 64 at ``L=64`` and 32 at
+    ``L=128``, so the floor costs nothing there.
+
+    The search is at most ``chunk / MMA_TILE_K`` calls to :func:`fused_smem_bytes`,
+    once per host entry and never in a launch.
+
     Dividing the chunk is necessary and not sufficient. A slice that divides ``L``
     but not the atom's K extent splits the K loop across an MMA step, and the atom
     reads its fragment whole, so the tail step reads operand columns the slice never
@@ -419,10 +443,8 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
 
     Returns:
         A divisor of ``chunk`` and a multiple of
-        :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_K`. Nothing wider than one MMA
-        step reaches the residency once the chunk-sized tiles are large enough, so
-        the fallback is
-        :data:`slinoss.ops.so3ssd.cute.fwd.chunk_increment.KBLOCK_MAX`.
+        :data:`slinoss.ops.so3ssd.cute.mma.MMA_TILE_K`, whose allocated budget fits
+        the carveout.
 
     Raises:
         ValueError: If no legal slice fits the carveout at this shape. The floor is
@@ -437,15 +459,15 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
             if smem_residency(budget) >= RESIDENT_MAX:
                 return kblk
         kblk -= MMA_TILE_K
-    kblk = min(chunk - chunk % MMA_TILE_K, KBLOCK_MAX)
-    if fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk) > smem_capacity():
+    floor = min(chunk - chunk % MMA_TILE_K, KBLOCK_MAX)
+    allocated = fused_smem_bytes(chunk, rows, span, itemsize, kblk=floor)
+    if allocated > smem_capacity():
         raise ValueError(
             f"no legal K slice fits at chunk={chunk} rows={rows} span={span}: "
-            f"one MMA step of {kblk} needs "
-            f"{fused_smem_bytes(chunk, rows, span, itemsize, kblk=kblk)} B of "
-            f"shared memory, capacity is {smem_capacity()} B"
+            f"one MMA step of {floor} needs {allocated} B of shared memory, capacity "
+            f"is {smem_capacity()} B"
         )
-    return kblk
+    return floor
 
 
 @cute.kernel
