@@ -519,6 +519,17 @@ def test_sign_coverage_is_the_binomial_tail() -> None:
     assert units_mod._sign_coverage_pct(30, 10) == pytest.approx(95.7226, abs=1e-4)
 
 
+def test_sign_coverage_holds_past_the_float_range() -> None:
+    # 2**count passes the largest float at 1024, so a float operand in the ratio
+    # raises OverflowError there and the interval cannot be formed at all. The
+    # coverage is a ratio of integers and has a value at any count.
+    assert units_mod._sign_coverage_pct(1024, 1) == 100.0
+    assert units_mod._sign_coverage_pct(4096, 1) == 100.0
+    low, high, coverage = median_ci(us(*(float(i) for i in range(1024))))
+    assert coverage >= CONFIDENCE_PCT
+    assert (low, high) == (480.0, 543.0)
+
+
 def test_median_ci_rank_is_the_tightest_interval_holding_the_confidence() -> None:
     # Coverage falls as the rank rises, so the tightest covering rank is the last
     # one before the first miss, at every count that has one.

@@ -469,7 +469,11 @@ def _sign_coverage_pct(count: int, rank: int) -> Percent:
     distribution.
     """
     tail = sum(comb(count, i) for i in range(rank))
-    return Percent(100.0 * (1.0 - 2.0 * tail / 2**count))
+    # Both sides of the ratio stay integers, because 2**count exceeds the largest
+    # float at 1024 samples and a float operand converts it. Integer true division
+    # is exact whatever the magnitudes, so the value is unchanged below that count
+    # and defined above it.
+    return Percent(100.0 * (1.0 - 2 * tail / 2**count))
 
 
 def _median_ci_rank(count: int) -> int:
