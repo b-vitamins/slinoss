@@ -336,6 +336,35 @@ def _store_run(
     The run width is ``len(vals)``, which the trace knows, so one body serves every
     width the callers use.
 
+    The convert here reaches no instruction of its own, and the byte permute keyed to
+    this line is not it. Measured on sm_86 at the acceptance shape, the bf16 traffic
+    of ``chunk_vector_bwd`` is four disjoint SASS classes over 314,818,560
+    warp-instructions:
+
+    ================== ========== ====== =========================================
+    class              inst       share  role
+    ================== ========== ====== =========================================
+    SHF.L.U32 by 0x10  31,334,400 9.95%  widen, one instruction per element
+    PRMT 0x7632        14,376,960 4.57%  unpack the high half of a packed pair
+    F2FP.BF16.PACK_AB   4,239,360 1.35%  narrow, two elements at once
+    PRMT 0x5410         2,949,120 0.94%  pack two halves for a shared store
+    ================== ========== ====== =========================================
+
+    2,211,840 of the ``PRMT 0x7632`` and 1,105,920 of the ``F2FP`` key to this line.
+    Carrying :func:`stage_shifted` and :func:`stage_state` at the destination tile's
+    own element type, so that this line converts nothing in either, leaves all four
+    counts unchanged to the instruction -- not one of the 55 convert-class
+    ``(line, opcode)`` pairs moves -- and costs 92,160 ``IADD3``. Adding a round trip
+    to :func:`stage_state`, which had none, likewise moves no per-pipe count on any
+    kernel of the tree, so ``bfloat16 -> float32 -> bfloat16`` around a pass with no
+    arithmetic in it is folded before ptxas. What is left is forced by the packed
+    tile: an element crossing between a packed 16-bit tile and a float32 register
+    costs one instruction per direction, which is the floor. Half the ``PRMT`` is
+    ``chunk_vector_bwd``'s own operand widening on two scalar dot products over
+    shared bfloat16 tiles. Reproduce with ``sm__inst_executed.sum`` and the five
+    per-pipe counters over ``scripts/perf/profile_target.py --op so3ssd --shape
+    acceptance``; every output is bitwise unchanged at all five shapes either way.
+
     Args:
         words: A tile from :func:`paired`, retiled at ``len(vals)``.
         frag: ``(1, len(vals))`` fragment of the tile's element type, built once by
