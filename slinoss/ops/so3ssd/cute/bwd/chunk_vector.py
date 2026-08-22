@@ -103,15 +103,16 @@ default configuration that is 640 blocks where the loop form launched 128, on an
 84-multiprocessor part.
 
 What crosses a lane tile is the transition chart: ``dtrans`` and ``dK`` are sums over
-lanes. A loop accumulated them in the row one block owned; separate blocks cannot.
-``dK`` leaves its epilogue in registers, so each tile writes its own float32 slot row
-and :func:`close_slots` sums the slots in a second launch. ``dtrans`` does not go that
-way. Every map between the rotation cotangent and it is linear, so the sum may cross
-them: each tile publishes :data:`PART_WORDS` words a token, increments an arrival
-counter, and the tile that reads the last value sums the slots and runs the maps once,
-which pays the two warp-serial scans and the exponential's adjoint on one tile of
-``tiles`` and deletes a launch. At one tile there are no slots, no counter and no
-published words, and the store is the output itself.
+lanes. A loop accumulated them in the row one block owned; separate blocks cannot. Each
+tile writes its own row and both sums close inside the launch, under one arrival
+counter: every tile increments it and the tile that reads the last value closes both.
+``dtrans`` publishes :data:`PART_WORDS` words a token, every map between the rotation
+cotangent and it being linear so the sum may cross them, and the closing tile runs the
+maps once, which pays the two warp-serial scans and the exponential's adjoint on one
+tile of ``tiles``. ``dK`` leaves its epilogue in registers into a float32 slot row that
+is past every map already, so closing it is an add of ``tiles`` rows in slot order and
+no map at all. Neither sum reaches a second launch. At one tile there are no slots, no
+counter and no published words, and the store is the output itself.
 
 The block's whole width waits on the increment. On the acceptance shape it is the
 largest single barrier site in the kernel: the shared read that broadcasts the
@@ -511,7 +512,6 @@ from slinoss._cute import (
     smem_residency,
     widen,
 )
-from slinoss._reduce import reduce_partials
 from slinoss.ops.so3ssd.cute.common import (
     TABLE_AC,
     TABLE_AFUSE,
@@ -596,7 +596,6 @@ __all__ = [
     "chunk_vector_backward",
     "chunk_vector_bwd",
     "chunk_vector_bwd_kernel",
-    "close_slots",
     "forced_tile",
     "gradient_tile",
     "lane_block",
@@ -731,10 +730,11 @@ cannot join the log-scale offset term ahead of the sum: the offset term is
 reverse-scanned at the closure and ``dls_step`` is not, so the two reach ``dtrans``
 through different maps.
 
-``dK`` is not here. Both taps of it now reach shared memory -- the current tap has
-two contributors under fusion and one of them is a different token's pass -- but the
-tile is summed over lanes by the slot buffer and the reduction launch that already
-carried it, not by this record."""
+``dK`` is not here and does not need to be. Its slot row is past every map, so its sum
+over lanes is an add and the closing tile reads the row back rather than a published
+word. Routing it through this record would publish eight more words a token on the
+token-innermost pitch the coalesced read-back needs, which is eight scalar stores where
+the row is two ``STG.E.128``."""
 
 PREFIX_WARPS: int = 4
 """Warps per block of :func:`chunk_prefix_bwd_kernel`.
@@ -1288,46 +1288,39 @@ class Slots(NamedTuple):
     the carry, which are sums over the heads of a group. The blocks holding the terms
     are concurrent and none can see the others' partials. Each such output gains a slot
     axis immediately outside its row axis: a block writes row ``slot * rows + local``,
-    and one second launch sums the ``slots`` copies of a row into the output's own.
+    and the ``slots`` copies of a row are summed into the output's own.
 
-    ``dtrans`` is the sum this does not close. Its remaining maps are linear, so its
-    partials are summed inside the producing launch under an arrival counter and it
-    needs no slot buffer at all. That is cheaper wherever it is available and it is
-    available only there: a slot row's partial has already had every map run on it, so
-    nothing but a second launch can finish it.
+    Which sum needs a second launch follows its grid axis, not its width. The lane
+    tiles of one ``(chunk, shard)`` are consecutive ``x`` indices, so ``dK``'s slots are
+    summed inside the producing launch under the arrival counter ``dtrans`` already
+    carries: the tile that arrives last reads the ``slots`` rows of its own
+    ``(batch, head, chunk)`` and adds them, which needs no map, no shared memory and no
+    zeroed accumulator. The head shards are not adjacent on any axis and ``dB`` and
+    ``dC`` are the launch's largest write, so those three keep :func:`vector_reduce`.
+
+    ``dtrans`` needs no slot buffer at all, its remaining maps being linear, so its
+    partials cross those maps as :data:`PART_WORDS` published words instead of a row.
+    That is available only there: a slot row has already had every map run on it, so
+    the only thing left to do to it is add it.
 
     At ``slots == 1`` there is no buffer and ``dest`` is the output. The row index is
     the same expression either way, ``slot`` being zero, so the kernel body does not
     know which mode it is in and neither mode carries a branch.
 
-    Outside the row axis rather than inside it, because the reduction's slab count is
-    what its grid puts on the y axis and that axis stops at 65,535. Inside, one slab
-    is one row: at ``B 4 H 18 T 2048`` that is 147,456 slabs of four columns and the
-    launch is refused. Outside, a slab is a head: 72 slabs of ``T*4`` columns, the
-    grid over columns carries the parallelism, and the block count rises rather than
-    the slab count.
-
-    Which second launch closes a buffer follows its output's layout, not its axis.
-    ``dK`` is contiguous, so :func:`close_slots` views it as ``(S, R, W)`` and
-    :func:`slinoss._reduce.reduce_partials` sums the rows.
-    ``dB`` and ``dC`` are bands that may be pitched in their last mode, where no such
-    view exists, so :func:`vector_reduce` sums them by mode instead; it takes the
-    carry with them, the three sharing one launch.
+    Outside the row axis rather than inside it, so that a slot is one contiguous run of
+    the rows a block owns. ``dK``'s closure reads a whole ``(batch, head, chunk)``
+    record of a slot as ``L`` tokens of eight adjacent float32, which is the form a
+    warp covers in one 128-byte access; inside the row axis the same record would be
+    ``tiles``-strided and every closing load would take its own sector.
 
     Attributes:
         dest: What the kernel writes. The output at one slot, a partial buffer at the
             output's own dtype above one.
         slots: Copies of each row, one per lane tile or one per head shard.
-        out: The output the sum closes onto, or None at one slot.
-        slabs: ``S`` of the reduction, the modes before the slot axis.
-        width: ``W`` of the reduction, the row axis and everything after it.
     """
 
     dest: Tensor
     slots: int
-    out: Tensor | None
-    slabs: int
-    width: int
 
 
 def open_slots(out: Tensor, slots: int, axis: int = -2) -> Slots:
@@ -1346,13 +1339,8 @@ def open_slots(out: Tensor, slots: int, axis: int = -2) -> Slots:
     """
     shape = [int(extent) for extent in out.shape]
     axis %= len(shape)
-    slabs, width = 1, 1
-    for extent in shape[:axis]:
-        slabs *= extent
-    for extent in shape[axis:]:
-        width *= extent
     if slots == 1:
-        return Slots(dest=out, slots=1, out=None, slabs=slabs, width=width)
+        return Slots(dest=out, slots=1)
     # The output's own width, not float32. A partial is one term of a sum the closure
     # rounds again on its own store, so a wider partial buys a rounding the output
     # cannot keep, and at the widest configured state the two vector buffers are
@@ -1364,28 +1352,7 @@ def open_slots(out: Tensor, slots: int, axis: int = -2) -> Slots:
         dtype=out.dtype,
         device=out.device,
     )
-    return Slots(dest=held, slots=slots, out=out, slabs=slabs, width=width)
-
-
-def close_slots(held: Slots) -> Tensor:
-    """Sum a slot buffer onto its output, in one launch, or return the output.
-
-    The output must be contiguous, the reduction being a row view of it. A pitched
-    destination goes through :func:`vector_reduce`.
-
-    Args:
-        held: From :func:`open_slots`.
-
-    Returns:
-        The output.
-    """
-    if held.out is None:
-        return held.dest
-    reduce_partials(
-        held.dest.view(held.slabs, held.slots, held.width),
-        out=held.out.view(held.slabs, held.width),
-    )
-    return held.out
+    return Slots(dest=held, slots=slots)
 
 
 def _lane_view(src: cute.Tensor, joff: cutlass.Int32) -> cute.Tensor:
@@ -2800,6 +2767,7 @@ def chunk_vector_bwd_kernel(
     gcarry: cute.Tensor,
     gdtrans: cute.Tensor,
     gdtap: cute.Tensor,
+    gdk: cute.Tensor,
     gpart: cute.Tensor,
     gcount: cute.Tensor,
     seqlen: cutlass.Int32,
@@ -2824,10 +2792,12 @@ def chunk_vector_bwd_kernel(
     Two axes carry outputs a block does not own alone. ``dB``, ``dC`` and the carry are
     sums over the heads of a group, so a shard past the first writes its own slot row,
     the offset being zero at one shard where the destination is the output itself.
-    ``dtrans`` and ``dK`` are sums over lanes. ``dK`` takes a slot row on the same
-    convention. ``dtrans`` does not: every map between the rotation cotangent and it is
+    ``dtrans`` and ``dK`` are sums over lanes and neither reaches a second launch. ``dK``
+    takes a slot row on the same convention and the tile that arrives last adds the
+    ``tiles`` rows of its own ``(batch, head, chunk)``, the row being past every map
+    already. ``dtrans`` takes no row: every map between the rotation cotangent and it is
     linear, so each tile publishes :data:`PART_WORDS` words a token to ``gpart`` and
-    the tile that arrives last sums them and runs the maps once.
+    the same tile sums them and runs the maps once.
 
     Both chart rows leave in one access. ``dtrans`` is four float32 a token and ``dK``
     is four a tap, and both destinations are allocated whole, so a row's offset is a
@@ -2887,7 +2857,11 @@ def chunk_vector_bwd_kernel(
         gdtrans: ``(B,H,T,4)`` float32 ``dtrans``, written by the lane tile that
             closes the chart. Never a slot buffer: the chart's sum over lane tiles is
             closed here.
-        gdtap: ``(B,H,tiles*T,2,4)`` float32 ``dK`` or its slot buffer, written.
+        gdtap: ``(B,H,tiles*T,2,4)`` float32 ``dK`` or its slot buffer, written by
+            every lane tile and read back by the one that arrives last.
+        gdk: ``(B,H,T,2,4)`` float32 ``dK``, written by the lane tile that closes the
+            slots. ``gdtap`` itself at one tile, where the store above is the output's
+            and this pass traces away.
         gpart: ``(B,H,C,tiles*PART_WORDS,L)`` float32 chart partials, written by every
             lane tile and read back by the one that arrives last. A rank-matched
             placeholder at one tile, where nothing crosses.
@@ -2925,7 +2899,9 @@ def chunk_vector_bwd_kernel(
         reproducible. What it sums is: :func:`_sum_slots` reads the slots of a word in
         ascending slot index and the affine terms enter after the sum, so the term
         order is one order for every arriver and a rerun at one shape reproduces
-        ``dtrans`` bit for bit. ``gcount`` must be zero at entry.
+        ``dtrans`` bit for bit. ``dK``'s close reads ``gdtap``'s slots in the same
+        ascending order, into a float32 accumulator opened at zero, so it holds too.
+        ``gcount`` must be zero at entry.
     """
     tid, _, _ = cute.arch.thread_idx()
     xidx, bidx, gidx = cute.arch.block_idx()
@@ -3625,6 +3601,34 @@ def chunk_vector_bwd_kernel(
             cute.arch.sync_threads()
             run = sflag[0] == tiles - 1
         if run:
+            # ``dK``'s slot rows close here and not in a launch of their own. They are
+            # past every map, so this is a float32 add of ``tiles`` rows in slot order --
+            # the order the reduction it replaces summed in, and the same order for
+            # every arriver, so it is bitwise what that launch produced. It needs no
+            # shared memory, no map and no zeroed accumulator, and the barrier, the
+            # fence and the arrival branch above are the ones ``dtrans`` already pays.
+            #
+            # A record is ``L`` tokens of eight adjacent float32 and the block owns two
+            # words a thread, so a warp covers 128 B of a slot in one access. The two
+            # stores are the reduction's own.
+            if cutlass.const_expr(tiles > 1):
+                vslot = gdtap[bidx, hidx, None, None, None]
+                kwords = chunk * 8
+                for step in cutlass.range_constexpr(-(-kwords // threads)):
+                    i = tid + step * threads
+                    # One guard, not two: past ``kwords`` the token index runs past
+                    # ``chunk`` and therefore past ``valid``, which is at most it.
+                    if i // 8 < valid:
+                        krow = t0 + i // 8
+                        ksum = zero
+                        for slot in range(tiles):
+                            ksum = ksum + _load_cg(
+                                vslot.iterator
+                                + vslot.layout(
+                                    (slot * seqlen + krow, (i % 8) // 4, i % 4)
+                                )
+                            )
+                        gdk[bidx, hidx, krow, (i % 8) // 4, i % 4] = ksum
             # The transition's own two cotangents and the chunk-input stage's half of
             # the log-scale cotangent are affine in the sum, so they enter after it and
             # are read by this tile alone. The rotation term passes through the same
@@ -3788,6 +3792,7 @@ def chunk_vector_bwd(
     gcarry: cute.Tensor,
     gdtrans: cute.Tensor,
     gdtap: cute.Tensor,
+    gdk: cute.Tensor,
     gpart: cute.Tensor,
     gcount: cute.Tensor,
     seqlen: cutlass.Int32,
@@ -3844,6 +3849,7 @@ def chunk_vector_bwd(
         gcarry,
         gdtrans,
         gdtap,
+        gdk,
         gpart,
         gcount,
         seqlen,
@@ -4060,6 +4066,7 @@ def chunk_vector_backward(
     warps: int = WARPS_WIDE,
     prefix_lp: Tensor | None = None,
     prefix_q: Tensor | None = None,
+    arrived: Tensor | None = None,
 ) -> ChunkVectorBwd:
     """Differentiate the rowwise vectors and the transition parameters.
 
@@ -4070,11 +4077,12 @@ def chunk_vector_backward(
 
     Two workspaces, both allocated here and freed on return, and both holding one
     partial row per block of a sum whose terms separate blocks cannot share. Above one
-    lane tile the transition chart is a sum over lanes: ``(B, H, tiles * T, 4)`` and
-    ``(B, H, tiles * T, 2, 4)``, float32 with their outputs. Above partial depth one
-    the two vectors and the carry are sums over heads: ``(B, G, splits * T, 3N)``
-    twice at the activation width and ``(B, G, splits * C, 3N)`` at float32, which is
-    :func:`partial_bytes`. Each partial carries its own output's width, that output's
+    lane tile ``dK`` is a sum over lanes: ``(B, H, tiles * T, 2, 4)`` float32 with its
+    output, closed inside the main launch by the tile that arrives last. Above partial
+    depth one the two vectors and the carry are sums over heads:
+    ``(B, G, splits * T, 3N)`` twice at the activation width and
+    ``(B, G, splits * C, 3N)`` at float32, which is :func:`partial_bytes`, closed by
+    :func:`vector_reduce`. Each partial carries its own output's width, that output's
     store being one more rounding on the same path. At one copy of either there is no
     buffer and the kernel stores the output directly.
 
@@ -4135,6 +4143,11 @@ def chunk_vector_backward(
             reads it too, so the scan runs once for both.
         prefix_q: ``(B,H,C,4,L)`` float32 inclusive quaternion prefix product,
             component-major, under the contract of ``prefix_lp``. Both or neither.
+        arrived: ``(B,H,C)`` int32 zeros, contiguous, the arrival counter the lane
+            sums close on, or None to allocate and zero it here. A caller whose
+            earlier launch already wrote the zeros hands them over and the fill costs
+            no launch; the tensor is read and incremented, never read after, so what
+            it holds on return is arrival order.
 
     Returns:
         :class:`ChunkVectorBwd`.
@@ -4215,21 +4228,23 @@ def chunk_vector_backward(
     carry_b = torch.empty(bsz, groups, chunks, dim, dtype=torch.float32, device=device)
     dtrans = torch.empty(bsz, heads, seqlen, 4, dtype=torch.float32, device=device)
     dK = torch.empty(bsz, heads, seqlen, 2, 4, dtype=torch.float32, device=device)
-    # The two outputs that are sums over lanes, and the three that are sums over the
+    # The one output that is a sum over lanes, and the three that are sums over the
     # heads of a group. Nothing else needs a partial row: every other output spans the
-    # state width and belongs to one head, so one block owns it.
+    # state width and belongs to one head, so one block owns it. ``dK``'s rows are read
+    # back and closed by the tile that arrives last, so the buffer is freed on return
+    # and no launch of its own reads it.
     tiles = dim // lane_block(dim)
     held = open_slots(dK, tiles, axis=-3)
     shared = tuple(open_slots(out, shards) for out in (dB, dC, carry_b))
-    # The chart partials the lane tiles publish and the arrival counter that closes
-    # them: :data:`PART_WORDS` words a token a tile, 23.59 MB at the acceptance shape,
-    # freed on return with the prefixes. ``dtrans`` takes no slot buffer and no second
-    # launch, the chart closing in whichever tile arrives last.
+    # The chart partials the lane tiles publish and the arrival counter that closes both
+    # lane sums: :data:`PART_WORDS` words a token a tile, 23.59 MB at the acceptance
+    # shape, freed on return with the prefixes. ``dtrans`` takes no slot buffer at all.
     #
-    # The counter is zeroed rather than counted by generation: the fill is 9.2 kB and
-    # its cost is visible, where a reset bug in a monotone counter is not. At one tile
-    # both are placeholders of the same rank and dtype, so the launch key is the same
-    # and the leading modes still index in range.
+    # The counter is zeroed rather than counted by generation: a reset bug in a monotone
+    # counter is invisible, where a fill is not. Its own launch is 9.2 kB and 1.86 us, so
+    # a caller whose earlier launch holds one block per element writes the zeros there
+    # and supplies it. At one tile both are placeholders of the same rank and dtype, so
+    # the launch key is the same and the leading modes still index in range.
     chart = torch.empty(
         bsz,
         heads,
@@ -4239,7 +4254,18 @@ def chunk_vector_backward(
         dtype=torch.float32,
         device=device,
     )
-    arrived = torch.zeros(bsz, heads, chunks, dtype=torch.int32, device=device)
+    if arrived is None:
+        arrived = torch.zeros(bsz, heads, chunks, dtype=torch.int32, device=device)
+    elif (
+        tuple(arrived.shape) != (bsz, heads, chunks)
+        or arrived.dtype is not torch.int32
+        or not arrived.is_contiguous()
+        or arrived.device != device
+    ):
+        raise ValueError(
+            f"arrived must be a contiguous int32 {(bsz, heads, chunks)} on {device}, "
+            f"got {tuple(arrived.shape)} {arrived.dtype} on {arrived.device}"
+        )
     # The two chunk-local transition prefixes, scanned once per (batch, head, chunk)
     # rather than once per lane tile. A caller whose earlier launch reads them hands
     # them over and the scan runs once for both; otherwise they are allocated here and
@@ -4290,6 +4316,7 @@ def chunk_vector_backward(
             shared[2].dest,
             dtrans,
             held.dest,
+            dK,
             chart,
             arrived,
             seqlen,
@@ -4310,7 +4337,6 @@ def chunk_vector_backward(
             min(RESIDENT_MAX, smem_residency(budget)),
         ),
     )
-    close_slots(held)
     if shards > 1:
         jit_launch(
             vector_reduce,

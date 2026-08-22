@@ -85,7 +85,10 @@ def test_coverage_of_refuses_an_arm_it_cannot_judge() -> None:
     # against nothing, which is the vacuous pass one level up.
     with pytest.raises(KeyError, match="no coverage entry"):
         coverage_of("so3ssd", "decode")
-    assert coverage_of(*SCAN_STEP).conditional[0].kernel == "reduce_rows_kernel"
+    # And a mode it does know resolves rather than raising, which is what makes the
+    # refusal above about the mode and not about the lookup. What the entry holds is
+    # asserted where the table is checked, not here.
+    assert coverage_of(*SCAN_STEP).required
 
 
 # ---------------------------------------------------------------------------

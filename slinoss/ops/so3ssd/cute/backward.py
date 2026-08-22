@@ -226,6 +226,7 @@ def so3ssd_bwd_cute(
         dC=dC,
         prefix_lp=prefixes.lp,
         prefix_q=prefixes.q,
+        arrived=inputs.arrived,
     )
     stream = boundary_backward(
         inputs.carry_u,

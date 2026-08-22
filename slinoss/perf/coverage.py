@@ -123,12 +123,6 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
         ),
         conditional=(
             Conditional(
-                "reduce_rows_kernel",
-                "3N above one lane tile, 48 columns: the vector backward writes "
-                "dtrans and dK once per lane tile and closes the slots in one "
-                "reduction, and at 3N == 48 there is one tile and no slot buffer",
-            ),
-            Conditional(
                 "vector_reduce_kernel",
                 "a head-sum depth above one: the vector backward shares a group's "
                 "heads over that many blocks and a second launch closes the partials, "

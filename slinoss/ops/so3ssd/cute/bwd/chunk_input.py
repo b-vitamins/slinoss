@@ -1119,6 +1119,7 @@ def chunk_input_bwd_kernel(
     gdlp: cute.Tensor,
     gdrot: cute.Tensor,
     gdscale: cute.Tensor,
+    gcount: cute.Tensor,
     seqlen: cutlass.Int32,
     tiled_mma: cute.TiledMma,
     threads: cutlass.Constexpr,
@@ -1155,6 +1156,10 @@ def chunk_input_bwd_kernel(
             the log-scale-prefix cotangent, every slot including the padded ones.
         gdrot: ``(B,H,C,3,3)`` float32, written with the closing rotation cotangent.
         gdscale: ``(B,H,C)`` float32, written with the closing scale cotangent.
+        gcount: ``(B,H,C)`` int32, written with zero. Not read here: it is the arrival
+            counter :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_bwd`
+            closes its lane sums on, and this grid holds one block per element of it, so
+            the zero rides an already-uniform branch instead of its own launch.
         seqlen: ``T``. Dynamic.
         tiled_mma: From :func:`slinoss.ops.so3ssd.cute.mma.make_mma`.
         threads: Block width. Compile-time.
@@ -1822,6 +1827,11 @@ def chunk_input_bwd_kernel(
         for i in cutlass.range_constexpr(3):
             for j in cutlass.range_constexpr(3):
                 gdrot[bidx, hidx, cidx, i, j] = drot[3 * i + j]
+        # The next launch's arrival counter, zeroed on the branch that was already
+        # uniform and already storing. This grid holds one block per element of it, so
+        # the fill needs no launch of its own; the launch boundary between here and the
+        # reader is the ordering.
+        gcount[bidx, hidx, cidx] = cutlass.Int32(0)
 
     for step in cutlass.range_constexpr(-(-chunk // threads)):
         token = tid + step * threads
@@ -1899,6 +1909,7 @@ def chunk_input_bwd(
     gdlp: cute.Tensor,
     gdrot: cute.Tensor,
     gdscale: cute.Tensor,
+    gcount: cute.Tensor,
     seqlen: cutlass.Int32,
     chunks: cutlass.Int32,
     bsz: cutlass.Int32,
@@ -1939,6 +1950,7 @@ def chunk_input_bwd(
         gdlp,
         gdrot,
         gdscale,
+        gcount,
         seqlen,
         make_mma(dtype, threads // 32),
         threads,
@@ -1977,6 +1989,10 @@ class ChunkInputBwd(NamedTuple):
         dchunk_rot: ``(B,H,C,3,3)`` float32 cotangent of each chunk's closing
             rotation, row-major.
         dchunk_scale: ``(B,H,C)`` float32 cotangent of each chunk's closing scale.
+        arrived: ``(B,H,C)`` int32 zeros, not a cotangent. The arrival counter
+            :func:`slinoss.ops.so3ssd.cute.bwd.chunk_vector.chunk_vector_backward`
+            closes its lane sums on, filled here because this grid is one block per
+            element of it and the fill would otherwise be a launch.
     """
 
     dU: Tensor
@@ -1984,6 +2000,7 @@ class ChunkInputBwd(NamedTuple):
     dlogp: Tensor
     dchunk_rot: Tensor
     dchunk_scale: Tensor
+    arrived: Tensor
 
 
 def chunk_input_backward(
@@ -2091,6 +2108,7 @@ def chunk_input_backward(
         bsz, heads, chunks, 3, 3, dtype=torch.float32, device=device
     )
     dchunk_scale = torch.empty(bsz, heads, chunks, dtype=torch.float32, device=device)
+    arrived = torch.empty(bsz, heads, chunks, dtype=torch.int32, device=device)
     jit_launch(
         chunk_input_bwd,
         (
@@ -2110,6 +2128,7 @@ def chunk_input_backward(
             dlogp,
             dchunk_rot,
             dchunk_scale,
+            arrived,
             seqlen,
             chunks,
             bsz,
@@ -2135,4 +2154,5 @@ def chunk_input_backward(
         dlogp=dlogp,
         dchunk_rot=dchunk_rot,
         dchunk_scale=dchunk_scale,
+        arrived=arrived,
     )
