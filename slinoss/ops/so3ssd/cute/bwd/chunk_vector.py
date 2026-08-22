@@ -2232,6 +2232,114 @@ def _rotate_rows(
 
 
 @cute.jit
+def _stage_run(
+    gb: cute.Tensor,
+    gbprev: cute.Tensor,
+    gu: cute.Tensor,
+    guprev: cute.Tensor,
+    gscore: cute.Tensor,
+    sb: cute.Tensor,
+    su: cute.Tensor,
+    sscore: cute.Tensor,
+    bidx: cutlass.Int32,
+    gidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    t0: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    nbase: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    tile: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    spad: cutlass.Constexpr,
+    mpad: cutlass.Constexpr,
+    has_prev: cutlass.Constexpr,
+) -> None:
+    """Issue one source-token block's three staged tiles, asynchronously, no wait.
+
+    Stated once because it has two call sites: hoisted for the first block, whose
+    write-after-read fence is a barrier the head already carries, and in the block
+    loop for every later one, whose fence is the barrier that closed the previous
+    iteration. Neither reads the transform table, so neither has to follow the build.
+
+    The three passes sit together so their global loads overlap: each one's issues
+    cover the next one's runs, and the caller's single ``cp_async_wait_group`` retires
+    all three.
+
+    Args:
+        gb: ``(B,G,T,tile)`` lane view of the forcing operand.
+        gbprev: ``(B,G,tile)`` streaming predecessor of ``gb``.
+        gu: ``(B,H,T,P)`` input operand.
+        guprev: ``(B,H,P)`` streaming predecessor of ``gu``.
+        gscore: ``(L,L)`` masked score record of this head and chunk.
+        sb: Operand-dtype tile of ``span + 1`` rows, written.
+        su: Operand-dtype tile of ``spad + 1`` rows, written.
+        sscore: Operand-dtype ``(L, span)`` tile, written.
+        bidx: Batch index.
+        gidx: Group index, which is what the lane view of ``gb`` is sliced on.
+        hidx: Head index.
+        t0: First token of the chunk.
+        valid: Tokens of the chunk that exist.
+        tid: Thread index within the block.
+        nbase: First chunk-local token of the block. Compile-time, so the shifted
+            passes fold their row offsets as they did at the call site this replaces.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        rows: ``P``. Compile-time.
+        tile: Lane-tile width. Compile-time.
+        span: Tokens of the block. Compile-time.
+        spad: ``span`` rounded to the atom's M mode. Compile-time.
+        mpad: ``chunk`` rounded to the atom's M mode. Compile-time.
+        has_prev: Whether a streaming predecessor exists. Compile-time.
+    """
+    stage_shifted(
+        gb,
+        gbprev,
+        sb,
+        bidx,
+        gidx,
+        t0,
+        nbase,
+        valid,
+        tid,
+        threads,
+        span,
+        tile,
+        has_prev,
+        True,
+    )
+    stage_shifted(
+        gu,
+        guprev,
+        su,
+        bidx,
+        hidx,
+        t0,
+        nbase,
+        valid,
+        tid,
+        threads,
+        spad,
+        rows,
+        has_prev,
+        True,
+    )
+    stage_score(
+        gscore,
+        sscore,
+        nbase,
+        tid,
+        threads,
+        chunk,
+        span,
+        mpad - chunk,
+        True,
+    )
+
+
+@cute.jit
 def _tap_epilogue(
     gdtap: cute.Tensor,
     sdb: cute.Tensor,
@@ -3366,6 +3474,42 @@ def chunk_vector_bwd_kernel(
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
+        # The first source-token block's tiles, issued here and waited two barriers
+        # down. They were issued at the top of the block loop, where their runs had
+        # only their own issues to cover them: the wait there was 8.62% of the kernel's
+        # samples for 1.55% of its instructions, the widest gap between work and wall
+        # any region of this kernel holds. What covers them here is the offset term's
+        # GEMM and butterfly and the closing transition's staging, and the barrier
+        # above is the write-after-read fence their destinations need. ``sscore``'s
+        # destination aliases the forcing gradient, whose last read is the previous
+        # head's epilogue; that barrier is the one under the head's own staging.
+        if cutlass.const_expr(blocks == 1):
+            _stage_run(
+                gbj,
+                gbprevj,
+                gu,
+                guprev,
+                gdscore[bidx, hidx, cidx, None, None],
+                sb,
+                su,
+                sscore,
+                bidx,
+                gidx,
+                hidx,
+                t0,
+                valid,
+                tid,
+                0,
+                threads,
+                chunk,
+                rows,
+                tile,
+                span,
+                spad,
+                mpad,
+                has_prev,
+            )
+
         # The offset term, and the log-scale cotangent it carries. The scale is
         # per target token, so it rides the accumulator's M mode and is applied
         # after the reduction that needs the unscaled value.
@@ -3439,65 +3583,42 @@ def chunk_vector_bwd_kernel(
 
         for nstep in cutlass.range_constexpr(blocks):
             nbase = nstep * span
-            stage_shifted(
-                gbj,
-                gbprevj,
-                sb,
-                bidx,
-                gidx,
-                t0,
-                nbase,
-                valid,
-                tid,
-                threads,
-                span,
-                tile,
-                has_prev,
-                True,
-            )
-            stage_shifted(
-                gu,
-                guprev,
-                su,
-                bidx,
-                hidx,
-                t0,
-                nbase,
-                valid,
-                tid,
-                threads,
-                spad,
-                rows,
-                has_prev,
-                True,
-            )
-            # The masked score, read rather than formed. Its value does not depend on
-            # the lane tile, so the fused form ran a GEMM, an exponential an element
-            # and a transpose store ``tiles`` times for one answer;
-            # :func:`slinoss.ops.so3ssd.cute.bwd.chunk_input.chunk_input_bwd_kernel`
-            # already holds the same product against the same mask and publishes it.
-            # Beside the two passes above so the three sets of global loads overlap,
-            # and the barrier below publishes all three. The tile it lands in aliases
-            # the forcing gradient, whose last read is the epilogue of the previous
-            # iteration, closed by the barrier at the end of that iteration.
-            stage_score(
-                gdscore[bidx, hidx, cidx, None, None],
-                sscore,
-                nbase,
-                tid,
-                threads,
-                chunk,
-                span,
-                mpad - chunk,
-                True,
-            )
-            # The staged tiles above are published here. One forcing column, so the
-            # rotation and the three products below run once a block where the two-tap
-            # form ran each of them twice. The three passes above are asynchronous
-            # where their element widths agree and the streaming carry is absent, so
-            # the loads are in flight across all three and each one's issues cover the
-            # next's; the wait retires the group for this thread before the barrier
-            # retires it for the block, and is a no-op where every pass took the
+            # Only the blocks that have a predecessor to fence against. The first one is
+            # hoisted above the offset term, where there is cover for its runs; the
+            # fence a later one needs is the barrier that closed the previous iteration,
+            # which is here, so a later one cannot be hoisted with it. The masked score
+            # lands in a tile that aliases the forcing gradient, whose last read is that
+            # same epilogue.
+            if cutlass.const_expr(blocks > 1):
+                _stage_run(
+                    gbj,
+                    gbprevj,
+                    gu,
+                    guprev,
+                    gdscore[bidx, hidx, cidx, None, None],
+                    sb,
+                    su,
+                    sscore,
+                    bidx,
+                    gidx,
+                    hidx,
+                    t0,
+                    valid,
+                    tid,
+                    nbase,
+                    threads,
+                    chunk,
+                    rows,
+                    tile,
+                    span,
+                    spad,
+                    mpad,
+                    has_prev,
+                )
+            # The staged tiles are published here. One forcing column, so the rotation
+            # and the three products below run once a block where the two-tap form ran
+            # each of them twice. The wait retires the group for this thread before the
+            # barrier retires it for the block, and is a no-op where every pass took the
             # register form, no group having been committed.
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
