@@ -407,14 +407,14 @@ def scan_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     and the same warps arrive with none of the round trip.
 
     Narrow arenas on sm_86, at the shipped 101,376 B carveout, against the paired
-    delta the wide form measures at that geometry over 200 alternations:
+    delta the wide form measures at that geometry over at least 200 alternations:
 
         L    P    3N    narrow   blocks   wide      delta
-        64   16   48    26,112   3        31,232    +0.6%
+        64   16   48    26,112   3        31,232    +0.0%
         64   48   48    29,952   3        35,072    +2.9%
         64   64   96    45,056   2        50,176    -2.7%
         128  48   48    49,152   2        55,296    +36.3%
-        64   64   240   81,920   1        87,040    -13.9%
+        64   64   240   81,920   1        87,040    -18.2%
 
     Only the last takes the wide form. ``L`` 128 is the near case and is refused by
     5,120 B: its score tile is 6,144 B against the 1,024 B of headroom the two-block
@@ -423,8 +423,10 @@ def scan_threads(chunk: int, rows: int, dim: int, itemsize: int = 2) -> int:
     Banked, not taken: ``P`` 64 ``3N`` 96 keeps both blocks and still measures 4.6 us
     faster wide, resolving. That is not the lever this gate prices -- there the
     second warp group arrives at an unchanged residency -- so the win has no account
-    here and taking it on the residency-preserving rule would also take ``P`` 16
-    ``3N`` 48, which measures 1.3 us slower.
+    here. The counterexample that used to stand beside that account is gone: ``P`` 16
+    ``3N`` 48 was recorded 1.3 us slower wide, and re-measured on a quiet host, where
+    that geometry's call is 7.2 us rather than the 259 us the earlier reading carried,
+    it is level to the event granule. The refusal rests on the account alone.
 
     Args:
         chunk: ``L``.
@@ -836,8 +838,22 @@ def chunk_scan_fwd_kernel(
     cute.arch.sync_threads()
 
     # Before the accumulators exist, so the peak live set is still the slice loop's.
-    # It reads the readout tile and the table, both published by the barrier above,
-    # and the barrier below publishes ``sdnow`` to the store epilogue.
+    # It reads the readout tile and the table, both published by the barrier above.
+    #
+    # No barrier follows. ``sdnow`` is read once, in the store epilogue, and the
+    # slice loop's top barrier stands between the write and that read, so a barrier
+    # here fences nothing. What it did instead was park the second warp group for
+    # the whole reduction: a PC-sample census at ``acceptance`` put 40.07% of the
+    # launch's barrier stall on the barrier that used to sit here, against 3.34% on
+    # the score tile's round trip and no more than 22.24% on any of the other six.
+    # Without it the threads at or above :data:`THREADS` fall out of the guard into
+    # the offset GEMM below and run it against the residue. That GEMM reads
+    # ``scrot`` and ``sbz``, both published by the barrier above and neither
+    # rewritten until the loop's own staging, which is past the loop's top barrier.
+    # Paired over 400 alternations at ``acceptance`` that is 408.576 -> 391.168 us,
+    # 1.0445x, and the barrier stall the launch pays falls 93.2 M warp-cycles to
+    # 80.3 M rather than to nothing: the parked warps move to the loop's top barrier,
+    # and what the launch wins is the half of the offset GEMM they now run early.
     #
     # The reduction partition is :data:`THREADS`, whatever the block width. It is
     # ``threads // L`` threads to a token and a butterfly over them, so a wider block
@@ -864,7 +880,6 @@ def chunk_scan_fwd_kernel(
                 chunk,
                 lanes,
             )
-    cute.arch.sync_threads()
 
     va_crot = cute.make_tensor(
         scrot.iterator, cute.make_layout((mpad, dim), stride=(ldv, 1))
