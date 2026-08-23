@@ -28,6 +28,14 @@ the floor that resolves anything.
 ``--seq`` holds one shape's geometry and varies its sequence length, which the six
 names cannot: they differ in five other extents as well.
 
+``--heads`` does the same for the head count, and exists because ``causal_conv1d``
+refuses a convolution row stride that is not a multiple of eight. That stride is
+Mamba2's in-projection width, the width carries ``+nheads`` over terms that are all
+multiples of eight, and no registered head count is one, so at every name here
+Mamba2 has no armed convolution on either of its paths. A count that is a multiple
+of eight is what makes the end-to-end clause measurable against the layer a Mamba2
+user runs.
+
 ``--end-to-end`` measures the second acceptance clause instead of the first. The
 first compares the scan operators at iso state dimension; the second compares the
 whole layer at iso ``d_model``, so norm, projections and convolution are inside both
@@ -347,6 +355,24 @@ def d_model_of(shape: OpShape) -> int:
     return layer_config(shape, groups=shape.groups).d_model
 
 
+def projection_width(shape: OpShape, groups: int) -> int:
+    """Mamba2's in-projection width at this geometry.
+
+    ``2*d_inner + 2*ngroups*dstate + nheads``, which is Mamba2's own formula. At iso
+    ``d_model`` the head count is the shape's: ``d_inner`` is ``H*P`` and ``headdim``
+    is ``P``.
+
+    Args:
+        shape: The SO(3) shape.
+        groups: Mamba2 group count.
+
+    Returns:
+        The width in elements.
+    """
+    d_inner = 2 * d_model_of(shape)
+    return 2 * d_inner + 2 * groups * shape.d_state + shape.heads
+
+
 def fused_path_blocker() -> str | None:
     """Report why Mamba2's fused forward cannot run, if it cannot.
 
@@ -355,6 +381,9 @@ def fused_path_blocker() -> str | None:
     rather than degrading. The unfused path guards the same handle and falls back to
     ``nn.Conv1d``. Probe the handle instead of the package: what decides is the
     symbol ``ssd_combined`` bound at import.
+
+    This is the package question alone. The geometry question is
+    :func:`conv_stride_blocker` and it applies to both paths.
 
     Returns:
         A one-line reason, or ``None`` if the fused path is callable.
@@ -371,6 +400,44 @@ def fused_path_blocker() -> str | None:
             "mamba_split_conv1d_scan_combined calls a None handle"
         )
     return None
+
+
+def conv_stride_blocker(shape: OpShape, groups: int) -> str | None:
+    """Report why ``causal_conv1d`` refuses this geometry, if it does.
+
+    Both Mamba2 forwards slice the convolution operand out of the in-projection
+    output, so the operand's row stride is the projection width, and ``causal_conv1d``
+    requires that stride to be a multiple of eight in its channel-last layout. Every
+    term of the width except the head count is already a multiple of eight, so the
+    head count alone decides, and no registered head count clears it.
+
+    This is not the fused path's problem alone. The unfused path guards the handle
+    against absence but not the stride against misalignment, so with the package
+    installed it raises from inside Mamba2 rather than falling back to ``nn.Conv1d``.
+    Unchecked that lands as a torch traceback partway through a sweep.
+
+    Args:
+        shape: The geometry to check.
+        groups: Mamba2 group count.
+
+    Returns:
+        A one-line reason, or ``None`` if the convolution can run.
+    """
+    try:
+        import causal_conv1d  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        # Absent, so Mamba2 takes ``nn.Conv1d`` on the unfused path and the stride
+        # never reaches a guard. The fused path is blocked by the handle instead.
+        return None
+    width = projection_width(shape, groups)
+    if width % 8 == 0:
+        return None
+    return (
+        f"causal_conv1d needs a convolution row stride that is a multiple of 8 and "
+        f"this geometry gives it {width:,}, the in-projection width, which H="
+        f"{shape.heads} leaves {width % 8} past a multiple; only a head count that "
+        f"is a multiple of 8 clears it, and --heads reaches one"
+    )
 
 
 def unbuilt_stage_blocker(device: torch.device) -> str | None:
@@ -777,6 +844,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "a table over the names is five geometries and not a sweep in T.",
     )
     parser.add_argument(
+        "--heads",
+        action="append",
+        type=int,
+        help="Head count to hold each shape at. Repeatable. Defaults to the shape's "
+        "own. A count that is not a multiple of 8 makes Mamba2's in-projection "
+        "width one too, and causal_conv1d refuses that stride on both of its "
+        "paths, so an armed baseline needs one that is.",
+    )
+    parser.add_argument(
         "--chunk",
         action="append",
         type=int,
@@ -889,6 +965,48 @@ def seq_variants(shape: OpShape, lengths: Sequence[int]) -> tuple[OpShape, ...]:
     return tuple(
         replace(shape, name=f"{shape.name}-t{seq}", seq=seq) for seq in lengths
     )
+
+
+def head_variants(shape: OpShape, counts: Sequence[int]) -> tuple[OpShape, ...]:
+    """One copy of a shape per requested head count.
+
+    This override exists for one reason: ``causal_conv1d`` refuses a convolution row
+    stride that is not a multiple of eight, that stride is Mamba2's in-projection
+    width, and the width carries ``+nheads`` over terms that are all multiples of
+    eight. Every registered head count -- 1, 12, 18 -- therefore blocks **both**
+    Mamba2 paths, not only the fused one, and Mamba2 falls back to ``nn.Conv1d`` or
+    raises. A head count that is a multiple of eight is what arms the baseline.
+
+    Only ``H`` moves, and ``G`` with it when the shape was ungrouped, so a shape that
+    gave every head its own ``B``/``C`` pair still does.
+
+    Args:
+        shape: The named shape.
+        counts: Head counts, or empty for the shape's own.
+
+    Returns:
+        The shapes to measure, in the order requested.
+
+    Raises:
+        ValueError: If a count is not positive, or does not divide by the group
+            count the shape keeps.
+    """
+    if not counts:
+        return (shape,)
+    out = []
+    for heads in counts:
+        if heads < 1:
+            raise ValueError(f"a head count must be positive, got {heads}")
+        groups = heads if shape.groups == shape.heads else shape.groups
+        if heads % groups:
+            raise ValueError(
+                f"{groups} groups do not divide {heads} heads; the group count is "
+                f"the shape's and the override moves only H"
+            )
+        out.append(
+            replace(shape, name=f"{shape.name}-h{heads}", heads=heads, groups=groups)
+        )
+    return tuple(out)
 
 
 def chunk_variants(shape: OpShape, lengths: Sequence[int]) -> tuple[OpShape, ...]:
@@ -1096,6 +1214,12 @@ def compare_block(
     from slinoss.mixer import SLinOSSMixer
     from slinoss.perf.workload import layer_config
 
+    stride = conv_stride_blocker(shape, groups)
+    if stride is not None:
+        # Here and not in the builder: counting a parameter builds the layer and
+        # never runs the convolution, so the geometry is only a blocker once a
+        # measurement is about to call it.
+        raise SystemExit(f"{shape.name}/g{groups} has no Mamba2 arm: {stride}")
     dtype = DTYPES[args.dtype]
     grads = mode == "step"
     path = "fused" if mem_eff_path else "unfused"
@@ -1297,6 +1421,12 @@ def _run_blocks(
     verdicts: list[BlockFaceoff] = []
     for shape in shapes:
         for groups in group_counts(shape, wanted):
+            # The convolution's refusal is per geometry, not per process, and it takes
+            # both paths with it, so the whole pair is skipped rather than one path.
+            stride = conv_stride_blocker(shape, groups)
+            if stride is not None:
+                print(f"skipping {shape.name}/g{groups}: {stride}")
+                continue
             for mode in modes:
                 for mem_eff in paths:
                     report, face = compare_block(
@@ -1384,7 +1514,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     shapes = [
         tiled
         for shape in named
-        for variant in seq_variants(shape, args.seq or ())
+        for wide in head_variants(shape, args.heads or ())
+        for variant in seq_variants(wide, args.seq or ())
         for tiled in chunk_variants(variant, args.chunk or ())
     ]
     modes = MODES if args.mode == "both" else (args.mode,)

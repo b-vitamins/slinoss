@@ -42,7 +42,9 @@ from scripts.bench.bench_mamba import (
     Parameters,
     chunk_variants,
     compare_so3ssd,
+    conv_stride_blocker,
     group_counts,
+    head_variants,
     load_scan,
     main,
     make_inputs,
@@ -62,7 +64,7 @@ from slinoss.perf.device import ClockPolicy, Contention, DeviceInfo
 from slinoss.perf.report import rate_table
 from slinoss.perf.timing import measure
 from slinoss.perf.units import Bytes, Count, Mebibytes, Megahertz, Percent
-from slinoss.perf.workload import OpShape
+from slinoss.perf.workload import SHAPES, OpShape
 
 pytestmark = [
     pytest.mark.cuda,
@@ -643,6 +645,61 @@ def test_a_stage_with_no_kernel_refuses_the_comparison() -> None:
     assert host is not None
     assert "build_ext" in host
     assert unbuilt_stage_blocker(torch.device("cuda")) is None
+
+
+def test_head_variants_reach_a_count_mamba2_can_convolve_at() -> None:
+    # The whole point of the override: `causal_conv1d` refuses every registered head
+    # count, so without it neither Mamba2 path runs and the comparison has no armed
+    # baseline at all. Only H moves, and G moves with it when G was H.
+    base = OpShape("acc", bsz=4, heads=18, seq=2048, rows=64, lanes=80, chunk=64)
+    assert head_variants(base, ()) == (base,)
+    (armed,) = head_variants(base, (16,))
+    assert armed.name == "acc-h16"
+    assert armed.heads == 16
+    assert (armed.bsz, armed.seq, armed.rows, armed.lanes, armed.chunk) == (
+        4,
+        2048,
+        64,
+        80,
+        64,
+    )
+    assert armed.groups == base.groups == 1
+    # A shape whose groups were its heads is the ungrouped case, and it stays that
+    # way: leaving G at the old H would make the override change two things.
+    ungrouped = OpShape(
+        "u", bsz=1, heads=12, seq=64, rows=48, lanes=16, chunk=64, groups=12
+    )
+    assert head_variants(ungrouped, (8,))[0].groups == 8
+    # A group count the shape holds fixed must still divide the new head count, so a
+    # band is not left serving a fractional number of heads.
+    banded = OpShape(
+        "b", bsz=1, heads=12, seq=64, rows=48, lanes=16, chunk=64, groups=4
+    )
+    with pytest.raises(ValueError, match="divide"):
+        head_variants(banded, (7,))
+
+
+def test_both_mamba_paths_are_refused_at_a_head_count_they_cannot_convolve() -> None:
+    # Mamba2's in-projection is ``2*d_inner + 2*ngroups*dstate + nheads`` wide, and
+    # both forwards slice the convolution operand out of that, so the operand's row
+    # stride is the projection width. ``causal_conv1d`` requires that stride to be a
+    # multiple of eight. Every other term is, so the head count decides. The failure
+    # mode is a raise from inside Mamba2 half a sweep in, and it takes the unfused
+    # path too: that path guards the handle against absence, not the stride against
+    # misalignment. The blocker is what turns the raise into a skip with a reason.
+    pytest.importorskip("causal_conv1d")
+    odd = OpShape("odd", bsz=1, heads=18, seq=64, rows=64, lanes=80, chunk=64)
+    even = OpShape("even", bsz=1, heads=16, seq=64, rows=64, lanes=80, chunk=64)
+    reason = conv_stride_blocker(odd, 1)
+    assert reason is not None
+    assert "2,802" in reason and "18" in reason
+    assert conv_stride_blocker(even, 1) is None
+    # The group count moves the width too, and by a multiple of eight, so it cannot
+    # rescue an odd head count or spoil an even one.
+    assert conv_stride_blocker(even, 2) is None
+    assert conv_stride_blocker(odd, 18) is not None
+    # Every registered head count is refused, which is why the override exists.
+    assert all(conv_stride_blocker(s, 1) is not None for s in SHAPES)
 
 
 # ---------------------------------------------------------------------------
