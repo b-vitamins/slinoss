@@ -1740,16 +1740,21 @@ def _run_at(row: cute.Tensor, vec: int) -> cute.Tensor:
     return cute.zipped_divide(cute.make_tensor(base, row.layout), (vec,))
 
 
-def _run_vals(frag: cute.Tensor, vec: int, width: int) -> tuple[Scalar, ...]:
+def _run_vals(
+    frag: cute.Tensor, vec: int, width: int, base: int = 0
+) -> tuple[Scalar, ...]:
     """A run fragment's elements in column order, widened to float32.
 
     Args:
-        frag: ``(width // vec, vec)`` fragment filled by :func:`_read_run`.
+        frag: ``(width // vec, vec)`` fragment filled by :func:`_read_run`, or a taller
+            one holding several runs.
         vec: Elements an access covers.
         width: Elements of the run.
+        base: First access row of the run. Nonzero only where one fragment holds the
+            runs of several steps.
     """
     elem = frag.element_type
-    return tuple(widen(frag[i // vec, i % vec], elem) for i in range(width))
+    return tuple(widen(frag[base + i // vec, i % vec], elem) for i in range(width))
 
 
 @cute.jit
@@ -2621,10 +2626,101 @@ def _tap_epilogue(
                 sdw2[j, prev] = dwp[j]
 
 
+def _readout_pass(
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+    itemsize: cutlass.Constexpr,
+) -> tuple[int, int, int, int]:
+    """The stride-loop geometry of :func:`_readout_epilogue`.
+
+    Args:
+        threads: Block width.
+        chunk: ``L``.
+        lanes: ``N``.
+        itemsize: Bytes of the operand dtype.
+
+    Returns:
+        The tokens one pass covers, the steps a thread takes, the run width of the
+        operand-dtype forcing read, and the runs a row holds.
+    """
+    per_pass = threads // LANE_GROUP
+    width = 3 * (lanes // LANE_GROUP)
+    ovec = _run_vec(width, itemsize)
+    return per_pass, -(-chunk // per_pass), ovec, width // ovec
+
+
+def readout_bfrag(
+    gb: cute.Tensor,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+) -> cute.Tensor:
+    """The register file :func:`read_readout_b` fills.
+
+    Args:
+        gb: ``(B,G,T,tile)`` lane view of the forcing vectors, for its element type.
+        threads: Block width.
+        chunk: ``L``.
+        lanes: ``N``.
+
+    Returns:
+        ``(steps * oaccs, ovec)``, indexed ``[step * oaccs + k, j]``.
+    """
+    size = gb.element_type.width // 8
+    _, steps, ovec, oaccs = _readout_pass(threads, chunk, lanes, size)
+    return cute.make_fragment((steps * oaccs, ovec), gb.element_type)
+
+
+@cute.jit
+def read_readout_b(
+    gb: cute.Tensor,
+    bfrag: cute.Tensor,
+    bidx: cutlass.Int32,
+    gidx: cutlass.Int32,
+    t0: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    chunk: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+) -> None:
+    """Issue the forcing read :func:`_readout_epilogue` consumes.
+
+    Split out because the read is head-invariant while the pass around it is not: the
+    address is the batch, the group, the chunk and the thread, so one issue serves every
+    head the block walks.
+
+    Args:
+        gb: ``(B,G,T,tile)`` lane view of the operand-dtype forcing vectors.
+        bfrag: The fragment from :func:`readout_bfrag`.
+        bidx: Batch index.
+        gidx: Group index.
+        t0: First token of the chunk.
+        valid: Tokens of the chunk that exist.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        chunk: ``L``. Compile-time.
+        lanes: ``N``. Compile-time.
+    """
+    size = gb.element_type.width // 8
+    per_pass, steps, ovec, oaccs = _readout_pass(threads, chunk, lanes, size)
+    lane = tid % LANE_GROUP
+    for step in cutlass.range_constexpr(steps):
+        ts = cutlass.min(_pass_row(tid // LANE_GROUP + step * per_pass), chunk - 1)
+        # A pad token's row is clamped into range: its diagonal scalar is zero and its
+        # closing three-vector is zero, so every use of the value is zero-valued.
+        brow = _run_at(gb[bidx, gidx, t0 + cutlass.min(ts, valid - 1), None], ovec)
+        for k in cutlass.range_constexpr(oaccs):
+            cute.autovec_copy(
+                brow[(None, oaccs * lane + k)], bfrag[(step * oaccs + k, None)]
+            )
+
+
 @cute.jit
 def _readout_epilogue(
     gdc: cute.Tensor,
-    gb: cute.Tensor,
+    bfrag: cute.Tensor,
     sdc: cute.Tensor,
     csum: cute.Tensor,
     bsum: cute.Tensor,
@@ -2671,12 +2767,13 @@ def _readout_epilogue(
     The first line rides the existing readout cotangent, so the diagonal's ``dC`` and
     rotation halves cost no term of their own.
 
-    ``b`` is read from global here. The staged forcing tile holds one source-token run
-    and this pass walks the chunk, so at ``L`` above the run it is the wrong rows;
-    accumulating the term in the run's own pass instead needs an ``L`` by lane-tile
-    float32 accumulator, which is 13,312 B against a 7,456 B gap. The read is 6,144 B
-    per head, chunk and lane tile, on a launch whose limiter is shared capacity, so the
-    accumulator is the expensive half of that trade and the read is the cheap one.
+    ``b`` is read from global, by :func:`read_readout_b` above the head loop. The staged
+    forcing tile holds one source-token run and this pass walks the chunk, so at ``L``
+    above the run it is the wrong rows; accumulating the term in the run's own pass
+    instead needs an ``L`` by lane-tile float32 accumulator, which is 13,312 B against a
+    7,456 B gap. The read is 6,144 B per chunk and lane tile, on a launch whose limiter
+    is shared capacity, so the accumulator is the expensive half of that trade and the
+    read is the cheap one.
 
     One head writes its shard's ``dC`` row in the destination's own dtype. A fold
     above one accumulates in float32 instead, because a shard's ``dC`` is a sum over
@@ -2716,7 +2813,8 @@ def _readout_epilogue(
     Args:
         gdc: ``(B,G,splits*T,3N)`` ``dC`` or its shard buffer, written by the head that
             completes the sum.
-        gb: ``(B,G,T,tile)`` lane view of the operand-dtype forcing vectors.
+        bfrag: The forcing runs :func:`read_readout_b` filled, one per step of this
+            pass. Head-invariant, hence read once for the block.
         sdc: ``(mma_rows(L), pitch)`` float32 readout gradient.
         csum: The float32 readout sum over the fold, from :func:`_fold_frag`.
             Accumulated when ``fold`` is above one and untouched otherwise.
@@ -2770,7 +2868,6 @@ def _readout_epilogue(
     bwords = _runs(bsum, fvec)
     dfrag = cute.make_fragment((faccs, fvec), sdc.element_type)
     cfrag = cute.make_fragment((oaccs, ovec), scrot.element_type)
-    bfrag = cute.make_fragment((oaccs, ovec), gb.element_type)
     ofrag = cute.make_fragment((gaccs, gvec), out)
     bsfrag = cute.make_fragment((faccs, fvec), bsum.element_type)
     closes = hstep == fold - 1
@@ -2794,14 +2891,9 @@ def _readout_epilogue(
         closing = ts == chunk - 1
         _read_run(grad, dfrag, ts, lane, faccs)
         _read_run(rots, cfrag, ts, lane, oaccs)
-        # A pad token's row is clamped into range: its diagonal scalar is zero and its
-        # closing three-vector is zero, so every use of the value is zero-valued.
-        brow = _run_at(gb[bidx, gidx, t0 + cutlass.min(ts, valid - 1), None], ovec)
-        for k in cutlass.range_constexpr(oaccs):
-            cute.autovec_copy(brow[(None, oaccs * lane + k)], bfrag[(k, None)])
         dvals = _run_vals(dfrag, fvec, width)
         cvals = _run_vals(cfrag, ovec, width)
-        bvals = _run_vals(bfrag, ovec, width)
+        bvals = _run_vals(bfrag, ovec, width, step * oaccs)
         dcs: list[Scalar] = []
         dbs: list[Scalar] = []
         for rep in cutlass.range_constexpr(width // 3):
@@ -3390,6 +3482,13 @@ def chunk_vector_bwd_kernel(
         False,
     )
 
+    # The readout epilogue's forcing read, on the same grounds: its address is the
+    # batch, the group, the chunk and the thread, so the pass read the same rows once a
+    # head. It walks the chunk rather than a source-token run, which is why the term
+    # cannot ride the staged tile instead.
+    bfrag = readout_bfrag(gbj, threads, chunk, lanes)
+    read_readout_b(gbj, bfrag, bidx, gidx, t0, valid, tid, threads, chunk, lanes)
+
     # The heads of one shard, rolled. Unrolling it at trace time was refused on a spill
     # -- local traffic 1,135.3 MB to 1,290.4 MB a launch at fold 18, a call 12,260.9 us
     # to 13,596.7 at fold 2 and 11,530.8 to 12,297.2 at fold 3 -- and that spill no
@@ -3832,7 +3931,7 @@ def chunk_vector_bwd_kernel(
         cute.arch.sync_threads()
         _readout_epilogue(
             gdcj,
-            gbj,
+            bfrag,
             sdc,
             csum,
             sumb,
