@@ -1012,6 +1012,121 @@ def stage_score(
                     cute.autovec_copy(loads[(step, None)], dst)
 
 
+def _table_duty(
+    mats: cutlass.Constexpr, parts: cutlass.Constexpr
+) -> tuple[tuple[int, ...], ...]:
+    """Assign the table's slots to ``parts`` groups, the heavy slot alone.
+
+    The groups are deliberately unbalanced, and two is the most a split can use.
+    Slot costs are 155, 70 and 28 float instructions: the fused first slot is two
+    tap matrices and two 3x3 products over two rotations, the second slot one of
+    each, the third slot nothing beyond the rotation every group computes anyway.
+    A third group therefore leaves the critical group at 155 where two groups
+    already put it, and pays a rotation and a copy of the body for nothing.
+
+    Args:
+        mats: Slot count, 1, 2 or 3. Compile-time.
+        parts: Groups to form, 1 or 2. Compile-time.
+
+    Returns:
+        One tuple of slot ids per group.
+    """
+    if mats == 1:
+        return ((TABLE_AC_SOLE,),)
+    third = (TABLE_AC,) if mats == 3 else ()
+    if parts == 1:
+        return ((TABLE_AP, TABLE_AN, *third),)
+    # The assignment is the measured one. ``Ac`` with ``An`` instead would put 98
+    # float instructions against 155 rather than 183 against 70, and is a separate
+    # arm: which multiply-adds ptxas contracts moves with the group's store list.
+    return ((TABLE_AP, *third), (TABLE_AN,))
+
+
+def _table_slots(
+    strans: cute.Tensor,
+    stap: cute.Tensor,
+    squat: cute.Tensor,
+    stable: cute.Tensor,
+    token: cutlass.Int32,
+    jobs: cutlass.Constexpr,
+    mats: cutlass.Constexpr,
+    fused: cutlass.Constexpr,
+    pitch: cutlass.Constexpr,
+) -> None:
+    """Compute and store one group's slots for one token.
+
+    Every group recomputes ``Ac`` rather than reading a shared copy: the rotation
+    is 28 float instructions, a shared round trip is at least two LSU operations,
+    and an LSU operation on this device costs like a dozen FMAs. Undecorated, so
+    the caller's dynamic group branch holds the whole body.
+
+    Both products are computed before either is stored, and in slot order. That is
+    not style: ``Ac`` must come out bitwise identical to the sole-slot build, and
+    reordering the arithmetic against the stores is enough to move which
+    multiply-add ptxas contracts.
+
+    Args:
+        strans: ``(4, L)`` staged transition parameters.
+        stap: ``(8, L)`` staged tap parameters.
+        squat: ``(4, L)`` quaternion prefix.
+        stable: ``(mats, L, pitch)`` table, written at this group's slots.
+        token: Chunk-local token, already bounded by ``L``.
+        jobs: Slot ids this group writes, from :func:`_table_duty`. Compile-time.
+            Unread at ``mats == 1``, whose sole slot admits no split.
+        mats: Slot count. Compile-time.
+        fused: Fuse the one-tap column into the first slot. Compile-time.
+        pitch: The table's float32 pitch. Compile-time.
+    """
+    ac = mat3_transpose(
+        rot_hom((squat[0, token], squat[1, token], squat[2, token], squat[3, token]))
+    )
+    if cutlass.const_expr(mats == 1):
+        _store_mat(stable, TABLE_AC_SOLE, token, ac, pitch)
+        return
+    wvec = (strans[0, token], strans[1, token], strans[2, token])
+    if cutlass.const_expr(TABLE_AP in jobs):
+        first = mat3_mul(
+            ac, tap_matrix((stap[0, token], stap[1, token], stap[2, token]), wvec)
+        )
+    if cutlass.const_expr(TABLE_AN in jobs):
+        an = mat3_mul(
+            ac, tap_matrix((stap[4, token], stap[5, token], stap[6, token]), wvec)
+        )
+    if cutlass.const_expr(TABLE_AP in jobs):
+        if cutlass.const_expr(fused):
+            # ``An_{t-1}`` is recomputed from the staged parameters of token
+            # ``t-1`` rather than read back out of the slot this pass is still
+            # writing. A read-back needs a barrier between the two halves of the
+            # table, and barrier is the top stall of every kernel that builds one.
+            # The recompute is one rotation and one tap matrix per token, O(L)
+            # against an O(L*N) launch.
+            #
+            # Clamped rather than branched: token 0 reads its own row and the
+            # factor below discards it.
+            prev = cutlass.max(token - 1, 0)
+            acp = mat3_transpose(
+                rot_hom(
+                    (squat[0, prev], squat[1, prev], squat[2, prev], squat[3, prev])
+                )
+            )
+            anp = mat3_mul(
+                acp,
+                tap_matrix(
+                    (stap[4, prev], stap[5, prev], stap[6, prev]),
+                    (strans[0, prev], strans[1, prev], strans[2, prev]),
+                ),
+            )
+            # I3: the raw per-step decay, never a ratio of prefixes, so
+            # ``ls <= 0`` puts it in ``(0, 1]``.
+            scale = select(token > 0, decay(strans[3, token]), cutlass.Float32(0.0))
+            first = tuple(first[e] + scale * anp[e] for e in range(9))
+        _store_mat(stable, TABLE_AP, token, first, pitch)
+    if cutlass.const_expr(TABLE_AN in jobs):
+        _store_mat(stable, TABLE_AN, token, an, pitch)
+    if cutlass.const_expr(TABLE_AC in jobs):
+        _store_mat(stable, TABLE_AC, token, ac, pitch)
+
+
 @cute.jit
 def build_table(
     strans: cute.Tensor,
@@ -1035,12 +1150,14 @@ def build_table(
             tile of the right dtype.
         squat: ``(4, L)`` float32 quaternion prefix, already renormalized.
         stable: ``(mats, L, pitch)`` float32, written. Slots are
-            :data:`slinoss.ops.so3ssd.cute.common.TABLE_AP`, ``TABLE_AN``, and,
-            when ``mats`` is three, ``TABLE_AC``. At ``mats == 1`` the sole slot is
-            ``TABLE_AC_SOLE``. At ``fused`` the first slot is ``TABLE_AFUSE``.
+            :data:`slinoss.ops.so3ssd.cute.common.TABLE_AP`, ``TABLE_AN`` and
+            ``TABLE_AC``. At ``mats == 1`` the sole slot is ``TABLE_AC_SOLE``. At
+            ``fused`` the first slot is ``TABLE_AFUSE``.
         tid: Thread index within the block.
-        threads: Block width. Compile-time.
-        chunk: ``L``. Compile-time.
+        threads: Block width. Compile-time. At ``threads >= 2 * chunk`` the build
+            widens: one thread group per slot rather than one thread per token.
+        chunk: ``L``. Compile-time. A multiple of 32 where the build widens, which
+            is what keeps the group index warp-uniform.
         mats: Slots to write, 1, 2 or 3. Compile-time, and must match the ``mats``
             the tile was allocated at. One writes ``Ac`` alone and computes neither
             tap matrix, so it also reads neither ``stap`` nor ``strans``.
@@ -1063,70 +1180,44 @@ def build_table(
         ``An``. That row is load-bearing under fusion and must not be predicated
         away.
     """
-    for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
-        token = tid + step * threads
-        if token < chunk:
-            ac = mat3_transpose(
-                rot_hom(
-                    (
-                        squat[0, token],
-                        squat[1, token],
-                        squat[2, token],
-                        squat[3, token],
-                    )
+    parts = 2 if mats >= 2 and threads >= 2 * chunk else 1
+    duty = _table_duty(mats, parts)
+    if cutlass.const_expr(parts == 1):
+        for step in cutlass.range_constexpr((chunk + threads - 1) // threads):
+            token = tid + step * threads
+            if token < chunk:
+                _table_slots(
+                    strans, stap, squat, stable, token, duty[0], mats, fused, pitch
                 )
-            )
-            if cutlass.const_expr(mats == 1):
-                _store_mat(stable, TABLE_AC_SOLE, token, ac, pitch)
-            else:
-                wvec = (strans[0, token], strans[1, token], strans[2, token])
-                ap = mat3_mul(
-                    ac,
-                    tap_matrix((stap[0, token], stap[1, token], stap[2, token]), wvec),
-                )
-                an = mat3_mul(
-                    ac,
-                    tap_matrix((stap[4, token], stap[5, token], stap[6, token]), wvec),
-                )
-                first = ap
-                if cutlass.const_expr(fused):
-                    # ``An_{t-1}`` is recomputed from the staged parameters of token
-                    # ``t-1`` rather than read back out of the slot this pass is
-                    # still writing. A read-back needs a barrier between the two
-                    # halves of the table, and barrier is the top stall of every
-                    # kernel that builds one. The recompute is one rotation and one
-                    # tap matrix per token, O(L) against an O(L*N) launch.
-                    #
-                    # Clamped rather than branched: token 0 reads its own row and the
-                    # factor below discards it.
-                    prev = cutlass.max(token - 1, 0)
-                    acp = mat3_transpose(
-                        rot_hom(
-                            (
-                                squat[0, prev],
-                                squat[1, prev],
-                                squat[2, prev],
-                                squat[3, prev],
-                            )
-                        )
+    else:
+        # One thread group per slot rather than one thread per token. The phase is
+        # bounded by the shared load of the quaternion prefix, not by the arithmetic
+        # over it, and ``chunk`` threads out of ``threads`` leave the scheduler
+        # nothing to switch to when that load misses. Splitting by slot puts
+        # ``parts`` loads in flight per token. ``group`` is warp-uniform because
+        # ``chunk`` is a multiple of the warp, so the branch below is a jump rather
+        # than a divergence, and ``token`` stays consecutive within a warp, so no
+        # store pattern moves.
+        total = chunk * parts
+        for step in cutlass.range_constexpr((total + threads - 1) // threads):
+            idx = tid + step * threads
+            # One guard, not two: past ``total`` the group index runs past ``parts``
+            # and matches no group below.
+            group = idx // chunk
+            token = idx % chunk
+            for one in cutlass.range_constexpr(parts):
+                if group == one:
+                    _table_slots(
+                        strans,
+                        stap,
+                        squat,
+                        stable,
+                        token,
+                        duty[one],
+                        mats,
+                        fused,
+                        pitch,
                     )
-                    anp = mat3_mul(
-                        acp,
-                        tap_matrix(
-                            (stap[4, prev], stap[5, prev], stap[6, prev]),
-                            (strans[0, prev], strans[1, prev], strans[2, prev]),
-                        ),
-                    )
-                    # I3: the raw per-step decay, never a ratio of prefixes, so
-                    # ``ls <= 0`` puts it in ``(0, 1]``.
-                    scale = select(
-                        token > 0, decay(strans[3, token]), cutlass.Float32(0.0)
-                    )
-                    first = tuple(ap[e] + scale * anp[e] for e in range(9))
-                _store_mat(stable, TABLE_AP, token, first, pitch)
-                _store_mat(stable, TABLE_AN, token, an, pitch)
-                if cutlass.const_expr(mats == 3):
-                    _store_mat(stable, TABLE_AC, token, ac, pitch)
 
 
 @cute.jit

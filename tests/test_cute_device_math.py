@@ -430,11 +430,16 @@ def test_reduced_slot_tables_match_the_three_slot_matrices() -> None:
     """``mats=2`` and ``mats=1`` write the same matrices at fewer slots.
 
     ``Ac`` is an intermediate of both taps and the taps are not intermediates of
-    ``Ac``, so neither reduction may change what it keeps. Asserted bitwise: the
-    arithmetic is identical in each case, so anything but equality means a slot
-    index moved. ``mats=1`` is the case where the constant changes, from
-    ``TABLE_AC`` to ``TABLE_AC_SOLE``, and reading the old one there would land on
-    a slot that does not exist.
+    ``Ac``, so neither reduction may change what it keeps. ``mats=1`` is the case
+    where the constant changes, from ``TABLE_AC`` to ``TABLE_AC_SOLE``, and reading
+    the old one there would land on a slot that does not exist.
+
+    The two-slot rows are held to a tolerance and not to equality, which is the
+    tighter statement of what the hardware can hold: the widened build assigns
+    ``Ac`` to the first thread group, so two slots and three slots give that group
+    different store lists, and ptxas contracts a multiply-add in one and not the
+    other. Measured, the disagreement is 16 ULP over a sixth of the entries. A moved
+    slot index is orders away from that and is what the tolerance still catches.
     """
     inp = make_inputs(
         bsz=2,
@@ -452,8 +457,14 @@ def test_reduced_slot_tables_match_the_three_slot_matrices() -> None:
     sole = _run_probe(inp.trans, inp.K, 64, mats=1)[2]
     assert tuple(taps.shape[3:]) == (2, 64, 9)
     assert tuple(sole.shape[3:]) == (1, 64, 9)
-    assert torch.equal(taps[:, :, :, TABLE_AP], full[:, :, :, TABLE_AP])
-    assert torch.equal(taps[:, :, :, TABLE_AN], full[:, :, :, TABLE_AN])
+    assert torch.allclose(
+        taps[:, :, :, TABLE_AP], full[:, :, :, TABLE_AP], rtol=1e-5, atol=1e-5
+    )
+    assert torch.allclose(
+        taps[:, :, :, TABLE_AN], full[:, :, :, TABLE_AN], rtol=1e-5, atol=1e-5
+    )
+    # One slot takes the unwidened body, whose first statement is this rotation, so
+    # here equality does hold.
     assert torch.equal(sole[:, :, :, TABLE_AC_SOLE], full[:, :, :, TABLE_AC])
     assert table_tile(64, 2).words == table_tile(64, 3).words - 9 * 64
     assert table_tile(64, 1).words == table_tile(64, 3).words - 18 * 64
