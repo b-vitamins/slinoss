@@ -45,8 +45,10 @@ from scripts.bench.bench_mamba import (
     DTYPES,
     block_runner,
     block_stream,
+    conv_stride_blocker,
     d_model_of,
     fused_path_blocker,
+    head_variants,
     make_mamba_block,
     mamba_chunk,
     parameter_counts,
@@ -180,6 +182,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", default="acceptance")
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help="Override the shape's head count. Mamba2's convolution refuses a row "
+        "stride that is not a multiple of eight, that stride is its in-projection "
+        "width, and the width carries +nheads over terms that are all multiples of "
+        "eight, so no registered head count clears it and a multiple of eight is "
+        "what makes either Mamba2 path measurable here.",
+    )
     parser.add_argument("--groups", type=int, default=1)
     parser.add_argument("--mamba-chunk", type=int, default=256)
     parser.add_argument(
@@ -616,6 +628,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     device = require_cuda(args.device)
     shape = shape_by_name(args.shape)
+    if args.heads is not None:
+        (shape,) = head_variants(shape, (args.heads,))
     dtype = DTYPES[args.dtype]
     mem_eff = args.mamba_path == "fused"
     mchunk = mamba_chunk(shape, args.mamba_chunk)
@@ -634,6 +648,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     blocker = fused_path_blocker()
     print(f"fused Mamba2 path: {'available' if blocker is None else blocker}")
+    stride = conv_stride_blocker(shape, args.groups)
+    if stride is not None:
+        # Both Mamba2 forwards slice the convolution operand out of the
+        # in-projection output, so this refuses the unfused path too and there is no
+        # baseline arm left to attribute against.
+        raise SystemExit(f"{shape.name}/g{args.groups} has no Mamba2 arm: {stride}")
     theirs_p, ours_p = parameter_counts(shape, args.groups)
     print(
         f"parameters: {theirs_p.label} {theirs_p.elements:,}  "
