@@ -605,12 +605,14 @@ from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes, chunk_suffix, quat_su
 from slinoss.ops.so3ssd.cute.table import (
     LANE_PAIR,
     apply_matrix,
+    apply_rotated,
     build_table,
     matrix_frag,
     paired,
     read_matrix,
+    read_rotated,
+    rotated_frags,
     stage_chunk,
-    stage_rotated,
     stage_score,
     stage_shifted,
     stage_state,
@@ -3364,6 +3366,30 @@ def chunk_vector_bwd_kernel(
     # where a fragment is an allocation an iteration.
     dincl = matrix_frag(gdincj, threads, rows, lanes)
 
+    # The readout basis's global read, hoisted out of the head loop. Its addressing is
+    # the batch, the group, the chunk and the thread, none of which the loop below
+    # varies, so the shipped form issued the same three loads once a head; only the
+    # transform is per head, because only the transform reads the table. The fragment is
+    # live across the whole body, six registers against 41 of headroom.
+    crotl, crotp = rotated_frags(gcj, threads, mpad, lanes, False, 0)
+    read_rotated(
+        gcj,
+        gcj,
+        crotl,
+        crotp,
+        bidx,
+        gidx,
+        t0,
+        0,
+        valid,
+        tid,
+        0,
+        threads,
+        mpad,
+        lanes,
+        False,
+    )
+
     # The heads of one shard, rolled. Unrolling it at trace time was refused on a spill
     # -- local traffic 1,135.3 MB to 1,290.4 MB a launch at fold 18, a call 12,260.9 us
     # to 13,596.7 at fold 2 and 11,530.8 to 12,297.2 at fold 3 -- and that spill no
@@ -3469,16 +3495,15 @@ def chunk_vector_bwd_kernel(
 
         # The readout basis is the M mode of two GEMMs and the K mode of a third, so it
         # is staged once; ``slp`` is passed as its scale tile and left unread, the
-        # per-token exponential belonging to the offset term alone. This pass reads the
-        # table, so it is the one staging pass that cannot precede the build.
-        stage_rotated(
-            gcj,
-            gcj,
+        # per-token exponential belonging to the offset term alone. The transform reads
+        # the table, so this half cannot precede the build; the read it consumes has no
+        # such order to keep and sits above the head loop.
+        apply_rotated(
+            crotl,
+            crotp,
             scrot,
             stable,
             slp,
-            bidx,
-            gidx,
             t0,
             0,
             valid,

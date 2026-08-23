@@ -103,11 +103,14 @@ __all__ = [
     "TABLE_PITCH",
     "TABLE_QUAD",
     "apply_matrix",
+    "apply_rotated",
     "build_table",
     "mat_at",
     "matrix_frag",
     "paired",
     "read_matrix",
+    "read_rotated",
+    "rotated_frags",
     "stage_chunk",
     "stage_matrix",
     "stage_pad",
@@ -2010,6 +2013,7 @@ def _store_rotated(
     scaled: cutlass.Constexpr,
     transposed: cutlass.Constexpr = False,
     pitch: cutlass.Constexpr = 9,
+    live: cutlass.Int32 | bool = True,
 ) -> None:
     """Transform one run of 3-vectors by one table slot and store the run.
 
@@ -2039,6 +2043,10 @@ def _store_rotated(
             reads and the permutation happens during the trace, so the emitted
             matvec is unchanged.
         pitch: The table's float32 pitch. Compile-time.
+        live: Whether this run's store is in range. ``True`` where the block width
+            divides the run count, and then the guard is traced away. The transform
+            runs either way: the read is clamped rather than predicated, so an
+            out-of-range run computes a value nobody stores.
     """
     mat = mat_at(stable, slot, token, pitch)
     if cutlass.const_expr(transposed):
@@ -2049,7 +2057,11 @@ def _store_rotated(
     if cutlass.const_expr(scaled):
         weight = sscale[token]
         out = tuple(weight * value for value in out)
-    store_pair(words, frag, row, 3 * pair, out)
+    if cutlass.const_expr(live is True):
+        store_pair(words, frag, row, 3 * pair, out)
+    else:
+        if live:
+            store_pair(words, frag, row, 3 * pair, out)
 
 
 def _rot_run(
@@ -2086,6 +2098,301 @@ def _rot_run(
     if wide >= narrow:
         return LANE_PAIR
     return ROT_RUN
+
+
+def _rot_carry(has_prev: cutlass.Constexpr, back: cutlass.Constexpr) -> bool:
+    """Whether a rotated pass reads the streaming carry-in.
+
+    ``g < 0`` is reachable only for the previous tap at the first token of the first
+    chunk, which is exactly the carry-in.
+
+    Args:
+        has_prev: Whether the caller supplied ``v_{-1}``.
+        back: Token offset of the vector, 0 or 1.
+
+    Returns:
+        Whether the second fragment is read.
+    """
+    return has_prev and back == 1
+
+
+def _rot_pass(
+    threads: cutlass.Constexpr, span: cutlass.Constexpr, lanes: cutlass.Constexpr
+) -> tuple[int, int, int, int, bool]:
+    """The stride-loop geometry of one :func:`stage_rotated` pass.
+
+    Args:
+        threads: Block width.
+        span: Rows to fill.
+        lanes: ``N``.
+
+    Returns:
+        The run width, the runs a row holds, the runs the pass covers, the steps a
+        thread takes, and whether the block width divides the run count.
+    """
+    run = _rot_run(threads, span, lanes)
+    pairs = lanes // run
+    total = span * pairs
+    return run, pairs, total, -(-total // threads), total % threads == 0
+
+
+def rotated_frags(
+    gv: cute.Tensor,
+    threads: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+    has_prev: cutlass.Constexpr,
+    back: cutlass.Constexpr,
+) -> tuple[cute.Tensor, cute.Tensor]:
+    """The register file one whole :func:`stage_rotated` pass reads into.
+
+    Allocated by the caller so the read and the transform can sit on either side of a
+    barrier: the transform reads the transform table, so it cannot precede the table
+    build, while the reads it consumes have no such order to keep.
+
+    Args:
+        gv: The pass's source, for its element type.
+        threads: Block width.
+        span: Rows to fill.
+        lanes: ``N``.
+        has_prev: Whether the caller supplied ``v_{-1}``.
+        back: Token offset of the vector, 0 or 1.
+
+    Returns:
+        The current-tap fragment and the carry-in fragment, each ``(3 * steps, run)``,
+        indexed ``[3 * step + k, j]`` by the step, the component and the element
+        within the run. The second aliases the first where there is no carry-in, for
+        the reason given in :func:`stage_rotated`.
+    """
+    run, _, _, steps, _ = _rot_pass(threads, span, lanes)
+    loads = cute.make_fragment((3 * steps, run), gv.element_type)
+    if cutlass.const_expr(_rot_carry(has_prev, back)):
+        return loads, cute.make_fragment((3 * steps, run), gv.element_type)
+    return loads, loads
+
+
+def _rotated_step(
+    tid: cutlass.Int32,
+    step: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    pairs: cutlass.Constexpr,
+    total: cutlass.Constexpr,
+    exact: cutlass.Constexpr,
+    t0: cutlass.Int32,
+    lbase: cutlass.Int32,
+    valid: cutlass.Int32,
+    back: cutlass.Constexpr,
+) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    """The row, the run and the two token indices one step of a rotated pass covers.
+
+    One clamp serves both reads: ``valid`` is at most the chunk, so the clamped token
+    indexes the table and the scale in bounds even when the M extent was rounded up
+    past the chunk, and ``t0`` plus it is inside the sequence.
+
+    Args:
+        tid: Thread index within the block.
+        step: Which step. Compile-time.
+        threads: Block width. Compile-time.
+        pairs: Runs a row holds. Compile-time.
+        total: Runs the pass covers. Compile-time.
+        exact: Whether the block width divides ``total``. Compile-time.
+        t0: First token of the chunk.
+        lbase: First chunk-local token of the run.
+        valid: Tokens of the chunk that exist.
+        back: Token offset of the vector, 0 or 1. Compile-time.
+
+    Returns:
+        The destination row, the run within it, the clamped chunk-local token, and the
+        global token the vector comes from, which is negative only at the carry-in.
+    """
+    i = tid + step * threads
+    if cutlass.const_expr(not exact):
+        i = cutlass.min(i, total - 1)
+    r = i // pairs
+    tsafe = cutlass.min(lbase + r, valid - 1)
+    return r, i - r * pairs, tsafe, t0 + tsafe - back
+
+
+@cute.jit
+def _rotated_vec(
+    loads: cute.Tensor,
+    prior: cute.Tensor,
+    slot: cutlass.Constexpr,
+    run: cutlass.Constexpr,
+    r: cutlass.Int32,
+    lbase: cutlass.Int32,
+    valid: cutlass.Int32,
+    gbase: cutlass.Int32,
+    has_prev: cutlass.Constexpr,
+    back: cutlass.Constexpr,
+) -> tuple[Scalar, ...]:
+    """One step's run, widened, with the carry-in and the dead rows resolved.
+
+    Args:
+        loads: The current-tap fragment.
+        prior: The carry-in fragment, read only where there is one.
+        slot: First fragment row of this step, three from there. Compile-time.
+        run: Elements per access. Compile-time.
+        r: Destination row.
+        lbase: First chunk-local token of the run.
+        valid: Tokens of the chunk that exist.
+        gbase: The global token the vector comes from.
+        has_prev: Whether the caller supplied ``v_{-1}``. Compile-time.
+        back: Token offset of the vector, 0 or 1. Compile-time.
+
+    Returns:
+        The run's ``3 * run`` float32 components, zeroed where the row carries no
+        token.
+    """
+    src = loads.element_type
+    # A plain range, not range_constexpr: a comprehension reaches the runtime stub.
+    # Both unroll at trace time.
+    got = tuple(widen(loads[slot + j // run, j % run], src) for j in range(3 * run))
+    if cutlass.const_expr(_rot_carry(has_prev, back)):
+        at_start = gbase < 0
+        got = tuple(
+            select(at_start, widen(prior[slot + j // run, j % run], src), got[j])
+            for j in range(3 * run)
+        )
+    keep = lbase + r < valid
+    if cutlass.const_expr(back == 1 and not has_prev):
+        keep = keep & (gbase >= 0)
+    return tuple(select(keep, value, cutlass.Float32(0.0)) for value in got)
+
+
+@cute.jit
+def read_rotated(
+    gv: cute.Tensor,
+    gvprev: cute.Tensor,
+    loads: cute.Tensor,
+    prior: cute.Tensor,
+    bidx: cutlass.Int32,
+    gidx: cutlass.Int32,
+    t0: cutlass.Int32,
+    lbase: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    back: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+    has_prev: cutlass.Constexpr,
+) -> None:
+    """Issue every global read of one :func:`stage_rotated` pass.
+
+    Split out so the reads can precede the transform table's build, which the
+    transform half depends on and they do not. Nothing is loaded under a predicate:
+    the index is clamped into range and the out-of-range value is replaced afterwards
+    by a select.
+
+    Args:
+        gv: ``(B,G,T,3N)`` operand-dtype source.
+        gvprev: ``(B,G,3N)`` streaming ``v_{-1}``. Read only where there is a
+            carry-in.
+        loads: The current-tap fragment from :func:`rotated_frags`.
+        prior: The carry-in fragment from the same call.
+        bidx: Batch index.
+        gidx: Group index.
+        t0: First token of the chunk.
+        lbase: First chunk-local token of the run.
+        valid: Tokens of the chunk that exist.
+        tid: Thread index within the block.
+        back: Token offset of the vector, 0 or 1. Compile-time.
+        threads: Block width. Compile-time.
+        span: Rows to fill. Compile-time.
+        lanes: ``N``. Compile-time.
+        has_prev: Whether ``gvprev`` was supplied. Compile-time.
+
+    Invariants:
+        The whole pass is in flight at once, so no step's slot is reused and the
+        fragment is ``3 * steps`` rows rather than the ``3 * PREFETCH // run``
+        :func:`stage_rotated` bounds itself to.
+    """
+    run, pairs, total, steps, exact = _rot_pass(threads, span, lanes)
+    for step in cutlass.range_constexpr(steps):
+        _, m, _, gbase = _rotated_step(
+            tid, step, threads, pairs, total, exact, t0, lbase, valid, back
+        )
+        _load_pair(
+            _paired_row(gv[bidx, gidx, cutlass.max(gbase, 0), None], run),
+            loads,
+            3 * step,
+            m,
+        )
+        if cutlass.const_expr(_rot_carry(has_prev, back)):
+            _load_pair(_paired_row(gvprev[bidx, gidx, None], run), prior, 3 * step, m)
+
+
+@cute.jit
+def apply_rotated(
+    loads: cute.Tensor,
+    prior: cute.Tensor,
+    dst: cute.Tensor,
+    stable: cute.Tensor,
+    sscale: cute.Tensor,
+    t0: cutlass.Int32,
+    lbase: cutlass.Int32,
+    valid: cutlass.Int32,
+    tid: cutlass.Int32,
+    slot: cutlass.Constexpr,
+    back: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    span: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+    has_prev: cutlass.Constexpr,
+    scaled: cutlass.Constexpr,
+    transposed: cutlass.Constexpr = False,
+    pitch: cutlass.Constexpr = 9,
+) -> None:
+    """Transform one :func:`read_rotated` fragment into a shared operand tile.
+
+    The step's coordinates are recomputed rather than carried, for the reason given in
+    :func:`apply_matrix`.
+
+    Args:
+        loads: The current-tap fragment :func:`read_rotated` filled.
+        prior: The carry-in fragment from the same call.
+        dst: Operand-dtype tile of at least ``span`` rows, written.
+        stable: ``(mats, L, pitch)`` float32 transform table.
+        sscale: ``(L,)`` float32 per-token scale. Read only when ``scaled``.
+        t0: First token of the chunk.
+        lbase: First chunk-local token of the run.
+        valid: Tokens of the chunk that exist.
+        tid: Thread index within the block.
+        slot: Table slot. Compile-time.
+        back: Token offset of the vector, 0 or 1. Compile-time.
+        threads: Block width. Compile-time.
+        span: Rows to fill. Compile-time.
+        lanes: ``N``. Compile-time.
+        has_prev: Whether a carry-in was supplied. Compile-time.
+        scaled: Whether to apply ``sscale``. Compile-time.
+        transposed: Apply the slot's transpose. Compile-time.
+        pitch: The table's float32 pitch. Compile-time.
+    """
+    run, pairs, total, steps, exact = _rot_pass(threads, span, lanes)
+    words = paired(dst, run)
+    frag = cute.make_fragment((1, run), dst.element_type)
+    for step in cutlass.range_constexpr(steps):
+        r, m, tsafe, gbase = _rotated_step(
+            tid, step, threads, pairs, total, exact, t0, lbase, valid, back
+        )
+        _store_rotated(
+            words,
+            frag,
+            stable,
+            sscale,
+            r,
+            tsafe,
+            m,
+            _rotated_vec(
+                loads, prior, 3 * step, run, r, lbase, valid, gbase, has_prev, back
+            ),
+            slot,
+            scaled,
+            transposed,
+            pitch,
+            exact or tid + step * threads < total,
+        )
 
 
 @cute.jit
@@ -2170,23 +2477,58 @@ def stage_rotated(
         :func:`slinoss.ops.so3ssd.cute.mma.smem_pitch`, which is what
         :data:`LANE_PAIR` and :data:`ROT_RUN` rest on.
     """
-    src = gv.element_type
-    zero = cutlass.Float32(0.0)
-    run = _rot_run(threads, span, lanes)
-    wide = 3 * run
-    pairs = lanes // run
-    total = span * pairs
-    steps = -(-total // threads)
     # The staging extents are all multiples of the block width at every legal
     # shape, so the store predicate below is elided. Both extents are multiples of
     # 16 and the block is four warps, so pairing keeps that. The general form is
     # kept because it costs nothing when it is not needed.
-    exact = total % threads == 0
+    run, pairs, total, steps, exact = _rot_pass(threads, span, lanes)
     depth = max(1, PREFETCH // run)
-    # g < 0 is reachable only for the previous tap at the first token of the first
-    # chunk, which is exactly the streaming carry-in.
-    carry = has_prev and back == 1
 
+    # One group is the whole pass, so the split form emits the same block in the same
+    # order and there is one body rather than two.
+    if cutlass.const_expr(steps <= depth):
+        loads, prior = rotated_frags(gv, threads, span, lanes, has_prev, back)
+        read_rotated(
+            gv,
+            gvprev,
+            loads,
+            prior,
+            bidx,
+            gidx,
+            t0,
+            lbase,
+            valid,
+            tid,
+            back,
+            threads,
+            span,
+            lanes,
+            has_prev,
+        )
+        apply_rotated(
+            loads,
+            prior,
+            dst,
+            stable,
+            sscale,
+            t0,
+            lbase,
+            valid,
+            tid,
+            slot,
+            back,
+            threads,
+            span,
+            lanes,
+            has_prev,
+            scaled,
+            transposed,
+            pitch,
+        )
+        return
+
+    src = gv.element_type
+    carry = _rot_carry(has_prev, back)
     words = paired(dst, run)
     frag = cute.make_fragment((1, run), dst.element_type)
     loads = cute.make_fragment((3 * depth, run), src)
@@ -2202,76 +2544,38 @@ def stage_rotated(
         width = min(depth, steps - group * depth)
         held = []
         for step in cutlass.range_constexpr(width):
-            i = tid + (group * depth + step) * threads
-            if cutlass.const_expr(not exact):
-                i = cutlass.min(i, total - 1)
-            r = i // pairs
-            m = i - r * pairs
-            # One clamp serves both reads: valid is at most the chunk, so the
-            # clamped token indexes stable and sscale in bounds even when the M
-            # extent was rounded up past the chunk, and t0 + it is inside the
-            # sequence.
-            tsafe = cutlass.min(lbase + r, valid - 1)
-            gbase = t0 + tsafe - back
-            gsafe = cutlass.max(gbase, 0)
+            first = group * depth + step
+            r, m, tsafe, gbase = _rotated_step(
+                tid, first, threads, pairs, total, exact, t0, lbase, valid, back
+            )
             _load_pair(
-                _paired_row(gv[bidx, gidx, gsafe, None], run), loads, 3 * step, m
+                _paired_row(gv[bidx, gidx, cutlass.max(gbase, 0), None], run),
+                loads,
+                3 * step,
+                m,
             )
             if cutlass.const_expr(carry):
                 _load_pair(
                     _paired_row(gvprev[bidx, gidx, None], run), prior, 3 * step, m
                 )
-            held.append((r, m, tsafe, gbase))
+            held.append((r, m, tsafe, gbase, first))
 
         for step in cutlass.range_constexpr(width):
-            r, m, tsafe, gbase = held[step]
-            # A plain range, not range_constexpr: a comprehension reaches the
-            # runtime stub. Both unroll at trace time.
-            got = tuple(
-                widen(loads[3 * step + j // run, j % run], src) for j in range(wide)
+            r, m, tsafe, gbase, first = held[step]
+            _store_rotated(
+                words,
+                frag,
+                stable,
+                sscale,
+                r,
+                tsafe,
+                m,
+                _rotated_vec(
+                    loads, prior, 3 * step, run, r, lbase, valid, gbase, has_prev, back
+                ),
+                slot,
+                scaled,
+                transposed,
+                pitch,
+                exact or tid + first * threads < total,
             )
-            if cutlass.const_expr(carry):
-                at_start = gbase < 0
-                got = tuple(
-                    select(
-                        at_start,
-                        widen(prior[3 * step + j // run, j % run], src),
-                        got[j],
-                    )
-                    for j in range(wide)
-                )
-            keep = lbase + r < valid
-            if cutlass.const_expr(back == 1 and not has_prev):
-                keep = keep & (gbase >= 0)
-            vec = tuple(select(keep, value, zero) for value in got)
-            if cutlass.const_expr(exact):
-                _store_rotated(
-                    words,
-                    frag,
-                    stable,
-                    sscale,
-                    r,
-                    tsafe,
-                    m,
-                    vec,
-                    slot,
-                    scaled,
-                    transposed,
-                    pitch,
-                )
-            else:
-                if tid + (group * depth + step) * threads < total:
-                    _store_rotated(
-                        words,
-                        frag,
-                        stable,
-                        sscale,
-                        r,
-                        tsafe,
-                        m,
-                        vec,
-                        slot,
-                        scaled,
-                        transposed,
-                        pitch,
-                    )
