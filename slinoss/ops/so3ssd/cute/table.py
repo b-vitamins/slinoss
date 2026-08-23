@@ -102,9 +102,12 @@ __all__ = [
     "ROT_RUN",
     "TABLE_PITCH",
     "TABLE_QUAD",
+    "apply_matrix",
     "build_table",
     "mat_at",
+    "matrix_frag",
     "paired",
+    "read_matrix",
     "stage_chunk",
     "stage_matrix",
     "stage_pad",
@@ -229,6 +232,9 @@ division is already a shift. At 128 threads:
 So the rewrite is available at exactly the geometries where it removes nothing, and
 absent at every geometry that pays a magic multiply. Enabling it needs a different
 thread-to-element map, which gives up the contiguity the pairing exists for."""
+
+_MATRIX_DEPTH: int = max(1, PREFETCH // LANE_PAIR)
+"""Steps of a matrix pass whose loads are in flight at once."""
 
 ROT_RUN: int = 4
 """Adjacent 3-vectors :func:`stage_rotated` transforms and stores per step.
@@ -1527,6 +1533,249 @@ def stage_state(
                     _store_run(words, frag, p, col, out)
 
 
+def _matrix_pass(
+    threads: cutlass.Constexpr, rows: cutlass.Constexpr, lanes: cutlass.Constexpr
+) -> tuple[int, int, int, bool]:
+    """The stride-loop geometry of one :func:`stage_matrix` pass.
+
+    Args:
+        threads: Block width.
+        rows: Rows to fill, ``P``.
+        lanes: ``N``.
+
+    Returns:
+        The runs a row holds, the runs the pass covers, the steps a thread takes, and
+        whether the block width divides the run count.
+    """
+    pairs = lanes // LANE_PAIR
+    total = rows * pairs
+    return pairs, total, -(-total // threads), total % threads == 0
+
+
+def matrix_frag(
+    gv: cute.Tensor,
+    threads: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+) -> cute.Tensor:
+    """The register file one whole :func:`stage_matrix` pass reads into.
+
+    Allocated by the caller so the read and the transform can sit on either side of a
+    barrier. Three accesses a step, one per component of the run's 3-vectors.
+
+    Args:
+        gv: The pass's source, for its element type.
+        threads: Block width.
+        rows: Rows to fill, ``P``.
+        lanes: ``N``.
+
+    Returns:
+        The ``(3 * steps, LANE_PAIR)`` fragment, indexed ``[3 * step + k, j]`` by the
+        step, the component and the element within the run.
+    """
+    _, _, steps, _ = _matrix_pass(threads, rows, lanes)
+    return cute.make_fragment((3 * steps, LANE_PAIR), gv.element_type)
+
+
+@cute.jit
+def read_matrix(
+    gv: cute.Tensor,
+    loads: cute.Tensor,
+    bidx: cutlass.Int32,
+    hidx: cutlass.Int32,
+    cidx: cutlass.Int32,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+) -> None:
+    """Issue every global read of one :func:`stage_matrix` pass.
+
+    The pass's own step is the only cover its runs get where it stands, and three
+    accesses do not cover a round trip. Split out, the reads go as far above the
+    transform as the caller has work to put between them; the transform reads nothing
+    but the fragment. A barrier between the two is legal because the reads are global
+    and target registers.
+
+    Args:
+        gv: ``(B,H,C,P,3N)`` source, as :func:`stage_matrix` takes it.
+        loads: The fragment from :func:`matrix_frag`, at the same geometry.
+        bidx: Batch index.
+        hidx: Head index.
+        cidx: Chunk index.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        rows: Rows to fill, ``P``. Compile-time.
+        lanes: ``N``. Compile-time.
+
+    Invariants:
+        The whole pass is in flight at once, so no step's slot is reused and the
+        fragment is ``3 * steps`` rows rather than the ``3 * PREFETCH // LANE_PAIR``
+        :func:`stage_matrix` bounds itself to. A caller that hoists is choosing to pay
+        the deeper prefetch in registers.
+    """
+    pairs, total, steps, exact = _matrix_pass(threads, rows, lanes)
+    for step in cutlass.range_constexpr(steps):
+        p, m = _matrix_step(tid, step, threads, pairs, total, exact)
+        _load_pair(_paired_row(gv[bidx, hidx, cidx, p, None]), loads, 3 * step, m)
+
+
+@cute.jit
+def apply_matrix(
+    loads: cute.Tensor,
+    dst: cute.Tensor,
+    sfp32: cute.Tensor,
+    mat: Mat3,
+    tid: cutlass.Int32,
+    threads: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    lanes: cutlass.Constexpr,
+    keep_fp32: cutlass.Constexpr,
+) -> None:
+    """Transform one :func:`read_matrix` fragment into an operand tile.
+
+    The step's coordinate is recomputed rather than carried: it is a shift and a
+    multiply-subtract off ``tid``, against two live registers a step held across
+    whatever the caller put between the halves.
+
+    Args:
+        loads: The fragment :func:`read_matrix` filled.
+        dst: Operand-dtype tile, as :func:`stage_matrix` takes it.
+        sfp32: Float32 tile, written only when ``keep_fp32``.
+        mat: The 3x3, row-major, entry ``3*r + c``.
+        tid: Thread index within the block.
+        threads: Block width. Compile-time.
+        rows: Rows to fill, ``P``. Compile-time.
+        lanes: ``N``. Compile-time.
+        keep_fp32: Whether to write ``sfp32``. Compile-time.
+    """
+    pairs, total, steps, exact = _matrix_pass(threads, rows, lanes)
+    words, frag, words32, frag32 = _matrix_dst(dst, sfp32, keep_fp32)
+    for step in cutlass.range_constexpr(steps):
+        p, m = _matrix_step(tid, step, threads, pairs, total, exact)
+        _matrix_store(
+            loads,
+            3 * step,
+            words,
+            frag,
+            words32,
+            frag32,
+            mat,
+            p,
+            m,
+            exact or tid + step * threads < total,
+            keep_fp32,
+        )
+
+
+def _matrix_step(
+    tid: cutlass.Int32,
+    step: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    pairs: cutlass.Constexpr,
+    total: cutlass.Constexpr,
+    exact: cutlass.Constexpr,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """The row and the run one step of a matrix pass covers.
+
+    An out-of-range step is clamped to the last run rather than predicated: it reads
+    a run that exists and its store is dropped instead.
+
+    Args:
+        tid: Thread index within the block.
+        step: Which step. Compile-time.
+        threads: Block width. Compile-time.
+        pairs: Runs a row holds. Compile-time.
+        total: Runs the pass covers. Compile-time.
+        exact: Whether the block width divides ``total``. Compile-time.
+
+    Returns:
+        The row ``P`` index and the run index within it.
+    """
+    i = tid + step * threads
+    if cutlass.const_expr(not exact):
+        i = cutlass.min(i, total - 1)
+    p = i // pairs
+    return p, i - p * pairs
+
+
+def _matrix_dst(
+    dst: cute.Tensor, sfp32: cute.Tensor, keep_fp32: cutlass.Constexpr
+) -> tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor]:
+    """The paired views and the staging fragments a matrix pass stores through.
+
+    Args:
+        dst: Operand-dtype tile.
+        sfp32: Float32 tile, used only when ``keep_fp32``.
+        keep_fp32: Whether the float32 copy is written. Compile-time.
+
+    Returns:
+        The operand view and its fragment, then the float32 view and its fragment.
+        The float32 pair aliases the operand pair when ``keep_fp32`` is false: every
+        use is under the same compile-time flag, so the alias is never reached and
+        never allocated, and the name is bound on both paths.
+    """
+    words = paired(dst)
+    frag = cute.make_fragment((1, LANE_PAIR), dst.element_type)
+    if cutlass.const_expr(keep_fp32):
+        words32 = paired(sfp32)
+        frag32 = cute.make_fragment((1, LANE_PAIR), cutlass.Float32)
+    else:
+        words32 = words
+        frag32 = frag
+    return words, frag, words32, frag32
+
+
+@cute.jit
+def _matrix_store(
+    loads: cute.Tensor,
+    slot: cutlass.Constexpr,
+    words: cute.Tensor,
+    frag: cute.Tensor,
+    words32: cute.Tensor,
+    frag32: cute.Tensor,
+    mat: Mat3,
+    p: cutlass.Int32,
+    m: cutlass.Int32,
+    live: cutlass.Int32 | bool,
+    keep_fp32: cutlass.Constexpr,
+) -> None:
+    """Apply the matrix to one step's two 3-vectors and store the pair.
+
+    Args:
+        loads: The read fragment.
+        slot: First fragment row of this step, three from there. Compile-time.
+        words: The operand view from :func:`_matrix_dst`.
+        frag: Its staging fragment.
+        words32: The float32 view, read only when ``keep_fp32``.
+        frag32: Its staging fragment.
+        mat: The 3x3, row-major.
+        p: Row of the tile.
+        m: Run within the row.
+        live: Whether this step's store is in range. ``True`` when the block width
+            divides the run count, and then the guard is traced away.
+        keep_fp32: Whether to write ``words32``. Compile-time.
+    """
+    src = loads.element_type
+    got = tuple(
+        widen(loads[slot + j // LANE_PAIR, j % LANE_PAIR], src)
+        for j in range(3 * LANE_PAIR)
+    )
+    out = mat3_matvec(mat, (got[0], got[1], got[2])) + mat3_matvec(
+        mat, (got[3], got[4], got[5])
+    )
+    col = 3 * m
+    if cutlass.const_expr(live is True):
+        store_pair(words, frag, p, col, out)
+        if cutlass.const_expr(keep_fp32):
+            store_pair(words32, frag32, p, col, out)
+    else:
+        if live:
+            store_pair(words, frag, p, col, out)
+            if cutlass.const_expr(keep_fp32):
+                store_pair(words32, frag32, p, col, out)
+
+
 @cute.jit
 def stage_matrix(
     gv: cute.Tensor,
@@ -1555,7 +1804,9 @@ def stage_matrix(
     against a second pass over the ``(P, 3N)`` global read.
 
     The pass runs in groups of ``PREFETCH // LANE_PAIR`` steps, loads first, for the
-    reason given in :func:`stage_rotated`.
+    reason given in :func:`stage_rotated`. A pass that fits one group is
+    :func:`read_matrix` followed by :func:`apply_matrix`; a caller with work to put
+    between the two halves calls them itself.
 
     Args:
         gv: ``(B,H,C,P,3N)`` source at the operand dtype or float32, widened on the
@@ -1580,58 +1831,43 @@ def stage_matrix(
         rests on.
     """
     src = gv.element_type
-    elem = dst.element_type
-    span = 3 * LANE_PAIR
-    pairs = lanes // LANE_PAIR
-    total = rows * pairs
-    steps = -(-total // threads)
-    exact = total % threads == 0
-    depth = max(1, PREFETCH // LANE_PAIR)
+    pairs, total, steps, exact = _matrix_pass(threads, rows, lanes)
 
-    words = paired(dst)
-    frag = cute.make_fragment((1, LANE_PAIR), elem)
-    loads = cute.make_fragment((3 * depth, LANE_PAIR), src)
-    # The false arm aliases the operand pair. Every use is under the same
-    # compile-time flag, so the alias is never reached and never allocated, and the
-    # name is bound on both paths.
-    if cutlass.const_expr(keep_fp32):
-        words32 = paired(sfp32)
-        frag32 = cute.make_fragment((1, LANE_PAIR), cutlass.Float32)
-    else:
-        words32 = words
-        frag32 = frag
+    # One group is the whole pass, so the split form emits the same block in the same
+    # order and there is one body rather than two.
+    if cutlass.const_expr(steps <= _MATRIX_DEPTH):
+        loads = matrix_frag(gv, threads, rows, lanes)
+        read_matrix(gv, loads, bidx, hidx, cidx, tid, threads, rows, lanes)
+        apply_matrix(loads, dst, sfp32, mat, tid, threads, rows, lanes, keep_fp32)
+        return
 
-    for group in cutlass.range_constexpr(-(-steps // depth)):
-        count = min(depth, steps - group * depth)
+    words, frag, words32, frag32 = _matrix_dst(dst, sfp32, keep_fp32)
+    loads = cute.make_fragment((3 * _MATRIX_DEPTH, LANE_PAIR), src)
+
+    for group in cutlass.range_constexpr(-(-steps // _MATRIX_DEPTH)):
+        count = min(_MATRIX_DEPTH, steps - group * _MATRIX_DEPTH)
         held = []
         for step in cutlass.range_constexpr(count):
-            i = tid + (group * depth + step) * threads
-            if cutlass.const_expr(not exact):
-                i = cutlass.min(i, total - 1)
-            p = i // pairs
-            m = i - p * pairs
+            first = group * _MATRIX_DEPTH + step
+            p, m = _matrix_step(tid, first, threads, pairs, total, exact)
             _load_pair(_paired_row(gv[bidx, hidx, cidx, p, None]), loads, 3 * step, m)
-            held.append((p, m))
+            held.append((p, m, first))
 
         for step in cutlass.range_constexpr(count):
-            p, m = held[step]
-            got = tuple(
-                widen(loads[3 * step + j // LANE_PAIR, j % LANE_PAIR], src)
-                for j in range(span)
+            p, m, first = held[step]
+            _matrix_store(
+                loads,
+                3 * step,
+                words,
+                frag,
+                words32,
+                frag32,
+                mat,
+                p,
+                m,
+                exact or tid + first * threads < total,
+                keep_fp32,
             )
-            out = mat3_matvec(mat, (got[0], got[1], got[2])) + mat3_matvec(
-                mat, (got[3], got[4], got[5])
-            )
-            col = 3 * m
-            if cutlass.const_expr(exact):
-                store_pair(words, frag, p, col, out)
-                if cutlass.const_expr(keep_fp32):
-                    store_pair(words32, frag32, p, col, out)
-            else:
-                if tid + (group * depth + step) * threads < total:
-                    store_pair(words, frag, p, col, out)
-                    if cutlass.const_expr(keep_fp32):
-                        store_pair(words32, frag32, p, col, out)
 
 
 def _table_quads(stable: cute.Tensor, slot: cutlass.Constexpr, token: cutlass.Int32):

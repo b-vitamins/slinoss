@@ -604,10 +604,12 @@ from slinoss.ops.so3ssd.cute.mma import (
 from slinoss.ops.so3ssd.cute.prefix import chunk_prefixes, chunk_suffix, quat_suffix_vjp
 from slinoss.ops.so3ssd.cute.table import (
     LANE_PAIR,
+    apply_matrix,
     build_table,
+    matrix_frag,
     paired,
+    read_matrix,
     stage_chunk,
-    stage_matrix,
     stage_rotated,
     stage_score,
     stage_shifted,
@@ -3357,6 +3359,11 @@ def chunk_vector_bwd_kernel(
     if cutlass.const_expr(fold > 1):
         csum.fill(0.0)
 
+    # The closing state's read, held in registers across one barrier of a head's body.
+    # Allocated here and not at the read because the head loop below is a dynamic loop,
+    # where a fragment is an allocation an iteration.
+    dincl = matrix_frag(gdincj, threads, rows, lanes)
+
     # The heads of one shard, rolled. Unrolling it at trace time was refused on a spill
     # -- local traffic 1,135.3 MB to 1,290.4 MB a launch at fold 18, a call 12,260.9 us
     # to 13,596.7 at fold 2 and 11,530.8 to 12,297.2 at fold 3 -- and that spill no
@@ -3527,6 +3534,15 @@ def chunk_vector_bwd_kernel(
                 has_prev,
             )
 
+        # The closing state's global read, issued a GEMM and a barrier above the
+        # transform that consumes it. The pass is six 32-bit loads a thread and its own
+        # three-access step is all that stood in front of the round trip: at the
+        # acceptance shape the first consumer, the widen of the first load, carried
+        # 6,342 of the kernel's 163,462 long-scoreboard samples on one instruction. The
+        # reads are global and land in registers, so the barrier below orders nothing
+        # they touch.
+        read_matrix(gdincj, dincl, bidx, hidx, cidx, tid, threads, rows, lanes)
+
         # The offset term, and the log-scale cotangent it carries. The scale is
         # per target token, so it rides the accumulator's M mode and is applied
         # after the reduction that needs the unscaled value.
@@ -3560,20 +3576,7 @@ def chunk_vector_bwd_kernel(
                 sdlp[wgroup, m] = sdlp[wgroup, m] + term
 
         cute.arch.sync_threads()
-        stage_matrix(
-            gdincj,
-            sstate,
-            sstate,
-            aclast,
-            bidx,
-            hidx,
-            cidx,
-            tid,
-            threads,
-            rows,
-            lanes,
-            False,
-        )
+        apply_matrix(dincl, sstate, sstate, aclast, tid, threads, rows, lanes, False)
         cute.arch.sync_threads()
 
         # The forcing product's right operand, loaded once a head. The rotated readout
