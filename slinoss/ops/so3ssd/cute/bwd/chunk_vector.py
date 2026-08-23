@@ -2562,8 +2562,32 @@ def _tap_epilogue(
         dstepmat = tuple(estep * d for d in dmat)
         gprev = mat3_mul(dstepmat, mat3_transpose(anprev))
         gnow = _mat_sub(mat3_mul(dmat, afuset), gprev)
-        mnow = mat3_mul(mat3_transpose(_mat_at(stable, TABLE_AC, token)), dmat)
-        mprev = mat3_mul(mat3_transpose(_mat_at(stable, TABLE_AC, prev)), dstepmat)
+        # One tap adjoint, not two. The row's own half and the row before it are the same
+        # instruction sequence on different operands, and both ran on lane 0 of a group of
+        # four. Selecting the operands by lane runs them together: ``dmat`` is group
+        # uniform after the butterfly and ``estep`` is group uniform, so ``dstepmat`` is
+        # too and the select needs no cross-lane traffic. Each output is still formed from
+        # the same operands in the same order on the lane that deposits it. Integer
+        # arithmetic rather than :func:`select`, which retypes to float32. Lanes 2 and 3
+        # carry the previous row's operands and discard the result; ``prev`` bounds their
+        # reads.
+        #
+        # The scalar loads below trade a bank conflict for half the load instructions:
+        # four active lanes a group over two component rows whose bank is ``tsel mod 32``
+        # put a group's previous-row lanes on the next group's own-row bank at a different
+        # address, so wavefronts a load go one to two while loads go twelve to six.
+        # :func:`_mat_at` stays conflict-free, its segment index being ``3 tsel + q mod 8``
+        # over three distinct ``tsel`` a phase, which differ by 3 mod 8.
+        lprev = cutlass.min(lane, 1)
+        tsel = token - lprev * (token - prev)
+        toff = 4 * lprev
+        dsel = tuple(select(lane == 0, dmat[e], dstepmat[e]) for e in range(9))
+        msel = mat3_mul(mat3_transpose(_mat_at(stable, TABLE_AC, tsel)), dsel)
+        dtapsel, dwsel = tap_matrix_vjp(
+            msel,
+            (stap[toff, tsel], stap[toff + 1, tsel], stap[toff + 2, tsel]),
+            (strans[0, tsel], strans[1, tsel], strans[2, tsel]),
+        )
         # ``decay`` is ``exp(2 ls)``, so the derivative of the fused slot in ``ls_t``
         # is twice the term ``e_t`` multiplies, contracted against its own cotangent.
         # The two is exact, so folding it into the deposit changes no bit.
@@ -2587,13 +2611,8 @@ def _tap_epilogue(
             if rows:
                 srow[token, base + lane] += held
         if keep:
-            dtap, dw = tap_matrix_vjp(
-                mnow,
-                (stap[0, token], stap[1, token], stap[2, token]),
-                (strans[0, token], strans[1, token], strans[2, token]),
-            )
             for j in cutlass.range_constexpr(3):
-                sdw[j, token] += dw[j]
+                sdw[j, token] += dwsel[j]
             sdw[3, token] += 2.0 * dstep
             if token < valid:
                 krow = jbase + t0 + token
@@ -2605,7 +2624,7 @@ def _tap_epilogue(
                     kfrag,
                     0,
                     1,
-                    (dtap[0], dtap[1], dtap[2], zero),
+                    (dtapsel[0], dtapsel[1], dtapsel[2], zero),
                 )
 
         # Everything above is indexed by the row's own token, everything below by the
@@ -2621,17 +2640,14 @@ def _tap_epilogue(
             held = _spread(gprev[base : base + LANE_GROUP], lane)
             if rows:
                 srow2[prev, base + lane] = held
-        if keep & back:
-            # Its cotangent carries ``e_t`` already, so nothing is scaled on the way
-            # out: every deposit here is a bare store or a bare add.
-            dtapp, dwp = tap_matrix_vjp(
-                mprev,
-                (stap[4, prev], stap[5, prev], stap[6, prev]),
-                (strans[0, prev], strans[1, prev], strans[2, prev]),
-            )
+        # Lane 1 holds the previous row's adjoint, so it is lane 1 that deposits it. One
+        # writer either way, and ``back`` already carries ``inside`` where the span is
+        # ragged. Its cotangent carries ``e_t`` already, so nothing is scaled on the way
+        # out: every deposit here is a bare store or a bare add.
+        if (lane == 1) & back:
             for j in cutlass.range_constexpr(3):
-                sdk[j, prev] += dtapp[j]
-                sdw2[j, prev] = dwp[j]
+                sdk[j, prev] += dtapsel[j]
+                sdw2[j, prev] = dwsel[j]
 
 
 def _readout_pass(
@@ -4079,7 +4095,10 @@ def chunk_vector_bwd_kernel(
         # lowers to the same MEMBAR.ALL.GPU, ERRBAR and CCTL.IVALL the atomic already
         # lowers to, with no memory instruction between the two triples, so it is the
         # same fence twice. The acquire half needs no cache reasoning either, since
-        # :func:`_sum_slots` reads the slots with ``ld.global.cg``, past L1.
+        # :func:`_sum_slots` reads the slots with ``ld.global.cg``, past L1 -- but it is
+        # not free to drop. ``release`` in its place is bitwise and slower: the bulk
+        # invalidate the acquire half lowers to is cheaper than the per-access L1 bypass
+        # the reduction's strong loads pay without it.
         # One thread increments and the second barrier broadcasts what it read: the
         # branch below is block-uniform, which is what makes the barriers inside it
         # legal.
