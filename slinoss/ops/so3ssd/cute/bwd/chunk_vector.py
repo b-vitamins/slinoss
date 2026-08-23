@@ -1052,6 +1052,11 @@ class Arena(NamedTuple):
         input: The shifted ``U`` tile.
         readout: The float32 readout gradient of one head. Epilogue only.
         words: Float32 words the arena spans.
+        raw_held: Whether ``readout`` stops below ``raw``, which is what decides
+            whether the raw forcing tile survives a head's epilogue and so may be
+            staged once for the block rather than once a head. True wherever ``dy``
+            and the state span at least the readout gradient, which is every shape
+            whose ``P`` reaches the lane tile.
     """
 
     forcing: int
@@ -1063,6 +1068,7 @@ class Arena(NamedTuple):
     input: int
     readout: int
     words: int
+    raw_held: bool
 
 
 def _words(tile: Tile, itemsize: int) -> int:
@@ -1108,6 +1114,7 @@ def arena(
     raw = _words(shifted_tile(span, tile), itemsize)
     forced = _words(forced_tile(span, tile), itemsize)
     inp = _words(shifted_tile(mma_rows(span), rows), itemsize)
+    read = _words(gradient_tile(mma_rows(chunk), tile), 4)
     base = forcing + tapped
     return Arena(
         forcing=0,
@@ -1118,11 +1125,8 @@ def arena(
         forced=base + out + state + raw,
         input=base + out + state + raw + forced,
         readout=base,
-        words=base
-        + max(
-            out + state + raw + forced + inp,
-            _words(gradient_tile(mma_rows(chunk), tile), 4),
-        ),
+        words=base + max(out + state + raw + forced + inp, read),
+        raw_held=read <= out + state,
     )
 
 
@@ -2265,17 +2269,17 @@ def _stage_run(
     spad: cutlass.Constexpr,
     mpad: cutlass.Constexpr,
     has_prev: cutlass.Constexpr,
+    forcing: cutlass.Constexpr,
 ) -> None:
-    """Issue one source-token block's three staged tiles, asynchronously, no wait.
+    """Issue one source-token block's staged tiles, asynchronously, no wait.
 
     Stated once because it has two call sites: hoisted for the first block, whose
     write-after-read fence is a barrier the head already carries, and in the block
     loop for every later one, whose fence is the barrier that closed the previous
     iteration. Neither reads the transform table, so neither has to follow the build.
 
-    The three passes sit together so their global loads overlap: each one's issues
-    cover the next one's runs, and the caller's single ``cp_async_wait_group`` retires
-    all three.
+    The passes sit together so their global loads overlap: each one's issues cover the
+    next one's runs, and the caller's single ``cp_async_wait_group`` retires them all.
 
     Args:
         gb: ``(B,G,T,tile)`` lane view of the forcing operand.
@@ -2283,7 +2287,7 @@ def _stage_run(
         gu: ``(B,H,T,P)`` input operand.
         guprev: ``(B,H,P)`` streaming predecessor of ``gu``.
         gscore: ``(L,L)`` masked score record of this head and chunk.
-        sb: Operand-dtype tile of ``span + 1`` rows, written.
+        sb: Operand-dtype tile of ``span + 1`` rows, written when ``forcing``.
         su: Operand-dtype tile of ``spad + 1`` rows, written.
         sscore: Operand-dtype ``(L, span)`` tile, written.
         bidx: Batch index.
@@ -2302,23 +2306,27 @@ def _stage_run(
         spad: ``span`` rounded to the atom's M mode. Compile-time.
         mpad: ``chunk`` rounded to the atom's M mode. Compile-time.
         has_prev: Whether a streaming predecessor exists. Compile-time.
+        forcing: Include the forcing pass. Compile-time. False where the caller staged
+            that tile once for the block instead, which it may do only when the block
+            loop has one iteration, ``nbase`` being the pass's only per-iteration term.
     """
-    stage_shifted(
-        gb,
-        gbprev,
-        sb,
-        bidx,
-        gidx,
-        t0,
-        nbase,
-        valid,
-        tid,
-        threads,
-        span,
-        tile,
-        has_prev,
-        True,
-    )
+    if cutlass.const_expr(forcing):
+        stage_shifted(
+            gb,
+            gbprev,
+            sb,
+            bidx,
+            gidx,
+            t0,
+            nbase,
+            valid,
+            tid,
+            threads,
+            span,
+            tile,
+            has_prev,
+            True,
+        )
     stage_shifted(
         gu,
         guprev,
@@ -3316,6 +3324,10 @@ def chunk_vector_bwd_kernel(
     sdw2 = smem.allocate_tensor(cutlass.Float32, trans_tile(chunk).layout(), 16)
     scrot = smem.allocate_tensor(elem, readout_tile(chunk, tile).layout(), SMEM_SEGMENT)
     space = arena(chunk, rows, dim, fold, span, elem.width // 8)
+    # One source-token block, and a readout gradient that stops below the raw
+    # forcing tile: together they are what lets that tile be staged once for the
+    # block instead of once a head.
+    rawheld = blocks == 1 and space.raw_held
     base = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((space.words,), stride=(1,)), 16
     )
@@ -3489,6 +3501,37 @@ def chunk_vector_bwd_kernel(
     bfrag = readout_bfrag(gbj, threads, chunk, lanes)
     read_readout_b(gbj, bfrag, bidx, gidx, t0, valid, tid, threads, chunk, lanes)
 
+    # The forcing tile's whole staging pass, hoisted out of the head loop. It is the
+    # longest pass the kernel stages, ``(span + 1) * tile`` elements, and its address is
+    # the batch, the group, the chunk, the thread and the block base; the head loop
+    # varies none of them, so the shipped form restaged the same rows once a head. This
+    # call is the tile's only writer, so no head below fences against it and the first
+    # head's wait and barrier publish it for all of them.
+    #
+    # Two conditions, both from the arena. The block base has to be the pass's only
+    # per-iteration term, which is one source-token block; and the epilogue's readout
+    # gradient, which aliases the operand tiles from the same base, has to stop below
+    # this one, which is ``raw_held``. Where either fails the pass stays inside the loop
+    # with :func:`_stage_run` and the tile is restaged, because there the epilogue of
+    # the head before overwrote it.
+    if cutlass.const_expr(rawheld):
+        stage_shifted(
+            gbj,
+            gbprevj,
+            sb,
+            bidx,
+            gidx,
+            t0,
+            0,
+            valid,
+            tid,
+            threads,
+            span,
+            tile,
+            has_prev,
+            True,
+        )
+
     # The heads of one shard, rolled. Unrolling it at trace time was refused on a spill
     # -- local traffic 1,135.3 MB to 1,290.4 MB a launch at fold 18, a call 12,260.9 us
     # to 13,596.7 at fold 2 and 11,530.8 to 12,297.2 at fold 3 -- and that spill no
@@ -3622,15 +3665,17 @@ def chunk_vector_bwd_kernel(
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        # The first source-token block's tiles, issued here and waited two barriers
-        # down. They were issued at the top of the block loop, where their runs had
-        # only their own issues to cover them: the wait there was 8.62% of the kernel's
-        # samples for 1.55% of its instructions, the widest gap between work and wall
-        # any region of this kernel holds. What covers them here is the offset term's
-        # GEMM and butterfly and the closing transition's staging, and the barrier
-        # above is the write-after-read fence their destinations need. ``sscore``'s
-        # destination aliases the forcing gradient, whose last read is the previous
-        # head's epilogue; that barrier is the one under the head's own staging.
+        # The first source-token block's per-head tiles, issued here and waited two
+        # barriers down. They were issued at the top of the block loop, where their runs
+        # had only their own issues to cover them: the wait there was 8.62% of the
+        # kernel's samples for 1.55% of its instructions, the widest gap between work
+        # and wall any region of this kernel holds. What covers them here is the offset
+        # term's GEMM and butterfly and the closing transition's staging, and the
+        # barrier above is the write-after-read fence their destinations need.
+        # ``sscore``'s destination aliases the forcing gradient, whose last read is the
+        # previous head's epilogue; that barrier is the one under the head's own
+        # staging. The forcing tile is not among them, being staged once for the block
+        # above the loop.
         if cutlass.const_expr(blocks == 1):
             _stage_run(
                 gbj,
@@ -3656,6 +3701,7 @@ def chunk_vector_bwd_kernel(
                 spad,
                 mpad,
                 has_prev,
+                not rawheld,
             )
 
         # The closing state's global read, issued a GEMM and a barrier above the
@@ -3758,6 +3804,7 @@ def chunk_vector_bwd_kernel(
                     spad,
                     mpad,
                     has_prev,
+                    True,
                 )
             # The staged tiles are published here. One forcing column, so the rotation
             # and the three products below run once a block where the two-tap form ran
