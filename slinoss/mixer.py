@@ -1,7 +1,7 @@
 """The sequence mixer and the column bands of its fused input projection.
 
 One GEMM produces every per-token operand of a mixer step: the value the
-convolution filters, the gate, the two state vectors, and the ten scan parameters
+convolution filters, the gate, the two state vectors, and the four scan parameters
 per head. Each consumer reads its own column band of that one output at the
 projection's pitch. Nothing is copied out of it, and nothing gets a projection of
 its own.
@@ -28,7 +28,7 @@ from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.conv import backends as conv_dispatch
 from slinoss.ops.mixer import backends as tail_dispatch
-from slinoss.ops.scanprep import LS_COLUMN, PARAM_COLS, ROTVEC_COLUMNS, TAP_COLUMNS
+from slinoss.ops.scanprep import LS_COLUMN, PARAM_COLS, ROTVEC_COLUMNS
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
 from slinoss.ops.so3ssd.reference import ScanPrologue
@@ -288,6 +288,9 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
       conjugation doubles the half-angle back. A turn every ``h`` tokens is
       therefore ``|w| = 2*pi/h``.
 
+    The taps take no row. They are the first-order-hold moments of the transition
+    these two rows set, so the grid reaches them already.
+
     Args:
         config: Supplies ``H`` and ``w_max``.
 
@@ -308,10 +311,6 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
         dtype=torch.float32,
     )
     rows[:, ROTVEC_COLUMNS] = radius[:, None] * axis / axis.norm(dim=-1, keepdim=True)
-    # Trapezoidal two-tap rule: half of the previous token's forcing and half of the
-    # current one, with no component along the axis and none across it, so the
-    # rotation carries all of the geometry. Column 0 of a tap is kr.
-    rows[:, TAP_COLUMNS].unflatten(-1, (2, 3))[..., 0] = 0.5
     return rows
 
 
@@ -574,9 +573,8 @@ class SLinOSSMixer(nn.Module):
 
     Initialization is principled where the scale sets the recurrence and the
     framework default elsewhere. ``param_bias`` is inverted through both bounded
-    maps onto one horizon grid over :data:`HORIZON_RANGE`, with the trapezoidal
-    two-tap rule and an isotropic axis per head; ``d_skip`` and ``norm_weight`` are
-    ones. The two
+    maps onto one horizon grid over :data:`HORIZON_RANGE`, with an isotropic axis per
+    head; ``d_skip`` and ``norm_weight`` are ones. The two
     projections keep :meth:`torch.nn.Linear.reset_parameters`, which is a default
     and not a choice, and the convolution taps take the same uniform bound over
     ``d_conv``. No depth scaling.

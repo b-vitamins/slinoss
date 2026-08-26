@@ -15,15 +15,17 @@ from slinoss.ops.scanprep import (
     ScanParams,
     bounded_logscale,
     bounded_rotvec,
+    foh_taps,
     pack_params,
     scanprep,
     scanprep_bwd_ref,
     scanprep_ref,
 )
+from slinoss.ops.scanprep.reference import FP32_FOH_TERMS
+from slinoss.ops.so3ssd import skew, tap_matrix
 
 Pair = tuple[Tensor, Tensor]
-Triple = tuple[Tensor, Tensor, Tensor]
-Mutator = Callable[[Tensor, Tensor, Tensor], Triple]
+Mutator = Callable[[Tensor, Tensor], Pair]
 
 EXTREME_RAWS: tuple[float, ...] = (
     -1e8,
@@ -208,55 +210,116 @@ def test_rotvec_rejects_illegal_bound(w_max: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The taps
+# ---------------------------------------------------------------------------
+
+
+def _moment_oracle(w: Tensor, ls: Tensor) -> Pair:
+    """``(int_0^1 r exp(Lr) dr, int_0^1 (1-r) exp(Lr) dr)`` as explicit matrices.
+
+    ``L = 2*ls*I + skew(w)`` and the two moments are ``phi_1(L) - phi_2(L)`` and
+    ``phi_2(L)``, which sit in the first block row of
+
+        exp([[L, I, 0], [0, 0, I], [0, 0, 0]])
+
+    because that block matrix's powers shift the identity along the row. One
+    ``matrix_exp`` therefore gives both, sharing no code with the chart under test:
+    neither the recurrence nor the truncated series appears here.
+    """
+    lead = w.shape[:-1]
+    eye = torch.eye(3, dtype=w.dtype).expand(*lead, 3, 3)
+    block = torch.zeros(*lead, 9, 9, dtype=w.dtype)
+    block[..., 0:3, 0:3] = 2.0 * ls[..., None, None] * eye + skew(w)
+    block[..., 0:3, 3:6] = eye
+    block[..., 3:6, 6:9] = eye
+    out = torch.linalg.matrix_exp(block)
+    phi1, phi2 = out[..., 0:3, 3:6], out[..., 0:3, 6:9]
+    return phi1 - phi2, phi2
+
+
+def test_taps_are_the_first_order_hold_moments() -> None:
+    """The taps against the integrals they are defined as, as matrices.
+
+    The comparison is at the matrix rather than at the chart, which is where the
+    operator reads them: ``g`` carries ``1/|w|^2`` and is ill-conditioned as ``|w|``
+    falls while ``g * w w^T`` is not, so a chart-level tolerance would be a claim
+    about the corner and not about the operator.
+
+    The grid crosses ``FOH_TAYLOR_RADIUS_SQ`` in both arguments and includes
+    ``|w| = 0``, where the chart divides by the floor. Non-axis directions are in it
+    because a transposed ``skew`` is invisible along a coordinate axis.
+    """
+    mags = torch.tensor([0.0, 1e-8, 1e-3, 0.5, 0.99, 2.0, 3.14], dtype=torch.float64)
+    axes = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.4, -0.5, 0.7], [-0.9, 0.2, -0.1]],
+        dtype=torch.float64,
+    )
+    axes = axes / axes.norm(dim=-1, keepdim=True)
+    scales = torch.tensor([0.0, -1e-8, -1e-3, -0.5, -2.0, -9.0], dtype=torch.float64)
+    shape = (len(mags), len(axes), len(scales))
+    w = (mags[:, None, None, None] * axes[None, :, None, :]).expand(*shape, 3)
+    ls = scales[None, None, :].expand(*shape)
+
+    tap = foh_taps(w, ls)
+    for slot, want in enumerate(_moment_oracle(w, ls)):
+        got = tap_matrix(tap[..., slot, :].contiguous(), w)
+        torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-13)
+
+
+def test_taps_hold_the_float32_truncation_to_its_own_width() -> None:
+    """The device path takes a shorter truncation of the same generator, so the two
+    term counts are one contract and the shorter one is held to float32."""
+    w, ls = _raw_pair(seed=12)
+    w = bounded_rotvec(w, W_MAX)
+    ls = bounded_logscale(ls)
+    wide = foh_taps(w, ls)
+    short = foh_taps(w, ls, terms=FP32_FOH_TERMS)
+    torch.testing.assert_close(short, wide, rtol=0.0, atol=1e-7)
+
+
+# ---------------------------------------------------------------------------
 # Column packing
 # ---------------------------------------------------------------------------
 
 
-def _raw_triple(
+def _raw_pair(
     bsz: int = 2,
     heads: int = 3,
     seqlen: int = 5,
     dtype: torch.dtype = torch.float64,
     seed: int = 0,
-) -> Triple:
+) -> Pair:
     gen = torch.Generator().manual_seed(seed)
 
     def rnd(*shape: int) -> Tensor:
         return torch.randn(*shape, generator=gen, dtype=torch.float64).to(dtype)
 
-    return (
-        rnd(bsz, heads, seqlen, 3),
-        rnd(bsz, heads, seqlen),
-        rnd(bsz, heads, seqlen, 2, 3),
-    )
+    return rnd(bsz, heads, seqlen, 3), rnd(bsz, heads, seqlen)
 
 
 def test_pack_params_lays_out_the_projection_column_order() -> None:
     """The column order is the operator's contract with the projection, and every
     kernel indexes it by hand, so it is asserted rather than assumed."""
-    w_raw, ls_raw, tap_raw = _raw_triple()
-    row = pack_params(w_raw, ls_raw, tap_raw)
+    w_raw, ls_raw = _raw_pair()
+    row = pack_params(w_raw, ls_raw)
     assert row.shape == (2, 5, 3 * PARAM_COLS)
     assert row.is_contiguous()
     head_major = row.unflatten(-1, (3, PARAM_COLS)).permute(0, 2, 1, 3)
     assert torch.equal(head_major[..., 0:3], w_raw)
     assert torch.equal(head_major[..., 3], ls_raw)
-    assert torch.equal(head_major[..., 4:].unflatten(-1, (2, 3)), tap_raw)
 
 
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda w, ls, tap: (w[..., :2], ls, tap), r"w_raw must be \(B,H,T,3\)"),
-        (lambda w, ls, tap: (w[0], ls, tap), r"w_raw must be \(B,H,T,3\)"),
-        (lambda w, ls, tap: (w, ls[..., :-1], tap), "ls_raw must be"),
-        (lambda w, ls, tap: (w, ls, tap[..., :2]), "tap_raw must be"),
-        (lambda w, ls, tap: (w, ls, tap[..., :1, :]), "tap_raw must be"),
+        (lambda w, ls: (w[..., :2], ls), r"w_raw must be \(B,H,T,3\)"),
+        (lambda w, ls: (w[0], ls), r"w_raw must be \(B,H,T,3\)"),
+        (lambda w, ls: (w, ls[..., :-1]), "ls_raw must be"),
     ],
 )
 def test_pack_params_rejects_shape_mismatch(mutate: Mutator, match: str) -> None:
     with pytest.raises(ValueError, match=match):
-        pack_params(*mutate(*_raw_triple()))
+        pack_params(*mutate(*_raw_pair()))
 
 
 # ---------------------------------------------------------------------------
@@ -319,15 +382,17 @@ def test_frontier_applies_the_bounded_maps_to_the_biased_row() -> None:
     """The maps are the ones asserted above, applied after the bias.
 
     A frontier that biased after the map, or dropped the bias, would still have
-    every shape and dtype right. The tap columns and the hard zero in lane 3 are
-    one packing contract, so they are asserted together.
+    every shape and dtype right. ``K`` is the taps of the transition the maps
+    produce, not of the raw row, so it is asserted against the packed transition;
+    the hard zero in lane 3 completes the packing contract.
     """
     params, pb = _operands(bias=1.0, seed=1)
     rows = _head_major(params, pb, heads=3)
     out = _apply(params, pb)
     assert torch.equal(out.trans[..., :3], bounded_rotvec(rows[..., 0:3], W_MAX))
     assert torch.equal(out.trans[..., 3], bounded_logscale(rows[..., 3]))
-    assert torch.equal(out.K[..., :3], rows[..., 4:].unflatten(-1, (2, 3)))
+    want = foh_taps(out.trans[..., :3].contiguous(), out.trans[..., 3])
+    assert torch.equal(out.K[..., :3], want)
     assert torch.equal(out.K[..., 3], torch.zeros_like(out.K[..., 3]))
 
 

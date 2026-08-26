@@ -32,7 +32,7 @@ from collections.abc import Callable
 
 import cutlass.cute as cute
 
-from slinoss._guard import ALIGN_BYTES
+from slinoss._guard import PROJ_ALIGN
 from slinoss.ops.scanprep import (
     PARAM_COLS,
     ScanGrads,
@@ -47,6 +47,7 @@ from slinoss.ops.scanprep.cute import (
     scanprep_backward,
     scanprep_forward,
 )
+from slinoss.ops.so3ssd import tap_matrix
 from tests.conftest import W_MAX, assert_max_rel, max_err
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
@@ -126,16 +127,10 @@ BALL_BOUND = W_MAX * (1.0 + 3.0 * torch.finfo(torch.float32).eps)
 
 EXTREME_RAWS = (-1e8, -1e4, -20.0, -1.0, -1e-8, 0.0, 1e-8, 1.0, 20.0, 1e4, 1e8)
 
-ALIGN_ELEMS = ALIGN_BYTES // 2
-"""Column multiple that keeps a slice's base address and row pitch aligned at every
-activation width. The requirement is ``ALIGN_BYTES // itemsize`` elements, which is
-eight at the narrowest activation and divides the four float32 needs, so one
-constant covers the sweep."""
-
 
 def _align(columns: int) -> int:
-    """Round a column count up to :data:`ALIGN_ELEMS`."""
-    return -(-columns // ALIGN_ELEMS) * ALIGN_ELEMS
+    """Round a column count up to :data:`slinoss._guard.PROJ_ALIGN`."""
+    return -(-columns // PROJ_ALIGN) * PROJ_ALIGN
 
 
 def _narrow(view: Tensor) -> Tensor:
@@ -143,9 +138,10 @@ def _narrow(view: Tensor) -> Tensor:
 
     Not ``contiguous()``. The pitched contract requires the row pitch to step on the
     alignment as well as the base to start on it, so a contiguous ``(B,T,width)`` is
-    legal only when ``width`` is already a multiple of :data:`ALIGN_ELEMS`; at
-    ``H = 1`` it is not. The band is therefore padded, which is what the producer
-    does to its projection width. The pitch still differs from the wide row's, so
+    legal only when ``width`` is already a multiple of the padding column count; at
+    ``H = 1`` it is not. The band is therefore padded, at the producer's own multiple:
+    once the pitch exceeds the row width the operand is a strict band, which owes the
+    sector and not the vector width. The pitch still differs from the wide row's, so
     both ends of the runtime pitch path are covered.
     """
     width = int(view.shape[-1])
@@ -155,6 +151,18 @@ def _narrow(view: Tensor) -> Tensor:
     band = own[..., :width]
     band.copy_(view)
     return band
+
+
+def _matrices(out: ScanParams) -> Tensor:
+    """Both tap operators as explicit float64 matrices, ``(B,H,T,2,3,3)``.
+
+    ``K`` is compared here rather than on the chart. ``g`` carries ``1/|w|^2``, so
+    what float32 holds of it is an absolute accuracy and not a relative one, while
+    ``g * w w^T`` -- the only form the scan reads it in -- is regular as ``|w|``
+    falls. A chart-level bound would be a claim about a corner no kernel downstream
+    can observe.
+    """
+    return tap_matrix(out.K[..., :3].double(), out.trans[..., None, :3].double())
 
 
 def _tag(shape: Shape, dtype: torch.dtype) -> str:
@@ -181,8 +189,8 @@ def _operands(
     bsz, heads, seqlen = shape
     gen = torch.Generator(device="cuda").manual_seed(seed)
     pwidth = heads * PARAM_COLS
-    poff = ALIGN_ELEMS
-    width = _align(poff + pwidth) + ALIGN_ELEMS
+    poff = PROJ_ALIGN
+    width = _align(poff + pwidth) + PROJ_ALIGN
     row = torch.randn(
         bsz, seqlen, width, generator=gen, dtype=torch.float32, device="cuda"
     )
@@ -239,7 +247,7 @@ def _leaves(ops: Operands, *, double: bool) -> Operands:
 
     The projection slice is rebuilt through :func:`_narrow` rather than ``clone``,
     which would give it a row pitch off the alignment at a head count whose row is
-    not already a multiple of :data:`ALIGN_ELEMS`.
+    not already a multiple of :data:`slinoss._guard.PROJ_ALIGN`.
     """
     params, pbias = ops
     if double:
@@ -266,12 +274,12 @@ def _band_dest(shape: Shape) -> Operands:
     bsz, heads, seqlen = shape
     width = heads * PARAM_COLS
     wide = torch.full(
-        (bsz, seqlen, _align(width) + 2 * ALIGN_ELEMS),
+        (bsz, seqlen, _align(width) + 2 * PROJ_ALIGN),
         float("nan"),
         dtype=torch.float32,
         device="cuda",
     )
-    return wide, wide[..., ALIGN_ELEMS : ALIGN_ELEMS + width]
+    return wide, wide[..., PROJ_ALIGN : PROJ_ALIGN + width]
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +306,7 @@ def test_forward_matches_reference(shape: Shape, dtype: torch.dtype) -> None:
 
     tag = _tag(shape, dtype)
     assert_max_rel(got.trans, want.trans, FWD_TOL, f"{tag}.trans")
-    assert_max_rel(got.K, want.K, FWD_TOL, f"{tag}.K")
+    assert_max_rel(_matrices(got), _matrices(want), FWD_TOL, f"{tag}.K")
 
 
 def test_lane_three_is_a_hard_zero() -> None:
@@ -415,9 +423,7 @@ def test_extreme_raws_match_the_reference() -> None:
     assert_max_rel(
         got.trans[..., :3], want.trans[..., :3], FWD_TOL, "cute-scanprep.extreme.w"
     )
-    # The taps are the identity on the biased row, and the bias is zero here, so
-    # the widening is exact and equality is the honest bound.
-    assert torch.equal(got.K[..., :3].double(), want.K[..., :3])
+    assert_max_rel(_matrices(got), _matrices(want), FWD_TOL, "cute-scanprep.extreme.K")
     # The log-scale column spans 1e8 down to zero, so a bound relative to the
     # column maximum is vacuous. The absolute bound is float32 rounding of log1p
     # near its largest reachable argument.
@@ -512,8 +518,8 @@ def test_backward_writes_dparams_into_a_supplied_band(backward: Backward) -> Non
     assert got.dparams is dest
     assert torch.equal(got.dparams, want.dparams)
     assert torch.equal(got.dparam_bias, want.dparam_bias)
-    assert bool(wide[..., :ALIGN_ELEMS].isnan().all())
-    assert bool(wide[..., ALIGN_ELEMS + heads * PARAM_COLS :].isnan().all())
+    assert bool(wide[..., :PROJ_ALIGN].isnan().all())
+    assert bool(wide[..., PROJ_ALIGN + heads * PARAM_COLS :].isnan().all())
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -705,7 +711,7 @@ def test_backward_rejects_a_misshaped_dparams_destination(backward: Backward) ->
     ops = _operands(REJECT, seed=16)
     cots = _cotangents(REJECT, seed=17)
     dest = _band_dest(REJECT)[1][..., 1:]
-    with pytest.raises(ValueError, match=r"dparams must be \(2, 8, 30\)"):
+    with pytest.raises(ValueError, match=r"dparams must be \(2, 8, 12\)"):
         backward(*cots, *ops, heads=REJECT[1], w_max=W_MAX, dparams=dest)
 
 

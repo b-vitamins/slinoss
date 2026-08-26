@@ -38,7 +38,6 @@ from slinoss.ops.scanprep import (
     LS_COLUMN,
     PARAM_COLS,
     ROTVEC_COLUMNS,
-    TAP_COLUMNS,
     bounded_logscale,
     bounded_rotvec,
     scanprep,
@@ -172,6 +171,17 @@ MIXER_CONFIG = SLinOSSConfig(
 UNGROUPED_CONFIG = SLinOSSConfig(
     d_model=32, d_state=48, d_head=16, n_groups=4, chunk_size=16
 )
+PAD_CONFIG = SLinOSSConfig(
+    d_model=32, d_state=48, d_head=32, n_groups=2, chunk_size=16, bias=True
+)
+"""A head count whose parameter band leaves the projection width off the sector.
+
+Every other band is a sector multiple by construction, so pad columns exist only
+when ``PARAM_COLS * H`` is not one. :data:`MIXER_CONFIG` carries four heads, whose
+sixteen parameter columns are a multiple, and the two pad tests would then run
+against an empty view. Two heads leave eight columns and the width rounds up by
+eight.
+"""
 BATCH = 2
 SEQLEN = 40
 
@@ -367,7 +377,7 @@ def test_pad_columns_of_the_projection_are_zero() -> None:
     Left as numbers, they are what a band addressed one sector wide reads, and they
     are plausible values rather than an obvious fault.
     """
-    cfg = MIXER_CONFIG
+    cfg = PAD_CONFIG
     mixer = SLinOSSMixer(cfg)
     assert mixer.layout.pad_width > 0
     x = _activations(cfg, torch.device("cpu"), torch.float32)
@@ -384,8 +394,9 @@ def test_pad_columns_of_the_gradient_buffer_are_zero(cuda: torch.device) -> None
     there. The pad rows of ``in_proj.weight.grad`` are where that shows, and a NaN
     in them poisons a global gradient norm rather than one row.
     """
-    cfg = MIXER_CONFIG
+    cfg = PAD_CONFIG
     mixer = SLinOSSMixer(cfg, device=cuda, dtype=torch.float32)
+    assert mixer.layout.pad_width > 0
     x = _activations(cfg, cuda, torch.float32)
     # Free blocks of exactly the buffer's size, filled with NaN: the allocator
     # serves the backward's torch.empty from them.
@@ -464,9 +475,7 @@ def test_initialization_inverts_the_bounded_maps() -> None:
     # I1 and I2 at step zero. The grids are what leaves a margin in the second.
     assert bool((ls <= 0.0).all())
     assert float(turn.max()) < cfg.w_max
-    taps = rows[:, TAP_COLUMNS].unflatten(-1, (2, 3))
-    assert torch.equal(taps[..., 0], torch.full_like(taps[..., 0], 0.5))
-    assert not taps[..., 1:].any()
+    assert rows.shape[1] == PARAM_COLS
 
 
 def test_every_head_turns_once_per_lifetime() -> None:

@@ -36,6 +36,28 @@ origin, costs an `rsqrt` and a clamp, and turns well-definedness into a
 whole-tensor validity check. The polynomial chart makes that condition
 structural.
 
+The taps are not free. First-order hold is the exact integral of the step against
+a forcing that is linear between the two tokens, so with the per-step generator
+`L = 2*ls*I + [w]_x`, whose exponential is the transition above,
+
+    K_prev = int_0^1 r exp(L r) dr       = phi_1(L) - phi_2(L)
+    K_curr = int_0^1 (1 - r) exp(L r) dr = phi_2(L)
+
+where `phi_k(x) = sum_n x^n / (n+k)!`. `L` is a scalar plus a skew part, hence
+normal, with eigenvalue `p = 2*ls` on `w` and `z = p + i*|w|` on the plane across
+it. The chart above is exactly those eigenvalues: `kr = Re f(z)`,
+`g = (f(p) - kr) / |w|^2`, `h = Im f(z) / |w|` for `f` either moment. So the
+projection carries four columns per head and the taps carry none: no tap
+parameter, no tap initialization, no trapezoidal or other approximation.
+
+Both `phi` come from the recurrence `phi_{k+1} = (phi_k - 1/k!)/x` off
+`phi_0 = exp(x)`, which costs one complex division per order and loses `eps/|x|`.
+Inside `|z|^2 < 1` the series is summed instead, at 20 terms in float64 and 12 on
+the device. The chart's own two divisions are by `|w|^2` and `|w|`, floored: `g`
+and `h` are ill-conditioned as `|w|` falls while `g w w^T` and `h [w]_x` are not,
+so the chart holds an absolute accuracy in that corner and the operator sees a
+relative one.
+
 ## Chunk factorization
 
 The sequence is cut into chunks of `L` tokens. Inside a chunk, two prefixes over

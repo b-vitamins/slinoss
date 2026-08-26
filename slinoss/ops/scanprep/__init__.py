@@ -1,4 +1,4 @@
-"""The scan's parameter frontier: bounded maps and tap packing."""
+"""The scan's parameter frontier: bounded maps and the taps they imply."""
 
 from slinoss.ops.scanprep.backends import (
     Backend,
@@ -15,12 +15,12 @@ from slinoss.ops.scanprep.reference import (
     LS_COLUMN,
     PARAM_COLS,
     ROTVEC_COLUMNS,
-    TAP_COLUMNS,
     ScanGrads,
     ScanParams,
     bounded_logscale,
     bounded_rotvec,
     check_dparams_out,
+    foh_taps,
     pack_params,
     scanprep_bwd_ref,
     scanprep_ref,
@@ -30,7 +30,6 @@ __all__ = [
     "LS_COLUMN",
     "PARAM_COLS",
     "ROTVEC_COLUMNS",
-    "TAP_COLUMNS",
     "Backend",
     "ScanGrads",
     "ScanParams",
@@ -41,6 +40,7 @@ __all__ = [
     "bounded_logscale",
     "bounded_rotvec",
     "check_dparams_out",
+    "foh_taps",
     "get",
     "names",
     "pack_params",

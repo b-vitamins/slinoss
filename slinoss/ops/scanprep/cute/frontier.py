@@ -8,17 +8,17 @@ so no phase here touches them. The maps themselves are in
 implementation.
 
 Parallel decomposition. One block per ``(batch, token tile)``. One thread owns one
-``(head, token)`` pair with the token innermost, reads that head's ten parameter
+``(head, token)`` pair with the token innermost, reads that head's four parameter
 columns itself, adds the per-head bias, and writes the head-major ``(B,H,T,4)``
 and ``(B,H,T,2,4)`` rows for its token. No shared memory and no barrier: the
-parameter slice's ten columns per head are the thread's own working set, so the
+parameter slice's four columns per head are the thread's own working set, so the
 transpose that a coalesced row load would need never arises, and neither does the
 tile it would be staged in. Bank conflicts are unreachable rather than avoided.
 
-That read is a ten-column gather per thread, not a coalesced row. It costs L1
+That read is a four-column gather per thread, not a coalesced row. It costs L1
 requests, not DRAM traffic: a block reads every head of its own token rows, so
-every sector it touches is fully consumed, and the ten loads of one column re-read
-the sectors the other nine touch.
+every sector it touches is fully consumed, and the four loads of one column re-read
+the sectors the other three touch.
 
 Operand layout. ``params`` is a slice of one projection output: the trailing axis
 has unit stride and the row stride is the full projection width, taken from the
@@ -33,7 +33,7 @@ read from the operand exactly as ``params``'s is, so the store needs no repack a
 the kernel needs no second addressing form.
 
 The backward is the same decomposition. One thread recovers its own biased
-parameter row, applies both Jacobians, stores its ten gradient columns, and then
+parameter row, applies every Jacobian, stores its four gradient columns, and then
 reduces them over the tile's tokens by warp shuffle. ``TILE_TOKENS`` divides the
 warp width, so a token run lies inside one warp and the reduction needs neither
 shared memory nor a barrier; the run's last lane writes the block's partial
@@ -47,12 +47,14 @@ and the parameter rows are widened on load so both maps and the bias reduction
 run in float32. Gradients are narrowed back to the input width once, on the store
 to ``dparams``.
 
-DRAM-bound. Per token the forward moves ``i*10*H + 48*H`` bytes at activation
-itemsize ``i``: the parameter row in, and 48 bytes of packed float32 per head out.
-The backward moves ``i*20*H + 48*H + 40*H/TILE_TOKENS`` bytes: both float32
-cotangents and the parameter row in, ``dparams`` out, and the partial bias row. The
-per-head bias is ``40*H`` bytes for the whole launch and is read once per block out
-of cache. No measured bandwidth is claimed here.
+Traffic. Per token the forward moves ``i*4*H + 48*H`` bytes at activation itemsize
+``i``: the parameter row in, and 48 bytes of packed float32 per head out. The
+backward moves ``i*8*H + 48*H + 16*H/TILE_TOKENS`` bytes: both float32 cotangents
+and the parameter row in, ``dparams`` out, and the partial bias row. The per-head
+bias is ``16*H`` bytes for the whole launch and is read once per block out of
+cache. ``K`` is derived rather than read, so the taps are the one term of the
+arithmetic that is not a handful of operations; no measured balance is claimed
+here.
 """
 
 import math
@@ -76,6 +78,8 @@ from slinoss._guard import check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
 from slinoss._reduce import reduce_partials
 from slinoss.ops.scanprep.cute.maps import (
+    foh_taps,
+    foh_taps_grad,
     log_scale,
     log_scale_grad,
     rotvec,
@@ -180,7 +184,7 @@ def _emit_maps(
     heads: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
 ) -> None:
-    """Apply both maps to one ``(head, token)`` pair per thread and pack the result.
+    """Map one ``(head, token)`` pair per thread, derive its taps, pack the result.
 
     Args:
         gparams: ``(B,T,H*PARAM_COLS)`` projection slice, activation dtype.
@@ -218,6 +222,7 @@ def _emit_maps(
         value = _biased_row(gparams, gbias, bidx, token, base, dtype)
         wx, wy, wz = rotvec(value[0], value[1], value[2], w_max)
         ls = log_scale(value[3])
+        taps = foh_taps(wx, wy, wz, ls)
         inside = t0 + row < seqlen
         if cutlass.const_expr(not exact):
             inside = inside & (flat < cutlass.Int32(items))
@@ -228,7 +233,7 @@ def _emit_maps(
             gtrans[bidx, head, token, 3] = ls
             for tap in cutlass.range_constexpr(2):
                 for comp in cutlass.range_constexpr(3):
-                    gpack[bidx, head, token, tap, comp] = value[4 + 3 * tap + comp]
+                    gpack[bidx, head, token, tap, comp] = taps[tap][comp]
                 gpack[bidx, head, token, tap, 3] = zero
 
 
@@ -298,7 +303,7 @@ def _pull_tokens(
     heads: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
 ) -> None:
-    """Pull both maps back for one ``(head, token)`` pair per thread.
+    """Pull the maps and the taps back for one ``(head, token)`` pair per thread.
 
     Args:
         gdtrans: ``(B,H,T,4)`` float32 cotangent of ``trans``.
@@ -324,7 +329,13 @@ def _pull_tokens(
     Invariants:
         A lane whose token lies past ``T`` takes a zero cotangent, so it contributes
         zero to the run total and the partial bias row of a ragged tile is the sum
-        over that tile's real tokens alone.
+        over that tile's real tokens alone. Every pullback here is linear in the
+        cotangent, so zeroing it on read is enough and no later stage needs a second
+        predicate.
+
+        The taps are a function of the mapped transition, so this direction
+        re-evaluates both maps rather than reading ``trans`` back: the read would be
+        ``16*H`` bytes a token against a rotvec and a softplus.
 
         The bias reduction is float32 over the gradients before they are narrowed,
         which is what the reference sums; narrowing first would lose the accumulator
@@ -344,23 +355,31 @@ def _pull_tokens(
         keep = t0 + row < seqlen
         base = head * PARAM_COLS
         value = _biased_row(gparams, gbias, bidx, token, base, dtype)
-        cot = [gdtrans[bidx, head, token, comp] for comp in range(4)]
-        for tap in cutlass.range_constexpr(2):
-            for comp in cutlass.range_constexpr(3):
-                cot.append(gdpack[bidx, head, token, tap, comp])
+        cot = [
+            select(keep, gdtrans[bidx, head, token, comp], zero) for comp in range(4)
+        ]
+        tap_cot = tuple(
+            tuple(
+                select(keep, gdpack[bidx, head, token, tap, comp], zero)
+                for comp in range(3)
+            )
+            for tap in range(2)
+        )
+        wx, wy, wz = rotvec(value[0], value[1], value[2], w_max)
+        tx, ty, tz, tls = foh_taps_grad(
+            wx, wy, wz, log_scale(value[3]), tap_cot[0], tap_cot[1]
+        )
         dx, dy, dz = rotvec_grad(
             value[0],
             value[1],
             value[2],
-            select(keep, cot[0], zero),
-            select(keep, cot[1], zero),
-            select(keep, cot[2], zero),
+            cot[0] + tx,
+            cot[1] + ty,
+            cot[2] + tz,
             w_max,
         )
         # Column order of one head's row, so both stores below are one loop.
-        grad = [dx, dy, dz, log_scale_grad(value[3]) * select(keep, cot[3], zero)]
-        for slot in cutlass.range_constexpr(2 * 3):
-            grad.append(select(keep, cot[4 + slot], zero))
+        grad = [dx, dy, dz, log_scale_grad(value[3]) * (cot[3] + tls)]
         inside = keep
         if cutlass.const_expr(not exact):
             inside = inside & (flat < cutlass.Int32(items))

@@ -23,9 +23,9 @@ needs a clamp, an epsilon, or a validity pass:
   singularity and needs no guard. The bound is non-strict only because the ratio
   rounds to one once ``|x|`` exceeds the reciprocal of the machine epsilon.
 
-Taps are unconstrained. In the polynomial chart ``K(v) = kr*v + g*(w.v)*w +
-h*(w x v)`` there is no well-definedness condition to enforce; the axis-angle
-normal form's constraint at ``w = 0`` is structural here.
+Taps are not parameters. They are the first-order-hold moments of the transition
+the two maps above define, so they carry no columns and no initialization:
+:func:`foh_taps` computes them from ``(w, ls)`` in closed form.
 """
 
 from __future__ import annotations
@@ -46,10 +46,13 @@ from slinoss._precision import (
 )
 
 __all__ = [
+    "FOH_TAYLOR_RADIUS_SQ",
+    "FP32_FOH_TERMS",
+    "FP64_FOH_TERMS",
     "LS_COLUMN",
     "PARAM_COLS",
     "ROTVEC_COLUMNS",
-    "TAP_COLUMNS",
+    "T2_FLOOR",
     "ScanGrads",
     "ScanParams",
     "bounded_logscale",
@@ -57,16 +60,19 @@ __all__ = [
     "check_cotangents",
     "check_dparams_out",
     "check_operands",
+    "foh_coeffs",
+    "foh_taps",
     "pack_params",
     "scanprep_bwd_ref",
     "scanprep_ref",
 ]
 
-PARAM_COLS = 10
-"""Projection columns one head spends on the transition and the two taps.
+PARAM_COLS = 4
+"""Projection columns one head spends on the transition.
 
-``(w_x, w_y, w_z, ls, kr0, g0, h0, kr1, g1, h1)``: three for the rotation vector,
-one for the log-scale, three per tap. Not a shape multiple, so it does not live in
+``(w_x, w_y, w_z, ls)``: three for the rotation vector, one for the log-scale. The
+taps are not among them; they are that transition's own forcing moments, computed
+by :func:`foh_taps`. Not a shape multiple, so it does not live in
 :mod:`slinoss.config`; it is this operator's own column count.
 """
 
@@ -76,8 +82,59 @@ ROTVEC_COLUMNS = slice(0, 3)
 LS_COLUMN = 3
 """Column of one head's parameter row holding the unconstrained log-scale."""
 
-TAP_COLUMNS = slice(4, PARAM_COLS)
-"""Columns of one head's parameter row holding both unconstrained taps."""
+# ---------------------------------------------------------------------------
+# First-order-hold taps
+#
+# The step's homogeneous generator is L = 2*ls*I + [w]_x, so the step is
+# exp(L) and the forcing of an input held linearly between its two token values
+# is the pair of moments
+#
+#   K_prev = int_0^1 r exp(L r) dr,   K_curr = int_0^1 (1 - r) exp(L r) dr,
+#
+# which are the entire functions phi_k(x) = sum_n x^n / (n + k)! at L:
+#
+#   K_prev = phi_1(L) - phi_2(L),     K_curr = phi_2(L).
+#
+# L is a scalar plus a skew part, hence normal, with eigenvalue p = 2*ls along w
+# and z = p + i*|w| on the plane across it. A function of L is therefore its
+# values at those eigenvalues, and the tap chart names exactly those: k_par =
+# f(p), k_re = Re f(z), k_im = Im f(z). Nothing is fitted and nothing is
+# approximated; phi_1 and phi_2 are evaluated where the operator needs them.
+#
+# The two phi are computed by the recurrence phi_{k+1} = (phi_k - 1/k!)/x from
+# phi_0 = exp(x), which is one complex division each. That division cancels for
+# small |x|, so under the radius below the series is summed instead. The device
+# path sums the same series at a shorter truncation, so it takes its
+# coefficients from here rather than deriving them again.
+# ---------------------------------------------------------------------------
+
+FOH_TAYLOR_RADIUS_SQ = 1.0
+"""``|z|^2`` below which the tap series is summed rather than divided.
+
+The recurrence forms ``phi_{k+1}`` from a difference of order ``|x|`` and divides
+it by ``x``, so it loses relative accuracy like ``eps/|x|``; the series loses
+``|x|^terms/(terms+k)!``. At unit radius the truncations below put the series
+error under both float32 and float64 rounding, and outside it the recurrence has
+already recovered them, so one radius covers both dtypes.
+"""
+
+FP64_FOH_TERMS = 20
+"""Series terms for the reference. ``1/21! = 2e-20`` relative at unit radius."""
+
+FP32_FOH_TERMS = 12
+"""Series terms for the device path. ``1/13! = 2e-10`` relative at unit radius."""
+
+T2_FLOOR = 1.0e-30
+"""Floor on ``|w|^2`` in the chart's two divisions.
+
+``g`` and ``h`` are the axial and skew coordinates of the tap against the
+unnormalized ``w``, so they carry ``1/|w|^2`` and ``1/|w|`` and are ill
+conditioned as ``|w| -> 0`` while the operator they encode is not: ``g`` reaches
+it multiplied by ``w w^T`` and ``h`` by ``[w]_x``. The floor is normal in float32,
+so both quotients stay finite, and at ``|w| = 0`` both numerators are exactly
+zero, which is the operator's own limit there. The chart entries themselves hold
+absolute rather than relative accuracy in that corner.
+"""
 
 
 def bounded_rotvec(raw: Tensor, w_max: float) -> Tensor:
@@ -116,17 +173,90 @@ def bounded_logscale(raw: Tensor) -> Tensor:
     return -softplus(raw)
 
 
-def pack_params(w_raw: Tensor, ls_raw: Tensor, tap_raw: Tensor) -> Tensor:
+def foh_coeffs(order: int, terms: int) -> tuple[float, ...]:
+    """Coefficients of ``phi_order`` in ascending powers of its argument.
+
+    Term ``n`` is ``1/(n + order)!``.
+
+    Args:
+        order: ``1`` or ``2``.
+        terms: How many terms to return.
+
+    Returns:
+        Coefficients in ascending powers.
+    """
+    return tuple(1.0 / math.factorial(n + order) for n in range(terms))
+
+
+def _horner_c(z: Tensor, coeffs: tuple[float, ...]) -> Tensor:
+    out = torch.full_like(z, coeffs[-1])
+    for coeff in reversed(coeffs[:-1]):
+        out = out * z + coeff
+    return out
+
+
+def _phi_pair(z: Tensor, terms: int) -> tuple[Tensor, Tensor]:
+    """``phi_1`` and ``phi_2`` of a complex argument.
+
+    Args:
+        z: Complex arguments, any shape.
+        terms: Series terms under :data:`FOH_TAYLOR_RADIUS_SQ`.
+
+    Returns:
+        ``(phi_1(z), phi_2(z))``, both complex, the shape of ``z``.
+    """
+    small = z.real.square() + z.imag.square() < FOH_TAYLOR_RADIUS_SQ
+    # The recurrence divides, so it runs at one where it would divide by zero.
+    # Its value there is discarded; a NaN would reach the gradient through the
+    # select, so it is kept out of the primal rather than masked afterwards.
+    safe = torch.where(small, torch.ones_like(z), z)
+    phi1 = (torch.exp(z) - 1.0) / safe
+    phi2 = (phi1 - 1.0) / safe
+    return (
+        torch.where(small, _horner_c(z, foh_coeffs(1, terms)), phi1),
+        torch.where(small, _horner_c(z, foh_coeffs(2, terms)), phi2),
+    )
+
+
+def foh_taps(w: Tensor, ls: Tensor, terms: int = FP64_FOH_TERMS) -> Tensor:
+    """First-order-hold taps of the step ``exp(2*ls*I + [w]_x)``, on the tap chart.
+
+    Exact: the two moments of the module header, evaluated at the generator's own
+    three eigenvalues and read off the chart
+    :func:`slinoss.ops.so3ssd.tap_matrix` applies.
+
+    Args:
+        w: Rotation vectors, shape ``(...,3)``.
+        ls: Log-scales, shape ``(...)``.
+        terms: Series terms under :data:`FOH_TAYLOR_RADIUS_SQ`.
+
+    Returns:
+        ``(kr, g, h)`` per tap, shape ``(...,2,3)``, tap 0 previous and 1 current,
+        in the dtype of ``w``.
+    """
+    t2 = (w * w).sum(-1).clamp_min(T2_FLOOR)
+    par_arg = 2.0 * ls
+    phi1, phi2 = _phi_pair(torch.complex(par_arg, t2.sqrt()), terms)
+    axial1, axial2 = _phi_pair(torch.complex(par_arg, torch.zeros_like(par_arg)), terms)
+    # Tap 0 is the previous token's coefficient, tap 1 the current token's.
+    per = torch.stack([phi1 - phi2, phi2], dim=-1)
+    par = torch.stack([axial1 - axial2, axial2], dim=-1).real
+    kr = per.real
+    return torch.stack(
+        [kr, (par - kr) / t2[..., None], per.imag * torch.rsqrt(t2)[..., None]], dim=-1
+    )
+
+
+def pack_params(w_raw: Tensor, ls_raw: Tensor) -> Tensor:
     """Lay head-major raw parameters out in the projection's column order.
 
-    The mixer's projection emits this layout directly. A caller holding the three
+    The mixer's projection emits this layout directly. A caller holding the two
     head-major tensors separately -- a test fixture or a benchmark -- packs them
     here rather than restating the column order.
 
     Args:
         w_raw: Unconstrained rotation vectors, ``(B,H,T,3)``.
         ls_raw: Unconstrained log-scales, ``(B,H,T)``.
-        tap_raw: Unconstrained taps ``(kr, g, h)``, ``(B,H,T,2,3)``.
 
     Returns:
         ``(B,T,H*PARAM_COLS)``, contiguous, in the dtype of ``w_raw``.
@@ -139,16 +269,9 @@ def pack_params(w_raw: Tensor, ls_raw: Tensor, tap_raw: Tensor) -> Tensor:
     lead = tuple(int(d) for d in w_raw.shape[:3])
     if tuple(ls_raw.shape) != lead:
         raise ValueError(f"ls_raw must be {lead}, got {tuple(ls_raw.shape)}")
-    if tuple(tap_raw.shape) != (*lead, 2, 3):
-        raise ValueError(f"tap_raw must be {(*lead, 2, 3)}, got {tuple(tap_raw.shape)}")
     bsz, heads, seqlen = lead
     row = torch.cat(
-        [
-            w_raw.permute(0, 2, 1, 3),
-            ls_raw.permute(0, 2, 1)[..., None],
-            tap_raw.permute(0, 2, 1, 3, 4).reshape(bsz, seqlen, heads, 6),
-        ],
-        dim=-1,
+        [w_raw.permute(0, 2, 1, 3), ls_raw.permute(0, 2, 1)[..., None]], dim=-1
     )
     return row.reshape(bsz, seqlen, heads * PARAM_COLS).contiguous()
 
@@ -227,12 +350,12 @@ def scanprep_ref(
     heads: int,
     w_max: float,
 ) -> ScanParams:
-    """Apply the bounded maps and pack the result.
+    """Apply the bounded maps, derive the taps, and pack the result.
 
     Args:
         params: Projection slice, ``(B,T,H*PARAM_COLS)``, activation dtype.
             Trailing stride one; the row stride is the projection width. Per head,
-            in order ``(w_x, w_y, w_z, ls, kr0, g0, h0, kr1, g1, h1)``.
+            in order ``(w_x, w_y, w_z, ls)``.
         param_bias: ``(H,PARAM_COLS)``, float32, added to every token's row
             before the maps.
         heads: ``H``.
@@ -256,7 +379,7 @@ def scanprep_ref(
         rows = (rows + param_bias.to(dtype)).permute(0, 2, 1, 3)
         w = bounded_rotvec(rows[..., ROTVEC_COLUMNS], w_max)
         ls = bounded_logscale(rows[..., LS_COLUMN])
-        tap = rows[..., TAP_COLUMNS].unflatten(-1, (2, 3))
+        tap = foh_taps(w, ls)
         trans = torch.cat([w, ls[..., None]], dim=-1).contiguous()
         packed = torch.cat([tap, torch.zeros_like(tap[..., :1])], dim=-1).contiguous()
 

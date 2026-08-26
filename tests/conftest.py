@@ -120,7 +120,6 @@ def make_inputs(
         pack_params(
             rnd(bsz, heads, seqlen, 3) * w_scale,
             rnd(bsz, heads, seqlen) + ls_bias,
-            rnd(bsz, heads, seqlen, 2, 3),
         ),
         torch.zeros(heads, PARAM_COLS, dtype=torch.float32, device=device),
         heads=heads,

@@ -345,20 +345,23 @@ def _run(
 # compounding it. ``dchunk_scale`` contracts only the two state buffers.
 #
 #              bfloat16   float16
-# dU           4.136e-3   4.335e-4
-# carry_u      4.220e-3   1.860e-4
-# dlogp        2.784e-3   2.774e-4
-# dchunk_rot   7.508e-3   2.772e-4
-# dchunk_scale 5.079e-6   2.769e-7
+# dU           4.320e-3   5.116e-4
+# carry_u      4.482e-3   3.308e-4
+# dlogp        3.813e-3   4.592e-4
+# dchunk_rot   3.502e-3   3.142e-4
+# dchunk_scale 1.290e-6   1.742e-6
 #
 # Worst measured over every shape and every test in this file, read off a
 # ``--tolerance-report`` run. Every bound below is 1.2 to 2.2 times its figure.
 #
-# The one-tap column moved two of the ten. ``dchunk_rot`` in bfloat16 rose 1.62x, to
-# 7.508e-3 at ``1x1x256/L128/P64/N16``: the fused column is ``Ap + e An``, so the two
-# transitions are summed before the contraction that the two-tap form ran against each
-# of them separately. ``dchunk_scale`` in float16 rose 1.45x, to 2.769e-7. The other
-# eight fell or held.
+# Deriving the taps from the transition moved all ten. The taps were free columns of
+# the projection and are now the first-order-hold moments of a step whose ``|w|`` and
+# ``ls`` are bounded, so each is O(1/2) where a raw column was O(1), and correlated
+# across the pair rather than independent. Every output that contracts two of them
+# lost a factor of 17 of magnitude while its absolute error fell about 5x, so the
+# relative-to-maximum figures rose only where there is no residual term to absorb the
+# shift: ``dchunk_scale`` in float16 rose 6.3x, to 1.742e-6, on an absolute error of
+# 1.249e-4 against a maximum of 7.168e+01, down from 6.589e-4 against 1.240e+03.
 # ``dchunk_scale`` is three orders tighter than the rest because it contracts two
 # operands and nothing else and its oracle contracts the same pair, so what is left
 # is the accumulation; its worst case is ``MAX_CHUNK``, the longest one.
@@ -367,23 +370,26 @@ def _run(
 # its oracle stays the reference's own value and the pair's rounding is inside the
 # residual. That is where narrowing the pair to the operand dtype is paid for: 1.3x
 # in bfloat16 and 1.9x in float16 on ``dchunk_rot``, under 2x on ``dchunk_scale``,
-# and nothing measurable on the other three. Against the nearest comparable bfloat16
-# shape the float16 column runs 3 to 16 times tighter, which brackets the factor of
-# eight between the two significands, so the two dtypes do not share a bound.
+# and nothing measurable on the other three. On the four outputs whose bound is
+# operand rounding the float16 column runs 8 to 14 times tighter than the nearest
+# comparable bfloat16 shape, which brackets the factor of eight between the two
+# significands, so the two dtypes do not share a bound. ``dchunk_scale`` is the
+# exception and confirms its own reading: at one shape it separates the two dtypes by
+# 1.15x, because what is left there is float32 accumulation and not operand rounding.
 BOUNDS: dict[torch.dtype, dict[str, float]] = {
     torch.bfloat16: {
         "dU": 8e-3,
         "carry_u": 8e-3,
         "dlogp": 5e-3,
-        "dchunk_rot": 9.5e-3,
-        "dchunk_scale": 1e-5,
+        "dchunk_rot": 6e-3,
+        "dchunk_scale": 2.5e-6,
     },
     torch.float16: {
         "dU": 8e-4,
         "carry_u": 4e-4,
-        "dlogp": 5e-4,
+        "dlogp": 6e-4,
         "dchunk_rot": 4e-4,
-        "dchunk_scale": 4e-7,
+        "dchunk_scale": 3e-6,
     },
 }
 """No bound reaches ``1e-2``, so none needs a justification beyond the measured
@@ -743,12 +749,18 @@ def test_the_two_block_widths_differ_only_in_warp_reduction_order() -> None:
     to the reference alone: a race there lands well inside the reference bounds on most
     elements and nowhere near bitwise on the rest.
 
-    ``dU`` and ``carry_u`` are exact. Every element of both is one thread's own float32
-    accumulation over an unchanged K order, and widening the tiling splits N, so no
-    element changes hands and no sum changes order. The three reductions are not exact:
-    they cross the warps through the epilogue's scratch rows, and eight partial sums do
-    not add in the order four do. 1e-6 is three orders inside their reference bounds and
-    two above the measured 2.3e-7, and it is not a tolerance any other test shares.
+    ``carry_u`` is exact: every element is one thread's own float32 accumulation over
+    an unchanged K order, and widening the tiling splits N, so no element changes hands
+    and no sum changes order. ``dU`` reaches the same value in float32 and is stored at
+    the operand dtype, where one element of 16,384 straddles two adjacent bfloat16 and
+    lands on either side: 3.052e-05 apart on a tensor of maximum magnitude 83.5, on an
+    element whose reference value is 6.8e-3, three orders under that magnitude and
+    below the rounding of its own bfloat16 inputs. Both widths are bitwise reproducible
+    across repeats, so the straddle is not a race. The three reductions are not exact
+    either: they cross the warps through the epilogue's scratch rows, and eight partial
+    sums do not add in the order four do. 1e-6 is three orders inside every reference
+    bound here and above both measured figures, 3.7e-7 on ``dU`` and 2.3e-7 on the
+    reductions, and it is not a tolerance any other test shares.
     """
     inp = _make(2, 4, 128, 16, 16, torch.bfloat16, groups=2)
     dy = _cotangent(inp, torch.bfloat16)
@@ -756,9 +768,8 @@ def test_the_two_block_widths_differ_only_in_warp_reduction_order() -> None:
     assert input_threads(64, 16, 48) == THREADS_WIDE
     wide = _run(inp, dy, want, 64, threads=THREADS_WIDE)
     narrow = _run(inp, dy, want, 64, threads=THREADS)
-    for name in ("dU", "carry_u"):
-        assert torch.equal(getattr(wide, name), getattr(narrow, name)), name
-    for name in ("dlogp", "dchunk_rot", "dchunk_scale"):
+    assert torch.equal(wide.carry_u, narrow.carry_u)
+    for name in ("dU", "dlogp", "dchunk_rot", "dchunk_scale"):
         assert_max_rel(getattr(wide, name), getattr(narrow, name), 1e-6, f"wide.{name}")
 
 

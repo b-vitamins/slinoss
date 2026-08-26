@@ -78,7 +78,7 @@ slinoss/
         backward.py the driver that sequences the seven backward launches
         fwd/        increment_passing, chunk_scan, and the pair the first fused
         bwd/        chunk_start, state_passing, chunk_input, chunk_vector, boundary
-    scanprep/     parameter maps: rotation vector, log-scale, taps
+    scanprep/     parameter maps: rotation vector, log-scale, the taps they imply
     mixer/        fused rowwise mixer tail
     block/        fused norm and activation kernels
     conv/         causal conv1d; the fast path is the C++ extension, not CuTe

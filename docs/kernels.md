@@ -496,8 +496,9 @@ instructions, and the class bar says nothing about that.
 
 ## One implementation each
 
-- The quaternion exponential, composition, conjugation, the tap chart, the 3x3
-  composition, and both prefixes have exactly one device-side implementation.
+- The quaternion exponential, composition, conjugation, the tap chart, the tap
+  moments, the 3x3 composition, and both prefixes have exactly one device-side
+  implementation.
   Duplicated math diverges, and the divergence is a correctness bug.
 - Parameter gradients are nine float32 accumulators per token per tap, reduced
   over the lane dimension, fused into the `dB` and `dC` epilogues. There is no

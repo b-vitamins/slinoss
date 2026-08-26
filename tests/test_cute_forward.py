@@ -39,9 +39,19 @@ LS_BIAS = -4.0
 # against the same operand construction.
 BOUNDS = {torch.bfloat16: 6e-3, torch.float16: 8e-4}
 
+# The streaming split's own bound, above the reference bound above it. The split
+# carries ``b_last`` and ``u_last`` at the operand dtype, so the tail rounds a carry
+# the whole-sequence path never materializes, and the split point is not a chunk
+# multiple, so the tail's first chunk accumulates a prefix the whole sequence
+# accumulated inside a longer one. Neither term is in the reference comparison, and
+# sharing its figure was an accident of an operand set in which both were smaller
+# than it. Worst measured: 6.849e-3, against 3.997e-3 for the same kernels' own
+# reference gap at the nearest shape.
+SPLIT_BOUND = 9e-3
+
 # The gradient bound of the autograd wiring test. Two contraction orders over the
 # same bf16 leaves, so it is the operand dtype's half-ulp against the largest
-# entry, like the forward's. Worst measured: 5.682e-3, on ``b_prev``.
+# entry, like the forward's. Worst measured: 7.092e-3, on ``dB``.
 GRAD_BOUND = 8e-3
 
 # (bsz, heads, seqlen, chunk, rows, lanes, streaming, dtype).
@@ -228,11 +238,10 @@ def test_the_streaming_split_reproduces_the_whole_sequence() -> None:
     torch.cuda.synchronize()
 
     joined = torch.cat([head.y, tail.y], dim=2)
-    # Both sides run the same kernels at the same width, so the gap is the
-    # reordering of one float32 chunk recurrence into two.
-    bound = BOUNDS[torch.bfloat16]
-    assert_max_rel(joined, whole.y, bound, "cute-split.y")
-    assert_max_rel(tail.state, whole.state, bound, "cute-split.state")
+    # Both sides run the same kernels at the same width, so the gap is the rounded
+    # carry and the reordering of one float32 chunk recurrence into two.
+    assert_max_rel(joined, whole.y, SPLIT_BOUND, "cute-split.y")
+    assert_max_rel(tail.state, whole.state, SPLIT_BOUND, "cute-split.state")
 
 
 # ---------------------------------------------------------------------------
