@@ -70,7 +70,7 @@ def _operands(
         rnd(bsz, heads, seqlen, rows),
         rnd(bsz, heads, seqlen, rows),
         rnd(bsz, seqlen, heads * rows),
-        rnd(heads, rows),
+        rnd(heads),
         rnd(heads, rows),
     )
 
@@ -88,7 +88,7 @@ def test_matches_the_written_composition(
     y, u, gate, d_skip, weight = _operands(bsz, heads, seqlen, rows)
     got = mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS)
 
-    x = y + d_skip[:, None, :] * u
+    x = y + d_skip[:, None, None] * u
     x = x * silu(_head_major(gate, heads))
     want = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS) * weight[:, None, :]
     assert torch.allclose(got, _token_major(want), rtol=0.0, atol=1e-15)
@@ -142,7 +142,7 @@ def test_skip_is_the_only_path_when_y_is_zero() -> None:
     _, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
     y = torch.zeros_like(u)
     got = mixer_tail_ref(y, u, gate, d_skip, weight, eps=1e-30)
-    x = d_skip[:, None, :] * u * silu(_head_major(gate, 2))
+    x = d_skip[:, None, None] * u * silu(_head_major(gate, 2))
     want = (
         x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-30) * weight[:, None, :]
     )
@@ -199,7 +199,7 @@ def test_reduction_is_wider_than_the_operands(dtype: torch.dtype) -> None:
         eps=EPS,
     )
 
-    narrow = (y.to(dtype) + d_skip.to(dtype)[:, None, :] * u.to(dtype)) * silu(
+    narrow = (y.to(dtype) + d_skip.to(dtype)[:, None, None] * u.to(dtype)) * silu(
         _head_major(gate.to(dtype), 2)
     )
     narrow = (
@@ -264,13 +264,18 @@ def test_rejects_mismatched_activation(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", ["d_skip", "weight"])
-def test_rejects_mismatched_parameter(name: str) -> None:
-    """Both parameters are ``(H,P)``; a ``d_inner`` vector is a caller bug."""
+def test_rejects_the_other_parameter_width(name: str) -> None:
+    """``d_skip`` is ``(H,)`` and ``weight`` is ``(H,P)``.
+
+    Each is refused at the other's width, which is the confusion worth a guard:
+    the two parameters sit side by side in every signature, and a per-row skip
+    broadcasts against ``(B,H,T,P)`` as silently as a per-head one.
+    """
     y, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
-    tensors = {"d_skip": d_skip, "weight": weight}
-    tensors[name] = tensors[name].flatten()
+    wide = d_skip[:, None].expand_as(weight).contiguous()
+    args = (wide, weight) if name == "d_skip" else (d_skip, weight[:, 0])
     with pytest.raises(ValueError, match=f"{name} must be"):
-        mixer_tail_ref(y, u, gate, tensors["d_skip"], tensors["weight"], eps=EPS)
+        mixer_tail_ref(y, u, gate, *args, eps=EPS)
 
 
 @pytest.mark.parametrize("eps", [0.0, -1e-5, -math.inf])

@@ -604,21 +604,28 @@ def test_the_documented_shape_fits_the_backward_arena(cuda: torch.device) -> Non
         assert bool(param.grad.isfinite().all()), name
 
 
-def test_param_bias_stays_float32_through_a_module_cast() -> None:
-    """A module-wide demotion must not take the one pinned parameter with it.
+def test_the_pinned_parameters_stay_float32_through_a_module_cast() -> None:
+    """A module-wide demotion must not take the pinned parameters with it.
 
     ``mixer.to(torch.bfloat16)`` is how the module reaches a kernel dtype, and
     scanprep refuses a low-precision ``param_bias`` (I4). Demoted, the cast succeeds
     and the next forward raises from an operator that has nothing to do with it.
+    ``d_skip`` is the second, and it demotes silently rather than raising, so the
+    only thing that catches it is this.
+
+    ``norm_weight`` is the control: it follows the cast, which is what makes the two
+    parameters of the tail differ in dtype on the shipped call.
     """
     mixer = SLinOSSMixer(MIXER_CONFIG).to(torch.bfloat16)
-    assert mixer.param_bias.dtype is torch.float32
+    for name in SLinOSSMixer.CRITICAL_FP32_TENSORS:
+        assert getattr(mixer, name).dtype is torch.float32, name
+    assert mixer.norm_weight.dtype is torch.bfloat16
     assert mixer.in_proj.weight.dtype is torch.bfloat16
     assert mixer.conv_weight.dtype is torch.bfloat16
     # A widening cast is left alone, so a float64 oracle stays float64 end to end.
-    assert (
-        SLinOSSMixer(MIXER_CONFIG).to(torch.float64).param_bias.dtype is torch.float64
-    )
+    wide = SLinOSSMixer(MIXER_CONFIG).to(torch.float64)
+    for name in SLinOSSMixer.CRITICAL_FP32_TENSORS:
+        assert getattr(wide, name).dtype is torch.float64, name
 
 
 def test_a_host_call_raises_from_a_band_guard() -> None:

@@ -486,9 +486,9 @@ def test_layer_config_derives_the_layer_the_scan_shape_belongs_to() -> None:
 def test_prep_shapes_align_every_band_and_carry_the_scan_shape_names() -> None:
     assert tuple(s.name for s in PREP_SHAPES) == SHAPE_NAMES
     # A band is handed over whole and pitched, so its base and the projection width
-    # both have to clear the alignment the kernels require. 10*H clears it only for
+    # both have to clear the alignment the kernels require. 4*H clears it only for
     # H a multiple of 4, which is why the width is padded and not merely summed.
-    assert SMALL_PREP.params_width == 10
+    assert SMALL_PREP.params_width == 4
     assert SMALL_PREP.bc_offset == 32
     assert SMALL_PREP.bc_width == 96
     assert SMALL_PREP.params_offset == 128
@@ -798,7 +798,7 @@ def test_make_mixer_inputs_keeps_the_projection_pitch_on_both_bands() -> None:
     assert tuple(got.u.shape) == (*lead, scan.rows)
     assert tuple(got.gate.shape) == token
     assert tuple(got.dout.shape) == token
-    assert tuple(got.d_skip.shape) == (scan.heads, scan.rows)
+    assert tuple(got.d_skip.shape) == (scan.heads,)
     assert tuple(got.weight.shape) == (scan.heads, scan.rows)
     # The gate and the output cotangent are bands of a wider projection: the row
     # pitch is the whole projection and only the trailing axis is unit stride.

@@ -281,7 +281,6 @@ def make_inputs(
             pack_params(
                 randn(*lead, 3, dt=torch.float32),
                 randn(*lead, dt=torch.float32),
-                randn(*lead, 2, 3, dt=torch.float32),
             ),
             torch.zeros(shape.heads, PARAM_COLS, dtype=torch.float32, device=device),
             heads=shape.heads,
@@ -658,7 +657,7 @@ class PrepShape:
 
     @property
     def params_width(self) -> int:
-        """Parameter-band width, ``10*H``."""
+        """Parameter-band width, ``4*H``."""
         return PARAM_COLS * self.scan.heads
 
     @property
@@ -683,7 +682,7 @@ class PrepShape:
 
         The row pitch of a band is the whole projection width, so the width has to
         clear :data:`slinoss._guard.PROJ_ALIGN` even though the sum of the bands need
-        not: ``10*H`` is a multiple of it only for ``H`` a multiple of 8. Padding the
+        not: ``4*H`` is a multiple of it only for ``H`` a multiple of 4. Padding the
         projection costs a few columns of its GEMM and keeps every ``H`` reachable,
         and a band whose pitch misses the sector is a refusal, not a slow path.
         """
@@ -1283,7 +1282,7 @@ class MixerInputs(NamedTuple):
         y: ``(B,H,T,P)`` scan output.
         u: ``(B,H,T,P)`` scan input, source of the skip term.
         gate: ``(B,T,H*P)`` pitched band of ``proj``.
-        d_skip: ``(H,P)`` skip scale, parameter dtype.
+        d_skip: ``(H,)`` skip scale, parameter dtype.
         weight: ``(H,P)`` norm scale, parameter dtype.
         dproj: ``(B,T,W)`` buffer the cotangent seed is a band of, contiguous. Held
             for the same two reasons as ``proj``.
@@ -1356,7 +1355,7 @@ def make_mixer_inputs(
         y=randn(*lead, scan.rows).requires_grad_(requires_grad),
         u=randn(*lead, scan.rows).requires_grad_(requires_grad),
         gate=proj[..., band].detach().requires_grad_(requires_grad),
-        d_skip=randn(scan.heads, scan.rows, dt=param).requires_grad_(requires_grad),
+        d_skip=randn(scan.heads, dt=param).requires_grad_(requires_grad),
         weight=randn(scan.heads, scan.rows, dt=param).requires_grad_(requires_grad),
         dproj=dproj,
         dout=dproj[..., band].detach(),

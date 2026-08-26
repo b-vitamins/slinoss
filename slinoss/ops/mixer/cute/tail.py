@@ -37,36 +37,41 @@ the butterfly inside it is entered by all 32 lanes or by none.
 Precision. The sum of squares, the dot product the backward reduces, and the
 reciprocal square root are float32 at every operand width. ``y``, ``u``, ``gate``
 and the output are the only low-precision tensors; they are widened on load and
-narrowed on store. Operand width and parameter width are independent, so float32
-parameters against bfloat16 activations is one call and not a cast.
+narrowed on store. Each parameter carries its own width, independent of the
+operands and of the other parameter, so a float32 ``d_skip`` against a bfloat16
+norm gain and bfloat16 activations is one call and not a cast.
 
-Parameter gradients. ``d_skip`` and ``weight`` are ``(H,P)``, so their gradients
-reduce over ``(B,T)``. Each lane accumulates its own columns across the rows its
-warp runs, the block sums the warps through one shared tile, and each block stores
-one ``(H,P)`` row of tile partials. That is the kernel's epilogue; there is no
-second pass over the operands. Closing the reduction inside the launch would need
-an accumulator zeroed before it, and a zero fill on the hot path is not available,
-so the partial buffer is ``torch.empty``, every element of it is written by the
-kernel, and the cross-tile sum is the backward's second launch,
-:func:`slinoss._reduce.reduce_partials` over that buffer alone. Both slots reduce
-in the one launch, and it narrows on its store, so the parameter dtype costs no
-cast here.
+Parameter gradients. ``weight`` is ``(H,P)``, so its gradient reduces over
+``(B,T)``: each lane accumulates its own columns across the rows its warp runs, the
+block sums the warps through one shared tile, and each block stores one ``(H,P)``
+row of partials. ``d_skip`` is ``(H,)``, so its gradient reduces over ``(B,T,P)``,
+and the extra axis closes inside the block -- one accumulator per lane, a warp
+butterfly, one float per warp in shared memory -- so a block stores one scalar per
+head rather than a row. That is the kernel's epilogue; there is no second pass over
+the operands. Closing the reduction inside the launch would need an accumulator
+zeroed before it, and a zero fill on the hot path is not available, so each partial
+buffer is ``torch.empty``, every element of it is written by the kernel, and the
+cross-tile sums are :func:`slinoss._reduce.reduce_partials` over those buffers
+alone. Two closing launches and not one: the two parameters differ in width and in
+dtype, and each reduction narrows on its own store, so neither gradient costs a
+cast.
 
-Shared memory. One tile, :func:`param_tile`, holding the per-warp parameter
-partials. A lane's accumulators sit at the warp-strided positions of :func:`_slots`
+Shared memory. Two tiles. :func:`param_tile` holds the per-warp ``weight``
+partials; a lane's accumulators sit at the warp-strided positions of :func:`_slots`
 rather than at the columns they belong to, so consecutive lanes touch consecutive
 words both when the warps write the tile and when warp 0 reads it back, and neither
-access can conflict. Its budget is computed from the layout and checked against the
-queried capacity, which is what bounds ``P``.
+access can conflict. :func:`skip_tile` holds the one float each warp reduced its
+whole ``d_skip`` contribution to. The budget is computed from both layouts and
+checked against the queried capacity, which is what bounds ``P``.
 
 DRAM-bound, both directions. Analytic byte counts, no measurement is committed.
 Per ``(b,h,t)`` row the forward reads ``y``, ``u`` and ``gate`` and writes the
 output: ``4*P`` operand elements, ``16*P`` B at float32 and ``8*P`` B at bfloat16.
 The backward reads ``dout``, ``y``, ``u`` and ``gate`` and writes ``dy``, ``du``
 and ``dgate``: ``7*P`` operand elements, ``28*P`` B at float32 and ``14*P`` B at
-bfloat16. On top of that both directions read the two ``(H,P)`` parameter rows,
-``2*H*P`` elements, and the backward writes ``2*ceil(B*T/ROWS)*H*P`` float32 of
-tile partials and reads them back once.
+bfloat16. On top of that both directions read ``H*P + H`` parameter elements, and
+the backward writes ``ceil(B*T/ROWS)*(H*P + H)`` float32 of tile partials and reads
+them back once.
 """
 
 import functools
@@ -100,9 +105,6 @@ from slinoss.ops.mixer.reference import MixerTailGrads, check_dgate_dest, tail_s
 __all__ = [
     "ROWS",
     "ROWS_PER_WARP",
-    "SLOTS",
-    "SLOT_DSKIP",
-    "SLOT_WEIGHT",
     "THREADS",
     "WARPS",
     "mixer_tail_backward",
@@ -112,6 +114,7 @@ __all__ = [
     "mixer_tail_fwd",
     "mixer_tail_fwd_kernel",
     "param_tile",
+    "skip_tile",
 ]
 
 WARPS = 8
@@ -131,18 +134,9 @@ reused across the sequence, so the register cost is the accumulators alone."""
 ROWS = WARPS * ROWS_PER_WARP
 """Rows one block covers on the flattened ``B*T`` axis."""
 
-SLOT_DSKIP = 0
-"""Partial slot holding the ``d_skip`` gradient."""
-
-SLOT_WEIGHT = 1
-"""Partial slot holding the ``weight`` gradient."""
-
-SLOTS = 2
-"""Parameter gradients the epilogue reduces."""
-
 
 def param_tile(segments: int) -> Tile:
-    """Per-warp parameter-gradient partials: ``(SLOTS, WARPS, 32*segments)``.
+    """Per-warp ``weight``-gradient partials: ``(WARPS, 32*segments)``.
 
     The trailing extent is the warp-strided column span rather than ``P``, so
     every lane writes a slot and every lane reads one back. The ``P`` predicate
@@ -155,7 +149,20 @@ def param_tile(segments: int) -> Tile:
         The tile.
     """
     span = cute.arch.WARP_SIZE * segments
-    return Tile((SLOTS, WARPS, span), (WARPS * span, span, 1))
+    return Tile((WARPS, span), (span, 1))
+
+
+def skip_tile() -> Tile:
+    """Per-warp ``d_skip``-gradient partials: ``(WARPS,)``.
+
+    One float per warp, not one per lane: ``d_skip`` is per head, so the row axis
+    closes in the warp butterfly and only the cross-warp sum is left for shared
+    memory.
+
+    Returns:
+        The tile.
+    """
+    return Tile((WARPS,), (1,))
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +252,8 @@ def mixer_tail_fwd_kernel(
         gy: ``(B,H,T,P)`` scan output, operand dtype.
         gu: ``(B,H,T,P)`` scan input, operand dtype.
         ggate: ``(B,T,H*P)`` gate, operand dtype, pitched.
-        gdskip: ``(H,P)`` skip scale, parameter dtype.
-        gweight: ``(H,P)`` norm scale, parameter dtype.
+        gdskip: ``(H,)`` skip scale, its own dtype.
+        gweight: ``(H,P)`` norm scale, its own dtype.
         gout: ``(B,T,H*P)`` written, operand dtype.
         tokens: ``B*T``. Dynamic.
         seqlen: ``T``, the divisor that splits a flat row index. Dynamic.
@@ -273,6 +280,8 @@ def mixer_tail_fwd_kernel(
     cols = _columns(lane, rows, segments, exact)
     # This head's band of the token-major operands. Uniform across the block.
     band = head * rows
+    # One scalar for the whole block, so it is read once and not once a column.
+    skip = widen(gdskip[head], gdskip.element_type)
 
     for step in cutlass.range_constexpr(ROWS_PER_WARP):
         token = tile * ROWS + step * WARPS + warp
@@ -287,8 +296,7 @@ def mixer_tail_fwd_kernel(
                 gate = widen(ggate[bidx, tidx, band + pos], src)
                 value = (
                     widen(gy[bidx, head, tidx, pos], src)
-                    + widen(gdskip[head, pos], par)
-                    * widen(gu[bidx, head, tidx, pos], src)
+                    + skip * widen(gu[bidx, head, tidx, pos], src)
                 ) * silu(gate, sigmoid(gate))
                 if cutlass.const_expr(masked):
                     value = select(col < rows, value, zero)
@@ -365,7 +373,8 @@ def mixer_tail_bwd_kernel(
     gdy: cute.Tensor,
     gdu: cute.Tensor,
     gdgate: cute.Tensor,
-    gpartial: cute.Tensor,
+    gpweight: cute.Tensor,
+    gpskip: cute.Tensor,
     tokens: cutlass.Int32,
     seqlen: cutlass.Int32,
     rows: cutlass.Int32,
@@ -382,15 +391,16 @@ def mixer_tail_bwd_kernel(
         gy: ``(B,H,T,P)`` scan output, operand dtype.
         gu: ``(B,H,T,P)`` scan input, operand dtype.
         ggate: ``(B,T,H*P)`` gate, operand dtype, pitched.
-        gdskip: ``(H,P)`` skip scale, parameter dtype.
-        gweight: ``(H,P)`` norm scale, parameter dtype.
+        gdskip: ``(H,)`` skip scale, its own dtype.
+        gweight: ``(H,P)`` norm scale, its own dtype.
         gdy: ``(B,H,T,P)`` written, operand dtype.
         gdu: ``(B,H,T,P)`` written, operand dtype.
         gdgate: ``(B,T,H*P)`` written, operand dtype, pitched.
-        gpartial: ``(SLOTS,tiles,H,P)`` float32, written with this block's
-            contribution to both parameter gradients. Every element is written:
-            a block whose rows are all out of range stores its zero
-            accumulators.
+        gpweight: ``(tiles,H,P)`` float32, written with this block's contribution
+            to the norm-gain gradient. Every element is written: a block whose rows
+            are all out of range stores its zero accumulators.
+        gpskip: ``(tiles,H)`` float32, the same for the skip gradient, one scalar
+            per block because the reduction also runs over ``P``.
         tokens: ``B*T``. Dynamic.
         seqlen: ``T``. Dynamic.
         rows: ``P``. Dynamic.
@@ -410,6 +420,7 @@ def mixer_tail_bwd_kernel(
     warp = cute.arch.warp_idx()
     smem = cutlass.utils.SmemAllocator()
     spartial = smem.allocate_tensor(cutlass.Float32, param_tile(segments).layout(), 16)
+    sskip = smem.allocate_tensor(cutlass.Float32, skip_tile().layout(), 16)
     src = gy.element_type
     par = gweight.element_type
     dst = gdy.element_type
@@ -418,6 +429,8 @@ def mixer_tail_bwd_kernel(
     slots = _slots(lane, segments)
     # This head's band of the token-major operands. Uniform across the block.
     band = head * rows
+    # One scalar for the whole block, so it is read once and not once a column.
+    skip = widen(gdskip[head], gdskip.element_type)
 
     acc_skip: list[Scalar] = [zero] * segments
     acc_weight: list[Scalar] = [zero] * segments
@@ -436,7 +449,6 @@ def mixer_tail_bwd_kernel(
                 gate = widen(ggate[bidx, tidx, band + pos], src)
                 sig = sigmoid(gate)
                 act = silu(gate, sig)
-                skip = widen(gdskip[head, pos], par)
                 uval = widen(gu[bidx, head, tidx, pos], src)
                 pre = widen(gy[bidx, head, tidx, pos], src) + skip * uval
                 dout = widen(gdout[bidx, tidx, band + pos], src)
@@ -448,9 +460,7 @@ def mixer_tail_bwd_kernel(
                     cot = select(inside, cot, zero)
                 sumsq = sumsq + value * value
                 dot = dot + cot * value
-                held.append(
-                    (value, pre, act, silu_grad(gate, sig), uval, skip, dout, cot)
-                )
+                held.append((value, pre, act, silu_grad(gate, sig), uval, dout, cot))
 
             total = f32(cute.arch.warp_reduction_sum(sumsq))
             paired = f32(cute.arch.warp_reduction_sum(dot))
@@ -461,7 +471,7 @@ def mixer_tail_bwd_kernel(
 
             for j in cutlass.range_constexpr(segments):
                 col, _, masked = cols[j]
-                value, pre, act, dact, uval, skip, dout, cot = held[j]
+                value, pre, act, dact, uval, dout, cot = held[j]
                 dvalue = scale * cot - coupling * value
                 dpre = dvalue * act
                 acc_skip[j] = acc_skip[j] + dpre * uval
@@ -479,26 +489,34 @@ def mixer_tail_bwd_kernel(
                     gdu[bidx, head, tidx, col] = du
                     gdgate[bidx, tidx, band + col] = dgate
 
+    # The row axis of the skip gradient closes here: the lane's columns, then the
+    # warp, so shared memory carries one float per warp rather than one per column.
+    lane_skip = zero
     for j in cutlass.range_constexpr(segments):
-        spartial[SLOT_DSKIP, warp, slots[j]] = acc_skip[j]
-        spartial[SLOT_WEIGHT, warp, slots[j]] = acc_weight[j]
+        lane_skip = lane_skip + acc_skip[j]
+    warp_skip = f32(cute.arch.warp_reduction_sum(lane_skip))
+    if lane == 0:
+        sskip[warp] = warp_skip
+    for j in cutlass.range_constexpr(segments):
+        spartial[warp, slots[j]] = acc_weight[j]
     cute.arch.sync_threads()
 
     if warp == 0:
         for j in cutlass.range_constexpr(segments):
             col, _, masked = cols[j]
-            total_skip = zero
             total_weight = zero
             for other in cutlass.range_constexpr(WARPS):
-                total_skip = total_skip + spartial[SLOT_DSKIP, other, slots[j]]
-                total_weight = total_weight + spartial[SLOT_WEIGHT, other, slots[j]]
+                total_weight = total_weight + spartial[other, slots[j]]
             if cutlass.const_expr(masked):
                 if col < rows:
-                    gpartial[SLOT_DSKIP, tile, head, col] = total_skip
-                    gpartial[SLOT_WEIGHT, tile, head, col] = total_weight
+                    gpweight[tile, head, col] = total_weight
             else:
-                gpartial[SLOT_DSKIP, tile, head, col] = total_skip
-                gpartial[SLOT_WEIGHT, tile, head, col] = total_weight
+                gpweight[tile, head, col] = total_weight
+        if lane == 0:
+            total_skip = zero
+            for other in cutlass.range_constexpr(WARPS):
+                total_skip = total_skip + sskip[other]
+            gpskip[tile, head] = total_skip
 
 
 @cute.jit
@@ -512,7 +530,8 @@ def mixer_tail_bwd(
     gdy: cute.Tensor,
     gdu: cute.Tensor,
     gdgate: cute.Tensor,
-    gpartial: cute.Tensor,
+    gpweight: cute.Tensor,
+    gpskip: cute.Tensor,
     tokens: cutlass.Int32,
     seqlen: cutlass.Int32,
     rows: cutlass.Int32,
@@ -535,7 +554,8 @@ def mixer_tail_bwd(
         gdy,
         gdu,
         gdgate,
-        gpartial,
+        gpweight,
+        gpskip,
         tokens,
         seqlen,
         rows,
@@ -558,7 +578,7 @@ def _segments(rows: int) -> int:
 
 @functools.cache
 def _budget(segments: int) -> int:
-    """Bytes the backward's partial tile occupies, against the queried capacity.
+    """Bytes the backward's two partial tiles occupy, against the queried capacity.
 
     Cached on ``segments`` because the capacity query walks the DSL's
     architecture table and the answer depends on nothing else.
@@ -567,14 +587,16 @@ def _budget(segments: int) -> int:
         segments: ``ceil(P/32)``.
 
     Returns:
-        The tile's byte count.
+        The tiles' byte count.
 
     Raises:
-        ValueError: If the tile exceeds capacity, which is what bounds ``P``.
+        ValueError: If the tiles exceed capacity, which is what bounds ``P``.
             Both directions check it, so a shape the backward cannot
             differentiate is refused by the forward too.
     """
-    return assert_smem_fits("mixer_tail_bwd", smem_bytes([(param_tile(segments), 4)]))
+    return assert_smem_fits(
+        "mixer_tail_bwd", smem_bytes([(param_tile(segments), 4), (skip_tile(), 4)])
+    )
 
 
 def _check_eps(eps: float) -> None:
@@ -622,24 +644,20 @@ def _check_operands(
         ValueError: On a shape mismatch, an empty operand, a non-positive
             ``eps``, a non-CUDA operand, a head-major operand that is not
             contiguous, a ``gate`` that is not pitched, or a ``P`` whose partial
-            tile exceeds the shared-memory capacity.
-        TypeError: On a dtype with no kernel path, or on a group that does not
-            share one dtype.
+            tiles exceed the shared-memory capacity.
+        TypeError: On a dtype with no kernel path, or on an activation group that
+            does not share one dtype.
     """
     shape = _check_shapes(y, u, gate, d_skip, weight)
     _check_eps(eps)
-    # Two groups, not one call: the activations and the parameters widen
-    # independently inside the kernel, so float32 parameters against
-    # low-precision activations is a supported call.
+    # One group for the activations and one operand each for the parameters: the
+    # three widen independently inside the kernel, so a float32 ``d_skip`` against a
+    # low-precision norm gain and low-precision activations is a supported call.
     check_dtypes(
         ((y, "y"), (u, "u"), (gate, "gate")), KERNEL_DTYPES, "kernel dtypes", "group"
     )
-    check_dtypes(
-        ((d_skip, "d_skip"), (weight, "weight")),
-        KERNEL_DTYPES,
-        "kernel dtypes",
-        "group",
-    )
+    check_dtypes(((d_skip, "d_skip"),), KERNEL_DTYPES, "kernel dtypes")
+    check_dtypes(((weight, "weight"),), KERNEL_DTYPES, "kernel dtypes")
     check_layout(((y, "y"), (u, "u"), (d_skip, "d_skip"), (weight, "weight")))
     check_pitched(((gate, "gate"),))
     _budget(_segments(shape[3]))
@@ -667,8 +685,10 @@ def mixer_tail_forward(
             :data:`slinoss._precision.KERNEL_DTYPES`.
         u: Scan input, ``(B,H,T,P)``, same dtype.
         gate: Gate, ``(B,T,H*P)``, same dtype, pitched.
-        d_skip: Per-row skip scale, ``(H,P)``, one of :data:`slinoss._precision.KERNEL_DTYPES`.
-        weight: Per-row norm scale, ``(H,P)``, same dtype as ``d_skip``.
+        d_skip: Per-head skip scale, ``(H,)``, one of
+            :data:`slinoss._precision.KERNEL_DTYPES`.
+        weight: Per-row norm scale, ``(H,P)``, likewise, and independent of
+            ``d_skip``'s.
         eps: Added to the mean square before the reciprocal square root.
 
     Returns:
@@ -678,9 +698,9 @@ def mixer_tail_forward(
         ValueError: On a shape mismatch, an empty operand, a non-positive
             ``eps``, a non-CUDA operand, a head-major operand that is not
             contiguous, a ``gate`` that is not pitched, or a ``P`` whose partial
-            tile exceeds the shared-memory capacity.
-        TypeError: On a dtype with no kernel path, or on a group that does not
-            share one dtype.
+            tiles exceed the shared-memory capacity.
+        TypeError: On a dtype with no kernel path, or on an activation group that
+            does not share one dtype.
     """
     bsz, heads, seqlen, rows = _check_operands(y, u, gate, d_skip, weight, eps)
     out = torch.empty(bsz, seqlen, heads * rows, dtype=y.dtype, device=y.device)
@@ -721,9 +741,10 @@ def mixer_tail_backward(
     """Pull the cotangent of the tail back to all five operands.
 
     The norm scale is recomputed from the operands, so the forward saves no
-    intermediate. Both parameter gradients are accumulated in the kernel's
-    epilogue as one ``(H,P)`` row of tile partials; the cross-tile sum is a second
-    launch over that buffer and reads no operand a second time.
+    intermediate. Both parameter gradients are accumulated in the kernel's epilogue,
+    the norm gain's as one ``(H,P)`` row of tile partials and the skip's as one
+    ``(H,)`` row; the cross-tile sums are two more launches over those buffers and
+    read no operand a second time.
 
     A supplied ``dgate`` is stored into directly. The kernel's layouts are dynamic
     except the trailing mode, so a destination at the projection's pitch is a store
@@ -735,7 +756,7 @@ def mixer_tail_backward(
         y: The forward's scan output, ``(B,H,T,P)``.
         u: The forward's scan input, ``(B,H,T,P)``.
         gate: The forward's gate, ``(B,T,H*P)``, pitched.
-        d_skip: The forward's skip scale, ``(H,P)``.
+        d_skip: The forward's skip scale, ``(H,)``.
         weight: The forward's norm scale, ``(H,P)``.
         eps: The epsilon the forward was called with.
         dgate: Destination for the gate gradient, ``(B,T,H*P)``, pitched, carrying
@@ -771,11 +792,10 @@ def mixer_tail_backward(
         dgate = torch.empty(bsz, seqlen, width, dtype=y.dtype, device=y.device)
     tokens = bsz * seqlen
     tiles = (tokens + ROWS - 1) // ROWS
-    # Every element is written by the kernel, so the accumulator is initialized
+    # Every element is written by the kernel, so both accumulators are initialized
     # inside the launch and nothing is filled here.
-    partial = torch.empty(
-        SLOTS, tiles, heads, rows, dtype=torch.float32, device=y.device
-    )
+    pweight = torch.empty(tiles, heads, rows, dtype=torch.float32, device=y.device)
+    pskip = torch.empty(tiles, heads, dtype=torch.float32, device=y.device)
     jit_launch(
         mixer_tail_bwd,
         (
@@ -788,7 +808,8 @@ def mixer_tail_backward(
             dy,
             du,
             dgate,
-            partial,
+            pweight,
+            pskip,
             tokens,
             seqlen,
             rows,
@@ -799,17 +820,12 @@ def mixer_tail_backward(
         ),
         (_segments(rows), rows % cute.arch.WARP_SIZE == 0),
     )
-    # Both slots reduce in one launch: head and row are the reduced width and the
-    # buffer is contiguous, so the flattening is a view. `_check_operands` holds the
-    # two parameters to one dtype, so one output dtype covers both slots and the
-    # narrowing happens on the kernel's store.
-    totals = reduce_partials(
-        partial.view(SLOTS, tiles, heads * rows), out_dtype=d_skip.dtype
-    ).view(SLOTS, heads, rows)
-    return MixerTailGrads(
-        dy=dy,
-        du=du,
-        dgate=dgate,
-        dd_skip=totals[SLOT_DSKIP],
-        dweight=totals[SLOT_WEIGHT],
-    )
+    # One launch each: the reduced width and the output dtype are both compile-time,
+    # and the two parameters share neither. Head and row are the reduced width of the
+    # norm gain and the buffer is contiguous, so its flattening is a view; the skip's
+    # partials are already flat. Both narrow on the reduction's own store.
+    dweight = reduce_partials(
+        pweight.view(1, tiles, heads * rows), out_dtype=weight.dtype
+    ).view(heads, rows)
+    dd_skip = reduce_partials(pskip.view(1, tiles, heads), out_dtype=d_skip.dtype)[0]
+    return MixerTailGrads(dy=dy, du=du, dgate=dgate, dd_skip=dd_skip, dweight=dweight)

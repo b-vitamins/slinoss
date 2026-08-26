@@ -82,7 +82,7 @@ def mixer_tail(
         y: Scan output, ``(B,H,T,P)``, head-major.
         u: Scan input, ``(B,H,T,P)``, head-major.
         gate: Gate, ``(B,T,H*P)``, token-major.
-        d_skip: Per-row skip scale, ``(H,P)``.
+        d_skip: Per-head skip scale, ``(H,)``.
         weight: Per-row norm scale, ``(H,P)``.
         eps: Added to the mean square before the reciprocal square root.
         backend: Backend name, or ``None`` to select the fastest registered backend

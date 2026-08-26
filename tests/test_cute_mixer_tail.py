@@ -39,9 +39,9 @@ from slinoss.ops.mixer.cute import (
 )
 from slinoss.ops.mixer.cute.tail import (
     ROWS_PER_WARP,
-    SLOTS,
     WARPS,
     param_tile,
+    skip_tile,
 )
 from tests.conftest import assert_max_rel
 
@@ -114,7 +114,7 @@ def _operands(
     y = rnd(bsz, heads, seqlen, rows)
     u = rnd(bsz, heads, seqlen, rows)
     gate = rnd(bsz, seqlen, heads * rows) * 3.0
-    d_skip = rnd(heads, rows) * 0.5
+    d_skip = rnd(heads) * 0.5
     weight = 1.0 + 0.25 * rnd(heads, rows)
     return (
         y.to(dtype),
@@ -424,7 +424,7 @@ FwdMutator = Callable[[Operands], Operands]
         (lambda o: (o[0][0], *o[1:]), ValueError, r"y must be \(B,H,T,P\)"),
         (lambda o: (o[0], o[1][..., :-16], *o[2:]), ValueError, r"u must be"),
         (lambda o: (*o[:2], o[2][:1], *o[3:]), ValueError, r"gate must be"),
-        (lambda o: (*o[:3], o[3][..., :-16], o[4]), ValueError, r"d_skip must be"),
+        (lambda o: (*o[:3], o[3][:1], o[4]), ValueError, r"d_skip must be"),
         (lambda o: (*o[:4], o[4][:1]), ValueError, r"weight must be"),
         (
             lambda o: (o[0][:0], o[1][:0], o[2][:0], *o[3:]),
@@ -437,7 +437,11 @@ FwdMutator = Callable[[Operands], Operands]
             r"kernel dtypes",
         ),
         (lambda o: (o[0].bfloat16(), *o[1:]), TypeError, r"u is"),
-        (lambda o: (*o[:3], o[3].bfloat16(), o[4]), TypeError, r"weight is"),
+        # Each parameter is its own group, so the only thing left to refuse one on
+        # is the set. A dtype mismatch between the two is legal and is the mixer's
+        # own call: a float32 d_skip against a norm gain at the module dtype.
+        (lambda o: (*o[:3], o[3].double(), o[4]), TypeError, r"d_skip has dtype"),
+        (lambda o: (*o[:4], o[4].double()), TypeError, r"weight has dtype"),
         (
             lambda o: (o[0].cpu(), o[1].cpu(), o[2].cpu(), o[3].cpu(), o[4].cpu()),
             ValueError,
@@ -526,12 +530,13 @@ def test_rejects_non_positive_eps() -> None:
 
 
 def test_oversized_rows_are_refused() -> None:
-    """``P`` is bounded by the partial tile against the queried capacity.
+    """``P`` is bounded by the partial tiles against the queried capacity.
 
     The bound is read from the device rather than written down, so this fails on
-    any host where the layout and the capacity disagree.
+    any host where the layout and the capacity disagree. The skip tile is a fixed
+    ``WARPS`` floats and does not scale with ``P``, so the ``+ 1`` clears it too.
     """
-    segments = smem_capacity() // (SLOTS * WARPS * WARP * 4) + 1
+    segments = smem_capacity() // (WARPS * WARP * 4) + 1
     rows = segments * WARP
     ops = _operands(1, 1, 1, rows, seed=18)
     with pytest.raises(ValueError, match=r"shared memory"):
@@ -539,18 +544,22 @@ def test_oversized_rows_are_refused() -> None:
 
 
 def test_partial_tile_budget_matches_the_layout() -> None:
-    """The budget comes from the layout, with no guard constant.
+    """The budget comes from the two layouts, with no guard constant.
 
-    Both accesses to the tile are unit-stride across the lanes of a warp, so the
-    trailing extent is what makes it conflict-free; a pitch added here would be
-    the tell that something else is indexing it.
+    Both accesses to the norm-gain tile are unit-stride across the lanes of a warp,
+    so the trailing extent is what makes it conflict-free; a pitch added here would
+    be the tell that something else is indexing it. The skip tile is one float per
+    warp and does not scale with ``P``, which is the whole reason a per-head skip
+    costs no shared memory worth budgeting.
     """
+    skip = skip_tile()
+    assert skip.shape == (WARPS,)
     for segments in (1, 4):
         tile = param_tile(segments)
-        assert tile.shape == (SLOTS, WARPS, WARP * segments)
+        assert tile.shape == (WARPS, WARP * segments)
         assert tile.stride[-1] == 1
-        nbytes = smem_bytes([(tile, 4)])
-        assert nbytes == SLOTS * WARPS * WARP * segments * 4
+        nbytes = smem_bytes([(tile, 4), (skip, 4)])
+        assert nbytes == (WARPS * WARP * segments + WARPS) * 4
         assert assert_smem_fits(f"mixer_tail_bwd[{segments}]", nbytes) == nbytes
         assert nbytes <= smem_capacity()
 

@@ -11,12 +11,17 @@ head can pass information through without going around the state. The gate is
 applied before the norm, so the norm sees the gated magnitude and the scale it
 divides by is the one the next projection actually reads.
 
+``d_skip`` is ``(H,)``: one scalar per head, which is the width Mamba2's ``D``
+carries. The skip is a gain on the whole head's direct path, and a per-row gain
+would be ``d_head`` times the parameters for a term the row's own ``B`` and ``C``
+already shape. ``weight`` stays ``(H,P)``, because a norm gain is per row by
+definition.
+
 The reduction runs over ``P``, the rows of one head, and never crosses the head
 axis. That keeps the whole tail rowwise: one ``(b, h, t)`` triple is one
 independent problem of length ``P``, which is what lets the fused kernel read
 each element once. A reduction over ``d_inner`` would couple every head at every
-token and force either a second pass or a cross-head barrier. Parameter count is
-unchanged: ``weight`` is ``(H,P)``, which is ``d_inner`` scalars.
+token and force either a second pass or a cross-head barrier.
 
 Layout. ``y`` and ``u`` arrive head-major, ``(B,H,T,P)``, which is what the scan
 and the convolution write. ``gate`` and the output are token-major, ``(B,T,H*P)``,
@@ -93,7 +98,7 @@ def tail_shape(
         y: Scan output, ``(B,H,T,P)``.
         u: Scan input, ``(B,H,T,P)``.
         gate: Gate, ``(B,T,H*P)``.
-        d_skip: Skip scale, ``(H,P)``.
+        d_skip: Skip scale, ``(H,)``.
         weight: Norm scale, ``(H,P)``.
 
     Returns:
@@ -112,11 +117,10 @@ def tail_shape(
     flat = (bsz, seqlen, heads * rows)
     if tuple(gate.shape) != flat:
         raise ValueError(f"gate must be {flat}, got {tuple(gate.shape)}")
-    for name, tensor in (("d_skip", d_skip), ("weight", weight)):
-        if tuple(tensor.shape) != (heads, rows):
-            raise ValueError(
-                f"{name} must be {(heads, rows)}, got {tuple(tensor.shape)}"
-            )
+    if tuple(d_skip.shape) != (heads,):
+        raise ValueError(f"d_skip must be {(heads,)}, got {tuple(d_skip.shape)}")
+    if tuple(weight.shape) != (heads, rows):
+        raise ValueError(f"weight must be {(heads, rows)}, got {tuple(weight.shape)}")
     return bsz, heads, seqlen, rows
 
 
@@ -135,7 +139,7 @@ def mixer_tail_ref(
         y: Scan output, shape ``(B,H,T,P)``.
         u: Scan input, shape ``(B,H,T,P)``. Source of the skip term.
         gate: Gate, shape ``(B,T,H*P)``, token-major.
-        d_skip: Per-row skip scale, shape ``(H,P)``.
+        d_skip: Per-head skip scale, shape ``(H,)``.
         weight: Per-row norm scale, shape ``(H,P)``.
         eps: Added to the mean square before the reciprocal square root. The
             reduction is over ``P`` and the summand is non-negative, so ``eps``
@@ -163,8 +167,9 @@ def mixer_tail_ref(
 
     dtype = pinned_dtype(y, u, gate, d_skip, weight)
     with autocast_disabled(y.device.type):
-        # (H,P) broadcasts against (B,H,T,P) once the token axis is inserted.
-        x = y.to(dtype) + d_skip.to(dtype)[:, None, :] * u.to(dtype)
+        # (H,) broadcasts against (B,H,T,P) once the token and row axes are inserted,
+        # and (H,P) once the token axis is.
+        x = y.to(dtype) + d_skip.to(dtype)[:, None, None] * u.to(dtype)
         x = x * silu(as_head_major(gate.to(dtype), heads))
         scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
         out = x * scale * weight.to(dtype)[:, None, :]
@@ -179,7 +184,7 @@ class MixerTailGrads(NamedTuple):
         du: ``(B,H,T,P)``, dtype of ``u``.
         dgate: ``(B,T,H*P)``, dtype of ``gate``. The destination the caller
             supplied, when it supplied one, and not a copy of it.
-        dd_skip: ``(H,P)``, dtype of ``d_skip``.
+        dd_skip: ``(H,)``, dtype of ``d_skip``.
         dweight: ``(H,P)``, dtype of ``weight``.
     """
 
@@ -250,7 +255,7 @@ def mixer_tail_bwd_ref(
         y: The forward's scan output, shape ``(B,H,T,P)``.
         u: The forward's scan input, shape ``(B,H,T,P)``.
         gate: The forward's gate, shape ``(B,T,H*P)``.
-        d_skip: The forward's skip scale, shape ``(H,P)``.
+        d_skip: The forward's skip scale, shape ``(H,)``.
         weight: The forward's norm scale, shape ``(H,P)``.
         eps: The forward's epsilon.
         dgate: Destination for the gate gradient, ``(B,T,H*P)``, carrying the shape,

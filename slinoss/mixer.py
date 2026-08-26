@@ -558,9 +558,8 @@ class SLinOSSMixer(nn.Module):
     consumer reads and writes its own column band in place.
 
     ``x`` is ``(B,T,d_model)`` and the result is ``(B,T,d_model)``, both in the
-    activation dtype. ``param_bias`` is float32 at every module dtype and stays
-    float32 through a module-wide cast, because the scan parameters it biases are
-    pinned (I4).
+    activation dtype. ``param_bias`` and ``d_skip`` are float32 at every module dtype
+    and stay float32 through a module-wide cast.
 
     CUDA. Every operand between the two projections is a column band, and
     :func:`slinoss._guard.check_pitched` holds a band to a device rule, so a CPU
@@ -574,7 +573,7 @@ class SLinOSSMixer(nn.Module):
     Initialization is principled where the scale sets the recurrence and the
     framework default elsewhere. ``param_bias`` is inverted through both bounded
     maps onto one horizon grid over :data:`HORIZON_RANGE`, with an isotropic axis per
-    head; ``d_skip`` and ``norm_weight`` are ones. The two
+    head; ``d_skip`` is standard normal and ``norm_weight`` is ones. The two
     projections keep :meth:`torch.nn.Linear.reset_parameters`, which is a default
     and not a choice, and the convolution taps take the same uniform bound over
     ``d_conv``. No depth scaling.
@@ -582,8 +581,15 @@ class SLinOSSMixer(nn.Module):
     Args:
         config: Shape and parameterization contract.
         device: Device for every parameter.
-        dtype: Dtype for every parameter except ``param_bias``.
+        dtype: Dtype for every parameter except those in
+            :data:`CRITICAL_FP32_TENSORS`.
     """
+
+    #: Parameters a module-wide cast may not demote. ``param_bias`` because scanprep
+    #: raises on a low-precision one (I4), ``d_skip`` because it is a per-head scalar
+    #: whose gradient reduces over ``B*T*P`` and whose stored width costs ``H``
+    #: floats.
+    CRITICAL_FP32_TENSORS: tuple[str, ...] = ("param_bias", "d_skip")
 
     def __init__(
         self,
@@ -616,8 +622,12 @@ class SLinOSSMixer(nn.Module):
             torch.empty(config.n_heads, PARAM_COLS, device=device, dtype=torch.float32)
         )
         self.d_skip = nn.Parameter(
-            torch.empty(config.n_heads, config.d_head, device=device, dtype=dtype)
+            torch.empty(config.n_heads, device=device, dtype=torch.float32)
         )
+        # Read by the parameter-group builder of whatever trainer wraps this; nothing
+        # in this tree reads it. Decay on a skip gain pulls the direct path toward
+        # deletion, which is a shrinkage of the architecture rather than of a weight.
+        cast(Any, self.d_skip)._no_weight_decay = True
         self.norm_weight = nn.Parameter(
             torch.empty(config.n_heads, config.d_head, device=device, dtype=dtype)
         )
@@ -651,20 +661,20 @@ class SLinOSSMixer(nn.Module):
             self.conv_weight.uniform_(-bound, bound)
             if self.conv_bias is not None:
                 self.conv_bias.zero_()
-            self.d_skip.fill_(1.0)
+            nn.init.normal_(self.d_skip)
             self.norm_weight.fill_(1.0)
             self.param_bias.copy_(_param_bias_init(cfg))
 
     def _apply(
         self, fn: Callable[[Tensor], Tensor], recurse: bool = True
     ) -> SLinOSSMixer:
-        """Apply ``fn`` to every parameter, then undo a demoted ``param_bias``.
+        """Apply ``fn`` to every parameter, then undo a demoted critical one.
 
         :meth:`torch.nn.Module.to` casts every floating-point parameter, and
         ``mixer.to(torch.bfloat16)`` is how the module is meant to reach a kernel
-        dtype. ``param_bias`` is the one parameter that cannot follow: scanprep
-        raises on a low-precision one (I4). A widening cast is left alone, so a
-        float64 module keeps a float64 oracle end to end.
+        dtype. The parameters :data:`CRITICAL_FP32_TENSORS` names cannot follow. Only
+        a demotion is undone, so a widening cast is left alone and a float64 module
+        keeps a float64 oracle end to end.
 
         Args:
             fn: The per-tensor operation :meth:`torch.nn.Module._apply` applies.
@@ -674,8 +684,10 @@ class SLinOSSMixer(nn.Module):
             This module.
         """
         super()._apply(fn, recurse)
-        if self.param_bias.dtype in LOW_PRECISION_DTYPES:
-            self.param_bias.data = self.param_bias.data.to(torch.float32)
+        for name in self.CRITICAL_FP32_TENSORS:
+            param = cast(Tensor, getattr(self, name))
+            if param.dtype in LOW_PRECISION_DTYPES:
+                param.data = param.data.to(torch.float32)
         return self
 
     def forward(self, x: Tensor) -> Tensor:
