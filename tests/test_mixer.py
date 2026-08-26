@@ -25,8 +25,7 @@ from torch.nn.functional import linear
 from slinoss._guard import PROJ_ALIGN, SECTOR_BYTES
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import (
-    DECAY_TAU_RANGE,
-    ROTATION_PERIOD_RANGE,
+    HORIZON_RANGE,
     ProjectionLayout,
     SLinOSSMixer,
     head_grid,
@@ -190,8 +189,8 @@ INIT_TOL = 2e-7
 """Bound on recovering an initialization grid through its own bounded map.
 
 The raw values are float32, so the round trip through ``log(expm1(.))`` and back
-carries that rounding and nothing else. Measured: 6.046e-08 for the decay grid and
-7.015e-08 for the period grid.
+carries that rounding and nothing else. Measured: 6.250e-08 for the decay row,
+2.988e-08 for the rotation row, and 3.262e-08 for their ratio.
 """
 
 _DPROJ_BAND = {
@@ -457,18 +456,32 @@ def test_initialization_inverts_the_bounded_maps() -> None:
     cfg = MIXER_CONFIG
     rows = SLinOSSMixer(cfg).param_bias.detach().double()
     ls = bounded_logscale(rows[:, LS_COLUMN])
-    tau = head_grid(DECAY_TAU_RANGE, cfg.n_heads).double()
-    assert_max_rel(-0.5 / ls, tau, INIT_TOL, "mixer init decay")
+    horizon = head_grid(HORIZON_RANGE, cfg.n_heads).double()
+    assert_max_rel(-0.5 / ls, horizon, INIT_TOL, "mixer init decay")
     w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
     turn = w.norm(dim=-1)
-    period = head_grid(ROTATION_PERIOD_RANGE, cfg.n_heads).double()
-    assert_max_rel(2.0 * math.pi / turn, period, INIT_TOL, "mixer init period")
+    assert_max_rel(2.0 * math.pi / turn, horizon, INIT_TOL, "mixer init period")
     # I1 and I2 at step zero. The grids are what leaves a margin in the second.
     assert bool((ls <= 0.0).all())
     assert float(turn.max()) < cfg.w_max
     taps = rows[:, TAP_COLUMNS].unflatten(-1, (2, 3))
     assert torch.equal(taps[..., 0], torch.full_like(taps[..., 0], 0.5))
     assert not taps[..., 1:].any()
+
+
+def test_every_head_turns_once_per_lifetime() -> None:
+    """Both scale rows come from one grid, read back through both bounded maps.
+
+    The assertions above hold a row to a constant, so a grid split back into one
+    range per row passes them while the ratio between the rows sweeps: the shortest
+    heads lose their oscillation inside the amplitude lifetime, the longest carry
+    several, and nothing states the schedule. The ratio is the invariant.
+    """
+    cfg = MIXER_CONFIG
+    rows = SLinOSSMixer(cfg).param_bias.detach().double()
+    tau = -0.5 / bounded_logscale(rows[:, LS_COLUMN])
+    turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
+    assert_max_rel(2.0 * math.pi / turn, tau, INIT_TOL, "turns per lifetime")
 
 
 def test_conjugation_turns_by_the_rotation_vector_norm() -> None:
@@ -484,8 +497,8 @@ def test_conjugation_turns_by_the_rotation_vector_norm() -> None:
     w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
     trace = rot_matrix(quat_exp(w)).diagonal(dim1=-2, dim2=-1).sum(-1)
     angle = torch.arccos(((trace - 1.0) / 2.0).clamp(-1.0, 1.0))
-    period = head_grid(ROTATION_PERIOD_RANGE, cfg.n_heads).double()
-    assert_max_rel(2.0 * math.pi / angle, period, INIT_TOL, "mixer rotation period")
+    horizon = head_grid(HORIZON_RANGE, cfg.n_heads).double()
+    assert_max_rel(2.0 * math.pi / angle, horizon, INIT_TOL, "mixer rotation period")
 
 
 def test_a_period_the_bound_cannot_reach_stays_finite() -> None:
@@ -497,12 +510,30 @@ def test_a_period_the_bound_cannot_reach_stays_finite() -> None:
     reaches it, and a NaN row trains to nothing rather than raising.
     """
     cfg = SLinOSSConfig(d_model=32, d_state=48, d_head=16, n_groups=2, w_max=1.0)
-    assert 2.0 * math.pi / ROTATION_PERIOD_RANGE[0] > cfg.w_max
+    assert 2.0 * math.pi / HORIZON_RANGE[0] > cfg.w_max
     rows = SLinOSSMixer(cfg).param_bias.detach().double()
     assert bool(rows.isfinite().all())
     # I2 still holds, which is what the cap is for.
     turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
     assert float(turn.max()) < cfg.w_max
+
+
+def test_the_default_bound_reaches_a_half_turn() -> None:
+    """What the default ``w_max`` leaves outside the ball.
+
+    ``bounded_rotvec`` approaches the bound without reaching it, so the reachable
+    rotations turn by strictly less than ``w_max``, and a half turn is exactly pi. A
+    bound short of pi therefore deletes every order-2 element of every finite
+    rotation group the recurrence could carry, at any weight, and I2 forbids closing
+    the gap by raising the bound to pi itself.
+    """
+    cfg = SLinOSSConfig(d_model=32, d_state=48)
+    raw = torch.zeros(1, 3, dtype=torch.float64)
+    raw[0, 0] = 1e6
+    turn = float(bounded_rotvec(raw, cfg.w_max).norm(dim=-1))
+    assert turn < cfg.w_max < math.pi
+    # Half the float32 spacing at pi, the dtype every kernel carries the bound in.
+    assert math.pi - turn < 1.2e-7
 
 
 @pytest.mark.cuda

@@ -35,8 +35,7 @@ from slinoss.ops.so3ssd.reference import ScanPrologue
 from slinoss.state import MixerState
 
 __all__ = [
-    "DECAY_TAU_RANGE",
-    "ROTATION_PERIOD_RANGE",
+    "HORIZON_RANGE",
     "ProjectionLayout",
     "SLinOSSMixer",
     "head_grid",
@@ -223,15 +222,21 @@ class ProjectionLayout:
         return band.unflatten(-1, (self.groups, self.state_dim)).permute(0, 2, 1, 3)
 
 
-DECAY_TAU_RANGE: tuple[float, float] = (2.0, 512.0)
-"""Tokens over which a head's amplitude falls by ``exp(-1)`` at initialization.
+HORIZON_RANGE: tuple[float, float] = (4.0, 256.0)
+"""Tokens a head turns in and remembers over, at initialization.
 
-One head per point of a log-spaced grid over this range, so the initial decay
-scales cover the range geometrically instead of clustering at one end.
+One head per point of a log-spaced grid over this range, so the initial scales
+cover it geometrically instead of clustering at one end. One range and not one per
+row: a head's rotation period and its decay time constant are the same number, so
+one turn takes one amplitude lifetime. Two ranges over the same geometric center
+differ only in span, and their ratio is then a log-linear sweep of turns per
+lifetime that nothing asks for.
+
+The low end is bounded twice. A two-token period is the alternating sign, which no
+sampled rotation resolves, and its ``2*pi/2`` exceeds
+:data:`_MAX_ANGLE_FRACTION` of any legal ``w_max``. The high end is free, and is
+the one number that moves the whole grid.
 """
-
-ROTATION_PERIOD_RANGE: tuple[float, float] = (4.0, 256.0)
-"""Tokens per rotation turn at initialization. Log-spaced across heads."""
 
 _AXIS_SEED = 0
 """Seed of the rotation-axis draw.
@@ -246,15 +251,15 @@ _MAX_ANGLE_FRACTION = 0.9
 
 The inverse of :func:`slinoss.ops.scanprep.bounded_rotvec` diverges as the
 requested norm approaches the bound. Inactive at the default ``w_max``, where the
-shortest period in :data:`ROTATION_PERIOD_RANGE` asks for ``pi/2``.
+shortest horizon in :data:`HORIZON_RANGE` asks for ``pi/2``, one half of it.
 """
 
 
 def head_grid(bounds: tuple[float, float], heads: int) -> Tensor:
     """One value per head, log-spaced over ``bounds``, endpoints included.
 
-    Log-spaced because both quantities laid out this way are scales: a linear grid
-    over a ratio of 128 puts most heads at the high end.
+    Log-spaced because the quantity is a scale: a linear grid over a ratio of 64
+    puts most heads at the high end.
 
     Args:
         bounds: ``(low, high)``, both positive.
@@ -270,17 +275,18 @@ def head_grid(bounds: tuple[float, float], heads: int) -> Tensor:
 def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     """Rows of ``param_bias`` at initialization, ``(H, PARAM_COLS)``, float32, CPU.
 
-    Both bounded maps are inverted, so the grids state what the recurrence does at
-    step zero rather than what an unbounded parameterization would do:
+    Both bounded maps are inverted, so the grid states what the recurrence does at
+    step zero rather than what an unbounded parameterization would do. Both scale
+    rows read the one grid, at ``h`` tokens for the head:
 
     - ``bounded_logscale(raw) = -softplus(raw)`` and the per-token amplitude factor
-      is ``exp(2*ls)``, so an amplitude that falls by ``exp(-1)`` over ``tau``
-      tokens is ``ls = -1/(2*tau)`` at ``raw = log(expm1(1/(2*tau)))``.
+      is ``exp(2*ls)``, so an amplitude that falls by ``exp(-1)`` over ``h``
+      tokens is ``ls = -1/(2*h)`` at ``raw = log(expm1(1/(2*h)))``.
     - ``bounded_rotvec(raw, w_max) = raw * w_max * rsqrt(1 + |raw|^2)`` gives
       ``|w| = s * w_max`` at ``|raw| = s * rsqrt(1 - s*s)``. Conjugation turns by
       ``|w|`` per token: ``quat_exp`` builds the half-angle quaternion and the
-      conjugation doubles the half-angle back. A turn every ``Pd`` tokens is
-      therefore ``|w| = 2*pi/Pd``.
+      conjugation doubles the half-angle back. A turn every ``h`` tokens is
+      therefore ``|w| = 2*pi/h``.
 
     Args:
         config: Supplies ``H`` and ``w_max``.
@@ -290,8 +296,9 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     """
     heads = config.n_heads
     rows = torch.zeros(heads, PARAM_COLS, dtype=torch.float32)
-    rows[:, LS_COLUMN] = torch.log(torch.expm1(0.5 / head_grid(DECAY_TAU_RANGE, heads)))
-    angle = 2.0 * math.pi / head_grid(ROTATION_PERIOD_RANGE, heads)
+    horizon = head_grid(HORIZON_RANGE, heads)
+    rows[:, LS_COLUMN] = torch.log(torch.expm1(0.5 / horizon))
+    angle = 2.0 * math.pi / horizon
     fraction = (angle / config.w_max).clamp(max=_MAX_ANGLE_FRACTION)
     radius = fraction * torch.rsqrt(1.0 - fraction * fraction)
     axis = torch.randn(
@@ -567,9 +574,9 @@ class SLinOSSMixer(nn.Module):
 
     Initialization is principled where the scale sets the recurrence and the
     framework default elsewhere. ``param_bias`` is inverted through both bounded
-    maps onto a decay grid over :data:`DECAY_TAU_RANGE` and a period grid over
-    :data:`ROTATION_PERIOD_RANGE`, with the trapezoidal two-tap rule and an
-    isotropic axis per head; ``d_skip`` and ``norm_weight`` are ones. The two
+    maps onto one horizon grid over :data:`HORIZON_RANGE`, with the trapezoidal
+    two-tap rule and an isotropic axis per head; ``d_skip`` and ``norm_weight`` are
+    ones. The two
     projections keep :meth:`torch.nn.Linear.reset_parameters`, which is a default
     and not a choice, and the convolution taps take the same uniform bound over
     ``d_conv``. No depth scaling.

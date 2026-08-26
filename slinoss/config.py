@@ -78,6 +78,10 @@ class SLinOSSConfig:
         d_conv: Causal depthwise convolution width.
         w_max: Bound on the rotation-vector norm. Strictly below pi so
             ``quat_exp`` is one branchless polynomial over the reachable domain.
+            The default is the largest bound float32 does not resolve from pi.
+            ``|w|`` approaches the bound without reaching it and a half turn is
+            exactly pi, so a bound short of pi puts every order-2 element of the
+            reachable group outside the ball at any weight.
         bias: Bias on the linear projections.
         conv_bias: Bias on the causal convolution.
         n_layers: Blocks in the stack.
@@ -99,7 +103,7 @@ class SLinOSSConfig:
     n_groups: int = 1
     chunk_size: int = 64
     d_conv: int = 4
-    w_max: float = 3.0
+    w_max: float = 3.14159265
     bias: bool = False
     conv_bias: bool = True
     n_layers: int = 1
