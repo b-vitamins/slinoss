@@ -22,6 +22,11 @@ cuda = [
     "nvidia-cutlass-dsl>=4.4",
     "cuda-python>=12.4",
 ]
+# The MAD harness under scripts/mad/. Its data layer is numpy and nothing else,
+# so the parity gate against the upstream generators runs on any host.
+mad = [
+    "numpy>=1.24",
+]
 # Profiling and benchmarking drivers under scripts/.
 perf = [
     "nvtx>=0.2",
