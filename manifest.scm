@@ -46,6 +46,12 @@
    ;; declares only in an extra.
    "python-accelerate"
 
+   ;; Ground truth for the UEA partition. scripts/tsc reproduces JAX's Threefry
+   ;; stream in numpy because the published bars were measured on it; the pinning
+   ;; tests import JAX itself and skip where it is absent, so this is test-only and
+   ;; nothing under scripts/ imports it.
+   "python-jax"
+
    ;; Test, lint, and type checking.
    "python-pytest"
    "python-pytest-cov"
