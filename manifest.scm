@@ -33,6 +33,19 @@
    "ninja"
    "pybind11"
 
+   ;; Corpus preparation and zero-shot evaluation for scripts/lm. The tokenizer
+   ;; and the dataset stream are used once, by `scripts.lm.run prep`, and write a
+   ;; token file with a digest; the loop itself reads that file and imports
+   ;; neither. lm-eval owns the eight tasks, their prompts and their metrics: a
+   ;; ranking computed here would be a ranking nobody else's numbers compare to.
+   "python-datasets"
+   "python-transformers"
+   "python-tokenizers"
+   "python-lm-eval"
+   ;; lm-eval's HuggingFace model module imports accelerate, which lm-eval itself
+   ;; declares only in an extra.
+   "python-accelerate"
+
    ;; Test, lint, and type checking.
    "python-pytest"
    "python-pytest-cov"
