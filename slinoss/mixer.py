@@ -573,10 +573,11 @@ class SLinOSSMixer(nn.Module):
     Initialization is principled where the scale sets the recurrence and the
     framework default elsewhere. ``param_bias`` is inverted through both bounded
     maps onto one horizon grid over :data:`HORIZON_RANGE`, with an isotropic axis per
-    head; ``d_skip`` is standard normal and ``norm_weight`` is ones. The two
-    projections keep :meth:`torch.nn.Linear.reset_parameters`, which is a default
-    and not a choice, and the convolution taps take the same uniform bound over
-    ``d_conv``. No depth scaling.
+    head; ``d_skip`` and ``norm_weight`` are ones. The input projection's parameter
+    band is zeroed, so the recurrence starts as the oscillator bank that grid states
+    rather than a per-token rotation drawn from the input; everything else in the two
+    projections keeps :meth:`torch.nn.Linear.reset_parameters`, and the convolution
+    taps take the same uniform bound over ``d_conv``. No depth scaling.
 
     Args:
         config: Shape and parameterization contract.
@@ -627,7 +628,12 @@ class SLinOSSMixer(nn.Module):
         # Read by the parameter-group builder of whatever trainer wraps this; nothing
         # in this tree reads it. Decay on a skip gain pulls the direct path toward
         # deletion, which is a shrinkage of the architecture rather than of a weight.
+        # param_bias needs the marker for the same reason and cannot get it from the
+        # usual dim < 2 rule, being rank two: the chart's zero is a 0.25-per-step
+        # decay and no rotation, a horizon under one token, so decay toward it
+        # deletes the horizon grid rather than shrinking a magnitude.
         cast(Any, self.d_skip)._no_weight_decay = True
+        cast(Any, self.param_bias)._no_weight_decay = True
         self.norm_weight = nn.Parameter(
             torch.empty(config.n_heads, config.d_head, device=device, dtype=dtype)
         )
@@ -650,18 +656,25 @@ class SLinOSSMixer(nn.Module):
         with torch.no_grad():
             self.in_proj.reset_parameters()
             self.out_proj.reset_parameters()
-            # The pad columns belong to no band. Zeroed rows keep them zero for
-            # every input, so a misaddressed band reads zeros rather than plausible
-            # numbers, and the cotangent's zeroed pad band is consistent with them.
-            stop = self.layout.params_off + PARAM_COLS * cfg.n_heads
-            self.in_proj.weight[stop:].zero_()
+            # One slice, two reasons. The parameter band, because a default draw
+            # there is a per-token rotation the grid cannot survive: on unit-RMS
+            # input a column fluctuates by 1/sqrt(3) whatever d_model is, a rotation
+            # vector of mean norm 0.92 against bias radii from 0.577 down to 0.008,
+            # so the step turns ~2.1 rad about an input-drawn axis and no head holds
+            # a phase for one token. Zeroed, the recurrence starts as the oscillator
+            # bank the grid states, and input dependence still grows at full rate:
+            # the pullback to a row is sum_t dL/draw_t x_t and carries no factor of
+            # the row. The pad columns after it, because they belong to no band, so
+            # zeros are what a misaddressed band should read rather than plausible
+            # numbers, and the cotangent's zeroed pad band has to agree with them.
+            self.in_proj.weight[self.layout.params_off :].zero_()
             if cfg.bias:
-                self.in_proj.bias[stop:].zero_()
+                self.in_proj.bias[self.layout.params_off :].zero_()
             bound = 1.0 / math.sqrt(cfg.d_conv)
             self.conv_weight.uniform_(-bound, bound)
             if self.conv_bias is not None:
                 self.conv_bias.zero_()
-            nn.init.normal_(self.d_skip)
+            self.d_skip.fill_(1.0)
             self.norm_weight.fill_(1.0)
             self.param_bias.copy_(_param_bias_init(cfg))
 

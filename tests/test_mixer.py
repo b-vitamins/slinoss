@@ -545,6 +545,77 @@ def test_the_default_bound_reaches_a_half_turn() -> None:
     assert math.pi - turn < 1.2e-7
 
 
+def test_the_projection_starts_the_transition_at_the_grid() -> None:
+    """The parameter band's rows are zero, so every token applies the grid itself.
+
+    Under ``nn.Linear``'s default those rows carry a Kaiming-uniform draw, and on
+    unit-RMS input a column of one fluctuates by ``1/sqrt(3)`` whatever ``d_model``
+    is: a rotation vector of mean norm 0.92 against bias radii running 0.577 down to
+    0.008. The step at init then turns about 2.1 rad about an input-drawn axis, no
+    head holds a phase for one token, and the grid the bias encodes is unreachable
+    until training shrinks the rows it is being read through.
+    """
+    cfg = MIXER_CONFIG
+    mixer = SLinOSSMixer(cfg)
+    x = _activations(cfg, torch.device("cpu"), torch.float32)
+    proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    assert cfg.bias
+    assert not mixer.layout.params(proj).any()
+
+
+def test_the_zeroed_parameter_band_still_takes_gradient() -> None:
+    """Zero rows are a starting point, not a stop.
+
+    The pullback to a projection row is ``sum_t dL/draw_t x_t`` and carries no factor
+    of the row itself, and ``bounded_rotvec`` has Jacobian ``w_max * I`` at the
+    origin, so input dependence grows from zero at full rate. A zero that also killed
+    the gradient would pin the recurrence to one LTI operator for the whole run.
+    """
+    cfg = MIXER_CONFIG
+    mixer = SLinOSSMixer(cfg)
+    x = _activations(cfg, torch.device("cpu"), torch.float32)
+    proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    rows = mixer.layout.params(proj).unflatten(-1, (cfg.n_heads, PARAM_COLS))
+    bounded_rotvec(rows[..., ROTVEC_COLUMNS], cfg.w_max).sum().backward()
+
+    grad = mixer.in_proj.weight.grad
+    assert grad is not None
+    stop = mixer.layout.params_off + PARAM_COLS * cfg.n_heads
+    band = grad[mixer.layout.params_off : stop]
+    assert bool(band.abs().amax() > 0.0)
+    # Every head's rotation rows, not just the first: a band addressed one head wide
+    # would leave the rest at zero and never separate the timescales.
+    reached = band.unflatten(0, (cfg.n_heads, PARAM_COLS))[:, ROTVEC_COLUMNS]
+    assert bool((reached.abs().amax(dim=(-2, -1)) > 0.0).all())
+
+
+def test_the_recurrence_rows_are_exempt_from_weight_decay() -> None:
+    """Both per-head float32 parameters carry the marker a trainer routes on.
+
+    ``param_bias`` is an operating point, not a magnitude: the chart's zero is a
+    0.25-per-step decay and no rotation, a horizon under one token, so decay toward it
+    deletes the grid rather than shrinking a weight. The rows are rank two, so the
+    usual ``dim < 2`` exemption does not reach them and the marker is the only thing
+    that does.
+    """
+    mixer = SLinOSSMixer(MIXER_CONFIG)
+    assert mixer.param_bias.dim() == 2
+    assert getattr(mixer.param_bias, "_no_weight_decay", False)
+    assert getattr(mixer.d_skip, "_no_weight_decay", False)
+
+
+def test_the_skip_gain_starts_at_one() -> None:
+    """The direct path is the identity at init.
+
+    A standard-normal gain gives half the heads a sign-flipped skip around a path that
+    carries the token itself, so the stream starts by subtracting part of its own
+    input, and the spread is a per-head scale nothing asked for. One is what the same
+    parameter is upstream.
+    """
+    mixer = SLinOSSMixer(MIXER_CONFIG)
+    assert torch.equal(mixer.d_skip, torch.ones_like(mixer.d_skip))
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     "dtype",
