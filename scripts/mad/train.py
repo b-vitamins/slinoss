@@ -3,7 +3,7 @@
 The protocol is the Kalman Linear Attention driver's ``experiments/commands/mad.py``:
 750 epochs of AdamW at a flat 1e-3, batch 128, no weight decay, gradient norm clipped at
 5, evaluation every tenth epoch, and a stop when 70 epochs pass without the best test
-loss improving. A task is solved or it is not, so nothing here tunes: the same numbers
+accuracy improving. A task is solved or it is not, so nothing here tunes: the same numbers
 run for every arch, and the mixer is the only thing that varies.
 
 Weight decay applies to matrices only. A parameter of dimension below two, or one its
@@ -59,8 +59,8 @@ class TrainConfig:
         schedule: A member of :data:`SCHEDULES`.
         warmup_epochs: Linear warmup from zero, cosine only.
         grad_clip: Gradient norm ceiling. Zero disables clipping.
-        patience: Epochs without a best-loss improvement before stopping. Counted in
-            epochs, not evaluations. Zero disables the stop.
+        patience: Epochs without a strict test-accuracy improvement before stopping.
+            Counted in epochs, not evaluations. Zero disables the stop.
         log_every: Evaluate every this many epochs. The final epoch always evaluates.
         precision: A member of :data:`PRECISIONS`.
         seed: Seeds the shuffle, and :func:`seed_all` for everything else.
@@ -138,9 +138,11 @@ class Report(NamedTuple):
     """What one arm produced.
 
     Attributes:
-        best: Metrics at the evaluation with the lowest test loss. Selection is by loss,
-            not by accuracy: accuracy is a step function of the logits and ties on a
-            solved task.
+        best: Metrics at the evaluation with the highest test micro accuracy, ties going
+            to the earliest. Selection is by accuracy because that is the reported
+            quantity and the one the published bars are: past a task's loss plateau the
+            two disagree, and a loss-selected arm reports the accuracy of a point every
+            later evaluation beats.
         best_epoch: Its epoch.
         final: The last evaluation's metrics.
         points: Every evaluation, in order.
@@ -459,7 +461,7 @@ def train(
         points.append(point)
         if on_point is not None:
             on_point(point)
-        if test.loss < best.loss:
+        if best_epoch < 0 or test.micro > best.micro:
             best, best_epoch = test, epoch
         if config.patience and epoch - best_epoch >= config.patience:
             stopped_early = True

@@ -87,6 +87,58 @@ class Frozen(nn.Module):
         return flat + 0.0 * self.scale
 
 
+class Scripted(nn.Module):
+    """A model whose evaluations follow a written script.
+
+    Accuracy and loss are driven separately, which is what separates patience on accuracy
+    from patience on loss. Every position gets ``confidence`` logit mass, on its target
+    where the script says correct and on the next class otherwise, so the softmax
+    denominator is the same either way: micro accuracy follows ``correct`` alone and the
+    loss follows ``confidence`` and ``correct`` together.
+
+    Args:
+        vocab_size: Classes.
+        correct: Positions to get right, one entry per evaluation.
+        confidence: Logit mass, one entry per evaluation.
+    """
+
+    def __init__(
+        self, vocab_size: int, correct: tuple[int, ...], confidence: tuple[float, ...]
+    ) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.zeros(1))
+        self.vocab_size = vocab_size
+        self.correct = correct
+        self.confidence = confidence
+        self.evaluations = 0
+
+    def forward(self, ids: Tensor) -> Tensor:
+        """Zero logits while training, the scripted evaluation while not.
+
+        Args:
+            ids: ``(B,1)`` int64, each row its own target.
+
+        Returns:
+            ``(B,1,vocab_size)`` float32.
+        """
+        logits = torch.zeros(*ids.shape, self.vocab_size)
+        if not self.training:
+            index = self.evaluations
+            self.evaluations += 1
+            for row in range(int(ids.shape[0])):
+                target = int(ids[row, 0])
+                hit = row < self.correct[index]
+                column = target if hit else (target + 1) % self.vocab_size
+                logits[row, 0, column] = self.confidence[index]
+        return logits + 0.0 * self.scale
+
+
+def scripted_pool() -> Pool:
+    """A split of eight positions, each its own target, train and test identical."""
+    ids = np.array([[0], [1], [2], [3], [0], [1], [2], [3]], dtype=np.int64)
+    return Pool(ids, ids.copy(), ids, ids.copy(), 0.0)
+
+
 class Grouped(nn.Module):
     """One parameter of each kind the decay split sorts on."""
 
@@ -310,6 +362,55 @@ def test_patience_is_counted_in_epochs() -> None:
     assert report.epochs_run == 4
     assert report.stopped_early
     assert report.best == report.final
+
+
+def test_selection_and_patience_read_accuracy_rather_than_loss() -> None:
+    """Both the reported metrics and the stop follow test accuracy.
+
+    The driver this protocol comes from keeps its best on test accuracy, resets patience on
+    a strict accuracy improvement, and writes that accuracy out as the arm's result.
+    Selecting on loss does two separable things and this script exposes both at once: the
+    loss never beats its first evaluation, so a loss-selected arm reports the accuracy of
+    its worst point and stops while accuracy is still moving.
+    """
+    correct = (1, 2, 3, 4, 5, 3)
+    model = Scripted(4, correct, (2.0, 3.0, 4.0, 5.0, 6.0, 7.0))
+    config = TrainConfig(
+        epochs=len(correct), batch_size=8, lr=0.1, log_every=1, patience=3, **CPU
+    )
+    report = train(model, scripted_pool(), config, vocab_size=4)
+
+    assert [point.test.micro for point in report.points] == [
+        pytest.approx(count / 8) for count in correct
+    ]
+    assert min(point.test.loss for point in report.points) == report.points[0].test.loss
+    assert not report.stopped_early
+    assert report.epochs_run == len(correct)
+    assert report.best_epoch == 4
+    assert report.best.micro == pytest.approx(5 / 8)
+    assert report.final.micro == pytest.approx(3 / 8)
+    assert report.best.loss > report.points[0].test.loss
+
+
+def test_patience_ignores_a_loss_that_improves_under_a_flat_accuracy() -> None:
+    """A strict accuracy improvement is the only thing that resets the counter.
+
+    The complement of the test above: a solved task whose loss keeps falling still stops,
+    because upstream compares accuracy with ``>``. Resetting on a loss gain instead would
+    run every solved arm to the full budget, which is most of MAD, and change the epoch
+    count the protocol reports.
+    """
+    model = Scripted(4, (8,) * 6, (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+    config = TrainConfig(epochs=6, batch_size=8, lr=0.1, log_every=1, patience=3, **CPU)
+    report = train(model, scripted_pool(), config, vocab_size=4)
+
+    losses = [point.test.loss for point in report.points]
+    assert losses == sorted(losses, reverse=True)
+    assert report.best.micro == pytest.approx(1.0)
+    assert report.best_epoch == 0
+    assert report.epochs_run == 4
+    assert report.stopped_early
+    assert report.best.loss == report.points[0].test.loss
 
 
 def test_bf16_leaves_the_master_weights_at_float32() -> None:
