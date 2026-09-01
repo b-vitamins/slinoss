@@ -282,7 +282,12 @@ def make_inputs(
                 randn(*lead, 3, dt=torch.float32),
                 randn(*lead, dt=torch.float32),
             ),
-            torch.zeros(shape.heads, PARAM_COLS, dtype=torch.float32, device=device),
+            # Drawn, not zeroed: the rotation drive is anchored to this row's own
+            # radius, so a zero bias floors the radius and hands the scan a bank of
+            # near-identity rotations at ``|w| ~ 1e-6`` instead of the spread the
+            # mixer runs on. Nothing downstream branches on ``|w|``, so the timing is
+            # the same either way; the operands are not.
+            randn(shape.heads, PARAM_COLS, dt=torch.float32),
             heads=shape.heads,
             w_max=W_MAX,
         )
@@ -802,9 +807,15 @@ def make_prep_inputs(
     return PrepInputs(
         proj=proj,
         params=proj[..., param_columns].detach().requires_grad_(requires_grad),
-        param_bias=torch.zeros(
-            scan.heads, PARAM_COLS, dtype=torch.float32, device=device
-        ).requires_grad_(requires_grad),
+        # Drawn, not zeroed: the rotation drive is anchored to this row's own
+        # radius, so a zero bias floors the radius and pins ``|w|`` near 1e-6 at
+        # every head. Both tap branches are evaluated and every guard is a select,
+        # so the timing would not move -- but the small-``|w|`` series is the branch
+        # whose value gets discarded, and a benchmark should measure the regime the
+        # mixer runs in. Drawn after ``proj`` so no seed's projection moves.
+        param_bias=randn(scan.heads, PARAM_COLS, dt=torch.float32).requires_grad_(
+            requires_grad
+        ),
         dtrans=randn(*lead, 4, dt=torch.float32),
         dK=randn(*lead, 2, 4, dt=torch.float32),
     )
