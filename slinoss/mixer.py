@@ -28,7 +28,7 @@ from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.conv import backends as conv_dispatch
 from slinoss.ops.mixer import backends as tail_dispatch
-from slinoss.ops.scanprep import LS_COLUMN, PARAM_COLS, ROTVEC_COLUMNS
+from slinoss.ops.scanprep import LS_COLUMN, LS_MAX_MAG, PARAM_COLS, ROTVEC_COLUMNS
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
 from slinoss.ops.so3ssd.reference import ScanPrologue
@@ -36,9 +36,12 @@ from slinoss.state import MixerState
 
 __all__ = [
     "HORIZON_RANGE",
+    "PERIOD_RANGE",
     "ProjectionLayout",
     "SLinOSSMixer",
+    "fibonacci_axes",
     "head_grid",
+    "head_lattice",
 ]
 
 
@@ -222,44 +225,62 @@ class ProjectionLayout:
         return band.unflatten(-1, (self.groups, self.state_dim)).permute(0, 2, 1, 3)
 
 
-HORIZON_RANGE: tuple[float, float] = (4.0, 256.0)
-"""Tokens a head turns in and remembers over, at initialization.
+HORIZON_RANGE: tuple[float, float] = (4.0, 4096.0)
+"""Tokens a head's amplitude decays over, at initialization.
 
-One head per point of a log-spaced grid over this range, so the initial scales
-cover it geometrically instead of clustering at one end. One range and not one per
-row: a head's rotation period and its decay time constant are the same number, so
-one turn takes one amplitude lifetime. Two ranges over the same geometric center
-differ only in span, and their ratio is then a log-linear sweep of turns per
-lifetime that nothing asks for.
+The per-token amplitude factor is ``exp(2*ls)``, so a horizon of ``h`` tokens is
+``ls = -0.5/h``.
 
-The low end is bounded twice. A two-token period is the alternating sign, which no
-sampled rotation resolves, and its ``2*pi/2`` exceeds
-:data:`_MAX_ANGLE_FRACTION` of any legal ``w_max``. The high end is free, and is
-the one number that moves the whole grid.
+The low end is bounded twice: a lifetime under two tokens is a decay no sampled
+sequence resolves, and :data:`slinoss.ops.scanprep.LS_MAX_MAG` forbids one
+outright. Four keeps a margin against both. The high end is four times the longest
+sequence any harness trains on, so the longest head still holds ``exp(-1/4)`` of
+its amplitude across a whole sequence: the reachable end of an undamped head, which
+a bounded decay map reaches only in the limit.
 """
 
-_AXIS_SEED = 0
-"""Seed of the rotation-axis draw.
+PERIOD_RANGE: tuple[float, float] = (4.0, 4096.0)
+"""Tokens a head's rotation turns in, at initialization.
 
-Fixed, and not the ambient generator: the axis grid is part of what
-initialization states, so it must not move with global RNG state. Every layer of
-a stack therefore draws the same axes.
+Conjugation turns by ``|w|`` per token -- ``quat_exp`` builds the half-angle
+quaternion and the conjugation doubles the half-angle back -- so a period of ``p``
+tokens is ``|w| = 2*pi/p``. Same bounds as :data:`HORIZON_RANGE`, for the matching
+pair of reasons: a two-token period is the alternating sign, which no sampled
+rotation resolves and whose ``2*pi/2`` exceeds :data:`_MAX_MAP_FRACTION` of any
+legal ``w_max``, and a period past the longest sequence is a turn no sequence
+completes.
+
+Two ranges and not one, which is the point. Turns per amplitude lifetime is the
+ratio ``h/p``, so a lattice over both sweeps it across the square of the range
+while a single grid pins it to the diagonal ``h == p``: every head turning exactly
+once before it forgets, a schedule nothing asks for and the whole reach of the bank
+at initialization. The corners are what the diagonal has no room for -- a head that
+decays without turning at all, which is the scalar transition, and a narrowband
+resonator that turns a thousand times inside its own memory.
 """
 
-_MAX_ANGLE_FRACTION = 0.9
-"""Cap on ``|w| / w_max`` at initialization.
+_MAX_MAP_FRACTION = 0.9
+"""Cap on how close an initialized row sits to either scale map's bound.
 
-The inverse of :func:`slinoss.ops.scanprep.bounded_rotvec` diverges as the
-requested norm approaches the bound. Inactive at the default ``w_max``, where the
-shortest horizon in :data:`HORIZON_RANGE` asks for ``pi/2``, one half of it.
+Both inverses diverge there: :func:`slinoss.ops.scanprep.bounded_rotvec` through
+``rsqrt(1 - s*s)`` and :func:`slinoss.ops.scanprep.bounded_logscale` through
+``logit``. Inactive at the default ``w_max`` and at
+:data:`slinoss.ops.scanprep.LS_MAX_MAG`, where the shortest period and the shortest
+horizon each ask for exactly one half of their own bound.
 """
 
 
 def head_grid(bounds: tuple[float, float], heads: int) -> Tensor:
     """One value per head, log-spaced over ``bounds``, endpoints included.
 
-    Log-spaced because the quantity is a scale: a linear grid over a ratio of 64
+    Log-spaced because the quantity is a scale: a linear grid over a ratio of 1024
     puts most heads at the high end.
+
+    Both endpoints come out exactly, which ``logspace`` does not give: it exponentiates
+    a base-10 logarithm, and neither the log nor the power is exact, so the lowest rung
+    lands 1e-7 above ``low``. The ratio is raised directly instead, and its zeroth and
+    first powers are exact by IEEE, so the range means what it says and the inverse
+    through ``logit`` is the one the bound was derived at.
 
     Args:
         bounds: ``(low, high)``, both positive.
@@ -269,27 +290,80 @@ def head_grid(bounds: tuple[float, float], heads: int) -> Tensor:
         ``(H,)``, float32, on the CPU.
     """
     low, high = bounds
-    return torch.logspace(math.log10(low), math.log10(high), heads, dtype=torch.float32)
+    if heads < 2:
+        return torch.full((heads,), low, dtype=torch.float32)
+    ramp = torch.arange(heads, dtype=torch.float64) / (heads - 1)
+    return (low * (high / low) ** ramp).float()
+
+
+def head_lattice(heads: int) -> tuple[Tensor, Tensor]:
+    """One ``(horizon, period)`` pair per head, boustrophedon over the two grids.
+
+    ``isqrt(H)`` horizons against ``ceil(H / isqrt(H))`` periods, as square as ``H``
+    allows, so neither axis collapses to one rung while the other takes them all.
+    The pairs run period-major with the horizon order reversed on every second
+    period, so consecutive heads differ in one coordinate: the head axis is the axis
+    a grouped operand shares along, and a snake keeps neighbours in it neighbours
+    here.
+
+    ``H`` need not factor. The lattice holds ``n_h * n_p >= H`` points and the first
+    ``H`` are taken, so at most ``n_h - 1`` points of the last period go unused and
+    no pair repeats.
+
+    Args:
+        heads: ``H``, at least one.
+
+    Returns:
+        ``(horizon, period)``, each ``(H,)`` float32 on the CPU.
+    """
+    n_h = max(1, math.isqrt(heads))
+    n_p = -(-heads // n_h)
+    rows = head_grid(HORIZON_RANGE, n_h).expand(n_p, n_h).clone()
+    rows[1::2] = rows[1::2].flip(-1)
+    period = head_grid(PERIOD_RANGE, n_p).repeat_interleave(n_h)
+    return rows.reshape(-1)[:heads], period[:heads]
+
+
+def fibonacci_axes(heads: int) -> Tensor:
+    """One unit rotation axis per head, a spherical Fibonacci set.
+
+    The height marches uniformly through ``(-1, 1)`` and the azimuth advances by the
+    golden angle. That is the lowest-discrepancy sphere set of a given size a closed
+    form gives: no two axes coincide, the set has no accumulation direction, and it
+    is a function of ``H`` alone. A pseudo-random draw needs a seed to be
+    reproducible at all and still clusters at the head counts this operator runs.
+
+    Args:
+        heads: ``H``, at least one.
+
+    Returns:
+        ``(H,3)`` float32 on the CPU, rows of unit norm.
+    """
+    index = torch.arange(heads, dtype=torch.float64) + 0.5
+    height = 1.0 - 2.0 * index / heads
+    radius = (1.0 - height * height).clamp(min=0.0).sqrt()
+    azimuth = index * (math.pi * (3.0 - math.sqrt(5.0)))
+    plane = torch.stack((azimuth.cos(), azimuth.sin()), dim=-1) * radius[:, None]
+    return torch.cat((plane, height[:, None]), dim=-1).float()
 
 
 def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     """Rows of ``param_bias`` at initialization, ``(H, PARAM_COLS)``, float32, CPU.
 
-    Both bounded maps are inverted, so the grid states what the recurrence does at
-    step zero rather than what an unbounded parameterization would do. Both scale
-    rows read the one grid, at ``h`` tokens for the head:
+    Both bounded maps are inverted, so the lattice states what the recurrence does
+    at step zero rather than what an unbounded parameterization would do. Each row
+    reads its own axis of :func:`head_lattice`:
 
-    - ``bounded_logscale(raw) = -softplus(raw)`` and the per-token amplitude factor
-      is ``exp(2*ls)``, so an amplitude that falls by ``exp(-1)`` over ``h``
-      tokens is ``ls = -1/(2*h)`` at ``raw = log(expm1(1/(2*h)))``.
+    - ``bounded_logscale(raw) = -LS_MAX_MAG*sigmoid(raw)``, so a horizon of ``h``
+      tokens is ``ls = -0.5/h`` at ``raw = logit(0.5/(h*LS_MAX_MAG))``.
     - ``bounded_rotvec(raw, w_max) = raw * w_max * rsqrt(1 + |raw|^2)`` gives
-      ``|w| = s * w_max`` at ``|raw| = s * rsqrt(1 - s*s)``. Conjugation turns by
-      ``|w|`` per token: ``quat_exp`` builds the half-angle quaternion and the
-      conjugation doubles the half-angle back. A turn every ``h`` tokens is
-      therefore ``|w| = 2*pi/h``.
+      ``|w| = s*w_max`` at ``|raw| = s * rsqrt(1 - s*s)``, so a period of ``p``
+      tokens is ``|w| = 2*pi/p`` at that radius along the head's axis.
 
-    The taps take no row. They are the first-order-hold moments of the transition
-    these two rows set, so the grid reaches them already.
+    The rotation row is also the drive's own scale, per
+    :func:`slinoss.ops.scanprep.anchored_rotvec`, so a head's radius sets how far one
+    token may move it. The taps take no row at all: they are the first-order-hold
+    moments of the transition these rows set, so the lattice reaches them already.
 
     Args:
         config: Supplies ``H`` and ``w_max``.
@@ -299,18 +373,12 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     """
     heads = config.n_heads
     rows = torch.zeros(heads, PARAM_COLS, dtype=torch.float32)
-    horizon = head_grid(HORIZON_RANGE, heads)
-    rows[:, LS_COLUMN] = torch.log(torch.expm1(0.5 / horizon))
-    angle = 2.0 * math.pi / horizon
-    fraction = (angle / config.w_max).clamp(max=_MAX_ANGLE_FRACTION)
-    radius = fraction * torch.rsqrt(1.0 - fraction * fraction)
-    axis = torch.randn(
-        heads,
-        3,
-        generator=torch.Generator().manual_seed(_AXIS_SEED),
-        dtype=torch.float32,
-    )
-    rows[:, ROTVEC_COLUMNS] = radius[:, None] * axis / axis.norm(dim=-1, keepdim=True)
+    horizon, period = head_lattice(heads)
+    decay = (0.5 / (horizon * LS_MAX_MAG)).clamp(max=_MAX_MAP_FRACTION)
+    rows[:, LS_COLUMN] = torch.logit(decay)
+    angle = (2.0 * math.pi / (period * config.w_max)).clamp(max=_MAX_MAP_FRACTION)
+    radius = angle * torch.rsqrt(1.0 - angle * angle)
+    rows[:, ROTVEC_COLUMNS] = radius[:, None] * fibonacci_axes(heads)
     return rows
 
 
@@ -571,13 +639,15 @@ class SLinOSSMixer(nn.Module):
     back. It takes no gradient.
 
     Initialization is principled where the scale sets the recurrence and the
-    framework default elsewhere. ``param_bias`` is inverted through both bounded
-    maps onto one horizon grid over :data:`HORIZON_RANGE`, with an isotropic axis per
-    head; ``d_skip`` and ``norm_weight`` are ones. The input projection's parameter
-    band is zeroed, so the recurrence starts as the oscillator bank that grid states
-    rather than a per-token rotation drawn from the input; everything else in the two
-    projections keeps :meth:`torch.nn.Linear.reset_parameters`, and the convolution
-    taps take the same uniform bound over ``d_conv``. No depth scaling.
+    framework default elsewhere. ``param_bias`` is inverted through both bounded maps
+    onto the two-axis lattice :func:`head_lattice` states, an amplitude horizon over
+    :data:`HORIZON_RANGE` against a rotation period over :data:`PERIOD_RANGE`, and the
+    axes are the equidistributed set :func:`fibonacci_axes` returns; ``d_skip`` and
+    ``norm_weight`` are ones. The input projection's parameter band is zeroed, so the
+    recurrence starts as the oscillator bank that lattice states rather than a
+    per-token rotation drawn from the input; everything else in the two projections
+    keeps :meth:`torch.nn.Linear.reset_parameters`, and the convolution taps take the
+    same uniform bound over ``d_conv``. No depth scaling.
 
     Args:
         config: Shape and parameterization contract.
@@ -629,9 +699,11 @@ class SLinOSSMixer(nn.Module):
         # in this tree reads it. Decay on a skip gain pulls the direct path toward
         # deletion, which is a shrinkage of the architecture rather than of a weight.
         # param_bias needs the marker for the same reason and cannot get it from the
-        # usual dim < 2 rule, being rank two: the chart's zero is a 0.25-per-step
-        # decay and no rotation, a horizon under one token, so decay toward it
-        # deletes the horizon grid rather than shrinking a magnitude.
+        # usual dim < 2 rule, being rank two: the chart's zero is the shortest rung
+        # the lattice has, a four-token horizon, and no rotation at all -- and the
+        # rotation row is also the drive's own scale, so decay toward zero deletes
+        # both the lattice and every head's input dependence on it rather than
+        # shrinking a magnitude.
         cast(Any, self.d_skip)._no_weight_decay = True
         cast(Any, self.param_bias)._no_weight_decay = True
         self.norm_weight = nn.Parameter(
@@ -657,14 +729,15 @@ class SLinOSSMixer(nn.Module):
             self.in_proj.reset_parameters()
             self.out_proj.reset_parameters()
             # One slice, two reasons. The parameter band, because a default draw
-            # there is a per-token rotation the grid cannot survive: on unit-RMS
-            # input a column fluctuates by 1/sqrt(3) whatever d_model is, a rotation
-            # vector of mean norm 0.92 against bias radii from 0.577 down to 0.008,
-            # so the step turns ~2.1 rad about an input-drawn axis and no head holds
-            # a phase for one token. Zeroed, the recurrence starts as the oscillator
-            # bank the grid states, and input dependence still grows at full rate:
-            # the pullback to a row is sum_t dL/draw_t x_t and carries no factor of
-            # the row. The pad columns after it, because they belong to no band, so
+            # there is a per-token rotation the lattice cannot survive: on unit-RMS
+            # input a column fluctuates by 1/sqrt(3) whatever d_model is, so the
+            # anchored drive is a vector of norm about 0.8 of the head's own bias
+            # radius pointing where the input picks, which tilts the axis some 30
+            # degrees a token at every timescale, and a head whose axis wanders that
+            # far holds no phase. Zeroed, the recurrence starts as the oscillator
+            # bank the lattice states, and input dependence is not pinned there: the
+            # pullback to a row is sum_t dL/dband_t x_t and carries no factor of the
+            # row itself. The pad columns after it, because they belong to no band, so
             # zeros are what a misaddressed band should read rather than plausible
             # numbers, and the cotangent's zeroed pad band has to agree with them.
             self.in_proj.weight[self.layout.params_off :].zero_()

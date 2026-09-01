@@ -34,6 +34,7 @@ import cutlass.cute as cute
 
 from slinoss._guard import PROJ_ALIGN
 from slinoss.ops.scanprep import (
+    LS_MAX_MAG,
     PARAM_COLS,
     ScanGrads,
     ScanParams,
@@ -48,7 +49,7 @@ from slinoss.ops.scanprep.cute import (
     scanprep_forward,
 )
 from slinoss.ops.so3ssd import tap_matrix
-from tests.conftest import W_MAX, assert_max_rel, max_err
+from tests.conftest import W_MAX, assert_max_rel
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -98,8 +99,13 @@ DTYPES = [torch.float32, torch.bfloat16]
 ONE = SHAPES[2]
 
 W_SCALE = 1.5
-"""Multiplies the raw rotation columns, so ``|w|`` sits near ``w_max`` rather than
-near zero and the saturating part of the map is exercised."""
+"""Multiplies the rotation columns of both operands, so ``|w|`` sits near ``w_max``
+rather than near zero and the saturating part of the map is exercised.
+
+On the bias it is the multiplier that does that. The band's drive is scaled by the
+bias radius and squashed by ``tanh``, so ``|raw| <= 2|bias|`` however large the band
+is; on the band the scale reaches the saturating part of ``tanh`` instead, which is
+the other map here that saturates."""
 
 # The forward is float32 arithmetic over exactly representable inputs at every
 # width, so the bound is float32 rounding of the bias add and the map. The rsqrt,
@@ -202,6 +208,7 @@ def _operands(
     pbias = torch.randn(
         heads, PARAM_COLS, generator=gen, dtype=torch.float32, device="cuda"
     )
+    pbias[:, :3] *= W_SCALE
     return params, pbias * bias
 
 
@@ -385,19 +392,21 @@ def test_float16_takes_its_own_kernel_path() -> None:
     assert_max_rel(got_grads.dparams, want_grads.dparams, 1e-3, f"{tag}.dparams")
 
 
-def _extreme_operands() -> Operands:
-    """One token per entry of :data:`EXTREME_RAWS`, in every parameter column.
+def _sweep(vals: Tensor) -> tuple[Operands, Shape]:
+    """One head per entry of ``vals``, in every parameter column, one token.
 
-    The bias is zero, so the biased row is the raw row exactly and the oracle
-    evaluates the maps at the same float32 values the kernel does.
+    The sweep goes in the bias and the band is zeroed, so the anchored row is the
+    swept value exactly: ``tanh(0) = 0`` kills the drive on the rotation columns and
+    the log-scale column is a plain sum. It has to be that way round. The band cannot
+    present an extreme to either map at all -- ``tanh`` bounds it and the anchor
+    scales what is left by the bias radius -- so the reachable domain of the rotation
+    map is the bias's, and the bias is per head rather than per token. The oracle
+    reads the same float32 values the kernel does.
     """
-    vals = torch.tensor(EXTREME_RAWS, dtype=torch.float32, device="cuda")
     count = int(vals.numel())
-    params = vals[:, None].expand(count, PARAM_COLS).reshape(1, count, PARAM_COLS)
-    return (
-        _narrow(params),
-        torch.zeros(1, PARAM_COLS, dtype=torch.float32, device="cuda"),
-    )
+    zeros = torch.zeros(1, 1, count * PARAM_COLS, dtype=torch.float32, device="cuda")
+    bias = vals[:, None].expand(count, PARAM_COLS).contiguous()
+    return (_narrow(zeros), bias), (1, count, 1)
 
 
 def test_extreme_raws_match_the_reference() -> None:
@@ -405,12 +414,12 @@ def test_extreme_raws_match_the_reference() -> None:
 
     I1 and I2 are produced by this kernel, so they are asserted on its output, and
     the domain that matters is the reachable one rather than a normal draw.
-    Magnitudes stop at 1e8 because ``|raw|^2`` overflows float32 near 1.8e19; past
-    that the float32 map and the float64 oracle disagree by width, not by kernel,
-    which is the next test.
+    Magnitudes stop at 1e8 because the squared radius overflows float32 near 1.8e19;
+    past that the float32 map and the float64 oracle disagree by width, not by
+    kernel, which is the next test.
     """
-    shape: Shape = (1, 1, len(EXTREME_RAWS))
-    ops = _extreme_operands()
+    vals = torch.tensor(EXTREME_RAWS, dtype=torch.float32, device="cuda")
+    ops, shape = _sweep(vals)
     want = _oracle(ops, shape)
 
     got = _forward(ops, shape)
@@ -424,28 +433,34 @@ def test_extreme_raws_match_the_reference() -> None:
         got.trans[..., :3], want.trans[..., :3], FWD_TOL, "cute-scanprep.extreme.w"
     )
     assert_max_rel(_matrices(got), _matrices(want), FWD_TOL, "cute-scanprep.extreme.K")
-    # The log-scale column spans 1e8 down to zero, so a bound relative to the
-    # column maximum is vacuous. The absolute bound is float32 rounding of log1p
-    # near its largest reachable argument.
-    assert max_err(got.trans[..., 3], want.trans[..., 3]) < 1e-6
-
-
-def test_overflowing_raw_norm_stays_finite() -> None:
-    """``|raw|^2`` overflows float32 near 1.8e19, and ``rsqrt(inf)`` is zero.
-
-    The map collapses to the centre of the ball rather than producing a NaN, which
-    is all I2 claims. The float64 oracle does not overflow, so this is a property
-    check and not a parity check.
-    """
-    shape: Shape = (1, 1, 8)
-    huge = torch.full((1, 8, PARAM_COLS), 1e30, dtype=torch.float32, device="cuda")
-    ops = (
-        _narrow(huge),
-        torch.zeros(1, PARAM_COLS, dtype=torch.float32, device="cuda"),
+    # The log-scale column is bounded by LS_MAX_MAG at both ends now, so a bound
+    # against the column maximum is a real claim rather than a vacuous one, and the
+    # sigmoid saturates exactly at each end rather than approaching it.
+    assert_max_rel(
+        got.trans[..., 3], want.trans[..., 3], FWD_TOL, "cute-scanprep.extreme.ls"
     )
+    assert float(got.trans[..., 3].min()) == -LS_MAX_MAG
+    assert float(got.trans[..., 3].max()) == 0.0
+
+
+def test_overflowing_radius_stays_finite() -> None:
+    """The squared bias radius overflows float32 near 1.8e19, so it is clamped.
+
+    ``t2 * rsqrt(t2)`` is how the device path forms the root, and an infinite ``t2``
+    would make that ``inf * 0``: a NaN in a column I2 promises is finite. Clamped, the
+    radius saturates the ball's own overflow instead and ``w`` collapses to the centre,
+    which is finite and inside the ball.
+
+    The bias and not the band, for the reason :func:`_sweep` states. The float64
+    oracle clamps at the same value but does not overflow on the way there, so this
+    is a property check and not a parity check.
+    """
+    vals = torch.full((8,), 1e30, dtype=torch.float32, device="cuda")
+    ops, shape = _sweep(vals)
     got = _forward(ops, shape)
     torch.cuda.synchronize()
     assert bool(torch.isfinite(got.trans).all())
+    assert bool(torch.isfinite(got.K).all())
     assert bool((got.trans[..., 3] <= 0.0).all())
     assert float(got.trans[..., :3].double().norm(dim=-1).max()) <= BALL_BOUND
 

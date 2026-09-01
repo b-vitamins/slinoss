@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from slinoss.config import MAX_CHUNK, MIN_CHUNK
+from slinoss.ops.scanprep import LS_MAX_MAG
 from slinoss.ops.so3ssd import SO3SSDResult, so3ssd_ref, so3ssm
 from tests.conftest import ScanInputs, assert_max_rel, make_inputs, max_err
 
@@ -51,34 +52,41 @@ def _check_parity(inp: ScanInputs, chunk: int, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-# One case per regime of the chunk-local decay ``exp(2*(lp_t - lp_s))`` at L = 16:
+# The bias no longer sets the regime: ``ls`` saturates at ``-LS_MAX_MAG``, so the
+# chunk-local decay ``exp(2*(lp_t - lp_s))`` bottoms out at ``exp(-2*LS_MAX_MAG*L)``
+# and the chunk length is the only thing that moves it. One case per end of the legal
+# range:
 #
-# - 5.0, where the prefix reaches -80 and the decay spans seventy decades without
-#   reaching zero, so underflow is nearest to meeting overflow;
-# - 20.0, where the distant pairs underflow to zero and the near-diagonal ones do
-#   not, which is the only arm that mixes the two inside one chunk;
-# - 400.0, where every off-diagonal decay is a hard zero and the prefix itself
-#   reaches -19200.
+# - L = 16, where the floor puts the most distant pair at 3.4e-4 and every pair in
+#   the chunk is significant, which is the regime every kernel test runs in;
+# - L = 128, the longest chunk, where it reaches 1.6e-28 -- the closest the operator
+#   can come to underflow, and still four orders inside a normal float32.
 #
-# The unbiased case is the file's control and runs as
-# ``test_rotation_magnitude_generic``.
-@pytest.mark.parametrize("ls_bias", [5.0, 20.0, 400.0])
-def test_saturated_decay(ls_bias: float) -> None:
-    """``exp(2*(lp_t - lp_s))`` underflows to zero and stays there. Forming the
-    difference before the exponential is what keeps underflow from meeting
-    overflow."""
-    inp = make_inputs(seqlen=48, seed=67, ls_bias=ls_bias, **TINY)
-    _check_parity(inp, 16, f"decay bias {ls_bias}")
+# So the arm the old bias ladder was reaching for does not exist any more, and the
+# claim is the stronger one: underflow is unreachable rather than survived. The
+# unbiased case is the file's control and runs as ``test_rotation_magnitude_generic``.
+@pytest.mark.parametrize("chunk", [MIN_CHUNK, MAX_CHUNK])
+def test_saturated_decay(chunk: int) -> None:
+    """The floor bounds the chunk-local decay below, so underflow cannot meet
+    overflow at all. Forming the difference before the exponential is still what
+    keeps them apart: the factored form would reach ``exp(-2*LS_MAX_MAG*T)`` over the
+    whole sequence, which no bound on ``ls`` can save."""
+    inp = make_inputs(seqlen=2 * chunk, seed=67, ls_bias=400.0, **TINY)
+    ls = inp.trans[..., 3]
+    assert float(ls.max()) == -LS_MAX_MAG
+    span = math.exp(-2.0 * LS_MAX_MAG * chunk)
+    assert span > torch.finfo(torch.float32).tiny
+    _check_parity(inp, chunk, f"floored decay, chunk {chunk}")
 
 
 # -20.0 leaves ``ls`` nonzero, so the prefix still shrinks. -50.0 is the boundary of
-# the predicate the body branches on, where softplus has underflowed far enough that
-# the decay is exactly one; a more negative bias is interior to it.
+# the predicate the body branches on, where the sigmoid has underflowed far enough
+# that the decay is exactly one; a more negative bias is interior to it.
 @pytest.mark.parametrize("ls_bias", [-20.0, -50.0])
 def test_vanishing_decay(ls_bias: float) -> None:
-    """``softplus`` underflows toward zero, so the transition approaches a pure
-    rotation and the prefix stops shrinking. ``softplus(x) <= exp(x)`` bounds the
-    residual; six standard deviations covers the raw sample."""
+    """``sigmoid`` underflows toward zero, so the transition approaches a pure
+    rotation and the prefix stops shrinking. ``LS_MAX_MAG*sigmoid(x) <= exp(x)``
+    bounds the residual; six standard deviations covers the raw sample."""
     inp = make_inputs(seqlen=48, seed=71, ls_bias=ls_bias, **TINY)
     ls = inp.trans[..., 3]
     assert float(ls.abs().max()) < math.exp(ls_bias + 6.0)

@@ -1,8 +1,9 @@
 """Bounded parameter maps: the device-side implementation, and the only one.
 
-    w  = w_max * raw * rsqrt(1 + |raw|^2)
-    ls = -softplus(raw)
-    K  = the first-order-hold moments of exp(2*ls*I + [w]_x)
+    raw = bias + |bias| * tanh(band)          on the rotation columns
+    w   = w_max * raw * rsqrt(1 + |raw|^2)
+    ls  = -LS_MAX_MAG * sigmoid(band + bias)
+    K   = the first-order-hold moments of exp(2*ls*I + [w]_x)
 
 Every map and every pullback lives here as plain Python functions over
 :data:`slinoss._cute.Scalar`, so a call from inside a ``@cute.kernel`` is inlined
@@ -10,32 +11,37 @@ at trace time. The kernels in :mod:`slinoss.ops.scanprep.cute.frontier` are the
 only callers. A second copy of any map would diverge from this one, and the
 divergence is a correctness bug.
 
-Nothing here emits dynamic control flow. ``rsqrt`` acts on ``1 + |raw|^2 >= 1``
-and ``softplus`` is evaluated through an identity whose exponential argument is
-never positive, so I1 and I2 are produced without a clamp, an epsilon, or a
-validity pass. The tap series and the tap recurrence are both evaluated and one
-is selected, so the removable singularity at the origin costs a predicated move
-rather than a branch: no function here contributes divergence.
+Nothing here emits dynamic control flow. ``rsqrt`` acts on ``1 + |raw|^2 >= 1``,
+the drive's radius is clamped both ways, and both ``sigmoid`` and ``tanh`` are evaluated
+through identities whose exponential argument is never positive, so I1 and I2 are
+produced without a clamp, an epsilon, or a validity pass. The tap series and the
+tap recurrence are both evaluated and one is selected, so the removable
+singularity at the origin costs a predicated move rather than a branch: no
+function here contributes divergence.
 
 Every quantity is float32 (I4), whatever width the raw parameters were stored at.
 """
 
 import math
-from typing import Any
 
 import cutlass
 import cutlass.cute as cute
 
 from slinoss._cute import LOG2_E, Scalar, f32, select
 from slinoss.ops.scanprep.reference import (
+    DRIVE_CEIL_SQ,
+    DRIVE_FLOOR_SQ,
     FOH_TAYLOR_RADIUS_SQ,
     FP32_FOH_TERMS,
+    LS_MAX_MAG,
     T2_FLOOR,
     foh_coeffs,
 )
 from slinoss.ops.so3ssd.cute.common import COS_HALF, SINC_HALF
 
 __all__ = [
+    "anchored_row",
+    "anchored_row_grad",
     "foh_taps",
     "foh_taps_grad",
     "log_scale",
@@ -47,28 +53,32 @@ __all__ = [
 _FOH_SERIES = tuple(foh_coeffs(order, FP32_FOH_TERMS) for order in (1, 2, 3))
 
 
-def _softplus_parts(raw: Scalar) -> tuple[Any, Scalar]:
-    """``(raw > 0, exp(-|raw|))``.
+def _folded_exp(raw: Scalar, gain: float) -> Scalar:
+    """``exp(-gain*|raw|)``, ``gain > 0``.
 
     The exponent is non-positive at every input, so the value lies in ``(0, 1]``
     and no input magnitude overflows. The absolute value is a select, not a
-    branch, so the predicate costs one predicated move and no divergence.
+    branch, so the fold costs one predicated move and no divergence.
     """
     positive = raw > cutlass.Float32(0.0)
-    return positive, f32(cute.exp2(select(positive, -raw, raw) * LOG2_E))
+    return f32(cute.exp2(select(positive, -raw, raw) * (gain * LOG2_E)))
+
+
+def _sigmoid(raw: Scalar) -> Scalar:
+    """``sigmoid(raw)``, in ``(0, 1)``.
+
+    ``1 / (1 + e)`` where ``raw > 0`` and ``e / (1 + e)`` elsewhere, with
+    ``e = exp(-|raw|)`` in ``(0, 1]``: one select, and no intermediate exceeds one,
+    so no input magnitude overflows.
+    """
+    small = _folded_exp(raw, 1.0)
+    return select(raw > cutlass.Float32(0.0), cutlass.Float32(1.0), small) / (
+        small + 1.0
+    )
 
 
 def log_scale(raw: Scalar) -> Scalar:
-    """``-softplus(raw) <= 0`` (I1).
-
-    Evaluated as ``min(-raw, 0) - log1p(exp(-|raw|))``. Both terms are bounded by
-    ``|raw|`` for every finite input, so neither the exponential nor the sum can
-    overflow, and both halves are selects on one predicate.
-
-    ``log1p`` is formed as ``log(1 + e)``. That addition drops the part of ``e``
-    below float32 epsilon, which is an absolute error of at most ``2^-24`` on a
-    quantity whose magnitude is ``|raw|``, and it drops nothing at all wherever
-    ``e`` is normal against one.
+    """``-LS_MAX_MAG * sigmoid(raw)``, in ``[-LS_MAX_MAG, 0]`` (I1).
 
     Args:
         raw: Unconstrained log-scale, float32.
@@ -76,16 +86,11 @@ def log_scale(raw: Scalar) -> Scalar:
     Returns:
         The log-scale, non-positive.
     """
-    positive, small = _softplus_parts(raw)
-    return select(positive, -raw, cutlass.Float32(0.0)) - f32(cute.log(small + 1.0))
+    return -LS_MAX_MAG * _sigmoid(raw)
 
 
 def log_scale_grad(raw: Scalar) -> Scalar:
-    """``d(-softplus)/draw = -sigmoid(raw)``.
-
-    ``sigmoid(raw)`` is ``1 / (1 + e)`` where ``raw > 0`` and ``e / (1 + e)``
-    elsewhere, with ``e = exp(-|raw|)`` in ``(0, 1]``: one select, and no
-    intermediate exceeds one, so no input magnitude overflows.
+    """``d(-LS_MAX_MAG*sigmoid)/draw = LS_MAX_MAG*s*(s - 1)`` at ``s = sigmoid(raw)``.
 
     Args:
         raw: Unconstrained log-scale, float32.
@@ -93,8 +98,96 @@ def log_scale_grad(raw: Scalar) -> Scalar:
     Returns:
         The derivative of :func:`log_scale`.
     """
-    positive, small = _softplus_parts(raw)
-    return -select(positive, cutlass.Float32(1.0), small) / (small + 1.0)
+    s = _sigmoid(raw)
+    return LS_MAX_MAG * s * (s - 1.0)
+
+
+def _tanh(raw: Scalar) -> Scalar:
+    """``tanh(raw)``, in ``(-1, 1)``.
+
+    ``(1 - e) / (1 + e)`` at ``e = exp(-2|raw|)``, signed back by a select on the
+    input. Folding the argument keeps the exponent non-positive, so no input
+    magnitude overflows and the quotient is never a ratio of two large numbers.
+    """
+    even = _folded_exp(raw, 2.0)
+    magnitude = (cutlass.Float32(1.0) - even) / (even + 1.0)
+    return select(raw > cutlass.Float32(0.0), magnitude, -magnitude)
+
+
+def _tanh_grad(raw: Scalar) -> Scalar:
+    """``1 - tanh(raw)^2 = 4e/(1 + e)^2`` at ``e = exp(-2|raw|)``.
+
+    Even in ``raw``, so the fold needs no sign put back.
+    """
+    even = _folded_exp(raw, 2.0)
+    denom = even + 1.0
+    return 4.0 * even / (denom * denom)
+
+
+def _anchor(bias: list[Scalar]) -> tuple[Scalar, Scalar]:
+    """``(|bias|, 1/|bias|)`` over the rotation columns, the norm clamped both ways.
+
+    The bounds are :data:`slinoss.ops.scanprep.reference.DRIVE_FLOOR_SQ` and
+    :data:`slinoss.ops.scanprep.reference.DRIVE_CEIL_SQ`, and both are here for the
+    same reason: the root is formed as ``t2 * rsqrt(t2)``, which needs a ``t2`` that
+    is normal at the bottom and finite at the top, or it returns ``0 * inf``. Outside
+    either bound the reciprocal is returned as zero, which is the subgradient the
+    reference's ``clamp`` takes there. Two compares and three selects, no branch.
+    """
+    zero = cutlass.Float32(0.0)
+    t2 = bias[0] * bias[0] + bias[1] * bias[1] + bias[2] * bias[2]
+    below = t2 < cutlass.Float32(DRIVE_FLOOR_SQ)
+    above = t2 > cutlass.Float32(DRIVE_CEIL_SQ)
+    t2 = select(below, cutlass.Float32(DRIVE_FLOOR_SQ), t2)
+    t2 = select(above, cutlass.Float32(DRIVE_CEIL_SQ), t2)
+    inv = f32(cute.rsqrt(t2))
+    return t2 * inv, select(below, zero, select(above, zero, inv))
+
+
+def anchored_row(band: list[Scalar], bias: list[Scalar]) -> list[Scalar]:
+    """One head's row of map inputs, from its token band and its bias.
+
+    ``bias + |bias|*tanh(band)`` on the rotation columns and the plain sum on the
+    log-scale column. The authority is
+    :func:`slinoss.ops.scanprep.reference.anchored_rotvec`, which states why the
+    drive is scaled.
+
+    Args:
+        band: ``PARAM_COLS`` token values, float32, in column order.
+        bias: ``PARAM_COLS`` per-head values, float32, same order.
+
+    Returns:
+        ``PARAM_COLS`` map inputs, same order.
+    """
+    radius, _ = _anchor(bias)
+    row = [bias[col] + radius * _tanh(band[col]) for col in range(3)]
+    return [*row, band[3] + bias[3]]
+
+
+def anchored_row_grad(
+    band: list[Scalar], bias: list[Scalar], cot: list[Scalar]
+) -> tuple[list[Scalar], list[Scalar]]:
+    """Split the cotangent of :func:`anchored_row` between the band and the bias.
+
+    The band's own factor is ``|bias| * tanh'``, one per column. The bias carries
+    two terms: the offset, whose Jacobian is the identity, and the radius, which
+    every rotation column reads, so its contribution is one dot product over the
+    three of them.
+
+    Args:
+        band: The forward's token values, ``PARAM_COLS`` float32.
+        bias: The forward's per-head values, ``PARAM_COLS`` float32.
+        cot: Cotangent of the row :func:`anchored_row` returned.
+
+    Returns:
+        ``(dband, dbias)``, each ``PARAM_COLS`` float32 in column order.
+    """
+    radius, inv = _anchor(bias)
+    drives = [_tanh(band[col]) for col in range(3)]
+    pull = inv * (cot[0] * drives[0] + cot[1] * drives[1] + cot[2] * drives[2])
+    dband = [cot[col] * radius * _tanh_grad(band[col]) for col in range(3)]
+    dbias = [cot[col] + pull * bias[col] for col in range(3)]
+    return [*dband, cot[3]], [*dbias, cot[3]]
 
 
 def rotvec(

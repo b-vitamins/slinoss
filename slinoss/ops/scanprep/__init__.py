@@ -12,11 +12,15 @@ from slinoss.ops.scanprep.backends import (
 )
 from slinoss.ops.scanprep.interface import ScanPrepFunction, scanprep
 from slinoss.ops.scanprep.reference import (
+    DRIVE_CEIL_SQ,
+    DRIVE_FLOOR_SQ,
     LS_COLUMN,
+    LS_MAX_MAG,
     PARAM_COLS,
     ROTVEC_COLUMNS,
     ScanGrads,
     ScanParams,
+    anchored_rotvec,
     bounded_logscale,
     bounded_rotvec,
     check_dparams_out,
@@ -27,7 +31,10 @@ from slinoss.ops.scanprep.reference import (
 )
 
 __all__ = [
+    "DRIVE_CEIL_SQ",
+    "DRIVE_FLOOR_SQ",
     "LS_COLUMN",
+    "LS_MAX_MAG",
     "PARAM_COLS",
     "ROTVEC_COLUMNS",
     "Backend",
@@ -37,6 +44,7 @@ __all__ = [
     "ScanPrepBackward",
     "ScanPrepForward",
     "ScanPrepFunction",
+    "anchored_rotvec",
     "bounded_logscale",
     "bounded_rotvec",
     "check_dparams_out",

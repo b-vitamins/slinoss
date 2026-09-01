@@ -62,8 +62,9 @@ class ScanPrepForward(Protocol):
 class ScanPrepBackward(Protocol):
     """Backward signature every backend implements.
 
-    ``param_bias`` is present because the maps' Jacobians are evaluated at
-    ``params + param_bias``.
+    ``param_bias`` is present because the maps' Jacobians are evaluated at the
+    anchored row, which reads both operands, and because it takes a gradient of its
+    own through the anchor's radius.
 
     ``dparams`` is where the parameter gradient is written: one band of the mixer's
     single fused gradient buffer, or ``None`` for a fresh contiguous allocation. It is

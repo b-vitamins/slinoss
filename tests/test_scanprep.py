@@ -11,8 +11,11 @@ import torch
 from torch import Tensor
 
 from slinoss.ops.scanprep import (
+    DRIVE_CEIL_SQ,
+    LS_MAX_MAG,
     PARAM_COLS,
     ScanParams,
+    anchored_rotvec,
     bounded_logscale,
     bounded_rotvec,
     foh_taps,
@@ -50,7 +53,7 @@ def _raws(dtype: torch.dtype = torch.float64) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# I1: ls <= 0
+# I1: -LS_MAX_MAG <= ls <= 0
 # ---------------------------------------------------------------------------
 
 
@@ -64,25 +67,48 @@ def test_logscale_is_non_positive(dtype: torch.dtype) -> None:
     assert bool(torch.isfinite(ls).all())
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_logscale_holds_the_lifetime_floor(dtype: torch.dtype) -> None:
+    """The lower half of I1, and that it is attained rather than approached.
+
+    The floor is what stops a token annihilating a row: at ``-LS_MAX_MAG`` the
+    per-token amplitude factor is ``exp(-2*LS_MAX_MAG)``, a lifetime of
+    ``0.5/LS_MAX_MAG`` tokens, and nothing downstream can drive it lower. No kernel
+    reads the bound, so a map that lost it would pass every other test here.
+    """
+    ls = bounded_logscale(_raws(dtype))
+    assert bool((ls >= -LS_MAX_MAG).all())
+    assert float(ls.min()) == pytest.approx(-LS_MAX_MAG, rel=torch.finfo(dtype).eps)
+    assert float(torch.exp(2.0 * ls).min()) == pytest.approx(
+        math.exp(-2.0 * LS_MAX_MAG)
+    )
+
+
 def test_logscale_is_strictly_negative_with_a_positive_decay() -> None:
     """Both strict claims, on the moderate range, in both wide dtypes.
 
-    I1 admits underflow: at raw = 1e4 the decay is exp(-2e4), which is zero in
-    every float format, and zero decay is the correct limit. So the closed interval
-    is the invariant, asserted over the extremes above, and the open one holds only
-    while softplus is nonzero.
+    I1 is stated closed at both ends because ``sigmoid`` saturates to an exact 0 and
+    an exact 1 in float: past raw = -40 the map returns a signed zero and past +40 it
+    returns the floor. Strictness holds where the sigmoid is not saturated, which is
+    the whole range any initialized row occupies.
     """
     for dtype in (torch.float32, torch.float64):
-        ls = bounded_logscale(torch.linspace(-40.0, 40.0, 201, dtype=dtype))
+        ls = bounded_logscale(torch.linspace(-16.0, 16.0, 201, dtype=dtype))
         decay = torch.exp(2.0 * ls)
         assert bool((ls < 0.0).all())
         assert bool((decay > 0.0).all())
-        assert bool((decay <= 1.0).all())
+        assert bool((decay < 1.0).all())
 
 
 def test_logscale_matches_the_closed_form() -> None:
+    """Against the definition, written out.
+
+    The quotient is accurate in both tails without a fold: an overflowing
+    ``exp(-raw)`` drives it to a signed zero, which is the map's own limit there, and
+    a vanishing one leaves the floor exactly.
+    """
     raw = _raws()
-    want = -torch.log1p(torch.exp(-raw.abs())) - raw.clamp_min(0.0)
+    want = -LS_MAX_MAG / (1.0 + torch.exp(-raw))
     torch.testing.assert_close(bounded_logscale(raw), want, rtol=1e-14, atol=0.0)
 
 
@@ -94,6 +120,84 @@ def test_logscale_is_monotone_decreasing() -> None:
 def test_logscale_gradcheck() -> None:
     raw = torch.linspace(-8.0, 8.0, 17, dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(bounded_logscale, (raw,))
+
+
+# ---------------------------------------------------------------------------
+# The anchored drive
+# ---------------------------------------------------------------------------
+
+
+def _drive_pair(seed: int, radius: float) -> Pair:
+    """``(band, bias)``, both ``(256,3)`` float64, the bias at a fixed radius."""
+    gen = torch.Generator().manual_seed(seed)
+    band = torch.randn(256, 3, generator=gen, dtype=torch.float64) * 4.0
+    bias = torch.randn(256, 3, generator=gen, dtype=torch.float64)
+    return band, radius * bias / bias.norm(dim=-1, keepdim=True)
+
+
+# Three radii spanning what the lattice hands out: the shortest period's row, a
+# generic one, and the longest period's row. All three sit above the floor, which is
+# the regime the bound is stated in; below it the floor deliberately raises the drive
+# and the case is ``test_anchored_drive_survives_a_zero_bias``.
+@pytest.mark.parametrize("radius", [3.0, 1e-2, 4.8e-4])
+def test_anchored_drive_is_bounded_by_the_bias_radius(radius: float) -> None:
+    """The drive is a bounded relative perturbation of the head's own row.
+
+    ``tanh`` bounds each column at one, so the displacement from the bias is at most
+    ``sqrt(3)`` radii however large the band grows. That is the whole point of the
+    anchor: an unscaled drive of order one swamps a row of radius 4.8e-4, which is
+    the longest period on the lattice, and deletes the head it was supposed to steer.
+    """
+    band, bias = _drive_pair(seed=21, radius=radius)
+    drive = anchored_rotvec(band, bias) - bias
+    assert bool((drive.abs() <= radius).all())
+    assert bool((drive.norm(dim=-1) <= math.sqrt(3.0) * radius).all())
+    assert bool(torch.isfinite(drive).all())
+
+
+def test_anchored_drive_is_the_bias_at_a_zero_band() -> None:
+    """A zeroed parameter band leaves the initialized bank exactly, which is what the
+    mixer's zeroed projection rows rely on."""
+    _, bias = _drive_pair(seed=22, radius=0.5)
+    assert torch.equal(anchored_rotvec(torch.zeros_like(bias), bias), bias)
+
+
+def test_anchored_drive_survives_a_zero_bias() -> None:
+    """The radius is floored, so the reciprocal the pullback forms is finite and the
+    forward is the bias itself: a head at the chart's origin takes no drive."""
+    band, _ = _drive_pair(seed=23, radius=1.0)
+    bias = torch.zeros_like(band)
+    out = anchored_rotvec(band, bias)
+    assert bool(torch.isfinite(out).all())
+    assert float(out.abs().max()) <= math.sqrt(1e-12)
+
+
+def test_anchored_drive_survives_a_radius_float32_cannot_square() -> None:
+    """The ceiling is a float32 claim asserted on the float64 reference, because I4
+    pins the maps to float32 and the reference owes the value the kernel produces.
+
+    Past 1.8e19 the squared radius leaves float32, and the device path forms the root
+    as ``t2 * rsqrt(t2)``, where an infinite ``t2`` is ``inf * 0``. Clamped, the row
+    is finite and the drive saturates at the largest radius float32 can square.
+    """
+    band, _ = _drive_pair(seed=25, radius=1.0)
+    bias = torch.full_like(band, 1e30)
+    out = anchored_rotvec(band, bias)
+    assert bool(torch.isfinite(out).all())
+    # The difference cancels eleven orders, so float64 holds the drive to 1.2e-5
+    # relative. Loose against that and still sharp against the claim: the unclamped
+    # radius is 1.7e30, eleven orders above the bound asserted here.
+    root = math.sqrt(DRIVE_CEIL_SQ)
+    assert float((out - bias).abs().max()) == pytest.approx(root, rel=1e-4)
+
+
+def test_anchored_drive_gradcheck() -> None:
+    """float64 gradcheck on both arguments. The bias carries two terms -- the offset
+    and the radius every column reads -- and only the second is easy to drop."""
+    gen = torch.Generator().manual_seed(24)
+    band = torch.randn(8, 3, generator=gen, dtype=torch.float64, requires_grad=True)
+    bias = torch.randn(8, 3, generator=gen, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(anchored_rotvec, (band, bias))
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +437,7 @@ def _operands(
     heads: int = 3,
     seqlen: int = 5,
     dtype: torch.dtype = torch.float64,
-    bias: float = 0.0,
+    bias: float = 1.0,
     strided: bool = False,
     seed: int = 0,
 ) -> Pair:
@@ -343,6 +447,12 @@ def _operands(
     runs one projection GEMM and hands out views. ``strided`` keeps it as a view;
     otherwise it is compacted. The two hold the same values, so an output difference
     between them is a layout bug.
+
+    ``bias`` scales the drawn bias rows and defaults to unit scale, not to zero. A
+    zero bias is the anchor's floor, where ``|w|`` is pinned at ``1e-6`` and the
+    pullback to the bias is the clamp's zero subgradient, so it is a degenerate
+    operator to assert anything but a shape on. The floor's own coverage is
+    ``test_anchored_drive_survives_a_zero_bias``.
     """
     gen = torch.Generator().manual_seed(seed)
 
@@ -364,9 +474,16 @@ def _apply(params: Tensor, param_bias: Tensor, *, heads: int = 3) -> ScanParams:
 
 
 def _head_major(params: Tensor, param_bias: Tensor, heads: int) -> Tensor:
-    """The biased parameter rows as ``(B,H,T,PARAM_COLS)``."""
-    rows = params.unflatten(-1, (heads, PARAM_COLS)) + param_bias
-    return rows.permute(0, 2, 1, 3)
+    """The map inputs the rows present, as ``(B,H,T,PARAM_COLS)``.
+
+    The rotation columns go through :func:`anchored_rotvec` and the log-scale column
+    is the plain sum. That split is the frontier's, not a convenience here: the drive
+    is scaled by the head's own radius and the log-scale has no radius to scale by.
+    """
+    rows = params.unflatten(-1, (heads, PARAM_COLS)).permute(0, 2, 1, 3)
+    bias = param_bias[:, None, :]
+    drive = anchored_rotvec(rows[..., 0:3], bias[..., 0:3])
+    return torch.cat((drive, rows[..., 3:] + bias[..., 3:]), dim=-1)
 
 
 def test_frontier_shapes_dtypes_and_contiguity() -> None:
@@ -378,19 +495,28 @@ def test_frontier_shapes_dtypes_and_contiguity() -> None:
     assert all(t.is_contiguous() for t in out)
 
 
-def test_frontier_applies_the_bounded_maps_to_the_biased_row() -> None:
-    """The maps are the ones asserted above, applied after the bias.
+def test_frontier_applies_the_bounded_maps_to_the_anchored_row() -> None:
+    """The maps are the ones asserted above, applied after the row is anchored.
 
-    A frontier that biased after the map, or dropped the bias, would still have
-    every shape and dtype right. ``K`` is the taps of the transition the maps
-    produce, not of the raw row, so it is asserted against the packed transition;
-    the hard zero in lane 3 completes the packing contract.
+    A frontier that anchored after the map, that summed the drive instead of scaling
+    it, or that dropped the bias, would still have every shape and dtype right. ``K``
+    is the taps of the transition the maps produce, not of the raw row, so it is
+    asserted against the packed transition; the hard zero in lane 3 completes the
+    packing contract.
     """
-    params, pb = _operands(bias=1.0, seed=1)
+    params, pb = _operands(seed=1)
     rows = _head_major(params, pb, heads=3)
     out = _apply(params, pb)
     assert torch.equal(out.trans[..., :3], bounded_rotvec(rows[..., 0:3], W_MAX))
-    assert torch.equal(out.trans[..., 3], bounded_logscale(rows[..., 3]))
+    # One ulp of LS_MAX_MAG, not bitwise. ``torch.sigmoid`` takes a vectorized path on
+    # a contiguous input and a scalar one on a strided view, and the two disagree in
+    # the last bit; the reference reaches it through a strided column of the row it
+    # packs. The claim under test is which map is applied to which row, and a
+    # dispatch difference inside the map does not bear on it.
+    ls_ulp = LS_MAX_MAG * torch.finfo(torch.float64).eps
+    assert float((out.trans[..., 3] - bounded_logscale(rows[..., 3])).abs().max()) <= (
+        ls_ulp
+    )
     want = foh_taps(out.trans[..., :3].contiguous(), out.trans[..., 3])
     assert torch.equal(out.K[..., :3], want)
     assert torch.equal(out.K[..., 3], torch.zeros_like(out.K[..., 3]))
@@ -400,7 +526,7 @@ def test_frontier_reads_a_projection_slice_without_repacking_it() -> None:
     """Bitwise equality against the compact operand. The shipped operand is a view
     of one projection output, so an implementation that only handled contiguous
     input would pass every other test in this file."""
-    params, pb = _operands(bias=1.0, strided=True, seed=3)
+    params, pb = _operands(strided=True, seed=3)
     assert params.stride(-1) == 1 and not params.is_contiguous()
     strided = _apply(params, pb)
     compact = _apply(params.contiguous(), pb)
@@ -441,6 +567,7 @@ def test_frontier_invariants_hold_on_the_packed_tensors() -> None:
     params, pb = _operands(seqlen=64, bias=1e6, seed=4)
     out = _apply(params * 1e6, pb)
     assert bool((out.trans[..., 3] <= 0.0).all())
+    assert bool((out.trans[..., 3] >= -LS_MAX_MAG).all())
     assert bool((out.trans[..., :3].norm(dim=-1) <= _ball_bound(torch.float64)).all())
     assert bool(torch.isfinite(out.trans).all())
     assert bool(torch.isfinite(out.K).all())
@@ -526,7 +653,7 @@ def test_reference_backward_matches_autograd_through_the_public_operator() -> No
     :func:`scanprep` routes the backward through the registry rather than through
     autograd's own graph. The two arms are equal only if the saved set is right.
     """
-    params, pb = _operands(bias=1.0, seed=8)
+    params, pb = _operands(seed=8)
     cots = _cotangents()
 
     leaves = tuple(t.detach().clone().requires_grad_(True) for t in (params, pb))
@@ -547,7 +674,7 @@ def test_reference_backward_matches_autograd_through_the_public_operator() -> No
 def test_reference_backward_ignores_the_cotangent_of_the_padding_lane() -> None:
     """Lane 3 of each tap is a constant zero, so its cotangent is the cotangent of
     nothing. A pullback that read it would leak into ``dparams``."""
-    params, pb = _operands(bias=1.0, seed=9)
+    params, pb = _operands(seed=9)
     dtrans, dK = _cotangents()
     loud = dK.clone()
     loud[..., 3] = 1e6

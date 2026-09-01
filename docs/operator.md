@@ -154,9 +154,12 @@ Guaranteed by parameterization, then asserted by tests. A clamp, an epsilon, or
 a branch added to work around one of these is a sign the parameterization is
 wrong, not the kernel.
 
-1. `ls <= 0`. The chunk-local log-scale prefix is monotone non-increasing and
-   every decay factor lies in `(0,1]`. Overflow is unreachable; underflow is
-   graceful and correct.
+1. `-LS_MAX_MAG <= ls <= 0`. The chunk-local log-scale prefix is monotone
+   non-increasing and every decay factor lies in `(0,1]`. Overflow is unreachable;
+   underflow is graceful and correct. Bounded below as well, which no kernel reads
+   and no other invariant needs: the floor is a lifetime floor, so no token
+   annihilates a row, and it is the decay's counterpart of `|w| <= w_max < pi`.
+   Both bounds are two-sided and neither is reached.
 2. `|w| <= w_max < pi`. The quaternion exponential is a single branchless
    minimax polynomial accurate to float32 epsilon over the whole reachable
    domain. Average active threads per warp stays at 32.00.

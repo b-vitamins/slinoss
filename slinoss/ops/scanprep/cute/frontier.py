@@ -9,7 +9,7 @@ implementation.
 
 Parallel decomposition. One block per ``(batch, token tile)``. One thread owns one
 ``(head, token)`` pair with the token innermost, reads that head's four parameter
-columns itself, adds the per-head bias, and writes the head-major ``(B,H,T,4)``
+columns itself, anchors them to the per-head bias, and writes the head-major ``(B,H,T,4)``
 and ``(B,H,T,2,4)`` rows for its token. No shared memory and no barrier: the
 parameter slice's four columns per head are the thread's own working set, so the
 transpose that a coalesced row load would need never arises, and neither does the
@@ -78,6 +78,8 @@ from slinoss._guard import check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
 from slinoss._reduce import reduce_partials
 from slinoss.ops.scanprep.cute.maps import (
+    anchored_row,
+    anchored_row_grad,
     foh_taps,
     foh_taps_grad,
     log_scale,
@@ -137,20 +139,24 @@ predicated.
 # traffic.
 
 
-def _biased_row(
+def _row_pair(
     gparams: cute.Tensor,
     gbias: cute.Tensor,
     bidx: cutlass.Int32,
     token: cutlass.Int32,
     base: cutlass.Int32,
     dtype: cutlass.Constexpr,
-) -> list[Scalar]:
-    """Read one head's parameter columns for one token and add the bias.
+) -> tuple[list[Scalar], list[Scalar]]:
+    """Read one head's parameter columns for one token, and its bias columns.
 
     The one place either direction reads ``params``, so both evaluate the maps at
     the same point. All ``PARAM_COLS`` loads are issued before the first use, which
     is what puts them in flight together; the group is the head's whole row, so no
     prefetch depth is chosen here.
+
+    Both rows are returned rather than their combination:
+    :func:`slinoss.ops.scanprep.cute.maps.anchored_row` is not a sum, so the
+    backward needs the two apart to split the cotangent between them.
 
     Args:
         gparams: ``(B,T,H*PARAM_COLS)`` projection slice, activation dtype.
@@ -161,10 +167,12 @@ def _biased_row(
         dtype: Activation element type. Compile-time.
 
     Returns:
-        ``PARAM_COLS`` float32 values in column order, widened on load (I4).
+        ``(band, bias)``, each ``PARAM_COLS`` float32 values in column order, the
+        band widened on load (I4).
     """
     raw = [gparams[bidx, token, base + slot] for slot in range(PARAM_COLS)]
-    return [widen(raw[slot], dtype) + gbias[base + slot] for slot in range(PARAM_COLS)]
+    band = [widen(raw[slot], dtype) for slot in range(PARAM_COLS)]
+    return band, [gbias[base + slot] for slot in range(PARAM_COLS)]
 
 
 @cute.jit
@@ -219,7 +227,8 @@ def _emit_maps(
         row = idx - head * tokens
         token = cutlass.min(t0 + row, last)
         base = head * PARAM_COLS
-        value = _biased_row(gparams, gbias, bidx, token, base, dtype)
+        band, bias = _row_pair(gparams, gbias, bidx, token, base, dtype)
+        value = anchored_row(band, bias)
         wx, wy, wz = rotvec(value[0], value[1], value[2], w_max)
         ls = log_scale(value[3])
         taps = foh_taps(wx, wy, wz, ls)
@@ -335,12 +344,13 @@ def _pull_tokens(
 
         The taps are a function of the mapped transition, so this direction
         re-evaluates both maps rather than reading ``trans`` back: the read would be
-        ``16*H`` bytes a token against a rotvec and a softplus.
+        ``16*H`` bytes a token against a rotvec and a sigmoid.
 
-        The bias reduction is float32 over the gradients before they are narrowed,
-        which is what the reference sums; narrowing first would lose the accumulator
-        width. It also runs on every lane, outside the store predicate, because a
-        shuffle needs the whole warp.
+        The bias reduction is float32 over its own gradients before the band's are
+        narrowed; narrowing first would lose the accumulator width. It also runs on
+        every lane, outside the store predicate, because a shuffle needs the whole
+        warp. The two gradients are not the same quantity on the rotation columns,
+        so the reduction takes the bias half and not the stored half.
     """
     items = tokens * heads
     steps = -(-items // threads)
@@ -354,7 +364,8 @@ def _pull_tokens(
         token = cutlass.min(t0 + row, last)
         keep = t0 + row < seqlen
         base = head * PARAM_COLS
-        value = _biased_row(gparams, gbias, bidx, token, base, dtype)
+        band, bias = _row_pair(gparams, gbias, bidx, token, base, dtype)
+        value = anchored_row(band, bias)
         cot = [
             select(keep, gdtrans[bidx, head, token, comp], zero) for comp in range(4)
         ]
@@ -378,15 +389,19 @@ def _pull_tokens(
             cot[2] + tz,
             w_max,
         )
-        # Column order of one head's row, so both stores below are one loop.
-        grad = [dx, dy, dz, log_scale_grad(value[3]) * (cot[3] + tls)]
+        # Column order of one head's row, so both stores below are one loop. The two
+        # destinations take different gradients: the row the maps read is the bias
+        # offset by a drive the bias itself scales, not a sum of the two.
+        dband, dbias = anchored_row_grad(
+            band, bias, [dx, dy, dz, log_scale_grad(value[3]) * (cot[3] + tls)]
+        )
         inside = keep
         if cutlass.const_expr(not exact):
             inside = inside & (flat < cutlass.Int32(items))
         if inside:
             for slot in cutlass.range_constexpr(PARAM_COLS):
-                gdparams[bidx, token, base + slot] = narrow(grad[slot], dtype)
-        run = [_run_sum(grad[slot], row, tokens) for slot in range(PARAM_COLS)]
+                gdparams[bidx, token, base + slot] = narrow(dband[slot], dtype)
+        run = [_run_sum(dbias[slot], row, tokens) for slot in range(PARAM_COLS)]
         emit = row == cutlass.Int32(tokens - 1)
         if cutlass.const_expr(not exact):
             emit = emit & (flat < cutlass.Int32(items))
@@ -716,7 +731,8 @@ def scanprep_backward(
         dK: Cotangent of ``K``, ``(B,H,T,2,4)`` float32, contiguous CUDA.
         params: The forward's projection slice, ``(B,T,H*PARAM_COLS)``.
         param_bias: The forward's bias, ``(H,PARAM_COLS)`` float32. The maps'
-            Jacobians are evaluated at ``params + param_bias``.
+            Jacobians are evaluated at the anchored row, so both operands are read
+            here as well as in the forward.
         heads: ``H``.
         w_max: The bound the forward used, in ``(0, pi)``.
         dparams: Destination for the parameter gradient, or ``None`` to allocate one.

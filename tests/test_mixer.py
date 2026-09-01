@@ -26,9 +26,12 @@ from slinoss._guard import PROJ_ALIGN, SECTOR_BYTES
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import (
     HORIZON_RANGE,
+    PERIOD_RANGE,
     ProjectionLayout,
     SLinOSSMixer,
+    fibonacci_axes,
     head_grid,
+    head_lattice,
 )
 from slinoss.ops.conv import backends as conv_dispatch
 from slinoss.ops.conv import causal_conv1d
@@ -36,8 +39,10 @@ from slinoss.ops.mixer import backends as tail_dispatch
 from slinoss.ops.mixer import mixer_tail
 from slinoss.ops.scanprep import (
     LS_COLUMN,
+    LS_MAX_MAG,
     PARAM_COLS,
     ROTVEC_COLUMNS,
+    anchored_rotvec,
     bounded_logscale,
     bounded_rotvec,
     scanprep,
@@ -195,12 +200,15 @@ as a tolerance rather than an equality so that a reordered reduction inside a
 backend reports a number.
 """
 
-INIT_TOL = 2e-7
-"""Bound on recovering an initialization grid through its own bounded map.
+INIT_TOL = 1e-6
+"""Bound on recovering an initialization lattice through its own bounded map.
 
-The raw values are float32, so the round trip through ``log(expm1(.))`` and back
-carries that rounding and nothing else. Measured: 6.250e-08 for the decay row,
-2.988e-08 for the rotation row, and 3.262e-08 for their ratio.
+The raw values are float32 and both inverses amplify that rounding by the raw
+magnitude they produce. For the decay row, ``d(log|ls|)/draw = 1 - sigmoid(raw)``,
+so a horizon comes back with relative error up to ``|raw| * eps``: 4.6e-7 at the
+4096-token rung, where ``raw = -7.62``. The rotation row carries the axis rounding
+on top of the radius rounding. This is a rounding bound, not a tolerance on the
+arithmetic; the arithmetic itself is exact in float64.
 """
 
 _DPROJ_BAND = {
@@ -457,44 +465,108 @@ def test_every_operand_and_every_destination_is_a_band(
 
 
 def test_initialization_inverts_the_bounded_maps() -> None:
-    """``param_bias`` holds the raw values the grids ask for, not the grids.
+    """``param_bias`` holds the raw values the lattice asks for, not the lattice.
 
-    Both scale maps are bounded and neither is the identity, so a grid written
+    Both scale maps are bounded and neither is the identity, so a lattice written
     straight into the rows lands at a decay and a period the map has moved, and both
     stay inside their invariant. The result is a mixer that trains and never covers
     the timescales it reports.
     """
     cfg = MIXER_CONFIG
     rows = SLinOSSMixer(cfg).param_bias.detach().double()
+    horizon, period = (t.double() for t in head_lattice(cfg.n_heads))
     ls = bounded_logscale(rows[:, LS_COLUMN])
-    horizon = head_grid(HORIZON_RANGE, cfg.n_heads).double()
     assert_max_rel(-0.5 / ls, horizon, INIT_TOL, "mixer init decay")
     w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
     turn = w.norm(dim=-1)
-    assert_max_rel(2.0 * math.pi / turn, horizon, INIT_TOL, "mixer init period")
-    # I1 and I2 at step zero. The grids are what leaves a margin in the second.
+    assert_max_rel(2.0 * math.pi / turn, period, INIT_TOL, "mixer init period")
+    # I1 and I2 at step zero, both bounds two-sided. The lattice is what leaves a
+    # margin in each.
     assert bool((ls <= 0.0).all())
+    assert bool((ls >= -LS_MAX_MAG).all())
     assert float(turn.max()) < cfg.w_max
     assert rows.shape[1] == PARAM_COLS
 
 
-def test_every_head_turns_once_per_lifetime() -> None:
-    """Both scale rows come from one grid, read back through both bounded maps.
+def test_turns_per_lifetime_sweeps_rather_than_holding_at_one() -> None:
+    """The two rows come from two ranges, so their ratio is free.
 
-    The assertions above hold a row to a constant, so a grid split back into one
-    range per row passes them while the ratio between the rows sweeps: the shortest
-    heads lose their oscillation inside the amplitude lifetime, the longest carry
-    several, and nothing states the schedule. The ratio is the invariant.
+    Turns per amplitude lifetime is ``h/p``. Driving both rows from one grid pins it
+    to one at every head -- every head turning exactly once before it forgets, a
+    schedule nothing asks for -- and the per-row assertions above cannot see that,
+    because each row is still correct against its own grid. The ratio is the
+    invariant, and what it has to do is sweep: the corner ``h/p >> 1`` is a
+    narrowband resonator and the corner ``h/p << 1`` is a head that decays before it
+    turns, which is the scalar transition.
     """
     cfg = MIXER_CONFIG
     rows = SLinOSSMixer(cfg).param_bias.detach().double()
     tau = -0.5 / bounded_logscale(rows[:, LS_COLUMN])
     turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
-    assert_max_rel(2.0 * math.pi / turn, tau, INIT_TOL, "turns per lifetime")
+    quality = tau * turn / (2.0 * math.pi)
+    horizon, period = (t.double() for t in head_lattice(cfg.n_heads))
+    assert_max_rel(quality, horizon / period, INIT_TOL, "turns per lifetime")
+    span = HORIZON_RANGE[1] / HORIZON_RANGE[0]
+    assert float(quality.max() / quality.min()) == pytest.approx(span**2, rel=1e-5)
+
+
+def test_the_lattice_snakes_and_repeats_no_pair() -> None:
+    """The two axes as a lattice, not as a product written in either order.
+
+    Consecutive heads differ in one coordinate, which is what makes the head axis a
+    usable grouping axis: a plain product jumps the whole horizon range at every
+    period boundary. ``H`` need not factor, so the tail of the last period is
+    dropped rather than wrapped, and no pair may repeat -- a repeat is a head that
+    costs parameters and adds no timescale.
+    """
+    for heads in (1, 2, 4, 7, 12, 16):
+        horizon, period = head_lattice(heads)
+        assert horizon.shape == period.shape == (heads,)
+        pairs = {(float(h), float(p)) for h, p in zip(horizon, period, strict=True)}
+        assert len(pairs) == heads
+        moved = (horizon.diff() != 0.0).long() + (period.diff() != 0.0).long()
+        assert bool((moved <= 1).all())
+    # Both endpoints of both ranges, at a head count that fills the lattice exactly.
+    horizon, period = head_lattice(16)
+    assert (float(horizon.min()), float(horizon.max())) == HORIZON_RANGE
+    assert (float(period.min()), float(period.max())) == PERIOD_RANGE
+
+
+def test_the_head_grid_is_log_spaced() -> None:
+    """A scale grid, not a linear one.
+
+    A linear grid over a ratio of 1024 puts fourteen of sixteen heads past the
+    hundred-token mark and leaves the short timescales to two of them. Log spacing is
+    what makes the rungs a bank; both endpoints are included so the ranges mean what
+    they say.
+    """
+    grid = head_grid(HORIZON_RANGE, 5).double()
+    step = (HORIZON_RANGE[1] / HORIZON_RANGE[0]) ** 0.25
+    assert_max_rel(grid[1:] / grid[:-1], torch.full((4,), step).double(), 1e-6, "step")
+    assert float(grid[0]) == HORIZON_RANGE[0]
+    assert float(grid[-1]) == HORIZON_RANGE[1]
+
+
+def test_the_axes_are_equidistributed_and_seedless() -> None:
+    """One unit axis per head, a function of ``H`` alone.
+
+    A pseudo-random draw needs a seed to reproduce and still clusters: two axes a few
+    degrees apart are two heads carrying one rotation plane. The Fibonacci set has a
+    minimum separation that falls like ``1/sqrt(H)``, so it is asserted against that
+    rather than against a constant.
+    """
+    for heads in (1, 4, 16, 64):
+        axes = fibonacci_axes(heads).double()
+        assert axes.shape == (heads, 3)
+        assert_max_rel(axes.norm(dim=-1), torch.ones(heads).double(), 1e-6, "unit")
+        if heads > 1:
+            gram = (axes @ axes.T).fill_diagonal_(-1.0)
+            assert float(gram.max()) < 1.0 - 1.0 / heads
+    assert torch.equal(fibonacci_axes(8), fibonacci_axes(8))
 
 
 def test_conjugation_turns_by_the_rotation_vector_norm() -> None:
-    """The period grid is a period of the rotation, not of half of it.
+    """The period axis is a period of the rotation, not of half of it.
 
     ``quat_exp`` builds a half-angle quaternion and conjugation doubles the angle
     back, so a token advances the phase by ``|w|``. Read as ``2|w|``, every
@@ -506,8 +578,8 @@ def test_conjugation_turns_by_the_rotation_vector_norm() -> None:
     w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
     trace = rot_matrix(quat_exp(w)).diagonal(dim1=-2, dim2=-1).sum(-1)
     angle = torch.arccos(((trace - 1.0) / 2.0).clamp(-1.0, 1.0))
-    horizon = head_grid(HORIZON_RANGE, cfg.n_heads).double()
-    assert_max_rel(2.0 * math.pi / angle, horizon, INIT_TOL, "mixer rotation period")
+    period = head_lattice(cfg.n_heads)[1].double()
+    assert_max_rel(2.0 * math.pi / angle, period, INIT_TOL, "mixer rotation period")
 
 
 def test_a_period_the_bound_cannot_reach_stays_finite() -> None:
@@ -519,7 +591,7 @@ def test_a_period_the_bound_cannot_reach_stays_finite() -> None:
     reaches it, and a NaN row trains to nothing rather than raising.
     """
     cfg = SLinOSSConfig(d_model=32, d_state=48, d_head=16, n_groups=2, w_max=1.0)
-    assert 2.0 * math.pi / HORIZON_RANGE[0] > cfg.w_max
+    assert 2.0 * math.pi / PERIOD_RANGE[0] > cfg.w_max
     rows = SLinOSSMixer(cfg).param_bias.detach().double()
     assert bool(rows.isfinite().all())
     # I2 still holds, which is what the cap is for.
@@ -545,15 +617,15 @@ def test_the_default_bound_reaches_a_half_turn() -> None:
     assert math.pi - turn < 1.2e-7
 
 
-def test_the_projection_starts_the_transition_at_the_grid() -> None:
-    """The parameter band's rows are zero, so every token applies the grid itself.
+def test_the_projection_starts_the_transition_at_the_lattice() -> None:
+    """The parameter band's rows are zero, so every token applies the lattice itself.
 
     Under ``nn.Linear``'s default those rows carry a Kaiming-uniform draw, and on
     unit-RMS input a column of one fluctuates by ``1/sqrt(3)`` whatever ``d_model``
-    is: a rotation vector of mean norm 0.92 against bias radii running 0.577 down to
-    0.008. The step at init then turns about 2.1 rad about an input-drawn axis, no
-    head holds a phase for one token, and the grid the bias encodes is unreachable
-    until training shrinks the rows it is being read through.
+    is. The anchor bounds what that does -- the drive is at most ``sqrt(3)`` of the
+    head's own radius -- but a bounded perturbation is still a perturbation: the axis
+    wanders tens of degrees a token at every timescale, and a head whose axis wanders
+    that far holds no phase. Zeroed, the lattice is what step zero applies.
     """
     cfg = MIXER_CONFIG
     mixer = SLinOSSMixer(cfg)
@@ -566,17 +638,21 @@ def test_the_projection_starts_the_transition_at_the_grid() -> None:
 def test_the_zeroed_parameter_band_still_takes_gradient() -> None:
     """Zero rows are a starting point, not a stop.
 
-    The pullback to a projection row is ``sum_t dL/draw_t x_t`` and carries no factor
-    of the row itself, and ``bounded_rotvec`` has Jacobian ``w_max * I`` at the
-    origin, so input dependence grows from zero at full rate. A zero that also killed
-    the gradient would pin the recurrence to one LTI operator for the whole run.
+    The pullback to a projection row is ``sum_t dL/dband_t x_t`` and carries no factor
+    of the row itself. The band's own factor is ``|bias| * tanh'(0)``, which is the
+    head's radius: nonzero at every rung, so input dependence grows from zero at every
+    timescale. A zero that also killed the gradient would pin the recurrence to one
+    LTI operator for the whole run. This goes through the anchor rather than around
+    it, because the anchor is where a factor could vanish.
     """
     cfg = MIXER_CONFIG
     mixer = SLinOSSMixer(cfg)
     x = _activations(cfg, torch.device("cpu"), torch.float32)
     proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
     rows = mixer.layout.params(proj).unflatten(-1, (cfg.n_heads, PARAM_COLS))
-    bounded_rotvec(rows[..., ROTVEC_COLUMNS], cfg.w_max).sum().backward()
+    bias = mixer.param_bias[:, ROTVEC_COLUMNS]
+    band = anchored_rotvec(rows[..., ROTVEC_COLUMNS], bias)
+    bounded_rotvec(band, cfg.w_max).sum().backward()
 
     grad = mixer.in_proj.weight.grad
     assert grad is not None
@@ -592,11 +668,12 @@ def test_the_zeroed_parameter_band_still_takes_gradient() -> None:
 def test_the_recurrence_rows_are_exempt_from_weight_decay() -> None:
     """Both per-head float32 parameters carry the marker a trainer routes on.
 
-    ``param_bias`` is an operating point, not a magnitude: the chart's zero is a
-    0.25-per-step decay and no rotation, a horizon under one token, so decay toward it
-    deletes the grid rather than shrinking a weight. The rows are rank two, so the
-    usual ``dim < 2`` exemption does not reach them and the marker is the only thing
-    that does.
+    ``param_bias`` is an operating point, not a magnitude: the chart's zero is the
+    shortest rung the lattice has and no rotation at all, and the rotation row is also
+    the drive's own scale, so decay toward zero deletes both the lattice and every
+    head's input dependence on it rather than shrinking a weight. The rows are rank
+    two, so the usual ``dim < 2`` exemption does not reach them and the marker is the
+    only thing that does.
     """
     mixer = SLinOSSMixer(MIXER_CONFIG)
     assert mixer.param_bias.dim() == 2

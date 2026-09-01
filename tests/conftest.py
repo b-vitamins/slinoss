@@ -3,19 +3,43 @@
 Every operator input comes from the real parameter maps. A fabricated ``trans``
 or ``K`` does not exercise the invariants the kernels rely on, and a fabricated
 chunk-start state does not exercise chunk composition, so neither is built here.
+
+The maps and not the frontier: ``scanprep_ref`` anchors the rotation drive to the
+head's bias radius, which is the mixer's parameterization of where a head sits, and
+an operand set built through it could not reach ``|w| = 0`` and ``|w| = w_max`` in
+the same call. The operator's contract is the packed ``(w, ls)`` and its taps, so
+that is what is built. The anchor's own coverage is ``tests/test_scanprep.py``.
 """
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple, TypedDict
 
 import pytest
 import torch
 from torch import Tensor
 
-from slinoss.ops.scanprep import PARAM_COLS, pack_params, scanprep_ref
+from slinoss.ops.scanprep import LS_MAX_MAG, bounded_logscale, bounded_rotvec, foh_taps
 
 W_MAX = 3.0
+
+LS_DECAY = 0.0181
+"""Per-token log-scale the cute fixtures run at, and the figure their bounds hold.
+
+A 64-token chunk keeps a tenth of its amplitude at this rate and a 128-token chunk a
+hundredth, so both ends of the ``K`` extent carry weight. Unbiased the same chunks
+reach 1e-7 and 1e-14, under float32 epsilon, and a chunk-length GEMM is then tested
+on a band next to the diagonal; undecayed it is tested on a constant.
+"""
+
+LS_BIAS = -math.log(LS_MAX_MAG / LS_DECAY - 1.0)
+"""Raw bias reaching :data:`LS_DECAY` through ``-LS_MAX_MAG*sigmoid``, about -2.55.
+
+Inverted rather than written down. The bias fixes the whole fixture's decay rate and
+every cute tolerance was derived at one, so a change to ``LS_MAX_MAG`` that left a
+literal behind would move every bound's regime without moving a bound.
+"""
 
 
 class ScanKwargs(TypedDict):
@@ -116,15 +140,11 @@ def make_inputs(
     # order and no ungrouped case moves.
     bc_heads = heads if groups is None else groups
     state_dim = 3 * lanes
-    params = scanprep_ref(
-        pack_params(
-            rnd(bsz, heads, seqlen, 3) * w_scale,
-            rnd(bsz, heads, seqlen) + ls_bias,
-        ),
-        torch.zeros(heads, PARAM_COLS, dtype=torch.float32, device=device),
-        heads=heads,
-        w_max=w_max,
-    )
+    w = bounded_rotvec(rnd(bsz, heads, seqlen, 3) * w_scale, w_max)
+    ls = bounded_logscale(rnd(bsz, heads, seqlen) + ls_bias)
+    tap = foh_taps(w, ls)
+    trans = torch.cat([w, ls[..., None]], dim=-1)
+    packed = torch.cat([tap, torch.zeros_like(tap[..., :1])], dim=-1)
 
     def leaf(t: Tensor, cast: torch.dtype | None = None) -> Tensor:
         out = t.detach().clone()
@@ -134,8 +154,8 @@ def make_inputs(
 
     return ScanInputs(
         U=leaf(rnd(bsz, heads, seqlen, rows), u_dtype),
-        trans=leaf(params.trans),
-        K=leaf(params.K),
+        trans=leaf(trans),
+        K=leaf(packed),
         B=leaf(rnd(bsz, bc_heads, seqlen, state_dim), bc_dtype),
         C=leaf(rnd(bsz, bc_heads, seqlen, state_dim), bc_dtype),
         z0=leaf(rnd(bsz, heads, rows, state_dim)) if with_state else None,

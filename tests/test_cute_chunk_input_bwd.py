@@ -73,16 +73,13 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_input import (
 )
 from slinoss.ops.so3ssd.cute.common import THREADS
 from slinoss.ops.so3ssd.cute.mma import THREADS_WIDE
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import LS_BIAS, ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it both ``exp(2*(lp_t - lp_r))`` and the increment
-# weight underflow a few tokens into the chunk, and every earlier source token
-# contributes nothing: the GEMMs would be tested on the chunk's last handful of
-# tokens and the increment terms on almost none.
-LS_BIAS = -4.0
+# LS_BIAS keeps both ``exp(2*(lp_t - lp_r))`` and the increment weight alive across the
+# chunk. Unbiased, the GEMMs are tested on the chunk's trailing tokens and the
+# increment terms on almost none.
 
 # (bsz, heads, seqlen, chunk, rows, lanes, dtype).
 #
@@ -345,37 +342,40 @@ def _run(
 # compounding it. ``dchunk_scale`` contracts only the two state buffers.
 #
 #              bfloat16   float16
-# dU           4.320e-3   5.116e-4
-# carry_u      4.482e-3   3.308e-4
-# dlogp        3.813e-3   4.592e-4
-# dchunk_rot   3.502e-3   3.142e-4
-# dchunk_scale 1.290e-6   1.742e-6
+# dU           5.392e-3   5.791e-4
+# carry_u      4.208e-3   4.197e-4
+# dlogp        3.811e-3   5.824e-4
+# dchunk_rot   4.562e-3   2.766e-4
+# dchunk_scale 1.219e-6   1.809e-6
 #
 # Worst measured over every shape and every test in this file, read off a
 # ``--tolerance-report`` run. Every bound below is 1.2 to 2.2 times its figure.
 #
-# Deriving the taps from the transition moved all ten. The taps were free columns of
-# the projection and are now the first-order-hold moments of a step whose ``|w|`` and
-# ``ls`` are bounded, so each is O(1/2) where a raw column was O(1), and correlated
-# across the pair rather than independent. Every output that contracts two of them
-# lost a factor of 17 of magnitude while its absolute error fell about 5x, so the
-# relative-to-maximum figures rose only where there is no residual term to absorb the
-# shift: ``dchunk_scale`` in float16 rose 6.3x, to 1.742e-6, on an absolute error of
-# 1.249e-4 against a maximum of 7.168e+01, down from 6.589e-4 against 1.240e+03.
+# The decay floor moved two of the ten. The log-scale map is bounded below now, so
+# ``tests.conftest.LS_BIAS`` is calibrated to hold the fixture's per-token decay where
+# it was, and at a matched rate the bounded map's distribution is still the narrower
+# of the two: it cannot draw a fast-decaying token, so the mask across the chunk is
+# flatter and both contractions carry more terms of comparable size. That is a
+# cancellation cost, not a magnitude one, so it lands on the dtype with the shorter
+# significand and on the two outputs that read the mask twice: ``carry_u`` in float16
+# rose 1.27x and ``dlogp`` 1.27x, and nothing else moved by more than the shape
+# sweep's own spread. The float64 case bounds what the algebra itself contributes at
+# 1.7e-7, three orders under every figure here, so what the two dtype columns price is
+# operand rounding and only that.
+#
 # ``dchunk_scale`` is three orders tighter than the rest because it contracts two
 # operands and nothing else and its oracle contracts the same pair, so what is left
 # is the accumulation; its worst case is ``MAX_CHUNK``, the longest one.
-# ``dchunk_rot`` is the closest to its bound of the five: its transition term
-# contracts that same pair, but its increment term contracts ``inc_local`` too, so
-# its oracle stays the reference's own value and the pair's rounding is inside the
-# residual. That is where narrowing the pair to the operand dtype is paid for: 1.3x
-# in bfloat16 and 1.9x in float16 on ``dchunk_rot``, under 2x on ``dchunk_scale``,
-# and nothing measurable on the other three. On the four outputs whose bound is
-# operand rounding the float16 column runs 8 to 14 times tighter than the nearest
-# comparable bfloat16 shape, which brackets the factor of eight between the two
-# significands, so the two dtypes do not share a bound. ``dchunk_scale`` is the
-# exception and confirms its own reading: at one shape it separates the two dtypes by
-# 1.15x, because what is left there is float32 accumulation and not operand rounding.
+# ``dchunk_rot`` sits closest to its bound in bfloat16: its transition term contracts
+# that same pair, but its increment term contracts ``inc_local`` too, so its oracle
+# stays the reference's own value and the pair's rounding is inside the residual, which
+# is where narrowing the pair to the operand dtype is paid for. On the four outputs
+# whose bound is operand rounding the float16 column runs 4.7 to 10.6 times tighter
+# than the nearest comparable bfloat16 shape, bracketing the factor of eight between
+# the two significands, so the two dtypes do not share a bound. ``dchunk_scale`` is the
+# exception and confirms its own reading: at that shape it goes the other way, 3.8x
+# looser in float16, because what is left there is float32 accumulation and not operand
+# rounding.
 BOUNDS: dict[torch.dtype, dict[str, float]] = {
     torch.bfloat16: {
         "dU": 8e-3,
@@ -386,8 +386,8 @@ BOUNDS: dict[torch.dtype, dict[str, float]] = {
     },
     torch.float16: {
         "dU": 8e-4,
-        "carry_u": 4e-4,
-        "dlogp": 6e-4,
+        "carry_u": 5.5e-4,
+        "dlogp": 8e-4,
         "dchunk_rot": 4e-4,
         "dchunk_scale": 3e-6,
     },

@@ -13,15 +13,20 @@ projection width. Nothing here repacks it.
 The numerical invariants the kernels rely on hold by construction, so no kernel
 needs a clamp, an epsilon, or a validity pass:
 
-- ``ls = -softplus(x) <= 0``, so every chunk-local log-scale prefix is monotone
-  non-increasing and every decay factor lies in ``(0,1]``. Overflow is
-  unreachable and underflow is graceful. The bound is non-strict only because
-  ``softplus`` underflows to zero for very negative ``x``.
+- ``-LS_MAX_MAG <= ls = -LS_MAX_MAG*sigmoid(x) <= 0``, so every chunk-local
+  log-scale prefix is monotone non-increasing and every decay factor lies in
+  ``(0,1]``. Overflow is unreachable and underflow is graceful. Bounded below as
+  well, which no kernel reads: see :data:`LS_MAX_MAG`.
 - ``|w| = w_max * |x| / sqrt(1 + |x|^2) <= w_max < pi``, so the quaternion
   exponential is a single branchless polynomial over the whole reachable domain.
   The map is analytic in ``x``: ``1 + |x|^2 >= 1``, so the rsqrt has no
   singularity and needs no guard. The bound is non-strict only because the ratio
   rounds to one once ``|x|`` exceeds the reciprocal of the machine epsilon.
+
+The rotation-vector row a token presents to that second map is not the raw sum of
+its projection columns and the head's bias. It is ``bias + |bias|*tanh(band)``:
+the drive is bounded, and bounded against the head's own radius rather than
+against one. See :func:`anchored_rotvec`.
 
 Taps are not parameters. They are the first-order-hold moments of the transition
 the two maps above define, so they carry no columns and no initialization:
@@ -35,7 +40,6 @@ from typing import NamedTuple
 
 import torch
 from torch import Tensor
-from torch.nn.functional import softplus
 
 from slinoss._guard import check_pitched
 from slinoss._precision import (
@@ -46,15 +50,19 @@ from slinoss._precision import (
 )
 
 __all__ = [
+    "DRIVE_CEIL_SQ",
+    "DRIVE_FLOOR_SQ",
     "FOH_TAYLOR_RADIUS_SQ",
     "FP32_FOH_TERMS",
     "FP64_FOH_TERMS",
     "LS_COLUMN",
+    "LS_MAX_MAG",
     "PARAM_COLS",
     "ROTVEC_COLUMNS",
     "T2_FLOOR",
     "ScanGrads",
     "ScanParams",
+    "anchored_rotvec",
     "bounded_logscale",
     "bounded_rotvec",
     "check_cotangents",
@@ -81,6 +89,45 @@ ROTVEC_COLUMNS = slice(0, 3)
 
 LS_COLUMN = 3
 """Column of one head's parameter row holding the unconstrained log-scale."""
+
+LS_MAX_MAG = 0.25
+"""Bound on ``|ls|``: the shortest amplitude lifetime the parameterization admits.
+
+The per-token amplitude factor is ``exp(2*ls)``, so a lifetime of ``h`` tokens is
+``ls = -0.5/h`` and this bound is a lifetime of ``0.5/LS_MAX_MAG``, two tokens. It
+is the decay's half of what ``w_max < pi`` already is for the rotation: a lifetime
+under two tokens is a decay a sampled sequence cannot resolve, exactly as a period
+under two tokens is a rotation it cannot resolve. The upper end is unchanged, so a
+token can still ask for no decay at all.
+
+Two-sided, so no token annihilates a row. A one-sided map lets one outlier token
+multiply the whole carried state by zero, which deletes the gradient of everything
+before it; clearing 99 percent of a row instead takes ``ln(100)/(2*LS_MAX_MAG)``,
+nine tokens, and a delimiter has that many.
+"""
+
+DRIVE_FLOOR_SQ = 1.0e-12
+"""Floor on the squared bias radius that scales a token's rotation drive.
+
+Normal in float32, and the radius it floors, ``1e-6``, is two and a half orders
+below the smallest an initialized head takes, so the floor is reachable only by
+training a head's rotation away entirely. There the drive and its pullback both go
+to zero, which is the head the bias already describes.
+"""
+
+DRIVE_CEIL_SQ = float(torch.finfo(torch.float32).max)
+"""Ceiling on the same squared radius, the largest finite float32.
+
+The radius is a squared sum, so a bias past ``1.8e19`` overflows it, and the device
+path forms the root as ``t2 * rsqrt(t2)``, where an infinite ``t2`` gives ``inf *
+0``: a NaN, in a column I2 promises is finite. The ceiling is stated here rather
+than left to the device because I4 pins the maps to float32 whatever width the
+parameters were stored at, so the reference owes the same value the kernel produces.
+Above it the drive saturates the ball's own overflow and ``w`` collapses to the
+centre, which is finite and inside the ball, and the pullback is zero on both sides
+of the clamp. Nineteen orders above the largest radius an initialized head takes, so
+nothing but a diverged parameter reaches it.
+"""
 
 # ---------------------------------------------------------------------------
 # First-order-hold taps
@@ -159,10 +206,11 @@ def bounded_rotvec(raw: Tensor, w_max: float) -> Tensor:
 
 
 def bounded_logscale(raw: Tensor) -> Tensor:
-    """Map an unconstrained scalar to a non-positive log-scale.
+    """Map an unconstrained scalar to a log-scale in ``[-LS_MAX_MAG, 0]``.
 
-    ``ls = -softplus(raw)``, so ``ls <= 0`` for every finite input and the decay
-    per step is in ``(0,1]``.
+    ``ls = -LS_MAX_MAG * sigmoid(raw)``, so ``ls <= 0`` for every finite input and
+    the decay per step is in ``(0,1]``. Bounded below as well as above, which is
+    what :data:`LS_MAX_MAG` is for.
 
     Args:
         raw: Unconstrained scalars, any shape.
@@ -170,7 +218,37 @@ def bounded_logscale(raw: Tensor) -> Tensor:
     Returns:
         Log-scales, same shape.
     """
-    return -softplus(raw)
+    return -LS_MAX_MAG * torch.sigmoid(raw)
+
+
+def anchored_rotvec(band: Tensor, bias: Tensor) -> Tensor:
+    """The rotation-vector row a token presents to :func:`bounded_rotvec`.
+
+    ``raw = bias + |bias| * tanh(band)``. Two bounds, and the second is the one that
+    matters. ``tanh`` alone bounds a token's drive by one; :func:`bounded_rotvec` is
+    linear at the origin, so a drive of order one still replaces a head whose bias
+    radius is ``5e-4`` and every slow head in the bank becomes whatever the token
+    asks for. Scaling the drive by the head's own radius makes it a bounded relative
+    perturbation instead: a token turns a head's axis by at most about 60 degrees
+    and moves its period by at most a factor of ``1 + sqrt(3)``, whatever timescale
+    the head sits at. The rotation stays fully per-token; what it no longer does is
+    forget which head it belongs to.
+
+    The squared radius is clamped on both sides, at :data:`DRIVE_FLOOR_SQ` and
+    :data:`DRIVE_CEIL_SQ`. Neither bound is reachable by an initialized head; both
+    keep the float32 arithmetic the device path does regular, and the clamp's zero
+    subgradient is what that path returns outside them.
+
+    Args:
+        band: Unconstrained token rows, ``(...,3)``.
+        bias: Per-head rows, broadcasting against ``band``, ``(...,3)``.
+
+    Returns:
+        Unconstrained rotation vectors, ``(...,3)``.
+    """
+    t2 = (bias * bias).sum(-1, keepdim=True)
+    radius = t2.clamp(min=DRIVE_FLOOR_SQ, max=DRIVE_CEIL_SQ).sqrt()
+    return bias + radius * torch.tanh(band)
 
 
 def foh_coeffs(order: int, terms: int) -> tuple[float, ...]:
@@ -356,8 +434,9 @@ def scanprep_ref(
         params: Projection slice, ``(B,T,H*PARAM_COLS)``, activation dtype.
             Trailing stride one; the row stride is the projection width. Per head,
             in order ``(w_x, w_y, w_z, ls)``.
-        param_bias: ``(H,PARAM_COLS)``, float32, added to every token's row
-            before the maps.
+        param_bias: ``(H,PARAM_COLS)``, float32. The head's operating point: it
+            offsets the log-scale column and both offsets and scales the rotation
+            drive, per :func:`anchored_rotvec`.
         heads: ``H``.
         w_max: Rotation-vector norm bound, in ``(0, pi)``.
 
@@ -376,9 +455,13 @@ def scanprep_ref(
         # (B,T,H,PARAM_COLS) -> (B,H,T,PARAM_COLS). unflatten of a unit-stride
         # trailing axis is a view, so the strided operand is read where it lies.
         rows = params.unflatten(-1, (heads, PARAM_COLS)).to(dtype)
-        rows = (rows + param_bias.to(dtype)).permute(0, 2, 1, 3)
-        w = bounded_rotvec(rows[..., ROTVEC_COLUMNS], w_max)
-        ls = bounded_logscale(rows[..., LS_COLUMN])
+        rows = rows.permute(0, 2, 1, 3)
+        bias = param_bias.to(dtype)[:, None, :]
+        w = bounded_rotvec(
+            anchored_rotvec(rows[..., ROTVEC_COLUMNS], bias[..., ROTVEC_COLUMNS]),
+            w_max,
+        )
+        ls = bounded_logscale(rows[..., LS_COLUMN] + bias[..., LS_COLUMN])
         tap = foh_taps(w, ls)
         trans = torch.cat([w, ls[..., None]], dim=-1).contiguous()
         packed = torch.cat([tap, torch.zeros_like(tap[..., :1])], dim=-1).contiguous()
@@ -409,8 +492,9 @@ def scanprep_bwd_ref(
         dK: Cotangent of ``K``, ``(B,H,T,2,4)``. Lane 3 is the cotangent of a
             constant and is discarded.
         params: The forward's projection slice, ``(B,T,H*PARAM_COLS)``.
-        param_bias: The forward's bias, ``(H,PARAM_COLS)``. The maps' Jacobians
-            are evaluated at ``params + param_bias``, so the bias is saved too.
+        param_bias: The forward's bias, ``(H,PARAM_COLS)``. The maps' Jacobians are
+            evaluated at the row the bias and the band form together, so the bias is
+            saved too.
         heads: ``H``.
         w_max: The forward's norm bound.
         dparams: Destination for the parameter gradient, or ``None`` to allocate
