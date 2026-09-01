@@ -35,11 +35,11 @@ from slinoss.ops.so3ssd.reference import ScanPrologue
 from slinoss.state import MixerState
 
 __all__ = [
-    "HORIZON_RANGE",
-    "PERIOD_RANGE",
+    "FALLBACK_SPAN",
     "ProjectionLayout",
     "SLinOSSMixer",
     "fibonacci_axes",
+    "head_band",
     "head_grid",
     "head_lattice",
 ]
@@ -190,6 +190,20 @@ class ProjectionLayout:
         """
         return self._vectors(proj, self.c_off)
 
+    def keys(self, proj: Tensor) -> Tensor:
+        """The ``B`` and ``C`` bands as one band, ``(B,T,2*G*3N)``, pitched.
+
+        They are adjacent by :attr:`c_off`, so the pair is one slice and the key
+        convolution is one call over it rather than two over the halves.
+
+        Args:
+            proj: ``(B,T,width)``.
+
+        Returns:
+            A view of ``proj``.
+        """
+        return proj[..., self.b_off : self.params_off]
+
     def params(self, proj: Tensor) -> Tensor:
         """The parameter band, ``(B,T,H*PARAM_COLS)``, pitched.
 
@@ -215,6 +229,29 @@ class ProjectionLayout:
         """
         return proj[..., self.params_off + PARAM_COLS * self.heads :]
 
+    def key_b(self, keys: Tensor) -> Tensor:
+        """``B`` inside a keys buffer, ``(B,G,T,3N)``.
+
+        Args:
+            keys: ``(B,T,2*G*3N)``, as :meth:`keys` cuts it or as the key
+                convolution returns it.
+
+        Returns:
+            A view of ``keys``, laid out like :meth:`b`.
+        """
+        return self._vectors(keys, 0)
+
+    def key_c(self, keys: Tensor) -> Tensor:
+        """``C`` inside a keys buffer, ``(B,G,T,3N)``.
+
+        Args:
+            keys: ``(B,T,2*G*3N)``.
+
+        Returns:
+            A view of ``keys``, laid out like :meth:`c`.
+        """
+        return self._vectors(keys, self.groups * self.state_dim)
+
     def _vectors(self, proj: Tensor, offset: int) -> Tensor:
         """One state band as the scan reads it.
 
@@ -225,39 +262,61 @@ class ProjectionLayout:
         return band.unflatten(-1, (self.groups, self.state_dim)).permute(0, 2, 1, 3)
 
 
-HORIZON_RANGE: tuple[float, float] = (4.0, 4096.0)
-"""Tokens a head's amplitude decays over, at initialization.
+FALLBACK_SPAN: float = 4096.0
+"""Slow end of the lattice when :attr:`SLinOSSConfig.seq_len` is None.
 
-The per-token amplitude factor is ``exp(2*ls)``, so a horizon of ``h`` tokens is
-``ls = -0.5/h``.
-
-The low end is bounded twice: a lifetime under two tokens is a decay no sampled
-sequence resolves, and :data:`slinoss.ops.scanprep.LS_MAX_MAG` forbids one
-outright. Four keeps a margin against both. The high end is four times the longest
-sequence any harness trains on, so the longest head still holds ``exp(-1/4)`` of
-its amplitude across a whole sequence: the reachable end of an undamped head, which
-a bounded decay map reaches only in the limit.
+A stack that does not state the sequence it trains on gets the widest band the
+harnesses in this tree ever ask for. Nothing derives this: it is the absence of an
+answer, and every configuration that carries ``seq_len`` reads
+:func:`head_band` instead.
 """
 
-PERIOD_RANGE: tuple[float, float] = (4.0, 4096.0)
-"""Tokens a head's rotation turns in, at initialization.
+_MAP_HEADROOM = 0.5
+"""Fraction of its own bound the fastest grid rung asks for.
 
-Conjugation turns by ``|w|`` per token -- ``quat_exp`` builds the half-angle
-quaternion and the conjugation doubles the half-angle back -- so a period of ``p``
-tokens is ``|w| = 2*pi/p``. Same bounds as :data:`HORIZON_RANGE`, for the matching
-pair of reasons: a two-token period is the alternating sign, which no sampled
-rotation resolves and whose ``2*pi/2`` exceeds :data:`_MAX_MAP_FRACTION` of any
-legal ``w_max``, and a period past the longest sequence is a turn no sequence
-completes.
-
-Two ranges and not one, which is the point. Turns per amplitude lifetime is the
-ratio ``h/p``, so a lattice over both sweeps it across the square of the range
-while a single grid pins it to the diagonal ``h == p``: every head turning exactly
-once before it forgets, a schedule nothing asks for and the whole reach of the bank
-at initialization. The corners are what the diagonal has no room for -- a head that
-decays without turning at all, which is the scalar transition, and a narrowband
-resonator that turns a thousand times inside its own memory.
+Half, so :func:`slinoss.ops.scanprep.bounded_rotvec` has as much room above the
+rung as below it. Both scale maps diverge at their bound and the grid is only an
+initialization, so a rung pinned near the bound is a rung the optimizer can move in
+one direction.
 """
+
+
+def head_band(config: SLinOSSConfig) -> tuple[float, float]:
+    """Band in tokens the lattice spans, both ends derived, ``(fast, slow)``.
+
+    The fast end is the period the rotation cap reaches at :data:`_MAP_HEADROOM` of
+    itself, ``2*pi / (_MAP_HEADROOM * w_max)``. Below it a rung either exceeds the
+    cap or sits against it, and a two-token period is the alternating sign no
+    sampled rotation resolves.
+
+    The slow end is one turn across the trained sequence. Past it a head is a
+    constant: it neither completes a turn, so it carries no phase, nor decays, so it
+    separates no timescale. The previous constant was four times the longest
+    sequence any harness ran, which put most of the bank past the slow end of every
+    shorter task -- at 8 heads and 32 tokens, six of the eight rungs.
+
+    A horizon and a period read the same band. The per-token amplitude factor is
+    ``exp(2*ls)``, so a horizon of ``h`` tokens is ``ls = -0.5/h``; conjugation
+    turns by ``|w|`` per token, ``quat_exp`` building the half angle and the
+    conjugation doubling it back, so a period of ``p`` tokens is ``|w| = 2*pi/p``.
+    One band, two grids over it, and not one grid: turns per amplitude lifetime is
+    the ratio ``h/p``, so a lattice over both sweeps it across the square of the
+    band while a single grid pins it to the diagonal ``h == p``. The corners are
+    what the diagonal has no room for -- a head that decays without turning at all,
+    which is the scalar transition, and a narrowband resonator that turns many times
+    inside its own memory.
+
+    Args:
+        config: Supplies ``w_max`` and ``seq_len``.
+
+    Returns:
+        ``(fast, slow)`` in tokens, with ``slow`` at least ``fast``. A ``seq_len``
+        under the fast end collapses the band to one rung rather than inverting it.
+    """
+    fast = 2.0 * math.pi / (_MAP_HEADROOM * config.w_max)
+    slow = FALLBACK_SPAN if config.seq_len is None else float(config.seq_len)
+    return (fast, max(fast, slow))
+
 
 _MAX_MAP_FRACTION = 0.9
 """Cap on how close an initialized row sits to either scale map's bound.
@@ -296,7 +355,7 @@ def head_grid(bounds: tuple[float, float], heads: int) -> Tensor:
     return (low * (high / low) ** ramp).float()
 
 
-def head_lattice(heads: int) -> tuple[Tensor, Tensor]:
+def head_lattice(heads: int, band: tuple[float, float]) -> tuple[Tensor, Tensor]:
     """One ``(horizon, period)`` pair per head, boustrophedon over the two grids.
 
     ``isqrt(H)`` horizons against ``ceil(H / isqrt(H))`` periods, as square as ``H``
@@ -312,15 +371,17 @@ def head_lattice(heads: int) -> tuple[Tensor, Tensor]:
 
     Args:
         heads: ``H``, at least one.
+        band: ``(fast, slow)`` in tokens, from :func:`head_band`. Both grids span
+            it.
 
     Returns:
         ``(horizon, period)``, each ``(H,)`` float32 on the CPU.
     """
     n_h = max(1, math.isqrt(heads))
     n_p = -(-heads // n_h)
-    rows = head_grid(HORIZON_RANGE, n_h).expand(n_p, n_h).clone()
+    rows = head_grid(band, n_h).expand(n_p, n_h).clone()
     rows[1::2] = rows[1::2].flip(-1)
-    period = head_grid(PERIOD_RANGE, n_p).repeat_interleave(n_h)
+    period = head_grid(band, n_p).repeat_interleave(n_h)
     return rows.reshape(-1)[:heads], period[:heads]
 
 
@@ -373,7 +434,7 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     """
     heads = config.n_heads
     rows = torch.zeros(heads, PARAM_COLS, dtype=torch.float32)
-    horizon, period = head_lattice(heads)
+    horizon, period = head_lattice(heads, head_band(config))
     decay = (0.5 / (horizon * LS_MAX_MAG)).clamp(max=_MAX_MAP_FRACTION)
     rows[:, LS_COLUMN] = torch.logit(decay)
     angle = (2.0 * math.pi / (period * config.w_max)).clamp(max=_MAX_MAP_FRACTION)
@@ -426,6 +487,7 @@ _Grads = tuple[
     Tensor | None,
     Tensor,
     Tensor | None,
+    Tensor | None,
     Tensor,
     Tensor,
     Tensor,
@@ -475,6 +537,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         in_bias: Tensor | None,
         conv_weight: Tensor,
         conv_bias: Tensor | None,
+        key_weight: Tensor | None,
         param_bias: Tensor,
         d_skip: Tensor,
         norm_weight: Tensor,
@@ -494,6 +557,24 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             activation=True,
             d_head=config.d_head,
         )
+        # No activation on the keys and no bias: a state vector's direction is what
+        # the scan contracts against, and a rectifier on its components confines
+        # every key to one octant. Token-major, because the scan reads B and C
+        # group-major from a flat band either way.
+        keys = (
+            None
+            if key_weight is None
+            else conv_dispatch.get(picks.conv)
+            .forward(
+                layout.keys(proj),
+                cast_to(key_weight, proj.dtype),
+                None,
+                activation=False,
+            )
+            .y
+        )
+        b_band = layout.b(proj) if keys is None else layout.key_b(keys)
+        c_band = layout.c(proj) if keys is None else layout.key_c(keys)
         params = prep_dispatch.get(picks.prep).forward(
             layout.params(proj), param_bias, heads=config.n_heads, w_max=config.w_max
         )
@@ -501,8 +582,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             step.y,
             params.trans,
             params.K,
-            layout.b(proj),
-            layout.c(proj),
+            b_band,
+            c_band,
             config.chunk_size,
         )
         tail = tail_dispatch.get(picks.tail).forward(
@@ -525,6 +606,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             norm_weight,
             out_weight,
             out_bias,
+            key_weight,
+            keys,
             # Last, so the parameter slices above stay fixed. Three Nones from a
             # backend whose backward rebuilds the boundary instead.
             *((None, None, None) if scan.prologue is None else scan.prologue),
@@ -540,7 +623,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         x, proj, conv_y, trans, K, scan_y, tail = saved[:7]
         in_weight, in_bias, conv_weight, conv_bias, param_bias = saved[7:12]
         d_skip, norm_weight, out_weight, out_bias = saved[12:16]
-        zstart, cquat, cscale = saved[16:]
+        key_weight, keys = saved[16:18]
+        zstart, cquat, cscale = saved[18:]
         layout: ProjectionLayout = ctx.layout
         config: SLinOSSConfig = ctx.config
         picks: _Backends = ctx.picks
@@ -564,6 +648,15 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             eps=config.norm_eps,
             dgate=layout.gate(dproj),
         )
+        # With a key convolution the scan's B and C cotangents belong to its output,
+        # not to the projection's band, so they land in their own buffer and the
+        # convolution's own pullback carries them the rest of the way. Without one
+        # the buffer is dproj itself and the band is written in place.
+        dkeys = dproj if keys is None else torch.empty_like(keys)
+        b_band = layout.b(proj) if keys is None else layout.key_b(keys)
+        c_band = layout.c(proj) if keys is None else layout.key_c(keys)
+        db_band = layout.b(dproj) if keys is None else layout.key_b(dkeys)
+        dc_band = layout.c(dproj) if keys is None else layout.key_c(dkeys)
         # The tail's du is the skip path's share of the scan's dU, handed over as the
         # scan's addend. The returned dU is the sum, so nothing adds it afterwards.
         scan_grads = scan_dispatch.get(picks.scan).backward(
@@ -574,14 +667,30 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             conv_y,
             trans,
             K,
-            layout.b(proj),
-            layout.c(proj),
+            b_band,
+            c_band,
             config.chunk_size,
-            dB=layout.b(dproj),
-            dC=layout.c(dproj),
+            dB=db_band,
+            dC=dc_band,
             dU_init=tail_grads.du,
             prologue=(None if zstart is None else ScanPrologue(zstart, cquat, cscale)),
         )
+        key_dweight: Tensor | None = None
+        if key_weight is not None:
+            key_dweight = cast_to(
+                conv_dispatch.get(picks.conv)
+                .backward(
+                    dkeys,
+                    None,
+                    layout.keys(proj),
+                    cast_to(key_weight, proj.dtype),
+                    None,
+                    activation=False,
+                    dx=layout.keys(dproj),
+                )
+                .dweight,
+                key_weight.dtype,
+            )
         prep_grads = prep_dispatch.get(picks.prep).backward(
             scan_grads.dtrans,
             scan_grads.dK,
@@ -607,6 +716,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             cast_opt(in_grads.dbias, in_weight.dtype),
             cast_to(conv_grads.dweight, conv_weight.dtype),
             cast_opt(conv_grads.dbias, conv_weight.dtype),
+            key_dweight,
             prep_grads.dparam_bias,
             tail_grads.dd_skip,
             tail_grads.dweight,
@@ -641,7 +751,7 @@ class SLinOSSMixer(nn.Module):
     Initialization is principled where the scale sets the recurrence and the
     framework default elsewhere. ``param_bias`` is inverted through both bounded maps
     onto the two-axis lattice :func:`head_lattice` states, an amplitude horizon over
-    :data:`HORIZON_RANGE` against a rotation period over :data:`PERIOD_RANGE`, and the
+    :func:`head_band` against a rotation period over the same band, and the
     axes are the equidistributed set :func:`fibonacci_axes` returns; ``d_skip`` and
     ``norm_weight`` are ones. The input projection's parameter band is zeroed, so the
     recurrence starts as the oscillator bank that lattice states rather than a
@@ -687,6 +797,20 @@ class SLinOSSMixer(nn.Module):
         self.conv_bias: Tensor | None = (
             nn.Parameter(torch.empty(config.d_inner, device=device, dtype=dtype))
             if config.conv_bias
+            else None
+        )
+        # One weight over both state bands, because they are adjacent columns, and a
+        # separate tap row per channel, so B and C are convolved independently.
+        self.key_weight: Tensor | None = (
+            nn.Parameter(
+                torch.empty(
+                    2 * config.n_groups * config.d_state,
+                    config.d_conv,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+            if config.key_conv
             else None
         )
         self.param_bias = nn.Parameter(
@@ -747,6 +871,16 @@ class SLinOSSMixer(nn.Module):
             self.conv_weight.uniform_(-bound, bound)
             if self.conv_bias is not None:
                 self.conv_bias.zero_()
+            if self.key_weight is not None:
+                # The delta, tap W-1 being the current token: the initialized mixer
+                # is the one with no key convolution at all, so the lattice the
+                # parameter band states is still what step zero does, and a key that
+                # spans more than its own token is only ever learned into. A draw
+                # like the value band's would instead mix three neighbours into every
+                # key before the first step, which is a different operator at
+                # initialization and not a generalization of this one.
+                self.key_weight.zero_()
+                self.key_weight[:, -1] = 1.0
             self.d_skip.fill_(1.0)
             self.norm_weight.fill_(1.0)
             self.param_bias.copy_(_param_bias_init(cfg))
@@ -799,6 +933,7 @@ class SLinOSSMixer(nn.Module):
                 self.in_proj.bias,
                 self.conv_weight,
                 self.conv_bias,
+                self.key_weight,
                 self.param_bias,
                 self.d_skip,
                 self.norm_weight,
@@ -863,6 +998,17 @@ class SLinOSSMixer(nn.Module):
             initial_state=state.conv,
             d_head=cfg.d_head,
         )
+        keys = (
+            None
+            if self.key_weight is None
+            else conv_dispatch.get(picks.conv).forward(
+                layout.keys(proj),
+                cast_to(self.key_weight, proj.dtype),
+                None,
+                activation=False,
+                initial_state=state.keys,
+            )
+        )
         params = prep_dispatch.get(picks.prep).forward(
             layout.params(proj), self.param_bias, heads=cfg.n_heads, w_max=cfg.w_max
         )
@@ -870,8 +1016,8 @@ class SLinOSSMixer(nn.Module):
             conv.y,
             params.trans,
             params.K,
-            layout.b(proj),
-            layout.c(proj),
+            layout.b(proj) if keys is None else layout.key_b(keys.y),
+            layout.c(proj) if keys is None else layout.key_c(keys.y),
             cfg.chunk_size,
             z0=state.ssm,
             b_prev=state.b_prev,
@@ -889,6 +1035,8 @@ class SLinOSSMixer(nn.Module):
         # After every read: the scan starts from state.ssm itself, and the
         # convolution's incoming window is state.conv.
         state.conv.copy_(conv.state)
+        if keys is not None:
+            state.keys.copy_(keys.state)
         state.ssm.copy_(scan.state)
         state.b_prev.copy_(scan.b_last)
         state.u_prev.copy_(scan.u_last)

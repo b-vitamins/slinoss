@@ -23,12 +23,13 @@ def mixer(dtype: torch.dtype = torch.bfloat16, device: str = "cpu") -> MixerStat
 
 
 def _fields(state: MixerState) -> dict[str, Tensor]:
-    """Every buffer, by field name, read off ``state`` on each call."""
+    """Every buffer, by field name, read off ``state`` on each call.
+
+    Off the dataclass rather than a written list: a buffer added to the container
+    and not to a list here would leave every rule below untested on it.
+    """
     return {
-        "conv": state.conv,
-        "ssm": state.ssm,
-        "b_prev": state.b_prev,
-        "u_prev": state.u_prev,
+        field.name: getattr(state, field.name) for field in dataclasses.fields(state)
     }
 
 
@@ -43,6 +44,11 @@ def test_allocate_matches_config(device: torch.device) -> None:
     config = SLinOSSConfig(d_model=48, d_state=96, d_head=32, d_conv=3)
     state = MixerState.allocate(config, 3, device=device, dtype=torch.bfloat16)
     assert tuple(state.conv.shape) == (3, config.d_conv - 1, config.d_inner)
+    assert tuple(state.keys.shape) == (
+        3,
+        config.d_conv - 1,
+        2 * config.n_groups * config.d_state,
+    )
     assert tuple(state.ssm.shape) == (3, config.n_heads, config.d_head, config.d_state)
     assert tuple(state.b_prev.shape) == (3, config.n_groups, config.d_state)
     assert tuple(state.u_prev.shape) == (3, config.n_heads, config.d_head)
@@ -151,6 +157,7 @@ def test_containers_are_frozen() -> None:
     ("mutate", "exc", "match"),
     [
         (lambda s: {"conv": s.conv[0]}, ValueError, "conv must be"),
+        (lambda s: {"keys": s.keys[:, :1]}, ValueError, "keys must be"),
         (lambda s: {"ssm": s.ssm[0]}, ValueError, "ssm must be"),
         (lambda s: {"b_prev": s.b_prev[0]}, ValueError, "b_prev must be"),
         (lambda s: {"u_prev": s.u_prev[0]}, ValueError, "u_prev must be"),
@@ -170,6 +177,7 @@ def test_containers_are_frozen() -> None:
             "one activation dtype only",
         ),
         (lambda s: {"conv": s.conv[:, :, :16]}, ValueError, "both are d_inner"),
+        (lambda s: {"keys": s.keys[:, :, :16]}, ValueError, "B and C hold"),
         (lambda s: {"u_prev": s.u_prev[:, :, :16]}, ValueError, "u_prev holds"),
         (lambda s: {"b_prev": s.b_prev[:, :, :16]}, ValueError, "b_prev holds"),
         # ``G`` divides ``H``: head ``h`` reads group ``h // (H // G)``, so a group
@@ -201,8 +209,8 @@ def test_mixer_rejects_bad_buffers(
     dtype error survives to a kernel launch, where it reads as a CUDA fault
     rather than as a shape mismatch.
 
-    Batch and device are mutated on ``conv`` alone. Both rules compare all four
-    buffers at once, so which one disagrees is not a separate failure mode.
+    Batch and device are mutated on ``conv`` alone. Both rules compare every
+    buffer at once, so which one disagrees is not a separate failure mode.
     """
     state = mixer()
     fields = _fields(state)

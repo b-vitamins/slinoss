@@ -14,6 +14,7 @@ parameters.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
@@ -25,11 +26,11 @@ from torch.nn.functional import linear
 from slinoss._guard import PROJ_ALIGN, SECTOR_BYTES
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import (
-    HORIZON_RANGE,
-    PERIOD_RANGE,
+    FALLBACK_SPAN,
     ProjectionLayout,
     SLinOSSMixer,
     fibonacci_axes,
+    head_band,
     head_grid,
     head_lattice,
 )
@@ -200,6 +201,13 @@ as a tolerance rather than an equality so that a reordered reduction inside a
 backend reports a number.
 """
 
+BAND = (4.0, 4096.0)
+"""A lattice band the grid assertions read, independent of any configuration.
+
+:func:`slinoss.mixer.head_band` derives both ends, so a test that asserts the grid
+spans what it is given must be given a band rather than read one.
+"""
+
 INIT_TOL = 1e-6
 """Bound on recovering an initialization lattice through its own bounded map.
 
@@ -270,9 +278,14 @@ def _public_composition(mixer: SLinOSSMixer, x: Tensor) -> Tensor:
     params = scanprep(
         layout.params(proj), mixer.param_bias, heads=cfg.n_heads, w_max=cfg.w_max
     )
-    scan = so3ssd(
-        step.y, params.trans, params.K, layout.b(proj), layout.c(proj), cfg.chunk_size
+    keys = (
+        None
+        if mixer.key_weight is None
+        else causal_conv1d(layout.keys(proj), mixer.key_weight, activation=False)
     )
+    b_band = layout.b(proj) if keys is None else layout.key_b(keys.y)
+    c_band = layout.c(proj) if keys is None else layout.key_c(keys.y)
+    scan = so3ssd(step.y, params.trans, params.K, b_band, c_band, cfg.chunk_size)
     tail = mixer_tail(
         scan.y,
         step.y,
@@ -311,14 +324,20 @@ def _spy_bands(
             real_backward = backend.backward
             bands = _FORWARD_BANDS[stage]
 
+            # The key convolution is the one call that carries activation=False,
+            # and it reads the state bands rather than the value band. Its
+            # provenance is covered by the gradient parity against the public
+            # composition; recording it here would overwrite the value band's.
             def forward(*args: Any, **kwargs: Any) -> Any:
-                for label, index in bands:
-                    seen[label] = args[index]
+                if kwargs.get("activation", True):
+                    for label, index in bands:
+                        seen[label] = args[index]
                 return real_forward(*args, **kwargs)
 
             def backward(*args: Any, **kwargs: Any) -> Any:
-                for label, _ in bands:
-                    dseen[_DPROJ_BAND[label]] = kwargs[_DPROJ_BAND[label]]
+                if kwargs.get("activation", True):
+                    for label, _ in bands:
+                        dseen[_DPROJ_BAND[label]] = kwargs[_DPROJ_BAND[label]]
                 return real_backward(*args, **kwargs)
 
             return backend._replace(
@@ -432,8 +451,13 @@ def test_every_operand_and_every_destination_is_a_band(
     anywhere in it returns the same numbers at the cost of a pass over the
     activations per band, and a per-band cotangent buffer costs another five. Both
     are silent in every other test here.
+
+    Without the key convolution, which is the case where every operand is a band of
+    the projection itself. With it, ``B`` and ``C`` are bands of its output instead,
+    which :func:`test_the_key_convolution_keeps_b_and_c_one_buffer` asserts and the
+    gradient parity above covers.
     """
-    cfg = MIXER_CONFIG
+    cfg = replace(MIXER_CONFIG, key_conv=False)
     seen: dict[str, Tensor] = {}
     dseen: dict[str, Tensor] = {}
     _spy_bands(monkeypatch, seen, dseen)
@@ -464,6 +488,38 @@ def test_every_operand_and_every_destination_is_a_band(
             assert (band.data_ptr() - base) // band.element_size() == offset, label
 
 
+@pytest.mark.cuda
+def test_the_key_convolution_keeps_b_and_c_one_buffer(cuda: torch.device) -> None:
+    """The key convolution writes one buffer, and the scan reads both bands of it.
+
+    Its output cannot be a band of the projection -- the projection holds the
+    operand it convolves -- so the fusion invariant moves rather than holding: one
+    extra buffer, both state bands cut from it, and the pullback landing back in the
+    projection's own cotangent band. Two calls over the halves, or a ``cat`` of two
+    outputs, would return the same numbers and cost a second pass.
+    """
+    cfg = MIXER_CONFIG
+    assert cfg.key_conv
+    mixer = SLinOSSMixer(cfg, device=cuda, dtype=torch.float32)
+    key_weight = mixer.key_weight
+    assert key_weight is not None
+    layout = mixer.layout
+    proj = torch.randn(BATCH, SEQLEN, layout.width, device=cuda, dtype=torch.float32)
+    keys = causal_conv1d(layout.keys(proj), key_weight, activation=False).y
+    span = layout.groups * layout.state_dim
+    assert keys.shape == (BATCH, SEQLEN, 2 * span)
+    base = keys.untyped_storage().data_ptr()
+    for band, offset in ((layout.key_b(keys), 0), (layout.key_c(keys), span)):
+        assert band.untyped_storage().data_ptr() == base
+        assert band.stride(-1) == 1
+        assert band.stride(-2) == 2 * span
+        assert (band.data_ptr() - base) // band.element_size() == offset
+    # The delta taps make the convolution the identity at initialization, so the two
+    # bands are the projection's own until a tap moves.
+    assert torch.equal(layout.key_b(keys), layout.b(proj))
+    assert torch.equal(layout.key_c(keys), layout.c(proj))
+
+
 def test_initialization_inverts_the_bounded_maps() -> None:
     """``param_bias`` holds the raw values the lattice asks for, not the lattice.
 
@@ -474,7 +530,7 @@ def test_initialization_inverts_the_bounded_maps() -> None:
     """
     cfg = MIXER_CONFIG
     rows = SLinOSSMixer(cfg).param_bias.detach().double()
-    horizon, period = (t.double() for t in head_lattice(cfg.n_heads))
+    horizon, period = (t.double() for t in head_lattice(cfg.n_heads, head_band(cfg)))
     ls = bounded_logscale(rows[:, LS_COLUMN])
     assert_max_rel(-0.5 / ls, horizon, INIT_TOL, "mixer init decay")
     w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
@@ -504,9 +560,10 @@ def test_turns_per_lifetime_sweeps_rather_than_holding_at_one() -> None:
     tau = -0.5 / bounded_logscale(rows[:, LS_COLUMN])
     turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
     quality = tau * turn / (2.0 * math.pi)
-    horizon, period = (t.double() for t in head_lattice(cfg.n_heads))
+    horizon, period = (t.double() for t in head_lattice(cfg.n_heads, head_band(cfg)))
     assert_max_rel(quality, horizon / period, INIT_TOL, "turns per lifetime")
-    span = HORIZON_RANGE[1] / HORIZON_RANGE[0]
+    band = head_band(cfg)
+    span = band[1] / band[0]
     assert float(quality.max() / quality.min()) == pytest.approx(span**2, rel=1e-5)
 
 
@@ -520,16 +577,16 @@ def test_the_lattice_snakes_and_repeats_no_pair() -> None:
     costs parameters and adds no timescale.
     """
     for heads in (1, 2, 4, 7, 12, 16):
-        horizon, period = head_lattice(heads)
+        horizon, period = head_lattice(heads, BAND)
         assert horizon.shape == period.shape == (heads,)
         pairs = {(float(h), float(p)) for h, p in zip(horizon, period, strict=True)}
         assert len(pairs) == heads
         moved = (horizon.diff() != 0.0).long() + (period.diff() != 0.0).long()
         assert bool((moved <= 1).all())
     # Both endpoints of both ranges, at a head count that fills the lattice exactly.
-    horizon, period = head_lattice(16)
-    assert (float(horizon.min()), float(horizon.max())) == HORIZON_RANGE
-    assert (float(period.min()), float(period.max())) == PERIOD_RANGE
+    horizon, period = head_lattice(16, BAND)
+    assert (float(horizon.min()), float(horizon.max())) == BAND
+    assert (float(period.min()), float(period.max())) == BAND
 
 
 def test_the_head_grid_is_log_spaced() -> None:
@@ -540,11 +597,11 @@ def test_the_head_grid_is_log_spaced() -> None:
     what makes the rungs a bank; both endpoints are included so the ranges mean what
     they say.
     """
-    grid = head_grid(HORIZON_RANGE, 5).double()
-    step = (HORIZON_RANGE[1] / HORIZON_RANGE[0]) ** 0.25
+    grid = head_grid(BAND, 5).double()
+    step = (BAND[1] / BAND[0]) ** 0.25
     assert_max_rel(grid[1:] / grid[:-1], torch.full((4,), step).double(), 1e-6, "step")
-    assert float(grid[0]) == HORIZON_RANGE[0]
-    assert float(grid[-1]) == HORIZON_RANGE[1]
+    assert float(grid[0]) == BAND[0]
+    assert float(grid[-1]) == BAND[1]
 
 
 def test_the_axes_are_equidistributed_and_seedless() -> None:
@@ -578,25 +635,48 @@ def test_conjugation_turns_by_the_rotation_vector_norm() -> None:
     w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
     trace = rot_matrix(quat_exp(w)).diagonal(dim1=-2, dim2=-1).sum(-1)
     angle = torch.arccos(((trace - 1.0) / 2.0).clamp(-1.0, 1.0))
-    period = head_lattice(cfg.n_heads)[1].double()
+    period = head_lattice(cfg.n_heads, head_band(cfg))[1].double()
     assert_max_rel(2.0 * math.pi / angle, period, INIT_TOL, "mixer rotation period")
 
 
-def test_a_period_the_bound_cannot_reach_stays_finite() -> None:
-    """The angle cap on the inverse of ``bounded_rotvec``.
+def test_the_fastest_rung_asks_for_half_of_any_bound() -> None:
+    """The fast end of the band is the bound's own, at every ``w_max``.
 
-    The inverse is ``s * rsqrt(1 - s*s)`` at ``s = |w| / w_max``, so a ``w_max``
-    below what the shortest period asks for takes the root of a negative number and
-    every row is NaN. Inactive at the default ``w_max``, so no other test here
-    reaches it, and a NaN row trains to nothing rather than raising.
+    The inverse of ``bounded_rotvec`` is ``s * rsqrt(1 - s*s)`` at ``s = |w| /
+    w_max``, which diverges at the bound and takes the root of a negative number
+    past it. A band whose fast end were an absolute token count would cross that for
+    a small enough ``w_max``; deriving it from the bound puts the rung at exactly
+    :data:`slinoss.mixer._MAP_HEADROOM` of it instead, so the clamp never fires and
+    the rung has as much room above it as below.
     """
-    cfg = SLinOSSConfig(d_model=32, d_state=48, d_head=16, n_groups=2, w_max=1.0)
-    assert 2.0 * math.pi / PERIOD_RANGE[0] > cfg.w_max
-    rows = SLinOSSMixer(cfg).param_bias.detach().double()
-    assert bool(rows.isfinite().all())
-    # I2 still holds, which is what the cap is for.
-    turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
-    assert float(turn.max()) < cfg.w_max
+    for w_max in (0.5, 1.0, 3.14159265):
+        cfg = SLinOSSConfig(
+            d_model=32, d_state=48, d_head=16, n_groups=2, w_max=w_max, seq_len=4096
+        )
+        assert 2.0 * math.pi / head_band(cfg)[0] == pytest.approx(0.5 * w_max)
+        rows = SLinOSSMixer(cfg).param_bias.detach().double()
+        assert bool(rows.isfinite().all())
+        # I2 still holds, which is what the bound is for.
+        turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
+        assert float(turn.max()) < cfg.w_max
+
+
+def test_the_band_narrows_to_the_trained_sequence() -> None:
+    """The slow end is one turn across ``seq_len``, not a harness's longest run.
+
+    A head whose period exceeds the sequence never completes a turn and a head whose
+    horizon does never decays within it: both are constants, and the absolute slow
+    end put six of eight rungs there at 32 tokens. The band is the mechanism, so it
+    is asserted on the rungs rather than on the constant.
+    """
+    base = dict(d_model=32, d_state=48, d_head=16, n_groups=2)
+    for seq_len in (32, 128, 1024):
+        cfg = SLinOSSConfig(**base, seq_len=seq_len)  # type: ignore[arg-type]
+        horizon, period = head_lattice(cfg.n_heads, head_band(cfg))
+        assert float(period.max()) == pytest.approx(float(seq_len))
+        assert float(horizon.max()) == pytest.approx(float(seq_len))
+    # Absent the sequence there is no band to derive, so the widest one stands.
+    assert head_band(SLinOSSConfig(**base))[1] == FALLBACK_SPAN  # type: ignore[arg-type]
 
 
 def test_the_default_bound_reaches_a_half_turn() -> None:

@@ -76,6 +76,13 @@ class SLinOSSConfig:
         chunk_size: Scan chunk length ``L``. Power of two in [16, 128]; the
             quaternion prefix scan is a shuffle scan over ``log2(L)`` steps.
         d_conv: Causal depthwise convolution width.
+        key_conv: Convolve the ``B`` and ``C`` bands as well as the value band.
+            Their taps start at the delta, so the initialized mixer is the one
+            without it and a key motif is only ever learned into.
+        seq_len: Tokens the stack trains on, or None. The head lattice's slow end
+            is one turn across it, so a bank is built for the sequence it sees
+            rather than for the longest a harness might ever run. None leaves the
+            slow end at :data:`slinoss.mixer.FALLBACK_SPAN`.
         w_max: Bound on the rotation-vector norm. Strictly below pi so
             ``quat_exp`` is one branchless polynomial over the reachable domain.
             The default is the largest bound float32 does not resolve from pi.
@@ -103,6 +110,8 @@ class SLinOSSConfig:
     n_groups: int = 1
     chunk_size: int = 64
     d_conv: int = 4
+    key_conv: bool = True
+    seq_len: int | None = None
     w_max: float = 3.14159265
     bias: bool = False
     conv_bias: bool = True
@@ -149,6 +158,8 @@ class SLinOSSConfig:
             )
         if self.d_conv < 1:
             raise ValueError(f"d_conv must be positive, got {self.d_conv}")
+        if self.seq_len is not None and self.seq_len < 1:
+            raise ValueError(f"seq_len must be positive or None, got {self.seq_len}")
         if not 0.0 < self.w_max < math.pi:
             raise ValueError(
                 f"w_max must lie in (0, pi) so quat_exp stays polynomial, "
