@@ -46,15 +46,12 @@ from slinoss.ops.so3ssd.cute.bwd.start_passing import (
 from slinoss.ops.so3ssd.cute.bwd.state_passing import state_passing_backward
 from slinoss.ops.so3ssd.cute.common import WARPS
 from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import LS_BIAS, ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it exp(2*lp) underflows a few tokens into the chunk, the
-# chunk decay is zero to float32, and the recurrence under test is the identity on
-# the readout cotangent.
-LS_BIAS = -4.0
+# LS_BIAS keeps the chunk decay above float32 epsilon. Unbiased, the recurrence under
+# test is the identity on the readout cotangent.
 
 CHUNK = 64
 

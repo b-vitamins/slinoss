@@ -52,7 +52,7 @@ from slinoss.ops.so3ssd.cute.prefix import (
     chunk_prefixes,
 )
 from slinoss.ops.so3ssd.cute.table import build_table, stage_chunk
-from tests.conftest import assert_max_rel, make_inputs
+from tests.conftest import LS_BIAS, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
@@ -62,11 +62,8 @@ def _lp_tile(chunk: int) -> Tile:
     return Tile((chunk,), (1,))
 
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it the prefix at the end of a 128-token chunk reaches
-# exp(2*lp) near 4e-90, the chunk decay underflows to zero, and the assertion on
-# it is skipped as subnormal rather than checked.
-LS_BIAS = -4.0
+# LS_BIAS keeps the chunk decay above float32 epsilon. Unbiased, it sits orders below
+# and the assertion on it measures rounding rather than the transition.
 
 
 @cute.kernel

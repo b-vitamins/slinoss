@@ -28,6 +28,7 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_start import (
     start_smem_bytes,
 )
 from tests.conftest import (
+    LS_BIAS,
     ScanInputs,
     assert_max_rel,
     make_inputs,
@@ -36,11 +37,8 @@ from tests.conftest import (
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it ``exp(2*lp)`` underflows a few tokens into the chunk
-# and every later row of the K extent contributes nothing, which would leave the
-# GEMM tested on the chunk's first handful of tokens.
-LS_BIAS = -4.0
+# LS_BIAS keeps every later row of the K extent weighted. Unbiased, the GEMM is
+# tested on the chunk's leading tokens alone.
 
 # (bsz, heads, seqlen, chunk, rows, lanes, dtype).
 #

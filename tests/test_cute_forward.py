@@ -23,14 +23,12 @@ if not torch.cuda.is_available():
 from slinoss._cute import executor_count
 from slinoss.ops.so3ssd import SO3SSDResult, resolve, so3ssd, so3ssd_ref
 from slinoss.ops.so3ssd.reference import to_heads
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import LS_BIAS, ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it the decay mask underflows a few tokens in and most
+# LS_BIAS keeps the decay mask above float32 epsilon across the chunk. Unbiased, most
 # of the score contributes nothing.
-LS_BIAS = -4.0
 
 # ``y`` carries the chunk scan's bound and ``state`` carries the chunk
 # increment's; both are one operand-dtype half-ulp against the largest entry, and

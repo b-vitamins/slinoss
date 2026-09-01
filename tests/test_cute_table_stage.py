@@ -65,14 +65,12 @@ from slinoss.ops.so3ssd.cute.table import (
     stage_matrix,
     stage_rotated,
 )
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import LS_BIAS, ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias is
-# a weak decay. Without it the table entries past the first few tokens are scaled to
-# nothing, which narrows the range the matvec is measured over.
-LS_BIAS = -4.0
+# LS_BIAS keeps the table entries past the first few tokens on scale. Unbiased, they
+# are scaled to nothing and the range the matvec is measured over narrows.
 
 SENTINEL = -7.0
 """Prefill of the float32 tile. ``keep_fp32`` off must leave every word of it."""

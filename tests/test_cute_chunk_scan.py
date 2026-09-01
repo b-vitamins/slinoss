@@ -33,6 +33,7 @@ from slinoss.ops.so3ssd.cute.fwd.chunk_scan import (
 from slinoss.ops.so3ssd.cute.fwd.increment_passing import increment_passing_forward
 from slinoss.ops.so3ssd.cute.mma import THREADS_WIDE, WARPS_WIDE
 from tests.conftest import (
+    LS_BIAS,
     ScanInputs,
     assert_max_rel,
     make_inputs,
@@ -41,11 +42,8 @@ from tests.conftest import (
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it the decay mask underflows a few tokens in and most of
-# the score contributes nothing, which would leave the diagonal GEMM tested on a
-# narrow band next to the diagonal.
-LS_BIAS = -4.0
+# LS_BIAS keeps the decay mask above float32 epsilon across the chunk. Unbiased, the
+# diagonal GEMM is tested on a narrow band next to the diagonal.
 
 # (bsz, heads, seqlen, chunk, rows, lanes, streaming, dtype).
 #

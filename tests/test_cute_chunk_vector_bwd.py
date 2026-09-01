@@ -73,16 +73,13 @@ from slinoss.ops.so3ssd.cute.bwd.chunk_vector import (
 from slinoss.ops.so3ssd.cute.common import WARPS
 from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE, mma_atoms
 from slinoss.ops.so3ssd.reference import from_heads
-from tests.conftest import ScanInputs, assert_max_rel, make_inputs
+from tests.conftest import LS_BIAS, ScanInputs, assert_max_rel, make_inputs
 
 pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 
-# scanprep maps the raw log scale through a negative softplus, so a negative bias
-# is a weak decay. Without it both ``exp(2*(lp_t - lp_r))`` and the increment
-# weight underflow a few tokens into the chunk, and every earlier source token
-# contributes nothing: the GEMMs would be tested on the chunk's last handful of
-# tokens and the increment terms on almost none.
-LS_BIAS = -4.0
+# LS_BIAS keeps both ``exp(2*(lp_t - lp_r))`` and the increment weight alive across the
+# chunk. Unbiased, the GEMMs are tested on the chunk's trailing tokens and the
+# increment terms on almost none.
 
 # (bsz, heads, seqlen, chunk, rows, lanes, dtype).
 #
