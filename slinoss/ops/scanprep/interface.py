@@ -1,9 +1,8 @@
 """Autograd entry point for the scan's parameter frontier.
 
-Saves ``params`` and ``param_bias``. The maps' Jacobians are evaluated at the
-anchored row :func:`slinoss.ops.scanprep.anchored_rotvec` forms from the two, so
-both are needed; nothing else is, because neither packed output is read back. That
-is two saved tensors, one of them ``(H,10)``.
+Saves ``params`` and ``param_bias``. The maps' Jacobians are evaluated at their
+sum, so both are needed; nothing else is, because neither packed output is read
+back. That is two saved tensors, one of them ``(H,4)``.
 
 No ``torch.amp.custom_fwd``. It casts every input to the autocast dtype, which is
 the opposite of I4: the maps produce float32 whatever the input width, and the
@@ -78,14 +77,12 @@ def scanprep(
     """The scan's parameter frontier. The public operator.
 
     Args:
-        params: Projection slice, ``(B,T,H*10)``, activation dtype, trailing
-            stride one. Per head, in order
-            ``(w_x, w_y, w_z, ls, kr0, g0, h0, kr1, g1, h1)``.
-        param_bias: ``(H,10)`` float32. The rotation columns anchor every token's
-            drive; the rest is added to the row. See
+        params: Projection slice, ``(B,T,H*4)``, activation dtype, trailing
+            stride one. Per head, in order ``(w_x, w_y, w_z, ls)``.
+        param_bias: ``(H,4)`` float32. Added to every token row. See
             :func:`slinoss.ops.scanprep.anchored_rotvec`.
         heads: ``H``.
-        w_max: Rotation-vector norm bound, in ``(0, pi)``.
+        w_max: Rotation-vector chart scale, in ``(0, pi)``.
         backend: Backend name, or ``None`` to select the fastest registered
             backend for the device and dtype.
 

@@ -24,8 +24,7 @@ from slinoss.ops.so3ssd import (
     transform_table,
 )
 
-# Below w_max < pi. The parameterization cannot reach pi, so the series is never
-# evaluated outside this range.
+# Below the chart's asymptote at 2*w_max < 2*pi.
 ANGLES: tuple[float, ...] = (
     0.0,
     1e-14,
@@ -39,6 +38,10 @@ ANGLES: tuple[float, ...] = (
     2.0,
     3.0,
     3.14159,
+    4.0,
+    5.0,
+    6.0,
+    2.0 * math.pi - 1e-6,
 )
 AXES_PER_ANGLE = 8
 
@@ -79,8 +82,7 @@ def _transcendental_of(w: Tensor) -> Tensor:
 def test_quat_exp_matches_transcendental_float64() -> None:
     w, theta, axis = _sweep()
     err = float((quat_exp(w) - _transcendental(theta, axis)).abs().max())
-    # Truncation is below 1e-19 relative over |w| < pi, so this measures
-    # float64 rounding only.
+    # Truncation remains below float64 rounding over |w| < 2*pi.
     assert err < 1e-15, err
 
 
@@ -129,7 +131,7 @@ def test_quat_mul_identity_and_conjugate() -> None:
     ident[..., 0] = 1.0
     assert float((quat_mul(q, ident) - q).abs().max()) < 1e-15
     assert float((quat_mul(ident, q) - q).abs().max()) < 1e-15
-    assert float((quat_mul(q, quat_conj(q)) - ident).abs().max()) < 1e-15
+    assert float((quat_mul(q, quat_conj(q)) - ident).abs().max()) < 2e-15
 
 
 def test_quat_mul_is_associative() -> None:

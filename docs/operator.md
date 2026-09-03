@@ -158,11 +158,14 @@ wrong, not the kernel.
    non-increasing and every decay factor lies in `(0,1]`. Overflow is unreachable;
    underflow is graceful and correct. Bounded below as well, which no kernel reads
    and no other invariant needs: the floor is a lifetime floor, so no token
-   annihilates a row, and it is the decay's counterpart of `|w| <= w_max < pi`.
+   annihilates a row, and it is the decay's counterpart of
+   `|w| <= 2*w_max < 2*pi`.
    Both bounds are two-sided and neither is reached.
-2. `|w| <= w_max < pi`. The quaternion exponential is a single branchless
-   minimax polynomial accurate to float32 epsilon over the whole reachable
-   domain. Average active threads per warp stays at 32.00.
+2. `|w| <= 2*w_max < 2*pi`. The quaternion exponential is a single branchless
+   polynomial accurate to float32 epsilon over the whole reachable domain. The
+   chart reaches `|w| = w_max`, including the canonical SO(3) half turn at the
+   default scale, at finite raw radius. Average active threads per warp stays at
+   32.00.
 3. A segment decay is never factored as `exp(2*lp_t) * exp(-2*lp_s)`. It is
    formed as `exp(2*(lp_t - lp_s))` from the log difference. Underflow times
    overflow is how NaN gets in. The one-tap form multiplies the mask by a second

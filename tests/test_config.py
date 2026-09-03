@@ -90,6 +90,7 @@ def test_legal_chunk_sizes(chunk_size: int) -> None:
         ({"d_conv": 0}, "d_conv must be positive"),
         ({"w_max": 0.0}, "w_max must lie in"),
         ({"w_max": -1.0}, "w_max must lie in"),
+        ({"w_max": 3.14159265}, "round below pi in float32"),
         ({"w_max": math.pi}, "w_max must lie in"),
         ({"w_max": 4.0}, "w_max must lie in"),
         ({"n_layers": 0}, "n_layers must be positive"),

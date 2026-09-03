@@ -7,7 +7,6 @@ cannot be invalidated later.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 LANE_MULTIPLE = 16
@@ -39,6 +38,14 @@ paired arms alternating order, medians over 24 launches: from 50257 to 50264 the
 three stages move by 1.86x, 1.91x and 1.71x, and the next multiple of 128 or of
 256 moves them no further. The pad columns are parameters no output reaches, so
 the rule is one operand load rather than one output tile.
+"""
+
+ROTATION_CHART_SCALE_MAX = 3.141592502593994
+"""Largest float32 strictly below pi.
+
+The parameter frontier pins its scalar arithmetic to float32. A decimal merely
+below :data:`math.pi` can round upward when it enters a kernel; this exact value
+cannot, so twice the chart scale remains strictly below ``2*pi`` there as well.
 """
 
 MIN_CHUNK = 16
@@ -83,12 +90,11 @@ class SLinOSSConfig:
             is one turn across it, so a bank is built for the sequence it sees
             rather than for the longest a harness might ever run. None leaves the
             slow end at :data:`slinoss.mixer.FALLBACK_SPAN`.
-        w_max: Bound on the rotation-vector norm. Strictly below pi so
-            ``quat_exp`` is one branchless polynomial over the reachable domain.
-            The default is the largest bound float32 does not resolve from pi.
-            ``|w|`` approaches the bound without reaching it and a half turn is
-            exactly pi, so a bound short of pi puts every order-2 element of the
-            reachable group outside the ball at any weight.
+        w_max: Scale of the rotation-vector chart, whose asymptotic radius is
+            ``2*w_max``. Strictly below pi so ``quat_exp`` is one branchless
+            polynomial over a domain below ``2*pi``. The default is the largest
+            scale float32 does not resolve from pi. A half turn is an interior,
+            finite-parameter point of this chart.
         bias: Bias on the linear projections.
         conv_bias: Bias on the causal convolution.
         n_layers: Blocks in the stack.
@@ -112,7 +118,7 @@ class SLinOSSConfig:
     d_conv: int = 4
     key_conv: bool = True
     seq_len: int | None = None
-    w_max: float = 3.14159265
+    w_max: float = ROTATION_CHART_SCALE_MAX
     bias: bool = False
     conv_bias: bool = True
     n_layers: int = 1
@@ -160,9 +166,9 @@ class SLinOSSConfig:
             raise ValueError(f"d_conv must be positive, got {self.d_conv}")
         if self.seq_len is not None and self.seq_len < 1:
             raise ValueError(f"seq_len must be positive or None, got {self.seq_len}")
-        if not 0.0 < self.w_max < math.pi:
+        if not 0.0 < self.w_max <= ROTATION_CHART_SCALE_MAX:
             raise ValueError(
-                f"w_max must lie in (0, pi) so quat_exp stays polynomial, "
+                f"w_max must lie in (0, pi) and round below pi in float32, "
                 f"got {self.w_max}"
             )
         if self.n_layers < 1:

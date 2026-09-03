@@ -1,7 +1,7 @@
 """Bounded parameter maps: the device-side implementation, and the only one.
 
-    raw = bias + |bias| * tanh(band)          on the rotation columns
-    w   = w_max * raw * rsqrt(1 + |raw|^2)
+    raw = bias + band
+    w   = w_max * raw * rsqrt(1 + |raw|^2/4)
     ls  = -LS_MAX_MAG * sigmoid(band + bias)
     K   = the first-order-hold moments of exp(2*ls*I + [w]_x)
 
@@ -11,10 +11,10 @@ at trace time. The kernels in :mod:`slinoss.ops.scanprep.cute.frontier` are the
 only callers. A second copy of any map would diverge from this one, and the
 divergence is a correctness bug.
 
-Nothing here emits dynamic control flow. ``rsqrt`` acts on ``1 + |raw|^2 >= 1``,
-the drive's radius is clamped both ways, and both ``sigmoid`` and ``tanh`` are evaluated
-through identities whose exponential argument is never positive, so I1 and I2 are
-produced without a clamp, an epsilon, or a validity pass. The tap series and the
+Nothing here emits dynamic control flow. ``rsqrt`` acts on ``1 + |raw|^2/4 >= 1``
+and ``sigmoid`` is evaluated through an identity whose exponential argument is
+never positive, so I1 and I2 are produced without a clamp, an epsilon, or a
+validity pass. The tap series and the
 tap recurrence are both evaluated and one is selected, so the removable
 singularity at the origin costs a predicated move rather than a branch: no
 function here contributes divergence.
@@ -29,8 +29,6 @@ import cutlass.cute as cute
 
 from slinoss._cute import LOG2_E, Scalar, f32, select
 from slinoss.ops.scanprep.reference import (
-    DRIVE_CEIL_SQ,
-    DRIVE_FLOOR_SQ,
     FOH_TAYLOR_RADIUS_SQ,
     FP32_FOH_TERMS,
     LS_MAX_MAG,
@@ -102,55 +100,11 @@ def log_scale_grad(raw: Scalar) -> Scalar:
     return LS_MAX_MAG * s * (s - 1.0)
 
 
-def _tanh(raw: Scalar) -> Scalar:
-    """``tanh(raw)``, in ``(-1, 1)``.
-
-    ``(1 - e) / (1 + e)`` at ``e = exp(-2|raw|)``, signed back by a select on the
-    input. Folding the argument keeps the exponent non-positive, so no input
-    magnitude overflows and the quotient is never a ratio of two large numbers.
-    """
-    even = _folded_exp(raw, 2.0)
-    magnitude = (cutlass.Float32(1.0) - even) / (even + 1.0)
-    return select(raw > cutlass.Float32(0.0), magnitude, -magnitude)
-
-
-def _tanh_grad(raw: Scalar) -> Scalar:
-    """``1 - tanh(raw)^2 = 4e/(1 + e)^2`` at ``e = exp(-2|raw|)``.
-
-    Even in ``raw``, so the fold needs no sign put back.
-    """
-    even = _folded_exp(raw, 2.0)
-    denom = even + 1.0
-    return 4.0 * even / (denom * denom)
-
-
-def _anchor(bias: list[Scalar]) -> tuple[Scalar, Scalar]:
-    """``(|bias|, 1/|bias|)`` over the rotation columns, the norm clamped both ways.
-
-    The bounds are :data:`slinoss.ops.scanprep.reference.DRIVE_FLOOR_SQ` and
-    :data:`slinoss.ops.scanprep.reference.DRIVE_CEIL_SQ`, and both are here for the
-    same reason: the root is formed as ``t2 * rsqrt(t2)``, which needs a ``t2`` that
-    is normal at the bottom and finite at the top, or it returns ``0 * inf``. Outside
-    either bound the reciprocal is returned as zero, which is the subgradient the
-    reference's ``clamp`` takes there. Two compares and three selects, no branch.
-    """
-    zero = cutlass.Float32(0.0)
-    t2 = bias[0] * bias[0] + bias[1] * bias[1] + bias[2] * bias[2]
-    below = t2 < cutlass.Float32(DRIVE_FLOOR_SQ)
-    above = t2 > cutlass.Float32(DRIVE_CEIL_SQ)
-    t2 = select(below, cutlass.Float32(DRIVE_FLOOR_SQ), t2)
-    t2 = select(above, cutlass.Float32(DRIVE_CEIL_SQ), t2)
-    inv = f32(cute.rsqrt(t2))
-    return t2 * inv, select(below, zero, select(above, zero, inv))
-
-
 def anchored_row(band: list[Scalar], bias: list[Scalar]) -> list[Scalar]:
     """One head's row of map inputs, from its token band and its bias.
 
-    ``bias + |bias|*tanh(band)`` on the rotation columns and the plain sum on the
-    log-scale column. The authority is
-    :func:`slinoss.ops.scanprep.reference.anchored_rotvec`, which states why the
-    drive is scaled.
+    ``bias + band`` on every column. The authority is
+    :func:`slinoss.ops.scanprep.reference.anchored_rotvec`.
 
     Args:
         band: ``PARAM_COLS`` token values, float32, in column order.
@@ -159,9 +113,7 @@ def anchored_row(band: list[Scalar], bias: list[Scalar]) -> list[Scalar]:
     Returns:
         ``PARAM_COLS`` map inputs, same order.
     """
-    radius, _ = _anchor(bias)
-    row = [bias[col] + radius * _tanh(band[col]) for col in range(3)]
-    return [*row, band[3] + bias[3]]
+    return [band[col] + bias[col] for col in range(4)]
 
 
 def anchored_row_grad(
@@ -169,10 +121,7 @@ def anchored_row_grad(
 ) -> tuple[list[Scalar], list[Scalar]]:
     """Split the cotangent of :func:`anchored_row` between the band and the bias.
 
-    The band's own factor is ``|bias| * tanh'``, one per column. The bias carries
-    two terms: the offset, whose Jacobian is the identity, and the radius, which
-    every rotation column reads, so its contribution is one dot product over the
-    three of them.
+    Addition has the identity pullback to both operands.
 
     Args:
         band: The forward's token values, ``PARAM_COLS`` float32.
@@ -182,22 +131,18 @@ def anchored_row_grad(
     Returns:
         ``(dband, dbias)``, each ``PARAM_COLS`` float32 in column order.
     """
-    radius, inv = _anchor(bias)
-    drives = [_tanh(band[col]) for col in range(3)]
-    pull = inv * (cot[0] * drives[0] + cot[1] * drives[1] + cot[2] * drives[2])
-    dband = [cot[col] * radius * _tanh_grad(band[col]) for col in range(3)]
-    dbias = [cot[col] + pull * bias[col] for col in range(3)]
-    return [*dband, cot[3]], [*dbias, cot[3]]
+    del band, bias
+    return list(cot), list(cot)
 
 
 def rotvec(
     rx: Scalar, ry: Scalar, rz: Scalar, w_max: Scalar
 ) -> tuple[Scalar, Scalar, Scalar]:
-    """Map an unconstrained vector into the closed ball of radius ``w_max`` (I2).
+    """Map an unconstrained vector into the closed ball of radius ``2*w_max`` (I2).
 
-    ``1 + |raw|^2 >= 1``, so the rsqrt is regular over the whole domain and needs
-    no guard. An overflowing ``|raw|^2`` gives ``rsqrt(inf) == 0``, which collapses
-    the result to the centre of the ball: finite, and still inside it.
+    ``1 + |raw|^2/4 >= 1``, so the rsqrt is regular over the whole domain and
+    needs no guard. The scale at the origin is unchanged, and ``|w| = w_max`` is
+    reached at finite raw radius.
 
     Args:
         rx: First component of the unconstrained vector, float32.
@@ -206,9 +151,9 @@ def rotvec(
         w_max: Radius bound. Checked against ``(0, pi)`` on the host.
 
     Returns:
-        ``(w_x, w_y, w_z)`` with ``|w| <= w_max``.
+        ``(w_x, w_y, w_z)`` with ``|w| <= 2*w_max``.
     """
-    scale = w_max * f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
+    scale = w_max * f32(cute.rsqrt(0.25 * (rx * rx + ry * ry + rz * rz) + 1.0))
     return rx * scale, ry * scale, rz * scale
 
 
@@ -224,7 +169,8 @@ def rotvec_grad(
     """Pullback of :func:`rotvec`, evaluated at the raw vector.
 
     The map is a radial rescaling, so its Jacobian is the scale times a rank-one
-    correction along ``raw``; ``inv * inv`` is ``1 / (1 + |raw|^2)``. The raw
+    correction along ``raw``; ``0.25*inv*inv`` is
+    ``0.25 / (1 + |raw|^2/4)``. The raw
     vector is the argument rather than ``w``: the pullback is a function of
     ``raw``, and recovering ``raw`` from ``w`` would invert a saturating map.
 
@@ -240,9 +186,9 @@ def rotvec_grad(
     Returns:
         The cotangent of the unconstrained vector.
     """
-    inv = f32(cute.rsqrt(rx * rx + ry * ry + rz * rz + 1.0))
+    inv = f32(cute.rsqrt(0.25 * (rx * rx + ry * ry + rz * rz) + 1.0))
     scale = w_max * inv
-    pull = inv * inv * (gx * rx + gy * ry + gz * rz)
+    pull = 0.25 * inv * inv * (gx * rx + gy * ry + gz * rz)
     return scale * (gx - pull * rx), scale * (gy - pull * ry), scale * (gz - pull * rz)
 
 
@@ -280,7 +226,7 @@ def _phi(p: Scalar, t: Scalar, orders: int) -> tuple[tuple[Scalar, Scalar], ...]
 
     Args:
         p: Real part, non-positive by I1.
-        t: Imaginary part, in ``[0, w_max]`` by I2.
+        t: Imaginary part, in ``[0, 2*w_max]`` by I2.
         orders: How many ``phi`` to return, at least one.
 
     Returns:

@@ -10,6 +10,12 @@ The one exception is a float64 activation dtype, which widens ``ssm`` to float64
 so a float64 path stays an oracle end to end instead of meeting a narrower
 state mid-recurrence.
 
+The recurrent state starts from a deterministic cyclic basis, not zero. A linear
+homogeneous action fixes zero under every transition, so a zero start deletes the
+orbit the rotation is meant to carry. Row ``(h,p)`` starts at coordinate
+``(h*P+p) mod 3N``. This distributes unit-norm carriers over the state coordinates
+without encoding a task, drawing randomness, or adding a learned parameter.
+
 Five buffers, not two. The operator's forcing is two-tap: token ``t`` reads its own
 forcing vector and the one at ``t-1``. So the recurrent state alone does not
 determine the next token's output, and ``b_prev`` and ``u_prev`` carry the previous
@@ -34,12 +40,52 @@ from torch import Tensor
 from slinoss._precision import check_pinned, check_supported
 from slinoss.config import SLinOSSConfig
 
-__all__ = ["MixerState", "StackState"]
+__all__ = ["MixerState", "StackState", "oscillator_basis"]
 
 
 def _state_dtype(dtype: torch.dtype) -> torch.dtype:
     """Dtype of ``ssm`` under an activation dtype of ``dtype``."""
     return torch.float64 if dtype is torch.float64 else torch.float32
+
+
+def _cyclic_basis(
+    heads: int,
+    rows: int,
+    state_dim: int,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> Tensor:
+    """One deterministic unit carrier per recurrent row."""
+    basis = torch.zeros(heads, rows, state_dim, device=device, dtype=dtype)
+    column = torch.arange(heads * rows, device=device).reshape(heads, rows)
+    column = column.remainder(state_dim)
+    return basis.scatter_(-1, column[..., None], 1.0)
+
+
+def oscillator_basis(
+    config: SLinOSSConfig,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Build the mixer's fixed homogeneous-state carrier.
+
+    Args:
+        config: Supplies ``H``, ``P`` and ``3N``.
+        device: Where to allocate the basis.
+        dtype: State dtype.
+
+    Returns:
+        ``(H,P,3N)`` with one unit coordinate per row.
+    """
+    return _cyclic_basis(
+        config.n_heads,
+        config.d_head,
+        config.d_state,
+        device=device,
+        dtype=dtype,
+    )
 
 
 @dataclass(frozen=True)
@@ -160,7 +206,7 @@ class MixerState:
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> MixerState:
-        """Allocate zeroed buffers for one layer.
+        """Allocate zeroed carries and a cyclic-basis recurrent state.
 
         Args:
             config: Shape contract. ``d_conv`` and ``d_inner`` size ``conv``;
@@ -182,6 +228,9 @@ class MixerState:
         """
         if batch < 1:
             raise ValueError(f"batch must be positive, got {batch}")
+        basis = oscillator_basis(
+            config, device=device, dtype=_state_dtype(dtype)
+        ).unsqueeze(0)
         return cls(
             conv=torch.zeros(
                 batch, config.d_conv - 1, config.d_inner, dtype=dtype, device=device
@@ -193,14 +242,7 @@ class MixerState:
                 dtype=dtype,
                 device=device,
             ),
-            ssm=torch.zeros(
-                batch,
-                config.n_heads,
-                config.d_head,
-                config.d_state,
-                dtype=_state_dtype(dtype),
-                device=device,
-            ),
+            ssm=basis.expand(batch, -1, -1, -1).clone(),
             b_prev=torch.zeros(
                 batch, config.n_groups, config.d_state, dtype=dtype, device=device
             ),
@@ -210,14 +252,21 @@ class MixerState:
         )
 
     def reset(self) -> None:
-        """Zero every buffer in place.
+        """Restore every buffer to its initial value in place.
 
         In place because a captured graph holds these addresses; a fresh
         allocation is not the buffer the graph writes.
         """
         self.conv.zero_()
         self.keys.zero_()
-        self.ssm.zero_()
+        basis = _cyclic_basis(
+            int(self.ssm.shape[1]),
+            int(self.ssm.shape[2]),
+            int(self.ssm.shape[3]),
+            device=self.ssm.device,
+            dtype=self.ssm.dtype,
+        )
+        self.ssm.copy_(basis.unsqueeze(0).expand_as(self.ssm))
         self.b_prev.zero_()
         self.u_prev.zero_()
 
@@ -282,7 +331,7 @@ class StackState:
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> StackState:
-        """Allocate zeroed buffers for every layer.
+        """Allocate initialized buffers for every layer.
 
         Args:
             config: Shape contract. ``n_layers`` fixes the entry count.
@@ -307,7 +356,7 @@ class StackState:
         )
 
     def reset(self) -> None:
-        """Zero every layer in place. See :meth:`MixerState.reset`."""
+        """Restore every layer in place. See :meth:`MixerState.reset`."""
         for layer in self.layers:
             layer.reset()
 

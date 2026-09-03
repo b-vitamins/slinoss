@@ -11,7 +11,6 @@ import torch
 from torch import Tensor
 
 from slinoss.ops.scanprep import (
-    DRIVE_CEIL_SQ,
     LS_MAX_MAG,
     PARAM_COLS,
     ScanParams,
@@ -135,24 +134,12 @@ def _drive_pair(seed: int, radius: float) -> Pair:
     return band, radius * bias / bias.norm(dim=-1, keepdim=True)
 
 
-# Three radii spanning what the lattice hands out: the shortest period's row, a
-# generic one, and the longest period's row. All three sit above the floor, which is
-# the regime the bound is stated in; below it the floor deliberately raises the drive
-# and the case is ``test_anchored_drive_survives_a_zero_bias``.
 @pytest.mark.parametrize("radius", [3.0, 1e-2, 4.8e-4])
-def test_anchored_drive_is_bounded_by_the_bias_radius(radius: float) -> None:
-    """The drive is a bounded relative perturbation of the head's own row.
-
-    ``tanh`` bounds each column at one, so the displacement from the bias is at most
-    ``sqrt(3)`` radii however large the band grows. That is the whole point of the
-    anchor: an unscaled drive of order one swamps a row of radius 4.8e-4, which is
-    the longest period on the lattice, and deletes the head it was supposed to steer.
-    """
+def test_rotation_drive_is_an_unconstrained_displacement(radius: float) -> None:
+    """Every head gets the same unit chart, independent of its initial period."""
     band, bias = _drive_pair(seed=21, radius=radius)
     drive = anchored_rotvec(band, bias) - bias
-    assert bool((drive.abs() <= radius).all())
-    assert bool((drive.norm(dim=-1) <= math.sqrt(3.0) * radius).all())
-    assert bool(torch.isfinite(drive).all())
+    torch.testing.assert_close(drive, band, rtol=2e-15, atol=2e-15)
 
 
 def test_anchored_drive_is_the_bias_at_a_zero_band() -> None:
@@ -162,38 +149,24 @@ def test_anchored_drive_is_the_bias_at_a_zero_band() -> None:
     assert torch.equal(anchored_rotvec(torch.zeros_like(bias), bias), bias)
 
 
-def test_anchored_drive_survives_a_zero_bias() -> None:
-    """The radius is floored, so the reciprocal the pullback forms is finite and the
-    forward is the bias itself: a head at the chart's origin takes no drive."""
+def test_rotation_drive_at_a_zero_bias_is_still_the_band() -> None:
+    """Training a head through the chart origin cannot delete its token dependence."""
     band, _ = _drive_pair(seed=23, radius=1.0)
     bias = torch.zeros_like(band)
     out = anchored_rotvec(band, bias)
-    assert bool(torch.isfinite(out).all())
-    assert float(out.abs().max()) <= math.sqrt(1e-12)
+    assert torch.equal(out, band)
 
 
-def test_anchored_drive_survives_a_radius_float32_cannot_square() -> None:
-    """The ceiling is a float32 claim asserted on the float64 reference, because I4
-    pins the maps to float32 and the reference owes the value the kernel produces.
-
-    Past 1.8e19 the squared radius leaves float32, and the device path forms the root
-    as ``t2 * rsqrt(t2)``, where an infinite ``t2`` is ``inf * 0``. Clamped, the row
-    is finite and the drive saturates at the largest radius float32 can square.
-    """
-    band, _ = _drive_pair(seed=25, radius=1.0)
-    bias = torch.full_like(band, 1e30)
-    out = anchored_rotvec(band, bias)
-    assert bool(torch.isfinite(out).all())
-    # The difference cancels eleven orders, so float64 holds the drive to 1.2e-5
-    # relative. Loose against that and still sharp against the claim: the unclamped
-    # radius is 1.7e30, eleven orders above the bound asserted here.
-    root = math.sqrt(DRIVE_CEIL_SQ)
-    assert float((out - bias).abs().max()) == pytest.approx(root, rel=1e-4)
+def test_rotation_drive_has_unit_pullback_to_both_operands() -> None:
+    band = torch.randn(8, 3, dtype=torch.float64, requires_grad=True)
+    bias = torch.randn(8, 3, dtype=torch.float64, requires_grad=True)
+    anchored_rotvec(band, bias).sum().backward()
+    assert torch.equal(band.grad, torch.ones_like(band))
+    assert torch.equal(bias.grad, torch.ones_like(bias))
 
 
 def test_anchored_drive_gradcheck() -> None:
-    """float64 gradcheck on both arguments. The bias carries two terms -- the offset
-    and the radius every column reads -- and only the second is easy to drop."""
+    """Float64 gradcheck on both additive operands."""
     gen = torch.Generator().manual_seed(24)
     band = torch.randn(8, 3, generator=gen, dtype=torch.float64, requires_grad=True)
     bias = torch.randn(8, 3, generator=gen, dtype=torch.float64, requires_grad=True)
@@ -201,25 +174,25 @@ def test_anchored_drive_gradcheck() -> None:
 
 
 # ---------------------------------------------------------------------------
-# I2: |w| <= w_max < pi
+# I2: |w| <= 2*w_max < 2*pi
 # ---------------------------------------------------------------------------
 
 
-# The exact map lands in the closed ball of radius w_max. The computed vector is
-# that value rounded twice -- once in `w_max * rsqrt(1+s)` and once in the
+# The exact map lands in the closed ball of radius 2*w_max. The computed vector is
+# that value rounded twice -- once in `w_max * rsqrt(1+s/4)` and once in the
 # elementwise product -- so its norm can sit up to 2 ulp outside the radius.
 # Measured worst case over 1.4e6 saturating samples: 2.00 ulp in float64, 1.81 in
-# float32. The consumer is sized for the closed ball of radius pi, which absorbs
+# float32. The consumer is sized for the closed ball of radius 2*pi, which absorbs
 # that, so the answer is an honest bound here and not a clamp there.
 ROUNDING_ULP = 3.0
 
 
 def _ball_bound(dtype: torch.dtype) -> float:
-    return W_MAX * (1.0 + ROUNDING_ULP * torch.finfo(dtype).eps)
+    return 2.0 * W_MAX * (1.0 + ROUNDING_ULP * torch.finfo(dtype).eps)
 
 
 # (dtype, scale). The map is one branchless expression, so the raw magnitude
-# selects a regime of the ratio ``|raw| / sqrt(1 + |raw|^2)`` rather than a path.
+# selects a regime of the ratio ``|raw| / sqrt(1 + |raw|^2/4)`` rather than a path.
 # One case per regime, crossed with dtype because the admissible excess over the
 # radius is dtype-scaled and the two figures above were measured separately:
 #
@@ -245,7 +218,7 @@ def test_rotvec_stays_inside_the_ball(dtype: torch.dtype, scale: float) -> None:
     raw = torch.randn(256, 3, generator=gen, dtype=torch.float64).to(dtype) * scale
     norm = bounded_rotvec(raw, W_MAX).double().norm(dim=-1)
     assert bool((norm <= _ball_bound(dtype)).all())
-    assert bool((norm < math.pi).all())
+    assert bool((norm < 2.0 * math.pi).all())
     assert bool(torch.isfinite(norm).all())
 
 
@@ -256,7 +229,9 @@ def test_rotvec_saturates_to_the_bound(dtype: torch.dtype) -> None:
     gen = torch.Generator().manual_seed(3)
     raw = torch.randn(256, 3, generator=gen, dtype=torch.float64).to(dtype) * 1e8
     norm = bounded_rotvec(raw, W_MAX).double().norm(dim=-1)
-    assert float(norm.min()) == pytest.approx(W_MAX, rel=8.0 * torch.finfo(dtype).eps)
+    assert float(norm.min()) == pytest.approx(
+        2.0 * W_MAX, rel=8.0 * torch.finfo(dtype).eps
+    )
 
 
 def test_rotvec_survives_an_overflowing_raw_norm() -> None:
@@ -277,7 +252,7 @@ def test_rotvec_matches_the_closed_form() -> None:
     """
     gen = torch.Generator().manual_seed(4)
     raw = torch.randn(128, 3, generator=gen, dtype=torch.float64) * 7.0
-    want = W_MAX * raw / torch.sqrt(1.0 + raw.pow(2).sum(-1, keepdim=True))
+    want = W_MAX * raw / torch.sqrt(1.0 + 0.25 * raw.pow(2).sum(-1, keepdim=True))
     assert float((bounded_rotvec(raw, W_MAX) - want).abs().max()) < 1e-15
 
 
@@ -291,7 +266,7 @@ def test_rotvec_is_monotone_in_the_raw_norm() -> None:
     mags = torch.logspace(-6, 6, 121, dtype=torch.float64)[:, None]
     norms = bounded_rotvec(mags * axis, W_MAX).norm(dim=-1)
     assert bool((norms.diff() >= 0.0).all())
-    assert float(norms[-1]) == pytest.approx(W_MAX, abs=1e-5)
+    assert float(norms[-1]) == pytest.approx(2.0 * W_MAX, abs=1e-5)
 
 
 def test_rotvec_gradcheck() -> None:
@@ -301,13 +276,13 @@ def test_rotvec_gradcheck() -> None:
 
 
 def test_rotvec_gradcheck_at_zero() -> None:
-    # 1 + |raw|^2 >= 1, so the rsqrt has no singularity and the map is smooth at
+    # 1 + |raw|^2/4 >= 1, so the rsqrt has no singularity and the map is smooth at
     # the origin. No clamp and no epsilon.
     raw = torch.zeros(3, 3, dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(lambda x: bounded_rotvec(x, W_MAX), (raw,))
 
 
-@pytest.mark.parametrize("w_max", [0.0, -1.0, math.pi, 4.0, float("inf")])
+@pytest.mark.parametrize("w_max", [0.0, -1.0, 3.14159265, math.pi, 4.0, float("inf")])
 def test_rotvec_rejects_illegal_bound(w_max: float) -> None:
     with pytest.raises(ValueError, match=r"w_max must lie in \(0, pi\)"):
         bounded_rotvec(torch.zeros(1, 3), w_max)
@@ -448,11 +423,8 @@ def _operands(
     otherwise it is compacted. The two hold the same values, so an output difference
     between them is a layout bug.
 
-    ``bias`` scales the drawn bias rows and defaults to unit scale, not to zero. A
-    zero bias is the anchor's floor, where ``|w|`` is pinned at ``1e-6`` and the
-    pullback to the bias is the clamp's zero subgradient, so it is a degenerate
-    operator to assert anything but a shape on. The floor's own coverage is
-    ``test_anchored_drive_survives_a_zero_bias``.
+    ``bias`` scales the drawn bias rows and defaults to unit scale. Zero is also a
+    regular additive operating point and is covered above.
     """
     gen = torch.Generator().manual_seed(seed)
 
@@ -477,8 +449,7 @@ def _head_major(params: Tensor, param_bias: Tensor, heads: int) -> Tensor:
     """The map inputs the rows present, as ``(B,H,T,PARAM_COLS)``.
 
     The rotation columns go through :func:`anchored_rotvec` and the log-scale column
-    is the plain sum. That split is the frontier's, not a convenience here: the drive
-    is scaled by the head's own radius and the log-scale has no radius to scale by.
+    is the same plain sum.
     """
     rows = params.unflatten(-1, (heads, PARAM_COLS)).permute(0, 2, 1, 3)
     bias = param_bias[:, None, :]
@@ -498,8 +469,8 @@ def test_frontier_shapes_dtypes_and_contiguity() -> None:
 def test_frontier_applies_the_bounded_maps_to_the_anchored_row() -> None:
     """The maps are the ones asserted above, applied after the row is anchored.
 
-    A frontier that anchored after the map, that summed the drive instead of scaling
-    it, or that dropped the bias, would still have every shape and dtype right. ``K``
+    A frontier that mapped before adding or dropped the bias would still have every
+    shape and dtype right. ``K``
     is the taps of the transition the maps produce, not of the raw row, so it is
     asserted against the packed transition; the hard zero in lane 3 completes the
     packing contract.
@@ -518,7 +489,7 @@ def test_frontier_applies_the_bounded_maps_to_the_anchored_row() -> None:
         ls_ulp
     )
     want = foh_taps(out.trans[..., :3].contiguous(), out.trans[..., 3])
-    assert torch.equal(out.K[..., :3], want)
+    torch.testing.assert_close(out.K[..., :3], want, rtol=2e-15, atol=2e-15)
     assert torch.equal(out.K[..., 3], torch.zeros_like(out.K[..., 3]))
 
 

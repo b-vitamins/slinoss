@@ -71,10 +71,11 @@ pytestmark = [pytest.mark.cuda, pytest.mark.cute]
 # exponential, which is where that cancellation is worst.
 VJP_REL = 5e-7
 
-# Truncating the derivative series at nine terms against the reference's
-# thirteen, over s <= pi^2. Both sides are float64 at fixed arguments, so this is
-# the truncation alone. Worst measured: 2.78e-14, on the scalar series.
-SERIES_REL = 1e-13
+# Truncating the derivative series at nine terms against the reference's thirteen,
+# over s <= (2*pi)^2. Both sides are float64 at fixed arguments, so this is the
+# truncation alone. Worst measured: 7.14e-09, on the scalar series, still below one
+# fifth of float32 epsilon.
+SERIES_REL = 2e-8
 
 
 class _Probe(NamedTuple):
@@ -212,7 +213,7 @@ def _vjp_launch(
 def _run(w_scale: float) -> _Probe:
     """Build one point per token and run every adjoint on it.
 
-    ``w`` and the tap come from the parameter map, so ``|w| <= w_max`` holds by
+    ``w`` and the tap come from the parameter map, so ``|w| <= 2*w_max`` holds by
     construction (I2) and the tap is the unconstrained triple the chart takes.
     The two cotangents are drawn: an adjoint's cotangent is arbitrary, and the
     pipeline that produces one is the kernel under test's caller.
@@ -292,10 +293,9 @@ def _poly(s: Tensor, coeffs: tuple[float, ...]) -> Tensor:
     return out
 
 
-# The parameter map sends |raw| to w_max * |raw| / sqrt(1 + |raw|^2), so the
-# scale reaches the top of the domain rather than passing through it: 8.0 puts
-# |w| within a percent of w_max, where the series argument is largest and its
-# cancellation worst. Zero is w = 0 exactly and 1e-8 is the neighbourhood of it.
+# The parameter map sends |raw| to w_max * |raw| / sqrt(1 + |raw|^2/4), so 8.0
+# puts |w| near the ``2*w_max`` edge, where the series argument is largest and its
+# cancellation worst. Zero is w = 0 exactly and 1e-8 is its neighbourhood.
 W_SCALES = [0.0, 1e-8, 1.0, 8.0]
 
 
@@ -390,7 +390,7 @@ def test_mat3_add_and_outer_are_entrywise() -> None:
 
 
 def test_fp32_derivative_series_holds_over_the_reachable_domain() -> None:
-    """Nine derivative terms are enough over ``s = |w|^2 <= pi^2``.
+    """Nine derivative terms are enough over ``s = |w|^2 <= (2*pi)^2``.
 
     ``FP32_SERIES_TERMS`` is sized for the primal series. Differentiating in ``s``
     scales term ``k`` by ``k`` and drops the constant term, so the truncation
@@ -401,7 +401,7 @@ def test_fp32_derivative_series_holds_over_the_reachable_domain() -> None:
     """
     assert len(COS_HALF_D) == FP32_SERIES_TERMS - 1
     assert len(SINC_HALF_D) == FP32_SERIES_TERMS - 1
-    s = torch.linspace(0.0, math.pi**2, 1025, dtype=torch.float64)
+    s = torch.linspace(0.0, (2.0 * math.pi) ** 2, 1025, dtype=torch.float64)
     for offset, short in ((0, COS_HALF_D), (1, SINC_HALF_D)):
         assert_max_rel(
             _poly(s, short),

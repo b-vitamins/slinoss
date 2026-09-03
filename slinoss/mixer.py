@@ -32,7 +32,7 @@ from slinoss.ops.scanprep import LS_COLUMN, LS_MAX_MAG, PARAM_COLS, ROTVEC_COLUM
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
 from slinoss.ops.so3ssd.reference import ScanPrologue
-from slinoss.state import MixerState
+from slinoss.state import MixerState, oscillator_basis
 
 __all__ = [
     "FALLBACK_SPAN",
@@ -272,21 +272,21 @@ answer, and every configuration that carries ``seq_len`` reads
 """
 
 _MAP_HEADROOM = 0.5
-"""Fraction of its own bound the fastest grid rung asks for.
+"""Fraction of the chart scale the fastest grid rung asks for.
 
-Half, so :func:`slinoss.ops.scanprep.bounded_rotvec` has as much room above the
-rung as below it. Both scale maps diverge at their bound and the grid is only an
-initialization, so a rung pinned near the bound is a rung the optimizer can move in
-one direction.
+Half preserves a four-token fastest period at the default scale and keeps the
+initialized bank well inside both the canonical SO(3) ball and the chart's
+``2*w_max`` asymptote.
 """
 
 
 def head_band(config: SLinOSSConfig) -> tuple[float, float]:
     """Band in tokens the lattice spans, both ends derived, ``(fast, slow)``.
 
-    The fast end is the period the rotation cap reaches at :data:`_MAP_HEADROOM` of
-    itself, ``2*pi / (_MAP_HEADROOM * w_max)``. Below it a rung either exceeds the
-    cap or sits against it, and a two-token period is the alternating sign no
+    The fast end is the period at :data:`_MAP_HEADROOM` of the chart scale,
+    ``2*pi / (_MAP_HEADROOM * w_max)``. This keeps initialization away from both
+    the canonical half-turn boundary and the chart's asymptote; training still has
+    the rest of the chart available. A two-token period is the alternating sign no
     sampled rotation resolves.
 
     The slow end is one turn across the trained sequence. Past it a head is a
@@ -319,13 +319,12 @@ def head_band(config: SLinOSSConfig) -> tuple[float, float]:
 
 
 _MAX_MAP_FRACTION = 0.9
-"""Cap on how close an initialized row sits to either scale map's bound.
+"""Cap on the initialized target as a fraction of either map's named scale.
 
-Both inverses diverge there: :func:`slinoss.ops.scanprep.bounded_rotvec` through
-``rsqrt(1 - s*s)`` and :func:`slinoss.ops.scanprep.bounded_logscale` through
-``logit``. Inactive at the default ``w_max`` and at
-:data:`slinoss.ops.scanprep.LS_MAX_MAG`, where the shortest period and the shortest
-horizon each ask for exactly one half of their own bound.
+The log-scale inverse diverges at one; the rotation inverse does not diverge until
+two under the finite-half-turn chart. One common cap keeps both initial rows away
+from a saturated coordinate. It is inactive at the defaults, where the shortest
+period and horizon each ask for exactly one half of their named scale.
 """
 
 
@@ -417,14 +416,13 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
 
     - ``bounded_logscale(raw) = -LS_MAX_MAG*sigmoid(raw)``, so a horizon of ``h``
       tokens is ``ls = -0.5/h`` at ``raw = logit(0.5/(h*LS_MAX_MAG))``.
-    - ``bounded_rotvec(raw, w_max) = raw * w_max * rsqrt(1 + |raw|^2)`` gives
-      ``|w| = s*w_max`` at ``|raw| = s * rsqrt(1 - s*s)``, so a period of ``p``
-      tokens is ``|w| = 2*pi/p`` at that radius along the head's axis.
+    - ``bounded_rotvec(raw, w_max) = raw*w_max*rsqrt(1 + |raw|^2/4)`` gives
+      ``|w| = s*w_max`` at ``|raw| = s*rsqrt(1 - s*s/4)``, so a period of ``p``
+      tokens is ``|w| = 2*pi/p`` at that radius along the head's axis. Unlike the
+      old unit-asymptote chart, ``s = 1`` is finite.
 
-    The rotation row is also the drive's own scale, per
-    :func:`slinoss.ops.scanprep.anchored_rotvec`, so a head's radius sets how far one
-    token may move it. The taps take no row at all: they are the first-order-hold
-    moments of the transition these rows set, so the lattice reaches them already.
+    The taps take no row at all: they are the first-order-hold moments of the
+    transition these rows set, so the lattice reaches them already.
 
     Args:
         config: Supplies ``H`` and ``w_max``.
@@ -438,7 +436,7 @@ def _param_bias_init(config: SLinOSSConfig) -> Tensor:
     decay = (0.5 / (horizon * LS_MAX_MAG)).clamp(max=_MAX_MAP_FRACTION)
     rows[:, LS_COLUMN] = torch.logit(decay)
     angle = (2.0 * math.pi / (period * config.w_max)).clamp(max=_MAX_MAP_FRACTION)
-    radius = angle * torch.rsqrt(1.0 - angle * angle)
+    radius = angle * torch.rsqrt(1.0 - 0.25 * angle * angle)
     rows[:, ROTVEC_COLUMNS] = radius[:, None] * fibonacci_axes(heads)
     return rows
 
@@ -495,6 +493,7 @@ _Grads = tuple[
     Tensor | None,
     None,
     None,
+    None,
 ]
 
 
@@ -543,6 +542,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         norm_weight: Tensor,
         out_weight: Tensor,
         out_bias: Tensor | None,
+        initial_state: Tensor,
         layout: ProjectionLayout,
         config: SLinOSSConfig,
     ) -> Tensor:
@@ -578,6 +578,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         params = prep_dispatch.get(picks.prep).forward(
             layout.params(proj), param_bias, heads=config.n_heads, w_max=config.w_max
         )
+        z0 = initial_state.unsqueeze(0).expand(x.shape[0], -1, -1, -1).contiguous()
         scan = scan_dispatch.get(picks.scan).forward(
             step.y,
             params.trans,
@@ -585,6 +586,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             b_band,
             c_band,
             config.chunk_size,
+            z0=z0,
         )
         tail = tail_dispatch.get(picks.tail).forward(
             scan.y, step.y, layout.gate(proj), d_skip, norm_weight, eps=config.norm_eps
@@ -608,6 +610,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             out_bias,
             key_weight,
             keys,
+            z0,
             # Last, so the parameter slices above stay fixed. Three Nones from a
             # backend whose backward rebuilds the boundary instead.
             *((None, None, None) if scan.prologue is None else scan.prologue),
@@ -623,8 +626,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         x, proj, conv_y, trans, K, scan_y, tail = saved[:7]
         in_weight, in_bias, conv_weight, conv_bias, param_bias = saved[7:12]
         d_skip, norm_weight, out_weight, out_bias = saved[12:16]
-        key_weight, keys = saved[16:18]
-        zstart, cquat, cscale = saved[18:]
+        key_weight, keys, z0 = saved[16:19]
+        zstart, cquat, cscale = saved[19:]
         layout: ProjectionLayout = ctx.layout
         config: SLinOSSConfig = ctx.config
         picks: _Backends = ctx.picks
@@ -670,6 +673,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             b_band,
             c_band,
             config.chunk_size,
+            z0=z0,
             dB=db_band,
             dC=dc_band,
             dU_init=tail_grads.du,
@@ -724,6 +728,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             cast_opt(out_grads.dbias, out_weight.dtype),
             None,
             None,
+            None,
         )
 
 
@@ -736,8 +741,8 @@ class SLinOSSMixer(nn.Module):
     consumer reads and writes its own column band in place.
 
     ``x`` is ``(B,T,d_model)`` and the result is ``(B,T,d_model)``, both in the
-    activation dtype. ``param_bias`` and ``d_skip`` are float32 at every module dtype
-    and stay float32 through a module-wide cast.
+    activation dtype. The transition embedding, skip gain, and fixed initial state
+    are float32 at every low-precision module dtype.
 
     CUDA. Every operand between the two projections is a column band, and
     :func:`slinoss._guard.check_pitched` holds a band to a device rule, so a CPU
@@ -748,16 +753,19 @@ class SLinOSSMixer(nn.Module):
     :class:`slinoss.state.MixerState` holds read at the front and written at the
     back. It takes no gradient.
 
-    Initialization is principled where the scale sets the recurrence and the
-    framework default elsewhere. ``param_bias`` is inverted through both bounded maps
-    onto the two-axis lattice :func:`head_lattice` states, an amplitude horizon over
-    :func:`head_band` against a rotation period over the same band, and the
-    axes are the equidistributed set :func:`fibonacci_axes` returns; ``d_skip`` and
-    ``norm_weight`` are ones. The input projection's parameter band is zeroed, so the
-    recurrence starts as the oscillator bank that lattice states rather than a
-    per-token rotation drawn from the input; everything else in the two projections
-    keeps :meth:`torch.nn.Linear.reset_parameters`, and the convolution taps take the
-    same uniform bound over ``d_conv``. No depth scaling.
+    Initialization is principled where the scale sets the recurrence and residual.
+    The per-head transition rows form ``transition_embedding``: a direct embedding
+    of heads into the operator chart, inverted through both bounded maps onto the
+    two-axis lattice :func:`head_lattice` states. It carries the standard no-decay
+    marker and its semantic name also places it with embeddings in trainers that use
+    the usual name-based parameter groups. Decay of a chart operating point changes
+    the represented operator rather than regularizing a weight. ``d_skip`` starts at
+    one. The recurrent state starts on a deterministic cyclic basis, because zero is
+    a fixed point of every homogeneous rotation. The input projection's parameter and
+    forcing-B bands are zeroed, and the output projection is zeroed, so the residual
+    branch starts as an exact no-op; all three remain trainable. Other input rows keep
+    :meth:`torch.nn.Linear.reset_parameters`, and the convolution taps take the same
+    uniform bound over ``d_conv``. No depth scaling.
 
     Args:
         config: Shape and parameterization contract.
@@ -766,11 +774,17 @@ class SLinOSSMixer(nn.Module):
             :data:`CRITICAL_FP32_TENSORS`.
     """
 
-    #: Parameters a module-wide cast may not demote. ``param_bias`` because scanprep
-    #: raises on a low-precision one (I4), ``d_skip`` because it is a per-head scalar
-    #: whose gradient reduces over ``B*T*P`` and whose stored width costs ``H``
-    #: floats.
-    CRITICAL_FP32_TENSORS: tuple[str, ...] = ("param_bias", "d_skip")
+    _version = 2
+    """State-dict version introducing the finite chart and transition embedding."""
+
+    #: Tensors a module-wide cast may not demote. ``param_bias`` is read by scanprep
+    #: (I4), the initial state is the scan accumulator, and ``d_skip`` is a per-head
+    #: scalar whose gradient reduces over ``B*T*P``.
+    CRITICAL_FP32_TENSORS: tuple[str, ...] = (
+        "param_bias",
+        "d_skip",
+        "initial_state",
+    )
 
     def __init__(
         self,
@@ -813,23 +827,22 @@ class SLinOSSMixer(nn.Module):
             if config.key_conv
             else None
         )
-        self.param_bias = nn.Parameter(
-            torch.empty(config.n_heads, PARAM_COLS, device=device, dtype=torch.float32)
+        init_device = device if device is not None else "cpu"
+        self.transition_embedding = nn.Embedding(
+            config.n_heads,
+            PARAM_COLS,
+            _weight=_param_bias_init(config).to(device=init_device),
         )
         self.d_skip = nn.Parameter(
             torch.empty(config.n_heads, device=device, dtype=torch.float32)
         )
-        # Read by the parameter-group builder of whatever trainer wraps this; nothing
-        # in this tree reads it. Decay on a skip gain pulls the direct path toward
-        # deletion, which is a shrinkage of the architecture rather than of a weight.
-        # param_bias needs the marker for the same reason and cannot get it from the
-        # usual dim < 2 rule, being rank two: the chart's zero is the shortest rung
-        # the lattice has, a four-token horizon, and no rotation at all -- and the
-        # rotation row is also the drive's own scale, so decay toward zero deletes
-        # both the lattice and every head's input dependence on it rather than
-        # shrinking a magnitude.
+        cast(Any, self.transition_embedding.weight)._no_weight_decay = True
         cast(Any, self.d_skip)._no_weight_decay = True
-        cast(Any, self.param_bias)._no_weight_decay = True
+        self.register_buffer(
+            "initial_state",
+            oscillator_basis(config, device=init_device, dtype=torch.float32),
+            persistent=False,
+        )
         self.norm_weight = nn.Parameter(
             torch.empty(config.n_heads, config.d_head, device=device, dtype=dtype)
         )
@@ -851,7 +864,13 @@ class SLinOSSMixer(nn.Module):
         cfg = self.config
         with torch.no_grad():
             self.in_proj.reset_parameters()
+            # Consume the projection's ordinary reset before replacing its value.
+            # This keeps a local no-op initialization from shifting the random draws
+            # of later layers in an enclosing stack.
             self.out_proj.reset_parameters()
+            self.out_proj.weight.zero_()
+            if self.out_proj.bias is not None:
+                self.out_proj.bias.zero_()
             # One slice, two reasons. The parameter band, because a default draw
             # there is a per-token rotation the lattice cannot survive: on unit-RMS
             # input a column fluctuates by 1/sqrt(3) whatever d_model is, so the
@@ -864,8 +883,10 @@ class SLinOSSMixer(nn.Module):
             # row itself. The pad columns after it, because they belong to no band, so
             # zeros are what a misaddressed band should read rather than plausible
             # numbers, and the cotangent's zeroed pad band has to agree with them.
+            self.in_proj.weight[self.layout.b_off : self.layout.c_off].zero_()
             self.in_proj.weight[self.layout.params_off :].zero_()
             if cfg.bias:
+                self.in_proj.bias[self.layout.b_off : self.layout.c_off].zero_()
                 self.in_proj.bias[self.layout.params_off :].zero_()
             bound = 1.0 / math.sqrt(cfg.d_conv)
             self.conv_weight.uniform_(-bound, bound)
@@ -883,7 +904,33 @@ class SLinOSSMixer(nn.Module):
                 self.key_weight[:, -1] = 1.0
             self.d_skip.fill_(1.0)
             self.norm_weight.fill_(1.0)
-            self.param_bias.copy_(_param_bias_init(cfg))
+            self.param_bias.copy_(
+                _param_bias_init(cfg).to(
+                    device=self.param_bias.device, dtype=self.param_bias.dtype
+                )
+            )
+            self.initial_state.copy_(
+                oscillator_basis(
+                    cfg,
+                    device=self.initial_state.device,
+                    dtype=self.initial_state.dtype,
+                )
+            )
+
+    @property
+    def param_bias(self) -> Tensor:
+        """Direct per-head chart rows, stored as a transition embedding."""
+        return self.transition_embedding.weight
+
+    @property
+    def transition_bias(self) -> Tensor:
+        """Effective per-head transition rows."""
+        return self.param_bias
+
+    @property
+    def skip_gain(self) -> Tensor:
+        """Effective direct-path gain."""
+        return self.d_skip
 
     def _apply(
         self, fn: Callable[[Tensor], Tensor], recurse: bool = True
@@ -910,6 +957,45 @@ class SLinOSSMixer(nn.Module):
                 param.data = param.data.to(torch.float32)
         return self
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Translate pre-v2 physical rows into the finite-chart embedding.
+
+        The initial state is a deterministic non-persistent buffer, so the serialized
+        key set grows only by replacing ``param_bias`` with the explicitly named
+        transition embedding. Version 1 used the unit-asymptote rotation chart;
+        ``r / sqrt(1 + .75*|r|^2)`` is the raw vector in the new chart that produces
+        the same physical rotation.
+        """
+        if int(local_metadata.get("version", 1)) < 2:
+            old_key = prefix + "param_bias"
+            new_key = prefix + "transition_embedding.weight"
+            if old_key in state_dict:
+                effective = state_dict.pop(old_key).clone()
+                rotation = effective[:, ROTVEC_COLUMNS]
+                radius_sq = (rotation * rotation).sum(-1, keepdim=True)
+                effective[:, ROTVEC_COLUMNS] = rotation * torch.rsqrt(
+                    1.0 + 0.75 * radius_sq
+                )
+                state_dict[new_key] = effective
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def forward(self, x: Tensor) -> Tensor:
         """Mix one sequence.
 
@@ -934,11 +1020,12 @@ class SLinOSSMixer(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 self.key_weight,
-                self.param_bias,
-                self.d_skip,
+                self.transition_bias,
+                self.skip_gain,
                 self.norm_weight,
                 self.out_proj.weight,
                 self.out_proj.bias,
+                self.initial_state,
                 self.layout,
                 self.config,
             ),
@@ -951,7 +1038,7 @@ class SLinOSSMixer(nn.Module):
         ``T = 1`` is a decode step and ``T > 1`` is a prefill. Both run the
         composition :meth:`forward` runs, on the same backends, with the four carries
         read at the front and written at the back, so stepping a sequence in any
-        partition from a zeroed state reproduces the whole-sequence result.
+        partition from a freshly allocated state reproduces the whole-sequence result.
 
         Not an autograd node. The backends are called directly, so no graph is
         recorded whatever the caller's grad mode, and the four writes are in place:
@@ -1010,7 +1097,10 @@ class SLinOSSMixer(nn.Module):
             )
         )
         params = prep_dispatch.get(picks.prep).forward(
-            layout.params(proj), self.param_bias, heads=cfg.n_heads, w_max=cfg.w_max
+            layout.params(proj),
+            self.transition_bias,
+            heads=cfg.n_heads,
+            w_max=cfg.w_max,
         )
         scan = scan_dispatch.get(picks.scan).forward(
             conv.y,
@@ -1027,7 +1117,7 @@ class SLinOSSMixer(nn.Module):
             scan.y,
             conv.y,
             layout.gate(proj),
-            self.d_skip,
+            self.skip_gain,
             self.norm_weight,
             eps=cfg.norm_eps,
         )

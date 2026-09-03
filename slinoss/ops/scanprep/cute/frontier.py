@@ -9,7 +9,7 @@ implementation.
 
 Parallel decomposition. One block per ``(batch, token tile)``. One thread owns one
 ``(head, token)`` pair with the token innermost, reads that head's four parameter
-columns itself, anchors them to the per-head bias, and writes the head-major ``(B,H,T,4)``
+columns itself, adds the per-head bias, and writes the head-major ``(B,H,T,4)``
 and ``(B,H,T,2,4)`` rows for its token. No shared memory and no barrier: the
 parameter slice's four columns per head are the thread's own working set, so the
 transpose that a coalesced row load would need never arises, and neither does the
@@ -57,8 +57,6 @@ arithmetic that is not a handful of operations; no measured balance is claimed
 here.
 """
 
-import math
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -77,6 +75,7 @@ from slinoss._cute import (
 from slinoss._guard import check_layout, check_pitched
 from slinoss._precision import KERNEL_DTYPES
 from slinoss._reduce import reduce_partials
+from slinoss.config import ROTATION_CHART_SCALE_MAX
 from slinoss.ops.scanprep.cute.maps import (
     anchored_row,
     anchored_row_grad,
@@ -604,10 +603,12 @@ def scanprep_bwd(
 
 def _check_w_max(w_max: float) -> None:
     """Raises:
-    ValueError: If ``w_max`` is outside ``(0, pi)``, which I2 requires.
+    ValueError: If float32 would not keep ``w_max`` below pi.
     """
-    if not 0.0 < w_max < math.pi:
-        raise ValueError(f"w_max must lie in (0, pi), got {w_max}")
+    if not 0.0 < w_max <= ROTATION_CHART_SCALE_MAX:
+        raise ValueError(
+            f"w_max must lie in (0, pi) and round below pi in float32, got {w_max}"
+        )
 
 
 def _check_kernel_dtype(params: Tensor) -> torch.dtype:
@@ -664,7 +665,7 @@ def scanprep_forward(
             elements. The row pitch itself is read at runtime.
         param_bias: ``(H,PARAM_COLS)`` float32, contiguous CUDA.
         heads: ``H``.
-        w_max: Rotation-vector norm bound, in ``(0, pi)``.
+        w_max: Rotation-vector chart scale, in ``(0, pi)``.
 
     Returns:
         A :class:`slinoss.ops.scanprep.ScanParams`. Both fields are float32
@@ -731,7 +732,7 @@ def scanprep_backward(
         dK: Cotangent of ``K``, ``(B,H,T,2,4)`` float32, contiguous CUDA.
         params: The forward's projection slice, ``(B,T,H*PARAM_COLS)``.
         param_bias: The forward's bias, ``(H,PARAM_COLS)`` float32. The maps'
-            Jacobians are evaluated at the anchored row, so both operands are read
+            Jacobians are evaluated at the additive row, so both operands are read
             here as well as in the forward.
         heads: ``H``.
         w_max: The bound the forward used, in ``(0, pi)``.

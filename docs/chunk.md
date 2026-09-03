@@ -123,7 +123,7 @@ defect. I3 forbids factoring `exp(2lp_t) * exp(-2lp_s)`, so nothing divides by t
 decay and a flushed exponent contributes exactly zero, which is what the map says a
 token that far back contributes.
 
-I2 is a per-step bound on `|w|` and does not see `L`.
+I2 is a per-step bound on `|w| <= 2*w_max` and does not see `L`.
 
 I5 renormalizes the quaternion prefix once per chunk. The drift that renormalization
 absorbs grows as the square root of `L`, not linearly: 1.41x per doubling measured

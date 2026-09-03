@@ -1,7 +1,7 @@
 """Adversarial suite.
 
-Saturated decay, ``w = 0`` exactly, ``|w|`` at the bound, a bound just below pi,
-extreme operand magnitudes, mixed dtypes, and the zero-padded ragged tail. No
+Saturated decay, ``w = 0`` exactly, ``|w|`` at the chart edge, a scale just below
+pi, extreme operand magnitudes, mixed dtypes, and the zero-padded ragged tail. No
 output may contain a NaN or an infinity, and the chunked path must stay in
 agreement with the sequential path everywhere.
 """
@@ -128,28 +128,24 @@ def test_rotation_magnitude_generic() -> None:
     _check_parity(inp, 16, "w_scale 1.0")
 
 
-# One case per distinct behaviour of the quaternion series at the bound, which
-# ``w_scale`` saturates so that ``|w| == w_max`` at every token:
+# One case per distinct behaviour of the quaternion series at the chart edge,
+# which ``w_scale`` saturates so that ``|w| == 2*w_max`` at every token:
 #
 # - 1e-6, a near-identity rotation, where the vector part is the only departure
 #   from the constant term;
 # - 3.0, the shipped bound;
-# - 3.1415926, five parts in 1e8 below pi, where the scalar part of the quaternion
-#   cancels to zero.
+# - 3.1415925, the largest float32 below pi, whose edge approaches a full turn.
 #
-# Every arm asserts the norm below pi, which is what sizes the consumer.
-@pytest.mark.parametrize("w_max", [1e-6, 3.0, 3.1415926])
-def test_rotation_at_the_bound(w_max: float) -> None:
-    """``w_scale`` saturates the parameter map, so ``|w|`` sits at ``w_max`` to
-    within the rounding of the final multiply. Near pi the scalar part of the
-    quaternion cancels to zero; the series loses relative accuracy there but not
-    absolute, which is what a unit quaternion needs."""
+# Every arm asserts the norm below 2*pi, which is what sizes the consumer.
+@pytest.mark.parametrize("w_max", [1e-6, 3.0, 3.1415925])
+def test_rotation_at_the_chart_edge(w_max: float) -> None:
+    """The chart approaches its ``2*w_max`` asymptote without leaving I2."""
     inp = make_inputs(seqlen=40, seed=89, w_scale=1e12, w_max=w_max, **TINY)
     norm = inp.trans[..., :3].norm(dim=-1)
     slack = 3.0 * torch.finfo(torch.float64).eps
-    assert float(norm.min()) == pytest.approx(w_max, rel=slack)
-    assert float(norm.max()) <= w_max * (1.0 + slack)
-    assert float(norm.max()) < math.pi
+    assert float(norm.min()) == pytest.approx(2.0 * w_max, rel=slack)
+    assert float(norm.max()) <= 2.0 * w_max * (1.0 + slack)
+    assert float(norm.max()) < 2.0 * math.pi
     _check_parity(inp, 16, f"w_max {w_max}")
 
 

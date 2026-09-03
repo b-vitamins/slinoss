@@ -13,7 +13,8 @@ dtype map, the DLPack wrapper, the tile and its budget -- are in
 Everything here is a plain Python function over ``cutlass.Float32`` scalars and
 tuples of them, so a call from inside a ``@cute.kernel`` is inlined at trace time
 and the loops over tuple entries unroll in the Python interpreter. Nothing here
-emits dynamic control flow: I1 (``ls <= 0``) and I2 (``|w| <= w_max < pi``) make
+emits dynamic control flow: I1 (``ls <= 0``) and
+I2 (``|w| <= 2*w_max < 2*pi``) make
 every branch unreachable. No function here contributes divergence, so whatever a
 caller's active-thread ratio is, this math does not lower it.
 
@@ -94,10 +95,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 # The float64 reference truncates the half-angle series at 14 terms. Over the
-# reachable domain s = |w|^2 <= pi^2 the term at k = 9 is 5e-13 relative to a
-# scalar part of order one, so 10 terms is exact to float32 rounding with three
-# terms of margin. Both truncations come from one generator in the reference, so
-# the device series cannot drift from the authority it is checked against.
+# reachable domain s = |w|^2 < (2*pi)^2 the omitted tail remains below float32
+# rounding. Both truncations come from one generator in the reference, so the
+# device series cannot drift from the authority it is checked against.
 FP32_SERIES_TERMS: int = 10
 
 COS_HALF: tuple[float, ...] = series_coeffs(0, FP32_SERIES_TERMS)

@@ -99,13 +99,7 @@ DTYPES = [torch.float32, torch.bfloat16]
 ONE = SHAPES[2]
 
 W_SCALE = 1.5
-"""Multiplies the rotation columns of both operands, so ``|w|`` sits near ``w_max``
-rather than near zero and the saturating part of the map is exercised.
-
-On the bias it is the multiplier that does that. The band's drive is scaled by the
-bias radius and squashed by ``tanh``, so ``|raw| <= 2|bias|`` however large the band
-is; on the band the scale reaches the saturating part of ``tanh`` instead, which is
-the other map here that saturates."""
+"""Multiplies both additive rotation operands, moving the chart away from zero."""
 
 # The forward is float32 arithmetic over exactly representable inputs at every
 # width, so the bound is float32 rounding of the bias add and the map. The rsqrt,
@@ -126,10 +120,10 @@ BWD_TOL = {torch.float32: 1e-6, torch.bfloat16: 4e-3}
 # bound; the different summation order is.
 BIAS_TOL = 1e-5
 
-# The exact map lands in the closed ball of radius w_max; the computed vector is
+# The exact map lands in the closed ball of radius 2*w_max; the computed vector is
 # that value rounded twice, so its norm can sit a few ulp outside. Same argument
 # and same constant as the reference's own bound.
-BALL_BOUND = W_MAX * (1.0 + 3.0 * torch.finfo(torch.float32).eps)
+BALL_BOUND = 2.0 * W_MAX * (1.0 + 3.0 * torch.finfo(torch.float32).eps)
 
 EXTREME_RAWS = (-1e8, -1e4, -20.0, -1.0, -1e-8, 0.0, 1e-8, 1.0, 20.0, 1e4, 1e8)
 
@@ -395,13 +389,8 @@ def test_float16_takes_its_own_kernel_path() -> None:
 def _sweep(vals: Tensor) -> tuple[Operands, Shape]:
     """One head per entry of ``vals``, in every parameter column, one token.
 
-    The sweep goes in the bias and the band is zeroed, so the anchored row is the
-    swept value exactly: ``tanh(0) = 0`` kills the drive on the rotation columns and
-    the log-scale column is a plain sum. It has to be that way round. The band cannot
-    present an extreme to either map at all -- ``tanh`` bounds it and the anchor
-    scales what is left by the bias radius -- so the reachable domain of the rotation
-    map is the bias's, and the bias is per head rather than per token. The oracle
-    reads the same float32 values the kernel does.
+    The sweep goes in the bias and the band is zeroed, so the additive row is the
+    swept value exactly. The oracle reads the same float32 values the kernel does.
     """
     count = int(vals.numel())
     zeros = torch.zeros(1, 1, count * PARAM_COLS, dtype=torch.float32, device="cuda")
@@ -444,17 +433,7 @@ def test_extreme_raws_match_the_reference() -> None:
 
 
 def test_overflowing_radius_stays_finite() -> None:
-    """The squared bias radius overflows float32 near 1.8e19, so it is clamped.
-
-    ``t2 * rsqrt(t2)`` is how the device path forms the root, and an infinite ``t2``
-    would make that ``inf * 0``: a NaN in a column I2 promises is finite. Clamped, the
-    radius saturates the ball's own overflow instead and ``w`` collapses to the centre,
-    which is finite and inside the ball.
-
-    The bias and not the band, for the reason :func:`_sweep` states. The float64
-    oracle clamps at the same value but does not overflow on the way there, so this
-    is a property check and not a parity check.
-    """
+    """An overflowing raw norm collapses through ``rsqrt(inf)`` without a NaN."""
     vals = torch.full((8,), 1e30, dtype=torch.float32, device="cuda")
     ops, shape = _sweep(vals)
     got = _forward(ops, shape)
@@ -647,7 +626,7 @@ def test_forward_rejects(
         _forward(mutate(*_operands(REJECT, seed=3)), REJECT)
 
 
-@pytest.mark.parametrize("w_max", [0.0, -1.0, 4.0, float("inf")])
+@pytest.mark.parametrize("w_max", [0.0, -1.0, 3.14159265, 4.0, float("inf")])
 def test_forward_rejects_illegal_bound(w_max: float) -> None:
     """I2 needs a bound strictly inside ``(0, pi)``."""
     params, pbias = _operands(REJECT, seed=3)

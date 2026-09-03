@@ -17,7 +17,7 @@ from it.
 
 ``trans`` and ``K`` are produced by the real parameter maps and then detached, so
 the numerical invariants hold on the benchmarked tensors -- ``ls <= 0`` and
-``|w| <= w_max`` -- while the measurement covers the scan alone. Fabricating them
+``|w| <= 2*w_max`` -- while the measurement covers the scan alone. Fabricating them
 from ``randn`` would put ``ls > 0`` into a decay prefix and measure a kernel that
 cannot run in training.
 
@@ -109,7 +109,7 @@ __all__ = [
 ]
 
 W_MAX: Final = 3.0
-"""Rotation-vector bound used by every benchmark. Below pi, as I2 requires."""
+"""Rotation-chart scale used by every benchmark. Below pi, as I2 requires."""
 
 SO3SSD: Final = "so3ssd"
 CONV: Final = "conv"
@@ -748,8 +748,8 @@ class PrepInputs(NamedTuple):
     Attributes:
         proj: ``(B,T,W)`` projection output, contiguous. Held only to keep the
             slice alive and to name the pitch; not differentiated.
-        params: ``(B,T,10H)`` pitched slice, activation dtype.
-        param_bias: ``(H,10)``, float32.
+        params: ``(B,T,4H)`` pitched slice, activation dtype.
+        param_bias: ``(H,4)``, float32.
         dtrans: ``(B,H,T,4)`` float32 cotangent seed.
         dK: ``(B,H,T,2,4)`` float32 cotangent seed.
     """

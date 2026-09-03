@@ -45,7 +45,7 @@ table column ``Afuse_s = ap_s + exp(2*ls_s) * an_{s-1}`` carries both taps again
 one operand ``b_{s-1}``, and what the reindex leaves over is two rank-one residues
 rather than a GEMM. Same operator, four GEMMs per chunk instead of seven.
 
-Value invariants -- ``ls <= 0`` and ``|w| < pi`` -- are the parameterization's
+Value invariants -- ``ls <= 0`` and ``|w| < 2*pi`` -- are the parameterization's
 job, not this module's. Nothing here scans a tensor to validate a numerical
 range and nothing here clamps.
 """
@@ -111,10 +111,10 @@ __all__ = [
 #   sin(sqrt(s)/2)/(sqrt(s)/2) = sum_k (-1)^k (s/4)^k / (2k+1)!
 #
 # Evaluating in s rather than |w| removes the sqrt, whose derivative is
-# undefined at w = 0. The reachable domain is the closed ball of radius pi, where
-# s/4 <= 2.4675 and the k = 12 term falls below 1e-19 relative, so 14 terms are
-# exact to float64 rounding over all of it. Sizing for the closed ball rather
-# than for w_max also absorbs the last-ulp rounding of the parameter map.
+# undefined at w = 0. The reachable domain is the closed ball of radius 2*pi,
+# where s/4 <= pi^2 and the 14-term truncation remains exact to float64 rounding.
+# Sizing for the closed ball rather than for one configured scale also absorbs the
+# last-ulp rounding of the parameter map.
 # tests/test_quat.py measures that against the transcendental form.
 # ---------------------------------------------------------------------------
 

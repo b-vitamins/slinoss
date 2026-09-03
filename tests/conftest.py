@@ -4,11 +4,9 @@ Every operator input comes from the real parameter maps. A fabricated ``trans``
 or ``K`` does not exercise the invariants the kernels rely on, and a fabricated
 chunk-start state does not exercise chunk composition, so neither is built here.
 
-The maps and not the frontier: ``scanprep_ref`` anchors the rotation drive to the
-head's bias radius, which is the mixer's parameterization of where a head sits, and
-an operand set built through it could not reach ``|w| = 0`` and ``|w| = w_max`` in
-the same call. The operator's contract is the packed ``(w, ls)`` and its taps, so
-that is what is built. The anchor's own coverage is ``tests/test_scanprep.py``.
+The maps and not the frontier: the operator's contract is the packed ``(w, ls)``
+and its taps, so that is what is built. The additive token/bias frontier has its own
+coverage in ``tests/test_scanprep.py``.
 """
 
 from __future__ import annotations
@@ -117,9 +115,9 @@ def make_inputs(
         with_state: Pass ``z0`` rather than defaulting to zero.
         streaming: Pass ``b_prev`` and ``u_prev``.
         w_scale: Multiplies the raw rotation vector. Large values drive ``|w|``
-            to ``w_max``; zero gives ``w = 0`` exactly.
+            to ``2*w_max``; zero gives ``w = 0`` exactly.
         ls_bias: Added to the raw log-scale. Positive means stronger decay.
-        w_max: Rotation-vector bound handed to the parameter map.
+        w_max: Rotation-vector chart scale handed to the parameter map.
         requires_grad: Mark every operand a differentiable leaf.
         u_dtype: Cast ``U`` and ``u_prev`` after construction. Defaults to
             ``dtype``. The streaming tail is part of ``U``, so it carries the

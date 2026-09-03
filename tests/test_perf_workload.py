@@ -195,10 +195,11 @@ def test_make_inputs_holds_the_numerical_invariants() -> None:
     # decay prefix and measure a kernel that cannot run in training.
     got = make_inputs(SMALL, CPU)
     assert torch.all(got.trans[..., 3] <= 0.0)
-    assert torch.all(torch.linalg.vector_norm(got.trans[..., :3], dim=-1) <= W_MAX)
-    # I2 is a bound below pi, not merely a bound: at pi the quaternion polynomial
-    # leaves the domain its minimax fit covers.
-    assert torch.pi > W_MAX
+    assert torch.all(
+        torch.linalg.vector_norm(got.trans[..., :3], dim=-1) <= 2.0 * W_MAX
+    )
+    # I2 is a float32-safe chart scale, so its asymptote stays below 2*pi.
+    assert 2.0 * torch.pi > 2.0 * W_MAX
     # Lane 3 of each tap is a hard zero, present for float4 alignment.
     assert torch.all(got.K[..., 3] == 0.0)
 

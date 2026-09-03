@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 from slinoss.config import SLinOSSConfig
-from slinoss.state import MixerState, StackState
+from slinoss.state import MixerState, StackState, oscillator_basis
 
 CONFIG = SLinOSSConfig(d_model=64, d_state=48, n_layers=3)
 """d_inner 128, H 2, P 64, 3N 48, three layers."""
@@ -53,9 +53,13 @@ def test_allocate_matches_config(device: torch.device) -> None:
     assert tuple(state.b_prev.shape) == (3, config.n_groups, config.d_state)
     assert tuple(state.u_prev.shape) == (3, config.n_heads, config.d_head)
     assert state.ssm.shape[-1] == 3 * config.n_lanes
+    assert all(buffer.is_contiguous() for buffer in _fields(state).values())
+    assert torch.equal(
+        state.ssm,
+        oscillator_basis(config, device=device)[None].expand_as(state.ssm),
+    )
     assert all(
-        buffer.is_contiguous() and not buffer.any()
-        for buffer in _fields(state).values()
+        not buffer.any() for name, buffer in _fields(state).items() if name != "ssm"
     )
     assert state.batch == 3
     assert state.device.type == device.type
@@ -97,18 +101,25 @@ def test_reset_keeps_the_buffer_addresses() -> None:
     state.reset()
     after = _fields(state)
     assert [buffer.data_ptr() for buffer in after.values()] == before
-    assert not any(buffer.any() for buffer in after.values())
+    assert torch.equal(
+        state.ssm,
+        oscillator_basis(CONFIG, device="cpu")[None].expand_as(state.ssm),
+    )
+    assert all(not buffer.any() for name, buffer in after.items() if name != "ssm")
 
 
 def test_clone_is_independent() -> None:
     """Catches a clone that returns views: writing the copy would corrupt the
     captured buffers it was taken from."""
     state = mixer(torch.float32)
+    original_values = {name: value.clone() for name, value in _fields(state).items()}
     copy = state.clone()
     original = _fields(state)
     for index, buffer in enumerate(_fields(copy).values(), start=1):
         buffer.fill_(float(index))
-    assert not any(buffer.any() for buffer in original.values())
+    assert all(
+        torch.equal(buffer, original_values[name]) for name, buffer in original.items()
+    )
     assert all(
         buffer.dtype is original[name].dtype
         and tuple(buffer.shape) == tuple(original[name].shape)
@@ -135,7 +146,10 @@ def test_stack_reset_and_clone_reach_every_layer() -> None:
         layer.ssm.fill_(1.0)
     copy = stack.clone()
     stack.reset()
-    assert all(not layer.conv.any() and not layer.ssm.any() for layer in stack.layers)
+    basis = oscillator_basis(CONFIG, device="cpu")[None].expand_as(stack.layers[0].ssm)
+    assert all(
+        not layer.conv.any() and torch.equal(layer.ssm, basis) for layer in stack.layers
+    )
     assert all(
         bool(layer.conv.eq(1.0).all()) and bool(layer.ssm.eq(1.0).all())
         for layer in copy.layers
