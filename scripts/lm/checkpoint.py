@@ -27,7 +27,7 @@ from slinoss import SLinOSSConfig, SLinOSSStack
 
 __all__ = ["FORMAT", "Checkpoint", "load", "load_model", "save"]
 
-FORMAT = 1
+FORMAT = 2
 """Layout version. A file from another version is refused, not guessed at."""
 
 
@@ -186,20 +186,16 @@ def load_model(
     from scripts.lm.model import build_model, layer_factories
 
     checkpoint = load(path)
-    entry = REGISTRY.entry(checkpoint.mixer)
-
-    def factory(d_model: int, max_length: int) -> torch.nn.Module:
-        return entry.build(d_model, max_length, **checkpoint.mixer_settings)
+    base_overrides = [
+        f"{key}={value}" for key, value in checkpoint.mixer_settings.items()
+    ]
+    factory = REGISTRY.resolve(checkpoint.mixer, base_overrides).factory
 
     final = None
     if checkpoint.hybrid_final is not None:
-        last = REGISTRY.entry(checkpoint.hybrid_final)
         settings = checkpoint.hybrid_final_settings or {}
-
-        def final_factory(d_model: int, max_length: int) -> torch.nn.Module:
-            return last.build(d_model, max_length, **settings)
-
-        final = final_factory
+        overrides = [f"{key}={value}" for key, value in settings.items()]
+        final = REGISTRY.resolve(checkpoint.hybrid_final, overrides).factory
 
     model = build_model(
         checkpoint.config,

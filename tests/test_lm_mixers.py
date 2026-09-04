@@ -52,6 +52,11 @@ class _Bare(nn.Module):
 def test_the_table_s_arms_are_all_registered() -> None:
     """The names a table's rows come from. A missing one is a typo found at launch."""
     assert set(ARMS) <= set(REGISTRY.names())
+    assert REGISTRY.entry("gpt").max_length_policy == "required"
+    assert all(
+        REGISTRY.entry(name).max_length_policy == "unused"
+        for name in set(ARMS) - {"gpt"}
+    )
 
 
 def test_a_baseline_s_settings_resolve_without_its_package() -> None:

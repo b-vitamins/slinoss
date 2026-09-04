@@ -39,6 +39,8 @@ from scripts.lm.groups import group_counts
 from scripts.lm.mixers import REGISTRY
 from scripts.lm.sizing import check_spread, size_arm
 from scripts.lm.train import Step, TrainConfig, train
+from scripts.provenance import capture as capture_provenance
+from scripts.provenance import identity
 
 __all__ = ["PRECISION", "TASKS", "Record", "main", "run_arm", "table"]
 
@@ -80,6 +82,8 @@ class Record:
             here.
         mixer: Registry name.
         mixer_settings: Settings the mixer was built at.
+        mixer_contract: Declared context and initialization contract.
+        mixer_constructions: Effective configuration of each constructed layer.
         hybrid_final: Registry name of the last layer's mixer, or None.
         d_model: Width.
         n_layers: Depth.
@@ -109,6 +113,8 @@ class Record:
     arm: str
     mixer: str
     mixer_settings: dict[str, Any]
+    mixer_contract: dict[str, Any]
+    mixer_constructions: list[dict[str, Any]]
     hybrid_final: str | None
     d_model: int
     n_layers: int
@@ -125,6 +131,7 @@ class Record:
     embedding_lr: float
     seed: int
     precision: str
+    precision_details: dict[str, Any]
     tokenizer: str
     dataset: str
     train_sha256: str
@@ -132,6 +139,11 @@ class Record:
     val_loss: float | None
     val_bpb: float | None
     train_loss: float
+    lengths: dict[str, Any]
+    seeds: dict[str, int]
+    data: dict[str, Any]
+    initialization: dict[str, str]
+    provenance: dict[str, Any]
     zero_shot: dict[str, float] | None = field(default=None)
 
     def average(self) -> float | None:
@@ -295,6 +307,7 @@ def run_arm(
     hybrid_overrides: Sequence[str] = (),
     n_layers: int = 12,
     quiet: bool = False,
+    provenance: dict[str, Any] | None = None,
 ) -> Record:
     """Train one arm and write its checkpoint and record.
 
@@ -315,6 +328,7 @@ def run_arm(
         hybrid_overrides: That mixer's settings.
         n_layers: Depth.
         quiet: Suppress progress lines.
+        provenance: Source, harness, dirty tree, and exact command identity.
 
     Returns:
         The record, already written.
@@ -340,6 +354,9 @@ def run_arm(
         device=device,
         dtype=torch.float32,
     )
+    constructions = [*resolved.constructions]
+    if final is not None:
+        constructions.extend(final.constructions)
 
     train_shard = Shard(
         corpus_mod.shard_path(corpus_root, "train"), manifest.train.tokens
@@ -380,10 +397,19 @@ def run_arm(
         hybrid_final=hybrid_final,
         hybrid_final_settings=None if final is None else final.settings,
     )
+    data = corpus_mod.to_dict(manifest)
     record = Record(
         arm=arm or mixer,
         mixer=mixer,
         mixer_settings=resolved.settings,
+        mixer_contract={
+            "base_max_length_policy": resolved.max_length_policy,
+            "hybrid_final_max_length_policy": (
+                None if final is None else final.max_length_policy
+            ),
+            "initialization": "mixer_constructor; no scaffold reinitialization",
+        },
+        mixer_constructions=constructions,
         hybrid_final=hybrid_final,
         d_model=d_model,
         n_layers=n_layers,
@@ -400,6 +426,12 @@ def run_arm(
         embedding_lr=result.embedding_lr,
         seed=config.seed,
         precision=PRECISION,
+        precision_details={
+            "parameter_dtype": str(next(stack.parameters()).dtype),
+            "autocast_dtype": "torch.bfloat16",
+            "recurrent_state_dtype": "torch.float32",
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        },
         tokenizer=manifest.tokenizer,
         dataset=manifest.dataset,
         train_sha256=manifest.train.digest,
@@ -407,6 +439,32 @@ def run_arm(
         val_loss=None if result.val is None else result.val.loss,
         val_bpb=None if result.val is None else result.val.bpb,
         train_loss=result.train_loss,
+        lengths={
+            "configured_task_length": config.seq_len,
+            "training_ceiling": config.seq_len,
+            "evaluation_ceiling": config.seq_len,
+            "observed_tensor_width": {
+                "train": config.seq_len,
+                "validation": config.seq_len,
+            },
+            "mixer_initialization_span": [
+                construction["effective_config"].get("init_span")
+                for construction in constructions
+                if "init_span" in construction["effective_config"]
+            ]
+            or None,
+        },
+        seeds={"model": config.seed, "data_order": config.seed},
+        data={**data, "identity": identity(data)},
+        initialization={
+            "scaffold": "framework constructor defaults; no post-construction pass",
+            "mixer": "owned by each mixer constructor",
+        },
+        provenance=(
+            capture_provenance("scripts/lm", ["<python-api>"], module="scripts.lm.run")
+            if provenance is None
+            else provenance
+        ),
     )
     write_record(out / RECORD_NAME, record)
     return record
@@ -568,6 +626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hybrid_overrides=args.hybrid_overrides,
             n_layers=args.n_layers,
             quiet=args.quiet,
+            provenance=capture_provenance("scripts/lm", argv, module="scripts.lm.run"),
         )
         line = f"{record.arm}  params {record.parameters:,}"
         if record.val_loss is not None:

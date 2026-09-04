@@ -41,6 +41,12 @@ def _record(arm: str, **overrides: Any) -> Record:
         arm=arm,
         mixer=arm,
         mixer_settings={"d_state": 96, "expand": 2.0, "band_conv": True},
+        mixer_contract={
+            "base_max_length_policy": "unused",
+            "hybrid_final_max_length_policy": None,
+            "initialization": "mixer_constructor; no scaffold reinitialization",
+        },
+        mixer_constructions=[],
         hybrid_final=None,
         d_model=512,
         n_layers=12,
@@ -57,6 +63,7 @@ def _record(arm: str, **overrides: Any) -> Record:
         embedding_lr=0.11,
         seed=0,
         precision=PRECISION,
+        precision_details={"parameter_dtype": "torch.float32"},
         tokenizer="EleutherAI/gpt-neox-20b",
         dataset="HuggingFaceFW/fineweb-edu",
         train_sha256=DIGEST,
@@ -64,6 +71,18 @@ def _record(arm: str, **overrides: Any) -> Record:
         val_loss=3.1,
         val_bpb=0.92,
         train_loss=3.2,
+        lengths={
+            "configured_task_length": 2048,
+            "training_ceiling": 2048,
+            "evaluation_ceiling": 2048,
+        },
+        seeds={"model": 0, "data_order": 0},
+        data={"identity": "c" * 64},
+        initialization={
+            "scaffold": "framework constructor defaults; no post-construction pass",
+            "mixer": "owned by each mixer constructor",
+        },
+        provenance={"repository_commit": "d" * 40},
     )
     return replace(base, **overrides)
 
