@@ -45,6 +45,7 @@ from slinoss.perf.units import INVARIANT, Count, PerfRecord
 __all__ = [
     "COVERAGE",
     "EXTENSION_GLOB",
+    "FORWARD_ONLY",
     "MODES",
     "TARGETED",
     "Conditional",
@@ -61,11 +62,32 @@ __all__ = [
 ]
 
 MODES: Final[tuple[str, ...]] = ("forward", "step")
-"""The two arms every operator is profiled under.
+"""The two arms an operator is profiled under.
 
 ``forward`` runs under ``no_grad``; ``step`` runs the forward and the backward, so it
 holds the forward's kernels too. One definition, because :data:`COVERAGE` is keyed by
-mode and a driver offering a third mode would be judged against no entry."""
+mode and a driver offering a third mode would be judged against no entry.
+
+Two, not three: no mode names the eager-versus-captured distinction. A captured replay
+is one launch of a recorded graph rather than a different arm over the same launches,
+so it is measured by ``scripts/perf/graph_speedup.py`` over
+:func:`slinoss.graph.capture_decode` and not here.
+
+Every operator carries a ``forward``. The ``step`` is carried by all but
+:data:`FORWARD_ONLY`."""
+
+FORWARD_ONLY: Final[tuple[str, ...]] = ("decode",)
+"""Operators with no step arm, and therefore no ``(op, "step")`` entry.
+
+An entry for an arm that cannot be built is a claim about a program nobody can run,
+and :func:`coverage_of` would then hand a denominator to a driver that reached that
+mode by mistake. The absence is the record, and it is not a hole: the completeness
+test asserts both that the entry is missing and that
+:func:`slinoss.perf.arms.op_arm` refuses the mode.
+
+``decode`` is here because :meth:`slinoss.mixer.SLinOSSMixer.step` is a ``no_grad``
+node. There is no backward at ``T == 1`` to measure, and a forward reported under the
+step's name would be one program's figure under another's label."""
 
 
 @dataclass(frozen=True)
@@ -168,6 +190,17 @@ COVERAGE: Final[dict[tuple[str, str], OpCoverage]] = {
     ("xent", "step"): OpCoverage(
         required=("xent_fwd_kernel", "reduce_rows_kernel", "xent_bwd_kernel")
     ),
+    ("decode", "forward"): OpCoverage(
+        required=(
+            "rmsnorm_residual_fwd_kernel",
+            "conv1d_fwd_kernel",
+            "scanprep_fwd_kernel",
+            "decode_fwd_kernel",
+            "decode_carry_kernel",
+            "mixer_tail_fwd_kernel",
+            "swiglu_fwd_kernel",
+        )
+    ),
 }
 """Every benchmarked arm, and the declared kernels it launches.
 
@@ -189,7 +222,24 @@ operator's path and into :data:`TARGETED`.
 
 ``rmsnorm_dweight_kernel`` appears once in ``block``'s step and is launched twice
 there, by the plain norm's backward and by the residual norm's. One key, because a
-capture merges the launches of one symbol into one counter row."""
+capture merges the launches of one symbol into one counter row.
+
+``decode``'s seven are the whole step's declared launches, in path order, and the arm
+launches every one of them ``layers`` times: the block's two norms and the stack's
+final one on ``rmsnorm_residual_fwd_kernel``, the value conv and the key conv on
+``conv1d_fwd_kernel``, then the frontier, the one-token recurrence's two, the fused
+tail and the FFN's gate. The recurrence is ``decode``'s and not ``so3ssd``'s, because
+the arm runs at ``T == 1`` and :meth:`slinoss.mixer.SLinOSSMixer.step` selects the
+one-token boundary there; ``increment_passing_fwd_kernel`` and
+``chunk_scan_fwd_kernel`` are the ``T``-token pair and the step launches neither, so
+naming them here would demand two launches this arm cannot make. That pairing and the
+``decode`` entry of :data:`slinoss.perf.dispatch.OP_REGISTRIES` move together.
+``rmsnorm_fwd_kernel`` is not among them and must not be added: every
+norm on the step's path carries a residual, including the stack's last, so the plain
+norm's absence is the shape of the path and not a missing launch. Neither is
+``reduce_rows_kernel``: the reductions that launch it are the frontier's and the
+tail's parameter-bias slots, which are backward work. The GEMMs, the embedding gather
+and the head are not declared kernels and are judged by nothing here."""
 
 
 @dataclass(frozen=True)

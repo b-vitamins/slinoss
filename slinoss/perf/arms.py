@@ -1,7 +1,7 @@
 """One operator, allocated at one shape, with the runner over it.
 
 Every driver needs the same three things from an operator: the shape record the
-report names, the inputs, and a region-labelled callable. The six families in
+report names, the inputs, and a region-labelled callable. The seven families in
 :mod:`slinoss.perf.workload` do not share a signature, so the name is resolved to
 one of them here. A driver reaches every operator through one call, and a family
 lands in one place rather than in every driver.
@@ -9,6 +9,9 @@ lands in one place rather than in every driver.
 The inputs are allocated once per arm. Two sets differ in address and in cache
 residency, and a paired comparison would attribute that difference to the backend,
 so both arms of a comparison run the runner this returns over one set.
+
+Six of the seven arms carry a forward and a step. ``decode`` carries a forward only,
+and refuses ``grads`` rather than returning a forward under the step's name.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from slinoss.perf.units import Count
 from slinoss.perf.workload import (
     BLOCK,
     CONV,
+    DECODE,
     MIXER,
     OPS,
     SCANPREP,
@@ -34,9 +38,12 @@ from slinoss.perf.workload import (
     conv_forward_only,
     conv_shape_by_name,
     conv_step,
+    decode_forward_only,
+    decode_shape_by_name,
     forward_only,
     make_block_inputs,
     make_conv_inputs,
+    make_decode_inputs,
     make_inputs,
     make_mixer_inputs,
     make_prep_inputs,
@@ -188,4 +195,19 @@ def op_arm(
             return xent_forward_only(xent, xent_shape, backend=backend, prefix=prefix)
 
         return OpArm(xent_shape, "xent", xent.differentiable, xent_run)
+    if op == DECODE:
+        # Refused before the shape is resolved and before anything is allocated, so
+        # the refusal costs nothing and reaches a caller with no device.
+        if grads:
+            raise ValueError(
+                "decode has no step arm: SLinOSSMixer.step is a no_grad node, so "
+                "there is no backward at T=1 to measure; use --mode forward"
+            )
+        decode_shape = decode_shape_by_name(shape_name)
+        decode = make_decode_inputs(decode_shape, device, dtype=dtype)
+
+        def decode_run(backend: str | None, prefix: str) -> Callable[[], None]:
+            return decode_forward_only(decode, backend=backend, prefix=prefix)
+
+        return OpArm(decode_shape, "decode", decode.differentiable, decode_run)
     raise ValueError(f"unknown op {op!r}; expected one of {OPS}")

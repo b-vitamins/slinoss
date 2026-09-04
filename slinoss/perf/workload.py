@@ -5,15 +5,16 @@ so the benchmarked path is the shipped path: :func:`slinoss.ops.so3ssd.so3ssd` a
 :func:`slinoss.ops.conv.causal_conv1d`, with no variant reachable from a script
 and not from the public API.
 
-Six shape vocabularies, because the six operators have six. The scan is indexed
+Seven shape vocabularies, because the seven operators have seven. The scan is indexed
 by ``(B,H,T,P,N,L)``, the causal conv1d by ``(B,T,D,W)``, the parameter frontier by
 ``(B,T,H,3N,G)``, the block by ``(B,T,d_model,d_ffn)``, the fused tail by the
-scan shape plus the width of the projection its gate is a band of, and the loss by
-the token count and the vocabulary. One name denotes one layer measured in six
-places: the conv's ``D`` is the scan's ``H*P``, and the frontier, the block, the tail
-and the loss hold the scan shape itself and read their widths off the
-:class:`slinoss.config.SLinOSSConfig` it implies or off ``B*T``, so none can drift
-from it.
+scan shape plus the width of the projection its gate is a band of, the loss by
+the token count and the vocabulary, and the decode step by the scan's widths at
+``T = 1`` with a batch and a depth of its own. One name denotes one layer measured in
+seven places: the conv's ``D`` is the scan's ``H*P``, and the frontier, the block, the
+tail, the loss and the decode step hold the scan shape itself and read their widths
+off the :class:`slinoss.config.SLinOSSConfig` it implies or off ``B*T``, so none can
+drift from it.
 
 ``trans`` and ``K`` are produced by the real parameter maps and then detached, so
 the numerical invariants hold on the benchmarked tensors -- ``ls <= 0`` and
@@ -34,7 +35,7 @@ it from the package initializer would build a cycle.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, NamedTuple
 
 import torch
@@ -50,13 +51,18 @@ from slinoss.ops.scanprep.reference import PARAM_COLS, pack_params, scanprep_ref
 from slinoss.ops.so3ssd import so3ssd
 from slinoss.ops.xent import cross_entropy
 from slinoss.perf.timing import region
-from slinoss.perf.units import Count
+from slinoss.perf.units import Bytes, Count
+from slinoss.stack import SLinOSSStack
+from slinoss.state import StackState
 
 __all__ = [
     "BLOCK",
     "BLOCK_SHAPES",
     "CONV",
     "CONV_SHAPES",
+    "DECODE",
+    "DECODE_L2_BYTES",
+    "DECODE_SHAPES",
     "MIXER",
     "MIXER_SHAPES",
     "OPS",
@@ -73,6 +79,8 @@ __all__ = [
     "BlockShape",
     "ConvInputs",
     "ConvShape",
+    "DecodeInputs",
+    "DecodeShape",
     "MixerInputs",
     "MixerShape",
     "OpInputs",
@@ -87,10 +95,13 @@ __all__ = [
     "conv_forward_only",
     "conv_shape_by_name",
     "conv_step",
+    "decode_forward_only",
+    "decode_shape_by_name",
     "forward_only",
     "layer_config",
     "make_block_inputs",
     "make_conv_inputs",
+    "make_decode_inputs",
     "make_inputs",
     "make_mixer_inputs",
     "make_prep_inputs",
@@ -117,11 +128,17 @@ SCANPREP: Final = "scanprep"
 BLOCK: Final = "block"
 MIXER: Final = "mixer"
 XENT: Final = "xent"
-OPS: Final[tuple[str, ...]] = (SO3SSD, CONV, SCANPREP, BLOCK, MIXER, XENT)
+DECODE: Final = "decode"
+OPS: Final[tuple[str, ...]] = (SO3SSD, CONV, SCANPREP, BLOCK, MIXER, XENT, DECODE)
 """Benchmarkable operators. The whole registry every driver dispatches on.
 
 Appended to, never reordered: the first entry is every driver's default, so moving
-it would change what a command with no ``--op`` profiles."""
+it would change what a command with no ``--op`` profiles.
+
+Six of the seven are one operator. ``decode`` is a whole stack at ``T == 1``, which
+is the only way one token's launch chain exists to be measured: no operator on it is
+reached at ``T == 1`` by any other arm, and the cost of a step is the chain and not
+any single link. It is forward-only; see :data:`slinoss.perf.coverage.MODES`."""
 
 
 @dataclass(frozen=True)
@@ -1674,5 +1691,314 @@ def xent_step(
             )
         with region(f"{prefix}.backward"):
             torch.autograd.grad(loss, targets, inputs.dloss)
+
+    return run
+
+
+DECODE_L2_BYTES: Final = 6 * 1024 * 1024
+"""Nominal L2 capacity the batch ladder below is placed against, in bytes.
+
+A model, and read for no verdict. The measured capacity is
+:attr:`slinoss.perf.device.DeviceInfo.l2_bytes` and the cache-resident exemption in
+:func:`slinoss.perf.ceiling.dram_time_floor` is applied against that. This figure
+exists so the ladder's placement can be stated: one layer's recurrent state is
+``4*B*d_inner*3N`` bytes, float32 at every low-precision activation dtype, so the
+batch at which it stops fitting is ``DECODE_L2_BYTES / (4*d_inner*3N)``.
+
+A power of two rather than a round decimal, and host-independent on purpose. Host
+independent because a shape family read off the device would name different batches
+on different hosts, which is not a fixed ladder. A power of two because ``4*d_inner*3N``
+is one at every geometry whose ``3N`` is sixteen times a power of two, so the
+crossover is an integer at those geometries and a decimal figure would hide that the
+ladder brackets it exactly. It also happens to equal the measured capacity of the
+sm_86 part this ladder was placed on, so the two do not disagree there."""
+
+DECODE_LAYERS: Final = 13
+"""Depth every decode shape but ``tiny`` carries. The whole-step attribution's.
+
+Depth is not swept. It multiplies the launch count and the footprint by the same
+factor at every name, so a second value would measure the batch ladder twice."""
+
+DECODE_BATCH: Final[dict[str, int]] = {
+    "tiny": 1,
+    "standard": 4,
+    "wide": 16,
+    "long": 64,
+    "ragged": 16,
+    "acceptance": 128,
+}
+"""Batch per shape name, and the whole point of the family.
+
+One decode step reads a layer's state once, so which side of the cache that state
+sits on decides the regime the step runs in, and the batch is what puts it there. The
+crossover ``DECODE_L2_BYTES / (4*d_inner*3N)`` and one layer's state as a multiple of
+it, at the batch chosen here:
+
+    name        d_inner  3N   B_cross      B  state/L2
+    tiny             16  48    1953.1      1    0.0005
+    standard        576  48      54.3      4    0.074
+    wide            768  96      20.4     16    0.79
+    long            576  48      54.3     64    1.18
+    ragged          576  48      54.3     16    0.30
+    acceptance     1152 240       5.4    128   23.6
+
+``tiny`` is the launch-latency floor: 3,072 bytes of state through a one-layer stack,
+where the step is its own launch count and nothing else. ``standard``, ``ragged`` and
+``long`` share a geometry and differ only in batch, so they are one fixed-width
+ladder crossing the cache between 16 and 64. ``acceptance`` is 23.6 times over at
+1.84 GB of state across the stack, which is the DRAM-bound end and the shape a
+bandwidth verdict is legible at."""
+
+
+@dataclass(frozen=True)
+class DecodeShape:
+    """One benchmarked decode-step size.
+
+    Attributes:
+        prep: The frontier whose layer this step decodes. ``H``, ``P``, ``3N``, ``G``
+            and the chunk come off it, so a decode figure and a training figure at
+            one name were taken over one geometry.
+        batch: Sequences stepped at once, ``B``. Decode's own axis, and the scan
+            shape's ``bsz`` is not used: at ``T == 1`` the token extent is gone and
+            the batch is the only extensive axis left, so it is what carries the
+            footprint across the cache. See :data:`DECODE_BATCH`.
+        layers: Depth. One state and one launch chain per layer.
+    """
+
+    prep: PrepShape
+    batch: int
+    layers: int
+
+    @property
+    def scan(self) -> OpShape:
+        """The scan whose geometry this step runs one token of."""
+        return self.prep.scan
+
+    @property
+    def name(self) -> str:
+        """Shape name. The scan's, because it is the same layer."""
+        return self.scan.name
+
+    @property
+    def groups(self) -> int:
+        """``G``, groups sharing one ``B``/``C`` pair. The frontier's."""
+        return self.prep.groups
+
+    @property
+    def classes(self) -> int:
+        """Vocabulary the step reads a token from and scores over."""
+        return XENT_CLASSES
+
+    @property
+    def config(self) -> SLinOSSConfig:
+        """The stack this step runs through.
+
+        The vocabulary is set, so the arm measures the program a sampler runs: a
+        token id in, logits out. Without it the embedding gather and the head GEMM
+        fall outside a measurement whose subject is one token's latency, and at small
+        batch the head's weight is the largest single read on that path.
+        """
+        return replace(
+            layer_config(self.scan, groups=self.groups),
+            n_layers=self.layers,
+            vocab_size=self.classes,
+        )
+
+    @property
+    def width(self) -> int:
+        """``d_inner``, which is ``H*P``."""
+        return layer_config(self.scan).d_inner
+
+    @property
+    def state_bytes(self) -> Bytes:
+        """One layer's recurrent state, exactly as allocated.
+
+        ``4*B*d_inner*3N``: :meth:`slinoss.state.MixerState.allocate` holds ``ssm``
+        in float32 at every activation dtype below it, and the four carries beside it
+        are three orders smaller. A model, not a measurement, and no verdict reads
+        it.
+        """
+        return Bytes(4 * self.batch * self.width * self.scan.d_state)
+
+    @property
+    def stack_state_bytes(self) -> Bytes:
+        """Every layer's recurrent state. What a step's footprint has to fit in
+        for a second token to find any of it cached."""
+        return Bytes(self.layers * int(self.state_bytes))
+
+    @property
+    def token_count(self) -> Count:
+        """Tokens per call, which is ``B``: one token per sequence, not ``B*T``."""
+        return Count(self.batch)
+
+    def describe(self) -> str:
+        """One line for a report note."""
+        return (
+            f"{self.name}: B={self.batch} T=1 layers={self.layers} "
+            f"H={self.scan.heads} P={self.scan.rows} d_inner={self.width} "
+            f"3N={self.scan.d_state} G={self.groups} "
+            f"state={int(self.state_bytes)}B/layer "
+            f"L2x{int(self.state_bytes) / DECODE_L2_BYTES:.3g}"
+        )
+
+
+DECODE_SHAPES: Final[tuple[DecodeShape, ...]] = tuple(
+    DecodeShape(
+        prep,
+        batch=DECODE_BATCH[prep.name],
+        # One layer at the smallest name: the shortest chain a step can have, so a
+        # per-launch cost is read there undivided by depth.
+        layers=1 if prep.name == "tiny" else DECODE_LAYERS,
+    )
+    for prep in PREP_SHAPES
+)
+"""The standard decode-step sizes, one per entry of :data:`SHAPES` and the same names.
+
+Built off :data:`PREP_SHAPES` rather than off a table of its own, so the names and
+their order are the shared ones and one ``--shape`` argument reaches every operator.
+The batch is the only number that is decode's, and a name absent from
+:data:`DECODE_BATCH` raises at import."""
+
+
+def decode_shape_by_name(name: str) -> DecodeShape:
+    """Look up a standard decode-step shape.
+
+    Args:
+        name: Shape name.
+
+    Returns:
+        The shape.
+
+    Raises:
+        KeyError: If the name is not one of :data:`DECODE_SHAPES`.
+    """
+    for shape in DECODE_SHAPES:
+        if shape.name == name:
+            return shape
+    raise KeyError(f"no decode shape {name!r}; have {[s.name for s in DECODE_SHAPES]}")
+
+
+class DecodeInputs(NamedTuple):
+    """One decode step's operands at one shape.
+
+    The stack, the token and the state are allocated once and every call reuses them,
+    so the measured region allocates none of the three. What the step computes from
+    them -- the projections, the conv output, the logits -- is allocated per call,
+    because that is what an eager decode step does. Removing those is what capture
+    is for, and :func:`slinoss.graph.capture_decode` with
+    ``scripts/perf/graph_speedup.py`` is where it is measured; a replay is one launch
+    of a recorded graph and not this program.
+
+    Attributes:
+        stack: The model, in the activation dtype, on the profiled device.
+        token: ``(B,1)`` int64 token ids, every entry in ``[0, classes)``.
+        state: The decode state, one entry per layer, advanced in place by every
+            call.
+    """
+
+    stack: SLinOSSStack
+    token: Tensor
+    state: StackState
+
+    @property
+    def differentiable(self) -> tuple[Tensor, ...]:
+        """Empty.
+
+        :meth:`slinoss.SLinOSSMixer.step` is a ``no_grad`` node and
+        :meth:`slinoss.SLinOSSStack.forward` disables grad whenever it is handed a
+        state, so nothing on this path is a differentiable leaf and there is no
+        tensor a backward could be taken with respect to.
+        """
+        return ()
+
+
+def make_decode_inputs(
+    shape: DecodeShape,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+) -> DecodeInputs:
+    """Build one decode step's operands at one shape.
+
+    No ``requires_grad`` argument, unlike every other family: no arm could honour
+    one. See :attr:`DecodeInputs.differentiable`.
+
+    No prefill either. No kernel on the step's path branches on a state value, and
+    the state is advanced in place, so the warmup iterations leave the measured ones
+    running against a stepped state; a prefill would allocate a whole sequence's
+    logits to reach the same launches.
+
+    Args:
+        shape: The problem size.
+        device: Where to allocate.
+        dtype: Activation dtype, carried by the parameters, the token embedding and
+            four of the five state buffers. The norm weights and the recurrent state
+            are float32 whatever this is.
+        seed: Generator seed.
+
+    Returns:
+        The inputs.
+    """
+    config = shape.config
+    # Seeded globally, not through a local generator: module initialization draws
+    # from the default one, so that is the only place a seed reaches it.
+    torch.manual_seed(seed)
+    stack = SLinOSSStack(config, device=device).to(dtype)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    return DecodeInputs(
+        stack=stack,
+        token=torch.randint(
+            shape.classes,
+            (shape.batch, 1),
+            dtype=torch.int64,
+            device=device,
+            generator=gen,
+        ),
+        state=StackState.allocate(config, shape.batch, device=device, dtype=dtype),
+    )
+
+
+def decode_forward_only(
+    inputs: DecodeInputs,
+    *,
+    backend: str | None = None,
+    prefix: str = "decode",
+) -> Callable[[], None]:
+    """A callable that runs one autoregressive step at ``T = 1``.
+
+    The state is not reset between calls. The step advances it in place, so
+    consecutive calls are consecutive tokens of one sequence, which is the steady
+    state a decode loop runs in; a reset would put five copies per layer inside the
+    region and measure them. The recurrence contracts -- ``ls <= 0`` -- under nonzero
+    forcing, so an unbounded run approaches a fixed point rather than drifting out of
+    range.
+
+    Args:
+        inputs: Decode operands.
+        backend: Must be None. The step selects through six registries and
+            :meth:`slinoss.SLinOSSStack.forward` forwards no override to any of them,
+            so a name accepted here would be dropped and the report would attribute
+            the automatic choice to it.
+        prefix: Region label prefix. See :func:`forward_only`.
+
+    Returns:
+        The callable, timed by :func:`slinoss.perf.timing.measure`.
+
+    Raises:
+        ValueError: If ``backend`` is not None.
+    """
+    if backend is not None:
+        raise ValueError(
+            f"decode takes no explicit backend, got {backend!r}: the stack forwards "
+            "no backend argument to the six registries its step selects through"
+        )
+
+    def run() -> None:
+        # Restated rather than relied on: the stack disables grad itself whenever it
+        # is given a state, so this holds the region to the same mode as every other
+        # forward arm instead of to one the callee happens to set.
+        with torch.no_grad(), region(f"{prefix}.forward"):
+            inputs.stack(inputs.token, inputs.state)
 
     return run

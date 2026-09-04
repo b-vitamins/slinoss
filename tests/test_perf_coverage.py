@@ -17,6 +17,7 @@ import pytest
 
 from slinoss.perf.coverage import (
     COVERAGE,
+    FORWARD_ONLY,
     MODES,
     TARGETED,
     Conditional,
@@ -49,8 +50,16 @@ def test_every_benchmarked_arm_has_an_entry_and_names_only_declared_kernels() ->
     ``coverage_verdict`` measures what an audit judged against this table, so an
     operator absent from it cannot be judged incomplete, and a kernel named here that
     no longer exists would demand a launch that can never happen.
+
+    Every pair but a step no arm can build. Those are named in ``FORWARD_ONLY`` and
+    their absence is checked below, against the raise that makes them unbuildable.
     """
-    assert set(COVERAGE) == {(op, mode) for op in OPS for mode in MODES}
+    assert set(COVERAGE) == {
+        (op, mode)
+        for op in OPS
+        for mode in MODES
+        if not (mode == "step" and op in FORWARD_ONLY)
+    }
     for (op, mode), entry in COVERAGE.items():
         assert entry.required, f"{op} {mode} requires nothing"
         for key in entry.kernels:
@@ -80,6 +89,23 @@ def test_every_declared_kernel_is_reached_by_an_arm_or_by_a_named_driver() -> No
         assert one.driver.startswith("scripts/perf/")
         assert len(one.reason) > 40
     assert len({one.kernel for one in TARGETED}) == len(TARGETED)
+
+
+def test_an_operator_with_no_step_arm_is_absent_rather_than_declared_empty() -> None:
+    """The escape from the cross-product, and the two things that bound it.
+
+    An operator whose step cannot be built has no entry, so nothing can be audited
+    against a fabricated one. What keeps that from becoming a hole is that the name is
+    a real operator with a forward, and that the arm raises on the mode; the raise is
+    asserted in ``tests/test_perf_arms.py``, which is where importing the operator
+    packages is allowed.
+    """
+    for op in FORWARD_ONLY:
+        assert op in OPS, f"{op} is not an operator"
+        assert (op, "forward") in COVERAGE
+        assert (op, "step") not in COVERAGE
+        with pytest.raises(KeyError, match="no coverage entry"):
+            coverage_of(op, "step")
 
 
 def test_coverage_of_refuses_an_arm_it_cannot_judge() -> None:

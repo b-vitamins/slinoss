@@ -77,6 +77,8 @@ DECLARED: Final[dict[str, str]] = {
     "conv1d_bwd_kernel": DRAM_BOUND,
     "conv1d_fwd_kernel": DRAM_BOUND,
     "conv1d_reduce_parts_kernel": SERIAL_TINY,
+    "decode_carry_kernel": SERIAL_TINY,
+    "decode_fwd_kernel": DRAM_BOUND,
     "increment_passing_fwd_kernel": DRAM_BOUND,
     "mixer_tail_bwd_kernel": DRAM_BOUND,
     "mixer_tail_fwd_kernel": DRAM_BOUND,
@@ -133,7 +135,14 @@ treated as a tail. Measured on sm_86 at the model geometry: 152.77 MB in 221.5 u
 the buffer is served from L2. The pass is at its own ceiling, so its cost is an
 argument about whether the partials should exist rather than about this kernel.
 
-Five entries are SERIAL-tiny, and only the first is unconditionally so.
+``decode_fwd_kernel`` is the one-token recurrence, DRAM-bound at 1.5 flop per state
+byte against a machine balance of 163, as ``slinoss/ops/decode/cute/step.py`` states
+it. Its footprint is linear in the batch and crosses this part's L2 at ``B = 8`` at
+the acceptance state width, so the batch a decode step actually runs at can put it
+under the cache, where the floor gives no verdict and the kernel is named unjudged.
+That is a statement about the shape and does not change the class.
+
+Six entries are SERIAL-tiny, and only the first is unconditionally so.
 ``boundary_bwd_kernel`` on the single-partial path reads a fixed few rows per chunk
 rather than a pass over the sequence, so no shape makes that path large enough to
 hold to a bandwidth. That is a property of the kernel and belongs here. Its
@@ -151,6 +160,16 @@ the second, which means the second's declaration has a range. Measured on sm_86:
 SERIAL-tiny is right for every shape the driver measures and stops being right
 somewhere above ``D`` 2048. Widening the workload past that needs the class
 revisited, not the floor lowered.
+
+``decode_carry_kernel`` overwrites ``b_prev`` with one token's ``B``, ``2*B*G*3N``
+activation bytes over a grid of ``(1, G, B)``. Its traffic follows the state width and
+the batch and not the sequence, and there is no sequence at one token, so no shape a
+decode step reaches makes it a pass to hold to a bandwidth. Its grid is one block per
+``(b, g)``, which is under this part's block floor at every batch a decode step runs
+at; SERIAL-tiny is what exempts a launch from that floor, and the exemption is the
+same statement as the class. It exists as a launch rather than as a store in
+``decode_fwd_kernel`` because a grid has no barrier to order the many reads of a
+group's row against the one write of it.
 
 ``chunk_prefix_bwd_kernel`` scans one chunk's transition prefixes once per
 ``(batch, head, chunk)`` so that ``chunk_vector_bwd_kernel`` and

@@ -58,7 +58,8 @@ CUDA = torch.device("cuda")
 
 TINY = "tiny"
 """The cheapest standard shape, ``B=1 H=1 T=256 P=16 N=16 L=64`` for the scan. Every
-family's table holds the name, at the same token count."""
+family's table holds the name; every one but ``decode``, whose step is one token,
+holds it at the same token count."""
 
 PAIRS = 8
 """Pairs behind a pinned verdict. Eight reaches nominal coverage, so the verdict
@@ -405,6 +406,7 @@ def test_bench_reaches_every_operator_under_its_own_region_prefix(
         "block": "block",
         "mixer": "mixer",
         "xent": "xent",
+        "decode": "decode",
     }
     assert sorted(prefixes) == sorted(OPS)
     for op in OPS:
@@ -412,8 +414,10 @@ def test_bench_reaches_every_operator_under_its_own_region_prefix(
         report, rate = bench(TINY, "forward", args, CUDA, None)
         assert report.title == f"bench: {op} tiny forward"
         assert rate.label == f"{op} tiny forward"
-        # One name per family table, and every family sees the same tokens at it.
-        assert rate.token_count == 256
+        # One name per family table, and every family but decode sees the same tokens
+        # at it: a decode step is one token per sequence, so its count is the batch
+        # and not the scan's B*T.
+        assert rate.token_count == (1 if op == "decode" else 256)
         assert report.notes[0].startswith("tiny: B=1 ")
         assert report.budget is not None
         assert f"{prefixes[op]}.forward" in report.budget.labels()

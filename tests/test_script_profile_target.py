@@ -190,7 +190,7 @@ def test_every_choice_the_driver_offers_selects_something() -> None:
     assert profile_target.DTYPES["bf16"] is torch.bfloat16
     assert profile_target.DTYPES["fp16"] is torch.float16
     assert profile_target.DTYPES["fp32"] is torch.float32
-    assert OPS == ("so3ssd", "conv", "scanprep", "block", "mixer", "xent")
+    assert OPS == ("so3ssd", "conv", "scanprep", "block", "mixer", "xent", "decode")
     for op in OPS:
         assert profile_target.parse_args(["--op", op]).op == op
     for shape in SHAPES:

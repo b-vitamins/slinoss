@@ -36,13 +36,14 @@ from slinoss.ops.block.backends import (
     swiglu_resolve,
 )
 from slinoss.ops.conv.backends import resolve as conv_resolve
+from slinoss.ops.decode.backends import resolve as decode_resolve
 from slinoss.ops.mixer.backends import resolve as mixer_resolve
 from slinoss.ops.scanprep.backends import resolve as prep_resolve
 from slinoss.ops.so3ssd.backends import resolve as scan_resolve
 from slinoss.ops.xent.backends import resolve as xent_resolve
 from slinoss.perf.coverage import DispatchVerdict, RegistryChoice
 from slinoss.perf.units import Count
-from slinoss.perf.workload import BLOCK, CONV, MIXER, SCANPREP, SO3SSD, XENT
+from slinoss.perf.workload import BLOCK, CONV, DECODE, MIXER, SCANPREP, SO3SSD, XENT
 
 __all__ = [
     "OP_REGISTRIES",
@@ -107,12 +108,31 @@ OP_REGISTRIES: Final[dict[str, tuple[OpRegistry, ...]]] = {
     ),
     MIXER: (OpRegistry("mixer_tail", mixer_resolve),),
     XENT: (OpRegistry("cross_entropy", xent_resolve),),
+    DECODE: (
+        OpRegistry("conv", conv_resolve),
+        OpRegistry("scanprep", prep_resolve),
+        OpRegistry("decode", decode_resolve),
+        OpRegistry("mixer_tail", mixer_resolve),
+        OpRegistry("rmsnorm_residual", rmsnorm_residual_resolve),
+        OpRegistry("swiglu", swiglu_resolve),
+    ),
 }
 """Every benchmarked operator, and the registries its arm dispatches through.
 
 The block's arm runs all three of its families, so all three are asked: a tree where
 only the swiglu backend failed to register would otherwise read as dispatching to
-kernels."""
+kernels.
+
+The decode arm is a whole block, so it asks six. Not ``rmsnorm``: every norm on the
+step's path is the fused one, including the stack's final one, so asking the plain
+registry would fail a verdict on a call the arm never makes. Not ``so3ssd`` either:
+:meth:`slinoss.mixer.SLinOSSMixer.step` selects the one-token recurrence through
+:mod:`slinoss.ops.decode` at ``T == 1``, which is the extent this arm runs, so
+``decode`` is the registry the step's scan stage dispatches through and the chunked
+one is never asked. That entry and the ``("decode", "forward")`` entry of
+:data:`slinoss.perf.coverage.COVERAGE` move together: a registry listed here that the
+step does not select through, or one it does select through and that is not listed,
+both read as a dispatch verdict on the wrong program."""
 
 
 def dispatch_verdict(

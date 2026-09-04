@@ -1,10 +1,16 @@
 """The benchmarked workloads: shapes, inputs, and the timed callables.
 
 Every test runs on the CPU reference at a shape small enough to be cheap, because
-what is under test is the workload definition and not the operator. The five
-standard size tables are checked against the shape constraints they have to
-satisfy, since a bench that runs at an illegal shape reports a number for a
-configuration the operator does not support.
+what is under test is the workload definition and not the operator. The standard
+size tables are checked against the shape constraints they have to satisfy, since a
+bench that runs at an illegal shape reports a number for a configuration the operator
+does not support.
+
+The decode family is the one whose callable is not run here.
+:class:`slinoss.SLinOSSMixer` is CUDA-only -- every operand between its two
+projections is a column band, and :func:`slinoss._guard.check_pitched` refuses a band
+off CUDA -- so what a decode step does is measured in ``tests/test_perf_arms.py`` and
+what it is declared to be is measured here.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from slinoss.perf.timing import measure, measure_paired
 from slinoss.perf.workload import (
     BLOCK_SHAPES,
     CONV_SHAPES,
+    DECODE_L2_BYTES,
+    DECODE_SHAPES,
     MIXER_SHAPES,
     PREP_SHAPES,
     SHAPE_NAMES,
@@ -26,6 +34,7 @@ from slinoss.perf.workload import (
     W_MAX,
     BlockShape,
     ConvShape,
+    DecodeShape,
     MixerShape,
     OpShape,
     PrepShape,
@@ -35,10 +44,13 @@ from slinoss.perf.workload import (
     conv_forward_only,
     conv_shape_by_name,
     conv_step,
+    decode_forward_only,
+    decode_shape_by_name,
     forward_only,
     layer_config,
     make_block_inputs,
     make_conv_inputs,
+    make_decode_inputs,
     make_inputs,
     make_mixer_inputs,
     make_prep_inputs,
@@ -83,6 +95,13 @@ SMALL_BLOCK = BlockShape(SMALL_LAYER)
 SMALL_MIXER = MixerShape(SMALL_PREP)
 """The tail of the layer :data:`SMALL_PREP` feeds: a 16-wide gate band of a
 144-wide projection, so the band is pitched and not the whole row."""
+
+SMALL_DECODE = DecodeShape(SMALL_PREP, batch=2, layers=2)
+"""One token through two layers of that same layer, at batch two.
+
+Two layers, so a state that fails to reach the second one shows; batch two, so a
+per-sequence extent is not one and the footprint arithmetic is not the batch-one
+special case."""
 
 
 # ---------------------------------------------------------------------------
@@ -884,3 +903,109 @@ def test_mixer_step_rejects_inputs_that_take_no_gradient() -> None:
     grads = make_mixer_inputs(SMALL_MIXER, CPU, requires_grad=True)
     with pytest.raises(ValueError, match="at least one input requiring grad"):
         mixer_step(grads, SMALL_MIXER, wrt=(grads.dout,))
+
+
+# ---------------------------------------------------------------------------
+# DecodeShape and DECODE_SHAPES
+# ---------------------------------------------------------------------------
+
+
+def test_decode_shapes_put_one_layer_state_on_both_sides_of_the_cache() -> None:
+    """The family's whole reason: a batch ladder that crosses the L2.
+
+    A ladder entirely under the cache measures a latency floor at every name, and one
+    entirely over it measures bandwidth at every name, so a bandwidth verdict would be
+    either unreachable or unavoidable rather than something the shape decides.
+    """
+    assert tuple(s.name for s in DECODE_SHAPES) == SHAPE_NAMES
+    state = {s.name: int(s.state_bytes) for s in DECODE_SHAPES}
+    assert min(state.values()) < DECODE_L2_BYTES < max(state.values())
+    for shape in DECODE_SHAPES:
+        assert shape.batch > 0
+        assert shape.layers > 0
+        assert shape.groups == shape.prep.groups
+        # 4 bytes: the recurrent state is float32 at every activation dtype the arm
+        # runs at.
+        assert state[shape.name] == 4 * shape.batch * shape.width * shape.scan.d_state
+        assert shape.stack_state_bytes == shape.layers * state[shape.name]
+        # One token per sequence, which is B*T only at T=1 and would be the scan's
+        # token count at any other length.
+        assert shape.token_count == shape.batch
+    # Three names share one geometry and differ only in batch, so they are one ladder
+    # over one width and not three unrelated points.
+    ladder = [s for s in DECODE_SHAPES if s.name in ("standard", "ragged", "long")]
+    assert len({(s.width, s.scan.d_state) for s in ladder}) == 1
+    assert sorted(s.batch for s in ladder) == [4, 16, 64]
+    assert state["standard"] < DECODE_L2_BYTES < state["long"]
+    assert state["tiny"] == 3_072
+    assert decode_shape_by_name("tiny").describe() == (
+        "tiny: B=1 T=1 layers=1 H=1 P=16 d_inner=16 3N=48 G=1 "
+        "state=3072B/layer L2x0.000488"
+    )
+    with pytest.raises(KeyError, match="no decode shape 'huge'"):
+        decode_shape_by_name("huge")
+
+
+def test_every_decode_shape_names_a_legal_stack() -> None:
+    # A shape whose config raises is not a slow bench, it is a driver that cannot
+    # start. The vocabulary has to be there: without it the embedding gather and the
+    # head GEMM fall outside a step whose subject is one token's latency.
+    for shape in DECODE_SHAPES:
+        config = shape.config
+        assert config.n_layers == shape.layers
+        assert config.vocab_size == shape.classes
+        assert config.d_inner == shape.width
+        assert config.n_groups == shape.groups
+        assert config.chunk_size == shape.scan.chunk
+    assert SMALL_DECODE.config.n_layers == 2
+
+
+# ---------------------------------------------------------------------------
+# make_decode_inputs
+# ---------------------------------------------------------------------------
+
+
+def test_make_decode_inputs_allocates_one_state_per_layer_and_no_leaf() -> None:
+    got = make_decode_inputs(SMALL_DECODE, CPU, dtype=torch.float32)
+    assert len(got.state.layers) == SMALL_DECODE.layers
+    assert got.state.batch == SMALL_DECODE.batch
+    assert tuple(got.token.shape) == (SMALL_DECODE.batch, 1)
+    assert got.token.dtype == torch.int64
+    assert bool((got.token >= 0).all())
+    assert bool((got.token < SMALL_DECODE.classes).all())
+    # Nothing to differentiate: the step records no graph, so a leaf here would be a
+    # gradient no arm can produce.
+    assert got.differentiable == ()
+    assert not got.state.layers[0].ssm.requires_grad
+    # The footprint model is stated over this allocation, so the two have to agree.
+    assert int(got.state.layers[0].ssm.numel()) * 4 == int(SMALL_DECODE.state_bytes)
+    # Two runs of a bench must compare the same numbers, parameters included.
+    first = make_decode_inputs(SMALL_DECODE, CPU, dtype=torch.float32, seed=7)
+    second = make_decode_inputs(SMALL_DECODE, CPU, dtype=torch.float32, seed=7)
+    assert torch.equal(first.token, second.token)
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(
+            first.stack.parameters(), second.stack.parameters(), strict=True
+        )
+    )
+    assert not torch.equal(
+        make_decode_inputs(SMALL_DECODE, CPU, dtype=torch.float32, seed=8).token,
+        first.token,
+    )
+
+
+# ---------------------------------------------------------------------------
+# decode_forward_only
+# ---------------------------------------------------------------------------
+
+
+def test_decode_forward_only_refuses_a_backend_it_cannot_forward() -> None:
+    # The stack selects per operator and forwards no override, so a name accepted here
+    # would be dropped and the report would attribute the automatic choice to it.
+    inputs = make_decode_inputs(SMALL_DECODE, CPU, dtype=torch.float32)
+    with pytest.raises(ValueError, match="decode takes no explicit backend"):
+        decode_forward_only(inputs, backend="reference")
+    # The mixer is CUDA-only, so what the callable does is measured in
+    # tests/test_perf_arms.py; that it exists at all is this file's business.
+    assert callable(decode_forward_only(inputs))
