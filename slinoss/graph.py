@@ -14,6 +14,17 @@ buffers this module owns, and why the outputs are views into the graph's private
 pool that the next replay overwrites. A caller who needs an output to outlive the
 next replay clones it.
 
+Fixed addresses are raw addresses, so the step also has to keep the memory behind
+them allocated. A recorded graph names no owner: the parameters and the state
+buffers it reads belong to the module and the state the caller built, and once the
+last reference to those is gone the allocator hands the blocks to the next request
+while the graph goes on reading and writing them. :class:`GraphedStep` therefore
+holds the recorded callable, which reaches both through its closure, and a caller
+who keeps only the step keeps everything the replay touches. Nothing about the
+freed form raises: the replay reads whatever was written over the parameters and
+returns non-finite logits, or gathers on an index that is no longer an index and
+faults far from here.
+
 Three things a caller must know about the general :func:`capture`. The function is
 run before it is recorded, ``warmup`` times, so a function with a side effect has
 that effect ``warmup`` times before the graph exists; :func:`capture_decode`
@@ -41,7 +52,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -89,11 +100,16 @@ class GraphedStep:
             of passing arguments.
         outputs: Whatever the captured function returned, holding views into the
             graph's private memory pool. Overwritten by the next replay.
+        recorded: The callable the graph was recorded from. Never called again;
+            held so the parameters and state buffers the graph addresses cannot
+            be freed while the step is alive. Required rather than defaulted: a
+            step built without it replays over reused memory.
     """
 
     graph: torch.cuda.CUDAGraph
     inputs: tuple[Tensor, ...]
     outputs: Any
+    recorded: Callable[..., Any]
 
     def __call__(self, *given: Tensor) -> Any:
         """Replay the step over ``given``.
@@ -146,7 +162,8 @@ def capture(
             pool.
 
     Returns:
-        The :class:`GraphedStep`.
+        The :class:`GraphedStep`, holding ``fn`` so that the parameters and state
+        it closes over outlive the caller's references to them.
 
     Raises:
         ValueError: If ``warmup`` is not positive, if an input is not on CUDA, or
@@ -196,7 +213,7 @@ def capture(
             f"host work and the graph did not record it, so the launch it traced is "
             f"not in the graph; raise warmup above {warmup} or load a payload"
         )
-    return GraphedStep(graph=graph, inputs=statics, outputs=outputs)
+    return GraphedStep(graph=graph, inputs=statics, outputs=outputs, recorded=fn)
 
 
 def _restore(state: StackState, saved: StackState) -> None:
@@ -204,12 +221,17 @@ def _restore(state: StackState, saved: StackState) -> None:
 
     In place, field by field: rebinding a field would leave the graph writing
     memory the caller no longer reads.
+
+    Enumerated from the dataclass rather than written out. A hand-written list here
+    is a list that can drift from the state it restores, and one that drops a buffer
+    leaves that buffer carrying the warmup's tokens while every other buffer carries
+    the caller's. The state is then internally inconsistent by exactly the warmup
+    length, which :mod:`slinoss.state` names as the reason every buffer is required
+    rather than optional.
     """
     for layer, snapshot in zip(state.layers, saved.layers, strict=True):
-        layer.conv.copy_(snapshot.conv)
-        layer.ssm.copy_(snapshot.ssm)
-        layer.b_prev.copy_(snapshot.b_prev)
-        layer.u_prev.copy_(snapshot.u_prev)
+        for carry in fields(layer):
+            getattr(layer, carry.name).copy_(getattr(snapshot, carry.name))
 
 
 def capture_decode(
@@ -237,7 +259,8 @@ def capture_decode(
         share: See :func:`capture`.
 
     Returns:
-        The :class:`GraphedStep`. Its input buffer holds zeros.
+        The :class:`GraphedStep`. Its input buffer holds zeros, and it holds
+        ``stack`` and ``state``, so a caller may drop both and keep the step.
 
     Raises:
         ValueError: On a stack with no head. The depth of ``state`` against the

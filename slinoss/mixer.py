@@ -27,6 +27,7 @@ from slinoss._linear import linear_backward
 from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
 from slinoss.config import DEFAULT_INIT_SPAN, SLinOSSConfig
 from slinoss.ops.conv import backends as conv_dispatch
+from slinoss.ops.decode import TOKENS, decode_step
 from slinoss.ops.mixer import backends as tail_dispatch
 from slinoss.ops.scanprep import LS_COLUMN, LS_MAX_MAG, PARAM_COLS, ROTVEC_COLUMNS
 from slinoss.ops.scanprep import backends as prep_dispatch
@@ -739,9 +740,9 @@ class SLinOSSMixer(nn.Module):
     call raises from the first consumer that checks one.
 
     :meth:`forward` mixes a whole sequence and threads no state. :meth:`step`
-    continues one: same composition, same backends, with the four carries
+    continues one: same composition, same backends, with the five carries
     :class:`slinoss.state.MixerState` holds read at the front and written at the
-    back. It takes no gradient.
+    back, and the recurrence selected on the token extent. It takes no gradient.
 
     Initialization is principled where the scale sets the recurrence and residual.
     The per-head transition rows form ``transition_embedding``: a direct embedding
@@ -1025,15 +1026,24 @@ class SLinOSSMixer(nn.Module):
     def step(self, x: Tensor, state: MixerState) -> Tensor:
         """Mix ``T`` tokens continuing from ``state``, and advance ``state`` in place.
 
-        ``T = 1`` is a decode step and ``T > 1`` is a prefill. Both run the
-        composition :meth:`forward` runs, on the same backends, with the four carries
-        read at the front and written at the back, so stepping a sequence in any
-        partition from a freshly allocated state reproduces the whole-sequence result.
+        ``T = 1`` is a decode step and ``T > 1`` is a prefill. Both read the five
+        carries at the front and leave them advanced at the back, so stepping a
+        sequence in any partition from a freshly allocated state reproduces the
+        whole-sequence result.
+
+        The recurrence is the one stage the two extents do not share.
+        :func:`slinoss.ops.decode.decode_step` is the ``T = 1`` boundary and
+        :mod:`slinoss.ops.so3ssd` is the ``T``-token one; they evaluate the same map
+        and differ in what they do with the state. The one-token boundary advances
+        ``ssm``, ``b_prev`` and ``u_prev`` in this state's own storage, so those three
+        take no copy at ``T = 1``; the chunked path allocates the three it returns and
+        the copy is how the carry advances. Every other stage is the composition
+        :meth:`forward` runs, on the same backends.
 
         Not an autograd node. The backends are called directly, so no graph is
-        recorded whatever the caller's grad mode, and the four writes are in place:
-        a captured graph holds those addresses, and a rebound buffer leaves replay
-        writing memory no consumer reads.
+        recorded whatever the caller's grad mode, and every write to ``state`` is in
+        place: a captured graph holds those addresses, and a rebound buffer leaves
+        replay writing memory no consumer reads.
 
         Cast the module rather than run under autocast. Autocast makes the
         projection's dtype the autocast dtype while the state keeps the parameter
@@ -1092,19 +1102,49 @@ class SLinOSSMixer(nn.Module):
             heads=cfg.n_heads,
             w_max=cfg.w_max,
         )
-        scan = scan_dispatch.get(picks.scan).forward(
-            conv.y,
-            params.trans,
-            params.K,
-            layout.b(proj) if keys is None else layout.key_b(keys.y),
-            layout.c(proj) if keys is None else layout.key_c(keys.y),
-            cfg.chunk_size,
-            z0=state.ssm,
-            b_prev=state.b_prev,
-            u_prev=state.u_prev,
-        )
+        b_band = layout.b(proj) if keys is None else layout.key_b(keys.y)
+        c_band = layout.c(proj) if keys is None else layout.key_c(keys.y)
+        if x.shape[1] == TOKENS:
+            # The branch is here and not in a registry. Both operators resolve on
+            # device type and activation dtype alone, so neither registry can hand a
+            # call to the other and which boundary a token extent wants is this call
+            # site's decision; see slinoss.ops.decode.backends.
+            #
+            # No carry copy follows. The boundary writes state.ssm, state.b_prev and
+            # state.u_prev in the caller's own storage, so the three copies the T-token
+            # path ends with would each be a full read and a full write of a buffer
+            # onto itself.
+            y = decode_step(
+                conv.y,
+                params.trans,
+                params.K,
+                b_band,
+                c_band,
+                ssm=state.ssm,
+                b_prev=state.b_prev,
+                u_prev=state.u_prev,
+            ).y
+        else:
+            scan = scan_dispatch.get(picks.scan).forward(
+                conv.y,
+                params.trans,
+                params.K,
+                b_band,
+                c_band,
+                cfg.chunk_size,
+                z0=state.ssm,
+                b_prev=state.b_prev,
+                u_prev=state.u_prev,
+            )
+            y = scan.y
+            # After every read: the scan starts from state.ssm itself and takes both
+            # carries at the front. It allocates the three it returns, so the carry is
+            # advanced by a copy rather than in place.
+            state.ssm.copy_(scan.state)
+            state.b_prev.copy_(scan.b_last)
+            state.u_prev.copy_(scan.u_last)
         tail = tail_dispatch.get(picks.tail).forward(
-            scan.y,
+            y,
             conv.y,
             layout.gate(proj),
             self.skip_gain,
@@ -1112,12 +1152,10 @@ class SLinOSSMixer(nn.Module):
             eps=cfg.norm_eps,
         )
         out = linear(tail, self.out_proj.weight, self.out_proj.bias)
-        # After every read: the scan starts from state.ssm itself, and the
-        # convolution's incoming window is state.conv.
+        # After every read: the convolution's incoming window is state.conv, and the
+        # key convolution's is state.keys. Both return a fresh window, at both token
+        # extents, so neither copy is redundant on either path.
         state.conv.copy_(conv.state)
         if keys is not None:
             state.keys.copy_(keys.state)
-        state.ssm.copy_(scan.state)
-        state.b_prev.copy_(scan.b_last)
-        state.u_prev.copy_(scan.u_last)
         return out

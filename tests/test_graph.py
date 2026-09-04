@@ -16,20 +16,28 @@ the same state, so the two runs start from identical carries.
 The empty capture is the failure that is otherwise silent: nothing is recorded, the
 replay is a no-op, the output buffer still holds what the warmup left in it, and a
 comparison against the eager result passes.
+
+Equivalence is the weakest of the properties a replay owes. A replay that allocated
+on every step, or synchronized on every step, would reproduce the eager step exactly
+and would not be a decode path: both put back the per-token host cost capture exists
+to remove. Both are asserted below, over several replays, because a cost paid once
+per capture and a cost paid once per step are the same reading after one replay.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from typing import NamedTuple, cast
 
 import pytest
 import torch
 from torch import Tensor
 
+from slinoss.blocks import SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.graph import GraphedStep, capture, capture_decode
 from slinoss.stack import SLinOSSStack
-from slinoss.state import StackState
+from slinoss.state import MixerState, StackState
 
 pytestmark = pytest.mark.cuda
 
@@ -64,9 +72,24 @@ def _cuda() -> torch.device:
 
 
 def _stack(device: torch.device) -> SLinOSSStack:
-    """A seeded stack, cast to the state dtype."""
+    """A seeded stack, cast to the state dtype, with every zeroed band drawn.
+
+    ``SLinOSSMixer.reset_parameters`` zeroes ``out_proj``, the forcing-B band and the
+    parameter band, and sets ``key_weight`` to the last-tap delta. Left that way four
+    of the five carries a layer holds are identically zero after a prefill and the
+    mixer output is exactly zero, so a bitwise comparison of replay against eager is
+    a comparison of zeros: it holds for a reason that has nothing to do with the
+    recorded addresses.
+    """
     torch.manual_seed(0)
-    return SLinOSSStack(GRAPH_CONFIG, device=device).to(DTYPE)
+    stack = SLinOSSStack(GRAPH_CONFIG, device=device).to(DTYPE)
+    for module in stack.blocks:
+        mixer = cast("SLinOSSBlock", module).mixer
+        mixer.in_proj.reset_parameters()
+        mixer.out_proj.reset_parameters()
+        if mixer.key_weight is not None:
+            torch.nn.init.normal_(mixer.key_weight, std=0.5)
+    return stack
 
 
 def _ids(device: torch.device, length: int) -> Tensor:
@@ -77,12 +100,22 @@ def _ids(device: torch.device, length: int) -> Tensor:
     return torch.randint(0, vocab, (BATCH, length), generator=generator).to(device)
 
 
+CARRIES = tuple(carry.name for carry in fields(MixerState))
+"""Every buffer name in a layer's state, read off the dataclass.
+
+Not written out here. The restore under test enumerates the same set, and a literal
+list in the test is a second enumeration free to drop the same field as the first.
+That is how a restore that never copied ``keys`` passed this file: both lists named
+the same four buffers, so the test agreed with the defect instead of the contract.
+"""
+
+
 def _buffers(state: StackState) -> list[tuple[str, Tensor]]:
     """Every carry in the state, labelled, in layer order."""
     return [
         (f"layer {index} {name}", getattr(layer, name))
         for index, layer in enumerate(state.layers)
-        for name in ("conv", "ssm", "b_prev", "u_prev")
+        for name in CARRIES
     ]
 
 
@@ -154,8 +187,10 @@ def test_the_capture_leaves_the_state_it_warmed_on_where_it_found_it(
 def test_a_replayed_step_is_the_eager_step(decode: Decode) -> None:
     """The replay issues the step's kernels over the step's carries.
 
-    Bitwise on both the logits and the four carries per layer. A graph missing a
-    launch, or holding one whose operands moved, fails one of them.
+    Bitwise on the logits and on every carry a layer holds. A graph missing a launch,
+    or holding one whose operands moved, fails one of them. The key convolution is
+    reached only through ``keys``, so it is unverified by any comparison that skips
+    that buffer.
     """
     logits = decode.step(decode.token)
     assert logits.shape == decode.eager_logits.shape
@@ -234,3 +269,103 @@ def test_a_captured_train_step_reproduces_the_eager_gradients() -> None:
         replayed = stack.get_parameter(name).grad
         assert replayed is not None, f"the replay left no gradient on {name}"
         assert torch.equal(replayed, eager), f"the replay left a different d{name}"
+
+
+# ---------------------------------------------------------------------------
+# What a replay must not do
+# ---------------------------------------------------------------------------
+
+REPLAYS = 4
+"""Replays inside each region under test.
+
+More than one, because a cost paid once per capture and a cost paid once per step are
+the same reading after a single replay.
+"""
+
+
+@dataclass(frozen=True)
+class Replay:
+    """A captured step the two tests below are free to advance.
+
+    Its own capture, not the ``decode`` fixture's. Those tests compare the state a
+    replay advanced against the eager step, so repeated replays on the same state
+    would make this file's result depend on the order it ran in.
+
+    Attributes:
+        step: The captured step.
+        token: ``(BATCH, 1)`` ids to replay over.
+    """
+
+    step: GraphedStep
+    token: Tensor
+
+
+@pytest.fixture(scope="module")
+def replay() -> Replay:
+    """Prefill, capture, and replay once, leaving the allocator at its steady state."""
+    device = _cuda()
+    stack = _stack(device)
+    state = StackState.allocate(GRAPH_CONFIG, BATCH, device=device, dtype=DTYPE)
+    stack(_ids(device, PROMPT), state)
+    step = capture_decode(stack, state)
+    token = _ids(device, PROMPT + 1)[:, -1:]
+    step(token)
+    return Replay(step=step, token=token)
+
+
+class Counters(NamedTuple):
+    """Two allocator readings, taken together.
+
+    Attributes:
+        current: Bytes the caching allocator currently holds out to tensors.
+        calls: Allocations it has served since the process started.
+    """
+
+    current: int
+    calls: int
+
+
+def _counters() -> Counters:
+    """Both readings, so a failure names which one moved.
+
+    ``current`` alone cannot see an allocation and a free in the same region, which is
+    what a replay that allocates per step looks like once its temporary is dropped.
+    ``calls`` is cumulative and sees it.
+    """
+    return Counters(
+        current=int(torch.cuda.memory_allocated()),
+        calls=int(torch.cuda.memory_stats()["allocation.all.allocated"]),
+    )
+
+
+def test_a_replay_allocates_nothing_in_the_steady_state(replay: Replay) -> None:
+    """The claim is the steady state of replay, not the absence of any allocation.
+
+    The captured function does allocate: the mixer's output is a fresh tensor per
+    call. It is allocated once, during the recording, out of the graph's private pool,
+    at an address every replay reuses -- which is why a replay must not reach the
+    allocator again. So the reading is taken after a replay has already run, and what
+    is asserted is that further replays move neither counter. An assertion that no
+    allocation happens anywhere would be false and would be deleted by whoever read
+    it next.
+    """
+    before = _counters()
+    for _ in range(REPLAYS):
+        replay.step(replay.token)
+    assert _counters() == before, "a replay reached the allocator"
+
+
+def test_a_replay_synchronizes_nothing(replay: Replay) -> None:
+    """A step that waits on the device once per token is not a decode path.
+
+    ``set_sync_debug_mode("error")`` raises from any call that waits, so the property
+    is asserted by running the region rather than by measuring it. The mode is process
+    wide and a failure inside the region would otherwise leave it set for every test
+    after this one, hence the ``finally``.
+    """
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(REPLAYS):
+            replay.step(replay.token)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

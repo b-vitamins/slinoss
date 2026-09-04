@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from slinoss.config import SLinOSSConfig
+from slinoss.graph import _restore
 from slinoss.state import MixerState, StackState, oscillator_basis
 
 CONFIG = SLinOSSConfig(d_model=64, d_state=48, n_layers=3)
@@ -106,6 +107,44 @@ def test_reset_keeps_the_buffer_addresses() -> None:
         oscillator_basis(CONFIG, device="cpu")[None].expand_as(state.ssm),
     )
     assert all(not buffer.any() for name, buffer in after.items() if name != "ssm")
+
+
+def test_restore_puts_back_every_buffer() -> None:
+    """Catches a graph restore that copies a subset of the buffers.
+
+    Found live: :func:`slinoss.graph._restore` copied four of the five, omitting
+    ``keys``, and the helper in ``tests/test_graph.py`` named the same four, so the
+    omission read as coverage. Every graph-captured decode replay then started from a
+    key-convolution carry ``warmup + 1`` tokens ahead of the rest of the state, which
+    is the condition :mod:`slinoss.state` names when it says a state that can be
+    missing one buffer is a state whose continuation is silently not the
+    whole-sequence result.
+
+    Here rather than beside the capture because ``tests/test_graph.py`` is CUDA-gated
+    and this invariant is the container's, not the device's: a restore that drops a
+    buffer drops it on any device. Values are distinct per layer and per buffer, so a
+    restore that copies the right count from the wrong source fails as well.
+    """
+    state = StackState.allocate(CONFIG, BATCH, device="cpu", dtype=torch.float32)
+    for depth, layer in enumerate(state.layers):
+        for index, buffer in enumerate(_fields(layer).values(), start=1):
+            buffer.fill_(float(10 * depth + index))
+    saved = state.clone()
+    for layer in state.layers:
+        for buffer in _fields(layer).values():
+            buffer.fill_(-1.0)
+    before = [b.data_ptr() for layer in state.layers for b in _fields(layer).values()]
+
+    _restore(state, saved)
+
+    for depth, (layer, snapshot) in enumerate(
+        zip(state.layers, saved.layers, strict=True)
+    ):
+        expected = _fields(snapshot)
+        for name, buffer in _fields(layer).items():
+            assert torch.equal(buffer, expected[name]), f"layer {depth} {name}"
+    after = [b.data_ptr() for layer in state.layers for b in _fields(layer).values()]
+    assert after == before, "the restore rebound a buffer"
 
 
 def test_clone_is_independent() -> None:

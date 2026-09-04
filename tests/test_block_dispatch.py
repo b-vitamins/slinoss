@@ -80,10 +80,21 @@ FAMILIES = [
 
 FAMILY_NAMES = ["rmsnorm", "rmsnorm_residual", "swiglu"]
 
-CUTE_REGISTERED = "cute" in rmsnorm_names()
+try:
+    import cutlass.cute  # noqa: F401
+except ImportError:
+    DSL_PRESENT = False
+else:
+    DSL_PRESENT = True
 
+# Host capability, not registry state. A skip on ``"cute" in rmsnorm_names()`` turned
+# a family that failed to register into nine silent skips, which is the failure the
+# tests below exist to report. Registration is asserted in
+# tests/test_backend_registration.py and the tests here then fail rather than
+# disappear.
 needs_cute = pytest.mark.skipif(
-    not CUTE_REGISTERED, reason="no CuTe backend registered on this host"
+    not (torch.cuda.is_available() and DSL_PRESENT),
+    reason="host cannot run the CuTe kernels: no CUDA device or no DSL",
 )
 
 

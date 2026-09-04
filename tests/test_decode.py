@@ -20,11 +20,13 @@ checked so a near-tie reports as a tie rather than as a decode bug.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import cast
 
 import pytest
 import torch
 
 from slinoss._precision import SUPPORTED_DTYPES
+from slinoss.blocks import SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.decode import _sample, generate
 from slinoss.stack import SLinOSSStack
@@ -74,7 +76,13 @@ def cuda() -> torch.device:
 def _stack(device: torch.device) -> SLinOSSStack:
     """A seeded float64 stack. Seeded because the ids compared below are one draw."""
     torch.manual_seed(0)
-    return SLinOSSStack(DECODE_CONFIG, device=device).to(torch.float64)
+    stack = SLinOSSStack(DECODE_CONFIG, device=device).to(torch.float64)
+    # The mixer's residual branch intentionally starts as an exact no-op. Activate
+    # only its final projection: unactivated, every logit is a function of its own
+    # token alone, so a state that stops advancing still reproduces the argmax.
+    for module in stack.blocks:
+        cast("SLinOSSBlock", module).mixer.out_proj.reset_parameters()
+    return stack
 
 
 def _prompt(device: torch.device) -> torch.Tensor:
