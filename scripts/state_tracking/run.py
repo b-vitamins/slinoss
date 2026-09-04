@@ -25,6 +25,8 @@ from typing import Any
 
 import torch
 
+from scripts.provenance import capture as capture_provenance
+from scripts.provenance import identity
 from scripts.state_tracking.instances import SplitConfig
 from scripts.state_tracking.mixers import REGISTRY, load_module, resolve
 from scripts.state_tracking.model import (
@@ -86,6 +88,7 @@ def run_arm(
     val_split: SplitConfig,
     *,
     quiet: bool,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a model, run the protocol, and return the record.
 
@@ -98,6 +101,9 @@ def run_arm(
         train_split: The train split.
         val_split: The validation split.
         quiet: Suppress the per-evaluation lines on stderr.
+        provenance: Source/harness/command identity captured before the arm starts.
+            Direct Python callers may omit it; the CLI captures one context and
+            passes it to every arm.
 
     Returns:
         The record, JSON-ready.
@@ -143,6 +149,15 @@ def run_arm(
         report,
         parameter_count(model),
         mixer_parameters(model),
+        mixer.max_length_policy,
+        mixer.constructions,
+        capture_provenance(
+            "scripts/state_tracking",
+            ["<python-api>"],
+            module="scripts.state_tracking.run",
+        )
+        if provenance is None
+        else provenance,
     )
 
 
@@ -157,6 +172,9 @@ def _record(
     report: Report,
     parameters: int,
     mixer_params: int,
+    max_length_policy: str,
+    constructions: list[dict[str, Any]],
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble one arm's record.
 
@@ -171,10 +189,30 @@ def _record(
         report: What the run produced.
         parameters: Trainable parameters.
         mixer_params: Trainable parameters inside the mixers.
+        max_length_policy: Declared consumption of the scaffold length context.
+        constructions: Effective per-layer mixer configurations.
+        provenance: Source, harness, dirty tree, and command identity.
 
     Returns:
         A JSON-ready dict.
     """
+    train_data = {
+        "task": task.name,
+        "supervision": task.supervision,
+        "split": asdict(train_split),
+    }
+    val_data = {
+        "task": task.name,
+        "supervision": task.supervision,
+        "split": asdict(val_split),
+    }
+    init_spans = [
+        construction["effective_config"].get("init_span")
+        for construction in constructions
+        if "init_span" in construction["effective_config"]
+    ]
+    train_width_max = max(train_split.max_length, train_split.pad_to)
+    val_width_max = max(val_split.max_length, val_split.pad_to)
     return {
         "task": task.name,
         "supervision": task.supervision,
@@ -182,10 +220,39 @@ def _record(
         "group_order": None if task.group is None else task.group.order,
         "mixer": mixer_name,
         "mixer_settings": settings,
+        "mixer_contract": {
+            "max_length_policy": max_length_policy,
+            "initialization": "mixer_constructor; no scaffold reinitialization",
+        },
+        "mixer_constructions": constructions,
         "model": asdict(model_config),
         "protocol": asdict(config),
         "train_split": asdict(train_split),
         "val_split": asdict(val_split),
+        "lengths": {
+            "configured_task_length": None,
+            "training_ceiling": train_split.max_length,
+            "evaluation_ceiling": val_split.max_length,
+            "observed_tensor_width": {
+                "train": {"min": train_split.min_length, "max": train_width_max},
+                "evaluation": {"min": val_split.min_length, "max": val_width_max},
+            },
+            "mixer_initialization_span": init_spans or None,
+        },
+        "seeds": {
+            "model": config.seed,
+            "train_data": train_split.seed,
+            "evaluation_data": val_split.seed,
+        },
+        "data": {
+            "train": {**train_data, "identity": identity(train_data)},
+            "evaluation": {**val_data, "identity": identity(val_data)},
+        },
+        "initialization": {
+            "scaffold": "framework constructor defaults; no post-construction pass",
+            "mixer": "owned by each mixer constructor",
+        },
+        "provenance": provenance,
         "parameters": parameters,
         "mixer_parameters": mixer_params,
         "best": _metrics(report.best),
@@ -352,6 +419,9 @@ def main(argv: list[str] | None = None) -> int:
         Process exit status. Zero unless an arm raised.
     """
     args = build_parser().parse_args(argv)
+    provenance = capture_provenance(
+        "scripts/state_tracking", argv, module="scripts.state_tracking.run"
+    )
     for module in args.mixer_module:
         load_module(module)
 
@@ -393,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
                     train_split,
                     val_split,
                     quiet=args.quiet,
+                    provenance=provenance,
                 )
                 line = json.dumps(record)
                 print(line, flush=True)

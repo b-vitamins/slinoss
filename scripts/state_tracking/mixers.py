@@ -32,8 +32,8 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
-from typing import Any, NamedTuple, cast
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -41,19 +41,25 @@ from torch import Tensor, nn
 from scripts.state_tracking.model import MixerFactory
 
 
-class Mixer(NamedTuple):
+@dataclass
+class Mixer:
     """A resolved mixer.
 
     Attributes:
         name: Registry key.
         factory: ``(d_model, max_length) -> module``, for the model builder.
         settings: The settings the factory closes over, defaults and overrides merged.
-            Goes into the run record as it is.
+        max_length_policy: Whether the constructor consumes the scaffold's widest
+            possible sequence. ``unused`` is explicit and means the value is recorded
+            but never handed to the constructor.
+        constructions: Effective configuration of every layer the factory built.
     """
 
     name: str
     factory: MixerFactory
     settings: dict[str, Any]
+    max_length_policy: Literal["required", "unused"]
+    constructions: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -61,14 +67,28 @@ class MixerEntry:
     """One registry entry.
 
     Attributes:
-        build: Constructor, called as ``build(d_model, max_length, **settings)``.
+        build: Constructor. Called as ``build(d_model, max_length, **settings)``
+            only under a ``required`` length policy, otherwise as
+            ``build(d_model, **settings)``.
+        max_length_policy: ``required`` when ``build`` accepts the scaffold's
+            ``max_length`` after ``d_model``; ``unused`` when it does not. There is no
+            default because silently guessing this contract caused the two historical
+            winner configurations to be mislabeled.
         defaults: Every setting ``build`` accepts, with its default. The set is closed:
             an override outside it is refused, and a default's type is what an override
             string is coerced to.
     """
 
     build: Callable[..., nn.Module]
+    max_length_policy: Literal["required", "unused"]
     defaults: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.max_length_policy not in {"required", "unused"}:
+            raise ValueError(
+                "max_length_policy must be 'required' or 'unused', got "
+                f"{self.max_length_policy!r}"
+            )
 
 
 REGISTRY: dict[str, MixerEntry] = {}
@@ -168,10 +188,38 @@ def resolve(name: str, overrides: Iterable[str] = ()) -> Mixer:
     entry = REGISTRY[name]
     settings = settings_from(name, overrides)
 
-    def factory(d_model: int, max_length: int) -> nn.Module:
-        return entry.build(d_model, max_length, **settings)
+    constructions: list[dict[str, Any]] = []
 
-    return Mixer(name, factory, settings)
+    def factory(d_model: int, max_length: int) -> nn.Module:
+        if max_length < 1:
+            raise ValueError(f"max_length must be positive, got {max_length}")
+        if entry.max_length_policy == "required":
+            module = entry.build(d_model, max_length, **settings)
+            consumed: int | None = max_length
+        else:
+            module = entry.build(d_model, **settings)
+            consumed = None
+        config = getattr(module, "config", None)
+        effective = (
+            asdict(cast(Any, config))
+            if is_dataclass(config)
+            else {"d_model": d_model, **settings}
+        )
+        constructions.append(
+            {
+                "module": f"{type(module).__module__}.{type(module).__qualname__}",
+                "effective_config": effective,
+                "context": {
+                    "max_length_supplied": max_length,
+                    "max_length_policy": entry.max_length_policy,
+                    "max_length_consumed": consumed,
+                },
+                "initialization": "mixer_constructor; no scaffold reinitialization",
+            }
+        )
+        return module
+
+    return Mixer(name, factory, settings, entry.max_length_policy, constructions)
 
 
 def load_module(path: str) -> None:
@@ -190,14 +238,11 @@ def load_module(path: str) -> None:
 # slinoss:
 
 
-def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
     """The tree's mixer.
 
     Args:
         d_model: Stream width.
-        max_length: Widest sequence this arm evaluates. SLinOSS carries no
-            length-dependent buffer, but its head lattice uses this span to avoid
-            initializing most heads outside the task's measured range.
         **settings: :class:`slinoss.SLinOSSConfig` fields.
 
     Returns:
@@ -205,9 +250,7 @@ def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     """
     from slinoss import SLinOSSConfig, SLinOSSMixer
 
-    return SLinOSSMixer(
-        SLinOSSConfig(d_model=d_model, seq_len=max_length, **settings)
-    )
+    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
 
 
 def _slinoss_defaults() -> dict[str, Any]:
@@ -229,6 +272,7 @@ def _slinoss_defaults() -> dict[str, Any]:
         "chunk_size": SLinOSSConfig.chunk_size,
         "d_conv": SLinOSSConfig.d_conv,
         "key_conv": SLinOSSConfig.key_conv,
+        "init_span": SLinOSSConfig.init_span,
         "w_max": SLinOSSConfig.w_max,
         "bias": SLinOSSConfig.bias,
         "conv_bias": SLinOSSConfig.conv_bias,
@@ -350,7 +394,6 @@ class CausalConv(nn.Module):
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         d_conv: Taps.
         expand: Inner width multiplier.
 
@@ -358,11 +401,8 @@ class CausalConv(nn.Module):
         ValueError: On fewer than one tap.
     """
 
-    def __init__(
-        self, d_model: int, max_length: int, d_conv: int = 4, expand: float = 2.0
-    ) -> None:
+    def __init__(self, d_model: int, d_conv: int = 4, expand: float = 2.0) -> None:
         super().__init__()
-        del max_length
         if d_conv < 1:
             raise ValueError(f"d_conv must be positive, got {d_conv}")
         inner = round(expand * d_model)
@@ -392,20 +432,22 @@ def _register_builtins() -> None:
     Called at import. The slinoss entry reads its defaults from
     :class:`slinoss.SLinOSSConfig`, which imports torch and nothing optional.
     """
-    register("slinoss", MixerEntry(_build_slinoss, _slinoss_defaults()))
+    register("slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults()))
     register(
         "attention",
         MixerEntry(
             lambda d_model, max_length, **kw: CausalAttention(
                 d_model, max_length, **kw
             ),
+            "required",
             {"n_heads": 16, "rotary": True},
         ),
     )
     register(
         "conv",
         MixerEntry(
-            lambda d_model, max_length, **kw: CausalConv(d_model, max_length, **kw),
+            lambda d_model, **kw: CausalConv(d_model, **kw),
+            "unused",
             {"d_conv": 4, "expand": 2.0},
         ),
     )

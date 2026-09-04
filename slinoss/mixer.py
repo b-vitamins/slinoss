@@ -25,7 +25,7 @@ from torch.nn.functional import linear
 from slinoss._guard import PROJ_ALIGN
 from slinoss._linear import linear_backward
 from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
-from slinoss.config import SLinOSSConfig
+from slinoss.config import DEFAULT_INIT_SPAN, SLinOSSConfig
 from slinoss.ops.conv import backends as conv_dispatch
 from slinoss.ops.mixer import backends as tail_dispatch
 from slinoss.ops.scanprep import LS_COLUMN, LS_MAX_MAG, PARAM_COLS, ROTVEC_COLUMNS
@@ -35,7 +35,7 @@ from slinoss.ops.so3ssd.reference import ScanPrologue
 from slinoss.state import MixerState, oscillator_basis
 
 __all__ = [
-    "FALLBACK_SPAN",
+    "DEFAULT_INIT_SPAN",
     "ProjectionLayout",
     "SLinOSSMixer",
     "fibonacci_axes",
@@ -262,15 +262,6 @@ class ProjectionLayout:
         return band.unflatten(-1, (self.groups, self.state_dim)).permute(0, 2, 1, 3)
 
 
-FALLBACK_SPAN: float = 4096.0
-"""Slow end of the lattice when :attr:`SLinOSSConfig.seq_len` is None.
-
-A stack that does not state the sequence it trains on gets the widest band the
-harnesses in this tree ever ask for. Nothing derives this: it is the absence of an
-answer, and every configuration that carries ``seq_len`` reads
-:func:`head_band` instead.
-"""
-
 _MAP_HEADROOM = 0.5
 """Fraction of the chart scale the fastest grid rung asks for.
 
@@ -289,11 +280,9 @@ def head_band(config: SLinOSSConfig) -> tuple[float, float]:
     the rest of the chart available. A two-token period is the alternating sign no
     sampled rotation resolves.
 
-    The slow end is one turn across the trained sequence. Past it a head is a
-    constant: it neither completes a turn, so it carries no phase, nor decays, so it
-    separates no timescale. The previous constant was four times the longest
-    sequence any harness ran, which put most of the bank past the slow end of every
-    shorter task -- at 8 heads and 32 tokens, six of the eight rungs.
+    The slow end is :attr:`SLinOSSConfig.init_span`. It is stated by the mixer
+    configuration rather than inferred from a harness's training or evaluation
+    ceiling: a buffer-sizing argument must not silently choose an initialization.
 
     A horizon and a period read the same band. The per-token amplitude factor is
     ``exp(2*ls)``, so a horizon of ``h`` tokens is ``ls = -0.5/h``; conjugation
@@ -307,14 +296,15 @@ def head_band(config: SLinOSSConfig) -> tuple[float, float]:
     inside its own memory.
 
     Args:
-        config: Supplies ``w_max`` and ``seq_len``.
+        config: Supplies ``w_max`` and ``init_span``.
 
     Returns:
-        ``(fast, slow)`` in tokens, with ``slow`` at least ``fast``. A ``seq_len``
-        under the fast end collapses the band to one rung rather than inverting it.
+        ``(fast, slow)`` in tokens, with ``slow`` at least ``fast``. An
+        ``init_span`` under the fast end collapses the band to one rung rather than
+        inverting it.
     """
     fast = 2.0 * math.pi / (_MAP_HEADROOM * config.w_max)
-    slow = FALLBACK_SPAN if config.seq_len is None else float(config.seq_len)
+    slow = float(config.init_span)
     return (fast, max(fast, slow))
 
 

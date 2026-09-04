@@ -48,6 +48,14 @@ below :data:`math.pi` can round upward when it enters a kernel; this exact value
 cannot, so twice the chart scale remains strictly below ``2*pi`` there as well.
 """
 
+DEFAULT_INIT_SPAN = 4096
+"""Default slow endpoint of the initialized period/horizon lattice, in tokens.
+
+This is an initialization parameter, not a promise about the length of an input
+buffer.  Keeping it explicit prevents a harness's train or evaluation ceiling from
+silently changing the operator it constructs.
+"""
+
 MIN_CHUNK = 16
 """Shortest legal chunk. Below this the chunked form loses to the streaming one:
 the per-chunk transform table costs order 120 FMA per token and amortizes over
@@ -86,10 +94,9 @@ class SLinOSSConfig:
         key_conv: Convolve the ``B`` and ``C`` bands as well as the value band.
             Their taps start at the delta, so the initialized mixer is the one
             without it and a key motif is only ever learned into.
-        seq_len: Tokens the stack trains on, or None. The head lattice's slow end
-            is one turn across it, so a bank is built for the sequence it sees
-            rather than for the longest a harness might ever run. None leaves the
-            slow end at :data:`slinoss.mixer.FALLBACK_SPAN`.
+        init_span: Slow endpoint of the initialized period/horizon lattice, in
+            tokens. This is independent of the sequence lengths a harness trains or
+            evaluates on; changing it is an explicit initialization change.
         w_max: Scale of the rotation-vector chart, whose asymptotic radius is
             ``2*w_max``. Strictly below pi so ``quat_exp`` is one branchless
             polynomial over a domain below ``2*pi``. The default is the largest
@@ -117,7 +124,7 @@ class SLinOSSConfig:
     chunk_size: int = 64
     d_conv: int = 4
     key_conv: bool = True
-    seq_len: int | None = None
+    init_span: int = DEFAULT_INIT_SPAN
     w_max: float = ROTATION_CHART_SCALE_MAX
     bias: bool = False
     conv_bias: bool = True
@@ -164,8 +171,8 @@ class SLinOSSConfig:
             )
         if self.d_conv < 1:
             raise ValueError(f"d_conv must be positive, got {self.d_conv}")
-        if self.seq_len is not None and self.seq_len < 1:
-            raise ValueError(f"seq_len must be positive or None, got {self.seq_len}")
+        if self.init_span < 1:
+            raise ValueError(f"init_span must be positive, got {self.init_span}")
         if not 0.0 < self.w_max <= ROTATION_CHART_SCALE_MAX:
             raise ValueError(
                 f"w_max must lie in (0, pi) and round below pi in float32, "

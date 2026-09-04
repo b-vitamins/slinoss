@@ -211,6 +211,24 @@ def test_record_carries_every_field_a_replay_needs(
         assert record["parameters"] > record["mixer_parameters"] > 0
         assert record["best_step"] in [point[0] for point in record["points"]]
         assert record["solved"] is False
+        assert record["mixer_contract"]["max_length_policy"] == "unused"
+        assert len(record["mixer_constructions"]) == record["model"]["n_layers"]
+        assert record["lengths"]["training_ceiling"] == 8
+        assert record["lengths"]["evaluation_ceiling"] == 12
+        assert record["lengths"]["mixer_initialization_span"] is None
+        assert record["seeds"] == {
+            "model": 0,
+            "train_data": 0,
+            "evaluation_data": 0,
+        }
+        assert len(record["data"]["train"]["identity"]) == 64
+        assert len(record["data"]["evaluation"]["identity"]) == 64
+        provenance = record["provenance"]
+        assert len(provenance["repository_commit"]) == 40
+        assert len(provenance["source"]["tree"]) == 40
+        assert len(provenance["harness"]["tree"]) == 40
+        assert len(provenance["dirty_diff_sha256"]) == 64
+        assert provenance["command_argv"]
     parity, group = records
     assert (parity["supervision"], parity["vocab_size"], parity["group_order"]) == (
         "last",
@@ -241,6 +259,9 @@ def test_the_mixer_is_sized_for_the_evaluation_not_the_training_split(
     assert records[0]["model"]["max_length"] == 12
     assert records[0]["train_split"]["max_length"] == 8
     assert records[0]["mixer_settings"] == {"n_heads": 4, "rotary": True}
+    construction = records[0]["mixer_constructions"][0]
+    assert construction["context"]["max_length_policy"] == "required"
+    assert construction["context"]["max_length_consumed"] == 12
 
 
 def test_out_file_holds_the_same_lines_as_stdout(

@@ -26,7 +26,7 @@ from torch.nn.functional import linear
 from slinoss._guard import PROJ_ALIGN, SECTOR_BYTES
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import (
-    FALLBACK_SPAN,
+    DEFAULT_INIT_SPAN,
     ProjectionLayout,
     SLinOSSMixer,
     fibonacci_axes,
@@ -649,7 +649,12 @@ def test_the_fastest_rung_asks_for_half_of_any_chart_scale() -> None:
     """
     for w_max in (0.5, 1.0, 3.1415925):
         cfg = SLinOSSConfig(
-            d_model=32, d_state=48, d_head=16, n_groups=2, w_max=w_max, seq_len=4096
+            d_model=32,
+            d_state=48,
+            d_head=16,
+            n_groups=2,
+            w_max=w_max,
+            init_span=4096,
         )
         assert 2.0 * math.pi / head_band(cfg)[0] == pytest.approx(0.5 * w_max)
         rows = SLinOSSMixer(cfg).transition_bias.detach().double()
@@ -659,22 +664,15 @@ def test_the_fastest_rung_asks_for_half_of_any_chart_scale() -> None:
         assert float(turn.max()) < cfg.w_max
 
 
-def test_the_band_narrows_to_the_trained_sequence() -> None:
-    """The slow end is one turn across ``seq_len``, not a harness's longest run.
-
-    A head whose period exceeds the sequence never completes a turn and a head whose
-    horizon does never decays within it: both are constants, and the absolute slow
-    end put six of eight rungs there at 32 tokens. The band is the mechanism, so it
-    is asserted on the rungs rather than on the constant.
-    """
+def test_the_band_uses_only_the_explicit_initialization_span() -> None:
+    """The lattice endpoint is an initialization setting, not task metadata."""
     base = dict(d_model=32, d_state=48, d_head=16, n_groups=2)
-    for seq_len in (32, 128, 1024):
-        cfg = SLinOSSConfig(**base, seq_len=seq_len)  # type: ignore[arg-type]
+    for init_span in (32, 128, 1024):
+        cfg = SLinOSSConfig(**base, init_span=init_span)  # type: ignore[arg-type]
         horizon, period = head_lattice(cfg.n_heads, head_band(cfg))
-        assert float(period.max()) == pytest.approx(float(seq_len))
-        assert float(horizon.max()) == pytest.approx(float(seq_len))
-    # Absent the sequence there is no band to derive, so the widest one stands.
-    assert head_band(SLinOSSConfig(**base))[1] == FALLBACK_SPAN  # type: ignore[arg-type]
+        assert float(period.max()) == pytest.approx(float(init_span))
+        assert float(horizon.max()) == pytest.approx(float(init_span))
+    assert head_band(SLinOSSConfig(**base))[1] == DEFAULT_INIT_SPAN  # type: ignore[arg-type]
 
 
 def test_the_default_chart_reaches_a_half_turn_at_finite_radius() -> None:

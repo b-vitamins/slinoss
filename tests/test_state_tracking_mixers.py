@@ -55,17 +55,36 @@ def test_slinoss_settings_build_a_legal_config() -> None:
 
     settings = resolve("slinoss").settings
     names = {field.name for field in fields(SLinOSSConfig)}
-    assert set(settings) <= names
+    stack_only = {
+        "d_model",
+        "n_layers",
+        "ffn_ratio",
+        "norm_eps",
+        "vocab_size",
+        "vocab_pad_multiple",
+    }
+    assert set(settings) == names - stack_only
     assert settings["d_state"] == 144
     config = SLinOSSConfig(d_model=128, **settings)
     assert config.d_state == 144
     assert config.d_model == 128
 
 
-def test_slinoss_factory_forwards_the_measured_sequence_span() -> None:
-    """Current SLinOSS sizes its head lattice from the supplied sequence span."""
-    mixer = resolve("slinoss").factory(128, MAX_LENGTH)
-    assert mixer.config.seq_len == MAX_LENGTH
+def test_slinoss_declares_length_unused_and_keeps_its_init_span() -> None:
+    """Task length cannot silently choose SLinOSS's initialization."""
+    from slinoss import SLinOSSMixer
+
+    resolved = resolve("slinoss")
+    mixer = resolved.factory(128, MAX_LENGTH)
+    assert isinstance(mixer, SLinOSSMixer)
+    assert resolved.max_length_policy == "unused"
+    assert mixer.config.init_span == 4096
+    assert resolved.constructions[0]["context"] == {
+        "max_length_supplied": MAX_LENGTH,
+        "max_length_policy": "unused",
+        "max_length_consumed": None,
+    }
+    assert resolved.constructions[0]["effective_config"]["init_span"] == 4096
 
 
 def test_overrides_are_read_at_the_defaults_type() -> None:
@@ -106,6 +125,21 @@ def test_resolve_closes_over_the_settings_it_reports() -> None:
     assert isinstance(built, CausalConv)
     assert built.d_conv == 2
     assert mixer.factory(D_MODEL, MAX_LENGTH) is not built
+    assert mixer.max_length_policy == "unused"
+    assert [item["context"]["max_length_consumed"] for item in mixer.constructions] == [
+        None,
+        None,
+    ]
+
+
+def test_length_consumption_is_mandatory_and_fail_closed() -> None:
+    """An entry cannot regain the old implicit accept-and-drop convention."""
+    with pytest.raises(ValueError, match="max_length_policy"):
+        MixerEntry(lambda d_model: nn.Identity(), "sometimes")  # type: ignore[arg-type]
+    attention = resolve("attention")
+    attention.factory(D_MODEL, MAX_LENGTH)
+    assert attention.max_length_policy == "required"
+    assert attention.constructions[0]["context"]["max_length_consumed"] == MAX_LENGTH
 
 
 def test_a_name_cannot_be_re_registered(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,7 +148,7 @@ def test_a_name_cannot_be_re_registered(monkeypatch: pytest.MonkeyPatch) -> None
     The registry is module state, so a baseline module imported twice, or two modules
     claiming one name, has to fail loudly.
     """
-    entry = MixerEntry(lambda d_model, max_length: nn.Identity(), {})
+    entry = MixerEntry(lambda d_model: nn.Identity(), "unused", {})
     monkeypatch.setitem(REGISTRY, "probe", entry)
     assert resolve("probe").settings == {}
     with pytest.raises(ValueError, match="mixer probe is already registered"):
@@ -130,7 +164,7 @@ def test_load_module_reports_a_missing_baseline() -> None:
 @pytest.mark.parametrize(
     "build",
     [
-        pytest.param(lambda: CausalConv(D_MODEL, MAX_LENGTH, d_conv=4), id="conv"),
+        pytest.param(lambda: CausalConv(D_MODEL, d_conv=4), id="conv"),
         pytest.param(
             lambda: CausalAttention(D_MODEL, MAX_LENGTH, n_heads=4), id="attention"
         ),
@@ -164,7 +198,7 @@ def test_conv_receptive_field_is_the_tap_count() -> None:
     the axis reads as carried state.
     """
     taps = 4
-    mixer = CausalConv(D_MODEL, MAX_LENGTH, d_conv=taps)
+    mixer = CausalConv(D_MODEL, d_conv=taps)
     mixer.eval()
     gen = torch.Generator().manual_seed(1)
     x = torch.randn(1, MAX_LENGTH, D_MODEL, generator=gen)
@@ -198,7 +232,7 @@ def test_attention_head_count_must_divide_the_stream() -> None:
     with pytest.raises(ValueError, match="does not divide d_model"):
         CausalAttention(D_MODEL, MAX_LENGTH, n_heads=5)
     with pytest.raises(ValueError, match="d_conv must be positive"):
-        CausalConv(D_MODEL, MAX_LENGTH, d_conv=0)
+        CausalConv(D_MODEL, d_conv=0)
 
 
 def test_position_blind_attention_is_available_as_a_control() -> None:

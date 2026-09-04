@@ -103,9 +103,9 @@ def test_the_mixer_is_causal() -> None:
 def test_one_module_reads_a_length_it_was_not_built_for(length: int) -> None:
     """One module, four widths, including one over the ``max_length`` it was handed.
 
-    ``_build_slinoss`` discards ``max_length`` because the recurrence carries no
-    length-dependent buffer. That is what an evaluation past the trained length rests on, so
-    a buffer introduced later has to fail here rather than at the first long batch.
+    The registry declares ``max_length`` unused because the recurrence carries no
+    length-dependent buffer. That is what an evaluation past the trained length rests on,
+    so a buffer introduced later has to fail here rather than at the first long batch.
     """
     mixer = _mixer(max_length=8)
     with torch.no_grad():
