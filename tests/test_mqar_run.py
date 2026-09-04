@@ -295,11 +295,31 @@ def test_a_dry_run_reports_the_whole_cell_and_trains_nothing(
     assert first["task"] == "mqar"
     assert first["mixer"] == "conv"
     assert first["settings"] == {"conv": {"kernel_size": 3}}
+    assert first["mixer_contracts"] == {
+        "conv": {"layer_index_policy": "unused", "max_length_policy": "unused"}
+    }
+    assert len(first["mixer_constructions"]) == 2
+    assert all(
+        construction["context"]["max_length_consumed"] is None
+        for construction in first["mixer_constructions"]
+    )
     assert first["dry_run"] is True
     assert first["preset"] is None
     assert first["random_non_queries"] is True
     assert first["vocab_size"] == 64
     assert first["max_length"] == 16
+    assert first["lengths"]["training_ceiling"] == 16
+    assert first["lengths"]["evaluation_ceiling"] == 16
+    assert first["lengths"]["mixer_initialization_span"] is None
+    assert first["seeds"] == {"model": 123, "data": 123}
+    assert len(first["data"]["identity"]) == 64
+    assert first["precision"]["parameter_dtype"] == "torch.float32"
+    provenance = first["provenance"]
+    assert len(provenance["repository_commit"]) == 40
+    assert len(provenance["source"]["tree"]) == 40
+    assert len(provenance["harness"]["tree"]) == 40
+    assert len(provenance["dirty_diff_sha256"]) == 64
+    assert provenance["command_argv"]
     assert first["leaked"] == 0.0
     assert first["parameters"] > 0
     assert first["steps_per_epoch"] == 1

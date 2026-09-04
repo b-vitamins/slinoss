@@ -52,7 +52,9 @@ SLINOSS_DEFAULTS: dict[str, Setting] = {
     "n_groups": 1,
     "chunk_size": 64,
     "d_conv": 4,
-    "w_max": 3.14159265,
+    "key_conv": True,
+    "init_span": 4096,
+    "w_max": 3.141592502593994,
     "bias": False,
     "conv_bias": True,
 }
@@ -77,18 +79,21 @@ class Stub(nn.Module):
         return x
 
 
-def build_stub(
-    d_model: int, layer_idx: int, max_length: int, **settings: Setting
-) -> nn.Module:
-    """Build a :class:`Stub`, ignoring the layer index and the length."""
-    del layer_idx, max_length
+def build_stub(d_model: int, **settings: Setting) -> nn.Module:
+    """Build a :class:`Stub` with no context dependency."""
     return Stub(d_model, **settings)
 
 
 @contextmanager
 def registered(name: str, defaults: dict[str, Setting] | None = None) -> Iterator[None]:
     """Register a stub for the duration of one test, through the public entry point."""
-    register(name, build_stub, STUB_DEFAULTS if defaults is None else defaults)
+    register(
+        name,
+        build_stub,
+        STUB_DEFAULTS if defaults is None else defaults,
+        layer_index_policy="unused",
+        max_length_policy="unused",
+    )
     try:
         yield
     finally:
@@ -133,6 +138,47 @@ def test_settings_reach_the_module_and_land_in_the_record() -> None:
         built = mixer.factory(8, 0, 16)
         assert isinstance(built, Stub)
         assert built.settings == {**STUB_DEFAULTS, "taps": 9}
+        assert mixer.constructions[0]["context"] == {
+            "layer_index_supplied": 0,
+            "layer_index_policy": "unused",
+            "layer_index_consumed": None,
+            "max_length_supplied": 16,
+            "max_length_policy": "unused",
+            "max_length_consumed": None,
+        }
+
+
+def test_context_policies_are_mandatory_and_consumed_only_when_declared() -> None:
+    """Constructor context cannot disappear behind a positional compatibility shim."""
+    with pytest.raises(TypeError):
+        register("missing-policy", build_stub, {})  # type: ignore[call-arg]
+
+    seen: list[tuple[int, int]] = []
+
+    def contextual(d_model: int, layer_idx: int, max_length: int) -> nn.Module:
+        seen.append((layer_idx, max_length))
+        return Stub(d_model)
+
+    register(
+        "contextual",
+        contextual,
+        {},
+        layer_index_policy="required",
+        max_length_policy="required",
+    )
+    try:
+        mixer = resolve(["contextual"])
+        mixer.factory(8, 3, 16)
+        assert seen == [(3, 16)]
+        context = mixer.constructions[0]["context"]
+        assert context["layer_index_consumed"] == 3
+        assert context["max_length_consumed"] == 16
+        with pytest.raises(ValueError, match="layer_idx must be non-negative"):
+            mixer.factory(8, -1, 16)
+        with pytest.raises(ValueError, match="max_length must be positive"):
+            mixer.factory(8, 0, 0)
+    finally:
+        REGISTRY.pop("contextual", None)
 
 
 @pytest.mark.parametrize(
@@ -203,7 +249,13 @@ def test_a_scoped_override_reaches_only_its_entry() -> None:
 def test_register_rejects_a_taken_or_reserved_name(name: str) -> None:
     """``.`` and ``+`` are the override and cycle syntaxes; a collision is silent."""
     with pytest.raises((KeyError, ValueError), match="mixer"):
-        register(name, build_stub, {})
+        register(
+            name,
+            build_stub,
+            {},
+            layer_index_policy="unused",
+            max_length_policy="unused",
+        )
 
 
 def test_a_baseline_slots_in_from_outside_the_tree(tmp_path: Path) -> None:
@@ -216,9 +268,10 @@ def test_a_baseline_slots_in_from_outside_the_tree(tmp_path: Path) -> None:
     module.write_text(
         "from torch import nn\n"
         "from scripts.mqar.mixers import register\n"
-        "def build(d_model, layer_idx, max_length, **settings):\n"
+        "def build(d_model, **settings):\n"
         "    return nn.Identity()\n"
-        'register("outside", build, {"width": 3})\n',
+        'register("outside", build, {"width": 3}, '
+        'layer_index_policy="unused", max_length_policy="unused")\n',
         encoding="utf-8",
     )
     try:
@@ -242,6 +295,10 @@ def test_the_published_control_defaults() -> None:
         "dropout": 0.1,
     }
     assert REGISTRY["conv"].defaults == {"kernel_size": 3}
+    assert all(
+        entry.layer_index_policy == entry.max_length_policy == "unused"
+        for entry in REGISTRY.values()
+    )
 
 
 def test_the_slinoss_entry_declares_the_operator_contract() -> None:

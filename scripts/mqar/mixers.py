@@ -28,10 +28,10 @@ import importlib
 import importlib.util
 import math
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
@@ -42,7 +42,7 @@ Setting = bool | int | float | str
 """A mixer setting. Its type is fixed by the registered default."""
 
 BuildFn = Callable[..., nn.Module]
-"""``(d_model, layer_idx, max_length, **settings) -> module``."""
+"""Constructor whose context arguments are governed by :class:`MixerEntry`."""
 
 
 class Mixer(NamedTuple):
@@ -52,11 +52,15 @@ class Mixer(NamedTuple):
         name: The cycle, joined with ``+``. Goes into the record verbatim.
         factory: What :class:`scripts.mqar.model.LanguageModel` calls per layer.
         settings: Merged settings per entry name, for the record.
+        contracts: Declared context-consumption policy per entry name.
+        constructions: Effective configuration and context of every built layer.
     """
 
     name: str
     factory: MixerFactory
     settings: dict[str, dict[str, Setting]]
+    contracts: dict[str, dict[str, str]]
+    constructions: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -65,19 +69,40 @@ class MixerEntry:
 
     Attributes:
         build: Constructor.
+        layer_index_policy: Whether ``build`` consumes the layer index.
+        max_length_policy: Whether ``build`` consumes the maximum sequence length.
         defaults: Every admissible setting, with its default. The types here are what
             command-line overrides are coerced to.
     """
 
     build: BuildFn
+    layer_index_policy: Literal["required", "unused"]
+    max_length_policy: Literal["required", "unused"]
     defaults: dict[str, Setting]
+
+    def __post_init__(self) -> None:
+        for name, policy in (
+            ("layer_index_policy", self.layer_index_policy),
+            ("max_length_policy", self.max_length_policy),
+        ):
+            if policy not in {"required", "unused"}:
+                raise ValueError(
+                    f"{name} must be 'required' or 'unused', got {policy!r}"
+                )
 
 
 REGISTRY: dict[str, MixerEntry] = {}
 """Name to entry. Populated at import with the three builtins."""
 
 
-def register(name: str, build: BuildFn, defaults: dict[str, Setting]) -> None:
+def register(
+    name: str,
+    build: BuildFn,
+    defaults: dict[str, Setting],
+    *,
+    layer_index_policy: Literal["required", "unused"],
+    max_length_policy: Literal["required", "unused"],
+) -> None:
     """Add a mixer.
 
     Args:
@@ -85,6 +110,8 @@ def register(name: str, build: BuildFn, defaults: dict[str, Setting]) -> None:
             override and cycle syntaxes reserve.
         build: Constructor.
         defaults: Admissible settings and their defaults.
+        layer_index_policy: Whether the constructor consumes its layer index.
+        max_length_policy: Whether the constructor consumes its maximum length.
 
     Raises:
         KeyError: If the name is taken.
@@ -94,7 +121,12 @@ def register(name: str, build: BuildFn, defaults: dict[str, Setting]) -> None:
         raise KeyError(f"mixer {name} is already registered")
     if "." in name or "+" in name:
         raise ValueError(f"mixer name {name!r} must not contain '.' or '+'")
-    REGISTRY[name] = MixerEntry(build=build, defaults=dict(defaults))
+    REGISTRY[name] = MixerEntry(
+        build=build,
+        layer_index_policy=layer_index_policy,
+        max_length_policy=max_length_policy,
+        defaults=dict(defaults),
+    )
 
 
 def resolve(names: Sequence[str], overrides: Iterable[str] = ()) -> Mixer:
@@ -120,12 +152,67 @@ def resolve(names: Sequence[str], overrides: Iterable[str] = ()) -> Mixer:
     scoped = _scope_overrides(names, overrides)
     settings = {name: settings_from(name, scoped[name]) for name in scoped}
     cycle = tuple(names)
+    contracts = {
+        name: {
+            "layer_index_policy": REGISTRY[name].layer_index_policy,
+            "max_length_policy": REGISTRY[name].max_length_policy,
+        }
+        for name in dict.fromkeys(cycle)
+    }
+    constructions: list[dict[str, Any]] = []
 
     def factory(d_model: int, layer_idx: int, max_length: int) -> nn.Module:
+        if layer_idx < 0:
+            raise ValueError(f"layer_idx must be non-negative, got {layer_idx}")
+        if max_length < 1:
+            raise ValueError(f"max_length must be positive, got {max_length}")
         name = cycle[layer_idx % len(cycle)]
-        return REGISTRY[name].build(d_model, layer_idx, max_length, **settings[name])
+        entry = REGISTRY[name]
+        context: list[int] = []
+        if entry.layer_index_policy == "required":
+            context.append(layer_idx)
+        if entry.max_length_policy == "required":
+            context.append(max_length)
+        module = entry.build(d_model, *context, **settings[name])
+        config = getattr(module, "config", None)
+        effective = (
+            asdict(cast(Any, config))
+            if is_dataclass(config)
+            else {"d_model": d_model, **settings[name]}
+        )
+        constructions.append(
+            {
+                "entry": name,
+                "module": f"{type(module).__module__}.{type(module).__qualname__}",
+                "effective_config": effective,
+                "context": {
+                    "layer_index_supplied": layer_idx,
+                    "layer_index_policy": entry.layer_index_policy,
+                    "layer_index_consumed": (
+                        layer_idx if entry.layer_index_policy == "required" else None
+                    ),
+                    "max_length_supplied": max_length,
+                    "max_length_policy": entry.max_length_policy,
+                    "max_length_consumed": (
+                        max_length if entry.max_length_policy == "required" else None
+                    ),
+                },
+                "initialization": (
+                    "mixer_constructor; protected from scaffold reinitialization"
+                    if getattr(module, "_no_reinit", False)
+                    else "scaffold blanket normal draw after construction"
+                ),
+            }
+        )
+        return module
 
-    return Mixer(name="+".join(cycle), factory=factory, settings=settings)
+    return Mixer(
+        name="+".join(cycle),
+        factory=factory,
+        settings=settings,
+        contracts=contracts,
+        constructions=constructions,
+    )
 
 
 def settings_from(name: str, overrides: Iterable[str]) -> dict[str, Setting]:
@@ -256,10 +343,7 @@ class CausalConv(nn.Module):
         return convolved * self.projection(x) + x
 
 
-def _build_attention(
-    d_model: int, layer_idx: int, max_length: int, **settings: Setting
-) -> nn.Module:
-    del layer_idx, max_length
+def _build_attention(d_model: int, **settings: Setting) -> nn.Module:
     return CausalAttention(
         d_model=d_model,
         num_heads=int(settings["num_heads"]),
@@ -268,17 +352,11 @@ def _build_attention(
     )
 
 
-def _build_conv(
-    d_model: int, layer_idx: int, max_length: int, **settings: Setting
-) -> nn.Module:
-    del layer_idx, max_length
+def _build_conv(d_model: int, **settings: Setting) -> nn.Module:
     return CausalConv(d_model=d_model, kernel_size=int(settings["kernel_size"]))
 
 
-def _build_slinoss(
-    d_model: int, layer_idx: int, max_length: int, **settings: Setting
-) -> nn.Module:
-    del layer_idx, max_length
+def _build_slinoss(d_model: int, **settings: Setting) -> nn.Module:
     from slinoss.config import SLinOSSConfig
     from slinoss.mixer import SLinOSSMixer
 
@@ -290,6 +368,8 @@ def _build_slinoss(
         n_groups=int(settings["n_groups"]),
         chunk_size=int(settings["chunk_size"]),
         d_conv=int(settings["d_conv"]),
+        key_conv=bool(settings["key_conv"]),
+        init_span=int(settings["init_span"]),
         w_max=float(settings["w_max"]),
         bias=bool(settings["bias"]),
         conv_bias=bool(settings["conv_bias"]),
@@ -313,6 +393,8 @@ def _slinoss_defaults() -> dict[str, Setting]:
         "n_groups",
         "chunk_size",
         "d_conv",
+        "key_conv",
+        "init_span",
         "w_max",
         "bias",
         "conv_bias",
@@ -388,9 +470,23 @@ def _register_builtins() -> None:
         "attention",
         _build_attention,
         {"num_heads": 1, "bias": True, "dropout": 0.1},
+        layer_index_policy="unused",
+        max_length_policy="unused",
     )
-    register("conv", _build_conv, {"kernel_size": 3})
-    register("slinoss", _build_slinoss, _slinoss_defaults())
+    register(
+        "conv",
+        _build_conv,
+        {"kernel_size": 3},
+        layer_index_policy="unused",
+        max_length_policy="unused",
+    )
+    register(
+        "slinoss",
+        _build_slinoss,
+        _slinoss_defaults(),
+        layer_index_policy="unused",
+        max_length_policy="unused",
+    )
 
 
 _register_builtins()

@@ -46,9 +46,11 @@ import json
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from scripts.mqar import mixers as mixer_registry
 from scripts.mqar.model import (
@@ -76,6 +78,8 @@ from scripts.mqar.train import (
     seed_all,
     train,
 )
+from scripts.provenance import capture as capture_provenance
+from scripts.provenance import identity
 
 PRESETS = ("repro", "figure2")
 """Named published protocols.
@@ -360,6 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         A process exit code.
     """
     args = build_parser().parse_args(argv)
+    provenance = capture_provenance("scripts/mqar", argv, module="scripts.mqar.run")
     for spec in args.mixer_module:
         mixer_registry.load_module(spec)
     mixer = mixer_registry.resolve(args.mixer, args.settings)
@@ -373,7 +378,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for seed in args.seed:
             for width in args.d_model:
                 for lr in args.lr:
-                    record = _run_cell(args, pool, mixer, width, lr, seed)
+                    record = _run_cell(
+                        args, pool, mixer, width, lr, seed, provenance=provenance
+                    )
                     line = json.dumps(record, sort_keys=True)
                     print(line, flush=True)
                     if sink is not None:
@@ -389,15 +396,34 @@ def _run_cell(
     width: int,
     lr: float,
     seed: int,
+    *,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     protocol = train_config(args, pool, lr, seed)
     seed_all(seed)
     shape = model_config(args, pool, width)
     model = LanguageModel(shape, mixer.factory)
+    train_segments = [_segment_record(segment) for segment in pool.train]
+    test_segments = [_segment_record(segment) for segment in pool.test]
+    data = {
+        "vocab_size": pool.vocab_size,
+        "random_non_queries": pool.random_non_queries,
+        "data_seed": int(args.data_seed),
+        "train_segments": train_segments,
+        "test_segments": test_segments,
+    }
+    initialization_spans = [
+        construction["effective_config"].get("init_span")
+        for construction in mixer.constructions
+        if "init_span" in construction["effective_config"]
+    ]
     record: dict[str, Any] = {
         "task": "mqar",
         "mixer": mixer.name,
         "settings": mixer.settings,
+        "mixer_contracts": mixer.contracts,
+        "mixer_constructions": mixer.constructions,
+        "model": asdict(shape),
         "d_model": width,
         "lr": lr,
         "seed": seed,
@@ -408,8 +434,51 @@ def _run_cell(
         "max_length": pool.max_length,
         "preset": args.preset,
         "random_non_queries": pool.random_non_queries,
-        "train_segments": [_segment_record(segment) for segment in pool.train],
-        "test_segments": [_segment_record(segment) for segment in pool.test],
+        "train_segments": train_segments,
+        "test_segments": test_segments,
+        "lengths": {
+            "configured_task_length": {
+                "train": sorted(
+                    {segment["input_seq_len"] for segment in train_segments}
+                ),
+                "evaluation": sorted(
+                    {segment["input_seq_len"] for segment in test_segments}
+                ),
+            },
+            "training_ceiling": max(
+                segment["input_seq_len"] for segment in train_segments
+            ),
+            "evaluation_ceiling": max(
+                segment["input_seq_len"] for segment in test_segments
+            ),
+            "observed_tensor_width": {
+                "train": sorted(
+                    {segment["input_seq_len"] for segment in train_segments}
+                ),
+                "evaluation": sorted(
+                    {segment["input_seq_len"] for segment in test_segments}
+                ),
+            },
+            "mixer_initialization_span": initialization_spans or None,
+        },
+        "seeds": {"model": seed, "data": int(args.data_seed)},
+        "data": {**data, "identity": identity(data)},
+        "initialization": {
+            "scaffold": "upstream blanket normal draw after module construction",
+            "mixer": "per-construction ownership recorded in mixer_constructions",
+        },
+        "precision": {
+            "protocol": protocol.precision,
+            "parameter_dtype": str(next(model.parameters()).dtype),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        },
+        "provenance": (
+            capture_provenance(
+                "scripts/mqar", ["<python-api>"], module="scripts.mqar.run"
+            )
+            if provenance is None
+            else provenance
+        ),
         "steps_per_epoch": batch_count(pool.train, protocol.batch_size),
         "protocol": {
             "max_epochs": protocol.max_epochs,
