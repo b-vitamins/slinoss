@@ -130,7 +130,6 @@ class CausalConv(nn.Module):
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         d_conv: Taps.
         expand: Inner width multiplier.
 
@@ -138,11 +137,8 @@ class CausalConv(nn.Module):
         ValueError: On fewer than one tap.
     """
 
-    def __init__(
-        self, d_model: int, max_length: int, d_conv: int = 4, expand: float = 2.0
-    ) -> None:
+    def __init__(self, d_model: int, d_conv: int = 4, expand: float = 2.0) -> None:
         super().__init__()
-        del max_length
         if d_conv < 1:
             raise ValueError(f"d_conv must be positive, got {d_conv}")
         inner = round(expand * d_model)

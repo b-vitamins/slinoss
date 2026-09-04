@@ -33,9 +33,12 @@ def registry() -> Registry:
     """A registry holding the two controls at known defaults."""
     fresh = Registry("probe")
     fresh.register(
-        "attention", MixerEntry(CausalAttention, {"n_heads": 4, "rotary": True})
+        "attention",
+        MixerEntry(CausalAttention, "required", {"n_heads": 4, "rotary": True}),
     )
-    fresh.register("conv", MixerEntry(CausalConv, {"d_conv": 4, "expand": 2.0}))
+    fresh.register(
+        "conv", MixerEntry(CausalConv, "unused", {"d_conv": 4, "expand": 2.0})
+    )
     return fresh
 
 
@@ -75,12 +78,25 @@ def test_resolve_closes_over_the_settings_it_reports(registry: Registry) -> None
     built = mixer.factory(D_MODEL, MAX_LENGTH)
     assert isinstance(built, CausalConv)
     assert built.d_conv == 2
+    assert mixer.max_length_policy == "unused"
+    assert mixer.constructions == [
+        {
+            "module": "scripts.harness.controls.CausalConv",
+            "effective_config": {"d_model": D_MODEL, "d_conv": 2, "expand": 2.0},
+            "context": {
+                "max_length_supplied": MAX_LENGTH,
+                "max_length_policy": "unused",
+                "max_length_consumed": None,
+            },
+            "initialization": "mixer_constructor; no scaffold reinitialization",
+        }
+    ]
     assert mixer.factory(D_MODEL, MAX_LENGTH) is not built
 
 
 def test_a_name_cannot_be_re_registered(registry: Registry) -> None:
     """Re-registration is refused: it would silently change what an arm measured."""
-    entry = MixerEntry(lambda d_model, max_length: nn.Identity(), {})
+    entry = MixerEntry(lambda d_model: nn.Identity(), "unused", {})
     registry.register("probe", entry)
     assert registry.resolve("probe").settings == {}
     with pytest.raises(ValueError, match="probe mixer probe is already registered"):
@@ -95,8 +111,12 @@ def test_two_registries_hold_one_name_at_different_defaults() -> None:
     both axes in one process a re-registration error.
     """
     first, second = Registry("first"), Registry("second")
-    first.register("conv", MixerEntry(CausalConv, {"d_conv": 2, "expand": 1.0}))
-    second.register("conv", MixerEntry(CausalConv, {"d_conv": 8, "expand": 4.0}))
+    first.register(
+        "conv", MixerEntry(CausalConv, "unused", {"d_conv": 2, "expand": 1.0})
+    )
+    second.register(
+        "conv", MixerEntry(CausalConv, "unused", {"d_conv": 8, "expand": 4.0})
+    )
     assert first.resolve("conv").settings["d_conv"] == 2
     assert second.resolve("conv").settings["d_conv"] == 8
 
@@ -105,3 +125,25 @@ def test_load_module_reports_a_missing_baseline() -> None:
     """``--mixer-module`` on a module that is not importable fails at the import."""
     with pytest.raises(ModuleNotFoundError):
         load_module("scripts.harness.not_a_baseline")
+
+
+def test_context_policy_is_mandatory_and_length_is_validated() -> None:
+    """Accepted context is either consumed or visibly unused; it is never deleted."""
+    with pytest.raises(ValueError, match="max_length_policy"):
+        MixerEntry(lambda d_model: nn.Identity(), "sometimes")  # type: ignore[arg-type]
+
+    fresh = Registry("probe")
+    seen: list[int] = []
+
+    def needs_length(d_model: int, max_length: int) -> nn.Module:
+        del d_model
+        seen.append(max_length)
+        return nn.Identity()
+
+    fresh.register("needed", MixerEntry(needs_length, "required"))
+    mixer = fresh.resolve("needed")
+    mixer.factory(D_MODEL, MAX_LENGTH)
+    assert seen == [MAX_LENGTH]
+    assert mixer.constructions[0]["context"]["max_length_consumed"] == MAX_LENGTH
+    with pytest.raises(ValueError, match="max_length must be positive"):
+        mixer.factory(D_MODEL, 0)

@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any, Literal, cast
 
 from torch import nn
 
@@ -38,7 +38,8 @@ The max length is passed because a mixer may need to size a positional term or a
 is the widest sequence the arm can produce, not the width of any one batch."""
 
 
-class Mixer(NamedTuple):
+@dataclass
+class Mixer:
     """A resolved mixer.
 
     Attributes:
@@ -46,11 +47,17 @@ class Mixer(NamedTuple):
         factory: ``(d_model, max_length) -> module``, for the model builder.
         settings: The settings the factory closes over, defaults and overrides merged.
             Goes into the run record as it is.
+        max_length_policy: Whether the constructor consumes the supplied maximum
+            length. ``unused`` is explicit and means it is recorded but never passed.
+        constructions: Effective configuration and context contract of every module
+            built by :attr:`factory`.
     """
 
     name: str
     factory: MixerFactory
     settings: dict[str, Any]
+    max_length_policy: Literal["required", "unused"]
+    constructions: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -59,13 +66,26 @@ class MixerEntry:
 
     Attributes:
         build: Constructor, called as ``build(d_model, max_length, **settings)``.
+            The length is passed only under a ``required`` policy; under ``unused``
+            it is called as ``build(d_model, **settings)``.
+        max_length_policy: ``required`` when :attr:`build` consumes the length and
+            ``unused`` when it does not. There is deliberately no default: guessing
+            this contract is the silent-swallowing defect this type prevents.
         defaults: Every setting ``build`` accepts, with its default. The set is closed:
             an override outside it is refused, and a default's type is what an override
             string is coerced to.
     """
 
     build: Callable[..., nn.Module]
+    max_length_policy: Literal["required", "unused"]
     defaults: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.max_length_policy not in {"required", "unused"}:
+            raise ValueError(
+                "max_length_policy must be 'required' or 'unused', got "
+                f"{self.max_length_policy!r}"
+            )
 
 
 def _coerce(name: str, key: str, default: Any, text: str) -> Any:
@@ -201,11 +221,44 @@ class Registry:
         """
         entry = self.entry(name)
         settings = self.settings_from(name, overrides)
+        constructions: list[dict[str, Any]] = []
 
         def factory(d_model: int, max_length: int) -> nn.Module:
-            return entry.build(d_model, max_length, **settings)
+            if max_length < 1:
+                raise ValueError(f"max_length must be positive, got {max_length}")
+            if entry.max_length_policy == "required":
+                module = entry.build(d_model, max_length, **settings)
+                consumed: int | None = max_length
+            else:
+                module = entry.build(d_model, **settings)
+                consumed = None
+            config = getattr(module, "config", None)
+            effective = (
+                asdict(cast(Any, config))
+                if is_dataclass(config)
+                else {"d_model": d_model, **settings}
+            )
+            constructions.append(
+                {
+                    "module": f"{type(module).__module__}.{type(module).__qualname__}",
+                    "effective_config": effective,
+                    "context": {
+                        "max_length_supplied": max_length,
+                        "max_length_policy": entry.max_length_policy,
+                        "max_length_consumed": consumed,
+                    },
+                    "initialization": "mixer_constructor; no scaffold reinitialization",
+                }
+            )
+            return module
 
-        return Mixer(name, factory, settings)
+        return Mixer(
+            name,
+            factory,
+            settings,
+            entry.max_length_policy,
+            constructions,
+        )
 
 
 def load_module(path: str) -> None:

@@ -23,7 +23,7 @@ MAX_LENGTH = 16
 @pytest.mark.parametrize(
     "build",
     [
-        pytest.param(lambda: CausalConv(D_MODEL, MAX_LENGTH, d_conv=4), id="conv"),
+        pytest.param(lambda: CausalConv(D_MODEL, d_conv=4), id="conv"),
         pytest.param(
             lambda: CausalAttention(D_MODEL, MAX_LENGTH, n_heads=4), id="attention"
         ),
@@ -57,7 +57,7 @@ def test_conv_receptive_field_is_the_tap_count() -> None:
     axis reads as carried state.
     """
     taps = 4
-    mixer = CausalConv(D_MODEL, MAX_LENGTH, d_conv=taps)
+    mixer = CausalConv(D_MODEL, d_conv=taps)
     mixer.eval()
     gen = torch.Generator().manual_seed(1)
     x = torch.randn(1, MAX_LENGTH, D_MODEL, generator=gen)
@@ -90,7 +90,7 @@ def test_attention_head_count_must_divide_the_stream() -> None:
     with pytest.raises(ValueError, match="does not divide d_model"):
         CausalAttention(D_MODEL, MAX_LENGTH, n_heads=5)
     with pytest.raises(ValueError, match="d_conv must be positive"):
-        CausalConv(D_MODEL, MAX_LENGTH, d_conv=0)
+        CausalConv(D_MODEL, d_conv=0)
 
 
 def test_position_blind_attention_is_available_as_a_control() -> None:
