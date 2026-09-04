@@ -19,7 +19,8 @@ by the time it is used that way.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
+from typing import cast
 
 import pytest
 import torch
@@ -108,6 +109,33 @@ def _tokens(vocab: int, device: torch.device, *, seed: int = 0) -> Tensor:
     return torch.randint(0, vocab, (BATCH, SEQLEN), generator=gen, device=device)
 
 
+def _activate(stack: SLinOSSStack) -> SLinOSSStack:
+    """Draw, in place, the projection bands initialization leaves at zero.
+
+    ``SLinOSSMixer.reset_parameters`` zeroes ``out_proj``, the forcing-B band and the
+    parameter band, so an untouched stack has a mixer output of exactly zero and a
+    transition that does not read its token. Every decode property below is then
+    satisfied by a memoryless model whatever the carries hold, and a deleted carry
+    advance reads as agreement.
+
+    Args:
+        stack: Modified in place; both projections of every block's mixer are redrawn.
+
+    Returns:
+        The same stack.
+    """
+    for module in stack.blocks:
+        mixer = cast("SLinOSSBlock", module).mixer
+        mixer.in_proj.reset_parameters()
+        mixer.out_proj.reset_parameters()
+        # The key convolution is initialized to the last-tap delta, which makes it a
+        # pass-through whose carry window no consumer reads. Drawn, the `keys` carry
+        # enters the result and a dropped key carry is observable.
+        if mixer.key_weight is not None:
+            torch.nn.init.normal_(mixer.key_weight, std=0.5)
+    return stack
+
+
 def _norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     """RMS norm over the trailing axis, stated rather than dispatched."""
     return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight
@@ -187,7 +215,19 @@ def test_the_stack_is_the_prenorm_residual_stack(
     fused = stack(fused_x)
     ref = _reference(stack, ref_x)
     tag = "activations" if vocab is None else "tokens"
-    assert_max_rel(fused, ref, PARITY_TOL, f"stack forward {tag}")
+    if vocab is None:
+        # No head, so the output is the residual stream and every column is live.
+        assert_max_rel(fused, ref, PARITY_TOL, f"stack forward {tag}")
+    else:
+        # Sliced, because the head is padded and the columns past the vocabulary hold
+        # ``finfo(dtype).min``: a relative bound divides by the reference's largest
+        # magnitude and no disagreement can cross it. A conditional rather than a
+        # slice that is a no-op on the branch above, since a reader cannot tell an
+        # intended no-op from an oversight. The fill itself is asserted by
+        # ``test_a_padded_head_is_an_unpadded_head_over_the_logits``.
+        assert_max_rel(
+            fused[..., :vocab], ref[..., :vocab], PARITY_TOL, f"stack forward {tag}"
+        )
 
     gen = torch.Generator(device=cuda).manual_seed(1)
     dout = torch.randn(fused.shape, generator=gen, device=cuda, dtype=fused.dtype)
@@ -397,7 +437,7 @@ def test_a_split_decode_reproduces_the_whole_sequence(
     # Seeded: the parameters come from the global generator, and the bound below is
     # the error of one draw. Unseeded, the splits would not be comparable either.
     torch.manual_seed(0)
-    stack = SLinOSSStack(cfg, device=cuda).to(torch.float64)
+    stack = _activate(SLinOSSStack(cfg, device=cuda).to(torch.float64))
     ids = _tokens(VOCAB, cuda)
     whole = stack(ids)
 
@@ -408,7 +448,12 @@ def test_a_split_decode_reproduces_the_whole_sequence(
         parts.append(stack(ids[:, offset : offset + length], state))
         offset += length
     assert offset == SEQLEN
-    assert_max_rel(torch.cat(parts, dim=1), whole, DECODE_TOL, f"decode {label}")
+    # Sliced to the meaningful columns. The padded ones hold
+    # ``torch.finfo(float64).min``, and a relative bound divides by the reference's
+    # largest magnitude, so left in they scale every disagreement by 1.8e308 and no
+    # error can cross a 1e-14 bound.
+    got = torch.cat(parts, dim=1)[..., :VOCAB]
+    assert_max_rel(got, whole[..., :VOCAB], DECODE_TOL, f"decode {label}")
 
 
 @pytest.mark.cuda
@@ -426,16 +471,17 @@ def test_a_step_advances_the_state_in_place_and_records_no_graph(
     least likely to admit: one partial chunk, no full one.
     """
     cfg = replace(STACK_CONFIG, vocab_size=VOCAB)
-    stack = SLinOSSStack(cfg, device=cuda).to(torch.bfloat16)
+    stack = _activate(SLinOSSStack(cfg, device=cuda).to(torch.bfloat16))
     state = StackState.allocate(cfg, BATCH, device=cuda, dtype=torch.bfloat16)
     layer = state.layers[0]
-    buffers = {
-        "conv": layer.conv,
-        "ssm": layer.ssm,
-        "b_prev": layer.b_prev,
-        "u_prev": layer.u_prev,
-    }
+    # Off the dataclass, not a written list. A literal here is a second enumeration
+    # of the same buffer set, free to drop the same one twice; that is how a restore
+    # that never copied `keys` passed the graph suite.
+    buffers = {field.name: getattr(layer, field.name) for field in fields(layer)}
     before = {name: buf.data_ptr() for name, buf in buffers.items()}
+    # Cloned, not value-checked: `ssm` is the oscillator basis and is already nonzero
+    # before the step, so `any()` over it is an assertion on a constant.
+    ssm_before = layer.ssm.clone()
 
     logits = stack(_tokens(VOCAB, cuda)[:, :1], state)
 
@@ -445,7 +491,7 @@ def test_a_step_advances_the_state_in_place_and_records_no_graph(
     for name, buf in buffers.items():
         assert buf.data_ptr() == before[name], name
         assert bool(buf.isfinite().all()), name
-    assert bool(layer.ssm.any()), "the recurrent state was not written"
+    assert not torch.equal(layer.ssm, ssm_before), "the recurrent state was not written"
 
 
 def test_a_state_the_stack_cannot_use_is_named_where_it_enters() -> None:

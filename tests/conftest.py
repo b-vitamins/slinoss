@@ -192,9 +192,49 @@ def max_err(a: Tensor, b: Tensor) -> float:
     return float((a.detach().double() - b.detach().double()).abs().max())
 
 
+SENTINELS = frozenset(
+    -float(torch.finfo(dtype).min)
+    for dtype in (torch.bfloat16, torch.float16, torch.float32, torch.float64)
+)
+"""Magnitudes a padded vocabulary column carries.
+
+:mod:`slinoss.stack` pads the head to a kernel width and fills the columns past
+``vocab_size`` with ``torch.finfo(dtype).min``, so a sample can never draw one. One
+magnitude per dtype the head runs at, and not one value: a reference written at
+bfloat16 and upcast to float64 keeps the bfloat16 magnitude.
+
+Compared exactly rather than by threshold. The fill is that value, so an exact
+comparison names the defect and nothing else; float16's magnitude is 65504, which a
+threshold would either miss or trip on legitimately.
+"""
+
+
 def rel_err(a: Tensor, b: Tensor) -> float:
-    """Maximum absolute difference over the reference magnitude."""
+    """Maximum absolute difference over the reference magnitude.
+
+    Args:
+        a: Measured tensor.
+        b: Reference tensor. Its largest magnitude is the denominator.
+
+    Returns:
+        The relative error.
+
+    Raises:
+        ValueError: If the denominator is a padding sentinel. A relative bound over
+            unsliced padded logits divides by 1.8e308 and cannot fail, at any
+            tolerance, for any model. Raising rather than slicing here: the
+            vocabulary extent is not in the tensor, so a repair would guess, and a
+            helper that quietly returns a different meaningless number is the defect
+            one layer down.
+    """
     scale = float(b.detach().double().abs().max())
+    if scale in SENTINELS:
+        raise ValueError(
+            f"the reference's largest magnitude is {scale:.6e}, which is the fill a "
+            f"padded head writes into the columns past the vocabulary. A relative "
+            f"bound divides by it and cannot fail. Slice both tensors to the real "
+            f"vocabulary, as in `got[..., :vocab_size]`, before asserting"
+        )
     return max_err(a, b) / max(scale, torch.finfo(torch.float64).tiny)
 
 
