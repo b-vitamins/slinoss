@@ -35,6 +35,8 @@ from typing import Any
 import torch
 
 from scripts.harness import load_module
+from scripts.provenance import capture as capture_provenance
+from scripts.provenance import identity
 from scripts.tsc import model as model_module
 from scripts.tsc.batching import Loader
 from scripts.tsc.corpus import load
@@ -120,6 +122,7 @@ def run_point(
     num_steps: int = NUM_STEPS,
     print_steps: int = PRINT_STEPS,
     patience: int = PATIENCE,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build and train one point, and return its record.
 
@@ -132,6 +135,7 @@ def run_point(
         num_steps: Step cap.
         print_steps: Evaluation interval.
         patience: Non-improving evaluations tolerated.
+        provenance: Source, harness, dirty tree, and exact command identity.
 
     Returns:
         The record.
@@ -186,6 +190,17 @@ def run_point(
         ),
     )
     reference = REFERENCE.get(point.dataset)
+    source = {
+        "corpus": asdict(corpus.manifest),
+        "partition_seed": point.seed,
+        "split_sizes": list(rows.sizes),
+    }
+    initialization_spans = [
+        construction["effective_config"].get("init_span")
+        for construction in mixer.constructions
+        if "init_span" in construction["effective_config"]
+    ]
+    parameter = next(built.parameters())
     return {
         "plan": plan,
         "key": point.key,
@@ -196,10 +211,48 @@ def run_point(
         "setting": asdict(setting),
         "overrides": list(overrides),
         "mixer_settings": mixer.settings,
+        "mixer_contract": {
+            "max_length_policy": mixer.max_length_policy,
+            "initialization": "mixer_constructor; no scaffold reinitialization",
+        },
+        "mixer_constructions": mixer.constructions,
         "corpus": asdict(corpus.manifest),
         "split_sizes": list(rows.sizes),
         "input_dim": splits.train.channels,
         "length": splits.train.length,
+        "lengths": {
+            "configured_task_length": corpus.manifest.length,
+            "training_ceiling": splits.train.length,
+            "evaluation_ceiling": max(splits.val.length, splits.test.length),
+            "observed_tensor_width": {
+                "train": splits.train.length,
+                "validation": splits.val.length,
+                "test": splits.test.length,
+            },
+            "mixer_initialization_span": initialization_spans or None,
+        },
+        "seeds": {
+            "model": point.seed,
+            "partition": point.seed,
+            "batch_order": point.seed,
+        },
+        "data": {**source, "identity": identity(source)},
+        "initialization": {
+            "scaffold": "framework constructor defaults; no post-construction pass",
+            "mixer": "owned by each mixer constructor",
+        },
+        "precision": {
+            "parameter_dtype": str(parameter.dtype),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "autocast": False,
+        },
+        "provenance": (
+            capture_provenance(
+                "scripts/tsc", ["<python-api>"], module="scripts.tsc.run"
+            )
+            if provenance is None
+            else provenance
+        ),
         "classes": splits.train.classes,
         "parameters": model_module.parameter_count(built),
         "mixer_parameters": model_module.mixer_parameters(built),
@@ -251,11 +304,14 @@ def lattice_from(options: argparse.Namespace) -> Lattice:
     )
 
 
-def execute(options: argparse.Namespace) -> int:
+def execute(
+    options: argparse.Namespace, *, provenance: dict[str, Any] | None = None
+) -> int:
     """Run what the invocation asks for.
 
     Args:
         options: Parsed arguments.
+        provenance: One source/harness/command identity shared by every selected point.
 
     Returns:
         A process exit status: zero unless a point raised under ``--keep-going``.
@@ -265,6 +321,10 @@ def execute(options: argparse.Namespace) -> int:
     """
     for path in options.mixer_module:
         load_module(path)
+    if provenance is None:
+        provenance = capture_provenance(
+            "scripts/tsc", ["<python-api>"], module="scripts.tsc.run"
+        )
     lattice = lattice_from(options)
     plan = plan_digest(lattice)
     if options.shard is None:
@@ -299,6 +359,7 @@ def execute(options: argparse.Namespace) -> int:
                 num_steps=options.num_steps,
                 print_steps=options.print_steps,
                 patience=options.patience,
+                provenance=provenance,
             )
         except Exception as exc:
             if not options.keep_going:
@@ -315,6 +376,7 @@ def execute(options: argparse.Namespace) -> int:
                     "dataset": point.dataset,
                     "mixer": point.mixer,
                     "seed": point.seed,
+                    "provenance": provenance,
                     "error": f"{type(exc).__name__}: {exc}",
                 },
             )
@@ -430,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         A process exit status.
     """
-    return execute(build_parser().parse_args(argv))
+    provenance = capture_provenance("scripts/tsc", argv, module="scripts.tsc.run")
+    return execute(build_parser().parse_args(argv), provenance=provenance)
 
 
 if __name__ == "__main__":

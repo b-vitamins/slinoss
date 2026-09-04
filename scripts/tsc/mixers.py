@@ -76,57 +76,52 @@ class Unwrap(nn.Module):
         return out[0] if isinstance(out, tuple) else out
 
 
-def _build_linoss_im(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_linoss_im(d_model: int, **settings: Any) -> nn.Module:
     """The reference recurrence under the implicit scheme.
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         **settings: ``ssm_dim``.
 
     Returns:
         A :class:`scripts.tsc.linoss.LinOSSRecurrence`.
     """
-    return LinOSSRecurrence(d_model, max_length, discretization="IM", **settings)
+    return LinOSSRecurrence(d_model, discretization="IM", **settings)
 
 
-def _build_linoss_imex(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_linoss_imex(d_model: int, **settings: Any) -> nn.Module:
     """The reference recurrence under the IMEX scheme.
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         **settings: ``ssm_dim``.
 
     Returns:
         A :class:`scripts.tsc.linoss.LinOSSRecurrence`.
     """
-    return LinOSSRecurrence(d_model, max_length, discretization="IMEX", **settings)
+    return LinOSSRecurrence(d_model, discretization="IMEX", **settings)
 
 
-def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
     """The tree's mixer.
 
     Args:
         d_model: Stream width.
-        max_length: Ignored. The recurrence carries no length-dependent buffer.
         **settings: :class:`slinoss.SLinOSSConfig` mixer fields.
 
     Returns:
         A :class:`slinoss.SLinOSSMixer`.
     """
-    del max_length
     from slinoss import SLinOSSConfig, SLinOSSMixer
 
     return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
 
 
-def _build_mamba2(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_mamba2(d_model: int, **settings: Any) -> nn.Module:
     """Mamba-2, from ``mamba_ssm``.
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         **settings: ``d_state``, ``d_conv``, ``expand``, ``headdim``, ``ngroups``.
 
     Returns:
@@ -135,18 +130,16 @@ def _build_mamba2(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     Raises:
         ModuleNotFoundError: When ``mamba_ssm`` is not installed.
     """
-    del max_length
     from mamba_ssm.modules.mamba2 import Mamba2  # type: ignore[import-not-found]
 
     return Mamba2(d_model=d_model, **settings)
 
 
-def _build_mamba3(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_mamba3(d_model: int, **settings: Any) -> nn.Module:
     """Mamba-3, from ``flash-linear-attention``.
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         **settings: ``state_size``, ``expand``, ``head_dim``, ``n_groups``, ``chunk_size``.
 
     Returns:
@@ -155,18 +148,16 @@ def _build_mamba3(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     Raises:
         ModuleNotFoundError: When ``fla`` is not installed.
     """
-    del max_length
     from fla.layers.mamba3 import Mamba3  # type: ignore[import-not-found]
 
     return Unwrap(Mamba3(hidden_size=d_model, **settings))
 
 
-def _build_gdn2(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_gdn2(d_model: int, **settings: Any) -> nn.Module:
     """Gated DeltaNet 2, from ``flash-linear-attention``.
 
     Args:
         d_model: Stream width.
-        max_length: Ignored.
         **settings: ``expand_v``, ``head_dim``, ``num_heads``, ``conv_size``,
             ``use_short_conv``, ``allow_neg_eigval``.
 
@@ -176,7 +167,6 @@ def _build_gdn2(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     Raises:
         ModuleNotFoundError: When ``fla`` is not installed.
     """
-    del max_length
     from fla.layers.gdn2 import GatedDeltaNet2  # type: ignore[import-not-found]
 
     return Unwrap(GatedDeltaNet2(hidden_size=d_model, **settings))
@@ -201,6 +191,8 @@ def _slinoss_defaults() -> dict[str, Any]:
         "n_groups": SLinOSSConfig.n_groups,
         "chunk_size": SLinOSSConfig.chunk_size,
         "d_conv": SLinOSSConfig.d_conv,
+        "key_conv": SLinOSSConfig.key_conv,
+        "init_span": SLinOSSConfig.init_span,
         "w_max": SLinOSSConfig.w_max,
         "bias": SLinOSSConfig.bias,
         "conv_bias": SLinOSSConfig.conv_bias,
@@ -234,17 +226,27 @@ def _register_builtins() -> None:
     Called at import. Only the slinoss entry reads defaults off another module, and
     :class:`slinoss.SLinOSSConfig` imports torch and nothing optional.
     """
-    REGISTRY.register("linoss_im", MixerEntry(_build_linoss_im, {"ssm_dim": 64}))
-    REGISTRY.register("linoss_imex", MixerEntry(_build_linoss_imex, {"ssm_dim": 64}))
-    REGISTRY.register("slinoss", MixerEntry(_build_slinoss, _slinoss_defaults()))
     REGISTRY.register(
-        "attention", MixerEntry(CausalAttention, {"n_heads": 4, "rotary": True})
+        "linoss_im", MixerEntry(_build_linoss_im, "unused", {"ssm_dim": 64})
     )
-    REGISTRY.register("conv", MixerEntry(CausalConv, {"d_conv": 4, "expand": 2.0}))
+    REGISTRY.register(
+        "linoss_imex", MixerEntry(_build_linoss_imex, "unused", {"ssm_dim": 64})
+    )
+    REGISTRY.register(
+        "slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults())
+    )
+    REGISTRY.register(
+        "attention",
+        MixerEntry(CausalAttention, "required", {"n_heads": 4, "rotary": True}),
+    )
+    REGISTRY.register(
+        "conv", MixerEntry(CausalConv, "unused", {"d_conv": 4, "expand": 2.0})
+    )
     REGISTRY.register(
         "mamba2",
         MixerEntry(
             _build_mamba2,
+            "unused",
             {"d_state": 96, "d_conv": 4, "expand": 2, "headdim": 16, "ngroups": 1},
         ),
     )
@@ -252,6 +254,7 @@ def _register_builtins() -> None:
         "mamba3",
         MixerEntry(
             _build_mamba3,
+            "unused",
             {
                 "state_size": 96,
                 "expand": 2,
@@ -265,6 +268,7 @@ def _register_builtins() -> None:
         "gdn2",
         MixerEntry(
             _build_gdn2,
+            "unused",
             {
                 "expand_v": 1.0,
                 "head_dim": 16,

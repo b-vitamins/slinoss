@@ -294,9 +294,37 @@ def test_one_point_end_to_end_writes_a_record_a_harvest_accepts(
     # The published state width is applied first, so a swept ssm_dim would follow and win.
     assert record["overrides"] == [f"ssm_dim={DATASETS[DATASET].ssm_dim}"]
     assert record["mixer_settings"]["ssm_dim"] == DATASETS[DATASET].ssm_dim
+    assert record["mixer_contract"] == {
+        "max_length_policy": "unused",
+        "initialization": "mixer_constructor; no scaffold reinitialization",
+    }
+    assert len(record["mixer_constructions"]) == 1
+    construction = record["mixer_constructions"][0]
+    assert construction["context"] == {
+        "max_length_supplied": 3,
+        "max_length_policy": "unused",
+        "max_length_consumed": None,
+    }
     assert record["corpus"] == asdict(read_manifest(corpus_root / DATASET))
     assert record["split_sizes"] == [16, 4, 4]
     assert (record["input_dim"], record["length"], record["classes"]) == (3, 3, 3)
+    assert record["lengths"] == {
+        "configured_task_length": 3,
+        "training_ceiling": 3,
+        "evaluation_ceiling": 3,
+        "observed_tensor_width": {"train": 3, "validation": 3, "test": 3},
+        "mixer_initialization_span": None,
+    }
+    assert record["seeds"] == {"model": SEED, "partition": SEED, "batch_order": SEED}
+    assert len(record["data"]["identity"]) == 64
+    assert record["precision"]["parameter_dtype"] == "torch.float32"
+    assert record["precision"]["autocast"] is False
+    provenance = record["provenance"]
+    assert len(provenance["repository_commit"]) == 40
+    assert len(provenance["source"]["tree"]) == 40
+    assert len(provenance["harness"]["tree"]) == 40
+    assert len(provenance["dirty_diff_sha256"]) == 64
+    assert provenance["command_argv"]
     assert record["parameters"] > record["mixer_parameters"] > 0
     assert record["reference"] == REFERENCE[DATASET]._asdict()
     assert record["device"] == "cpu"

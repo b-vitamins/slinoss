@@ -202,7 +202,6 @@ class LinOSSRecurrence(nn.Module):
 
     Args:
         d_model: Stream width, the reference's ``H``.
-        max_length: Ignored. The signature is the registry's.
         ssm_dim: Oscillators, the reference's ``ssm_size`` and ``P``. The scan carries
             ``2 * ssm_dim`` reals per channel-free position, not ``ssm_dim``.
         discretization: ``IM`` or ``IMEX``.
@@ -214,12 +213,10 @@ class LinOSSRecurrence(nn.Module):
     def __init__(
         self,
         d_model: int,
-        max_length: int = 0,
         ssm_dim: int = 64,
         discretization: str = "IM",
     ) -> None:
         super().__init__()
-        del max_length
         if d_model < 1 or ssm_dim < 1:
             raise ValueError(
                 f"d_model {d_model} and ssm_dim {ssm_dim} must be positive"
