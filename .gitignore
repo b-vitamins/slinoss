@@ -23,6 +23,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+.sources/
 
 # Generated AOT payloads and JIT caches.
 slinoss/_aot/
@@ -35,4 +36,3 @@ out/
 *.ncu-rep
 *.nsys-rep
 *.sqlite
-
