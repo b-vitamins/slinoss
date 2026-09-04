@@ -448,7 +448,6 @@ def memorization(
     *,
     vocab_size: int,
     seq_len: int,
-    is_training: bool,
     kv_map: dict[tuple[Any, ...], tuple[Any, ...]],
     ignore_index: int = IGNORE_INDEX,
 ) -> Instance:
@@ -456,14 +455,13 @@ def memorization(
 
     The mapping is fixed across the whole task, so nothing in the context says what a
     key maps to and the value has to come from the weights. Both splits are drawn the
-    same way and from the same map; ``is_training`` is accepted and ignored so every
-    generator takes one call.
+    same way and from the same map. Its task contract declares the split role
+    invariant, so no unused role argument reaches this function.
 
     Args:
         rng: Draw source.
         vocab_size: Vocabulary, including the insert token at ``vocab_size - 1``.
         seq_len: Width of the returned instance. Even.
-        is_training: Ignored. The two splits differ only in their draws.
         kv_map: The fixed mapping, from :func:`build_kv_map`. Single-token keys and
             values, so a pair spends two positions.
         ignore_index: Target value at an unsupervised position.
@@ -475,7 +473,6 @@ def memorization(
     Raises:
         ValueError: On an odd ``seq_len``.
     """
-    del is_training
     if seq_len % KV_MOTIF_SIZE != 0:
         raise ValueError(f"seq_len must be even, got {seq_len}")
 
@@ -503,24 +500,21 @@ def compression(
     *,
     vocab_size: int,
     seq_len: int,
-    is_training: bool,
 ) -> Instance:
     """One compression instance: a random stream closed by the compression token.
 
     The target is the input, so the task is to reconstruct the whole stream from
     whatever the state holds at the compression token. Both splits are drawn the same
-    way; ``is_training`` is accepted and ignored.
+    way. Its task contract declares the split role invariant.
 
     Args:
         rng: Draw source.
         vocab_size: Vocabulary, including the compression token at ``vocab_size - 1``.
         seq_len: Width of the returned instance.
-        is_training: Ignored. The two splits differ only in their draws.
 
     Returns:
         The instance, width ``seq_len``. Every position is supervised.
     """
-    del is_training
     tokens = rng.choice(np.arange(vocab_size - 1), size=(seq_len - 1,), replace=True)
     inputs = np.concatenate([tokens.reshape(-1), np.array([vocab_size - 1])])
     inputs = inputs.astype(np.int64)
@@ -533,7 +527,6 @@ def selective_copying(
     blank_rng: np.random.RandomState,
     vocab_size: int,
     seq_len: int,
-    is_training: bool,
     num_tokens_to_copy: int,
     ignore_index: int = IGNORE_INDEX,
 ) -> Instance:
@@ -543,7 +536,7 @@ def selective_copying(
     their offsets carry no information and the state has to select on content. The copy
     token then opens exactly as many blank positions as there are tokens to reproduce,
     and those are the only supervised positions. Both splits are drawn the same way;
-    ``is_training`` is accepted and ignored.
+    its task contract declares the split role invariant.
 
     Args:
         rng: Draw source for the tokens.
@@ -552,7 +545,6 @@ def selective_copying(
         vocab_size: Vocabulary, including the copy token at ``vocab_size - 1`` and the
             blank at ``vocab_size - 2``.
         seq_len: Width of the returned instance.
-        is_training: Ignored. The two splits differ only in their draws.
         num_tokens_to_copy: Tokens in the run.
         ignore_index: Target value at an unsupervised position.
 
@@ -562,7 +554,6 @@ def selective_copying(
     Raises:
         ValueError: When the run and its copy leave no room for a blank.
     """
-    del is_training
     if seq_len <= 2 * num_tokens_to_copy + 1:
         raise ValueError(
             f"seq_len must exceed 2 * num_tokens_to_copy + 1 = "

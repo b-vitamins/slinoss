@@ -18,7 +18,7 @@ Kalman Linear Attention driver differ:
     Linear init      torch default (LM)         normal, std 0.02     0.02
                      normal 0.02 (AutoEncoder)
     decoder posemb   sincos, half-half concat   interleaved          half-half
-    max_length       seq_len (benchmark.py)     the input's          the pool's width
+    mixer length     seq_len (benchmark.py)     task seq_len         task seq_len
 
 The initialization pass reaches the scaffold only. Every mixer keeps whatever its own
 constructor chose, so a mixer arrives with its authors' initialization rather than this
@@ -36,9 +36,12 @@ import torch
 from torch import Tensor, nn
 
 MixerFactory = Callable[[int, int], nn.Module]
-"""``(d_model, max_length) -> module``, mapping ``(B,T,d_model)`` to ``(B,T,d_model)``
-causally. ``max_length`` is the widest sequence the mixer will see, for a mixer that has
-to size a buffer or a mask; a recurrence ignores it."""
+"""``(d_model, configured_task_length) -> module``.
+
+MAD-Lab passes the generator's configured ``seq_len`` to every mixer constructor.
+That is not always the observed tensor width: autoregressive recall shifts a
+128-token generated stream into 127 model inputs.
+"""
 
 
 @dataclass(frozen=True)
@@ -47,8 +50,11 @@ class ModelConfig:
 
     Attributes:
         vocab_size: Embedding rows and head columns.
-        width: Positions per example. Sizes the bottleneck decoder's position code and
-            is the ``max_length`` handed to the mixer factory.
+        task_length: Generator's configured ``seq_len``. Handed to the mixer factory
+            exactly once, matching MAD-Lab's constructor contract.
+        observed_width: Positions in the tensors the generator actually returned.
+            Sizes the bottleneck decoder's position code; it must not replace
+            ``task_length`` at the mixer boundary.
         d_model: Residual stream width.
         n_layers: Mixer and channel-mixer pairs.
         bottleneck: Route through :class:`BottleneckModel` rather than
@@ -61,7 +67,8 @@ class ModelConfig:
     """
 
     vocab_size: int
-    width: int
+    task_length: int
+    observed_width: int
     d_model: int = 128
     n_layers: int = 1
     bottleneck: bool = False
@@ -71,7 +78,14 @@ class ModelConfig:
     init_std: float = 0.02
 
     def __post_init__(self) -> None:
-        for name in ("vocab_size", "width", "d_model", "n_layers", "ffn_multiple_of"):
+        for name in (
+            "vocab_size",
+            "task_length",
+            "observed_width",
+            "d_model",
+            "n_layers",
+            "ffn_multiple_of",
+        ):
             value = getattr(self, name)
             if value < 1:
                 raise ValueError(f"{name} must be positive, got {value}")
@@ -211,8 +225,9 @@ def _init_scaffold(module: nn.Module, std: float) -> None:
     if isinstance(module, nn.Linear):
         if _fresh(module.weight):
             nn.init.normal_(module.weight, mean=0.0, std=std)
-        if module.bias is not None and _fresh(module.bias):
-            nn.init.zeros_(module.bias)
+        bias = cast(Tensor | None, getattr(module, "bias", None))
+        if bias is not None and _fresh(bias):
+            nn.init.zeros_(bias)
     elif isinstance(module, nn.Embedding) and _fresh(module.weight):
         nn.init.normal_(module.weight, mean=0.0, std=std)
 
@@ -260,7 +275,7 @@ def _encoder(config: ModelConfig, mixer: MixerFactory) -> nn.Sequential:
     """
     layers: list[nn.Module] = []
     for _ in range(config.n_layers):
-        built = protect(mixer(config.d_model, config.width))
+        built = protect(mixer(config.d_model, config.task_length))
         layers.append(Residual(built, config.d_model, config.norm_eps))
         layers.append(
             Residual(
@@ -311,7 +326,7 @@ class BottleneckModel(nn.Module):
     decoder is not residual and does not expand.
 
     Args:
-        config: Scaffold shape. ``width`` sizes the position code.
+        config: Scaffold shape. ``observed_width`` sizes the position code.
         mixer: Sequence-mixer factory.
     """
 
@@ -332,7 +347,7 @@ class BottleneckModel(nn.Module):
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=config.head_bias)
         self.register_buffer(
             "positions",
-            sincos_positions(config.width, config.d_model),
+            sincos_positions(config.observed_width, config.d_model),
             persistent=False,
         )
         self.apply(lambda m: _init_scaffold(m, config.init_std))
@@ -341,7 +356,8 @@ class BottleneckModel(nn.Module):
         """Reconstruct every position from the last state.
 
         Args:
-            ids: ``(B,T)`` int64 token ids, ``T`` at most ``config.width``.
+            ids: ``(B,T)`` int64 token ids, ``T`` at most
+                ``config.observed_width``.
 
         Returns:
             ``(B,T,vocab_size)`` logits.
@@ -350,9 +366,10 @@ class BottleneckModel(nn.Module):
             ValueError: On an input wider than the position code.
         """
         length = int(ids.shape[1])
-        if length > self.config.width:
+        if length > self.config.observed_width:
             raise ValueError(
-                f"input has {length} positions, code carries {self.config.width}"
+                f"input has {length} positions, code carries "
+                f"{self.config.observed_width}"
             )
         state = self.encoder(self.token_embeds(ids))[:, -1:, :]
         code = cast(Tensor, self.positions)[:length]

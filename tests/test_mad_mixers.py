@@ -44,7 +44,7 @@ class Stub(nn.Module):
 
     def __init__(self, d_model: int, max_length: int, **settings: Any) -> None:
         super().__init__()
-        del max_length
+        self.max_length = max_length
         self.settings = settings
         self.weight = nn.Parameter(torch.zeros(d_model))
 
@@ -85,12 +85,12 @@ def test_an_unregistered_name_names_what_is_registered() -> None:
 def test_a_taken_name_is_refused() -> None:
     """Re-registration would silently change what every later arm measured."""
     with pytest.raises(ValueError, match="already registered"):
-        register("conv", MixerEntry(Stub))
+        register("conv", MixerEntry(Stub, "required"))
 
 
 def test_overrides_are_read_at_the_type_of_the_default() -> None:
     """Each setting's default type is the rule, and the flag reads either spelling."""
-    with registered("stub", MixerEntry(Stub, dict(STUB_DEFAULTS))):
+    with registered("stub", MixerEntry(Stub, "required", dict(STUB_DEFAULTS))):
         settings = settings_from(
             "stub", ["mode=narrow", "taps=7", "gain=0.5", "gated=false"]
         )
@@ -123,7 +123,7 @@ def test_a_bad_override_is_refused_with_its_reason(override: str, message: str) 
     Dropping either would leave the record claiming a setting the mixer never saw.
     """
     with (
-        registered("stub", MixerEntry(Stub, dict(STUB_DEFAULTS))),
+        registered("stub", MixerEntry(Stub, "required", dict(STUB_DEFAULTS))),
         pytest.raises(ValueError, match=message),
     ):
         settings_from("stub", [override])
@@ -131,13 +131,29 @@ def test_a_bad_override_is_refused_with_its_reason(override: str, message: str) 
 
 def test_resolve_closes_over_the_settings_it_reports() -> None:
     """The factory builds with exactly the settings the record carries."""
-    with registered("stub", MixerEntry(Stub, dict(STUB_DEFAULTS))):
+    with registered("stub", MixerEntry(Stub, "required", dict(STUB_DEFAULTS))):
         mixer = resolve("stub", ["taps=9"])
         assert mixer.name == "stub"
         assert mixer.settings == {**STUB_DEFAULTS, "taps": 9}
         built = mixer.factory(8, 16)
         assert isinstance(built, Stub)
         assert built.settings == mixer.settings
+        assert built.max_length == 16
+        assert mixer.constructions[0]["context"]["max_length_consumed"] == 16
+
+
+def test_length_consumption_is_mandatory_and_fail_closed() -> None:
+    """An entry cannot regain the old implicit accept-and-drop convention."""
+    with pytest.raises(ValueError, match="max_length_policy"):
+        MixerEntry(Stub, "sometimes")  # type: ignore[arg-type]
+    resolved = resolve("slinoss")
+    built = resolved.factory(128, 256)
+    from slinoss import SLinOSSMixer
+
+    assert isinstance(built, SLinOSSMixer)
+    assert built.config.init_span == 4096
+    assert resolved.max_length_policy == "unused"
+    assert resolved.constructions[0]["context"]["max_length_consumed"] is None
 
 
 def test_slinoss_defaults_track_the_config() -> None:
@@ -151,7 +167,15 @@ def test_slinoss_defaults_track_the_config() -> None:
 
     defaults = REGISTRY["slinoss"].defaults
     fields = set(SLinOSSConfig.__dataclass_fields__)
-    assert set(defaults) <= fields
+    stack_only = {
+        "d_model",
+        "n_layers",
+        "ffn_ratio",
+        "norm_eps",
+        "vocab_size",
+        "vocab_pad_multiple",
+    }
+    assert set(defaults) == fields - stack_only
     for key in set(defaults) - {"d_state"}:
         assert defaults[key] == getattr(SLinOSSConfig, key)
     assert defaults["w_max"] > 3.0
@@ -233,7 +257,7 @@ def test_conv_reaches_exactly_d_conv_positions() -> None:
     stated one -- one tap too many and the floor is no longer a floor.
     """
     taps = 3
-    mixer = CausalConv(8, 16, d_conv=taps).eval()
+    mixer = CausalConv(8, d_conv=taps).eval()
     x = torch.randn(1, 10, 8)
     moved = x.clone()
     moved[:, 4] += 1.0
@@ -249,7 +273,7 @@ def test_conv_reaches_exactly_d_conv_positions() -> None:
 def test_conv_refuses_a_tapless_setting() -> None:
     """Zero taps is a mixer that cannot see its own position."""
     with pytest.raises(ValueError, match="d_conv must be positive"):
-        CausalConv(8, 16, d_conv=0)
+        CausalConv(8, d_conv=0)
 
 
 def test_rotary_turns_pairs_without_changing_their_length() -> None:

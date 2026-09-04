@@ -194,18 +194,16 @@ CASES: dict[str, Case] = {
         {
             "vocab_size": 16,
             "seq_len": 8,
-            "is_training": True,
             "kv_map": MEM_KV_MAP,
         },
     ),
-    "comp": Case(COMP_TRAIN, 4, {"vocab_size": 16, "seq_len": 8, "is_training": True}),
+    "comp": Case(COMP_TRAIN, 4, {"vocab_size": 16, "seq_len": 8}),
     "sc": Case(
         SC_TRAIN,
         5,
         {
             "vocab_size": 16,
             "seq_len": 16,
-            "is_training": True,
             "num_tokens_to_copy": 3,
         },
         blank_seed=5,
@@ -320,7 +318,6 @@ def test_selective_copying_blanks_come_from_the_second_stream() -> None:
     settings = {
         "vocab_size": 16,
         "seq_len": 16,
-        "is_training": True,
         "num_tokens_to_copy": 3,
     }
     first = selective_copying(

@@ -10,16 +10,16 @@ calls, so its parity gate runs anywhere.
 
 Draw order follows `mad-lab`'s ``generate_data``. One generator serves both splits and
 the train split is drawn first, so a pool is reproduced by its seed alone and the test
-split is not the train split's stream replayed. ``is_training`` is the only setting that
-differs between the two: it selects the target stream, which supervises every position
-in train and the probed positions in test.
+split is not the train split's stream replayed. Recall tasks declare that their target
+stream consumes the train/test role; the other three declare their generator invariant
+to it and never receive an unused argument.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -53,8 +53,11 @@ class TaskSpec:
     Attributes:
         name: Short key, as :data:`TASKS` and the command line use it.
         mad_name: The name MAD reports the task under.
-        generator: Instance generator, called as ``generator(rng, is_training=...,
-            **kwargs)``.
+        generator: Instance generator. ``split_policy`` declares whether it is
+            called with an ``is_training`` keyword.
+        split_policy: ``required`` when train and test targets differ by role;
+            ``invariant`` when they differ only by their independent draws. This is
+            explicit so an accepted role argument is never deleted inside a generator.
         vocab_size: Symbols, including whatever special tokens the generator reserves.
         seq_len: Generator length setting. Not the width, which the generator fixes;
             the two recall tasks with a copy prefix return ``seq_len - 1`` positions.
@@ -72,6 +75,7 @@ class TaskSpec:
     name: str
     mad_name: str
     generator: Callable[..., Instance]
+    split_policy: Literal["required", "invariant"]
     vocab_size: int
     seq_len: int
     num_train: int
@@ -82,6 +86,11 @@ class TaskSpec:
     ladder: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.split_policy not in {"required", "invariant"}:
+            raise ValueError(
+                f"{self.name}: split_policy must be required or invariant, got "
+                f"{self.split_policy!r}"
+            )
         unknown = self.supplied - SUPPLIED
         if unknown:
             raise ValueError(f"{self.name}: cannot supply {sorted(unknown)}")
@@ -134,6 +143,7 @@ TASKS: dict[str, TaskSpec] = {
         name="icr",
         mad_name="in-context-recall",
         generator=in_context_recall,
+        split_policy="required",
         vocab_size=16,
         seq_len=128,
         num_train=12800,
@@ -148,6 +158,7 @@ TASKS: dict[str, TaskSpec] = {
         name="nicr",
         mad_name="noisy-in-context-recall",
         generator=noisy_in_context_recall,
+        split_policy="required",
         # 32, not 16: the noise vocabulary is carved out of the same range, so 16 less
         # 16 noise symbols leaves no key-value vocabulary at all. 32 leaves the 16 the
         # other recall tasks get, and the ladder's vocabulary rungs each add the same
@@ -167,6 +178,7 @@ TASKS: dict[str, TaskSpec] = {
         name="ficr",
         mad_name="fuzzy-in-context-recall",
         generator=fuzzy_in_context_recall,
+        split_policy="required",
         vocab_size=16,
         seq_len=128,
         num_train=12800,
@@ -181,6 +193,7 @@ TASKS: dict[str, TaskSpec] = {
         name="mem",
         mad_name="memorization",
         generator=memorization,
+        split_policy="invariant",
         vocab_size=256,
         seq_len=32,
         num_train=256,
@@ -191,6 +204,7 @@ TASKS: dict[str, TaskSpec] = {
         name="comp",
         mad_name="compression",
         generator=compression,
+        split_policy="invariant",
         vocab_size=16,
         seq_len=32,
         num_train=12800,
@@ -205,6 +219,7 @@ TASKS: dict[str, TaskSpec] = {
         name="sc",
         mad_name="selective-copying",
         generator=selective_copying,
+        split_policy="invariant",
         vocab_size=16,
         seq_len=256,
         num_train=12800,
@@ -286,9 +301,12 @@ def _draw(
     """
     if count < 1:
         raise ValueError(f"{spec.name}: a split needs at least one example")
-    pairs = [
-        spec.generator(rng, is_training=is_training, **kwargs) for _ in range(count)
-    ]
+    if spec.split_policy == "required":
+        pairs = [
+            spec.generator(rng, is_training=is_training, **kwargs) for _ in range(count)
+        ]
+    else:
+        pairs = [spec.generator(rng, **kwargs) for _ in range(count)]
     widths = {len(inputs) for inputs, _ in pairs}
     if len(widths) != 1:
         raise ValueError(f"{spec.name}: ragged instances, widths {sorted(widths)}")

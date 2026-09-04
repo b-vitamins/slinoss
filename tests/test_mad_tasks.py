@@ -161,10 +161,8 @@ def test_ragged_instances_are_refused() -> None:
     would otherwise produce an object array and fail somewhere downstream instead.
     """
 
-    def ragged(
-        rng: np.random.Generator, *, vocab_size: int, seq_len: int, is_training: bool
-    ) -> Instance:
-        del is_training
+    def ragged(rng: np.random.Generator, *, vocab_size: int, seq_len: int) -> Instance:
+        del vocab_size
         width = seq_len + int(rng.integers(0, 2))
         row = np.zeros(width, dtype=np.int64)
         return Instance(row, row)
@@ -173,6 +171,7 @@ def test_ragged_instances_are_refused() -> None:
         name="ragged",
         mad_name="ragged",
         generator=ragged,
+        split_policy="invariant",
         vocab_size=16,
         seq_len=8,
         num_train=32,
@@ -180,6 +179,29 @@ def test_ragged_instances_are_refused() -> None:
     )
     with pytest.raises(ValueError, match="ragged instances"):
         build_pool(spec, seed=0)
+
+    with pytest.raises(ValueError, match="split_policy"):
+        TaskSpec(
+            name="bad",
+            mad_name="bad",
+            generator=ragged,
+            split_policy="ignored",  # type: ignore[arg-type]
+            vocab_size=16,
+            seq_len=8,
+            num_train=4,
+        )
+
+
+def test_split_roles_are_explicit() -> None:
+    """Only generators whose output depends on split role receive that role."""
+    assert {name: spec.split_policy for name, spec in TASKS.items()} == {
+        "icr": "required",
+        "nicr": "required",
+        "ficr": "required",
+        "mem": "invariant",
+        "comp": "invariant",
+        "sc": "invariant",
+    }
 
 
 def test_specs_are_the_task_configs() -> None:

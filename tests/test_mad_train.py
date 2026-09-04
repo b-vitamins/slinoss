@@ -172,7 +172,13 @@ def copy_pool(num_train: int, num_test: int, width: int, vocab_size: int) -> Poo
 
 def identity_model(vocab_size: int, width: int) -> nn.Module:
     """The scaffold with a mixer that carries nothing between positions."""
-    config = ModelConfig(vocab_size=vocab_size, width=width, d_model=16, n_layers=1)
+    config = ModelConfig(
+        vocab_size=vocab_size,
+        task_length=width,
+        observed_width=width,
+        d_model=16,
+        n_layers=1,
+    )
     return build_model(config, lambda d_model, max_length: nn.Identity())
 
 
@@ -183,7 +189,8 @@ def identity_model(vocab_size: int, width: int) -> nn.Module:
         ("precision", "fp16"),
         ("epochs", 0),
         ("batch_size", 0),
-        ("log_every", 0),
+        ("eval_every", 0),
+        ("float32_matmul_precision", "fastest"),
         ("lr", 0.0),
         ("patience", -1),
         ("grad_clip", -1.0),
@@ -205,10 +212,12 @@ def test_the_default_protocol_is_the_published_one() -> None:
     every arm at once and is not visible in any single record.
     """
     config = TrainConfig()
-    assert (config.epochs, config.patience, config.log_every) == (750, 70, 10)
+    assert (config.epochs, config.patience, config.eval_every) == (750, 70, 10)
     assert (config.batch_size, config.lr, config.weight_decay) == (128, 1e-3, 0.0)
     assert (config.schedule, config.precision, config.seed) == ("none", "fp32", 12345)
     assert config.grad_clip == 5.0
+    assert config.drop_last is True
+    assert config.float32_matmul_precision == "high"
 
 
 def test_the_flat_schedule_is_flat() -> None:
@@ -252,10 +261,18 @@ def test_training_drops_the_short_tail_and_evaluation_keeps_it() -> None:
     The protocol's ``DataLoader`` drops the tail while training, and an evaluation that
     dropped it would score a split it does not report.
     """
-    shuffled = list(_batches(10, 4, shuffle=True, generator=torch.Generator()))
+    shuffled = list(
+        _batches(
+            10,
+            4,
+            shuffle=True,
+            drop_last=True,
+            generator=torch.Generator(),
+        )
+    )
     assert [int(batch.numel()) for batch in shuffled] == [4, 4]
     assert len(set(torch.cat(shuffled).tolist())) == 8
-    whole = list(_batches(10, 4, shuffle=False, generator=None))
+    whole = list(_batches(10, 4, shuffle=False, drop_last=False, generator=None))
     assert [int(batch.numel()) for batch in whole] == [4, 4, 2]
     assert torch.cat(whole).tolist() == list(range(10))
 
@@ -263,7 +280,22 @@ def test_training_drops_the_short_tail_and_evaluation_keeps_it() -> None:
 def test_a_split_under_one_batch_is_refused() -> None:
     """Dropping the only batch would train on nothing and report the loss of nothing."""
     with pytest.raises(ValueError, match="under one batch"):
-        list(_batches(3, 4, shuffle=True, generator=None))
+        list(_batches(3, 4, shuffle=True, drop_last=True, generator=None))
+
+
+def test_training_can_explicitly_keep_the_short_tail() -> None:
+    """The MAD-Lab batching policy is available and includes every example."""
+    batches = list(
+        _batches(
+            10,
+            4,
+            shuffle=True,
+            drop_last=False,
+            generator=torch.Generator().manual_seed(0),
+        )
+    )
+    assert [int(batch.numel()) for batch in batches] == [4, 4, 2]
+    assert sorted(torch.cat(batches).tolist()) == list(range(10))
 
 
 def test_micro_and_macro_separate_on_an_unbalanced_split() -> None:
@@ -335,7 +367,7 @@ def test_the_loop_learns_a_task_a_position_wise_model_can_learn() -> None:
     one that trained.
     """
     config = TrainConfig(
-        epochs=40, batch_size=8, lr=0.05, log_every=10, patience=0, **CPU
+        epochs=40, batch_size=8, lr=0.05, eval_every=10, patience=0, **CPU
     )
     seed_all(config.seed)
     model = identity_model(8, 4)
@@ -351,11 +383,11 @@ def test_the_loop_learns_a_task_a_position_wise_model_can_learn() -> None:
 def test_patience_is_counted_in_epochs() -> None:
     """A run whose loss never improves stops ``patience`` epochs after its best.
 
-    Counted in epochs, not in evaluations: at ``log_every`` 10 the two differ by a factor
+    Counted in epochs, not in evaluations: at ``eval_every`` 10 the two differ by a factor
     of ten and the published patience is 70 epochs.
     """
     config = TrainConfig(
-        epochs=20, batch_size=4, lr=0.1, log_every=1, patience=3, **CPU
+        epochs=20, batch_size=4, lr=0.1, eval_every=1, patience=3, **CPU
     )
     report = train(Frozen(4), copy_pool(8, 4, 4, 4), config, vocab_size=4)
     assert report.best_epoch == 0
@@ -376,7 +408,7 @@ def test_selection_and_patience_read_accuracy_rather_than_loss() -> None:
     correct = (1, 2, 3, 4, 5, 3)
     model = Scripted(4, correct, (2.0, 3.0, 4.0, 5.0, 6.0, 7.0))
     config = TrainConfig(
-        epochs=len(correct), batch_size=8, lr=0.1, log_every=1, patience=3, **CPU
+        epochs=len(correct), batch_size=8, lr=0.1, eval_every=1, patience=3, **CPU
     )
     report = train(model, scripted_pool(), config, vocab_size=4)
 
@@ -401,7 +433,9 @@ def test_patience_ignores_a_loss_that_improves_under_a_flat_accuracy() -> None:
     count the protocol reports.
     """
     model = Scripted(4, (8,) * 6, (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
-    config = TrainConfig(epochs=6, batch_size=8, lr=0.1, log_every=1, patience=3, **CPU)
+    config = TrainConfig(
+        epochs=6, batch_size=8, lr=0.1, eval_every=1, patience=3, **CPU
+    )
     report = train(model, scripted_pool(), config, vocab_size=4)
 
     losses = [point.test.loss for point in report.points]
@@ -420,7 +454,7 @@ def test_bf16_leaves_the_master_weights_at_float32() -> None:
     parameters would change the optimizer's arithmetic as well as the forward pass, and
     the loss is taken at float32 either way.
     """
-    config = TrainConfig(epochs=1, batch_size=8, log_every=1, precision="bf16", **CPU)
+    config = TrainConfig(epochs=1, batch_size=8, eval_every=1, precision="bf16", **CPU)
     seed_all(config.seed)
     model = identity_model(8, 4)
     report = train(model, copy_pool(16, 8, 4, 8), config, vocab_size=8)

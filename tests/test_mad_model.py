@@ -37,7 +37,7 @@ class Shift(nn.Module):
 
     def __init__(self, d_model: int, max_length: int) -> None:
         super().__init__()
-        del max_length
+        self.max_length = max_length
         self.proj = nn.Linear(d_model, d_model)
         with torch.no_grad():
             self.proj.weight.fill_(0.25)
@@ -58,8 +58,13 @@ class Shift(nn.Module):
 
 
 def config(**kwargs: object) -> ModelConfig:
-    """A small scaffold config, ``vocab_size`` 11 and ``width`` 8 unless overridden."""
-    settings: dict[str, object] = {"vocab_size": 11, "width": 8, "d_model": 16}
+    """A small scaffold config with task and observed lengths 8."""
+    settings: dict[str, object] = {
+        "vocab_size": 11,
+        "task_length": 8,
+        "observed_width": 8,
+        "d_model": 16,
+    }
     settings.update(kwargs)
     return ModelConfig(**settings)  # pyright: ignore[reportArgumentType]
 
@@ -123,6 +128,13 @@ def test_initialization_stops_at_the_mixer() -> None:
         weight, bias = mixer.proj.weight, mixer.proj.bias
         torch.testing.assert_close(weight, torch.full_like(weight, 0.25))
         torch.testing.assert_close(bias, torch.full_like(bias, 0.5))
+
+
+def test_configured_task_length_not_observed_width_reaches_the_mixer() -> None:
+    """The autoregressive shift cannot silently shorten constructor context."""
+    model = build_model(config(task_length=128, observed_width=127), Shift)
+    mixers = [module for module in model.modules() if isinstance(module, Shift)]
+    assert [mixer.max_length for mixer in mixers] == [128]
 
 
 def test_scaffold_weights_are_normal_and_biases_are_zero() -> None:

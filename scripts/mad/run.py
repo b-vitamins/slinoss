@@ -8,7 +8,7 @@ Records go to stdout as JSON lines and the summary table to stderr, so a redirec
 the data and leaves the table on the terminal. A record carries everything an arm is: the
 task and any axis moved off its baseline, the mixer and every resolved setting, the
 protocol, the pool's leakage and width, the parameter count, and each evaluation. Nothing
-about the host goes in.
+about the runtime environment or credentials goes in; source and command provenance do.
 
 A baseline whose package is not a dependency of this tree registers itself in a module of
 its own; ``--mixer-module`` imports it before the name is resolved.
@@ -17,6 +17,7 @@ its own; ``--mixer-module`` imports it before the name is resolved.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from dataclasses import asdict, replace
@@ -29,6 +30,8 @@ from scripts.mad.mixers import REGISTRY, load_module, resolve
 from scripts.mad.model import ModelConfig, build_model, parameter_count
 from scripts.mad.tasks import LEAKAGE_LIMIT, TASKS, Pool, TaskSpec, build_pool
 from scripts.mad.train import Point, Report, TrainConfig, seed_all, train
+from scripts.provenance import capture as capture_provenance
+from scripts.provenance import identity
 
 
 def parse_axes(pairs: list[str]) -> dict[str, Any]:
@@ -94,6 +97,7 @@ def run_task(
     *,
     data_seed: int,
     quiet: bool,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a pool, build a model, run the protocol, and return the record.
 
@@ -108,6 +112,7 @@ def run_task(
         data_seed: Seeds the pool. Held apart from the model seed so a paired
             comparison can share a pool across arms and vary only the initialization.
         quiet: Suppress the per-evaluation lines on stderr.
+        provenance: Source/harness/command identity captured before the task starts.
 
     Returns:
         The record, JSON-ready.
@@ -116,10 +121,12 @@ def run_task(
     mixer = resolve(mixer_name, overrides)
     model_config = ModelConfig(
         vocab_size=spec.vocab_size,
-        width=pool.width,
+        task_length=spec.seq_len,
+        observed_width=pool.width,
         bottleneck=spec.bottleneck,
         **model_args,
     )
+    torch.set_float32_matmul_precision(config.float32_matmul_precision)
     seed_all(config.seed)
     model = build_model(model_config, mixer.factory).to(config.device)
 
@@ -148,7 +155,29 @@ def run_task(
         pool,
         report,
         parameter_count(model),
+        data_seed,
+        mixer.max_length_policy,
+        mixer.constructions,
+        capture_provenance("scripts/mad", ["<python-api>"], module="scripts.mad.run")
+        if provenance is None
+        else provenance,
     )
+
+
+def _pool_identity(pool: Pool) -> str:
+    """Hash the exact train/test arrays, including shapes and dtypes."""
+    digest = hashlib.sha256()
+    for name, array in (
+        ("train_inputs", pool.train_inputs),
+        ("train_targets", pool.train_targets),
+        ("test_inputs", pool.test_inputs),
+        ("test_targets", pool.test_targets),
+    ):
+        digest.update(name.encode() + b"\0")
+        digest.update(str(array.dtype).encode() + b"\0")
+        digest.update(json.dumps(array.shape).encode() + b"\0")
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _record(
@@ -160,6 +189,10 @@ def _record(
     pool: Pool,
     report: Report,
     parameters: int,
+    data_seed: int,
+    max_length_policy: str,
+    constructions: list[dict[str, Any]],
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble one arm's record.
 
@@ -172,37 +205,88 @@ def _record(
         pool: The pool, for its leakage and width.
         report: What the run produced.
         parameters: Trainable parameter count.
+        data_seed: Seed from which the exact pool was drawn.
+        max_length_policy: Declared consumption of configured task length.
+        constructions: Effective per-layer mixer configurations.
+        provenance: Source, harness, dirty tree, and command identity.
 
     Returns:
         A JSON-ready dict. ``leaky`` flags a pool over
         :data:`scripts.mad.tasks.LEAKAGE_LIMIT`, which invalidates the arm rather than
         merely warning about it.
     """
+    task_settings = {
+        "vocab_size": spec.vocab_size,
+        "seq_len": spec.seq_len,
+        "num_train": spec.num_train,
+        "num_test": spec.num_test,
+        **spec.extra,
+    }
+    init_spans = [
+        construction["effective_config"].get("init_span")
+        for construction in constructions
+        if "init_span" in construction["effective_config"]
+    ]
     return {
         "task": spec.name,
         "mad_task": spec.mad_name,
-        "task_settings": {
-            "vocab_size": spec.vocab_size,
-            "seq_len": spec.seq_len,
-            "num_train": spec.num_train,
-            "num_test": spec.num_test,
-            **spec.extra,
+        "task_settings": task_settings,
+        "task_contract": {
+            "split_policy": spec.split_policy,
+            "generator": f"{spec.generator.__module__}.{spec.generator.__qualname__}",
         },
         "mixer": mixer_name,
         "mixer_settings": settings,
+        "mixer_contract": {
+            "max_length_policy": max_length_policy,
+            "initialization": "mixer constructor; protected from scaffold reinitialization",
+        },
+        "mixer_constructions": constructions,
         "model": asdict(model_config),
         "protocol": asdict(config),
+        "selection": {
+            "split": "test",
+            "metric": "micro_accuracy",
+            "evaluation_interval_epochs": config.eval_every,
+        },
         "width": pool.width,
+        "lengths": {
+            "configured_task_length": spec.seq_len,
+            "training_ceiling": int(pool.train_inputs.shape[1]),
+            "evaluation_ceiling": int(pool.test_inputs.shape[1]),
+            "observed_tensor_width": {
+                "train": int(pool.train_inputs.shape[1]),
+                "evaluation": int(pool.test_inputs.shape[1]),
+            },
+            "mixer_initialization_span": init_spans or None,
+        },
+        "seeds": {
+            "model": config.seed,
+            "shuffle": config.seed,
+            "data": data_seed,
+        },
+        "pool": {
+            "identity": _pool_identity(pool),
+            "spec_identity": identity(task_settings),
+            "train_examples": int(pool.train_inputs.shape[0]),
+            "test_examples": int(pool.test_inputs.shape[0]),
+        },
+        "initialization": {
+            "scaffold": f"normal std={model_config.init_std}; mixer parameters exempt",
+            "mixer": "owned by each mixer constructor",
+        },
+        "provenance": provenance,
         "leakage": pool.leakage,
         "leaky": pool.leakage > LEAKAGE_LIMIT,
         "parameters": parameters,
         "best": report.best._asdict(),
-        "best_epoch": report.best_epoch,
+        "best_epoch": report.best_epoch + 1,
+        "epoch_indexing": "one_based",
         "final": report.final._asdict(),
         "epochs_run": report.epochs_run,
         "stopped_early": report.stopped_early,
         "points": [
-            [p.epoch, p.step, p.train_loss, p.test.loss, p.test.micro, p.test.macro]
+            [p.epoch + 1, p.step, p.train_loss, p.test.loss, p.test.micro, p.test.macro]
             for p in report.points
         ],
     }
@@ -306,7 +390,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--grad-clip", type=float, default=protocol.grad_clip)
     parser.add_argument("--patience", type=int, default=protocol.patience)
-    parser.add_argument("--log-every", type=int, default=protocol.log_every)
+    parser.add_argument("--eval-every", type=int, default=protocol.eval_every)
+    parser.add_argument(
+        "--drop-last",
+        action=argparse.BooleanOptionalAction,
+        default=protocol.drop_last,
+        help="drop a short final training batch; KLA does, MAD-Lab does not",
+    )
+    parser.add_argument(
+        "--float32-matmul-precision",
+        default=protocol.float32_matmul_precision,
+        choices=("highest", "high", "medium"),
+    )
     parser.add_argument(
         "--precision", default=protocol.precision, choices=("fp32", "bf16")
     )
@@ -335,6 +430,8 @@ def main(argv: list[str] | None = None) -> int:
         recall of its own train split.
     """
     args = build_parser().parse_args(argv)
+    provenance = capture_provenance("scripts/mad", argv, module="scripts.mad.run")
+    provenance["mixer_modules"] = list(args.mixer_module)
     for module in args.mixer_module:
         load_module(module)
 
@@ -348,7 +445,9 @@ def main(argv: list[str] | None = None) -> int:
         schedule=args.schedule,
         grad_clip=args.grad_clip,
         patience=args.patience,
-        log_every=args.log_every,
+        eval_every=args.eval_every,
+        drop_last=args.drop_last,
+        float32_matmul_precision=args.float32_matmul_precision,
         precision=args.precision,
         device=args.device,
     )
@@ -367,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
                     replace(base, seed=seed),
                     data_seed=seed if args.data_seed is None else args.data_seed,
                     quiet=args.quiet,
+                    provenance=provenance,
                 )
                 line = json.dumps(record)
                 print(line, flush=True)

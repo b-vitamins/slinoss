@@ -61,7 +61,11 @@ class TrainConfig:
         grad_clip: Gradient norm ceiling. Zero disables clipping.
         patience: Epochs without a strict test-accuracy improvement before stopping.
             Counted in epochs, not evaluations. Zero disables the stop.
-        log_every: Evaluate every this many epochs. The final epoch always evaluates.
+        eval_every: Evaluate every this many epochs. The final epoch always evaluates.
+        drop_last: Whether training omits a short final batch. Explicit because
+            MAD-Lab keeps it while the KLA driver drops it; baseline batch 128 divides
+            every pool, but the paper's batch 172 does not.
+        float32_matmul_precision: PyTorch float32 matmul policy. MAD-Lab sets ``high``.
         precision: A member of :data:`PRECISIONS`.
         seed: Seeds the shuffle, and :func:`seed_all` for everything else.
         device: Where the model and the pool live.
@@ -76,7 +80,9 @@ class TrainConfig:
     warmup_epochs: int = 5
     grad_clip: float = 5.0
     patience: int = 70
-    log_every: int = 10
+    eval_every: int = 10
+    drop_last: bool = True
+    float32_matmul_precision: str = "high"
     precision: str = "fp32"
     seed: int = 12345
     device: str = "cuda"
@@ -90,7 +96,7 @@ class TrainConfig:
             raise ValueError(
                 f"precision must be one of {PRECISIONS}, got {self.precision}"
             )
-        for name in ("epochs", "batch_size", "log_every"):
+        for name in ("epochs", "batch_size", "eval_every"):
             value = getattr(self, name)
             if value < 1:
                 raise ValueError(f"{name} must be positive, got {value}")
@@ -102,6 +108,11 @@ class TrainConfig:
             value = getattr(self, name)
             if value < 0:
                 raise ValueError(f"{name} must not be negative, got {value}")
+        if self.float32_matmul_precision not in {"highest", "high", "medium"}:
+            raise ValueError(
+                "float32_matmul_precision must be highest, high, or medium, got "
+                f"{self.float32_matmul_precision!r}"
+            )
 
 
 class Metrics(NamedTuple):
@@ -225,34 +236,36 @@ def _to_device(array: NDArray[np.int64], device: str) -> Tensor:
 
 
 def _batches(
-    count: int, batch_size: int, *, shuffle: bool, generator: torch.Generator | None
+    count: int,
+    batch_size: int,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    generator: torch.Generator | None,
 ) -> Iterator[Tensor]:
     """Index batches over ``count`` examples.
 
     Args:
         count: Examples.
         batch_size: Examples per batch.
-        shuffle: Whether to permute. Shuffled iteration drops the short tail, which is
-            what the protocol's ``drop_last`` does; unshuffled iteration keeps it, so an
-            evaluation covers the whole split.
+        shuffle: Whether to permute.
+        drop_last: Whether to omit a short final batch.
         generator: Draw source for the permutation.
 
     Yields:
         Index tensors.
 
     Raises:
-        ValueError: When a shuffled split is shorter than one batch, which would train
-            on nothing.
+        ValueError: When ``drop_last`` would leave no batch.
     """
-    if shuffle:
-        if count < batch_size:
-            raise ValueError(f"{count} examples is under one batch of {batch_size}")
-        order = torch.randperm(count, generator=generator)
-        for start in range(0, count - batch_size + 1, batch_size):
-            yield order[start : start + batch_size]
-        return
-    for start in range(0, count, batch_size):
-        yield torch.arange(start, min(start + batch_size, count))
+    if drop_last and count < batch_size:
+        raise ValueError(f"{count} examples is under one batch of {batch_size}")
+    order = (
+        torch.randperm(count, generator=generator) if shuffle else torch.arange(count)
+    )
+    stop = count - count % batch_size if drop_last else count
+    for start in range(0, stop, batch_size):
+        yield order[start : min(start + batch_size, count)]
 
 
 def _autocast(config: TrainConfig) -> torch.autocast:
@@ -369,7 +382,11 @@ def evaluate(
     model.eval()
     tally = _Tally(vocab_size, config.device)
     for index in _batches(
-        int(inputs.shape[0]), config.batch_size, shuffle=False, generator=None
+        int(inputs.shape[0]),
+        config.batch_size,
+        shuffle=False,
+        drop_last=False,
+        generator=None,
     ):
         batch = index.to(config.device)
         with _autocast(config):
@@ -418,7 +435,11 @@ def train(
     shuffle.manual_seed(config.seed)
 
     count = int(train_inputs.shape[0])
-    steps_per_epoch = count // config.batch_size
+    steps_per_epoch = (
+        count // config.batch_size
+        if config.drop_last
+        else math.ceil(count / config.batch_size)
+    )
     points: list[Point] = []
     best = Metrics(math.inf, 0.0, 0.0)
     best_epoch = -1
@@ -430,7 +451,11 @@ def train(
     for epoch in range(config.epochs):
         running = 0.0
         for index in _batches(
-            count, config.batch_size, shuffle=True, generator=shuffle
+            count,
+            config.batch_size,
+            shuffle=True,
+            drop_last=config.drop_last,
+            generator=shuffle,
         ):
             batch = index.to(device)
             rate = lr_at(config, step, steps_per_epoch)
@@ -447,7 +472,7 @@ def train(
             running += float(loss.detach())
             step += 1
 
-        due = (epoch + 1) % config.log_every == 0 or epoch == config.epochs - 1
+        due = (epoch + 1) % config.eval_every == 0 or epoch == config.epochs - 1
         if not due:
             continue
         test = evaluate(

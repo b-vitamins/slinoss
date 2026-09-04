@@ -23,16 +23,26 @@ RECORD_KEYS = {
     "task",
     "mad_task",
     "task_settings",
+    "task_contract",
     "mixer",
     "mixer_settings",
+    "mixer_contract",
+    "mixer_constructions",
     "model",
     "protocol",
+    "selection",
     "width",
+    "lengths",
+    "seeds",
+    "pool",
+    "initialization",
+    "provenance",
     "leakage",
     "leaky",
     "parameters",
     "best",
     "best_epoch",
+    "epoch_indexing",
     "final",
     "epochs_run",
     "stopped_early",
@@ -120,7 +130,7 @@ def test_the_driver_runs_both_backbones_and_records_them() -> None:
             "1",
             "--batch-size",
             "16",
-            "--log-every",
+            "--eval-every",
             "1",
             "--device",
             "cpu",
@@ -144,15 +154,51 @@ def test_the_driver_runs_both_backbones_and_records_them() -> None:
         assert record["task_settings"]["num_train"] == 64
         assert record["protocol"]["seed"] == 0
         assert record["protocol"]["device"] == "cpu"
+        assert record["protocol"]["eval_every"] == 1
+        assert record["protocol"]["drop_last"] is True
+        assert record["protocol"]["float32_matmul_precision"] == "high"
         assert record["model"]["d_model"] == 16
+        assert record["model"]["task_length"] == 16
         assert record["parameters"] > 0
         assert record["leakage"] == 0.0
         assert record["leaky"] is False
         assert record["epochs_run"] == 1
         assert len(record["points"]) == 1
+        assert record["points"][0][0] == 1
+        assert record["best_epoch"] == 1
+        assert record["epoch_indexing"] == "one_based"
+        assert record["selection"] == {
+            "split": "test",
+            "metric": "micro_accuracy",
+            "evaluation_interval_epochs": 1,
+        }
+        assert record["seeds"] == {"model": 0, "shuffle": 0, "data": 0}
+        assert len(record["pool"]["identity"]) == 64
+        assert len(record["pool"]["spec_identity"]) == 64
+        assert record["mixer_contract"]["max_length_policy"] == "unused"
+        construction = record["mixer_constructions"][0]
+        assert construction["context"] == {
+            "max_length_supplied": 16,
+            "max_length_policy": "unused",
+            "max_length_consumed": None,
+        }
+        assert record["provenance"]["command_argv"][-1] == "--quiet"
+        assert "--eval-every" in record["provenance"]["command_argv"]
+        assert len(record["provenance"]["dirty_diff_sha256"]) == 64
     icr, comp = records
     # The copy prefix spends a position, so multi-query recall is a position short.
     assert (icr["width"], comp["width"]) == (15, 16)
+    assert (icr["model"]["observed_width"], comp["model"]["observed_width"]) == (
+        15,
+        16,
+    )
+    assert icr["lengths"]["configured_task_length"] == 16
+    assert icr["lengths"]["observed_tensor_width"] == {
+        "train": 15,
+        "evaluation": 15,
+    }
+    assert icr["task_contract"]["split_policy"] == "required"
+    assert comp["task_contract"]["split_policy"] == "invariant"
     assert icr["model"]["bottleneck"] is False
     assert comp["model"]["bottleneck"] is True
     assert "conv" in err.getvalue()
