@@ -67,19 +67,20 @@ tasks; and the Walker arithmetic-with-brackets extension.
 
 ## MAD-Lab
 
-Protocol: `kla-paper-v2`, seed 12345, one run per task. Five of six tasks are
+Protocol: `kla-paper-v2`, seed 12345, one run per task. All six tasks are
 complete.
 
 | Task | Best accuracy | Best epoch | Final/stop | Published comparison |
 | :--- | ---: | ---: | :--- | :--- |
 | Memorization | 100.0000% | 20 | 100.0000% at epoch 90 | above KLA+ 99.94% |
 | Context recall | 99.9986% | 20 | 99.9121% at epoch 90 | above KLA+ 99.94% |
+| Noisy context recall | 100.0000% | 20 | 99.9051% at epoch 90 | above KLA+ 99.95% |
 | Compression | 83.7451% | 220 | 82.9785% at epoch 290 | below KLA+ 88.87% |
 | Fuzzy recall | 41.5355% | 70 | 38.6823% at epoch 140 | below KLA 45.70%; near KLA+ 43.32% |
 | Selective copy | 72.7246% | 470 | 72.6953% at epoch 540 | below KLA+ 91.45% and the historical SLinOSS 94.71% |
 
-Pending: noisy context recall. Selective copy is a material
-regression and does not satisfy the campaign's "respectable MAD" gate.
+Selective copy is a material regression and does not satisfy the campaign's
+"respectable MAD" gate.
 
 ## MQAR
 
