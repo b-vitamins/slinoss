@@ -1,8 +1,8 @@
 """Run one state-tracking arm, or a list of them, and write one record per arm.
 
     python3 -m scripts.state_tracking.run --task parity --mixer slinoss
-    python3 -m scripts.state_tracking.run --task A5 --mixer attention --seed 0 1 2
-    python3 -m scripts.state_tracking.run --task cycle_nav --val-max-length 512
+    python3 -m scripts.state_tracking.run --profile walker-group-prefix --task A5
+    python3 -m scripts.state_tracking.run --profile pdssm-groups-reconstruction
 
 Records go to stdout as JSON lines and the summary table to stderr, so a redirect keeps the
 data and leaves the table on the terminal. A record carries everything an arm is: the task
@@ -35,8 +35,12 @@ from scripts.state_tracking.model import (
     mixer_parameters,
     parameter_count,
 )
-from scripts.state_tracking.tasks import AUTOMATA, Task
-from scripts.state_tracking.tasks import resolve as resolve_task
+from scripts.state_tracking.tasks import (
+    AUTOMATA,
+    PROFILE_DEFAULTS,
+    Task,
+    resolve_profile,
+)
 from scripts.state_tracking.train import (
     Point,
     Report,
@@ -109,8 +113,11 @@ def run_arm(
         The record, JSON-ready.
     """
     mixer = resolve(mixer_name, overrides)
+    if task.output_vocab_size is None:  # narrowed by Task.__post_init__
+        raise AssertionError("resolved task output vocabulary is missing")
     model_config = ModelConfig(
-        vocab_size=task.vocab_size,
+        input_vocab_size=task.input_vocab_size,
+        output_vocab_size=task.output_vocab_size,
         max_length=max(val_split.max_length, train_split.max_length),
         **model_args,
     )
@@ -196,28 +203,51 @@ def _record(
     Returns:
         A JSON-ready dict.
     """
-    train_data = {
+    task_contract = asdict(task.contract)
+    task_data = {
         "task": task.name,
         "supervision": task.supervision,
-        "split": asdict(train_split),
+        "input_vocab_size": task.input_vocab_size,
+        "output_vocab_size": task.output_vocab_size,
+        "group_order": None if task.group is None else task.group.order,
+        "benchmark_contract": task_contract,
     }
-    val_data = {
-        "task": task.name,
-        "supervision": task.supervision,
-        "split": asdict(val_split),
-    }
+    train_data = {**task_data, "split": asdict(train_split)}
+    val_data = {**task_data, "split": asdict(val_split)}
     init_spans = [
         construction["effective_config"].get("init_span")
         for construction in constructions
         if "init_span" in construction["effective_config"]
+    ]
+    init_lattices = [
+        {
+            key: construction["effective_config"].get(key)
+            for key in (
+                "context_length",
+                "init_span",
+                "init_period_context_scale",
+                "init_decay_context_scale",
+                "resolved_init_period_span",
+                "resolved_init_decay_span",
+            )
+        }
+        for construction in constructions
+        if "resolved_init_period_span" in construction["effective_config"]
     ]
     train_width_max = max(train_split.max_length, train_split.pad_to)
     val_width_max = max(val_split.max_length, val_split.pad_to)
     return {
         "task": task.name,
         "supervision": task.supervision,
-        "vocab_size": task.vocab_size,
+        "vocab_size": (
+            task.input_vocab_size
+            if task.input_vocab_size == task.output_vocab_size
+            else None
+        ),
+        "input_vocab_size": task.input_vocab_size,
+        "output_vocab_size": task.output_vocab_size,
         "group_order": None if task.group is None else task.group.order,
+        "benchmark_contract": task_contract,
         "mixer": mixer_name,
         "mixer_settings": settings,
         "mixer_contract": {
@@ -238,6 +268,7 @@ def _record(
                 "evaluation": {"min": val_split.min_length, "max": val_width_max},
             },
             "mixer_initialization_span": init_spans or None,
+            "mixer_initialization_lattice": init_lattices or None,
         },
         "seeds": {
             "model": config.seed,
@@ -318,11 +349,20 @@ def build_parser() -> argparse.ArgumentParser:
         prog="scripts.state_tracking.run", description="Run state-tracking arms."
     )
     parser.add_argument(
+        "--profile",
+        default="pdssm-regular",
+        choices=tuple(PROFILE_DEFAULTS),
+        help="benchmark contract; tasks from another contract are rejected",
+    )
+    parser.add_argument(
         "--task",
         nargs="+",
-        default=sorted(AUTOMATA),
+        default=None,
         metavar="NAME",
-        help=f"tasks to run, from {sorted(AUTOMATA)} or a group spec such as A5",
+        help=(
+            f"tasks within --profile; automata are {sorted(AUTOMATA)}, "
+            "Walker groups use A5/S5, PD reconstructions use pdssm:A5:2"
+        ),
     )
     parser.add_argument(
         "--mixer", default="attention", help=f"one of {sorted(REGISTRY)}"
@@ -418,7 +458,12 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Process exit status. Zero unless an arm raised.
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        tasks = resolve_profile(args.profile, args.task)
+    except ValueError as exc:
+        parser.error(str(exc))
     provenance = capture_provenance(
         "scripts/state_tracking", argv, module="scripts.state_tracking.run"
     )
@@ -453,9 +498,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for seed in args.seed:
             train_split, val_split = splits(args, seed)
-            for name in args.task:
+            for task in tasks:
                 record = run_arm(
-                    resolve_task(name),
+                    task,
                     args.mixer,
                     args.settings,
                     model_args,

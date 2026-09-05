@@ -122,7 +122,7 @@ def test_dropout_is_the_last_thing_in_the_block() -> None:
 
 
 def test_model_shape_and_layer_count() -> None:
-    """Logits at every position, over the one shared vocabulary.
+    """Logits at every position, over the configured output vocabulary.
 
     Every position, not just the last: a group task supervises the whole trajectory and
     the loss selects with the batch's mask.
@@ -137,6 +137,24 @@ def test_model_shape_and_layer_count() -> None:
     assert out.shape == (2, 5, VOCAB)
     assert model.head.out_features == VOCAB
     assert model.embedding.num_embeddings == VOCAB
+
+
+def test_input_and_output_vocabularies_can_differ_without_ambiguity() -> None:
+    """A generator alphabet embeds at width 2 while the head predicts all 60 states."""
+    config = ModelConfig(
+        2,
+        MAX_LENGTH,
+        d_model=D_MODEL,
+        n_layers=1,
+        dropout=0.0,
+        output_vocab_size=60,
+    )
+    model = build_model(config, _linear_factory([]))
+    assert model.embedding.num_embeddings == 2
+    assert model.head.out_features == 60
+    assert model(torch.zeros(3, 5, dtype=torch.long)).shape == (3, 5, 60)
+    with pytest.raises(ValueError, match="vocab_size is ambiguous"):
+        _ = config.vocab_size
 
 
 def test_layers_do_not_share_a_mixer() -> None:
@@ -219,8 +237,10 @@ def test_no_initialization_pass_touches_a_default() -> None:
 def test_model_config_validation() -> None:
     """A malformed shape is refused at construction rather than at the first forward."""
     ModelConfig(VOCAB, MAX_LENGTH, dropout=0.0)
-    with pytest.raises(ValueError, match="vocab_size must be positive"):
+    with pytest.raises(ValueError, match="input_vocab_size must be positive"):
         ModelConfig(0, MAX_LENGTH)
+    with pytest.raises(ValueError, match="output_vocab_size must be positive"):
+        ModelConfig(VOCAB, MAX_LENGTH, output_vocab_size=0)
     with pytest.raises(ValueError, match="max_length must be positive"):
         ModelConfig(VOCAB, 0)
     with pytest.raises(ValueError, match="d_model must be positive"):

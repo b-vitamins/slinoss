@@ -44,6 +44,8 @@ class Mixer:
         max_length_policy: Whether the constructor consumes the configured task
             length. ``unused`` is explicit and means the value is recorded but never
             handed to the constructor.
+        initialization_policy: Which owner initializes ordinary nested linear and
+            embedding parameters after construction.
         constructions: Effective configuration of every layer the factory built.
     """
 
@@ -51,6 +53,7 @@ class Mixer:
     factory: MixerFactory
     settings: dict[str, Any]
     max_length_policy: Literal["required", "unused"]
+    initialization_policy: Literal["constructor", "scaffold"]
     constructions: list[dict[str, Any]]
 
 
@@ -67,17 +70,28 @@ class MixerEntry:
         defaults: Every setting ``build`` accepts, with its default. The set is closed:
             an override outside it is refused, and a default's type is what an override
             string is coerced to.
+        initialization_policy: ``constructor`` preserves every parameter exactly as
+            ``build`` initialized it. ``scaffold`` explicitly opts ordinary nested
+            ``Linear`` and ``Embedding`` parameters into the harness's initialization
+            pass. The latter exists for external implementations whose published model
+            applies a model-wide initializer; it may never be inferred from module type.
     """
 
     build: Callable[..., nn.Module]
     max_length_policy: Literal["required", "unused"]
     defaults: dict[str, Any] = field(default_factory=dict)
+    initialization_policy: Literal["constructor", "scaffold"] = "constructor"
 
     def __post_init__(self) -> None:
         if self.max_length_policy not in {"required", "unused"}:
             raise ValueError(
                 "max_length_policy must be 'required' or 'unused', got "
                 f"{self.max_length_policy!r}"
+            )
+        if self.initialization_policy not in {"constructor", "scaffold"}:
+            raise ValueError(
+                "initialization_policy must be 'constructor' or 'scaffold', got "
+                f"{self.initialization_policy!r}"
             )
 
 
@@ -189,12 +203,19 @@ def resolve(name: str, overrides: Iterable[str] = ()) -> Mixer:
         else:
             module = entry.build(d_model, **settings)
             consumed = None
+        cast(Any, module)._mad_initialization_policy = entry.initialization_policy
         config = getattr(module, "config", None)
         effective = (
             asdict(cast(Any, config))
             if is_dataclass(config)
             else {"d_model": d_model, **settings}
         )
+        for field_name in (
+            "resolved_init_period_span",
+            "resolved_init_decay_span",
+        ):
+            if hasattr(config, field_name):
+                effective[field_name] = getattr(config, field_name)
         constructions.append(
             {
                 "module": f"{type(module).__module__}.{type(module).__qualname__}",
@@ -204,12 +225,24 @@ def resolve(name: str, overrides: Iterable[str] = ()) -> Mixer:
                     "max_length_policy": entry.max_length_policy,
                     "max_length_consumed": consumed,
                 },
-                "initialization": "mixer_constructor; protected from scaffold reinitialization",
+                "initialization_policy": entry.initialization_policy,
+                "initialization": (
+                    "mixer_constructor; protected from scaffold reinitialization"
+                    if entry.initialization_policy == "constructor"
+                    else "explicit scaffold pass over nested Linear/Embedding parameters"
+                ),
             }
         )
         return module
 
-    return Mixer(name, factory, settings, entry.max_length_policy, constructions)
+    return Mixer(
+        name,
+        factory,
+        settings,
+        entry.max_length_policy,
+        entry.initialization_policy,
+        constructions,
+    )
 
 
 def load_module(path: str) -> None:
@@ -228,19 +261,22 @@ def load_module(path: str) -> None:
 # slinoss:
 
 
-def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
+def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     """The tree's mixer.
 
     Args:
         d_model: Stream width.
-        **settings: :class:`slinoss.SLinOSSConfig` fields.
+        max_length: Configured task context. This is never inferred from the tensor.
+        **settings: User-controlled :class:`slinoss.SLinOSSConfig` fields.
 
     Returns:
         A :class:`slinoss.SLinOSSMixer`. CUDA only, from its own guards.
     """
     from slinoss import SLinOSSConfig, SLinOSSMixer
 
-    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
+    return SLinOSSMixer(
+        SLinOSSConfig(d_model=d_model, context_length=max_length, **settings)
+    )
 
 
 def _slinoss_defaults() -> dict[str, Any]:
@@ -263,6 +299,8 @@ def _slinoss_defaults() -> dict[str, Any]:
         "d_conv": SLinOSSConfig.d_conv,
         "key_conv": SLinOSSConfig.key_conv,
         "init_span": SLinOSSConfig.init_span,
+        "init_period_context_scale": SLinOSSConfig.init_period_context_scale,
+        "init_decay_context_scale": SLinOSSConfig.init_decay_context_scale,
         "w_max": SLinOSSConfig.w_max,
         "bias": SLinOSSConfig.bias,
         "conv_bias": SLinOSSConfig.conv_bias,
@@ -416,7 +454,7 @@ def _register_builtins() -> None:
     Called at import. The slinoss entry reads its defaults from
     :class:`slinoss.SLinOSSConfig`, which imports torch and nothing optional.
     """
-    register("slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults()))
+    register("slinoss", MixerEntry(_build_slinoss, "required", _slinoss_defaults()))
     register(
         "attention",
         MixerEntry(

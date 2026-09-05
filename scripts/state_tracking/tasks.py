@@ -1,6 +1,6 @@
-"""The state-tracking tasks: five finite automata and the group word problem.
+"""State-tracking tasks, with the benchmark contract attached to every task.
 
-Every generator here is a transcription of one file under
+The five named automaton generators are transcriptions of files under
 `structured-linear-cdes`'s ``data_dir/fl_tasks/``, which
 `expressive-sparse-state-space-model`'s ``state_tracking_PyTorch`` carries byte-identical.
 The draw order and the draw shapes are upstream's, call for call, so a sample is
@@ -20,23 +20,36 @@ initialization and dropout draw from -- the model's stochastic state becomes a f
 the last sample's index. Each generator here seeds a local :class:`torch.Generator`
 instead, which consumes the same stream and touches nothing global.
 
-    task                 vocab  supervised  what the state is
-    parity                   3  last        one bit, the count of ``b`` mod 2
-    even_pairs               3  last        the first token, held to the end
-    cycle_nav                9  last        a position on ``Z_5``
-    mod_arith_no_brack      10  last        a residue mod 5, under BIDMAS
-    mod_arith_w_brack       12  last        a residue mod 5, over a bracket tree
-    <group spec>      |G|<=512  all         the running product in the group
+    task                    inputs  outputs  supervised  what the state is
+    parity                       3        3  last        one bit, ``b`` count mod 2
+    even_pairs                   3        3  last        the first token
+    cycle_nav                    9        9  last        a position on ``Z_5``
+    mod_arith_no_brack          10       10  last        a residue mod 5
+    mod_arith_w_brack           12       12  last        a bracket-stack residue
+    <group spec>               |G|      |G|  all         every prefix product
+    pdssm:<group>:<generators>    n      |G|  last        final generator-word state
 
 Token 0 is never emitted by an automaton task, which is what lets the batcher pad with
-it. A group task's tokens are ``0..|G| - 1`` and 0 is the identity, so there the pad
-token and the identity element coincide: a padded position feeds the recurrence the
-identity, and the mask keeps it out of the loss either way.
+it. In an all-elements group task, 0 is the identity, so padding is also a no-op. In a
+generator-alphabet group task, 0 is a real action; right padding is nevertheless outside
+the loss mask and occurs after every supervised position, so causality keeps it from
+altering a scored state.
+
+The distinction in the last two rows is essential.  Walker/Merrill's group word problem
+uses every group element as an input and labels every prefix.  PD-SSM's non-solvable
+table uses a small generator alphabet and a group-state output alphabet.  The released
+PD-SSM repository does not include that table's data generator or its randomly selected
+extra permutations.  This module therefore exposes the released regular tasks as exact,
+the two-generator A5 task as a cross-release reconstruction from IBM's predecessor, and
+the remaining PD-SSM group rows as explicitly labelled deterministic paper
+reconstructions.  It never calls those unreleased rows exact.
 """
 
 from __future__ import annotations
 
+import hashlib
 import random
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -53,6 +66,55 @@ MODULUS = 5
 
 PAD_TOKEN = 0
 """The batcher's fill. Emitted by no automaton task; the identity in a group task."""
+
+PDSSM_REVISION = "8682e78101be84f67ceb64702855e5d9e820f7d2"
+"""Revision of IBM's released PD-SSM repository mirrored under ``.sources``."""
+
+IBM_A5_REVISION = "5bdc7f7a6a7ad01c1db67ea1f68800810fe6cf19"
+"""Revision of IBM's predecessor release containing the two-generator A5 task."""
+
+WALKER_REVISION = "243cb30fcd85406a94f2810ec762c59e6e2bb1c7"
+"""Revision of Walker's released all-elements, all-prefix group task."""
+
+PDSSM_REGULAR_PROFILE = "pdssm-regular"
+PDSSM_GROUP_PROFILE = "pdssm-groups-reconstruction"
+WALKER_GROUP_PROFILE = "walker-group-prefix"
+WALKER_EXTENSION_PROFILE = "walker-extension"
+
+
+@dataclass(frozen=True)
+class TaskContract:
+    """The provenance and fidelity of a task definition.
+
+    ``fidelity`` is deliberately categorical rather than a prose footnote.  A record
+    consumer can reject reconstructed axes without guessing from a task name.
+    """
+
+    profile: str
+    fidelity: str
+    source: str
+    revision: str
+    implementation: str
+    generator_selection: str = "not-applicable"
+    generator_labels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.fidelity not in {
+            "source-exact",
+            "cross-release-reconstruction",
+            "paper-reconstruction",
+            "extension",
+        }:
+            raise ValueError(f"unknown task-contract fidelity {self.fidelity!r}")
+
+
+CUSTOM_CONTRACT = TaskContract(
+    profile="custom",
+    fidelity="extension",
+    source="caller-defined",
+    revision="unversioned",
+    implementation="caller-defined Task",
+)
 
 
 class Sample(NamedTuple):
@@ -81,29 +143,72 @@ class Task:
 
     Attributes:
         name: Spec that named it.
-        vocab_size: Tokens, and classes on the head. Upstream's ``data_dim`` and
-            ``label_dim`` are both this: input tokens and labels share one vocabulary.
+        input_vocab_size: Number of input symbols.
+        output_vocab_size: Number of head classes. Defaults to ``input_vocab_size``;
+            it differs for generator-alphabet group tasks.
         sample: The generator.
         supervision: ``last`` or ``all``. Reported in the record because it decides what
             an accuracy is an accuracy over.
         min_length: Shortest sequence the generator accepts.
         group: The group, for a word-problem task; None for an automaton task.
+        contract: Source and fidelity attached to every emitted record.
+        generator_elements: Group-element indices represented by input symbols.
     """
 
     name: str
-    vocab_size: int
+    input_vocab_size: int
     sample: SampleFn
     supervision: str
     min_length: int = 1
     group: Group | None = None
+    output_vocab_size: int | None = None
+    contract: TaskContract = CUSTOM_CONTRACT
+    generator_elements: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.vocab_size < 1:
-            raise ValueError(f"{self.name}: vocab_size must be positive")
+        if self.input_vocab_size < 1:
+            raise ValueError(f"{self.name}: input_vocab_size must be positive")
+        if self.output_vocab_size is None:
+            object.__setattr__(self, "output_vocab_size", self.input_vocab_size)
+        if self.output_vocab_size is None or self.output_vocab_size < 1:
+            raise ValueError(f"{self.name}: output_vocab_size must be positive")
         if self.supervision not in ("last", "all"):
             raise ValueError(f"{self.name}: supervision must be last or all")
         if self.min_length < 1:
             raise ValueError(f"{self.name}: min_length must be positive")
+        if self.generator_elements:
+            if self.group is None:
+                raise ValueError(f"{self.name}: generators require a group")
+            if len(self.generator_elements) != self.input_vocab_size:
+                raise ValueError(
+                    f"{self.name}: {len(self.generator_elements)} generators for "
+                    f"input_vocab_size {self.input_vocab_size}"
+                )
+            if len(set(self.generator_elements)) != len(self.generator_elements):
+                raise ValueError(f"{self.name}: generator elements repeat")
+            if any(
+                not 0 <= element < self.group.order
+                for element in self.generator_elements
+            ):
+                raise ValueError(f"{self.name}: generator element outside the group")
+            if self.output_vocab_size != self.group.order:
+                raise ValueError(
+                    f"{self.name}: generator task needs {self.group.order} output classes"
+                )
+
+    @property
+    def vocab_size(self) -> int:
+        """The legacy shared vocabulary, only when input and output really share it.
+
+        Raising on an asymmetric task prevents the exact bug this harness used to have:
+        silently sizing both the embedding and classifier from the generator count.
+        """
+        if self.input_vocab_size != self.output_vocab_size:
+            raise ValueError(
+                f"{self.name}: vocab_size is ambiguous; use input_vocab_size or "
+                "output_vocab_size"
+            )
+        return self.input_vocab_size
 
 
 def _rng(seed: int) -> torch.Generator:
@@ -394,15 +499,98 @@ def word_problem(group: Group) -> SampleFn:
     return sample
 
 
+def generator_word_problem(
+    group: Group, generator_elements: tuple[int, ...]
+) -> SampleFn:
+    """A final-state task over a small alphabet of group generators.
+
+    Input symbol ``i`` applies ``generator_elements[i]``.  The classifier still predicts
+    one of all ``|G|`` states, so this task requires distinct input and output vocabulary
+    sizes.  Only the final state is supervised, matching IBM's released two-generator A5
+    task and the final-label scaffold used by PD-SSM's released regular benchmark.
+    """
+
+    def sample(seed: int, min_length: int, max_length: int) -> Sample:
+        _check_lengths(min_length, max_length)
+        generator = _rng(seed)
+        length = _draw(generator, min_length, max_length + 1)
+        ids = tuple(
+            int(token)
+            for token in torch.randint(
+                0, len(generator_elements), (length,), generator=generator
+            ).tolist()
+        )
+        elements = tuple(generator_elements[token] for token in ids)
+        return _last(ids, group.prefix(elements)[-1])
+
+    return sample
+
+
+def _contract(
+    profile: str,
+    fidelity: str,
+    source: str,
+    revision: str,
+    implementation: str,
+    *,
+    generator_selection: str = "not-applicable",
+    generator_labels: tuple[str, ...] = (),
+) -> TaskContract:
+    """Build a contract without repeating field names in the task table."""
+    return TaskContract(
+        profile=profile,
+        fidelity=fidelity,
+        source=source,
+        revision=revision,
+        implementation=implementation,
+        generator_selection=generator_selection,
+        generator_labels=generator_labels,
+    )
+
+
+_PDSSM_REGULAR_CONTRACT = _contract(
+    PDSSM_REGULAR_PROFILE,
+    "source-exact",
+    "IBM/expressive-sparse-state-space-model:state_tracking_PyTorch",
+    PDSSM_REVISION,
+    "scripts.state_tracking.tasks; byte-pinned fixtures against released generators",
+)
+
+_WALKER_EXTENSION_CONTRACT = _contract(
+    WALKER_EXTENSION_PROFILE,
+    "extension",
+    "Benjamin-Walker/structured-linear-cdes:data_dir/fl_tasks",
+    WALKER_REVISION,
+    "scripts.state_tracking.tasks.mod_arith_w_brack; not in PD-SSM Table 2",
+)
+
+
 AUTOMATA: dict[str, Task] = {
-    "parity": Task("parity", 3, parity, "last"),
-    "even_pairs": Task("even_pairs", 3, even_pairs, "last"),
-    "cycle_nav": Task("cycle_nav", MAX_POSITION + 4, cycle_nav, "last"),
+    "parity": Task("parity", 3, parity, "last", contract=_PDSSM_REGULAR_CONTRACT),
+    "even_pairs": Task(
+        "even_pairs", 3, even_pairs, "last", contract=_PDSSM_REGULAR_CONTRACT
+    ),
+    "cycle_nav": Task(
+        "cycle_nav",
+        MAX_POSITION + 4,
+        cycle_nav,
+        "last",
+        contract=_PDSSM_REGULAR_CONTRACT,
+    ),
     "mod_arith_no_brack": Task(
-        "mod_arith_no_brack", MODULUS + 5, mod_arith_no_brack, "last"
+        "mod_arith_no_brack",
+        MODULUS + 5,
+        mod_arith_no_brack,
+        "last",
+        contract=_PDSSM_REGULAR_CONTRACT,
     ),
     "mod_arith_w_brack": Task(
-        "mod_arith_w_brack", MODULUS + 7, mod_arith_w_brack, "last", min_length=2
+        "mod_arith_w_brack",
+        MODULUS + 7,
+        mod_arith_w_brack,
+        "last",
+        min_length=2,
+        contract=_WALKER_EXTENSION_CONTRACT,
     ),
 }
 """The five automaton tasks, keyed as upstream's module names.
@@ -414,13 +602,123 @@ transductions -- reversal, sorting, addition, square roots -- which measure a
 transduction rather than a state, and none of the trees this harness is compared against
 reports them on this axis."""
 
+PDSSM_REGULAR_TASKS = (
+    "parity",
+    "even_pairs",
+    "cycle_nav",
+    "mod_arith_no_brack",
+)
+"""Exactly the four tasks in PD-SSM's released state-tracking harness."""
+
+PDSSM_GROUP_VARIANTS: dict[str, tuple[int, ...]] = {
+    "A5": (2, 6, 8, 12),
+    "S5": (4, 8, 32),
+}
+"""Rows in PD-SSM's non-solvable-group table; generator identities are unreleased."""
+
+PDSSM_GROUP_TASKS = tuple(
+    f"pdssm:{group_name}:{count}"
+    for group_name, counts in PDSSM_GROUP_VARIANTS.items()
+    for count in counts
+)
+
+PROFILE_DEFAULTS: dict[str, tuple[str, ...]] = {
+    PDSSM_REGULAR_PROFILE: PDSSM_REGULAR_TASKS,
+    PDSSM_GROUP_PROFILE: PDSSM_GROUP_TASKS,
+    WALKER_GROUP_PROFILE: (),
+    WALKER_EXTENSION_PROFILE: ("mod_arith_w_brack",),
+}
+"""Named, mutually exclusive task families used by the CLI's fail-closed gate."""
+
+_PDSSM_GROUP_SPEC = re.compile(r"^pdssm:(A5|S5):([0-9]+)$")
+_PDSSM_RECONSTRUCTION_KEY = "slinoss-pdssm-group-reconstruction-v1"
+
+
+def _base_generator_labels(group: Group) -> tuple[str, str]:
+    """Canonical two generators used as the reconstruction's connected base.
+
+    A5's labels are the exact actions in IBM's released predecessor task: a five-cycle
+    and the double transposition ``(01)(23)``.  S5 uses the same cycle and the standard
+    transposition ``(01)``; the PD-SSM paper does not release its S5 generator identities.
+    """
+    if group.name == "A5":
+        return ("12340", "10324")
+    if group.name == "S5":
+        return ("12340", "10234")
+    raise ValueError(f"PD-SSM group reconstruction does not define {group.name}")
+
+
+def _reconstruction_generators(group: Group, count: int) -> tuple[int, ...]:
+    """Choose a nested, deterministic stand-in for PD-SSM's unreleased random set."""
+    base_labels = _base_generator_labels(group)
+    base = tuple(group.labels.index(label) for label in base_labels)
+    candidates = [
+        index
+        for index in range(1, group.order)
+        if index not in base
+    ]
+    candidates.sort(
+        key=lambda index: hashlib.sha256(
+            f"{_PDSSM_RECONSTRUCTION_KEY}:{group.name}:{group.labels[index]}".encode()
+        ).digest()
+    )
+    return base + tuple(candidates[: count - len(base)])
+
+
+def _resolve_pdssm_group(name: str, group_name: str, count: int) -> Task:
+    """Resolve one explicitly reconstructed row of PD-SSM's group table."""
+    allowed = PDSSM_GROUP_VARIANTS[group_name]
+    if count not in allowed:
+        raise ValueError(
+            f"{name}: generator count is not a published row; {group_name} has {allowed}"
+        )
+    group = parse(group_name)
+    elements = _reconstruction_generators(group, count)
+    labels = tuple(group.labels[element] for element in elements)
+    if group_name == "A5" and count == 2:
+        fidelity = "cross-release-reconstruction"
+        source = "IBM/selective-dense-state-space-model:tasks/regular/A5.py"
+        revision = IBM_A5_REVISION
+        selection = (
+            "exact two action matrices from IBM predecessor; sample stream adapted to "
+            "this harness"
+        )
+    else:
+        fidelity = "paper-reconstruction"
+        source = "PD-SSM paper Table nonsolvable; generator identities not released"
+        revision = PDSSM_REVISION
+        selection = (
+            f"{_PDSSM_RECONSTRUCTION_KEY}; canonical generating pair followed by "
+            "SHA-256-ranked distinct non-identity permutations"
+        )
+    contract = _contract(
+        PDSSM_GROUP_PROFILE,
+        fidelity,
+        source,
+        revision,
+        "scripts.state_tracking.tasks.generator_word_problem",
+        generator_selection=selection,
+        generator_labels=labels,
+    )
+    return Task(
+        name,
+        count,
+        generator_word_problem(group, elements),
+        "last",
+        group=group,
+        output_vocab_size=group.order,
+        contract=contract,
+        generator_elements=elements,
+    )
+
 
 def resolve(name: str) -> Task:
     """The task one spec names.
 
     Args:
-        name: An :data:`AUTOMATA` key, or a group spec such as ``A5``, ``S5``, ``Z60`` or
-            ``A5_x_Z2``. Upstream spells the group task ``A5`` too.
+        name: An :data:`AUTOMATA` key; a Walker/Merrill all-elements group spec such as
+            ``A5``; or an explicitly reconstructed PD-SSM table row such as
+            ``pdssm:A5:2``.
 
     Returns:
         The task.
@@ -431,10 +729,57 @@ def resolve(name: str) -> Task:
     """
     if name in AUTOMATA:
         return AUTOMATA[name]
+    match = _PDSSM_GROUP_SPEC.fullmatch(name)
+    if match is not None:
+        return _resolve_pdssm_group(name, match.group(1), int(match.group(2)))
+    if name.startswith("pdssm:"):
+        raise ValueError(
+            f"no reconstructed PD-SSM group task {name!r}; choices are "
+            f"{PDSSM_GROUP_TASKS}"
+        )
     try:
         group = parse(name)
     except ValueError as exc:
         raise ValueError(
-            f"no task {name!r}; automata are {sorted(AUTOMATA)}, or a group spec ({exc})"
+            f"no task {name!r}; automata are {sorted(AUTOMATA)}, reconstructed PD-SSM "
+            f"rows are {PDSSM_GROUP_TASKS}, or use a group spec ({exc})"
         ) from exc
-    return Task(group.name, group.order, word_problem(group), "all", group=group)
+    contract = _contract(
+        WALKER_GROUP_PROFILE,
+        "source-exact",
+        "Benjamin-Walker/structured-linear-cdes:data_dir/dataloaders.py",
+        WALKER_REVISION,
+        "scripts.state_tracking.tasks.word_problem; group elements relabelled bijectively",
+        generator_selection="all group elements, uniformly sampled",
+        generator_labels=group.labels,
+    )
+    return Task(
+        group.name,
+        group.order,
+        word_problem(group),
+        "all",
+        group=group,
+        contract=contract,
+        generator_elements=tuple(range(group.order)),
+    )
+
+
+def resolve_profile(profile: str, names: Sequence[str] | None) -> tuple[Task, ...]:
+    """Resolve tasks through a named family and reject cross-family mixtures.
+
+    The gate is intentionally strict.  A bare ``A5`` cannot be confused with
+    ``pdssm:A5:2`` just because both have 60 output states.
+    """
+    if profile not in PROFILE_DEFAULTS:
+        raise ValueError(f"unknown profile {profile!r}; choices are {tuple(PROFILE_DEFAULTS)}")
+    selected = PROFILE_DEFAULTS[profile] if names is None else tuple(names)
+    if not selected:
+        raise ValueError(f"profile {profile!r} requires at least one explicit task")
+    tasks = tuple(resolve(name) for name in selected)
+    wrong = [task.name for task in tasks if task.contract.profile != profile]
+    if wrong:
+        owners = {task.name: task.contract.profile for task in tasks if task.name in wrong}
+        raise ValueError(
+            f"profile {profile!r} cannot run tasks from another contract: {owners}"
+        )
+    return tasks

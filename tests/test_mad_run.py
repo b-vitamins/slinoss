@@ -28,6 +28,7 @@ RECORD_KEYS = {
     "mixer_settings",
     "mixer_contract",
     "mixer_constructions",
+    "harness_profile",
     "model",
     "protocol",
     "selection",
@@ -149,6 +150,11 @@ def test_the_driver_runs_both_backbones_and_records_them() -> None:
     for record in records:
         assert set(record) == RECORD_KEYS
         assert record["mixer"] == "conv"
+        assert record["harness_profile"]["name"] == "legacy-hybrid"
+        assert record["harness_profile"]["locked"] is False
+        assert len(record["harness_profile"]["identity"]) == 64
+        assert len(record["harness_profile"]["task_baselines_identity"]) == 64
+        assert record["harness_profile"]["task_baselines"]["comp"]["seq_len"] == 32
         assert record["mixer_settings"] == {"d_conv": 3, "expand": 2.0}
         assert record["task_settings"]["seq_len"] == 16
         assert record["task_settings"]["num_train"] == 64
@@ -176,12 +182,14 @@ def test_the_driver_runs_both_backbones_and_records_them() -> None:
         assert len(record["pool"]["identity"]) == 64
         assert len(record["pool"]["spec_identity"]) == 64
         assert record["mixer_contract"]["max_length_policy"] == "unused"
+        assert record["mixer_contract"]["initialization_policy"] == "constructor"
         construction = record["mixer_constructions"][0]
         assert construction["context"] == {
             "max_length_supplied": 16,
             "max_length_policy": "unused",
             "max_length_consumed": None,
         }
+        assert construction["initialization_policy"] == "constructor"
         assert record["provenance"]["command_argv"][-1] == "--quiet"
         assert "--eval-every" in record["provenance"]["command_argv"]
         assert len(record["provenance"]["dirty_diff_sha256"]) == 64

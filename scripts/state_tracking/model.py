@@ -56,8 +56,9 @@ class ModelConfig:
     """Scaffold shape.
 
     Attributes:
-        vocab_size: Tokens in, and classes out. One vocabulary serves both, as upstream's
-            ``data_dim`` and ``label_dim`` do.
+        input_vocab_size: Number of input symbols; upstream's ``data_dim``.
+        output_vocab_size: Number of classifier classes; upstream's ``label_dim``.
+            Defaults to ``input_vocab_size`` for the released regular tasks.
         max_length: Widest batch the arm can produce, passed to the mixer factory.
         d_model: Residual width. Upstream's ``model_dim``, 128.
         n_layers: Blocks. Upstream's ``num_blocks``, 2.
@@ -65,20 +66,38 @@ class ModelConfig:
         use_glu: Whether each block carries the gated-linear branch.
     """
 
-    vocab_size: int
+    input_vocab_size: int
     max_length: int
     d_model: int = 128
     n_layers: int = 2
     dropout: float = 0.01
     use_glu: bool = False
+    output_vocab_size: int | None = None
 
     def __post_init__(self) -> None:
-        for name in ("vocab_size", "max_length", "d_model", "n_layers"):
+        if self.output_vocab_size is None:
+            object.__setattr__(self, "output_vocab_size", self.input_vocab_size)
+        for name in (
+            "input_vocab_size",
+            "output_vocab_size",
+            "max_length",
+            "d_model",
+            "n_layers",
+        ):
             value = getattr(self, name)
-            if value < 1:
+            if value is None or value < 1:
                 raise ValueError(f"{name} must be positive, got {value}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+
+    @property
+    def vocab_size(self) -> int:
+        """The legacy shared size, refusing asymmetric input/output vocabularies."""
+        if self.input_vocab_size != self.output_vocab_size:
+            raise ValueError(
+                "vocab_size is ambiguous; use input_vocab_size or output_vocab_size"
+            )
+        return self.input_vocab_size
 
 
 class Block(nn.Module):
@@ -129,7 +148,7 @@ class StateTracker(nn.Module):
     def __init__(self, config: ModelConfig, factory: MixerFactory) -> None:
         super().__init__()
         self.config = config
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.embedding = nn.Embedding(config.input_vocab_size, config.d_model)
         self.blocks = nn.ModuleList(
             Block(
                 factory(config.d_model, config.max_length),
@@ -139,17 +158,19 @@ class StateTracker(nn.Module):
             )
             for _ in range(config.n_layers)
         )
-        self.head = nn.Linear(config.d_model, config.vocab_size)
+        if config.output_vocab_size is None:  # narrowed by ModelConfig.__post_init__
+            raise AssertionError("resolved output vocabulary is missing")
+        self.head = nn.Linear(config.d_model, config.output_vocab_size)
 
     def forward(self, tokens: Tensor) -> Tensor:
         """Logits at every position.
 
         Args:
-            tokens: ``(B,T)`` int64 in ``[0, vocab_size)``.
+            tokens: ``(B,T)`` int64 in ``[0, input_vocab_size)``.
 
         Returns:
-            ``(B,T,vocab_size)``. Every position, never just the last: the loss selects
-            with the batch's mask, and a group task supervises all of them.
+            ``(B,T,output_vocab_size)``. Every position, never just the last: the loss
+            selects with the batch's mask.
         """
         x = self.embedding(tokens)
         for block in self.blocks:

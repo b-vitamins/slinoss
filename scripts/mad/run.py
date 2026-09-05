@@ -28,6 +28,7 @@ import torch
 
 from scripts.mad.mixers import REGISTRY, load_module, resolve
 from scripts.mad.model import ModelConfig, build_model, parameter_count
+from scripts.mad.profiles import PROFILES, HarnessProfile, get_profile
 from scripts.mad.tasks import LEAKAGE_LIMIT, TASKS, Pool, TaskSpec, build_pool
 from scripts.mad.train import Point, Report, TrainConfig, seed_all, train
 from scripts.provenance import capture as capture_provenance
@@ -88,6 +89,23 @@ def _spec(name: str, axes: dict[str, Any]) -> TaskSpec:
     return spec.override(**axes) if axes else spec
 
 
+def _task_baselines() -> dict[str, dict[str, Any]]:
+    """Serialize all six baseline task contracts into every named profile record."""
+    return {
+        name: {
+            "mad_name": spec.mad_name,
+            "vocab_size": spec.vocab_size,
+            "seq_len": spec.seq_len,
+            "num_train": spec.num_train,
+            "num_test": spec.num_test,
+            "bottleneck": spec.bottleneck,
+            "split_policy": spec.split_policy,
+            **spec.extra,
+        }
+        for name, spec in sorted(TASKS.items())
+    }
+
+
 def run_task(
     spec: TaskSpec,
     mixer_name: str,
@@ -98,6 +116,7 @@ def run_task(
     data_seed: int,
     quiet: bool,
     provenance: dict[str, Any] | None = None,
+    profile_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a pool, build a model, run the protocol, and return the record.
 
@@ -113,6 +132,8 @@ def run_task(
             comparison can share a pool across arms and vary only the initialization.
         quiet: Suppress the per-evaluation lines on stderr.
         provenance: Source/harness/command identity captured before the task starts.
+        profile_record: Atomic scaffold/protocol profile resolved by the CLI. The
+            programmatic API records itself explicitly when omitted.
 
     Returns:
         The record, JSON-ready.
@@ -161,6 +182,13 @@ def run_task(
         capture_provenance("scripts/mad", ["<python-api>"], module="scripts.mad.run")
         if provenance is None
         else provenance,
+        {
+            "name": model_config.scaffold_profile,
+            "locked": False,
+            "references": ["programmatic API; inspect resolved model and protocol"],
+        }
+        if profile_record is None
+        else profile_record,
     )
 
 
@@ -193,6 +221,7 @@ def _record(
     max_length_policy: str,
     constructions: list[dict[str, Any]],
     provenance: dict[str, Any],
+    profile_record: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble one arm's record.
 
@@ -209,6 +238,7 @@ def _record(
         max_length_policy: Declared consumption of configured task length.
         constructions: Effective per-layer mixer configurations.
         provenance: Source, harness, dirty tree, and command identity.
+        profile_record: Named atomic harness contract.
 
     Returns:
         A JSON-ready dict. ``leaky`` flags a pool over
@@ -227,6 +257,30 @@ def _record(
         for construction in constructions
         if "init_span" in construction["effective_config"]
     ]
+    initialization_policies = {
+        construction["initialization_policy"] for construction in constructions
+    }
+    if len(initialization_policies) != 1:
+        raise RuntimeError(
+            "one mixer resolved to inconsistent initialization policies: "
+            f"{sorted(initialization_policies)}"
+        )
+    initialization_policy = next(iter(initialization_policies))
+    init_lattices = [
+        {
+            key: construction["effective_config"].get(key)
+            for key in (
+                "context_length",
+                "init_span",
+                "init_period_context_scale",
+                "init_decay_context_scale",
+                "resolved_init_period_span",
+                "resolved_init_decay_span",
+            )
+        }
+        for construction in constructions
+        if "resolved_init_period_span" in construction["effective_config"]
+    ]
     return {
         "task": spec.name,
         "mad_task": spec.mad_name,
@@ -239,9 +293,15 @@ def _record(
         "mixer_settings": settings,
         "mixer_contract": {
             "max_length_policy": max_length_policy,
-            "initialization": "mixer constructor; protected from scaffold reinitialization",
+            "initialization_policy": initialization_policy,
+            "initialization": (
+                "mixer constructor; protected from scaffold reinitialization"
+                if initialization_policy == "constructor"
+                else "explicit scaffold pass over nested Linear/Embedding parameters"
+            ),
         },
         "mixer_constructions": constructions,
+        "harness_profile": profile_record,
         "model": asdict(model_config),
         "protocol": asdict(config),
         "selection": {
@@ -259,6 +319,7 @@ def _record(
                 "evaluation": int(pool.test_inputs.shape[1]),
             },
             "mixer_initialization_span": init_spans or None,
+            "mixer_initialization_lattice": init_lattices or None,
         },
         "seeds": {
             "model": config.seed,
@@ -342,6 +403,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"tasks to run, from {sorted(TASKS)}; default all six",
     )
     parser.add_argument(
+        "--profile",
+        default="legacy-hybrid",
+        choices=sorted(PROFILES),
+        help=(
+            "atomic scaffold/protocol contract; kla-paper-v2 is a locked textual "
+            "reconstruction, while legacy-hybrid permits explicit overrides for replay"
+        ),
+    )
+    parser.add_argument(
         "--mixer", default="attention", help=f"one of {sorted(REGISTRY)}"
     )
     parser.add_argument(
@@ -379,32 +449,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="pool seed; defaults to each arm's own seed",
     )
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--n-layers", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=protocol.epochs)
-    parser.add_argument("--batch-size", type=int, default=protocol.batch_size)
-    parser.add_argument("--lr", type=float, default=protocol.lr)
-    parser.add_argument("--weight-decay", type=float, default=protocol.weight_decay)
-    parser.add_argument(
-        "--schedule", default=protocol.schedule, choices=("none", "cosine")
-    )
-    parser.add_argument("--grad-clip", type=float, default=protocol.grad_clip)
-    parser.add_argument("--patience", type=int, default=protocol.patience)
-    parser.add_argument("--eval-every", type=int, default=protocol.eval_every)
+    parser.add_argument("--d-model", type=int, default=None)
+    parser.add_argument("--n-layers", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--schedule", default=None, choices=("none", "cosine"))
+    parser.add_argument("--grad-clip", type=float, default=None)
+    parser.add_argument("--patience", type=int, default=None)
+    parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument(
         "--drop-last",
         action=argparse.BooleanOptionalAction,
-        default=protocol.drop_last,
+        default=None,
         help="drop a short final training batch; KLA does, MAD-Lab does not",
     )
     parser.add_argument(
         "--float32-matmul-precision",
-        default=protocol.float32_matmul_precision,
+        default=None,
         choices=("highest", "high", "medium"),
     )
-    parser.add_argument(
-        "--precision", default=protocol.precision, choices=("fp32", "bf16")
-    )
+    parser.add_argument("--precision", default=None, choices=("fp32", "bf16"))
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -419,6 +485,59 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolved_profile(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> tuple[HarnessProfile, dict[str, Any], dict[str, Any]]:
+    """Resolve optional CLI values against one atomic profile.
+
+    A locked profile accepts a repeated value, which keeps fully explicit replay
+    commands valid, but refuses a conflicting value instead of quietly ceasing to be
+    that profile.
+    """
+    profile = get_profile(args.profile)
+    model_args = profile.model_args()
+    train_args = profile.train_args()
+    model_cli = {"d_model": "--d-model", "n_layers": "--n-layers"}
+    train_cli = {
+        "epochs": "--epochs",
+        "batch_size": "--batch-size",
+        "lr": "--lr",
+        "weight_decay": "--weight-decay",
+        "schedule": "--schedule",
+        "grad_clip": "--grad-clip",
+        "patience": "--patience",
+        "eval_every": "--eval-every",
+        "drop_last": "--drop-last/--no-drop-last",
+        "float32_matmul_precision": "--float32-matmul-precision",
+        "precision": "--precision",
+    }
+
+    for field, flag in model_cli.items():
+        supplied = getattr(args, field)
+        if supplied is None:
+            continue
+        expected = model_args[field]
+        if profile.locked and supplied != expected:
+            parser.error(
+                f"profile {profile.name} locks {flag} to {expected!r}; got {supplied!r}"
+            )
+        model_args[field] = supplied
+
+    for field, flag in train_cli.items():
+        supplied = getattr(args, field)
+        if supplied is None:
+            continue
+        expected = train_args[field]
+        if profile.locked and supplied != expected:
+            parser.error(
+                f"profile {profile.name} locks {flag} to {expected!r}; got {supplied!r}"
+            )
+        train_args[field] = supplied
+
+    train_args["device"] = args.device
+    return profile, model_args, train_args
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run every requested task at every requested seed.
 
@@ -429,28 +548,29 @@ def main(argv: list[str] | None = None) -> int:
         Process exit status. Nonzero when any pool leaked, since such an arm reports
         recall of its own train split.
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    profile, model_args, train_args = _resolved_profile(args, parser)
+    if not profile.published_table_eligible:
+        print(
+            f"  profile {profile.name!r} is {profile.contract_status} and is not "
+            "eligible by itself for a published-table claim",
+            file=sys.stderr,
+            flush=True,
+        )
     provenance = capture_provenance("scripts/mad", argv, module="scripts.mad.run")
     provenance["mixer_modules"] = list(args.mixer_module)
+    provenance["harness_profile"] = profile.name
     for module in args.mixer_module:
         load_module(module)
 
     axes = parse_axes(args.axis)
-    model_args = {"d_model": args.d_model, "n_layers": args.n_layers}
-    base = TrainConfig(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        schedule=args.schedule,
-        grad_clip=args.grad_clip,
-        patience=args.patience,
-        eval_every=args.eval_every,
-        drop_last=args.drop_last,
-        float32_matmul_precision=args.float32_matmul_precision,
-        precision=args.precision,
-        device=args.device,
-    )
+    base = TrainConfig(**train_args)
+    profile_record = profile.record()
+    task_baselines = _task_baselines()
+    profile_record["task_baselines"] = task_baselines
+    profile_record["task_baselines_identity"] = identity(task_baselines)
+    profile_record["identity"] = identity(profile_record)
 
     records: list[dict[str, Any]] = []
     handle = args.out.open("a") if args.out is not None else None
@@ -467,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
                     data_seed=seed if args.data_seed is None else args.data_seed,
                     quiet=args.quiet,
                     provenance=provenance,
+                    profile_record=profile_record,
                 )
                 line = json.dumps(record)
                 print(line, flush=True)

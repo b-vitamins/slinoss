@@ -24,6 +24,7 @@ The group half needs no fixture: upstream's ``GroupCompositionDataset`` draws fr
 from __future__ import annotations
 
 import random
+from itertools import pairwise
 from typing import NamedTuple
 
 import pytest
@@ -33,11 +34,14 @@ from scripts.state_tracking.tasks import (
     AUTOMATA,
     MODULUS,
     PAD_TOKEN,
+    PDSSM_GROUP_TASKS,
+    PDSSM_REGULAR_TASKS,
     Sample,
     Task,
     mod_arith_no_brack,
     mod_arith_w_brack,
     resolve,
+    resolve_profile,
     word_problem,
 )
 
@@ -919,9 +923,83 @@ def test_resolve_falls_through_to_a_group_spec() -> None:
 def test_task_validates_its_own_fields() -> None:
     """A malformed task is refused at construction, not at the first batch."""
     ok: Sample = Sample((1,), (1,), (True,))
-    with pytest.raises(ValueError, match="vocab_size must be positive"):
+    with pytest.raises(ValueError, match="input_vocab_size must be positive"):
         Task("bad", 0, lambda s, lo, hi: ok, "last")
+    with pytest.raises(ValueError, match="output_vocab_size must be positive"):
+        Task("bad", 3, lambda s, lo, hi: ok, "last", output_vocab_size=0)
     with pytest.raises(ValueError, match="supervision must be last or all"):
         Task("bad", 3, lambda s, lo, hi: ok, "final")
     with pytest.raises(ValueError, match="min_length must be positive"):
         Task("bad", 3, lambda s, lo, hi: ok, "last", min_length=0)
+
+
+def test_pdssm_a5_two_uses_two_inputs_and_sixty_output_states() -> None:
+    """The released IBM A5 actions are inputs; all A5 elements remain output labels.
+
+    This is the structural mismatch a single ``vocab_size`` concealed.  The action labels
+    are computed independently from IBM's two released matrices in the source audit.
+    """
+    task = resolve("pdssm:A5:2")
+    assert task.group is not None
+    assert task.input_vocab_size == 2
+    assert task.output_vocab_size == task.group.order == 60
+    assert task.contract.fidelity == "cross-release-reconstruction"
+    assert task.contract.generator_labels == ("12340", "10324")
+    assert task.supervision == "last"
+    with pytest.raises(ValueError, match="vocab_size is ambiguous"):
+        _ = task.vocab_size
+
+    sample = task.sample(7, 8, 8)
+    assert all(0 <= token < 2 for token in sample.ids)
+    assert sample.supervised == (False,) * 7 + (True,)
+    elements = tuple(task.generator_elements[token] for token in sample.ids)
+    assert sample.targets[-1] == task.group.prefix(elements)[-1]
+    assert 0 <= sample.targets[-1] < 60
+
+
+def test_pdssm_group_reconstructions_are_nested_distinct_and_labelled() -> None:
+    """Every reconstructed table row states exactly which permutations it uses."""
+    tasks = [resolve(name) for name in PDSSM_GROUP_TASKS]
+    for task in tasks:
+        assert task.contract.profile == "pdssm-groups-reconstruction"
+        assert len(task.generator_elements) == task.input_vocab_size
+        assert len(set(task.generator_elements)) == task.input_vocab_size
+        assert 0 not in task.generator_elements
+        assert task.group is not None
+        assert task.contract.generator_labels == tuple(
+            task.group.labels[index] for index in task.generator_elements
+        )
+        reached = {0}
+        frontier = [0]
+        while frontier:
+            state = frontier.pop()
+            for generator in task.generator_elements:
+                successor = task.group.compose(state, generator)
+                if successor not in reached:
+                    reached.add(successor)
+                    frontier.append(successor)
+        assert len(reached) == task.group.order
+    for group_name, counts in (("A5", (2, 6, 8, 12)), ("S5", (4, 8, 32))):
+        labels = [
+            resolve(f"pdssm:{group_name}:{count}").contract.generator_labels
+            for count in counts
+        ]
+        assert all(
+            long[: len(short)] == short for short, long in pairwise(labels)
+        )
+
+
+def test_profiles_are_fail_closed_and_the_default_is_the_released_four() -> None:
+    """Task families cannot be mixed under a convenient but false benchmark label."""
+    assert tuple(task.name for task in resolve_profile("pdssm-regular", None)) == (
+        PDSSM_REGULAR_TASKS
+    )
+    assert tuple(
+        task.name for task in resolve_profile("pdssm-groups-reconstruction", None)
+    ) == PDSSM_GROUP_TASKS
+    with pytest.raises(ValueError, match="another contract"):
+        resolve_profile("pdssm-regular", ["A5"])
+    with pytest.raises(ValueError, match="another contract"):
+        resolve_profile("walker-group-prefix", ["pdssm:A5:2"])
+    with pytest.raises(ValueError, match="not a published row"):
+        resolve("pdssm:A5:4")

@@ -18,10 +18,11 @@ decay scales with the rate too -- and that is upstream's behaviour, one step in 
 Two upstream defects are not transcribed.
 
 ``train.py`` calls ``optimizer.step()`` twice per update, at lines 152 and 155, with
-``optimizer.zero_grad()`` between them. The second call is not a no-op: AdamW's update is
-built from the moment estimates, which the zeroed gradient leaves populated, so every
-update is applied once from the gradient and then a second time from stale momentum, and
-the decoupled weight decay is charged twice. This module steps once.
+``optimizer.zero_grad()`` between them. Under modern PyTorch's default
+``zero_grad(set_to_none=True)``, the second call sees every gradient as ``None`` and is
+inert, including for AdamW's decoupled decay. The release leaves PyTorch unpinned, so an
+older zero-to-tensor interpretation cannot be reconstructed as part of the protocol.
+This module states the current executable semantics directly and steps once.
 
 ``optimizer.zero_grad()`` sits at the top of every micro-step, so under
 ``accumulation_steps > 1`` each micro-batch erases the last one's gradient and the update

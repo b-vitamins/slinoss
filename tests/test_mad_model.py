@@ -158,6 +158,17 @@ def test_protect_marks_every_parameter() -> None:
         assert getattr(param, "_no_reinit", False)
 
 
+def test_scaffold_initialization_is_an_explicit_opt_in() -> None:
+    """A published model-wide initializer runs only when its entry names that owner."""
+    inner = nn.Linear(4, 4)
+    inner._mad_initialization_policy = "scaffold"  # type: ignore[attr-defined]
+    assert protect(inner) is inner
+    assert not getattr(inner.weight, "_no_reinit", False)
+    inner._mad_initialization_policy = "silent"  # type: ignore[attr-defined]
+    with pytest.raises(ValueError, match="initialization policy"):
+        protect(inner)
+
+
 def test_ffn_width_follows_the_rounding_rule() -> None:
     """352 at `mad-lab`'s rounding, 341 at KLA's, from the same ``8/3`` rule."""
     assert config(d_model=128).d_ffn == 352

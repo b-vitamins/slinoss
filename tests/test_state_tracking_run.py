@@ -23,6 +23,7 @@ import pytest
 
 from scripts.state_tracking.instances import SplitConfig
 from scripts.state_tracking.run import build_parser, main, splits, table
+from scripts.state_tracking.tasks import PDSSM_REGULAR_TASKS
 from scripts.state_tracking.train import TrainConfig
 
 TINY = [
@@ -88,6 +89,8 @@ def test_defaults_are_the_published_protocol() -> None:
     """
     args = build_parser().parse_args([])
     protocol = TrainConfig()
+    assert args.profile == "pdssm-regular"
+    assert args.task is None
     assert args.num_steps == protocol.num_steps
     assert args.batch_size == protocol.batch_size
     assert args.lr == protocol.lr
@@ -198,7 +201,10 @@ def test_record_carries_every_field_a_replay_needs(
     to a split without being recorded fails here. Both supervision modes are run, since the
     group half is what carries the group order.
     """
-    records = _run(["--task", "parity", "A5"], capsys)
+    records = _run(["--task", "parity"], capsys)
+    records += _run(
+        ["--profile", "walker-group-prefix", "--task", "A5"], capsys
+    )
     assert [record["task"] for record in records] == ["parity", "A5"]
     split_fields = {field.name for field in fields(SplitConfig)}
     for record in records:
@@ -212,6 +218,7 @@ def test_record_carries_every_field_a_replay_needs(
         assert record["best_step"] in [point[0] for point in record["points"]]
         assert record["solved"] is False
         assert record["mixer_contract"]["max_length_policy"] == "unused"
+        assert record["benchmark_contract"]["fidelity"] == "source-exact"
         assert len(record["mixer_constructions"]) == record["model"]["n_layers"]
         assert record["lengths"]["training_ceiling"] == 8
         assert record["lengths"]["evaluation_ceiling"] == 12
@@ -242,6 +249,44 @@ def test_record_carries_every_field_a_replay_needs(
     )
     assert parity["best"]["positions"] == 8
     assert group["best"]["positions"] > 8
+
+
+def test_default_run_is_exactly_the_released_pdssm_regular_suite(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A bare run excludes the bracketed extension and every reconstructed group row."""
+    records = _run([], capsys)
+    assert tuple(record["task"] for record in records) == PDSSM_REGULAR_TASKS
+    assert all(
+        record["benchmark_contract"]["profile"] == "pdssm-regular"
+        for record in records
+    )
+
+
+def test_asymmetric_group_record_carries_both_vocabularies_and_generators(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The record cannot collapse a two-symbol input into its 60-state classifier."""
+    record = _run(
+        [
+            "--profile",
+            "pdssm-groups-reconstruction",
+            "--task",
+            "pdssm:A5:2",
+        ],
+        capsys,
+    )[0]
+    assert record["vocab_size"] is None
+    assert (record["input_vocab_size"], record["output_vocab_size"]) == (2, 60)
+    assert (record["model"]["input_vocab_size"], record["model"]["output_vocab_size"]) == (
+        2,
+        60,
+    )
+    contract = record["benchmark_contract"]
+    assert contract["fidelity"] == "cross-release-reconstruction"
+    assert contract["generator_labels"] == ["12340", "10324"]
+    assert record["data"]["train"]["benchmark_contract"] == contract
+    assert record["best"]["positions"] == 8
 
 
 def test_the_mixer_is_sized_for_the_evaluation_not_the_training_split(
@@ -285,7 +330,7 @@ def test_table_rows_and_the_mean(capsys: pytest.CaptureFixture[str]) -> None:
     The mean is what a seed bank is read on, so a mean row printed for a single arm would
     be mistaken for one.
     """
-    records = _run(["--task", "parity", "A5"], capsys)
+    records = _run(["--task", "parity", "even_pairs"], capsys)
     lines = table(records).splitlines()
     assert lines[0].split() == COLUMNS
     assert len(lines) == 6

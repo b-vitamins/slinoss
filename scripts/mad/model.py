@@ -10,15 +10,20 @@ The shape is `mad-lab`'s ``LanguageModel``, and :class:`BottleneckModel` is its
 is the whole input reconstructed from the state at one position. Where `mad-lab` and the
 Kalman Linear Attention driver differ:
 
-    piece            mad-lab                    KLA                  here
-    norm             RMSNorm, eps 1e-5          same                 same
-    channel mixer    SwiGLU, ceil16(8d/3)=352   int(8d/3)=341        352
-    head             norm, Linear with bias     Linear, no bias      bias, a flag
-    tying            untied                     untied               untied
-    Linear init      torch default (LM)         normal, std 0.02     0.02
-                     normal 0.02 (AutoEncoder)
-    decoder posemb   sincos, half-half concat   interleaved          half-half
-    mixer length     seq_len (benchmark.py)     task seq_len         task seq_len
+    piece            mad-lab                    KLA repository
+    norm             RMSNorm, eps 1e-5          same
+    channel mixer    separate SwiGLU, width 352 fused SwiGLU, width 341
+    causal head      Linear with bias            Linear, no bias
+    compression head Linear with bias            Linear with bias
+    encoder-final    absent in AutoEncoder       RMSNorm
+    decoder posemb   sincos, half-half concat    interleaved
+    mixer length     seq_len (benchmark.py)      configured task seq_len
+
+The model config selects either shape explicitly. ``kla-paper-v2`` is a locked textual
+reconstruction: it uses the KLA v0.0.1 repository scaffold where the paper is silent and
+replaces that repository's ``[128, 128]`` compression decoder with the paper's stated
+``[240, 120]`` widths. The released repository did not execute this combination, so the
+profile records that it is not independently eligible for a published-table claim.
 
 The initialization pass reaches the scaffold only. Every mixer keeps whatever its own
 constructor chose, so a mixer arrives with its authors' initialization rather than this
@@ -30,7 +35,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -59,9 +64,18 @@ class ModelConfig:
         n_layers: Mixer and channel-mixer pairs.
         bottleneck: Route through :class:`BottleneckModel` rather than
             :class:`CausalModel`.
+        scaffold_profile: Name of the atomic harness profile that selected this shape.
         ffn_multiple_of: Rounding of the SwiGLU hidden width. 16 is `mad-lab`'s and
             gives 352 at ``d_model`` 128; 1 gives KLA's 341.
-        head_bias: Bias on the head. `mad-lab` has one, KLA does not.
+        fused_ffn_input: Use KLA's single ``w12`` input projection rather than
+            MAD-Lab's separate ``w1`` and ``w2`` projections.
+        head_bias: Bias on the causal LM head. `mad-lab` has one, KLA does not.
+        bottleneck_head_bias: Bias on the compression unembed projection.
+        bottleneck_encoder_norm: Apply KLA's final encoder norm before selecting the
+            bottleneck state. MAD-Lab's autoencoder selects the raw residual stream.
+        decoder_widths: The two hidden widths after the compression bottleneck.
+        position_layout: ``half`` for MAD-Lab's concatenated sine/cosine code or
+            ``interleaved`` for the KLA scaffold's code.
         norm_eps: RMS norm epsilon.
         init_std: Standard deviation of the scaffold's normal initialization.
     """
@@ -72,8 +86,14 @@ class ModelConfig:
     d_model: int = 128
     n_layers: int = 1
     bottleneck: bool = False
+    scaffold_profile: str = "legacy-hybrid"
     ffn_multiple_of: int = 16
+    fused_ffn_input: bool = False
     head_bias: bool = True
+    bottleneck_head_bias: bool = True
+    bottleneck_encoder_norm: bool = False
+    decoder_widths: tuple[int, int] = (128, 128)
+    position_layout: Literal["half", "interleaved"] = "half"
     norm_eps: float = 1e-5
     init_std: float = 0.02
 
@@ -93,6 +113,20 @@ class ModelConfig:
             raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
         if self.init_std <= 0.0:
             raise ValueError(f"init_std must be positive, got {self.init_std}")
+        if not self.scaffold_profile:
+            raise ValueError("scaffold_profile must not be empty")
+        if len(self.decoder_widths) != 2 or any(
+            width < 1 for width in self.decoder_widths
+        ):
+            raise ValueError(
+                "decoder_widths must contain two positive widths, got "
+                f"{self.decoder_widths}"
+            )
+        if self.position_layout not in {"half", "interleaved"}:
+            raise ValueError(
+                "position_layout must be 'half' or 'interleaved', got "
+                f"{self.position_layout!r}"
+            )
 
     @property
     def d_ffn(self) -> int:
@@ -142,12 +176,17 @@ class SwiGLU(nn.Module):
     Args:
         d_model: Stream width.
         d_ffn: Hidden width.
+        fused_input: Whether gate and value share one KLA-style input projection.
     """
 
-    def __init__(self, d_model: int, d_ffn: int) -> None:
+    def __init__(self, d_model: int, d_ffn: int, *, fused_input: bool) -> None:
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_ffn, bias=False)
-        self.w2 = nn.Linear(d_model, d_ffn, bias=False)
+        self.fused_input = fused_input
+        if fused_input:
+            self.w12 = nn.Linear(d_model, 2 * d_ffn, bias=False)
+        else:
+            self.w1 = nn.Linear(d_model, d_ffn, bias=False)
+            self.w2 = nn.Linear(d_model, d_ffn, bias=False)
         self.w3 = nn.Linear(d_ffn, d_model, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -159,7 +198,11 @@ class SwiGLU(nn.Module):
         Returns:
             ``(B,T,d_model)``.
         """
-        return self.w3(nn.functional.silu(self.w1(x)) * self.w2(x))
+        if self.fused_input:
+            gate, value = self.w12(x).chunk(2, dim=-1)
+        else:
+            gate, value = self.w1(x), self.w2(x)
+        return self.w3(nn.functional.silu(gate) * value)
 
 
 class Residual(nn.Module):
@@ -189,19 +232,28 @@ class Residual(nn.Module):
 
 
 def protect(module: nn.Module) -> nn.Module:
-    """Exempt every parameter of ``module`` from the scaffold's initialization pass.
+    """Apply a mixer's explicit ownership rule for scaffold initialization.
 
-    A mixer's initialization is part of the mixer. The pass would overwrite any
-    :class:`torch.nn.Linear` weight it can reach with a normal draw, so a mixer whose
-    projections are deliberately left at the framework default, or deliberately not,
-    has to say so.
+    Constructor ownership is the default: a mixer's initialization is part of the
+    mixer, and the scaffold may not overwrite it. An external published implementation
+    can instead opt into ``scaffold`` ownership through its registry entry. That choice
+    is attached by the resolved factory and recorded with every construction; guessing
+    from a class or silently swallowing the model-wide pass is forbidden.
 
     Args:
         module: The mixer.
 
     Returns:
         ``module``, for use as an expression.
+
+    Raises:
+        ValueError: On an initialization policy the registry does not define.
     """
+    policy = getattr(module, "_mad_initialization_policy", "constructor")
+    if policy == "scaffold":
+        return module
+    if policy != "constructor":
+        raise ValueError(f"unknown mixer initialization policy {policy!r}")
     for param in module.parameters():
         cast(Any, param)._no_reinit = True
     return module
@@ -232,8 +284,12 @@ def _init_scaffold(module: nn.Module, std: float) -> None:
         nn.init.normal_(module.weight, mean=0.0, std=std)
 
 
-def sincos_positions(length: int, width: int) -> Tensor:
-    """Sinusoidal position code, `mad-lab`'s ``posemb_sincos_1d``.
+def sincos_positions(
+    length: int,
+    width: int,
+    layout: Literal["half", "interleaved"] = "half",
+) -> Tensor:
+    """Sinusoidal position code from either maintained MAD scaffold.
 
     Sines in the first half of the width and cosines in the second, not interleaved, and
     the frequency ladder is spaced by ``log(10000)/(half - 1)`` so the slowest column is
@@ -241,8 +297,9 @@ def sincos_positions(length: int, width: int) -> Tensor:
 
     Args:
         length: Positions.
-        width: Channels. At 2 the ladder is a single frequency, since the spacing
+        width: Channels. At 2 the half-layout ladder is degenerate.
             divides by ``half - 1``.
+        layout: ``half`` for MAD-Lab or ``interleaved`` for the KLA repository.
 
     Returns:
         ``(length, width)`` float32.
@@ -250,17 +307,34 @@ def sincos_positions(length: int, width: int) -> Tensor:
     Raises:
         ValueError: On ``width < 4``, where the ladder's spacing is degenerate.
     """
-    if width < 4:
-        raise ValueError(f"width must be at least 4, got {width}")
-    half = width // 2
-    ladder = torch.exp(
-        torch.arange(half, dtype=torch.float32) * -(math.log(10000) / (half - 1))
-    )
-    angle = torch.arange(length, dtype=torch.float32).unsqueeze(1) * ladder.unsqueeze(0)
-    code = torch.cat([angle.sin(), angle.cos()], dim=1)
-    if width % 2 == 1:
-        code = torch.cat([code, torch.zeros(length, 1)], dim=1)
-    return code
+    if layout == "half":
+        if width < 4:
+            raise ValueError(f"width must be at least 4, got {width}")
+        half = width // 2
+        ladder = torch.exp(
+            torch.arange(half, dtype=torch.float32) * -(math.log(10000) / (half - 1))
+        )
+        angle = torch.arange(length, dtype=torch.float32).unsqueeze(
+            1
+        ) * ladder.unsqueeze(0)
+        code = torch.cat([angle.sin(), angle.cos()], dim=1)
+        if width % 2 == 1:
+            code = torch.cat([code, torch.zeros(length, 1)], dim=1)
+        return code
+    if layout == "interleaved":
+        if width < 1:
+            raise ValueError(f"width must be positive, got {width}")
+        position = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+        ladder = torch.exp(
+            torch.arange(0, width, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / width)
+        )
+        code = torch.zeros(length, width, dtype=torch.float32)
+        code[:, 0::2] = torch.sin(position * ladder)
+        if width > 1:
+            code[:, 1::2] = torch.cos(position * ladder[: width // 2])
+        return code
+    raise ValueError(f"unknown position layout {layout!r}")
 
 
 def _encoder(config: ModelConfig, mixer: MixerFactory) -> nn.Sequential:
@@ -279,7 +353,13 @@ def _encoder(config: ModelConfig, mixer: MixerFactory) -> nn.Sequential:
         layers.append(Residual(built, config.d_model, config.norm_eps))
         layers.append(
             Residual(
-                SwiGLU(config.d_model, config.d_ffn), config.d_model, config.norm_eps
+                SwiGLU(
+                    config.d_model,
+                    config.d_ffn,
+                    fused_input=config.fused_ffn_input,
+                ),
+                config.d_model,
+                config.norm_eps,
             )
         )
     return nn.Sequential(*layers)
@@ -323,7 +403,9 @@ class BottleneckModel(nn.Module):
     `mad-lab`'s ``AutoEncoder`` at ``global_pool='last'``. The whole sequence has to be
     reconstructed from one ``d_model`` vector, so the state at the final position is the
     only thing the decoder sees and the task measures what that state retained. The
-    decoder is not residual and does not expand.
+    decoder is not residual. Its two widths are profile-owned because the published
+    KLA table specifies ``[240, 120]`` while the current KLA repository uses
+    ``[128, 128]``.
 
     Args:
         config: Scaffold shape. ``observed_width`` sizes the position code.
@@ -335,19 +417,29 @@ class BottleneckModel(nn.Module):
         self.config = config
         self.token_embeds = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder = _encoder(config, mixer)
+        self.encoder_norm = (
+            RMSNorm(config.d_model, config.norm_eps)
+            if config.bottleneck_encoder_norm
+            else nn.Identity()
+        )
+        first, second = config.decoder_widths
         self.decoder = nn.Sequential(
             RMSNorm(config.d_model, config.norm_eps),
-            nn.Linear(config.d_model, config.d_model),
+            nn.Linear(config.d_model, first),
             nn.GELU(),
-            RMSNorm(config.d_model, config.norm_eps),
-            nn.Linear(config.d_model, config.d_model),
+            RMSNorm(first, config.norm_eps),
+            nn.Linear(first, second),
             nn.GELU(),
         )
-        self.norm = RMSNorm(config.d_model, config.norm_eps)
-        self.head = nn.Linear(config.d_model, config.vocab_size, bias=config.head_bias)
+        self.norm = RMSNorm(second, config.norm_eps)
+        self.head = nn.Linear(
+            second, config.vocab_size, bias=config.bottleneck_head_bias
+        )
         self.register_buffer(
             "positions",
-            sincos_positions(config.observed_width, config.d_model),
+            sincos_positions(
+                config.observed_width, config.d_model, config.position_layout
+            ),
             persistent=False,
         )
         self.apply(lambda m: _init_scaffold(m, config.init_std))
@@ -371,7 +463,7 @@ class BottleneckModel(nn.Module):
                 f"input has {length} positions, code carries "
                 f"{self.config.observed_width}"
             )
-        state = self.encoder(self.token_embeds(ids))[:, -1:, :]
+        state = self.encoder_norm(self.encoder(self.token_embeds(ids)))[:, -1:, :]
         code = cast(Tensor, self.positions)[:length]
         return self.head(self.norm(self.decoder(state + code)))
 

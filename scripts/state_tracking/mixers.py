@@ -205,6 +205,12 @@ def resolve(name: str, overrides: Iterable[str] = ()) -> Mixer:
             if is_dataclass(config)
             else {"d_model": d_model, **settings}
         )
+        for field_name in (
+            "resolved_init_period_span",
+            "resolved_init_decay_span",
+        ):
+            if hasattr(config, field_name):
+                effective[field_name] = getattr(config, field_name)
         constructions.append(
             {
                 "module": f"{type(module).__module__}.{type(module).__qualname__}",
@@ -238,19 +244,22 @@ def load_module(path: str) -> None:
 # slinoss:
 
 
-def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
+def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     """The tree's mixer.
 
     Args:
         d_model: Stream width.
-        **settings: :class:`slinoss.SLinOSSConfig` fields.
+        max_length: Widest configured train/evaluation context.
+        **settings: User-controlled :class:`slinoss.SLinOSSConfig` fields.
 
     Returns:
         A :class:`slinoss.SLinOSSMixer`. CUDA only, from its own guards.
     """
     from slinoss import SLinOSSConfig, SLinOSSMixer
 
-    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
+    return SLinOSSMixer(
+        SLinOSSConfig(d_model=d_model, context_length=max_length, **settings)
+    )
 
 
 def _slinoss_defaults() -> dict[str, Any]:
@@ -273,6 +282,8 @@ def _slinoss_defaults() -> dict[str, Any]:
         "d_conv": SLinOSSConfig.d_conv,
         "key_conv": SLinOSSConfig.key_conv,
         "init_span": SLinOSSConfig.init_span,
+        "init_period_context_scale": SLinOSSConfig.init_period_context_scale,
+        "init_decay_context_scale": SLinOSSConfig.init_decay_context_scale,
         "w_max": SLinOSSConfig.w_max,
         "bias": SLinOSSConfig.bias,
         "conv_bias": SLinOSSConfig.conv_bias,
@@ -432,7 +443,7 @@ def _register_builtins() -> None:
     Called at import. The slinoss entry reads its defaults from
     :class:`slinoss.SLinOSSConfig`, which imports torch and nothing optional.
     """
-    register("slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults()))
+    register("slinoss", MixerEntry(_build_slinoss, "required", _slinoss_defaults()))
     register(
         "attention",
         MixerEntry(

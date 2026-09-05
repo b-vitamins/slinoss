@@ -1,10 +1,11 @@
 """The MAD training loop.
 
-The protocol is the Kalman Linear Attention driver's ``experiments/commands/mad.py``:
-750 epochs of AdamW at a flat 1e-3, batch 128, no weight decay, gradient norm clipped at
-5, evaluation every tenth epoch, and a stop when 70 epochs pass without the best test
-accuracy improving. A task is solved or it is not, so nothing here tunes: the same numbers
-run for every arch, and the mixer is the only thing that varies.
+The default protocol is the published Kalman Linear Attention MAD protocol: 750 epochs of
+AdamW at a flat 1e-3, batch 172, no weight decay, gradient norm clipped at 5, evaluation
+every tenth epoch, and a stop when 70 epochs pass without the best test accuracy improving.
+The named ``legacy-hybrid`` driver profile explicitly restores batch 128 for replaying the
+repository implementation's deliberate departure. A task is solved or it is not, so
+nothing here tunes: the same numbers run for every architecture.
 
 Weight decay applies to matrices only. A parameter of dimension below two, or one its
 own module marked ``_no_weight_decay``, sits in the second group at zero decay -- a
@@ -63,8 +64,8 @@ class TrainConfig:
             Counted in epochs, not evaluations. Zero disables the stop.
         eval_every: Evaluate every this many epochs. The final epoch always evaluates.
         drop_last: Whether training omits a short final batch. Explicit because
-            MAD-Lab keeps it while the KLA driver drops it; baseline batch 128 divides
-            every pool, but the paper's batch 172 does not.
+            MAD-Lab keeps it while the KLA driver drops it. The paper's batch 172 does
+            not divide the standard pools.
         float32_matmul_precision: PyTorch float32 matmul policy. MAD-Lab sets ``high``.
         precision: A member of :data:`PRECISIONS`.
         seed: Seeds the shuffle, and :func:`seed_all` for everything else.
@@ -72,7 +73,7 @@ class TrainConfig:
     """
 
     epochs: int = 750
-    batch_size: int = 128
+    batch_size: int = 172
     lr: float = 1e-3
     min_lr: float = 1e-6
     weight_decay: float = 0.0

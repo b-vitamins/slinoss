@@ -213,7 +213,7 @@ def test_the_default_protocol_is_the_published_one() -> None:
     """
     config = TrainConfig()
     assert (config.epochs, config.patience, config.eval_every) == (750, 70, 10)
-    assert (config.batch_size, config.lr, config.weight_decay) == (128, 1e-3, 0.0)
+    assert (config.batch_size, config.lr, config.weight_decay) == (172, 1e-3, 0.0)
     assert (config.schedule, config.precision, config.seed) == ("none", "fp32", 12345)
     assert config.grad_clip == 5.0
     assert config.drop_last is True
