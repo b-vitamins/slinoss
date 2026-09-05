@@ -16,9 +16,28 @@ payload the moment a step reaches it. A hand-written list would drift silently a
 the drift would show up as a fallback compile.
 
 ``build`` verifies in child processes by default: one ``cold --payload strict`` per
-mode, which raises on a key the payload does not hold. It fails loudly, so it is
+cell, which raises on a key the payload does not hold. It fails loudly, so it is
 the whole CI entry point. A build host with no device cannot run the discovery
 step at all -- ``build`` needs one.
+
+What one run of a step discovers is one cell of the reachable set, and the decode
+step's set has two axes. ``decode_fwd`` is compiled with
+``(THREADS, row_group(N), N // row_group(N))`` and declares its operands' dtypes, so
+it is specialized on the activation dtype and on ``N``; ``decode_carry`` is compiled
+with ``(THREADS,)`` alone, so it is specialized on the dtype and one entry serves
+every width. Nothing else is an axis: no extent, stride or pitch reaches a key, so
+one entry serves every batch, head count, grouping and row count. ``build`` therefore
+walks :data:`DECODE_WIDTHS` x :data:`DTYPES` for the decode mode -- 27 entries, and
+around 670 KiB -- rather than the one cell its geometry flags name. ``--widths``
+narrows the ladder for a deployment that knows its width; the default never does,
+because a payload short a cell fails by compiling rather than by raising.
+
+A decode cell runs against a state no prefill advanced. The prefill runs the chunked
+scan, whose shared memory grows with ``d_state`` and stops two rungs short of the
+decode row walk's 384, so a walk that prefilled would build a payload narrower than
+the kernel it is building it for. ``cold`` prefills by default, because there the
+prefill is the setup a first decode step is measured against; ``--no-prefill`` is what
+a verification child passes.
 """
 
 import time
@@ -32,16 +51,19 @@ would misattribute it.
 """
 
 import argparse
+import itertools
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
 from slinoss import aot
 from slinoss._cute import cache_events, compiled_launches, executor_count
-from slinoss.config import SLinOSSConfig
+from slinoss._precision import KERNEL_DTYPES
+from slinoss.config import STATE_MULTIPLE, SLinOSSConfig
 from slinoss.ops.xent import cross_entropy
 from slinoss.perf.device import (
     contention,
@@ -59,10 +81,45 @@ MODES = ("forward", "step", "decode")
 """What a step can be. ``step`` is forward, backward and an optimizer update."""
 
 DTYPE = torch.bfloat16
-"""The dtype the kernel path runs. float32 falls back to the reference scan."""
+"""The dtype the whole-sequence kernel path runs. float32 falls back to the
+reference scan, so ``forward`` and ``step`` are built at this width alone."""
+
+DTYPES = {str(dtype).removeprefix("torch."): dtype for dtype in KERNEL_DTYPES}
+"""Activations a rowwise kernel reads, by flag spelling.
+
+Derived from :data:`slinoss._precision.KERNEL_DTYPES` rather than listed, so a dtype
+the registry gains is a dtype the payload gains. The decode step is rowwise at every
+one of them, which is why its ladder has a dtype axis and the scan's does not.
+"""
+
+DECODE_WIDTHS = tuple(range(STATE_MULTIPLE, 8 * STATE_MULTIPLE + 1, STATE_MULTIPLE))
+"""Every ``d_state`` a decode payload covers by default: 48 through 384.
+
+A multiple of :data:`slinoss.config.STATE_MULTIPLE` because ``d_state`` is ``3N``
+with ``N`` a multiple of half a warp, and stopping at 384 because the row walk holds
+``N`` 3-vectors per state row in shared memory and 384 is the last width that fits.
+The step is the multiple and not a coarser one: ``N`` sets ``row_group(N)`` and
+``N // row_group(N)``, both compile-time, so every rung is its own key.
+"""
 
 PAYLOAD_MODES = ("none", "load", "strict")
 """Whether ``cold`` consults a payload, and whether a miss is fatal."""
+
+
+class Cell(NamedTuple):
+    """One point of the set a mode's payload has to cover.
+
+    Attributes:
+        d_state: Per-head state width ``3N``.
+        dtype: Activation dtype, spelled as a key of :data:`DTYPES`.
+    """
+
+    d_state: int
+    dtype: str
+
+    def label(self) -> str:
+        """This cell, for a progress line."""
+        return f"3N {self.d_state:<4d} {self.dtype}"
 
 
 def add_geometry(parser: argparse.ArgumentParser) -> None:
@@ -71,6 +128,10 @@ def add_geometry(parser: argparse.ArgumentParser) -> None:
     The defaults are the acceptance geometry. Both subcommands take them, and a
     payload built at one geometry serves another only where the launch keys agree,
     so the two must be given the same flags.
+
+    ``--d-state`` and ``--dtype`` are the two of these that reach a decode launch
+    key. ``build`` overrides both per cell; ``cold`` runs the one it is given, which
+    is how a verification child checks a cell rather than the parent's geometry.
 
     Args:
         parser: Parser to add to.
@@ -86,6 +147,7 @@ def add_geometry(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--layers", type=int, default=13)
     parser.add_argument("--vocab", type=int, default=50257)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
 
 
 GEOMETRY = (
@@ -100,6 +162,7 @@ GEOMETRY = (
     "layers",
     "vocab",
     "device",
+    "dtype",
 )
 """The geometry flags, by attribute name, for passing on to a child process."""
 
@@ -117,9 +180,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     build.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     build.add_argument(
+        "--widths",
+        nargs="+",
+        type=int,
+        default=list(DECODE_WIDTHS),
+        help=(
+            "d_state values the decode payload covers. Defaults to every legal "
+            "width, since a payload short a width compiles there rather than "
+            "raising. Narrow it only for a deployment that runs one."
+        ),
+    )
+    build.add_argument(
         "--no-verify",
         action="store_true",
-        help="Skip the child-process check that the payload covers every mode.",
+        help="Skip the child-process check that the payload covers every cell.",
     )
     add_geometry(build)
 
@@ -127,15 +201,56 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     cold.add_argument("--mode", choices=MODES, default="step")
     cold.add_argument("--payload", choices=PAYLOAD_MODES, default="none")
     cold.add_argument("--payload-path", default=str(aot.PAYLOAD_DIR))
+    cold.add_argument(
+        "--no-prefill",
+        action="store_true",
+        help=(
+            "Decode against a state no prefill advanced. The prefill runs the "
+            "chunked scan, which does not fit at the widest d_state the decode "
+            "kernel serves; skipping it is what lets a wide cell be checked at all."
+        ),
+    )
     add_geometry(cold)
     return parser.parse_args(argv)
 
 
-def build_config(args: argparse.Namespace) -> SLinOSSConfig:
-    """The geometry the step runs at."""
+def cells(mode: str, args: argparse.Namespace) -> tuple[Cell, ...]:
+    """The set one mode's payload has to cover.
+
+    The decode step is rowwise and runs at every dtype in :data:`DTYPES` and every
+    width in ``--widths``, and each pair is its own launch key. The scan is neither:
+    float32 falls back to the reference, and a chunked scan's keys carry the chunk
+    rather than ``N``, so ``forward`` and ``step`` are the one cell their flags name.
+
+    Args:
+        mode: One of :data:`MODES`.
+        args: The command line.
+
+    Returns:
+        The cells, in build order.
+    """
+    if mode != "decode":
+        return (Cell(d_state=args.d_state, dtype=args.dtype),)
+    widths = getattr(args, "widths", None) or [args.d_state]
+    return tuple(
+        Cell(d_state=width, dtype=name)
+        for width, name in itertools.product(widths, DTYPES)
+    )
+
+
+def build_config(args: argparse.Namespace, d_state: int | None = None) -> SLinOSSConfig:
+    """The geometry the step runs at.
+
+    Args:
+        args: The command line.
+        d_state: Width to use instead of ``args.d_state``, for one cell of a ladder.
+
+    Returns:
+        The config.
+    """
     return SLinOSSConfig(
         d_model=args.d_model,
-        d_state=args.d_state,
+        d_state=args.d_state if d_state is None else d_state,
         d_head=args.d_head,
         n_groups=args.groups,
         chunk_size=args.chunk,
@@ -146,7 +261,12 @@ def build_config(args: argparse.Namespace) -> SLinOSSConfig:
 
 
 def build_step(
-    mode: str, args: argparse.Namespace, config: SLinOSSConfig, device: torch.device
+    mode: str,
+    args: argparse.Namespace,
+    config: SLinOSSConfig,
+    device: torch.device,
+    dtype: torch.dtype = DTYPE,
+    prefill: bool = True,
 ) -> Callable[[], object]:
     """The callable one step calls once.
 
@@ -161,18 +281,27 @@ def build_step(
         args: The geometry.
         config: The geometry, resolved.
         device: Where to run.
+        dtype: Activation dtype. One of :data:`DTYPES`. The scan has a kernel at
+            :data:`DTYPE` alone; the decode step has one at every width.
+        prefill: Advance the state through ``--prefill`` tokens of the chunked scan
+            first. Ignored outside ``decode``. False decodes against the allocated
+            zero state, which reaches the same two launchers -- no launch key carries
+            a value -- and reaches them at every ``d_state`` the decode kernel serves
+            rather than only at those the scan's shared budget also admits.
 
     Returns:
         The callable. Takes no arguments.
     """
     torch.manual_seed(0)
-    stack = SLinOSSStack(config, device=device).to(DTYPE)
+    stack = SLinOSSStack(config, device=device).to(dtype)
     vocab = config.vocab_size
     assert vocab is not None
 
     if mode == "decode":
-        state = StackState.allocate(config, args.batch, device=device, dtype=DTYPE)
-        stack(torch.randint(0, vocab, (args.batch, args.prefill), device=device), state)
+        state = StackState.allocate(config, args.batch, device=device, dtype=dtype)
+        if prefill:
+            ids = torch.randint(0, vocab, (args.batch, args.prefill), device=device)
+            stack(ids, state)
         token = torch.randint(0, vocab, (args.batch, 1), device=device)
         return lambda: stack(token, state)
 
@@ -245,7 +374,14 @@ def cold(args: argparse.Namespace) -> int:
         if loaded is None:
             raise FileNotFoundError(f"no payload at {args.payload_path} to load")
     config = build_config(args)
-    step = build_step(args.mode, args, config, device)
+    step = build_step(
+        args.mode,
+        args,
+        config,
+        device,
+        DTYPES[args.dtype],
+        prefill=not args.no_prefill,
+    )
     torch.cuda.synchronize(device)
     setup1 = time.perf_counter()
     during_setup = cache_events()
@@ -262,7 +398,7 @@ def cold(args: argparse.Namespace) -> int:
     total = ended - _START
     compile_s = events.compile_us / 1e6
     print(
-        f"mode {args.mode}  payload {args.payload}"
+        f"mode {args.mode}  dtype {args.dtype}  payload {args.payload}"
         + (f" ({len(loaded)} entries)" if loaded is not None else "")
     )
     print(
@@ -291,7 +427,9 @@ def cold(args: argparse.Namespace) -> int:
     return 0
 
 
-def _child_argv(mode: str, args: argparse.Namespace, out: Path) -> list[str]:
+def _child_argv(
+    mode: str, args: argparse.Namespace, out: Path, cell: Cell
+) -> list[str]:
     """The command line one verification child runs.
 
     ``sys.executable`` and ``__file__`` rather than ``-m``, so the child does not
@@ -301,6 +439,8 @@ def _child_argv(mode: str, args: argparse.Namespace, out: Path) -> list[str]:
         mode: The mode to verify.
         args: The parent's command line.
         out: Payload directory.
+        cell: The cell to verify. Overrides the parent's width and dtype, so a
+            child checks the cell it was given rather than the parent's geometry.
 
     Returns:
         The argv vector.
@@ -316,17 +456,27 @@ def _child_argv(mode: str, args: argparse.Namespace, out: Path) -> list[str]:
         "--payload-path",
         str(out),
     ]
+    # The same omission the build made. A decode payload holds decode keys, so a
+    # child that prefilled would demand the scan's keys of it and a strict load would
+    # refuse them -- and at the widest two widths the scan does not fit at all.
+    if mode == "decode":
+        argv.append("--no-prefill")
+    overridden = {"d_state": cell.d_state, "dtype": cell.dtype}
     for name in GEOMETRY:
-        argv += [f"--{name.replace('_', '-')}", str(getattr(args, name))]
+        value = overridden.get(name, getattr(args, name))
+        argv += [f"--{name.replace('_', '-')}", str(value)]
     return argv
 
 
 def verify(modes: Sequence[str], args: argparse.Namespace, out: Path) -> None:
-    """Run one strict-payload child per mode.
+    """Run one strict-payload child per cell of every mode.
 
     The parent has every executor in its own cache, so it cannot tell a payload hit
     from a cache hit. A child process can: it loads the payload, and a key the
     payload does not hold raises instead of compiling.
+
+    Per cell rather than per mode. A decode payload's whole claim is that it covers
+    a set of widths and dtypes, and one child at one width verifies one of them.
 
     Args:
         modes: Modes to verify.
@@ -337,17 +487,55 @@ def verify(modes: Sequence[str], args: argparse.Namespace, out: Path) -> None:
         RuntimeError: If a child fails. Its output is printed first.
     """
     for mode in modes:
-        print(f"--- verify {mode}", flush=True)
-        done = subprocess.run(_child_argv(mode, args, out), check=False)
-        if done.returncode != 0:
-            raise RuntimeError(
-                f"the payload at {out} does not cover mode {mode}: the strict child "
-                f"exited {done.returncode}"
-            )
+        for cell in cells(mode, args):
+            print(f"--- verify {mode} {cell.label()}", flush=True)
+            done = subprocess.run(_child_argv(mode, args, out, cell), check=False)
+            if done.returncode != 0:
+                raise RuntimeError(
+                    f"the payload at {out} does not cover mode {mode} at "
+                    f"{cell.label()}: the strict child exited {done.returncode}"
+                )
+
+
+def _covers(manifest: aot.Manifest, expected: int) -> None:
+    """Refuse a decode payload short a cell.
+
+    At least one ``decode_fwd`` key per cell walked and one ``decode_carry`` key per
+    dtype, which is what the two launchers' compile-time arguments make them. Counted
+    rather than matched key by key, so the check does not restate the key format and
+    cannot drift from it: an equal total with the wrong split still fails, because a
+    width that reached no forward kernel leaves the forward count short.
+
+    A lower bound and not an equality because the manifest is written from the
+    process's whole executor cache. This entry point runs one build per process, where
+    the bound is tight; a caller that built twice in one process, or that ran other
+    decode work first, inflates the count and is not accused of a shortfall for it.
+
+    Args:
+        manifest: What the build wrote.
+        expected: Decode cells walked.
+
+    Raises:
+        RuntimeError: On a forward or carry count below the walked set's.
+    """
+    keys = [entry.key for entry in manifest.entries]
+    forward = len({key for key in keys if "decode_fwd" in key})
+    carry = len({key for key in keys if "decode_carry" in key})
+    if forward < expected or carry < len(DTYPES):
+        raise RuntimeError(
+            f"the payload holds {forward} decode_fwd and {carry} decode_carry keys "
+            f"for {expected} cells over {len(DTYPES)} dtypes; a cell that exported "
+            f"no key is a shape a loaded payload compiles rather than refuses"
+        )
 
 
 def build(args: argparse.Namespace) -> int:
     """Compile every launch the modes reach, export it, and write the manifest.
+
+    A mode is walked cell by cell: one step per ``(d_state, dtype)`` for ``decode``,
+    one for each of the others. The executor cache spans the walk, so a key two cells
+    share is compiled once and exported once. A decode cell skips the prefill, so the
+    walk's reach is the decode kernel's and not the chunked scan's.
 
     Args:
         args: The command line.
@@ -357,44 +545,58 @@ def build(args: argparse.Namespace) -> int:
 
     Raises:
         RuntimeError: If a mode compiled nothing, which means the kernel path was
-            not taken and the payload would be silently short. Or if verification
-            fails.
+            not taken and the payload would be silently short. If the decode entry
+            count is below the walked cell set's. Or if verification fails.
     """
     device = require_cuda(args.device)
     out = Path(args.out)
-    config = build_config(args)
+    decode_cells = 0
     for mode in args.modes:
-        before = cache_events()
-        step = build_step(mode, args, config, device)
-        step()
-        torch.cuda.synchronize(device)
-        after = cache_events()
-        gained = after.compiled - before.compiled
-        if gained == 0 and before.compiled == 0:
-            raise RuntimeError(
-                f"mode {mode} compiled no executor; the kernel path was not taken"
+        for cell in cells(mode, args):
+            decode_cells += mode == "decode"
+            before = cache_events()
+            config = build_config(args, cell.d_state)
+            step = build_step(
+                mode,
+                args,
+                config,
+                device,
+                DTYPES[cell.dtype],
+                prefill=mode != "decode",
             )
-        print(
-            f"{mode:8s} compiled {gained:4d} in "
-            f"{(after.compile_us - before.compile_us) / 1e6:8.3f} s",
-            flush=True,
-        )
+            step()
+            torch.cuda.synchronize(device)
+            after = cache_events()
+            gained = after.compiled - before.compiled
+            if gained == 0 and before.compiled == 0:
+                raise RuntimeError(
+                    f"mode {mode} compiled no executor; the kernel path was not taken"
+                )
+            print(
+                f"{mode:8s} {cell.label():<18s} compiled {gained:4d} in "
+                f"{(after.compile_us - before.compile_us) / 1e6:8.3f} s",
+                flush=True,
+            )
 
     launches = compiled_launches()
     manifest = aot.build(launches, path=out)
+    if decode_cells:
+        _covers(manifest, decode_cells)
     total = sum((out / entry.file).stat().st_size for entry in manifest.entries)
     print(f"\npayload {out}")
     for field, value in manifest.identity._asdict().items():
         print(f"  {field:14s} {value}")
     print(
         f"  entries        {len(manifest.entries)} from {len(launches)} launches, "
-        f"{total / 1024.0:,.1f} KiB"
+        f"{total / 1024.0:,.1f} KiB, {total:,} bytes"
     )
     _stamp(device)
     if not args.no_verify:
         verify(args.modes, args, out)
+        checked = sum(len(cells(mode, args)) for mode in args.modes)
         print(
-            f"\nverified {len(manifest.entries)} entries over {len(args.modes)} modes"
+            f"\nverified {len(manifest.entries)} entries over {checked} cells of "
+            f"{len(args.modes)} modes"
         )
     return 0
 

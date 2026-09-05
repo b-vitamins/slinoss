@@ -45,7 +45,14 @@ include = ["slinoss*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-slinoss = ["py.typed"]
+# `_aot` is a build output, not a package: it holds no `__init__.py` and is
+# gitignored. Named here anyway, because `slinoss.aot.PAYLOAD_DIR` sits inside the
+# package precisely so an install can carry a payload built before the wheel was
+# made, and a directory no pattern names is copied by nothing. Both kinds are
+# listed: an object is what a launch loads and the manifest is what says which
+# object answers which key, so a wheel holding one and not the other holds a
+# payload that cannot be read. Absent a build the patterns match nothing.
+slinoss = ["py.typed", "_aot/manifest.json", "_aot/*.o"]
 
 # --------------------------------------------------------------------------
 # Lint

@@ -28,6 +28,17 @@ generated kernel.
 Neither is the launch stream in a payload entry. Every launcher takes it as the
 last of its runtime arguments and the exported object keeps it there, so one entry
 serves every stream, which is what lets a captured graph replay a payload entry.
+
+What an entry is specialized on is its key and nothing more: the launcher, its
+compile-time arguments, and the dtype and rank each runtime argument declared. No
+extent, stride or pitch is in a key, so one entry serves every batch, head count,
+grouping and row count a launcher is called at, and a build that covers a shape
+covers every shape that differs only in those. Read the launcher's compile-time
+arguments to see what is left. The decode step is the worked example: ``decode_fwd``
+takes ``(THREADS, row_group(N), N // row_group(N))``, so it needs one entry per
+``(activation dtype, N)``; ``decode_carry`` takes ``(THREADS,)``, so it needs one per
+dtype. Over-stating the axes is the expensive mistake, because it makes a payload
+that covers one width look like a payload that covers the operator.
 """
 
 from __future__ import annotations
@@ -66,9 +77,10 @@ __all__ = [
 ]
 
 PAYLOAD_DIR: Final = Path(__file__).resolve().parent / "_aot"
-"""Where a payload lives by default. Inside the package, so an installed wheel
-carries one if the build ran before the wheel was made, and gitignored, so a
-built payload is never committed."""
+"""Where a payload lives by default. Inside the package, and named by
+``[tool.setuptools.package-data]``, so an installed wheel carries one if the build
+ran before the wheel was made; gitignored, so a built payload is never committed.
+Placement alone does not put a file in a wheel, so the two go together."""
 
 MANIFEST: Final = "manifest.json"
 """The manifest's file name inside a payload directory."""

@@ -17,19 +17,26 @@ No architecture string is hardcoded. nvcc targets whatever
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from setuptools import setup
-
-ROOT = Path(__file__).resolve().parent
 
 MODULE = "slinoss._C._conv1d"
 """Import path of the compiled module. Mirrors ``slinoss._C.EXTENSION``."""
 
 # Distinct stems. The object name is the source name with the extension
 # replaced, so two sources called causal_conv1d in one directory collide.
+#
+# Relative, and passed through as written. ``build_ext --inplace`` accepts an
+# absolute path but ``bdist_wheel`` refuses one, so absolutizing these against
+# this file's parent leaves a tree that compiles in place and has no
+# distribution -- and therefore no way to ship a payload from
+# ``slinoss.aot.PAYLOAD_DIR``. Every build backend invokes this script with its
+# own directory as the working directory, which is what these are relative to.
 SOURCES = ["csrc/causal_conv1d.cpp", "csrc/causal_conv1d_kernel.cu"]
+
+INCLUDE_DIRS = ["csrc"]
+"""Header search path. Relative for the same reason as :data:`SOURCES`."""
 
 CXX_FLAGS = ["-O3"]
 
@@ -54,8 +61,8 @@ def _build() -> tuple[list[Any], dict[str, Any]]:
         return [], {}
     extension = CUDAExtension(
         name=MODULE,
-        sources=[str(ROOT / source) for source in SOURCES],
-        include_dirs=[str(ROOT / "csrc")],
+        sources=SOURCES,
+        include_dirs=INCLUDE_DIRS,
         extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
     )
     return [extension], {"build_ext": BuildExtension}
