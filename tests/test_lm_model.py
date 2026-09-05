@@ -1,9 +1,9 @@
 """The swap: that it happens, that it is the only thing that differs, and what it counts.
 
-The whole comparison rests on one attribute assignment. If the swap silently failed, every arm
-would be slinoss under another name and the table would read as a set of near-ties; if it half
-happened, an arm would be a hybrid nobody asked for. So the assertions are on identity -- the
-module in the block is the one the factory made -- rather than on a loss going down.
+The whole comparison rests on one factory per block. If construction silently failed, every
+arm could be slinoss under another name and the table would read as a set of near-ties. So the
+assertions are on identity -- the module in the block is the one the factory made -- rather
+than on a loss going down.
 
 The counts are the other half. Arms are matched on non-embedding parameters, so that number has
 to be the total less exactly the token table and the head, and the mixer count has to be the
@@ -24,6 +24,8 @@ from torch import Tensor, nn
 from scripts.harness import MixerFactory
 from scripts.lm.mixers import REGISTRY
 from scripts.lm.model import (
+    MixerLM,
+    MixerResidualBlock,
     build_model,
     layer_factories,
     mixer_parameters,
@@ -31,7 +33,7 @@ from scripts.lm.model import (
     parameter_count,
     scaffold_config,
 )
-from slinoss import SLinOSSBlock, SLinOSSConfig, SLinOSSMixer, SLinOSSStack
+from slinoss import SLinOSSConfig, SLinOSSMixer
 
 D_MODEL = 64
 N_LAYERS = 3
@@ -75,12 +77,12 @@ def _config(d_state: int = 48) -> SLinOSSConfig:
     )
 
 
-def _blocks(model: SLinOSSStack) -> list[SLinOSSBlock]:
+def _blocks(model: MixerLM) -> list[MixerResidualBlock]:
     """The stack's blocks, typed."""
-    return [block for block in model.blocks if isinstance(block, SLinOSSBlock)]
+    return [block for block in model.blocks if isinstance(block, MixerResidualBlock)]
 
 
-def _build(factories: list[MixerFactory], d_state: int = 48) -> SLinOSSStack:
+def _build(factories: list[MixerFactory], d_state: int = 48) -> MixerLM:
     """A stack with those factories, one per layer."""
     torch.manual_seed(0)
     return build_model(_config(d_state), factories, max_length=MAX_LENGTH)
@@ -155,12 +157,7 @@ def test_a_mixer_built_at_another_width_is_refused() -> None:
 
 
 def test_the_non_embedding_count_is_the_total_less_the_table_and_the_head() -> None:
-    """The matched quantity, by subtraction rather than by a second walk.
-
-    The embedding and the head are identical across arms at one width, so a total-parameter
-    match would let a wider mixer hide behind them. The head is counted at its padded width,
-    which is why this subtracts the module rather than ``vocab * d_model``.
-    """
+    """The diagnostic count is a literal subtraction from the published total."""
     model = _build(layer_factories(_factory(1), N_LAYERS))
     embedding = model.embedding
     head = model.head
@@ -203,6 +200,38 @@ def test_two_arms_differ_by_their_mixers_and_by_nothing_else() -> None:
     assert parameter_count(thick) - parameter_count(thin) == mixer_parameters(
         thick
     ) - mixer_parameters(thin)
+
+
+def test_the_published_gpt_widths_reproduce_the_two_total_parameter_scales() -> None:
+    """The paper's 496/1360 widths identify the mixer-only total-count convention."""
+    for width, target in ((496, 45_000_000), (1360, 180_000_000)):
+        if (2 * width) % 64:
+            # The scaffold config's placeholder mixer validation is stricter than GPT;
+            # use its narrowest head solely for these off-grid published widths.
+            cfg = scaffold_config(
+                d_model=width,
+                n_layers=12,
+                vocab_size=32768,
+                d_head=16,
+            )
+        else:
+            cfg = scaffold_config(d_model=width, n_layers=12, vocab_size=32768)
+        resolved = REGISTRY.resolve("gpt")
+        model = build_model(cfg, layer_factories(resolved.factory, 12), max_length=2048)
+        assert parameter_count(model) == pytest.approx(target, rel=0.02)
+
+
+def test_only_the_token_table_is_stored_in_bfloat16() -> None:
+    """The paper's storage exception must not become a bf16 compute path."""
+    model = _build(layer_factories(_factory(1), N_LAYERS))
+    assert model.embedding.weight.dtype is torch.bfloat16
+    assert all(
+        param.dtype is torch.float32
+        for name, param in model.named_parameters()
+        if not name.startswith("embedding.")
+    )
+    ids = torch.arange(8, dtype=torch.int64).remainder(VOCAB).reshape(2, 4)
+    assert model(ids).dtype is torch.float32
 
 
 def test_the_slinoss_arm_goes_through_the_same_swap() -> None:

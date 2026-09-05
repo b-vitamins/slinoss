@@ -3,7 +3,7 @@
 Every other file in this suite runs at toy widths on the CPU, which is what makes the loop's
 arithmetic checkable by hand. None of them would catch the failures that only exist at the real
 shape: a chunked scan whose shared-memory budget refuses the width, a fused cross entropy over a
-50k-column padded head, a bf16 autocast region that overflows, an optimizer that does not fit
+50k-column padded head, the published fp32 compute path, an optimizer that does not fit
 next to the activations.
 
 The other thing this file exists for is the silent fallback. Every stage has a reference path and
@@ -87,15 +87,11 @@ def test_dispatch_picks_the_kernel_backend_for_every_stage() -> None:
     above already established that the DSL imports and the extension is built, so a reference
     resolution here is a dispatch bug and not a missing dependency.
     """
+    assert scan_backends.resolve(None, "cuda", torch.float32).name == scan_backends.CUTE
     assert (
-        scan_backends.resolve(None, "cuda", torch.bfloat16).name == scan_backends.CUTE
+        conv_backends.resolve(None, "cuda", torch.float32).name == conv_backends.NATIVE
     )
-    assert (
-        conv_backends.resolve(None, "cuda", torch.bfloat16).name == conv_backends.NATIVE
-    )
-    assert (
-        xent_backends.resolve(None, "cuda", torch.bfloat16).name == xent_backends.CUTE
-    )
+    assert xent_backends.resolve(None, "cuda", torch.float32).name == xent_backends.CUTE
 
 
 @pytest.mark.parametrize(("d_model", "micro_batch", "needed_gib"), SCALES)

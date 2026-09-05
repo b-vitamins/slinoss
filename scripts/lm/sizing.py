@@ -1,12 +1,10 @@
-"""Solve the width that puts two arms at one parameter count.
+"""Solve the width that puts two arms at one total parameter count.
 
 A table whose arms differ in size is not a comparison, and a table whose arms were sized by
 hand is a comparison nobody can reproduce. So the width is solved: fix the depth, fix the
-target non-embedding parameter count, and search ``d_model`` for the arm that lands nearest.
-
-Non-embedding, because the token table and the head scale with the vocabulary and are
-identical across arms at one width; counting them would let a wider mixer hide behind a shared
-table. :func:`scripts.lm.model.non_embedding_parameters` is the count.
+target total parameter count, and search ``d_model`` for the arm that lands nearest. The
+published 45M and 180M labels include the untied embedding and LM head: the reported widths
+496 and 1360 reproduce those totals under the published mixer-only scaffold.
 
 The search is a bisection over a grid, not over the integers. Every arm here constrains the
 width: ``d_inner = expand * d_model`` must be a multiple of ``d_head``, ``d_state`` must be a
@@ -49,10 +47,10 @@ arms.
 """
 
 SPREAD_TOLERANCE = 0.02
-"""Largest relative spread in non-embedding parameters a table may carry across arms."""
+"""Largest relative spread in total parameters a table may carry across arms."""
 
 Counter = Callable[[int], int]
-"""``d_model -> non-embedding parameters``. Monotone increasing."""
+"""``d_model -> total parameters``. Monotone increasing."""
 
 
 class Sizing(NamedTuple):
@@ -62,7 +60,7 @@ class Sizing(NamedTuple):
         mixer: Registry name.
         d_model: Solved width, a multiple of :data:`WIDTH_MULTIPLE`.
         n_layers: Depth, the same for every arm.
-        parameters: Non-embedding trainable parameters at that width. The achieved count,
+        parameters: Total trainable parameters at that width. The achieved count,
             recorded rather than the target, because the target is not reachable on the
             grid.
         target: What was asked for.
@@ -95,7 +93,7 @@ def solve_width(
     """The grid width whose parameter count is nearest ``target``.
 
     Args:
-        target: Non-embedding parameters wanted.
+        target: Total parameters wanted.
         count: Parameters at a width. Called once per bisection step, so it may build a
             model; the search is logarithmic in the grid size.
         low: Smallest width to consider.
@@ -165,7 +163,7 @@ def size_arm(
     host it runs on, or size the arm it is matched to and pass the width through.
 
     Args:
-        target: Non-embedding parameters wanted.
+        target: Total parameters wanted.
         mixer: Registry name.
         n_layers: Depth.
         vocab_size: Tokens, for the scaffold. Does not affect the count.
@@ -186,7 +184,7 @@ def size_arm(
     from scripts.lm.model import (
         build_model,
         layer_factories,
-        non_embedding_parameters,
+        parameter_count,
         scaffold_config,
     )
 
@@ -201,14 +199,14 @@ def size_arm(
             layer_factories(resolved.factory, n_layers),
             max_length=max_length,
         )
-        return non_embedding_parameters(model)
+        return parameter_count(model)
 
     d_model = solve_width(target, count, low=low, high=high, multiple=multiple)
     return Sizing(mixer, d_model, n_layers, count(d_model), target)
 
 
 def spread(counts: Mapping[str, int]) -> float:
-    """Relative spread in non-embedding parameters.
+    """Relative spread in total parameters.
 
     Args:
         counts: Parameters per arm. A mapping rather than a sequence of :class:`Sizing`,

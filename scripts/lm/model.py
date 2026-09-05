@@ -1,39 +1,31 @@
-"""The scaffold every arm is scored on: :class:`slinoss.SLinOSSStack` with the mixer swapped.
+"""The published KLA language-model scaffold: embedding, mixer blocks, norm, head.
 
-The tree already ships the whole language model -- embedding, ``n_layers`` pre-norm blocks
-with a SwiGLU FFN, one fused final norm, a head padded to a tensor-core multiple -- so this
-module writes no scaffold. It replaces one attribute:
+KLA follows Mamba's *fused-MLP mixer*: the expansion, gate and channel mixing live inside
+the sequence mixer. There is no second transformer-style FFN after it. This is independently
+identified by the paper's dimensions: a 12-layer 8-head attention control at width 496 has
+44.3M total parameters, and width 1360 has 177.9M, only under the mixer-only scaffold. Adding
+an external FFN makes both published 45M/180M configurations impossible.
 
-    stack.blocks[i].mixer = factory(d_model, max_length)
-
-:meth:`slinoss.SLinOSSBlock.forward` calls ``self.mixer(normed)`` on the whole-sequence path,
-so any module mapping ``(B,T,d_model)`` to ``(B,T,d_model)`` slots in. Every arm therefore
-shares the scaffold bit for bit: the same fused residual norms, the same float32 stream
-between blocks, the same FFN orientation, the same padded head. A difference between two arms
-is the mixer, and the parameter-count difference between them is the mixer's too, which is
-what makes :mod:`scripts.lm.sizing` well posed.
-
-The swap is uniform. The slinoss arm also goes through it, building its mixer from the
-registry like any baseline, rather than keeping the one the block constructed. A special case
-for the arm under test is how a harness stops being a comparison; the cost is one discarded
-mixer's worth of transient host memory per layer.
-
-A per-layer list rather than one factory, because the hybrid arm is a per-layer choice: eleven
-layers of one mixer and a twelfth of another is a list and needs no second code path.
+Every block is therefore exactly ``x = x + mixer(rmsnorm(x))``. A per-layer factory list
+supports the published hybrid without a second build path. The token table is stored in
+bfloat16 and cast on lookup; every mixer, norm, residual and head computation remains fp32.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import cast
 
 import torch
 from torch import nn
 
 from scripts.harness import MixerFactory
-from slinoss import SLinOSSBlock, SLinOSSConfig, SLinOSSMixer, SLinOSSStack
+from slinoss import SLinOSSConfig, SLinOSSMixer
+from slinoss.ops.block import rmsnorm
 
 __all__ = [
+    "MixerLM",
+    "MixerResidualBlock",
     "build_model",
     "layer_factories",
     "mixer_parameters",
@@ -41,6 +33,77 @@ __all__ = [
     "parameter_count",
     "scaffold_config",
 ]
+
+
+class MixerResidualBlock(nn.Module):
+    """One pre-norm residual mixer and no external FFN."""
+
+    def __init__(self, d_model: int, mixer: nn.Module, *, norm_eps: float) -> None:
+        super().__init__()
+        self.norm_eps = norm_eps
+        self.norm_weight = nn.Parameter(torch.ones(d_model, dtype=torch.float32))
+        self.mixer = mixer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the published fused-mixer block."""
+        return x + self.mixer(rmsnorm(x, self.norm_weight, eps=self.norm_eps))
+
+
+class MixerLM(nn.Module):
+    """Untied embedding/head around a uniform list of mixer-residual blocks."""
+
+    def __init__(self, config: SLinOSSConfig, mixers: Sequence[nn.Module]) -> None:
+        super().__init__()
+        if config.vocab_size is None:
+            raise ValueError("the LM scaffold requires vocab_size")
+        if len(mixers) != config.n_layers:
+            raise ValueError(f"{len(mixers)} mixers for {config.n_layers} layers")
+        self.config = config
+        self.embedding = nn.Embedding(
+            config.vocab_size, config.d_model, dtype=torch.bfloat16
+        )
+        self.blocks = nn.ModuleList(
+            MixerResidualBlock(config.d_model, mixer, norm_eps=config.norm_eps)
+            for mixer in mixers
+        )
+        self.norm_weight = nn.Parameter(torch.ones(config.d_model, dtype=torch.float32))
+        self.head = nn.Linear(
+            config.d_model,
+            config.padded_vocab_size,
+            bias=config.bias,
+            dtype=torch.float32,
+        )
+
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> MixerLM:
+        """Move/cast the model while preserving the protocol's parameter dtypes."""
+        super()._apply(fn, recurse)
+        self.embedding.weight.data = self.embedding.weight.data.to(torch.bfloat16)
+        self.norm_weight.data = self.norm_weight.data.to(torch.float32)
+        for block in self.blocks:
+            cast("MixerResidualBlock", block).norm_weight.data = cast(
+                "MixerResidualBlock", block
+            ).norm_weight.data.to(torch.float32)
+        return self
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """Return causal next-token logits, with padded columns made unreachable."""
+        if ids.ndim != 2:
+            raise ValueError(f"expected (B,T) token ids, got {tuple(ids.shape)}")
+        hidden = self.embedding(ids).to(self.head.weight.dtype)
+        for block in self.blocks:
+            hidden = cast("MixerResidualBlock", block)(hidden)
+        hidden = rmsnorm(hidden, self.norm_weight, eps=self.config.norm_eps)
+        logits = self.head(hidden)
+        vocab = self.config.vocab_size
+        if vocab is None or logits.shape[-1] == vocab:
+            return logits
+        dead = logits.new_full(
+            (*logits.shape[:-1], logits.shape[-1] - vocab),
+            torch.finfo(logits.dtype).min,
+        )
+        return torch.cat((logits[..., :vocab], dead), dim=-1)
 
 
 def scaffold_config(
@@ -56,8 +119,9 @@ def scaffold_config(
 ) -> SLinOSSConfig:
     """The config the scaffold reads.
 
-    Only ``d_model``, ``n_layers``, ``vocab_size``, ``ffn_ratio``, ``bias`` and
-    ``norm_eps`` reach the scaffold. The mixer fields are here because
+    Only ``d_model``, ``n_layers``, ``vocab_size``, ``bias`` and ``norm_eps`` reach the
+    scaffold. ``ffn_ratio`` is retained only for checkpoint-schema compatibility and does
+    not instantiate an external FFN. The mixer fields are here because
     :class:`slinoss.SLinOSSConfig` validates them all at construction and the block needs a
     complete config to build the mixer it is about to have replaced; their values do not
     reach any arm, so they sit at the narrowest legal setting.
@@ -122,7 +186,7 @@ def build_model(
     max_length: int,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-) -> SLinOSSStack:
+) -> MixerLM:
     """Build the scaffold and swap in one mixer per layer.
 
     Construction is on the host and the move is one call at the end, so no arm is ever half
@@ -149,19 +213,17 @@ def build_model(
     """
     if len(factories) != config.n_layers:
         raise ValueError(f"{len(factories)} factories for {config.n_layers} layers")
-    stack = SLinOSSStack(config, device="cpu", dtype=torch.float32)
-    for module, factory in zip(stack.blocks, factories, strict=True):
-        block = cast("SLinOSSBlock", module)
+    mixers: list[nn.Module] = []
+    for factory in factories:
         mixer = factory(config.d_model, max_length)
         if isinstance(mixer, SLinOSSMixer) and mixer.config.d_model != config.d_model:
             raise ValueError(
                 f"mixer built at d_model {mixer.config.d_model} and the scaffold is "
                 f"{config.d_model}"
             )
-        # Through the module API, not by assignment: the block declares its own mixer as a
-        # SLinOSSMixer, and what goes in here is any mixer the registry builds.
-        block.add_module("mixer", mixer)
-    return cast("SLinOSSStack", stack.to(device=device, dtype=dtype))
+        mixers.append(mixer)
+    model = MixerLM(config, mixers)
+    return model.to(device=device, dtype=dtype or torch.float32)
 
 
 def parameter_count(model: nn.Module) -> int:
@@ -177,7 +239,7 @@ def parameter_count(model: nn.Module) -> int:
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
 
 
-def non_embedding_parameters(model: SLinOSSStack) -> int:
+def non_embedding_parameters(model: MixerLM) -> int:
     """Trainable parameters outside the token table and the head.
 
     Args:
@@ -195,7 +257,7 @@ def non_embedding_parameters(model: SLinOSSStack) -> int:
     return total
 
 
-def mixer_parameters(model: SLinOSSStack) -> int:
+def mixer_parameters(model: MixerLM) -> int:
     """Trainable parameters inside the mixers only.
 
     Args:
@@ -208,6 +270,6 @@ def mixer_parameters(model: SLinOSSStack) -> int:
     """
     total = 0
     for module in model.blocks:
-        block = cast("SLinOSSBlock", module)
+        block = cast("MixerResidualBlock", module)
         total += sum(p.numel() for p in block.mixer.parameters() if p.requires_grad)
     return total

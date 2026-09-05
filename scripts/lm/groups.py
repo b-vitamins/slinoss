@@ -126,7 +126,10 @@ def classify(name: str, param: Tensor) -> str:
         One of :data:`GROUPS`.
     """
     leaf = name.rsplit(".", 1)[-1]
-    if "embedding" in name:
+    # Only the token table. SLinOSS also owns a ``transition_embedding`` and the
+    # substring rule silently gave that state-space parameter the token table's
+    # enormous learning rate instead of its declared SSM group.
+    if name.startswith("embedding."):
         return "embedding"
     if name.startswith("head."):
         return "unembedding"

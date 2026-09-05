@@ -27,8 +27,14 @@ from torch import nn
 from scripts.lm.checkpoint import FORMAT, load, load_model, save
 from scripts.lm.corpus import CorpusManifest, ShardCounts
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import build_model, layer_factories, scaffold_config
-from slinoss import SLinOSSBlock, SLinOSSConfig, SLinOSSMixer, SLinOSSStack
+from scripts.lm.model import (
+    MixerLM,
+    MixerResidualBlock,
+    build_model,
+    layer_factories,
+    scaffold_config,
+)
+from slinoss import SLinOSSConfig, SLinOSSMixer
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -61,7 +67,7 @@ def _config() -> SLinOSSConfig:
     )
 
 
-def _stack(mixer: str = "slinoss", overrides: tuple[str, ...] = ()) -> SLinOSSStack:
+def _stack(mixer: str = "slinoss", overrides: tuple[str, ...] = ()) -> MixerLM:
     """A built arm, and the settings it was built at."""
     torch.manual_seed(0)
     resolved = REGISTRY.resolve(mixer, overrides)
@@ -70,14 +76,16 @@ def _stack(mixer: str = "slinoss", overrides: tuple[str, ...] = ()) -> SLinOSSSt
     )
 
 
-def _mixers(model: SLinOSSStack) -> list[nn.Module]:
+def _mixers(model: MixerLM) -> list[nn.Module]:
     """The mixer in each block, in order."""
-    return [block.mixer for block in model.blocks if isinstance(block, SLinOSSBlock)]
+    return [
+        block.mixer for block in model.blocks if isinstance(block, MixerResidualBlock)
+    ]
 
 
 def _save(
     path: Path, mixer: str = "slinoss", overrides: tuple[str, ...] = ()
-) -> SLinOSSStack:
+) -> MixerLM:
     """Build an arm, perturb it so its weights are not an initialization, and write it."""
     stack = _stack(mixer, overrides)
     with torch.no_grad():

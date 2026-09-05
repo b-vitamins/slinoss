@@ -3,7 +3,7 @@
 Four subcommands, one artifact each.
 
     prep    a corpus directory: two token files and a manifest with their digests
-    size    a width per arm at a target non-embedding parameter count
+    size    a width per arm at a target total parameter count
     train   a checkpoint and a record
     merge   an lm-eval results file folded into a record
     table   the eight-column table, from records
@@ -44,13 +44,8 @@ from scripts.provenance import identity
 
 __all__ = ["PRECISION", "TASKS", "Record", "main", "run_arm", "table"]
 
-PRECISION = "bf16-autocast/fp32-state"
-"""The one precision every arm runs at.
-
-A named deviation from the protocol, which ran float32 throughout. Float32 here would take
-the operator's reference path and measure a different program. Recorded per row so a table
-cannot mix two.
-"""
+PRECISION = "fp32-compute/bf16-token-embedding"
+"""The published precision: fp32 compute, with only the token table stored in bf16."""
 
 TASKS: tuple[tuple[str, str, str], ...] = (
     ("lambada_openai", "acc", "LAMBADA"),
@@ -87,7 +82,7 @@ class Record:
         hybrid_final: Registry name of the last layer's mixer, or None.
         d_model: Width.
         n_layers: Depth.
-        parameters: Non-embedding trainable parameters. What arms are matched on.
+        parameters: Total trainable parameters. What arms are matched on.
         total_parameters: All trainable parameters, padding columns included.
         mixer_parameters: Trainable parameters inside the mixers.
         group_parameters: Trainable parameters per optimizer group.
@@ -413,7 +408,7 @@ def run_arm(
         hybrid_final=hybrid_final,
         d_model=d_model,
         n_layers=n_layers,
-        parameters=model_mod.non_embedding_parameters(stack),
+        parameters=model_mod.parameter_count(stack),
         total_parameters=model_mod.parameter_count(stack),
         mixer_parameters=model_mod.mixer_parameters(stack),
         group_parameters=group_counts(stack),
@@ -427,8 +422,16 @@ def run_arm(
         seed=config.seed,
         precision=PRECISION,
         precision_details={
-            "parameter_dtype": str(next(stack.parameters()).dtype),
-            "autocast_dtype": "torch.bfloat16",
+            "parameter_dtype": "mixed-by-contract",
+            "token_embedding_dtype": str(stack.embedding.weight.dtype),
+            "compute_parameter_dtypes": sorted(
+                {
+                    str(param.dtype)
+                    for name, param in stack.named_parameters()
+                    if not name.startswith("embedding.")
+                }
+            ),
+            "autocast_dtype": None,
             "recurrent_state_dtype": "torch.float32",
             "float32_matmul_precision": torch.get_float32_matmul_precision(),
         },

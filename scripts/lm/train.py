@@ -15,10 +15,9 @@ So: one :meth:`torch.optim.Optimizer.zero_grad` before the micro-steps, each mic
 divided by the accumulation count, one clip over the summed gradient, one
 :meth:`torch.optim.Optimizer.step`, and no global seeding anywhere below :func:`train`.
 
-Precision is bf16 autocast over float32 parameters and float32 optimizer state. The protocol
-this reproduces ran float32 throughout; float32 here would take the operator's reference path
-and measure a different program, so the deviation is named rather than hidden, and it is the
-same deviation for every arm.
+The published protocol runs every computation in fp32. Only the token-embedding table is
+stored in bfloat16; the model casts its lookup to fp32 before the first block. There is no
+autocast region and all registered fast operators support fp32 explicitly.
 
 The loss is :func:`slinoss.ops.xent.cross_entropy`, which takes the class count separately
 from the operand width. That is the padded head exactly: the head emits
@@ -98,7 +97,7 @@ class TrainConfig:
     seed: int = 0
     eval_batch: int = 8
     log_every: int = 50
-    autocast_dtype: torch.dtype | None = field(default=torch.bfloat16)
+    autocast_dtype: torch.dtype | None = field(default=None)
 
     def __post_init__(self) -> None:
         window = self.micro_batch * self.seq_len
@@ -220,7 +219,7 @@ def accumulate(
     accum: int,
     classes: int,
     device: torch.device | str,
-    autocast_dtype: torch.dtype | None = torch.bfloat16,
+    autocast_dtype: torch.dtype | None = None,
 ) -> float:
     """One optimizer step's worth of gradient, and nothing else.
 
@@ -269,7 +268,7 @@ def evaluate(
     batch_size: int,
     classes: int,
     device: torch.device | str,
-    autocast_dtype: torch.dtype | None = torch.bfloat16,
+    autocast_dtype: torch.dtype | None = None,
     bytes_per_token: float | None = None,
 ) -> Evaluation:
     """Score every window of a shard, in order.

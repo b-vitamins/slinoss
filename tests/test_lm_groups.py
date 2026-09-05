@@ -111,6 +111,18 @@ def test_the_groups_partition_every_trainable_parameter() -> None:
     assert counts["embedding"] == VOCAB * D_MODEL
 
 
+def test_transition_embedding_is_ssm_not_token_embedding() -> None:
+    """A shared word in a leaf name must not override its explicit SSM policy."""
+    model = _model("slinoss")
+    found = [
+        (name, classify(name, param))
+        for name, param in model.named_parameters()
+        if "transition_embedding" in name
+    ]
+    assert found
+    assert all(group == "ssm" for _, group in found)
+
+
 def test_an_arm_with_no_state_space_parameter_reports_zero() -> None:
     """``conv`` carries no transition, so ``ssm`` is empty and the optimizer omits it.
 
