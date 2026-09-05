@@ -102,6 +102,9 @@ class Record:
         val_loss: Held-out nats per token.
         val_bpb: Held-out bits per byte.
         train_loss: Trailing mean training loss.
+        train_seconds: Synchronized wall time spent in optimizer steps.
+        validation_seconds: Synchronized wall time spent in held-out evaluation.
+        tokens_per_second: Training throughput over optimizer-step wall time.
         zero_shot: Accuracy per lm-eval task in ``[0, 1]``, or None before a merge.
     """
 
@@ -139,6 +142,9 @@ class Record:
     data: dict[str, Any]
     initialization: dict[str, str]
     provenance: dict[str, Any]
+    train_seconds: float | None = None
+    validation_seconds: float | None = None
+    tokens_per_second: float | None = None
     zero_shot: dict[str, float] | None = field(default=None)
 
     def average(self) -> float | None:
@@ -462,6 +468,9 @@ def run_arm(
             if provenance is None
             else provenance
         ),
+        train_seconds=result.train_seconds,
+        validation_seconds=result.validation_seconds,
+        tokens_per_second=result.tokens_per_second,
     )
     write_record(out / RECORD_NAME, record)
     return record
@@ -630,6 +639,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             line += f"  val loss {record.val_loss:.4f}"
         if record.val_bpb is not None:
             line += f"  val bpb {record.val_bpb:.4f}"
+        if record.tokens_per_second is not None:
+            line += f"  {record.tokens_per_second:,.0f} tok/s"
         print(line)
         return 0
 

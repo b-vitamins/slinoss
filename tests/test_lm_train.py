@@ -196,6 +196,11 @@ def test_exactly_one_update_per_step(tmp_path: Path) -> None:
         device="cpu",
     )
     assert result.steps == 1
+    assert result.train_seconds > 0.0
+    assert result.validation_seconds >= 0.0
+    assert result.tokens_per_second == pytest.approx(
+        result.tokens / result.train_seconds
+    )
 
     reference = _model()
     batch = next(

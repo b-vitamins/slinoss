@@ -28,6 +28,7 @@ from the operand width. That is the padded head exactly: the head emits
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -180,6 +181,9 @@ class TrainResult(NamedTuple):
             changed width cannot re-derive a different number.
         embedding_lr: The transferred token-table rate.
         accum: Micro batches per step.
+        train_seconds: Synchronized wall time spent in optimizer steps.
+        validation_seconds: Synchronized wall time spent in held-out evaluation.
+        tokens_per_second: Training tokens divided by ``train_seconds``.
     """
 
     steps: int
@@ -189,6 +193,16 @@ class TrainResult(NamedTuple):
     peak_lr: float
     embedding_lr: float
     accum: int
+    train_seconds: float
+    validation_seconds: float
+    tokens_per_second: float
+
+
+def _synchronize(device: torch.device | str) -> None:
+    """Close the asynchronous CUDA queue at a timing boundary."""
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        torch.cuda.synchronize(resolved)
 
 
 def loss_on(model: nn.Module, batch: Batch, *, classes: int) -> Tensor:
@@ -381,6 +395,8 @@ def train(
     window = max(1, min(steps, 20))
     step_lr = peak_lr
 
+    _synchronize(device)
+    train_started = time.perf_counter()
     for step in range(steps):
         factor = (
             lr_at(
@@ -418,6 +434,9 @@ def train(
         ):
             on_step(Step(step, mean, step_lr, norm))
 
+    _synchronize(device)
+    train_seconds = time.perf_counter() - train_started
+    validation_started = time.perf_counter()
     val = (
         None
         if val_shard is None
@@ -432,12 +451,18 @@ def train(
             bytes_per_token=bytes_per_token,
         )
     )
+    _synchronize(device)
+    validation_seconds = time.perf_counter() - validation_started
+    tokens = steps * config.token_batch
     return TrainResult(
         steps=steps,
-        tokens=steps * config.token_batch,
+        tokens=tokens,
         train_loss=sum(recent) / len(recent) if recent else math.nan,
         val=val,
         peak_lr=peak_lr,
         embedding_lr=embedding_lr,
         accum=accum,
+        train_seconds=train_seconds,
+        validation_seconds=validation_seconds,
+        tokens_per_second=tokens / train_seconds,
     )
