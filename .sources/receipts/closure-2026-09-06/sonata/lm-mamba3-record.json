@@ -1,0 +1,352 @@
+{
+  "arm": "mamba3",
+  "d_model": 320,
+  "data": {
+    "dataset": "/data2/sureshmeena/lm-data/kla-fineweb-edu-100b",
+    "dataset_config": "",
+    "dataset_split": "train",
+    "dtype": "uint16",
+    "eot_token_id": 0,
+    "identity": "2d1e428944a3f3fbedeb3e58a22df3521013f4c85cd082258b838371d190abe8",
+    "revision": "0.0.0",
+    "text_field": "text",
+    "tokenizer": "EleutherAI/gpt-neox-20b",
+    "train": {
+      "digest": "71d2e65ae2b74765a1b64e3a94df2995e4f04d454dc8d59c656764ba4449c9a9",
+      "text_bytes": 77464132,
+      "tokens": 16778020
+    },
+    "val": {
+      "digest": "2b84252746009a39506dad2c722a40cd54baa041152242c35ae9ca8810ff1a8b",
+      "text_bytes": 4915322,
+      "tokens": 1048969
+    },
+    "vocab_size": 50277
+  },
+  "dataset": "/data2/sureshmeena/lm-data/kla-fineweb-edu-100b",
+  "embedding_lr": 0.232379000772445,
+  "group_parameters": {
+    "embedding": 16088640,
+    "hidden": 8340480,
+    "scalar": 6464,
+    "ssm": 240,
+    "unembedding": 16089600
+  },
+  "hybrid_final": null,
+  "initialization": {
+    "mixer": "owned by each mixer constructor",
+    "scaffold": "framework constructor defaults; no post-construction pass"
+  },
+  "lengths": {
+    "configured_task_length": 2048,
+    "evaluation_ceiling": 2048,
+    "observed_tensor_width": {
+      "train": 2048,
+      "validation": 2048
+    },
+    "training_ceiling": 2048
+  },
+  "mixer": "mamba3",
+  "mixer_constructions": [
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    },
+    {
+      "context": {
+        "max_length_consumed": null,
+        "max_length_policy": "unused",
+        "max_length_supplied": 2048
+      },
+      "effective_config": {
+        "chunk_size": 64,
+        "d_model": 320,
+        "expand": 2,
+        "head_dim": 64,
+        "n_groups": 1,
+        "state_size": 96
+      },
+      "initialization": "mixer_constructor; no scaffold reinitialization",
+      "module": "scripts.lm.mixers.Unwrap"
+    }
+  ],
+  "mixer_contract": {
+    "base_max_length_policy": "unused",
+    "hybrid_final_max_length_policy": null,
+    "initialization": "mixer_constructor; no scaffold reinitialization"
+  },
+  "mixer_parameters": 8343024,
+  "mixer_settings": {
+    "chunk_size": 64,
+    "expand": 2,
+    "head_dim": 64,
+    "n_groups": 1,
+    "state_size": 96
+  },
+  "n_layers": 12,
+  "parameters": 40525424,
+  "peak_lr": 0.0030983866769659337,
+  "precision": "fp32-compute/bf16-token-embedding",
+  "precision_details": {
+    "autocast_dtype": null,
+    "compute_parameter_dtypes": [
+      "torch.float32"
+    ],
+    "float32_matmul_precision": "highest",
+    "parameter_dtype": "mixed-by-contract",
+    "recurrent_state_dtype": "torch.float32",
+    "token_embedding_dtype": "torch.bfloat16"
+  },
+  "provenance": {
+    "command": "/data2/sureshmeena/projects/slinoss-closure-lm-20260906/scripts/lm/run.py train --out /data2/sureshmeena/slinoss-results/closure-50ea-lm-mamba3-45m-100step --corpus /data2/sureshmeena/lm-data/master-audit-neox-18m --mixer mamba3 --target-parameters 45000000 --n-layers 12 --seq-len 2048 --micro-batch 8 --token-batch 131072 --token-budget 13107200 --seed 0 --eval-batch 8 --log-every 10 --device cuda",
+    "command_argv": [
+      "/data2/sureshmeena/projects/slinoss-closure-lm-20260906/scripts/lm/run.py",
+      "train",
+      "--out",
+      "/data2/sureshmeena/slinoss-results/closure-50ea-lm-mamba3-45m-100step",
+      "--corpus",
+      "/data2/sureshmeena/lm-data/master-audit-neox-18m",
+      "--mixer",
+      "mamba3",
+      "--target-parameters",
+      "45000000",
+      "--n-layers",
+      "12",
+      "--seq-len",
+      "2048",
+      "--micro-batch",
+      "8",
+      "--token-batch",
+      "131072",
+      "--token-budget",
+      "13107200",
+      "--seed",
+      "0",
+      "--eval-batch",
+      "8",
+      "--log-every",
+      "10",
+      "--device",
+      "cuda"
+    ],
+    "cwd": "/data2/sureshmeena/projects/slinoss-closure-lm-20260906",
+    "dirty": false,
+    "dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "dirty_files": [],
+    "harness": {
+      "commit": "50ea79fe09eeae35864784ecae316363ce3ab1e8",
+      "path": "scripts/lm",
+      "tree": "9e1eb46258477011764cf696ffdb23cbcaa31275"
+    },
+    "repository_commit": "50ea79fe09eeae35864784ecae316363ce3ab1e8",
+    "source": {
+      "commit": "50ea79fe09eeae35864784ecae316363ce3ab1e8",
+      "path": "slinoss",
+      "tree": "5c340024befe5dfc9627b77d9ba8443776518683"
+    }
+  },
+  "seed": 0,
+  "seeds": {
+    "data_order": 0,
+    "model": 0
+  },
+  "seq_len": 2048,
+  "steps": 100,
+  "token_batch": 131072,
+  "token_budget": 13107200,
+  "tokenizer": "EleutherAI/gpt-neox-20b",
+  "tokens": 13107200,
+  "tokens_per_second": 65381.60262244365,
+  "total_parameters": 40525424,
+  "train_loss": 7.565604194998741,
+  "train_seconds": 200.47229609359056,
+  "train_sha256": "71d2e65ae2b74765a1b64e3a94df2995e4f04d454dc8d59c656764ba4449c9a9",
+  "val_bpb": 2.2999738106212266,
+  "val_loss": 7.470293611288071,
+  "val_sha256": "2b84252746009a39506dad2c722a40cd54baa041152242c35ae9ca8810ff1a8b",
+  "validation_seconds": 2.1460529807955027,
+  "zero_shot": null
+}

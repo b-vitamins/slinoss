@@ -83,9 +83,24 @@ regression and does not satisfy the campaign's "respectable MAD" gate.
 
 ## Language modelling
 
-Pending: one synchronized 10-minute SLinOSS probe and one matched-parameter
-Mamba3 probe. The final record will include matched-token validation loss and
-wall-clock throughput.
+Both synchronized, bounded arms are complete. They use the same GPT-NeoX
+tokenizer, 2,048-token context,
+13,107,200-token budget, 100 optimizer steps, seed 0, and approximately 40.5M
+parameters.
+
+- SLinOSS: 40,501,976 parameters; validation loss **8.556816**; validation BPB
+  **2.634495**; 306.659 s synchronized training time; 6.091 s validation time;
+  **42,741.9 tokens/s**.
+- Mamba3: 40,525,424 parameters; validation loss **7.470294**; validation BPB
+  **2.299974**; 200.472 s synchronized training time; 2.146 s validation time;
+  **65,381.6 tokens/s**.
+
+The result is finite and materially better than the old-master faceplant
+(validation loss 9.9262), but its logged pre-clip gradient norm grew from 1.84
+at step 0 to roughly 0.5M at the end and exceeded 1.0M mid-run. At a parameter
+spread of only 23,448 parameters (0.058%), SLinOSS trails Mamba3 by **1.086523
+validation-loss points** and delivers **65.37% of Mamba3 throughput**. It is no
+longer a NaN/divergence faceplant, but it is not yet competitive or healthy.
 
 ## Raw receipts
 
