@@ -780,11 +780,17 @@ branch runs into current-tip measurements. The durable record presently supports
   423,780 total / 408,104 mixer parameters);
 - historical `109a56b` selective-copy point estimates of 94.71% and 92.28%;
 - the causal z0 and anchored-drive results recorded in section 9;
-- no clean, complete, matched all-six-MAD plus LM result table at the current
-  master tip yet.
+- exact repaired-source MAD point estimates under `kla-paper-v2`, seed 12345:
+  memorization 100.0000%, context recall 99.9986%, compression 83.7451%, fuzzy
+  recall 41.5355%, and selective copy 72.7246%; noisy recall remains pending;
+- a matched 100-step, 13,107,200-token LM probe at 2,048-token context:
+  40,501,976-parameter SLinOSS reached validation loss 8.556816 at 42,741.9
+  tokens/s, while 40,525,424-parameter Mamba3 reached 7.470294 at 65,381.6
+  tokens/s. SLinOSS's logged pre-clip gradient norm exceeded one million.
 
-Accordingly, current master is a measurement-established **state-tracking
-winner** at both H8/G4 and H8/G8. It is not yet a measurement-established joint
-MAD/LM crusher.
+Accordingly, the repaired source is a measurement-established **A5
+state-tracking winner** at both H8/G4 and H8/G8. Its selective-copy result and
+matched LM loss/throughput decisively reject joint-crusher status; the remaining
+state and noisy-recall rows are still running.
 That wording must remain until one exact current-tip configuration is evaluated
 under the locked harnesses and fair state/parameter disclosures.
