@@ -1,6 +1,6 @@
 # SLinOSS mixer anatomy and capability diagnosis
 
-**Status:** current for the source committed with this note on 2026-09-05. This
+**Status:** current for the source committed with this note on 2026-09-06. This
 file is part of the mixer contract: any change to `SLinOSSMixerConfig`,
 `SLinOSSConfig`, `SLinOSSMixer`, `MixerState`, `scanprep`, `so3ssd`, or the mixer
 tail must update the anatomy, initialization, counts, and diagnosis here in the
@@ -39,11 +39,12 @@ skip, and norm remain head-specific. At fixed `E` and `S`, changing `P` changes
 `H` but not the number of recurrent state scalars `HPS = ES`; changing `G`
 increases B/C projection parameters and cache without changing `ES`.
 
-The fused input projection has width
+The fused input projection computes
 
 ```text
 A = align_up(4H, 16)
-Q = 2E + 2GS + A
+F = 2E + 2GS + 4H       useful projected features
+Q = 2E + 2GS + A        aligned activation stride
 ```
 
 and the following contiguous column bands:
@@ -51,7 +52,7 @@ and the following contiguous column bands:
 ```text
 x [B,T,D]
   |
-  `-- in_proj [Q,D] -----------------------------------------------------.
+  `-- in_proj [F,D] -> aligned buffer [Q] -------------------------------.
        value [E] | gate [E] | B [GS] | C [GS] | transition [4H] | pad   |
            |           |          |        |             |               |
        causal       tail gate   optional B/C        scanprep             |
@@ -71,9 +72,10 @@ x [B,T,D]
                                 output [B,T,D]
 ```
 
-The alignment tail has `A - 4H` projected columns. Those rows are stored and
-count as parameters, but no semantic consumer reads them and their cotangent is
-zero.
+The alignment tail has `A - 4H` storage columns but no projection rows. The
+GEMM writes its `F` useful outputs directly into a buffer whose token stride is
+`Q`; kernels retain their sector-aligned pitch without dead parameters or
+optimizer state.
 
 ## 2. Exact recurrent operator
 
@@ -190,8 +192,8 @@ The table describes one `SLinOSSMixer`. The default constructor has
 
 | Parameter | Shape | Count | Effective role | Initialization | Precision / decay contract |
 | --- | ---: | ---: | --- | --- | --- |
-| `in_proj.weight` | `[Q,D]` | `QD` | all token operands | PyTorch linear draw; B/C rows rescaled to row norm `1/sqrt(S)`; transition/pad rows zero | module dtype; ordinary decay except harness policy |
-| `in_proj.bias` | `[Q]` | `Q` if `bias` | same bands | PyTorch default; B/C, transition, and pad rows zero | module dtype; absent by default |
+| `in_proj.weight` | `[F,D]` | `FD` | all token operands | PyTorch linear draw; B/C rows rescaled to row norm `1/sqrt(S)`; transition rows zero | module dtype; ordinary decay except harness policy |
+| `in_proj.bias` | `[F]` | `F` if `bias` | same bands | PyTorch default; B/C and transition rows zero | module dtype; absent by default |
 | `conv_weight` | `[E,W]` | `EW` | depthwise causal value convolution | uniform `[-1/sqrt(W), +1/sqrt(W)]` | module dtype |
 | `conv_bias` | `[E]` | `E` if enabled | value-conv bias | zero | module dtype; enabled by default |
 | `key_weight` | `[2GS,W]` | `2GSW` if enabled | independent depthwise causal conv on B and C channels | exact delta: all zero except current-token tap = 1 | module dtype; enabled by default |
@@ -211,14 +213,14 @@ is applied before the B/C-convolution or fused-projection pullback.
 The exact count is
 
 ```text
-QD + [bias]Q + EW + [conv_bias]E + [key_conv]2GSW
+FD + [bias]F + EW + [conv_bias]E + [key_conv]2GSW
    + 4H + H + E + DE + [bias]D.
 ```
 
 At the defaults this simplifies to
 
 ```text
-QD + EW + 2E + 2GSW + 5H + DE.
+FD + EW + 2E + 2GSW + 5H + DE.
 ```
 
 No-weight-decay markings are declarations by the module. MAD, LM, and state
@@ -229,13 +231,13 @@ the spelling of a mixer leaf.
 
 ### Concrete instantiated counts
 
-| Configuration | `Q` / pad | Mixer parameters | Core recurrent scalars `ES` | Comment |
+| Configuration | `F` / `Q-F` | Mixer parameters | Core recurrent scalars `ES` | Comment |
 | --- | ---: | ---: | ---: | --- |
 | `D128 E256 P64 H4 G1 S144 W4` | `816 / 0` | `139,924` | `36,864` | current H4/G1 MAD/state geometry |
 | `D128 E256 P32 H8 G1 S144 W4` | `832 / 0` | `141,992` | `36,864` | H8/G1 changes transport heads without buying B/C groups |
 | `D128 E256 P32 H8 G4 S144 W4` | `1,696 / 0` | `256,040` | `36,864` | H8/G4 changes addressing capacity and parameters, not core state size |
 | `D128 E256 P32 H8 G8 S144 W4` | `2,848 / 0` | `408,104` | `36,864` | one independent B/C system per head; core state remains fixed |
-| `D320 E640 P64 H10 G1 S96 W4` | `1,520 / 8` | `695,858` | `61,440` | current small LM-probe geometry; 2,560 pad-weight scalars |
+| `D320 E640 P64 H10 G1 S96 W4` | `1,512 / 8` | `693,298` | `61,440` | current small LM-probe geometry; aligned storage has no parameter rows |
 
 For the first row the individual counts are: input projection 104,448; value
 conv 1,024; conv bias 256; key conv 1,152; transition bias 16; skip 4;
@@ -392,6 +394,19 @@ source keeps the full chart and carrier required by A5 while making B, C and
 output live and bounded. That is a source fact, not yet a transferred performance
 claim; section 14 records only runs actually made on this source.
 
+One historical branch also paired adjacent transition heads, labelled D00/D10 in
+the experiment record. Each pair duplicated one initialized horizon, period, and
+rotation axis. Its even head used the unrestricted coordinate
+`raw = bias + token_band`; its odd head first used
+`raw = bias + |bias|*token_band`, and a later variant bounded that relative term
+with `tanh`. This was a bespoke optimization hedge, not B/C grouping and not a
+standard ingredient inherited from the compared literature. It has no isolated
+paying ablation: the radius-driven arm alone failed A5, paired arms solved A5, and
+an unrestricted homogeneous chart also solves A5. Pairing additionally halves
+the number of distinct initialized spectral points. It is absent from repaired
+master, where every head has its own lattice point and uses the same unrestricted
+coordinate.
+
 Two older implementations sharpen the initialization diagnosis. Production
 SLinOSS at `slinoss-old` commit `5eb1e26` defaulted to `G=H`, left its fused B/C
 rows and output projection live under framework initialization, and normalized
@@ -456,6 +471,16 @@ Its relevant implementation facts are:
 - all linears, including output, begin live under Xavier-uniform gain
   `2^-2.5`;
 - the released ablation says the erase gate supplies most of GDN2's gain.
+
+The small Xavier gain is not directly transplantable as a B/C mechanism. GDN2
+applies it to every linear and puts q/k through a nonlinear short-convolution path
+before exact L2 normalization. Repaired SLinOSS instead has a linear,
+identity-initialized B/C path before exact L2 normalization and initializes each
+raw address to expected norm one. Multiplying only those rows by a scalar leaves
+the forward address unchanged (away from epsilon) while multiplying the
+normalization VJP by the reciprocal scalar. Thus `2^-2.5` on SLinOSS B/C alone
+would chiefly be a roughly `2^2.5 = 5.66` times angular-gradient preconditioner,
+not a smaller write or a GDN2-style operator repair.
 
 The user's measured GDN2 selective-copy result is about 95%. Its mechanism is
 not raw capacity. A normalized key identifies one address; the delta term erases
@@ -738,21 +763,28 @@ Primary local sources used for the diagnosis:
 The current source establishes what master constructs; it does not turn older
 branch runs into current-tip measurements. The durable record presently supports:
 
-- the state-tracking winner's paired free/stable H8/G4 result improved from
-  99.70% to 100.00% and solved at 10k with a perfect held-out tail;
-- on the repaired operator, cyclic H8/G4 reached 95.43% overall and 91.65% tail
-  at 5k before an external supervisor-lifecycle kill interrupted the arm;
+- a historical paired free/stable H8/G4 configuration improved from 99.70% to
+  100.00% and solved at 10k with a perfect held-out tail, but no matched
+  paired-versus-homogeneous ablation attributes that result to pairing;
+- exact current master, which has no parity pairing, reached 95.43%/91.65% at
+  5k, 94.72%/85.75% at the 10k learning-rate peak, and recovered to 99.97%
+  overall / 99.84% tail at 15k on cyclic H8/G4 with two layers
+  (`solved=True`, loss 0.0015, 528,012 total model parameters);
 - changing only that H8/G4 initial state to zero collapsed the matched 5k point
   to 4.56% overall and 3.24% tail, a controlled -90.87/-88.41 point effect;
-- exact current master at cyclic H8/G8 reached 68.68%/45.41% at 5k, then
-  100.00% overall and 100.00% tail at 10k (`solved=True`, loss 0.0001,
-  832,140 total model parameters);
+- exact current master at cyclic H8/G8 with two layers reached 68.68%/45.41%
+  at 5k, then 100.00% overall and 100.00% tail at 10k (`solved=True`, loss
+  0.0001, 832,140 total model parameters);
+- exact current master at cyclic H8/G8/P32 with one layer reached 99.9786%
+  overall and 100.00% on the longest held-out tail at 20k (loss 0.00243,
+  423,780 total / 408,104 mixer parameters);
 - historical `109a56b` selective-copy point estimates of 94.71% and 92.28%;
 - the causal z0 and anchored-drive results recorded in section 9;
 - no clean, complete, matched all-six-MAD plus LM result table at the current
   master tip yet.
 
 Accordingly, current master is a measurement-established **state-tracking
-winner** at H8/G8. It is not yet a measurement-established joint MAD/LM crusher.
+winner** at both H8/G4 and H8/G8. It is not yet a measurement-established joint
+MAD/LM crusher.
 That wording must remain until one exact current-tip configuration is evaluated
 under the locked harnesses and fair state/parameter disclosures.

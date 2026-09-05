@@ -202,7 +202,7 @@ def linear_maps(config: SLinOSSConfig) -> tuple[LinearMap, ...]:
 
     The widths come from the configuration and from
     :class:`slinoss.mixer.ProjectionLayout`, which is where the projection's
-    padded width is decided, so a change to either reaches this table without an
+    useful width is decided, so a change to either reaches this table without an
     edit here. A test holds the table against the shapes a built stack carries.
 
     Args:
@@ -212,7 +212,7 @@ def linear_maps(config: SLinOSSConfig) -> tuple[LinearMap, ...]:
         One entry per weight, in module order.
     """
     layers = config.n_layers
-    width = ProjectionLayout.from_config(config).width
+    width = ProjectionLayout.from_config(config).out_features
     maps = [
         LinearMap("in_proj", config.d_model, width, layers),
         LinearMap("out_proj", config.d_inner, config.d_model, layers),
@@ -1005,10 +1005,9 @@ def width_experiments(
 ) -> Iterator[Experiment]:
     """The input projection's three GEMMs at its width and at the next tile.
 
-    The projection's width is the band total plus the padding that keeps every
-    band offset on a sector, so above that bound it is free. Rounding it to a
-    whole tile removes a partial tile and pays for the columns it adds. Both arms
-    run at their own flop and the wall clock decides.
+    The projection computes only useful features; its output buffer supplies the
+    aligned token stride separately. Rounding the feature count to a whole tile
+    removes a partial tile and pays for the columns it adds.
 
     Args:
         config: The geometry.
@@ -1019,7 +1018,7 @@ def width_experiments(
         One experiment per stage, or nothing if the width is already a whole
         tile.
     """
-    width = ProjectionLayout.from_config(config).width
+    width = ProjectionLayout.from_config(config).out_features
     wider = tiled_up(width)
     if wider == width:
         return

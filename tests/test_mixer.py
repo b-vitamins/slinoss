@@ -28,6 +28,7 @@ from slinoss.config import ROTATION_CHART_SCALE_MAX, SLinOSSConfig
 from slinoss.mixer import (
     ProjectionLayout,
     SLinOSSMixer,
+    _aligned_linear,
     _head_lattice,
 )
 from slinoss.ops.conv import backends as conv_dispatch
@@ -66,6 +67,12 @@ def _proj(layout: ProjectionLayout, seqlen: int = 6) -> torch.Tensor:
     """A projection output to cut bands from."""
     gen = torch.Generator().manual_seed(0)
     return torch.randn(2, seqlen, layout.width, generator=gen)
+
+
+def _project(mixer: SLinOSSMixer, x: Tensor) -> Tensor:
+    """Differentiable projection with the mixer's physical token stride."""
+    logical = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    return torch.nn.functional.pad(logical, (0, mixer.layout.pad_width))
 
 
 @pytest.mark.parametrize("cfg", CONFIGS)
@@ -255,7 +262,7 @@ def _public_composition(mixer: SLinOSSMixer, x: Tensor) -> Tensor:
     """
     cfg = mixer.config
     layout = mixer.layout
-    proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    proj = _project(mixer, x)
     step = causal_conv1d(
         layout.value(proj),
         mixer.conv_weight,
@@ -400,47 +407,35 @@ def test_gradcheck_over_every_input(cuda: torch.device) -> None:
     assert torch.autograd.gradcheck(run, (x, *params), fast_mode=True)
 
 
-def test_pad_columns_of_the_projection_are_zero() -> None:
-    """The columns no band owns carry zeros for every input.
-
-    The projection computes them because its width is padded to the sector rule.
-    Left as numbers, they are what a band addressed one sector wide reads, and they
-    are plausible values rather than an obvious fault.
-    """
+def test_alignment_storage_is_not_a_parameter() -> None:
+    """The aligned pitch costs storage, not dead projection rows."""
     cfg = PAD_CONFIG
     mixer = SLinOSSMixer(cfg)
     assert mixer.layout.pad_width > 0
     x = _activations(cfg, torch.device("cpu"), torch.float32)
-    proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
-    assert not mixer.layout.pad(proj).any()
+    with torch.no_grad():
+        proj = _aligned_linear(
+            x, mixer.in_proj.weight, mixer.in_proj.bias, mixer.layout
+        )
+    want = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    assert torch.equal(mixer.layout.projected(proj), want)
+    assert mixer.in_proj.out_features == mixer.layout.out_features
+    assert mixer.in_proj.weight.shape[0] == mixer.layout.out_features
+    assert proj.stride(-2) == mixer.layout.width
 
 
 @pytest.mark.cuda
-def test_pad_columns_of_the_gradient_buffer_are_zero(cuda: torch.device) -> None:
-    """The one band of the cotangent buffer no consumer writes is zeroed.
-
-    ``dproj`` is allocated uninitialized, so a missing zero leaves the input
-    projection's pullback reducing over whatever the caching allocator last held
-    there. The pad rows of ``in_proj.weight.grad`` are where that shows, and a NaN
-    in them poisons a global gradient norm rather than one row.
-    """
+def test_alignment_storage_has_no_gradient_rows(cuda: torch.device) -> None:
+    """The pitched cotangent returns only useful projection gradients."""
     cfg = PAD_CONFIG
     mixer = SLinOSSMixer(cfg, device=cuda, dtype=torch.float32)
     assert mixer.layout.pad_width > 0
     x = _activations(cfg, cuda, torch.float32)
-    # Free blocks of exactly the buffer's size, filled with NaN: the allocator
-    # serves the backward's torch.empty from them.
-    poison = [
-        torch.full((BATCH, SEQLEN, mixer.layout.width), float("nan"), device=cuda)
-        for _ in range(4)
-    ]
-    del poison
     mixer(x).square().sum().backward()
 
     grad = mixer.in_proj.weight.grad
     assert grad is not None
-    stop = mixer.layout.params_off + PARAM_COLS * cfg.n_heads
-    assert not grad[stop:].any()
+    assert grad.shape[0] == mixer.layout.out_features
     assert bool(grad.isfinite().all())
 
 
@@ -575,7 +570,7 @@ def test_the_projection_starts_the_transition_at_the_lattice() -> None:
     cfg = MIXER_CONFIG
     mixer = SLinOSSMixer(cfg)
     x = _activations(cfg, torch.device("cpu"), torch.float32)
-    proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    proj = _project(mixer, x)
     assert cfg.bias
     assert not mixer.layout.params(proj).any()
 
@@ -623,7 +618,7 @@ def test_the_zeroed_parameter_band_still_takes_gradient() -> None:
     cfg = MIXER_CONFIG
     mixer = SLinOSSMixer(cfg)
     x = _activations(cfg, torch.device("cpu"), torch.float32)
-    proj = linear(x, mixer.in_proj.weight, mixer.in_proj.bias)
+    proj = _project(mixer, x)
     rows = mixer.layout.params(proj).unflatten(-1, (cfg.n_heads, PARAM_COLS))
     bias = mixer.transition_bias[:, ROTVEC_COLUMNS]
     band = rows[..., ROTVEC_COLUMNS] + bias

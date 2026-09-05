@@ -93,13 +93,13 @@ class ProjectionLayout:
 
     @property
     def pad_width(self) -> int:
-        """Columns past the last band. They belong to no consumer.
+        """Storage columns past the last projected feature."""
+        return self.width - self.out_features
 
-        A cotangent buffer must still zero them: the projection's own pullback
-        reads the whole width, so a column no band wrote is a column of garbage
-        rather than a column of zero.
-        """
-        return self.width - self.params_off - PARAM_COLS * self.heads
+    @property
+    def out_features(self) -> int:
+        """Number of useful projection columns."""
+        return self.params_off + PARAM_COLS * self.heads
 
     def value(self, proj: Tensor) -> Tensor:
         """Value view ``[B,T,E]``."""
@@ -126,9 +126,9 @@ class ProjectionLayout:
         stop = self.params_off + PARAM_COLS * self.heads
         return proj[..., self.params_off : stop]
 
-    def pad(self, proj: Tensor) -> Tensor:
-        """Alignment-padding view, empty when ``pad_width == 0``."""
-        return proj[..., self.params_off + PARAM_COLS * self.heads :]
+    def projected(self, proj: Tensor) -> Tensor:
+        """Projected columns, excluding alignment-only storage."""
+        return proj[..., : self.out_features]
 
     def key_b(self, keys: Tensor) -> Tensor:
         """B view inside a convolved B/C buffer."""
@@ -221,6 +221,33 @@ def _l2_normalize_vjp_(grad: Tensor, unit: Tensor, scale: Tensor) -> None:
     grad.mul_(scale.to(grad.dtype))
 
 
+def _aligned_linear(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    layout: ProjectionLayout,
+) -> Tensor:
+    """Project useful features into a buffer with an aligned token stride."""
+    device_type = x.device.type
+    if torch.is_autocast_enabled(device_type):
+        dtype = torch.get_autocast_dtype(device_type)
+        operand = x.to(dtype)
+        matrix = weight.to(dtype)
+    else:
+        operand = x
+        matrix = weight
+    proj = torch.empty(
+        (*x.shape[:-1], layout.width), device=x.device, dtype=operand.dtype
+    )
+    out = layout.projected(proj).flatten(0, -2)
+    flat = operand.flatten(0, -2)
+    if bias is None:
+        torch.mm(flat, matrix.t(), out=out)
+    else:
+        torch.addmm(bias.to(out.dtype), flat, matrix.t(), out=out)
+    return proj
+
+
 class _Backends(NamedTuple):
     """Resolved backend names in execution order."""
 
@@ -280,7 +307,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         layout: ProjectionLayout,
         config: SLinOSSMixerConfig,
     ) -> Tensor:
-        proj = linear(x, in_weight, in_bias)
+        proj = _aligned_linear(x, in_weight, in_bias, layout)
         picks = _resolve(proj)
         # The taps carry the activation dtype: a kernel backend holds every operand
         # of the convolution to one dtype, and the reference widens either way.
@@ -377,11 +404,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         out_grads = linear_backward(
             dout, tail, out_weight, has_bias=out_bias is not None
         )
-        # One buffer for every band's cotangent, uninitialized: each consumer writes
-        # its own band in full. Only the columns no consumer owns are zeroed, and
-        # the projection's pullback then reads the whole width.
+        # One buffer for every band's cotangent; each consumer writes its band.
         dproj = torch.empty(proj.shape, dtype=proj.dtype, device=proj.device)
-        layout.pad(dproj).zero_()
 
         tail_grads = tail_dispatch.get(picks.tail).backward(
             out_grads.dinput,
@@ -457,7 +481,9 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             activation=True,
             dx=layout.value(dproj),
         )
-        in_grads = linear_backward(dproj, x, in_weight, has_bias=in_bias is not None)
+        in_grads = linear_backward(
+            layout.projected(dproj), x, in_weight, has_bias=in_bias is not None
+        )
         return (
             cast_to(in_grads.dinput, x.dtype),
             cast_to(in_grads.dweight, in_weight.dtype),
@@ -497,7 +523,7 @@ class SLinOSSMixer(Float32Module):
         self.layout = ProjectionLayout.from_config(config)
         self.in_proj = nn.Linear(
             config.d_model,
-            self.layout.width,
+            self.layout.out_features,
             bias=config.bias,
             device=device,
             dtype=dtype,
@@ -558,9 +584,7 @@ class SLinOSSMixer(Float32Module):
                 out_bias.zero_()
             bc_weight = self.in_proj.weight[self.layout.b_off : self.layout.params_off]
             row_scale = bc_weight.float().square().sum(-1, keepdim=True).rsqrt()
-            bc_weight.mul_(
-                (row_scale / math.sqrt(config.d_state)).to(bc_weight.dtype)
-            )
+            bc_weight.mul_((row_scale / math.sqrt(config.d_state)).to(bc_weight.dtype))
             self.in_proj.weight[self.layout.params_off :].zero_()
             in_bias = cast(Tensor | None, self.in_proj.bias)
             if in_bias is not None:
@@ -606,7 +630,7 @@ class SLinOSSMixer(Float32Module):
             raise ValueError(
                 f"x holds batch {int(x.shape[0])} and state holds {state.batch}"
             )
-        proj = linear(x, self.in_proj.weight, self.in_proj.bias)
+        proj = _aligned_linear(x, self.in_proj.weight, self.in_proj.bias, layout)
         if proj.dtype is not state.conv.dtype:
             raise ValueError(
                 f"the projection is {proj.dtype} and the state is "
