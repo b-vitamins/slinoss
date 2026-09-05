@@ -788,6 +788,78 @@ def test_device_info_reads_the_part_it_runs_on() -> None:
     assert info.sharing.foreign_memory_mib >= 0.0
 
 
+class _NoSmemProperties:
+    """Torch device properties with the three shared-memory fields dropped.
+
+    Proxies one real properties object and hides the names torch grew after 2.6.0,
+    so the compatibility read runs whatever torch is installed rather than only on
+    the version that lacks them.
+    """
+
+    _DROPPED = (
+        "shared_memory_per_block",
+        "shared_memory_per_block_optin",
+        "shared_memory_per_multiprocessor",
+    )
+
+    def __init__(self, props: object) -> None:
+        self._props = props
+
+    def __getattr__(self, name: str) -> object:
+        if name in self._DROPPED:
+            raise AttributeError(name)
+        return getattr(self._props, name)
+
+
+def _without_smem(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make torch report properties carrying no shared-memory field, at any ordinal.
+
+    Args:
+        monkeypatch: The fixture.
+    """
+    real = torch.cuda.get_device_properties(0)
+
+    def properties(ordinal: int) -> _NoSmemProperties:
+        del ordinal
+        return _NoSmemProperties(real)
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_device_info_reads_shared_memory_off_the_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # torch grew the three shared-memory properties after 2.6.0, and 2.6.0 carries
+    # no shared-memory field at all, so on the fleet's torch the record is
+    # unbuildable from torch alone. Both routes read the same driver quantity, so
+    # they must agree to the byte on one part.
+    pytest.importorskip("cuda.bindings.driver")
+    truth = device_info(0, _returning(None), _apps(None))
+    _without_smem(monkeypatch)
+    info = device_info(0, _returning(None), _apps(None))
+    assert info.smem_per_block_bytes == truth.smem_per_block_bytes
+    assert info.smem_optin_per_block_bytes == truth.smem_optin_per_block_bytes
+    assert info.smem_per_sm_bytes == truth.smem_per_sm_bytes
+    assert info.smem_per_block_bytes > 0
+    assert info.smem_optin_per_block_bytes >= info.smem_per_block_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_device_info_refuses_a_shared_memory_figure_no_route_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Both routes fail: torch carries no property and the driver rejects the
+    # ordinal. A default is the one outcome forbidden here, since it would pass an
+    # occupancy or arena verdict against a budget the part does not have. The
+    # message names the quantity and the torch version, or the reader cannot tell a
+    # missing dependency from a torch too old to ask.
+    _without_smem(monkeypatch)
+    with pytest.raises(RuntimeError, match="carries no shared_memory_per_block") as bad:
+        device_info(999, _returning(None), _apps(None))
+    assert torch.__version__ in str(bad.value)
+
+
 # ---------------------------------------------------------------------------
 # Ceilings
 # ---------------------------------------------------------------------------

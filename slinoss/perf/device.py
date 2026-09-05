@@ -3,6 +3,11 @@
 Nothing here is hardcoded per architecture. Shared-memory capacity, SM count,
 and register file size are read from the device, so a report is valid on the
 part it was taken on and carries the evidence to prove which part that was.
+The three shared-memory capacities come from torch where it carries them and from
+the driver where it does not; torch grew the properties after 2.6.0, which is what
+the verification fleet runs. Neither route answering raises rather than defaults: a
+substituted capacity passes an arena verdict against a budget the part does not
+have, and the kernel then fails at launch instead of here.
 
 Two conditions the numbers depend on and neither the code nor the shape controls
 are probed and stamped: whether the clock is pinned, and whether anything else
@@ -595,6 +600,90 @@ class DeviceInfo(PerfRecord):
         return Count(2 * self.sm_count)
 
 
+_SMEM_DRIVER_ATTRIBUTE: Final[dict[str, str]] = {
+    "shared_memory_per_block": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK",
+    "shared_memory_per_block_optin": (
+        "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN"
+    ),
+    "shared_memory_per_multiprocessor": (
+        "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR"
+    ),
+}
+"""Torch property name to the driver attribute carrying the same quantity.
+
+torch 2.6.0 exposes no shared-memory field on the properties object at all, so
+every name on the left is absent on the fleet's torch and present on a newer one.
+The driver has carried all three since CUDA 9.
+"""
+
+
+def _driver_attribute(ordinal: int, attribute: str) -> int:
+    """Read one ``CUdevice_attribute`` off the driver.
+
+    Args:
+        ordinal: Torch device ordinal. ``CUDA_VISIBLE_DEVICES`` renumbers the
+            driver API the same way it renumbers torch, so the two ordinals agree
+            and only NVML sits in the other index space; see :func:`smi_selector`.
+            Measured: ``cuDeviceGetCount`` reports 1 under ``=0`` on a two-part
+            host.
+        attribute: ``CU_DEVICE_ATTRIBUTE_`` name.
+
+    Returns:
+        The attribute value.
+
+    Raises:
+        ImportError: If cuda-python is absent.
+        AttributeError: If the installed cuda-python does not name the attribute.
+        RuntimeError: If the driver refused the ordinal or the query.
+    """
+    from cuda.bindings import driver
+
+    # A device attribute needs cuInit and no context; torch has already run it and
+    # a second call is idempotent, so the read costs nothing on the device.
+    driver.cuInit(0)
+    status, device = driver.cuDeviceGet(ordinal)
+    if status != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGet({ordinal}) returned {status}")
+    status, value = driver.cuDeviceGetAttribute(
+        getattr(driver.CUdevice_attribute, attribute), device
+    )
+    if status != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGetAttribute({attribute}) returned {status}")
+    return int(value)
+
+
+def _smem_bytes(props: object, ordinal: int, name: str) -> Bytes:
+    """One shared-memory capacity, from torch where it has it, else the driver.
+
+    Args:
+        props: Properties object for ``ordinal``, as torch returns.
+        ordinal: Torch device ordinal.
+        name: Torch property name, a key of :data:`_SMEM_DRIVER_ATTRIBUTE`.
+
+    Returns:
+        The capacity in bytes. Identical on both routes; both read the same
+        driver quantity.
+
+    Raises:
+        RuntimeError: If torch does not carry the property and the driver did not
+            answer for it either, naming the quantity and the torch version.
+    """
+    value = getattr(props, name, None)
+    if value is not None:
+        return Bytes(int(value))
+    try:
+        return Bytes(_driver_attribute(ordinal, _SMEM_DRIVER_ATTRIBUTE[name]))
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"torch {torch.__version__} carries no {name} on the properties of "
+            f"ordinal {ordinal}, and the driver could not answer "
+            f"{_SMEM_DRIVER_ATTRIBUTE[name]}: {exc}. Install the `cuda` extra or "
+            f"a torch that carries the property; a substituted capacity would "
+            f"pass every occupancy and arena verdict in slinoss.perf against a "
+            f"budget the part does not have"
+        ) from exc
+
+
 def device_info(
     ordinal: int = 0,
     query: SmiQuery = smi_query,
@@ -617,7 +706,8 @@ def device_info(
             ``-1`` for a device that has no ordinal, so this is a CPU device
             arriving where a part is being named. Checked first, or the failure
             reports the absence of CUDA on a host that has it.
-        RuntimeError: If CUDA is unavailable.
+        RuntimeError: If CUDA is unavailable, or if a shared-memory capacity is
+            readable from neither torch nor the driver.
     """
     if ordinal < 0:
         raise ValueError(f"device_info needs a cuda ordinal, got {ordinal}")
@@ -631,9 +721,13 @@ def device_info(
         warp_thread_count=Count(props.warp_size),
         max_threads_per_sm_count=Count(props.max_threads_per_multi_processor),
         regs_per_sm_count=Count(props.regs_per_multiprocessor),
-        smem_per_block_bytes=Bytes(props.shared_memory_per_block),
-        smem_optin_per_block_bytes=Bytes(props.shared_memory_per_block_optin),
-        smem_per_sm_bytes=Bytes(props.shared_memory_per_multiprocessor),
+        smem_per_block_bytes=_smem_bytes(props, ordinal, "shared_memory_per_block"),
+        smem_optin_per_block_bytes=_smem_bytes(
+            props, ordinal, "shared_memory_per_block_optin"
+        ),
+        smem_per_sm_bytes=_smem_bytes(
+            props, ordinal, "shared_memory_per_multiprocessor"
+        ),
         l2_bytes=Bytes(props.L2_cache_size),
         total_memory_bytes=Bytes(props.total_memory),
         clocks=clock_policy(ordinal, query),
