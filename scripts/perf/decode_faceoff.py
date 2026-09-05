@@ -303,7 +303,12 @@ first, and is separated by a probe that can still void the pair.
 """
 
 BANK_SCHEMA: Final = 3
-"""Version of the per-cell artifact layout. A bank at another version is refused, not read."""
+"""Version of the per-cell artifact layout. A bank at another version is refused, not read.
+
+An appended field whose absent reading is documented is not a version change. ``schema`` is
+in :data:`MATCHED_PROVENANCE`, so a bump refuses every banked cell; refusing a cell that
+reads correctly, to announce a field it does not carry, costs the whole bank. A bump is for a
+field whose meaning changed under a name that did not."""
 
 GRAPH_CELLS_PER_PROCESS: Final = 1
 """Graph cells one process may measure.
@@ -894,6 +899,36 @@ ESTIMATOR: Final = (
 )
 """How every figure in the table was reduced. Named because a margin without a dispersion
 is not a margin, and a dispersion without an estimator is not a bound."""
+
+
+def order_statistic_us(
+    samples: Sequence[Microseconds], quantile: float
+) -> Microseconds:
+    """One quantile of a sample, as an order statistic.
+
+    Args:
+        samples: Timed samples, in any order. Not mutated.
+        quantile: In ``[0, 1]``.
+
+    Returns:
+        The nearest-rank order statistic: the sorted sample at ``ceil(q*n) - 1``, clamped
+        into range.
+
+    Raises:
+        ValueError: On an empty sample or a quantile outside ``[0, 1]``. An empty sample has
+            no quantile and a zero would print as a measured duration.
+
+    Nearest-rank and not interpolated, so every printed figure is a duration that was
+    actually observed. An interpolated quantile of a bimodal sample -- which is what host
+    run-ahead produces here -- lands between the two modes, at a latency the loop never ran.
+    """
+    if not samples:
+        raise ValueError("no samples, so no quantile")
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(f"quantile {quantile} is outside [0, 1]")
+    ordered = sorted(samples)
+    rank = min(max(math.ceil(quantile * len(ordered)) - 1, 0), len(ordered) - 1)
+    return Microseconds(ordered[rank])
 
 
 # --------------------------------------------------------------------------
@@ -2880,6 +2915,12 @@ class Cell(NamedTuple):
             field, and the column prints a dash rather than a count: a table whose rows were
             taken at different iteration counts has to say per row which count it carries,
             because the half-width the row is judged on is a function of that count.
+        slinoss_samples_duration_us: Every timed SLinOSS sample, in measurement order.
+            Retained so a reader recomputes the median, the quantiles and the half-width
+            rather than taking three summary floats on trust, and sees drift across the
+            loop that no summary shows. Empty means the record predates the field.
+        mamba_samples_duration_us: The same for Mamba3, from the same paired loop, so the
+            two orders line up pairwise and a difference is read per iteration.
     """
 
     point: GridPoint
@@ -2902,6 +2943,8 @@ class Cell(NamedTuple):
     floor: FloorPair
     witness: Witness = NO_WITNESS
     iters: int = 0
+    slinoss_samples_duration_us: tuple[Microseconds, ...] = ()
+    mamba_samples_duration_us: tuple[Microseconds, ...] = ()
 
 
 def measure_cell(
@@ -2984,9 +3027,11 @@ def measure_cell(
         slinoss_duration_us=sl.median_duration_us,
         slinoss_resolution_pct=sl.resolution_pct,
         slinoss_spread_pct=sl.spread_pct,
+        slinoss_samples_duration_us=tuple(sl.samples_duration_us),
         mamba_duration_us=m3.median_duration_us,
         mamba_resolution_pct=m3.resolution_pct,
         mamba_spread_pct=m3.spread_pct,
+        mamba_samples_duration_us=tuple(m3.samples_duration_us),
         ratio=sl.median_duration_us / m3.median_duration_us,
         paired_delta_us=out.comparison.delta_median_duration_us,
         paired_low_us=out.comparison.delta_low_duration_us,
@@ -3694,9 +3739,15 @@ def cell_record(cell: Cell, *, stored: Mapping[str, Any]) -> dict[str, Any]:
         "slinoss_duration_us": float(cell.slinoss_duration_us),
         "slinoss_resolution_pct": float(cell.slinoss_resolution_pct),
         "slinoss_spread_pct": float(cell.slinoss_spread_pct),
+        "slinoss_samples_duration_us": [
+            float(one) for one in cell.slinoss_samples_duration_us
+        ],
         "mamba_duration_us": float(cell.mamba_duration_us),
         "mamba_resolution_pct": float(cell.mamba_resolution_pct),
         "mamba_spread_pct": float(cell.mamba_spread_pct),
+        "mamba_samples_duration_us": [
+            float(one) for one in cell.mamba_samples_duration_us
+        ],
         "ratio": float(cell.ratio),
         "paired_delta_us": float(cell.paired_delta_us),
         "paired_low_us": float(cell.paired_low_us),
@@ -3765,9 +3816,18 @@ def cell_from_record(record: Mapping[str, Any]) -> Cell:
         slinoss_duration_us=Microseconds(record["slinoss_duration_us"]),
         slinoss_resolution_pct=Percent(record["slinoss_resolution_pct"]),
         slinoss_spread_pct=Percent(record["slinoss_spread_pct"]),
+        # Empty in a record written before the field existed, on the same rule as `iters`:
+        # the summary floats it does carry are not resampled into a sample list, because a
+        # fabricated list would read as the measured one.
+        slinoss_samples_duration_us=tuple(
+            Microseconds(one) for one in record.get("slinoss_samples_duration_us", ())
+        ),
         mamba_duration_us=Microseconds(record["mamba_duration_us"]),
         mamba_resolution_pct=Percent(record["mamba_resolution_pct"]),
         mamba_spread_pct=Percent(record["mamba_spread_pct"]),
+        mamba_samples_duration_us=tuple(
+            Microseconds(one) for one in record.get("mamba_samples_duration_us", ())
+        ),
         ratio=record["ratio"],
         paired_delta_us=Microseconds(record["paired_delta_us"]),
         paired_low_us=Microseconds(record["paired_low_us"]),
@@ -4088,6 +4148,62 @@ def witness_mark(one: Witness) -> str:
     return f"{one.stamp[:4]}{one.replicates}"
 
 
+def dispersion_lines(cells: Sequence[Cell]) -> tuple[str, ...]:
+    """The quantiles of each row's own samples, one line per arm.
+
+    Args:
+        cells: Measured cells, in table order.
+
+    Returns:
+        Lines, empty when no cell in the sequence banked its samples.
+
+    The table carries a median and a half-width per arm, which is what a verdict is read
+    off. This block carries what those two summarize: the sample count, ``p10``, the median,
+    ``p90`` and the extremes, every one an order statistic of the samples the row banked, so
+    a reader recomputes the summary rather than taking it. A row banked before the samples
+    were retained is named here rather than dropped, because a block holding fewer rows than
+    the table would read as a block over all of them.
+    """
+    banked = [
+        cell
+        for cell in cells
+        if cell.slinoss_samples_duration_us and cell.mamba_samples_duration_us
+    ]
+    if not banked:
+        return ()
+    header = (
+        f"{'boundary':11s} {'exec':6s} {'B':>4s} {'arm':7s} {'n':>6s} {'p10':>11s} "
+        f"{'median':>11s} {'p90':>11s} {'min':>11s} {'max':>11s}"
+    )
+    lines = [
+        "dispersion, over each row's own samples. p10, p50 and p90 are nearest-rank order "
+        "statistics, so every figure is a latency the loop observed.",
+        header,
+        "-" * len(header),
+    ]
+    for cell in banked:
+        for arm, samples in (
+            (SLINOSS, cell.slinoss_samples_duration_us),
+            (MAMBA3, cell.mamba_samples_duration_us),
+        ):
+            lines.append(
+                f"{cell.boundary:11s} {cell.execution:6s} {cell.point.batch:4d} "
+                f"{arm:7s} {len(samples):6,d} "
+                f"{order_statistic_us(samples, 0.10):11,.3f} "
+                f"{order_statistic_us(samples, 0.50):11,.3f} "
+                f"{order_statistic_us(samples, 0.90):11,.3f} "
+                f"{min(samples):11,.3f} {max(samples):11,.3f}"
+            )
+    missing = len(cells) - len(banked)
+    if missing:
+        lines.append(
+            f"{missing} of {len(cells)} rows banked no samples and are absent from this "
+            f"block: their records predate the field. Their medians and half-widths stand; "
+            f"only the recomputation does not."
+        )
+    return tuple(lines)
+
+
 def render(
     cells: Sequence[Cell],
     verdicts: Sequence[Verdict],
@@ -4208,6 +4324,10 @@ def render(
             elif not cell.floor.available and cell.floor.detail not in seen:
                 seen.append(cell.floor.detail)
                 lines.append(f"floor {cell.regime} rows: {cell.floor.detail}")
+        spread = dispersion_lines(cells)
+        if spread:
+            lines.append("")
+            lines.extend(spread)
     lines.append("")
     if void:
         lines.append(void)
@@ -4323,9 +4443,15 @@ def as_json(
                 "slinoss_duration_us": float(cell.slinoss_duration_us),
                 "slinoss_resolution_pct": float(cell.slinoss_resolution_pct),
                 "slinoss_spread_pct": float(cell.slinoss_spread_pct),
+                "slinoss_samples_duration_us": [
+                    float(one) for one in cell.slinoss_samples_duration_us
+                ],
                 "mamba_duration_us": float(cell.mamba_duration_us),
                 "mamba_resolution_pct": float(cell.mamba_resolution_pct),
                 "mamba_spread_pct": float(cell.mamba_spread_pct),
+                "mamba_samples_duration_us": [
+                    float(one) for one in cell.mamba_samples_duration_us
+                ],
                 "ratio": cell.ratio,
                 "paired_delta_us": float(cell.paired_delta_us),
                 "paired_low_us": float(cell.paired_low_us),

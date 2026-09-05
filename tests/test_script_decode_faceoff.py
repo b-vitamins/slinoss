@@ -81,6 +81,8 @@ from scripts.perf.decode_faceoff import (
     Witness,
     admit,
     agrees_within_half_widths,
+    cell_from_record,
+    cell_record,
     closing_probe,
     competitor_provenance,
     crossover,
@@ -88,6 +90,7 @@ from scripts.perf.decode_faceoff import (
     default_resource,
     defers,
     dependency_set,
+    dispersion_lines,
     enumerate_grid,
     file_manifest,
     fit_cross_check,
@@ -106,6 +109,7 @@ from scripts.perf.decode_faceoff import (
     measure_replicated,
     moved_bytes,
     nearest_mamba_d_state,
+    order_statistic_us,
     parse_args,
     path_class,
     poisons,
@@ -260,6 +264,7 @@ def a_cell(
     boundary: str = RECURRENCE,
     execution: str = GRAPH,
     iters: int = 1_000,
+    samples: tuple[float, ...] = (),
 ) -> Cell:
     """A fabricated measured cell, for the parts of the driver downstream of timing.
 
@@ -276,6 +281,9 @@ def a_cell(
         execution: Eager or graph.
         iters: Timed iterations behind the two medians. Zero marks a record written
             before the field existed.
+        samples: SLinOSS's per-iteration samples. Mamba3's are the same divided by the
+            ratio, so the two arms differ in the block under test. Empty by default, which
+            is what a record written before the field carries.
 
     Returns:
         The cell. Every duration is a literal, so a table test asserts on the driver's
@@ -292,9 +300,11 @@ def a_cell(
         slinoss_duration_us=Microseconds(slinoss_us),
         slinoss_resolution_pct=Percent(resolution_pct),
         slinoss_spread_pct=Percent(2.0),
+        slinoss_samples_duration_us=tuple(Microseconds(one) for one in samples),
         mamba_duration_us=Microseconds(slinoss_us / ratio),
         mamba_resolution_pct=Percent(mamba_resolution_pct),
         mamba_spread_pct=Percent(1.5),
+        mamba_samples_duration_us=tuple(Microseconds(one / ratio) for one in samples),
         ratio=ratio,
         paired_delta_us=Microseconds(-100.0),
         paired_low_us=Microseconds(-102.0),
@@ -1567,6 +1577,88 @@ def test_the_smoke_pass_enumerates_and_discloses_without_a_device(
     assert "ONE GRAPH CELL PER PROCESS" in out
     assert "NEVER ACROSS TREES" in out
     assert "is_outproj_norm" in out
+
+
+def test_a_quantile_is_an_order_statistic_and_never_a_value_between_two_samples() -> (
+    None
+):
+    """An interpolated quantile of a bimodal sample names a latency the loop never ran, and
+    bimodal is what this instrument produces: host run-ahead splits the samples into two
+    modes and the midpoint between them is a duration of nothing.
+
+    Ten distinct samples, out of order, so the rank rule itself is pinned. Every other rule
+    that lands on an observed sample disagrees here: linear interpolation reads 1.9, 5.5 and
+    9.1, and rounding ``q*(n-1)`` reads 2 at the tenth percentile.
+    """
+    samples = tuple(
+        Microseconds(one) for one in (7.0, 2.0, 9.0, 4.0, 1.0, 10.0, 5.0, 3.0, 8.0, 6.0)
+    )
+    observed = set(samples)
+    quantiles = [order_statistic_us(samples, q) for q in (0.0, 0.1, 0.5, 0.9, 1.0)]
+    assert all(one in observed for one in quantiles)
+    assert quantiles == [1.0, 1.0, 5.0, 9.0, 10.0]
+
+
+def test_a_quantile_of_no_samples_raises_rather_than_reading_zero() -> None:
+    """A zero prints in the same column as a duration and would read as a fast row."""
+    with pytest.raises(ValueError, match="no samples"):
+        order_statistic_us((), 0.5)
+    with pytest.raises(ValueError, match="outside"):
+        order_statistic_us((Microseconds(1.0),), 1.5)
+
+
+def test_the_dispersion_block_prints_each_arms_own_order_statistics() -> None:
+    """One block built off one arm's samples would print the same row twice under two
+    names, and the pair's asymmetry is the whole point of the comparison."""
+    cell = a_cell(samples=(10.0, 20.0, 30.0, 40.0, 90.0), ratio=0.5, slinoss_us=30.0)
+    lines = dispersion_lines([cell])
+    slinoss_row = next(one for one in lines if " slinoss " in one)
+    mamba_row = next(one for one in lines if " mamba3 " in one)
+    # p50 of five samples is the third: ceil(0.5*5) - 1 = 2.
+    assert "30.000" in slinoss_row
+    assert "10.000" in slinoss_row
+    assert "90.000" in slinoss_row
+    # Mamba3's samples are SLinOSS's over the ratio, so every figure doubles.
+    assert "60.000" in mamba_row
+    assert "180.000" in mamba_row
+
+
+def test_a_row_that_banked_no_samples_is_counted_rather_than_dropped() -> None:
+    """A block silently shorter than the table it sits under reads as a block over all of
+    it, and a reader would take the recomputation as covering rows it never saw."""
+    lines = dispersion_lines([a_cell(samples=(1.0, 2.0, 3.0)), a_cell(batch=32)])
+    assert any("1 of 2 rows banked no samples" in one for one in lines)
+
+
+def test_a_block_over_rows_that_banked_nothing_is_empty_rather_than_a_header() -> None:
+    """A header over no rows claims a recomputation that is not there."""
+    assert dispersion_lines([a_cell(), a_cell(batch=32)]) == ()
+
+
+def test_the_banked_record_carries_every_sample_the_row_measured() -> None:
+    """The summary floats are three reductions of the samples; without the samples in the
+    artifact, no reader can recompute them or see drift across the loop."""
+    cell = a_cell(samples=(10.0, 20.0, 30.0), ratio=0.5, slinoss_us=20.0)
+    record = cell_record(cell, stored={"schema": BANK_SCHEMA})
+    assert record["slinoss_samples_duration_us"] == [10.0, 20.0, 30.0]
+    assert record["mamba_samples_duration_us"] == [20.0, 40.0, 60.0]
+    back = cell_from_record(record)
+    assert back.slinoss_samples_duration_us == cell.slinoss_samples_duration_us
+    assert back.mamba_samples_duration_us == cell.mamba_samples_duration_us
+
+
+def test_a_record_written_before_the_samples_existed_loads_with_none_of_them() -> None:
+    """On the rule `iters` set: an absent field reads as absent, never as a value derived
+    from the summary, because a list synthesized off a median would read as measured."""
+    record = cell_record(
+        a_cell(samples=(10.0,), slinoss_us=10.0), stored={"schema": BANK_SCHEMA}
+    )
+    del record["slinoss_samples_duration_us"]
+    del record["mamba_samples_duration_us"]
+    back = cell_from_record(record)
+    assert back.slinoss_samples_duration_us == ()
+    assert back.mamba_samples_duration_us == ()
+    assert back.slinoss_duration_us == pytest.approx(10.0)
 
 
 # --------------------------------------------------------------------------

@@ -284,6 +284,32 @@ unmeasured classes. Nine of the 720 legal cells are refused: three because `n_he
 forces a `d_head` of 256 to 1024, outside the measured MMA N-mode list, and six because
 `ngroups` of 4, 8 or 16 is neither 1 nor `nheads` and Mamba3 admits only those two.
 
+### Reproducing it
+
+Every row of that table comes from `scripts/perf/decode_faceoff.py`, and the launch graph
+above from `scripts/perf/decode_census.py`. One class, banked cell by cell:
+
+    PYTHONPATH=<tree root> python3 scripts/perf/decode_faceoff.py --bank <dir> \
+        --boundary recurrence whole_step --execution graph \
+        --dtype bf16 --d-model 512 --d-state 144 --mamba-d-state 128 \
+        --sharing G1 --mode siso
+
+An invocation measures what it can and writes one JSON file per cell, so it is re-run
+until the bank reports no cell pending. A graph cell is measured one per process, which
+is the rule the disclosures state. `--render-only` re-renders a finished bank and takes no
+sample, and it is the only way to render on a card running foreign compute, because the
+gate that protects a sample otherwise waits for the card to go idle.
+
+A cell carries what is needed to refuse it later: both arms' medians, their full sample
+lists, the iteration count, the paired interval, state bytes, parameter counts, the
+resolved backend tuple, the fitted floor, the card reading it was admitted under, and a
+provenance block holding the torch version, the card name and UUID, the SLinOSS and
+resolved `mamba_ssm` package directories each with a digest over every `.py` beneath it,
+the competitor's origin in `.sources` with its per-file manifest, and the interpreter,
+environment root, triton and `apache-tvm-ffi` versions. A record differing on any keyed
+field is refused rather than blended, so a table is assembled across windows and never
+across trees.
+
 ## Remaining bottleneck, and the limits
 
 **The recurrence gap is state bytes, not kernel work.** Against Mamba3 at matched
@@ -350,6 +376,26 @@ Limits that constrain what any of these figures can be used for:
   whole margin under test. The judged graph rows carry half-widths at or under 1.111% of
   their medians; refused rows carry 3.35% to 20.43%. A row that cannot be resolved is
   reported unjudged with its count, not resolved by more samples.
+- **Every sample is banked, and the quantiles are order statistics.** A cell carries each
+  arm's per-iteration samples beside its median, so the interval is recomputable from the
+  artifact instead of resting on three summary floats. The quantiles are nearest-rank:
+  every figure printed is a duration the loop ran, because these samples go bimodal under
+  host run-ahead and a midpoint between the two modes is a duration of nothing. The field
+  was appended without bumping the bank schema, because the schema is part of the
+  provenance a cell is matched on and a bump refuses every cell already banked in order to
+  announce a field they do not carry. Absent reads as absent, never as a list synthesized
+  from a median, and the dispersion block says how many rows it left out.
+- **The grid was measured in a tree three files from this one, and re-measured here.** The
+  run tree's `slinoss/` differs from this commit in docstrings in two files and one field on
+  `GraphedStep`, none of them on the timed path. All seven graph classes were re-measured at
+  this commit, same card, own bank, samples retained: every one of the eighteen verdict
+  words is unchanged and every judged geometric mean lands within 1.2% of the figure quoted
+  here -- recurrence/graph 1.1527 against 1.1525, worst 1.1731 against 1.1698 at batch 32;
+  whole_step/graph 0.8875 against 0.8859, worst 1.0270 against 1.0251 at batch 128. On the
+  decisive class no median moved by more than one 1.024 us timer tick. One class sits
+  outside the 1.2%: `3N = 192` against `d_state = 64` reads 2.2608 against 2.8916, and that
+  is a judged-set change and not a latency change, because its set gained a tick-quantized
+  batch-1 row. That pairing hands this operator three times the state and carries no claim.
 - **The batch-1 recurrence is below the instrument.** Both medians land on the same
   1.024 us CUDA-event tick, which priced onto both is 14.29% of the ratio against a 10%
   margin. That is a tick-quantization limit, not a variance one, so it is unjudged at
