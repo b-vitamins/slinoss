@@ -141,5 +141,9 @@ Receipt files can contain duplicate completed attempts from supervisor retries;
 the benchmark ledger above deduplicates by protocol cell and reports the best
 valid seed according to that protocol's declared selection rule.
 
+The hardware-specific runtime and routing ledger is
+`.sources/notes/EXPERIMENT_RUNTIME_MATRIX.md`; its end-to-end timing records are
+sealed alongside the benchmark receipts under `timings/`.
+
 At final closure, live result files will be pulled again, this note will be
 completed, and `Final master commit` will be replaced with the landed commit.
