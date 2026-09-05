@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from slinoss.config import SLinOSSConfig
-from slinoss.state import MixerState, StackState, oscillator_basis
+from slinoss.state import MixerState, StackState
 
 CONFIG = SLinOSSConfig(d_model=64, d_state=48, n_layers=3)
 """d_inner 128, H 2, P 64, 3N 48, three layers."""
@@ -38,6 +38,15 @@ def _buffers(state: MixerState) -> dict[str, Tensor]:
     return {name: value for name, value in _fields(state).items() if value is not None}
 
 
+def _assert_cyclic(ssm: Tensor) -> None:
+    batch, heads, rows, width = ssm.shape
+    expected = torch.arange(heads * rows, device=ssm.device)
+    expected = expected.reshape(heads, rows).remainder(width).expand(batch, -1, -1)
+    assert torch.equal(ssm.argmax(-1), expected)
+    assert torch.equal(ssm.sum(-1), torch.ones_like(ssm[..., 0]))
+    assert torch.count_nonzero(ssm) == batch * heads * rows
+
+
 def test_allocate_matches_config(device: torch.device) -> None:
     """Buffer shapes come from the config, not from the default shape.
 
@@ -60,13 +69,10 @@ def test_allocate_matches_config(device: torch.device) -> None:
     assert tuple(state.u_prev.shape) == (3, config.n_heads, config.d_head)
     assert state.ssm.shape[-1] == 3 * config.n_lanes
     assert all(buffer.is_contiguous() for buffer in _buffers(state).values())
-    assert torch.equal(
-        state.ssm,
-        oscillator_basis(config, device=device)[None].expand_as(state.ssm),
-    )
     assert all(
         not buffer.any() for name, buffer in _buffers(state).items() if name != "ssm"
     )
+    _assert_cyclic(state.ssm)
     assert state.batch == 3
     assert state.device.type == device.type
 
@@ -114,11 +120,8 @@ def test_reset_keeps_the_buffer_addresses() -> None:
     state.reset()
     after = _buffers(state)
     assert [buffer.data_ptr() for buffer in after.values()] == before
-    assert torch.equal(
-        state.ssm,
-        oscillator_basis(CONFIG, device="cpu")[None].expand_as(state.ssm),
-    )
     assert all(not buffer.any() for name, buffer in after.items() if name != "ssm")
+    _assert_cyclic(state.ssm)
 
 
 def test_clone_is_independent() -> None:
@@ -159,10 +162,9 @@ def test_stack_reset_and_clone_reach_every_layer() -> None:
         layer.ssm.fill_(1.0)
     copy = stack.clone()
     stack.reset()
-    basis = oscillator_basis(CONFIG, device="cpu")[None].expand_as(stack.layers[0].ssm)
-    assert all(
-        not layer.conv.any() and torch.equal(layer.ssm, basis) for layer in stack.layers
-    )
+    assert all(not layer.conv.any() for layer in stack.layers)
+    for layer in stack.layers:
+        _assert_cyclic(layer.ssm)
     assert all(
         bool(layer.conv.eq(1.0).all()) and bool(layer.ssm.eq(1.0).all())
         for layer in copy.layers

@@ -252,11 +252,6 @@ def _record(
         "num_test": spec.num_test,
         **spec.extra,
     }
-    init_spans = [
-        construction["effective_config"].get("init_span")
-        for construction in constructions
-        if "init_span" in construction["effective_config"]
-    ]
     initialization_policies = {
         construction["initialization_policy"] for construction in constructions
     }
@@ -271,7 +266,6 @@ def _record(
             key: construction["effective_config"].get(key)
             for key in (
                 "context_length",
-                "init_span",
                 "init_period_context_scale",
                 "init_decay_context_scale",
                 "resolved_init_period_span",
@@ -318,7 +312,6 @@ def _record(
                 "train": int(pool.train_inputs.shape[1]),
                 "evaluation": int(pool.test_inputs.shape[1]),
             },
-            "mixer_initialization_span": init_spans or None,
             "mixer_initialization_lattice": init_lattices or None,
         },
         "seeds": {

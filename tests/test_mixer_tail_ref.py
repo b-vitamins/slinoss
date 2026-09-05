@@ -79,7 +79,7 @@ def _operands(
 def test_matches_the_written_composition(
     bsz: int, heads: int, seqlen: int, rows: int
 ) -> None:
-    """The output is the skip, the gate, and the per-head norm, in that order.
+    """The output is the skip, per-head norm, and gate, in that order.
 
     The expectation is written head-major and converted at the end, which also
     pins the output order: head ``h`` lands at columns ``h*P`` through
@@ -89,8 +89,12 @@ def test_matches_the_written_composition(
     got = mixer_tail_ref(y, u, gate, d_skip, weight, eps=EPS)
 
     x = y + d_skip[:, None, None] * u
-    x = x * silu(_head_major(gate, heads))
-    want = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS) * weight[:, None, :]
+    want = (
+        x
+        * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
+        * weight[:, None, :]
+        * silu(_head_major(gate, heads))
+    )
     assert torch.allclose(got, _token_major(want), rtol=0.0, atol=1e-15)
 
 
@@ -112,15 +116,27 @@ def test_reduction_does_not_cross_the_head_axis() -> None:
 def test_norm_is_scale_invariant_up_to_eps() -> None:
     """Scaling the pre-norm value cancels, so ``eps`` is the only asymmetry.
 
-    Both the skip and the gate are homogeneous in nothing, so the scale is
-    applied to ``y`` and ``u`` together with ``d_skip`` left alone and the gate
-    frozen at a constant, which makes the pre-norm value exactly proportional.
+    Scaling ``y`` and ``u`` together makes the pre-norm value proportional while
+    leaving the post-norm gate unchanged.
     """
     y, u, shaped, d_skip, weight = _operands(2, 2, 3, 8)
     gate = torch.full_like(shaped, 4.0)
     small = mixer_tail_ref(y, u, gate, d_skip, weight, eps=1e-30)
     large = mixer_tail_ref(8.0 * y, 8.0 * u, gate, d_skip, weight, eps=1e-30)
     assert torch.allclose(small, large, rtol=1e-12, atol=1e-12)
+
+
+def test_gate_magnitude_survives_the_norm() -> None:
+    """A scalar gate rescales the row instead of being normalized away."""
+    y, u, shaped, d_skip, weight = _operands(2, 2, 3, 8)
+    low_gate = torch.full_like(shaped, 1.0)
+    high_gate = torch.full_like(shaped, 2.0)
+    low = mixer_tail_ref(y, u, low_gate, d_skip, weight, eps=EPS)
+    high = mixer_tail_ref(y, u, high_gate, d_skip, weight, eps=EPS)
+    ratio = silu(torch.tensor(2.0, dtype=low.dtype)) / silu(
+        torch.tensor(1.0, dtype=low.dtype)
+    )
+    assert torch.allclose(high, low * ratio, rtol=1e-12, atol=1e-12)
 
 
 def test_closed_gate_kills_the_row() -> None:
@@ -138,13 +154,16 @@ def test_closed_gate_kills_the_row() -> None:
 
 
 def test_skip_is_the_only_path_when_y_is_zero() -> None:
-    """With ``y = 0`` the pre-norm value is exactly ``d_skip * u * silu(gate)``."""
+    """With ``y = 0`` the normalized value comes only from ``d_skip * u``."""
     _, u, gate, d_skip, weight = _operands(2, 2, 3, 8)
     y = torch.zeros_like(u)
     got = mixer_tail_ref(y, u, gate, d_skip, weight, eps=1e-30)
-    x = d_skip[:, None, None] * u * silu(_head_major(gate, 2))
+    x = d_skip[:, None, None] * u
     want = (
-        x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-30) * weight[:, None, :]
+        x
+        * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-30)
+        * weight[:, None, :]
+        * silu(_head_major(gate, 2))
     )
     assert torch.allclose(got, _token_major(want), rtol=1e-12, atol=1e-12)
 
@@ -199,13 +218,12 @@ def test_reduction_is_wider_than_the_operands(dtype: torch.dtype) -> None:
         eps=EPS,
     )
 
-    narrow = (y.to(dtype) + d_skip.to(dtype)[:, None, None] * u.to(dtype)) * silu(
-        _head_major(gate.to(dtype), 2)
-    )
+    narrow = y.to(dtype) + d_skip.to(dtype)[:, None, None] * u.to(dtype)
     narrow = (
         narrow
         * torch.rsqrt(narrow.square().mean(-1, keepdim=True) + EPS)
         * weight.to(dtype)[:, None, :]
+        * silu(_head_major(gate.to(dtype), 2))
     )
 
     assert (got.float() - oracle).abs().max() < (

@@ -310,7 +310,6 @@ def test_a_dry_run_reports_the_whole_cell_and_trains_nothing(
     assert first["max_length"] == 16
     assert first["lengths"]["training_ceiling"] == 16
     assert first["lengths"]["evaluation_ceiling"] == 16
-    assert first["lengths"]["mixer_initialization_span"] is None
     assert first["seeds"] == {"model": 123, "data": 123}
     assert len(first["data"]["identity"]) == 64
     assert first["precision"]["parameter_dtype"] == "torch.float32"

@@ -412,11 +412,6 @@ def _run_cell(
         "train_segments": train_segments,
         "test_segments": test_segments,
     }
-    initialization_spans = [
-        construction["effective_config"].get("init_span")
-        for construction in mixer.constructions
-        if "init_span" in construction["effective_config"]
-    ]
     record: dict[str, Any] = {
         "task": "mqar",
         "mixer": mixer.name,
@@ -459,7 +454,6 @@ def _run_cell(
                     {segment["input_seq_len"] for segment in test_segments}
                 ),
             },
-            "mixer_initialization_span": initialization_spans or None,
         },
         "seeds": {"model": seed, "data": int(args.data_seed)},
         "data": {**data, "identity": identity(data)},

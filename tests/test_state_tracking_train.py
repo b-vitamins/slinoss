@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -200,6 +201,15 @@ def test_weight_decay_split_is_by_parameter_name() -> None:
     assert groups[0]["params"][0] is model.embedding.weight
     total = sum(1 for _ in model.parameters())
     assert len(groups[0]["params"]) + len(groups[1]["params"]) == total
+
+
+def test_weight_decay_honors_an_explicit_parameter_exemption() -> None:
+    model = _model()
+    marked = cast(nn.Linear, model.blocks[0].mixer).weight
+    cast(Any, marked)._no_weight_decay = True
+    groups = parameter_groups(model, PROTOCOL)
+    assert any(param is marked for param in groups[0]["params"])
+    assert all(param is not marked for param in groups[1]["params"])
 
 
 def test_frozen_parameters_reach_no_group() -> None:

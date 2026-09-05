@@ -14,16 +14,19 @@ bfloat16 and cast on lookup; every mixer, norm, residual and head computation re
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import cast
 
 import torch
 from torch import nn
 
 from scripts.harness import MixerFactory
-from slinoss import SLinOSSConfig, SLinOSSMixer
+from slinoss import SLinOSSMixer
+from slinoss.config import VOCAB_MULTIPLE
 from slinoss.ops.block import rmsnorm
 
 __all__ = [
+    "LMConfig",
     "MixerLM",
     "MixerResidualBlock",
     "build_model",
@@ -31,8 +34,46 @@ __all__ = [
     "mixer_parameters",
     "non_embedding_parameters",
     "parameter_count",
-    "scaffold_config",
 ]
+
+
+@dataclass(frozen=True)
+class LMConfig:
+    """Configuration consumed by the external mixer-only LM scaffold."""
+
+    d_model: int
+    n_layers: int
+    vocab_size: int
+    bias: bool = False
+    norm_eps: float = 1e-5
+    vocab_pad_multiple: int = VOCAB_MULTIPLE
+
+    def __post_init__(self) -> None:
+        if self.d_model < 1:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.n_layers < 1:
+            raise ValueError(f"n_layers must be positive, got {self.n_layers}")
+        if self.vocab_size < 1:
+            raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
+        if self.norm_eps <= 0.0:
+            raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
+        if self.vocab_pad_multiple < 1:
+            raise ValueError(
+                f"vocab_pad_multiple must be positive, got {self.vocab_pad_multiple}"
+            )
+        if (
+            self.vocab_pad_multiple != 1
+            and self.vocab_pad_multiple % VOCAB_MULTIPLE != 0
+        ):
+            raise ValueError(
+                "vocab_pad_multiple must be 1 or a multiple of "
+                f"{VOCAB_MULTIPLE}, got {self.vocab_pad_multiple}"
+            )
+
+    @property
+    def padded_vocab_size(self) -> int:
+        """Vocabulary width rounded up to ``vocab_pad_multiple``."""
+        return -(-self.vocab_size // self.vocab_pad_multiple) * self.vocab_pad_multiple
 
 
 class MixerResidualBlock(nn.Module):
@@ -52,16 +93,12 @@ class MixerResidualBlock(nn.Module):
 class MixerLM(nn.Module):
     """Untied embedding/head around a uniform list of mixer-residual blocks."""
 
-    def __init__(self, config: SLinOSSConfig, mixers: Sequence[nn.Module]) -> None:
+    def __init__(self, config: LMConfig, mixers: Sequence[nn.Module]) -> None:
         super().__init__()
-        if config.vocab_size is None:
-            raise ValueError("the LM scaffold requires vocab_size")
         if len(mixers) != config.n_layers:
             raise ValueError(f"{len(mixers)} mixers for {config.n_layers} layers")
         self.config = config
         padded_vocab_size = config.padded_vocab_size
-        if padded_vocab_size is None:
-            raise ValueError("the LM scaffold requires a padded vocabulary size")
         self.embedding = nn.Embedding(
             config.vocab_size, config.d_model, dtype=torch.bfloat16
         )
@@ -100,61 +137,13 @@ class MixerLM(nn.Module):
         hidden = rmsnorm(hidden, self.norm_weight, eps=self.config.norm_eps)
         logits = self.head(hidden)
         vocab = self.config.vocab_size
-        if vocab is None or logits.shape[-1] == vocab:
+        if logits.shape[-1] == vocab:
             return logits
-        dead = logits.new_full(
+        padding = logits.new_full(
             (*logits.shape[:-1], logits.shape[-1] - vocab),
             torch.finfo(logits.dtype).min,
         )
-        return torch.cat((logits[..., :vocab], dead), dim=-1)
-
-
-def scaffold_config(
-    *,
-    d_model: int,
-    n_layers: int,
-    vocab_size: int,
-    ffn_ratio: float = 4.0,
-    d_state: int = 48,
-    d_head: int = 64,
-    bias: bool = False,
-    norm_eps: float = 1e-5,
-) -> SLinOSSConfig:
-    """The config the scaffold reads.
-
-    Only ``d_model``, ``n_layers``, ``vocab_size``, ``bias`` and ``norm_eps`` reach the
-    scaffold. ``ffn_ratio`` is retained only for checkpoint-schema compatibility and does
-    not instantiate an external FFN. The mixer fields are here because
-    :class:`slinoss.SLinOSSConfig` validates them all at construction and the block needs a
-    complete config to build the mixer it is about to have replaced; their values do not
-    reach any arm, so they sit at the narrowest legal setting.
-
-    Args:
-        d_model: Residual width.
-        n_layers: Blocks.
-        vocab_size: Tokens the embedding gathers and classes the head carries meaning on.
-        ffn_ratio: FFN hidden width as a multiple of ``d_model``.
-        d_state: Unused by the scaffold; the narrowest legal width by default.
-        d_head: Unused by the scaffold, but it must divide ``d_inner``.
-        bias: Bias on the FFN and the head.
-        norm_eps: RMS norm epsilon.
-
-    Returns:
-        The config.
-
-    Raises:
-        ValueError: From :class:`slinoss.SLinOSSConfig`.
-    """
-    return SLinOSSConfig(
-        d_model=d_model,
-        d_state=d_state,
-        d_head=d_head,
-        n_layers=n_layers,
-        ffn_ratio=ffn_ratio,
-        bias=bias,
-        norm_eps=norm_eps,
-        vocab_size=vocab_size,
-    )
+        return torch.cat((logits[..., :vocab], padding), dim=-1)
 
 
 def layer_factories(
@@ -183,7 +172,7 @@ def layer_factories(
 
 
 def build_model(
-    config: SLinOSSConfig,
+    config: LMConfig,
     factories: Sequence[MixerFactory],
     *,
     max_length: int,
@@ -200,7 +189,7 @@ def build_model(
     mixer's own initialization, so the seed has to be set first for an arm to reproduce.
 
     Args:
-        config: Scaffold shape, from :func:`scaffold_config`.
+        config: Scaffold shape.
         factories: One mixer factory per layer, from :func:`layer_factories`.
         max_length: Longest sequence the arm will run, passed to each factory.
         device: Destination device.

@@ -46,9 +46,7 @@ class Float32Module(nn.Module):
 
     _float32_names: tuple[str, ...] = ()
 
-    def _apply(
-        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
-    ) -> Self:
+    def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> Self:
         super()._apply(fn, recurse)
         for name in self._float32_names:
             tensor = cast(Tensor, getattr(self, name))

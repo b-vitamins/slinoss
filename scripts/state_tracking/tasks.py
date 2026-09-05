@@ -652,11 +652,7 @@ def _reconstruction_generators(group: Group, count: int) -> tuple[int, ...]:
     """Choose a nested, deterministic stand-in for PD-SSM's unreleased random set."""
     base_labels = _base_generator_labels(group)
     base = tuple(group.labels.index(label) for label in base_labels)
-    candidates = [
-        index
-        for index in range(1, group.order)
-        if index not in base
-    ]
+    candidates = [index for index in range(1, group.order) if index not in base]
     candidates.sort(
         key=lambda index: hashlib.sha256(
             f"{_PDSSM_RECONSTRUCTION_KEY}:{group.name}:{group.labels[index]}".encode()
@@ -771,14 +767,18 @@ def resolve_profile(profile: str, names: Sequence[str] | None) -> tuple[Task, ..
     ``pdssm:A5:2`` just because both have 60 output states.
     """
     if profile not in PROFILE_DEFAULTS:
-        raise ValueError(f"unknown profile {profile!r}; choices are {tuple(PROFILE_DEFAULTS)}")
+        raise ValueError(
+            f"unknown profile {profile!r}; choices are {tuple(PROFILE_DEFAULTS)}"
+        )
     selected = PROFILE_DEFAULTS[profile] if names is None else tuple(names)
     if not selected:
         raise ValueError(f"profile {profile!r} requires at least one explicit task")
     tasks = tuple(resolve(name) for name in selected)
     wrong = [task.name for task in tasks if task.contract.profile != profile]
     if wrong:
-        owners = {task.name: task.contract.profile for task in tasks if task.name in wrong}
+        owners = {
+            task.name: task.contract.profile for task in tasks if task.name in wrong
+        }
         raise ValueError(
             f"profile {profile!r} cannot run tasks from another contract: {owners}"
         )

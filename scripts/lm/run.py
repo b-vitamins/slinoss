@@ -337,7 +337,7 @@ def run_arm(
     final = REGISTRY.resolve(hybrid_final, hybrid_overrides) if hybrid_final else None
 
     torch.manual_seed(config.seed)
-    scaffold = model_mod.scaffold_config(
+    scaffold = model_mod.LMConfig(
         d_model=d_model, n_layers=n_layers, vocab_size=manifest.vocab_size
     )
     stack = model_mod.build_model(
@@ -450,12 +450,6 @@ def run_arm(
                 "train": config.seq_len,
                 "validation": config.seq_len,
             },
-            "mixer_initialization_span": [
-                construction["effective_config"].get("init_span")
-                for construction in constructions
-                if "init_span" in construction["effective_config"]
-            ]
-            or None,
         },
         seeds={"model": config.seed, "data_order": config.seed},
         data={**data, "identity": identity(data)},

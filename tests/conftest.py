@@ -216,6 +216,16 @@ def assert_max_rel(got: Tensor, want: Tensor, bound: float, label: str) -> float
     return err
 
 
+@pytest.fixture
+def reference_smem_capacity(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Fix dispatch-policy tests to a device-independent shared-memory budget."""
+    from slinoss import _cute
+
+    capacity = 101_376
+    monkeypatch.setattr(_cute, "get_smem_capacity_in_bytes", lambda: capacity)
+    return capacity
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--tolerance-report",

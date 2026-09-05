@@ -271,28 +271,27 @@ def lr_at(config: TrainConfig, step: int) -> float:
 def parameter_groups(model: nn.Module, config: TrainConfig) -> list[dict[str, Any]]:
     """Split parameters into the two decay groups.
 
-    The split is on the substring ``embedding`` appearing in a parameter's name, which is
-    upstream's rule verbatim. A mixer that names an internal parameter ``embedding`` lands
-    in the undecayed group; that is a naming contract, not an accident, and
-    :func:`scripts.state_tracking.model.build_model` keeps the token table's name inside
-    it.
+    The token embedding keeps upstream's name-based exemption. A parameter may also
+    declare ``_no_weight_decay`` explicitly; this preserves the same transition
+    operating-point treatment without coupling optimizer behavior to a parameter name.
 
     Args:
         model: The model.
         config: The protocol, for the two decays.
 
     Returns:
-        Two AdamW groups, embedding first.
+        Two AdamW groups, undecayed first.
     """
-    embedding: list[nn.Parameter] = []
-    others: list[nn.Parameter] = []
+    plain: list[nn.Parameter] = []
+    decay: list[nn.Parameter] = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        (embedding if "embedding" in name else others).append(param)
+        exempt = "embedding" in name or bool(getattr(param, "_no_weight_decay", False))
+        (plain if exempt else decay).append(param)
     return [
-        {"params": embedding, "weight_decay": config.weight_decay_embedding},
-        {"params": others, "weight_decay": config.weight_decay_others},
+        {"params": plain, "weight_decay": config.weight_decay_embedding},
+        {"params": decay, "weight_decay": config.weight_decay_others},
     ]
 
 

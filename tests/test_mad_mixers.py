@@ -153,24 +153,10 @@ def test_length_consumption_is_mandatory_and_fail_closed() -> None:
     from slinoss import SLinOSSMixer
 
     assert isinstance(built, SLinOSSMixer)
-    assert built.config.init_span == 4096
     assert resolved.max_length_policy == "unused"
     assert resolved.initialization_policy == "constructor"
     assert resolved.constructions[0]["context"]["max_length_consumed"] is None
     assert resolved.constructions[0]["initialization_policy"] == "constructor"
-
-
-def test_slinoss_init_span_is_explicit_and_independent_of_task_length() -> None:
-    """Master's one lattice moves only through the recorded constructor setting."""
-    resolved = resolve("slinoss", ["init_span=512"])
-    built = resolved.factory(128, 32)
-    from slinoss import SLinOSSMixer
-
-    assert isinstance(built, SLinOSSMixer)
-    assert built.config.init_span == 512
-    effective = resolved.constructions[0]["effective_config"]
-    assert effective["init_span"] == 512
-    assert resolved.constructions[0]["context"]["max_length_consumed"] is None
 
 
 def test_slinoss_defaults_track_the_config() -> None:
@@ -180,25 +166,15 @@ def test_slinoss_defaults_track_the_config() -> None:
     every order-2 element of the reachable group outside the ball, and an arm inheriting
     that from a stale copy would measure a different operator than its record names.
     """
-    from slinoss import SLinOSSConfig
+    from slinoss import SLinOSSMixerConfig
 
     defaults = REGISTRY["slinoss"].defaults
-    fields = set(SLinOSSConfig.__dataclass_fields__)
-    stack_only = {
-        "d_model",
-        "n_layers",
-        "ffn_ratio",
-        "norm_eps",
-        "vocab_size",
-        "vocab_pad_multiple",
-    }
-    assert set(defaults) == fields - stack_only
+    fields = set(SLinOSSMixerConfig.__dataclass_fields__)
+    assert set(defaults) == fields - {"d_model"}
     for key in set(defaults) - {"d_state"}:
-        assert defaults[key] == getattr(SLinOSSConfig, key)
-    assert defaults["w_max"] > 3.0
+        assert defaults[key] == getattr(SLinOSSMixerConfig, key)
     assert defaults["d_state"] % 48 == 0
-    # Constructible at the scaffold's width: d_inner must divide into whole heads.
-    SLinOSSConfig(d_model=128, **defaults)
+    SLinOSSMixerConfig(d_model=128, **defaults)
 
 
 @pytest.mark.cuda

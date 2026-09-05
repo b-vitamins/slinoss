@@ -984,9 +984,7 @@ def test_pdssm_group_reconstructions_are_nested_distinct_and_labelled() -> None:
             resolve(f"pdssm:{group_name}:{count}").contract.generator_labels
             for count in counts
         ]
-        assert all(
-            long[: len(short)] == short for short, long in pairwise(labels)
-        )
+        assert all(long[: len(short)] == short for short, long in pairwise(labels))
 
 
 def test_profiles_are_fail_closed_and_the_default_is_the_released_four() -> None:
@@ -994,9 +992,12 @@ def test_profiles_are_fail_closed_and_the_default_is_the_released_four() -> None
     assert tuple(task.name for task in resolve_profile("pdssm-regular", None)) == (
         PDSSM_REGULAR_TASKS
     )
-    assert tuple(
-        task.name for task in resolve_profile("pdssm-groups-reconstruction", None)
-    ) == PDSSM_GROUP_TASKS
+    assert (
+        tuple(
+            task.name for task in resolve_profile("pdssm-groups-reconstruction", None)
+        )
+        == PDSSM_GROUP_TASKS
+    )
     with pytest.raises(ValueError, match="another contract"):
         resolve_profile("pdssm-regular", ["A5"])
     with pytest.raises(ValueError, match="another contract"):

@@ -11,29 +11,10 @@ STATE_MULTIPLE = 3 * LANE_MULTIPLE
 """``d_state`` is ``3N`` and therefore a multiple of 48."""
 
 HEAD_MULTIPLE = 16
-"""``P`` is a multiple of this because it is the N mode of two of the scan GEMMs.
-
-The MMA tile's N mode is 16 wide. An N extent that is not a multiple of 16 does
-not compile: the tiled MMA fails IR verification rather than padding. 8 and 24
-were measured to fail, 16, 48, 64, 96 and 128 to pass. The M mode is free; it is
-rounded up inside the kernel and the store is predicated.
-"""
+"""MMA width of the scan GEMMs' ``P`` dimension."""
 
 VOCAB_MULTIPLE = 8
-"""Head output columns one sixteen-byte tensor-core operand load covers at bf16.
-
-All three of the head's GEMMs carry the output width on the mode that gates the
-kernel choice: the forward's ``N``, the input gradient's ``K``, the weight
-gradient's ``M``. A width that is not a multiple of this drops all three onto a
-kernel built for a scalar load and for half the MMA K-extent, which is why they
-fall off together.
-
-Measured bf16 on one Ampere part, 8192 tokens, ``d_model`` 576, clocks unlocked,
-paired arms alternating order, medians over 24 launches: from 50257 to 50264 the
-three stages move by 1.86x, 1.91x and 1.71x, and the next multiple of 128 or of
-256 moves them no further. The pad columns are parameters no output reaches, so
-the rule is one operand load rather than one output tile.
-"""
+"""Bfloat16 head columns covered by one sixteen-byte operand load."""
 
 ROTATION_CHART_SCALE_MAX = 3.141592502593994
 """Largest float32 strictly below pi.
@@ -43,30 +24,11 @@ below :data:`math.pi` can round upward when it enters a kernel; this exact value
 cannot, so twice the chart scale remains strictly below ``2*pi`` there as well.
 """
 
-DEFAULT_INIT_SPAN = 4096
-"""Default slow endpoint of the initialized period/horizon lattice, in tokens.
-
-This is an initialization parameter, not a promise about the length of an input
-buffer.  Keeping it explicit prevents a harness's train or evaluation ceiling from
-silently changing the operator it constructs.
-"""
-
 MIN_CHUNK = 16
-"""Shortest legal chunk. Below this the chunked form loses to the streaming one:
-the per-chunk transform table costs order 120 FMA per token and amortizes over
-``N`` lanes only from ``N = 16``."""
+"""Shortest chunk that amortizes the transform table over the lane tile."""
 
 MAX_CHUNK = 128
-"""Longest legal chunk, set by the widest block one vector load covers.
-
-The prefix scan gives one lane a block of ``ceil(L/32)`` consecutive tokens. Up to
-four words the compiler folds that block into one vector load, so the access is
-conflict-free by construction, and both shared bank-conflict counters read zero at
-the chunk sizes the bench covers. At eight words, which is ``L = 256``, the block
-is wider than any shared vector load and the construction no longer holds. Bank
-conflicts are a defect rather than a tradeoff, so the shape is constrained
-instead. Nothing is lost: at ``L = 256`` the score tile alone is 256 KB
-of float32 accumulator, four times the register file of a block."""
+"""Longest chunk whose lane block fits one conflict-free vector load."""
 
 
 @dataclass(frozen=True)
@@ -89,14 +51,6 @@ class SLinOSSMixerConfig:
         key_conv: Convolve the ``B`` and ``C`` bands as well as the value band.
             Their taps start at the delta, so the initialized mixer is the one
             without it and a key motif is only ever learned into.
-        init_span: Slow endpoint of the initialized period/horizon lattice, in
-            tokens. This is independent of the sequence lengths a harness trains or
-            evaluates on; changing it is an explicit initialization change.
-        w_max: Scale of the rotation-vector chart, whose asymptotic radius is
-            ``2*w_max``. Strictly below pi so ``quat_exp`` is one branchless
-            polynomial over a domain below ``2*pi``. The default is the largest
-            scale float32 does not resolve from pi. A half turn is an interior,
-            finite-parameter point of this chart.
         bias: Bias on the linear projections.
         conv_bias: Bias on the causal convolution.
         norm_eps: RMS norm epsilon.
@@ -110,8 +64,6 @@ class SLinOSSMixerConfig:
     chunk_size: int = 64
     d_conv: int = 4
     key_conv: bool = True
-    init_span: int = DEFAULT_INIT_SPAN
-    w_max: float = ROTATION_CHART_SCALE_MAX
     bias: bool = False
     conv_bias: bool = True
     norm_eps: float = 1e-5
@@ -153,13 +105,6 @@ class SLinOSSMixerConfig:
             )
         if self.d_conv < 1:
             raise ValueError(f"d_conv must be positive, got {self.d_conv}")
-        if self.init_span < 1:
-            raise ValueError(f"init_span must be positive, got {self.init_span}")
-        if not 0.0 < self.w_max <= ROTATION_CHART_SCALE_MAX:
-            raise ValueError(
-                f"w_max must lie in (0, pi) and round below pi in float32, "
-                f"got {self.w_max}"
-            )
         if self.norm_eps <= 0.0:
             raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
 
@@ -226,13 +171,7 @@ class SLinOSSConfig(SLinOSSMixerConfig):
 
     @property
     def padded_vocab_size(self) -> int | None:
-        """Head output width: ``vocab_size`` rounded up to ``vocab_pad_multiple``.
-
-        None when there is no head. Equal to ``vocab_size`` when that is already a
-        multiple, so a caller who supplies an aligned width pays nothing. The
-        columns past ``vocab_size`` are the padding; see
-        :meth:`slinoss.SLinOSSStack.forward` for what they hold.
-        """
+        """``vocab_size`` rounded up to ``vocab_pad_multiple``, or None."""
         if self.vocab_size is None:
             return None
         multiple = self.vocab_pad_multiple

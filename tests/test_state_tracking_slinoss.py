@@ -78,7 +78,21 @@ def test_the_registry_builds_the_mixer_and_a_gradient_reaches_it() -> None:
     for name, param in mixer.named_parameters():
         assert param.grad is not None, name
         assert bool(torch.isfinite(param.grad).all()), name
+    in_grad = mixer.in_proj.weight.grad
+    assert in_grad is not None
+    layout = mixer.layout
+    for name, band in {
+        "B": in_grad[layout.b_off : layout.c_off],
+        "C": in_grad[layout.c_off : layout.params_off],
+        "transition": in_grad[layout.params_off :],
+    }.items():
+        assert bool(band.abs().max() > 0), name
+    assert mixer.transition_bias.grad is not None
+    assert bool(mixer.transition_bias.grad.abs().max() > 0)
+    assert mixer.out_proj.weight.grad is not None
+    assert bool(mixer.out_proj.weight.grad.abs().max() > 0)
     assert x.grad is not None
+    assert bool(x.grad.abs().max() > 0)
 
 
 def test_the_mixer_is_causal() -> None:
@@ -89,10 +103,6 @@ def test_the_mixer_is_causal() -> None:
     void every number on the axis at once, since the label sits at the last position.
     """
     mixer = _mixer()
-    # The production residual branch intentionally starts as a no-op. Activate only
-    # its final projection so this test exercises the mixer's temporal dependency
-    # instead of proving that two identically zero tensors are equal.
-    mixer.out_proj.reset_parameters()
     mixer.eval()
     x = torch.randn(2, 12, D_MODEL, device="cuda")
     perturbed = x.clone()

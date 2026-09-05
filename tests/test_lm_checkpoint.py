@@ -28,13 +28,13 @@ from scripts.lm.checkpoint import FORMAT, load, load_model, save
 from scripts.lm.corpus import CorpusManifest, ShardCounts
 from scripts.lm.mixers import REGISTRY
 from scripts.lm.model import (
+    LMConfig,
     MixerLM,
     MixerResidualBlock,
     build_model,
     layer_factories,
-    scaffold_config,
 )
-from slinoss import SLinOSSConfig, SLinOSSMixer
+from slinoss import SLinOSSMixer
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -60,11 +60,9 @@ def _manifest() -> CorpusManifest:
     )
 
 
-def _config() -> SLinOSSConfig:
+def _config() -> LMConfig:
     """The scaffold config."""
-    return scaffold_config(
-        d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB, d_state=48, d_head=16
-    )
+    return LMConfig(d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB)
 
 
 def _stack(mixer: str = "slinoss", overrides: tuple[str, ...] = ()) -> MixerLM:

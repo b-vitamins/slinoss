@@ -1,11 +1,11 @@
 """Fused mixer tail. CuTe DSL forward and backward.
 
     x   = y + d_skip * u
-    x   = x * silu(gate)
-    out = x * rsqrt(mean(x^2) + eps) * weight
+    x   = x * rsqrt(mean(x^2) + eps) * weight
+    out = x * silu(gate)
 
-One kernel per direction, and one launch for the forward. The skip, the gate, and
-the norm are one pass over the operands: every element is read once and every
+One kernel per direction, and one launch for the forward. The skip, norm, and gate
+are one pass over the operands: every element is read once and every
 intermediate stays in registers.
 
 Layout. ``y`` and ``u`` are head-major, ``(B,H,T,P)``, and ``gate`` and the output
@@ -246,7 +246,7 @@ def mixer_tail_fwd_kernel(
     segments: cutlass.Constexpr,
     exact: cutlass.Constexpr,
 ) -> None:
-    """Apply the skip, the gate, and the per-head RMS norm.
+    """Apply the skip, per-head RMS norm, and gate.
 
     Args:
         gy: ``(B,H,T,P)`` scan output, operand dtype.
@@ -293,11 +293,9 @@ def mixer_tail_fwd_kernel(
             sumsq = zero
             for j in cutlass.range_constexpr(segments):
                 col, pos, masked = cols[j]
-                gate = widen(ggate[bidx, tidx, band + pos], src)
-                value = (
-                    widen(gy[bidx, head, tidx, pos], src)
-                    + skip * widen(gu[bidx, head, tidx, pos], src)
-                ) * silu(gate, sigmoid(gate))
+                value = widen(gy[bidx, head, tidx, pos], src) + skip * widen(
+                    gu[bidx, head, tidx, pos], src
+                )
                 if cutlass.const_expr(masked):
                     value = select(col < rows, value, zero)
                 sumsq = sumsq + value * value
@@ -308,7 +306,14 @@ def mixer_tail_fwd_kernel(
 
             for j in cutlass.range_constexpr(segments):
                 col, pos, masked = cols[j]
-                out = narrow(held[j] * scale * widen(gweight[head, pos], par), dst)
+                gate = widen(ggate[bidx, tidx, band + pos], src)
+                out = narrow(
+                    held[j]
+                    * scale
+                    * widen(gweight[head, pos], par)
+                    * silu(gate, sigmoid(gate)),
+                    dst,
+                )
                 if cutlass.const_expr(masked):
                     if col < rows:
                         gout[bidx, tidx, band + col] = out
@@ -448,19 +453,19 @@ def mixer_tail_bwd_kernel(
                 col, pos, masked = cols[j]
                 gate = widen(ggate[bidx, tidx, band + pos], src)
                 sig = sigmoid(gate)
-                act = silu(gate, sig)
                 uval = widen(gu[bidx, head, tidx, pos], src)
-                pre = widen(gy[bidx, head, tidx, pos], src) + skip * uval
+                value = widen(gy[bidx, head, tidx, pos], src) + skip * uval
                 dout = widen(gdout[bidx, tidx, band + pos], src)
-                value = pre * act
-                cot = dout * widen(gweight[head, pos], par)
+                weight = widen(gweight[head, pos], par)
+                act = silu(gate, sig)
+                cot = dout * weight * act
                 if cutlass.const_expr(masked):
                     inside = col < rows
                     value = select(inside, value, zero)
                     cot = select(inside, cot, zero)
                 sumsq = sumsq + value * value
                 dot = dot + cot * value
-                held.append((value, pre, act, silu_grad(gate, sig), uval, dout, cot))
+                held.append((value, weight, act, silu_grad(gate, sig), uval, dout, cot))
 
             total = f32(cute.arch.warp_reduction_sum(sumsq))
             paired = f32(cute.arch.warp_reduction_sum(dot))
@@ -471,14 +476,13 @@ def mixer_tail_bwd_kernel(
 
             for j in cutlass.range_constexpr(segments):
                 col, _, masked = cols[j]
-                value, pre, act, dact, uval, dout, cot = held[j]
+                value, weight, act, dact, uval, dout, cot = held[j]
                 dvalue = scale * cot - coupling * value
-                dpre = dvalue * act
-                acc_skip[j] = acc_skip[j] + dpre * uval
-                acc_weight[j] = acc_weight[j] + dout * value * scale
-                dy = narrow(dpre, dst)
-                du = narrow(dpre * skip, dst)
-                dgate = narrow(dvalue * pre * dact, dst)
+                acc_skip[j] = acc_skip[j] + dvalue * uval
+                acc_weight[j] = acc_weight[j] + dout * value * scale * act
+                dy = narrow(dvalue, dst)
+                du = narrow(dvalue * skip, dst)
+                dgate = narrow(dout * value * scale * weight * dact, dst)
                 if cutlass.const_expr(masked):
                     if col < rows:
                         gdy[bidx, head, tidx, col] = dy
@@ -678,7 +682,7 @@ def mixer_tail_forward(
     *,
     eps: float,
 ) -> Tensor:
-    """Apply the skip, the gate, and the per-head RMS norm, in one launch.
+    """Apply the skip, per-head RMS norm, and gate in one launch.
 
     Args:
         y: Scan output, ``(B,H,T,P)``, contiguous CUDA, one of

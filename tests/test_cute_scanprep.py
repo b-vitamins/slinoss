@@ -469,7 +469,9 @@ def test_backward_matches_reference_autograd(shape: Shape, dtype: torch.dtype) -
 
     tag = _tag(shape, dtype)
     assert_max_rel(got.dparams, want.dparams, BWD_TOL[dtype], f"{tag}.dparams")
-    assert_max_rel(got.dtransition_bias, want.dtransition_bias, BIAS_TOL, f"{tag}.dtransition_bias")
+    assert_max_rel(
+        got.dtransition_bias, want.dtransition_bias, BIAS_TOL, f"{tag}.dtransition_bias"
+    )
 
 
 def test_backward_ignores_the_lane_three_cotangent() -> None:
@@ -541,7 +543,9 @@ def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     tag = f"{_tag(ONE, dtype)}.e2e"
     assert_max_rel(got.trans, want.trans, FWD_TOL, f"{tag}.trans")
     assert_max_rel(_grad(fast[0]), _grad(oracle[0]), BWD_TOL[dtype], f"{tag}.dparams")
-    assert_max_rel(_grad(fast[1]), _grad(oracle[1]), BIAS_TOL, f"{tag}.dtransition_bias")
+    assert_max_rel(
+        _grad(fast[1]), _grad(oracle[1]), BIAS_TOL, f"{tag}.dtransition_bias"
+    )
 
 
 # ---------------------------------------------------------------------------

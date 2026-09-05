@@ -3,13 +3,11 @@
 Everything between the scan output and the output projection:
 
     x = y + d_skip * u
-    x = x * silu(gate)
-    out = x * rsqrt(mean(x^2) + eps) * weight
+    x = x * rsqrt(mean(x^2) + eps) * weight
+    out = x * silu(gate)
 
-The skip term is the direct path from the scan input to the scan output, so a
-head can pass information through without going around the state. The gate is
-applied before the norm, so the norm sees the gated magnitude and the scale it
-divides by is the one the next projection actually reads.
+The gate follows normalization so a headwise scalar gate changes output
+amplitude instead of being divided back out by the norm.
 
 ``d_skip`` is ``(H,)``: one scalar per head, which is the width Mamba2's ``D``
 carries. The skip is a gain on the whole head's direct path, and a per-row gain
@@ -133,7 +131,7 @@ def mixer_tail_ref(
     *,
     eps: float,
 ) -> Tensor:
-    """Apply the skip, the gate, and the per-head RMS norm.
+    """Apply the skip, per-head RMS norm, and gate.
 
     Args:
         y: Scan output, shape ``(B,H,T,P)``.
@@ -170,9 +168,13 @@ def mixer_tail_ref(
         # (H,) broadcasts against (B,H,T,P) once the token and row axes are inserted,
         # and (H,P) once the token axis is.
         x = y.to(dtype) + d_skip.to(dtype)[:, None, None] * u.to(dtype)
-        x = x * silu(as_head_major(gate.to(dtype), heads))
         scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
-        out = x * scale * weight.to(dtype)[:, None, :]
+        out = (
+            x
+            * scale
+            * weight.to(dtype)[:, None, :]
+            * silu(as_head_major(gate.to(dtype), heads))
+        )
         return as_token_major(out).to(y.dtype)
 
 

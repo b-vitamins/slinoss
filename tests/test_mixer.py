@@ -21,16 +21,13 @@ import pytest
 import torch
 from torch import Tensor
 from torch.func import functional_call
-from torch.nn.functional import linear
+from torch.nn.functional import linear, normalize
 
 from slinoss._guard import PROJ_ALIGN, SECTOR_BYTES
-from slinoss.config import DEFAULT_INIT_SPAN, SLinOSSConfig
+from slinoss.config import ROTATION_CHART_SCALE_MAX, SLinOSSConfig
 from slinoss.mixer import (
     ProjectionLayout,
     SLinOSSMixer,
-    _fibonacci_axes,
-    _head_band,
-    _head_grid,
     _head_lattice,
 )
 from slinoss.ops.conv import backends as conv_dispatch
@@ -48,7 +45,7 @@ from slinoss.ops.scanprep import (
 )
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
-from slinoss.ops.so3ssd import quat_exp, rot_matrix, so3ssd
+from slinoss.ops.so3ssd import so3ssd
 from tests.conftest import assert_max_rel
 
 # Two configurations, chosen for the parameter band's width against the padding
@@ -199,13 +196,6 @@ as a tolerance rather than an equality so that a reordered reduction inside a
 backend reports a number.
 """
 
-BAND = (4.0, 4096.0)
-"""A lattice band the grid assertions read, independent of any configuration.
-
-:func:`slinoss.mixer._head_band` derives both ends, so a test that asserts the grid
-spans what it is given must be given a band rather than read one.
-"""
-
 INIT_TOL = 1e-6
 """Bound on recovering an initialization lattice through its own bounded map.
 
@@ -274,7 +264,10 @@ def _public_composition(mixer: SLinOSSMixer, x: Tensor) -> Tensor:
         d_head=cfg.d_head,
     )
     params = scanprep(
-        layout.params(proj), mixer.transition_bias, heads=cfg.n_heads, w_max=cfg.w_max
+        layout.params(proj),
+        mixer.transition_bias,
+        heads=cfg.n_heads,
+        w_max=ROTATION_CHART_SCALE_MAX,
     )
     keys = (
         None
@@ -283,8 +276,19 @@ def _public_composition(mixer: SLinOSSMixer, x: Tensor) -> Tensor:
     )
     b_band = layout.b(proj) if keys is None else layout.key_b(keys.y)
     c_band = layout.c(proj) if keys is None else layout.key_c(keys.y)
-    z0 = mixer.initial_state[None].expand(x.shape[0], -1, -1, -1).contiguous()
-    scan = so3ssd(step.y, params.trans, params.K, b_band, c_band, cfg.chunk_size, z0=z0)
+    b_band = normalize(b_band, dim=-1, eps=1e-12)
+    c_band = normalize(c_band, dim=-1, eps=1e-12)
+    z0 = cast(Tensor, mixer.initial_state)
+    z0 = z0.unsqueeze(0).expand(x.shape[0], -1, -1, -1).contiguous()
+    scan = so3ssd(
+        step.y,
+        params.trans,
+        params.K,
+        b_band,
+        c_band,
+        cfg.chunk_size,
+        z0=z0,
+    )
     tail = mixer_tail(
         scan.y,
         step.y,
@@ -485,6 +489,9 @@ def test_every_operand_and_every_destination_is_a_band(
             assert band.stride(-1) == 1, label
             assert band.stride(-2) == layout.width, label
             assert (band.data_ptr() - base) // band.element_size() == offset, label
+    for label in ("B", "C"):
+        norm = seen[label].float().square().sum(-1).sqrt()
+        torch.testing.assert_close(norm, torch.ones_like(norm), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.cuda
@@ -520,166 +527,39 @@ def test_the_key_convolution_keeps_b_and_c_one_buffer(cuda: torch.device) -> Non
 
 
 def test_initialization_inverts_the_bounded_maps() -> None:
-    """The effective transition bias holds raw values, not mapped lattice values.
-
-    Both scale maps are bounded and neither is the identity, so a lattice written
-    straight into the rows lands at a decay and a period the map has moved, and both
-    stay inside their invariant. The result is a mixer that trains and never covers
-    the timescales it reports.
-    """
-    cfg = MIXER_CONFIG
-    rows = SLinOSSMixer(cfg).transition_bias.detach().double()
-    horizon, period = (t.double() for t in _head_lattice(cfg.n_heads, _head_band(cfg)))
-    ls = bounded_logscale(rows[:, LS_COLUMN])
-    assert_max_rel(-0.5 / ls, horizon, INIT_TOL, "mixer init decay")
-    w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
-    turn = w.norm(dim=-1)
-    assert_max_rel(2.0 * math.pi / turn, period, INIT_TOL, "mixer init period")
-    # I1 and I2 at step zero. The lattice stays inside the chart scale, leaving
-    # another whole scale before the rotation asymptote.
-    assert bool((ls <= 0.0).all())
-    assert bool((ls >= -LS_MAX_MAG).all())
-    assert float(turn.max()) < cfg.w_max
-    assert rows.shape[1] == PARAM_COLS
-
-
-def test_turns_per_lifetime_sweeps_rather_than_holding_at_one() -> None:
-    """The two rows come from two ranges, so their ratio is free.
-
-    Turns per amplitude lifetime is ``h/p``. Driving both rows from one grid pins it
-    to one at every head -- every head turning exactly once before it forgets, a
-    schedule nothing asks for -- and the per-row assertions above cannot see that,
-    because each row is still correct against its own grid. The ratio is the
-    invariant, and what it has to do is sweep: the corner ``h/p >> 1`` is a
-    narrowband resonator and the corner ``h/p << 1`` is a head that decays before it
-    turns, which is the scalar transition.
-    """
-    cfg = MIXER_CONFIG
-    rows = SLinOSSMixer(cfg).transition_bias.detach().double()
-    tau = -0.5 / bounded_logscale(rows[:, LS_COLUMN])
-    turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
-    quality = tau * turn / (2.0 * math.pi)
-    horizon, period = (t.double() for t in _head_lattice(cfg.n_heads, _head_band(cfg)))
-    assert_max_rel(quality, horizon / period, INIT_TOL, "turns per lifetime")
-    band = _head_band(cfg)
-    span = band[1] / band[0]
-    assert float(quality.max() / quality.min()) == pytest.approx(span**2, rel=1e-5)
-
-
-def test_the_lattice_snakes_and_repeats_no_pair() -> None:
-    """The two axes as a lattice, not as a product written in either order.
-
-    Consecutive heads differ in one coordinate, which is what makes the head axis a
-    usable grouping axis: a plain product jumps the whole horizon range at every
-    period boundary. ``H`` need not factor, so the tail of the last period is
-    dropped rather than wrapped, and no pair may repeat -- a repeat is a head that
-    costs parameters and adds no timescale.
-    """
-    for heads in (1, 2, 4, 7, 12, 16):
-        horizon, period = _head_lattice(heads, BAND)
-        assert horizon.shape == period.shape == (heads,)
-        pairs = {(float(h), float(p)) for h, p in zip(horizon, period, strict=True)}
-        assert len(pairs) == heads
-        moved = (horizon.diff() != 0.0).long() + (period.diff() != 0.0).long()
-        assert bool((moved <= 1).all())
-    # Both endpoints of both ranges, at a head count that fills the lattice exactly.
-    horizon, period = _head_lattice(16, BAND)
-    assert (float(horizon.min()), float(horizon.max())) == BAND
-    assert (float(period.min()), float(period.max())) == BAND
-
-
-def test_the_head_grid_is_log_spaced() -> None:
-    """A scale grid, not a linear one.
-
-    A linear grid over a ratio of 1024 puts fourteen of sixteen heads past the
-    hundred-token mark and leaves the short timescales to two of them. Log spacing is
-    what makes the rungs a bank; both endpoints are included so the ranges mean what
-    they say.
-    """
-    grid = _head_grid(BAND, 5).double()
-    step = (BAND[1] / BAND[0]) ** 0.25
-    assert_max_rel(grid[1:] / grid[:-1], torch.full((4,), step).double(), 1e-6, "step")
-    assert float(grid[0]) == BAND[0]
-    assert float(grid[-1]) == BAND[1]
-
-
-def test_the_axes_are_equidistributed_and_seedless() -> None:
-    """One unit axis per head, a function of ``H`` alone.
-
-    A pseudo-random draw needs a seed to reproduce and still clusters: two axes a few
-    degrees apart are two heads carrying one rotation plane. The Fibonacci set has a
-    minimum separation that falls like ``1/sqrt(H)``, so it is asserted against that
-    rather than against a constant.
-    """
-    for heads in (1, 4, 16, 64):
-        axes = _fibonacci_axes(heads).double()
-        assert axes.shape == (heads, 3)
-        assert_max_rel(axes.norm(dim=-1), torch.ones(heads).double(), 1e-6, "unit")
-        if heads > 1:
-            gram = (axes @ axes.T).fill_diagonal_(-1.0)
-            assert float(gram.max()) < 1.0 - 1.0 / heads
-    assert torch.equal(_fibonacci_axes(8), _fibonacci_axes(8))
-
-
-def test_conjugation_turns_by_the_rotation_vector_norm() -> None:
-    """The period axis is a period of the rotation, not of half of it.
-
-    ``quat_exp`` builds a half-angle quaternion and conjugation doubles the angle
-    back, so a token advances the phase by ``|w|``. Read as ``2|w|``, every
-    initialized period is halved, and a halved period is still a plausible one, so
-    nothing else here fails.
-    """
-    cfg = MIXER_CONFIG
-    rows = SLinOSSMixer(cfg).transition_bias.detach().double()
-    w = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max)
-    trace = rot_matrix(quat_exp(w)).diagonal(dim1=-2, dim2=-1).sum(-1)
-    angle = torch.arccos(((trace - 1.0) / 2.0).clamp(-1.0, 1.0))
-    period = _head_lattice(cfg.n_heads, _head_band(cfg))[1].double()
-    assert_max_rel(2.0 * math.pi / angle, period, INIT_TOL, "mixer rotation period")
-
-
-def test_the_fastest_rung_asks_for_half_of_any_chart_scale() -> None:
-    """The fast end of the initialized band is half the chart scale.
-
-    A band whose fast end were an absolute token count would cross the canonical
-    SO(3) range for a small enough ``w_max``. Deriving it from the scale puts the
-    rung at exactly :data:`slinoss.mixer._MAP_HEADROOM`, independent of that scale.
-    """
-    for w_max in (0.5, 1.0, 3.1415925):
+    """The fixed physical spectra survive inversion through both bounded maps."""
+    for heads in (1, 2, 3, 4, 8):
         cfg = SLinOSSConfig(
-            d_model=32,
+            d_model=8 * heads,
             d_state=48,
+            expand=2.0,
             d_head=16,
-            n_groups=2,
-            w_max=w_max,
-            init_span=4096,
+            n_groups=heads,
         )
-        assert 2.0 * math.pi / _head_band(cfg)[0] == pytest.approx(0.5 * w_max)
         rows = SLinOSSMixer(cfg).transition_bias.detach().double()
-        assert bool(rows.isfinite().all())
-        # I2 still holds, with the initialization inside the named scale.
-        turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], cfg.w_max).norm(dim=-1)
-        assert float(turn.max()) < cfg.w_max
+        horizon, period = (value.double() for value in _head_lattice(heads))
+        ls = bounded_logscale(rows[:, LS_COLUMN])
+        turn = bounded_rotvec(rows[:, ROTVEC_COLUMNS], ROTATION_CHART_SCALE_MAX).norm(
+            dim=-1
+        )
+        assert_max_rel(-0.5 / ls, horizon, INIT_TOL, "mixer init decay")
+        assert_max_rel(2.0 * math.pi / turn, period, INIT_TOL, "mixer init period")
+        assert bool((ls <= 0.0).all() and (ls >= -LS_MAX_MAG).all())
+        assert float(turn.max()) < ROTATION_CHART_SCALE_MAX
+        assert rows.shape == (heads, PARAM_COLS)
+        if heads > 1:
+            assert float(horizon.min()) == 4.0
+            assert float(horizon.max()) == 4096.0
+            assert float(period.min()) == 4.0
+            assert float(period.max()) == 256.0
 
 
-def test_the_band_uses_only_the_explicit_initialization_span() -> None:
-    """The lattice endpoint is an initialization setting, not task metadata."""
-    base = dict(d_model=32, d_state=48, d_head=16, n_groups=2)
-    for init_span in (32, 128, 1024):
-        cfg = SLinOSSConfig(**base, init_span=init_span)  # type: ignore[arg-type]
-        horizon, period = _head_lattice(cfg.n_heads, _head_band(cfg))
-        assert float(period.max()) == pytest.approx(float(init_span))
-        assert float(horizon.max()) == pytest.approx(float(init_span))
-    assert _head_band(SLinOSSConfig(**base))[1] == DEFAULT_INIT_SPAN  # type: ignore[arg-type]
-
-
-def test_the_default_chart_reaches_a_half_turn_at_finite_radius() -> None:
+def test_the_fixed_chart_reaches_a_half_turn_at_finite_radius() -> None:
     """Every order-2 SO(3) element is an interior point, not an asymptote."""
-    cfg = SLinOSSConfig(d_model=32, d_state=48)
     raw = torch.zeros(1, 3, dtype=torch.float64)
-    fraction = math.pi / cfg.w_max
+    fraction = math.pi / ROTATION_CHART_SCALE_MAX
     raw[0, 0] = fraction / math.sqrt(1.0 - 0.25 * fraction * fraction)
-    turn = float(bounded_rotvec(raw, cfg.w_max).norm(dim=-1))
+    turn = float(bounded_rotvec(raw, ROTATION_CHART_SCALE_MAX).norm(dim=-1))
     assert turn == pytest.approx(math.pi, abs=1e-14)
     assert float(raw.norm()) < 2.0
 
@@ -700,31 +580,34 @@ def test_the_projection_starts_the_transition_at_the_lattice() -> None:
     assert not mixer.layout.params(proj).any()
 
 
-def test_the_homogeneous_orbit_starts_from_a_cyclic_basis() -> None:
-    """Zero cannot carry a rotation; every row instead gets one unit coordinate."""
+def test_initial_state_is_a_fixed_cyclic_carrier() -> None:
+    """Each recurrent row starts from one deterministic unit coordinate."""
     mixer = SLinOSSMixer(MIXER_CONFIG)
-    state = mixer.initial_state
-    assert state.shape == (
-        MIXER_CONFIG.n_heads,
-        MIXER_CONFIG.d_head,
-        MIXER_CONFIG.d_state,
-    )
-    assert torch.equal(state.square().sum(-1), torch.ones_like(state[..., 0]))
-    column = state.argmax(-1)
-    want = torch.arange(MIXER_CONFIG.d_inner).reshape(
-        MIXER_CONFIG.n_heads, MIXER_CONFIG.d_head
-    )
-    assert torch.equal(column, want.remainder(MIXER_CONFIG.d_state))
+    state = cast(Tensor, mixer.initial_state)
+    heads, rows, width = state.shape
+    expected = torch.arange(heads * rows).reshape(heads, rows).remainder(width)
+    assert torch.equal(state.argmax(-1), expected)
+    assert torch.equal(state.sum(-1), torch.ones_like(state[..., 0]))
+    assert torch.count_nonzero(state) == heads * rows
+    assert not state.requires_grad
+    assert "initial_state" not in mixer.state_dict()
 
 
-def test_forcing_and_residual_output_start_as_trainable_no_ops() -> None:
-    """The seeded orbit is not drowned by random forcing or a random residual."""
+def test_bc_and_output_paths_start_live_and_balanced() -> None:
+    """B/C have unit expected vector norm and the residual path is live."""
     mixer = SLinOSSMixer(MIXER_CONFIG)
     layout = mixer.layout
-    assert not mixer.in_proj.weight[layout.b_off : layout.c_off].any()
+    bc_weight = mixer.in_proj.weight[layout.b_off : layout.params_off].float()
+    want = torch.full(
+        (bc_weight.shape[0],),
+        1.0 / math.sqrt(MIXER_CONFIG.d_state),
+    )
+    assert torch.allclose(bc_weight.norm(dim=-1), want, rtol=1e-6, atol=1e-7)
+    assert bool(bc_weight[: layout.groups * layout.state_dim].any())
+    assert bool(bc_weight[layout.groups * layout.state_dim :].any())
     assert mixer.in_proj.bias is not None
-    assert not mixer.in_proj.bias[layout.b_off : layout.c_off].any()
-    assert not mixer.out_proj.weight.any()
+    assert not mixer.in_proj.bias[layout.b_off : layout.params_off].any()
+    assert bool(mixer.out_proj.weight.any())
     assert mixer.out_proj.bias is not None
     assert not mixer.out_proj.bias.any()
 
@@ -744,7 +627,7 @@ def test_the_zeroed_parameter_band_still_takes_gradient() -> None:
     rows = mixer.layout.params(proj).unflatten(-1, (cfg.n_heads, PARAM_COLS))
     bias = mixer.transition_bias[:, ROTVEC_COLUMNS]
     band = rows[..., ROTVEC_COLUMNS] + bias
-    bounded_rotvec(band, cfg.w_max).sum().backward()
+    bounded_rotvec(band, ROTATION_CHART_SCALE_MAX).sum().backward()
 
     grad = mixer.in_proj.weight.grad
     assert grad is not None

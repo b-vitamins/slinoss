@@ -10,7 +10,7 @@ from torch import Tensor
 from slinoss._precision import check_pinned, check_supported
 from slinoss.config import SLinOSSConfig, SLinOSSMixerConfig
 
-__all__ = ["MixerState", "StackState", "oscillator_basis"]
+__all__ = ["MixerState", "StackState"]
 
 
 def _state_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -18,7 +18,7 @@ def _state_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float64 if dtype is torch.float64 else torch.float32
 
 
-def _cyclic_basis(
+def _cyclic_state(
     heads: int,
     rows: int,
     state_dim: int,
@@ -26,27 +26,10 @@ def _cyclic_basis(
     device: torch.device | str,
     dtype: torch.dtype,
 ) -> Tensor:
-    """One deterministic unit carrier per recurrent row."""
-    basis = torch.zeros(heads, rows, state_dim, device=device, dtype=dtype)
+    """Deterministic unit carrier for each recurrent row, shape ``[H,P,S]``."""
+    state = torch.zeros(heads, rows, state_dim, device=device, dtype=dtype)
     column = torch.arange(heads * rows, device=device).reshape(heads, rows)
-    column = column.remainder(state_dim)
-    return basis.scatter_(-1, column[..., None], 1.0)
-
-
-def oscillator_basis(
-    config: SLinOSSMixerConfig,
-    *,
-    device: torch.device | str,
-    dtype: torch.dtype = torch.float32,
-) -> Tensor:
-    """Build the fixed homogeneous carrier ``[H,P,S]``."""
-    return _cyclic_basis(
-        config.n_heads,
-        config.d_head,
-        config.d_state,
-        device=device,
-        dtype=dtype,
-    )
+    return state.scatter_(-1, column.remainder(state_dim)[..., None], 1.0)
 
 
 @dataclass(frozen=True)
@@ -65,8 +48,7 @@ class MixerState:
                 f"conv must be (B, d_conv - 1, d_inner), got {tuple(self.conv.shape)}"
             )
         if self.keys is not None and (
-            self.keys.ndim != 3
-            or int(self.keys.shape[1]) != int(self.conv.shape[1])
+            self.keys.ndim != 3 or int(self.keys.shape[1]) != int(self.conv.shape[1])
         ):
             raise ValueError(
                 f"keys must be (B, d_conv - 1, 2*G*3N) over conv's own history "
@@ -161,9 +143,6 @@ class MixerState:
         """Allocate one state for a fixed positive ``batch``."""
         if batch < 1:
             raise ValueError(f"batch must be positive, got {batch}")
-        basis = oscillator_basis(
-            config, device=device, dtype=_state_dtype(dtype)
-        ).unsqueeze(0)
         return cls(
             conv=torch.zeros(
                 batch, config.d_conv - 1, config.d_inner, dtype=dtype, device=device
@@ -179,7 +158,15 @@ class MixerState:
                 if config.key_conv
                 else None
             ),
-            ssm=basis.expand(batch, -1, -1, -1).clone(),
+            ssm=_cyclic_state(
+                config.n_heads,
+                config.d_head,
+                config.d_state,
+                dtype=_state_dtype(dtype),
+                device=device,
+            )
+            .unsqueeze(0)
+            .repeat(batch, 1, 1, 1),
             b_prev=torch.zeros(
                 batch, config.n_groups, config.d_state, dtype=dtype, device=device
             ),
@@ -197,14 +184,16 @@ class MixerState:
         self.conv.zero_()
         if self.keys is not None:
             self.keys.zero_()
-        basis = _cyclic_basis(
-            int(self.ssm.shape[1]),
-            int(self.ssm.shape[2]),
-            int(self.ssm.shape[3]),
-            device=self.ssm.device,
-            dtype=self.ssm.dtype,
+        heads, rows, state_dim = (int(size) for size in self.ssm.shape[1:])
+        self.ssm.copy_(
+            _cyclic_state(
+                heads,
+                rows,
+                state_dim,
+                device=self.ssm.device,
+                dtype=self.ssm.dtype,
+            )
         )
-        self.ssm.copy_(basis.unsqueeze(0).expand_as(self.ssm))
         self.b_prev.zero_()
         self.u_prev.zero_()
 

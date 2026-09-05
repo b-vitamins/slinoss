@@ -182,18 +182,16 @@ def size_arm(
     """
     from scripts.lm.mixers import REGISTRY
     from scripts.lm.model import (
+        LMConfig,
         build_model,
         layer_factories,
         parameter_count,
-        scaffold_config,
     )
 
     resolved = REGISTRY.resolve(mixer, overrides)
 
     def count(d_model: int) -> int:
-        config = scaffold_config(
-            d_model=d_model, n_layers=n_layers, vocab_size=vocab_size
-        )
+        config = LMConfig(d_model=d_model, n_layers=n_layers, vocab_size=vocab_size)
         model = build_model(
             config,
             layer_factories(resolved.factory, n_layers),

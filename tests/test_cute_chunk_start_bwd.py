@@ -277,13 +277,16 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert start_smem_bytes(64, 16, 48) < nbytes
 
 
-def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
+def test_rejects_a_shape_the_carveout_cannot_hold(
+    reference_smem_capacity: int,
+) -> None:
     """An oversized state width is refused on the host, not silently clipped.
 
     ``3N`` is legal at any multiple of 48, and the rotated readout tile grows with
     it, so the largest legal ``3N`` at ``MAX_CHUNK`` is set by the carveout and
     nothing else checks it.
     """
+    assert smem_capacity() == reference_smem_capacity
     inp = _make(1, 1, MAX_CHUNK, 16, 112, torch.bfloat16)
     dy = _cotangent(inp, torch.bfloat16)
     with pytest.raises(ValueError, match="chunk_start_bwd"):

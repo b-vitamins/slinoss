@@ -19,6 +19,7 @@ by the time it is used that way.
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import pytest
@@ -332,6 +333,31 @@ def test_the_ffn_output_is_a_canonical_linear() -> None:
     bound = cfg.d_ffn**-0.5
     assert float(weight.abs().max()) <= bound
     assert float(bias.abs().max()) <= bound
+
+
+def test_residual_outputs_use_one_depth_scaling_rule() -> None:
+    """Both residual branches scale by ``1/sqrt(2 * depth)`` at construction."""
+    shallow_cfg = replace(STACK_CONFIG, n_layers=1)
+    deep_cfg = replace(STACK_CONFIG, n_layers=4)
+    torch.manual_seed(0)
+    shallow = SLinOSSBlock(shallow_cfg)
+    torch.manual_seed(0)
+    deep = SLinOSSBlock(deep_cfg)
+    ratio = math.sqrt(shallow_cfg.n_layers / deep_cfg.n_layers)
+    torch.testing.assert_close(
+        deep.mixer.out_proj.weight,
+        shallow.mixer.out_proj.weight * ratio,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        deep.ffn_out.weight,
+        shallow.ffn_out.weight * ratio,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert deep.ffn_out.bias is not None
+    assert not deep.ffn_out.bias.any()
 
 
 DECODE_SPLITS = [

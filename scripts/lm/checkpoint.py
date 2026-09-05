@@ -23,12 +23,11 @@ from typing import Any, NamedTuple
 import torch
 
 from scripts.lm.corpus import CorpusManifest, from_dict, to_dict
-from scripts.lm.model import MixerLM
-from slinoss import SLinOSSConfig
+from scripts.lm.model import LMConfig, MixerLM
 
 __all__ = ["FORMAT", "Checkpoint", "load", "load_model", "save"]
 
-FORMAT = 2
+FORMAT = 3
 """Layout version. A file from another version is refused, not guessed at."""
 
 
@@ -50,7 +49,7 @@ class Checkpoint(NamedTuple):
         state_dict: Parameter and buffer tensors.
     """
 
-    config: SLinOSSConfig
+    config: LMConfig
     manifest: CorpusManifest | None
     mixer: str
     mixer_settings: dict[str, Any]
@@ -68,7 +67,7 @@ def save(
     path: Path,
     model: MixerLM,
     *,
-    config: SLinOSSConfig,
+    config: LMConfig,
     mixer: str,
     mixer_settings: dict[str, Any],
     max_length: int,
@@ -141,7 +140,7 @@ def load(path: Path) -> Checkpoint:
         raise ValueError(f"checkpoint format is {found} and this reader is {FORMAT}")
     raw_manifest = payload["manifest"]
     return Checkpoint(
-        config=SLinOSSConfig(**payload["config"]),
+        config=LMConfig(**payload["config"]),
         manifest=None if raw_manifest is None else from_dict(raw_manifest),
         mixer=payload["mixer"],
         mixer_settings=payload["mixer_settings"],

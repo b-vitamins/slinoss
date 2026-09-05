@@ -163,9 +163,7 @@ def _row(
         ``PARAM_COLS`` float32 map inputs in column order.
     """
     raw = [gparams[bidx, token, base + slot] for slot in range(PARAM_COLS)]
-    return [
-        widen(raw[slot], dtype) + gbias[base + slot] for slot in range(PARAM_COLS)
-    ]
+    return [widen(raw[slot], dtype) + gbias[base + slot] for slot in range(PARAM_COLS)]
 
 
 @cute.jit

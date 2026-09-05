@@ -43,7 +43,7 @@ from scripts.lm import shim
 from scripts.lm.checkpoint import save
 from scripts.lm.corpus import CorpusManifest, ShardCounts
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import MixerLM, build_model, layer_factories, scaffold_config
+from scripts.lm.model import LMConfig, MixerLM, build_model, layer_factories
 from scripts.lm.shim import SLinOSSEvalWrapper
 
 D_MODEL = 64
@@ -98,9 +98,7 @@ def _save(path: Path, *, manifest: CorpusManifest | None) -> MixerLM:
     ``tests/test_lm_checkpoint.py`` covers.
     """
     torch.manual_seed(0)
-    config = scaffold_config(
-        d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB, d_state=48, d_head=16
-    )
+    config = LMConfig(d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB)
     resolved = REGISTRY.resolve("conv")
     stack = build_model(
         config, layer_factories(resolved.factory, N_LAYERS), max_length=MAX_LENGTH

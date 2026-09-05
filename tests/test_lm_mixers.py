@@ -4,7 +4,7 @@ Three failure modes here, none of which shows up until an arm is a day into a ru
 
 A default named in this module that is not a field of the thing it builds raises at
 construction, after the corpus is prepped and the width solved. The slinoss entry reads its
-defaults off :class:`slinoss.SLinOSSConfig` for exactly that reason, so the check is that the
+defaults off :class:`slinoss.SLinOSSMixerConfig` for exactly that reason, so the check is that the
 keys are the config's and that ``d_state`` -- the one value the config has no default for -- is
 legal for the kernel.
 
@@ -26,7 +26,7 @@ from torch import Tensor, nn
 
 from scripts.lm.groups import classify
 from scripts.lm.mixers import REGISTRY, Unwrap
-from slinoss import SLinOSSConfig, SLinOSSMixer
+from slinoss import SLinOSSMixer, SLinOSSMixerConfig
 
 ARMS = ("slinoss", "gpt", "conv", "mamba2", "mamba3", "gdn2")
 
@@ -80,7 +80,7 @@ def test_the_slinoss_defaults_are_all_config_fields() -> None:
     keyword; every other key has to be a field.
     """
     settings = REGISTRY.resolve("slinoss").settings
-    names = {field.name for field in fields(SLinOSSConfig)}
+    names = {field.name for field in fields(SLinOSSMixerConfig)}
     assert set(settings) <= names
     assert "d_model" not in settings
     assert "context_length" not in settings
@@ -97,17 +97,16 @@ def test_the_slinoss_defaults_are_the_config_s_own_values() -> None:
     for key, value in settings.items():
         if key == "d_state":
             continue
-        assert value == getattr(SLinOSSConfig, key)
+        assert value == getattr(SLinOSSMixerConfig, key)
     assert settings["d_state"] > 0
     assert settings["d_state"] % 48 == 0
 
 
-def test_slinoss_declares_context_unused_and_keeps_its_init_span() -> None:
-    """The fixed-span master mixer must not silently claim to consume context."""
-    resolved = REGISTRY.resolve("slinoss", ["init_span=8192"])
+def test_slinoss_declares_context_unused() -> None:
+    """The mixer has no length-sized parameter or buffer."""
+    resolved = REGISTRY.resolve("slinoss")
     mixer = resolved.factory(128, 2048)
     assert isinstance(mixer, SLinOSSMixer)
-    assert mixer.config.init_span == 8192
     assert resolved.constructions[-1]["context"] == {
         "max_length_supplied": 2048,
         "max_length_policy": "unused",

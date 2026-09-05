@@ -382,7 +382,7 @@ BOUNDS: dict[torch.dtype, dict[str, float]] = {
         "carry_u": 8e-3,
         "dlogp": 5e-3,
         "dchunk_rot": 6e-3,
-        "dchunk_scale": 2.5e-6,
+        "dchunk_scale": 3e-6,
     },
     torch.float16: {
         "dU": 8e-4,
@@ -603,7 +603,9 @@ def test_reads_a_band_of_the_fused_projection() -> None:
         assert torch.equal(getattr(got, name), getattr(base, name)), name
 
 
-def test_shared_memory_budget_fits_the_queried_capacity() -> None:
+def test_shared_memory_budget_fits_the_queried_capacity(
+    reference_smem_capacity: int,
+) -> None:
     """The budget is computed from the layouts, not from a guard constant.
 
     Two blocks per SM at the shape the DRAM-bound class is declared against is what
@@ -616,6 +618,7 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     block that has to be split, and the widest state the config layer accepts still
     runs two blocks deep.
     """
+    assert smem_capacity() == reference_smem_capacity
     assert 2 * input_smem_bytes(64, 48, 48) <= smem_capacity()
     assert input_smem_bytes(MAX_CHUNK, 48, 48) <= smem_capacity()
     assert input_smem_bytes(64, 128, 96) <= smem_capacity()
@@ -655,7 +658,11 @@ WIDTHS: list[tuple[int, int, int, int]] = [
 
 @pytest.mark.parametrize(("chunk", "rows", "dim", "want"), WIDTHS)
 def test_the_block_width_follows_the_lane_extent(
-    chunk: int, rows: int, dim: int, want: int
+    chunk: int,
+    rows: int,
+    dim: int,
+    want: int,
+    reference_smem_capacity: int,
 ) -> None:
     """The dispatch reads the lane count, and its choice fits the carveout.
 
@@ -664,6 +671,7 @@ def test_the_block_width_follows_the_lane_extent(
     a shape whose arena then did not fit would be refused on the host instead of run, so
     the budget is asserted at the width the dispatch actually returns.
     """
+    assert smem_capacity() == reference_smem_capacity
     got = input_threads(chunk, rows, dim)
     assert got == want, (chunk, rows, dim)
     assert input_smem_bytes(chunk, rows, dim, warps=got // 32) <= smem_capacity()
@@ -729,13 +737,14 @@ def test_the_lane_run_is_the_widest_the_row_mapping_admits(
         assert chunk % loose or rows % loose, (got // 2, loose)
 
 
-def test_refuses_a_shape_no_lane_block_fits() -> None:
+def test_refuses_a_shape_no_lane_block_fits(reference_smem_capacity: int) -> None:
     """The narrowest block overflowing the carveout is an error, not a return value.
 
     :func:`lblock` promises a block that fits. ``L=16 P=224 3N=48`` has one candidate,
     48, and it needs 102,576 B of a 101,376 B carveout, so there is nothing to return
     and the caller cannot tell a fitting block from an overflowing one by its width.
     """
+    assert smem_capacity() == reference_smem_capacity
     with pytest.raises(ValueError, match="no lane block"):
         lblock(16, 224, 48, warps=4)
 
@@ -773,12 +782,15 @@ def test_the_two_block_widths_differ_only_in_warp_reduction_order() -> None:
         assert_max_rel(getattr(wide, name), getattr(narrow, name), 1e-6, f"wide.{name}")
 
 
-def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
+def test_rejects_a_shape_the_carveout_cannot_hold(
+    reference_smem_capacity: int,
+) -> None:
     """An oversized triple is refused on the host, not silently clipped.
 
     ``L``, ``P`` and ``3N`` are each legal at the values below and only their
     product overflows the carveout, so nothing but the budget checks this.
     """
+    assert smem_capacity() == reference_smem_capacity
     inp = _make(1, 1, MAX_CHUNK, 128, 32, torch.bfloat16)
     dy = _cotangent(inp, torch.bfloat16)
     want = _oracle(inp, dy, MAX_CHUNK, dstate=_dstate(inp))

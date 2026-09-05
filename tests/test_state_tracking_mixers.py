@@ -51,21 +51,13 @@ def test_slinoss_settings_build_a_legal_config() -> None:
     lands on a GPU host after a split has been generated, so both are settled here.
     ``d_state`` is named in the registry because the config has no default for it.
     """
-    from slinoss import SLinOSSConfig
+    from slinoss import SLinOSSMixerConfig
 
     settings = resolve("slinoss").settings
-    names = {field.name for field in fields(SLinOSSConfig)}
-    stack_only = {
-        "d_model",
-        "n_layers",
-        "ffn_ratio",
-        "norm_eps",
-        "vocab_size",
-        "vocab_pad_multiple",
-    }
-    assert set(settings) == names - stack_only
+    names = {field.name for field in fields(SLinOSSMixerConfig)}
+    assert set(settings) == names - {"d_model"}
     assert settings["d_state"] == 144
-    config = SLinOSSConfig(d_model=128, **settings)
+    config = SLinOSSMixerConfig(d_model=128, **settings)
     assert config.d_state == 144
     assert config.d_model == 128
 
@@ -78,13 +70,11 @@ def test_slinoss_declares_context_unused_and_keeps_fixed_init() -> None:
     mixer = resolved.factory(128, MAX_LENGTH)
     assert isinstance(mixer, SLinOSSMixer)
     assert resolved.max_length_policy == "unused"
-    assert mixer.config.init_span == 4096
     assert resolved.constructions[0]["context"] == {
         "max_length_supplied": MAX_LENGTH,
         "max_length_policy": "unused",
         "max_length_consumed": None,
     }
-    assert resolved.constructions[0]["effective_config"]["init_span"] == 4096
 
 
 def test_overrides_are_read_at_the_defaults_type() -> None:

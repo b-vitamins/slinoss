@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple
+import math
+from typing import NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
@@ -64,6 +65,13 @@ class SLinOSSBlock(Float32Module):
             device=device,
             dtype=dtype,
         )
+        residual_scale = 1.0 / math.sqrt(2.0 * config.n_layers)
+        with torch.no_grad():
+            self.mixer.out_proj.weight.mul_(residual_scale)
+            self.ffn_out.weight.mul_(residual_scale)
+            bias = cast(Tensor | None, self.ffn_out.bias)
+            if bias is not None:
+                bias.zero_()
 
     def forward(
         self,

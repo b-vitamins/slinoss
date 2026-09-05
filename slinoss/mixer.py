@@ -13,14 +13,14 @@ from torch.nn.functional import linear
 from slinoss._guard import PROJ_ALIGN
 from slinoss._linear import linear_backward
 from slinoss._precision import Float32Module, cast_opt, cast_to
-from slinoss.config import SLinOSSMixerConfig
+from slinoss.config import ROTATION_CHART_SCALE_MAX, SLinOSSMixerConfig
 from slinoss.ops.conv import backends as conv_dispatch
 from slinoss.ops.mixer import backends as tail_dispatch
 from slinoss.ops.scanprep import LS_COLUMN, LS_MAX_MAG, PARAM_COLS, ROTVEC_COLUMNS
 from slinoss.ops.scanprep import backends as prep_dispatch
 from slinoss.ops.so3ssd import backends as scan_dispatch
 from slinoss.ops.so3ssd.reference import ScanPrologue
-from slinoss.state import MixerState, oscillator_basis
+from slinoss.state import MixerState, _cyclic_state
 
 __all__ = ["ProjectionLayout", "SLinOSSMixer"]
 
@@ -148,35 +148,36 @@ class ProjectionLayout:
         return band.unflatten(-1, (self.groups, self.state_dim)).permute(0, 2, 1, 3)
 
 
-_MAP_HEADROOM = 0.5
-
-
-def _head_band(config: SLinOSSMixerConfig) -> tuple[float, float]:
-    """Initialized period/horizon band in tokens."""
-    fast = 2.0 * math.pi / (_MAP_HEADROOM * config.w_max)
-    slow = float(config.init_span)
-    return (fast, max(fast, slow))
-
-
-_MAX_MAP_FRACTION = 0.9
+_PERIOD_BAND = (4.0, 256.0)
+_HORIZON_BAND = (4.0, 4096.0)
+_L2_EPS = 1e-12
 
 
 def _head_grid(bounds: tuple[float, float], heads: int) -> Tensor:
     """Log-spaced ``float32`` grid with exact endpoints."""
     low, high = bounds
-    if heads < 2:
-        return torch.full((heads,), low, dtype=torch.float32)
     ramp = torch.arange(heads, dtype=torch.float64) / (heads - 1)
     return (low * (high / low) ** ramp).float()
 
 
-def _head_lattice(heads: int, band: tuple[float, float]) -> tuple[Tensor, Tensor]:
-    """Boustrophedon ``(horizon, period)`` pairs over a near-square grid."""
+def _head_lattice(heads: int) -> tuple[Tensor, Tensor]:
+    """Independent decay-horizon and rotation-period spectra."""
+    if heads == 1:
+        horizon = math.sqrt(_HORIZON_BAND[0] * _HORIZON_BAND[1])
+        period = math.sqrt(_PERIOD_BAND[0] * _PERIOD_BAND[1])
+        return (
+            torch.tensor([horizon], dtype=torch.float32),
+            torch.tensor([period], dtype=torch.float32),
+        )
+    if heads < 4:
+        horizon = _head_grid(_HORIZON_BAND, heads)
+        period = _head_grid(_PERIOD_BAND, heads).roll(1)
+        return horizon, period
     n_h = max(1, math.isqrt(heads))
     n_p = -(-heads // n_h)
-    rows = _head_grid(band, n_h).expand(n_p, n_h).clone()
+    rows = _head_grid(_HORIZON_BAND, n_h).expand(n_p, n_h).clone()
     rows[1::2] = rows[1::2].flip(-1)
-    period = _head_grid(band, n_p).repeat_interleave(n_h)
+    period = _head_grid(_PERIOD_BAND, n_p).repeat_interleave(n_h)
     return rows.reshape(-1)[:heads], period[:heads]
 
 
@@ -194,13 +195,30 @@ def _transition_bias_init(config: SLinOSSMixerConfig) -> Tensor:
     """Invert the physical period/horizon lattice into raw transition rows."""
     heads = config.n_heads
     rows = torch.zeros(heads, PARAM_COLS, dtype=torch.float32)
-    horizon, period = _head_lattice(heads, _head_band(config))
-    decay = (0.5 / (horizon * LS_MAX_MAG)).clamp(max=_MAX_MAP_FRACTION)
+    horizon, period = _head_lattice(heads)
+    decay = 0.5 / (horizon * LS_MAX_MAG)
     rows[:, LS_COLUMN] = torch.logit(decay)
-    angle = (2.0 * math.pi / (period * config.w_max)).clamp(max=_MAX_MAP_FRACTION)
+    angle = 2.0 * math.pi / (period * ROTATION_CHART_SCALE_MAX)
     radius = angle * torch.rsqrt(1.0 - 0.25 * angle * angle)
     rows[:, ROTVEC_COLUMNS] = radius[:, None] * _fibonacci_axes(heads)
     return rows
+
+
+def _l2_normalize_(value: Tensor) -> Tensor:
+    """Normalize the trailing state axis in place and return its inverse norm."""
+    dtype = torch.float64 if value.dtype is torch.float64 else torch.float32
+    norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True, dtype=dtype)
+    scale = norm.clamp_min(_L2_EPS).reciprocal()
+    value.mul_(scale.to(value.dtype))
+    return scale
+
+
+def _l2_normalize_vjp_(grad: Tensor, unit: Tensor, scale: Tensor) -> None:
+    """Apply the L2-normalization pullback to ``grad`` in place."""
+    radial = torch.linalg.vecdot(grad, unit, dim=-1).unsqueeze(-1)
+    radial.masked_fill_(scale >= 1.0 / _L2_EPS, 0.0)
+    grad.addcmul_(unit, radial, value=-1.0)
+    grad.mul_(scale.to(grad.dtype))
 
 
 class _Backends(NamedTuple):
@@ -291,8 +309,13 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         )
         b_band = layout.b(proj) if keys is None else layout.key_b(keys)
         c_band = layout.c(proj) if keys is None else layout.key_c(keys)
+        b_scale = _l2_normalize_(b_band)
+        c_scale = _l2_normalize_(c_band)
         params = prep_dispatch.get(picks.prep).forward(
-            layout.params(proj), transition_bias, heads=config.n_heads, w_max=config.w_max
+            layout.params(proj),
+            transition_bias,
+            heads=config.n_heads,
+            w_max=ROTATION_CHART_SCALE_MAX,
         )
         z0 = initial_state.unsqueeze(0).expand(x.shape[0], -1, -1, -1).contiguous()
         scan = scan_dispatch.get(picks.scan).forward(
@@ -327,6 +350,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             key_weight,
             keys,
             z0,
+            b_scale,
+            c_scale,
             # Last, so the parameter slices above stay fixed. Three Nones from a
             # backend whose backward rebuilds the boundary instead.
             *((None, None, None) if scan.prologue is None else scan.prologue),
@@ -343,7 +368,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
         in_weight, in_bias, conv_weight, conv_bias, transition_bias = saved[7:12]
         d_skip, norm_weight, out_weight, out_bias = saved[12:16]
         key_weight, keys, z0 = saved[16:19]
-        zstart, cquat, cscale = saved[19:]
+        b_scale, c_scale = saved[19:21]
+        zstart, cquat, cscale = saved[21:]
         layout: ProjectionLayout = ctx.layout
         config: SLinOSSMixerConfig = ctx.config
         picks: _Backends = ctx.picks
@@ -395,6 +421,8 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             dU_init=tail_grads.du,
             prologue=(None if zstart is None else ScanPrologue(zstart, cquat, cscale)),
         )
+        _l2_normalize_vjp_(db_band, b_band, b_scale)
+        _l2_normalize_vjp_(dc_band, c_band, c_scale)
         key_dweight: Tensor | None = None
         if key_weight is not None:
             key_dweight = cast_to(
@@ -417,7 +445,7 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
             layout.params(proj),
             transition_bias,
             heads=config.n_heads,
-            w_max=config.w_max,
+            w_max=ROTATION_CHART_SCALE_MAX,
             dparams=layout.params(dproj),
         )
         conv_grads = conv_dispatch.get(picks.conv).backward(
@@ -451,7 +479,6 @@ class _SLinOSSMixerFunction(torch.autograd.Function):
 class SLinOSSMixer(Float32Module):
     """Fused SO(3) state-space mixer with whole-sequence and decode paths."""
 
-    initial_state: Tensor
     _float32_names = (
         "transition_bias",
         "d_skip",
@@ -506,7 +533,13 @@ class SLinOSSMixer(Float32Module):
         cast(Any, self.d_skip)._no_weight_decay = True
         self.register_buffer(
             "initial_state",
-            oscillator_basis(config, device=init_device, dtype=torch.float32),
+            _cyclic_state(
+                config.n_heads,
+                config.d_head,
+                config.d_state,
+                device=init_device,
+                dtype=torch.float32,
+            ),
             persistent=False,
         )
         self.norm_weight = nn.Parameter(
@@ -520,15 +553,18 @@ class SLinOSSMixer(Float32Module):
             dtype=dtype,
         )
         with torch.no_grad():
-            self.out_proj.weight.zero_()
             out_bias = cast(Tensor | None, self.out_proj.bias)
             if out_bias is not None:
                 out_bias.zero_()
-            self.in_proj.weight[self.layout.b_off : self.layout.c_off].zero_()
+            bc_weight = self.in_proj.weight[self.layout.b_off : self.layout.params_off]
+            row_scale = bc_weight.float().square().sum(-1, keepdim=True).rsqrt()
+            bc_weight.mul_(
+                (row_scale / math.sqrt(config.d_state)).to(bc_weight.dtype)
+            )
             self.in_proj.weight[self.layout.params_off :].zero_()
             in_bias = cast(Tensor | None, self.in_proj.bias)
             if in_bias is not None:
-                in_bias[self.layout.b_off : self.layout.c_off].zero_()
+                in_bias[self.layout.b_off : self.layout.params_off].zero_()
                 in_bias[self.layout.params_off :].zero_()
             bound = 1.0 / math.sqrt(config.d_conv)
             self.conv_weight.uniform_(-bound, bound)
@@ -598,18 +634,22 @@ class SLinOSSMixer(Float32Module):
                 initial_state=cast(Tensor, state.keys),
             )
         )
+        b_band = layout.b(proj) if keys is None else layout.key_b(keys.y)
+        c_band = layout.c(proj) if keys is None else layout.key_c(keys.y)
+        _l2_normalize_(b_band)
+        _l2_normalize_(c_band)
         params = prep_dispatch.get(picks.prep).forward(
             layout.params(proj),
             self.transition_bias,
             heads=cfg.n_heads,
-            w_max=cfg.w_max,
+            w_max=ROTATION_CHART_SCALE_MAX,
         )
         scan = scan_dispatch.get(picks.scan).forward(
             conv.y,
             params.trans,
             params.K,
-            layout.b(proj) if keys is None else layout.key_b(keys.y),
-            layout.c(proj) if keys is None else layout.key_c(keys.y),
+            b_band,
+            c_band,
             cfg.chunk_size,
             z0=state.ssm,
             b_prev=state.b_prev,

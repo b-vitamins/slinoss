@@ -21,7 +21,7 @@ if not torch.cuda.is_available():
 
 from collections.abc import Callable
 
-from slinoss._cute import smem_budget, smem_residency
+from slinoss._cute import smem_budget, smem_capacity, smem_residency
 from slinoss.config import MAX_CHUNK
 from slinoss.ops.so3ssd import chunked_forward
 from slinoss.ops.so3ssd.cute.fwd import chunk_increment
@@ -228,6 +228,7 @@ def test_slice_is_the_atom_k_extent_at_every_legal_shape() -> None:
 
 def test_slice_narrows_only_when_the_widest_one_would_cost_a_block(
     monkeypatch: pytest.MonkeyPatch,
+    reference_smem_capacity: int,
 ) -> None:
     """``kblock`` trades slice width for residency, and only when it has to.
 
@@ -237,6 +238,7 @@ def test_slice_narrows_only_when_the_widest_one_would_cost_a_block(
     to fit, and one that always narrowed would pay the extra staging pass for
     nothing. This is what makes the ceiling safe to widen again.
     """
+    assert smem_capacity() == reference_smem_capacity
     monkeypatch.setattr(chunk_increment, "KBLOCK_MAX", 2 * MMA_TILE_K)
     budget = smem_budget(TARGET_BLOCKS)
     wide = increment_smem_bytes(MAX_CHUNK, 64, 96, kblk=2 * MMA_TILE_K)

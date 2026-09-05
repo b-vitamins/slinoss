@@ -25,7 +25,6 @@ from scripts.tsc.linoss import LinOSSRecurrence
 from scripts.tsc.mixers import REGISTRY, Unwrap, paper_overrides
 from scripts.tsc.model import ModelConfig, build_model
 from scripts.tsc.protocol import DATASETS, setting_for
-from slinoss import SLinOSSConfig
 
 REGISTERED = (
     "attention",
@@ -124,23 +123,25 @@ def test_a_baselines_settings_resolve_without_its_package() -> None:
 
 
 def test_the_slinoss_defaults_are_config_fields_at_the_configs_own_values() -> None:
-    """Read off :class:`slinoss.SLinOSSConfig`, except the two this axis has to choose.
+    """Read off :class:`slinoss.SLinOSSMixerConfig`, except the two this axis chooses.
 
     A default named here that is not a field raises at construction. ``d_state`` has no default
     on the config and must be a positive multiple of 48 for the kernels; ``d_head`` is narrowed
     from 64 to fit ``hidden_dim`` 16, which is the whole reason this entry restates anything.
     """
     settings = REGISTRY.resolve("slinoss").settings
-    assert set(settings) <= {field.name for field in fields(SLinOSSConfig)}
+    from slinoss import SLinOSSMixerConfig
+
+    assert set(settings) <= {field.name for field in fields(SLinOSSMixerConfig)}
     assert "d_model" not in settings
     for key, value in settings.items():
         if key in {"d_state", "d_head"}:
             continue
-        assert value == getattr(SLinOSSConfig, key), key
+        assert value == getattr(SLinOSSMixerConfig, key), key
     assert settings["d_state"] > 0 and settings["d_state"] % 48 == 0
     assert settings["d_head"] == 16
     # The narrowing is a departure from the config and has to stay visible as one.
-    assert SLinOSSConfig.d_head != settings["d_head"]
+    assert SLinOSSMixerConfig.d_head != settings["d_head"]
 
 
 def test_the_published_state_width_reaches_the_reference_recurrence_alone() -> None:

@@ -83,9 +83,7 @@ the last, and the three norm weights stay float32 through a module-wide cast.
 ```python
 from slinoss import SLinOSSStack
 
-cfg = SLinOSSConfig(
-    d_model=576, d_state=48, d_head=48, n_layers=13, vocab_size=50257
-)
+cfg = SLinOSSConfig(d_model=576, d_state=48, d_head=48, n_layers=13, vocab_size=50257)
 model = SLinOSSStack(cfg).cuda().to(torch.bfloat16)
 
 ids = torch.randint(0, 50257, (4, 2048), device="cuda")
@@ -115,8 +113,8 @@ addresses. Prefill and a single token are the same call at two sequence lengths.
 from slinoss import StackState
 
 state = StackState.allocate(cfg, 4, device="cuda", dtype=torch.bfloat16)
-logits = model(ids[:, :-1], state)   # prefill
-logits = model(ids[:, -1:], state)   # one token
+logits = model(ids[:, :-1], state)  # prefill
+logits = model(ids[:, -1:], state)  # one token
 ```
 
 Cast the module to the state's dtype rather than decoding under autocast.

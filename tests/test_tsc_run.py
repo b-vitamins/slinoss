@@ -313,7 +313,6 @@ def test_one_point_end_to_end_writes_a_record_a_harvest_accepts(
         "training_ceiling": 3,
         "evaluation_ceiling": 3,
         "observed_tensor_width": {"train": 3, "validation": 3, "test": 3},
-        "mixer_initialization_span": None,
     }
     assert record["seeds"] == {"model": SEED, "partition": SEED, "batch_order": SEED}
     assert len(record["data"]["identity"]) == 64

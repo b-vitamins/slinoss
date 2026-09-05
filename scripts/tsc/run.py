@@ -195,11 +195,6 @@ def run_point(
         "partition_seed": point.seed,
         "split_sizes": list(rows.sizes),
     }
-    initialization_spans = [
-        construction["effective_config"].get("init_span")
-        for construction in mixer.constructions
-        if "init_span" in construction["effective_config"]
-    ]
     parameter = next(built.parameters())
     return {
         "plan": plan,
@@ -229,7 +224,6 @@ def run_point(
                 "validation": splits.val.length,
                 "test": splits.test.length,
             },
-            "mixer_initialization_span": initialization_spans or None,
         },
         "seeds": {
             "model": point.seed,

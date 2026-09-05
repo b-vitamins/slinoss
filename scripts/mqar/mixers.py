@@ -28,7 +28,7 @@ import importlib
 import importlib.util
 import math
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, NamedTuple, cast
@@ -36,6 +36,7 @@ from typing import Any, Literal, NamedTuple, cast
 import torch
 from torch import Tensor, nn
 
+from scripts.harness import build_slinoss, slinoss_defaults
 from scripts.mqar.model import MixerFactory, protect
 
 Setting = bool | int | float | str
@@ -357,52 +358,11 @@ def _build_conv(d_model: int, **settings: Setting) -> nn.Module:
 
 
 def _build_slinoss(d_model: int, **settings: Setting) -> nn.Module:
-    from slinoss.config import SLinOSSConfig
-    from slinoss.mixer import SLinOSSMixer
-
-    config = SLinOSSConfig(
-        d_model=d_model,
-        d_state=int(settings["d_state"]),
-        expand=float(settings["expand"]),
-        d_head=int(settings["d_head"]),
-        n_groups=int(settings["n_groups"]),
-        chunk_size=int(settings["chunk_size"]),
-        d_conv=int(settings["d_conv"]),
-        key_conv=bool(settings["key_conv"]),
-        init_span=int(settings["init_span"]),
-        w_max=float(settings["w_max"]),
-        bias=bool(settings["bias"]),
-        conv_bias=bool(settings["conv_bias"]),
-    )
-    return protect(SLinOSSMixer(config))
+    return protect(build_slinoss(d_model, **settings))
 
 
 def _slinoss_defaults() -> dict[str, Setting]:
-    """Read every slinoss setting's default off :class:`slinoss.config.SLinOSSConfig`.
-
-    Only ``d_state`` is named here, because it has no default there. Everything else is
-    read from the dataclass so this registry cannot drift from the contract it configures.
-    """
-    from slinoss.config import SLinOSSConfig
-
-    declared = {field.name: field for field in fields(SLinOSSConfig)}
-    defaults: dict[str, Setting] = {"d_state": 144}
-    for name in (
-        "expand",
-        "d_head",
-        "n_groups",
-        "chunk_size",
-        "d_conv",
-        "key_conv",
-        "init_span",
-        "w_max",
-        "bias",
-        "conv_bias",
-    ):
-        default = declared[name].default
-        assert isinstance(default, bool | int | float | str), name
-        defaults[name] = default
-    return defaults
+    return cast("dict[str, Setting]", slinoss_defaults(144))
 
 
 def _coerce(key: str, default: Setting, text: str) -> Setting:

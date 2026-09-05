@@ -824,7 +824,9 @@ def test_writes_into_a_band_of_the_projection_gradient() -> None:
         assert outside.isnan().all()
 
 
-def test_shared_memory_budget_fits_the_queried_capacity() -> None:
+def test_shared_memory_budget_fits_the_queried_capacity(
+    reference_smem_capacity: int,
+) -> None:
     """The budget is computed from the layouts, not from a guard constant.
 
     The block over source tokens is what the budget buys: the full atom tile at
@@ -841,6 +843,7 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     below the fold: the 13,312 B a shared fold sum took is more than the carveout has
     spare at that block, so every depth under the fold used to demote it to 32.
     """
+    assert smem_capacity() == reference_smem_capacity
     assert vblock(64, 48, 48, 1) == 64
     assert vector_smem_bytes(64, 48, 48, 1, 64) <= smem_capacity()
     # The fold no longer halves the block, and the full budget fits at every depth.
@@ -882,7 +885,9 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
     assert vector_smem_bytes(64, 64, 240, 1, 64, 2, groups) <= smem_capacity()
 
 
-def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
+def test_rejects_a_shape_the_carveout_cannot_hold(
+    reference_smem_capacity: int,
+) -> None:
     """An oversized triple is refused on the host, not silently clipped.
 
     ``L``, ``P`` and ``3N`` are each legal at the values below and only their
@@ -891,6 +896,7 @@ def test_rejects_a_shape_the_carveout_cannot_hold() -> None:
     score fragment as well as a row band, and refusing is the contract rather than
     a smaller block.
     """
+    assert smem_capacity() == reference_smem_capacity
     inp = _make(1, 1, MAX_CHUNK, 16, 16, torch.bfloat16)
     dy = _cotangent(inp, torch.bfloat16)
     want = _oracle(inp, dy, MAX_CHUNK, dstate=_dstate(inp))
@@ -1086,6 +1092,7 @@ def test_rejects_an_extent_the_atom_cannot_cover(
     groups: int | None,
     splits: int | None,
     match: str,
+    reference_smem_capacity: int,
 ) -> None:
     """The fix for an illegal extent is the shape, never a padding path.
 
@@ -1093,6 +1100,7 @@ def test_rejects_an_extent_the_atom_cannot_cover(
     reference refuses ``P = 24`` and ``3N = 24`` itself, so no pipeline can produce a
     matching set, and the extent check runs before any element is read.
     """
+    assert smem_capacity() == reference_smem_capacity
     seqlen = 128
     chunks = -(-seqlen // chunk)
     inp = _make(2, 2, seqlen, rows, lanes, torch.bfloat16, groups=groups)

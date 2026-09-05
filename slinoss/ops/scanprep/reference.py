@@ -403,9 +403,7 @@ def scanprep_ref(
         rows = params.unflatten(-1, (heads, PARAM_COLS)).to(dtype)
         rows = rows.permute(0, 2, 1, 3)
         bias = transition_bias.to(dtype)[:, None, :]
-        w = bounded_rotvec(
-            rows[..., ROTVEC_COLUMNS] + bias[..., ROTVEC_COLUMNS], w_max
-        )
+        w = bounded_rotvec(rows[..., ROTVEC_COLUMNS] + bias[..., ROTVEC_COLUMNS], w_max)
         ls = bounded_logscale(rows[..., LS_COLUMN] + bias[..., LS_COLUMN])
         tap = foh_taps(w, ls)
         trans = torch.cat([w, ls[..., None]], dim=-1).contiguous()
@@ -461,7 +459,9 @@ def scanprep_bwd_ref(
     cl = transition_bias.detach().requires_grad_(True)
     with torch.enable_grad():
         out = scanprep_ref(pl, cl, heads=heads, w_max=w_max)
-    grad, dtransition_bias = torch.autograd.grad((out.trans, out.K), (pl, cl), (dtrans, dK))
+    grad, dtransition_bias = torch.autograd.grad(
+        (out.trans, out.K), (pl, cl), (dtrans, dK)
+    )
     if dparams is None:
         dparams = grad.contiguous()
     else:

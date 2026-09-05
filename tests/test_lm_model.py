@@ -17,6 +17,8 @@ assertion and the thing asserted.
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 import torch
 from torch import Tensor, nn
@@ -24,6 +26,7 @@ from torch import Tensor, nn
 from scripts.harness import MixerFactory
 from scripts.lm.mixers import REGISTRY
 from scripts.lm.model import (
+    LMConfig,
     MixerLM,
     MixerResidualBlock,
     build_model,
@@ -31,7 +34,6 @@ from scripts.lm.model import (
     mixer_parameters,
     non_embedding_parameters,
     parameter_count,
-    scaffold_config,
 )
 from slinoss import SLinOSSConfig, SLinOSSMixer
 
@@ -70,11 +72,9 @@ def _factory(tag: int, rank: int = 1) -> MixerFactory:
     return build
 
 
-def _config(d_state: int = 48) -> SLinOSSConfig:
+def _config() -> LMConfig:
     """The scaffold config these tests build on."""
-    return scaffold_config(
-        d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB, d_state=d_state
-    )
+    return LMConfig(d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB)
 
 
 def _blocks(model: MixerLM) -> list[MixerResidualBlock]:
@@ -82,10 +82,21 @@ def _blocks(model: MixerLM) -> list[MixerResidualBlock]:
     return [block for block in model.blocks if isinstance(block, MixerResidualBlock)]
 
 
-def _build(factories: list[MixerFactory], d_state: int = 48) -> MixerLM:
+def _build(factories: list[MixerFactory]) -> MixerLM:
     """A stack with those factories, one per layer."""
     torch.manual_seed(0)
-    return build_model(_config(d_state), factories, max_length=MAX_LENGTH)
+    return build_model(_config(), factories, max_length=MAX_LENGTH)
+
+
+def test_lm_config_contains_only_scaffold_fields() -> None:
+    assert {field.name for field in fields(LMConfig)} == {
+        "d_model",
+        "n_layers",
+        "vocab_size",
+        "bias",
+        "norm_eps",
+        "vocab_pad_multiple",
+    }
 
 
 def test_the_swap_replaces_every_block_s_mixer() -> None:
@@ -205,17 +216,7 @@ def test_two_arms_differ_by_their_mixers_and_by_nothing_else() -> None:
 def test_the_published_gpt_widths_reproduce_the_two_total_parameter_scales() -> None:
     """The paper's 496/1360 widths identify the mixer-only total-count convention."""
     for width, target in ((496, 45_000_000), (1360, 180_000_000)):
-        if (2 * width) % 64:
-            # The scaffold config's placeholder mixer validation is stricter than GPT;
-            # use its narrowest head solely for these off-grid published widths.
-            cfg = scaffold_config(
-                d_model=width,
-                n_layers=12,
-                vocab_size=32768,
-                d_head=16,
-            )
-        else:
-            cfg = scaffold_config(d_model=width, n_layers=12, vocab_size=32768)
+        cfg = LMConfig(d_model=width, n_layers=12, vocab_size=32768)
         resolved = REGISTRY.resolve("gpt")
         model = build_model(cfg, layer_factories(resolved.factory, 12), max_length=2048)
         assert parameter_count(model) == pytest.approx(target, rel=0.02)
@@ -244,9 +245,7 @@ def test_the_slinoss_arm_goes_through_the_same_swap() -> None:
     """
     resolved = REGISTRY.resolve("slinoss", ("d_state=144",))
     assert resolved.settings["d_state"] == 144
-    for block in _blocks(
-        _build(layer_factories(resolved.factory, N_LAYERS), d_state=48)
-    ):
+    for block in _blocks(_build(layer_factories(resolved.factory, N_LAYERS))):
         mixer = block.mixer
         assert isinstance(mixer, SLinOSSMixer)
         assert mixer.config.d_state == 144

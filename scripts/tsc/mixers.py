@@ -35,7 +35,14 @@ from typing import Any
 
 from torch import nn
 
-from scripts.harness import CausalAttention, CausalConv, MixerEntry, Registry
+from scripts.harness import (
+    CausalAttention,
+    CausalConv,
+    MixerEntry,
+    Registry,
+    build_slinoss,
+    slinoss_defaults,
+)
 from scripts.tsc.linoss import LinOSSRecurrence
 from scripts.tsc.protocol import Setting
 
@@ -102,21 +109,6 @@ def _build_linoss_imex(d_model: int, **settings: Any) -> nn.Module:
     return LinOSSRecurrence(d_model, discretization="IMEX", **settings)
 
 
-def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
-    """The tree's mixer.
-
-    Args:
-        d_model: Stream width.
-        **settings: :class:`slinoss.SLinOSSConfig` mixer fields.
-
-    Returns:
-        A :class:`slinoss.SLinOSSMixer`.
-    """
-    from slinoss import SLinOSSConfig, SLinOSSMixer
-
-    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
-
-
 def _build_mamba2(d_model: int, **settings: Any) -> nn.Module:
     """Mamba-2, from ``mamba_ssm``.
 
@@ -172,33 +164,6 @@ def _build_gdn2(d_model: int, **settings: Any) -> nn.Module:
     return Unwrap(GatedDeltaNet2(hidden_size=d_model, **settings))
 
 
-def _slinoss_defaults() -> dict[str, Any]:
-    """The mixer's own defaults, read off its config rather than restated.
-
-    ``d_state`` has no default there and is named here: it is ``3N`` with ``N`` a multiple of
-    16, so 96 is ``N = 32``. ``d_head`` is narrowed from the config's 64 because this axis runs
-    at ``hidden_dim`` 16.
-
-    Returns:
-        Every mixer field an arm may move.
-    """
-    from slinoss import SLinOSSConfig
-
-    return {
-        "d_state": 96,
-        "expand": SLinOSSConfig.expand,
-        "d_head": 16,
-        "n_groups": SLinOSSConfig.n_groups,
-        "chunk_size": SLinOSSConfig.chunk_size,
-        "d_conv": SLinOSSConfig.d_conv,
-        "key_conv": SLinOSSConfig.key_conv,
-        "init_span": SLinOSSConfig.init_span,
-        "w_max": SLinOSSConfig.w_max,
-        "bias": SLinOSSConfig.bias,
-        "conv_bias": SLinOSSConfig.conv_bias,
-    }
-
-
 def paper_overrides(mixer: str, setting: Setting) -> list[str]:
     """The mixer settings the published per-dataset config fixes.
 
@@ -224,7 +189,7 @@ def _register_builtins() -> None:
     """Register every mixer this module defines.
 
     Called at import. Only the slinoss entry reads defaults off another module, and
-    :class:`slinoss.SLinOSSConfig` imports torch and nothing optional.
+    :class:`slinoss.SLinOSSMixerConfig` imports torch and nothing optional.
     """
     REGISTRY.register(
         "linoss_im", MixerEntry(_build_linoss_im, "unused", {"ssm_dim": 64})
@@ -233,7 +198,8 @@ def _register_builtins() -> None:
         "linoss_imex", MixerEntry(_build_linoss_imex, "unused", {"ssm_dim": 64})
     )
     REGISTRY.register(
-        "slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults())
+        "slinoss",
+        MixerEntry(build_slinoss, "unused", slinoss_defaults(96, d_head=16)),
     )
     REGISTRY.register(
         "attention",

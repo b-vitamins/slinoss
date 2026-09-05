@@ -1,26 +1,4 @@
-"""The whole loop at both scales' shapes, on the built kernel path.
-
-Every other file in this suite runs at toy widths on the CPU, which is what makes the loop's
-arithmetic checkable by hand. None of them would catch the failures that only exist at the real
-shape: a chunked scan whose shared-memory budget refuses the width, a fused cross entropy over a
-50k-column padded head, the published fp32 compute path, an optimizer that does not fit
-next to the activations.
-
-The other thing this file exists for is the silent fallback. Every stage has a reference path and
-dispatch takes it without a word, so an unbuilt tree trains correctly and slowly and reports the
-number as this program's. The dispatch test pins the backend each stage resolves to, so a tree
-that lost its extension says so here rather than in a bad throughput figure a week later.
-
-Three steps, not a run: what is under test is that the shape runs at all and that the numbers
-coming out are finite. Loss values off random tokens are meaningless beyond that, so the only
-value pinned is the first step's, which must sit at the uniform-prediction entropy of the
-vocabulary. A loss far from it means the labels and the class count disagree, which at a padded
-head is the one alignment error that produces a plausible number.
-
-The accumulation count is one here. It is a memory decision the config derives, and the
-equivalence between an accumulated step and a single larger batch is pinned on the CPU in
-``tests/test_lm_train.py``; what the kernel sees is the micro batch's shape, and that is real.
-"""
+"""CUDA integration at the two language-model scale shapes."""
 
 from __future__ import annotations
 
@@ -45,7 +23,7 @@ if not _C.is_available():
 from scripts.lm.corpus import DTYPE
 from scripts.lm.data import Shard
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import build_model, layer_factories, scaffold_config
+from scripts.lm.model import LMConfig, build_model, layer_factories
 from scripts.lm.train import Step, TrainConfig, train
 from slinoss.ops.conv import backends as conv_backends
 from slinoss.ops.so3ssd import backends as scan_backends
@@ -79,15 +57,15 @@ def _shard(path: Path, windows: int) -> Shard:
     return Shard(path, tokens)
 
 
-def test_dispatch_picks_the_kernel_backend_for_every_stage() -> None:
-    """The scan, the conv and the loss, at the dtype and device a run uses.
-
-    A tree that is importable but not built resolves all three to the reference and trains at a
-    fraction of the speed with no symptom. Asserted rather than skipped over: the module gate
-    above already established that the DSL imports and the extension is built, so a reference
-    resolution here is a dispatch bug and not a missing dependency.
-    """
-    assert scan_backends.resolve(None, "cuda", torch.float32).name == scan_backends.CUTE
+def test_dispatch_matches_the_declared_precision_contract() -> None:
+    """Pin intentional fp32 dispatch and availability of every fast backend."""
+    assert (
+        scan_backends.resolve(None, "cuda", torch.float32).name
+        == scan_backends.REFERENCE
+    )
+    assert (
+        scan_backends.resolve(None, "cuda", torch.bfloat16).name == scan_backends.CUTE
+    )
     assert (
         conv_backends.resolve(None, "cuda", torch.float32).name == conv_backends.NATIVE
     )
@@ -125,7 +103,7 @@ def test_three_steps_at_a_scale_s_shape(
     torch.manual_seed(0)
     resolved = REGISTRY.resolve("slinoss")
     stack = build_model(
-        scaffold_config(d_model=d_model, n_layers=N_LAYERS, vocab_size=VOCAB),
+        LMConfig(d_model=d_model, n_layers=N_LAYERS, vocab_size=VOCAB),
         layer_factories(resolved.factory, N_LAYERS),
         max_length=SEQ_LEN,
         device="cuda",

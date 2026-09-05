@@ -207,6 +207,7 @@ def install(
     monkeypatch.setattr(bench_mamba, "SHAPES", (SMALL,))
     monkeypatch.setattr(bench_mamba, "shape_by_name", small_by_name)
     monkeypatch.setattr(bench_mamba, "parameter_counts", fabricated_params)
+    monkeypatch.setattr(bench_mamba, "unbuilt_stage_blocker", lambda _device: None)
     return fn
 
 

@@ -227,7 +227,9 @@ def test_shared_memory_budget_fits_the_queried_capacity() -> None:
         assert wide - narrow == 2 * score_tile(chunk).words
 
 
-def test_the_block_width_follows_the_arena_and_not_the_chunk_length() -> None:
+def test_the_block_width_follows_the_arena_and_not_the_chunk_length(
+    reference_smem_capacity: int,
+) -> None:
     """Eight warps only where the narrow arena already holds one block.
 
     The wide form buys a second warp per scheduler and pays a score tile, a barrier
@@ -236,6 +238,7 @@ def test_the_block_width_follows_the_arena_and_not_the_chunk_length() -> None:
     measured on sm_86, ``L`` 128 ``P`` 48 ``3N`` 48 loses 36.3% of the launch that
     way. Where the arena already holds one block the bytes cost no residency.
     """
+    assert smem_capacity() == reference_smem_capacity
     # The narrow arena pins one block, so the tile is free of residency.
     assert smem_residency(scan_smem_bytes(64, 64, 240)) == 1
     assert scan_threads(64, 64, 240) == THREADS_WIDE

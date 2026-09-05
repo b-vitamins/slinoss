@@ -1,15 +1,4 @@
-"""The five parameter groups: a partition, and the right parameter in each.
-
-Two things are checked and they are different. That the rule is a partition -- every trainable
-parameter in exactly one group, the union the whole set -- is what stops a parameter from
-silently training at no rate or at two. That the state-space parameters land in ``ssm`` is what
-the group exists for: a transition parameter at a projection's rate leaves the scan's stability
-assumption, and decayed it shrinks the dynamics rather than a weight.
-
-Routing is checked on the real parameter names, because that is what it reads. A rule verified
-against invented names would pass while ``mixer_norm_weight`` went to ``ssm`` for containing
-``mixer``.
-"""
+"""Optimizer-group partition and policy tests."""
 
 from __future__ import annotations
 
@@ -24,7 +13,7 @@ from scripts.lm.groups import (
     parameter_groups,
 )
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import MixerLM, build_model, layer_factories, scaffold_config
+from scripts.lm.model import LMConfig, MixerLM, build_model, layer_factories
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -35,7 +24,7 @@ MAX_LENGTH = 32
 def _model(mixer: str, overrides: tuple[str, ...] = ()) -> MixerLM:
     """A two-layer stack with one mixer swapped into every block."""
     torch.manual_seed(0)
-    config = scaffold_config(d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB)
+    config = LMConfig(d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB)
     resolved = REGISTRY.resolve(mixer, overrides)
     return build_model(
         config, layer_factories(resolved.factory, N_LAYERS), max_length=MAX_LENGTH
@@ -56,7 +45,6 @@ def _model(mixer: str, overrides: tuple[str, ...] = ()) -> MixerLM:
         ("blocks.0.mixer.out_proj.weight", "hidden"),
         ("blocks.0.mixer.conv_weight", "hidden"),
         ("blocks.0.mixer.norm_weight", "scalar"),
-        ("blocks.0.mixer.transition_bias", "ssm"),
     ],
 )
 def test_the_rule_routes_the_real_names(name: str, group: str) -> None:
@@ -71,17 +59,12 @@ def test_the_rule_routes_the_real_names(name: str, group: str) -> None:
 
 
 def test_a_flagged_parameter_reaches_the_ssm_group() -> None:
-    """A baseline's own ``_no_weight_decay`` declaration is honoured without a per-arm table.
-
-    Both routes are needed: the flag covers what a mixer declares, and the leaf names cover
-    a transition parameter that declares nothing.
-    """
+    """A mixer's ``_no_weight_decay`` declaration identifies recurrence parameters."""
     plain = torch.zeros(8)
     flagged = torch.zeros(8)
     flagged._no_weight_decay = True  # type: ignore[attr-defined]
     assert classify("blocks.0.mixer.A_log", plain) == "scalar"
     assert classify("blocks.0.mixer.A_log", flagged) == "ssm"
-    assert classify("blocks.0.mixer.d_skip", plain) == "ssm"
 
 
 def test_the_flag_only_counts_inside_a_mixer() -> None:
@@ -127,16 +110,14 @@ def test_an_arm_with_no_state_space_parameter_reports_zero() -> None:
     }
 
 
-def test_the_policy_puts_the_state_space_group_at_a_tenth_with_no_decay() -> None:
+def test_the_policy_uses_one_hidden_rate_and_keeps_ssm_undecayed() -> None:
     """The rates and decays the protocol specifies, read off the policy rather than typed."""
-    policy = GroupPolicy(
-        lr=1e-3, embedding_lr=0.1, ssm_multiplier=0.1, weight_decay=0.1
-    )
+    policy = GroupPolicy(lr=1e-3, embedding_lr=0.1, weight_decay=0.1)
     assert policy.rate("hidden") == pytest.approx(1e-3)
     assert policy.rate("unembedding") == pytest.approx(1e-3)
     assert policy.rate("scalar") == pytest.approx(1e-3)
     assert policy.rate("embedding") == pytest.approx(0.1)
-    assert policy.rate("ssm") == pytest.approx(1e-4)
+    assert policy.rate("ssm") == pytest.approx(1e-3)
     assert policy.decay("hidden") == pytest.approx(0.1)
     assert policy.decay("unembedding") == pytest.approx(0.1)
     assert policy.decay("embedding") == 0.0

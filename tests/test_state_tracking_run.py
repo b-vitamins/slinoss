@@ -202,9 +202,7 @@ def test_record_carries_every_field_a_replay_needs(
     group half is what carries the group order.
     """
     records = _run(["--task", "parity"], capsys)
-    records += _run(
-        ["--profile", "walker-group-prefix", "--task", "A5"], capsys
-    )
+    records += _run(["--profile", "walker-group-prefix", "--task", "A5"], capsys)
     assert [record["task"] for record in records] == ["parity", "A5"]
     split_fields = {field.name for field in fields(SplitConfig)}
     for record in records:
@@ -222,7 +220,6 @@ def test_record_carries_every_field_a_replay_needs(
         assert len(record["mixer_constructions"]) == record["model"]["n_layers"]
         assert record["lengths"]["training_ceiling"] == 8
         assert record["lengths"]["evaluation_ceiling"] == 12
-        assert record["lengths"]["mixer_initialization_span"] is None
         assert record["seeds"] == {
             "model": 0,
             "train_data": 0,
@@ -258,8 +255,7 @@ def test_default_run_is_exactly_the_released_pdssm_regular_suite(
     records = _run([], capsys)
     assert tuple(record["task"] for record in records) == PDSSM_REGULAR_TASKS
     assert all(
-        record["benchmark_contract"]["profile"] == "pdssm-regular"
-        for record in records
+        record["benchmark_contract"]["profile"] == "pdssm-regular" for record in records
     )
 
 
@@ -278,7 +274,10 @@ def test_asymmetric_group_record_carries_both_vocabularies_and_generators(
     )[0]
     assert record["vocab_size"] is None
     assert (record["input_vocab_size"], record["output_vocab_size"]) == (2, 60)
-    assert (record["model"]["input_vocab_size"], record["model"]["output_vocab_size"]) == (
+    assert (
+        record["model"]["input_vocab_size"],
+        record["model"]["output_vocab_size"],
+    ) == (
         2,
         60,
     )

@@ -16,6 +16,7 @@ from scripts.harness.registry import (
     Registry,
     load_module,
 )
+from scripts.harness.slinoss import build_slinoss, slinoss_defaults
 
 __all__ = [
     "CausalAttention",
@@ -25,5 +26,7 @@ __all__ = [
     "MixerFactory",
     "Registry",
     "Rotary",
+    "build_slinoss",
     "load_module",
+    "slinoss_defaults",
 ]

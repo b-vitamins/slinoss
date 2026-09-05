@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import math
 from typing import Any
 
 import pytest
@@ -88,11 +87,6 @@ def test_legal_chunk_sizes(chunk_size: int) -> None:
         ({"chunk_size": 48}, "power of two"),
         ({"chunk_size": 100}, "power of two"),
         ({"d_conv": 0}, "d_conv must be positive"),
-        ({"w_max": 0.0}, "w_max must lie in"),
-        ({"w_max": -1.0}, "w_max must lie in"),
-        ({"w_max": 3.14159265}, "round below pi in float32"),
-        ({"w_max": math.pi}, "w_max must lie in"),
-        ({"w_max": 4.0}, "w_max must lie in"),
         ({"n_layers": 0}, "n_layers must be positive"),
         ({"ffn_ratio": 0.0}, "ffn_ratio must be positive"),
         ({"norm_eps": 0.0}, "norm_eps must be positive"),

@@ -12,7 +12,7 @@ lives in a module of its own that calls :func:`register` at import, which
 optional dependency at module scope.
 
     name       what it is                                       settings
-    slinoss    the tree's mixer, at its own defaults            SLinOSSConfig fields
+    slinoss    the tree's mixer, at its own defaults            mixer config fields
     attention  causal multi-head attention with rotary          n_heads, rotary
     conv       causal depthwise convolution over d_conv taps    d_conv
 
@@ -30,6 +30,7 @@ from typing import Any, Literal, cast
 import torch
 from torch import Tensor, nn
 
+from scripts.harness import build_slinoss, slinoss_defaults
 from scripts.mad.model import MixerFactory
 
 
@@ -258,50 +259,6 @@ def load_module(path: str) -> None:
     importlib.import_module(path)
 
 
-# slinoss:
-
-
-def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
-    """The tree's mixer.
-
-    Args:
-        d_model: Stream width.
-        **settings: User-controlled :class:`slinoss.SLinOSSConfig` fields.
-
-    Returns:
-        A :class:`slinoss.SLinOSSMixer`. CUDA only, from its own guards.
-    """
-    from slinoss import SLinOSSConfig, SLinOSSMixer
-
-    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
-
-
-def _slinoss_defaults() -> dict[str, Any]:
-    """The mixer's own defaults, read off its config rather than restated.
-
-    ``d_state`` has no default there and is named here: it is ``3N`` with ``N`` a
-    multiple of 16, so 144 is the rung nearest the 128-wide stream.
-
-    Returns:
-        Every :class:`slinoss.SLinOSSConfig` field an arm may move.
-    """
-    from slinoss import SLinOSSConfig
-
-    return {
-        "d_state": 144,
-        "expand": SLinOSSConfig.expand,
-        "d_head": SLinOSSConfig.d_head,
-        "n_groups": SLinOSSConfig.n_groups,
-        "chunk_size": SLinOSSConfig.chunk_size,
-        "d_conv": SLinOSSConfig.d_conv,
-        "key_conv": SLinOSSConfig.key_conv,
-        "init_span": SLinOSSConfig.init_span,
-        "w_max": SLinOSSConfig.w_max,
-        "bias": SLinOSSConfig.bias,
-        "conv_bias": SLinOSSConfig.conv_bias,
-    }
-
-
 # controls:
 
 
@@ -447,9 +404,9 @@ def _register_builtins() -> None:
     """Register the three mixers this module defines.
 
     Called at import. The slinoss entry reads its defaults from
-    :class:`slinoss.SLinOSSConfig`, which imports torch and nothing optional.
+    :class:`slinoss.SLinOSSMixerConfig`, which imports torch and nothing optional.
     """
-    register("slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults()))
+    register("slinoss", MixerEntry(build_slinoss, "unused", slinoss_defaults(144)))
     register(
         "attention",
         MixerEntry(

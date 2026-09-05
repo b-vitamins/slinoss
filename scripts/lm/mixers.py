@@ -34,7 +34,14 @@ from typing import Any
 
 from torch import Tensor, nn
 
-from scripts.harness import CausalAttention, CausalConv, MixerEntry, Registry
+from scripts.harness import (
+    CausalAttention,
+    CausalConv,
+    MixerEntry,
+    Registry,
+    build_slinoss,
+    slinoss_defaults,
+)
 
 __all__ = ["REGISTRY", "Unwrap"]
 
@@ -68,21 +75,6 @@ class Unwrap(nn.Module):
         """
         out = self.inner(x)
         return out[0] if isinstance(out, tuple) else out
-
-
-def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
-    """The tree's mixer.
-
-    Args:
-        d_model: Stream width.
-        **settings: :class:`slinoss.SLinOSSConfig` mixer fields.
-
-    Returns:
-        A :class:`slinoss.SLinOSSMixer`.
-    """
-    from slinoss import SLinOSSConfig, SLinOSSMixer
-
-    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
 
 
 def _build_mamba2(d_model: int, **settings: Any) -> nn.Module:
@@ -140,40 +132,14 @@ def _build_gdn2(d_model: int, **settings: Any) -> nn.Module:
     return Unwrap(GatedDeltaNet2(hidden_size=d_model, **settings))
 
 
-def _slinoss_defaults() -> dict[str, Any]:
-    """The mixer's own defaults, read off its config rather than restated.
-
-    ``d_state`` has none there and is named here: it is ``3N`` with ``N`` a multiple of 16,
-    and 96 is ``N = 32``, the state width the baselines default to.
-
-    Returns:
-        Every mixer field an arm may move.
-    """
-    from slinoss import SLinOSSConfig
-
-    return {
-        "d_state": 96,
-        "expand": SLinOSSConfig.expand,
-        "d_head": SLinOSSConfig.d_head,
-        "n_groups": SLinOSSConfig.n_groups,
-        "chunk_size": SLinOSSConfig.chunk_size,
-        "d_conv": SLinOSSConfig.d_conv,
-        "key_conv": SLinOSSConfig.key_conv,
-        "init_span": SLinOSSConfig.init_span,
-        "w_max": SLinOSSConfig.w_max,
-        "bias": SLinOSSConfig.bias,
-        "conv_bias": SLinOSSConfig.conv_bias,
-    }
-
-
 def _register_builtins() -> None:
     """Register every mixer this module defines.
 
     Called at import. Only the slinoss entry reads a default off another module, and
-    :class:`slinoss.SLinOSSConfig` imports torch and nothing optional.
+    :class:`slinoss.SLinOSSMixerConfig` imports torch and nothing optional.
     """
     REGISTRY.register(
-        "slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults())
+        "slinoss", MixerEntry(build_slinoss, "unused", slinoss_defaults(96))
     )
     REGISTRY.register(
         "gpt", MixerEntry(CausalAttention, "required", {"n_heads": 8, "rotary": True})

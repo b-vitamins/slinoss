@@ -1,9 +1,7 @@
 # SLinOSS mixer anatomy and capability diagnosis
 
-**Status:** current for `slinoss/` tree object
-`e769a12bacd24fea0d9dfee707b6aded9f95ea24` (the mixer source at repository
-commit `1b7b995526311309001f037c2c4175e3068d0888`) on 2026-09-05. This file is
-part of the mixer contract: any change to
+**Status:** current for the source committed with this note on 2026-09-05. This
+file is part of the mixer contract: any change to `SLinOSSMixerConfig`,
 `SLinOSSConfig`, `SLinOSSMixer`, `MixerState`, `scanprep`, `so3ssd`, or the mixer
 tail must update the anatomy, initialization, counts, and diagnosis here in the
 same change.
@@ -64,7 +62,7 @@ x [B,T,D]
                                       |
                               y [B,H,T,P]
                                       |
-                       skip + SiLU gate + head RMSNorm
+                       skip + head RMSNorm + SiLU gate
                                       |
                               tail [B,T,E]
                                       |
@@ -145,8 +143,9 @@ effective operand produced from the token changes with `t`.
 | direct skip | `[H]` | no | `d_skip` |
 | head RMS gain | `[H,P]` | no | `norm_weight` |
 
-There is no learned initial state, no learned tap tensor, no step counter, and no
-separate B/C/value projection. One fused projection supplies all token operands.
+The initial state is a fixed, nonpersistent cyclic buffer rather than a learned
+parameter. There is no learned tap tensor, step counter, or separate B/C/value
+projection. One fused projection supplies all token operands.
 
 ## 4. Transition parameterization
 
@@ -160,14 +159,14 @@ raw_ls = transition_bias[h,3]   + token_band[b,t,h,3]
 The physical rotation vector is
 
 ```text
-w = w_max * raw_w / sqrt(1 + ||raw_w||^2 / 4)
+w = w_chart * raw_w / sqrt(1 + ||raw_w||^2 / 4)
 ```
 
-where the default `w_max = 3.141592502593994` is the largest float32 strictly
-below pi. The reachable radius is strictly below `2*w_max`, so every canonical
-SO(3) rotation, including a half-turn, is an interior finite-parameter point.
-The derivative at the origin is `w_max`; there is no inner `tanh` or
-head-radius multiplier.
+where `w_chart = 3.141592502593994`, the largest float32 strictly below pi, is a
+fixed operator constant rather than a constructor knob. The reachable radius is
+strictly below `2*w_chart`, so every canonical SO(3) rotation, including a
+half-turn, is an interior finite-parameter point. The derivative at the origin
+is `w_chart`; there is no inner `tanh` or head-radius multiplier.
 
 The physical log-scale is
 
@@ -191,16 +190,23 @@ The table describes one `SLinOSSMixer`. The default constructor has
 
 | Parameter | Shape | Count | Effective role | Initialization | Precision / decay contract |
 | --- | ---: | ---: | --- | --- | --- |
-| `in_proj.weight` | `[Q,D]` | `QD` | all token operands | PyTorch linear Kaiming-uniform, then B, transition, and pad rows zeroed | module dtype; ordinary decay except harness policy |
-| `in_proj.bias` | `[Q]` | `Q` if `bias` | same bands | PyTorch default, then B, transition, pad zeroed | module dtype; absent by default |
+| `in_proj.weight` | `[Q,D]` | `QD` | all token operands | PyTorch linear draw; B/C rows rescaled to row norm `1/sqrt(S)`; transition/pad rows zero | module dtype; ordinary decay except harness policy |
+| `in_proj.bias` | `[Q]` | `Q` if `bias` | same bands | PyTorch default; B/C, transition, and pad rows zero | module dtype; absent by default |
 | `conv_weight` | `[E,W]` | `EW` | depthwise causal value convolution | uniform `[-1/sqrt(W), +1/sqrt(W)]` | module dtype |
 | `conv_bias` | `[E]` | `E` if enabled | value-conv bias | zero | module dtype; enabled by default |
 | `key_weight` | `[2GS,W]` | `2GSW` if enabled | independent depthwise causal conv on B and C channels | exact delta: all zero except current-token tap = 1 | module dtype; enabled by default |
 | `transition_bias` | `[H,4]` | `4H` | static head operating points for rotation and decay | inverted period/horizon lattice | pinned fp32; marked no-weight-decay |
 | `d_skip` | `[H]` | `H` | direct `U` gain | one | pinned fp32; marked no-weight-decay |
 | `norm_weight` | `[H,P]` | `HP=E` | per-row RMSNorm gain | one | module dtype |
-| `out_proj.weight` | `[D,E]` | `DE` | mixer output projection | **zero** after consuming PyTorch reset | module dtype |
+| `out_proj.weight` | `[D,E]` | `DE` | mixer output projection | live PyTorch linear draw; scaled by `1/sqrt(2*n_layers)` inside `SLinOSSBlock` | module dtype |
 | `out_proj.bias` | `[D]` | `D` if `bias` | output bias | zero | module dtype; absent by default |
+
+For a whitened unit-RMS input, the B/C row rescaling gives each projected
+S-vector expected squared norm one. After the optional B/C convolution, every
+realized vector is L2-normalized over S in fp32 (fp64 for the double oracle) and
+stored back into its existing projection band. The scan therefore receives unit
+B/C vectors without another activation-sized buffer. The normalization pullback
+is applied before the B/C-convolution or fused-projection pullback.
 
 The exact count is
 
@@ -215,39 +221,33 @@ At the defaults this simplifies to
 QD + EW + 2E + 2GSW + 5H + DE.
 ```
 
-No-weight-decay markings are declarations by the module, not a universal
-optimizer law. The MAD and LM harnesses honor `_no_weight_decay`. The official
-state-tracking-compatible grouping follows the upstream name rule: names
-containing `embedding` get embedding decay and everything else gets ordinary
-decay. Consequently the transition embedding is exempt there, while `d_skip`
-is in the ordinary group despite its module flag. This is explicit harness
-behavior, not silent fallback.
+No-weight-decay markings are declarations by the module. MAD, LM, and state
+tracking honor them; state tracking additionally preserves upstream's exemption
+for the token embedding. MQAR intentionally applies its published decay to every
+parameter. The distinction is explicit in each harness rather than inferred from
+the spelling of a mixer leaf.
 
 ### Concrete instantiated counts
 
 | Configuration | `Q` / pad | Mixer parameters | Core recurrent scalars `ES` | Comment |
 | --- | ---: | ---: | ---: | --- |
 | `D128 E256 P64 H4 G1 S144 W4` | `816 / 0` | `139,924` | `36,864` | current H4/G1 MAD/state geometry |
+| `D128 E256 P32 H8 G1 S144 W4` | `832 / 0` | `141,992` | `36,864` | H8/G1 changes transport heads without buying B/C groups |
 | `D128 E256 P32 H8 G4 S144 W4` | `1,696 / 0` | `256,040` | `36,864` | H8/G4 changes addressing capacity and parameters, not core state size |
+| `D128 E256 P32 H8 G8 S144 W4` | `2,848 / 0` | `408,104` | `36,864` | one independent B/C system per head; core state remains fixed |
 | `D320 E640 P64 H10 G1 S96 W4` | `1,520 / 8` | `695,858` | `61,440` | current small LM-probe geometry; 2,560 pad-weight scalars |
 
 For the first row the individual counts are: input projection 104,448; value
-conv 1,024; conv bias 256; key conv 1,152; transition embedding 16; skip 4;
+conv 1,024; conv bias 256; key conv 1,152; transition bias 16; skip 4;
 norm 256; output projection 32,768.
 
-## 6. Fixed and runtime state
+## 6. Runtime state
 
-`initial_state` is a non-persistent fp32 buffer of shape `[H,P,S]`, not a
-parameter. Every row contains one unit coordinate:
-
-```text
-initial_state[h,p,(h*P+p) mod S] = 1
-```
-
-This deterministic cyclic oscillator basis gives the homogeneous rotation a
-nonzero carrier before any token write. It encodes no task label and draws no
-randomness, but it is an architectural prior: output can be produced by rotating
-and reading this carrier even when B is zero.
+The module stores a nonpersistent fp32 cyclic state `[H,P,S]`. Row `(h,p)` is a
+unit vector at column `(h*P+p) mod S`. Whole-sequence execution expands that
+buffer across the batch as `z0`; decode allocation and reset reproduce the same
+state. It is deterministic, fixed, absent from checkpoints and parameter counts,
+and casts only between fp32 and the fp64 oracle state.
 
 Incremental inference allocates five mutable buffers per layer and batch item:
 
@@ -265,88 +265,83 @@ Per batch item this is
 (W-1)E + [key_conv](W-1)2GS + HPS + GS + HP
 ```
 
-scalars. It is 38,896 scalars at H4/G1 and 41,920 at H8/G4 for the D128
-geometry above when key convolution is enabled. There is no step counter.
+scalars. It is 38,896 scalars at H4/G1 or H8/G1 and 41,920 at H8/G4 for the
+D128 geometry above when key convolution is enabled. There is no step counter.
 
 ## 7. Initialization, exactly
 
 ### 7.1 Static transition bank
 
-The initialized fast endpoint is
+Rotation period and decay horizon use separate fixed physical bands:
 
 ```text
-fast = 2*pi / (0.5*w_max) ~= 4 tokens
+period  in [4, 256] tokens
+horizon in [4, 4096] tokens
 ```
 
-and the slow endpoint is the explicit constructor field `init_span`, 4096 by
-default. Sequence length is not consulted. Horizons and periods are two
-independent log grids over `[fast, init_span]`, laid out as a nearly square
-boustrophedon lattice across heads. Rotation axes use a deterministic spherical
+Neither sequence length nor a constructor reach/span knob is consulted. At four
+or more heads, the two log grids form a nearly square boustrophedon lattice.
+Two- and three-head models receive independent endpoint-covering grids rather
+than collapsing one axis. A one-head model uses the geometric midpoint of each
+band: horizon 128, period 32. Rotation axes use a deterministic spherical
 Fibonacci set.
 
 For H=4 the four `(horizon, period)` corners are approximately
 
 ```text
-(4,4), (4096,4), (4096,4096), (4,4096).
+(4,4), (4096,4), (4096,256), (4,256).
 ```
 
 The desired physical period and horizon are inverted through the bounded maps,
 so the initialization specifies the operator itself, not merely raw parameter
-values. The slowest mode retains `exp(-T/4096)` across `T` tokens: 93.94% at
-`T=256` and 77.88% at `T=1024`.
+values. The slowest decay mode retains `exp(-T/4096)` across `T` tokens: 93.94%
+at `T=256` and 77.88% at `T=1024`.
 
 ### 7.2 Token paths and residual boundary
 
 After ordinary framework resets, the constructor makes these deliberate edits:
 
-- value, gate, and C projection rows remain live random;
-- B projection rows are zero;
+- value and gate projection rows remain live random;
+- B and C projection rows remain live but are balanced to expected unit vector
+  norm on whitened input;
+- realized B and C vectors are L2-normalized after their optional convolution;
 - all four token transition-displacement rows are zero;
 - alignment-pad rows are zero;
 - the B/C convolution begins as the identity/delta;
 - `d_skip` and `norm_weight` are one;
-- the recurrent state is the cyclic basis;
-- the entire output projection is zero.
+- recurrent state begins at the deterministic cyclic basis;
+- `out_proj` begins live under its framework draw.
 
-Thus the state-writing term is initially zero, while an autonomous rotated
-carrier and its C read are live internally. The mixer output is nevertheless
-exactly zero because `out_proj` is zero, so a residual block begins as an exact
-identity.
+An `SLinOSSMixer` cannot know the depth of an external scaffold. It therefore
+keeps the live output draw unchanged. `SLinOSSBlock`, which does know stack
+depth, scales both its mixer and FFN output matrices by
+`1/sqrt(2*n_layers)` and zeroes the FFN output bias. This places residual-branch
+variance ownership at the scaffold boundary instead of encoding stack depth in
+a standalone mixer configuration.
 
-This has two optimization consequences that must not be euphemized:
+The initialized model has both an immediately observable transport carrier and
+live token forcing. Its first backward reaches B, C, token-transition,
+static-transition, convolution, tail, and output paths; there is no zero-output
+gradient blackout.
 
-1. On the first backward pass, `d(out_proj.weight)` can be nonzero, but the
-   gradient into the mixer tail is multiplied by the zero output weight. Every
-   earlier mixer parameter therefore receives zero gradient on optimizer step
-   one. This is a one-step cold start.
-2. The B parameter is trainable and can receive gradient after the output path
-   becomes live, but the model begins with no token-dependent state writes. The
-   transition can be trained against the nonzero cyclic carrier before B becomes
-   useful. The initialization therefore strongly favors learning autonomous
-   transport before input-driven memory.
+### 7.3 Repairs made by the cleanup campaign
 
-These are code facts. Whether a one-step delay alone materially changes a long
-run is an empirical question; the broader autonomous-versus-input-driven bias is
-structural.
+- Every tensor is initialized once; block and stack constructors no longer
+  recursively reset children.
+- Every legal head count receives both a meaningful phase and retention scale;
+  low-head models no longer collapse to the fast decay endpoint.
+- Rotation reach and initialization coverage are fixed operator invariants;
+  `w_max` and `init_span` are no longer benchmark knobs.
+- B and C enter the scan with unit runtime norm, so their magnitude no longer
+  changes address, write strength and read scale simultaneously.
+- The tail is `RMSNorm(scan + skip) * silu(gate)`, so gate magnitude survives.
+- LM no longer trains the transition and skip parameters at an unexplained
+  one-tenth learning rate. Static transition and skip parameters retain their
+  explicit no-weight-decay declaration.
 
-### 7.3 Initialization defects exposed by the cleanup audit
-
-Three additional defects belong in the durable diagnosis:
-
-- Before cleanup, construction recursively reset each mixer through its block
-  and stack. A stack mixer consumed several unrelated random initializations
-  before retaining the last one, so seed-to-parameter mapping depended on
-  container history. Construction now initializes each tensor once.
-- The nominal two-dimensional head lattice collapses the horizon axis for
-  `H=1,2,3` because `isqrt(H)=1`. Every such legal mixer receives only the fast
-  decay horizon despite advertising a long-memory bank.
-- The tail computes `RMSNorm((scan + skip) * silu(gate))`. Because the gate is a
-  scalar per head row, RMS normalization largely divides its magnitude back out.
-  The meaningful ordering is `RMSNorm(scan + skip) * silu(gate)`.
-
-These are independent of the larger innovation-correction proposal: reset once,
-cover both physical spectra at every legal head count, and place a gate where it
-can modulate amplitude.
+These repairs do not implement the innovation-correction recurrence in section
+12. They remove avoidable cold starts and self-cancellation while retaining the
+existing additive SO(3) scan.
 
 ## 8. Block and stack boundary
 
@@ -359,25 +354,27 @@ pre-norm -> mixer -> residual add/pre-norm -> SwiGLU FFN
 
 with the residual stream accumulated in fp32. `SLinOSSStack` optionally adds an
 unpadded token embedding, final fp32 norm gain, and an untied padded vocabulary
-head. There is no depth scaling and no weight tying. None of those parameters is
-included in section 5's mixer counts.
+head. Both residual branch output matrices use `1/sqrt(2*n_layers)` scaling;
+there is no weight tying. None of those surrounding parameters is included in
+section 5's mixer counts.
 
-## 9. What changed between the historical MAD winner and current master
+## 9. Historical differential diagnosis
 
 The selective-copy winner was commit `109a56b` as a complete configuration; the
-state-tracking winner entered at `2e75c89` and is the basis of current master.
-The difference is a bundle, not one `tanh` switch:
+pre-cleanup state-tracking winner entered at `2e75c89`. The repaired source keeps
+the state winner's reachable operator while removing its input-path cold start:
 
-| Axis | Historical MAD winner `109a56b` | Current master | Mechanistic effect |
+| Axis | MAD winner `109a56b` | Pre-cleanup state winner | Repaired source |
 | --- | --- | --- | --- |
-| rotation chart | radius asymptotes below pi | radius asymptotes below 2pi; half-turn finite | master removes a real A5/group reachability defect |
-| token rotation drive | `bias + ||bias||*tanh(delta)` | `bias + delta`, then one outer radial map | old drive preserves each head's initialized scale but suppresses slow-head gradients/reach; master is globally reachable |
-| recurrent `z0` | zero | fixed cyclic nonzero basis | changes input-driven memory into a live autonomous carrier |
-| B/write projection | live framework random | zero | master starts with no input-driven state update |
-| output projection | live framework random | zero | master starts as residual no-op and blocks all inner gradients on step one |
-| B/C short conv | absent | present but exact identity initially | no forward difference at initialization; adds learnable local motifs |
-| token transition band | zero | zero | same static transition bank at initialization |
-| period/horizon endpoint | hard-coded 4096 | explicit constructor `init_span=4096` | same default physics; master prevents a harness length from changing it silently |
+| rotation chart | radius below pi | full finite SO(3) reach | full finite SO(3) reach |
+| token rotation drive | radius-anchored `tanh` | direct additive displacement | direct additive displacement |
+| recurrent `z0` | zero | fixed cyclic basis | fixed cyclic basis |
+| B/C projection | both live random | B zero, C live random | both live; balanced rows and unit runtime vectors |
+| output projection | live random | zero | live; depth-scaled by native block |
+| B/C short conv | absent | identity-initialized, learnable | identity-initialized, learnable |
+| token transition band | zero | zero | zero |
+| period / horizon | both 4..4096 | both 4..4096 | period 4..256; horizon 4..4096 |
+| tail gate | before head RMS norm | before head RMS norm | after head RMS norm |
 
 Historical point estimates reported for the complete `109a56b` configuration
 were 94.71% and 92.28% selective copy on two seeds. They do not isolate any one
@@ -388,14 +385,23 @@ sufficient for selective copy (about 89.01%) nor compatible with A5 (about
 7.15%). Those facts reject both simplistic stories, "tanh caused MAD" and "live
 B alone caused MAD."
 
-The defensible differential diagnosis is: the state winner intentionally moved
-the model toward homogeneous group action (full chart, nonzero carrier, quiet
-token transition), while simultaneously moving initialization away from
-input-driven memory (zero B and zero output). That bundle favors state algebra
-and creates an avoidable conflict with write-heavy tasks. The chart itself is
-resolved: retaining full finite SO(3) reach is mandatory. The unresolved design
-question is the correct state-editing rule and balanced initialization, not chart
-reach or head-count roulette.
+The defensible historical diagnosis is: the state winner moved toward
+homogeneous group action (full chart, cyclic carrier, quiet token transition)
+while moving away from input-driven memory (zero B and output). The repaired
+source keeps the full chart and carrier required by A5 while making B, C and
+output live and bounded. That is a source fact, not yet a transferred performance
+claim; section 14 records only runs actually made on this source.
+
+Two older implementations sharpen the initialization diagnosis. Production
+SLinOSS at `slinoss-old` commit `5eb1e26` defaulted to `G=H`, left its fused B/C
+rows and output projection live under framework initialization, and normalized
+each realized complex B/C vector to unit RMS (L2 norm `sqrt(S)`). Its recurrent
+state was zero. The research SP2SSD mixer at `c2a9064` also used live Xavier B/C
+and output projections, but initialized its actual correction precision to
+`softplus(-8) ~= 0.000335`, effectively freezing the update. Commit `3a5e775`
+replaced that dead corner with `phi_init=1` and live gentle modulation. Thus
+projection liveness alone is insufficient: the operator-level write/correction
+coefficient and the number of independent address systems must also be live.
 
 ## 10. Winning ingredients found in `.sources`
 
@@ -426,9 +432,9 @@ finite group:
 **Ingredient:** a token-selective transition family with group closure,
 non-positive-real spectrum where required, and a reachable representation of
 the target group. SLinOSS's full SO(3) chart and noncommutative quaternion scan
-directly supply this for A5. The cyclic carrier makes the homogeneous action
-immediately observable, but a nonzero carrier could also be written from input;
-the theory does not require that it be a fixed constructor buffer.
+directly supply this for A5. The fixed cyclic carrier makes the homogeneous
+action immediately observable; the controlled current-source ablation in
+section 14 establishes that this carrier is load-bearing for the mixer.
 
 ### 10.2 Selective copy: GDN2's actual guts
 
@@ -457,8 +463,8 @@ or corrects the state only in that addressed direction while preserving
 unrelated associations; the independent value-axis write decides what to
 commit. That is lossless selective editing under collisions.
 
-Current SLinOSS has an additive outer-product write and a token read, but no key
-normalization and no state-dependent erase/correction. Its homogeneous
+Repaired SLinOSS L2-normalizes realized B/C vectors but retains an additive
+outer-product write with no state-dependent erase/correction. Its homogeneous
 transition globally rotates/contracts every lane in a head. It can append
 information, transport it, and globally forget it; it cannot directly say
 "replace the value at this content address while leaving the rest alone."
@@ -528,10 +534,11 @@ Its 440M ablations are specific:
 
 The important lesson is balance and normalization, not "turn B on." An
 asymmetric B-only intervention is empirically the worst bias configuration in
-Mamba-3. Positive, normalized, paired B/C paths are synergistic. SLinOSS already
-has the mathematically stronger SO(3) transition and a first-order-hold
-previous/current update, but master initializes B dead, C live, and output dead.
-That is the opposite of the source-backed LM regime.
+Mamba-3. Positive, normalized, paired B/C paths are synergistic. SLinOSS has the
+mathematically stronger SO(3) transition and a first-order-hold previous/current
+update. The pre-cleanup state winner initialized B dead, C live, and output
+dead; the repaired source makes all three paths live and L2-normalizes both B
+and C at runtime.
 
 **Ingredient:** live, normalized, balanced read/write/output paths around stable
 selective dynamics. MIMO rank is a secondary capacity/throughput choice, not the
@@ -554,9 +561,10 @@ first causal repair.
 **Ingredient:** a well-covered, near-conservative oscillatory spectrum with
 damping independent of frequency and a variance-controlled input forcing path.
 SLinOSS already has the right stable transport family and a two-dimensional
-period/horizon lattice. Its remaining risks are coarse allocation at low H,
-fixed 4096 scaling across regimes, and unnormalized forcing—not lack of an
-oscillator.
+period/horizon lattice. The repaired low-head allocation covers both physical
+axes instead of collapsing to the fast endpoint. Its remaining risks are the
+fixed 4096-token horizon across regimes and unconstrained forcing after
+initialization—not lack of an oscillator.
 
 ### 10.7 MQAR and associative recall
 
@@ -602,28 +610,37 @@ paper do not define one executable matching configuration.
 
 ### Established
 
-SLinOSS master is unusually strong at **transport and state algebra**:
+SLinOSS is unusually strong at **transport and state algebra**:
 
 - full finite SO(3) reach, including half-turns;
 - noncommutative composition under an exact associative scan;
 - stable nonexpansive dynamics;
 - independent phase and decay coordinates;
 - exact first-order-hold forcing;
-- a live autonomous carrier at initialization.
+- a fixed cyclic carrier plus live, input-driven write/read paths.
 
-It is weakly parameterized and badly initialized for **state editing**:
+The cleanup repair removed the known initialization self-owns:
+
+- B and C start live and variance-balanced rather than asymmetrically live/dead;
+- B and C are unit runtime vectors rather than magnitude-coupled addresses;
+- output starts live, with depth scaling owned by the native block;
+- the cyclic state makes the homogeneous SO(3) action observable immediately;
+- the output gate follows RMS normalization and therefore retains amplitude;
+- decay horizon and rotation period use separate physical spectra.
+
+It remains weakly parameterized for **state editing**:
 
 - additive writes do not inspect the previous state;
-- B/C are not normalized content addresses;
 - there is no targeted erase, innovation, or confidence feedback;
-- master begins with B dead, C live, output dead, and z0 live;
 - G=1 shares one B/C address system across all heads;
 - its generous raw state size can mask these deficits on easier tasks.
 
 That is the real tension. It is not "SO(3) helps A5 but hurts MAD." Rotation and
 decay are complementary and are present in other joint winners. The conflict is
-between an **autonomous-carrier initialization plus blind additive writes** and
-the **live, normalized, state-aware edits** required by selective memory and LM.
+between **blind additive writes** and the **normalized, state-aware edits**
+required by selective memory and LM. The cleanup campaign fixes cold starts and
+scale cancellation; it deliberately does not claim to have added the missing
+editing operation.
 
 ### The simplest credible common denominator
 
@@ -631,28 +648,25 @@ The source evidence supports one coherent mixer, not task-specific init:
 
 1. Keep the current full-reach SO(3) transition, stable decay, and independent
    period/horizon bank.
-2. Seed state from a live, normalized token write rather than relying on a fixed
-   task-independent carrier. A zero runtime state is then compatible with
-   memory tasks and does not remove group expressivity after the first symbol.
+2. Keep the fixed cyclic carrier established by the controlled A5 comparison;
+   normalized token forcing must coexist with it rather than replace it.
 3. Replace blind additive writing with a normalized innovation/delta update. In
    orientation compatible with a `[P,S]` state, the minimal form is
 
    ```text
    Zbar_t = a_t R_t Z_{t-1}
-   k_t    = normalize(B_t)
-   old_t  = Zbar_t k_t
-   Z_t    = Zbar_t + beta_t outer(v_t - old_t, k_t)
-   y_t    = Z_t normalize(C_t)
+   Bhat_t = normalize(B_t)
+   Chat_t = normalize(C_t)
+   old_t  = Zbar_t (erase_t * Bhat_t)
+   Z_t    = Zbar_t - outer(old_t, Bhat_t)
+                     + outer(write_t * U_t, Bhat_t)
+   y_t    = Z_t Chat_t
    ```
 
-   This preserves SO(3) transport while adding GDN2/DeltaNet's missing
-   collision-aware correction. A channelwise erase/write generalization is
-   available if the scalar beta proves insufficient, but it is not the first
-   form to ship.
-4. Initialize B, C, value, and output live and variance-balanced. Normalize B/C
-   and initialize any B/C offsets as a paired positive scheme, not B-only. Keep
-   token transition deltas zero so the explicit SO(3) bank remains the initial
-   transport.
+   This preserves SO(3) transport while adding GDN2/DeltaNet's collision-aware,
+   independently gated erase and write.
+4. Keep B, C, value and output live and variance-balanced, with zero token
+   transition deltas so the explicit SO(3) bank remains the initial transport.
 5. Scale write magnitude from recurrence variance (for example by the
    contraction-dependent stationary-variance factor), not by benchmark name or
    an arbitrary A5/SC knob.
@@ -726,12 +740,19 @@ branch runs into current-tip measurements. The durable record presently supports
 
 - the state-tracking winner's paired free/stable H8/G4 result improved from
   99.70% to 100.00% and solved at 10k with a perfect held-out tail;
+- on the repaired operator, cyclic H8/G4 reached 95.43% overall and 91.65% tail
+  at 5k before an external supervisor-lifecycle kill interrupted the arm;
+- changing only that H8/G4 initial state to zero collapsed the matched 5k point
+  to 4.56% overall and 3.24% tail, a controlled -90.87/-88.41 point effect;
+- exact current master at cyclic H8/G8 reached 68.68%/45.41% at 5k, then
+  100.00% overall and 100.00% tail at 10k (`solved=True`, loss 0.0001,
+  832,140 total model parameters);
 - historical `109a56b` selective-copy point estimates of 94.71% and 92.28%;
 - the causal z0 and anchored-drive results recorded in section 9;
 - no clean, complete, matched all-six-MAD plus LM result table at the current
   master tip yet.
 
-Accordingly, current master is a source-established **state-tracking design
-winner**, not yet a measurement-established joint MAD/LM crusher. That wording
-must remain until one exact current-tip configuration is evaluated under the
-locked harnesses and fair state/parameter disclosures.
+Accordingly, current master is a measurement-established **state-tracking
+winner** at H8/G8. It is not yet a measurement-established joint MAD/LM crusher.
+That wording must remain until one exact current-tip configuration is evaluated
+under the locked harnesses and fair state/parameter disclosures.

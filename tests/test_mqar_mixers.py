@@ -53,12 +53,11 @@ SLINOSS_DEFAULTS: dict[str, Setting] = {
     "chunk_size": 64,
     "d_conv": 4,
     "key_conv": True,
-    "init_span": 4096,
-    "w_max": 3.141592502593994,
     "bias": False,
     "conv_bias": True,
+    "norm_eps": 1e-5,
 }
-"""The slinoss entry's declared settings, read off ``SLinOSSConfig`` at import.
+"""The slinoss entry's declared settings, read off ``SLinOSSMixerConfig`` at import.
 
 Pinned as literals rather than against the dataclass, because the dataclass is what the
 entry reads: a change there is a change to every arm's shape and has to be acknowledged
@@ -302,7 +301,7 @@ def test_the_published_control_defaults() -> None:
 
 
 def test_the_slinoss_entry_declares_the_operator_contract() -> None:
-    """Every setting, at the value ``SLinOSSConfig`` declares."""
+    """Every setting, at the value ``SLinOSSMixerConfig`` declares."""
     assert REGISTRY["slinoss"].defaults == SLINOSS_DEFAULTS
 
 

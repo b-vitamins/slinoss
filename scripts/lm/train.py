@@ -17,7 +17,8 @@ divided by the accumulation count, one clip over the summed gradient, one
 
 The published protocol runs every computation in fp32. Only the token-embedding table is
 stored in bfloat16; the model casts its lookup to fp32 before the first block. There is no
-autocast region and all registered fast operators support fp32 explicitly.
+autocast region. The scan therefore uses its fp32 reference backend; its tensor-core
+backend is available only to explicit bf16/fp16 configurations.
 
 The loss is :func:`slinoss.ops.xent.cross_entropy`, which takes the class count separately
 from the operand width. That is the padded head exactly: the head emits
@@ -68,7 +69,6 @@ class TrainConfig:
         micro_batch: Sequences per forward.
         base_lr: Hidden-group rate before transfer.
         embedding_base_lr: Token-table rate before transfer.
-        ssm_multiplier: Multiple of the transferred rate the state-space group runs at.
         weight_decay: Decay for the decayed groups.
         betas: AdamW betas.
         eps: AdamW epsilon.
@@ -87,7 +87,6 @@ class TrainConfig:
     micro_batch: int = 8
     base_lr: float = 4e-3
     embedding_base_lr: float = 0.3
-    ssm_multiplier: float = 0.1
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.8, 0.95)
     eps: float = 1e-10
@@ -360,15 +359,14 @@ def train(
     policy = GroupPolicy(
         lr=peak_lr,
         embedding_lr=embedding_lr,
-        ssm_multiplier=config.ssm_multiplier,
         weight_decay=config.weight_decay,
     )
     groups = parameter_groups(model, policy)
     optimizer = torch.optim.AdamW(
         groups, lr=peak_lr, betas=config.betas, eps=config.eps, fused=False
     )
-    # The schedule multiplies every group by one factor, so the ratios the policy set --
-    # the state-space group's 0.1x, the token table's own rate -- hold at every step.
+    # The schedule multiplies every group by one factor, preserving the token
+    # embedding's separately transferred rate.
     peaks = [float(group["lr"]) for group in optimizer.param_groups]
 
     stream = batches(

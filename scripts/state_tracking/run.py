@@ -214,17 +214,11 @@ def _record(
     }
     train_data = {**task_data, "split": asdict(train_split)}
     val_data = {**task_data, "split": asdict(val_split)}
-    init_spans = [
-        construction["effective_config"].get("init_span")
-        for construction in constructions
-        if "init_span" in construction["effective_config"]
-    ]
     init_lattices = [
         {
             key: construction["effective_config"].get(key)
             for key in (
                 "context_length",
-                "init_span",
                 "init_period_context_scale",
                 "init_decay_context_scale",
                 "resolved_init_period_span",
@@ -267,7 +261,6 @@ def _record(
                 "train": {"min": train_split.min_length, "max": train_width_max},
                 "evaluation": {"min": val_split.min_length, "max": val_width_max},
             },
-            "mixer_initialization_span": init_spans or None,
             "mixer_initialization_lattice": init_lattices or None,
         },
         "seeds": {

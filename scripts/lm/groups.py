@@ -9,7 +9,6 @@ from torch import Tensor, nn
 
 __all__ = [
     "GROUPS",
-    "SSM_LEAVES",
     "GroupPolicy",
     "classify",
     "group_counts",
@@ -19,9 +18,6 @@ __all__ = [
 GROUPS = ("embedding", "unembedding", "hidden", "scalar", "ssm")
 """Group names, in report order."""
 
-SSM_LEAVES = frozenset({"transition_bias", "d_skip"})
-"""State-space leaves, also recognized through ``_no_weight_decay``."""
-
 
 @dataclass(frozen=True)
 class GroupPolicy:
@@ -29,11 +25,10 @@ class GroupPolicy:
 
     lr: float
     embedding_lr: float
-    ssm_multiplier: float = 0.1
     weight_decay: float = 0.1
 
     def __post_init__(self) -> None:
-        for name in ("lr", "embedding_lr", "ssm_multiplier"):
+        for name in ("lr", "embedding_lr"):
             value = getattr(self, name)
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive, got {value}")
@@ -48,8 +43,6 @@ class GroupPolicy:
             raise ValueError(f"group must be one of {GROUPS}, got {group!r}")
         if group == "embedding":
             return self.embedding_lr
-        if group == "ssm":
-            return self.lr * self.ssm_multiplier
         return self.lr
 
     def decay(self, group: str) -> float:
@@ -61,14 +54,13 @@ class GroupPolicy:
 
 def classify(name: str, param: Tensor) -> str:
     """Return the unique optimizer group for ``param``."""
-    leaf = name.rsplit(".", 1)[-1]
     if name.startswith("embedding."):
         return "embedding"
     if name.startswith("head."):
         return "unembedding"
     in_mixer = ".mixer." in f".{name}"
     flagged: Any = getattr(param, "_no_weight_decay", False)
-    if in_mixer and (bool(flagged) or leaf in SSM_LEAVES):
+    if in_mixer and bool(flagged):
         return "ssm"
     if "norm" in name or param.ndim == 1:
         return "scalar"

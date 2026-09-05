@@ -41,7 +41,9 @@ class ScanPrepFunction(torch.autograd.Function):
         w_max: float,
         backend_name: str,
     ) -> _Packed:
-        out = get(backend_name).forward(params, transition_bias, heads=heads, w_max=w_max)
+        out = get(backend_name).forward(
+            params, transition_bias, heads=heads, w_max=w_max
+        )
         ctx.save_for_backward(params, transition_bias)
         ctx.heads = heads
         ctx.w_max = w_max
