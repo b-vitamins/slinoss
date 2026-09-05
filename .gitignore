@@ -28,6 +28,9 @@ Thumbs.db
 !.sources/notes/
 .sources/notes/*
 !.sources/notes/SLINOSS_MIXER_ANATOMY.md
+!.sources/notes/EXPERIMENTAL_CLOSURE_2026-09-06.md
+!.sources/receipts/
+!.sources/receipts/**
 
 # Generated AOT payloads and JIT caches.
 slinoss/_aot/
