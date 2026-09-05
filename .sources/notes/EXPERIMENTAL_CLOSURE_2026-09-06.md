@@ -18,7 +18,7 @@ the final master commit.
 
 ## State tracking
 
-Completed: **20/28 benchmark rows**. Solved: **20/20 completed rows**.
+Completed: **22/28 benchmark rows**. Solved: **20/22 completed rows**.
 
 ### Walker/KLA Figure-1-style fixed-length A5 sweep
 
@@ -61,9 +61,14 @@ All 14 fixed-length cells are solved at depth 1.
 - PD-SSM reconstructed `S5:4`: **100.0000%** at step 5,000, two layers, with
   **100.0000% in every reported length band**. Total/mixer parameters:
   832,712/816,208.
+- PD-SSM reconstructed `S5:8`: **2.0264%** at step 100,000, two layers; the
+  longest reported band is **0.0000%**. This cell is not solved.
+- Walker S5: **5.7610%** at step 100,000, two layers; the longest reported
+  band is **3.5301%**. This cell is not solved. Total/mixer parameters:
+  847,560/816,208.
 
-Remaining native rows: PD-SSM `S5:8`, `S5:32`; Walker S5; four released regular
-tasks; and the Walker arithmetic-with-brackets extension.
+Remaining native rows: PD-SSM `S5:32`; four released regular tasks; and the
+Walker arithmetic-with-brackets extension.
 
 ## MAD-Lab
 
