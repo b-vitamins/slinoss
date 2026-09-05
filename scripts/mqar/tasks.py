@@ -35,7 +35,7 @@ from scripts.mqar.instances import Instance, multiquery_ar
 MAX_SEED = 2**32
 """Seed space. The low half is train, the high half is test."""
 
-FIGURE2_CELLS = ((64, 4), (128, 8), (256, 16))
+FIGURE2_CELLS = ((64, 4), (128, 8), (256, 16), (512, 64))
 """``(input_seq_len, num_kv_pairs)`` cells the ICLR24 figure-2 sweep reports."""
 
 FIGURE2_EXAMPLES = (100_000, 3_000)

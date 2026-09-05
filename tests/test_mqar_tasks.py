@@ -63,6 +63,11 @@ LEAKY_FRACTION = 0.030333333333333334
 """Measured leakage of :data:`LEAKY`. Fixed seeds, so this is a constant, not a rate."""
 
 
+def test_figure2_cells_match_the_iclr24_release() -> None:
+    """The published sweep reaches its longest 512-token, 64-pair cell."""
+    assert FIGURE2_CELLS == ((64, 4), (128, 8), (256, 16), (512, 64))
+
+
 def hand_segment(rows: list[list[int]], num_kv_pairs: int) -> Segment:
     """A segment built from literal rows, for the pool-level functions.
 
