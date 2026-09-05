@@ -81,6 +81,31 @@ complete.
 Pending: noisy context recall. Selective copy is a material
 regression and does not satisfy the campaign's "respectable MAD" gate.
 
+## MQAR
+
+This is the Zoology ICLR-24 Figure-2 task. The authoritative paper and
+[`iclr24` release](https://github.com/HazyResearch/zoology/releases/tag/iclr24)
+contain four matched train/test cells: `64:4`, `128:8`, `256:16`, and
+`512:64`. The current Zoology `main` config comments out the last cell; the
+in-tree preset inherited that omission until `ef93e4a`, which restores it.
+
+The paper and its current config specify two layers, while the release-tag
+script conditionally set four layers for non-attention mixers. These receipts
+use the paper-text/current-config interpretation: two layers. This is a bounded
+point profile at `d_model=128`, learning rate `1e-3`, and model/data seed 123,
+not the published selection over four widths and four learning rates. Each cell
+uses vocabulary 8,192, 100,000 training rows, 3,000 test rows, padding filler,
+64 epochs maximum, weight decay 0.1, and early stopping above 99% accuracy.
+The model has 1,329,704 parameters and uses the default SLinOSS constructor
+geometry (`d_head=64`, `n_groups=1`) in both layers.
+
+| Cell (length:pairs) | Best example accuracy | Best position accuracy | Best epoch | Runtime | Status |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| `64:4` | 99.9500% | 99.9500% | 2 | 36.390 s | complete; zero leakage |
+| `128:8` | 99.9375% | 99.9375% | 2 | 66.062 s | complete; zero leakage |
+| `256:16` | 99.0604% | 99.0604% | 18 | 819.350 s | complete; zero leakage |
+| `512:64` | — | — | — | — | running from the corrected four-cell harness |
+
 ## Language modelling
 
 Both synchronized, bounded arms are complete. They use the same GPT-NeoX

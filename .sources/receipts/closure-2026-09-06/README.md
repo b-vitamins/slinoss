@@ -3,7 +3,8 @@
 This directory is a point-in-time snapshot of completed JSONL result rows for
 the SLinOSS closure campaign begun on 2026-09-06.
 
-- `sonata/`: fixed-length A5, Walker/PD A5, and completed MAD rows.
+- `sonata/`: fixed-length A5, Walker/PD A5, completed MAD rows, bounded LM
+  records, and completed MQAR cells.
 - `automation/`: fixed-length A5 length 14 and native PD-SSM S5 rows.
 - `SHA256SUMS`: content hashes for the raw receipts.
 
