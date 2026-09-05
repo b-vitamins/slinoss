@@ -24,7 +24,10 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
-.sources/
+.sources/*
+!.sources/notes/
+.sources/notes/*
+!.sources/notes/SLINOSS_MIXER_ANATOMY.md
 
 # Generated AOT payloads and JIT caches.
 slinoss/_aot/
