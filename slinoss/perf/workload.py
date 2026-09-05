@@ -282,11 +282,7 @@ def make_inputs(
                 randn(*lead, 3, dt=torch.float32),
                 randn(*lead, dt=torch.float32),
             ),
-            # Drawn, not zeroed: the rotation drive is anchored to this row's own
-            # radius, so a zero bias floors the radius and hands the scan a bank of
-            # near-identity rotations at ``|w| ~ 1e-6`` instead of the spread the
-            # mixer runs on. Nothing downstream branches on ``|w|``, so the timing is
-            # the same either way; the operands are not.
+            # Drawn rather than zeroed to exercise token-dependent transitions.
             randn(shape.heads, PARAM_COLS, dt=torch.float32),
             heads=shape.heads,
             w_max=W_MAX,
@@ -749,21 +745,21 @@ class PrepInputs(NamedTuple):
         proj: ``(B,T,W)`` projection output, contiguous. Held only to keep the
             slice alive and to name the pitch; not differentiated.
         params: ``(B,T,4H)`` pitched slice, activation dtype.
-        param_bias: ``(H,4)``, float32.
+        transition_bias: ``(H,4)``, float32.
         dtrans: ``(B,H,T,4)`` float32 cotangent seed.
         dK: ``(B,H,T,2,4)`` float32 cotangent seed.
     """
 
     proj: Tensor
     params: Tensor
-    param_bias: Tensor
+    transition_bias: Tensor
     dtrans: Tensor
     dK: Tensor
 
     @property
     def differentiable(self) -> tuple[Tensor, ...]:
         """The two tensors gradients are taken with respect to."""
-        return (self.params, self.param_bias)
+        return (self.params, self.transition_bias)
 
     @property
     def cotangents(self) -> tuple[Tensor, ...]:
@@ -784,7 +780,7 @@ def make_prep_inputs(
     Args:
         shape: The problem size.
         device: Where to allocate.
-        dtype: Dtype of the projection. ``param_bias`` is float32 regardless, as
+        dtype: Dtype of the projection. ``transition_bias`` is float32 regardless, as
             I4 requires.
         requires_grad: Whether the two differentiable inputs carry gradients.
         seed: Generator seed, so two runs benchmark the same numbers.
@@ -807,13 +803,8 @@ def make_prep_inputs(
     return PrepInputs(
         proj=proj,
         params=proj[..., param_columns].detach().requires_grad_(requires_grad),
-        # Drawn, not zeroed: the rotation drive is anchored to this row's own
-        # radius, so a zero bias floors the radius and pins ``|w|`` near 1e-6 at
-        # every head. Both tap branches are evaluated and every guard is a select,
-        # so the timing would not move -- but the small-``|w|`` series is the branch
-        # whose value gets discarded, and a benchmark should measure the regime the
-        # mixer runs in. Drawn after ``proj`` so no seed's projection moves.
-        param_bias=randn(scan.heads, PARAM_COLS, dt=torch.float32).requires_grad_(
+        # Drawn rather than zeroed to exercise token-dependent transitions.
+        transition_bias=randn(scan.heads, PARAM_COLS, dt=torch.float32).requires_grad_(
             requires_grad
         ),
         dtrans=randn(*lead, 4, dt=torch.float32),
@@ -844,7 +835,7 @@ def prep_forward_only(
         with torch.no_grad(), region(f"{prefix}.forward"):
             scanprep(
                 inputs.params,
-                inputs.param_bias,
+                inputs.transition_bias,
                 heads=shape.scan.heads,
                 w_max=W_MAX,
                 backend=backend,
@@ -885,7 +876,7 @@ def prep_step(
         with region(f"{prefix}.forward"):
             out = scanprep(
                 inputs.params,
-                inputs.param_bias,
+                inputs.transition_bias,
                 heads=shape.scan.heads,
                 w_max=W_MAX,
                 backend=backend,

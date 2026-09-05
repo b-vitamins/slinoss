@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ def mixer(dtype: torch.dtype = torch.bfloat16, device: str = "cpu") -> MixerStat
     return MixerState.allocate(CONFIG, BATCH, device=device, dtype=dtype)
 
 
-def _fields(state: MixerState) -> dict[str, Tensor]:
+def _fields(state: MixerState) -> dict[str, Tensor | None]:
     """Every buffer, by field name, read off ``state`` on each call.
 
     Off the dataclass rather than a written list: a buffer added to the container
@@ -31,6 +32,10 @@ def _fields(state: MixerState) -> dict[str, Tensor]:
     return {
         field.name: getattr(state, field.name) for field in dataclasses.fields(state)
     }
+
+
+def _buffers(state: MixerState) -> dict[str, Tensor]:
+    return {name: value for name, value in _fields(state).items() if value is not None}
 
 
 def test_allocate_matches_config(device: torch.device) -> None:
@@ -44,6 +49,7 @@ def test_allocate_matches_config(device: torch.device) -> None:
     config = SLinOSSConfig(d_model=48, d_state=96, d_head=32, d_conv=3)
     state = MixerState.allocate(config, 3, device=device, dtype=torch.bfloat16)
     assert tuple(state.conv.shape) == (3, config.d_conv - 1, config.d_inner)
+    assert state.keys is not None
     assert tuple(state.keys.shape) == (
         3,
         config.d_conv - 1,
@@ -53,16 +59,23 @@ def test_allocate_matches_config(device: torch.device) -> None:
     assert tuple(state.b_prev.shape) == (3, config.n_groups, config.d_state)
     assert tuple(state.u_prev.shape) == (3, config.n_heads, config.d_head)
     assert state.ssm.shape[-1] == 3 * config.n_lanes
-    assert all(buffer.is_contiguous() for buffer in _fields(state).values())
+    assert all(buffer.is_contiguous() for buffer in _buffers(state).values())
     assert torch.equal(
         state.ssm,
         oscillator_basis(config, device=device)[None].expand_as(state.ssm),
     )
     assert all(
-        not buffer.any() for name, buffer in _fields(state).items() if name != "ssm"
+        not buffer.any() for name, buffer in _buffers(state).items() if name != "ssm"
     )
     assert state.batch == 3
     assert state.device.type == device.type
+
+
+def test_key_history_exists_only_when_key_conv_is_enabled() -> None:
+    assert mixer().keys is not None
+    config = dataclasses.replace(CONFIG, key_conv=False)
+    state = MixerState.allocate(config, BATCH, device="cpu", dtype=torch.float32)
+    assert state.keys is None
 
 
 @pytest.mark.parametrize(
@@ -95,11 +108,11 @@ def test_reset_keeps_the_buffer_addresses() -> None:
     leaves the graph and the container pointing at different memory.
     """
     state = mixer(torch.float32)
-    for index, buffer in enumerate(_fields(state).values(), start=1):
+    for index, buffer in enumerate(_buffers(state).values(), start=1):
         buffer.fill_(float(index))
-    before = [buffer.data_ptr() for buffer in _fields(state).values()]
+    before = [buffer.data_ptr() for buffer in _buffers(state).values()]
     state.reset()
-    after = _fields(state)
+    after = _buffers(state)
     assert [buffer.data_ptr() for buffer in after.values()] == before
     assert torch.equal(
         state.ssm,
@@ -112,10 +125,10 @@ def test_clone_is_independent() -> None:
     """Catches a clone that returns views: writing the copy would corrupt the
     captured buffers it was taken from."""
     state = mixer(torch.float32)
-    original_values = {name: value.clone() for name, value in _fields(state).items()}
+    original_values = {name: value.clone() for name, value in _buffers(state).items()}
     copy = state.clone()
-    original = _fields(state)
-    for index, buffer in enumerate(_fields(copy).values(), start=1):
+    original = _buffers(state)
+    for index, buffer in enumerate(_buffers(copy).values(), start=1):
         buffer.fill_(float(index))
     assert all(
         torch.equal(buffer, original_values[name]) for name, buffer in original.items()
@@ -123,7 +136,7 @@ def test_clone_is_independent() -> None:
     assert all(
         buffer.dtype is original[name].dtype
         and tuple(buffer.shape) == tuple(original[name].shape)
-        for name, buffer in _fields(copy).items()
+        for name, buffer in _buffers(copy).items()
     )
 
 
@@ -171,7 +184,7 @@ def test_containers_are_frozen() -> None:
     ("mutate", "exc", "match"),
     [
         (lambda s: {"conv": s.conv[0]}, ValueError, "conv must be"),
-        (lambda s: {"keys": s.keys[:, :1]}, ValueError, "keys must be"),
+        (lambda s: {"keys": cast(Tensor, s.keys)[:, :1]}, ValueError, "keys must be"),
         (lambda s: {"ssm": s.ssm[0]}, ValueError, "ssm must be"),
         (lambda s: {"b_prev": s.b_prev[0]}, ValueError, "b_prev must be"),
         (lambda s: {"u_prev": s.u_prev[0]}, ValueError, "u_prev must be"),
@@ -191,7 +204,11 @@ def test_containers_are_frozen() -> None:
             "one activation dtype only",
         ),
         (lambda s: {"conv": s.conv[:, :, :16]}, ValueError, "both are d_inner"),
-        (lambda s: {"keys": s.keys[:, :, :16]}, ValueError, "B and C hold"),
+        (
+            lambda s: {"keys": cast(Tensor, s.keys)[:, :, :16]},
+            ValueError,
+            "B and C hold",
+        ),
         (lambda s: {"u_prev": s.u_prev[:, :, :16]}, ValueError, "u_prev holds"),
         (lambda s: {"b_prev": s.b_prev[:, :, :16]}, ValueError, "b_prev holds"),
         # ``G`` divides ``H``: head ``h`` reads group ``h // (H // G)``, so a group
@@ -213,7 +230,7 @@ def test_containers_are_frozen() -> None:
     ],
 )
 def test_mixer_rejects_bad_buffers(
-    mutate: Callable[[MixerState], dict[str, Tensor]],
+    mutate: Callable[[MixerState], dict[str, Tensor | None]],
     exc: type[Exception],
     match: str,
 ) -> None:
@@ -230,7 +247,13 @@ def test_mixer_rejects_bad_buffers(
     fields = _fields(state)
     fields.update(mutate(state))
     with pytest.raises(exc, match=match):
-        MixerState(**fields)
+        MixerState(
+            conv=cast(Tensor, fields["conv"]),
+            keys=fields["keys"],
+            ssm=cast(Tensor, fields["ssm"]),
+            b_prev=cast(Tensor, fields["b_prev"]),
+            u_prev=cast(Tensor, fields["u_prev"]),
+        )
 
 
 @pytest.mark.parametrize(

@@ -51,7 +51,7 @@ class ScanPrepForward(Protocol):
     def __call__(
         self,
         params: Tensor,
-        param_bias: Tensor,
+        transition_bias: Tensor,
         /,
         *,
         heads: int,
@@ -62,7 +62,7 @@ class ScanPrepForward(Protocol):
 class ScanPrepBackward(Protocol):
     """Backward signature every backend implements.
 
-    ``param_bias`` is present because the maps' Jacobians are evaluated at the
+    ``transition_bias`` is present because the maps' Jacobians are evaluated at the
     additive row, which reads both operands, and because it takes a gradient of its
     own.
 
@@ -78,7 +78,7 @@ class ScanPrepBackward(Protocol):
         dtrans: Tensor,
         dK: Tensor,
         params: Tensor,
-        param_bias: Tensor,
+        transition_bias: Tensor,
         /,
         *,
         heads: int,

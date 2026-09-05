@@ -80,9 +80,10 @@ def _ids(device: torch.device, length: int) -> Tensor:
 def _buffers(state: StackState) -> list[tuple[str, Tensor]]:
     """Every carry in the state, labelled, in layer order."""
     return [
-        (f"layer {index} {name}", getattr(layer, name))
+        (f"layer {index} {name}", value)
         for index, layer in enumerate(state.layers)
-        for name in ("conv", "ssm", "b_prev", "u_prev")
+        for name in ("conv", "keys", "ssm", "b_prev", "u_prev")
+        if (value := getattr(layer, name)) is not None
     ]
 
 

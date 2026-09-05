@@ -1,6 +1,6 @@
 """Autograd entry point for the scan's parameter frontier.
 
-Saves ``params`` and ``param_bias``. The maps' Jacobians are evaluated at their
+Saves ``params`` and ``transition_bias``. The maps' Jacobians are evaluated at their
 sum, so both are needed; nothing else is, because neither packed output is read
 back. That is two saved tensors, one of them ``(H,4)``.
 
@@ -36,13 +36,13 @@ class ScanPrepFunction(torch.autograd.Function):
     def forward(
         ctx: Any,
         params: Tensor,
-        param_bias: Tensor,
+        transition_bias: Tensor,
         heads: int,
         w_max: float,
         backend_name: str,
     ) -> _Packed:
-        out = get(backend_name).forward(params, param_bias, heads=heads, w_max=w_max)
-        ctx.save_for_backward(params, param_bias)
+        out = get(backend_name).forward(params, transition_bias, heads=heads, w_max=w_max)
+        ctx.save_for_backward(params, transition_bias)
         ctx.heads = heads
         ctx.w_max = w_max
         ctx.backend_name = backend_name
@@ -54,21 +54,21 @@ class ScanPrepFunction(torch.autograd.Function):
         dtrans: Tensor,
         dK: Tensor,
     ) -> _Grads:
-        params, param_bias = ctx.saved_tensors
+        params, transition_bias = ctx.saved_tensors
         grads = get(ctx.backend_name).backward(
             dtrans,
             dK,
             params,
-            param_bias,
+            transition_bias,
             heads=ctx.heads,
             w_max=ctx.w_max,
         )
-        return (grads.dparams, grads.dparam_bias, None, None, None)
+        return (grads.dparams, grads.dtransition_bias, None, None, None)
 
 
 def scanprep(
     params: Tensor,
-    param_bias: Tensor,
+    transition_bias: Tensor,
     *,
     heads: int,
     w_max: float,
@@ -79,8 +79,7 @@ def scanprep(
     Args:
         params: Projection slice, ``(B,T,H*4)``, activation dtype, trailing
             stride one. Per head, in order ``(w_x, w_y, w_z, ls)``.
-        param_bias: ``(H,4)`` float32. Added to every token row. See
-            :func:`slinoss.ops.scanprep.anchored_rotvec`.
+        transition_bias: ``(H,4)`` float32, added to every token row.
         heads: ``H``.
         w_max: Rotation-vector chart scale, in ``(0, pi)``.
         backend: Backend name, or ``None`` to select the fastest registered
@@ -97,6 +96,6 @@ def scanprep(
     impl = resolve(backend, params.device.type, params.dtype)
     trans, packed = cast(
         "_Packed",
-        ScanPrepFunction.apply(params, param_bias, heads, w_max, impl.name),
+        ScanPrepFunction.apply(params, transition_bias, heads, w_max, impl.name),
     )
     return ScanParams(trans=trans, K=packed)

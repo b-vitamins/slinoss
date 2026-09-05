@@ -54,6 +54,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -315,8 +316,9 @@ def initialize(model: nn.Module, n_layers: int, init_std: float) -> None:
     for _, module in _unprotected(model):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, std=init_std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+            bias = cast(Tensor | None, module.bias)
+            if bias is not None:
+                nn.init.zeros_(bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=init_std)
     rescaled = init_std / math.sqrt(2 * n_layers)

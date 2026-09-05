@@ -1,68 +1,13 @@
-"""The residual block: fused pre-norm, the mixer, fused pre-norm, a SwiGLU FFN.
-
-    normed, r = norm(x, r);   m = mixer(normed)
-    normed, r = norm(m, r);   h = W_o swiglu(W_g normed, W_u normed)
-
-The block hands back ``(h, r)``: the branch output unadded and the stream it
-belongs to. The add is the next fused norm's first operation, so the stream is
-touched once per norm instead of once per add and again per norm, and a stack
-carries one pass over it per branch. The last branch is added by the stack's
-final norm.
-
-The stream is float32 at every activation dtype, which is what the fused norm
-returns. A deep stack therefore accumulates wide and narrows only where a GEMM
-reads.
-
-The FFN projection is two GEMMs over two weights rather than one GEMM over a
-fused ``[gate | up]`` weight. :func:`slinoss.ops.block.swiglu` takes contiguous
-operands and the two halves of a fused projection output are column bands, so one
-GEMM buys either a copy of both halves or a pitched path through the activation
-kernel. Slicing one fused weight is not a third option: each slice's pullback
-allocates a full-width zero buffer and the two are summed, which is an allocation
-per step that the two-weight form does not make. What the two-weight form costs
-instead is a second read of ``normed``.
-
-The output projection's weight is stored ``(d_ffn, d_model)``, the transpose of
-what :class:`torch.nn.Linear` holds, so the contraction is ``gated @ W`` and the
-weight gradient comes out ``(d_ffn, d_model)`` as well. The orientation is a
-throughput decision, not a convention.
-
-The model, which is a model and not a measurement: a weight gradient whose
-reduction extent is the token count is ``(d_model, d_ffn) = (576, 2304)`` in the
-``nn.Linear`` orientation, and cuBLAS covers that shape with a ``256x128`` tile.
-3 by 18 tiles is 54 blocks over 84 multiprocessors, 0.64 of one wave, so the tail
-of the wave is the whole kernel. Transposed, the same contraction fills 1.07
-waves.
-
-Measured at ``d_model 576``, ``d_ffn 2304``, 8,192 tokens, bf16, on an RTX A6000
-(sm_86, 84 multiprocessors) whose clocks cannot be locked, medians over 20
-launches per arm with the arms alternating: forward, dgrad and wgrad together take
-722.9 us at 90.2 TFLOPS stored ``(d_model, d_ffn)`` and 582.7 us at 112.0 TFLOPS
-stored ``(d_ffn, d_model)``. The wgrad alone goes from 294.6 us at 73.8 TFLOPS to
-173.5 us at 125.3 TFLOPS. An 8,192-cube bf16 GEMM measured in the same process
-reaches 112 to 113 TFLOPS, so the transposed store is at that ceiling and the
-framework orientation is at 80% of it.
-
-The win is per width. At ``d_model 1024``, ``d_ffn 4096`` the same three stages
-take 2,028.5 us at 101.6 TFLOPS stored ``(d_model, d_ffn)`` against 2,153.5 us at
-95.7 TFLOPS transposed, and there the framework orientation is the faster one.
-The store stays transposed because it is measured faster at the configured width,
-and the choice cannot be deferred to run time: the shape is in the state dict,
-and which orientation wins depends on the multiprocessor count of whichever
-device the gradient lands on.
-"""
+"""Pre-norm residual block with an SLinOSS mixer and SwiGLU FFN."""
 
 from __future__ import annotations
 
-import math
-from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
-from torch.nn import init
 
-from slinoss._precision import LOW_PRECISION_DTYPES
+from slinoss._precision import Float32Module
 from slinoss.config import SLinOSSConfig
 from slinoss.mixer import SLinOSSMixer
 from slinoss.ops.block import rmsnorm_residual, swiglu
@@ -85,25 +30,10 @@ class BlockOutput(NamedTuple):
     residual: Tensor
 
 
-class SLinOSSBlock(nn.Module):
-    """Pre-norm residual block around :class:`slinoss.SLinOSSMixer`.
+class SLinOSSBlock(Float32Module):
+    """Two fused residual norms around a mixer and a SwiGLU FFN."""
 
-    Two fused residual norms, the mixer, and a SwiGLU FFN of width
-    :attr:`slinoss.SLinOSSConfig.d_ffn`. Both norm weights are float32 at every
-    module dtype and stay float32 through a module-wide cast, because the kernel
-    backend refuses a low-precision norm weight (I4).
-
-    CUDA, for the same reason the mixer is: its operands are column bands of one
-    projection and the band rule is a device rule.
-
-    Initialization is the framework default everywhere except the norm weights,
-    which are ones, and the mixer, which owns its own. No depth scaling.
-
-    Args:
-        config: Shape and parameterization contract.
-        device: Device for every parameter.
-        dtype: Dtype for every parameter except the two norm weights.
-    """
+    _float32_names = ("mixer_norm_weight", "ffn_norm_weight")
 
     def __init__(
         self,
@@ -115,11 +45,11 @@ class SLinOSSBlock(nn.Module):
         super().__init__()
         self.config = config
         self.mixer_norm_weight = nn.Parameter(
-            torch.empty(config.d_model, device=device, dtype=torch.float32)
+            torch.ones(config.d_model, device=device, dtype=torch.float32)
         )
         self.mixer = SLinOSSMixer(config, device=device, dtype=dtype)
         self.ffn_norm_weight = nn.Parameter(
-            torch.empty(config.d_model, device=device, dtype=torch.float32)
+            torch.ones(config.d_model, device=device, dtype=torch.float32)
         )
         self.ffn_gate = nn.Linear(
             config.d_model, config.d_ffn, bias=config.bias, device=device, dtype=dtype
@@ -127,58 +57,13 @@ class SLinOSSBlock(nn.Module):
         self.ffn_up = nn.Linear(
             config.d_model, config.d_ffn, bias=config.bias, device=device, dtype=dtype
         )
-        # Transposed against nn.Linear. See the module docstring: this orientation
-        # is what puts the weight gradient on a full wave.
-        self.ffn_out_weight = nn.Parameter(
-            torch.empty(config.d_ffn, config.d_model, device=device, dtype=dtype)
+        self.ffn_out = nn.Linear(
+            config.d_ffn,
+            config.d_model,
+            bias=config.bias,
+            device=device,
+            dtype=dtype,
         )
-        self.ffn_out_bias: Tensor | None = (
-            nn.Parameter(torch.empty(config.d_model, device=device, dtype=dtype))
-            if config.bias
-            else None
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        """Initialize every parameter in place, the mixer's included.
-
-        Called by the constructor.
-        """
-        with torch.no_grad():
-            self.mixer_norm_weight.fill_(1.0)
-            self.ffn_norm_weight.fill_(1.0)
-            self.mixer.reset_parameters()
-            self.ffn_gate.reset_parameters()
-            self.ffn_up.reset_parameters()
-            # Over the transpose, so the framework default sees the fan_in it would
-            # see on the nn.Linear this replaces.
-            init.kaiming_uniform_(self.ffn_out_weight.t(), a=math.sqrt(5))
-            if self.ffn_out_bias is not None:
-                bound = 1.0 / math.sqrt(self.config.d_ffn)
-                self.ffn_out_bias.uniform_(-bound, bound)
-
-    def _apply(
-        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
-    ) -> SLinOSSBlock:
-        """Apply ``fn`` to every parameter, then undo a demoted norm weight.
-
-        ``block.to(torch.bfloat16)`` is how the module is meant to reach a kernel
-        dtype, and the two norm weights are the parameters that cannot follow. A
-        widening cast is left alone, so a float64 module keeps a float64 oracle
-        end to end.
-
-        Args:
-            fn: The per-tensor operation :meth:`torch.nn.Module._apply` applies.
-            recurse: Whether to descend into submodules.
-
-        Returns:
-            This module.
-        """
-        super()._apply(fn, recurse)
-        for weight in (self.mixer_norm_weight, self.ffn_norm_weight):
-            if weight.dtype in LOW_PRECISION_DTYPES:
-                weight.data = weight.data.to(torch.float32)
-        return self
 
     def forward(
         self,
@@ -219,16 +104,7 @@ class SLinOSSBlock(nn.Module):
             )
             post = rmsnorm_residual(mixed, pre.residual, self.ffn_norm_weight, eps=eps)
             gated = swiglu(self.ffn_gate(post.normed), self.ffn_up(post.normed))
-            # Stated as one mm over the flattened tokens rather than left to
-            # matmul's folding rule, which reaches a batched kernel on an operand
-            # that is not contiguous.
-            flat = gated.flatten(0, 1)
-            out = (
-                torch.mm(flat, self.ffn_out_weight)
-                if self.ffn_out_bias is None
-                else torch.addmm(self.ffn_out_bias, flat, self.ffn_out_weight)
-            )
             return BlockOutput(
-                hidden=out.view(gated.shape[0], gated.shape[1], -1),
+                hidden=self.ffn_out(gated),
                 residual=post.residual,
             )

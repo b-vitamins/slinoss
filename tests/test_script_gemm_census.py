@@ -88,7 +88,7 @@ def _weights(stack: SLinOSSStack) -> dict[str, Tensor]:
         "out_proj": block.mixer.out_proj.weight,
         "ffn_gate": block.ffn_gate.weight,
         "ffn_up": block.ffn_up.weight,
-        "ffn_out": block.ffn_out_weight,
+        "ffn_out": block.ffn_out.weight,
         "head": stack.head.weight,
     }
 
@@ -113,32 +113,16 @@ def test_the_role_table_is_the_stacks_own_weights() -> None:
         assert one.call_count == (1 if one.name == "head" else CENSUS_CONFIG.n_layers)
 
 
-def test_a_transposed_weight_swaps_the_two_forward_transpose_cases() -> None:
-    """``ffn_out``, stored ``(I,O)``, against ``ffn_gate``, stored ``(O,I)``.
-
-    The stored orientation fixes all three cases at once, and every shape it
-    produces is a shape another map already runs: ``ffn_out``'s dgrad is
-    ``ffn_gate``'s forward and its wgrad is ``ffn_gate``'s wgrad, one cuBLAS kernel
-    for each pair. Same stage and same shape is one row; same shape at different
-    stages is two rows over one launch stream, and a table keyed by shape alone
-    loses the stage the row is read for.
-    """
+def test_every_linear_uses_the_framework_orientation() -> None:
     cfg = CENSUS_CONFIG
     table = {(one.label, one.stage): one for one in gemm_shapes(cfg, TOKENS)}
-    gate, out = "ffn_gate+ffn_up", "ffn_out"
-    assert [table[gate, stage].layout for stage in (FWD, DGRAD)] == [TN, NN]
-    assert [table[out, stage].layout for stage in (FWD, DGRAD)] == [NN, TN]
-    assert table[out, DGRAD].key == table[gate, FWD].key
-    assert table[out, FWD].key == table[gate, DGRAD].key
-    # The weight gradient comes out in the stored shape, which is the point of the
-    # orientation: it is what decides how many tiles the token reduction covers.
-    # Transposed, ffn_out's is the shape the two gate projections already ran, so the
-    # three are one row and its launch count is the sum.
-    assert (gate, WGRAD) not in table and (out, WGRAD) not in table
-    merged = table[f"{gate}+{out}", WGRAD]
-    assert merged.layout == NT
-    assert (merged.m, merged.n, merged.k) == (cfg.d_ffn, cfg.d_model, TOKENS)
-    assert merged.call_count == 3 * cfg.n_layers
+    for label in ("ffn_gate+ffn_up", "out_proj+ffn_out"):
+        assert [table[label, stage].layout for stage in (FWD, DGRAD, WGRAD)] == [
+            TN,
+            NN,
+            NT,
+        ]
+    assert table["out_proj+ffn_out", FWD].call_count == 2 * cfg.n_layers
 
 
 class FakeKernel(NamedTuple):
@@ -207,15 +191,15 @@ def test_a_rows_figures_are_the_launches_behind_it() -> None:
     """
     iters = 3
     table = {(one.label, one.stage): one for one in gemm_shapes(CENSUS_CONFIG, TOKENS)}
-    pair = [table["ffn_out", DGRAD], table["ffn_gate+ffn_up", FWD]]
+    pair = [table["out_proj+ffn_out", DGRAD], table["ffn_gate+ffn_up", FWD]]
     shared = census(pair, _profile(pair, iters), iters, CEILING)
     assert shared.unassigned == ()
     layers = CENSUS_CONFIG.n_layers
     by_stage = {row.stage: row for row in shared.rows}
-    assert by_stage[DGRAD].step_duration_us == pytest.approx(LAUNCH_US * layers)
+    assert by_stage[DGRAD].step_duration_us == pytest.approx(LAUNCH_US * 2 * layers)
     assert by_stage[FWD].step_duration_us == pytest.approx(LAUNCH_US * 2 * layers)
 
-    alone = table["out_proj", FWD]
+    alone = table["out_proj+ffn_out", FWD]
     tiled = _profile([alone], 1)
     with_gemv = FakeProfile(
         (
@@ -231,7 +215,7 @@ def test_a_rows_figures_are_the_launches_behind_it() -> None:
     assert len(got.rows) == 1
     row = got.rows[0]
     assert row.duration.median_duration_us == pytest.approx(LAUNCH_US)
-    assert row.step_duration_us == pytest.approx(LAUNCH_US * layers)
+    assert row.step_duration_us == pytest.approx(LAUNCH_US * 2 * layers)
     assert row.achieved_tflops == pytest.approx(OUT_PROJ_TFLOPS)
     assert row.ceiling_pct == pytest.approx(OUT_PROJ_TFLOPS)
     assert any("gemv2T_kernel_val" in line for line in got.unassigned)

@@ -1,45 +1,14 @@
-"""The stack: an optional embedding, ``n_layers`` blocks, a final fused norm, an
-optional head.
-
-    r = None
-    for each block:  h, r = block(h, r)
-    out = W_head norm(h, r)
-
-One fused norm per branch and one more at the end. Every block returns its branch
-output unadded, so the final norm is the add the last block did not do rather than
-an extra pass over the stream.
-
-The stream is float32 from the first block's norm to the last, which is what
-:func:`slinoss.ops.block.rmsnorm_residual` returns at every activation dtype. The
-head reads the normed output in the activation dtype, so nothing but the stream is
-wide.
-
-``vocab_size`` decides both ends together. With it the stack takes token ids and
-returns logits; without it the stack takes and returns activations, and embeds
-into a larger model that owns those two layers.
-
-The head is :attr:`slinoss.SLinOSSConfig.padded_vocab_size` wide, not
-``vocab_size``: all three of its GEMMs read their operand alignment off that
-width, so an unaligned one costs every one of them its wide load and half its MMA
-K-extent. The columns past ``vocab_size`` carry ``finfo(dtype).min``, which is
-zero under every softmax and unreachable by every argmax. The embedding is a
-gather and is not padded.
-
-A :class:`slinoss.StackState` threads decode through the same loop: each block
-continues its own layer and advances it in place, so a prefill and a single-token
-step are one call at two sequence lengths.
-"""
+"""SLinOSS block stack with optional token embedding and vocabulary head."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
 from torch.nn.functional import linear
 
-from slinoss._precision import LOW_PRECISION_DTYPES, cast_opt, cast_to
+from slinoss._precision import Float32Module, cast_opt, cast_to
 from slinoss.blocks import BlockOutput, SLinOSSBlock
 from slinoss.config import SLinOSSConfig
 from slinoss.ops.block import rmsnorm_residual
@@ -51,36 +20,7 @@ _HeadGrads = tuple[Tensor, Tensor, Tensor | None, None]
 
 
 class _PaddedHeadFunction(torch.autograd.Function):
-    """The head GEMM and the constant it writes past ``vocab_size``, as one node.
-
-    The padding columns are constants, so a cotangent on one must reach neither
-    head gradient. Autograd states that by recording the write and clearing the
-    padding band of the cotangent in the pullback, and clearing a band of a tensor
-    it does not own makes it clone the whole logit block first. Measured at the
-    reference geometry: one 1.65 GB device-to-device copy, 2.416 ms, a third of the
-    step's glue, and 2,424 MiB of peak against 1,166 MiB, the clone and the cleared
-    cotangent both being the size of the logit block.
-
-    The write is not recorded here, and the pullback clears nothing on the cotangent.
-    It keeps the padding out of each gradient where that gradient reads it, and every
-    contraction stays at the padded width while it does, because that width is what
-    aligns them: narrowing the vocabulary axis of ``dnormed`` costs 4.05 ms of the
-    4.62 ms the aligned one takes, and narrowing ``dbias`` 0.61 ms of 1.21 ms.
-    ``dweight`` and ``dbias`` reduce over tokens, so a padding column reaches only a
-    padding row of either, and that band is overwritten with zero. ``dnormed``
-    contracts the vocabulary axis, so it reads a copy of the weight whose padding rows
-    are zero, which costs 0.13 ms.
-
-    Every product is then the recorded version's and every sum is over the same terms
-    in the same order, because a zero padding row contributes exactly the zero a
-    cleared padding column contributed. Measured at the reference geometry over a
-    cotangent drawn on every column, padding included: all three gradients bitwise
-    the recorded version's at bf16, float32 and float64.
-
-    No :func:`torch.amp.custom_fwd`. Autocast rewrites the GEMM's operands where it
-    is issued, and the gradients are cast back to the parameter dtypes on the way
-    out, so nothing here needs the eager cast that would also demote ``normed``.
-    """
+    """Aligned head whose padded logits and gradients are constants/zeros."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -134,34 +74,10 @@ class _PaddedHeadFunction(torch.autograd.Function):
         )
 
 
-class SLinOSSStack(nn.Module):
-    """``n_layers`` :class:`slinoss.SLinOSSBlock` under one config.
+class SLinOSSStack(Float32Module):
+    """A stack of :class:`SLinOSSBlock` modules under one config."""
 
-    The final norm weight is float32 at every module dtype and stays float32
-    through a module-wide cast, for the reason the block's two are (I4).
-
-    CUDA, for the reason the mixer is.
-
-    Initialization is the framework default everywhere except the final norm
-    weight, which is ones, and the blocks, which own their own. No depth scaling
-    and no weight tying: the head is its own parameter, and the embedding stays
-    ``vocab_size`` rows while the head is
-    :attr:`slinoss.SLinOSSConfig.padded_vocab_size`.
-
-    The head's rows past ``vocab_size`` are left at the framework default. Their
-    value never reaches an output, because :meth:`forward` overwrites their columns
-    with ``finfo(dtype).min``, and their gradient is exactly zero, because the
-    pullback of that write contracts the live columns only. Both are
-    :class:`_PaddedHeadFunction`.
-
-    Args:
-        config: Shape and parameterization contract. ``n_layers`` sets the depth,
-            ``vocab_size`` decides whether the embedding and the head exist, and
-            ``vocab_pad_multiple`` sets how much wider than ``vocab_size`` the head
-            is.
-        device: Device for every parameter.
-        dtype: Dtype for every parameter except the norm weights.
-    """
+    _float32_names = ("norm_weight",)
 
     def __init__(
         self,
@@ -182,7 +98,7 @@ class SLinOSSStack(nn.Module):
             for _ in range(config.n_layers)
         )
         self.norm_weight = nn.Parameter(
-            torch.empty(config.d_model, device=device, dtype=torch.float32)
+            torch.ones(config.d_model, device=device, dtype=torch.float32)
         )
         padded_vocab = config.padded_vocab_size
         self.head: nn.Linear | None = (
@@ -196,41 +112,6 @@ class SLinOSSStack(nn.Module):
             if padded_vocab is not None
             else None
         )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        """Initialize every parameter in place, every block's included.
-
-        Called by the constructor.
-        """
-        with torch.no_grad():
-            self.norm_weight.fill_(1.0)
-            if self.embedding is not None:
-                self.embedding.reset_parameters()
-            if self.head is not None:
-                self.head.reset_parameters()
-            for module in self.blocks:
-                cast("SLinOSSBlock", module).reset_parameters()
-
-    def _apply(
-        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
-    ) -> SLinOSSStack:
-        """Apply ``fn`` to every parameter, then undo a demoted norm weight.
-
-        Each block undoes its own two; this handles the final one. A widening cast
-        is left alone.
-
-        Args:
-            fn: The per-tensor operation :meth:`torch.nn.Module._apply` applies.
-            recurse: Whether to descend into submodules.
-
-        Returns:
-            This module.
-        """
-        super()._apply(fn, recurse)
-        if self.norm_weight.dtype in LOW_PRECISION_DTYPES:
-            self.norm_weight.data = self.norm_weight.data.to(torch.float32)
-        return self
 
     def forward(self, x: Tensor, state: StackState | None = None) -> Tensor:
         """Run every block over one sequence, or continue one from ``state``.

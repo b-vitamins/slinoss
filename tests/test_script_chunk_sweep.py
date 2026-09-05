@@ -18,6 +18,8 @@ import math
 import pytest
 import torch
 
+pytest.importorskip("cutlass")
+
 from scripts.perf.chunk_sweep import (
     CANDIDATES,
     FLAT,
@@ -43,7 +45,6 @@ from scripts.perf.chunk_sweep import (
     step_model,
     traffic_terms,
 )
-from slinoss._cute import smem_residency
 from slinoss.config import HEAD_MULTIPLE, MAX_CHUNK, MIN_CHUNK, STATE_MULTIPLE
 from slinoss.perf.workload import SHAPES, shape_by_name
 
@@ -252,6 +253,8 @@ def test_a_width_the_launch_falls_back_from_refuses_nothing() -> None:
 @CUTE
 @pytest.mark.cute
 def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> None:
+    from slinoss._cute import smem_residency
+
     rows = arena_rows(ACCEPTANCE, CANDIDATES, CAPACITY)
     assert {row.chunk for row in rows} == set(CANDIDATES)
     for row in rows:
@@ -359,6 +362,8 @@ def test_an_occupancy_row_names_the_resource_that_sets_its_residency() -> None:
 @CUTE
 @pytest.mark.cute
 def test_the_residency_bar_is_the_granular_one_not_the_capacity_divided() -> None:
+    from slinoss._cute import smem_residency
+
     # k blocks pay k reservations against a capacity that has one subtracted
     # already, and each is rounded up to a granule. Both corrections are needed:
     # a plain divide reads one block high in a 512 B band under the two-block

@@ -207,6 +207,12 @@ def _restore(state: StackState, saved: StackState) -> None:
     """
     for layer, snapshot in zip(state.layers, saved.layers, strict=True):
         layer.conv.copy_(snapshot.conv)
+        if layer.keys is not None:
+            if snapshot.keys is None:
+                raise ValueError("saved state is missing key-convolution history")
+            layer.keys.copy_(snapshot.keys)
+        elif snapshot.keys is not None:
+            raise ValueError("saved state unexpectedly has key-convolution history")
         layer.ssm.copy_(snapshot.ssm)
         layer.b_prev.copy_(snapshot.b_prev)
         layer.u_prev.copy_(snapshot.u_prev)

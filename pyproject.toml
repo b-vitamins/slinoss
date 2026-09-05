@@ -102,14 +102,13 @@ include = ["slinoss", "tests", "scripts"]
 exclude = ["slinoss/_aot", "**/__pycache__"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
-# typings/cutlass declares the CuTe DSL surface dynamically typed, which is what
-# it is; the stub itself carries the reasons. The DSL sits on a search-path root
-# that is not the site-packages directory, so `useLibraryCodeForTypes` does not
-# reach it and a stub is the only lever. Nothing else is stubbed and no rule is
-# disabled: slinoss, torch, pytest, and numpy stay fully checked.
+# CuTe is optional locally; the bundled stubs type its dynamic DSL surface.
 stubPath = "typings"
 reportMissingImports = "error"
 reportMissingTypeStubs = "none"
+# The optional CuTe runtime is absent on CPU-only hosts; its checked interface is
+# supplied by ``typings`` while unresolved imports remain hard errors.
+reportMissingModuleSource = "none"
 reportPrivateImportUsage = "none"
 reportUnusedExpression = "error"
 reportUnnecessaryComparison = "error"

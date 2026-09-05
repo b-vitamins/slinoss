@@ -14,7 +14,6 @@ from slinoss.ops.scanprep import (
     LS_MAX_MAG,
     PARAM_COLS,
     ScanParams,
-    anchored_rotvec,
     bounded_logscale,
     bounded_rotvec,
     foh_taps,
@@ -119,58 +118,6 @@ def test_logscale_is_monotone_decreasing() -> None:
 def test_logscale_gradcheck() -> None:
     raw = torch.linspace(-8.0, 8.0, 17, dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(bounded_logscale, (raw,))
-
-
-# ---------------------------------------------------------------------------
-# The anchored drive
-# ---------------------------------------------------------------------------
-
-
-def _drive_pair(seed: int, radius: float) -> Pair:
-    """``(band, bias)``, both ``(256,3)`` float64, the bias at a fixed radius."""
-    gen = torch.Generator().manual_seed(seed)
-    band = torch.randn(256, 3, generator=gen, dtype=torch.float64) * 4.0
-    bias = torch.randn(256, 3, generator=gen, dtype=torch.float64)
-    return band, radius * bias / bias.norm(dim=-1, keepdim=True)
-
-
-@pytest.mark.parametrize("radius", [3.0, 1e-2, 4.8e-4])
-def test_rotation_drive_is_an_unconstrained_displacement(radius: float) -> None:
-    """Every head gets the same unit chart, independent of its initial period."""
-    band, bias = _drive_pair(seed=21, radius=radius)
-    drive = anchored_rotvec(band, bias) - bias
-    torch.testing.assert_close(drive, band, rtol=2e-15, atol=2e-15)
-
-
-def test_anchored_drive_is_the_bias_at_a_zero_band() -> None:
-    """A zeroed parameter band leaves the initialized bank exactly, which is what the
-    mixer's zeroed projection rows rely on."""
-    _, bias = _drive_pair(seed=22, radius=0.5)
-    assert torch.equal(anchored_rotvec(torch.zeros_like(bias), bias), bias)
-
-
-def test_rotation_drive_at_a_zero_bias_is_still_the_band() -> None:
-    """Training a head through the chart origin cannot delete its token dependence."""
-    band, _ = _drive_pair(seed=23, radius=1.0)
-    bias = torch.zeros_like(band)
-    out = anchored_rotvec(band, bias)
-    assert torch.equal(out, band)
-
-
-def test_rotation_drive_has_unit_pullback_to_both_operands() -> None:
-    band = torch.randn(8, 3, dtype=torch.float64, requires_grad=True)
-    bias = torch.randn(8, 3, dtype=torch.float64, requires_grad=True)
-    anchored_rotvec(band, bias).sum().backward()
-    assert torch.equal(band.grad, torch.ones_like(band))
-    assert torch.equal(bias.grad, torch.ones_like(bias))
-
-
-def test_anchored_drive_gradcheck() -> None:
-    """Float64 gradcheck on both additive operands."""
-    gen = torch.Generator().manual_seed(24)
-    band = torch.randn(8, 3, generator=gen, dtype=torch.float64, requires_grad=True)
-    bias = torch.randn(8, 3, generator=gen, dtype=torch.float64, requires_grad=True)
-    assert torch.autograd.gradcheck(anchored_rotvec, (band, bias))
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +363,7 @@ def _operands(
     strided: bool = False,
     seed: int = 0,
 ) -> Pair:
-    """``(params, param_bias)``.
+    """``(params, transition_bias)``.
 
     ``params`` is cut out of a wider row, which is the shipped layout: the mixer
     runs one projection GEMM and hands out views. ``strided`` keeps it as a view;
@@ -440,20 +387,19 @@ def _operands(
     return params, rnd(heads, PARAM_COLS).to(pinned) * bias
 
 
-def _apply(params: Tensor, param_bias: Tensor, *, heads: int = 3) -> ScanParams:
+def _apply(params: Tensor, transition_bias: Tensor, *, heads: int = 3) -> ScanParams:
     """:func:`scanprep_ref` at the default bound."""
-    return scanprep_ref(params, param_bias, heads=heads, w_max=W_MAX)
+    return scanprep_ref(params, transition_bias, heads=heads, w_max=W_MAX)
 
 
-def _head_major(params: Tensor, param_bias: Tensor, heads: int) -> Tensor:
+def _head_major(params: Tensor, transition_bias: Tensor, heads: int) -> Tensor:
     """The map inputs the rows present, as ``(B,H,T,PARAM_COLS)``.
 
-    The rotation columns go through :func:`anchored_rotvec` and the log-scale column
-    is the same plain sum.
+    Both token and static rows are added before the bounded maps.
     """
     rows = params.unflatten(-1, (heads, PARAM_COLS)).permute(0, 2, 1, 3)
-    bias = param_bias[:, None, :]
-    drive = anchored_rotvec(rows[..., 0:3], bias[..., 0:3])
+    bias = transition_bias[:, None, :]
+    drive = rows[..., 0:3] + bias[..., 0:3]
     return torch.cat((drive, rows[..., 3:] + bias[..., 3:]), dim=-1)
 
 
@@ -466,8 +412,8 @@ def test_frontier_shapes_dtypes_and_contiguity() -> None:
     assert all(t.is_contiguous() for t in out)
 
 
-def test_frontier_applies_the_bounded_maps_to_the_anchored_row() -> None:
-    """The maps are the ones asserted above, applied after the row is anchored.
+def test_frontier_maps_the_sum_of_token_and_static_rows() -> None:
+    """The maps are applied after adding the static row.
 
     A frontier that mapped before adding or dropped the bias would still have every
     shape and dtype right. ``K``
@@ -545,7 +491,7 @@ def test_frontier_invariants_hold_on_the_packed_tensors() -> None:
 
 
 def test_frontier_gradcheck() -> None:
-    """float64 gradcheck on both inputs, ``param_bias`` included."""
+    """float64 gradcheck on both inputs, ``transition_bias`` included."""
     params, pb = _operands(bsz=1, heads=1, seqlen=3, seed=5)
     leaves = tuple(t.detach().clone().requires_grad_() for t in (params, pb))
 
@@ -566,7 +512,7 @@ def _stride_two(bsz: int, seqlen: int, width: int) -> Tensor:
     [
         (lambda p, pb: (p, pb, 0), ValueError, "heads must be positive"),
         (lambda p, pb: (p[..., :-1], pb, 3), ValueError, "params must be"),
-        (lambda p, pb: (p, pb[:-1], 3), ValueError, "param_bias must be"),
+        (lambda p, pb: (p, pb[:-1], 3), ValueError, "transition_bias must be"),
         (
             lambda p, pb: (_stride_two(2, 5, 3 * PARAM_COLS), pb, 3),
             ValueError,
@@ -635,8 +581,8 @@ def test_reference_backward_matches_autograd_through_the_public_operator() -> No
     total.backward()
 
     got = scanprep_bwd_ref(*cots, params, pb, heads=3, w_max=W_MAX)
-    names = ("dparams", "dparam_bias")
-    want = (got.dparams, got.dparam_bias)
+    names = ("dparams", "dtransition_bias")
+    want = (got.dparams, got.dtransition_bias)
     for leaf, ref, name in zip(leaves, want, names, strict=True):
         assert leaf.grad is not None
         torch.testing.assert_close(leaf.grad, ref, msg=name)
@@ -652,7 +598,7 @@ def test_reference_backward_ignores_the_cotangent_of_the_padding_lane() -> None:
     quiet = scanprep_bwd_ref(dtrans, dK, params, pb, heads=3, w_max=W_MAX)
     got = scanprep_bwd_ref(dtrans, loud, params, pb, heads=3, w_max=W_MAX)
     assert torch.equal(got.dparams, quiet.dparams)
-    assert torch.equal(got.dparam_bias, quiet.dparam_bias)
+    assert torch.equal(got.dtransition_bias, quiet.dtransition_bias)
     assert float(quiet.dparams.abs().max()) > 0.0
 
 

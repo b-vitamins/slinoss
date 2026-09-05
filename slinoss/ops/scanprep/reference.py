@@ -24,9 +24,7 @@ needs a clamp, an epsilon, or a validity pass:
   radius instead of at the chart's asymptote.
 
 The rotation-vector row a token presents to that second map is the raw sum of its
-projection columns and the head's bias. The outer radial map is the one bound:
-the token projection retains an unconstrained chart and a unit pullback at its
-zero initialization. See :func:`anchored_rotvec`.
+projection columns and the head's bias. The outer radial map is the one bound.
 
 Taps are not parameters. They are the first-order-hold moments of the transition
 the two maps above define, so they carry no columns and no initialization:
@@ -51,8 +49,6 @@ from slinoss._precision import (
 from slinoss.config import ROTATION_CHART_SCALE_MAX
 
 __all__ = [
-    "DRIVE_CEIL_SQ",
-    "DRIVE_FLOOR_SQ",
     "FOH_TAYLOR_RADIUS_SQ",
     "FP32_FOH_TERMS",
     "FP64_FOH_TERMS",
@@ -63,7 +59,6 @@ __all__ = [
     "T2_FLOOR",
     "ScanGrads",
     "ScanParams",
-    "anchored_rotvec",
     "bounded_logscale",
     "bounded_rotvec",
     "check_cotangents",
@@ -106,12 +101,6 @@ multiply the whole carried state by zero, which deletes the gradient of everythi
 before it; clearing 99 percent of a row instead takes ``ln(100)/(2*LS_MAX_MAG)``,
 nine tokens, and a delimiter has that many.
 """
-
-DRIVE_FLOOR_SQ = 1.0e-12
-"""Legacy drive-radius floor, retained for source compatibility but no longer used."""
-
-DRIVE_CEIL_SQ = float(torch.finfo(torch.float32).max)
-"""Legacy drive-radius ceiling, retained for source compatibility but no longer used."""
 
 # ---------------------------------------------------------------------------
 # First-order-hold taps
@@ -208,26 +197,6 @@ def bounded_logscale(raw: Tensor) -> Tensor:
         Log-scales, same shape.
     """
     return -LS_MAX_MAG * torch.sigmoid(raw)
-
-
-def anchored_rotvec(band: Tensor, bias: Tensor) -> Tensor:
-    """The rotation-vector row a token presents to :func:`bounded_rotvec`.
-
-    ``raw = bias + band``. The bias is the initialized operating point and the band
-    is an unconstrained token displacement. Bounding the displacement here would
-    duplicate :func:`bounded_rotvec`'s job, restrict the rotations a token can
-    reach, and make a zero-initialized projection's gradient proportional to the
-    head's initialized frequency. That last coupling suppresses the slowest head's
-    token gradient by thousands relative to the fastest one.
-
-    Args:
-        band: Unconstrained token rows, ``(...,3)``.
-        bias: Per-head rows, broadcasting against ``band``, ``(...,3)``.
-
-    Returns:
-        Unconstrained rotation vectors, ``(...,3)``.
-    """
-    return bias + band
 
 
 def foh_coeffs(order: int, terms: int) -> tuple[float, ...]:
@@ -354,14 +323,14 @@ class ScanGrads(NamedTuple):
         dparams: ``(B,T,H*PARAM_COLS)``, dtype of ``params``. Contiguous when the
             backward allocated it, and the caller's own tensor -- a pitched band of a
             wider gradient buffer -- when the caller supplied one.
-        dparam_bias: ``(H,PARAM_COLS)``, dtype of ``param_bias``.
+        dtransition_bias: ``(H,PARAM_COLS)``, dtype of ``transition_bias``.
     """
 
     dparams: Tensor
-    dparam_bias: Tensor
+    dtransition_bias: Tensor
 
 
-def check_operands(params: Tensor, param_bias: Tensor, heads: int) -> None:
+def check_operands(params: Tensor, transition_bias: Tensor, heads: int) -> None:
     """Validate the operand set.
 
     The shape, stride, and dtype contract every backend shares. The kernel host
@@ -371,13 +340,13 @@ def check_operands(params: Tensor, param_bias: Tensor, heads: int) -> None:
 
     Args:
         params: ``(B,T,H*PARAM_COLS)``.
-        param_bias: ``(H,PARAM_COLS)``.
+        transition_bias: ``(H,PARAM_COLS)``.
         heads: ``H``.
 
     Raises:
         ValueError: On a non-positive ``heads``, a rank or shape mismatch, or a
             trailing axis whose stride is not one.
-        TypeError: On an unsupported dtype, or on a low-precision ``param_bias``.
+        TypeError: On an unsupported dtype, or on a low-precision ``transition_bias``.
     """
     if heads < 1:
         raise ValueError(f"heads must be positive, got {heads}")
@@ -386,9 +355,9 @@ def check_operands(params: Tensor, param_bias: Tensor, heads: int) -> None:
         raise ValueError(
             f"params must be (B,T,{want}) at heads={heads}, got {tuple(params.shape)}"
         )
-    if tuple(param_bias.shape) != (heads, PARAM_COLS):
+    if tuple(transition_bias.shape) != (heads, PARAM_COLS):
         raise ValueError(
-            f"param_bias must be {(heads, PARAM_COLS)}, got {tuple(param_bias.shape)}"
+            f"transition_bias must be {(heads, PARAM_COLS)}, got {tuple(transition_bias.shape)}"
         )
     # Row stride is the projection width, so only the trailing axis is pinned.
     if params.stride(-1) != 1:
@@ -397,12 +366,12 @@ def check_operands(params: Tensor, param_bias: Tensor, heads: int) -> None:
             f"got {params.stride(-1)}"
         )
     check_supported(params, "params")
-    check_pinned(param_bias, "param_bias")
+    check_pinned(transition_bias, "transition_bias")
 
 
 def scanprep_ref(
     params: Tensor,
-    param_bias: Tensor,
+    transition_bias: Tensor,
     *,
     heads: int,
     w_max: float,
@@ -413,8 +382,7 @@ def scanprep_ref(
         params: Projection slice, ``(B,T,H*PARAM_COLS)``, activation dtype.
             Trailing stride one; the row stride is the projection width. Per head,
             in order ``(w_x, w_y, w_z, ls)``.
-        param_bias: ``(H,PARAM_COLS)``, float32. The head's operating point, added
-            to the token row per :func:`anchored_rotvec`.
+        transition_bias: ``(H,PARAM_COLS)``, float32 head operating points.
         heads: ``H``.
         w_max: Rotation-vector chart scale, in ``(0, pi)``.
 
@@ -425,19 +393,18 @@ def scanprep_ref(
     Raises:
         ValueError: On a shape mismatch, a trailing stride other than one, or a
             ``w_max`` outside ``(0, pi)``.
-        TypeError: On an unsupported dtype, or on a low-precision ``param_bias``.
+        TypeError: On an unsupported dtype, or on a low-precision ``transition_bias``.
     """
-    check_operands(params, param_bias, heads)
-    dtype = pinned_dtype(params, param_bias)
+    check_operands(params, transition_bias, heads)
+    dtype = pinned_dtype(params, transition_bias)
     with autocast_disabled(params.device.type):
         # (B,T,H,PARAM_COLS) -> (B,H,T,PARAM_COLS). unflatten of a unit-stride
         # trailing axis is a view, so the strided operand is read where it lies.
         rows = params.unflatten(-1, (heads, PARAM_COLS)).to(dtype)
         rows = rows.permute(0, 2, 1, 3)
-        bias = param_bias.to(dtype)[:, None, :]
+        bias = transition_bias.to(dtype)[:, None, :]
         w = bounded_rotvec(
-            anchored_rotvec(rows[..., ROTVEC_COLUMNS], bias[..., ROTVEC_COLUMNS]),
-            w_max,
+            rows[..., ROTVEC_COLUMNS] + bias[..., ROTVEC_COLUMNS], w_max
         )
         ls = bounded_logscale(rows[..., LS_COLUMN] + bias[..., LS_COLUMN])
         tap = foh_taps(w, ls)
@@ -451,7 +418,7 @@ def scanprep_bwd_ref(
     dtrans: Tensor,
     dK: Tensor,
     params: Tensor,
-    param_bias: Tensor,
+    transition_bias: Tensor,
     /,
     *,
     heads: int,
@@ -470,7 +437,7 @@ def scanprep_bwd_ref(
         dK: Cotangent of ``K``, ``(B,H,T,2,4)``. Lane 3 is the cotangent of a
             constant and is discarded.
         params: The forward's projection slice, ``(B,T,H*PARAM_COLS)``.
-        param_bias: The forward's bias, ``(H,PARAM_COLS)``. The maps' Jacobians are
+        transition_bias: The forward's bias, ``(H,PARAM_COLS)``. The maps' Jacobians are
             evaluated at the row the bias and the band form together, so the bias is
             saved too.
         heads: ``H``.
@@ -487,28 +454,28 @@ def scanprep_bwd_ref(
         TypeError: On an unsupported dtype, or a destination whose dtype is not that
             of ``params``.
     """
-    check_cotangents(dtrans, dK, params, param_bias, heads)
+    check_cotangents(dtrans, dK, params, transition_bias, heads)
     if dparams is not None:
         check_dparams_out(dparams, params, heads)
     pl = params.detach().requires_grad_(True)
-    cl = param_bias.detach().requires_grad_(True)
+    cl = transition_bias.detach().requires_grad_(True)
     with torch.enable_grad():
         out = scanprep_ref(pl, cl, heads=heads, w_max=w_max)
-    grad, dparam_bias = torch.autograd.grad((out.trans, out.K), (pl, cl), (dtrans, dK))
+    grad, dtransition_bias = torch.autograd.grad((out.trans, out.K), (pl, cl), (dtrans, dK))
     if dparams is None:
         dparams = grad.contiguous()
     else:
         # Copy, not accumulate: the destination is a band of a buffer whose other
         # columns belong to other operators, and no phase zeroed this band.
         dparams.copy_(grad)
-    return ScanGrads(dparams=dparams, dparam_bias=dparam_bias)
+    return ScanGrads(dparams=dparams, dtransition_bias=dtransition_bias)
 
 
 def check_cotangents(
     dtrans: Tensor,
     dK: Tensor,
     params: Tensor,
-    param_bias: Tensor,
+    transition_bias: Tensor,
     heads: int,
 ) -> tuple[int, int]:
     """Validate the backward's operand set.
@@ -519,7 +486,7 @@ def check_cotangents(
         dtrans: Cotangent of ``trans``.
         dK: Cotangent of ``K``.
         params: The forward's projection slice.
-        param_bias: The forward's bias.
+        transition_bias: The forward's bias.
         heads: ``H``.
 
     Returns:
@@ -537,10 +504,10 @@ def check_cotangents(
             f"params must be (B,T,{want}) at heads={heads}, got {tuple(params.shape)}"
         )
     check_supported(params, "params")
-    check_pinned(param_bias, "param_bias")
-    if tuple(param_bias.shape) != (heads, PARAM_COLS):
+    check_pinned(transition_bias, "transition_bias")
+    if tuple(transition_bias.shape) != (heads, PARAM_COLS):
         raise ValueError(
-            f"param_bias must be {(heads, PARAM_COLS)}, got {tuple(param_bias.shape)}"
+            f"transition_bias must be {(heads, PARAM_COLS)}, got {tuple(transition_bias.shape)}"
         )
     bsz, seqlen = int(params.shape[0]), int(params.shape[1])
     if tuple(dtrans.shape) != (bsz, heads, seqlen, 4):

@@ -18,6 +18,7 @@ EXPECTED = {
     "MixerState",
     "SLinOSSBlock",
     "SLinOSSConfig",
+    "SLinOSSMixerConfig",
     "SLinOSSMixer",
     "SLinOSSStack",
     "StackState",

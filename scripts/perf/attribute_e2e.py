@@ -127,7 +127,7 @@ SHARED_REDUCE = "reduce_rows"
 """The one kernel three stages launch.
 
 ``reduce_partials`` closes a slot buffer for the tail's two parameter gradients, for
-scanprep's ``dparam_bias``, and for the scan's ``dK`` lane tiles. One symbol, three
+scanprep's ``dtransition_bias``, and for the scan's ``dK`` lane tiles. One symbol, three
 call sites, and the profiler groups by name, so the row cannot be attributed to a
 stage by name alone. It is reported as its own stage rather than charged to one of
 the three.

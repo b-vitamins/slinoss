@@ -1,28 +1,4 @@
-"""The five parameter groups, and the rule that puts a parameter in exactly one.
-
-    embedding     the token table                      own rate, no decay
-    unembedding   the head                             base rate, decay
-    hidden        two-dimensional projection weights    base rate, decay
-    scalar        norm gains, biases, anything 1-D      base rate, no decay
-    ssm           the state-space parameters            0.1x rate, no decay
-
-The state-space group is separated because a recurrence's transition parameters sit inside a
-scan: a rate that suits a projection drives them past the stability the scan assumes, and
-decay on them shrinks the dynamics rather than a weight. Two things route a parameter there,
-and both are needed. A ``_no_weight_decay`` attribute is what the mixers in this tree and in
-``mamba_ssm`` already set, so a baseline's own declaration is honoured without a per-baseline
-table. :data:`SSM_LEAVES` names the rest by leaf, because a transition parameter that carries
-no flag is still a transition parameter.
-
-Two named deviations from a rule that would route by rank alone. A norm gain goes to
-``scalar`` even at rank two, because ``SLinOSSMixer.norm_weight`` is ``(H,P)`` and is a gain.
-The depthwise convolution kernel goes to ``hidden`` at rank two, matching ``mamba_ssm``, which
-flags ``A_log`` and ``D`` and leaves ``conv1d.weight`` in the decayed group.
-
-The partition is the point. Upstream trainers on this axis lose parameters to a group rule
-that overlaps or misses, so :func:`parameter_groups` checks that the groups cover every
-trainable parameter exactly once and refuses to build an optimizer otherwise.
-"""
+"""Disjoint optimizer parameter groups."""
 
 from __future__ import annotations
 
@@ -43,25 +19,13 @@ __all__ = [
 GROUPS = ("embedding", "unembedding", "hidden", "scalar", "ssm")
 """Group names, in report order."""
 
-SSM_LEAVES = frozenset({"param_bias", "d_skip"})
-"""Mixer leaves that are state-space parameters whatever their rank.
-
-``param_bias`` carries the transition and the taps; ``d_skip`` is the direct path's gain and
-already declares ``_no_weight_decay``. Named as well as flagged so the routing does not
-depend on an attribute another tree might drop.
-"""
+SSM_LEAVES = frozenset({"transition_bias", "d_skip"})
+"""State-space leaves, also recognized through ``_no_weight_decay``."""
 
 
 @dataclass(frozen=True)
 class GroupPolicy:
-    """Rate and decay per group.
-
-    Attributes:
-        lr: Base rate, already transferred to this arm's width and batch.
-        embedding_lr: Rate for the token table, transferred by the same factor.
-        ssm_multiplier: Multiple of ``lr`` the state-space group runs at.
-        weight_decay: Decay for the two decayed groups.
-    """
+    """Learning-rate and decay policy."""
 
     lr: float
     embedding_lr: float
@@ -79,17 +43,7 @@ class GroupPolicy:
             )
 
     def rate(self, group: str) -> float:
-        """The rate one group runs at.
-
-        Args:
-            group: Group name.
-
-        Returns:
-            The rate.
-
-        Raises:
-            ValueError: On an unknown group.
-        """
+        """Learning rate for ``group``."""
         if group not in GROUPS:
             raise ValueError(f"group must be one of {GROUPS}, got {group!r}")
         if group == "embedding":
@@ -99,36 +53,15 @@ class GroupPolicy:
         return self.lr
 
     def decay(self, group: str) -> float:
-        """The decay one group carries.
-
-        Args:
-            group: Group name.
-
-        Returns:
-            The decay.
-
-        Raises:
-            ValueError: On an unknown group.
-        """
+        """Weight decay for ``group``."""
         if group not in GROUPS:
             raise ValueError(f"group must be one of {GROUPS}, got {group!r}")
         return self.weight_decay if group in {"unembedding", "hidden"} else 0.0
 
 
 def classify(name: str, param: Tensor) -> str:
-    """Which group a parameter belongs to.
-
-    Args:
-        name: Dotted parameter name, as :meth:`torch.nn.Module.named_parameters` gives it.
-        param: The parameter, for its rank and its flags.
-
-    Returns:
-        One of :data:`GROUPS`.
-    """
+    """Return the unique optimizer group for ``param``."""
     leaf = name.rsplit(".", 1)[-1]
-    # Only the token table. SLinOSS also owns a ``transition_embedding`` and the
-    # substring rule silently gave that state-space parameter the token table's
-    # enormous learning rate instead of its declared SSM group.
     if name.startswith("embedding."):
         return "embedding"
     if name.startswith("head."):
@@ -143,16 +76,7 @@ def classify(name: str, param: Tensor) -> str:
 
 
 def group_counts(model: nn.Module) -> dict[str, int]:
-    """Trainable parameters per group.
-
-    Args:
-        model: The model.
-
-    Returns:
-        A count per name in :data:`GROUPS`, zeros included. An arm whose mixer carries no
-        state-space parameter reports ``ssm`` at zero, which is correct rather than
-        missing.
-    """
+    """Trainable parameter count per group, zeros included."""
     counts: dict[str, int] = dict.fromkeys(GROUPS, 0)
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -161,25 +85,7 @@ def group_counts(model: nn.Module) -> dict[str, int]:
 
 
 def parameter_groups(model: nn.Module, policy: GroupPolicy) -> list[dict[str, Any]]:
-    """Build the optimizer's param groups.
-
-    Args:
-        model: The model.
-        policy: Rates and decay.
-
-    Returns:
-        One dict per non-empty group, carrying ``name``, ``params``, ``lr`` and
-        ``weight_decay``. ``lr`` is the group's rate at the peak; the trainer scales every
-        group by one schedule factor, so the ratios between groups hold at every step.
-
-    Raises:
-        ValueError: On a parameter reachable under two names. A tied weight has two names
-            and one identity, so the rule would route it by whichever name came first and
-            the choice would be invisible. Nothing in this scaffold ties, and a baseline
-            that does has to say which group it wants rather than inherit an accident.
-            Found by walking with ``remove_duplicate=False``, since the default walk hides
-            a tie by yielding the shared parameter once, under its first name.
-    """
+    """Build disjoint optimizer groups; reject parameters reachable twice."""
     members: dict[str, list[Tensor]] = {group: [] for group in GROUPS}
     first: dict[int, str] = {}
     for name, param in model.named_parameters(remove_duplicate=False):

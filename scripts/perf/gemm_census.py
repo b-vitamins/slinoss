@@ -218,7 +218,7 @@ def linear_maps(config: SLinOSSConfig) -> tuple[LinearMap, ...]:
         LinearMap("out_proj", config.d_inner, config.d_model, layers),
         LinearMap("ffn_gate", config.d_model, config.d_ffn, layers),
         LinearMap("ffn_up", config.d_model, config.d_ffn, layers),
-        LinearMap("ffn_out", config.d_ffn, config.d_model, layers, transposed=True),
+        LinearMap("ffn_out", config.d_ffn, config.d_model, layers),
     ]
     padded_vocab = config.padded_vocab_size
     if padded_vocab is not None:

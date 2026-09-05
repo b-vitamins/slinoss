@@ -16,11 +16,12 @@ nothing about what it scores.
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import pytest
 import torch
 
-from slinoss import _C
+from slinoss import _C, SLinOSSMixer
 
 if not torch.cuda.is_available():
     pytest.skip("no CUDA device", allow_module_level=True)
@@ -56,9 +57,9 @@ VAL_SPLIT = SplitConfig(min_length=8, max_length=12, seed=0, count=8)
 MODEL_ARGS = {"d_model": D_MODEL, "n_layers": 1, "dropout": 0.0, "use_glu": False}
 
 
-def _mixer(max_length: int = MAX_LENGTH) -> torch.nn.Module:
+def _mixer(max_length: int = MAX_LENGTH) -> SLinOSSMixer:
     """The registry's slinoss entry, built at its own defaults, on the device."""
-    return resolve("slinoss").factory(D_MODEL, max_length).cuda()
+    return cast(SLinOSSMixer, resolve("slinoss").factory(D_MODEL, max_length).cuda())
 
 
 def test_the_registry_builds_the_mixer_and_a_gradient_reaches_it() -> None:

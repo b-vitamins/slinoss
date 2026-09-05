@@ -206,6 +206,7 @@ class SLinOSSEvalWrapper(_HFLMBase):
         Raises:
             NotImplementedError: Always.
         """
+        del context, max_length, stop, generation_kwargs
         raise NotImplementedError(
             "this harness scores likelihoods, it does not generate"
         )

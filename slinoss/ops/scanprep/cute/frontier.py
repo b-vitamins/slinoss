@@ -37,7 +37,7 @@ parameter row, applies every Jacobian, stores its four gradient columns, and the
 reduces them over the tile's tokens by warp shuffle. ``TILE_TOKENS`` divides the
 warp width, so a token run lies inside one warp and the reduction needs neither
 shared memory nor a barrier; the run's last lane writes the block's partial
-``dparam_bias`` row. Summing those rows is the backward's second launch,
+``dtransition_bias`` row. Summing those rows is the backward's second launch,
 :func:`slinoss._reduce.reduce_partials` over the ``(batch, tile)`` axes flattened
 into one.
 
@@ -77,8 +77,6 @@ from slinoss._precision import KERNEL_DTYPES
 from slinoss._reduce import reduce_partials
 from slinoss.config import ROTATION_CHART_SCALE_MAX
 from slinoss.ops.scanprep.cute.maps import (
-    anchored_row,
-    anchored_row_grad,
     foh_taps,
     foh_taps_grad,
     log_scale,
@@ -138,24 +136,20 @@ predicated.
 # traffic.
 
 
-def _row_pair(
+def _row(
     gparams: cute.Tensor,
     gbias: cute.Tensor,
     bidx: cutlass.Int32,
     token: cutlass.Int32,
     base: cutlass.Int32,
     dtype: cutlass.Constexpr,
-) -> tuple[list[Scalar], list[Scalar]]:
-    """Read one head's parameter columns for one token, and its bias columns.
+) -> list[Scalar]:
+    """Read one head's parameter row plus its static operating point.
 
     The one place either direction reads ``params``, so both evaluate the maps at
     the same point. All ``PARAM_COLS`` loads are issued before the first use, which
     is what puts them in flight together; the group is the head's whole row, so no
     prefetch depth is chosen here.
-
-    Both rows are returned rather than their combination:
-    :func:`slinoss.ops.scanprep.cute.maps.anchored_row` is not a sum, so the
-    backward needs the two apart to split the cotangent between them.
 
     Args:
         gparams: ``(B,T,H*PARAM_COLS)`` projection slice, activation dtype.
@@ -166,12 +160,12 @@ def _row_pair(
         dtype: Activation element type. Compile-time.
 
     Returns:
-        ``(band, bias)``, each ``PARAM_COLS`` float32 values in column order, the
-        band widened on load (I4).
+        ``PARAM_COLS`` float32 map inputs in column order.
     """
     raw = [gparams[bidx, token, base + slot] for slot in range(PARAM_COLS)]
-    band = [widen(raw[slot], dtype) for slot in range(PARAM_COLS)]
-    return band, [gbias[base + slot] for slot in range(PARAM_COLS)]
+    return [
+        widen(raw[slot], dtype) + gbias[base + slot] for slot in range(PARAM_COLS)
+    ]
 
 
 @cute.jit
@@ -226,8 +220,7 @@ def _emit_maps(
         row = idx - head * tokens
         token = cutlass.min(t0 + row, last)
         base = head * PARAM_COLS
-        band, bias = _row_pair(gparams, gbias, bidx, token, base, dtype)
-        value = anchored_row(band, bias)
+        value = _row(gparams, gbias, bidx, token, base, dtype)
         wx, wy, wz = rotvec(value[0], value[1], value[2], w_max)
         ls = log_scale(value[3])
         taps = foh_taps(wx, wy, wz, ls)
@@ -363,8 +356,7 @@ def _pull_tokens(
         token = cutlass.min(t0 + row, last)
         keep = t0 + row < seqlen
         base = head * PARAM_COLS
-        band, bias = _row_pair(gparams, gbias, bidx, token, base, dtype)
-        value = anchored_row(band, bias)
+        value = _row(gparams, gbias, bidx, token, base, dtype)
         cot = [
             select(keep, gdtrans[bidx, head, token, comp], zero) for comp in range(4)
         ]
@@ -388,19 +380,14 @@ def _pull_tokens(
             cot[2] + tz,
             w_max,
         )
-        # Column order of one head's row, so both stores below are one loop. The two
-        # destinations take different gradients: the row the maps read is the bias
-        # offset by a drive the bias itself scales, not a sum of the two.
-        dband, dbias = anchored_row_grad(
-            band, bias, [dx, dy, dz, log_scale_grad(value[3]) * (cot[3] + tls)]
-        )
+        draw = [dx, dy, dz, log_scale_grad(value[3]) * (cot[3] + tls)]
         inside = keep
         if cutlass.const_expr(not exact):
             inside = inside & (flat < cutlass.Int32(items))
         if inside:
             for slot in cutlass.range_constexpr(PARAM_COLS):
-                gdparams[bidx, token, base + slot] = narrow(dband[slot], dtype)
-        run = [_run_sum(dbias[slot], row, tokens) for slot in range(PARAM_COLS)]
+                gdparams[bidx, token, base + slot] = narrow(draw[slot], dtype)
+        run = [_run_sum(draw[slot], row, tokens) for slot in range(PARAM_COLS)]
         emit = row == cutlass.Int32(tokens - 1)
         if cutlass.const_expr(not exact):
             emit = emit & (flat < cutlass.Int32(items))
@@ -651,7 +638,7 @@ def _check_tokens(bsz: int, seqlen: int) -> None:
 
 def scanprep_forward(
     params: Tensor,
-    param_bias: Tensor,
+    transition_bias: Tensor,
     *,
     heads: int,
     w_max: float,
@@ -663,7 +650,7 @@ def scanprep_forward(
             :data:`slinoss._precision.KERNEL_DTYPES`. Trailing stride one; base
             address and row pitch on a multiple of ``ALIGN_BYTES // itemsize``
             elements. The row pitch itself is read at runtime.
-        param_bias: ``(H,PARAM_COLS)`` float32, contiguous CUDA.
+        transition_bias: ``(H,PARAM_COLS)`` float32, contiguous CUDA.
         heads: ``H``.
         w_max: Rotation-vector chart scale, in ``(0, pi)``.
 
@@ -680,9 +667,9 @@ def scanprep_forward(
     """
     _check_w_max(w_max)
     dtype = _check_kernel_dtype(params)
-    check_operands(params, param_bias, heads)
+    check_operands(params, transition_bias, heads)
     check_pitched(((params, "params"),))
-    check_layout(((param_bias, "param_bias"),))
+    check_layout(((transition_bias, "transition_bias"),))
     bsz, seqlen = int(params.shape[0]), int(params.shape[1])
     _check_tokens(bsz, seqlen)
 
@@ -694,7 +681,7 @@ def scanprep_forward(
         scanprep_fwd,
         (
             params,
-            param_bias.reshape(-1),
+            transition_bias.reshape(-1),
             trans,
             packed,
             seqlen,
@@ -716,13 +703,13 @@ def scanprep_backward(
     dtrans: Tensor,
     dK: Tensor,
     params: Tensor,
-    param_bias: Tensor,
+    transition_bias: Tensor,
     *,
     heads: int,
     w_max: float,
     dparams: Tensor | None = None,
 ) -> ScanGrads:
-    """Pull both cotangents back to ``params`` and ``param_bias``.
+    """Pull both cotangents back to ``params`` and ``transition_bias``.
 
     The cotangent of lane 3 of each tap is the cotangent of a constant and is
     discarded.
@@ -731,7 +718,7 @@ def scanprep_backward(
         dtrans: Cotangent of ``trans``, ``(B,H,T,4)`` float32, contiguous CUDA.
         dK: Cotangent of ``K``, ``(B,H,T,2,4)`` float32, contiguous CUDA.
         params: The forward's projection slice, ``(B,T,H*PARAM_COLS)``.
-        param_bias: The forward's bias, ``(H,PARAM_COLS)`` float32. The maps'
+        transition_bias: The forward's bias, ``(H,PARAM_COLS)`` float32. The maps'
             Jacobians are evaluated at the additive row, so both operands are read
             here as well as in the forward.
         heads: ``H``.
@@ -743,7 +730,7 @@ def scanprep_backward(
     Returns:
         A :class:`slinoss.ops.scanprep.ScanGrads`. ``dparams`` is the supplied
         destination when there is one and a contiguous allocation at the activation
-        dtype otherwise; ``dparam_bias`` is ``(H,PARAM_COLS)`` float32.
+        dtype otherwise; ``dtransition_bias`` is ``(H,PARAM_COLS)`` float32.
 
     Raises:
         ValueError: On a shape mismatch, a trailing stride other than one, a
@@ -754,7 +741,7 @@ def scanprep_backward(
     """
     _check_w_max(w_max)
     dtype = _check_kernel_dtype(params)
-    bsz, seqlen = check_cotangents(dtrans, dK, params, param_bias, heads)
+    bsz, seqlen = check_cotangents(dtrans, dK, params, transition_bias, heads)
     for tensor, name in ((dtrans, "dtrans"), (dK, "dK")):
         if tensor.dtype is not torch.float32:
             raise ValueError(f"{name} must be float32 (I4), got {tensor.dtype}")
@@ -767,7 +754,7 @@ def scanprep_backward(
         (
             (dtrans, "dtrans"),
             (dK, "dK"),
-            (param_bias, "param_bias"),
+            (transition_bias, "transition_bias"),
         )
     )
     _check_tokens(bsz, seqlen)
@@ -786,7 +773,7 @@ def scanprep_backward(
             dtrans,
             dK,
             params,
-            param_bias.reshape(-1),
+            transition_bias.reshape(-1),
             dparams,
             partial,
             seqlen,
@@ -805,7 +792,7 @@ def scanprep_backward(
     # buffer is contiguous, so the flattening is a view.
     return ScanGrads(
         dparams=dparams,
-        dparam_bias=reduce_partials(partial.view(1, bsz * tiles, width)).view(
+        dtransition_bias=reduce_partials(partial.view(1, bsz * tiles, width)).view(
             heads, PARAM_COLS
         ),
     )

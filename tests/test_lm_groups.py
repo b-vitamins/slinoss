@@ -24,8 +24,7 @@ from scripts.lm.groups import (
     parameter_groups,
 )
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import build_model, layer_factories, scaffold_config
-from slinoss import SLinOSSStack
+from scripts.lm.model import MixerLM, build_model, layer_factories, scaffold_config
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -33,7 +32,7 @@ VOCAB = 64
 MAX_LENGTH = 32
 
 
-def _model(mixer: str, overrides: tuple[str, ...] = ()) -> SLinOSSStack:
+def _model(mixer: str, overrides: tuple[str, ...] = ()) -> MixerLM:
     """A two-layer stack with one mixer swapped into every block."""
     torch.manual_seed(0)
     config = scaffold_config(d_model=D_MODEL, n_layers=N_LAYERS, vocab_size=VOCAB)
@@ -52,12 +51,12 @@ def _model(mixer: str, overrides: tuple[str, ...] = ()) -> SLinOSSStack:
         ("blocks.0.mixer_norm_weight", "scalar"),
         ("blocks.0.ffn_norm_weight", "scalar"),
         ("blocks.0.ffn_gate.weight", "hidden"),
-        ("blocks.0.ffn_out_weight", "hidden"),
+        ("blocks.0.ffn_out.weight", "hidden"),
         ("blocks.0.mixer.in_proj.weight", "hidden"),
         ("blocks.0.mixer.out_proj.weight", "hidden"),
         ("blocks.0.mixer.conv_weight", "hidden"),
         ("blocks.0.mixer.norm_weight", "scalar"),
-        ("blocks.0.mixer.param_bias", "ssm"),
+        ("blocks.0.mixer.transition_bias", "ssm"),
     ],
 )
 def test_the_rule_routes_the_real_names(name: str, group: str) -> None:
@@ -93,7 +92,7 @@ def test_the_flag_only_counts_inside_a_mixer() -> None:
     """
     flagged = torch.zeros(4, 4)
     flagged._no_weight_decay = True  # type: ignore[attr-defined]
-    assert classify("blocks.0.ffn_out_weight", flagged) == "hidden"
+    assert classify("blocks.0.ffn_out.weight", flagged) == "hidden"
 
 
 def test_the_groups_partition_every_trainable_parameter() -> None:
@@ -109,18 +108,6 @@ def test_the_groups_partition_every_trainable_parameter() -> None:
     assert sum(counts.values()) == total
     assert counts["ssm"] > 0
     assert counts["embedding"] == VOCAB * D_MODEL
-
-
-def test_transition_embedding_is_ssm_not_token_embedding() -> None:
-    """A shared word in a leaf name must not override its explicit SSM policy."""
-    model = _model("slinoss")
-    found = [
-        (name, classify(name, param))
-        for name, param in model.named_parameters()
-        if "transition_embedding" in name
-    ]
-    assert found
-    assert all(group == "ssm" for _, group in found)
 
 
 def test_an_arm_with_no_state_space_parameter_reports_zero() -> None:

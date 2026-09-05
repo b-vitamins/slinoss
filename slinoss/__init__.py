@@ -1,7 +1,7 @@
 """Oscillatory state-space sequence mixer with an SO(3) operator."""
 
 from slinoss.blocks import BlockOutput, SLinOSSBlock
-from slinoss.config import SLinOSSConfig
+from slinoss.config import SLinOSSConfig, SLinOSSMixerConfig
 from slinoss.decode import DecodeOutput, generate
 from slinoss.graph import GraphedStep, capture, capture_decode
 from slinoss.mixer import SLinOSSMixer
@@ -18,6 +18,7 @@ __all__ = [
     "SLinOSSBlock",
     "SLinOSSConfig",
     "SLinOSSMixer",
+    "SLinOSSMixerConfig",
     "SLinOSSStack",
     "StackState",
     "__version__",

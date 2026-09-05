@@ -1,9 +1,4 @@
-"""Configuration for the mixer, the block, and the stack.
-
-Every shape constraint the kernels rely on is validated here, at construction,
-so no kernel needs a padding path or a guard. Frozen: an invariant checked once
-cannot be invalidated later.
-"""
+"""Validated mixer and stack configuration."""
 
 from __future__ import annotations
 
@@ -75,8 +70,8 @@ of float32 accumulator, four times the register file of a block."""
 
 
 @dataclass(frozen=True)
-class SLinOSSConfig:
-    """Shape and parameterization contract.
+class SLinOSSMixerConfig:
+    """Mixer shape and parameterization contract.
 
     Attributes:
         d_model: Residual-stream width.
@@ -104,16 +99,7 @@ class SLinOSSConfig:
             finite-parameter point of this chart.
         bias: Bias on the linear projections.
         conv_bias: Bias on the causal convolution.
-        n_layers: Blocks in the stack.
-        ffn_ratio: FFN hidden width as a multiple of ``d_model``.
         norm_eps: RMS norm epsilon.
-        vocab_size: Tokens the embedding gathers from, or None for an
-            embedding-free stack. Also the number of logits the head's output
-            carries meaning on; the head itself is
-            :attr:`padded_vocab_size` wide.
-        vocab_pad_multiple: Multiple the head's output width is rounded up to. 1
-            leaves it at ``vocab_size``; anything else is a multiple of
-            :data:`VOCAB_MULTIPLE`. The embedding is a gather and is never padded.
     """
 
     d_model: int
@@ -128,11 +114,7 @@ class SLinOSSConfig:
     w_max: float = ROTATION_CHART_SCALE_MAX
     bias: bool = False
     conv_bias: bool = True
-    n_layers: int = 1
-    ffn_ratio: float = 4.0
     norm_eps: float = 1e-5
-    vocab_size: int | None = None
-    vocab_pad_multiple: int = VOCAB_MULTIPLE
 
     def __post_init__(self) -> None:
         if self.d_model < 1:
@@ -178,12 +160,45 @@ class SLinOSSConfig:
                 f"w_max must lie in (0, pi) and round below pi in float32, "
                 f"got {self.w_max}"
             )
+        if self.norm_eps <= 0.0:
+            raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
+
+    @property
+    def d_inner(self) -> int:
+        """Expanded mixer width."""
+        return round(self.expand * self.d_model)
+
+    @property
+    def n_heads(self) -> int:
+        """Number of heads."""
+        return self.d_inner // self.d_head
+
+    @property
+    def heads_per_group(self) -> int:
+        """Heads sharing one B/C pair."""
+        return self.n_heads // self.n_groups
+
+    @property
+    def n_lanes(self) -> int:
+        """Independent 3-vectors per recurrent row."""
+        return self.d_state // 3
+
+
+@dataclass(frozen=True)
+class SLinOSSConfig(SLinOSSMixerConfig):
+    """Block/stack settings layered on :class:`SLinOSSMixerConfig`."""
+
+    n_layers: int = 1
+    ffn_ratio: float = 4.0
+    vocab_size: int | None = None
+    vocab_pad_multiple: int = VOCAB_MULTIPLE
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be positive, got {self.n_layers}")
         if self.ffn_ratio <= 0.0:
             raise ValueError(f"ffn_ratio must be positive, got {self.ffn_ratio}")
-        if self.norm_eps <= 0.0:
-            raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
         if self.vocab_size is not None and self.vocab_size < 1:
             raise ValueError(
                 f"vocab_size must be positive or None, got {self.vocab_size}"
@@ -203,26 +218,6 @@ class SLinOSSConfig:
                 f"between costs parameters and buys nothing; got "
                 f"{self.vocab_pad_multiple}"
             )
-
-    @property
-    def d_inner(self) -> int:
-        """Inner width. ``round`` so a float ``expand`` cannot truncate."""
-        return round(self.expand * self.d_model)
-
-    @property
-    def n_heads(self) -> int:
-        """Heads per layer, ``H``."""
-        return self.d_inner // self.d_head
-
-    @property
-    def heads_per_group(self) -> int:
-        """Heads sharing one ``B``/``C`` pair, ``H // G``."""
-        return self.n_heads // self.n_groups
-
-    @property
-    def n_lanes(self) -> int:
-        """Independent 3-vectors per head, ``N``."""
-        return self.d_state // 3
 
     @property
     def d_ffn(self) -> int:

@@ -114,7 +114,7 @@ FWD_TOL = 1e-6
 # storage leaves only the arithmetic.
 BWD_TOL = {torch.float32: 1e-6, torch.bfloat16: 4e-3}
 
-# dparam_bias is reduced in float32 over the tokens of a tile and then over the
+# dtransition_bias is reduced in float32 over the tokens of a tile and then over the
 # tiles, against a float64 sum over every token in the reference. Both cotangents
 # are float32 whatever the activation width, so the width of the terms is not the
 # bound; the different summation order is.
@@ -179,7 +179,7 @@ def _operands(
     bias: float = 1.0,
     strided: bool = False,
 ) -> Operands:
-    """``(params, param_bias)`` on CUDA.
+    """``(params, transition_bias)`` on CUDA.
 
     The projection slice is cut out of a wider row at an aligned column offset, with
     padding before and after it, so a kernel that assumed a compact operand reads
@@ -462,14 +462,14 @@ def test_backward_matches_reference_autograd(shape: Shape, dtype: torch.dtype) -
     torch.cuda.synchronize()
 
     assert got.dparams.shape == (bsz, seqlen, heads * PARAM_COLS)
-    assert got.dparam_bias.shape == (heads, PARAM_COLS)
+    assert got.dtransition_bias.shape == (heads, PARAM_COLS)
     assert got.dparams.dtype is dtype
-    assert got.dparam_bias.dtype is torch.float32
+    assert got.dtransition_bias.dtype is torch.float32
     assert all(t.is_contiguous() for t in got)
 
     tag = _tag(shape, dtype)
     assert_max_rel(got.dparams, want.dparams, BWD_TOL[dtype], f"{tag}.dparams")
-    assert_max_rel(got.dparam_bias, want.dparam_bias, BIAS_TOL, f"{tag}.dparam_bias")
+    assert_max_rel(got.dtransition_bias, want.dtransition_bias, BIAS_TOL, f"{tag}.dtransition_bias")
 
 
 def test_backward_ignores_the_lane_three_cotangent() -> None:
@@ -485,7 +485,7 @@ def test_backward_ignores_the_lane_three_cotangent() -> None:
     torch.cuda.synchronize()
 
     assert torch.equal(got.dparams, quiet.dparams)
-    assert torch.equal(got.dparam_bias, quiet.dparam_bias)
+    assert torch.equal(got.dtransition_bias, quiet.dtransition_bias)
     assert float(quiet.dparams.abs().max()) > 0.0
 
 
@@ -511,7 +511,7 @@ def test_backward_writes_dparams_into_a_supplied_band(backward: Backward) -> Non
 
     assert got.dparams is dest
     assert torch.equal(got.dparams, want.dparams)
-    assert torch.equal(got.dparam_bias, want.dparam_bias)
+    assert torch.equal(got.dtransition_bias, want.dtransition_bias)
     assert bool(wide[..., :PROJ_ALIGN].isnan().all())
     assert bool(wide[..., PROJ_ALIGN + heads * PARAM_COLS :].isnan().all())
 
@@ -541,7 +541,7 @@ def test_forward_and_backward_end_to_end(dtype: torch.dtype) -> None:
     tag = f"{_tag(ONE, dtype)}.e2e"
     assert_max_rel(got.trans, want.trans, FWD_TOL, f"{tag}.trans")
     assert_max_rel(_grad(fast[0]), _grad(oracle[0]), BWD_TOL[dtype], f"{tag}.dparams")
-    assert_max_rel(_grad(fast[1]), _grad(oracle[1]), BIAS_TOL, f"{tag}.dparam_bias")
+    assert_max_rel(_grad(fast[1]), _grad(oracle[1]), BIAS_TOL, f"{tag}.dtransition_bias")
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +604,7 @@ def _gapped(tensor: Tensor) -> Tensor:
         (
             lambda p, pb: (p, _gapped(pb)),
             ValueError,
-            r"param_bias must be contiguous",
+            r"transition_bias must be contiguous",
         ),
     ],
 )

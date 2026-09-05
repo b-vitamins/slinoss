@@ -38,8 +38,6 @@ from slinoss.ops.scanprep.reference import (
 from slinoss.ops.so3ssd.cute.common import COS_HALF, SINC_HALF
 
 __all__ = [
-    "anchored_row",
-    "anchored_row_grad",
     "foh_taps",
     "foh_taps_grad",
     "log_scale",
@@ -98,41 +96,6 @@ def log_scale_grad(raw: Scalar) -> Scalar:
     """
     s = _sigmoid(raw)
     return LS_MAX_MAG * s * (s - 1.0)
-
-
-def anchored_row(band: list[Scalar], bias: list[Scalar]) -> list[Scalar]:
-    """One head's row of map inputs, from its token band and its bias.
-
-    ``bias + band`` on every column. The authority is
-    :func:`slinoss.ops.scanprep.reference.anchored_rotvec`.
-
-    Args:
-        band: ``PARAM_COLS`` token values, float32, in column order.
-        bias: ``PARAM_COLS`` per-head values, float32, same order.
-
-    Returns:
-        ``PARAM_COLS`` map inputs, same order.
-    """
-    return [band[col] + bias[col] for col in range(4)]
-
-
-def anchored_row_grad(
-    band: list[Scalar], bias: list[Scalar], cot: list[Scalar]
-) -> tuple[list[Scalar], list[Scalar]]:
-    """Split the cotangent of :func:`anchored_row` between the band and the bias.
-
-    Addition has the identity pullback to both operands.
-
-    Args:
-        band: The forward's token values, ``PARAM_COLS`` float32.
-        bias: The forward's per-head values, ``PARAM_COLS`` float32.
-        cot: Cotangent of the row :func:`anchored_row` returned.
-
-    Returns:
-        ``(dband, dbias)``, each ``PARAM_COLS`` float32 in column order.
-    """
-    del band, bias
-    return list(cot), list(cot)
 
 
 def rotvec(

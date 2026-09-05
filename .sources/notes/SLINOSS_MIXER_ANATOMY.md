@@ -138,7 +138,7 @@ effective operand produced from the token changes with `t`.
 | `B` write direction | `[B,G,T,S]` | yes, optionally local | B band + optional key conv |
 | `C` read direction | `[B,G,T,S]` | yes, optionally local | C band + optional key conv |
 | transition displacement | `[B,H,T,4]` | yes | transition band |
-| transition operating point | `[H,4]` | no | `transition_embedding.weight` |
+| transition operating point | `[H,4]` | no | `transition_bias` |
 | SO(3) transition and scale | `[B,H,T,4]` | yes | operating point + displacement + bounded maps |
 | FOH taps | `[B,H,T,2,4]` packed | yes | deterministic functions of transition |
 | recurrent state | `[B,H,P,S]` | history-dependent | scan output/carry; not a parameter |
@@ -153,8 +153,8 @@ separate B/C/value projection. One fused projection supplies all token operands.
 The token row is added directly to the static head embedding:
 
 ```text
-raw_w  = transition_embedding[h,0:3] + token_band[b,t,h,0:3]
-raw_ls = transition_embedding[h,3]   + token_band[b,t,h,3]
+raw_w  = transition_bias[h,0:3] + token_band[b,t,h,0:3]
+raw_ls = transition_bias[h,3]   + token_band[b,t,h,3]
 ```
 
 The physical rotation vector is
@@ -196,7 +196,7 @@ The table describes one `SLinOSSMixer`. The default constructor has
 | `conv_weight` | `[E,W]` | `EW` | depthwise causal value convolution | uniform `[-1/sqrt(W), +1/sqrt(W)]` | module dtype |
 | `conv_bias` | `[E]` | `E` if enabled | value-conv bias | zero | module dtype; enabled by default |
 | `key_weight` | `[2GS,W]` | `2GSW` if enabled | independent depthwise causal conv on B and C channels | exact delta: all zero except current-token tap = 1 | module dtype; enabled by default |
-| `transition_embedding.weight` (`param_bias`) | `[H,4]` | `4H` | static head operating points for rotation and decay | inverted period/horizon lattice | pinned fp32; marked no-weight-decay |
+| `transition_bias` | `[H,4]` | `4H` | static head operating points for rotation and decay | inverted period/horizon lattice | pinned fp32; marked no-weight-decay |
 | `d_skip` | `[H]` | `H` | direct `U` gain | one | pinned fp32; marked no-weight-decay |
 | `norm_weight` | `[H,P]` | `HP=E` | per-row RMSNorm gain | one | module dtype |
 | `out_proj.weight` | `[D,E]` | `DE` | mixer output projection | **zero** after consuming PyTorch reset | module dtype |
@@ -254,7 +254,7 @@ Incremental inference allocates five mutable buffers per layer and batch item:
 | Buffer | Shape | Dtype | Purpose |
 | --- | ---: | --- | --- |
 | `conv` | `[B,W-1,E]` | activation | value-conv history |
-| `keys` | `[B,W-1,2GS]` | activation | B/C-conv history; allocated even if key conv is off |
+| `keys` | `[B,W-1,2GS]` | activation | B/C-conv history; absent when key conv is off |
 | `ssm` | `[B,H,P,S]` | fp32 (fp64 oracle exception) | recurrent state |
 | `b_prev` | `[B,G,S]` | activation | previous FOH write direction |
 | `u_prev` | `[B,H,P]` | activation | previous FOH input |
@@ -262,12 +262,11 @@ Incremental inference allocates five mutable buffers per layer and batch item:
 Per batch item this is
 
 ```text
-(W-1)E + (W-1)2GS + HPS + GS + HP
+(W-1)E + [key_conv](W-1)2GS + HPS + GS + HP
 ```
 
 scalars. It is 38,896 scalars at H4/G1 and 41,920 at H8/G4 for the D128
-geometry above. The key cache is present to keep state shape independent of the
-`key_conv` flag. There is no step counter.
+geometry above when key convolution is enabled. There is no step counter.
 
 ## 7. Initialization, exactly
 
@@ -329,6 +328,25 @@ This has two optimization consequences that must not be euphemized:
 These are code facts. Whether a one-step delay alone materially changes a long
 run is an empirical question; the broader autonomous-versus-input-driven bias is
 structural.
+
+### 7.3 Initialization defects exposed by the cleanup audit
+
+Three additional defects belong in the durable diagnosis:
+
+- Before cleanup, construction recursively reset each mixer through its block
+  and stack. A stack mixer consumed several unrelated random initializations
+  before retaining the last one, so seed-to-parameter mapping depended on
+  container history. Construction now initializes each tensor once.
+- The nominal two-dimensional head lattice collapses the horizon axis for
+  `H=1,2,3` because `isqrt(H)=1`. Every such legal mixer receives only the fast
+  decay horizon despite advertising a long-memory bank.
+- The tail computes `RMSNorm((scan + skip) * silu(gate))`. Because the gate is a
+  scalar per head row, RMS normalization largely divides its magnitude back out.
+  The meaningful ordering is `RMSNorm(scan + skip) * silu(gate)`.
+
+These are independent of the larger innovation-correction proposal: reset once,
+cover both physical spectra at every legal head count, and place a gate where it
+can modulate amplitude.
 
 ## 8. Block and stack boundary
 

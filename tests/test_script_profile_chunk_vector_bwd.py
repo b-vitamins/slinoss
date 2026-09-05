@@ -18,6 +18,8 @@ import types
 import pytest
 import torch
 
+pytest.importorskip("cutlass")
+
 from slinoss.ops.so3ssd.cute.bwd.chunk_vector import chunk_vector_backward
 from slinoss.ops.so3ssd.cute.common import WARPS
 from slinoss.ops.so3ssd.cute.mma import WARPS_WIDE

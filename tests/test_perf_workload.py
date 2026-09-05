@@ -529,7 +529,7 @@ def test_make_prep_inputs_keeps_the_projection_pitch_on_the_parameter_band() -> 
     assert not got.params.is_contiguous()
     # Leaves, so the backward measures the frontier and not a pullback into a
     # zeroed projection buffer.
-    assert got.differentiable == (got.params, got.param_bias)
+    assert got.differentiable == (got.params, got.transition_bias)
     assert all(t.requires_grad and t.is_leaf for t in got.differentiable)
     assert not any(t.requires_grad for t in got.cotangents)
     plain = make_prep_inputs(SMALL_PREP, CPU, requires_grad=False)
@@ -538,7 +538,7 @@ def test_make_prep_inputs_keeps_the_projection_pitch_on_the_parameter_band() -> 
     # packed outputs' cotangents.
     low = make_prep_inputs(SMALL_PREP, CPU, dtype=torch.bfloat16)
     assert low.params.dtype == torch.bfloat16
-    assert low.param_bias.dtype == torch.float32
+    assert low.transition_bias.dtype == torch.float32
     assert low.dtrans.dtype == torch.float32
     assert low.dK.dtype == torch.float32
     lead = (scan.bsz, scan.heads, scan.seq)

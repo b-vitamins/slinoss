@@ -26,7 +26,7 @@ from torch import Tensor, nn
 
 from scripts.lm.groups import classify
 from scripts.lm.mixers import REGISTRY, Unwrap
-from slinoss import SLinOSSConfig
+from slinoss import SLinOSSConfig, SLinOSSMixer
 
 ARMS = ("slinoss", "gpt", "conv", "mamba2", "mamba3", "gdn2")
 
@@ -106,6 +106,7 @@ def test_slinoss_declares_context_unused_and_keeps_its_init_span() -> None:
     """The fixed-span master mixer must not silently claim to consume context."""
     resolved = REGISTRY.resolve("slinoss", ["init_span=8192"])
     mixer = resolved.factory(128, 2048)
+    assert isinstance(mixer, SLinOSSMixer)
     assert mixer.config.init_span == 8192
     assert resolved.constructions[-1]["context"] == {
         "max_length_supplied": 2048,

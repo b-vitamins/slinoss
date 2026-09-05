@@ -1093,6 +1093,8 @@ def _table_slots(
         _store_mat(stable, TABLE_AC_SOLE, token, ac, pitch)
         return
     wvec = (strans[0, token], strans[1, token], strans[2, token])
+    first = ac
+    an = ac
     if cutlass.const_expr(TABLE_AP in jobs):
         first = mat3_mul(
             ac, tap_matrix((stap[0, token], stap[1, token], stap[2, token]), wvec)

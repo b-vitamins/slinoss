@@ -1,34 +1,4 @@
-"""Inference state containers for the single-token decode path.
-
-:class:`MixerState` holds one layer, :class:`StackState` holds a stack. Both are
-frozen: the buffers are allocated once and every later write goes through them
-in place. CUDA-graph capture records buffer addresses, so a container that
-rebinds a field leaves replay writing memory no consumer reads.
-
-``ssm`` is float32 under every low-precision activation dtype, as I4 requires.
-The one exception is a float64 activation dtype, which widens ``ssm`` to float64
-so a float64 path stays an oracle end to end instead of meeting a narrower
-state mid-recurrence.
-
-The recurrent state starts from a deterministic cyclic basis, not zero. A linear
-homogeneous action fixes zero under every transition, so a zero start deletes the
-orbit the rotation is meant to carry. Row ``(h,p)`` starts at coordinate
-``(h*P+p) mod 3N``. This distributes unit-norm carriers over the state coordinates
-without encoding a task, drawing randomness, or adding a learned parameter.
-
-Five buffers, not two. The operator's forcing is two-tap: token ``t`` reads its own
-forcing vector and the one at ``t-1``. So the recurrent state alone does not
-determine the next token's output, and ``b_prev`` and ``u_prev`` carry the previous
-token's vector and input. ``keys`` carries the key convolution's own history, for
-the same reason ``conv`` carries the value convolution's. Every one is required
-rather than optional, because a state that can be missing one is a state whose
-continuation is silently not the whole-sequence result; ``keys`` is allocated even
-where :attr:`slinoss.config.SLinOSSConfig.key_conv` is off, so the state's shape is
-a function of the widths alone.
-
-No step counter. The decode path reads none, and a counter is state that can
-disagree with the buffers it claims to describe.
-"""
+"""Mutable-buffer state for prefill and token decode."""
 
 from __future__ import annotations
 
@@ -38,7 +8,7 @@ import torch
 from torch import Tensor
 
 from slinoss._precision import check_pinned, check_supported
-from slinoss.config import SLinOSSConfig
+from slinoss.config import SLinOSSConfig, SLinOSSMixerConfig
 
 __all__ = ["MixerState", "StackState", "oscillator_basis"]
 
@@ -64,21 +34,12 @@ def _cyclic_basis(
 
 
 def oscillator_basis(
-    config: SLinOSSConfig,
+    config: SLinOSSMixerConfig,
     *,
     device: torch.device | str,
     dtype: torch.dtype = torch.float32,
 ) -> Tensor:
-    """Build the mixer's fixed homogeneous-state carrier.
-
-    Args:
-        config: Supplies ``H``, ``P`` and ``3N``.
-        device: Where to allocate the basis.
-        dtype: State dtype.
-
-    Returns:
-        ``(H,P,3N)`` with one unit coordinate per row.
-    """
+    """Build the fixed homogeneous carrier ``[H,P,S]``."""
     return _cyclic_basis(
         config.n_heads,
         config.d_head,
@@ -90,23 +51,10 @@ def oscillator_basis(
 
 @dataclass(frozen=True)
 class MixerState:
-    """Decode state of one mixer layer.
-
-    Attributes:
-        conv: Causal-convolution history, shape ``(B, d_conv - 1, d_inner)``,
-            activation dtype. Time-major, so index ``-1`` is the newest token.
-        keys: Key-convolution history, shape ``(B, d_conv - 1, 2*G*3N)``, activation
-            dtype. Time-major, like ``conv``.
-        ssm: Recurrent scan state, shape ``(B, H, P, 3N)``. float32, or float64
-            when the activation dtype is float64. ``H * P`` is ``d_inner``.
-        b_prev: Previous token's forcing vector, shape ``(B, G, 3N)``, activation
-            dtype. ``G`` divides ``H``.
-        u_prev: Previous token's forcing input, shape ``(B, H, P)``, activation
-            dtype.
-    """
+    """One layer's convolution, scan, and FOH decode carries."""
 
     conv: Tensor
-    keys: Tensor
+    keys: Tensor | None
     ssm: Tensor
     b_prev: Tensor
     u_prev: Tensor
@@ -116,7 +64,10 @@ class MixerState:
             raise ValueError(
                 f"conv must be (B, d_conv - 1, d_inner), got {tuple(self.conv.shape)}"
             )
-        if self.keys.ndim != 3 or int(self.keys.shape[1]) != int(self.conv.shape[1]):
+        if self.keys is not None and (
+            self.keys.ndim != 3
+            or int(self.keys.shape[1]) != int(self.conv.shape[1])
+        ):
             raise ValueError(
                 f"keys must be (B, d_conv - 1, 2*G*3N) over conv's own history "
                 f"length, got {tuple(self.keys.shape)} against "
@@ -139,11 +90,10 @@ class MixerState:
         # are the operands B and U themselves at one token, not an accumulator. After
         # the pinning rule above, so a float64 activation dtype reports the state it
         # needs rather than the carry that already followed it.
-        for name, carry in (
-            ("keys", self.keys),
-            ("b_prev", self.b_prev),
-            ("u_prev", self.u_prev),
-        ):
+        carries = (("b_prev", self.b_prev), ("u_prev", self.u_prev))
+        if self.keys is not None:
+            carries = (("keys", self.keys), *carries)
+        for name, carry in carries:
             if carry.dtype is not self.conv.dtype:
                 raise ValueError(
                     f"{name} is {carry.dtype} and conv is {self.conv.dtype}; "
@@ -173,59 +123,42 @@ class MixerState:
                 f"b_prev holds {groups} groups, which does not divide the {heads} "
                 f"heads ssm holds"
             )
-        if int(self.keys.shape[2]) != 2 * groups * dim:
+        if self.keys is not None and int(self.keys.shape[2]) != 2 * groups * dim:
             raise ValueError(
                 f"keys holds {int(self.keys.shape[2])} channels and B and C hold "
                 f"{2 * groups * dim} between them"
             )
         batches = {
             "conv": int(self.conv.shape[0]),
-            "keys": int(self.keys.shape[0]),
             "ssm": int(self.ssm.shape[0]),
             "b_prev": int(self.b_prev.shape[0]),
             "u_prev": int(self.u_prev.shape[0]),
         }
+        if self.keys is not None:
+            batches["keys"] = int(self.keys.shape[0])
         if len(set(batches.values())) != 1:
             raise ValueError(f"one batch only, got {batches}")
         devices = {
             "conv": self.conv.device,
-            "keys": self.keys.device,
             "ssm": self.ssm.device,
             "b_prev": self.b_prev.device,
             "u_prev": self.u_prev.device,
         }
+        if self.keys is not None:
+            devices["keys"] = self.keys.device
         if len(set(devices.values())) != 1:
             raise ValueError(f"one device only, got {devices}")
 
     @classmethod
     def allocate(
         cls,
-        config: SLinOSSConfig,
+        config: SLinOSSMixerConfig,
         batch: int,
         *,
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> MixerState:
-        """Allocate zeroed carries and a cyclic-basis recurrent state.
-
-        Args:
-            config: Shape contract. ``d_conv`` and ``d_inner`` size ``conv``;
-                ``d_conv``, ``n_groups`` and ``d_state`` size ``keys``;
-                ``n_heads``, ``d_head``, and ``d_state`` size ``ssm``;
-                ``n_groups`` and ``d_state`` size ``b_prev``.
-            batch: Batch ``B``, fixed for the lifetime of the buffers.
-            device: Where every buffer lives.
-            dtype: Activation dtype, carried by ``conv``, ``keys``, ``b_prev``
-                and ``u_prev``. ``ssm`` is float32, or float64 when ``dtype`` is
-                float64.
-
-        Returns:
-            The state.
-
-        Raises:
-            ValueError: If ``batch`` is not positive.
-            TypeError: If ``dtype`` is not supported.
-        """
+        """Allocate one state for a fixed positive ``batch``."""
         if batch < 1:
             raise ValueError(f"batch must be positive, got {batch}")
         basis = oscillator_basis(
@@ -235,12 +168,16 @@ class MixerState:
             conv=torch.zeros(
                 batch, config.d_conv - 1, config.d_inner, dtype=dtype, device=device
             ),
-            keys=torch.zeros(
-                batch,
-                config.d_conv - 1,
-                2 * config.n_groups * config.d_state,
-                dtype=dtype,
-                device=device,
+            keys=(
+                torch.zeros(
+                    batch,
+                    config.d_conv - 1,
+                    2 * config.n_groups * config.d_state,
+                    dtype=dtype,
+                    device=device,
+                )
+                if config.key_conv
+                else None
             ),
             ssm=basis.expand(batch, -1, -1, -1).clone(),
             b_prev=torch.zeros(
@@ -258,7 +195,8 @@ class MixerState:
         allocation is not the buffer the graph writes.
         """
         self.conv.zero_()
-        self.keys.zero_()
+        if self.keys is not None:
+            self.keys.zero_()
         basis = _cyclic_basis(
             int(self.ssm.shape[1]),
             int(self.ssm.shape[2]),
@@ -278,7 +216,7 @@ class MixerState:
         """
         return MixerState(
             conv=self.conv.clone(),
-            keys=self.keys.clone(),
+            keys=None if self.keys is None else self.keys.clone(),
             ssm=self.ssm.clone(),
             b_prev=self.b_prev.clone(),
             u_prev=self.u_prev.clone(),
@@ -297,12 +235,7 @@ class MixerState:
 
 @dataclass(frozen=True)
 class StackState:
-    """Decode state of a stack.
-
-    Attributes:
-        layers: One :class:`MixerState` per layer, in stack order. All share a
-            batch and a device.
-    """
+    """One :class:`MixerState` per layer, sharing batch and device."""
 
     layers: tuple[MixerState, ...]
 
@@ -331,21 +264,7 @@ class StackState:
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> StackState:
-        """Allocate initialized buffers for every layer.
-
-        Args:
-            config: Shape contract. ``n_layers`` fixes the entry count.
-            batch: Batch ``B``, fixed for the lifetime of the buffers.
-            device: Where every buffer lives.
-            dtype: Activation dtype. See :meth:`MixerState.allocate`.
-
-        Returns:
-            The state, with ``config.n_layers`` entries.
-
-        Raises:
-            ValueError: If ``batch`` is not positive.
-            TypeError: If ``dtype`` is not supported.
-        """
+        """Allocate ``config.n_layers`` independent states."""
         # One allocation per layer. A repeated entry would alias one buffer
         # across the stack, so every layer would read its neighbour's state.
         return cls(

@@ -21,8 +21,7 @@ from __future__ import annotations
 import torch
 
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import build_model, layer_factories, scaffold_config
-from slinoss import SLinOSSStack
+from scripts.lm.model import MixerLM, build_model, layer_factories, scaffold_config
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -30,7 +29,7 @@ VOCAB = 100
 MAX_LENGTH = 16
 
 
-def _stack() -> SLinOSSStack:
+def _stack() -> MixerLM:
     """A two-layer stack with a vocabulary that does not divide the alignment multiple."""
     torch.manual_seed(0)
     config = scaffold_config(
@@ -42,7 +41,7 @@ def _stack() -> SLinOSSStack:
     )
 
 
-def _logits(model: SLinOSSStack) -> torch.Tensor:
+def _logits(model: MixerLM) -> torch.Tensor:
     """Logits over a fixed batch."""
     ids = torch.arange(8, dtype=torch.int64).remainder(VOCAB).reshape(2, 4)
     with torch.no_grad():

@@ -24,7 +24,7 @@ from dataclasses import replace
 import pytest
 import torch
 from torch import Tensor, nn
-from torch.nn.functional import cross_entropy, linear, silu
+from torch.nn.functional import cross_entropy, silu
 
 from slinoss.blocks import SLinOSSBlock
 from slinoss.config import SLinOSSConfig
@@ -135,12 +135,7 @@ def _reference(stack: SLinOSSStack, x: Tensor) -> Tensor:
         hidden = hidden + module.mixer(_norm(hidden, module.mixer_norm_weight, eps))
         pre = _norm(hidden, module.ffn_norm_weight, eps)
         gated = silu(module.ffn_gate(pre)) * module.ffn_up(pre)
-        # Through the framework's own linear over the transposed weight. The block
-        # stores that weight (d_ffn, d_model) and contracts it directly, so this
-        # states the map the nn.Linear it replaced stated, and the gradient reaching
-        # the stored parameter through this view is the parity between the two call
-        # forms as well as the parity of the composition.
-        out = linear(gated, module.ffn_out_weight.t(), module.ffn_out_bias)
+        out = module.ffn_out(gated)
         hidden = hidden + out
     normed = _norm(hidden, stack.norm_weight, eps)
     if stack.head is None:
@@ -322,46 +317,18 @@ def test_norm_weights_stay_float32_through_a_module_cast() -> None:
     assert wide.norm_weight.dtype is torch.float64
 
 
-def test_the_ffn_output_weight_is_stored_transposed() -> None:
-    """The stored orientation of the output projection, and the fan_in with it.
-
-    ``(d_ffn, d_model)`` is a throughput contract, not a convention: the weight
-    gradient comes out in the stored shape, and in the :class:`torch.nn.Linear`
-    orientation that shape covers 0.64 of a wave on the device the block is written
-    for. A return to the framework orientation changes no value and no dtype.
-
-    Neither does initializing over the stored shape instead of over its transpose,
-    which is why the draw is checked against the framework's own and not only
-    against the extents. The default is uniform on ``+-1/sqrt(fan_in)`` with
-    ``fan_in`` the contraction extent, so reading ``fan_in`` off the wrong axis
-    rescales every weight in the layer by ``sqrt(d_ffn/d_model)`` and every bias
-    with it. The variance distinguishes that from the right draw; the bound alone
-    does not, since a wider uniform still fits under a maximum over finitely many
-    samples. The comparison is against a live :class:`torch.nn.Linear` of the map
-    this replaces, so it holds whatever the framework's default becomes.
-    """
+def test_the_ffn_output_is_a_canonical_linear() -> None:
     cfg = STACK_CONFIG
     # Seeded: the asserts below are sample statistics, and the tolerances are chosen
     # against the sample count rather than against a run of luck.
     torch.manual_seed(0)
     block = SLinOSSBlock(cfg)
-    framework = nn.Linear(cfg.d_ffn, cfg.d_model, bias=cfg.bias)
-    assert block.ffn_out_bias is not None
-    assert framework.bias is not None
-    # Detached because every statistic below reads a leaf as a scalar.
-    weight = block.ffn_out_weight.detach()
-    bias = block.ffn_out_bias.detach()
-    ref_weight = framework.weight.detach()
-    ref_bias = framework.bias.detach()
-    assert weight.shape == (cfg.d_ffn, cfg.d_model)
-    assert weight.shape == ref_weight.t().shape
-    assert bias.shape == ref_bias.shape
-    # A uniform's variance is a third of the square of its bound, so matching the
-    # framework's variance over 2,048 samples pins the bound, and with it the axis
-    # fan_in was read from. The relative standard error of the estimate is 2%; the
-    # error it has to catch is a factor of d_ffn/d_model, which is 4.
-    assert float(weight.var()) == pytest.approx(float(ref_weight.var()), rel=0.1)
-    assert float(bias.var()) == pytest.approx(float(ref_bias.var()), rel=0.2)
+    assert isinstance(block.ffn_out, nn.Linear)
+    assert block.ffn_out.bias is not None
+    weight = block.ffn_out.weight.detach()
+    bias = block.ffn_out.bias.detach()
+    assert weight.shape == (cfg.d_model, cfg.d_ffn)
+    assert bias.shape == (cfg.d_model,)
     bound = cfg.d_ffn**-0.5
     assert float(weight.abs().max()) <= bound
     assert float(bias.abs().max()) <= bound

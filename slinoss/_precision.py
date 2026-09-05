@@ -13,10 +13,11 @@ defect rather than a speed/accuracy trade.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import Self, cast
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 LOW_PRECISION_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16, torch.float16)
 """Admitted for ``U``, ``B``, ``C``, ``Y`` and GEMM operands only."""
@@ -38,6 +39,22 @@ reference oracle's width and runs in torch.
 
 PINNED_TENSORS: tuple[str, ...] = ("trans", "K", "q", "Q", "lp", "table", "z")
 """Names that must never carry a dtype from :data:`LOW_PRECISION_DTYPES`."""
+
+
+class Float32Module(nn.Module):
+    """Module whose named tensors stay float32 under low-precision casts."""
+
+    _float32_names: tuple[str, ...] = ()
+
+    def _apply(
+        self, fn: Callable[[Tensor], Tensor], recurse: bool = True
+    ) -> Self:
+        super()._apply(fn, recurse)
+        for name in self._float32_names:
+            tensor = cast(Tensor, getattr(self, name))
+            if tensor.dtype in LOW_PRECISION_DTYPES:
+                tensor.data = tensor.data.float()
+        return self
 
 
 def check_supported(tensor: Tensor, name: str) -> None:

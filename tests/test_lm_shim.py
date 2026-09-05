@@ -43,9 +43,8 @@ from scripts.lm import shim
 from scripts.lm.checkpoint import save
 from scripts.lm.corpus import CorpusManifest, ShardCounts
 from scripts.lm.mixers import REGISTRY
-from scripts.lm.model import build_model, layer_factories, scaffold_config
+from scripts.lm.model import MixerLM, build_model, layer_factories, scaffold_config
 from scripts.lm.shim import SLinOSSEvalWrapper
-from slinoss import SLinOSSStack
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -91,7 +90,7 @@ def _manifest() -> CorpusManifest:
     )
 
 
-def _save(path: Path, *, manifest: CorpusManifest | None) -> SLinOSSStack:
+def _save(path: Path, *, manifest: CorpusManifest | None) -> MixerLM:
     """Write an arm and return the stack that was written.
 
     The control mixer, because the wrapper is mixer-agnostic by construction: the checkpoint
