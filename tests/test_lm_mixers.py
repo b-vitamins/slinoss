@@ -53,10 +53,10 @@ def test_the_table_s_arms_are_all_registered() -> None:
     """The names a table's rows come from. A missing one is a typo found at launch."""
     assert set(ARMS) <= set(REGISTRY.names())
     assert REGISTRY.entry("gpt").max_length_policy == "required"
-    assert REGISTRY.entry("slinoss").max_length_policy == "required"
+    assert REGISTRY.entry("slinoss").max_length_policy == "unused"
     assert all(
         REGISTRY.entry(name).max_length_policy == "unused"
-        for name in set(ARMS) - {"gpt", "slinoss"}
+        for name in set(ARMS) - {"gpt"}
     )
 
 
@@ -102,20 +102,15 @@ def test_the_slinoss_defaults_are_the_config_s_own_values() -> None:
     assert settings["d_state"] % 48 == 0
 
 
-def test_slinoss_consumes_the_declared_context_exactly_once() -> None:
-    """The LM adapter must not silently discard or duplicate model context."""
-    resolved = REGISTRY.resolve(
-        "slinoss",
-        ["forcing_init=controllability", "init_decay_context_scale=16.0"],
-    )
+def test_slinoss_declares_context_unused_and_keeps_its_init_span() -> None:
+    """The fixed-span master mixer must not silently claim to consume context."""
+    resolved = REGISTRY.resolve("slinoss", ["init_span=8192"])
     mixer = resolved.factory(128, 2048)
-    assert mixer.config.context_length == 2048
-    assert mixer.config.forcing_init == "controllability"
-    assert mixer.config.init_decay_context_scale == 16.0
+    assert mixer.config.init_span == 8192
     assert resolved.constructions[-1]["context"] == {
         "max_length_supplied": 2048,
-        "max_length_policy": "required",
-        "max_length_consumed": 2048,
+        "max_length_policy": "unused",
+        "max_length_consumed": None,
     }
 
 

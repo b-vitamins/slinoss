@@ -23,7 +23,8 @@ from typing import Any, NamedTuple
 import torch
 
 from scripts.lm.corpus import CorpusManifest, from_dict, to_dict
-from slinoss import SLinOSSConfig, SLinOSSStack
+from scripts.lm.model import MixerLM
+from slinoss import SLinOSSConfig
 
 __all__ = ["FORMAT", "Checkpoint", "load", "load_model", "save"]
 
@@ -65,7 +66,7 @@ class Checkpoint(NamedTuple):
 
 def save(
     path: Path,
-    model: SLinOSSStack,
+    model: MixerLM,
     *,
     config: SLinOSSConfig,
     mixer: str,
@@ -160,7 +161,7 @@ def load_model(
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-) -> tuple[SLinOSSStack, Checkpoint]:
+) -> tuple[MixerLM, Checkpoint]:
     """Read one arm and rebuild it.
 
     The mixers come from :data:`scripts.lm.mixers.REGISTRY` at the stored settings, so a

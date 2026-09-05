@@ -27,6 +27,16 @@ cuda = [
 mad = [
     "numpy>=1.24",
 ]
+# Language-model corpus preparation and zero-shot evaluation. Training itself
+# reads the prepared numpy memmaps and does not import this optional stack.
+lm = [
+    "numpy>=1.24",
+    "datasets>=2.18",
+    "transformers>=4.40",
+    "tokenizers>=0.19",
+    "lm-eval>=0.4",
+    "accelerate>=0.30",
+]
 # Profiling and benchmarking drivers under scripts/.
 perf = [
     "nvtx>=0.2",

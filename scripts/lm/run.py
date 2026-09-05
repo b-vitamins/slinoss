@@ -239,7 +239,7 @@ def table(records: Sequence[Record]) -> str:
         records: One per arm, in the order to print.
 
     Returns:
-        The table as text: arm, non-embedding parameters, held-out bits per byte, the eight
+        The table as text: arm, total parameters, held-out bits per byte, the eight
         accuracies in percent, and their mean.
 
     Raises:

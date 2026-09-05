@@ -259,8 +259,8 @@ def build(
     Raises:
         ValueError: From :func:`write_shards`, or on a tokenizer with no end-of-text id.
     """
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
+    from datasets import load_dataset  # type: ignore[import-not-found]
+    from transformers import AutoTokenizer  # type: ignore[import-not-found]
 
     tok = AutoTokenizer.from_pretrained(tokenizer)
     eot = tok.eos_token_id

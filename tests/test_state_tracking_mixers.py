@@ -62,7 +62,6 @@ def test_slinoss_settings_build_a_legal_config() -> None:
         "norm_eps",
         "vocab_size",
         "vocab_pad_multiple",
-        "context_length",
     }
     assert set(settings) == names - stack_only
     assert settings["d_state"] == 144
@@ -71,27 +70,21 @@ def test_slinoss_settings_build_a_legal_config() -> None:
     assert config.d_model == 128
 
 
-def test_slinoss_records_context_but_keeps_fixed_init_by_default() -> None:
-    """Configured context is explicit and inert unless an axis opts into it."""
+def test_slinoss_declares_context_unused_and_keeps_fixed_init() -> None:
+    """The supplied ceiling is recorded but cannot silently change initialization."""
     from slinoss import SLinOSSMixer
 
     resolved = resolve("slinoss")
     mixer = resolved.factory(128, MAX_LENGTH)
     assert isinstance(mixer, SLinOSSMixer)
-    assert resolved.max_length_policy == "required"
+    assert resolved.max_length_policy == "unused"
     assert mixer.config.init_span == 4096
-    assert mixer.config.context_length == MAX_LENGTH
-    assert mixer.config.resolved_init_period_span == 4096
-    assert mixer.config.resolved_init_decay_span == 4096
     assert resolved.constructions[0]["context"] == {
         "max_length_supplied": MAX_LENGTH,
-        "max_length_policy": "required",
-        "max_length_consumed": MAX_LENGTH,
+        "max_length_policy": "unused",
+        "max_length_consumed": None,
     }
     assert resolved.constructions[0]["effective_config"]["init_span"] == 4096
-    assert resolved.constructions[0]["effective_config"][
-        "resolved_init_period_span"
-    ] == 4096
 
 
 def test_overrides_are_read_at_the_defaults_type() -> None:

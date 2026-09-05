@@ -59,6 +59,9 @@ class MixerLM(nn.Module):
         if len(mixers) != config.n_layers:
             raise ValueError(f"{len(mixers)} mixers for {config.n_layers} layers")
         self.config = config
+        padded_vocab_size = config.padded_vocab_size
+        if padded_vocab_size is None:
+            raise ValueError("the LM scaffold requires a padded vocabulary size")
         self.embedding = nn.Embedding(
             config.vocab_size, config.d_model, dtype=torch.bfloat16
         )
@@ -69,7 +72,7 @@ class MixerLM(nn.Module):
         self.norm_weight = nn.Parameter(torch.ones(config.d_model, dtype=torch.float32))
         self.head = nn.Linear(
             config.d_model,
-            config.padded_vocab_size,
+            padded_vocab_size,
             bias=config.bias,
             dtype=torch.float32,
         )
@@ -252,8 +255,7 @@ def non_embedding_parameters(model: MixerLM) -> int:
     """
     total = parameter_count(model)
     for module in (model.embedding, model.head):
-        if module is not None:
-            total -= sum(p.numel() for p in module.parameters() if p.requires_grad)
+        total -= sum(p.numel() for p in module.parameters() if p.requires_grad)
     return total
 
 

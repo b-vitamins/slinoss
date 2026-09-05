@@ -70,13 +70,11 @@ class Unwrap(nn.Module):
         return out[0] if isinstance(out, tuple) else out
 
 
-def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
     """The tree's mixer.
 
     Args:
         d_model: Stream width.
-        max_length: Declared model context. This is constructor metadata and is
-            never inferred from an observed batch width.
         **settings: :class:`slinoss.SLinOSSConfig` mixer fields.
 
     Returns:
@@ -84,9 +82,7 @@ def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     """
     from slinoss import SLinOSSConfig, SLinOSSMixer
 
-    return SLinOSSMixer(
-        SLinOSSConfig(d_model=d_model, context_length=max_length, **settings)
-    )
+    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
 
 
 def _build_mamba2(d_model: int, **settings: Any) -> nn.Module:
@@ -163,10 +159,7 @@ def _slinoss_defaults() -> dict[str, Any]:
         "chunk_size": SLinOSSConfig.chunk_size,
         "d_conv": SLinOSSConfig.d_conv,
         "key_conv": SLinOSSConfig.key_conv,
-        "forcing_init": SLinOSSConfig.forcing_init,
         "init_span": SLinOSSConfig.init_span,
-        "init_period_context_scale": SLinOSSConfig.init_period_context_scale,
-        "init_decay_context_scale": SLinOSSConfig.init_decay_context_scale,
         "w_max": SLinOSSConfig.w_max,
         "bias": SLinOSSConfig.bias,
         "conv_bias": SLinOSSConfig.conv_bias,
@@ -180,7 +173,7 @@ def _register_builtins() -> None:
     :class:`slinoss.SLinOSSConfig` imports torch and nothing optional.
     """
     REGISTRY.register(
-        "slinoss", MixerEntry(_build_slinoss, "required", _slinoss_defaults())
+        "slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults())
     )
     REGISTRY.register(
         "gpt", MixerEntry(CausalAttention, "required", {"n_heads": 8, "rotary": True})

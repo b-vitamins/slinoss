@@ -261,12 +261,11 @@ def load_module(path: str) -> None:
 # slinoss:
 
 
-def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
+def _build_slinoss(d_model: int, **settings: Any) -> nn.Module:
     """The tree's mixer.
 
     Args:
         d_model: Stream width.
-        max_length: Configured task context. This is never inferred from the tensor.
         **settings: User-controlled :class:`slinoss.SLinOSSConfig` fields.
 
     Returns:
@@ -274,9 +273,7 @@ def _build_slinoss(d_model: int, max_length: int, **settings: Any) -> nn.Module:
     """
     from slinoss import SLinOSSConfig, SLinOSSMixer
 
-    return SLinOSSMixer(
-        SLinOSSConfig(d_model=d_model, context_length=max_length, **settings)
-    )
+    return SLinOSSMixer(SLinOSSConfig(d_model=d_model, **settings))
 
 
 def _slinoss_defaults() -> dict[str, Any]:
@@ -299,8 +296,6 @@ def _slinoss_defaults() -> dict[str, Any]:
         "d_conv": SLinOSSConfig.d_conv,
         "key_conv": SLinOSSConfig.key_conv,
         "init_span": SLinOSSConfig.init_span,
-        "init_period_context_scale": SLinOSSConfig.init_period_context_scale,
-        "init_decay_context_scale": SLinOSSConfig.init_decay_context_scale,
         "w_max": SLinOSSConfig.w_max,
         "bias": SLinOSSConfig.bias,
         "conv_bias": SLinOSSConfig.conv_bias,
@@ -454,7 +449,7 @@ def _register_builtins() -> None:
     Called at import. The slinoss entry reads its defaults from
     :class:`slinoss.SLinOSSConfig`, which imports torch and nothing optional.
     """
-    register("slinoss", MixerEntry(_build_slinoss, "required", _slinoss_defaults()))
+    register("slinoss", MixerEntry(_build_slinoss, "unused", _slinoss_defaults()))
     register(
         "attention",
         MixerEntry(

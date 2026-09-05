@@ -154,29 +154,23 @@ def test_length_consumption_is_mandatory_and_fail_closed() -> None:
 
     assert isinstance(built, SLinOSSMixer)
     assert built.config.init_span == 4096
-    assert built.config.context_length == 256
-    assert resolved.max_length_policy == "required"
+    assert resolved.max_length_policy == "unused"
     assert resolved.initialization_policy == "constructor"
-    assert resolved.constructions[0]["context"]["max_length_consumed"] == 256
+    assert resolved.constructions[0]["context"]["max_length_consumed"] is None
     assert resolved.constructions[0]["initialization_policy"] == "constructor"
 
 
-def test_slinoss_context_scales_resolve_from_configured_task_length() -> None:
-    """The shared span law consumes task metadata, never observed tensor width."""
-    resolved = resolve(
-        "slinoss",
-        ["init_period_context_scale=1", "init_decay_context_scale=16"],
-    )
+def test_slinoss_init_span_is_explicit_and_independent_of_task_length() -> None:
+    """Master's one lattice moves only through the recorded constructor setting."""
+    resolved = resolve("slinoss", ["init_span=512"])
     built = resolved.factory(128, 32)
     from slinoss import SLinOSSMixer
 
     assert isinstance(built, SLinOSSMixer)
-    assert built.config.context_length == 32
-    assert built.config.resolved_init_period_span == 32
-    assert built.config.resolved_init_decay_span == 512
+    assert built.config.init_span == 512
     effective = resolved.constructions[0]["effective_config"]
-    assert effective["resolved_init_period_span"] == 32
-    assert effective["resolved_init_decay_span"] == 512
+    assert effective["init_span"] == 512
+    assert resolved.constructions[0]["context"]["max_length_consumed"] is None
 
 
 def test_slinoss_defaults_track_the_config() -> None:
@@ -197,7 +191,6 @@ def test_slinoss_defaults_track_the_config() -> None:
         "norm_eps",
         "vocab_size",
         "vocab_pad_multiple",
-        "context_length",
     }
     assert set(defaults) == fields - stack_only
     for key in set(defaults) - {"d_state"}:
