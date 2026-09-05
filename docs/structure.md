@@ -16,7 +16,10 @@ Every operator lives in `slinoss/ops/<name>/` and has the same five parts:
 - `backends.py` -- the forward and backward `Protocol`s, the `Registry`, the
   registrations.
 - `interface.py` -- the one `torch.autograd.Function` and the one public
-  callable.
+  callable. An operator with no gradient holds the callable alone and no
+  `Function`; `decode` is the one. Its registry still carries a backward, one that
+  raises and names the differentiable operator, because an absent entry is a
+  registry a caller can hold a gradient through by accident.
 - `__init__.py` -- the re-export surface.
 
 A kernel is never the specification. If a kernel and the reference disagree, the
@@ -39,6 +42,12 @@ One entry point per operator, not one per implementation.
   axis, so a shape a kernel cannot hold raises rather than resolving to another
   backend. A shared-memory bound is a bound on the configuration, not a fallback
   trigger.
+- Two operators that evaluate one map at different token extents are two
+  registries, and which one a call wants is the call site's decision. `decode` is
+  the one-token recurrence and `so3ssd` is the `T`-token one; `SLinOSSMixer.step`
+  branches on `T` and neither registry can hand a call to the other. The branch
+  cannot move into a registry: a token extent is a shape, and the rule above is
+  what keeps a kernel's shape refusal a refusal.
 - A direction implemented as several launches has one driver module in `cute/`
   that sequences them, and `backends.py` registers the driver, never a kernel.
   The backward driver rematerializes what it needs from the saved inputs, except
@@ -59,7 +68,7 @@ slinoss/
   stack.py        SLinOSSStack
   config.py       SLinOSSConfig, and the shape multiples every operator asserts
   state.py        inference state containers
-  decode.py       single-token decode path
+  decode.py       the generation loop over the one-token path
   graph.py        CUDA-graph capture and replay
   _precision.py   float32-pinning policy, dtype sets
   _registry.py    Backend and Registry, shared by every operator
@@ -78,6 +87,9 @@ slinoss/
         backward.py the driver that sequences the seven backward launches
         fwd/        increment_passing, chunk_scan, and the pair the first fused
         bwd/        chunk_start, state_passing, chunk_input, chunk_vector, boundary
+    decode/       the same recurrence at one token, in place, no gradient
+      cute/
+        step.py     the launches one token costs
     scanprep/     parameter maps: rotation vector, log-scale, the taps they imply
     mixer/        fused rowwise mixer tail
     block/        fused norm and activation kernels

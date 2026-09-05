@@ -112,8 +112,24 @@ a transposed score tile is not.
   than as occupancy.
 - A footprint that grows with a configuration knob is a ceiling on that knob.
   Tile the knob, or the supported range is whatever the arena happens to hold.
-  The backward holds whole `3N` extents, which caps `d_state` well below what
-  `SLinOSSConfig` accepts.
+  The backward holds whole `3N` extents, so the ceiling on `d_state` moves with
+  `chunk_size` and `d_head` together and is not a constant. Largest `d_state` the
+  forward launchers admit, bf16 activations on a 101,376 B carveout:
+
+  | `chunk_size` / `d_head` | 16 | 32 | 48 | 64 | 80 | 96 | 112 | 128 |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 16 | 576 | 480 | 384 | 336 | 288 | 240 | 240 | 192 |
+  | 32 | 432 | 432 | 384 | 336 | 288 | 240 | 192 | 192 |
+  | 64 | 432 | 432 | 336 | 288 | 240 | 240 | 192* | 192* |
+  | 128 | 240* | 192* | 192* | 144* | 144* | 144* | 96* | 96* |
+
+  The backward ceiling equals the forward ceiling except at the starred pairs,
+  where the backward admits nothing: those ten geometries infer at every width in
+  the table and train at none, and `SLinOSSConfig` accepts all of them, so the
+  refusal arrives at the first `.backward()`. `chunk_vector_bwd` binds seven of
+  the ten; at `chunk_size 128` with `d_head` at 96 or more no `chunk_input_bwd`
+  lane block fits either. `tests/test_cute_smem.py` reads the whole grid off the
+  layouts and fails on any pair whose backward set is empty.
 - The shared-memory budget is computed from the layouts and asserted against the
   queried capacity by a test. No guard or slop constants.
 - The pitch is the conflict rule, and it has two sides that no single pitch

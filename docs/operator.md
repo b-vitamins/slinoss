@@ -237,6 +237,17 @@ The `z` row is the state the operator takes and returns. The `(B,H,C,P,3N)`
 chunk-start state and its cotangent are not on that boundary and are not float32:
 they carry the activation dtype, per invariant 4.
 
+At one token the operator takes `z` and advances it in place instead of returning
+it, and `b_prev` and `u_prev` with it. There is nothing to factor at that extent:
+a single-token chunk has no prefix to form and no chunk-start copy, so the
+activation-dtype `zstart` of invariant 4 does not exist and the float32 row is
+read once and written once. `slinoss/ops/decode/` is that boundary and it is the
+same map, asserted against both `T`-token implementations in float64. A caller
+that copies any of the three carries out of it is reading and writing a buffer
+onto itself, which is the traffic the in-place signature exists to delete.
+`docs/decode.md` holds that stage's fusion boundary, its roofline account and its
+drift table.
+
 `B` and `C` are grouped: head `h` reads group `h // (H // G)`, so `G` divides
 `H`, and `G == H` is the ungrouped case rather than a separate signature. The
 broadcast from groups to heads has the cross-head `dB` reduction as its

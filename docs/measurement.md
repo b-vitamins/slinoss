@@ -112,6 +112,21 @@ Each rule below exists because it has been violated before.
   every operator already has -- `_C.is_available()` for the conv, a CUDA check
   plus a DSL import for the rest -- so the check is one rule over six operators
   rather than a patch for the one that failed.
+- The registries an arm is asked about are the ones its own call takes, not the
+  ones its operator owns. Where a call site branches on the token extent, an arm at
+  one extent dispatches through one recurrence and never the other, so listing the
+  other in `OP_REGISTRIES` produces a verdict on a registry the arm never selects
+  through, and it reads clean because that registry resolves. The `decode` arm is
+  the case: it runs at one token, so it asks `decode` and not `so3ssd`. That entry
+  and the arm's `COVERAGE` row move in one edit, since the required kernel list is
+  the same claim about the same launches.
+- A graph arm holds what its replay reads. A recorded graph addresses the module's
+  parameters and the state buffers by pointer and names no owner of either, so an
+  arm that keeps the replay and drops what it recorded over lets the allocator hand
+  those blocks to the next request: the replay then times a kernel sequence over
+  somebody else's memory and returns non-finite numbers rather than raising.
+  `GraphedStep` holds the recorded callable for this reason, which is what leaves an
+  eager arm and a graph arm of one step comparable.
 - A profiler that is not installed is an environment defect, named as one, before
   the workload is allocated. `ncu` and `nsys` are probed on `PATH` and then in the
   CUDA bin directories, and a miss raises with every path tried in the message.
