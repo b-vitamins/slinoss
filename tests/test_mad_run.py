@@ -110,7 +110,7 @@ def test_the_driver_runs_both_backbones_and_records_them() -> None:
     out = io.StringIO()
     err = io.StringIO()
     with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "records.jsonl"
+        path = Path(folder) / "nested" / "records.jsonl"
         argv = [
             "--task",
             "icr",

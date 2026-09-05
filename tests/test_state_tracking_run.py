@@ -317,7 +317,7 @@ def test_out_file_holds_the_same_lines_as_stdout(
     Appends rather than truncates: a seed bank is filled by several invocations writing to
     one file.
     """
-    out = tmp_path / "records.jsonl"
+    out = tmp_path / "nested" / "records.jsonl"
     first = _run(["--task", "parity", "--out", str(out)], capsys)
     second = _run(["--task", "even_pairs", "--out", str(out)], capsys)
     lines = out.read_text().splitlines()

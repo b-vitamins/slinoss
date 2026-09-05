@@ -494,6 +494,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     records: list[dict[str, Any]] = []
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
     handle = args.out.open("a") if args.out is not None else None
     try:
         for seed in args.seed:
