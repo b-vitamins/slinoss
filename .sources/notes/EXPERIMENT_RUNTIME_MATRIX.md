@@ -28,7 +28,8 @@ conservative admission rule:
 | Walker A5 variable-length row | one cell, solved at 20k | not isolated | Automation | The benchmark receipt has no wall-time field; do not use a reaper-interrupted wrapper as a timer. |
 | Walker S5 variable-length row, two layers | one full 100k cell | 87.97 min | Automation | Completed stable timing. |
 | PD-SSM S5:4/8/32 | mixed bundle | 180.02 min | Automation | The bundle contains two 100k failure paths and is far beyond a Sonata window. |
-| Regular tasks and Walker bracketed arithmetic | six cells | pending | Automation | Promote a cell to Sonata only after this closure records an isolated wall time below 20 minutes. |
+| Regular parity + even-pairs bundle, two layers | parity 100k + even pairs 25k | 127.25 min | Automation | One uninterrupted bundle; parity exhausted the full budget and even pairs solved. |
+| Remaining regular/Walker arithmetic | pending | pending | Automation | Promote a cell to Sonata only after this closure records an isolated wall time below 20 minutes. |
 
 ## MAD-Lab
 
