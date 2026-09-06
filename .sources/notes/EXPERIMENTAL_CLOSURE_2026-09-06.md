@@ -18,7 +18,7 @@ the final master commit.
 
 ## State tracking
 
-Completed: **26/28 benchmark rows**. Solved: **22/26 completed rows**.
+Completed: **27/28 benchmark rows**. Solved: **22/27 completed rows**.
 
 ### Walker/KLA Figure-1-style fixed-length A5 sweep
 
@@ -78,9 +78,12 @@ All 14 fixed-length cells are solved at depth 1.
 - Released regular `even_pairs`: **100.0000%** at step 25,000, two layers,
   with **100.0000% in every reported length band**. Total/mixer parameters:
   817,491/816,208.
+- Released regular `mod_arith_no_brack`: **71.6309%** at step 80,000, two
+  layers; the longest reported band is **21.8750%**. Its final step-100,000
+  accuracy is **69.1528%**. This cell is not solved. Total/mixer parameters:
+  819,290/816,208.
 
-Remaining native rows: released regular `mod_arith_no_brack` and the Walker
-arithmetic-with-brackets extension.
+Remaining native row: the Walker arithmetic-with-brackets extension.
 
 ## MAD-Lab
 
