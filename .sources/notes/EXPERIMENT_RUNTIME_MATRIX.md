@@ -30,7 +30,7 @@ conservative admission rule:
 | PD-SSM S5:4/8/32 | mixed bundle | 180.02 min | Automation | The bundle contains two 100k failure paths and is far beyond a Sonata window. |
 | Regular parity + even-pairs bundle, two layers | parity 100k + even pairs 25k | 127.25 min | Automation | One uninterrupted bundle; parity exhausted the full budget and even pairs solved. |
 | Regular cycle-navigation + unbracketed-arithmetic bundle, two layers | cycle navigation 90k + arithmetic 100k | 183.98 min | Automation | One uninterrupted bundle; cycle navigation solved and arithmetic exhausted the full budget. |
-| Walker bracketed arithmetic, two layers | pending | pending | Automation | This cell is already far beyond a Sonata window; retain Automation routing. |
+| Walker bracketed arithmetic, two layers | one full 100k cell | 97.03 min | Automation | The first attempt was externally terminated; the uninterrupted second attempt exhausted the full budget. |
 
 ## MAD-Lab
 

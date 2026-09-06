@@ -1,14 +1,19 @@
 # SLinOSS experimental closure record — 2026-09-06
 
-Status: in progress. This note records only completed benchmark rows. It will be
-updated with the remaining state-tracking, MAD, and LM results, then stamped with
-the final master commit.
+Status: complete. This note records the frozen candidate, every requested
+benchmark row, and the content-addressed evidence used to land it.
 
 ## Candidate identity
 
-- Final master commit: **TBD**
-- Experiment source and harness commit: `3c64ddac2188811957aa8ef8473b930aa18c7640`
-- Closure branch tip at this snapshot: `50ea79f`
+- Frozen closure commit: **TBD until the complete evidence commit is made**
+- Benchmarked mixer source tree: `5c340024befe5dfc9627b77d9ba8443776518683`.
+  Every result receipt carries this exact tree, irrespective of the later
+  harness-only commit from which it was launched.
+- Final harness trees: state tracking
+  `768670d70a900f1f2a389db6892f22d6dc07b021`, MAD-Lab
+  `dc268e11cfdcac2a9033fbb1def7968ef097b41b`, language modelling
+  `9e1eb46258477011764cf696ffdb23cbcaa31275`, and MQAR
+  `6a9f5b3cae7258f40289cac78e0dba42f4161814`.
 - State-tracking geometry: `d_head=32`, `n_groups=8`, one layer for A5 and two
   layers for native S5/regular tasks.
 - MAD geometry: `d_head=32`, `n_groups=4`, using the same mixer recurrence and
@@ -18,7 +23,7 @@ the final master commit.
 
 ## State tracking
 
-Completed: **27/28 benchmark rows**. Solved: **22/27 completed rows**.
+Completed: **28/28 benchmark rows**. Solved: **22/28 rows**.
 
 ### Walker/KLA Figure-1-style fixed-length A5 sweep
 
@@ -82,8 +87,9 @@ All 14 fixed-length cells are solved at depth 1.
   layers; the longest reported band is **21.8750%**. Its final step-100,000
   accuracy is **69.1528%**. This cell is not solved. Total/mixer parameters:
   819,290/816,208.
-
-Remaining native row: the Walker arithmetic-with-brackets extension.
+- Walker extension `mod_arith_w_brack`: **33.6060%** at the full step-100,000
+  endpoint, two layers; the longest reported band is **21.4286%**. This cell is
+  not solved. Total/mixer parameters: 819,804/816,208.
 
 ## MAD-Lab
 
@@ -152,15 +158,27 @@ longer a NaN/divergence faceplant, but it is not yet competitive or healthy.
 
 ## Raw receipts
 
-The point-in-time receipt bundle is under
+The complete receipt bundle is under
 `.sources/receipts/closure-2026-09-06/`. `SHA256SUMS` seals this snapshot.
 Receipt files can contain duplicate completed attempts from supervisor retries;
 the benchmark ledger above deduplicates by protocol cell and reports the best
 valid seed according to that protocol's declared selection rule.
 
+Every one of the 48 result objects parses as JSON and identifies mixer source
+tree `5c340024befe5dfc9627b77d9ba8443776518683`. Receipts whose provenance is
+marked dirty list only result/export files; no source or harness file differs
+from its recorded tree. The first bracketed-arithmetic attempt was terminated
+externally; its supervisor record preserves two attempts and one failed attempt,
+while the reported result is the uninterrupted 97.03-minute second attempt.
+
 The hardware-specific runtime and routing ledger is
 `.sources/notes/EXPERIMENT_RUNTIME_MATRIX.md`; its end-to-end timing records are
 sealed alongside the benchmark receipts under `timings/`.
 
-At final closure, live result files will be pulled again, this note will be
-completed, and `Final master commit` will be replaced with the landed commit.
+## Verification
+
+- `shasum -a 256 -c SHA256SUMS`: every raw result and timing receipt passes.
+- Full local suite: **1,622 passed, 230 environment-gated skips, 0 failed**.
+- `ruff check .`: passed.
+- `git diff --check`: passed.
+- Final repository trees agree with the tree identities recorded above.
