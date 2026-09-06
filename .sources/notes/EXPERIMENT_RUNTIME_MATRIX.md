@@ -27,7 +27,7 @@ conservative admission rule:
 | PD-SSM A5:2/6/8/12 bundle, one layer | four cells | 13.08 min | Sonata | Completed bundle timing. |
 | Walker A5 variable-length row | one cell, solved at 20k | not isolated | Automation | The benchmark receipt has no wall-time field; do not use a reaper-interrupted wrapper as a timer. |
 | Walker S5 variable-length row, two layers | one full 100k cell | 87.97 min | Automation | Completed stable timing. |
-| PD-SSM S5:4/8/32 | mixed bundle | final timing pending | Automation | The bundle contains 100k failure paths and is already known to exceed a Sonata window. |
+| PD-SSM S5:4/8/32 | mixed bundle | 180.02 min | Automation | The bundle contains two 100k failure paths and is far beyond a Sonata window. |
 | Regular tasks and Walker bracketed arithmetic | six cells | pending | Automation | Promote a cell to Sonata only after this closure records an isolated wall time below 20 minutes. |
 
 ## MAD-Lab
