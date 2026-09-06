@@ -6,6 +6,13 @@ file is part of the mixer contract: any change to `SLinOSSMixerConfig`,
 tail must update the anatomy, initialization, counts, and diagnosis here in the
 same change.
 
+**Authoritative code checkpoint:**
+`a8ea238741c44361da87bfb42b653f16f0e8f4f7`. This checkpoint preserves the
+benchmarked mixer, recurrence, initialization, and default runtime layout choices.
+Its only post-closure executable change makes the offline chunk-layout census
+accept an explicit shared-memory carveout instead of silently querying whichever
+GPU runs the report.
+
 This note has three evidence labels:
 
 - **Code fact** means directly established by the current implementation.

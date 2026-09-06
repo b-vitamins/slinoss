@@ -5,6 +5,11 @@ benchmark row, and the content-addressed evidence used to land it.
 
 ## Candidate identity
 
+- Authoritative code checkpoint:
+  `a8ea238741c44361da87bfb42b653f16f0e8f4f7`. It descends from the frozen
+  closure and adds only explicit shared-memory-capacity plumbing for offline
+  kernel-layout analysis. Runtime callers omit the override, so the mixer,
+  initialization, recurrence, and default launch choices remain unchanged.
 - Frozen closure commit: `37f04d5a46d79bd66f96ce2397c2670082fc3e11`
 - Benchmarked mixer source tree: `5c340024befe5dfc9627b77d9ba8443776518683`.
   Every result receipt carries this exact tree, irrespective of the later
@@ -179,6 +184,7 @@ sealed alongside the benchmark receipts under `timings/`.
 
 - `shasum -a 256 -c SHA256SUMS`: every raw result and timing receipt passes.
 - Full local suite: **1,622 passed, 230 environment-gated skips, 0 failed**.
+- Capacity-plumbing suite in a CuTe-enabled H200 environment: **131 passed**.
 - `ruff check .`: passed.
 - `git diff --check`: passed.
 - Final repository trees agree with the tree identities recorded above.
