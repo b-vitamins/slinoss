@@ -5,7 +5,7 @@ benchmark row, and the content-addressed evidence used to land it.
 
 ## Candidate identity
 
-- Frozen closure commit: **TBD until the complete evidence commit is made**
+- Frozen closure commit: `37f04d5a46d79bd66f96ce2397c2670082fc3e11`
 - Benchmarked mixer source tree: `5c340024befe5dfc9627b77d9ba8443776518683`.
   Every result receipt carries this exact tree, irrespective of the later
   harness-only commit from which it was launched.
