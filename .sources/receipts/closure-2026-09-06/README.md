@@ -5,7 +5,8 @@ the SLinOSS closure campaign begun on 2026-09-06.
 
 - `sonata/`: fixed-length A5, Walker/PD A5, completed MAD rows, bounded LM
   records, and completed MQAR cells.
-- `automation/`: fixed-length A5 length 14 and native PD-SSM S5 rows.
+- `automation/`: fixed-length A5 length 14, native PD-SSM S5 rows, and MQAR
+  `512:64`.
 - `timings/`: immutable supervisor job records used for end-to-end wall times in
   `.sources/notes/EXPERIMENT_RUNTIME_MATRIX.md`.
 - `SHA256SUMS`: content hashes for the raw receipts.

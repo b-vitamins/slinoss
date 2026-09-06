@@ -50,12 +50,12 @@ Automation and group the other five into bounded Sonata jobs.
 | 64:4 | 196 | 3 | 36.39 s / 47.40 s | Sonata |
 | 128:8 | 196 | 3 | 66.06 s / 77.57 s | Sonata |
 | 256:16 | 391 | 19 | 819.35 s / 856.98 s | Sonata |
-| 512:64 | 782 | up to 64 | final timing pending; projected 90--95 min | Automation |
+| 512:64 | 782 | 32 | 2,749.77 s / 2,762.46 s | Automation |
 
 The 512 cell is not a modest extension of the 256 cell: its published batch
-ladder doubles the steps per epoch, each epoch contains twice as many tokens,
-and the harder 64-association problem may miss early stopping. It must never be
-sent to Sonata.
+ladder doubles the steps per epoch and each epoch contains twice as many
+tokens. Even though it stopped early at epoch 31, it took 46.04 minutes
+end-to-end and must never be sent to Sonata.
 
 ## Bounded language modelling
 

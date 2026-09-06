@@ -110,7 +110,9 @@ geometry (`d_head=64`, `n_groups=1`) in both layers.
 | `64:4` | 99.9500% | 99.9500% | 2 | 36.390 s | complete; zero leakage |
 | `128:8` | 99.9375% | 99.9375% | 2 | 66.062 s | complete; zero leakage |
 | `256:16` | 99.0604% | 99.0604% | 18 | 819.350 s | complete; zero leakage |
-| `512:64` | — | — | — | — | running from the corrected four-cell harness |
+| `512:64` | 99.7661% | 99.7661% | 31 | 2,749.766 s | complete; zero leakage |
+
+All four canonical Figure-2 cells are complete and exceed 99% example accuracy.
 
 ## Language modelling
 
