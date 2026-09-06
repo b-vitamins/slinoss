@@ -29,6 +29,7 @@ from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
+from torch.nn.utils import parametrize
 
 from scripts.lm import corpus as corpus_mod
 from scripts.lm.data import Batch, Shard, batches, val_batches
@@ -42,6 +43,7 @@ ARMS = (
     "zero-z0",
     "paired-bc",
     "zero-z0-paired-bc",
+    "normalized-transition",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -130,6 +132,28 @@ class _OldLM(nn.Module):
         return self.head(_rmsnorm(hidden, self.norm_weight, 1e-5))
 
 
+class _PackedRowScale(nn.Module):
+    """Apply a fixed functional scale to one packed projection row band."""
+
+    def __init__(
+        self,
+        rows: int,
+        start: int,
+        stop: int,
+        factor: float,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        scale = torch.ones(rows, 1, device=device, dtype=dtype)
+        scale[start:stop] = factor
+        self.register_buffer("scale", scale, persistent=False)
+
+    def forward(self, weight: Tensor) -> Tensor:
+        return weight * self.scale
+
+
 def _build_old(
     *,
     old_root: Path,
@@ -216,6 +240,28 @@ def _build_current(
             if mutation == "none"
             else mutation + "; C_projection_rows.copy_(B_projection_rows)"
         )
+    if arm == "normalized-transition":
+        factor = 1.0 / math.sqrt(d_model)
+        for block in model.blocks:
+            mixer = block.mixer
+            layout = mixer.layout
+            weight = mixer.in_proj.weight
+            parametrize.register_parametrization(
+                mixer.in_proj,
+                "weight",
+                _PackedRowScale(
+                    weight.shape[0],
+                    layout.params_off,
+                    layout.out_features,
+                    factor,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                ),
+            )
+        mutation = (
+            "token-transition projection output scaled by "
+            f"1/sqrt(d_model)={factor:.17g}; reachable set unchanged"
+        )
     return model, {
         "operator": mixer_name,
         "settings": resolved.settings,
@@ -269,9 +315,14 @@ def _gradient_metrics(model: nn.Module) -> dict[str, Any]:
         return result
     sliced: list[tuple[str, Tensor]] = []
     for module in model.modules():
-        if not isinstance(module, SLinOSSMixer) or module.in_proj.weight.grad is None:
+        if not isinstance(module, SLinOSSMixer):
             continue
-        grad = module.in_proj.weight.grad
+        if parametrize.is_parametrized(module.in_proj, "weight"):
+            grad = module.in_proj.parametrizations.weight.original.grad
+        else:
+            grad = module.in_proj.weight.grad
+        if grad is None:
+            continue
         layout = module.layout
         sliced.extend(
             (
