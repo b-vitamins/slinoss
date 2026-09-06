@@ -386,7 +386,14 @@ def fused_smem_bytes(
     )
 
 
-def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
+def fused_kblock(
+    chunk: int,
+    rows: int,
+    span: int,
+    itemsize: int = 2,
+    *,
+    capacity: int | None = None,
+) -> int:
     """Widest K slice that still holds :data:`RESIDENT_MAX` blocks on one SM.
 
     A wider slice is one barrier pair per chunk fewer, and the residency is worth more
@@ -440,6 +447,8 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
         rows: ``P``.
         span: Band width, :data:`SPLIT`.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
+        capacity: Explicit carveout for offline layout modelling. The current
+            device is queried when omitted.
 
     Returns:
         A divisor of ``chunk`` and a multiple of
@@ -456,16 +465,17 @@ def fused_kblock(chunk: int, rows: int, span: int, itemsize: int = 2) -> int:
             budget = fused_smem_bytes(
                 chunk, rows, span, itemsize, kblk=kblk, pitch=SLICE_PITCH
             )
-            if smem_residency(budget) >= RESIDENT_MAX:
+            if smem_residency(budget, capacity=capacity) >= RESIDENT_MAX:
                 return kblk
         kblk -= MMA_TILE_K
     floor = min(chunk - chunk % MMA_TILE_K, KBLOCK_MAX)
     allocated = fused_smem_bytes(chunk, rows, span, itemsize, kblk=floor)
-    if allocated > smem_capacity():
+    available = smem_capacity() if capacity is None else capacity
+    if allocated > available:
         raise ValueError(
             f"no legal K slice fits at chunk={chunk} rows={rows} span={span}: "
             f"one MMA step of {floor} needs {allocated} B of shared memory, capacity "
-            f"is {smem_capacity()} B"
+            f"is {available} B"
         )
     return floor
 

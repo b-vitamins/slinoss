@@ -592,7 +592,12 @@ def tblock(chunk: int) -> int:
 
 
 def _lane_block(
-    chunk: int, rows: int, dim: int, itemsize: int, warps: int
+    chunk: int,
+    rows: int,
+    dim: int,
+    itemsize: int,
+    warps: int,
+    capacity: int | None = None,
 ) -> tuple[int, int]:
     """Lane block the carveout admits, and the bytes it costs.
 
@@ -617,16 +622,23 @@ def _lane_block(
         if dim % blk == 0
     ]
     for candidate in costs:
-        if smem_residency(candidate[1]) >= RESIDENT_MIN:
+        if smem_residency(candidate[1], capacity=capacity) >= RESIDENT_MIN:
             return candidate
+    available = smem_capacity() if capacity is None else capacity
     for candidate in costs:
-        if candidate[1] <= smem_capacity():
+        if candidate[1] <= available:
             return candidate
     return costs[-1]
 
 
 def lblock(
-    chunk: int, rows: int, dim: int, itemsize: int = 2, *, warps: int = WARPS
+    chunk: int,
+    rows: int,
+    dim: int,
+    itemsize: int = 2,
+    *,
+    warps: int = WARPS,
+    capacity: int | None = None,
 ) -> int:
     """Lane extent held in shared memory at once.
 
@@ -661,6 +673,8 @@ def lblock(
         dim: ``3N``.
         itemsize: Bytes per operand element. Always 2 for the tensor-core atom.
         warps: Warps per block, which the two per-warp scratch tiles carry.
+        capacity: Explicit carveout for offline layout modelling. The current
+            device is queried when omitted.
 
     Returns:
         The widest divisor of ``3N`` that is a multiple of :data:`LANE_MULTIPLE` and
@@ -678,12 +692,13 @@ def lblock(
             caller cannot tell a block that fits from one that overflows by its value,
             and every caller of this function goes on to launch at what it returns.
     """
-    blk, nbytes = _lane_block(chunk, rows, dim, itemsize, warps)
-    if nbytes > smem_capacity():
+    blk, nbytes = _lane_block(chunk, rows, dim, itemsize, warps, capacity)
+    available = smem_capacity() if capacity is None else capacity
+    if nbytes > available:
         raise ValueError(
             f"chunk_input_bwd has no lane block that fits at L={chunk} P={rows} "
             f"3N={dim}: the narrowest, {blk}, needs {nbytes} B and the carveout is "
-            f"{smem_capacity()} B"
+            f"{available} B"
         )
     return blk
 

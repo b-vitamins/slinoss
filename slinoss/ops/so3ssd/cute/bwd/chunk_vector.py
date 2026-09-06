@@ -1213,6 +1213,7 @@ def vblock(
     fold: int,
     itemsize: int = 2,
     warp_groups: int = 1,
+    capacity: int | None = None,
 ) -> int:
     """Source-token block: one M tile of the atom, or half of one to fit.
 
@@ -1238,6 +1239,8 @@ def vblock(
             operator ships: a caller that launches must pass the width's own group
             count, or the budget this reads is short by ``4 * L`` bytes a group and
             the block it returns is one the launch cannot allocate.
+        capacity: Explicit carveout for offline layout modelling. The current
+            device is queried when omitted.
 
     Returns:
         The block. A shape that fits at neither candidate is refused by
@@ -1247,7 +1250,7 @@ def vblock(
     floor = min(chunk, MMA_TILE_M // 2)
     if span > floor:
         budget = vector_smem_bytes(chunk, rows, dim, fold, span, itemsize, warp_groups)
-        if budget > smem_capacity():
+        if budget > (smem_capacity() if capacity is None else capacity):
             span = floor
     return span
 

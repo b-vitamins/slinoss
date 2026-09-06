@@ -262,7 +262,7 @@ def test_every_arena_row_agrees_with_the_carveout_it_was_judged_against() -> Non
         assert row.capacity_pct == pytest.approx(100.0 * row.smem_bytes / CAPACITY)
         # The report must not claim a residency the launch bound will not ask
         # for, so it is held against the launch's own helper, not to a divide.
-        assert row.resident == smem_residency(row.smem_bytes)
+        assert row.resident == smem_residency(row.smem_bytes, capacity=CAPACITY)
         # A verdict and its bytes cannot disagree: one is derived from the other.
         assert bool(row.refused_by) == (row.smem_bytes > CAPACITY)
         assert row.floor_bytes <= row.smem_bytes
@@ -382,7 +382,9 @@ def test_the_residency_bar_is_the_granular_one_not_the_capacity_divided() -> Non
         assert residency_at(budget + 1, CAPACITY) == blocks - 1
     # Against the launch bound, which queries the device for the same carveout.
     for nbytes in (1, 4096, 33024, 50176, 50177, 101376):
-        assert residency_at(nbytes, CAPACITY) == smem_residency(nbytes)
+        assert residency_at(nbytes, CAPACITY) == smem_residency(
+            nbytes, capacity=CAPACITY
+        )
 
 
 # ---------------------------------------------------------------------------

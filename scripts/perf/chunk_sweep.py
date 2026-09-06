@@ -207,7 +207,7 @@ class ArenaKernel(NamedTuple):
     binding: bool = True
 
 
-def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
+def arena_kernels(fold: int, capacity: int) -> tuple[ArenaKernel, ...]:
     """Every kernel on the CuTe path that allocates shared memory.
 
     The backward's state passing and the boundary allocate none, so ``L`` cannot
@@ -225,6 +225,7 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
         fold: Heads one vector-backward block walks. A fold above one adds the
             cross-head accumulator to that kernel's arena, so both folds appear
             when they differ.
+        capacity: Explicit shared-memory carveout used by every layout chooser.
 
     Returns:
         One entry per kernel and block width, forward launches first.
@@ -265,7 +266,7 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
             # raises. The bytes column still reports the narrowest block's cost,
             # which is what the refusal is judged on.
             try:
-                return f"lblk={lblock(chunk, rows, dim, warps=w)}"
+                return f"lblk={lblock(chunk, rows, dim, warps=w, capacity=capacity)}"
             except ValueError:
                 return "lblk=none"
 
@@ -289,10 +290,19 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
         return ArenaKernel(
             name=f"chunk_vector_bwd/fold{f}/w{w}",
             nbytes=lambda c, p, d: vector_smem_bytes(
-                c, p, d, f, vblock(c, p, d, f), warp_groups=groups
+                c,
+                p,
+                d,
+                f,
+                vblock(c, p, d, f, warp_groups=groups, capacity=capacity),
+                warp_groups=groups,
             ),
-            knob=lambda c, p, d: f"span={vblock(c, p, d, f)}",
-            slice_of=lambda c, p, d: vblock(c, p, d, f),
+            knob=lambda c, p, d: (
+                f"span={vblock(c, p, d, f, warp_groups=groups, capacity=capacity)}"
+            ),
+            slice_of=lambda c, p, d: vblock(
+                c, p, d, f, warp_groups=groups, capacity=capacity
+            ),
             binding=w == WARPS_WIDE,
         )
 
@@ -305,10 +315,14 @@ def arena_kernels(fold: int) -> tuple[ArenaKernel, ...]:
             # twice, once through the chunk-sized tiles and once through the slice
             # the budget left for them.
             nbytes=lambda c, p, d: fused_smem_bytes(
-                c, p, SPLIT, kblk=fused_kblock(c, p, SPLIT)
+                c, p, SPLIT, kblk=fused_kblock(c, p, SPLIT, capacity=capacity)
             ),
-            knob=lambda c, p, d: f"span={SPLIT} kblk={fused_kblock(c, p, SPLIT)}",
-            slice_of=lambda c, p, d: fused_kblock(c, p, SPLIT),
+            knob=lambda c, p, d: (
+                f"span={SPLIT} kblk={fused_kblock(c, p, SPLIT, capacity=capacity)}"
+            ),
+            slice_of=lambda c, p, d: fused_kblock(
+                c, p, SPLIT, capacity=capacity
+            ),
         ),
     ]
     entries.extend(scan(w) for w in widths)
@@ -404,7 +418,7 @@ def arena_rows(
     Returns:
         One row per kernel per chunk length, grouped by chunk length.
     """
-    kernels = arena_kernels(geo.fold)
+    kernels = arena_kernels(geo.fold, capacity)
     rows: list[ArenaRow] = []
     for chunk in chunks:
         for kernel in kernels:
@@ -443,13 +457,9 @@ def residency_at(nbytes: int, capacity: int) -> int:
     Returns:
         Blocks the carveout holds, floor at one.
     """
-    from slinoss._cute import SMEM_GRANULE, SMEM_RESERVED
+    from slinoss._cute import smem_residency
 
-    carveout = capacity + SMEM_RESERVED
-    if nbytes <= 0:
-        return carveout
-    block = -(-(nbytes + SMEM_RESERVED) // SMEM_GRANULE) * SMEM_GRANULE
-    return max(1, carveout // block)
+    return smem_residency(nbytes, capacity=capacity)
 
 
 def budget_at(blocks: int, capacity: int) -> int:
@@ -469,12 +479,9 @@ def budget_at(blocks: int, capacity: int) -> int:
     Raises:
         ValueError: If ``blocks`` is below one, which has no largest budget.
     """
-    from slinoss._cute import SMEM_GRANULE, SMEM_RESERVED
+    from slinoss._cute import smem_budget
 
-    if blocks < 1:
-        raise ValueError(f"blocks must be at least one, got {blocks}")
-    carveout = capacity + SMEM_RESERVED
-    return (carveout // blocks) // SMEM_GRANULE * SMEM_GRANULE - SMEM_RESERVED
+    return smem_budget(blocks, capacity=capacity)
 
 
 def legal_chunks(rows: Sequence[ArenaRow]) -> tuple[int, ...]:

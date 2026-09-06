@@ -788,7 +788,7 @@ six, and exact at one, two, four and five, which is why the error survived.
 """
 
 
-def smem_residency(nbytes: int) -> int:
+def smem_residency(nbytes: int, *, capacity: int | None = None) -> int:
     """Blocks per SM a shared-memory budget allows, at least one.
 
     ``smem_capacity() // nbytes`` is the wrong divisor and reads one block too
@@ -804,19 +804,21 @@ def smem_residency(nbytes: int) -> int:
         nbytes: Bytes one block's tiles add up to. Zero or less yields the
             occupancy limit no shared memory implies, which is not a limit at all,
             so the caller's own cap decides.
+        capacity: Explicit per-block carveout. The current device is queried when
+            omitted.
 
     Returns:
         Blocks the carveout holds, floor at one. One is returned for a budget that
         does not fit at all; :func:`assert_smem_fits` is what refuses that.
     """
-    carveout = smem_capacity() + SMEM_RESERVED
+    carveout = (smem_capacity() if capacity is None else capacity) + SMEM_RESERVED
     if nbytes <= 0:
         return carveout
     block = -(-(nbytes + SMEM_RESERVED) // SMEM_GRANULE) * SMEM_GRANULE
     return max(1, carveout // block)
 
 
-def smem_budget(blocks: int) -> int:
+def smem_budget(blocks: int, *, capacity: int | None = None) -> int:
     """Largest per-block tile budget that still admits ``blocks`` blocks per SM.
 
     The exact inverse of :func:`smem_residency`: the returned budget computes as
@@ -827,6 +829,8 @@ def smem_budget(blocks: int) -> int:
 
     Args:
         blocks: Blocks per SM asked for.
+        capacity: Explicit per-block carveout. The current device is queried when
+            omitted.
 
     Returns:
         Bytes one block's tiles may add up to.
@@ -837,7 +841,7 @@ def smem_budget(blocks: int) -> int:
     """
     if blocks < 1:
         raise ValueError(f"blocks must be at least one, got {blocks}")
-    carveout = smem_capacity() + SMEM_RESERVED
+    carveout = (smem_capacity() if capacity is None else capacity) + SMEM_RESERVED
     return (carveout // blocks) // SMEM_GRANULE * SMEM_GRANULE - SMEM_RESERVED
 
 
