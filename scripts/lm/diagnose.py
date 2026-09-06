@@ -44,6 +44,7 @@ ARMS = (
     "paired-bc",
     "zero-z0-paired-bc",
     "normalized-transition",
+    "v2-lift-so3",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -208,6 +209,33 @@ def _build_current(
     scaffold = model_mod.LMConfig(
         d_model=d_model, n_layers=n_layers, vocab_size=vocab_size
     )
+    if arm == "v2-lift-so3":
+        from scripts.harness.v2_lift_so3 import build_v2_lift_so3
+        from scripts.harness import slinoss_defaults
+
+        settings = slinoss_defaults(96)
+        settings["key_conv"] = False
+
+        def factory(width: int, _max_length: int) -> nn.Module:
+            return build_v2_lift_so3(width, **settings)
+
+        model = model_mod.build_model(
+            scaffold,
+            model_mod.layer_factories(factory, n_layers),
+            max_length=2048,
+            device=device,
+            dtype=torch.float32,
+        )
+        return model, {
+            "operator": "v2-lift-so3",
+            "settings": settings,
+            "mutation": (
+                "production v2x2ssd learning geometry lifted to SO(3): live fan-in "
+                "projection; U-only convolution; polar row-RMS B/C; global post-gate "
+                "RMSNorm; normal D; live output; fan-in-normalized full-reach transition; "
+                "current deterministic cyclic z0"
+            ),
+        }
     model = model_mod.build_model(
         scaffold,
         model_mod.layer_factories(resolved.factory, n_layers),
@@ -449,7 +477,7 @@ def _activation_probe(
             "output": _stats(hidden),
             "input_mixer_cosine": _cosine(before, mixed),
         }
-        if deep and isinstance(block.mixer, SLinOSSMixer):
+        if deep and type(block.mixer) is SLinOSSMixer:
             row["slinoss"] = _inspect_current_mixer(block.mixer, normed[:1])
         layers.append(row)
     final = _rmsnorm(hidden, model.norm_weight, model.config.norm_eps)
