@@ -54,6 +54,8 @@ ARMS = (
     "r10-mamba3-bc",
     "r10-mamba3-bc-unit",
     "r10-mamba3-bc-unit-zero-bias",
+    "r10-mamba3-bc-unit-frozen-bias",
+    "r10-mamba3-bc-unit-frozen-token",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -354,6 +356,8 @@ def _build_current(
         "r10-mamba3-bc",
         "r10-mamba3-bc-unit",
         "r10-mamba3-bc-unit-zero-bias",
+        "r10-mamba3-bc-unit-frozen-bias",
+        "r10-mamba3-bc-unit-frozen-token",
     }:
         from scripts.harness import slinoss_defaults
         from scripts.harness.prior_bc_so3 import (
@@ -370,6 +374,8 @@ def _build_current(
             "r10-mamba3-bc": build_mamba3_bc,
             "r10-mamba3-bc-unit": build_unit_mamba3_bc,
             "r10-mamba3-bc-unit-zero-bias": build_unit_zero_bias_mamba3_bc,
+            "r10-mamba3-bc-unit-frozen-bias": build_unit_mamba3_bc,
+            "r10-mamba3-bc-unit-frozen-token": build_unit_mamba3_bc,
         }[arm]
 
         def factory(width: int, _max_length: int) -> nn.Module:
@@ -388,6 +394,8 @@ def _build_current(
             if arm in {
                 "r10-mamba3-bc-unit",
                 "r10-mamba3-bc-unit-zero-bias",
+                "r10-mamba3-bc-unit-frozen-bias",
+                "r10-mamba3-bc-unit-frozen-token",
             }
             else ""
         )
@@ -396,6 +404,24 @@ def _build_current(
             if arm == "r10-mamba3-bc-unit-zero-bias"
             else ""
         )
+        if arm == "r10-mamba3-bc-unit-frozen-bias":
+            for block in model.blocks:
+                block.mixer.transition_bias.requires_grad_(False)
+            alignment += "; transition_bias frozen"
+        if arm == "r10-mamba3-bc-unit-frozen-token":
+            for block in model.blocks:
+                mixer = block.mixer
+                start = mixer.layout.params_off
+                stop = mixer.layout.out_features
+
+                def zero_token_transition(
+                    grad: Tensor, *, start: int = start, stop: int = stop
+                ) -> Tensor:
+                    grad[start:stop].zero_()
+                    return grad
+
+                mixer.in_proj.weight.register_hook(zero_token_transition)
+            alignment += "; token-transition projection rows frozen at zero"
         return model, {
             "operator": arm,
             "settings": settings,
