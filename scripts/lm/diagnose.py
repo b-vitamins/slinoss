@@ -56,6 +56,7 @@ ARMS = (
     "r10-mamba3-bc-unit-zero-bias",
     "r10-mamba3-bc-unit-frozen-bias",
     "r10-mamba3-bc-unit-frozen-token",
+    "r10-mamba3-bc-unit-key-conv",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -358,12 +359,14 @@ def _build_current(
         "r10-mamba3-bc-unit-zero-bias",
         "r10-mamba3-bc-unit-frozen-bias",
         "r10-mamba3-bc-unit-frozen-token",
+        "r10-mamba3-bc-unit-key-conv",
     }:
         from scripts.harness import slinoss_defaults
         from scripts.harness.prior_bc_so3 import (
             build_mamba3_bc,
             build_old_slinoss_bc,
             build_unit_mamba3_bc,
+            build_unit_mamba3_bc_key_conv,
             build_unit_zero_bias_mamba3_bc,
         )
 
@@ -376,6 +379,7 @@ def _build_current(
             "r10-mamba3-bc-unit-zero-bias": build_unit_zero_bias_mamba3_bc,
             "r10-mamba3-bc-unit-frozen-bias": build_unit_mamba3_bc,
             "r10-mamba3-bc-unit-frozen-token": build_unit_mamba3_bc,
+            "r10-mamba3-bc-unit-key-conv": build_unit_mamba3_bc_key_conv,
         }[arm]
 
         def factory(width: int, _max_length: int) -> nn.Module:
@@ -396,6 +400,7 @@ def _build_current(
                 "r10-mamba3-bc-unit-zero-bias",
                 "r10-mamba3-bc-unit-frozen-bias",
                 "r10-mamba3-bc-unit-frozen-token",
+                "r10-mamba3-bc-unit-key-conv",
             }
             else ""
         )
@@ -422,6 +427,8 @@ def _build_current(
 
                 mixer.in_proj.weight.register_hook(zero_token_transition)
             alignment += "; token-transition projection rows frozen at zero"
+        if arm == "r10-mamba3-bc-unit-key-conv":
+            alignment += "; B/C causal convolution retained (delta initialized)"
         return model, {
             "operator": arm,
             "settings": settings,

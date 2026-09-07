@@ -69,8 +69,6 @@ class _R10BCMixer(SLinOSSMixer):
     """Common R10 body with the prior-specific B/C realization left abstract."""
 
     def __init__(self, config: SLinOSSMixerConfig) -> None:
-        if config.key_conv:
-            raise ValueError("old SLinOSS and Mamba3 do not convolve B/C")
         if config.bias:
             raise ValueError("the source B/C projections are bias-free")
         super().__init__(config)
@@ -97,7 +95,17 @@ class _R10BCMixer(SLinOSSMixer):
             activation=True,
             d_head=cfg.d_head,
         )
-        B, C = self._vectors(layout.b(projected), layout.c(projected))
+        if self.key_weight is None:
+            b_raw, c_raw = layout.b(projected), layout.c(projected)
+        else:
+            keys = causal_conv1d(
+                layout.keys(projected),
+                self.key_weight,
+                None,
+                activation=False,
+            ).y
+            b_raw, c_raw = layout.key_b(keys), layout.key_c(keys)
+        B, C = self._vectors(b_raw, c_raw)
         params = scanprep(
             layout.params(projected) * self.transition_tangent_scale,
             self.transition_bias,
@@ -226,6 +234,13 @@ def build_unit_zero_bias_mamba3_bc(
     return UnitZeroBiasMamba3BCMixer(_config(d_model, settings))
 
 
+def build_unit_mamba3_bc_key_conv(d_model: int, **settings: object) -> nn.Module:
+    exact = dict(settings)
+    exact["key_conv"] = True
+    exact["bias"] = False
+    return UnitMamba3BCMixer(SLinOSSMixerConfig(d_model=d_model, **exact))
+
+
 __all__ = [
     "Mamba3BCMixer",
     "OldSLinOSSBCMixer",
@@ -234,5 +249,6 @@ __all__ = [
     "build_mamba3_bc",
     "build_old_slinoss_bc",
     "build_unit_mamba3_bc",
+    "build_unit_mamba3_bc_key_conv",
     "build_unit_zero_bias_mamba3_bc",
 ]
