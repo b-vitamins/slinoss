@@ -47,6 +47,8 @@ ARMS = (
     "paired-bc",
     "zero-z0-paired-bc",
     "normalized-transition",
+    "normalized-transition-no-key-conv",
+    "normalized-transition-depth-scaled",
     "v2-lift-so3",
     "r10-old-bc",
     "r10-mamba3-bc",
@@ -307,6 +309,16 @@ def _build_current(
 
     mixer_name = "mamba3" if arm == "mamba3" else "slinoss"
     resolved = REGISTRY.resolve(mixer_name, ())
+    factory = resolved.factory
+    resolved_settings = dict(resolved.settings)
+    if arm == "normalized-transition-no-key-conv":
+        from scripts.harness import build_slinoss
+
+        resolved_settings["key_conv"] = False
+
+        def factory(width: int, _max_length: int) -> nn.Module:
+            return build_slinoss(width, **resolved_settings)
+
     scaffold = model_mod.LMConfig(
         d_model=d_model, n_layers=n_layers, vocab_size=vocab_size
     )
@@ -395,7 +407,7 @@ def _build_current(
         }
     model = model_mod.build_model(
         scaffold,
-        model_mod.layer_factories(resolved.factory, n_layers),
+        model_mod.layer_factories(factory, n_layers),
         max_length=2048,
         device=device,
         dtype=torch.float32,
@@ -425,7 +437,11 @@ def _build_current(
             if mutation == "none"
             else mutation + "; C_projection_rows.copy_(B_projection_rows)"
         )
-    if arm == "normalized-transition":
+    if arm in {
+        "normalized-transition",
+        "normalized-transition-no-key-conv",
+        "normalized-transition-depth-scaled",
+    }:
         factor = 1.0 / math.sqrt(d_model)
         for block in model.blocks:
             mixer = block.mixer
@@ -447,9 +463,20 @@ def _build_current(
             "token-transition projection output scaled by "
             f"1/sqrt(d_model)={factor:.17g}; reachable set unchanged"
         )
+    if arm == "normalized-transition-no-key-conv":
+        mutation += "; key_conv=False"
+    if arm == "normalized-transition-depth-scaled":
+        residual_scale = 1.0 / math.sqrt(n_layers)
+        with torch.no_grad():
+            for block in model.blocks:
+                block.mixer.out_proj.weight.mul_(residual_scale)
+        mutation += (
+            "; out_proj.weight *= 1/sqrt(n_layers) = "
+            f"{residual_scale:.17g}"
+        )
     return model, {
         "operator": mixer_name,
-        "settings": resolved.settings,
+        "settings": resolved_settings,
         "mutation": mutation,
     }
 
