@@ -39,6 +39,7 @@ from scripts.lm.schedule import lr_at, transfer
 ARMS = (
     "current",
     "mamba3",
+    "mamba3-heavy-tail",
     "official-mamba3",
     "old-v2x2",
     "zero-z0",
@@ -48,6 +49,7 @@ ARMS = (
     "v2-lift-so3",
     "r10-old-bc",
     "r10-mamba3-bc",
+    "r10-mamba3-bc-unit",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -244,6 +246,50 @@ def _build_current(
             "mutation": "none",
         }
 
+    if arm == "mamba3-heavy-tail":
+        from fla.layers.mamba3 import Mamba3 as FLAMamba3
+        from mamba_ssm.modules.mamba3 import heavy_tail_activation
+
+        class HeavyTailFLAMamba3(FLAMamba3):
+            def _compute_a(self, dd_a: Tensor) -> Tensor:
+                return (-heavy_tail_activation(dd_a.float())).clamp(
+                    max=-self.A_floor
+                )
+
+        scaffold = model_mod.LMConfig(
+            d_model=d_model, n_layers=n_layers, vocab_size=vocab_size
+        )
+
+        def factory(width: int, _max_length: int) -> nn.Module:
+            return HeavyTailFLAMamba3(
+                hidden_size=width,
+                state_size=96,
+                expand=2,
+                head_dim=64,
+                n_groups=1,
+                chunk_size=64,
+            )
+
+        model = model_mod.build_model(
+            scaffold,
+            model_mod.layer_factories(factory, n_layers),
+            max_length=2048,
+            device=device,
+            dtype=torch.float32,
+        )
+        return model, {
+            "operator": "mamba3-heavy-tail",
+            "implementation": "fla.layers.mamba3.Mamba3",
+            "settings": {
+                "state_size": 96,
+                "expand": 2,
+                "head_dim": 64,
+                "n_groups": 1,
+                "chunk_size": 64,
+            },
+            "mutation": "replace FLA negative-softplus A with official heavy-tail A",
+        }
+
     mixer_name = "mamba3" if arm == "mamba3" else "slinoss"
     resolved = REGISTRY.resolve(mixer_name, ())
     scaffold = model_mod.LMConfig(
@@ -276,16 +322,21 @@ def _build_current(
                 "current deterministic cyclic z0"
             ),
         }
-    if arm in {"r10-old-bc", "r10-mamba3-bc"}:
+    if arm in {"r10-old-bc", "r10-mamba3-bc", "r10-mamba3-bc-unit"}:
         from scripts.harness import slinoss_defaults
         from scripts.harness.prior_bc_so3 import (
             build_mamba3_bc,
             build_old_slinoss_bc,
+            build_unit_mamba3_bc,
         )
 
         settings = slinoss_defaults(96)
         settings["key_conv"] = False
-        builder = build_old_slinoss_bc if arm == "r10-old-bc" else build_mamba3_bc
+        builder = {
+            "r10-old-bc": build_old_slinoss_bc,
+            "r10-mamba3-bc": build_mamba3_bc,
+            "r10-mamba3-bc-unit": build_unit_mamba3_bc,
+        }[arm]
 
         def factory(width: int, _max_length: int) -> nn.Module:
             return builder(width, **settings)
@@ -298,13 +349,18 @@ def _build_current(
             dtype=torch.float32,
         )
         source = "old-v2x2" if arm == "r10-old-bc" else "mamba3"
+        magnitude = (
+            "; realized vectors rescaled to unit L2 norm as a magnitude-only control"
+            if arm == "r10-mamba3-bc-unit"
+            else ""
+        )
         return model, {
             "operator": arm,
             "settings": settings,
             "mutation": (
                 "R10 transition and current SO(3)/cyclic-z0 body; bias-free default "
                 "fan-in B/C projection; no B/C convolution; source-faithful "
-                f"{source} B/C realization"
+                f"{source} B/C realization{magnitude}"
             ),
         }
     model = model_mod.build_model(
@@ -404,7 +460,12 @@ def _gradient_metrics(model: nn.Module) -> dict[str, Any]:
         for name, param in model.named_parameters()
         if param.grad is not None
     )
-    result: dict[str, Any] = {"families": generic}
+    leaves = _metric_rows(
+        (name, cast(Tensor, param.grad))
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    )
+    result: dict[str, Any] = {"families": generic, "leaves": leaves}
 
     # The current mixer packs five causally different paths into in_proj.  A
     # whole-matrix norm would hide the exact path monopolising global clipping.
@@ -471,11 +532,18 @@ def _inspect_current_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
     )
     b_raw = (layout.b(proj) if keys is None else layout.key_b(keys)).clone()
     c_raw = (layout.c(proj) if keys is None else layout.key_c(keys)).clone()
-    b, c = b_raw.clone(), c_raw.clone()
-    _l2_normalize_(b)
-    _l2_normalize_(c)
+    if hasattr(mixer, "_vectors"):
+        b, c = mixer._vectors(b_raw, c_raw)
+        vector_rule = type(mixer).__name__
+    else:
+        b, c = b_raw.clone(), c_raw.clone()
+        _l2_normalize_(b)
+        _l2_normalize_(c)
+        vector_rule = "l2-unit"
+    raw_params = layout.params(proj)
+    tangent_scale = float(getattr(mixer, "transition_tangent_scale", 1.0))
     params = prep_dispatch.get(picks.prep).forward(
-        layout.params(proj),
+        raw_params * tangent_scale,
         mixer.transition_bias,
         heads=cfg.n_heads,
         w_max=ROTATION_CHART_SCALE_MAX,
@@ -505,8 +573,12 @@ def _inspect_current_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
 
     decay = torch.exp(2.0 * params.trans[..., 3])
     return {
+        "vector_rule": vector_rule,
+        "transition_tangent_scale": tangent_scale,
         "raw_B_vector_norm": _stats(torch.linalg.vector_norm(b_raw.float(), dim=-1)),
         "raw_C_vector_norm": _stats(torch.linalg.vector_norm(c_raw.float(), dim=-1)),
+        "realized_B_vector_norm": _stats(torch.linalg.vector_norm(b.float(), dim=-1)),
+        "realized_C_vector_norm": _stats(torch.linalg.vector_norm(c.float(), dim=-1)),
         "normalized_BC_dot": _stats((b.float() * c.float()).sum(-1)),
         "C_K_B": coupling,
         "transition_decay": _stats(decay),
@@ -524,6 +596,102 @@ def _inspect_current_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
 
 
 @torch.no_grad()
+def _inspect_mamba3_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
+    inner = getattr(mixer, "inner", mixer)
+    if not (
+        type(inner).__module__.startswith("mamba_ssm.modules.mamba3")
+        or type(inner).__module__.startswith("fla.layers.mamba3")
+    ):
+        raise TypeError(f"not a Mamba3 mixer: {type(inner)!r}")
+
+    projected = inner.in_proj(x)
+    d_inner = int(getattr(inner, "d_inner", getattr(inner, "intermediate_size", 0)))
+    d_state = int(getattr(inner, "d_state", getattr(inner, "ssm_state_size", 0)))
+    n_heads = int(getattr(inner, "nheads", getattr(inner, "num_heads", 0)))
+    n_groups = int(getattr(inner, "num_bc_heads", getattr(inner, "n_groups", 0)))
+    head_dim = int(getattr(inner, "headdim", getattr(inner, "head_dim", 0)))
+    rank = int(inner.mimo_rank)
+    angles = int(inner.num_rope_angles)
+    z, value, b_raw, c_raw, dd_dt, dd_a, trap, _angle = torch.split(
+        projected,
+        [
+            d_inner,
+            d_inner,
+            d_state * n_groups * rank,
+            d_state * n_groups * rank,
+            n_heads,
+            n_heads,
+            n_heads,
+            angles,
+        ],
+        dim=-1,
+    )
+    shape = (*b_raw.shape[:-1], rank, n_groups, d_state)
+    b_norm = inner.B_norm(b_raw.view(shape))
+    c_norm = inner.C_norm(c_raw.view(shape))
+    heads_per_group = n_heads // n_groups
+    b_head = b_norm.repeat_interleave(heads_per_group, dim=-2)
+    c_head = c_norm.repeat_interleave(heads_per_group, dim=-2)
+    b_bias = inner.B_bias.permute(1, 0, 2)
+    c_bias = inner.C_bias.permute(1, 0, 2)
+    b_real = b_head + b_bias
+    c_real = c_head + c_bias
+
+    dt = torch.nn.functional.softplus(dd_dt.float() + inner.dt_bias.float())
+    if hasattr(inner, "_compute_a"):
+        a = inner._compute_a(dd_a)
+        a_rule = "negative-softplus"
+    else:
+        from mamba_ssm.modules.mamba3 import heavy_tail_activation
+
+        a = -heavy_tail_activation(dd_a.float())
+        a = a.clamp(max=-float(inner.A_floor))
+        a_rule = "negative-heavy-tail"
+    alpha = torch.exp(a * dt)
+    lam = torch.sigmoid(trap.float())
+    gamma = dt * lam
+    beta = dt * (1.0 - lam) * alpha
+    qk = (b_real.float() * c_real.float()).sum(-1)
+    value = value.unflatten(-1, (n_heads, head_dim))
+    z = z.unflatten(-1, (n_heads, head_dim))
+    return {
+        "implementation": f"{type(inner).__module__}.{type(inner).__name__}",
+        "A_rule": a_rule,
+        "raw_B": _stats(b_raw),
+        "raw_C": _stats(c_raw),
+        "normalized_B_vector_norm": _stats(
+            torch.linalg.vector_norm(b_norm.float(), dim=-1)
+        ),
+        "normalized_C_vector_norm": _stats(
+            torch.linalg.vector_norm(c_norm.float(), dim=-1)
+        ),
+        "realized_B_vector_norm": _stats(
+            torch.linalg.vector_norm(b_real.float(), dim=-1)
+        ),
+        "realized_C_vector_norm": _stats(
+            torch.linalg.vector_norm(c_real.float(), dim=-1)
+        ),
+        "C_B": _stats(qk),
+        "dt": _stats(dt),
+        "A": _stats(a),
+        "alpha": _stats(alpha),
+        "beta": _stats(beta),
+        "gamma": _stats(gamma),
+        "gamma_C_B": _stats(gamma.unsqueeze(-2) * qk),
+        "beta_C_B": _stats(beta.unsqueeze(-2) * qk),
+        "value": _stats(value),
+        "gate": _stats(torch.nn.functional.silu(z)),
+    }
+
+
+def _capture_first_operand(destination: dict[str, Tensor]):
+    def hook(_module: nn.Module, operands: tuple[Tensor, ...]) -> None:
+        destination["value"] = operands[0].detach()
+
+    return hook
+
+
+@torch.no_grad()
 def _activation_probe(
     model: nn.Module, batch: Batch, classes: int, *, deep: bool
 ) -> dict[str, Any]:
@@ -538,7 +706,19 @@ def _activation_probe(
     for index, block in enumerate(model.blocks):
         before = hidden
         normed = _rmsnorm(before, block.norm_weight, block.norm_eps)
-        mixed = _unwrap(block.mixer(normed))
+        inner = getattr(block.mixer, "inner", block.mixer)
+        out_proj = getattr(inner, "out_proj", None)
+        captured: dict[str, Tensor] = {}
+        handle = None
+        if isinstance(out_proj, nn.Linear):
+            handle = out_proj.register_forward_pre_hook(
+                _capture_first_operand(captured)
+            )
+        try:
+            mixed = _unwrap(block.mixer(normed))
+        finally:
+            if handle is not None:
+                handle.remove()
         hidden = before + mixed
         row: dict[str, Any] = {
             "layer": index,
@@ -548,8 +728,17 @@ def _activation_probe(
             "output": _stats(hidden),
             "input_mixer_cosine": _cosine(before, mixed),
         }
-        if deep and type(block.mixer) is SLinOSSMixer:
+        if "value" in captured:
+            row["pre_out_proj"] = _stats(captured["value"])
+        if isinstance(out_proj, nn.Linear):
+            row["out_proj_weight"] = _stats(out_proj.weight)
+        if deep and isinstance(block.mixer, SLinOSSMixer):
             row["slinoss"] = _inspect_current_mixer(block.mixer, normed[:1])
+        if deep and (
+            type(inner).__module__.startswith("mamba_ssm.modules.mamba3")
+            or type(inner).__module__.startswith("fla.layers.mamba3")
+        ):
+            row["mamba3"] = _inspect_mamba3_mixer(block.mixer, normed[:1])
         layers.append(row)
     final = _rmsnorm(hidden, model.norm_weight, model.config.norm_eps)
     probe_loss = _loss(model, batch, classes)

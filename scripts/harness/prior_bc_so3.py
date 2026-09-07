@@ -180,6 +180,17 @@ class Mamba3BCMixer(_R10BCMixer):
         )
 
 
+class UnitMamba3BCMixer(Mamba3BCMixer):
+    """Magnitude control: Mamba3's realized directions, rescaled to L2 norm one."""
+
+    def _vectors(self, b_raw: Tensor, c_raw: Tensor) -> tuple[Tensor, Tensor]:
+        b, c = super()._vectors(b_raw, c_raw)
+        return (
+            F.normalize(b.float(), dim=-1, eps=self.config.norm_eps).to(b.dtype),
+            F.normalize(c.float(), dim=-1, eps=self.config.norm_eps).to(c.dtype),
+        )
+
+
 def _config(d_model: int, settings: dict[str, object]) -> SLinOSSMixerConfig:
     exact = dict(settings)
     exact["key_conv"] = False
@@ -195,9 +206,15 @@ def build_mamba3_bc(d_model: int, **settings: object) -> nn.Module:
     return Mamba3BCMixer(_config(d_model, settings))
 
 
+def build_unit_mamba3_bc(d_model: int, **settings: object) -> nn.Module:
+    return UnitMamba3BCMixer(_config(d_model, settings))
+
+
 __all__ = [
     "Mamba3BCMixer",
     "OldSLinOSSBCMixer",
+    "UnitMamba3BCMixer",
     "build_mamba3_bc",
     "build_old_slinoss_bc",
+    "build_unit_mamba3_bc",
 ]
