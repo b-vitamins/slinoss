@@ -45,6 +45,8 @@ ARMS = (
     "zero-z0-paired-bc",
     "normalized-transition",
     "v2-lift-so3",
+    "r10-old-bc",
+    "r10-mamba3-bc",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -210,8 +212,8 @@ def _build_current(
         d_model=d_model, n_layers=n_layers, vocab_size=vocab_size
     )
     if arm == "v2-lift-so3":
-        from scripts.harness.v2_lift_so3 import build_v2_lift_so3
         from scripts.harness import slinoss_defaults
+        from scripts.harness.v2_lift_so3 import build_v2_lift_so3
 
         settings = slinoss_defaults(96)
         settings["key_conv"] = False
@@ -234,6 +236,37 @@ def _build_current(
                 "projection; U-only convolution; polar row-RMS B/C; global post-gate "
                 "RMSNorm; normal D; live output; fan-in-normalized full-reach transition; "
                 "current deterministic cyclic z0"
+            ),
+        }
+    if arm in {"r10-old-bc", "r10-mamba3-bc"}:
+        from scripts.harness import slinoss_defaults
+        from scripts.harness.prior_bc_so3 import (
+            build_mamba3_bc,
+            build_old_slinoss_bc,
+        )
+
+        settings = slinoss_defaults(96)
+        settings["key_conv"] = False
+        builder = build_old_slinoss_bc if arm == "r10-old-bc" else build_mamba3_bc
+
+        def factory(width: int, _max_length: int) -> nn.Module:
+            return builder(width, **settings)
+
+        model = model_mod.build_model(
+            scaffold,
+            model_mod.layer_factories(factory, n_layers),
+            max_length=2048,
+            device=device,
+            dtype=torch.float32,
+        )
+        source = "old-v2x2" if arm == "r10-old-bc" else "mamba3"
+        return model, {
+            "operator": arm,
+            "settings": settings,
+            "mutation": (
+                "R10 transition and current SO(3)/cyclic-z0 body; bias-free default "
+                "fan-in B/C projection; no B/C convolution; source-faithful "
+                f"{source} B/C realization"
             ),
         }
     model = model_mod.build_model(
@@ -537,6 +570,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-base-lr", type=float, default=0.3)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=3.0)
+    parser.add_argument("--abort-grad-norm", type=float, default=math.inf)
     parser.add_argument("--warmdown-fraction", type=float, default=0.4)
     return parser
 
@@ -684,6 +718,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload["gradient_snapshots"][str(step)] = _gradient_metrics(model)
         grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
         scale = min(1.0, args.grad_clip / max(grad_norm, 1e-30))
+        if not math.isfinite(grad_norm) or grad_norm >= args.abort_grad_norm:
+            payload["steps"].append(
+                {
+                    "step": step,
+                    "loss": mean,
+                    "lr": peak_lr * factor,
+                    "grad_norm_preclip": grad_norm,
+                    "clip_scale": scale,
+                }
+            )
+            payload.update(
+                {
+                    "status": "aborted",
+                    "abort_reason": (
+                        f"pre-clip gradient norm {grad_norm} reached "
+                        f"threshold {args.abort_grad_norm}"
+                    ),
+                    "training_seconds": training_seconds,
+                    "telemetry_seconds": telemetry_seconds,
+                }
+            )
+            _write(args.out, payload)
+            print(f"ABORT arm={args.arm} step={step} grad={grad_norm:.3e}", flush=True)
+            return 2
         clipped += int(scale < 1.0)
         clip_scales.append(scale)
         optimizer.step()
