@@ -417,8 +417,9 @@ coordinate.
 Two older implementations sharpen the initialization diagnosis. Production
 SLinOSS at `slinoss-old` commit `5eb1e26` defaulted to `G=H`, left its fused B/C
 rows and output projection live under framework initialization, and normalized
-each realized complex B/C vector to unit RMS (L2 norm `sqrt(S)`). Its recurrent
-state was zero. The research SP2SSD mixer at `c2a9064` also used live Xavier B/C
+the magnitudes of its `N` realized complex B/C lanes to unit RMS (packed-real
+L2 norm `sqrt(N)`, not `sqrt(2N)`). Its recurrent state was zero. The research
+SP2SSD mixer at `c2a9064` also used live Xavier B/C
 and output projections, but initialized its actual correction precision to
 `softplus(-8) ~= 0.000335`, effectively freezing the update. Commit `3a5e775`
 replaced that dead corner with `phi_init=1` and live gentle modulation. Thus
