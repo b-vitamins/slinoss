@@ -41,6 +41,7 @@ ARMS = (
     "mamba3",
     "mamba3-heavy-tail",
     "official-mamba3",
+    "official-mamba3-depth-scaled",
     "old-v2x2",
     "zero-z0",
     "paired-bc",
@@ -50,6 +51,7 @@ ARMS = (
     "r10-old-bc",
     "r10-mamba3-bc",
     "r10-mamba3-bc-unit",
+    "r10-mamba3-bc-unit-zero-bias",
 )
 SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
 DEEP_STEPS = frozenset({-1, 9, 99})
@@ -209,7 +211,7 @@ def _build_current(
     from scripts.lm import model as model_mod
     from scripts.lm.mixers import REGISTRY, Unwrap
 
-    if arm == "official-mamba3":
+    if arm in {"official-mamba3", "official-mamba3-depth-scaled"}:
         from mamba_ssm.modules.mamba3 import Mamba3 as OfficialMamba3
 
         scaffold = model_mod.LMConfig(
@@ -233,6 +235,13 @@ def _build_current(
             device=device,
             dtype=torch.float32,
         )
+        if arm == "official-mamba3-depth-scaled":
+            residual_scale = 1.0 / math.sqrt(n_layers)
+            with torch.no_grad():
+                for block in model.blocks:
+                    block.mixer.out_proj.weight.mul_(residual_scale)
+        else:
+            residual_scale = 1.0
         return model, {
             "operator": "official-mamba3",
             "implementation": "mamba_ssm.modules.mamba3.Mamba3",
@@ -243,7 +252,11 @@ def _build_current(
                 "ngroups": 1,
                 "chunk_size": 64,
             },
-            "mutation": "none",
+            "mutation": (
+                "none"
+                if residual_scale == 1.0
+                else f"out_proj.weight *= 1/sqrt(n_layers) = {residual_scale:.17g}"
+            ),
         }
 
     if arm == "mamba3-heavy-tail":
@@ -324,12 +337,18 @@ def _build_current(
                 "current deterministic cyclic z0"
             ),
         }
-    if arm in {"r10-old-bc", "r10-mamba3-bc", "r10-mamba3-bc-unit"}:
+    if arm in {
+        "r10-old-bc",
+        "r10-mamba3-bc",
+        "r10-mamba3-bc-unit",
+        "r10-mamba3-bc-unit-zero-bias",
+    }:
         from scripts.harness import slinoss_defaults
         from scripts.harness.prior_bc_so3 import (
             build_mamba3_bc,
             build_old_slinoss_bc,
             build_unit_mamba3_bc,
+            build_unit_zero_bias_mamba3_bc,
         )
 
         settings = slinoss_defaults(96)
@@ -338,6 +357,7 @@ def _build_current(
             "r10-old-bc": build_old_slinoss_bc,
             "r10-mamba3-bc": build_mamba3_bc,
             "r10-mamba3-bc-unit": build_unit_mamba3_bc,
+            "r10-mamba3-bc-unit-zero-bias": build_unit_zero_bias_mamba3_bc,
         }[arm]
 
         def factory(width: int, _max_length: int) -> nn.Module:
@@ -353,7 +373,15 @@ def _build_current(
         source = "old-v2x2" if arm == "r10-old-bc" else "mamba3"
         magnitude = (
             "; realized vectors rescaled to unit L2 norm as a magnitude-only control"
-            if arm == "r10-mamba3-bc-unit"
+            if arm in {
+                "r10-mamba3-bc-unit",
+                "r10-mamba3-bc-unit-zero-bias",
+            }
+            else ""
+        )
+        alignment = (
+            "; B_bias and C_bias initialized to zero but left trainable"
+            if arm == "r10-mamba3-bc-unit-zero-bias"
             else ""
         )
         return model, {
@@ -362,7 +390,7 @@ def _build_current(
             "mutation": (
                 "R10 transition and current SO(3)/cyclic-z0 body; bias-free default "
                 "fan-in B/C projection; no B/C convolution; source-faithful "
-                f"{source} B/C realization{magnitude}"
+                f"{source} B/C realization{magnitude}{alignment}"
             ),
         }
     model = model_mod.build_model(

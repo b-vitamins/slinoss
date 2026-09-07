@@ -191,6 +191,16 @@ class UnitMamba3BCMixer(Mamba3BCMixer):
         )
 
 
+class UnitZeroBiasMamba3BCMixer(UnitMamba3BCMixer):
+    """Alignment control: unit Mamba3 vectors with the shared +1 offsets zeroed."""
+
+    def __init__(self, config: SLinOSSMixerConfig) -> None:
+        super().__init__(config)
+        with torch.no_grad():
+            self.B_bias.zero_()
+            self.C_bias.zero_()
+
+
 def _config(d_model: int, settings: dict[str, object]) -> SLinOSSMixerConfig:
     exact = dict(settings)
     exact["key_conv"] = False
@@ -210,11 +220,19 @@ def build_unit_mamba3_bc(d_model: int, **settings: object) -> nn.Module:
     return UnitMamba3BCMixer(_config(d_model, settings))
 
 
+def build_unit_zero_bias_mamba3_bc(
+    d_model: int, **settings: object
+) -> nn.Module:
+    return UnitZeroBiasMamba3BCMixer(_config(d_model, settings))
+
+
 __all__ = [
     "Mamba3BCMixer",
     "OldSLinOSSBCMixer",
     "UnitMamba3BCMixer",
+    "UnitZeroBiasMamba3BCMixer",
     "build_mamba3_bc",
     "build_old_slinoss_bc",
     "build_unit_mamba3_bc",
+    "build_unit_zero_bias_mamba3_bc",
 ]
