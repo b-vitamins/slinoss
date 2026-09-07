@@ -207,7 +207,7 @@ def _build_current(
     *, arm: str, d_model: int, n_layers: int, vocab_size: int, device: str
 ) -> tuple[nn.Module, dict[str, Any]]:
     from scripts.lm import model as model_mod
-    from scripts.lm.mixers import REGISTRY
+    from scripts.lm.mixers import REGISTRY, Unwrap
 
     if arm == "official-mamba3":
         from mamba_ssm.modules.mamba3 import Mamba3 as OfficialMamba3
@@ -261,13 +261,15 @@ def _build_current(
         )
 
         def factory(width: int, _max_length: int) -> nn.Module:
-            return HeavyTailFLAMamba3(
-                hidden_size=width,
-                state_size=96,
-                expand=2,
-                head_dim=64,
-                n_groups=1,
-                chunk_size=64,
+            return Unwrap(
+                HeavyTailFLAMamba3(
+                    hidden_size=width,
+                    state_size=96,
+                    expand=2,
+                    head_dim=64,
+                    n_groups=1,
+                    chunk_size=64,
+                )
             )
 
         model = model_mod.build_model(
@@ -562,8 +564,16 @@ def _inspect_current_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
     denom = full.y.float().norm().clamp_min(1e-30)
 
     heads_per_group = cfg.n_heads // cfg.n_groups
-    bh = b.repeat_interleave(heads_per_group, dim=1).unflatten(-1, (-1, 3))
-    ch = c.repeat_interleave(heads_per_group, dim=1).unflatten(-1, (-1, 3))
+    bh = (
+        b
+        if b.shape[1] == cfg.n_heads
+        else b.repeat_interleave(heads_per_group, dim=1)
+    ).unflatten(-1, (-1, 3))
+    ch = (
+        c
+        if c.shape[1] == cfg.n_heads
+        else c.repeat_interleave(heads_per_group, dim=1)
+    ).unflatten(-1, (-1, 3))
     coupling: dict[str, dict[str, float | bool]] = {}
     for tap_index, name in enumerate(("previous", "current")):
         matrix = tap_matrix(params.K[..., tap_index, :3], params.trans[..., :3])
@@ -598,10 +608,7 @@ def _inspect_current_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
 @torch.no_grad()
 def _inspect_mamba3_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
     inner = getattr(mixer, "inner", mixer)
-    if not (
-        type(inner).__module__.startswith("mamba_ssm.modules.mamba3")
-        or type(inner).__module__.startswith("fla.layers.mamba3")
-    ):
+    if not _is_mamba3(inner):
         raise TypeError(f"not a Mamba3 mixer: {type(inner)!r}")
 
     projected = inner.in_proj(x)
@@ -684,6 +691,13 @@ def _inspect_mamba3_mixer(mixer: nn.Module, x: Tensor) -> dict[str, Any]:
     }
 
 
+def _is_mamba3(module: nn.Module) -> bool:
+    return all(
+        hasattr(module, name)
+        for name in ("num_rope_angles", "mimo_rank", "B_norm", "C_norm", "dt_bias")
+    )
+
+
 def _capture_first_operand(destination: dict[str, Tensor]):
     def hook(_module: nn.Module, operands: tuple[Tensor, ...]) -> None:
         destination["value"] = operands[0].detach()
@@ -734,10 +748,7 @@ def _activation_probe(
             row["out_proj_weight"] = _stats(out_proj.weight)
         if deep and isinstance(block.mixer, SLinOSSMixer):
             row["slinoss"] = _inspect_current_mixer(block.mixer, normed[:1])
-        if deep and (
-            type(inner).__module__.startswith("mamba_ssm.modules.mamba3")
-            or type(inner).__module__.startswith("fla.layers.mamba3")
-        ):
+        if deep and _is_mamba3(inner):
             row["mamba3"] = _inspect_mamba3_mixer(block.mixer, normed[:1])
         layers.append(row)
     final = _rmsnorm(hidden, model.norm_weight, model.config.norm_eps)
