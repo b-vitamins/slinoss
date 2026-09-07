@@ -58,8 +58,8 @@ ARMS = (
     "r10-mamba3-bc-unit-frozen-token",
     "r10-mamba3-bc-unit-key-conv",
 )
-SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 24, 49, 74, 99})
-DEEP_STEPS = frozenset({-1, 9, 99})
+SNAPSHOT_STEPS = frozenset({0, 1, 4, 9, 19, 24, 49, 74, 99})
+DEEP_STEPS = frozenset({-1, 9, 19, 99})
 _LOG2E = 1.0 / math.log(2.0)
 
 
@@ -564,9 +564,12 @@ def _gradient_metrics(model: nn.Module) -> dict[str, Any]:
     except (ImportError, ModuleNotFoundError):
         return result
     sliced: list[tuple[str, Tensor]] = []
-    for module in model.modules():
-        if not isinstance(module, SLinOSSMixer):
-            continue
+    transition_heads: list[dict[str, float | int]] = []
+    from slinoss.mixer import _head_lattice
+
+    for layer, module in enumerate(
+        item for item in model.modules() if isinstance(item, SLinOSSMixer)
+    ):
         if parametrize.is_parametrized(module.in_proj, "weight"):
             grad = module.in_proj.parametrizations.weight.original.grad
         else:
@@ -583,8 +586,33 @@ def _gradient_metrics(model: nn.Module) -> dict[str, Any]:
                 ("token_transition", grad[layout.params_off : layout.out_features]),
             )
         )
+        bias_grad = module.transition_bias.grad
+        if bias_grad is not None:
+            horizon, period = _head_lattice(module.config.n_heads)
+            token = grad[layout.params_off : layout.out_features].unflatten(
+                0, (module.config.n_heads, 4)
+            )
+            for head in range(module.config.n_heads):
+                transition_heads.append(
+                    {
+                        "layer": layer,
+                        "head": head,
+                        "initial_horizon": float(horizon[head]),
+                        "initial_period": float(period[head]),
+                        "bias_rotation_grad_norm": float(
+                            bias_grad[head, :3].float().norm()
+                        ),
+                        "bias_decay_grad_abs": float(bias_grad[head, 3].float().abs()),
+                        "token_rotation_grad_norm": float(
+                            token[head, :3].float().norm()
+                        ),
+                        "token_decay_grad_norm": float(token[head, 3].float().norm()),
+                    }
+                )
     if sliced:
         result["slinoss_in_proj_bands"] = _metric_rows(sliced)
+    if transition_heads:
+        result["slinoss_transition_heads"] = transition_heads
     return result
 
 
