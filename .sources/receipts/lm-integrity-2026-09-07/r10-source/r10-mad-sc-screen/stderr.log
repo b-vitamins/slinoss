@@ -1,0 +1,17 @@
+  profile 'kla-paper-v2' is textual-reconstruction and is not eligible by itself for a published-table claim
+  sc epoch 10 train 1.8146 test 1.7717 micro 0.3429 macro 0.3426
+  sc epoch 20 train 1.3101 test 1.2849 micro 0.4918 macro 0.4919
+  sc epoch 30 train 1.0854 test 1.1045 micro 0.5618 macro 0.5618
+  sc epoch 40 train 1.0068 test 1.0375 micro 0.5802 macro 0.5802
+  sc epoch 50 train 0.9359 test 1.0089 micro 0.5912 macro 0.5911
+  sc epoch 60 train 0.8951 test 0.9996 micro 0.5967 macro 0.5969
+  sc epoch 70 train 0.8680 test 0.9349 micro 0.6211 macro 0.6210
+  sc epoch 80 train 0.8057 test 0.9475 micro 0.6171 macro 0.6170
+  sc epoch 90 train 0.7887 test 0.9816 micro 0.6095 macro 0.6096
+  sc epoch 100 train 0.7575 test 0.9766 micro 0.6138 macro 0.6137
+  sc epoch 110 train 0.7449 test 0.9576 micro 0.6184 macro 0.6181
+  sc epoch 120 train 0.7170 test 0.9647 micro 0.6216 macro 0.6218
+  sc epoch 130 train 0.6928 test 1.0252 micro 0.6087 macro 0.6085
+  sc epoch 140 train 0.6776 test 1.0302 micro 0.6058 macro 0.6057
+  sc epoch 150 train 0.6771 test 1.0164 micro 0.6209 macro 0.6208
+  sc epoch 160 train 0.6547 test 1.0144 micro 0.6249 macro 0.6251
