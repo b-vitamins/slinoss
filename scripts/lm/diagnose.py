@@ -39,6 +39,7 @@ from scripts.lm.schedule import lr_at, transfer
 ARMS = (
     "current",
     "mamba3",
+    "official-mamba3",
     "old-v2x2",
     "zero-z0",
     "paired-bc",
@@ -205,6 +206,43 @@ def _build_current(
 ) -> tuple[nn.Module, dict[str, Any]]:
     from scripts.lm import model as model_mod
     from scripts.lm.mixers import REGISTRY
+
+    if arm == "official-mamba3":
+        from mamba_ssm.modules.mamba3 import Mamba3 as OfficialMamba3
+
+        scaffold = model_mod.LMConfig(
+            d_model=d_model, n_layers=n_layers, vocab_size=vocab_size
+        )
+
+        def factory(width: int, _max_length: int) -> nn.Module:
+            return OfficialMamba3(
+                d_model=width,
+                d_state=96,
+                expand=2,
+                headdim=64,
+                ngroups=1,
+                chunk_size=64,
+            )
+
+        model = model_mod.build_model(
+            scaffold,
+            model_mod.layer_factories(factory, n_layers),
+            max_length=2048,
+            device=device,
+            dtype=torch.float32,
+        )
+        return model, {
+            "operator": "official-mamba3",
+            "implementation": "mamba_ssm.modules.mamba3.Mamba3",
+            "settings": {
+                "d_state": 96,
+                "expand": 2,
+                "headdim": 64,
+                "ngroups": 1,
+                "chunk_size": 64,
+            },
+            "mutation": "none",
+        }
 
     mixer_name = "mamba3" if arm == "mamba3" else "slinoss"
     resolved = REGISTRY.resolve(mixer_name, ())
